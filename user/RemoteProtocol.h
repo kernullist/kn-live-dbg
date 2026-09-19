@@ -4,6 +4,7 @@
 // v1 is cleartext TCP. See docs/REMOTE_OPERATOR_SESSION.md.
 
 #include "McpJson.h"
+#include "CommandInput.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -256,12 +257,12 @@ namespace knremote
     inline bool ConstantTimeEqual(const std::string& left, const std::string& right)
     {
         const size_t n = left.size() > right.size() ? left.size() : right.size();
-        unsigned char acc = static_cast<unsigned char>(left.size() ^ right.size());
+        size_t acc = left.size() ^ right.size();
         for (size_t i = 0; i < n; ++i)
         {
             const unsigned char a = i < left.size() ? static_cast<unsigned char>(left[i]) : 0;
             const unsigned char b = i < right.size() ? static_cast<unsigned char>(right[i]) : 0;
-            acc = static_cast<unsigned char>(acc | (a ^ b));
+            acc |= static_cast<size_t>(a ^ b);
         }
         return acc == 0;
     }
@@ -365,7 +366,7 @@ namespace knremote
         bool ok = false;
         do
         {
-            if (addr == nullptr || text.empty())
+            if (addr == nullptr || text.empty() || text.find(L'\0') != std::wstring::npos)
             {
                 break;
             }
@@ -420,10 +421,8 @@ namespace knremote
                 break;
             }
 
-            wchar_t* end = nullptr;
-            const unsigned long parsed = wcstoul(portText.c_str(), &end, 10);
-            if (end == portText.c_str() || (end != nullptr && *end != 0) ||
-                parsed == 0 || parsed > 65535)
+            uint16_t parsed = 0;
+            if (!commandinput::ParsePort(portText, &parsed))
             {
                 if (error != nullptr)
                 {
@@ -545,142 +544,9 @@ namespace knremote
         return ok;
     }
 
-    inline size_t FindKey(const std::wstring& json, const wchar_t* key)
-    {
-        std::wstring needle = L"\"";
-        needle += key;
-        needle += L"\"";
-        size_t pos = 0;
-        while (pos < json.size())
-        {
-            const size_t found = json.find(needle, pos);
-            if (found == std::wstring::npos)
-            {
-                return std::wstring::npos;
-            }
-            size_t colon = found + needle.size();
-            while (colon < json.size() && (json[colon] == L' ' || json[colon] == L'\t'))
-            {
-                ++colon;
-            }
-            if (colon < json.size() && json[colon] == L':')
-            {
-                return colon + 1;
-            }
-            pos = found + 1;
-        }
-        return std::wstring::npos;
-    }
-
     inline bool GetStringField(const std::wstring& json, const wchar_t* key, std::wstring* value)
     {
-        bool ok = false;
-        do
-        {
-            if (value == nullptr)
-            {
-                break;
-            }
-            value->clear();
-            size_t pos = FindKey(json, key);
-            if (pos == std::wstring::npos)
-            {
-                break;
-            }
-            while (pos < json.size() && (json[pos] == L' ' || json[pos] == L'\t'))
-            {
-                ++pos;
-            }
-            if (pos >= json.size() || json[pos] != L'\"')
-            {
-                break;
-            }
-            ++pos;
-            std::wstring out;
-            bool terminated = false;
-            while (pos < json.size())
-            {
-                wchar_t ch = json[pos++];
-                if (ch == L'\\')
-                {
-                    if (pos >= json.size())
-                    {
-                        break;
-                    }
-                    wchar_t next = json[pos++];
-                    if (next == L'\"' || next == L'\\' || next == L'/')
-                    {
-                        out.push_back(next);
-                    }
-                    else if (next == L'n')
-                    {
-                        out.push_back(L'\n');
-                    }
-                    else if (next == L'r')
-                    {
-                        out.push_back(L'\r');
-                    }
-                    else if (next == L't')
-                    {
-                        out.push_back(L'\t');
-                    }
-                    else if (next == L'u')
-                    {
-                        if (pos + 4 > json.size())
-                        {
-                            break;
-                        }
-                        unsigned int codepoint = 0;
-                        bool hexOk = true;
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            const wchar_t hex = json[pos++];
-                            codepoint <<= 4;
-                            if (hex >= L'0' && hex <= L'9')
-                            {
-                                codepoint += static_cast<unsigned int>(hex - L'0');
-                            }
-                            else if (hex >= L'a' && hex <= L'f')
-                            {
-                                codepoint += static_cast<unsigned int>(hex - L'a' + 10);
-                            }
-                            else if (hex >= L'A' && hex <= L'F')
-                            {
-                                codepoint += static_cast<unsigned int>(hex - L'A' + 10);
-                            }
-                            else
-                            {
-                                hexOk = false;
-                                break;
-                            }
-                        }
-                        if (!hexOk)
-                        {
-                            break;
-                        }
-                        out.push_back(static_cast<wchar_t>(codepoint));
-                    }
-                    else
-                    {
-                        out.push_back(next);
-                    }
-                    continue;
-                }
-                if (ch == L'\"')
-                {
-                    terminated = true;
-                    break;
-                }
-                out.push_back(ch);
-            }
-            if (!terminated)
-            {
-                break;
-            }
-            *value = out;
-            ok = true;
-        } while (false);
-        return ok;
+        return key != nullptr && mcpjson::GetString(json, key, value);
     }
 
     inline bool GetNumberField(const std::wstring& json, const wchar_t* key, int64_t* value)
@@ -688,26 +554,21 @@ namespace knremote
         bool ok = false;
         do
         {
-            if (value == nullptr)
+            std::wstring raw;
+            if (key == nullptr || value == nullptr || !mcpjson::FindRawValue(json, key, &raw) || raw.empty())
             {
                 break;
             }
-            size_t pos = FindKey(json, key);
-            if (pos == std::wstring::npos)
+            const bool negative = raw[0] == L'-';
+            uint64_t magnitude = 0;
+            const uint64_t limit = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) + (negative ? 1ull : 0ull);
+            if (!commandinput::ParseDigits(negative ? raw.substr(1) : raw, 10, &magnitude) || magnitude > limit)
             {
                 break;
             }
-            while (pos < json.size() && (json[pos] == L' ' || json[pos] == L'\t'))
-            {
-                ++pos;
-            }
-            wchar_t* end = nullptr;
-            const long long parsed = wcstoll(json.c_str() + pos, &end, 10);
-            if (end == json.c_str() + pos)
-            {
-                break;
-            }
-            *value = parsed;
+            *value = negative
+                ? (magnitude == limit ? (std::numeric_limits<int64_t>::min)() : -static_cast<int64_t>(magnitude))
+                : static_cast<int64_t>(magnitude);
             ok = true;
         } while (false);
         return ok;
@@ -715,35 +576,13 @@ namespace knremote
 
     inline bool GetBoolField(const std::wstring& json, const wchar_t* key, bool* value)
     {
-        bool ok = false;
-        do
+        std::wstring raw;
+        const bool ok = key != nullptr && value != nullptr && mcpjson::FindRawValue(json, key, &raw) &&
+            (raw == L"true" || raw == L"false");
+        if (ok)
         {
-            if (value == nullptr)
-            {
-                break;
-            }
-            size_t pos = FindKey(json, key);
-            if (pos == std::wstring::npos)
-            {
-                break;
-            }
-            while (pos < json.size() && (json[pos] == L' ' || json[pos] == L'\t'))
-            {
-                ++pos;
-            }
-            if (json.compare(pos, 4, L"true") == 0)
-            {
-                *value = true;
-                ok = true;
-                break;
-            }
-            if (json.compare(pos, 5, L"false") == 0)
-            {
-                *value = false;
-                ok = true;
-                break;
-            }
-        } while (false);
+            *value = raw == L"true";
+        }
         return ok;
     }
 

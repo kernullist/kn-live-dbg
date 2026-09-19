@@ -2,14 +2,18 @@
 
 #include "EtwScanner.h"
 #include "McpServer.h"
+#include "McpJson.h"
 
 #include <Aclapi.h>
+#include <winhttp.h>
 #include <algorithm>
 #include <iostream>
 #include <limits>
 #include <set>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "winhttp.lib")
 
 namespace
 {
@@ -288,6 +292,38 @@ int RunMcpToolCatalogSelfTest()
 
     do
     {
+        McpServer queueServer;
+        queueServer.jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        Check(&context, queueServer.jobReadyEvent_ != nullptr, L"queue-test-event");
+        McpEngineRequest queueRequest{ McpRequestKind::ToolCall, L"memory.write_virtual", L"{}" };
+        McpEngineResult queueResult;
+        Check(&context, queueServer.EnqueueAndWait(queueRequest, 0, &queueResult) && queueResult.IsError &&
+            queueResult.Text.find(L"cancelled before execution") != std::wstring::npos && !queueServer.TryPopJob(),
+            L"timeout-removes-pending-write");
+        ResetEvent(queueServer.JobReadyEvent());
+        auto runningWait = std::async(std::launch::async, [&]()
+        {
+            return queueServer.EnqueueAndWait(queueRequest, 1000, &queueResult);
+        });
+        const DWORD runningSignal = WaitForSingleObject(queueServer.JobReadyEvent(), 5000);
+        auto runningJob = queueServer.TryPopJob();
+        Check(&context, runningSignal == WAIT_OBJECT_0 && runningJob != nullptr, L"queue-dispatch-test");
+        Check(&context, runningWait.get() && queueResult.IsError &&
+            queueResult.Text.find(L"outcome unknown") != std::wstring::npos, L"timeout-does-not-claim-running-write-cancelled");
+        if (runningJob != nullptr)
+        {
+            runningJob->ResultPromise.set_value(McpEngineResult{});
+        }
+        auto stopWait = std::async(std::launch::async, [&]()
+        {
+            return queueServer.EnqueueAndWait(queueRequest, 30000, &queueResult);
+        });
+        Check(&context, WaitForSingleObject(queueServer.JobReadyEvent(), 5000) == WAIT_OBJECT_0, L"queue-stop-test");
+        queueServer.RequestStop();
+        Check(&context, stopWait.wait_for(std::chrono::seconds(2)) == std::future_status::ready && stopWait.get() &&
+            queueResult.IsError && !queueServer.TryPopJob(), L"stop-unblocks-transport-without-engine-drain");
+        queueServer.Stop();
+
         std::vector<McpToolCatalogEntry> catalog = BuildMcpToolCatalogSnapshot();
         Check(&context, !catalog.empty(), L"catalog-not-empty");
 
@@ -487,4 +523,103 @@ int RunMcpToolCatalogSelfTest()
     } while (false);
 
     return exitCode;
+}
+
+int RunMcpTransportSelfTest()
+{
+    SelfTestContext context;
+    McpServer server;
+    McpServerConfig config;
+    config.Port = 51768;
+    config.BindAddress = L"127.0.0.1";
+    config.Password = L"kn-command-selftest";
+    std::wstring error;
+    if (!server.Start(config, &error))
+    {
+        std::wcerr << L"[mcp.http.selftest] listener failed: " << error << L"\n";
+        return 1;
+    }
+    HINTERNET session = WinHttpOpen(L"KnLiveDbg command self-test", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET connection = session != nullptr ? WinHttpConnect(session, L"127.0.0.1", config.Port, 0) : nullptr;
+    if (session != nullptr)
+    {
+        WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+    }
+    auto post = [&](const std::string& body, DWORD expectedStatus, const wchar_t* expectedText, const wchar_t* name)
+    {
+        HINTERNET request = connection != nullptr ? WinHttpOpenRequest(connection, L"POST", L"/mcp/", nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr;
+        bool ok = false;
+        do
+        {
+            if (request == nullptr)
+            {
+                break;
+            }
+            const std::wstring headers = L"Authorization: Bearer " + config.Password + L"\r\nContent-Type: application/json\r\n";
+            if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
+                    const_cast<char*>(body.data()), static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) ||
+                !WinHttpReceiveResponse(request, nullptr))
+            {
+                break;
+            }
+            DWORD status = 0;
+            DWORD statusBytes = sizeof(status);
+            if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusBytes, WINHTTP_NO_HEADER_INDEX) || status != expectedStatus)
+            {
+                break;
+            }
+            std::string response;
+            char chunk[4096];
+            DWORD received = 0;
+            bool complete = false;
+            while (WinHttpReadData(request, chunk, sizeof(chunk), &received))
+            {
+                if (received == 0)
+                {
+                    complete = true;
+                    break;
+                }
+                response.append(chunk, received);
+                if (response.size() > 65536)
+                {
+                    break;
+                }
+            }
+            const std::wstring decoded = mcpjson::Utf8ToWide(response);
+            ok = complete && mcpjson::ValidateDocument(decoded) && decoded.find(expectedText) != std::wstring::npos;
+        } while (false);
+        if (request != nullptr)
+        {
+            WinHttpCloseHandle(request);
+        }
+        Check(&context, ok, name);
+    };
+    const std::string ping = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+    post(ping, 200, L"\"result\":{}", L"http-complete-body");
+    post(ping + "garbage", 200, L"-32700", L"http-trailing-data-rejected");
+    post(R"({"jsonrpc":"2.0","id":1,"method":"ping","method":"initialize"})", 200, L"-32700", L"http-duplicate-key-rejected");
+    post(R"({"id":1,"method":"ping"})", 200, L"-32600", L"http-jsonrpc-version-required");
+    post(R"({"jsonrpc":"2.0","id":true,"method":"ping"})", 200, L"-32600", L"http-invalid-id-rejected");
+    post(std::string("\xc0\xaf", 2), 200, L"-32700", L"http-invalid-utf8-rejected");
+    std::string large = R"({"jsonrpc":"2.0","id":1,"method":"ping","padding":")";
+    large.append(1024 * 1024 - large.size() - 2, 'x');
+    large += "\"}";
+    post(large, 200, L"\"result\":{}", L"http-body-at-limit");
+    large.insert(large.size() - 2, "x");
+    post(large, 400, L"-32700", L"http-body-over-limit-rejected");
+    post(ping, 200, L"\"result\":{}", L"http-recovers-after-rejected-body");
+    if (connection != nullptr)
+    {
+        WinHttpCloseHandle(connection);
+    }
+    if (session != nullptr)
+    {
+        WinHttpCloseHandle(session);
+    }
+    server.Stop();
+    std::wcout << L"[mcp.http.selftest] passed=" << context.Passed << L" failed=" << context.Failed << L"\n";
+    return context.Failed == 0 ? 0 : 1;
 }

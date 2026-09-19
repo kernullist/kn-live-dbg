@@ -201,6 +201,8 @@
     <ClInclude Include="CloudFileScanner.h" />
     <ClInclude Include="CloakSession.h" />
     <ClInclude Include="CommandRegistry.h" />
+    <ClInclude Include="CommandInput.h" />
+    <ClInclude Include="CommandAuditSelfTest.inl" />
     <ClInclude Include="CompletionHints.h" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />

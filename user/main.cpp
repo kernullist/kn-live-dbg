@@ -8,6 +8,7 @@
 #include "CallbackScanner.h"
 #include "CloudFileScanner.h"
 #include "CommandRegistry.h"
+#include "CommandInput.h"
 #include "CompletionHints.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
@@ -458,9 +459,8 @@ static void UninstallOutputTee()
 
 static std::wstring BuildLogFileName()
 {
-    // KnLiveDbg-YYYYMMDD-HHMMSS.log -- collation-friendly and unique
-    // per second. The user can launch multiple sessions and they
-    // will not collide unless the same second is hit twice.
+    // Keep rapid toggles and simultaneous processes from truncating a log.
+    static std::atomic<uint64_t> sequence{0};
     SYSTEMTIME st = {};
     GetLocalTime(&st);
 
@@ -473,6 +473,7 @@ static std::wstring BuildLogFileName()
        << std::setw(2) << std::setfill(L'0') << st.wHour
        << std::setw(2) << std::setfill(L'0') << st.wMinute
        << std::setw(2) << std::setfill(L'0') << st.wSecond
+       << L"-" << GetCurrentProcessId() << L"-" << sequence.fetch_add(1)
        << L".log";
     return ss.str();
 }
@@ -519,18 +520,7 @@ static bool EnableOutputLog(std::wstring* outPath, std::wstring* outError)
 
     std::wstring path = exeDir + L"\\" + BuildLogFileName();
 
-    std::string narrowPath;
-    {
-        int needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        if (needed > 0)
-        {
-            narrowPath.resize(static_cast<size_t>(needed - 1));
-            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1,
-                                narrowPath.data(), needed, nullptr, nullptr);
-        }
-    }
-
-    g_OutputLog.File.open(narrowPath, std::ios::out | std::ios::binary | std::ios::trunc);
+    g_OutputLog.File.open(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
     if (!g_OutputLog.File.is_open())
     {
         if (outError != nullptr)
@@ -595,6 +585,11 @@ static bool DisableOutputLog(std::wstring* outPath)
 
 static void HandleLogCommand(const std::vector<std::wstring>& args)
 {
+    if (args.size() > 2)
+    {
+        std::wcerr << L"log: invalid argument count\n";
+        return;
+    }
     std::wstring sub = (args.size() > 1) ? args[1] : L"status";
     std::transform(sub.begin(), sub.end(), sub.begin(),
                    [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
@@ -609,12 +604,12 @@ static void HandleLogCommand(const std::vector<std::wstring>& args)
         }
         else
         {
-            std::wcout << L"log enable failed: " << error;
+            std::wcerr << L"log enable failed: " << error;
             if (!path.empty())
             {
-                std::wcout << L" (current=" << path << L")";
+                std::wcerr << L" (current=" << path << L")";
             }
-            std::wcout << L"\n";
+            std::wcerr << L"\n";
         }
     }
     else if (sub == L"disable" || sub == L"off" || sub == L"stop")
@@ -647,8 +642,8 @@ static void HandleLogCommand(const std::vector<std::wstring>& args)
     }
     else
     {
-        std::wcout << L"unknown log subcommand: " << sub << L"\n";
-        std::wcout << L"usage: log [enable|disable|status]\n";
+        std::wcerr << L"unknown log subcommand: " << sub << L"\n";
+        std::wcerr << L"usage: log [enable|disable|status]\n";
     }
 }
 
@@ -814,8 +809,10 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
         if (kmon != nullptr)
         {
             std::wstring stopError;
-            kmon->Stop(&stopError);
-            g_KmonForShutdown.store(nullptr);
+            if (kmon->Stop(&stopError))
+            {
+                g_KmonForShutdown.store(nullptr);
+            }
         }
         TiSubscriber* sub = g_TiSubscriberForShutdown.load();
         if (sub != nullptr)
@@ -1695,7 +1692,7 @@ static STARTUP_SYMBOL_PATH_INFO BuildStartupSymbolPath(const std::wstring& baseS
     return info;
 }
 
-static std::vector<std::wstring> Split(const std::wstring& line)
+static std::vector<std::wstring> Split(const std::wstring& line, bool* complete = nullptr)
 {
     // Whitespace-delimited tokenizer with double-quote support. We only
     // recognise '"' as a quote character, matching CMD/PowerShell convention
@@ -1707,6 +1704,10 @@ static std::vector<std::wstring> Split(const std::wstring& line)
     // segments; the quoting only affects whether interior whitespace is
     // preserved.
     std::vector<std::wstring> parts;
+    if (complete != nullptr)
+    {
+        *complete = line.find(L'\0') == std::wstring::npos;
+    }
     const size_t length = line.size();
     size_t i = 0;
 
@@ -1745,6 +1746,10 @@ static std::vector<std::wstring> Split(const std::wstring& line)
                 if (i < length)
                 {
                     ++i;
+                }
+                else if (complete != nullptr)
+                {
+                    *complete = false;
                 }
                 tokenStarted = true;
                 continue;
@@ -2371,73 +2376,7 @@ static bool ShouldRouteToDbgEng(const std::wstring& command)
 
 static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64_t* output)
 {
-    bool ok = false;
-
-    do
-    {
-        if (output == nullptr || value.empty())
-        {
-            break;
-        }
-
-        if (value[0] == L'+' || value[0] == L'-')
-        {
-            break;
-        }
-
-        std::wstring text = value;
-        if (!text.empty() && (text[0] == L'L' || text[0] == L'l'))
-        {
-            text = text.substr(1);
-        }
-
-        if (!text.empty() && (text[0] == L'+' || text[0] == L'-'))
-        {
-            break;
-        }
-
-        text.erase(std::remove(text.begin(), text.end(), L'`'), text.end());
-        if (text.empty())
-        {
-            break;
-        }
-
-        int base = static_cast<int>(numberBase);
-        if (base == 0)
-        {
-            // Callers pass 0 to mean "decimal, unless the token has an explicit
-            // 0x/hex-digit hint". wcstoull base 0 would treat a leading 0 as
-            // octal, so !ti /pid 010 would become 8.
-            base = 10;
-        }
-
-        if (text.size() > 2 && text[0] == L'0' && (text[1] == L'x' || text[1] == L'X'))
-        {
-            base = 16;
-        }
-        else if (text.size() > 2 && text[0] == L'0' && (text[1] == L'n' || text[1] == L'N'))
-        {
-            text = text.substr(2);
-            base = 10;
-        }
-        else if (text.find_first_of(L"abcdefABCDEF") != std::wstring::npos)
-        {
-            base = 16;
-        }
-
-        errno = 0;
-        wchar_t* end = nullptr;
-        uint64_t parsed = wcstoull(text.c_str(), &end, base);
-        if (end == nullptr || *end != L'\0' || errno == ERANGE)
-        {
-            break;
-        }
-
-        *output = parsed;
-        ok = true;
-    } while (false);
-
-    return ok;
+    return commandinput::ParseUnsigned(value, numberBase, output);
 }
 
 static bool ContainsAddressExpressionOperator(const std::wstring& value)
@@ -2546,9 +2485,9 @@ static bool EvaluateAddressExpression(
         while (termStart <= expression.size())
         {
             size_t operatorIndex = FindAddressExpressionOperator(expression, termStart);
-            std::wstring term = expression.substr(
+            std::wstring term = TrimWhitespace(expression.substr(
                 termStart,
-                operatorIndex == std::wstring::npos ? std::wstring::npos : operatorIndex - termStart);
+                operatorIndex == std::wstring::npos ? std::wstring::npos : operatorIndex - termStart));
 
             uint64_t termValue = 0;
             if (!ResolveAddressTerm(symbols, state, term, &termValue, error))
@@ -3284,6 +3223,7 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"kd" ||
             command == L"log" ||
             command == L"mcp" ||
+            command == L"remote" ||
             command == L"query" ||
             command == L"home" ||
             command == L"dashboard" ||
@@ -7088,7 +7028,7 @@ static uint32_t PageBoundedReadChunk(uint64_t address, size_t offset, uint32_t l
 
     do
     {
-        if (offset >= length)
+        if (offset >= length || !commandinput::IsValidAddressRange(address, length))
         {
             break;
         }
@@ -7116,7 +7056,7 @@ static bool ReadSparseVirtualMemory(
 
     do
     {
-        if (view == nullptr || length == 0)
+        if (view == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -7217,7 +7157,7 @@ static bool ReadSparsePhysicalMemory(
 
     do
     {
-        if (view == nullptr || length == 0)
+        if (view == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(physicalAddress, length))
         {
             if (error != nullptr)
             {
@@ -7878,7 +7818,7 @@ static bool ReadKernelBytes(
 
     do
     {
-        if (bytes == nullptr || length == 0)
+        if (bytes == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -9959,7 +9899,7 @@ static bool ReadProcessVirtualMemory(
 
     do
     {
-        if (bytes == nullptr || length == 0)
+        if (bytes == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -10025,7 +9965,7 @@ static bool WriteProcessVirtualMemory(
 
     do
     {
-        if (bytes.empty())
+        if (bytes.size() > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, bytes.size()))
         {
             if (error != nullptr)
             {
@@ -10888,6 +10828,14 @@ static bool ReadEnterPromptLine(std::wstring* line, bool* cancelled, std::wstrin
 
         *line = L"";
         *cancelled = false;
+        if (g_RemoteOriginActive.load())
+        {
+            if (error != nullptr)
+            {
+                *error = L"supply values on the command line";
+            }
+            break;
+        }
         if (!std::getline(std::wcin, *line))
         {
             if (error != nullptr)
@@ -11624,7 +11572,7 @@ static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& sta
             argIndex += 2;
         }
 
-        if (args.size() < argIndex + 3)
+        if (args.size() != argIndex + 3)
         {
             std::wcerr << L"usage: m [/process <process-id>] <source> <destination> <length>\n";
             break;
@@ -12100,6 +12048,12 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerSt
         if (HasHelpToken(args, 1))
         {
             PrintProbeHelp();
+            break;
+        }
+
+        if (action != L"load" && args.size() > 2)
+        {
+            std::wcerr << L"probe: invalid argument count\n";
             break;
         }
 
@@ -21757,7 +21711,7 @@ static void HandleWdFilterCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -21847,7 +21801,7 @@ static void HandleInputStackCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -21930,7 +21884,7 @@ static void HandleDmaCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -22008,7 +21962,7 @@ static void HandleHvCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -22866,6 +22820,15 @@ static void HandleTiCommand(
         }
 
         std::wstring action = ToLower(args[1]);
+
+        if (((action == L"stop" || action == L"status" || action == L"stats" || action == L"clear") && args.size() > 2) ||
+            (action == L"recent" && args.size() > 3) ||
+            (action == L"save" && (args.size() != 3 || args[2].empty())) ||
+            (action == L"by" && args.size() != 4))
+        {
+            std::wcerr << L"!ti: invalid argument count for " << action << L"\n";
+            break;
+        }
 
         if (action == L"start")
         {
@@ -24028,6 +23991,31 @@ static bool StartTimelineAutoDrainWorker(DebuggerState& state, DeviceClient* dev
 static void StopTimelineAutoDrainWorker()
 {
     g_TimelineAutoDrainWorker.Stop();
+}
+
+static bool StopCollectorsBeforeDriverRelease()
+{
+    std::wstring error;
+    bool ok = GetKmonInstance().Stop(&error);
+    if (ok)
+    {
+        g_KmonForShutdown.store(nullptr);
+    }
+    else
+    {
+        std::wcerr << L"collector shutdown failed: " << error << L"; driver handle retained\n";
+    }
+    if (GetTiSubscriberInstance().Stop(&error))
+    {
+        g_TiSubscriberForShutdown.store(nullptr);
+    }
+    else
+    {
+        std::wcerr << L"TI shutdown failed: " << error << L"\n";
+        ok = false;
+    }
+    StopTimelineAutoDrainWorker();
+    return ok;
 }
 
 static TimelineAutoDrainSnapshot QueryTimelineAutoDrainSnapshot()
@@ -25334,6 +25322,15 @@ static void HandleKmonCommand(
             action = ToLower(args[1]);
         }
 
+        if (((action == L"stop" || action == L"status" || action == L"stats" || action == L"clear") && args.size() > 2) ||
+            (action == L"recent" && args.size() > 3) ||
+            (action == L"save" && (args.size() != 3 || args[2].empty())) ||
+            (action == L"by" && args.size() != 4))
+        {
+            std::wcerr << L"!kmon: invalid argument count for " << action << L"\n";
+            break;
+        }
+
         if (action == L"start")
         {
             if (kmon.IsActive())
@@ -25557,13 +25554,17 @@ static void HandleKmonCommand(
 
         if (action == L"stop")
         {
-            if (!kmon.IsActive())
+            if (!kmon.IsActive() && !kmon.IotraceArmed())
             {
                 std::wcerr << L"!kmon: not active.\n";
                 break;
             }
             std::wstring stopError;
-            kmon.Stop(&stopError);
+            if (!kmon.Stop(&stopError))
+            {
+                std::wcerr << L"!kmon stop failed: " << stopError << L"; retry stop before unloading the driver.\n";
+                break;
+            }
             g_KmonForShutdown.store(nullptr);
             PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
             std::wcout << L" stopped. TI and timeline live are left running.\n";
@@ -25941,6 +25942,11 @@ static void HandleTimelineCommand(
         }
 
         std::wstring action = ToLower(args[1]);
+        if ((action == L"status" || action == L"clear" || action == L"reset") && args.size() != 2)
+        {
+            std::wcerr << L"!timeline: unexpected extra argument\n";
+            break;
+        }
         if (action == L"status")
         {
             TimelineStats stats = state.Timeline.GetStats();
@@ -31278,6 +31284,20 @@ static int RunConsoleSurfaceSelfTest()
             L"timeline-update-parser-rejects-unknown-option");
 
         uint64_t parsedNumber = 0;
+        for (const auto& invalid : std::vector<std::wstring>
+            {L" -1", L"0n-1", L"0n+1", L"`-1", L"1 ", std::wstring(L"10\0ff", 5)})
+        {
+            CheckConsoleSurfaceSelfTest(&context, !ParseUnsigned(invalid, 16, &parsedNumber),
+                L"unsigned-token-rejects-hidden-sign-space-or-nul");
+        }
+        for (const auto& info : CommandRegistry::Commands())
+        {
+            if (info.Support == CommandSupport::Native || info.Support == CommandSupport::Alias)
+            {
+                CheckConsoleSurfaceSelfTest(&context, IsNativeOwnedCommand(NormalizeInputCommand(info.Name)),
+                    std::wstring(L"registered-native-route-") + info.Name);
+            }
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             ParseUnsigned(L"010", 0, &parsedNumber) && parsedNumber == 10,
@@ -32663,9 +32683,9 @@ static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
             break;
         }
 
-        wchar_t* end = nullptr;
-        unsigned long parsed = wcstoul(value.c_str(), &end, 10);
-        if (end == nullptr || *end != L'\0' || parsed == 0)
+        uint64_t parsed = 0;
+        if (!commandinput::ParseDigits(value, 10, &parsed) || parsed == 0 ||
+            parsed > (std::numeric_limits<size_t>::max)())
         {
             break;
         }
@@ -33508,503 +33528,132 @@ static bool ExtractBalancedJsonObject(const std::wstring& text, std::wstring* js
 
 static bool ParseJsonStringAt(const std::wstring& text, size_t quote, std::wstring* value, size_t* next)
 {
-    bool ok = false;
-    std::wstring result;
-
-    do
+    size_t end = quote;
+    const bool ok = value != nullptr && mcpjson::ScanString(text, &end);
+    if (ok)
     {
-        if (value == nullptr || quote >= text.size() || text[quote] != L'\"')
+        *value = mcpjson::Unescape(text.substr(quote, end - quote));
+        if (next != nullptr)
         {
-            break;
+            *next = end;
         }
-
-        for (size_t index = quote + 1; index < text.size(); ++index)
-        {
-            wchar_t ch = text[index];
-            if (ch == L'\"')
-            {
-                *value = result;
-                if (next != nullptr)
-                {
-                    *next = index + 1;
-                }
-                ok = true;
-                break;
-            }
-
-            if (ch != L'\\' || index + 1 >= text.size())
-            {
-                result += ch;
-                continue;
-            }
-
-            wchar_t escaped = text[++index];
-            switch (escaped)
-            {
-            case L'\"':
-            case L'\\':
-            case L'/':
-                result += escaped;
-                break;
-            case L'b':
-                result += L'\b';
-                break;
-            case L'f':
-                result += L'\f';
-                break;
-            case L'n':
-                result += L'\n';
-                break;
-            case L'r':
-                result += L'\r';
-                break;
-            case L't':
-                result += L'\t';
-                break;
-            default:
-                result += escaped;
-                break;
-            }
-        }
-    } while (false);
-
+    }
     return ok;
 }
 
 static bool ExtractJsonStringValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = 0;
-
-    do
-    {
-        if (value == nullptr)
-        {
-            break;
-        }
-
-        while ((pos = json.find(pattern, pos)) != std::wstring::npos)
-        {
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
-            {
-                break;
-            }
-
-            size_t quote = colon + 1;
-            while (quote < json.size() && iswspace(json[quote]) != 0)
-            {
-                ++quote;
-            }
-
-            if (quote < json.size() && json[quote] == L'\"')
-            {
-                ok = ParseJsonStringAt(json, quote, value, nullptr);
-                break;
-            }
-
-            pos = colon + 1;
-        }
-    } while (false);
-
-    return ok;
+    return mcpjson::GetString(json, key, value);
 }
 
 static bool ExtractJsonBoolValue(const std::wstring& json, const std::wstring& key, bool* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) && (raw == L"true" || raw == L"false");
+    if (ok)
     {
-        if (value == nullptr || pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t item = colon + 1;
-        while (item < json.size() && iswspace(json[item]) != 0)
-        {
-            ++item;
-        }
-
-        if (json.compare(item, 4, L"true") == 0)
-        {
-            *value = true;
-            ok = true;
-        }
-        else if (json.compare(item, 5, L"false") == 0)
-        {
-            *value = false;
-            ok = true;
-        }
-    } while (false);
-
+        *value = raw == L"true";
+    }
     return ok;
 }
 
 static bool ExtractJsonScalarValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) &&
+        !raw.empty() && raw[0] != L'{' && raw[0] != L'[';
+    if (ok)
     {
-        if (value == nullptr)
-        {
-            break;
-        }
-
-        if (ExtractJsonStringValue(json, key, value))
-        {
-            ok = true;
-            break;
-        }
-
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t start = colon + 1;
-        while (start < json.size() && iswspace(json[start]) != 0)
-        {
-            ++start;
-        }
-
-        size_t end = start;
-        while (end < json.size() &&
-               json[end] != L',' &&
-               json[end] != L'}' &&
-               json[end] != L']' &&
-               iswspace(json[end]) == 0)
-        {
-            ++end;
-        }
-
-        if (end > start)
-        {
-            *value = TrimWhitespace(json.substr(start, end - start));
-            ok = !value->empty();
-        }
-    } while (false);
-
+        *value = raw[0] == L'"' ? mcpjson::Unescape(raw) : raw;
+    }
     return ok;
+}
+
+static std::vector<std::wstring> ExtractJsonArrayElements(
+    const std::wstring& json, const std::wstring& key, wchar_t expected)
+{
+    std::vector<std::wstring> values;
+    std::wstring raw;
+    if (mcpjson::FindRawValue(json, key, &raw) && !raw.empty() && raw[0] == L'[')
+    {
+        size_t pos = 1;
+        mcpjson::SkipWhitespace(raw, &pos);
+        while (pos < raw.size() && raw[pos] != L']')
+        {
+            size_t end = pos;
+            if (raw[pos] != expected || !mcpjson::ScanValue(raw, pos, &end))
+            {
+                values.clear();
+                break;
+            }
+            const std::wstring item = raw.substr(pos, end - pos);
+            values.push_back(expected == L'"' ? mcpjson::Unescape(item) : item);
+            pos = end;
+            mcpjson::SkipWhitespace(raw, &pos);
+            if (pos < raw.size() && raw[pos] == L',')
+            {
+                ++pos;
+                mcpjson::SkipWhitespace(raw, &pos);
+            }
+        }
+    }
+    return values;
 }
 
 static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& json, const std::wstring& key)
 {
-    std::vector<std::wstring> objects;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
-    {
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t bracket = json.find(L'[', pos + pattern.size());
-        if (bracket == std::wstring::npos)
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int objectDepth = 0;
-        size_t objectStart = std::wstring::npos;
-        for (size_t index = bracket + 1; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'\"')
-            {
-                inString = true;
-            }
-            else if (ch == L'{')
-            {
-                if (objectDepth == 0)
-                {
-                    objectStart = index;
-                }
-                ++objectDepth;
-            }
-            else if (ch == L'}')
-            {
-                --objectDepth;
-                if (objectDepth == 0 && objectStart != std::wstring::npos)
-                {
-                    objects.push_back(json.substr(objectStart, index - objectStart + 1));
-                    objectStart = std::wstring::npos;
-                }
-            }
-            else if (ch == L']' && objectDepth == 0)
-            {
-                break;
-            }
-        }
-    } while (false);
-
-    return objects;
+    return ExtractJsonArrayElements(json, key, L'{');
 }
 
 static bool ExtractJsonObjectValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) && !raw.empty() && raw[0] == L'{';
+    if (ok)
     {
-        if (value == nullptr || pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t start = colon + 1;
-        while (start < json.size() && iswspace(json[start]) != 0)
-        {
-            ++start;
-        }
-
-        if (start >= json.size() || json[start] != L'{')
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int depth = 0;
-        for (size_t index = start; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'\"')
-            {
-                inString = true;
-            }
-            else if (ch == L'{')
-            {
-                ++depth;
-            }
-            else if (ch == L'}')
-            {
-                --depth;
-                if (depth == 0)
-                {
-                    *value = json.substr(start, index - start + 1);
-                    ok = true;
-                    break;
-                }
-            }
-        }
-    } while (false);
-
+        *value = raw;
+    }
     return ok;
 }
 
 static std::vector<std::wstring> ExtractJsonStringArrayValues(const std::wstring& json, const std::wstring& key)
 {
-    std::vector<std::wstring> values;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
-    {
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t bracket = json.find(L'[', pos + pattern.size());
-        if (bracket == std::wstring::npos)
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int arrayDepth = 0;
-        for (size_t index = bracket; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'[')
-            {
-                ++arrayDepth;
-                continue;
-            }
-
-            if (ch == L']')
-            {
-                --arrayDepth;
-                if (arrayDepth == 0)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            if (arrayDepth == 1 && ch == L'\"')
-            {
-                std::wstring value;
-                size_t next = index + 1;
-                if (ParseJsonStringAt(json, index, &value, &next))
-                {
-                    values.push_back(value);
-                    index = next - 1;
-                }
-            }
-        }
-    } while (false);
-
-    return values;
+    return ExtractJsonArrayElements(json, key, L'"');
 }
 
 static std::vector<std::wstring> ExtractJsonObjectKeys(const std::wstring& json)
 {
     std::vector<std::wstring> keys;
-    int objectDepth = 0;
-    bool inString = false;
-    bool escaped = false;
-
-    for (size_t index = 0; index < json.size(); ++index)
+    size_t pos = 0;
+    mcpjson::SkipWhitespace(json, &pos);
+    if (pos < json.size() && json[pos] == L'{' && mcpjson::ValidateDocument(json))
     {
-        wchar_t ch = json[index];
-        if (inString)
+        ++pos;
+        mcpjson::SkipWhitespace(json, &pos);
+        while (pos < json.size() && json[pos] != L'}')
         {
-            if (escaped)
+            std::wstring key;
+            if (!ParseJsonStringAt(json, pos, &key, &pos))
             {
-                escaped = false;
-            }
-            else if (ch == L'\\')
-            {
-                escaped = true;
-            }
-            else if (ch == L'\"')
-            {
-                inString = false;
-            }
-            continue;
-        }
-
-        if (ch == L'\"')
-        {
-            if (objectDepth == 1)
-            {
-                std::wstring key;
-                size_t next = index + 1;
-                if (!ParseJsonStringAt(json, index, &key, &next))
-                {
-                    break;
-                }
-
-                size_t probe = next;
-                while (probe < json.size() && iswspace(json[probe]) != 0)
-                {
-                    ++probe;
-                }
-
-                if (probe < json.size() && json[probe] == L':')
-                {
-                    keys.push_back(ToLower(key));
-                }
-
-                index = next - 1;
-                continue;
-            }
-
-            inString = true;
-            continue;
-        }
-
-        if (ch == L'{')
-        {
-            ++objectDepth;
-            continue;
-        }
-        if (ch == L'}')
-        {
-            --objectDepth;
-            if (objectDepth < 0)
-            {
+                keys.clear();
                 break;
             }
-            continue;
+            keys.push_back(key);
+            mcpjson::SkipWhitespace(json, &pos);
+            ++pos;
+            if (!mcpjson::ScanValue(json, pos, &pos))
+            {
+                keys.clear();
+                break;
+            }
+            mcpjson::SkipWhitespace(json, &pos);
+            if (pos < json.size() && json[pos] == L',')
+            {
+                ++pos;
+                mcpjson::SkipWhitespace(json, &pos);
+            }
         }
     }
-
     return keys;
 }
 
@@ -34030,6 +33679,16 @@ static bool ValidateJsonObjectKeys(
     const std::wstring& context,
     std::wstring* error)
 {
+    size_t objectStart = 0;
+    mcpjson::SkipWhitespace(json, &objectStart);
+    if (objectStart >= json.size() || json[objectStart] != L'{' || !mcpjson::ValidateDocument(json))
+    {
+        if (error != nullptr)
+        {
+            *error = context + L" must be a complete JSON object with unique keys";
+        }
+        return false;
+    }
     bool ok = true;
     std::vector<std::wstring> keys = ExtractJsonObjectKeys(json);
 
@@ -38599,6 +38258,14 @@ static void HandleAiPlannedWrite(
 {
     do
     {
+        if (args.size() > 4 ||
+            (args.size() >= 3 && ToLower(args[2]) == L"confirm" && args.size() != 3) ||
+            (args.size() == 4 && ToLower(args[3]) != L"confirm"))
+        {
+            std::wcerr << L"usage: ai write [index] [confirm]\n";
+            break;
+        }
+
         if (aiState.Commands.empty())
         {
             std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> or a disable/enable goal first\n";
@@ -38715,6 +38382,13 @@ static void HandleAiPlannedWrite(
             symbols,
             ai,
             aiState);
+
+        if (!beforeResult.Error.empty())
+        {
+            std::wcerr << L"ai write aborted: prewrite backup failed\n";
+            WriteAiTranscriptEvent(aiState, L"ai_write_blocked", L"prewrite backup failed", item.Command);
+            break;
+        }
 
         std::vector<std::wstring> commandArgs = Split(item.Command);
         ExecuteCommandWithTranscript(
@@ -44899,7 +44573,12 @@ static bool ExtractAiCapabilityBooleanArg(
         std::wstring scalar;
         if (!ExtractJsonScalarValue(argsJson, key, &scalar))
         {
-            ok = true;
+            std::wstring raw;
+            ok = !mcpjson::FindRawValue(argsJson, key, &raw);
+            if (!ok && error != nullptr)
+            {
+                *error = L"invalid boolean argument " + key;
+            }
             break;
         }
 
@@ -50684,6 +50363,50 @@ static bool HandleCommand(
         std::wstring command = NormalizeInputCommand(args[0]);
         std::wstring error;
 
+        bool complete = true;
+        Split(originalLine, &complete);
+        if (originalLine.find(L'\0') != std::wstring::npos ||
+            (IsNativeOwnedCommand(command) && command != L"kd" && !complete))
+        {
+            std::wcerr << L"invalid command: embedded NUL or unterminated quote\n";
+            break;
+        }
+
+        struct ArgumentRange
+        {
+            const wchar_t* Command;
+            size_t Minimum;
+            size_t Maximum;
+        };
+        static const ArgumentRange ranges[] =
+        {
+            { L"q", 1, 1 }, { L"qq", 1, 1 }, { L"qd", 1, 1 },
+            { L"quit", 1, 1 }, { L"exit", 1, 1 }, { L"unload", 1, 1 },
+            { L"kddetach", 1, 1 }, { L"cls", 1, 1 },
+            { L"backend", 1, 2 }, { L"procctx", 1, 2 },
+            { L"n", 1, 2 }, { L"sq", 1, 2 }, { L"write", 2, 2 },
+            { L"setfield", 5, 5 }, { L"c", 4, 4 },
+            { L"query", 2, 3 }, { L"ln", 2, 2 }, { L"addr", 2, 2 },
+            { L"x", 2, 2 }, { L"lm", 1, 2 }, { L"modules", 1, 2 }, { L"!ci", 1, 2 }
+        };
+        bool validArity = true;
+        if (!(args.size() >= 2 && IsHelpToken(args[1])))
+        {
+            for (const auto& range : ranges)
+            {
+                if (command == range.Command && (args.size() < range.Minimum || args.size() > range.Maximum))
+                {
+                    std::wcerr << L"invalid argument count for " << command << L"; use help " << command << L"\n";
+                    validArity = false;
+                    break;
+                }
+            }
+        }
+        if (!validArity)
+        {
+            break;
+        }
+
         if (command == L"help")
         {
             if (args.size() >= 2 && ToLower(args[1]) == L"all")
@@ -50765,7 +50488,8 @@ static bool HandleCommand(
         }
         else if (command == L"kdinit")
         {
-            state.DbgEngRemoteKernel = false;
+            bool remoteKernel = false;
+            std::wstring connectOptions;
             if (args.size() >= 2 && ToLower(args[1]) == L"/remote")
             {
                 if (args.size() < 3)
@@ -50774,22 +50498,20 @@ static bool HandleCommand(
                     break;
                 }
 
-                state.DbgEngRemoteKernel = true;
-                state.DbgEngConnectOptions = JoinArgs(args, 2);
+                remoteKernel = true;
+                connectOptions = JoinArgs(args, 2);
             }
             else if (args.size() >= 2 && ToLower(args[1]) == L"/local")
             {
-                state.DbgEngConnectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
+                connectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
             }
             else if (args.size() >= 2)
             {
                 std::wcerr << L"usage: kdinit [/local [connect-options]|/remote <connect-options>]\n";
                 break;
             }
-            else
-            {
-                state.DbgEngConnectOptions.clear();
-            }
+            state.DbgEngRemoteKernel = remoteKernel;
+            state.DbgEngConnectOptions = connectOptions;
 
             if (dbgeng.IsReady())
             {
@@ -50829,7 +50551,7 @@ static bool HandleCommand(
                 break;
             }
 
-            ExecuteDbgEngCommand(dbgeng, symbols, state, JoinArgs(args, 1), true);
+            ExecuteDbgEngCommand(dbgeng, symbols, state, commandinput::RawCommandTail(originalLine), true);
         }
         else if (command == L"u" || command == L"uf")
         {
@@ -50866,7 +50588,7 @@ static bool HandleCommand(
         else if ((command == L"?" || command == L"??") && args.size() >= 2)
         {
             uint64_t value = 0;
-            if (ParseAddressOrSymbol(symbols, state, args[1], &value, &error))
+            if (ParseAddressOrSymbol(symbols, state, JoinArgs(args, 1), &value, &error))
             {
                 PrintColoredText(L"Evaluate expression", KNDBG_COLOR_TITLE);
                 std::wcout << L": " << HexText(value) << L" = " << std::dec << value << L"\n";
@@ -51516,10 +51238,14 @@ static bool HandleCommand(
         }
         else if (command == L"|")
         {
-            std::wcout << L"0 id: current process context is not pinned by native backend\n";
+            HandleProcessContextCommand({ L"procctx", L"status" }, state, device, symbols);
         }
         else if (command == L"unload")
         {
+            if (!StopCollectorsBeforeDriverRelease())
+            {
+                break;
+            }
             DriverUnloadResult unloadResult = {};
             PrintLifecycleHeader(L"Main driver unload", L"device: " KNDBG_USER_DEVICE_NAME);
             PrintLifecycleStep(L"close device handle", L"release controller session");
@@ -51537,7 +51263,7 @@ static bool HandleCommand(
         }
         else if (command == L"q" || command == L"qq" || command == L"qd" || command == L"quit" || command == L"exit")
         {
-            keepRunning = false;
+            keepRunning = !StopCollectorsBeforeDriverRelease();
         }
         else if (command.size() > 0 && command[0] == L'!')
         {
@@ -51757,37 +51483,37 @@ static bool McpValidateToken(const std::wstring& value, std::wstring* error)
     return ok;
 }
 
-// Validates a hex byte list ("90 90 90" or "0x90 0x90"). Spaces separate bytes.
-static bool McpValidateByteList(const std::wstring& value, std::wstring* error)
+// Canonicalize the protocol's hex values independently of the console radix.
+static bool McpNormalizeByteList(std::wstring* value, std::wstring* error)
 {
-    bool ok = false;
-    do
+    bool ok = value != nullptr;
+    std::wstring normalized;
+    bool complete = true;
+    const std::vector<std::wstring> tokens = value != nullptr ? Split(*value, &complete) : std::vector<std::wstring>{};
+    ok = ok && complete && !tokens.empty();
+    for (const auto& token : tokens)
     {
-        if (value.empty())
+        uint64_t parsed = 0;
+        const std::wstring digits = token.rfind(L"0x", 0) == 0 || token.rfind(L"0X", 0) == 0 ? token.substr(2) : token;
+        if (!commandinput::ParseDigits(digits, 16, &parsed))
         {
-            *error = L"empty bytes";
+            ok = false;
             break;
         }
-
-        bool valid = true;
-        for (wchar_t ch : value)
+        if (!normalized.empty())
         {
-            bool isHex = (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F');
-            if (!isHex && ch != L' ' && ch != L'x' && ch != L'X')
-            {
-                valid = false;
-                break;
-            }
+            normalized += L" ";
         }
-        if (!valid)
-        {
-            *error = L"bytes must be space-separated hex values";
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
+        normalized += HexText(parsed);
+    }
+    if (ok)
+    {
+        *value = normalized;
+    }
+    else if (error != nullptr)
+    {
+        *error = L"bytes must be a nonempty list of hexadecimal values";
+    }
     return ok;
 }
 
@@ -51844,6 +51570,15 @@ static McpEngineResult DispatchMcpWriteTool(
 
     do
     {
+        McpToolCatalogEntry catalogEntry;
+        if (!FindMcpToolCatalogEntry(tool, &catalogEntry) || catalogEntry.ReadOnly ||
+            !ValidateMcpToolArguments(tool, argsJson, &argError))
+        {
+            result.IsError = true;
+            result.Text = L"invalid write tool arguments: " + argError;
+            break;
+        }
+
         if (tool == L"memory.write_virtual")
         {
             std::wstring address;
@@ -51858,13 +51593,19 @@ static McpEngineResult DispatchMcpWriteTool(
             }
             McpGetArg(argsJson, L"width", &width);
             McpGetArg(argsJson, L"process", &process);
-            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            if (!McpValidateToken(address, &argError) || !McpNormalizeByteList(&bytes, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
                 break;
             }
 
+            if (!width.empty() && width != L"1" && width != L"2" && width != L"4" && width != L"8")
+            {
+                result.IsError = true;
+                result.Text = L"memory.write_virtual width must be 1, 2, 4, or 8";
+                break;
+            }
             std::wstring enter = L"eb";
             if (width == L"2")
             {
@@ -51902,7 +51643,7 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.Text = L"memory.write_physical requires 'physical_address' and 'bytes'";
                 break;
             }
-            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            if (!McpValidateToken(address, &argError) || !McpNormalizeByteList(&bytes, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
@@ -51921,7 +51662,7 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.Text = L"memory.fill requires 'address', 'length', 'pattern'";
                 break;
             }
-            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpValidateByteList(pattern, &argError))
+            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpNormalizeByteList(&pattern, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
@@ -52292,6 +52033,12 @@ static McpEngineResult DispatchMcpWriteTool(
                 Split(safety.BackupCommand), safety.BackupCommand, L"mcp",
                 state, dbgeng, device, service, symbols, ai, aiState);
             text += L"[backup] " + safety.BackupCommand + L"\n" + before.Output;
+            if (!before.Error.empty())
+            {
+                result.IsError = true;
+                result.Text = text + before.Error + L"\nwrite cancelled because the backup failed";
+                break;
+            }
         }
 
         CommandExecutionResult wrote = ExecuteCommandWithTranscript(
@@ -52310,6 +52057,11 @@ static McpEngineResult DispatchMcpWriteTool(
                 Split(safety.VerifyCommand), safety.VerifyCommand, L"mcp",
                 state, dbgeng, device, service, symbols, ai, aiState);
             text += L"[verify] " + safety.VerifyCommand + L"\n" + after.Output;
+            if (!after.Error.empty())
+            {
+                text += after.Error;
+                result.IsError = true;
+            }
         }
 
         if (!safety.Warning.empty())
@@ -52544,6 +52296,13 @@ static McpEngineResult DispatchMcpRequest(
     // Tool call. Write-ness is decided by the kTools table (single source of
     // truth) via the server, not a parallel hardcoded list.
     const std::wstring& tool = request.Name;
+    std::wstring argumentError;
+    if (!ValidateMcpToolArguments(tool, request.ArgumentsJson.empty() ? L"{}" : request.ArgumentsJson, &argumentError))
+    {
+        result.IsError = true;
+        result.Text = argumentError;
+        return result;
+    }
     if (g_McpServer.IsWriteTool(tool))
     {
         if (!g_McpServer.AllowWrite())
@@ -52583,21 +52342,26 @@ static McpEngineResult DispatchMcpRequest(
             return result;
         }
 
-        std::wstring funcText;
         bool isFunction = false;
-        if (ExtractAiCapabilityScalarAlias(argsJson, {L"function"}, &funcText))
+        if (!ExtractAiCapabilityBooleanArg(argsJson, L"function", &isFunction, &argErr))
         {
-            std::wstring lowered = ToLower(funcText);
-            isFunction = (lowered == L"true" || lowered == L"1" || lowered == L"yes");
+            result.IsError = true;
+            result.Text = argErr;
+            return result;
         }
 
         std::vector<std::wstring> dargs;
         dargs.push_back(isFunction ? L"uf" : L"u");
         dargs.push_back(address);
         std::wstring countText;
-        if (ExtractAiCapabilityScalarAlias(argsJson, {L"count"}, &countText) &&
-            ValidateAiCapabilityScalarText(countText, L"count", &argErr))
+        if (ExtractAiCapabilityScalarAlias(argsJson, {L"count"}, &countText))
         {
+            if (!ValidateAiCapabilityScalarText(countText, L"count", &argErr))
+            {
+                result.IsError = true;
+                result.Text = argErr;
+                return result;
+            }
             dargs.push_back(countText);
         }
 
@@ -53630,6 +53394,14 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
 {
     std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
 
+    const bool setup = sub == L"client-setup" || sub == L"setup" || sub == L"connect";
+    if ((sub != L"help" && sub != L"?" && sub != L"client-setup" && sub != L"setup" && sub != L"connect" && sub != L"endpoint" && sub != L"on" && sub != L"start" && sub != L"off" && sub != L"stop" && sub != L"status") ||
+        (sub != L"on" && sub != L"start" && args.size() > (setup ? 3u : 2u)))
+    {
+        std::wcerr << L"invalid mcp subcommand or argument count\n";
+        return;
+    }
+
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
@@ -53718,45 +53490,22 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             return;
         }
 
-        McpServerConfig config;
-        for (size_t i = 2; i < args.size(); ++i)
+        if (g_RemoteServer.IsRunning())
         {
-            if (args[i] == L"--allow-write" || args[i] == L"allow-write")
-            {
-                config.AllowWrite = true;
-            }
-            else if (args[i] == L"--loopback")
-            {
-                config.BindAddress = L"loopback";
-            }
-            else if (args[i] == L"--bind")
-            {
-                if (i + 1 < args.size())
-                {
-                    config.BindAddress = args[i + 1];
-                    ++i;
-                }
-            }
-            else if (args[i].rfind(L"--bind=", 0) == 0)
-            {
-                config.BindAddress = args[i].substr(7);
-            }
-            else if (args[i] == L"--token" || args[i] == L"--new-token" ||
-                     args[i].rfind(L"--token=", 0) == 0)
-            {
-                std::wcerr << L"mcp on no longer uses persisted tokens. "
-                           << L"Set a session password at the prompt.\n";
-                return;
-            }
-            else
-            {
-                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
-                if (parsed > 0 && parsed < 65536)
-                {
-                    config.Port = static_cast<uint16_t>(parsed);
-                }
-            }
+            std::wcerr << L"mcp on failed: remote server is running (listen XOR)\n";
+            return;
         }
+        McpServerConfig config;
+        commandinput::ListenerOptions options;
+        std::wstring optionError;
+        if (!commandinput::ParseListenerOptions(args, 2, false, config.Port, &options, &optionError))
+        {
+            std::wcerr << L"mcp start failed: " << optionError << L"\n";
+            return;
+        }
+        config.Port = options.Port;
+        config.BindAddress = options.BindAddress;
+        config.AllowWrite = options.AllowWrite;
 
         config.BindAddress = NormalizeMcpBindAddress(config.BindAddress);
         if (!IsMcpWildcardBind(config.BindAddress) &&
@@ -54172,7 +53921,11 @@ static void RunRemoteEngineLoop(
                     dispatchResult.Stdout = executed.Output;
                     dispatchResult.Stderr = executed.Error;
                     dispatchResult.KeepRunning = executed.KeepRunning;
-                    dispatchResult.IsError = false;
+                    dispatchResult.IsError = !executed.Error.empty();
+                    if (dispatchResult.IsError)
+                    {
+                        dispatchResult.Code = L"command-failed";
+                    }
                 }
             }
 
@@ -54216,6 +53969,13 @@ static void HandleRemoteCommand(
 {
     std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
 
+    if ((sub != L"help" && sub != L"?" && sub != L"off" && sub != L"stop" && sub != L"disconnect" && sub != L"on" && sub != L"start" && sub != L"status") ||
+        (sub != L"on" && sub != L"start" && args.size() > 2))
+    {
+        std::wcerr << L"invalid remote subcommand or argument count\n";
+        return;
+    }
+
     if (sub == L"help" || sub == L"?")
     {
         PrintSessionHelp(L"remote");
@@ -54255,31 +54015,16 @@ static void HandleRemoteCommand(
         }
 
         RemoteServerConfig config;
-        config.Port = knremote::kDefaultPort;
-        config.BindAddress = L"0.0.0.0";
-        for (size_t i = 2; i < args.size(); ++i)
+        commandinput::ListenerOptions options;
+        std::wstring optionError;
+        if (!commandinput::ParseListenerOptions(args, 2, true, knremote::kDefaultPort, &options, &optionError))
         {
-            if (args[i] == L"--loopback")
-            {
-                config.BindAddress = L"127.0.0.1";
-            }
-            else if (args[i] == L"--bind" && i + 1 < args.size())
-            {
-                config.BindAddress = args[++i];
-            }
-            else if (args[i] == L"--peer" && i + 1 < args.size())
-            {
-                config.Peer = args[++i];
-            }
-            else
-            {
-                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
-                if (parsed > 0 && parsed < 65536)
-                {
-                    config.Port = static_cast<uint16_t>(parsed);
-                }
-            }
+            std::wcerr << L"remote on failed: " << optionError << L"\n";
+            return;
         }
+        config.Port = options.Port;
+        config.BindAddress = options.BindAddress;
+        config.Peer = options.Peer;
 
         if (config.Port == knremote::kMcpPort)
         {
@@ -54288,6 +54033,15 @@ static void HandleRemoteCommand(
         }
 
         config.BindAddress = knremote::NormalizeBindAddress(config.BindAddress);
+        in_addr bindAddress = {};
+        in_addr peerAddress = {};
+        if (!knremote::ParseIpv4(config.BindAddress, &bindAddress) ||
+            (!config.Peer.empty() && !knremote::ParseIpv4(config.Peer, &peerAddress)))
+        {
+            std::wcerr << L"remote on failed: --bind and --peer require IPv4 addresses\n";
+            return;
+        }
+
         config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\remote-audit-" +
                            std::to_wstring(config.Port) + L".jsonl";
         config.AddFirewall = !knremote::IsLoopbackBind(config.BindAddress);
@@ -54368,6 +54122,8 @@ static void HandleRemoteCommand(
     }
 }
 
+#include "CommandAuditSelfTest.inl"
+
 int wmain(int argc, wchar_t** argv)
 {
     // Last-resort crash diagnostics for faults that escape every guard
@@ -54422,6 +54178,10 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunMcpToolCatalogSelfTest();
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
+        {
+            return RunMcpTransportSelfTest();
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"remote-protocol")
         {
             return RunRemoteProtocolSelfTest();
@@ -54433,6 +54193,10 @@ int wmain(int argc, wchar_t** argv)
         if (argc >= 3 && ToLower(argv[2]) == L"console")
         {
             return RunConsoleSurfaceSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"commands")
+        {
+            return RunCommandAuditSelfTest();
         }
         if (argc >= 4 &&
             ToLower(argv[2]) ==
@@ -54453,10 +54217,14 @@ int wmain(int argc, wchar_t** argv)
             int timelineExit = RunTimelineSelfTest();
             int mcpExit = RunMcpToolCatalogSelfTest();
             int consoleExit = RunConsoleSurfaceSelfTest();
-            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0) ? 0 : 1;
+            int commandExit = RunCommandAuditSelfTest();
+            int remoteExit = RunRemoteProtocolSelfTest();
+            int connectExit = RunRemoteConnectArgvSelfTest();
+            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0 && commandExit == 0 &&
+                remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
         return 2;
     }
 
@@ -54538,7 +54306,9 @@ int wmain(int argc, wchar_t** argv)
     DriverService service(
         state.CloakActive ? state.Cloak.ServiceName.c_str() : KNDBG_SERVICE_NAME,
         state.CloakActive ? state.Cloak.DisplayName.c_str() : KNDBG_DISPLAY_NAME);
-    DeviceClient device;
+    // Kmon may retain the device after a failed disarm and retry in its destructor.
+    // Construct the device first so it outlives that function-local singleton.
+    static DeviceClient device;
     SymbolEngine symbols;
     DbgEngBackend dbgeng;
     AiProviderRuntime ai;
@@ -54784,18 +54554,18 @@ int wmain(int argc, wchar_t** argv)
 
     StopMcpServer();
     g_RemoteServer.Stop();
-    StopTimelineAutoDrainWorker();
+    const bool collectorsStopped = StopCollectorsBeforeDriverRelease();
     dbgeng.Shutdown();
-    bool cleanupOk = true;
-    if (!CleanupByovdFixtureDriverOnExit(state))
+    bool cleanupOk = collectorsStopped;
+    if (collectorsStopped && !CleanupByovdFixtureDriverOnExit(state))
     {
         cleanupOk = false;
     }
-    if (!CleanupProbeDriverOnExit(state))
+    if (collectorsStopped && !CleanupProbeDriverOnExit(state))
     {
         cleanupOk = false;
     }
-    if (!CleanupMainDriverOnExit(state, device, service))
+    if (collectorsStopped && !CleanupMainDriverOnExit(state, device, service))
     {
         cleanupOk = false;
     }
@@ -54816,10 +54586,6 @@ int wmain(int argc, wchar_t** argv)
     // write), then print where this session's evidence landed before the
     // console goes away. Idempotent Stops cover the never-started case.
     {
-        std::wstring stopError;
-        GetKmonInstance().Stop(&stopError);
-        GetTiSubscriberInstance().Stop(&stopError);
-
         struct SessionArtifactGroup
         {
             const wchar_t* Label;

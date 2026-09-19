@@ -1,4 +1,5 @@
 #include "DeviceClient.h"
+#include "CommandInput.h"
 #include "NativeHandleSnapshot.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
@@ -702,6 +703,15 @@ bool DeviceClient::ReadMemory(
 
     do
     {
+        if (!commandinput::IsValidAddressRange(address, length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (bytes == nullptr || length == 0 || length > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)
@@ -773,6 +783,15 @@ bool DeviceClient::ReadProcessVirtual(
 
     do
     {
+        if (!commandinput::IsValidAddressRange(address, length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (bytes != nullptr)
         {
             bytes->clear();
@@ -880,6 +899,15 @@ bool DeviceClient::WriteMemory(uint64_t address, const std::vector<uint8_t>& byt
 
     do
     {
+        if (!commandinput::IsValidAddressRange(address, bytes.size()))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (bytes.empty() || bytes.size() > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)
@@ -1033,6 +1061,15 @@ bool DeviceClient::TranslateVirtual(
 
     do
     {
+        if (!commandinput::IsValidAddressRange(virtualAddress, length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (info == nullptr || length == 0 || length > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)
@@ -1514,6 +1551,15 @@ bool DeviceClient::ReadPhysical(uint64_t physicalAddress, uint32_t length, std::
 
     do
     {
+        if (!commandinput::IsValidAddressRange(physicalAddress, length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (bytes == nullptr || length == 0 || length > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)
@@ -1677,6 +1723,15 @@ bool DeviceClient::WritePhysical(uint64_t physicalAddress, const std::vector<uin
 
     do
     {
+        if (!commandinput::IsValidAddressRange(physicalAddress, bytes.size()))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Invalid memory range: zero length or address overflow";
+            }
+            break;
+        }
+
         if (bytes.empty() || bytes.size() > KNDBG_MAX_TRANSFER_SIZE)
         {
             if (error != nullptr)

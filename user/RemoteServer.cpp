@@ -5,6 +5,7 @@
 #include "RemoteFirewall.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cwctype>
 #include <fstream>
@@ -440,7 +441,7 @@ HANDLE RemoteServer::WriteOffEvent() const
 std::shared_ptr<RemoteJob> RemoteServer::TryPopJob()
 {
     std::lock_guard<std::mutex> lock(queueMutex_);
-    if (queue_.empty())
+    if (!running_.load() || queue_.empty())
     {
         return nullptr;
     }
@@ -747,7 +748,7 @@ bool RemoteServer::EnqueueAndWait(
 
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
-            if (queue_.size() >= knremote::kMaxPending)
+            if (!running_.load() || queue_.size() >= knremote::kMaxPending)
             {
                 result->IsError = true;
                 result->Code = L"engine-busy";
@@ -762,17 +763,109 @@ bool RemoteServer::EnqueueAndWait(
         // Keep the TCP session alive while the engine runs (dump/hunt can
         // exceed the 60s dead-peer window). Heartbeats also give the client
         // a frame to reset its recv deadline.
+        DWORD lastHeartbeat = GetTickCount();
+        bool disconnected = false;
         for (;;)
         {
-            if (future.wait_for(std::chrono::milliseconds(knremote::kHeartbeatMs)) ==
+            if (future.wait_for(std::chrono::milliseconds(50)) ==
                 std::future_status::ready)
             {
                 break;
             }
-            SendJson(
-                client,
-                knremote::MakeObject(L"heartbeat", L"s-hb", L""),
-                nullptr);
+            if (!running_.load())
+            {
+                disconnected = true;
+                break;
+            }
+
+            // The listener owns this socket while awaiting the engine. Keep
+            // consuming control frames so queued commands can be cancelled.
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(client, &readable);
+            timeval poll = {};
+            const int ready = select(0, &readable, nullptr, nullptr, &poll);
+            if (ready == SOCKET_ERROR)
+            {
+                disconnected = true;
+                break;
+            }
+            if (ready > 0)
+            {
+                std::wstring control;
+                if (!RecvFrame(client, &control, GetTickCount() + knremote::kFrameDeadlineMs, nullptr))
+                {
+                    disconnected = true;
+                    break;
+                }
+                std::wstring type;
+                std::wstring id;
+                int64_t version = 0;
+                if (!knremote::GetNumberField(control, L"v", &version) || version != 1 ||
+                    !knremote::GetStringField(control, L"type", &type))
+                {
+                    disconnected = true;
+                    break;
+                }
+                knremote::GetStringField(control, L"id", &id);
+                if (type == L"disconnect")
+                {
+                    disconnected = true;
+                    break;
+                }
+                if (type == L"cancel")
+                {
+                    bool cancelled = false;
+                    {
+                        std::lock_guard<std::mutex> lock(queueMutex_);
+                        const auto pending = std::find(queue_.begin(), queue_.end(), job);
+                        if (pending != queue_.end())
+                        {
+                            queue_.erase(pending);
+                            job->Cancelled->store(true);
+                            RemoteEngineResult cancelledResult;
+                            cancelledResult.IsError = true;
+                            cancelledResult.Code = L"cancelled";
+                            cancelledResult.Stderr = L"request cancelled before execution";
+                            job->ResultPromise.set_value(cancelledResult);
+                            cancelled = true;
+                        }
+                    }
+                    if (!cancelled)
+                    {
+                        SendJson(client, knremote::MakeObject(L"error", id, L"\"code\":\"not-cancelable\""), nullptr);
+                    }
+                }
+                else if (type == L"heartbeat")
+                {
+                    SendJson(client, knremote::MakeObject(L"heartbeat", id, L""), nullptr);
+                }
+                else
+                {
+                    SendJson(client, knremote::MakeObject(L"error", id, L"\"code\":\"engine-busy\""), nullptr);
+                }
+            }
+            if (knremote::IntervalElapsed(lastHeartbeat, knremote::kHeartbeatMs))
+            {
+                if (!SendJson(client, knremote::MakeObject(L"heartbeat", L"s-hb", L""), nullptr))
+                {
+                    disconnected = true;
+                    break;
+                }
+                lastHeartbeat = GetTickCount();
+            }
+        }
+        if (disconnected)
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            const auto pending = std::find(queue_.begin(), queue_.end(), job);
+            if (pending != queue_.end())
+            {
+                job->Cancelled->store(true);
+                queue_.erase(pending);
+            }
+            commandInFlight_.store(false);
+            break;
         }
         *result = future.get();
         commandInFlight_.store(false);
@@ -969,9 +1062,8 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
             }
             lastActivity = GetTickCount();
 
-            int64_t msgVersion = 1;
-            knremote::GetNumberField(json, L"v", &msgVersion);
-            if (msgVersion != 1)
+            int64_t msgVersion = 0;
+            if (!knremote::GetNumberField(json, L"v", &msgVersion) || msgVersion != 1)
             {
                 SendJson(client, knremote::MakeObject(L"error", L"s-0", L"\"code\":\"unsupported-v\""), nullptr);
                 break;
@@ -1113,7 +1205,10 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
             }
 
             RemoteEngineResult result;
-            EnqueueAndWait(line, msgId, client, &result);
+            if (!EnqueueAndWait(line, msgId, client, &result))
+            {
+                break;
+            }
             lastActivity = GetTickCount();
             lastHeartbeat = lastActivity;
 
@@ -1137,6 +1232,10 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
                 emptyExtra += result.KeepRunning ? L"true" : L"false";
                 emptyExtra += L",\"isError\":";
                 emptyExtra += result.IsError ? L"true" : L"false";
+                if (result.IsError && !result.Code.empty())
+                {
+                    emptyExtra += L",\"code\":" + knremote::Quote(result.Code);
+                }
                 SendJson(client, knremote::MakeObject(L"command-result", msgId, emptyExtra), nullptr);
             }
             else

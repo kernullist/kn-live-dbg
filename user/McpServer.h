@@ -116,6 +116,7 @@ struct McpToolCatalogEntry
 
 std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
 bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
+bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error);
 
 class McpServer
 {
@@ -161,6 +162,7 @@ public:
     std::shared_ptr<McpJob> TryPopJob();
 
 private:
+    friend int RunMcpToolCatalogSelfTest();
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);

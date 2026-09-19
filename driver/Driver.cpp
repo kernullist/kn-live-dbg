@@ -1330,7 +1330,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
         }
 
         bool la57Active = KnDbgIsLa57Active();
-        if (!KnDbgIsCanonicalAddress(VirtualAddress, la57Active))
+        if (KnDbgRangeOverflows(VirtualAddress, Length) || !KnDbgIsCanonicalAddress(VirtualAddress, la57Active))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -3460,9 +3460,10 @@ static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
 {
     // Unhook any interposed target before anything else: a live dispatch
     // entry pointing into this image would crash the moment we unload.
-    // Retry because a stuck in-flight dispatch would otherwise race the
-    // unload; dispatch calls are short, so 2s total is generous.
-    for (ULONG attempt = 0; attempt < 5; ++attempt)
+    // DriverUnload cannot fail. Do not free executable code while a dispatch
+    // is still returning through it, even if the target exceeds our IOCTL
+    // disarm timeout. The controller disarms before requesting SCM unload.
+    for (;;)
     {
         ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
         NTSTATUS disarmStatus = KnDbgIotraceDisarmLocked(TRUE);

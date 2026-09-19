@@ -58,12 +58,8 @@ namespace
         return sock;
     }
 
-    bool SendAuth(SOCKET sock, const wchar_t* password)
+    bool SendTestJson(SOCKET sock, const std::wstring& json)
     {
-        const std::wstring json = knremote::MakeObject(
-            L"auth",
-            L"c-1",
-            L"\"password\":" + knremote::Quote(password));
         std::string bytes;
         if (!knremote::EncodeFrame(json, &bytes, nullptr))
         {
@@ -84,6 +80,12 @@ namespace
             sent += n;
         }
         return true;
+    }
+
+    bool SendAuth(SOCKET sock, const wchar_t* password)
+    {
+        return SendTestJson(sock, knremote::MakeObject(
+            L"auth", L"c-1", L"\"password\":" + knremote::Quote(password)));
     }
 
     bool RecvAuthJson(SOCKET sock, std::wstring* json, std::wstring* error)
@@ -317,6 +319,9 @@ int RunRemoteProtocolSelfTest()
     uint16_t port = 0;
     Check(&ctx, ParseRemoteConnectArgs(3, argvOk, &host, &port, &error) && host == L"10.0.0.5", L"connect-lan");
 
+    WSADATA clientWsa = {};
+    const bool clientWsaStarted = WSAStartup(MAKEWORD(2, 2), &clientWsa) == 0;
+    Check(&ctx, clientWsaStarted, L"client-winsock-start");
     RemoteServer server;
     RemoteServerConfig config;
     config.Port = 51767;
@@ -390,6 +395,21 @@ int RunRemoteProtocolSelfTest()
                 std::wstring helloType;
                 knremote::GetStringField(hello, L"type", &helloType);
                 Check(&ctx, gotHello && helloType == L"hello", L"auth-ok-hello");
+                Check(&ctx, SendTestJson(okSock, knremote::MakeObject(L"command-submit", L"c-2", L"\"line\":\"version\"")),
+                    L"queued-command-send");
+                Check(&ctx, WaitForSingleObject(server.JobReadyEvent(), 5000) == WAIT_OBJECT_0, L"queued-command-arrived");
+                Check(&ctx, SendTestJson(okSock, knremote::MakeObject(L"cancel", L"c-3", L"")), L"queued-cancel-send");
+                std::wstring cancelledReply;
+                std::wstring cancelledCode;
+                const bool gotCancelled = RecvAuthJson(okSock, &cancelledReply, &recvError);
+                knremote::GetStringField(cancelledReply, L"code", &cancelledCode);
+                Check(&ctx, gotCancelled && cancelledCode == L"cancelled" && !server.TryPopJob(), L"queued-cancel-prevents-execution");
+                Check(&ctx, SendTestJson(okSock, knremote::MakeObject(L"command-submit", L"c-4", L"\"line\":\"version\"")),
+                    L"stop-queued-command-send");
+                Check(&ctx, WaitForSingleObject(server.JobReadyEvent(), 5000) == WAIT_OBJECT_0, L"stop-queued-command-arrived");
+                const ULONGLONG stopStart = GetTickCount64();
+                server.Stop();
+                Check(&ctx, GetTickCount64() - stopStart < 5000 && !server.TryPopJob(), L"stop-cancels-queue-without-engine-deadlock");
                 knremote::CloseTcpGraceful(okSock, knremote::kCloseDrainMs);
             }
         }
@@ -398,6 +418,10 @@ int RunRemoteProtocolSelfTest()
         Check(&ctx, !server.IsRunning(), L"server-stop");
     }
 
+    if (clientWsaStarted)
+    {
+        WSACleanup();
+    }
     if (ctx.Failed != 0)
     {
         std::wcerr << L"[remote.selftest] failures=" << ctx.Failed << L"\n";
