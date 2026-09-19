@@ -132,6 +132,7 @@
     <ClCompile Include="CodeTargetResolver.cpp" />
     <ClCompile Include="KernelMonitorVerification.cpp" />
     <ClCompile Include="KernelMonitorCatalog.cpp" />
+    <ClCompile Include="KernelMonitorHunting.cpp" />
     <ClCompile Include="KernelMonitorPipeline.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
     <ClCompile Include="GameBuildManifestGenerator.cpp" />
@@ -222,6 +223,8 @@
     <ClInclude Include="ExecutableImageVerifier.h" />
     <ClInclude Include="CodeTargetResolver.h" />
     <ClInclude Include="ExecutableRegionCatalog.h" />
+    <ClInclude Include="KmonHunting.h" />
+    <ClInclude Include="KmonHuntingJson.h" />
     <ClInclude Include="KmonWorkQueue.h" />
     <ClInclude Include="ContentHash.h" />
     <ClInclude Include="GameBuildManifest.h" />

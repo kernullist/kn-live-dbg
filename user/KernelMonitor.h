@@ -6,6 +6,7 @@
 #include "CodeTargetResolver.h"
 #include "ExecutableImageVerifier.h"
 #include "ExecutableRegionCatalog.h"
+#include "KmonHunting.h"
 #include "KmonWorkQueue.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
@@ -246,6 +247,8 @@ public:
 
     KmonStats SnapshotStats() const;
     KmonOptions CurrentOptions() const;
+    std::vector<KmonHuntCase> HuntCases() const;
+    std::wstring HuntCasesJson() const;
     bool IsMapperWatchActive() const;
     std::vector<uint32_t> SnapshotWatchPids() const;
     std::wstring SnapshotMapperWatchId() const;
@@ -312,8 +315,12 @@ private:
     void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader);
     void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
-        const ObservationIdentity& identity = {});
+        const ObservationIdentity& identity = {}, uint64_t observedAt = 0);
     void ScanExecutionReferences();
+    void ScanCommunicationSurfaces();
+    void ScanUserExecutionSurfaces(HANDLE process, const ObservationIdentity& identity,
+        const std::vector<std::pair<uint64_t, uint32_t>>& modules, bool inventoryComplete);
+    void QueueObservedStack(const TiEventRecord& record);
     uint64_t ObserveExecutableRegion(ExecutableRegionObservation observation);
     void ScanUserRegionCatalog(HANDLE process, const ObservationIdentity& identity,
         const struct ProcessVadScanResult& vad,
@@ -473,6 +480,11 @@ private:
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> GraphicsSlotCursors;
     uint64_t KernelImageCursor = 0;
     uint64_t NextImageScanTickMs = 0;
+    uint64_t NextChannelScanTickMs = 0;
+    uint32_t ChannelScanCursor = 0;
+    mutable std::mutex HuntMutex;
+    KmonHuntIndex HuntIndex;
+    std::map<std::pair<uint32_t, uint64_t>, uint32_t> UserThreadCursors;
     struct ExecutionReferenceWork
     {
         uint64_t Target = 0;

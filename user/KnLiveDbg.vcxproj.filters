@@ -463,6 +463,9 @@
     <ClCompile Include="KernelMonitorVerification.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="KernelMonitorHunting.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KernelMonitorCatalog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -482,6 +485,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CodeTargetResolver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="KmonHunting.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="KmonHuntingJson.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutableRegionCatalog.h">

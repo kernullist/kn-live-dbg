@@ -715,9 +715,15 @@ namespace
         { L"off", L"!kmon iotrace off", L"restore the interposed dispatch entry" },
         { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
+        { L"cases", L"!kmon cases [/json]", L"recent kernel/user investigation leads; no communication verdict" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
         { L"clear", L"!kmon clear", L"empty the derived ring" },
         { L"help", nullptr, L"show !kmon usage" },
+    };
+
+    const CompletionHint kKmonCaseTokens[] =
+    {
+        { L"/json", L"!kmon cases /json", L"structured observations and claim boundaries" },
     };
 
     const CompletionHint kKmonOptTokens[] =
@@ -1497,7 +1503,8 @@ namespace
 
     const CompletionScopeTable kKmonScopes[] =
     {
-        SCOPE(L"", L"!kmon [start] | stop | status | recent | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
+        SCOPE(L"", L"!kmon [start] | stop | status | recent | cases | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
+        SCOPE(L"cases", L"!kmon cases [/json]", L"recent investigation leads", kKmonCaseTokens),
         SCOPE(L"opts", L"!kmon [/name] [/verbose] [/background] [/driver] [/pid] [/log]", L"kmon start options", kKmonOptTokens),
     };
 
@@ -1923,7 +1930,11 @@ namespace
         }
         else if (command == L"!kmon")
         {
-            if (!first.empty() && first != L"help")
+            if (first == L"cases")
+            {
+                scope = L"cases";
+            }
+            else if (!first.empty() && first != L"help")
             {
                 scope = L"opts";
             }

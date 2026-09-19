@@ -350,6 +350,10 @@ struct ProcessThreadScanOptions
     bool UserModuleEnumerationComplete = false;
     bool IncludeApc = false;
     bool IncludeStacks = false;
+    bool CorrelateVad = true;
+    uint32_t SkipThreads = 0;
+    uint32_t DetailLimit = 0;
+    uint32_t TimeBudgetMs = 0;
     // Hunt enables this only for known security-product processes. A missing
     // suspend/freeze field or read then participates in retry/incomplete
     // coverage instead of being treated as unrelated thread telemetry.
@@ -359,6 +363,7 @@ struct ProcessThreadScanOptions
 
 struct ProcessThreadScanResult
 {
+    uint32_t ResumeIndex = 0;
     ProcessTriageTarget Target = {};
     std::vector<ProcessThreadRecord> Records;
     std::vector<std::wstring> Warnings;

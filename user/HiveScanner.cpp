@@ -284,7 +284,15 @@ namespace
             }
             layout->FromPdb = true;
 
-            if (layout->GetCellOffset >= kMaxLayoutProbe ||
+            if (getCell.Length != sizeof(uint64_t) || getCell.IsBitField ||
+                (layout->HasRelease && (releaseCell.Length != sizeof(uint64_t) || releaseCell.IsBitField)) ||
+                (layout->HasAllocate && (allocate.Length != sizeof(uint64_t) || allocate.IsBitField)) ||
+                (layout->HasFree && (freeField.Length != sizeof(uint64_t) || freeField.IsBitField)) ||
+                embeddedHive.Offset >= kMaxLayoutProbe || getCell.Offset >= kMaxLayoutProbe ||
+                (layout->HasRelease && (releaseCell.Offset >= kMaxLayoutProbe || layout->ReleaseCellOffset > kMaxLayoutProbe - 8)) ||
+                (layout->HasAllocate && (allocate.Offset >= kMaxLayoutProbe || layout->AllocateOffset > kMaxLayoutProbe - 8)) ||
+                (layout->HasFree && (freeField.Offset >= kMaxLayoutProbe || layout->FreeOffset > kMaxLayoutProbe - 8)) ||
+                layout->GetCellOffset > kMaxLayoutProbe - 8 ||
                 layout->HiveListOffset >= 0x4000)
             {
                 if (warnings != nullptr)
@@ -487,6 +495,15 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             record.Index = index;
             record.ListEntryAddress = entry;
             record.HiveAddress = hiveBase;
+            if (hiveBase > UINT64_MAX - kMaxLayoutProbe)
+            {
+                result->Warnings.push_back(L"hive field address overflow; walk stopped");
+                break;
+            }
+            record.GetCellSlot = hiveBase + layout.GetCellOffset;
+            record.ReleaseCellSlot = layout.HasRelease ? hiveBase + layout.ReleaseCellOffset : 0;
+            record.AllocateSlot = layout.HasAllocate ? hiveBase + layout.AllocateOffset : 0;
+            record.FreeSlot = layout.HasFree ? hiveBase + layout.FreeOffset : 0;
 
             uint64_t getCell = 0;
             if (!ReadU64(device_, hiveBase + layout.GetCellOffset, &getCell))
@@ -549,7 +566,11 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             if (layout.HasAllocate)
             {
                 uint64_t allocate = 0;
-                if (ReadU64(device_, hiveBase + layout.AllocateOffset, &allocate) && allocate != 0)
+                if (!ReadU64(device_, hiveBase + layout.AllocateOffset, &allocate))
+                {
+                    record.CoverageIncomplete = true;
+                }
+                else if (allocate != 0)
                 {
                     record.HasAllocate = true;
                     record.Allocate = allocate;
@@ -558,7 +579,11 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             if (layout.HasFree)
             {
                 uint64_t freeRoutine = 0;
-                if (ReadU64(device_, hiveBase + layout.FreeOffset, &freeRoutine) && freeRoutine != 0)
+                if (!ReadU64(device_, hiveBase + layout.FreeOffset, &freeRoutine))
+                {
+                    record.CoverageIncomplete = true;
+                }
+                else if (freeRoutine != 0)
                 {
                     record.HasFree = true;
                     record.Free = freeRoutine;

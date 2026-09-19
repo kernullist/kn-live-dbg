@@ -6770,6 +6770,13 @@ bool KernelMonitor::Start(
             NextKpageScanTickMs = 0;
             NextUserScanTickMs = 0;
             NextImageScanTickMs = 0;
+            NextChannelScanTickMs = 0;
+            ChannelScanCursor = 0;
+            UserThreadCursors.clear();
+            {
+                std::lock_guard<std::mutex> huntLock(HuntMutex);
+                HuntIndex = KmonHuntIndex{};
+            }
             KernelImageCursor = 0;
             RegionCatalog = ExecutableRegionCatalog{};
             UserRegionCursors.clear();
@@ -7205,6 +7212,13 @@ void KernelMonitor::WorkerLoop()
                     : kThreadScanIntervalMs);
         }
 
+        if (!StopRequested.load() && nowMs >= NextChannelScanTickMs)
+        {
+            ScanCommunicationSurfaces();
+            NextChannelScanTickMs = GetTickCount64() + 5000;
+            IngestLiveTimeline();
+            IngestThreatIntel();
+        }
         if (nowMs >= NextImageScanTickMs)
         {
             ScanKernelExecutableImages();
@@ -7432,10 +7446,7 @@ void KernelMonitor::IngestThreatIntel()
                 }
             }
 
-            // Attach the ETW-captured callstack to the event: the return
-            // addresses identify the exact API chain (e.g. SKY -> kernel32!
-            // ReadProcessMemory -> ntdll!NtReadVirtualMemory) rather than
-            // just the process name. Symbolization happens at display time.
+            // Stack addresses are historical references, not current RIPs.
             if (!record.CallstackAddresses.empty() &&
                 classified.Kind != L"driver.captured")
             {
@@ -7451,6 +7462,7 @@ void KernelMonitor::IngestThreatIntel()
                 classified.Evidence[L"callstack"] = stackText;
                 classified.Evidence[L"callstack_depth"] =
                     std::to_wstring(record.CallstackAddresses.size());
+                QueueObservedStack(record);
             }
 
             if (classified.Kind == L"inject.remote" ||
@@ -13103,10 +13115,7 @@ void KernelMonitor::ScanUserModeHostility()
                     KmonIsWindowsBuiltinLeaf(target.Leaf) ||
                     watched ||
                     pathClass == L"drop";
-                target.Interesting =
-                    target.HighPriority ||
-                    pathClass == L"third_party" ||
-                    pathClass == L"unknown";
+                target.Interesting = true;
                 targets.push_back(std::move(target));
                 }
             }
@@ -14722,10 +14731,8 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 codeIdentity.CreateTime = QueryPidCreateTime(device, symbols, processHandle, pid);
             }
-            if (watched || dropHost || defaultWatched)
-            {
-                ScanUserRegionCatalog(processHandle, codeIdentity, kernelVad, moduleRanges, moduleInventoryComplete);
-            }
+            ScanUserRegionCatalog(processHandle, codeIdentity, kernelVad, moduleRanges, moduleInventoryComplete);
+            ScanUserExecutionSurfaces(processHandle, codeIdentity, moduleRanges, moduleInventoryComplete);
             const auto cursorKey = std::make_pair(pid, codeIdentity.CreateTime);
             const auto boundCursors = [&](auto& cursors)
             {
@@ -16148,7 +16155,10 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
-        (event.Kind == L"coverage.execution_path" && event.Evidence[L"termination"] == L"no_supported_head_transfer");
+        ((event.Kind == L"coverage.channel" || event.Kind == L"coverage.user_references") &&
+            event.Evidence[L"source_status"] != L"failed") ||
+        (event.Kind == L"coverage.execution_path" && (event.Evidence[L"termination"] == L"no_supported_head_transfer" ||
+            event.Evidence[L"reference_role"] == L"etw_stack_return"));
     if (quietOverlay || quietFile || quietCoverage)
     {
         event.Evidence[L"display_suppressed"] = L"true";
@@ -16416,6 +16426,10 @@ bool KernelMonitor::SaveTo(const std::wstring& path, std::wstring* error) const
 
 void KernelMonitor::Clear()
 {
+    {
+        std::lock_guard<std::mutex> huntLock(HuntMutex);
+        HuntIndex = KmonHuntIndex{};
+    }
     {
         std::lock_guard<std::mutex> lock(RingMutex);
         Ring.clear();

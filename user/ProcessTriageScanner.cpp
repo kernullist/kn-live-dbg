@@ -5341,7 +5341,7 @@ bool ProcessTriageScanner::ScanThreads(
         // hunt VAD triage.  Without it, a stack reference to a private
         // PE-like RX page is indistinguishable from an ordinary JIT page.
         vadOptions.ProbePe = options.IncludeStacks;
-        if (ScanVad(vadOptions, &vadResult, nullptr))
+        if (options.CorrelateVad && ScanVad(vadOptions, &vadResult, nullptr))
         {
             vadRecords = vadResult.Records;
             if (vadResult.Truncated ||
@@ -5356,7 +5356,8 @@ bool ProcessTriageScanner::ScanThreads(
         }
         else
         {
-            result->Warnings.push_back(L"VAD correlation unavailable for thread-start classification");
+            result->Warnings.push_back(options.CorrelateVad ?
+                L"VAD correlation unavailable for thread-start classification" : L"VAD correlation disabled for bounded reference collection");
             result->Incomplete = true;
             result->CoverageComplete = false;
         }
@@ -5395,8 +5396,19 @@ bool ProcessTriageScanner::ScanThreads(
         std::vector<uint64_t> visited;
         uint64_t previous = listHead;
         bool threadListLinkFailure = false;
+        const uint64_t detailStarted = GetTickCount64();
         while (current != 0 && current != listHead && result->ThreadsVisited < kMaxThreads)
         {
+            if ((options.DetailLimit != 0 && result->Records.size() >= options.DetailLimit) ||
+                (options.TimeBudgetMs != 0 && GetTickCount64() - detailStarted >= options.TimeBudgetMs))
+            {
+                result->ResumeIndex = static_cast<uint32_t>(result->ThreadsVisited);
+                result->Truncated = true;
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(L"thread detail budget exhausted; resume index is a best-effort list position");
+                break;
+            }
             if (!IsKernelAddress(current))
             {
                 result->Warnings.push_back(L"thread list entry is not kernel-canonical: " + Hex(current, 16));
@@ -5415,6 +5427,23 @@ bool ProcessTriageScanner::ScanThreads(
                 break;
             }
             visited.push_back(current);
+
+            if (result->ThreadsVisited < options.SkipThreads)
+            {
+                uint64_t next = 0;
+                uint64_t blink = 0;
+                if (!ReadListEntry(device_, current, &next, &blink, nullptr) || blink != previous)
+                {
+                    threadListLinkFailure = true;
+                    result->Incomplete = true;
+                    result->CoverageComplete = false;
+                    break;
+                }
+                ++result->ThreadsVisited;
+                previous = current;
+                current = next;
+                continue;
+            }
 
             uint64_t ethread = 0;
             if (!TrySub(current, layout.ThreadListEntry.Offset, &ethread))

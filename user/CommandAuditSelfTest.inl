@@ -55,6 +55,15 @@ static int RunCommandAuditSelfTest()
         !dbgeng.IsReady(), L"remote stays native in dbgeng mode");
 
     state.Backend = DebuggerState::BackendMode::Native;
+    const auto huntCases = run(L"!kmon cases /json");
+    check(huntCases.Error.empty() && huntCases.Output.find(L"kmon.hunt.v1") != std::wstring::npos &&
+        huntCases.Output.find(L"\"communication_proven\":false") != std::wstring::npos,
+        L"kmon cases JSON is available without a driver");
+    for (const auto& line : {L"!kmon cases /json extra", L"!kmon cases /unknown", L"!kmon cases 0"})
+    {
+        const auto invalidCases = run(line);
+        check(invalidCases.Error.find(L"usage") != std::wstring::npos, L"kmon cases rejects invalid arguments");
+    }
     for (const auto& line : std::vector<std::wstring>
         { L"q extra", L"qq extra", L"qd extra", L"quit extra", L"exit extra", L"unload extra",
           L"write on extra", L"setfield nt!TYPE 0 Field 1 extra", L"c 0 1 2 extra", L"query 0 1 extra",

@@ -8,6 +8,8 @@
 
 #include "../user/GameBuildManifest.h"
 #include "../user/KmonWorkQueue.h"
+#include "../user/KmonHunting.h"
+#include "kmon-hunting-selftest.h"
 
 #include <iostream>
 
@@ -53,7 +55,7 @@ bool ArbitraryImageSelfTest()
 
 int main()
 {
-    const bool pure = KmonHandleTrackingSelfTest() && ObservationModelSelfTest();
+    const bool pure = KmonHandleTrackingSelfTest() && ObservationModelSelfTest() && KmonHuntingPolicySelfTest();
     std::cout << "[kmon.core] handle ABI, rotation, lifecycle, channel controls: "
         << (pure ? "PASS" : "FAIL") << "\n";
     HANDLE file = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -86,5 +88,6 @@ int main()
     std::cout << "[kmon.core] manifest bounds, secondary vptr, slot and queue controls: " << (manifest ? "PASS" : "FAIL") << "\n";
     const bool actualImage = ArbitraryImageSelfTest();
     std::cout << "[kmon.core] arbitrary-name EXE, second executable page and mid-page change: " << (actualImage ? "PASS" : "FAIL") << "\n";
-    return pure && found && image && branches && catalog && manifest && actualImage ? 0 : 1;
+    const bool hunting = KmonHuntingSelfTest();
+    return pure && found && image && branches && catalog && manifest && actualImage && hunting ? 0 : 1;
 }

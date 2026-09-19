@@ -17,6 +17,10 @@ struct HiveRecord
     uint64_t ReleaseCellRoutine = 0;
     uint64_t Allocate = 0;
     uint64_t Free = 0;
+    uint64_t GetCellSlot = 0;
+    uint64_t ReleaseCellSlot = 0;
+    uint64_t AllocateSlot = 0;
+    uint64_t FreeSlot = 0;
     std::wstring GetCellModule;
     std::wstring GetCellSymbol;
     std::wstring ReleaseCellModule;

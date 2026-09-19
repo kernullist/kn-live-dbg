@@ -17,6 +17,7 @@ struct FirmwareTableProviderRecord
     uint64_t Flink = 0;
     uint64_t Blink = 0;
     uint64_t FirmwareTableHandler = 0;
+    uint64_t HandlerSlot = 0;
     uint64_t DriverObject = 0;
     uint64_t DriverStart = 0;
     uint32_t DriverSize = 0;
@@ -40,6 +41,7 @@ struct FirmwareTableScanResult
     std::wstring ResourceSymbol;
     std::wstring LayoutName;
     bool UsedFallbackLayout = true;
+    bool CoverageComplete = false;
 };
 
 class FirmwareTableScanner

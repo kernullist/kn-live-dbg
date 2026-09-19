@@ -6,11 +6,14 @@
 !kmon start /name game.exe /background /log C:\kmon-evidence
 !kmon status
 !kmon recent 100
+!kmon cases /json
 !kmon save C:\kmon-evidence\session.jsonl
 !kmon stop
 ```
 
 ## 관측과 판정
+
+커널·유저 연관 사건, 비 IOCTL 채널의 검사 범위와 외부 비교 절차는 [연관 헌팅](KMON_CROSS_DOMAIN_HUNTING.md)을 참고한다.
 
 | 기록 | 의미 |
 |---|---|
@@ -22,6 +25,7 @@
 | `coverage.image_cow` | 이미지 페이지의 COW 관측. 이 속성만으로 변조나 악성을 판정하지 않음 |
 | `coverage.image`, `coverage.kernel_pages` | 비교·실패·제외 범위, 순회 커서 및 완료 상태 |
 | `coverage.capture*`, `coverage.pipeline` | 캡처 예약·저장 결과, 첫 바이트 지연, 큐 초과 및 수집 손실 |
+| `coverage.channel`, `coverage.user_references` | firmware/hive/ETW 등록 및 프로세스 실행 참조의 관측 범위 |
 | `sensor.*` | 수집 기능의 실패나 제한 상태 |
 
 모듈 범위에 포함된 주소도 `owned_unverified`일 수 있다. `owned_verified`는 **명시된 비교 범위**의 바이트가 일치한다는 뜻이다. 서명·파일 경로·이미지 포함 관계만으로 전체 함수의 정상성을 보증하지 않는다. 참조 파일 자체가 신뢰할 수 있는 배포본인지는 운영 환경에서 관리해야 한다.

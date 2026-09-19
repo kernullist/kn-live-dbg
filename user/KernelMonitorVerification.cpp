@@ -1,4 +1,6 @@
 #include "KernelMonitor.h"
+#include "ContentHash.h"
+#include "KmonHuntingJson.h"
 
 #include <TlHelp32.h>
 #include <algorithm>
@@ -11,9 +13,11 @@ namespace
     {
         const wchar_t* hex = L"0123456789abcdef";
         std::wstring result;
-        result.reserve(bytes.size() * 2);
-        for (uint8_t value : bytes)
+        const size_t count = (std::min<size_t>)(bytes.size(), 64);
+        result.reserve(count * 2);
+        for (size_t i = 0; i < count; ++i)
         {
+            const uint8_t value = bytes[i];
             result.push_back(hex[value >> 4]);
             result.push_back(hex[value & 15]);
         }
@@ -285,7 +289,7 @@ void KernelMonitor::ScanKernelExecutableImages()
 }
 
 void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
-    const std::wstring& role, const ObservationIdentity& identity)
+    const std::wstring& role, const ObservationIdentity& identity, uint64_t observedAt)
 {
     if (target == 0)
     {
@@ -314,7 +318,8 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
         return;
     }
     ExecutionReferenceKeys.insert(key);
-    ExecutionReferences.push_back({target, slot, ObservationFileTime(), GetTickCount64(), actual, role});
+    ExecutionReferences.push_back({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
+        GetTickCount64(), actual, role});
 }
 
 void KernelMonitor::ScanExecutionReferences()
@@ -331,6 +336,17 @@ void KernelMonitor::ScanExecutionReferences()
         ExecutionReferences.pop_front();
         const auto referenceKey = ReferenceKey(work.Target, work.Slot, work.Role, work.Identity);
         ExecutionReferenceKeys.erase(referenceKey);
+        {
+            std::lock_guard<std::mutex> lock(HuntMutex);
+            HuntIndex.Retire(work.Identity, work.Target, work.Slot, work.Role);
+        }
+        if (GetTickCount64() - work.ObservedMs > 30000)
+        {
+            ++ExecutionReferenceDropped;
+            EmitUnique(L"coverage.references", L"scan_failed:references:expired", L"", L"references",
+                L"queued reference expired", L"reference older than 30 seconds was discarded", work.Identity.ProcessId);
+            continue;
+        }
         if (ExecutionReferenceLastChecked.size() >= 16384)
         {
             ExecutionReferenceLastChecked.erase(std::min_element(ExecutionReferenceLastChecked.begin(), ExecutionReferenceLastChecked.end(),
@@ -342,6 +358,10 @@ void KernelMonitor::ScanExecutionReferences()
         ExecutionReferenceLastChecked[referenceKey] = GetTickCount64();
         const uint32_t pid = work.Identity.ProcessId;
         HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (pid != 0 && process == nullptr)
+        {
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        }
         const std::unique_ptr<void, decltype(&CloseHandle)> processOwner(process, &CloseHandle);
         if (pid != 0 && !work.Identity.SameInstance(ObserveProcessIdentity(pid, process)))
         {
@@ -368,6 +388,10 @@ void KernelMonitor::ScanExecutionReferences()
             {
                 return address >= 0xFFFF800000000000ull &&
                     device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+            }
+            if (work.Role == L"instrumentation_callback" && work.Slot != 0 && address == work.Slot && size == 8)
+            {
+                return device->ReadMemory(address, 8, bytes, nullptr);
             }
             bytes->resize(size);
             SIZE_T read = 0;
@@ -428,11 +452,30 @@ void KernelMonitor::ScanExecutionReferences()
             }
             return CodeOwnership::Unknown;
         };
-        const bool pointerSlot = work.Slot != 0 && (work.Role == L"iat" || work.Role == L"vtable_candidate" ||
-            work.Role == L"manifest_vtable" || work.Role == L"cfg_dispatch_slot" ||
-            work.Role == L"graphics_data_pointer_candidate");
-        const auto chain = pointerSlot ? ResolveReferencedCodeTarget(work.Target, work.Slot, reader, inspect) :
-            ResolveCodeTarget(work.Target, reader, inspect);
+        const bool pointerSlot = work.Slot != 0 && KmonPointerReference(work.Role);
+        CodeTargetChain chain;
+        if (work.Role == L"etw_stack_return")
+        {
+            CodeTargetHop hop;
+            hop.Address = work.Target & ~4095ull;
+            if (reader(hop.Address, 4096, &hop.Bytes) && hop.Bytes.size() == 4096)
+            {
+                hop.Ownership = inspect(hop.Address, hop.Bytes);
+                chain.HasModifiedCode = hop.Ownership == CodeOwnership::OwnedModified;
+                chain.HasUnownedExecutable = hop.Ownership == CodeOwnership::UnownedExecutable;
+                chain.Hops.push_back(std::move(hop));
+                chain.Termination = L"historical_stack_page_checked; not_a_function_entry";
+            }
+            else
+            {
+                chain.Termination = L"historical_stack_location_unreadable";
+            }
+        }
+        else
+        {
+            chain = pointerSlot ? ResolveReferencedCodeTarget(work.Target, work.Slot, reader, inspect) :
+                ResolveCodeTarget(work.Target, reader, inspect);
+        }
         KmonEvent event;
         event.Kind = chain.HasModifiedCode || chain.HasUnownedExecutable ? L"finding.execution_path" : L"coverage.execution_path";
         event.ProcessId = pid;
@@ -440,14 +483,19 @@ void KernelMonitor::ScanExecutionReferences()
         event.Observation.Identity = work.Identity;
         event.Observation.Source = work.Role;
         event.Observation.Timestamp = work.ObservedAt;
+        event.Observation.MonotonicMs = work.ObservedMs;
+        event.Observation.DependencyGroup = L"static_code_reference";
+        event.Evidence[L"module_inventory"] = modules.empty() ? L"unavailable" : L"snapshot";
         event.Evidence[L"relationship"] = L"address";
         event.Evidence[L"reference_role"] = work.Role;
         event.Evidence[L"slot"] = std::to_wstring(work.Slot);
+        event.Evidence[L"reference_target"] = std::to_wstring(work.Target);
         event.Evidence[L"termination"] = chain.Termination;
         event.Evidence[L"execution_observed"] = L"false";
         event.Evidence[L"reference_consistency"] = !chain.ReferenceChecked ? L"not_revalidated" :
             (chain.ReferenceStable ? L"slot_checked_before_and_after" : L"changed_or_unreadable");
         event.Evidence[L"path_read_at"] = std::to_wstring(ObservationFileTime());
+        size_t captures = 0;
         for (size_t i = 0; i < chain.Hops.size(); ++i)
         {
             const auto& hop = chain.Hops[i];
@@ -463,6 +511,84 @@ void KernelMonitor::ScanExecutionReferences()
             event.Evidence[key + L"target"] = std::to_wstring(hop.Target);
             event.Evidence[key + L"ownership"] = CodeOwnershipName(hop.Ownership);
             event.Evidence[key + L"bytes"] = BytesHex(hop.Bytes);
+            event.Evidence[key + L"bytes_read"] = std::to_wstring(hop.Bytes.size());
+            event.Evidence[key + L"bytes_prefix_length"] = std::to_wstring((std::min<size_t>)(hop.Bytes.size(), 64));
+            if (KmonHuntOwnership(hop.Ownership) && (!chain.ReferenceChecked || chain.ReferenceStable))
+            {
+                KmonHuntReference reference;
+                reference.Context.Identity = work.Identity;
+                reference.Context.Source = work.Role;
+                reference.Context.DependencyGroup = hop.Ownership == CodeOwnership::OwnedModified ?
+                    L"memory_vs_file" : L"executable_memory_metadata";
+                reference.Context.Ownership = hop.Ownership;
+                reference.Address = hop.Address;
+                reference.Root = work.Target;
+                reference.Slot = work.Slot;
+                reference.Role = work.Role;
+                reference.ReferenceTimestamp = work.ObservedAt;
+                reference.SlotStable = chain.ReferenceChecked && chain.ReferenceStable;
+                const uint64_t base = hop.Address & ~4095ull;
+                std::vector<uint8_t> page;
+                bool comparable = false;
+                if (captures < 2 && reader(base, 4096, &page) && page.size() == 4096)
+                {
+                    ++captures;
+                    const size_t offset = static_cast<size_t>(hop.Address - base);
+                    comparable = hop.Bytes.size() <= page.size() - offset &&
+                        std::equal(hop.Bytes.begin(), hop.Bytes.end(), page.begin() + offset);
+                }
+                if (reference.SlotStable)
+                {
+                    std::vector<uint8_t> slotBytes;
+                    uint64_t target = 0;
+                    reference.SlotStable = reader(work.Slot, 8, &slotBytes) && slotBytes.size() == 8;
+                    if (reference.SlotStable)
+                    {
+                        std::memcpy(&target, slotBytes.data(), 8);
+                        reference.SlotStable = target == work.Target;
+                    }
+                    if (!reference.SlotStable)
+                    {
+                        event.Evidence[L"capture_reference_consistency"] = L"changed_or_unreadable";
+                        continue;
+                    }
+                }
+                if (pid != 0 && !work.Identity.SameInstance(ObserveProcessIdentity(pid, process)))
+                {
+                    continue;
+                }
+                reference.Context.Timestamp = ObservationFileTime();
+                reference.Context.MonotonicMs = GetTickCount64();
+                if (comparable)
+                {
+                    ExecutableRegionObservation observation;
+                    observation.Context = reference.Context;
+                    // A page boundary is not an allocation boundary.
+                    MEMORY_BASIC_INFORMATION region = {};
+                    if (pid != 0 && process != nullptr && VirtualQueryEx(process, reinterpret_cast<LPCVOID>(base),
+                        &region, sizeof(region)) == sizeof(region))
+                    {
+                        observation.Context.AllocationBase = reinterpret_cast<uint64_t>(region.AllocationBase);
+                    }
+                    observation.Range = {base, 4096};
+                    observation.Executable = true;
+                    observation.ContentSha256 = ContentHash::Bytes(page);
+                    observation.ContentBytes = page.size();
+                    reference.Context.MappingGeneration = ObserveExecutableRegion(observation);
+                    reference.PageSha256 = observation.ContentSha256;
+                    reference.PageComparable = KmonComparablePage(page);
+                    event.Evidence[key + L"capture_id"] = std::to_wstring(
+                        QueueCapturedBytes(L"hunt_reference", base, reference.Context, page));
+                }
+                {
+                    std::lock_guard<std::mutex> lock(HuntMutex);
+                    reference.Id = HuntIndex.Observe(reference);
+                }
+                if (reference.Id != 0)
+                {
+                    event.Evidence[key + L"hunt_reference"] = KmonHuntReferenceJson(reference);
+                }
+            }
         }
         RecordEvent(std::move(event));
     }

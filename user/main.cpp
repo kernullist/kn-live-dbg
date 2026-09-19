@@ -24982,6 +24982,9 @@ static void PrintKmonHelp()
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
+    std::wcout << L"  !kmon cases [/json]  bounded recent kernel/user investigation leads (30s expiry)\n";
+    std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
+    std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
     std::wcout << L"  /log /verbose /manifest /throttle apply on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
@@ -25799,6 +25802,35 @@ static void HandleKmonCommand(
             }
             StartTimelineAutoDrainWorker(state, &device);
             RunKmonLiveTail(kmon);
+            break;
+        }
+
+        if (action == L"cases")
+        {
+            if (args.size() > 3 || (args.size() == 3 && ToLower(args[2]) != L"/json"))
+            {
+                std::wcerr << L"!kmon cases: usage: !kmon cases [/json]\n";
+                break;
+            }
+            if (args.size() == 3)
+            {
+                std::wcout << kmon.HuntCasesJson() << L"\n";
+                break;
+            }
+            const auto cases = kmon.HuntCases();
+            for (const auto& item : cases)
+            {
+                std::wcout << L"[kmon.case] " << item.Kind << L" relation=" << ObservationRelationName(item.Relation)
+                    << L" pid=" << item.Primary.Context.Identity.ProcessId << L" address=" << item.Primary.Address
+                    << L" role=" << item.Primary.Role;
+                if (item.HasRelated)
+                {
+                    std::wcout << L" related_pid=" << item.Related.Context.Identity.ProcessId
+                        << L" related_address=" << item.Related.Address;
+                }
+                std::wcout << L"\n";
+            }
+            std::wcout << L"[kmon.cases] returned=" << cases.size() << L" claim=investigation_leads communication_proven=false\n";
             break;
         }
 

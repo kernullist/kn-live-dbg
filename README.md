@@ -397,6 +397,7 @@ set-ppl-antimalware [on|off|status]
 !kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background|/nowatch] [/log <dir>]
 !kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
 !kmon iotrace <driver-name> on|off|status   # lab-only IOCTL interposition (ABI 17)
+!kmon cases [/json]                       # recent kernel/user investigation leads
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
 ai chat <goal> [/verbose]
@@ -2241,6 +2242,8 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 - **Forgot `!ti stop`?** The subscriber's destructor calls Stop on normal exit (`exit`, Ctrl+C), and the console control handler calls Stop on hard exit (window close, logoff, shutdown). A clean teardown happens in every path except `TerminateProcess`. After a TerminateProcess, recover with `logman stop KnLiveDbg-Ti -ets`.
 
 ## Kernel-cheat monitor (`!kmon`)
+
+The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
 
 `!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` (or `!kmon start`) arms collectors and stays on the live tail.
 
