@@ -9,7 +9,7 @@ Reference pages:
 
 ## Backend Rule
 
-KnLiveDbg currently has a native live-memory backend, not a KD transport backend. This means commands fall into three groups:
+KnLiveDbg has a native live-memory backend alongside DbgEng routing. Commands fall into four groups:
 
 1. Native
    - Can be implemented using the current driver, `DbgHelp`, and local system APIs.
@@ -50,9 +50,17 @@ Backend mode differences:
 | --- | --- | --- | --- |
 | `auto` | Enabled for implemented live-memory commands. | Enabled for DbgEng-routed commands, `!extension` commands, and unknown `.meta` commands. | Normal mixed operation. |
 | `native` | Enabled. | Disabled except for explicit raw escapes such as `kd`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
-| `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
+| `dbgeng` | All native-owned commands run before the raw DbgEng catch-all. | Other commands use `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
 
-The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver path (`IsNativeOwnedCommand`) is never sent to DbgEng. That includes session control (`q`/`unload`/`write`/`probe`/`procctx`/`backend`/`kdinit`/`mcp`/`ai`), native memory (`d*`/`e*`/`phys`/`pe*`/`vtop`/`f`/`m`/`setfield`/`u`/`uf`/`dt`), dumps (`dump-raw`/`dump-pe`), leftover detectors (`!payload`/`!mapper`/`!kpage`/`!pool pe`), PPL (`set-ppl-antimalware`), symbols (`lm`/`x`/`ln`/`.sympath`/`.reload`), and all native bang scanners (`!hunt`/`!ti`/`!timeline`/`!ssdt`/...). Only commands outside that set are raw-executed through DbgEng. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver path (`IsNativeOwnedCommand`) is never sent to DbgEng. That includes session control (`q`/`unload`/`write`/`probe`/`procctx`/`backend`/`kdinit`/`mcp`/`remote`/`ai`), native memory (`d*`/`e*`/`phys`/`pe*`/`vtop`/`f`/`m`/`setfield`/`u`/`uf`/`dt`), dumps (`dump-raw`/`dump-pe`), leftover detectors (`!payload`/`!mapper`/`!kpage`/`!pool pe`), PPL (`set-ppl-antimalware`), symbols (`lm`/`x`/`ln`/`.sympath`/`.reload`), and all native bang scanners (`!hunt`/`!ti`/`!timeline`/`!ssdt`/...). Only commands outside that set are raw-executed through DbgEng. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+
+## Input Validation and Audit
+
+The 2026-09-19 registry has **261 entries: 151 Native, 17 Alias, and 93 DbgEng**. The [command audit](COMMAND_AUDIT_20260919.md) records handler coverage and regression evidence. Registry coverage includes dispatch/help checks for DbgEng entries; it does not certify the external debugger engine or target behavior.
+
+Native parsing rejects embedded NULs, unterminated quotes, invalid numeric suffixes/signs, overflow, and extra arguments on fixed-arity commands before side effects. Numeric inputs retain their documented radix rules, including `0x`, `0n`, and debugger address separators where supported. Listener and `--connect` ports use decimal `1..65535`. Zero-length, overflowing, and over-limit memory transfers are rejected before allocation or IOCTL dispatch.
+
+`?` and `??` evaluate the complete spaced expression. `kd <windbg-command>` preserves the original command tail and quotes for DbgEng. `remote` remains native-owned in every backend mode. Bare `|` displays the pinned `procctx` context.
 
 ## Native Commands
 

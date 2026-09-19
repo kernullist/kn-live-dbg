@@ -50,11 +50,11 @@ records. An open and close wholly between snapshots can still be missed;
 Opt-in, lab-only: `!kmon iotrace <driver-name> on|off|status` resolves the
 named driver's DRIVER_OBJECT via the `\Driver` object-directory walk
 (`IntegrityScanner`, user mode — the driver never does name lookups), then
-arms the probe driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
+arms the main `KnLiveDbg.sys` driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
 write ACK magic):
 
 - The target's `MajorFunction[IRP_MJ_DEVICE_CONTROL]` is swapped to the
-  probe's trampoline after SEH-validating `Type == IO_TYPE_DRIVER` and
+  driver's trampoline after SEH-validating `Type == IO_TYPE_DRIVER` and
   referencing the DRIVER_OBJECT with `ObReferenceObjectByPointer` so the
   target cannot be freed while the hook is live. The trampoline records
   caller pid, IOCTL code, and in/out lengths into a non-paged spinlocked
@@ -63,17 +63,27 @@ write ACK magic):
 - The kmon worker drains the ring (`IOCTL_KNDBG_IOTRACE_DRAIN` 0x817) and
   prints `driver.ioctl` events, first-seen per (pid, IOCTL code) with a
   256-entry cap, decoded into function/device-type/method plus lengths.
-- DISARM restores the original entry, waits (up to ~400 ms, retried on
-  unload) for in-flight trampolines to leave, and only then drops the
-  reference; `!kmon stop` and driver unload disarm forcibly. If a dispatch
-  stays stuck past the wait, disarm reports busy and keeps the reference
-  rather than freeing under a live call.
+- DISARM restores the original entry and waits for active trampolines to
+  leave (4,000 waits of nominally 100 us each). If dispatch is still active,
+  it reports `STATUS_DEVICE_BUSY` and keeps the target reference. Scheduling
+  can make the elapsed wait longer than the nominal 400 ms.
+- Normal `q`/`unload` stops kmon, TI, and timeline before closing the device.
+  If I/O-trace disarm fails, the controller keeps the device available and
+  reports failure so cleanup can be retried. Driver unload retries disarm
+  while it is busy, with no fixed retry count; a stuck target dispatch can
+  therefore delay unload indefinitely. Active dispatch code must not be
+  released just because a timeout expired.
 - Risk statement: interposing a dispatch entry tampers with live kernel
   state and can crash the host if the target driver misbehaves; it is
   gated behind an explicit per-driver arm command and is intended for lab
   analysis of a captured loader, not for always-on monitoring.
 
 ## Acceptance criteria (Phase A)
+
+The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) records build and
+driver-free regression evidence for the shutdown changes. It does not prove
+live dispatch/unload race behavior; those checks remain on the
+[manual checklist](MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle).
 
 - With `!kmon start /name loader.exe` and a loader that opens a device
   handle, a `driver.handle` event appears after its rotating scan with

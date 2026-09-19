@@ -5,7 +5,7 @@
 | Title | Dedicated Remote Operator Session (thin TUI on PC B, engine+driver on PC A) |
 | Author | Kn-Live-Dbg / 꿀보 |
 | Date | 2026-08-27 |
-| Status | Implemented (rev 9, 2026-08-27). Operator guide: `docs/REMOTE_SETUP.md` |
+| Status | Implemented; command/transport audit updated 2026-09-19. [Operator guide](REMOTE_SETUP.ko.md), [audit evidence](COMMAND_AUDIT_20260919.md) |
 | Audience | Kn-Live-Dbg maintainers (driver ABI, user-mode engine, MCP) |
 | Related | `docs/REMOTE_SETUP.md`, `docs/ARCHITECTURE.md`, `docs/MCP_SERVER_DESIGN.md`, `docs/MCP_SETUP.md`, `docs/FEATURE_PLAN.md`. Canonical copy: `docs/REMOTE_OPERATOR_SESSION.md` |
 
@@ -47,7 +47,7 @@ LiveKD-style 분할은 `docs/ARCHITECTURE.md`와 코드가 일치한다.
    - in-process http.sys Streamable HTTP. 기본 bind `0.0.0.0`, 기본 포트 **51766**, session password 4–128, Bearer, **plaintext HTTP**. `mcp-endpoint.json`은 session password를 디스크에 쓴다 (`WriteMcpEndpointFile`).
    - listener는 kernel을 만지지 않고 private `std::deque<std::shared_ptr<McpJob>> queue_`에 넣는다. `McpJob`는 `{ McpEngineRequest, std::promise<McpEngineResult> }`뿐이다. `Cancelled` 없음. origin 없음.
    - `RunMcpEngineLoop`: 진입 시 `SetWriteMode(AllowWrite)`, 종료 시 **무조건** `SetWriteMode(true)`. 콘솔 reader는 queue가 아니라 `RequestStop` / `statusRequested` side-channel (`off`/`status`/`q`만).
-   - `EnqueueAndWait(..., 30000, ...)`: timeout은 로컬 `engine timeout`만 세팅하고 running job을 cancel하지 않는다. `maxPending_ = 8`.
+   - `EnqueueAndWait(..., 30000, ...)`: 30초 응답 대기 또는 stop 시 큐에 남은 요청은 제거한다. 이미 디스패치됐으면 결과 불명 오류를 반환하며 실행은 계속될 수 있다. `maxPending_ = 8`. MCP cancellation notification은 작업을 취소하지 않는다.
    - tool allowlist. raw `knkd>` 아님.
 
 4. `kdinit /remote` (`user/DbgEngBackend.cpp` `AttachKernelWide(DEBUG_ATTACH_KERNEL_CONNECTION, ...)`)는 WinDbg KD attach다. KnLiveDbg 세션 이동이 아니다.
@@ -102,15 +102,15 @@ LiveKD-style 분할은 `docs/ARCHITECTURE.md`와 코드가 일치한다.
 | C6 | MCP/AI catalog는 LLM용. 인간 REPL allowlist가 아니다. live `kTools[]`는 읽기 67 + 쓰기 12. | `user/McpServer.cpp` |
 | C8 | `TiSubscriber`만 자체 스레드. remote도 engine queue로 넣는다. | MCP design §4.4 |
 | C9 | Scanner non-cancelable. in-flight preempt 없음. MCP timeout도 running job을 안 죽인다. | `UserModeHunter::Scan`, `EnqueueAndWait` |
-| C10 | `ScopedCommandProgress`는 `WriteConsoleW`. `ExecuteCommandWithTranscript`는 항상 `enabled = !args.empty()`. MCP origin disable **없음**. | `user/main.cpp` |
-| C11 | MCP queue는 단일 FIFO, 깊이 8, 30s. 설계 문서 이중 deque **미구현**. `McpJob::Cancelled` **미구현**. | `McpServer::queue_` |
+| C10 | `ScopedCommandProgress`는 콘솔 핸들에 직접 쓴다. `ExecuteCommandWithTranscript`의 `enableConsoleProgress`는 remote에서 false다. MCP origin 전체를 끄는 처리는 없다. | `user/main.cpp` |
+| C11 | MCP queue는 단일 FIFO, 깊이 8, 응답 대기 30초. timeout/stop은 queue mutex 아래에서 대기 요청을 제거한다. 이중 deque와 `McpJob::Cancelled` 필드는 사용하지 않는다. | `McpServer::queue_`, `EnqueueAndWait` |
 | C12 | `mcp on` 콘솔은 `RequestStop` side-channel. 로컬 라인을 queue에 넣지 않음. | `RunMcpEngineLoop` |
 | C13 | Address-only `e*`/`pe*` → `ReadEnterPromptLine` → `std::getline(std::wcin)`. | `PromptForEnterBytes` |
 | C14 | cloak `UserDeviceName` 랜덤. B는 compiled name을 `CreateFileW`하면 안 된다. cloak는 mutex **두 개**. | `CloakSession.h`, `wmain` |
 | C15 | `home`은 `PrintStartupTui` 텍스트. `!timeline dashboard`는 A HTML + 로컬 브라우저. | `PrintStartupTui` |
 | C16 | `dump-kernel`/`dump-live`는 A 파일에 수 GB. `IsWriteLikeCommandLine`에 **없음**. `KNDBG_MAX_TRANSFER_SIZE` 1 MB/IOCTL은 dump 파일 크기와 무관. | `IsWriteLikeCommandLine`, `MemoryDumper.h` |
 | C17 | `Crypt32.lib` `Httpapi.lib` `Ws2_32.lib` 링크됨. `Secur32.lib` 없음. | `user/KnLiveDbg.vcxproj` |
-| C18 | `log enable`은 path 인자가 없다. `EnableOutputLog` → `<exeDir>\KnLiveDbg-<timestamp>.log`. | `HandleLogCommand` |
+| C18 | `log enable`은 path 인자가 없다. `EnableOutputLog`는 EXE 디렉터리에 `KnLiveDbg-YYYYMMDD-HHMMSS-<pid>-<sequence>.log`를 만든다. wide 경로를 지원하고 빠른 재시작도 파일을 구분한다. | `HandleLogCommand` |
 | C19 | `McpValidatePath`는 MCP write tool 전용 (`..` / unsafe char / quotes). native dump는 임의 경로. | `user/main.cpp` |
 | C20 | `g_EngineTid` / capture-depth assert는 MCP 설계에만 있고 **코드에 없음**. | grep empty |
 
@@ -351,77 +351,36 @@ sequenceDiagram
   R->>E: RequestStop / writeOffRequested (not queued)
 ```
 
-**v1 queue: MCP FIFO 복사, 추출 아님 (대안 H).**
+**v1 queue: 별도 remote FIFO.** MCP와 remote는 같은 시간에 리스닝하지 않으며 각자의 큐를 유지한다.
 
-`user/RemoteServer.h` private:
+현재 `user/RemoteServer.h`의 job 형태:
 
 ```cpp
-enum class RemoteJobKind
-{
-    CommandLine = 0,
-    Completion = 1
-};
-
-struct RemoteJobResult
-{
-    bool IsError = false;
-    bool KeepRunning = true;
-    std::wstring Stdout;
-    std::wstring Stderr;
-};
-
 struct RemoteJob
 {
-    RemoteJobKind Kind;
-    std::wstring CommandLine;
-    size_t CompletionCursor = 0;
-    std::promise<RemoteJobResult> Done;
+    std::wstring Line;
+    std::wstring RequestId;
+    std::promise<RemoteEngineResult> ResultPromise;
     std::shared_ptr<std::atomic<bool>> Cancelled;
 };
-
-class RemoteServer
-{
-    // copy of McpServer: queueMutex_, deque<shared_ptr<RemoteJob>>,
-    // jobReadyEvent_, maxPending_ = 4
-    bool EnqueueAndWait(const std::shared_ptr<RemoteJob>& job,
-                        uint32_t timeoutMs, // 0 = infinite; MUST NOT wait_for(0ms)
-                        RemoteJobResult* result);
-    std::shared_ptr<RemoteJob> TryPopJob();
-    void RequestStop(); // reader-safe: running_=false, SetEvent(stopEvent_)
-};
 ```
 
-`EnqueueAndWait` 대기 (MCP `wait_for(milliseconds(timeoutMs))`를 그대로 복사하면 **안 된다**. MCP는 항상 `30000`만 넘긴다. `wait_for(0ms)`는 즉시 timeout이다):
+`EnqueueAndWait`는 완료 future를 50ms 단위로 확인하면서 stop 상태와 TCP 제어 프레임도 처리한다. 명령 전체에 MCP의 30초 응답 대기를 적용하지 않는다. 15초 heartbeat로 긴 작업 중 연결을 유지한다.
 
-```cpp
-if (timeoutMs == 0)
-{
-    future.wait(); // INFINITE. command-submit path
-}
-else if (future.wait_for(std::chrono::milliseconds(timeoutMs))
-         != std::future_status::ready)
-{
-    result->IsError = true;
-    result->Text = L"engine timeout";
-    return true; // job stays running (C9), shared_ptr keeps promise alive
-}
-*result = future.get();
-```
-
-- 명령: `timeoutMs == 0` → `future.wait()`. completion: `timeoutMs == 5000` → `wait_for`.
-- `RemoteJob`는 `std::atomic` 멤버를 직접 갖지 않는다 (non-movable). `Cancelled`는 `shared_ptr<atomic<bool>>`. job 자체는 항상 `shared_ptr` (MCP와 동일: timeout/abandon 후에도 engine이 `set_value` 가능).
-- MCP `McpEngineRequest`를 이 구조에 넣지 않는다.
-- `McpServer::queue_`를 이 작업에서 수정하지 않는다.
-- `cancel`: queue에 남아 있으면 `Cancelled=true`로 pop 시 skip. in-flight면 `not-cancelable`.
+- `cancel`: queue mutex 아래에서 아직 큐에 있는 job을 제거하고 `Cancelled=true`, `code=cancelled`로 완료한다. 이미 엔진이 가져갔으면 `not-cancelable`이다.
+- disconnect/stop: 큐에 남은 job은 제거한다. listener join이 엔진의 queue drain을 기다리는 교착이나 나중 실행을 만들지 않는다.
+- 이미 디스패치된 명령은 선점·롤백하지 않는다. engine이 `shared_ptr<RemoteJob>`을 보유하므로 전송 대기가 끝나도 promise 저장소는 살아 있다.
+- 명령 오류는 `RemoteEngineResult::IsError`와 `Code`로 전달한다. stderr-only 오류도 `command-failed` 같은 오류 프레임이 되며 성공으로 처리하지 않는다.
+- `completion-request`는 서버가 `CollectCompletionCandidates`에서 접두어와 일치하는 후보를 직접 반환한다. 명령 실행 중에는 `engine-busy`다. 실제 클라이언트 Tab은 로컬 completion 테이블을 사용한다.
 
 **`RunRemoteEngineLoop`** (`user/main.cpp`), `RunMcpEngineLoop` 모델. write mode는 이 루프 진입/종료에서 바꾸지 않는다.
 
-1. control reader thread: `ReadConsoleW` (simple). **queue에 넣지 않는** 라인. HANDLE을 같이 올린다 — 200ms 루프의 atomic만으로는 60s confirm wait를 깨지 못한다.
+1. control reader thread: `ReadConsoleW`로 제어 라인을 읽는다. 명령 큐에 넣지 않고 stop/status/write-off 요청을 전달한다.
    - `off` / `remote off` / `q` / `quit` / `exit` / `unload` → `g_RemoteServer.RequestStop()` (`running_=false` + `SetEvent(stopEvent_)`). `q` family와 `unload`는 `g_StopRequested=true` (기존 process teardown이 드라이버를 내린다). `HandleCommand("unload")`를 이 루프에서 실행하지 않는다.
    - `disconnect` / `remote disconnect` → 세션 소켓 shutdown. listen은 유지, 다시 accept. v1: `remote off`만 루프 종료.
    - `status` / `remote status` → `statusRequested`.
-   - `write off` → `writeOffRequested=true` **그리고 `SetEvent(writeOffEvent_)`**. reader는 `DeviceClient`를 호출하지 않음. engine이 다음 깨는 지점(200ms 루프 또는 confirm wait)에서 `SetWriteMode(false)`. 로컬과 같이 이후 세션에 남는다.
-2. engine loop: `WaitForSingleObject(JobReadyEvent, 200)`. `writeOffRequested`면 `SetWriteMode(false)` + hello writeMode atomic false + `ResetEvent(writeOffEvent_)`. `statusRequested`면 콘솔에 peer/bytes. `TryPopJob` → deny-list → `ExecuteCommandWithTranscript`.
+   - `write off` → `writeOffRequested=true`와 `SetEvent(writeOffEvent_)`. reader는 `DeviceClient`를 호출하지 않는다. 엔진이 제어 루프에 복귀하면 write를 해제하며 이미 실행 중인 명령을 선점하지 않는다.
+2. engine loop: `WaitForSingleObject(JobReadyEvent, 200)`. `writeOffRequested`면 `SetWriteMode(false)`와 hello 상태 갱신 후 이벤트를 reset한다. `statusRequested`면 bind/peer를 출력한다. `TryPopJob` → deny-list → `ExecuteCommandWithTranscript` 순서다.
 3. 종료: `RemoteServer::Stop()` (방화벽 규칙 삭제), queued jobs fail. **write mode restore 없음.**
 
 **Optional full local REPL:** v1 **없음**. A는 MCP와 같이 control plane만. 이유: kill switch를 in-flight `!hunt` 뒤에 넣지 않기 위함. 로컬에서 `!callbacks`를 치고 싶으면 `remote off` 후 풍부한 REPL, 또는 B에서 친다. Goal 4의 “로컬 풀 REPL”은 v1에서 명시적으로 뺀다.
@@ -440,15 +399,11 @@ if (wr != WAIT_OBJECT_0)
 
 control reader가 `stopEvent` / `writeOffEvent`에 `SetEvent`를 하지 않으면 engine은 60s 동안 atomic을 보지 못한다. wait 중에 atomic을 폴링하지 않는다. 아무 non-confirm 결과든 write 없음.
 
-**클라이언트 스레드**
+**현재 클라이언트 실행 모델**
 
-| Thread | Owns |
-|---|---|
-| Main | 콘솔 라인 편집, **로컬 Tab** (`ApplyTabCompletion`), 로컬 history/`cls`, prompt. 명령은 `command-submit` |
-| Reader | TCP recv loop. demux heartbeat/progress/result/error/write-preview/disconnect |
-| (none extra) | Send는 `sendMutex_`로 프레임 직렬화 (한 소켓에 두 스레드 write 금지) |
+`RemoteClientMain`은 한 스레드에서 라인 편집, 로컬 Tab/history/`cls`, 전송과 응답 수신을 처리한다. 입력 중에는 소켓을 poll하고, 제출 뒤에는 `PollIncoming`으로 heartbeat/result/error를 기다린다. 별도 Reader 스레드와 send mutex 구조는 구현되지 않았다.
 
-Main이 blocking `recv`를 하지 않는다. Ctrl+C: 입력 중이면 라인 clear. in-flight면 `cancel` 송신 (queued-only). `ConsoleHandler` 미등록.
+Ctrl+C는 라인 입력 중 현재 입력을 지운다. 결과 대기 중 `cancel` 프레임을 보내는 키 바인딩은 없다. 서버의 queued cancel 프로토콜 지원과 클라이언트 UI 지원을 구분한다.
 
 `InstallOutputTee()`는 `wmain` 최상단이라 client에도 깔린다. 허용. `log enable`은 client에 없다.
 
@@ -556,7 +511,7 @@ flowchart TD
 - 명령 출력 색: A `PrintColoredText`가 remote origin이면 VT SGR을 캡처 스트림에 넣는다. B는 콘솔이면 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, 파이프/파일이면 CSI를 스트립한다. JSON `\u001b` round-trip.
 - **Tab은 로컬** `ApplyTabCompletion` / `CollectCompletionCandidates` (`user/CompletionHints.cpp`). A TUI와 **같은 테이블**. 모호한 prefix는 annotated listing. `remote on <Tab>`은 `--loopback` / `--bind` / `--peer`. 클라 Tab은 `completion-request`를 보내지 않는다 (프로토콜 타입은 서버에 남아 있음).
 - `cls`는 클라 로컬. `disconnect` / `q` / `quit` / `exit`는 프로토콜 disconnect (A `HandleCommand`로 안 감).
-- Password: TCP 후 prompt. **5–128** printable ASCII, 공백 없음 (`SanitizeRemotePassword`, `kPasswordMin=5`).
+- Password: 연결 전에 prompt. **5–128** printable ASCII, 공백 없음 (`SanitizeRemotePassword`, `kPasswordMin=5`).
 - Address-only `e*`/`pe*`: hard-error `supply values on the command line`. write-preview는 **미구현**.
 - 배너: hello 필드 (`cleartext=true` on v1). A non-loopback이면 평문 경고 + listen IP 목록.
 - 재연결 = 새 세션. password를 다시 친다.
@@ -587,7 +542,7 @@ Connect/disconnect는 `PrintConsoleOnly` 한 줄 (tee/`log enable`과 별개 핸
 
 ## API / Interface Changes
 
-드라이버 ABI 15 변경 없음.
+remote 프로토콜 버전은 v1이다. 현재 컨트롤러/드라이버 ABI는 `shared/KnLiveDbgIoctl.h`의 17이며, remote 기능 자체가 별도 드라이버 ABI를 추가하지는 않는다.
 
 | Area | Change |
 |---|---|
@@ -604,9 +559,9 @@ Connect/disconnect는 `PrintConsoleOnly` 한 줄 (tee/`log enable`과 별개 핸
 | `tools/validate-remote-protocol.ps1` | driver-free gate |
 | docs | README `kdinit /remote` vs `remote on` |
 
-`McpServer::queue_` / `RunMcpEngineLoop` **무변경** (XOR v1).
+MCP와 remote는 별도 FIFO를 유지한다. 2026-09-19 감사에서 양쪽 대기·정지 경로를 수정했으며 공유 `EngineQueue`를 추출하지 않았다.
 
-`ExecuteCommandWithTranscript` 시그니처 변경 (호환 기본값으로 MCP 경로 유지):
+후속 progress 인터페이스 제안 (아래 `ProgressSink`와 함수 시그니처는 미구현):
 
 ```cpp
 struct ProgressSink
@@ -621,11 +576,11 @@ static CommandExecutionResult ExecuteCommandWithTranscript(
     bool enableConsoleProgress = true);
 ```
 
-MCP 호출은 오늘과 같이 `enableConsoleProgress=true` (회귀 없음). remote는 `false` + sink. **이것은 신규 훅이다. MCP가 이미 origin disable을 한다는 주장은 거짓이다.**
+이 제안은 현재 함수 시그니처가 아니다. 현재 remote origin은 콘솔 progress 출력을 끄며 progress frame은 아직 보내지 않는다.
 
 `ProgressSink::OnProgress`는 mutex로 thread-safe. remote command PR 이후 progress PR에서: console worker 금지, timer worker는 sink만 호출, session thread가 frame을 보낸다. 또는 engine이 HandleCommand **전후**에만 찍으면 긴 hunt 동안 progress가 없다 — 그래서 timer worker → sink가 맞다. worker는 `wcout`/`WriteConsoleW` 금지.
 
-`g_EngineTid`: `wmain` controller path에서 DuplicateHandle 직후 저장. debug assert 위치는 `HandleCommand` 진입, `ScopedWideStreamCapture` ctor, remote-origin dispatch뿐. **`DeviceClient::Ioctl`에 넣지 않는다** — `TimelineAutoDrainWorker`가 이미 `DrainTimelineEvents`를 engine 밖에서 친다 (`g_TimelineLiveIoMutex`). 그 IOCTL은 기존 예외로 남긴다. C3를 “모든 IOCTL = engine thread”로 주장하지 않는다.
+`g_EngineTid`는 controller의 메인 엔진 스레드를 나타내며 remote dispatch가 스레드 소유권을 검사한다. 모든 `DeviceClient` IOCTL이 메인 스레드에서 실행된다는 보장은 없다. `TimelineAutoDrainWorker`의 drain IOCTL은 별도 동기화 경로다.
 
 ---
 
@@ -727,10 +682,10 @@ Atom 카운터: sessions, commands ok/denied/busy, bytes in/out, last duration. 
 
 ## Testing
 
-물리 2호기 없음.
+2026-09-19 감사는 드라이버 없는 Release/Debug corpus와 loopback transport를 검증했다. 두 PC 라이브 세션, 커널 write, load/unload 경합은 아래 별도 수동 항목이다. 상세 결과는 [명령 감사](COMMAND_AUDIT_20260919.md)를 따른다.
 
 1. **`KnLiveDbg.exe --self-test remote-protocol`**  
-   loopback **plain TCP** framing (no TLS). magic reject, oversize, 60s deadline (short test timeout), password compare, deny-list unit. default bind parser is `0.0.0.0`; `--loopback` is `127.0.0.1`.  
+   52개 검사: loopback plain TCP framing, password/auth, deny-list, 엄격한 옵션, 대기 요청 cancel, 엔진이 큐를 처리하지 않는 동안 stop. 기본 bind는 `0.0.0.0`, fixture는 `127.0.0.1:51767`만 사용한다.
    `tools/validate-remote-protocol.ps1` post-build.
 
 2. **`--self-test connect-argv`**  
@@ -740,10 +695,10 @@ Atom 카운터: sessions, commands ok/denied/busy, bytes in/out, last duration. 
    A elevated `remote on --loopback` (driver 있음). B `KnLiveDbg.exe --connect 127.0.0.1:51767`. cloak A에 대해 **두 mutex skip** 수동 항목.
 
 4. **MCP 회귀**  
-   queue를 안 옮기므로 `validate-mcp-tool-catalog.ps1` + 기존 console self-test. `mcp on` live queue golden은 이 작업의 범위가 아님.
+   `--self-test mcp-tools` 75개 검사와 별도 `--self-test mcp-http` 9개 검사. HTTP fixture는 `127.0.0.1:51768` 및 URL 등록 권한이 필요하다. 실행 중 작업을 선점한다는 보장은 없다.
 
 5. **`--self-test all`**  
-   timeline + mcp-tools + console만. remote-protocol / connect-argv는 **넣지 않음**. 별도 `tools/validate-remote-protocol.ps1`.
+   timeline + mcp-tools + console + commands + remote-protocol + connect-argv. HTTP.sys 권한이 필요한 mcp-http는 별도다. 포트가 겹치는 fixture는 순차 실행한다.
 
 Merge gate (command-submit, shipped):
 
@@ -890,7 +845,7 @@ v1 listen/client already speak raw TCP + KNR1. This appendix would wrap that str
 9. **같은 EXE `--connect`.** unknown argv hard error. `--connect`는 `ParseCloakArgs` 전.
 10. **ABI 15 유지. feature default off. IPv4 only. port 51767. reject 51766.**
 11. **address-only enter는 hard-error `supply values on the command line`.** write-preview는 미구현. A per-write confirm 없음.
-12. **ProgressSink / g_EngineTid / queued cancel은 신규 작업.** tid assert는 `HandleCommand`/capture/remote dispatch. `DeviceClient::Ioctl` 아님 (`DrainTimelineEvents` 예외).
+12. **ProgressSink는 후속이다.** queued cancel과 remote dispatch의 엔진 스레드 검사는 구현됐다. `DeviceClient::Ioctl` 전체에 thread-ID 제한을 적용하지 않는다 (`DrainTimelineEvents` worker 경로).
 13. **`ai` from B = Allow.** 운영 권고 `KNLIVEDBG_AI_REMOTE_POLICY=local-only`.
 14. **`probe load` from B = Deny.** SCM은 A.
 
@@ -898,7 +853,7 @@ v1 listen/client already speak raw TCP + KNR1. This appendix would wrap that str
 
 ## Implementation status
 
-MCP `queue_`는 손대지 않았다. `mcp on`과 listen XOR.
+MCP/remote는 별도 FIFO이며 `mcp on`과 `remote on`은 양방향 listen XOR를 적용한다. 2026-09-19 감사는 두 큐의 대기·정지 경로를 수정했다.
 
 | Slice | Status |
 |---|---|
@@ -910,7 +865,9 @@ MCP `queue_`는 손대지 않았다. `mcp on`과 listen XOR.
 | ProgressSink progress frames | not shipped (A still uses console progress disabled for remote origin) |
 | write-preview / write-confirm on B | not shipped; address-only enter is hard-error |
 | docs (`REMOTE_SETUP.md`, README, FEATURE_PLAN, `kdinit /remote` 구분) | shipped |
-| `--self-test all` includes remote-protocol | no; use `tools/validate-remote-protocol.ps1` |
+| `--self-test all` includes remote-protocol | yes; includes connect-argv and commands too |
+| queued cancel / disconnect / stop | shipped; running commands cannot be preempted |
+| client in-flight Ctrl+C cancel | not shipped; synchronous result wait |
 | TLS 1.3 TOFU | v2, Appendix A |
 
 Files: `user/RemoteProtocol.h`, `user/RemoteServer.h/.cpp`, `user/RemoteClient.cpp`, `user/RemoteFirewall.h/.cpp`, `user/RemoteSelfTest.cpp`, `user/CompletionHints.cpp` (`remote on` scope), `user/CommandRegistry.cpp`, `user/main.cpp` (`wmain` 사다리, `HandleRemoteCommand`, `RunRemoteEngineLoop`, `g_RemoteOriginActive`), `tools/validate-remote-protocol.ps1`.

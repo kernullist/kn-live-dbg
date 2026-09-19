@@ -36,6 +36,7 @@ kn-live-dbg/
   tools/validate-timeline-selftest.ps1  driver-free timeline regression check
   tools/validate-console-surface.ps1    driver-free help/completion regression check
   tools/validate-remote-protocol.ps1    driver-free remote session protocol check
+  tools/validate-command-audit.ps1      command corpus and ASan parser checks
   research/evasion-research-ledger.json  source-to-detector claim ledger
 ```
 
@@ -116,6 +117,7 @@ identification (code stomping detection). TI events now carry ETW-captured calls
 - `docs/REMOTE_SETUP.md` is the operator guide for the LAN `knkd>` session (`remote on` / `KnLiveDbg.exe --connect`). `docs/REMOTE_OPERATOR_SESSION.md` is the design. This is not `kdinit /remote`. `mcp on` and `remote on` cannot run at the same time.
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
 - `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
+- [Command audit](docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
 
 ## Build
 
@@ -216,6 +218,23 @@ x64\Release\dbghelp.dll
 x64\Release\DbgModel.dll
 x64\Release\symsrv.dll
 ```
+
+## Validation
+
+Run these after building the corresponding configuration:
+
+```powershell
+.\x64\Release\KnLiveDbg.exe --self-test all
+.\x64\Debug\KnLiveDbg.exe --self-test all
+.\tools\validate-command-audit.ps1 -Sanitize
+.\tools\validate-command-audit.ps1 -Configuration Debug -Sanitize
+.\x64\Release\KnLiveDbg.exe --self-test mcp-http
+.\x64\Debug\KnLiveDbg.exe --self-test mcp-http
+```
+
+`all` includes `timeline`, `mcp-tools`, `console`, `commands`, `remote-protocol`, and `connect-argv`; it runs before driver loading and symbol initialization. `mcp-http` is separate because its HTTP.sys loopback listener needs URL registration rights. Run network fixtures sequentially: remote uses `127.0.0.1:51767`, and HTTP uses `127.0.0.1:51768`. Neither fixture adds firewall rules or listens externally.
+
+`validate-command-audit.ps1 -Sanitize` builds the standalone numeric/JSON parser corpus with AddressSanitizer and runs the already-built executable's command corpus. The [audit report](docs/COMMAND_AUDIT_20260919.md) records 1,988 command checks and 275,002 parser checks per configuration. These checks do not execute live kernel writes, load/unload races, or commands against an external DbgEng target; use the [manual checklist](docs/MANUAL_TEST_CHECKLIST.md) for those paths.
 
 ## Run
 
@@ -1481,7 +1500,7 @@ Live walking (`!wnf instances` / `!wnf instance` / `!wnf data`):
 3. **Legacy `RTL_AVL_TABLE` path** is tried only when the LIST_ENTRY walker produces no records. The AVL table is located by trying `NameSet`/`NameSubscriptionTable`/`SubscriptionTable`/`NameInstanceTable`/`NameInstances` fields on `nt!_WNF_SUBSCRIPTION_TABLE`, `nt!_WNF_SILODRIVERSTATE`, and `nt!_WNF_PROCESS_CONTEXT` types from the loaded PDB. The walker performs iterative in-order traversal with bounded depth (64) and node count (16384). Each node's user data starts at offset `+0x20` (past `sizeof(_RTL_BALANCED_LINKS)`); the user data is a `_WNF_NAME_INSTANCE` whose `StateName`, `ChangeStamp`, `DataSize`, and `LastDataBlock` (or `StateData`/`DataBlock`) fields are read via PDB-resolved offsets.
 4. `instance <hash|entry-address>` filters the walk to a matching state name or stable LIST_ENTRY-mode entry address. `data <hash|entry-address>` dumps up to 256 bytes of the last-published payload as a classic hex+ASCII view. The legacy AVL path follows PDB-resolved `LastDataBlock`/`StateData` fields, while the modern LIST_ENTRY path heuristically scans the first 0x200 bytes of the matched entry for a kernel-canonical pointer whose dereferenced header matches the documented `_WNF_DATA_BLOCK` shape (`DataSize`, `AllocatedSize`, `ChangeStamp`). If that heuristic fails, diagnostics print a per-pointer header census so the build-specific data slot can be inspected manually.
 5. Each surfaced entry annotates the **owning process** recovered from the stable EPROCESS pointer at `node-0x30` of every chained node (entry-level metadata, 100% recovery across entries that carry at least one chained node). Per-entry chain decomposition is printed as `chained_nodes=N subscribers=X resolved=Y other_objects=Z tags={Ntfc:N Wnf:N Sect:N ...}` so an operator immediately sees how many real subscribers exist versus backing kernel objects. The `subscribers` count counts only true subscription tags (`Ntfc` / `Wnf ` / `WnfN`); `resolved` counts how many of any node yielded `pid=N image="..."`. The listing path (`!wnf instances`) emits only resolved subscriber lines per entry; single-entry views (`!wnf instance`, `!wnf data`) still print every node with prefix and body hex dumps so a build's record layout can be characterized. EPROCESS resolution uses a two-path acceptance: classical `_DISPATCHER_HEADER.Type == 0x03` fast-path, or shape-only validation of PDB-resolved `_EPROCESS.UniqueProcessId` (4-aligned, `0 < pid <= 0x100000`) AND `ImageFileName` (`>= 3` printable-ASCII chars). Candidates within `0x200` bytes of the chained node are rejected as same-chunk noise.
-6. `log enable` / `log disable` mirrors the entire console session to a timestamped UTF-8 log file (`KnLiveDbg-YYYYMMDD-HHMMSS.log`) in the EXE directory. Useful for capturing voluminous `!wnf instances` output for offline analysis; console coloring is preserved live while the log file receives clean text.
+6. `log enable` / `log disable` tees console standard output to a UTF-8 file named `KnLiveDbg-YYYYMMDD-HHMMSS-<pid>-<sequence>.log` in the EXE directory. Wide paths are supported, and the per-process sequence keeps rapid log sessions from truncating each other. The log receives plain text; stderr and direct console-handle output are not part of this tee.
 
 Diagnostic subcommands for builds where automatic detection picks the wrong chain:
 

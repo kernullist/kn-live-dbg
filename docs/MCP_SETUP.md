@@ -84,11 +84,13 @@ mcp status     # current state
 
 | Option | Meaning | Default |
 |------|------|--------|
-| `<port>` (positional arg) | Listening port. Only `0 < port < 65536` applies; anything else is ignored | `51766` |
-| `--allow-write` (or `allow-write`) | Lab write mode. Registers the 10 write tools + arms kernel write | none = read-only |
+| `<port>` (positional arg) | Decimal listening port, `1..65535`; invalid values reject the command | `51766` |
+| `--allow-write` (or `allow-write`) | Lab write mode. Registers the 12 write tools + arms kernel write | none = read-only |
 | `--loopback` | Listen on `127.0.0.1` / `[::1]` only | off = all interfaces |
 | `--bind <addr>` | Override listen address. `0.0.0.0` / `*` / `+` = all adapters; `loopback` = local only; or a concrete IP | `0.0.0.0` |
 | `--bind=<addr>` | Same as above (joined form) | none |
+
+At startup, unknown options, duplicate options/ports, conflicting bind options, and missing values fail before the password prompt. Ports reject signs, hexadecimal notation, whitespace inside the value, and trailing characters. Stop `remote` before starting MCP; the two listeners are mutually exclusive.
 
 Default bind is **all adapters** (`0.0.0.0`, http.sys strong wildcard `+`). This is required on multi-NIC hosts (physical + Hyper-V/VMware/VPN). Do not pin a single adapter IP unless you have a reason: that is how the server used to bind the wrong NIC.
 
@@ -191,7 +193,7 @@ knkd> mcp on 51766 --allow-write
 ```
 
 - Read-only (default): on engine entry, `SetWriteMode(false)` **disarms the kernel write flag itself**. The write tools are not registered, and when called they are rejected with `writes are disabled; start the MCP server with --allow-write (lab mode)`.
-- `--allow-write`: the 10 write tools are exposed and `SetWriteMode(true)` arms kernel writes. Kernel-memory writes use the preflight/backup/verify-diff/audit rails; file/ring operations are still gated, audited, and warned when backup/verify is not meaningful (interactive confirmation is skipped).
+- `--allow-write`: the 12 write tools are exposed and `SetWriteMode(true)` arms kernel writes. Kernel-memory writes use preflight/backup/verify-diff/audit; a required backup failure aborts the mutation, and execution/read-back failures return `isError:true`. File/ring operations remain gated and audited where backup/verification does not apply. MCP skips interactive confirmation; `mcp write-confirm on` is not implemented.
 - **Mode-switch caveat**: if the server is already running, `mcp on --allow-write` (or `--bind`/port change) is **ignored** (it only prints `MCP server is already running on port N`). To change flags, first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch. A new `mcp on` always asks for a new session password.
 - **Recommendation**: take a VM snapshot before a write session, and capture an analysis baseline (`snapshot.capture`). It is for isolated VMs only; never use it on a live EDR/AC box.
 
@@ -236,7 +238,7 @@ If you write `.mcp.json` directly (token via **env indirection**, never commit i
 
 > `${KNLIVEDBG_TOKEN}` is the **session password**, not a saved 256-bit token. On the same PC, dot-source `mcp-load-env.ps1` before starting Claude Code. After another `mcp on`, load the env again (the password changed). The bridge is not needed for current Claude Code builds.
 
-Useful knobs: per-server `timeout` (ms; keep it above the server's 30-second engine limit), `headersHelper` (issue a rotating token on connect), `alwaysLoad`.
+Useful knobs: per-server `timeout` (ms; keep it above the server's 30-second response wait), `headersHelper` (issue a rotating token on connect), `alwaysLoad`. The response wait is not an execution deadline; see §5.2 before retrying a timed-out write.
 
 ### 4.2 Claude Desktop
 
@@ -276,7 +278,7 @@ Equivalent `config.toml` (the token is sent as `Authorization: Bearer <env value
 [mcp_servers.knlivedbg]
 url = "http://192.168.56.10:51766/mcp"
 bearer_token_env_var = "KNLIVEDBG_TOKEN"
-tool_timeout_sec = 60    # server returns engine timeout after 30s
+tool_timeout_sec = 60    # Server response wait is 30s; running work may continue.
 ```
 
 Then `export KNLIVEDBG_TOKEN=<token>` (PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`) in the shell that launches Codex. A static header works too:
@@ -300,7 +302,7 @@ env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 
 Notes:
 - Use `codex mcp add <name> --url <url> --bearer-token-env-var <env>` for Streamable HTTP. The `--env VAR=VALUE -- <command>` form is only for **stdio** servers.
-- Timeouts: `startup_timeout_sec` defaults to 10s and `tool_timeout_sec` to 60s. KnLiveDbg returns `engine timeout` after 30s, so raising only the client timeout cannot make a longer scan finish; narrow or split the scan.
+- Timeouts: `startup_timeout_sec` defaults to 10s and `tool_timeout_sec` to 60s. KnLiveDbg waits up to 30s for an engine result. A still-queued request is cancelled; an already-dispatched request keeps running and returns an unknown-outcome error. Raising the client timeout does not extend this response wait. Narrow scan scope, and inspect state before retrying any mutation (§5.2).
 - Codex is a non-browser client (sends no `Origin`) and connects on the bound host, so the bearer token is the only barrier — same as Claude (§5).
 
 > All clients below are non-browser MCP clients, so the bearer token is the only barrier (§5). Watch the **field-name traps**: Gemini uses `httpUrl`, Cline uses `type: "streamableHttp"`, Goose uses `uri` + `streamable_http`, Windsurf uses `serverUrl`. The endpoint is plain `http://` — the token crosses the wire unencrypted, so keep it on a trusted LAN/loopback or front it with TLS / an SSH tunnel.
@@ -493,6 +495,23 @@ Always on while `mcp on` (independent of the `ai audit` toggle). It records ever
 - `decision` values: `ok` / `unknown-tool` / `writes-disabled` / `engine-busy` / `tool-error` / `unknown-resource` / `session-open`
 - The last 50 lines are also exposed via the resource `kn://audit/tail`.
 
+### 5.2 Request validation and response waits
+
+`mcp off` returns to the REPL's default write-on mode; it does not leave local writes disarmed. Run `write off` after returning if the interactive session should stay read-only.
+
+The HTTP request body is capped at **1 MiB**. Body-read failures, incomplete bodies, and oversized bodies return HTTP 400 with JSON-RPC `-32700`. Malformed JSON returns `-32700` over HTTP 200. The parser rejects trailing data, duplicate decoded object keys, invalid UTF-8, and nesting deeper than 64. Requests require `jsonrpc:"2.0"`, a method string, and a string/number/null ID when an ID is present; malformed envelopes return `-32600`.
+
+Tool arguments must match the advertised schema: required fields and exact string/boolean/array types are enforced, array elements must be strings, and unknown keys fail. Numeric tool values are strings where the schema says `string`. Memory widths accept only their advertised values; byte lists are hexadecimal regardless of the console radix. Empty/malformed patterns and invalid ranges are rejected before mutation.
+
+The engine serializes work with at most eight pending jobs. The 30-second wait has two distinct outcomes:
+
+- `engine wait ended; request cancelled before execution`: the job was removed from the queue and will not execute later.
+- `engine wait ended after dispatch; outcome unknown, inspect state before retrying`: dispatch already occurred. The operation can still finish; inspect target state and the audit trail before retrying, especially for writes.
+
+Stopping the listener also ends waits and cancels queued work. Already-dispatched work cannot be preempted. MCP `notifications/cancelled` is accepted as a notification but does not currently remove a job; do not treat client cancellation as proof that a mutation was prevented.
+
+The [command audit](COMMAND_AUDIT_20260919.md) records driver-free JSON/schema, queue, and HTTP regression results. `--self-test mcp-http` runs separately from `--self-test all` and needs HTTP.sys loopback URL registration rights.
+
 ---
 
 ## 6. Capability Catalog
@@ -638,7 +657,9 @@ claude mcp list                      # confirm connected
 | Connection 403 | `--loopback` plus a non-loopback Host, or a browser Origin that is not loopback |
 | Cannot connect from remote (timeout) | Firewall inbound blocked. Allow the port/client IP with `New-NetFirewallRule`. Confirm `mcp on` listed the IP the client is using (default is all interfaces) |
 | `writes are disabled` | Read-only mode. **If already running, `mcp on --allow-write` is ignored** (prints `MCP server is already running`) -> first stop with `off`+Enter (engine loop) or `mcp off`, then relaunch with `mcp on <port> --allow-write`. A new `mcp on` asks for a new session password |
-| `engine busy; retry shortly` or `engine timeout` | tools/call arrives not as a JSON-RPC error code but as an `isError:true` CallToolResult. On wait-queue (8) saturation, `engine busy` (audit `engine-busy`); on exceeding the 30s engine wait, `engine timeout` (audit `tool-error`). Retry after the queue drains, or shorten/split the scan with `limit`/`count`; a larger client timeout does not extend this server limit. (`-32603` occurs only on the congested `resources/read` path) |
+| `engine busy; retry shortly` | The request was not queued. Wait for engine capacity, then retry. `tools/call` returns `isError:true`; congested `resources/read` uses `-32603`. |
+| `request cancelled before execution` | The response wait ended while the job was queued; it was removed and cannot execute later. Retry after the engine is available. |
+| `outcome unknown, inspect state before retrying` | The response wait ended after dispatch. The command may still execute or finish; inspect state before retrying a mutation. |
 | Driver load failure | Test signing not enabled -> reboot after `bcdedit /set testsigning on` / running non-elevated |
 | `symType=0 (SymNone)` | The symbol DLL bundle was not placed next to the EXE (see 2.1) |
 
@@ -842,5 +863,5 @@ Export the current Threat-Intelligence ring to C:\lab\ti.jsonl, then clear the i
 - **Give concrete values**: specifying PID/module name/address makes the arguments precise. If you don't know them, resolve first with `process.find`/`symbol.search`.
 - **Ask for cross-correlation**: "combine the VADs, threads, and TI and pull only the evidence pointing at the same region" — you get analysis, not a single listing.
 - **Go read->confirm->code**: narrow down with `address.inspect` (identity) -> `memory.read_virtual` (bytes) -> `code.disasm` (instructions).
-- **Slow scans**: `hunt.run`/full scans can exceed the 30s engine wait — narrow or split the scope with `limit`/`count`; raising only the client timeout does not extend it.
+- **Slow scans**: narrow or split `hunt.run`/full scans using supported `limit`/`count` arguments. After the 30s response wait, a dispatched scan can keep running. A larger client timeout does not extend the server wait; inspect state before retrying mutations.
 - **Audit trail**: check what the model called via `kn://audit/tail` or `mcp-audit-<port>.jsonl`.

@@ -8,6 +8,13 @@ machines, and Windows builds.
 
 ## Current Roadmap
 
+The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) is complete for the
+261-entry registry: numeric/JSON validation, fixed-arity dispatch, write backup
+failures, MCP queue timeout handling, remote queued cancellation/stop, collector
+shutdown, and log-file naming were corrected. Release/Debug driver-free
+regression gates passed; live kernel writes, lifecycle races, and external
+DbgEng execution remain on the [manual checklist](MANUAL_TEST_CHECKLIST.md).
+
 Completed core slices:
 
 1. Native VAD and thread/APC triage.

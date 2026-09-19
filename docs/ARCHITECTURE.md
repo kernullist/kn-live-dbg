@@ -46,6 +46,36 @@ This keeps the driver small and reduces the amount of complex parser/symbol code
 
 `--cloak` is an opt-in ephemeral identity: user mode generates a leaf name, copies the EXE/SYS/runtime DLLs, relaunches, and publishes `DeviceName`/`SymbolicLink` under the new service `Parameters` key. `DriverEntry` reads `RegistryPath\Parameters` and uses those UNICODE_STRING values for `IoCreateDeviceSecure` / `IoCreateSymbolicLink`; missing or invalid values keep the compiled `KnLiveDbg` names. Shutdown stops/deletes the random service and removes the copied SYS/sidecars. The running copy of the EXE is marked for reboot-delete.
 
+## Command, transport, and shutdown boundaries
+
+`CommandInput.h` provides bounded numeric parsing shared by console, MCP,
+and remote argument handling. Native command dispatch validates NULs, quotes,
+arity, and memory ranges before side effects; raw `kd` retains the original
+DbgEng command tail. `McpJson.h` validates complete JSON, UTF-8, duplicate
+decoded keys, and nesting depth. MCP also checks required fields, known keys,
+and exact argument types against the live tool catalog.
+
+MCP and remote listeners marshal work to the main engine thread and cannot
+listen simultaneously. MCP uses a FIFO with at most eight pending jobs and
+a 30-second response wait. Timeout/stop removes a job if it is still queued;
+once dispatched, its outcome is unknown to the timed-out caller and execution
+continues. The shared job keeps the promise alive. MCP cancellation
+notifications do not currently cancel jobs.
+
+Remote waits poll the socket and stop state while the engine runs, so protocol
+`cancel`, disconnect, and listener stop can remove queued work. A running
+command cannot be preempted. Command failures propagate to the remote error
+frame even when there is no standard output. The shipped client waits for
+each result synchronously and has no in-flight cancel key binding.
+
+Normal quit/unload cleanup stops kmon, TI, and timeline collectors before
+closing the device. Failed I/O-trace disarm retains the device for retry;
+the normal quit/unload path reports failure instead of abandoning cleanup.
+Driver unload waits for active traced dispatches before releasing their code.
+
+See the [command audit](COMMAND_AUDIT_20260919.md) for regression evidence and
+the live-kernel tests that remain outside the driver-free corpus.
+
 ## IOCTL Contract
 
 The ABI lives in `shared/KnLiveDbgIoctl.h`.
@@ -74,7 +104,7 @@ Current calls:
 20. `IOCTL_KNDBG_GET_PHYSICAL_RANGES`
 21. `IOCTL_KNDBG_SET_PROCESS_LOGGING`
 
-All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. Current `KNDBG_ABI_VERSION` is 16. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses. ABI version 7 makes MDL-backed virtual reads opt-in through `KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK`; the driver additionally requires canonical system range and resident-page preflight before `MmProbeAndLockPages`, so broad scanners keep failed pointer probes on the safer `MmCopyMemory` path. ABI version 8 adds the read-only `IOCTL_KNDBG_READ_MSR` primitive, which permits only a fixed architectural MSR whitelist (`IA32_EFER`/`STAR`/`LSTAR`/`CSTAR`/`FMASK`/`FS_BASE`/`GS_BASE`/`KERNEL_GS_BASE`) and pins thread affinity to a caller-selected processor so per-CPU MSR divergence is observable; no write-mode gate is required because the call is read-only. ABI version 9 adds the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive, which returns CR0/CR2/CR3/CR4/CR8 read on a caller-selected processor under the same affinity-pinned pattern. ABI version 10 adds the read-only `IOCTL_KNDBG_READ_IDT` primitive, which returns the IDTR (base + limit) read via `__sidt` on a caller-selected processor. Later ABI versions add the bounded kernel live-callback ring (`IOCTL_KNDBG_TIMELINE_CONTROL` / `STATUS` / `DRAIN`) used by `!timeline live`, `IOCTL_KNDBG_READ_PROCESS_VIRTUAL` for DTB-qualified process virtual reads, and ABI version 15 `IOCTL_KNDBG_GET_PHYSICAL_RANGES`, which copies `MmGetPhysicalMemoryRanges()` into a bounded `{Base,Size}[]` so user mode can stream a complete dump without mapping MMIO holes. ABI version 16 adds `IOCTL_KNDBG_SET_PROCESS_LOGGING`, which calls `ZwSetInformationProcess(ProcessEnableLogging / ProcessEnableReadWriteVmLogging)` so ETW-TI `ReadVM`/`WriteVM`/`Suspend` events are actually generated on watched processes.
+All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. Current `KNDBG_ABI_VERSION` is 17. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses. ABI version 7 makes MDL-backed virtual reads opt-in through `KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK`; the driver additionally requires canonical system range and resident-page preflight before `MmProbeAndLockPages`, so broad scanners keep failed pointer probes on the safer `MmCopyMemory` path. ABI version 8 adds the read-only `IOCTL_KNDBG_READ_MSR` primitive, which permits only a fixed architectural MSR whitelist (`IA32_EFER`/`STAR`/`LSTAR`/`CSTAR`/`FMASK`/`FS_BASE`/`GS_BASE`/`KERNEL_GS_BASE`) and pins thread affinity to a caller-selected processor so per-CPU MSR divergence is observable; no write-mode gate is required because the call is read-only. ABI version 9 adds the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive, which returns CR0/CR2/CR3/CR4/CR8 read on a caller-selected processor under the same affinity-pinned pattern. ABI version 10 adds the read-only `IOCTL_KNDBG_READ_IDT` primitive, which returns the IDTR (base + limit) read via `__sidt` on a caller-selected processor. Later ABI versions add the bounded kernel live-callback ring (`IOCTL_KNDBG_TIMELINE_CONTROL` / `STATUS` / `DRAIN`) used by `!timeline live`, `IOCTL_KNDBG_READ_PROCESS_VIRTUAL` for DTB-qualified process virtual reads, and ABI version 15 `IOCTL_KNDBG_GET_PHYSICAL_RANGES`, which copies `MmGetPhysicalMemoryRanges()` into a bounded `{Base,Size}[]` so user mode can stream a complete dump without mapping MMIO holes. ABI version 16 adds `IOCTL_KNDBG_SET_PROCESS_LOGGING`, which calls `ZwSetInformationProcess(ProcessEnableLogging / ProcessEnableReadWriteVmLogging)` so ETW-TI `ReadVM`/`WriteVM`/`Suspend` events are actually generated on watched processes. ABI version 17 adds `IOCTL_KNDBG_IOTRACE_CONTROL` / `DRAIN` for the opt-in driver interaction trace described in [DRIVER_INTERACTION_TRACKING_DESIGN.md](DRIVER_INTERACTION_TRACKING_DESIGN.md).
 
 ## Physical Memory Flow
 

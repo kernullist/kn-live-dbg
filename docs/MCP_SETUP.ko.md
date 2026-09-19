@@ -84,11 +84,13 @@ mcp status     # 현재 상태
 
 | 옵션 | 의미 | 기본값 |
 |------|------|--------|
-| `<port>` (위치 인자) | 리스닝 포트. `0 < port < 65536`만 적용, 그 외는 무시 | `51766` |
-| `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 10종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
+| `<port>` (위치 인자) | 10진수 리스닝 포트 `1..65535`. 잘못된 값은 명령 거부 | `51766` |
+| `--allow-write` (또는 `allow-write`) | Lab write 모드. write 툴 12종 등록 + 커널 write 무장 | 없음 = 읽기 전용 |
 | `--loopback` | `127.0.0.1` / `[::1]`만 리스닝 | 끔 = 모든 인터페이스 |
 | `--bind <addr>` | 리스닝 주소 지정. `0.0.0.0` / `*` / `+` = 모든 어댑터, `loopback` = 로컬만, 또는 구체 IP | `0.0.0.0` |
 | `--bind=<addr>` | 위와 동일(붙여 쓰는 형태) | 없음 |
+
+시작 시 알 수 없는 옵션, 중복 옵션·포트, 충돌하는 bind 옵션, 빠진 값은 비밀번호를 묻기 전에 거부한다. 포트에 부호, 16진수 표기, 값 내부의 공백, 뒤따르는 문자를 넣을 수 없다. MCP와 remote 리스너는 동시에 실행할 수 없으므로 먼저 `remote`를 중지한다.
 
 기본 바인드는 **모든 어댑터**(`0.0.0.0`, http.sys 강한 와일드카드 `+`)다. 물리 NIC + Hyper-V/VMware/VPN이 섞인 호스트에서 엉뚱한 어댑터에 붙지 않게 하기 위해서다. 특별한 이유가 없으면 단일 IP로 고정하지 마라.
 
@@ -191,7 +193,7 @@ knkd> mcp on 51766 --allow-write
 ```
 
 - 읽기 전용(기본): 엔진 진입 시 `SetWriteMode(false)`로 **커널 write 플래그 자체를 비무장**한다. write 툴은 등록되지 않으며, 호출 시 `writes are disabled; start the MCP server with --allow-write (lab mode)`로 거부된다.
-- `--allow-write`: write 툴 10종이 노출되고 `SetWriteMode(true)`로 커널 write가 무장된다. 커널 메모리 write는 preflight/backup/verify-diff/audit 레일을 타고, 파일/링 작업은 backup/verify가 의미 없는 경우에도 게이트·감사·경고를 유지한다(인터랙티브 확인은 생략).
+- `--allow-write`: write 툴 12종이 노출되고 `SetWriteMode(true)`로 커널 write가 무장된다. 커널 메모리 write는 preflight/backup/verify-diff/audit를 거친다. 필요한 백업 생성에 실패하면 변경을 중단하고, 실행·read-back 실패는 `isError:true`로 반환한다. 백업·검증이 적용되지 않는 파일·링 작업도 게이트와 감사를 유지한다. MCP는 대화형 확인을 생략하며, `mcp write-confirm on`은 미구현이다.
 - **모드 전환 주의**: 서버가 이미 실행 중이면 `mcp on --allow-write`(또는 `--bind`/포트 변경)는 **무시**된다(`MCP server is already running on port N`만 출력). 플래그를 바꾸려면 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 다시 띄운다. `mcp on`을 다시 하면 세션 비밀번호도 다시 입력한다.
 - **권고**: write 세션 전 VM 스냅샷을 찍고, 분석 baseline(`snapshot.capture`)을 캡처하라. 격리 VM 전용이며 라이브 EDR/AC 박스에서는 절대 쓰지 않는다.
 
@@ -236,7 +238,7 @@ claude mcp list
 
 > `${KNLIVEDBG_TOKEN}`은 **세션 비밀번호**다(저장된 256-bit 토큰이 아님). 같은 PC에서는 Claude Code를 시작하기 전에 `mcp-load-env.ps1`을 dot-source한다. `mcp on`을 다시 하면 환경을 다시 읽는다(비밀번호가 바뀜). 최신 Claude Code에는 브리지가 필요 없다.
 
-유용한 노브: per-server `timeout`(ms, 서버의 30초 엔진 한도보다 크게 유지), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`.
+유용한 설정: per-server `timeout`(ms, 서버의 30초 응답 대기보다 크게 유지), `headersHelper`(접속 시 회전 토큰 발급), `alwaysLoad`. 응답 대기는 실행 제한 시간이 아니다. 시간 초과된 쓰기를 재시도하기 전에 §5.2를 확인한다.
 
 ### 4.2 Claude Desktop
 
@@ -276,7 +278,7 @@ codex mcp add knlivedbg --url 'http://192.168.56.10:51766/mcp' --bearer-token-en
 [mcp_servers.knlivedbg]
 url = "http://192.168.56.10:51766/mcp"
 bearer_token_env_var = "KNLIVEDBG_TOKEN"
-tool_timeout_sec = 60    # 서버는 30초 후 engine timeout 반환
+tool_timeout_sec = 60    # Server response wait is 30s; running work may continue.
 ```
 
 그다음 Codex를 띄우는 셸에서 `export KNLIVEDBG_TOKEN=<token>`(PowerShell: `$env:KNLIVEDBG_TOKEN="<token>"`). 정적 헤더도 가능:
@@ -300,7 +302,7 @@ env = { KNLIVEDBG_TOKEN = "<token-from-server>" }
 
 참고:
 - Streamable HTTP는 `codex mcp add <name> --url <url> --bearer-token-env-var <env>`로 등록한다. `--env VAR=VALUE -- <command>` 형식은 **stdio** 서버 전용이다.
-- 타임아웃: `startup_timeout_sec` 기본 10s, `tool_timeout_sec` 기본 60s. KnLiveDbg는 30초 후 `engine timeout`을 반환하므로 클라이언트 timeout만 늘려도 긴 스캔은 끝나지 않는다. 범위를 줄이거나 나눠 실행한다.
+- 타임아웃: `startup_timeout_sec` 기본 10s, `tool_timeout_sec` 기본 60s. KnLiveDbg는 엔진 결과를 최대 30초 기다린다. 아직 큐에 있으면 취소하지만, 이미 디스패치됐으면 실행을 계속하며 결과 불명 오류를 반환한다. 클라이언트 timeout을 늘려도 이 응답 대기는 연장되지 않는다. 스캔 범위를 줄이고, 변경 작업은 상태를 확인한 뒤 재시도한다(§5.2).
 - Codex는 비브라우저 클라이언트(`Origin` 미전송)이고 바인드 호스트로 접속하므로 bearer 토큰이 유일한 장벽 — Claude와 동일(§5).
 
 > 아래 클라이언트는 모두 비브라우저 MCP 클라이언트라 bearer 토큰이 유일한 장벽(§5). **필드명 함정** 주의: Gemini는 `httpUrl`, Cline은 `type: "streamableHttp"`, Goose는 `uri` + `streamable_http`, Windsurf는 `serverUrl`을 쓴다. 엔드포인트는 평문 `http://`라 토큰이 암호화 없이 전송되니, 신뢰된 LAN/loopback에서만 쓰거나 TLS/SSH 터널로 감싼다.
@@ -493,6 +495,23 @@ New-NetFirewallRule -DisplayName "knlivedbg-mcp" -Direction Inbound `
 - `decision` 값: `ok` / `unknown-tool` / `writes-disabled` / `engine-busy` / `tool-error` / `unknown-resource` / `session-open`
 - 마지막 50줄은 리소스 `kn://audit/tail`로도 노출된다.
 
+### 5.2 요청 검증과 응답 대기
+
+`mcp off` 후 REPL은 기본 write-on으로 복귀한다. 로컬 쓰기를 계속 차단하려면 복귀 후 `write off`를 실행한다.
+
+HTTP 요청 본문은 **1 MiB**로 제한한다. 본문 읽기 실패, 불완전한 본문, 크기 초과는 HTTP 400과 JSON-RPC `-32700`을 반환한다. 잘못된 JSON은 HTTP 200으로 `-32700`을 반환한다. 파서는 뒤따르는 데이터, 디코딩 후 중복되는 객체 키, 잘못된 UTF-8, 64를 넘는 중첩 깊이를 거부한다. 요청에는 `jsonrpc:"2.0"`과 문자열 method가 필요하며, ID가 있으면 문자열·숫자·null이어야 한다. 잘못된 요청 형식은 `-32600`이다.
+
+툴 인자는 공개 스키마와 일치해야 한다. 필수 필드, 문자열·불리언·배열 타입을 검사하고 배열 원소는 문자열만 받으며, 알 수 없는 키는 거부한다. 스키마가 `string`으로 지정한 숫자 인자도 문자열로 보내야 한다. 메모리 width는 공개된 값만 허용하고, 바이트 목록은 콘솔 진법과 무관하게 16진수다. 비어 있거나 잘못된 패턴과 유효하지 않은 범위는 변경 전에 거부한다.
+
+엔진은 작업을 직렬 실행하며 대기 큐는 최대 8개다. 30초 응답 대기 종료는 두 가지로 구분한다.
+
+- `engine wait ended; request cancelled before execution`: 큐에서 제거했으므로 나중에도 실행되지 않는다.
+- `engine wait ended after dispatch; outcome unknown, inspect state before retrying`: 이미 디스패치됐다. 작업이 계속 실행되거나 완료될 수 있으므로, 특히 쓰기는 대상 상태와 감사 기록을 확인한 뒤 재시도한다.
+
+리스너 중지도 대기를 끝내고 큐에 남은 작업을 취소한다. 이미 디스패치된 작업은 선점할 수 없다. MCP `notifications/cancelled`는 알림으로 수신하지만 현재 작업을 제거하지 않는다. 클라이언트에서 취소했다는 사실만으로 변경이 방지됐다고 판단하면 안 된다.
+
+[명령 감사 보고서](COMMAND_AUDIT_20260919.md)에 드라이버 없는 JSON·스키마·큐·HTTP 회귀 결과가 있다. `--self-test mcp-http`는 `--self-test all`과 별도로 실행하며 HTTP.sys loopback URL 등록 권한이 필요하다.
+
 ---
 
 ## 6. 제공 기능 카탈로그
@@ -638,7 +657,9 @@ claude mcp list                      # connected 확인
 | 연결이 403 | `--loopback`인데 loopback이 아닌 Host로 접속했거나, Origin이 비-loopback인 브라우저 컨텍스트 |
 | 원격에서 접속 불가(타임아웃) | 방화벽 인바운드 차단. `New-NetFirewallRule`로 포트/클라이언트 IP 허용. `mcp on`이 찍어 준 IP로 접속 중인지 확인(기본은 모든 인터페이스) |
 | `writes are disabled` | 읽기 전용 모드. **이미 실행 중이면 `mcp on --allow-write`는 무시됨**(`MCP server is already running` 출력) → 먼저 `off`+Enter(엔진 루프) 또는 `mcp off`로 중지한 뒤 `mcp on <port> --allow-write`로 재기동. `mcp on`을 다시 하면 세션 비밀번호도 다시 입력한다. |
-| `engine busy; retry shortly` 또는 `engine timeout` | tools/call은 JSON-RPC 에러코드가 아니라 `isError:true` CallToolResult로 옴. 대기 큐(8개) 포화 시 `engine busy`(audit `engine-busy`), 30초 엔진 대기 초과 시 `engine timeout`(audit `tool-error`). 큐가 비면 재시도하거나 `limit`/`count`로 범위를 줄이거나 나눈다. 클라이언트 timeout을 키워도 서버 한도는 늘지 않는다. (`-32603`은 `resources/read` 혼잡 경로에서만 발생) |
+| `engine busy; retry shortly` | 요청이 큐에 들어가지 않았다. 엔진에 여유가 생긴 뒤 재시도한다. `tools/call`은 `isError:true`, 혼잡한 `resources/read`는 `-32603`을 반환한다. |
+| `request cancelled before execution` | 큐에서 기다리던 중 응답 대기가 끝나 요청을 제거했다. 나중에 실행되지 않으므로 엔진에 여유가 생긴 뒤 재시도할 수 있다. |
+| `outcome unknown, inspect state before retrying` | 디스패치 후 응답 대기가 끝났다. 명령이 계속 실행되거나 완료될 수 있으므로 변경 작업은 상태 확인 후 재시도한다. |
 | 드라이버 로드 실패 | 테스트 서명 미활성 → `bcdedit /set testsigning on` 후 재부팅 / 비-elevated 실행 |
 | `symType=0 (SymNone)` | 심볼 DLL 묶음을 EXE 옆에 두지 않음(2.1 참고) |
 
@@ -839,5 +860,5 @@ PID 1234의 보호를 none 으로 벗겨줘.
 - **구체값을 줘라**: PID/모듈명/주소를 명시하면 인자가 정확해진다. 모르면 `process.find`/`symbol.search`로 먼저 해석.
 - **교차 상관을 요구하라**: "VAD와 스레드와 TI를 합쳐 같은 영역을 가리키는 증거만 추려" — 단일 나열이 아닌 분석이 나온다.
 - **read→확인→코드 순으로**: `address.inspect`(정체) → `memory.read_virtual`(바이트) → `code.disasm`(명령어)로 좁혀라.
-- **느린 스캔**: `hunt.run`/전수 스캔은 30초 엔진 대기를 넘길 수 있다 — `limit`/`count`로 범위를 줄이거나 나눈다. 클라이언트 timeout만 올려도 서버 한도는 늘지 않는다.
+- **느린 스캔**: `hunt.run`/전수 스캔은 지원하는 `limit`/`count`로 범위를 줄이거나 나눈다. 30초 응답 대기가 끝나도 디스패치된 스캔은 계속 실행될 수 있다. 클라이언트 timeout으로 서버 대기를 연장할 수 없으며 변경 작업은 상태 확인 후 재시도한다.
 - **감사 추적**: 모델이 무엇을 호출했는지는 `kn://audit/tail` 또는 `mcp-audit-<port>.jsonl`로 확인.

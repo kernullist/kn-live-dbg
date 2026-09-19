@@ -6,7 +6,7 @@ This document defines a design for adding an **MCP (Model Context Protocol) serv
 
 The core principles carry over directly from the philosophy of the existing `docs/AI_ASSISTED_WORKFLOWS.md`: the AI is advisory by default, no hidden automatic writes, raw evidence is preserved, the driver stays a narrow memory primitive, and sensitive kernel state can be kept local-only. MCP is a **third frontend** that reuses the **same capability catalog + guard layer** as the existing `ai` command (following the REPL and the internal AiProvider).
 
-> Conclusion summary (first): **in-process loopback Streamable HTTP**, **read-only v1**, **single-engine-thread serialization**, **100% reuse of the existing catalog/guards**, **kernel write flag disarmed when MCP is enabled**.
+> Current implementation (2026-09-19): in-process HTTP.sys, default `0.0.0.0:51766`, optional `--loopback`, read-only by default, 12 write tools under `--allow-write`, and a single engine FIFO. Use [MCP_SETUP.md](MCP_SETUP.md) for operation and the [command audit](COMMAND_AUDIT_20260919.md) for evidence. Phased plans and initial scaffold notes below are implementation history; unimplemented features are identified separately.
 
 ---
 
@@ -34,7 +34,7 @@ Every design decision derives from the facts below. All have been verified in co
 |---|------|------------------|
 | C1 | **Single controller**: the driver enforces `KNDBG_VERSION_FLAG_SINGLE_CONTROLLER`. User-mode opens `\\.\KnLiveDbg` exclusively via `CreateFileW(... ShareMode=0 ...)`, with one global `DeviceClient`. | `DeviceClient::Open` (`ShareMode=0`), `shared/KnLiveDbgIoctl.h` |
 | C2 | **No batch/headless mode**: `wmain` ignores argc/argv. It always enters the interactive REPL (`knkd>`). | `wmain` (`UNREFERENCED_PARAMETER(argc/argv)`), REPL loop `while(!g_StopRequested)` |
-| C3 | **Single-threaded engine**: all `HandleCommand` dispatch, all `DeviceClient` IOCTLs, and all `SymbolEngine` (DbgHelp/DIA) calls run only on the main REPL thread. `DeviceClient` has no lock, and DbgHelp/DIA are not thread-safe. | `DeviceClient` (no lock), `SymbolEngine` |
+| C3 | **Single-threaded command engine**: command dispatch and symbol work are serialized on the main thread. Collector workers have separately synchronized IOCTL paths, including timeline drain; not every `DeviceClient` call runs on the main thread. | `RunMcpEngineLoop`, `TimelineAutoDrainWorker`, `SymbolEngine` |
 | C4 | **Output capture already exists**: `ScopedWideStreamCapture` swaps the **process-global rdbuf** of `std::wcout`/`std::wcerr` to a string buffer. Transcript/AI evidence already uses it. | `ScopedWideStreamCapture` (`std::wcout.rdbuf(&outBuffer_)`) |
 | C5 | **Driver write is ON by default**: in `IRP_MJ_CREATE` the handle context `WriteEnabled = TRUE`. The kernel-side gate of the write-virtual/physical/SetProcessProtection handlers is only this flag + `KNDBG_WRITE_ACK_MAGIC` (a public compile-time constant). **The entire write-safety pipeline exists only in user-mode.** | `Driver.cpp` (`WriteEnabled = TRUE`), `KnLiveDbgIoctl.h` (`KNDBG_WRITE_ACK_MAGIC`) |
 | C6 | **Capability catalog + guards exist**: 20 read-only tools, per-tool argument whitelist, value validation (rejecting `;`/newlines/control chars/help tokens), rejection of write-like/raw-kd/nested-ai/session-change/unload, single execution path. | `IsSupportedAiCapabilityTool`, `ValidateAiCapabilityToolArgKeys`, `ValidateAiCapabilityScalarText`, `ContainsUnsafeAiCommandCharacters`, `ExecuteAiCapabilityPlan` |
@@ -47,7 +47,7 @@ Every design decision derives from the facts below. All have been verified in co
 
 ## 3. Architecture Decisions
 
-### 3.1 Transport: in-process loopback Streamable HTTP (not stdio)
+### 3.1 Transport: in-process Streamable HTTP (not stdio)
 
 **Decision**: place a **Streamable HTTP** endpoint (`http://127.0.0.1:<port>/mcp`) inside the already-running elevated controller process. **stdio is not used as the primary transport for the live process.**
 
@@ -59,19 +59,19 @@ Rationale:
 4. **HTTP coexists cleanly with the console**: the HTTP listener owns its own socket/thread and never touches the console. The operator REPL stays alive, preserving the human-in-the-loop (security-critical).
 5. **Claude Code, Cursor, Codex, and Grok Build natively support Streamable HTTP** (see §8 below), so they connect directly without a transport shim. Claude Desktop supports remote HTTP connectors, but those connections originate in Anthropic's cloud and cannot reach this local loopback/private endpoint; its local `claude_desktop_config.json` path remains stdio. `tools/mcp-bridge.ps1` therefore exists only for Claude Desktop local MCP and legacy stdio-only clients. It pins and constrains the stateless `mcp-remote` bridge, which never touches the device and can be freely spawned.
 
-**Implementation stack**: the HTTP server is a new addition (the current project only links the `winhttp.lib` *client*, with no server socket/pipe).
-- First choice: **HTTP Server API (http.sys, `httpapi.lib`)** -- `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup` (`http://127.0.0.1:<port>/mcp`). This gains kernel-side URL reservation and ACL, and avoids raw socket parsing. A URL reservation (`netsh http add urlacl` or SDDL) may be required (open question §10).
+**Implementation stack**: HTTP Server API (http.sys, `httpapi.lib`). The default URL prefix is `http://+:<port>/mcp/`; `--loopback` registers only loopback prefixes. URL registration rights are required. WinSock below is the rejected alternative.
+- Adopted APIs: `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup`. HTTP.sys owns HTTP framing.
 - Alternative: a small WinSock listener that explicitly `bind()`s to `INADDR_LOOPBACK` -- the only external dependency is `ws2_32`, but HTTP/1.1 parsing must be hand-written.
 
-**POST response mode**: synchronous read tools answer with `Content-Type: application/json` (single response, simplest). Tools that need elicitation/progress notifications (future writes) **must** answer with `text/event-stream` (SSE) -- because you cannot embed a server-to-client request inside a single JSON POST response (§7.4).
+**POST response mode**: current read/write tools return `application/json`. SSE progress and per-write elicitation are not implemented.
 
 ### 3.2 Process Model: in-process, ON/OFF by command, coexisting with the REPL
 
-**Decision**: not a separate bridge process but a **subsystem inside `KnLiveDbg.exe`**. It shares the single device handle/symbol engine/state (C1). OFF by default; activating it via the operator console command `mcp on <port>` prints a token and an immediately-pasteable client config. `mcp off` stops it instantly.
+**Decision**: a subsystem inside `KnLiveDbg.exe`, sharing the device handle, symbol engine, and state (C1). It is OFF by default; `mcp on` prompts for a session password and prints connection details. `mcp off` requests stop but cannot preempt an already-running command.
 
-- Create the `McpServer` object in `wmain` alongside `service/device/symbols/ai/aiState`, but keep it dormant until `mcp on`.
+- The global `g_McpServer` does not listen until `mcp on`.
 - When activated, spawn one HTTP listener thread. This thread **never touches the kernel directly** -- it only does HTTP validation (auth/host/origin/size) -> JSON-RPC parsing -> job creation -> push to the engine queue -> waiting on the per-job completion future.
-- Shutdown path (`mcp off` / Ctrl-C / `wmain` cleanup): stop the listener -> drain the queue and cancel waiting jobs -> `SetWriteMode(false)` -> disarm write -> join the worker -> existing driver cleanup.
+- `RequestStop` wakes listener waits; `Stop` fails queued jobs and joins the listener. Dispatched engine work runs to completion. Write mode on return to the REPL is described in §5.7.
 
 **The operator REPL is retained.** However, in MCP-enabled mode the console input switches to a simple line reader (to avoid the global rdbuf race of §4.2).
 
@@ -94,67 +94,22 @@ C3 (single-threaded engine) + C4 (global rdbuf capture) is the subtlest part. A 
 
 ### 4.1 Single engine thread + serial job queue
 
+The implementation uses one `McpServer::queue_`, with no separate `EngineQueue` or priority CONSOLE queue. The HTTP thread enqueues requests; `RunMcpEngineLoop` on the main thread waits on `JobReadyEvent`, then calls `TryPopJob` and `DispatchMcpRequest`.
+
 ```text
-[HTTP listener thread]                 [engine thread = main thread]
-  validate(auth/host/origin/size)     drain loop:
-  parse JSON-RPC                        wait(QueueCv) until !Queue.empty()
-  build McpJob ----------- push ----->  pop (operator job first)
-  future.wait_for(timeout)              if CONSOLE: ExecuteCommandWithTranscript
-  serialize result <---- promise -----  if MCP: guard validation + capability dispatch + serialize
-                                        set promise
+HTTP listener -> validate -> queue_ -> engine dispatch -> ResultPromise
+                      30s response wait     one job at a time
 ```
 
-Data structures (following the code style):
-
 ```cpp
-// MCP job marshalled onto the single engine thread.
 struct McpJob
 {
-    McpJobKind Kind;                 // Console or Mcp
-    std::vector<std::wstring> Args;  // synthetic command/capability args
-    std::wstring OriginalLine;
-    std::promise<McpResult> Done;
-    std::atomic<bool> Cancelled;
-};
-
-class EngineQueue
-{
-public:
-    bool Push(std::shared_ptr<McpJob> job);   // bounded; false => engine busy
-
-    std::shared_ptr<McpJob> Pop();            // operator(Console) jobs first
-
-private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<std::shared_ptr<McpJob>> consoleJobs_;
-    std::deque<std::shared_ptr<McpJob>> mcpJobs_;
-    size_t maxMcpPending_ = 8;
+    McpEngineRequest Request;
+    std::promise<McpEngineResult> ResultPromise;
 };
 ```
 
-The engine loop (replaces the existing `while(!g_StopRequested) ReadInteractiveCommandLine`):
-
-```cpp
-while (!g_StopRequested)
-{
-    std::shared_ptr<McpJob> job = queue.Pop(); // blocks on cv
-    if (job == nullptr)
-    {
-        continue;
-    }
-
-    if (job->Cancelled.load())
-    {
-        // queued-but-cancelled: drop without touching the engine
-        job->Done.set_value(McpResult::Cancelled());
-        continue;
-    }
-
-    McpResult result = DispatchOnEngineThread(job, state, device, symbols /* ... */);
-    job->Done.set_value(std::move(result));
-}
-```
+The console reader sends only `off`/`status` control requests. It does not execute engine commands or write to captured streams. The full REPL resumes after MCP stops.
 
 ### 4.2 Global rdbuf hazard and mitigation (mandatory)
 
@@ -164,16 +119,16 @@ Rules (invariants):
 
 1. **`ScopedWideStreamCapture` is created only on the engine thread.** The HTTP listener thread never creates a capture.
 2. **At most 1 alive at a time.** Nesting within a single thread is allowed because the LIFO restore holds (e.g., a capability path captures once more internally). **Cross-thread concurrent capture is forbidden.**
-3. In debug builds, grab the engine TID at startup and place `assert(GetCurrentThreadId() == g_EngineTid)` + a `g_CaptureDepth` singleness assert at every entry point of `DeviceClient`/`SymbolEngine` and the capture ctor/dtor. Enforce by code, not by convention.
-4. **In MCP-enabled mode, switch console input to a simple line reader.** The live-rendering interactive editor (`ReadInteractiveCommandLine`) renders directly to the console/`wcout` while typing, so if it is alive concurrently with an MCP job capture, it races the global rdbuf. Therefore in MCP mode result output is handled only by the engine thread, and the console reader thread only pushes completed lines as a CONSOLE job. (Rich editing/history inline rendering is reserved for pure REPL mode.)
-5. **`ScopedCommandProgress` is disabled in MCP-origin jobs** (`enabled=false`). This worker writes directly to `STD_OUTPUT_HANDLE` (C10), bypassing capture/redirection. In HTTP mode it does not corrupt framing, but it sprays MCP noise onto the operator console and would be a corruption source for a future stdio bridge.
+3. Preserve engine-thread ownership. Adding thread-ID assertions to every `DeviceClient`/`SymbolEngine` entry point remains a hardening target, not a guarantee implemented across all call sites.
+4. **The MCP console is a control-only reader.** It uses `ReadConsoleW` and forwards stop/status flags, without enqueuing CONSOLE jobs. Rich editing remains in the normal REPL.
+5. **Console progress bypasses stream capture.** `ScopedCommandProgress` writes directly to the console handle. Remote dispatch disables it; MCP does not have a blanket origin-based disable. MCP uses HTTP, so this console output does not enter JSON-RPC framing. It is not an MCP progress notification.
 
 ### 4.3 Backpressure / Cancellation / Lifetime
 
 - **One in-flight**: the engine runs only one job at a time. A long scan (UserModeHunter, !pool pe, full callbacks) blocks all other MCP requests and the operator for that duration -- this is **intentional backpressure**, not to be masked by a false cancellation promise.
-- **Bounded waiting queue (e.g., MCP 8)**: when full, respond with `isError:true` ("engine busy") (§7.3 -- not a JSON-RPC -32xxx).
-- **Operator priority**: pop CONSOLE jobs from the queue before MCP jobs. However, an in-flight job cannot be preempted, so this does not guarantee "the operator always runs immediately" (stated honestly).
-- **Cancellation (honest model)**: a cancellation notification removes **only jobs still in the queue**. A dispatched scan runs to completion -- because scanners have no stop token (C9) and `DeviceIoControl` is synchronous. We do not promise "mid-flight cancellation." To keep scans short, enforce `limit`/`count` arguments.
+- **At most eight pending jobs**: a full queue returns `isError:true` and `engine busy; retry shortly` for `tools/call`. The request was not queued.
+- **Operator control**: a separate reader forwards stop/status requests. There is no priority CONSOLE queue, and a running engine command cannot be preempted.
+- **Response wait ends**: after 30 seconds or stop, a still-queued request is removed under the queue mutex and returns `engine wait ended; request cancelled before execution`. If dispatch already occurred, it returns `engine wait ended after dispatch; outcome unknown, inspect state before retrying`; execution can continue. Inspect state before retrying mutations. MCP cancellation notifications do not currently cancel jobs.
 - **Late-result lifetime**: the `McpJob` is owned by the engine as a `shared_ptr`. Even if the worker abandons the future on timeout, the job/result storage stays alive until the engine sets the promise (never set a promise on freed memory). By the one-in-flight rule, a timeout-but-running job naturally blocks the queue (= normal backpressure, not a hang).
 - **No engine-thread reentrancy**: engine-thread code never enqueue-and-waits on its own queue (self-deadlock). Only the transport thread waits on a future. nested-ai/`assistant.answer` is rejected as before, so the reentrant path is closed.
 
@@ -206,7 +161,7 @@ Practical constraint: a lab VM on a **physically separate PC** cannot be reached
 
 ### 5.2 Authentication and password handling
 
-1. `mcp on` **prompts the operator** for a temporary session password (type + confirm). 4-128 printable ASCII, no spaces. It is **not persisted** and is cleared on `mcp off` / process exit.
+1. `mcp on` prompts twice for a temporary session password: 4-128 printable ASCII characters, no spaces. The protected endpoint file stores it for the same-box bridge; it is not reused across restarts and normal stop clears the file secrets.
 2. Clients send `Authorization: Bearer <password>` (the raw password is also accepted). Constant-time compare, 401 on mismatch.
 3. `mcp on` still writes a protected `mcp-endpoint.json` for the same-box Desktop/legacy stdio bridge. Native clients should use IP + port + password directly. Never commit the password to git.
 4. Print listen IPs so the operator can tell a remote client which address to use. Do not mint or reuse a disk token.
@@ -225,20 +180,22 @@ MCP **selects one of two modes via an explicit flag at startup**. Because the an
 Activated only by an explicit flag. When activated:
 
 1. **Register the full write tool surface** (§6.1 write namespace). `WriteEnabled` stays TRUE for the session (no need to momentarily toggle write per operation -- since write is a first-class citizen). PPL allows an **arbitrary target** via `process.set_protection` (lab); self-PPL being that special case, the problem of `IOCTL_KNDBG_SET_PROCESS_PROTECTION`/write-virtual sharing the same `WriteEnabled` naturally disappears.
-2. **Keep the frictionless automatic safety rails for every write** -- reuse the existing `ai write confirm` machinery but drop only the interactive confirmation: (1) preflight read (current bytes) -> (2) emit backup/restore commands -> (3) write -> (4) post-write read-back **verify-diff** -> (5) write-audit JSONL (`WriteCommandAuditEvent`). These rails prevent **the LLM from silently breaking the live state under analysis and thereby invalidating the analysis itself**, and make every mutation recoverable and auditable.
+2. **Memory write checks** follow preflight -> supported backup/restore -> write -> read-back -> audit. Failure to create a required backup aborts the mutation; execution/verification errors return `isError:true`. File/ring operations do not all have memory backups. Backup and read-back do not guarantee automatic recovery from every side effect.
 3. **Typed write tools only** (the no-raw-command-string rule still holds). The model calls via validated typed arguments like `memory.write_virtual {address, bytes}`, not a raw string like `eb <addr> <bytes>` -- closing the injection/chaining/parsing surface and letting the model call more precisely.
-4. **Elicitation OFF by default** (lab frictionless). Per-write human confirmation (SSE elicitation, §7.4) can be turned on with `mcp write-confirm on`.
+4. **Per-write elicitation is unimplemented.** `mcp write-confirm on` is not a supported command. For individual confirmation, keep MCP read-only and use local `ai write [index] confirm`.
 
 #### 5.3.3 Residual risks and recommendations for Lab write mode (must be understood)
 
-- **Confused deputy (the most realistic threat)**: malware/attacker-controlled kernel data under analysis (process names, module paths, memory contents) can flow into the model context and, via prompt injection, **induce destructive writes**. Typed arguments, value validation, backup/verify, and audit make this recoverable/traceable but **do not fully prevent it**. Opening writes in the same session while reading untrusted memory is an inherent risk.
-- **Recommendations**: (1) take a **VM checkpoint/snapshot** before a write session (since it is an isolated VM, instant rollback -- the strongest lab safety net). (2) Capture an analysis baseline with `!snapshot` before writing. (3) Keep loopback + token + single-session pin as is. (4) If unattended trust is a concern, use `mcp write-confirm on`.
+- **Confused deputy**: process names, paths, and memory under analysis can enter model context and induce an incorrect write. Typed validation, backups, and auditing neither fully prevent this nor guarantee recovery.
+- **Recommendations**: take a VM checkpoint and analysis baseline before a write session. Limit network exposure, and keep MCP read-only when individual operator confirmation is required.
 - **Raw `kd`/DbgEng passthrough remains separately closed** (§5.4-3). The typed write tools already satisfy the "write" requirement, and a raw command is hang/crash/arbitrary-execution, a far larger door. Decide separately if needed.
-- TI **subscription start** (`!ti start`) remains console-only due to the side effect of creating an ETW session/file; `ti.query` only reads the existing ring. If unattended lab TI is desired, `ti.subscribe` can be added under write mode.
+- `ti.subscribe` is implemented. `action=status` is read-only; `start`/`stop` require `--allow-write` because they change the ETW session. `ti.query` reads the existing ring.
 
 > Recommended driver hardening (follow-up, ABI bump): for read-only mode correctness, the current structure where `SetWriteMode(false)` closes both PPL and write remains valid. However, if you later want "read-only + self-PPL only" again, add a `WriteEnabled`-independent gate to `IOCTL_KNDBG_SET_PROCESS_PROTECTION`.
 
-### 5.4 Input guards (sealing prompt injection)
+### 5.4 Input validation
+
+The request-body cap is 1 MiB and JSON nesting is limited to 64. Validate the complete JSON document, UTF-8, duplicate decoded keys, JSON-RPC envelope, and each tool's required fields, known keys, and exact types. Arrays contain strings only. Hex byte lists are independent of console radix; widths and ranges are checked too. HTTP statuses, error codes, and response waits are documented in [the operator guide §5.2](MCP_SETUP.md#52-request-validation-and-response-waits).
 
 1. Every `tools/call` passes the existing guards **as is**: `IsSupportedAiCapabilityTool` (tool allowlist) + `ValidateAiCapabilityToolArgKeys` (per-tool argument-key whitelist) + per-value `ValidateAiCapabilityScalarText` + `ContainsUnsafeAiCommandCharacters` (rejecting `;`/CR/LF/control chars) + scope enum normalization + `IsHelpToken` rejection.
 2. **Never accept a raw command string over MCP (including writes).** Only a `tool` + typed args. In read-only mode, the worst an injected model can do is "select another read scanner with in-range arguments." In Lab write mode, write tools are reachable but go through **typed arguments + value validation + backup/verify/audit**, and raw kd/session-change/unload are not exposed in either mode.
@@ -247,19 +204,19 @@ Activated only by an explicit flag. When activated:
 
 ### 5.5 Egress redaction
 
-Both the text captured by `ScopedWideStreamCapture` and the serialized JSON are redacted with `MaybeRedactTranscriptText` **before leaving the process (before HTTP UTF-8 conversion)**. The external model is treated as a potentially adversarial principal, and we do not hand over uncurated raw kernel addresses/symbols/paths (KASLR / symbol exposure).
+The initial design proposed blanket redaction before transport. The current MCP path preserves analysis fidelity and does not automatically redact every result or audit argument. The `ai transcript` redaction setting is not a blanket MCP guarantee.
 
 ### 5.6 Auditing (mandatory, not optional)
 
-One append-only JSONL record per MCP request: timestamp, peer (loopback port/PID), session id, tool, **redacted args**, decision (allow/deny + which guard fired), result byte size, write-arm state. (A result hash alone is insufficient -- you need size + a redacted snippet of what left.) Expose `kn://audit/tail` as a read-only resource so a monitoring client can observe model behavior.
+Data requests and session starts append JSONL records with `ts`, `session`, `peerPort`, `method`, `tool`, `args` truncated to 512 characters, `decision`, `isError`, `resultBytes`, and `writeArmed`. Argument redaction and logging every transport rejection are not guaranteed. `kn://audit/tail` exposes the last 50 lines.
 
 ### 5.7 Kill switch
 
-`mcp off` / Ctrl-C (`ConsoleHandler`) does: stop the listener -> drain the queue + cancel waiting jobs -> `SetWriteMode(false)` (disarm the kernel flag) -> disarm write -> join the worker -> existing driver cleanup. Ensures an abnormal exit does not leave the handle write-enabled.
+`off`/`mcp off` stops new work and cancels queued jobs. Already-dispatched work can occupy the engine until completion. On normal return to the REPL, `RunMcpEngineLoop` calls `SetWriteMode(true)` to restore the interactive default. Therefore `mcp off` does not disarm local writes; run `write off` after returning if needed. Process exit follows the separate collector/device cleanup path.
 
 ### 5.8 Session pin
 
-Issue an `Mcp-Session-Id` in the `InitializeResult`, then require it on every subsequent request (400 if absent). **A second concurrent `initialize` is rejected** (single engine / single device -> single MCP session). This keeps the write-arm/elicitation state and audit attribution unambiguous, and prevents two LLMs from interleaving IOCTLs.
+`initialize` issues a new `Mcp-Session-Id`. Subsequent session-checked requests must match it; a missing or invalid ID returns JSON-RPC `-32600` over HTTP 200. A new `initialize` currently replaces the prior ID rather than rejecting a second initializer. This is not an exclusive-client ownership guarantee; authentication relies on the session password.
 
 ---
 
@@ -352,6 +309,8 @@ Exposed in Claude Code as the `/mcp__knlivedbg__<prompt>` slash command. They on
 
 ## 7. Structured Output Strategy
 
+The current catalog mixes structured results and text-only tools. The sections below retain the output design targets; per-tool `outputSchema`, uniform pagination, and `resource_link` are not blanket guarantees. Use the operator guide §6 and `tools/list` for the current contract.
+
 ### 7.1 2-tier
 
 - **Tier A (ships immediately, all 18 tools)**: wrap the existing text executor with `ScopedWideStreamCapture` (C4) to capture `CommandExecutionResult.Output` -> redact -> `{content:[{type:"text", text:<captured>}]}`. With zero scanner changes, all tools work on day 1.
@@ -378,7 +337,9 @@ Exposed in Claude Code as the `/mcp__knlivedbg__<prompt>` slash command. They on
 - **Tool argument-validation/execution/`engine busy`/`device busy`/`writes disabled`/scope errors = `isError:true` CallToolResult content** (with a text explanation). So the model self-corrects.
 - JSON-RPC protocol errors are only for **unknown tool (-32601) / malformed params (-32602) / parse / invalid request / auth / session**. (No business errors like `-32000`/`-32001` -- that breaks model self-correction and becomes an error oracle.)
 
-### 7.4 Token budget / pagination / large payloads
+### 7.4 Token budget / pagination / large payloads (design targets)
+
+The following are targets for a uniform output contract. Pagination, `resource_link`, and a 64KB/200-record cap are not implemented uniformly across tools. Use `tools/list` and the operator guide §6 for supported arguments.
 
 - All list tools: `offset`+`limit` + a `{total, returned, truncated, next_offset}` envelope. A conservative default cap (e.g., 200 records / 64KB); on overflow `truncated:true` + an explicit hint (never a silent drop). `UserModeHunter`/pool-scan especially have a bounded default.
 - Large outputs (snapshot/dump/full pool listing) reference a `kn://` resource via **`resource_link`** instead of inline. (Claude Code warns at ~10k tokens and truncates/persists at ~25k (`MAX_MCP_OUTPUT_TOKENS`).)
@@ -436,7 +397,7 @@ On a network bind (§5.1.1): the session password is the only barrier, so **allo
 
 `${KNLIVEDBG_TOKEN}` is the session password. Same-box: `mcp-load-env.ps1` loads it from the live endpoint.
 
-Useful knobs: per-server `timeout` (ms, raise it for slow scans -- not extended by progress notifications), `headersHelper` (rotating token at connect time), `alwaysLoad`.
+A larger client timeout does not extend the server's 30-second response wait. Dispatched work may continue; use the outcome distinction in §4.3.
 
 ### 8.3 Claude Desktop
 
@@ -454,7 +415,7 @@ Do not expose the kernel endpoint publicly merely to use a Claude remote connect
 | **1. Read catalog (Tier A)** | Engine queue + console-line-as-job drain loop, 18 read-only tools reusing `ExecuteAiCapabilityPlan` + `ScopedWideStreamCapture` text. origin="mcp" audit. Default read-only mode = `SetWriteMode(false)` disarmed. | The external LLM drives the full read forensics surface under guards/audit. **The first ship with real value.** |
 | **2. Structured JSON (Tier B)** | Write/reuse a `Build*Json` per scanner -> `structuredContent` + outputSchema. offset/limit pagination. Unified surrogate-safe escaper. | Promote text->structured per tool with no contract change. |
 | **3. Resources + prompts** | `kn://modules`/`drivers`/`snapshot`/`ti/stats`/`audit/tail` + 7 playbook prompts. Large payloads via `resource_link`. | Model self-grounding + slash-command workflows. |
-| **4. Lab write mode** | Register the write namespace (§6.1.1) via `mcp on --allow-write`. `WriteEnabled=TRUE` for the session. Automatic preflight/backup/verify-diff/audit on every write (no interactive confirmation). `process.set_protection` arbitrary target. `dump.*` output root restriction. Optional per-write SSE elicitation via `mcp write-confirm on`. | Isolated lab/VM only (decision §10-Q1/Q2). OFF by default, not registered without `--allow-write`. VM snapshot recommended before writing. |
+| **4. Lab write mode** | `--allow-write`, supported backup/read-back/audit, and arbitrary-PID `process.set_protection` are implemented. Per-write SSE elicitation remains a follow-up. | OFF by default. Current behavior is documented in the operator guide §3.4 and §6.2. |
 
 Each stage can ship independently, and no later stage weakens the Phase-0 security posture.
 
@@ -467,9 +428,9 @@ The 6 open items of the §3 initial design are finalized as below.
 1. **Server stack -> http.sys (`httpapi.lib`)**. A hand-rolled HTTP parser in an elevated process is a top-priority EoP surface, so offload to the kernel-audited http.sys. **Administrator/SYSTEM needs no separate `netsh urlacl` reservation for `HttpAddUrlToUrlGroup`**. Default prefix `http://+:<port>/mcp/` (all interfaces). `--loopback` uses `http://127.0.0.1:<port>/mcp` + `http://[::1]:<port>/mcp`. WinSock rejected.
 2. **Port -> fixed default + override**. A port scan is trivially available -> the security benefit of randomization is approximately 0 while the cost of breaking the client config every session is large (real authentication is the session password). A fixed default in the private range (e.g., `51766`) + `mcp on <port>` override.
 3. **Write exposure -> full open in Lab write mode (Q1, updated 2026-06-24)**. Since it is an isolated lab/VM (Q2), open the full typed write tool set (§6.1.1) via `mcp on --allow-write` for analysis fidelity. But "open != safety rails removed" -- keep frictionless automatic preflight/backup/verify-diff/audit (§5.3.2) and continue to forbid raw kd / arbitrary commands / hidden writes. The non-lab default is read-only + kernel flag disarmed (§5.3.1). VM snapshot recommended before writing (§5.3.3). *(Replaces the earlier "PPL exception only" decision.)*
-4. **Client auth -> operator-typed session password at `mcp on`**. Not persisted. Clients send `Authorization: Bearer <password>`. Same-box snippets may load that password into `KNLIVEDBG_TOKEN` via `mcp-load-env.ps1`. No project-scope commit.
+4. **Client authentication** uses the session password entered at `mcp on`. The protected same-box bridge endpoint stores it, normal stop clears the secrets, and restart does not reuse it.
 5. **Execution environment -> centered on an isolated analysis VM (Q2)**. Default all-interface bind is for lab NICs; `--loopback` remains available. (If a need arises to use it on a live EDR/AC box, review the named-pipe option from the backlog.)
-6. **Timeouts/caps -> adopt starting defaults, tune by measurement on a live VM**. Engine wait 30s (split or bound scans that exceed it; client timeout alone cannot extend it), MCP waiting queue 8, per-result 64KB/200 records, raw read 1MB (driver cap), forced `limit` on hunt/pool-scan. All exposed in config.
+6. **Current limits**: response wait 30 seconds, eight pending MCP jobs, request body 1 MiB. The response wait is not an execution deadline. Uniform 64KB/200-record results and full configuration exposure were initial targets; inspect each tool's implemented limits.
 
 Remaining backlog (decide at operation/implementation time): whether to limit the port ACL to the elevated account via http.sys SDDL; the driver hardening (§5.3.1) that adds a gate independent of `WriteEnabled` to `SetProcessProtection` to remove the momentary write window.
 
@@ -497,7 +458,7 @@ Line numbers may shift, so treat function names as the primary reference.
 
 ---
 
-## 11.1 Implementation Status (v0 scaffold, feature/mcp-server)
+## 11.1 Initial Implementation Record (v0 scaffold, historical)
 
 An initial scaffold that implements Phase 0~1 + the write namespace (§6.1.1) all at once is in place.
 
@@ -601,16 +562,16 @@ Side fix: found a bug where the `resources/read` listener handled only `session/
 
 - Live verification items: `mcp on` -> `claude mcp add --transport http` connect -> `tools/list`/`resources/list` + round trips of `callbacks.list`/`ssdt.scan`/`kn://modules/kernel` etc. -> the `memory.write_virtual` backup/verify path via `--allow-write` (test VM, after a snapshot).
 
-### 11.1.5 Current catalog (2026-08)
+### 11.1.5 Current catalog and validation (2026-09-19)
 
-The live `kTools` table in `user/McpServer.cpp` is the source of truth. Operator-facing tables live in `MCP_SETUP.md` §6. As of this writing that table exposes **67 read tools** and **11 write tools**. Phase 2 quiet surfaces added `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, and `timer.list`. Lab write mode `process.set_protection` now accepts an arbitrary target PID; the earlier v0 self-only mapping is historical.
+The current `kTools` table in `user/McpServer.cpp` contains **67 read tools + 12 write tools = 79 total**. Operator tables are in [MCP_SETUP.md §6](MCP_SETUP.md#6-capability-catalog). `ti.subscribe` start/stop require write mode, and `process.set_protection` accepts an arbitrary PID. Release/Debug passed 75 MCP-tool checks and nine separate HTTP checks per configuration. The [command audit](COMMAND_AUDIT_20260919.md) records parser ASan/queue evidence and live-kernel validation limits.
 
-## 12. Design Core 7-line Summary
+## 12. Current Implementation Summary
 
-1. **In-process loopback Streamable HTTP** (not stdio), OFF by default, activated via `mcp on`.
-2. Marshal all MCP requests onto a **single engine thread** via a serial queue; the HTTP thread never touches the kernel.
-3. `ScopedWideStreamCapture` is **engine-thread-only, one at a time** (prevents the global rdbuf UAF).
-4. **Two modes** -- read-only by default (`SetWriteMode(false)` disarms the kernel flag) / **Lab write mode** (`--allow-write`, isolated VM) fully opens typed write tools but keeps automatic backup/verify/audit, forbidding raw kd / hidden writes.
-5. Every `tools/call` passes the **existing catalog + guards**, no raw commands / new primitives, egress redaction.
-6. Results mirror `structuredContent` + identical JSON text, errors are `isError:true`, large payloads via `resource_link` + pagination.
-7. **Cancellation is queue-stage only** (in-flight scans cannot be preempted -- honest), single session pin, mandatory audit, kill switch disarms down to the kernel.
+1. The in-process HTTP.sys server is OFF by default, binds `0.0.0.0:51766` by default, and supports `--loopback`.
+2. Kernel/symbol work runs on one engine FIFO; stream capture belongs to that thread.
+3. Read-only is the default; `--allow-write` exposes 12 write tools.
+4. Complete JSON and advertised tool schemas are validated; raw commands are not accepted.
+5. Some tools return structured JSON and others text. Uniform pagination and elicitation remain follow-ups.
+6. An ended wait cancels only queued jobs. Dispatched outcomes may be unknown; MCP cancellation notifications do not remove jobs.
+7. After `mcp off`, the REPL returns to its default write-on mode. Session files, auditing, and authentication follow the implementation contracts above.

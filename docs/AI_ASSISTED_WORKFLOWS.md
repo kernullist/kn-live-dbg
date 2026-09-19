@@ -481,6 +481,8 @@ The command layers semantic explanations on top of native `dt` and `dtx` output:
 
 Implemented entrypoint: `ai write [index] [confirm]`. If the plan has one write, `ai write` and `ai write confirm` do not need an index.
 
+The parser accepts only that argument shape. Invalid indices, misplaced `confirm`, and trailing arguments fail before execution; they cannot turn a preview into a write.
+
 Because write mode is enabled by default per device handle, the AI path adds an operator safety layer around planned mutations:
 
 1. Before a write, read and display the current value.
@@ -488,8 +490,8 @@ Because write mode is enabled by default per device handle, the AI path adds an 
 3. For native `e*` virtual writes, treat the default address-space context as System (`pid 4`) unless the command includes `/process <process-id>`.
 4. For virtual writes, offer `vtop` context when useful, including the leaf entry physical address, writable state, and whether a temporary write-bit flip plus VA flush is expected. Kernel VA edits should be described as temporary write-enable plus original-VA write; translated user VA edits should be described as physical writes through the selected process context.
 5. For physical writes, warn when the target could be page tables, device memory, or firmware-owned memory.
-6. Generate backup and restore commands before applying the write.
-7. Re-read the target after the write and show a compact before/after diff.
+6. Generate backup and restore commands before applying the write. When the plan requires a pre-write backup, failure to create it aborts the mutation; confirmation does not bypass that failure.
+7. Re-read the target after the write and show a compact before/after diff. A read-back failure or mismatch is an error, including when the result is returned through MCP or remote execution.
 8. Mark high-risk targets such as list links, reference counts, callback routine pointers, dispatch tables, page table entries, and executable code.
 
 This feature should never hide the exact command being executed.

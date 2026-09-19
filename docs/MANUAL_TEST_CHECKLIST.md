@@ -1,13 +1,49 @@
 # Manual Test Checklist
 
-This document tracks the live-kernel validation that must be run on a
-test-signing VM for the reliability and CPU-state detection work. The build
-machine can only confirm that the code compiles and signs; correctness and
-false-positive behavior must be observed against a running kernel.
+This document separates driver-free regression gates from live-kernel
+validation on a test-signing VM. Parser, dispatch, and transport checks run
+without loading the driver. Kernel behavior and false positives still need
+observation against a running kernel.
 
 Check an item off only after it passes on a clean machine. A failure on a clean
 machine means a false positive (or a layout/assumption bug) and must be fixed
 before the feature is trusted.
+
+## Driver-free regression gate (2026-09-19)
+
+```powershell
+.\x64\Release\KnLiveDbg.exe --self-test all
+.\x64\Debug\KnLiveDbg.exe --self-test all
+.\tools\validate-command-audit.ps1 -Sanitize
+.\tools\validate-command-audit.ps1 -Configuration Debug -Sanitize
+.\x64\Release\KnLiveDbg.exe --self-test mcp-http
+.\x64\Debug\KnLiveDbg.exe --self-test mcp-http
+.\tools\validate-kmon-core.ps1 -Sanitize
+```
+
+The [command audit](COMMAND_AUDIT_20260919.md) records the verified results:
+
+| Suite | Checks per Release/Debug configuration |
+| --- | ---: |
+| `commands` | 1,988 |
+| `console` | 524 |
+| `timeline` | 28 |
+| `mcp-tools` | 75 |
+| `remote-protocol` | 52 |
+| `connect-argv` | 4 |
+| `mcp-http` (separate) | 9 |
+| Standalone parser with AddressSanitizer | 275,002 |
+
+`--self-test all` runs the first six suites before elevation, driver loading,
+and symbol initialization. `mcp-http` requires HTTP.sys URL registration
+rights and runs separately. Run network fixtures sequentially: remote binds
+`127.0.0.1:51767`, HTTP binds `127.0.0.1:51768`. Neither opens an external
+listener or adds firewall rules. The sanitizer script instruments the
+standalone parser; its executable command checks use the normal build.
+
+These results do not check off any live-kernel item below. Live writes,
+collector/load/unload races, and an external DbgEng target remain separate
+VM or hardware tests.
 
 ## Prerequisites
 
@@ -19,7 +55,7 @@ before the feature is trusted.
    .\KnLiveDbg.exe
    ```
 3. Confirm startup reaches the `knkd>` prompt with the driver loaded, the device
-   open, ABI verified (version 16), and `nt` kernel symbols resolved (the
+   open, ABI verified (version 17), and `nt` kernel symbols resolved (the
    dashboard shows symbol state; if `symType=0 (SymNone)`, fix the symbol path
    before running symbol-dependent checks).
 
@@ -315,6 +351,13 @@ contract sled never observed, child exited before the COW sample). That does not
 
 ## Write-path safety (C5/C6)
 
+- **AI/MCP backup failure:** make the intended backup destination unwritable
+  in a disposable VM, then attempt a planned memory write. Confirm the command
+  fails before mutation and the original bytes remain unchanged. Restore the
+  destination and verify the normal backup/write/read-back sequence.
+- **MCP response timeout:** queued requests must report cancellation before
+  execution and must not run later. Already-dispatched requests report an
+  unknown outcome; inspect the target and audit trail before retrying a write.
 - **Read-back verification (C5):** a normal `e*` / `eb`/`eq` write to a 4 KB-mapped
   address still succeeds and the value is confirmed (a silent dropped write now
   surfaces as `write verification failed ...`). Smoke test with `write on` then
@@ -344,6 +387,23 @@ Two-PC LAN:
 3. Confirm inbound rule `knlivedbg-remote` exists while listening and is gone after `remote off`.
 
 Driver-free: `.\tools\validate-remote-protocol.ps1 -Configuration Release`.
+Both remote suites also run in `--self-test all`. The loopback corpus covers
+queued cancellation and stop without waiting for the engine to drain the queue.
+On a live target, also verify command errors reach B as `command-failed` and
+address-only physical edits (`pe*`) fail without waiting for stdin.
+
+## Collector and shutdown lifecycle
+
+- Start `!kmon`, TI, and the timeline collector, then exercise normal `q` and
+  `unload` paths in a disposable VM. Collectors must stop before the device
+  closes; repeat startup/stop to catch stale handles and worker lifetimes.
+- During an I/O-trace disarm failure, confirm the device remains open for a
+  retry and normal `q`/`unload` does not report successful cleanup. Resolve the
+  failure and retry. Exercise active traced dispatch during driver unload;
+  dispatch code must remain resident until those calls finish.
+- Toggle `log enable` / `log disable` repeatedly within one second, including
+  an executable directory with non-ASCII characters. Each session must retain
+  a distinct `KnLiveDbg-YYYYMMDD-HHMMSS-<pid>-<sequence>.log` file.
 
 ## Deferred
 
