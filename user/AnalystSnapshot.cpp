@@ -490,6 +490,20 @@ std::vector<KmonHuntCase> FilterAnalystCases(const std::vector<KmonHuntCase>& ca
 
 bool SaveAnalystSnapshot(const std::wstring& path, const std::wstring& json, std::wstring* error)
 {
+    Snapshot parsed;
+    if (!Parse(json, &parsed))
+    {
+        if (error != nullptr)
+        {
+            *error = L"snapshot must use a supported analyst schema";
+        }
+        return false;
+    }
+    return SaveObservationJson(path, json, error);
+}
+
+bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std::wstring* error)
+{
     bool ok = false;
     std::wstring ignored;
     if (error == nullptr)
@@ -499,8 +513,7 @@ bool SaveAnalystSnapshot(const std::wstring& path, const std::wstring& json, std
     *error = L"snapshot must be valid, bounded JSON and use a new output path";
     do
     {
-        Snapshot parsed;
-        if (!DiskPath(path) || !Parse(json, &parsed))
+        if (!DiskPath(path) || json.size() > MaxSnapshotBytes || !mcpjson::ValidateDocument(json) || !SnapshotStringsValid(json))
         {
             break;
         }

@@ -69,6 +69,30 @@
   },
   "sources": [
     {
+      "id": "hasherezade-hollowing-24h2-2025",
+      "title": "Process Hollowing on Windows 11 24H2",
+      "publisher": "hasherezade",
+      "published_on": "2025-01-27",
+      "verified_on": "2026-09-20",
+      "url": "https://hshrzd.wordpress.com/2025/01/27/process-hollowing-on-windows-11-24h2/",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Original research compares MEM_PRIVATE RunPE with MEM_IMAGE alternatives on Windows 11 24H2; not a current exploit recipe or detector recall result.",
+      "primitive": "Image-backed impersonation can preserve normal layout classifications and requires independent content and image identity evidence."
+    },
+    {
+      "id": "microsoft-virtualquery-layout",
+      "title": "VirtualQueryEx",
+      "publisher": "Microsoft",
+      "published_on": "2022-05-24",
+      "verified_on": "2026-09-20",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "Current API contract checked on the verification date; publication metadata is not a technique introduction date.",
+      "primitive": "Region attributes coalesce contiguous pages; copy-on-write image pages still report MEM_IMAGE."
+    },
+    {
       "id": "bitdefender-bind-link-2026",
       "title": "Bind Link Abuse: One Windows Feature, Many Ways to Blind Your EDR",
       "publisher": "Bitdefender Labs",
@@ -382,6 +406,39 @@
     }
   ],
   "techniques": [
+    {
+      "id": "user-process-layout-history",
+      "title": "Process-instance layout changes and image impersonation leads",
+      "family": "process-injection",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": ["hasherezade-hollowing-24h2-2025", "microsoft-virtualquery-layout", "elastic-cloudfiles-ffi-2026"],
+      "observable": "Initial and periodic complete VA traversals expose executable permission, allocation and image mapping changes; independently qualified memory/file metadata and code comparisons also inspect unchanged layouts.",
+      "detector_anchors": [
+        { "path": "user/ProcessLayoutCore.h", "contains": "inline Delta Compare" },
+        { "path": "user/ProcessLayoutMonitor.cpp", "contains": "ProcessLayoutMonitor::Discover" },
+        { "path": "user/KernelMonitorLayout.cpp", "contains": "finding.layout_image_identity" }
+      ],
+      "positive_controls": [
+        { "path": "tools/process-layout-selftest.cpp", "contains": "real split protection delta" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "unchanged layout image identity mismatch detected" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "newly started child discovered and snapshotted" }
+      ],
+      "negative_controls": [
+        { "path": "tools/process-layout-selftest.cpp", "contains": "partial removal rejected" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "equivalent split" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "read failure is not mismatch" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-process-layout.ps1 -Sanitize" ],
+      "limitations": [
+        "Polling and bounded non-atomic sweeps can miss transient changes. Partial snapshots never imply absence; denied or capped processes remain coverage gaps.",
+        "Doppelganging, Herpaderping and Ghosting attribution needs section/file-object or historical evidence. Current mapped-name file identity is not proof of the original backing file.",
+        "Owned-process and synthetic controls do not establish real-cheat recall, clean fleet false-positive rates or external kernel validation."
+      ],
+      "next_action": "Operator validation on supported Windows builds, WOW64/PPL and labeled impersonation/JIT corpora; inspect coverage ages and queue loss before assigning detection claims."
+    },
     {
       "id": "callback-registration-removal",
       "title": "Security callback removal with owner persistence",

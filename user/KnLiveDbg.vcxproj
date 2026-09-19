@@ -134,6 +134,8 @@
     <ClCompile Include="KernelMonitorCatalog.cpp" />
     <ClCompile Include="KernelMonitorHunting.cpp" />
     <ClCompile Include="KernelMonitorPipeline.cpp" />
+    <ClCompile Include="KernelMonitorLayout.cpp" />
+    <ClCompile Include="ProcessLayoutMonitor.cpp" />
     <ClCompile Include="ExecutionSurfaceScanner.cpp" />
     <ClCompile Include="AnalystSnapshot.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
@@ -268,6 +270,8 @@
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="KernelMonitor.h" />
+    <ClInclude Include="ProcessLayoutCore.h" />
+    <ClInclude Include="ProcessLayoutMonitor.h" />
     <ClInclude Include="TimelineDashboard.h" />
     <ClInclude Include="TimelineModel.h" />
     <ClInclude Include="TimelineSelfTest.h" />

@@ -171,7 +171,13 @@ void KernelMonitor::CollectorLoop()
                     if (Lower(event.Source) == L"kernel-live")
                     {
                         KmonEvent classified;
-                        if (KmonClassifyLiveEvent(event, &classified) &&
+                        const bool known = KmonClassifyLiveEvent(event, &classified);
+                        if (known &&
+                            (classified.Kind == L"process.create" || classified.Kind == L"process.masquerade"))
+                        {
+                            LayoutMonitor.RequestDiscovery();
+                        }
+                        if (known &&
                             (classified.Kind == L"driver.drop_load" || classified.Kind == L"driver.official_load" ||
                                 classified.Kind == L"driver.image_only"))
                         {
@@ -601,6 +607,15 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"persistence_queue_dropped"] = std::to_wstring(CapturedPages.Loss());
         event.Evidence[L"diagnostic_queue_dropped"] = std::to_wstring(PipelineEvents.Loss());
         event.Evidence[L"catalog_queue_dropped"] = std::to_wstring(CapturedRegions.Loss());
+        const auto layout = LayoutMonitor.Stats();
+        event.Evidence[L"layout_tracked"] = std::to_wstring(layout.Tracked);
+        event.Evidence[L"layout_completed"] = std::to_wstring(layout.Completed);
+        event.Evidence[L"layout_failed"] = std::to_wstring(layout.Failed);
+        event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
+        event.Evidence[L"layout_dropped"] = std::to_wstring(LayoutCandidates.Loss());
+        event.Evidence[L"layout_checked"] = std::to_wstring(LayoutChecked.load());
+        event.Evidence[L"layout_rejected"] = std::to_wstring(LayoutRejected.load());
+        event.Evidence[L"layout_oldest_ms"] = std::to_wstring(layout.OldestAgeMs);
         event.Evidence[L"catalog_stale_observations"] = std::to_wstring(RegionCatalog.StaleObservations);
         event.Evidence[L"catalog_rejected"] = std::to_wstring(RegionCatalog.Rejected);
         event.Evidence[L"catalog_links_evicted"] = std::to_wstring(RegionCatalog.LinksEvicted);

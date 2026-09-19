@@ -461,6 +461,18 @@ Human-readable native command output uses scoped console attributes for high-sig
 21. `ai report` writes a Markdown report with session context, provider status, transcript settings, write-audit path, parsed plan, and raw AI plan response.
 22. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
 
+## Process layout monitoring
+
+`ProcessLayoutMonitor` adds an independent read-only discovery/layout thread to
+Kmon. It collects complete non-free VA traversals under Boot/PID/create-time
+identity, retains immutable first/latest snapshots and compares intervals rather
+than MBI row indices. Failed or capped sweeps preserve prior observations. New
+process events request an early inventory with a 200ms floor; polling targets one
+second. Bounded candidates cross `KmonWorkQueue` to the analysis thread, which
+revalidates identity/mapping before page and image verification. JSON readers copy
+immutable histories and a value copy of the pending cursor. Stop joins this thread
+before draining pipeline events. Details: [process layout guide](KMON_PROCESS_LAYOUTS.md).
+
 ## Hardening Backlog
 
 No large hardening backlog item is currently left open in this document. New work should be added here once it is scoped.

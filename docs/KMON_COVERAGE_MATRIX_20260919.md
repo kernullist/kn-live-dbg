@@ -30,6 +30,7 @@
 | 유저 수동 매핑·raw shellcode·reflection | VAD·VirtualQuery·실제 PTE의 실행 영역 전체 페이지 순환 | 이미지 이름·헤더·신규 스레드·콜백 참조 없이도 수집 |
 | 정상 프로세스 위장·정상 DLL 내부 implant | 선택된 모든 프로세스의 EXE/DLL 실행 섹션 비교 | 감시 이름·Windows 기본 프로세스 여부로 비교를 제외하지 않음 |
 | hollowing·stomping·ghosted/replaced backing | 이미지 바이트 비교, 매핑 대조, 참조를 검증할 수 없는 실행 페이지 보존 | 정확한 기법명은 별도 분석. 참조 파일/헤더 확인 실패를 정상 일치로 취급하지 않음 |
+| 프로세스별 배치 변화·신규 인스턴스 | 이름 미지정 시 전체 프로세스 발견, 초기·최신 완전 VA 순회, 할당/권한/매핑 변화와 초기·주기적 이미지 검증 연결 | 초기 상태는 정상 기준이 아님. 부분 순회는 비교하지 않으며 도플갱잉의 TxF 이력은 증명하지 않음. [배치 가이드](KMON_PROCESS_LAYOUTS.md) 참고 |
 | VAD unlink·VAD 권한 위장·PTE 직접 매핑 | 모든 선택 프로세스의 재개 가능한 사용자 페이지 테이블 순회 | VAD가 불완전하면 DKOM 확정은 제한되지만 현재 실행 페이지 읽기는 별도 재검증 |
 | threadless·APC·thread-pool·TLS·VEH·WNF 기반 실행 | 전체 실행 메모리/이미지 검사, APC·instrumentation·ETW 스택 참조; TLS 배열·재배치 기준 비교와 WorkerFactory 시작 루틴 | 휴면 TP 객체 그래프, VEH/WNF 전용 실행 추적은 미지원; 메타데이터는 실행 증거가 아님 |
 | PEB KernelCallbackTable 변조 | PDB로 확인한 native x64 루트와 64개 후보, 루트 교체 재검증, 저장 스냅샷 비교 | 전체 테이블 길이·WOW64 KCT·GUI 메시지 실행은 미확정. [분석가용 가이드](KMON_ANALYST_SURFACES.md) 참고 |

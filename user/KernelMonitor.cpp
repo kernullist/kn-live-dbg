@@ -6538,6 +6538,11 @@ KmonStats KernelMonitor::SnapshotStats() const
     stats.CatalogRecords = CatalogRecords.load();
     stats.CatalogEvicted = CatalogEvicted.load();
     stats.KpageResumeAddress = KpageResumeAddress.load();
+    stats.Layout = LayoutMonitor.Stats();
+    stats.LayoutPending = LayoutCandidates.Size();
+    stats.LayoutDropped = LayoutCandidates.Loss();
+    stats.LayoutChecked = LayoutChecked.load();
+    stats.LayoutRejected = LayoutRejected.load();
     stats.HookScans = HookScans.load();
     stats.CpuHookScans = CpuHookScans.load();
     stats.UserHostilityScans = UserHostilityScans.load();
@@ -6847,6 +6852,11 @@ bool KernelMonitor::Start(
             }
 
             ResetPipeline();
+            LayoutAllProcesses = options.WatchPids.empty() && options.WatchNames.empty();
+            LayoutMonitor.Reset(options.LayoutScanIntervalMs);
+            LayoutCandidates.Reset();
+            LayoutChecked.store(0);
+            LayoutRejected.store(0);
             StopRequested.store(false);
             LiveOutput.store(Options.AttachLiveTail);
             Active.store(true);
@@ -6857,6 +6867,7 @@ bool KernelMonitor::Start(
                     CaptureWriter = std::thread(&KernelMonitor::CaptureWriterLoop, this);
                     CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, this);
                     Collector = std::thread(&KernelMonitor::CollectorLoop, this);
+                    LayoutWorker = std::thread(&KernelMonitor::LayoutLoop, this);
                     Worker = std::thread(&KernelMonitor::WorkerLoop, this);
                 }
                 catch (...)
@@ -6923,6 +6934,10 @@ bool KernelMonitor::Start(
 
     if (!ok && StopRequested.load())
     {
+        if (LayoutWorker.joinable())
+        {
+            LayoutWorker.join();
+        }
         if (Collector.joinable())
         {
             Collector.join();
@@ -6960,6 +6975,10 @@ bool KernelMonitor::Stop(std::wstring* error)
         {
             worker = std::move(Worker);
         }
+    }
+    if (LayoutWorker.joinable())
+    {
+        LayoutWorker.join();
     }
     if (Collector.joinable())
     {
@@ -7061,6 +7080,7 @@ void KernelMonitor::WorkerLoop()
             IngestThreatIntel();
             DrainIotraceEvents();
             DrainPipelineEvents();
+            DrainLayoutCandidates();
 
         const uint64_t nowMs = GetTickCount64();
         const bool mapperWatch = IsMapperWatchActive();
@@ -16184,6 +16204,7 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
+        (event.Kind == L"coverage.layout" && (event.Task == L"complete" || event.Task == L"initial_observation")) ||
         event.Kind == L"coverage.page_candidates" ||
         event.Kind == L"coverage.image_permissions" ||
         ((event.Kind == L"coverage.channel" || event.Kind == L"coverage.user_references" || event.Kind == L"coverage.user_pages") &&

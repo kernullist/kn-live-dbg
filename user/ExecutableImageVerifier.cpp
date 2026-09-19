@@ -149,6 +149,7 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
     const ObservationReader& reader, std::wstring* reason)
 {
     bool ok = false;
+    bool mismatch = false;
     do
     {
         std::vector<uint8_t> bytes;
@@ -158,8 +159,12 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
         }
         IMAGE_DOS_HEADER dos = {};
         std::memcpy(&dos, bytes.data(), sizeof(dos));
-        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 16 * 1024 * 1024 ||
-            !ReadExact(reader, imageBase, dos.e_lfanew, sizeof(IMAGE_NT_HEADERS64), &bytes))
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 16 * 1024 * 1024)
+        {
+            mismatch = true;
+            break;
+        }
+        if (!ReadExact(reader, imageBase, dos.e_lfanew, sizeof(IMAGE_NT_HEADERS64), &bytes))
         {
             break;
         }
@@ -169,21 +174,27 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
             nt.FileHeader.TimeDateStamp != metadata.TimeDateStamp || nt.OptionalHeader.Magic != metadata.OptionalMagic ||
             nt.FileHeader.NumberOfSections != metadata.Sections.size())
         {
+            mismatch = true;
             break;
         }
         // SizeOfImage, CheckSum and AddressOfEntryPoint have the same PE32 offsets.
         if (nt.OptionalHeader.SizeOfImage != metadata.SizeOfImage ||
             nt.OptionalHeader.CheckSum != metadata.CheckSum || nt.OptionalHeader.AddressOfEntryPoint != metadata.EntryPointRva)
         {
+            mismatch = true;
             break;
         }
         if (metadata.HasPdbIdentity)
         {
-            if (!ReadExact(reader, imageBase, metadata.PdbRva, 24, &bytes) ||
-                std::memcmp(bytes.data(), "RSDS", 4) != 0 ||
+            if (!ReadExact(reader, imageBase, metadata.PdbRva, 24, &bytes))
+            {
+                break;
+            }
+            if (std::memcmp(bytes.data(), "RSDS", 4) != 0 ||
                 std::memcmp(bytes.data() + 4, &metadata.PdbGuid, sizeof(GUID)) != 0 ||
                 std::memcmp(bytes.data() + 20, &metadata.PdbAge, 4) != 0)
             {
+                mismatch = true;
                 break;
             }
         }
@@ -192,7 +203,7 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
     if (reason != nullptr)
     {
         *reason = ok ? (metadata.HasPdbIdentity ? L"pe_and_pdb_identity_match" : L"pe_identity_match_no_pdb") :
-            L"live_image_identity_unreadable_or_mismatched";
+            (mismatch ? L"live_image_identity_mismatch" : L"live_image_identity_unreadable");
     }
     return ok;
 }

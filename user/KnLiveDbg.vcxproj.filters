@@ -25,6 +25,12 @@
     <ClCompile Include="AnalystSnapshot.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="KernelMonitorLayout.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ProcessLayoutMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ExecutionSurfaceScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -238,6 +244,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AnalystSnapshot.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessLayoutCore.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessLayoutMonitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionSurfaceCore.h">

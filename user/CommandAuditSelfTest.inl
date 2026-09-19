@@ -55,6 +55,32 @@ static int RunCommandAuditSelfTest()
         !dbgeng.IsReady(), L"remote stays native in dbgeng mode");
 
     state.Backend = DebuggerState::BackendMode::Native;
+    const auto layouts = run(L"!kmon layouts /json");
+    check(layouts.Error.empty() && layouts.Output.find(L"kmon.layouts.v1") != std::wstring::npos &&
+        layouts.Output.find(L"\"baseline_trusted\":false") != std::wstring::npos,
+        L"layout inventory is readable without starting collectors");
+    for (const auto& line : {L"!kmon layouts /pid 0", L"!kmon layouts /pid 4", L"!kmon layouts /pid -1",
+        L"!kmon layouts /pid 4294967296", L"!kmon layouts /pid", L"!kmon layouts /initial",
+        L"!kmon layouts /json /json", L"!kmon layouts /save /json", L"!kmon layouts /unknown",
+        L"!kmon layouts /pid 5 /pid 6", L"!kmon layouts 55"})
+    {
+        check(run(line).Error.find(L"usage") != std::wstring::npos, L"layout invalid options rejected");
+    }
+    check(run(L"!kmon layouts /pid 55 /initial /json").Error.empty(), L"layout initial export option");
+    check(IsWriteLikeCommandLine(L"!kmon layouts /pid 55 /save output.json") &&
+        !IsWriteLikeCommandLine(L"!kmon layouts /pid 55 /json"), L"layout export write classification");
+    for (const auto& value : {L"999", L"60001", L"-1", L"4294967296", L"x"})
+    {
+        KmonOptions options;
+        std::wstring error;
+        check(!ParseKmonStartArgs({L"/layout-ms", value}, 0, &options, &error), L"layout interval validation");
+    }
+    {
+        KmonOptions options;
+        std::wstring error;
+        check(ParseKmonStartArgs({L"/layout-ms", L"1500"}, 0, &options, &error) && options.LayoutScanIntervalMs == 1500,
+            L"layout interval accepted");
+    }
     const auto huntCases = run(L"!kmon cases /json");
     check(huntCases.Error.empty() && huntCases.Output.find(L"kmon.hunt.v1") != std::wstring::npos &&
         huntCases.Output.find(L"\"communication_proven\":false") != std::wstring::npos,

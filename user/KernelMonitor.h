@@ -15,6 +15,7 @@
 #include "TimelineStore.h"
 #include "OrphanKernelPageScanner.h"
 #include "KmonExecutablePages.h"
+#include "ProcessLayoutMonitor.h"
 
 #include <atomic>
 #include <cstddef>
@@ -44,6 +45,7 @@ struct KmonOptions
     std::wstring DataDirectory;
     uint32_t HiddenScanIntervalMs = 5000;
     uint32_t MapperScanIntervalMs = 8000;
+    uint32_t LayoutScanIntervalMs = 5000;
     bool VerboseDrivers = false;
     bool AttachLiveTail = true;
 };
@@ -117,6 +119,11 @@ struct KmonStats
     uint64_t CatalogRecords = 0;
     uint64_t CatalogEvicted = 0;
     uint64_t KpageResumeAddress = 0;
+    ProcessLayoutStats Layout;
+    uint64_t LayoutPending = 0;
+    uint64_t LayoutDropped = 0;
+    uint64_t LayoutChecked = 0;
+    uint64_t LayoutRejected = 0;
 };
 
 // P1: post-load identity baseline for a loaded driver image. The image head
@@ -251,6 +258,8 @@ public:
     KmonOptions CurrentOptions() const;
     std::vector<KmonHuntCase> HuntCases(const AnalystCaseFilter& filter = {}) const;
     std::wstring HuntCasesJson(const AnalystCaseFilter& filter = {}, std::vector<KmonHuntCase>* cases = nullptr) const;
+    std::wstring LayoutsJson(uint32_t pid = 0, bool initial = false) const;
+    std::wstring LayoutsText(uint32_t pid = 0, bool initial = false) const;
     bool IsMapperWatchActive() const;
     std::vector<uint32_t> SnapshotWatchPids() const;
     std::wstring SnapshotMapperWatchId() const;
@@ -260,6 +269,8 @@ private:
     friend bool KmonPipelineSelfTest();
     void WorkerLoop();
     void CollectorLoop();
+    void LayoutLoop();
+    void DrainLayoutCandidates();
     void CaptureLoop();
     void CaptureWriterLoop();
     void DrainPipelineEvents(bool finalDrain = false);
@@ -394,6 +405,12 @@ private:
     std::atomic<bool> StopRequested{false};
     std::thread Worker;
     std::thread Collector;
+    std::thread LayoutWorker;
+    ProcessLayoutMonitor LayoutMonitor;
+    bool LayoutAllProcesses = true;
+    KmonWorkQueue<ProcessLayoutCandidate> LayoutCandidates{2048};
+    std::atomic<uint64_t> LayoutChecked{0};
+    std::atomic<uint64_t> LayoutRejected{0};
     std::thread CaptureWorker;
     std::thread CaptureWriter;
     std::atomic<bool> CaptureStopping{false};
@@ -469,6 +486,7 @@ private:
         uint64_t LastUsedMs = 0;
         uint64_t LastReferenceCheckMs = 0;
         bool Loaded = false;
+        bool LayoutIdentityReported = false;
         bool ManifestChecked = false;
         bool ManifestMatches = false;
         size_t ObjectCursor = 0;

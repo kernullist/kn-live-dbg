@@ -4985,6 +4985,7 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"recent",
                     L"cases",
                     L"surfaces",
+                    L"layouts",
                     L"diff",
                     L"save",
                     L"clear",
@@ -24996,13 +24997,17 @@ static void PrintKmonHelp()
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
+    std::wcout << L"  /layout-ms N    memory layout rescan target, 1000..60000 ms (default 5000)\n";
+    std::wcout << L"  no /pid or /name: discover all processes every second, including new instances\n";
+    std::wcout << L"  !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
+    std::wcout << L"    per-PID export includes regions and recent deltas; first observed is not clean\n";
     std::wcout << L"  !kmon cases [/pid N] [/role name] [/json] [/save path]  recent leads (30s expiry)\n";
     std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
     std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
-    std::wcout << L"  /log /verbose /manifest /throttle apply on the first start; later start extends watches.\n";
+    std::wcout << L"  /log /verbose /manifest /throttle /layout-ms apply on first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
@@ -25278,6 +25283,18 @@ static bool ParseKmonStartArgs(
                 return false;
             }
             options->GameManifestPath = args[i + 1];
+            i += 2;
+            continue;
+        }
+        if (opt == L"/layout-ms")
+        {
+            uint64_t interval = 0;
+            if (i + 1 >= args.size() || !ParseUnsigned(args[i + 1], 10, &interval) || interval < 1000 || interval > 60000)
+            {
+                *error = L"/layout-ms requires 1000..60000 milliseconds";
+                return false;
+            }
+            options->LayoutScanIntervalMs = static_cast<uint32_t>(interval);
             i += 2;
             continue;
         }
@@ -25628,6 +25645,15 @@ static void HandleKmonCommand(
                        << L" catalog_records=" << stats.CatalogRecords << L" evicted=" << stats.CatalogEvicted << L"\n";
             std::wcout << L"  handle_oldest_age_ms=" << stats.HandleOldestScanAgeMs
                        << L" handle_pending=" << stats.HandlePendingRecords << L"\n";
+            std::wcout << L"  layout_scope=" << (stats.Layout.AllProcesses ? L"all_processes" : L"selected_processes")
+                       << L" tracked=" << stats.Layout.Tracked << L" completed=" << stats.Layout.Completed
+                       << L" unavailable=" << stats.Layout.Unavailable << L" pending_sweeps=" << stats.Layout.Pending
+                       << L" oldest_ms=" << stats.Layout.OldestAgeMs << L" interval_ms=" << stats.Layout.IntervalMs << L"\n";
+            std::wcout << L"  layout_inventory_complete=" << stats.Layout.InventoryComplete
+                       << L" inventory_failures=" << stats.Layout.InventoryFailures << L" over_cap=" << stats.Layout.ProcessCap
+                       << L" rows=" << stats.Layout.StoredRows << L" failed=" << stats.Layout.Failed
+                       << L" verification_pending=" << stats.LayoutPending << L" dropped=" << stats.LayoutDropped
+                       << L" checked=" << stats.LayoutChecked << L" rejected=" << stats.LayoutRejected << L"\n";
             std::wcout << L"  mapper_watch=";
             if (stats.MapperWatchRemainMs > 0)
             {
@@ -25819,6 +25845,80 @@ static void HandleKmonCommand(
             }
             StartTimelineAutoDrainWorker(state, &device);
             RunKmonLiveTail(kmon);
+            break;
+        }
+
+        if (action == L"layouts")
+        {
+            uint32_t pid = 0;
+            bool initial = false;
+            bool jsonOutput = false;
+            bool valid = true;
+            std::wstring savePath;
+            std::set<std::wstring> seen;
+            for (size_t i = 2; valid && i < args.size(); ++i)
+            {
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if (option == L"/initial")
+                {
+                    initial = true;
+                }
+                else if ((option == L"/pid" || option == L"/save") && i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    if (option == L"/pid")
+                    {
+                        uint64_t parsed = 0;
+                        valid = ParseUnsigned(value, 10, &parsed) && parsed > 4 && parsed <= UINT32_MAX;
+                        pid = static_cast<uint32_t>(parsed);
+                    }
+                    else
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+            }
+            if (!valid || (initial && pid == 0))
+            {
+                std::wcerr << L"!kmon layouts: usage: !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
+                break;
+            }
+            const auto json = kmon.LayoutsJson(pid, initial);
+            if (!savePath.empty())
+            {
+                std::wstring error;
+                if (!SaveObservationJson(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon layouts: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
+            }
+            else
+            {
+                std::wcout << kmon.LayoutsText(pid, initial);
+                if (!savePath.empty())
+                {
+                    std::wcout << L"[kmon.snapshot] wrote " << savePath << L"\n";
+                }
+            }
             break;
         }
 
@@ -34173,7 +34273,7 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
         if (command == L"!kmon" && args.size() >= 2)
         {
             const auto action = ToLower(args[1]);
-            if (action == L"cases" || action == L"surfaces")
+            if (action == L"cases" || action == L"surfaces" || action == L"layouts")
             {
                 for (size_t i = 2; i < args.size(); ++i)
                 {

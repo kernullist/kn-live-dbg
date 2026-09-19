@@ -408,6 +408,7 @@ set-ppl-antimalware [on|off|status]
 !kmon iotrace <driver-name> on|off|status   # lab-only IOCTL interposition (ABI 17)
 !kmon cases [/pid N] [/role name] [/json] [/save path]  # recent investigation leads
 !kmon surfaces <pid> [/json] [/save path]   # TLS, qualified KCT, WorkerFactory metadata
+!kmon layouts [/pid N [/initial]] [/json] [/save path]  # process memory layout history
 !kmon diff <before.json> <after.json> [/json]  # saved observations; no remediation claim
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
@@ -2253,6 +2254,8 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 - **Forgot `!ti stop`?** The subscriber's destructor calls Stop on normal exit (`exit`, Ctrl+C), and the console control handler calls Stop on hard exit (window close, logoff, shutdown). A clean teardown happens in every path except `TerminateProcess`. After a TerminateProcess, recover with `logman stop KnLiveDbg-Ti -ets`.
 
 ## Kernel-cheat monitor (`!kmon`)
+
+Without `/pid` or `/name`, a dedicated reader inventories existing and new processes, retains first/latest complete virtual-memory layouts, and compares allocation, mapping and protection changes. Discovery targets one second; periodic layout sweeps default to five seconds (`/layout-ms 1000..60000` on first start). `!kmon layouts` exposes coverage and per-process JSON snapshots. Initial observations are not trusted clean baselines, and executable/image changes feed the existing verification pipeline. See the [layout guide](docs/KMON_PROCESS_LAYOUTS.md) for budgets, process identity, partial scans and detection limits.
 
 The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
 

@@ -717,6 +717,7 @@ namespace
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent kernel/user investigation leads" },
         { L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"TLS, KCT and WorkerFactory references" },
+        { L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"process memory layout history and changes" },
         { L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
         { L"clear", L"!kmon clear", L"empty the derived ring" },
@@ -739,6 +740,14 @@ namespace
         { L"/handle-start", L"/handle-start <N>", L"resume at the reported handle value" },
     };
 
+    const CompletionHint kKmonLayoutTokens[] =
+    {
+        { L"/pid", L"/pid <PID>", L"include regions and latest deltas for this instance" },
+        { L"/initial", L"/initial", L"first complete observation; requires /pid" },
+        { L"/json", L"/json", L"print structured layout observations" },
+        { L"/save", L"/save <path>", L"persist UTF-8 JSON to a new file" },
+    };
+
     const CompletionHint kKmonOptTokens[] =
     {
         { L"/pid", L"/pid <PID>", L"optional; add inject.remote for this PID" },
@@ -751,6 +760,7 @@ namespace
         { L"/throttle", L"/throttle <N>", L"max TUI events per second" },
         { L"/log", L"/log <dir>", L"derived JSONL directory" },
         { L"/manifest", L"/manifest <path>", L"optional exact-build game verification rules" },
+        { L"/layout-ms", L"/layout-ms <1000..60000>", L"layout rescan target interval; first start only" },
         { L"help", nullptr, L"show !kmon option usage" },
     };
 
@@ -1519,6 +1529,7 @@ namespace
         SCOPE(L"", L"!kmon [start] | stop | status | recent | cases | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
         SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent investigation leads", kKmonCaseTokens),
         SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"static callback references", kKmonSurfaceTokens),
+        SCOPE(L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"memory layout observations", kKmonLayoutTokens),
         SCOPE(L"opts", L"!kmon [/name] [/verbose] [/background] [/driver] [/pid] [/log]", L"kmon start options", kKmonOptTokens),
     };
 
@@ -1944,7 +1955,7 @@ namespace
         }
         else if (command == L"!kmon")
         {
-            if (first == L"cases" || first == L"surfaces")
+            if (first == L"cases" || first == L"surfaces" || first == L"layouts")
             {
                 scope = first;
             }

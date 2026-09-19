@@ -143,6 +143,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             // A DLL can be unloaded and replaced at the same base/path. Never
             // let a failed cached reference disable verification indefinitely.
             work.Loaded = false;
+            work.LayoutIdentityReported = false;
             work.LastAttemptMs = 0;
             work.ManifestChecked = false;
             work.ManifestMatches = false;
