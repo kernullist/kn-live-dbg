@@ -6,35 +6,11 @@
 #include <string>
 #include <vector>
 
-// Stage 2: inline patches on hot ntoskrnl/win32k entry points.
-//
-// A mapper or BYOVD driver that hides a process, reads a game, or blinds a
-// syscall query usually rewrites the first bytes of a hot entry point with a
-// transfer or an int3 trap instead of only hooking a callback table. This layer
-// reads the entry prologue of a symbol-resolved target list and decides from
-// the entry shape plus the ownership of the transfer target.
-//
-// Boundaries, all fail-closed:
-//   * a transfer that stays inside the module owning the function is how
-//     Windows applies a kernel hotpatch, so it is not a verdict;
-//   * win32k.sys forwards NtUser* into win32kbase/win32kfull, so a head
-//     transfer into an inbox image is not a verdict either -- only a non-inbox
-//     destination is;
-//   * a transfer through a register (jmp rax) has no statically known
-//     destination, so it stays a deferral instead of a guess;
-//   * a patch inside the function body, a .data slot swap (hook.dataptr), and a
-//     callback/SSDT/IDT hook (hook.unbacked) are covered by other layers;
-//   * a head transfer whose decoded destination is below the canonical kernel
-//     floor is not a verdict, and not a deferral either: such a value is not
-//     kernel code at all (the 32-bit immediate of a push/ret head sign-extends
-//     into the user half, and a thunk slot or an r/m the decoder read can hold
-//     anything). KmonCountMapperStubs applies the same rule to its stub slots,
-//     so a value that is data there is not a hook destination here. The int3
-//     trap form is unaffected.
-//
-// The reads repeat the canonical-address guard the kernel helpers in
-// KernelMonitor.cpp apply: a bogus size or a user-mode address must never turn
-// into a speculative read.
+// Entry-shape alerts retain their historical location-based noise filters.
+// Every resolved entry is also queued into the common byte/branch verifier
+// before those filters: same-module and inbox destinations are inspected there.
+// A shape exclusion is not an integrity verdict. Unknown register targets,
+// cycles and failed reads remain explicit coverage states in that verifier.
 
 namespace
 {
@@ -251,79 +227,6 @@ namespace
             return L"plain";
         }
     }
-}
-
-KmonInlinePatchDecode KmonDecodeInlinePatchHead(
-    const uint8_t* bytes,
-    size_t size,
-    uint64_t address)
-{
-    KmonInlinePatchDecode decode = {};
-    if (bytes == nullptr || address == 0 || size == 0)
-    {
-        return decode;
-    }
-    // Only the forms a hook can plant are decoded. The ordinary prologue bytes
-    // (push, sub rsp, mov, call __chkstk) stay Plain, so a normal entry cannot
-    // become a transfer verdict.
-    if (bytes[0] == 0xCC)
-    {
-        decode.Shape = KmonInlinePatchShape::Trap;
-        return decode;
-    }
-    if (size >= 5 && bytes[0] == 0xE9)
-    {
-        int32_t relative = 0;
-        std::memcpy(&relative, bytes + 1, sizeof(relative));
-        decode.Shape = KmonInlinePatchShape::NearJump;
-        decode.Target = address + 5 + static_cast<int64_t>(relative);
-        decode.TargetKnown = true;
-        return decode;
-    }
-    if (size >= 6 && bytes[0] == 0xFF && bytes[1] == 0x25)
-    {
-        int32_t relative = 0;
-        std::memcpy(&relative, bytes + 2, sizeof(relative));
-        decode.Shape = KmonInlinePatchShape::RipIndirect;
-        decode.SlotAddress = address + 6 + static_cast<int64_t>(relative);
-        return decode;
-    }
-    // mov reg,imm64 followed by jmp reg: the ModRM r/m field has to name the
-    // same register the mov loaded, because the immediate is only the target
-    // when that register is the one the jump consumes. A jump through any other
-    // register has no statically known destination, so it must not be reported
-    // with this immediate as its target.
-    if (size >= 12 && bytes[0] == 0x48 && bytes[1] >= 0xB8 && bytes[1] <= 0xBF &&
-        bytes[10] == 0xFF && (bytes[11] & 0xF8) == 0xE0 &&
-        (bytes[11] & 0x07) == (bytes[1] - 0xB8))
-    {
-        uint64_t immediate = 0;
-        std::memcpy(&immediate, bytes + 2, sizeof(immediate));
-        decode.Shape = KmonInlinePatchShape::RegisterImmediate;
-        decode.Target = immediate;
-        decode.TargetKnown = true;
-        return decode;
-    }
-    // push imm32; ret: the ret sign-extends the pushed value, so this form only
-    // reaches kernel code for the top window of the kernel half (0xFFFFFFFF8..
-    // upwards, the only canonical kernel range a 32-bit immediate can express).
-    // The decode reports the sign-extended value as-is, and the classifier is
-    // what refuses a value below the canonical kernel floor.
-    if (size >= 6 && bytes[0] == 0x68 && bytes[5] == 0xC3)
-    {
-        int32_t immediate = 0;
-        std::memcpy(&immediate, bytes + 1, sizeof(immediate));
-        decode.Shape = KmonInlinePatchShape::PushRet;
-        decode.Target = static_cast<uint64_t>(static_cast<int64_t>(immediate));
-        decode.TargetKnown = true;
-        return decode;
-    }
-    if (size >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xF8) == 0xE0)
-    {
-        decode.Shape = KmonInlinePatchShape::RegisterIndirect;
-        return decode;
-    }
-    return decode;
 }
 
 bool KmonDecodeInlinePatchStub(
@@ -583,6 +486,7 @@ void KernelMonitor::ScanKernelInlinePatches()
 
     for (const ResolvedTarget& target : resolved)
     {
+        QueueExecutionReference(target.Address, 0, L"entrypoint");
         if (StopRequested.load())
         {
             break;

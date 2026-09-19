@@ -1319,6 +1319,12 @@ std::vector<TiEventRecord> TiSubscriber::RecentSince(uint64_t minTimestampInclus
     return out;
 }
 
+uint64_t TiSubscriber::PeekNextSequence() const
+{
+    std::lock_guard<std::mutex> lock(RingMutex);
+    return NextRingSequence;
+}
+
 std::vector<TiEventRecord> TiSubscriber::RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const
 {
     std::vector<TiEventRecord> out;

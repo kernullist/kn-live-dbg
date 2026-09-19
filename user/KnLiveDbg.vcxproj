@@ -127,6 +127,14 @@
     <ClCompile Include="DmaPostureScanner.cpp" />
     <ClCompile Include="InputStackScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
+    <ClCompile Include="ExecutableImage.cpp" />
+    <ClCompile Include="ExecutableImageVerifier.cpp" />
+    <ClCompile Include="CodeTargetResolver.cpp" />
+    <ClCompile Include="KernelMonitorVerification.cpp" />
+    <ClCompile Include="KernelMonitorCatalog.cpp" />
+    <ClCompile Include="KernelMonitorPipeline.cpp" />
+    <ClCompile Include="GameBuildManifest.cpp" />
+    <ClCompile Include="GameBuildManifestGenerator.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
     <ClCompile Include="MapperRemnantScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
@@ -164,7 +172,9 @@
     <ClCompile Include="SnapshotJson.cpp" />
     <ClCompile Include="SnapshotModel.cpp" />
     <ClCompile Include="SnapshotPrinter.cpp" />
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="main.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
@@ -206,6 +216,17 @@
     <ClInclude Include="DmaPostureScanner.h" />
     <ClInclude Include="InputStackScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
+    <ClInclude Include="ExecutableImage.h" />
+    <ClInclude Include="ExecutableImageVerifier.h" />
+    <ClInclude Include="CodeTargetResolver.h" />
+    <ClInclude Include="ExecutableRegionCatalog.h" />
+    <ClInclude Include="KmonWorkQueue.h" />
+    <ClInclude Include="ContentHash.h" />
+    <ClInclude Include="GameBuildManifest.h" />
+    <ClInclude Include="NativeHandleSnapshot.h" />
+    <ClInclude Include="KmonHandleTracking.h" />
+    <ClInclude Include="ObservationModel.h" />
+    <ClInclude Include="ObservationWindows.h" />
     <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="LeftoverCommon.h" />
     <ClInclude Include="MapperRemnantScanner.h" />

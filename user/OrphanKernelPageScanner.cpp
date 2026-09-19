@@ -68,6 +68,46 @@ namespace
         return overlaps;
     }
 
+    uint64_t LeafPhysical(uint64_t entry, uint64_t size)
+    {
+        // Large-page PAT is bit 12; physical bases are aligned to leaf size.
+        return EntryPhysical(entry) & ~(size - 1);
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> UnownedLeafRanges(
+        const std::vector<LeftoverModuleRange>& modules, uint64_t start, uint64_t size, uint64_t resume)
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> uncovered;
+        uint64_t end = 0;
+        if (!LeftoverTryAdd(start, size, &end) || size == 0 || resume >= end)
+        {
+            return uncovered;
+        }
+        uint64_t cursor = (std::max)(start, resume);
+        std::vector<std::pair<uint64_t, uint64_t>> covered;
+        for (const auto& module : modules)
+        {
+            if (module.Base < module.End && module.Base < end && module.End > cursor)
+            {
+                covered.emplace_back((std::max)(cursor, module.Base), (std::min)(end, module.End));
+            }
+        }
+        std::sort(covered.begin(), covered.end());
+        for (const auto& range : covered)
+        {
+            if (cursor < range.first)
+            {
+                uncovered.emplace_back(cursor, range.first);
+            }
+            cursor = (std::max)(cursor, range.second);
+        }
+        if (cursor < end)
+        {
+            uncovered.emplace_back(cursor, end);
+        }
+        return uncovered;
+    }
+
     bool LooksLikePciMmioHole(uint64_t physical)
     {
         return physical >= 0x00000000F0000000ull &&
@@ -280,6 +320,7 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
             open = OrphanKernelPageRegion{};
         };
 
+        bool truncated = false;
         auto addLeaf = [&](
             uint64_t va,
             uint64_t size,
@@ -298,7 +339,8 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
                 ++result->SelfMapLeavesSkipped;
                 return;
             }
-            if (RegionOverlapsModule(modules_, va, size))
+            const auto ranges = UnownedLeafRanges(modules_, va, size, options.Incremental ? options.ResumeAddress : 0);
+            if (ranges.empty())
             {
                 ++result->ModuleLeavesSkipped;
                 return;
@@ -311,35 +353,48 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
                 return;
             }
 
-            if (haveOpen &&
-                open.End == va &&
-                open.Writable == writable &&
-                open.LargePage == largePage &&
-                open.SessionSpace == session)
+            for (const auto& range : ranges)
             {
-                open.End = va + size;
-                return;
+                if (haveOpen &&
+                    open.End == range.first &&
+                    open.Writable == writable &&
+                    open.LargePage == largePage &&
+                    open.SessionSpace == session)
+                {
+                    open.End = range.second;
+                    continue;
+                }
+                flushOpen();
+                if (options.Incremental && result->Regions.size() >= (std::max<uint32_t>)(1, options.Limit))
+                {
+                    result->ResumeAddress = range.first;
+                    truncated = true;
+                    return;
+                }
+                open.Start = range.first;
+                open.End = range.second;
+                open.PhysicalAddress = LeafPhysical(entry, size) + range.first - va;
+                open.Writable = writable;
+                open.Executable = true;
+                open.LargePage = largePage;
+                open.SessionSpace = session;
+                haveOpen = true;
             }
-
-            flushOpen();
-            open.Start = va;
-            open.End = va + size;
-            open.PhysicalAddress = EntryPhysical(entry);
-            open.Writable = writable;
-            open.Executable = true;
-            open.LargePage = largePage;
-            open.SessionSpace = session;
-            haveOpen = true;
         };
 
-        bool truncated = false;
         while (!stack.empty() && !truncated)
         {
             Level current = stack.back();
             stack.pop_back();
 
-            if (result->TablePagesWalked >= options.MaxTablePages)
+            if (current.Index >= 512)
             {
+                continue;
+            }
+            if (static_cast<uint64_t>(result->TablePagesWalked) + result->TableReadFailures >= options.MaxTablePages)
+            {
+                result->ResumeAddress = LeftoverSignExtendVa(current.VaBase |
+                    (static_cast<uint64_t>(current.Index) << shiftBase[current.Depth]), result->La57);
                 truncated = true;
                 break;
             }
@@ -348,6 +403,7 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
             std::wstring readError;
             if (!LeftoverReadPhysicalPage(device_, current.TablePa, &page, &readError))
             {
+                ++result->TableReadFailures;
                 result->Warnings.push_back(
                     L"page-table read failed at PA " +
                     LeftoverFormatHex(current.TablePa, 16) + L": " + readError);
@@ -377,6 +433,11 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
                     continue;
                 }
 
+                const uint64_t subtreeSize = 1ull << shift;
+                if (options.Incremental && va < options.ResumeAddress && options.ResumeAddress - va >= subtreeSize)
+                {
+                    continue;
+                }
                 const bool isLeaf = (current.Depth == leafDepth) ||
                     (EntryLarge(entry) && current.Depth >= (result->La57 ? 2u : 1u));
                 if (isLeaf)
@@ -393,10 +454,18 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
                         current.Depth != leafDepth,
                         current.AncestorsWritable,
                         current.AncestorsExecutable);
+                    if (truncated)
+                    {
+                        break;
+                    }
                     continue;
                 }
 
                 Level child = {};
+                if (!current.AncestorsExecutable || !EntryExecutable(entry))
+                {
+                    continue;
+                }
                 child.TablePa = EntryPhysical(entry);
                 child.VaBase = current.VaBase | (static_cast<uint64_t>(index) << shift);
                 child.Depth = current.Depth + 1;
@@ -412,16 +481,22 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
                     truncated = true;
                     break;
                 }
+                // Ascending DFS allows a VA cursor to reconstruct the walk
+                // from the current CR3 without trusting cached paging entries.
+                current.Index = index + 1;
+                stack.push_back(current);
                 stack.push_back(child);
+                break;
             }
         }
 
         flushOpen();
-        result->PageWalkComplete = !truncated;
+        result->TraversalFinished = !truncated;
+        result->PageWalkComplete = !truncated && result->TableReadFailures == 0;
         if (truncated)
         {
             result->Warnings.push_back(
-                L"kernel page-table walk hit the table-page cap; coverage is partial");
+                L"kernel page-table walk hit a table or region budget; coverage is partial");
         }
         ok = true;
     } while (false);
@@ -773,6 +848,7 @@ void OrphanKernelPageScanner::FinalizeRegions(
         result->Warnings.push_back(
             L"orphan-page output truncated to " + std::to_wstring(limit) +
             L" of " + std::to_wstring(filtered.size()) + L" region(s)");
+        result->RegionsDropped = filtered.size() - limit;
         filtered.resize(limit);
     }
     result->Regions = std::move(filtered);
@@ -870,6 +946,9 @@ std::wstring BuildOrphanKernelPageJson(const OrphanKernelPageResult& result)
     out += L",\"pfnWalkComplete\":";
     out += result.PfnWalkComplete ? L"true" : L"false";
     out += L",\"tablePagesWalked\":" + std::to_wstring(result.TablePagesWalked);
+    out += L",\"resumeAddress\":" + std::to_wstring(result.ResumeAddress);
+    out += L",\"tableReadFailures\":" + std::to_wstring(result.TableReadFailures);
+    out += L",\"regionsDropped\":" + std::to_wstring(result.RegionsDropped);
     out += L",\"executableLeaves\":" + std::to_wstring(result.ExecutableLeaves);
     out += L",\"moduleLeavesSkipped\":" + std::to_wstring(result.ModuleLeavesSkipped);
     out += L",\"selfMapLeavesSkipped\":" + std::to_wstring(result.SelfMapLeavesSkipped);
@@ -934,6 +1013,28 @@ bool OrphanKernelPageSelfTest()
 
     do
     {
+        const std::vector<LeftoverModuleRange> overlapping =
+        {
+            {0x404000, 0x406000, L"second"},
+            {0x401000, 0x402000, L"first"},
+            {0x405000, 0x407000, L"overlap"}
+        };
+        const auto gaps = UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0);
+        const auto resumed = UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0x403000);
+        if (gaps.size() != 3 || gaps[0] != std::make_pair(0x400000ull, 0x401000ull) ||
+            gaps[1] != std::make_pair(0x402000ull, 0x404000ull) ||
+            gaps[2] != std::make_pair(0x407000ull, 0x600000ull) ||
+            resumed.size() != 2 || resumed[0] != std::make_pair(0x403000ull, 0x404000ull) ||
+            resumed[1] != gaps[2] ||
+            LeafPhysical(0x80001083, 0x200000) != 0x80000000 ||
+            LeafPhysical(0x80001083, 0x40000000) != 0x80000000 ||
+            LeafPhysical(0x80001003, 0x1000) != 0x80001000 ||
+            !UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0x600000).empty() ||
+            !UnownedLeafRanges({{0x400000, 0x600000, L"full"}}, 0x400000, 0x200000, 0).empty())
+        {
+            ok = false;
+            break;
+        }
         const uint64_t pteBase = 0xFFFFF68000000000ull;
         const uint64_t va = 0xFFFFC08012345000ull;
         const uint64_t va48 = va & 0x0000FFFFFFFFFFFFull;

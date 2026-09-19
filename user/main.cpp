@@ -24957,7 +24957,7 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
 static void PrintKmonHelp()
 {
     std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
-    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/throttle N]\n";
+    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/manifest <path>] [/throttle N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
@@ -24967,11 +24967,11 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
     std::wcout << L"dwm.exe is watched by default (no /name needed): its Microsoft-signed main\n";
-    std::wcout << L"image text, graphics vtables, and heap vtable clones are compared every\n";
-    std::wcout << L"scan tick because PresentDWM/PresentMPO render hooks land there.\n";
+    std::wcout << L"image text, graphics vtables, and heap vtable clones use bounded rotating scans.\n";
+    std::wcout << L"Every watched main EXE and DLL is checked regardless of its filename.\n";
     std::wcout << L"Mapper and user-mode implant detections auto-capture the region to\n";
-    std::wcout << L"<log dir>\\captures (deduped, 256MB budget) so volatile evidence survives\n";
-    std::wcout << L"unmaps and reboots. Layers: driver_image (kernel driver on load),\n";
+    std::wcout << L"<log dir>\\captures (bounded queues, 256MB session budget). First bytes are read\n";
+    std::wcout << L"before asynchronous chunk persistence. Read/queue failures remain visible. Layers:\n";
     std::wcout << L"orphan_wx (2MB W+X samples), pool_pe (with .sys import check),\n";
     std::wcout << L"private_exec/pe, cloned_vtable (+ hook page), apc_routine (injected\n";
     std::wcout << L"user-mode entry), hidden_eprocess (DKOM evidence), graphics_dispatch\n";
@@ -24993,7 +24993,8 @@ static void PrintKmonHelp()
     std::wcout << L"  /verbose        kept for compatibility; every driver load/unload and device\n";
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
-    std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
+    std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
+    std::wcout << L"  /log /verbose /manifest /throttle apply on the first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
@@ -25003,7 +25004,7 @@ static void PrintKmonHelp()
     std::wcout << L"          masquerade/hollow/implant (incl. cloned_vtable, main_image_text,\n";
     std::wcout << L"          resource_only_pe as a quiet downgrade note), builtin/drop inject.remote\n";
     std::wcout << L"          (System-origin APC/context always shows, routine page auto-captured),\n";
-    std::wcout << L"          process.credscan, driver.captured (image auto-dump), gap.kernel_rw,\n";
+    std::wcout << L"          process.credscan, coverage.capture (persisted bytes), gap.kernel_rw,\n";
     std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids,\n";
     std::wcout << L"          hook.window / process.impair from TI (see logged kinds)\n";
 std::wcout << L"          hook.inline / hook.breakpoint (hot kernel entry head transfer or int3),\n";
@@ -25261,6 +25262,17 @@ static bool ParseKmonStartArgs(
             i += 2;
             continue;
         }
+        if (opt == L"/manifest")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/manifest requires a path";
+                return false;
+            }
+            options->GameManifestPath = args[i + 1];
+            i += 2;
+            continue;
+        }
         if (opt == L"/log")
         {
             if (i + 1 >= args.size())
@@ -25353,10 +25365,11 @@ static void HandleKmonCommand(
                 const bool firstStartOnly =
                     extra.VerboseDrivers ||
                     !extra.LogDirectory.empty() ||
+                    !extra.GameManifestPath.empty() ||
                     extra.ThrottlePerSecond != KmonOptions{}.ThrottlePerSecond;
                 if (firstStartOnly)
                 {
-                    std::wcerr << L"!kmon: /verbose, /log, and /throttle apply only on the first start";
+                    std::wcerr << L"!kmon: /verbose, /log, /manifest, and /throttle apply only on the first start";
                     if (addedWatch)
                     {
                         std::wcerr << L"; watches were updated";
@@ -25577,6 +25590,23 @@ static void HandleKmonCommand(
                        << L" hook_scans=" << stats.HookScans
                        << L" cpu_hook_scans=" << stats.CpuHookScans
                        << L" user_scans=" << stats.UserHostilityScans << L"\n";
+            std::wcout << L"  collector_last_ms=" << stats.CollectorLastMs
+                       << L" max_gap_ms=" << stats.CollectorMaxGapMs
+                       << L" lost=" << stats.CollectionLost << L" ti_lost=" << stats.TiSessionLost
+                       << L" analysis_pending=" << stats.AnalysisPending << L"\n";
+            std::wcout << L"  capture_queued=" << stats.CaptureQueued
+                       << L" pending=" << stats.CapturePending << L" failed=" << stats.CaptureFailed
+                       << L" first_max_ms=" << stats.CaptureFirstMaxMs << L"\n";
+            std::wcout << L"  user_cursor=" << stats.UserScanCursor
+                       << L" oldest_age_ms=" << stats.UserOldestScanMs
+                       << L" budget_exceeded=" << stats.AnalysisBudgetExceeded
+                       << L" last_analysis_ms=" << stats.AnalysisLastCompleteMs << L"\n";
+            std::wcout << L"  image_remaining_pages=" << stats.ImageRemainingPages
+                       << L" last_image_completion_ms=" << stats.ImageLastCompleteMs
+                       << L" kpage_resume=" << std::hex << stats.KpageResumeAddress << std::dec
+                       << L" catalog_records=" << stats.CatalogRecords << L" evicted=" << stats.CatalogEvicted << L"\n";
+            std::wcout << L"  handle_oldest_age_ms=" << stats.HandleOldestScanAgeMs
+                       << L" handle_pending=" << stats.HandlePendingRecords << L"\n";
             std::wcout << L"  mapper_watch=";
             if (stats.MapperWatchRemainMs > 0)
             {
@@ -54378,6 +54408,10 @@ int wmain(int argc, wchar_t** argv)
     knremote::EnableVirtualTerminalConsoles();
     CommandRegistry::SetColorPrinter(PrintCommandRegistryColoredText);
 
+    if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
+    {
+        return RunGameManifestCommand(argc, argv);
+    }
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
     {
         if (argc >= 3 && ToLower(argv[2]) == L"timeline")

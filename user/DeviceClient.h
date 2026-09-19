@@ -126,11 +126,11 @@ public:
     void Close();
     bool IsOpen() const;
 
-    // Boot-stable type index of "Device" objects, learned by matching this
+    // Boot-stable type index of "File" objects, learned by matching this
     // client's own device handle in a SystemExtendedHandleInformation walk
     // (no NtQueryObject name query, which can block on device objects).
     // Returns false when the index cannot be resolved.
-    bool QueryDeviceObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error);
+    bool QueryFileObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error);
 
     // Iotrace (ABI 17): interpose the target driver's IRP_MJ_DEVICE_CONTROL.
     // Mode is one of KNDBG_IOTRACE_MODE_*; driverObjectAddress is required

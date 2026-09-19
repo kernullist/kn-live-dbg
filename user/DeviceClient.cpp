@@ -1,4 +1,5 @@
 #include "DeviceClient.h"
+#include "NativeHandleSnapshot.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 
@@ -92,32 +93,9 @@ bool DeviceClient::IsOpen() const
     return device_ != INVALID_HANDLE_VALUE;
 }
 
-namespace
-{
-    struct DeviceClientHandleEntryEx
-    {
-        PVOID Object;
-        HANDLE ProcessId;
-        ULONG HandleValue;
-        ACCESS_MASK GrantedAccess;
-        USHORT CreatorBackTraceIndex;
-        USHORT ObjectTypeIndex;
-        ULONG HandleAttributes;
-        ULONG Reserved;
-    };
-
-    struct DeviceClientHandleInfoEx
-    {
-        ULONG_PTR NumberOfHandles;
-        ULONG_PTR Reserved;
-        DeviceClientHandleEntryEx Handles[1];
-    };
-}
-
-bool DeviceClient::QueryDeviceObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error)
+bool DeviceClient::QueryFileObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error)
 {
     bool ok = false;
-
     do
     {
         if (objectTypeIndex == nullptr)
@@ -125,113 +103,30 @@ bool DeviceClient::QueryDeviceObjectTypeIndex(uint32_t* objectTypeIndex, std::ws
             break;
         }
         *objectTypeIndex = 0;
-        if (device_ == INVALID_HANDLE_VALUE)
+        if (!IsOpen())
         {
-            if (error != nullptr)
-            {
-                *error = L"device handle is not open";
-            }
             break;
         }
-
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (ntdll == nullptr)
+        std::vector<NativeHandleEntry> entries;
+        if (!QueryNativeHandleSnapshot(&entries, error))
         {
-            if (error != nullptr)
-            {
-                *error = L"ntdll is not loaded";
-            }
             break;
         }
-        typedef LONG NtStatusLocal;
-        typedef NtStatusLocal(NTAPI* NtQuerySystemInformationPtr)(
-            int,
-            PVOID,
-            ULONG,
-            PULONG);
-        auto query = reinterpret_cast<NtQuerySystemInformationPtr>(
-            GetProcAddress(ntdll, "NtQuerySystemInformation"));
-        if (query == nullptr)
+        const ULONG_PTR wanted = reinterpret_cast<ULONG_PTR>(device_);
+        for (const auto& entry : entries)
         {
-            if (error != nullptr)
+            if (entry.UniqueProcessId == GetCurrentProcessId() && entry.HandleValue == wanted)
             {
-                *error = L"NtQuerySystemInformation is unavailable";
-            }
-            break;
-        }
-
-        const ULONG currentPid = GetCurrentProcessId();
-        const ULONG wanted = static_cast<ULONG>(
-            reinterpret_cast<ULONG_PTR>(device_));
-        const int SystemExtendedHandleInformation = 64;
-
-        std::vector<uint8_t> buffer;
-        for (ULONG attempt = 0; attempt < 4; ++attempt)
-        {
-            ULONG required = 0;
-            LONG status = query(
-                SystemExtendedHandleInformation,
-                nullptr,
-                0,
-                &required);
-            if (required == 0)
-            {
-                required = 1u << 20;
-            }
-            buffer.assign(static_cast<size_t>(required) + (1u << 20), 0);
-            ULONG returned = 0;
-            status = query(
-                SystemExtendedHandleInformation,
-                buffer.data(),
-                static_cast<ULONG>(buffer.size()),
-                &returned);
-            if (status == 0)
-            {
-                auto info = reinterpret_cast<DeviceClientHandleInfoEx*>(buffer.data());
-                const size_t capacity =
-                    (buffer.size() - sizeof(ULONG_PTR) * 2) /
-                    sizeof(DeviceClientHandleEntryEx);
-                const ULONG_PTR count =
-                    info->NumberOfHandles < capacity
-                        ? info->NumberOfHandles
-                        : capacity;
-                bool found = false;
-                for (ULONG_PTR index = 0; index < count; ++index)
-                {
-                    const DeviceClientHandleEntryEx& entry = info->Handles[index];
-                    if (static_cast<ULONG>(
-                            reinterpret_cast<ULONG_PTR>(entry.ProcessId)) ==
-                            currentPid &&
-                        entry.HandleValue == wanted)
-                    {
-                        *objectTypeIndex = entry.ObjectTypeIndex;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    if (error != nullptr)
-                    {
-                        *error = L"own device handle was not found in the handle table";
-                    }
-                    break;
-                }
-                ok = true;
-                break;
-            }
-            if (status != 0xC0000004u /* STATUS_INFO_LENGTH_MISMATCH */)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"NtQuerySystemInformation handles failed: 0x" +
-                        std::to_wstring(static_cast<unsigned long>(status));
-                }
+                *objectTypeIndex = entry.ObjectTypeIndex;
+                ok = *objectTypeIndex != 0;
                 break;
             }
         }
     } while (false);
-
+    if (!ok && error != nullptr && error->empty())
+    {
+        *error = L"own File handle type was not available in the native snapshot";
+    }
     return ok;
 }
 

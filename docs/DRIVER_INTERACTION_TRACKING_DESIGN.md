@@ -26,24 +26,24 @@ Status: **Phase A and Phase B.1 are implemented** (ABI 17, IOCTL 0x816/0x817).
 
 ## Phase A — watched-PID handle-table diffing (implemented, no driver change)
 
-Observability without kernel interposition: periodically diff the watched
-process's handle table and report new handles whose kernel object is a
-Device or Driver.
+Watched File handles are parsed with the native pointer-width ABI and followed
+through `FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT`. PDB field offsets,
+object type tags, address bounds, cycle detection and a stack-depth budget
+qualify each connection. Filesystem and control-device channels remain
+separate; unreadable paths remain unknown.
 
-- Implemented as `KernelMonitor::ScanWatchedHandleTables` on the ~8 s
-  user-scan tick: `HandleTableScanner` per watched pid (max 8), silent
-  first-pass baseline per pid, then `driver.handle` events for new
-  (handle,object) pairs whose `ObjectTypeIndex` equals the Device type
-  index learned once per boot from the client's own device handle
-  (`DeviceClient::QueryDeviceObjectTypeIndex`; no NtQueryObject name
-  queries, which can block on device objects).
-- Evidence: handle value, object address, granted access, pid. Handle
-  closes are not tracked. Scan failure is a `scan_failed:handles:<pid>`
-  coverage note; a non-watched pid never emits.
-- Known v1 limits (deliberate): device NAME resolution and BYOVD-list
-  cross-referencing are follow-ups; use `!handles` / `!devstack` on the
-  reported object address for manual triage. An open+close between two
-  ticks is missed.
+`DeviceClient::QueryFileObjectTypeIndex` learns the File type index from the
+client's own `CreateFile` handle. A shared system handle snapshot is consumed
+by a rotating batch of eight watched PIDs. Per-PID pending records retain a
+128-record resolution cursor. Evidence includes process creation identity,
+full-width handle/access values, File/device/driver addresses, and observation
+generation. Complete snapshots produce `present_at_attach`, `opened`, `closed`
+and `reappeared` transitions. Closed objects are never dereferenced.
+
+Ordinary filesystem observations are retained in the ring/log while their
+console display is quiet. Snapshot or symbol failures are coverage/sensor
+records. An open and close wholly between snapshots can still be missed;
+`!kmon status` exposes the oldest PID scan age and pending work.
 
 ## Phase B — kernel-side IOCTL observability (B.1 implemented as `!kmon iotrace`)
 
@@ -76,8 +76,9 @@ write ACK magic):
 ## Acceptance criteria (Phase A)
 
 - With `!kmon start /name loader.exe` and a loader that opens a device
-  handle, a `driver.handle` event appears within one user-scan tick with
-  device name and access mask; a BYOVD-listed driver name is highlighted.
+  handle, a `driver.handle` event appears after its rotating scan with
+  access mask and a qualified connection or an explicit unknown status. Device
+  names and BYOVD matching are not required for retaining the observation.
 - No `driver.handle` events for non-watched processes (watch-gated like
   `loader.activity`).
 - Handle-table walk failure surfaces as a coverage note

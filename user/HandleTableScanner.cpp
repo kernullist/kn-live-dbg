@@ -1,4 +1,5 @@
 #include "HandleTableScanner.h"
+#include "NativeHandleSnapshot.h"
 
 #include "LayoutResolver.h"
 #include "McpJson.h"
@@ -31,25 +32,6 @@ namespace
         PVOID SystemInformation,
         ULONG SystemInformationLength,
         PULONG ReturnLength);
-
-    struct SystemHandleTableEntryEx
-    {
-        PVOID Object;
-        ULONG_PTR UniqueProcessId;
-        ULONG_PTR HandleValue;
-        ULONG GrantedAccess;
-        USHORT CreatorBackTraceIndex;
-        USHORT ObjectTypeIndex;
-        ULONG HandleAttributes;
-        ULONG Reserved;
-    };
-
-    struct SystemHandleInformationEx
-    {
-        ULONG_PTR NumberOfHandles;
-        ULONG_PTR Reserved;
-        SystemHandleTableEntryEx Handles[1];
-    };
 
     struct ProcessIdentity
     {
@@ -1001,45 +983,31 @@ bool HandleTableScanner::Scan(
             break;
         }
 
-        if (buffer.size() < sizeof(ULONG_PTR) * 2)
+        std::vector<NativeHandleEntry> entries;
+        if (!ParseNativeHandleSnapshot(buffer.data(), buffer.size(), needed, &entries))
         {
             if (error != nullptr)
             {
-                *error = L"handle snapshot is truncated";
+                *error = L"native handle snapshot is truncated or inconsistent";
             }
             break;
         }
-
-        const SystemHandleInformationEx* table =
-            reinterpret_cast<const SystemHandleInformationEx*>(buffer.data());
-        const size_t headerBytes = offsetof(SystemHandleInformationEx, Handles);
-        const uint64_t count = static_cast<uint64_t>(table->NumberOfHandles);
-        const uint64_t maxCount = (buffer.size() - headerBytes) / sizeof(SystemHandleTableEntryEx);
-        const uint64_t useCount = count < maxCount ? count : maxCount;
-        if (count > maxCount)
-        {
-            result->Warnings.push_back(L"handle snapshot was truncated by buffer size");
-        }
-
+        const size_t useCount = entries.size();
         result->HandlesEnumerated = useCount;
-        result->CoverageComplete = count <= maxCount && status >= 0;
+        result->CoverageComplete = true;
         std::unordered_set<uint32_t> owners;
         bool storeCapWarned = false;
 
         for (uint64_t index = 0; index < useCount; ++index)
         {
-            const SystemHandleTableEntryEx& entry = table->Handles[index];
+            const NativeHandleEntry& entry = entries[index];
             HandleTableRecord record = {};
             if (static_cast<uint64_t>(entry.UniqueProcessId) > 0xFFFFFFFFull)
             {
                 continue;
             }
             record.OwnerPid = static_cast<uint32_t>(entry.UniqueProcessId);
-            if (static_cast<uint64_t>(entry.HandleValue) > 0xFFFFFFFFull)
-            {
-                continue;
-            }
-            record.HandleValue = static_cast<uint32_t>(entry.HandleValue);
+            record.HandleValue = static_cast<uint64_t>(entry.HandleValue);
             record.GrantedAccess = entry.GrantedAccess;
             record.ObjectTypeIndex = entry.ObjectTypeIndex;
             record.HandleAttributes = entry.HandleAttributes;

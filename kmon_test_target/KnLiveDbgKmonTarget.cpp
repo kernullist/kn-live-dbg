@@ -68,9 +68,9 @@ namespace
         return dir;
     }
 
-    std::wstring NotepadCopyPath()
+    std::wstring FixtureCopyPath(bool masquerade)
     {
-        return FixtureDir() + L"\\notepad.exe";
+        return FixtureDir() + (masquerade ? L"\\notepad.exe" : L"\\ordinary-kmon-target.exe");
     }
 
     bool UnlinkPathNow(const std::wstring& path)
@@ -440,7 +440,7 @@ namespace
         return ok;
     }
 
-    bool CopySelfToNotepad(std::wstring* outPath)
+    bool CopySelfToFixture(std::wstring* outPath, bool masquerade = false)
     {
         bool ok = false;
         do
@@ -450,7 +450,7 @@ namespace
                 break;
             }
             std::wstring src = SelfPath();
-            std::wstring dst = NotepadCopyPath();
+            std::wstring dst = FixtureCopyPath(masquerade);
             if (src.empty())
             {
                 break;
@@ -528,7 +528,7 @@ namespace
         do
         {
             std::wstring image;
-            if (!CopySelfToNotepad(&image))
+            if (!CopySelfToFixture(&image))
             {
                 std::fwprintf(stderr, L"copy self failed\n");
                 break;
@@ -735,9 +735,9 @@ int wmain(int argc, wchar_t** argv)
     }
 
     std::wstring image;
-    if (!CopySelfToNotepad(&image))
+    if (!CopySelfToFixture(&image, scenario == L"masquerade"))
     {
-        std::fwprintf(stderr, L"failed to copy fixture to %s\n", NotepadCopyPath().c_str());
+        std::fwprintf(stderr, L"failed to copy fixture to %s\n", FixtureCopyPath(scenario == L"masquerade").c_str());
         return 1;
     }
 

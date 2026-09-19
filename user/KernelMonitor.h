@@ -1,6 +1,13 @@
 #pragma once
 
 #include "DeviceClient.h"
+#include "KmonHandleTracking.h"
+#include "ObservationWindows.h"
+#include "CodeTargetResolver.h"
+#include "ExecutableImageVerifier.h"
+#include "ExecutableRegionCatalog.h"
+#include "KmonWorkQueue.h"
+#include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
 #include "TimelineStore.h"
@@ -27,6 +34,7 @@ struct KmonOptions
     uint32_t ThrottlePerSecond = 50;
     uint32_t RingCapacity = 65536;
     std::wstring LogDirectory;
+    std::wstring GameManifestPath;
     // Root for on-disk scanner data (data\byovd\...); under --cloak the
     // process runs from a %TEMP% copy without the data tree, so main.cpp
     // anchors this to the original exe folder like LogDirectory.
@@ -39,6 +47,7 @@ struct KmonOptions
 
 struct KmonEvent
 {
+    ObservationContext Observation;
     uint64_t Sequence = 0;
     uint64_t Timestamp = 0;
     std::wstring Kind;
@@ -85,6 +94,26 @@ struct KmonStats
     uint32_t LogRotations = 0;
     uint64_t StartTickMs = 0;
     uint64_t LastEventTickMs = 0;
+    uint64_t HandleOldestScanAgeMs = 0;
+    uint64_t HandlePendingRecords = 0;
+    uint64_t CollectorLastMs = 0;
+    uint64_t CollectorMaxGapMs = 0;
+    uint64_t CollectionLost = 0;
+    uint64_t TiSessionLost = 0;
+    uint64_t CaptureQueued = 0;
+    uint64_t CaptureFailed = 0;
+    uint64_t CaptureFirstMaxMs = 0;
+    uint64_t CapturePending = 0;
+    uint64_t AnalysisPending = 0;
+    uint64_t UserScanCursor = 0;
+    uint64_t UserOldestScanMs = 0;
+    uint64_t AnalysisBudgetExceeded = 0;
+    uint64_t AnalysisLastCompleteMs = 0;
+    uint64_t ImageRemainingPages = 0;
+    uint64_t ImageLastCompleteMs = 0;
+    uint64_t CatalogRecords = 0;
+    uint64_t CatalogEvicted = 0;
+    uint64_t KpageResumeAddress = 0;
 };
 
 // P1: post-load identity baseline for a loaded driver image. The image head
@@ -223,7 +252,19 @@ public:
     std::vector<uint64_t> SnapshotResiduePfns() const;
 
 private:
+    friend bool KmonPipelineSelfTest();
     void WorkerLoop();
+    void CollectorLoop();
+    void CaptureLoop();
+    void CaptureWriterLoop();
+    void DrainPipelineEvents(bool finalDrain = false);
+    void ResetPipeline();
+    bool QueueCapture(const std::wstring& role, uint64_t address, uint64_t size,
+        const ObservationIdentity& identity, uint64_t eventTimestamp, std::wstring* note,
+        uint64_t mappingGeneration = 0);
+    uint64_t QueueCapturedBytes(const std::wstring& role, uint64_t address,
+        const ObservationContext& context, const std::vector<uint8_t>& bytes);
+
     void IngestThreatIntel();
     void IngestLiveTimeline();
     void NoteCredscanRead(
@@ -233,8 +274,8 @@ private:
     // Auto-capture turns a mapper/user-mode detection into preserved
     // evidence: both the Berkan kernel arena and its explorer stub pages
     // were detected while resident but lost before a human could dump.
-    // Returns an evidence note (" capture=<path> capture_bytes=<n>") on
-    // success. Worker thread context.
+    // Returns a queued capture id; coverage.capture reports persistence and
+    // failed ranges asynchronously. Analysis thread context.
     bool CaptureRegion(
         const wchar_t* layer,
         uint64_t address,
@@ -265,6 +306,18 @@ private:
     void ScanKernelThreads();
     // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
     void ScanKernelInlinePatches();
+    CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
+        const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget);
+    void ScanKernelExecutableImages();
+    void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
+        const ObservationIdentity& identity, const ObservationReader& reader);
+    void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
+        const ObservationIdentity& identity = {});
+    void ScanExecutionReferences();
+    uint64_t ObserveExecutableRegion(ExecutableRegionObservation observation);
+    void ScanUserRegionCatalog(HANDLE process, const ObservationIdentity& identity,
+        const struct ProcessVadScanResult& vad,
+        const std::vector<std::pair<uint64_t, uint32_t>>& modules, bool inventoryComplete);
 
     // Stage 3: mapper-stub / pool-table-hiding residual verdict for one
     // orphan-page region. Returns true when the region produced a signal.
@@ -316,11 +369,123 @@ private:
     void RotateLogLocked();
     std::wstring BuildLogFilePath(int rotationIndex) const;
 
+    mutable std::mutex LifecycleMutex;
+    mutable std::mutex LoggingControlMutex;
+    mutable std::mutex IotraceMutex;
     mutable std::mutex StateMutex;
     KmonOptions Options;
     std::atomic<bool> Active{false};
     std::atomic<bool> StopRequested{false};
     std::thread Worker;
+    std::thread Collector;
+    std::thread CaptureWorker;
+    std::thread CaptureWriter;
+    std::atomic<bool> CaptureStopping{false};
+    std::atomic<bool> WriterStopping{false};
+    struct CaptureRequest
+    {
+        uint64_t Id = 0;
+        uint64_t Address = 0;
+        uint64_t Size = 0;
+        uint64_t Offset = 0;
+        uint64_t SubmittedMs = 0;
+        uint64_t EventTimestamp = 0;
+        uint64_t MappingGeneration = 0;
+        ObservationIdentity Identity;
+        std::wstring Role;
+        std::wstring Key;
+    };
+    struct CapturedPage
+    {
+        uint64_t Id = 0;
+        uint64_t Address = 0;
+        uint64_t Offset = 0;
+        uint64_t RequestedBytes = 0;
+        uint64_t FirstDelayMs = 0;
+        ObservationContext Context;
+        std::wstring Role;
+        std::vector<uint8_t> Bytes;
+    };
+    KmonWorkQueue<TiEventRecord> CollectedTi{2048};
+    KmonWorkQueue<TimelineEvent> CollectedLive{2048};
+    KmonWorkQueue<CaptureRequest> PriorityCaptures{256};
+    KmonWorkQueue<CaptureRequest> ContinuedCaptures{256};
+    KmonWorkQueue<CapturedPage> CapturedPages{512};
+    KmonWorkQueue<KmonEvent> PipelineEvents{512};
+    KmonWorkQueue<ExecutableRegionObservation> CapturedRegions{2048};
+    struct CandidateCaptureState
+    {
+        uint64_t LastAttemptMs = 0;
+        bool Persisted = false;
+    };
+    // Capture state is shared with the writer and guarded by CapturesMutex.
+    std::map<uint64_t, CandidateCaptureState> CandidateCaptures;
+    std::atomic<uint64_t> NextCaptureId{1};
+    std::atomic<uint64_t> CollectorLastMs{0};
+    std::atomic<uint64_t> CollectorMaxGapMs{0};
+    std::atomic<uint64_t> CollectionLost{0};
+    std::atomic<uint64_t> TiSessionLost{0};
+    std::atomic<bool> TiAvailable{false};
+    std::atomic<uint64_t> CaptureQueued{0};
+    std::atomic<uint64_t> CaptureFailed{0};
+    std::atomic<uint64_t> CaptureFirstMaxMs{0};
+    std::atomic<uint64_t> UserScanCursor{0};
+    std::atomic<uint64_t> UserOldestScanMs{0};
+    std::atomic<uint64_t> AnalysisBudgetExceeded{0};
+    std::atomic<uint64_t> AnalysisLastCompleteMs{0};
+    std::atomic<uint64_t> ImageRemainingPages{0};
+    std::atomic<uint64_t> ImageLastCompleteMs{0};
+    uint64_t NextPipelineStatusMs = 0;
+    uint32_t HighPriorityPidCursor = 0;
+    uint32_t BackgroundPidCursor = 0;
+    std::map<uint32_t, uint64_t> UserLastScanMs;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> HeapPageCursors;
+
+
+    struct ImageVerificationWork
+    {
+        executable_image::DiskPeMetadata Reference;
+        ExecutableSweep Sweep;
+        ObservationIdentity Identity;
+        std::wstring Path;
+        uint64_t Base = 0;
+        uint64_t LastAttemptMs = 0;
+        uint64_t LastUsedMs = 0;
+        uint64_t LastReferenceCheckMs = 0;
+        bool Loaded = false;
+        bool ManifestChecked = false;
+        bool ManifestMatches = false;
+        size_t ObjectCursor = 0;
+        std::map<std::pair<uint32_t, uint32_t>, std::wstring> ObjectReports;
+        std::map<uint32_t, uint64_t> ReportedHashes;
+    };
+    ImageVerificationWork* FindImageWork(const std::wstring& path, uint64_t base,
+        const ObservationIdentity& identity);
+    GameBuildManifest GameManifest;
+    bool GameManifestActive = false;
+    std::map<std::wstring, ImageVerificationWork> ImageWork;
+    std::map<std::pair<uint32_t, uint64_t>, size_t> UserImageCursors;
+    ExecutableRegionCatalog RegionCatalog;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserRegionCursors;
+    std::atomic<uint64_t> CatalogRecords{0};
+    std::atomic<uint64_t> CatalogEvicted{0};
+    std::atomic<uint64_t> KpageResumeAddress{0};
+    std::map<std::pair<uint64_t, uint32_t>, uint32_t> GraphicsSlotCursors;
+    uint64_t KernelImageCursor = 0;
+    uint64_t NextImageScanTickMs = 0;
+    struct ExecutionReferenceWork
+    {
+        uint64_t Target = 0;
+        uint64_t Slot = 0;
+        uint64_t ObservedAt = 0;
+        uint64_t ObservedMs = 0;
+        ObservationIdentity Identity;
+        std::wstring Role;
+    };
+    std::deque<ExecutionReferenceWork> ExecutionReferences;
+    std::set<std::wstring> ExecutionReferenceKeys;
+    std::map<std::wstring, uint64_t> ExecutionReferenceLastChecked;
+    uint64_t ExecutionReferenceDropped = 0;
 
     TiSubscriber* Ti = nullptr;
     TimelineStore* Timeline = nullptr;
@@ -340,12 +505,12 @@ private:
     std::unordered_map<uint32_t, uint32_t> WatchChildPids;
     // First-seen TI task names per watched pid backing loader.activity.
     std::unordered_map<uint32_t, std::unordered_set<std::wstring>> WatchActivityTasks;
-    // Handle-table diff state for watched pids: pid -> known (handle,object)
-    // pairs. First pass per pid is a silent baseline; later passes emit
-    // driver.handle for new Device-typed handles.
-    std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> WatchKnownHandles;
-    uint32_t WatchDeviceTypeIndex = 0;
-    bool WatchDeviceTypeKnown = false;
+    // Worker-owned snapshots; WatchMutex protects lifecycle/reset access.
+    std::map<uint32_t, KmonHandleHistory> WatchKnownHandles;
+    uint32_t WatchHandleLastPid = 0;
+    uint32_t WatchFileTypeIndex = 0;
+    bool WatchFileTypeKnown = false;
+    KmonChannelLayout ChannelLayout;
     // Iotrace state (guard with WatchMutex): armed flag for the worker
     // drain loop, target name for evidence, and first-seen (pid, ioctl)
     // pairs so the tail shows the traffic shape without a firehose.
@@ -506,8 +671,7 @@ private:
     std::map<std::wstring, std::wstring> TiResolvedImageCache;
     std::map<std::wstring, uint64_t> TiResolvedImageTickMs;
 
-    // Detection-time evidence capture state: per-session (layer, address)
-    // dedupe plus a byte budget so auto-capture can never fill the disk.
+    // In-flight identity/address/role dedupe plus a 256 MiB session budget.
     // Guarded by CapturesMutex; reset on Start().
     mutable std::mutex CapturesMutex;
     std::set<std::wstring> CapturedKeys;
@@ -786,35 +950,6 @@ enum class KmonInlinePatchKind
     Int3Breakpoint,
 };
 
-// Entry shapes the decoder recognises. Ordinary prologue bytes (push, sub rsp,
-// mov, call __chkstk) stay Plain, so a normal entry can never be a verdict.
-enum class KmonInlinePatchShape
-{
-    Plain = 0,
-    Trap,
-    NearJump,
-    RipIndirect,
-    RegisterImmediate,
-    PushRet,
-    RegisterIndirect,
-};
-
-// Pure byte-level decode of one entry prologue. RipIndirect carries the slot
-// address instead of a target because the destination is the qword in the slot
-// and needs one more read; RegisterIndirect has no static destination at all.
-// Pure, so the self-test can drive every accepted form.
-struct KmonInlinePatchDecode
-{
-    KmonInlinePatchShape Shape = KmonInlinePatchShape::Plain;
-    bool TargetKnown = false;
-    uint64_t Target = 0;
-    uint64_t SlotAddress = 0;
-};
-
-KmonInlinePatchDecode KmonDecodeInlinePatchHead(
-    const uint8_t* bytes,
-    size_t size,
-    uint64_t address);
 // A pool stub whose continuation is statically known: mov reg,imm64 / jmp reg,
 // a near jump, or push imm32 / ret. The rip-slot form needs a read this decoder
 // does not do, so it stays a plain unbacked head transfer.
@@ -924,3 +1059,5 @@ const wchar_t* KmonResidualSignalKindName(KmonResidualSignalKind kind);
 // synthetic inputs. It runs inside KernelMonitorSelfTest, which the console
 // surface self-test already registers, so the self-test surface is unchanged.
 bool KernelMonitorMapperPoolSelfTest();
+
+bool KmonPipelineSelfTest();
