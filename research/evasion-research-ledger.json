@@ -1,7 +1,7 @@
 {
   "schema": "kn-live-dbg.evasion-research-ledger.v1",
   "title": "KNLiveDbg Windows defense-evasion research and claim ledger",
-  "reviewed_through": "2026-07-30",
+  "reviewed_through": "2026-09-20",
   "scope": {
     "platform": "Windows x64 kernel, process, file-system, telemetry, and security-product impairment",
     "start_date": "2023-01-01",
@@ -28,42 +28,42 @@
       {
         "id": "bitdefender-labs",
         "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "elastic-security-labs",
-        "url": "https://www.elastic.co/security-labs/category/internals",
-        "last_checked_on": "2026-07-30"
+        "url": "https://www.elastic.co/security-labs/threat-command/category/platform-internals",
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "eset-research",
         "url": "https://www.welivesecurity.com/en/eset-research/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "google-threat-intelligence",
         "url": "https://cloud.google.com/blog/topics/threat-intelligence",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "mitre-attack-updates",
         "url": "https://attack.mitre.org/resources/updates/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "safebreach-research",
-        "url": "https://www.safebreach.com/resources/research/",
-        "last_checked_on": "2026-07-30"
+        "url": "https://www.safebreach.com/breach-and-attack-simulation-research-and-news/",
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "arxiv-security-recent",
         "url": "https://arxiv.org/list/cs.CR/recent",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "atomic-red-team-t1685",
         "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       }
     ]
   },
@@ -73,7 +73,7 @@
       "title": "Bind Link Abuse: One Windows Feature, Many Ways to Blind Your EDR",
       "publisher": "Bitdefender Labs",
       "published_on": "2026-07-15",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/bind-link-abuses-windows-feature-edr-evasion-technique",
       "source_type": "vendor-research",
       "primary": true,
@@ -85,8 +85,8 @@
       "title": "The Immutable Illusion: Pwning Your Kernel with Cloud Files",
       "publisher": "Elastic Security Labs",
       "published_on": "2026-02-20",
-      "verified_on": "2026-07-30",
-      "url": "https://www.elastic.co/security-labs/immutable-illusion",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/immutable-illusion",
       "source_type": "vendor-research",
       "primary": true,
       "version_note": "Author research documents Cloud Filter-backed False File Immutability and Redux/GodFault-Redux.",
@@ -97,7 +97,7 @@
       "title": "EDR killers explained: Beyond the drivers",
       "publisher": "ESET Research",
       "published_on": "2026-03-19",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.welivesecurity.com/en/eset-research/edr-killers-explained-beyond-the-drivers/",
       "source_type": "vendor-research",
       "primary": true,
@@ -109,7 +109,7 @@
       "title": "T1685 Throttle Cybersecurity Agent Network Traffic via QoS Policy",
       "publisher": "Red Canary Atomic Red Team",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
       "source_type": "open-test",
       "primary": true,
@@ -121,8 +121,8 @@
       "title": "Shedding light on the ABYSSWORKER driver",
       "publisher": "Elastic Security Labs",
       "published_on": "2025-03-20",
-      "verified_on": "2026-07-30",
-      "url": "https://www.elastic.co/security-labs/abyssworker",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/abyssworker",
       "source_type": "vendor-research",
       "primary": true,
       "version_note": "Reverse engineering enumerates callback removal, dispatch replacement, minifilter detach, and thread/process termination handlers.",
@@ -133,7 +133,7 @@
       "title": "Process Injection Using Windows Thread Pools",
       "publisher": "SafeBreach Labs",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.safebreach.com/blog/process-injection-using-windows-thread-pools/",
       "source_type": "vendor-research",
       "primary": true,
@@ -145,7 +145,7 @@
       "title": "Update on Windows Downdate",
       "publisher": "SafeBreach Labs",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.safebreach.com/blog/update-on-windows-downdate-downgrade-attacks/",
       "source_type": "vendor-research",
       "primary": true,
@@ -157,7 +157,7 @@
       "title": "Detection Strategy DET0577 for KernelCallbackTable hijacking",
       "publisher": "MITRE ATT&CK",
       "published_on": "2025-10-21",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://attack.mitre.org/detectionstrategies/DET0577/",
       "source_type": "detection-strategy",
       "primary": true,
@@ -169,7 +169,7 @@
       "title": "Detection Strategy DET0467 for TLS callback injection",
       "publisher": "MITRE ATT&CK",
       "published_on": "2025-10-21",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://attack.mitre.org/detectionstrategies/DET0467/",
       "source_type": "detection-strategy",
       "primary": true,
@@ -181,7 +181,7 @@
       "title": "Finding vulnerable drivers with hooking and reading result verification",
       "publisher": "Springer Cybersecurity",
       "published_on": "2026-05-13",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://link.springer.com/article/10.1186/s42400-025-00434-w",
       "source_type": "academic-paper",
       "primary": true,
@@ -193,7 +193,7 @@
       "title": "Unveiling BYOVD Threats: Malware's Use and Abuse of Kernel Drivers",
       "publisher": "NDSS Symposium",
       "published_on": "2026-02-23",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.ndss-symposium.org/wp-content/uploads/2026-s1491-paper.pdf",
       "source_type": "academic-paper",
       "primary": true,
@@ -205,7 +205,7 @@
       "title": "PsLookupProcessByProcessId function",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupprocessbyprocessid",
       "source_type": "official-doc",
       "primary": true,
@@ -217,7 +217,7 @@
       "title": "PsLookupThreadByThreadId function",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupthreadbythreadid",
       "source_type": "official-doc",
       "primary": true,
@@ -229,7 +229,7 @@
       "title": "Volatility 3 Windows handle-table traversal",
       "publisher": "Volatility Foundation",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://github.com/volatilityfoundation/volatility3/blob/fffd844b8ed7df500e74115a0ee6f818e6afa59f/volatility3/framework/plugins/windows/handles.py",
       "source_type": "reference-source",
       "primary": true,
@@ -241,7 +241,7 @@
       "title": "ReactOS executive handle-table implementation",
       "publisher": "ReactOS",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://github.com/reactos/reactos/blob/c606fd79b1c879bad37e49a69e71986dfbc2052e/ntoskrnl/ex/handle.c",
       "source_type": "reference-source",
       "primary": true,
@@ -253,7 +253,7 @@
       "title": "RX-INT: A Kernel Engine for Real-Time Detection and Analysis of In-Memory Threats",
       "publisher": "arXiv",
       "published_on": "2025-08-05",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2508.03879",
       "source_type": "academic-paper",
       "primary": true,
@@ -265,7 +265,7 @@
       "title": "An In-kernel Forensics Engine for Investigating Evasive Attacks",
       "publisher": "arXiv",
       "published_on": "2025-05-10",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2505.06498",
       "source_type": "academic-paper",
       "primary": true,
@@ -277,7 +277,7 @@
       "title": "Trace of the Times: Rootkit Detection through Temporal Anomalies in Kernel Activity",
       "publisher": "arXiv",
       "published_on": "2025-03-04",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2503.02402",
       "source_type": "academic-paper",
       "primary": true,
@@ -289,7 +289,7 @@
       "title": "EvilEDR: Repurposing EDR as an Offensive Tool",
       "publisher": "USENIX Security 2025",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.usenix.org/conference/usenixsecurity25/presentation/alachkar",
       "source_type": "academic-paper",
       "primary": true,
@@ -301,7 +301,7 @@
       "title": "I Solemnly Swear My Driver Is Up to No Good: Hunting for Attestation Signed Malware",
       "publisher": "Mandiant",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://cloud.google.com/blog/topics/threat-intelligence/hunting-attestation-signed-malware",
       "source_type": "vendor-research",
       "primary": true,
@@ -313,7 +313,7 @@
       "title": "Bindlink overview",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows/win32/bindlink/",
       "source_type": "official-doc",
       "primary": true,
@@ -325,7 +325,7 @@
       "title": "FilterVolumeInstanceFindFirst",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows/win32/api/fltuser/nf-fltuser-filtervolumeinstancefindfirst",
       "source_type": "official-doc",
       "primary": true,
@@ -747,6 +747,14 @@
       "observable": "Executable VAD/page state, loader and backing-file cross-views, thread/APC/stack provenance, and live-versus-disk bytes disagree.",
       "detector_anchors": [
         {
+          "path": "user/KernelMonitorHunting.cpp",
+          "contains": "ScanExecutablePageCandidates"
+        },
+        {
+          "path": "user/KernelMonitorVerification.cpp",
+          "contains": "ScanExecutableImage"
+        },
+        {
           "path": "user/UserModeHunter.cpp",
           "contains": "module_stomping_permission_evidence"
         },
@@ -772,9 +780,9 @@
       ],
       "limitations": [
         "Periodic collection leaves a TOCTOU gap compared with event-driven stateful hashing.",
-        "Headerless kernel executable pages are not yet covered by a full ownership sweep."
+        "Resident headerless code can be observed through bounded executable-page and ownership inspection, but unobserved ranges, unreadable pages, and transient mappings remain coverage gaps."
       ],
-      "next_action": "Add event-driven or higher-frequency provenance capture and a header-independent executable-page ownership corpus."
+      "next_action": "Extend event-driven provenance and the header-independent ownership corpus; measure full-sweep latency and transient-map recall on labeled live fixtures."
     },
     {
       "id": "pspcidtable-full-cross-view",
@@ -882,7 +890,7 @@
       "negative_controls": [],
       "validation_commands": [],
       "limitations": [
-        "Current VAD/thread/APC/stack evidence generally observes these variants only after execution."
+        "Current executable-memory inspection can flag resident code before execution, but does not enumerate the dormant thread-pool object graph or prove which queued callback will invoke it."
       ],
       "next_action": "Build a read-only worker-factory and thread-pool object graph collector with benign thread-pool negative controls."
     },

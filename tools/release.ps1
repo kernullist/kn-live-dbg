@@ -2,7 +2,11 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [switch]$SkipBuild,
-    [switch]$NoVersionBump
+    [switch]$NoVersionBump,
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+    [string]$WindowsTargetPlatformVersion,
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$TestCertificateThumbprint
 )
 
 $ErrorActionPreference = "Stop"
@@ -648,14 +652,22 @@ if ($currentResearchLedgerHash -ne
 
 if (-not $SkipBuild)
 {
-    if ($NoVersionBump)
-    {
-        & $buildScript -Configuration $Configuration
+    $buildParameters = @{
+        Configuration = $Configuration
     }
-    else
+    if (-not $NoVersionBump)
     {
-        & $buildScript -Configuration $Configuration -BumpVersion
+        $buildParameters.BumpVersion = $true
     }
+    if (-not [string]::IsNullOrWhiteSpace($WindowsTargetPlatformVersion))
+    {
+        $buildParameters.WindowsTargetPlatformVersion = $WindowsTargetPlatformVersion
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TestCertificateThumbprint))
+    {
+        $buildParameters.TestCertificateThumbprint = $TestCertificateThumbprint
+    }
+    & $buildScript @buildParameters
     if ($LASTEXITCODE -ne 0)
     {
         exit $LASTEXITCODE
@@ -810,6 +822,7 @@ if (Test-Path $vendorManifest)
 }
 
 $toolScripts = @(
+    "mcp-bridge.ps1",
     "update-byovd-intel.ps1",
     "run-hunt-clean-host.ps1",
     "validate-hunt-clean-host.ps1",
@@ -838,6 +851,62 @@ foreach ($toolScriptName in $toolScripts)
         -DestinationRoot $stagingDir `
         -RelativePath (
             "tools\$toolScriptName") `
+        -Entries $entries
+}
+
+$fixturePaths = @(
+    "tools\KnLiveDbgHuntTarget.exe",
+    "tools\KnLiveDbgHuntTargetDll.dll",
+    "tools\KnLiveDbgKmonTarget.exe"
+)
+foreach ($fixturePath in $fixturePaths)
+{
+    Copy-PackageRelativeFile `
+        -SourceRoot $outputDir `
+        -DestinationRoot $stagingDir `
+        -RelativePath $fixturePath `
+        -Entries $entries
+}
+
+$documentationPaths = @(
+    "LICENSE",
+    "third_party\zydis\amalgamated\LICENSE-Zycore.txt",
+    "third_party\zydis\amalgamated\LICENSE-Zydis.txt",
+    "docs\AI_ASSISTED_WORKFLOWS.md",
+    "docs\ARCHITECTURE.md",
+    "docs\COMMAND_AUDIT_20260919.md",
+    "docs\DRIVER_INTERACTION_TRACKING_DESIGN.md",
+    "docs\FEATURE_PLAN.md",
+    "docs\HUNT_TEST_TARGET.md",
+    "docs\KMON_ADVERSARIAL_REVIEW_20260920.md",
+    "docs\KMON_COVERAGE_MATRIX_20260919.md",
+    "docs\KMON_CROSS_DOMAIN_HUNTING.md",
+    "docs\KMON_DETECTION_VERIFICATION.md",
+    "docs\KMON_HUNTING_RESEARCH_20260919.md",
+    "docs\KMON_TEST_TARGET.md",
+    "docs\MANUAL_TEST_CHECKLIST.md",
+    "docs\MCP_SERVER_DESIGN.ko.md",
+    "docs\MCP_SERVER_DESIGN.md",
+    "docs\MCP_SETUP.ko.md",
+    "docs\MCP_SETUP.md",
+    "docs\RELEASE_NOTES_0.0.33.md",
+    "docs\RESEARCH_REFRESH_20260920.md",
+    "docs\REMOTE_OPERATOR_SESSION.md",
+    "docs\REMOTE_SETUP.ko.md",
+    "docs\REMOTE_SETUP.md",
+    "docs\TIMELINE_COMMAND_USAGE.ko.md",
+    "docs\TIMELINE_COMMAND_USAGE.md",
+    "docs\WINDBG_COMMAND_COVERAGE.md",
+    "research\kmon-adversarial-review-20260920.json",
+    "research\kmon-coverage-validation-20260920.json",
+    "research\kmon-hunting-validation-20260919.json"
+)
+foreach ($documentationPath in $documentationPaths)
+{
+    Copy-PackageRelativeFile `
+        -SourceRoot $repo `
+        -DestinationRoot $stagingDir `
+        -RelativePath $documentationPath `
         -Entries $entries
 }
 

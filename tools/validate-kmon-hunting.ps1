@@ -92,12 +92,26 @@ $badRows = @(
 foreach ($bad in $badRows)
 {
     Set-Content -LiteralPath $invalid -Value $bad -Encoding utf8
-    & $replay --replay $invalid 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 2)
+    # Windows PowerShell 5.1 promotes redirected native stderr to an error.
+    # Capture the expected diagnostic separately and check the actual exit code.
+    $invalidRun = Start-Process -FilePath $replay `
+        -ArgumentList @('--replay', ('"' + $invalid + '"')) `
+        -WindowStyle Hidden -Wait -PassThru `
+        -RedirectStandardOutput (Join-Path $output 'invalid-stdout.txt') `
+        -RedirectStandardError (Join-Path $output 'invalid-stderr.txt')
+    try
     {
-        throw 'Malformed replay input was not rejected'
+        if ($invalidRun.ExitCode -ne 2)
+        {
+            throw 'Malformed replay input was not rejected'
+        }
+    }
+    finally
+    {
+        $invalidRun.Dispose()
     }
 }
+Write-Output "[kmon.replay] malformed_inputs=$($badRows.Count) rejected=$($badRows.Count)"
 $baselineHash = ''
 if ($PeSieve)
 {

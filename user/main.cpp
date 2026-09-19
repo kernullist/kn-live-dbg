@@ -7664,6 +7664,15 @@ static bool ResolveProcessAddressContext(
             break;
         }
 
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+
         uint32_t dtbOffset = 0;
         uint32_t userDtbOffset = 0;
         if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &dtbOffset, &userDtbOffset, error))
@@ -37003,6 +37012,13 @@ static bool ResolveWriteTargetForRestore(
         *byteCount = 0;
         *addressContext = ProcessAddressContext{};
         *hasAddressContext = false;
+
+        // Native restore reads cannot succeed without an open device.
+        // Reject before symbol resolution can contact a symbol server.
+        if (!device.IsOpen())
+        {
+            break;
+        }
 
         std::wstring command = NormalizeInputCommand(commandArgs[0]);
         std::wstring error;

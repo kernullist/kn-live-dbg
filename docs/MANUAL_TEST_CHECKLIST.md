@@ -9,7 +9,7 @@ Check an item off only after it passes on a clean machine. A failure on a clean
 machine means a false positive (or a layout/assumption bug) and must be fixed
 before the feature is trusted.
 
-## Driver-free regression gate (2026-09-19)
+## Driver-free regression gate (2026-09-20)
 
 ```powershell
 .\x64\Release\KnLiveDbg.exe --self-test all
@@ -19,13 +19,16 @@ before the feature is trusted.
 .\x64\Release\KnLiveDbg.exe --self-test mcp-http
 .\x64\Debug\KnLiveDbg.exe --self-test mcp-http
 .\tools\validate-kmon-core.ps1 -Sanitize
+.\tools\validate-kmon-core.ps1 -Configuration Debug -Sanitize
+.\tools\validate-kmon-hunting.ps1 -Sanitize -PeSieve C:\tools\pe-sieve64.exe
+.\tools\validate-kmon-hunting.ps1 -Configuration Debug -Sanitize -PeSieve C:\tools\pe-sieve64.exe
 ```
 
-The [command audit](COMMAND_AUDIT_20260919.md) records the verified results:
+The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the [Kmon review](KMON_ADVERSARIAL_REVIEW_20260920.md) records the later command/page extensions. Build-time validators require the source tree and compiler. Release artifact checks are listed in the [v0.0.33 release notes](RELEASE_NOTES_0.0.33.md).
 
 | Suite | Checks per Release/Debug configuration |
 | --- | ---: |
-| `commands` | 1,988 |
+| `commands` | 1,993 |
 | `console` | 524 |
 | `timeline` | 28 |
 | `mcp-tools` | 75 |
@@ -33,6 +36,8 @@ The [command audit](COMMAND_AUDIT_20260919.md) records the verified results:
 | `connect-argv` | 4 |
 | `mcp-http` (separate) | 9 |
 | Standalone parser with AddressSanitizer | 275,002 |
+| Kmon hunting / page coverage with AddressSanitizer | 11,326 / 54 |
+| Kmon core groups with AddressSanitizer | 7 |
 
 `--self-test all` runs the first six suites before elevation, driver loading,
 and symbol initialization. `mcp-http` requires HTTP.sys URL registration

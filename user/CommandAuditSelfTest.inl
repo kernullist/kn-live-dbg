@@ -254,6 +254,21 @@ static int RunCommandAuditSelfTest()
     }
     check(run(L"ai write 1 confirm").Error.find(L"prewrite backup failed") != std::wstring::npos,
         L"AI write stops when backup fails");
+    SymbolEngine disconnectedSymbols;
+    ProcessAddressContext disconnectedContext = {};
+    bool restorePhysical = false;
+    bool hasRestoreContext = false;
+    uint64_t restoreAddress = 0;
+    uint64_t restoreSize = 0;
+    const bool restoreResolved = ResolveWriteTargetForRestore(proposal.Command, state, device,
+        disconnectedSymbols, &restorePhysical, &restoreAddress, &restoreSize,
+        &disconnectedContext, &hasRestoreContext);
+    const bool contextResolved = ResolveProcessAddressContext(device, disconnectedSymbols,
+        KNDBG_SYSTEM_PROCESS_ID, &disconnectedContext, &error);
+    check(!restoreResolved && !contextResolved && error == L"driver device is not open" &&
+        !disconnectedSymbols.IsReady() && disconnectedSymbols.CopyModules().empty() &&
+        !hasRestoreContext && !state.HasKernelProcessContext,
+        L"disconnected restore and process resolution fail before symbol initialization");
     aiState.Commands.clear();
     check(BuildLogFileName() != BuildLogFileName(), L"rapid log toggles do not reuse a filename");
     check(!run(L"log invalid-action").Error.empty(), L"invalid log action is reported as an error");
