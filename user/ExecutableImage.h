@@ -124,6 +124,7 @@ namespace executable_image
     bool DiskFileIdentityMatches(
         HANDLE file,
         const DiskPeMetadata& metadata);
+    bool DiskReferenceIdentityMatches(const std::wstring& path, const DiskPeMetadata& metadata);
     bool ApplyBaseRelocationsToDiskPage(
         const DiskPeMetadata& metadata,
         uint32_t pageRva,

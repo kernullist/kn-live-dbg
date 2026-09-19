@@ -1,6 +1,7 @@
 #include "ExecutableImageVerifier.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <set>
 
@@ -216,8 +217,14 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
     result.Coverage.Attempted = true;
     result.Coverage.RequestedBytes = size;
     result.Coverage.Reason = L"reference_or_live_read_failed";
+    const bool addressValid = imageBase <= UINT64_MAX - rva && imageBase + rva <= UINT64_MAX - size;
     do
     {
+        if (!addressValid)
+        {
+            result.Coverage.Reason = L"invalid_address_range";
+            break;
+        }
         const auto section = FindDiskSectionForRva(metadata, rva);
         if (section == nullptr || !section->Executable || size == 0 || size > 4096 ||
             rva >= metadata.SizeOfImage || size > metadata.SizeOfImage - rva ||
@@ -242,15 +249,6 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
         {
             break;
         }
-        if (result.Expected != result.Observed)
-        {
-            std::vector<uint8_t> confirmed;
-            if (!ReadExact(reader, imageBase, rva, size, &confirmed) || confirmed != result.Observed)
-            {
-                result.Coverage.Reason = L"live_bytes_unstable_or_unreadable";
-                break;
-            }
-        }
         std::vector<bool> mutableBytes(size, false);
         const auto mask = [&](const std::vector<DiskPeMutableRange>& ranges)
         {
@@ -267,6 +265,30 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
         };
         mask(metadata.LoaderMutableRanges);
         mask(metadata.DynamicRelocationRanges);
+        bool differs = false;
+        for (uint32_t i = 0; i < size; ++i)
+        {
+            differs = differs || (!mutableBytes[i] && result.Expected[i] != result.Observed[i]);
+        }
+        if (differs)
+        {
+            std::vector<uint8_t> confirmed;
+            bool stable = ReadExact(reader, imageBase, rva, size, &confirmed);
+            for (uint32_t i = 0; stable && i < size; ++i)
+            {
+                stable = mutableBytes[i] || confirmed[i] == result.Observed[i];
+            }
+            if (!stable)
+            {
+                result.Coverage.Reason = L"live_bytes_unstable_or_unreadable";
+                break;
+            }
+        }
+        if (!DiskReferenceIdentityMatches(path, metadata))
+        {
+            result.Coverage.Reason = L"reference_changed_during_compare";
+            break;
+        }
         for (uint32_t i = 0; i < size; ++i)
         {
             if (mutableBytes[i])
@@ -297,7 +319,10 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
     if (!result.Coverage.TraversalComplete)
     {
         result.Coverage.FailedBytes = size;
-        result.Coverage.Failed.push_back({imageBase + rva, size});
+        if (addressValid)
+        {
+            result.Coverage.Failed.push_back({imageBase + rva, size});
+        }
     }
     return result;
 }
@@ -359,11 +384,11 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Coverage.RangesTruncated = sweep->Coverage.RangesTruncated || page.Coverage.RangesTruncated;
         results.push_back(std::move(page));
     }
-    const bool hasChanges = std::any_of(results.begin(), results.end(), [](const ExecutablePageResult& page)
+    const bool hasComparedBytes = std::any_of(results.begin(), results.end(), [](const ExecutablePageResult& page)
     {
-        return page.Ownership == CodeOwnership::OwnedModified;
+        return page.Coverage.ComparedBytes != 0;
     });
-    if (hasChanges && !QualifyExecutableReference(metadata, imageBase, reader, &reason))
+    if (hasComparedBytes && !QualifyExecutableReference(metadata, imageBase, reader, &reason))
     {
         // The mapping may have changed after the initial identity read.
         for (auto& page : results)
@@ -527,6 +552,88 @@ bool ExecutableImageVerifierSelfTest()
         {
             break;
         }
+        bool reviewControls = true;
+        const auto reviewCheck = [&](bool condition, const char* name)
+        {
+            if (!condition)
+            {
+                std::fprintf(stderr, "[kmon.review] FAIL %s\n", name);
+                reviewControls = false;
+            }
+        };
+        for (bool dynamic : {false, true})
+        {
+            auto mutableMetadata = metadata;
+            auto& ranges = dynamic ? mutableMetadata.DynamicRelocationRanges : mutableMetadata.LoaderMutableRanges;
+            ranges.push_back({0x3004, 1});
+            size_t mutableReads = 0;
+            const ObservationReader mutableReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+            {
+                if (!reader(address, count, bytes))
+                {
+                    return false;
+                }
+                if (address == loadedBase + 0x3000)
+                {
+                    (*bytes)[4] ^= static_cast<uint8_t>(++mutableReads);
+                }
+                return true;
+            };
+            const auto stableChange = CompareExecutableRange(path, mutableMetadata, loadedBase, 0x3000, 4096, mutableReader);
+            reviewCheck(stableChange.Ownership == CodeOwnership::OwnedModified && stableChange.Changes.size() == 1 &&
+                stableChange.Changes[0].Address == 0x3500 && stableChange.Coverage.ComparedBytes == 4095 &&
+                stableChange.Coverage.SkippedBytes == 1 && stableChange.Coverage.FailedBytes == 0,
+                dynamic ? "dynamic mutation preserves stable code change" : "loader mutation preserves stable code change");
+        }
+        ExecutableSweep cleanReuse;
+        cleanReuse.Initialize(metadata);
+        const ObservationReader cleanReuseReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+        {
+            const bool read = reader(address, count, bytes);
+            if (read && address == loadedBase + 0x1000 && count == 4096)
+            {
+                live[0] = 0;
+            }
+            return read;
+        };
+        const auto reusedClean = AdvanceExecutableSweep(path, metadata, loadedBase, cleanReuseReader, 1, 6, &cleanReuse);
+        live[0] = 'M';
+        reviewCheck(reusedClean.size() == 1 && reusedClean[0].Ownership == CodeOwnership::OwnedUnverified &&
+            !reusedClean[0].Coverage.Complete() && cleanReuse.Pages.empty(), "clean bytes do not validate a replaced image");
+
+        const auto rewriteReference = [&](const std::vector<uint8_t>& bytes)
+        {
+            HANDLE output = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (output == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+            DWORD count = 0;
+            const bool writtenAll = WriteFile(output, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr) &&
+                count == bytes.size();
+            CloseHandle(output);
+            return writtenAll;
+        };
+        bool replacedReference = false;
+        auto replacedDisk = disk;
+        replacedDisk[0x2900] ^= 1;
+        const ObservationReader replaceReferenceReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+        {
+            const bool read = reader(address, count, bytes);
+            if (read && !replacedReference)
+            {
+                replacedReference = rewriteReference(replacedDisk);
+            }
+            return read;
+        };
+        const auto staleReference = CompareExecutableRange(path, metadata, loadedBase, 0x3000, 4096, replaceReferenceReader);
+        reviewCheck(replacedReference && staleReference.Ownership == CodeOwnership::OwnedUnverified &&
+            staleReference.Changes.empty(), "reference file changed during live read");
+        if (!rewriteReference(disk) || !ReadDiskPeMetadata(path, &metadata, nullptr) || !reviewControls)
+        {
+            break;
+        }
         // A loader or hotpatch transition must not become a stable difference.
         size_t changingReads = 0;
         const ObservationReader changingReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
@@ -553,6 +660,13 @@ bool ExecutableImageVerifierSelfTest()
         if (discarded.Ownership != CodeOwnership::OwnedUnverified || !discarded.Changes.empty() ||
             discarded.Coverage.SkippedBytes != 4096 || discarded.Coverage.ComparedBytes != 0)
         {
+            break;
+        }
+        const auto invalidDiscarded = CompareExecutableRange(path, discardable, UINT64_MAX - 0xFFF, 0x3000, 4096, reader);
+        if (!invalidDiscarded.Coverage.Skipped.empty() || !invalidDiscarded.Coverage.Failed.empty() ||
+            invalidDiscarded.Coverage.TraversalComplete || invalidDiscarded.Coverage.FailedBytes != 4096)
+        {
+            std::fprintf(stderr, "[kmon.review] FAIL discarded range address overflow\n");
             break;
         }
         // A second read failure cannot confirm the first mismatching read.

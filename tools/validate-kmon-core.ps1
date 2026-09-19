@@ -48,7 +48,7 @@ $quotedSourceList = foreach ($item in $sources)
     '"' + $item + '"'
 }
 $quotedSources = $quotedSourceList -join ' '
-$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /link /INCREMENTAL:NO' -f $vcvars, $flags, $quotedSources, $exe, ($output.Replace('\', '/') + '/')
+$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}compiler.pdb" /link /INCREMENTAL:NO' -f $vcvars, $flags, $quotedSources, $exe, ($output.Replace('\', '/') + '/')
 $batch = Join-Path $output 'compile.cmd'
 Set-Content -LiteralPath $batch -Value ("@echo off`r`n" + $command + "`r`nexit /b %errorlevel%") -Encoding ascii
 & $batch

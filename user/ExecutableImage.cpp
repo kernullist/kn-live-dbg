@@ -1632,6 +1632,20 @@ namespace executable_image
         return ok;
     }
 
+    bool DiskReferenceIdentityMatches(const std::wstring& rawPath, const DiskPeMetadata& metadata)
+    {
+        const std::wstring path = NormalizeReferencePath(rawPath);
+        HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const bool matches = DiskFileIdentityMatches(file, metadata);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(file);
+        }
+        return matches;
+    }
+
     bool DiskFileIdentityMatches(
         HANDLE file,
         const DiskPeMetadata& metadata)
