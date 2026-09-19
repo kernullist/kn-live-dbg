@@ -137,6 +137,8 @@ struct ProcessVadScanOptions
     bool HiddenPteExecutableOnly = false;
     bool RequireVadCoverageForHiddenPtes = false;
     uint32_t HiddenPteLimit = 0;
+    uint32_t HiddenPteTableBudget = 0;
+    uint64_t HiddenPteResumeAddress = 0;
     uint32_t Limit = 0;
 };
 
@@ -157,6 +159,9 @@ struct ProcessVadScanResult
     uint64_t PteLeafMappings = 0;
     uint64_t PageTablePagesRead = 0;
     uint64_t PageTableReadFailures = 0;
+    uint64_t HiddenPteResumeAddress = 0;
+    bool HiddenPteTraversalFinished = false;
+    bool HiddenPteBudgetExhausted = false;
     uint64_t HiddenPteRanges = 0;
     uint64_t HiddenPteBytes = 0;
     uint64_t HiddenPteExecutableCount = 0;

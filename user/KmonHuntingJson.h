@@ -12,6 +12,8 @@ inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
     out += L",\"pid\":" + std::to_wstring(identity.ProcessId);
     out += L",\"create_time\":" + mcpjson::Quote(std::to_wstring(identity.CreateTime));
     out += L",\"eprocess\":" + mcpjson::Quote(std::to_wstring(identity.Eprocess));
+    out += L",\"session_id\":" + std::to_wstring(identity.SessionId);
+    out += L",\"session_known\":" + std::wstring(identity.SessionKnown ? L"true" : L"false");
     out += L",\"address\":" + mcpjson::Quote(std::to_wstring(row.Address));
     out += L",\"root\":" + mcpjson::Quote(std::to_wstring(row.Root));
     out += L",\"slot\":" + mcpjson::Quote(std::to_wstring(row.Slot));
@@ -26,6 +28,7 @@ inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
     out += L",\"page_sha256\":" + mcpjson::Quote(row.PageSha256);
     out += L",\"page_comparable\":" + std::wstring(row.PageComparable ? L"true" : L"false");
     out += L",\"slot_stable\":" + std::wstring(row.SlotStable ? L"true" : L"false");
+    out += L",\"page_executable_verified\":" + std::wstring(row.PageExecutableVerified ? L"true" : L"false");
     out += L",\"pfn_known\":" + std::wstring(context.PfnKnown ? L"true" : L"false");
     out += L",\"pfn\":" + mcpjson::Quote(std::to_wstring(context.Pfn));
     out += L",\"execution_observed\":false}";

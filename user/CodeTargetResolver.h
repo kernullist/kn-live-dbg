@@ -49,6 +49,7 @@ struct CodeTargetChain
     std::wstring Termination = L"unresolved";
     bool HasModifiedCode = false;
     bool HasUnownedExecutable = false;
+    bool HasUnexpectedExecutable = false;
     bool ReferenceChecked = false;
     bool ReferenceStable = false;
 };

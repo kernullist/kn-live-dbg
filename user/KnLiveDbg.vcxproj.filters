@@ -490,6 +490,15 @@
     <ClInclude Include="KmonHunting.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="KmonExecutablePages.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="UserExecutablePteWalker.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExecutableImagePermissions.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="KmonHuntingJson.h">
       <Filter>Header Files</Filter>
     </ClInclude>

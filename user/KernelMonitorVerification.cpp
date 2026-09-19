@@ -1,6 +1,7 @@
 #include "KernelMonitor.h"
 #include "ContentHash.h"
 #include "KmonHuntingJson.h"
+#include "ExecutableImagePermissions.h"
 
 #include <TlHelp32.h>
 #include <algorithm>
@@ -59,6 +60,32 @@ namespace
             CloseHandle(snapshot);
         }
         return modules;
+    }
+
+    bool ResolveHuntAddressSpace(DeviceClient& device, SymbolEngine& symbols,
+        const ObservationIdentity& identity, ProcessAddressContext* context)
+    {
+        TypeFieldInfo pcb = {}, dtb = {}, create = {};
+        if (!symbols.FindField(L"nt!_EPROCESS", L"Pcb", &pcb, nullptr) ||
+            !symbols.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtb, nullptr) ||
+            !symbols.FindField(L"nt!_EPROCESS", L"CreateTime", &create, nullptr) ||
+            pcb.IsBitField || dtb.IsBitField || create.IsBitField || dtb.Length != 8 || create.Length != 8 ||
+            pcb.Offset >= 0x10000 || dtb.Offset >= 0x10000 || create.Offset >= 0x10000 ||
+            pcb.Offset + dtb.Offset > 0x10000 - 8 ||
+            !device.ResolveProcess(identity.ProcessId, static_cast<uint32_t>(pcb.Offset + dtb.Offset), 0, context, nullptr) ||
+            context->Eprocess < 0xFFFF800000000000ull || context->Eprocess > UINT64_MAX - create.Offset - 8 ||
+            (identity.Eprocess != 0 && identity.Eprocess != context->Eprocess))
+        {
+            return false;
+        }
+        std::vector<uint8_t> bytes;
+        uint64_t creation = 0;
+        if (!device.ReadMemory(context->Eprocess + create.Offset, 8, &bytes, nullptr) || bytes.size() != 8)
+        {
+            return false;
+        }
+        std::memcpy(&creation, bytes.data(), 8);
+        return creation == identity.CreateTime && creation != 0 && context->DirectoryTableBase != 0;
     }
 }
 
@@ -119,6 +146,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.ManifestChecked = false;
             work.ManifestMatches = false;
             work.ObjectCursor = 0;
+            work.PermissionCursor = 0;
             work.ObjectReports.clear();
             work.ReportedHashes.clear();
             work.Sweep = {};
@@ -254,6 +282,74 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     return state;
 }
 
+void KernelMonitor::ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
+    const ObservationIdentity& identity, const ObservationReader& reader)
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    if (!GetLiveTargets(&device, &symbols) || ExecutionReferences.size() >= 64)
+    {
+        return;
+    }
+    auto work = FindImageWork(path, base, identity);
+    if (work == nullptr || !QualifyExecutableReference(work->Reference, base, reader, nullptr))
+    {
+        return;
+    }
+    ProcessAddressContext context = {};
+    if (identity.ProcessId != 0 && !ResolveHuntAddressSpace(*device, *symbols, identity, &context))
+    {
+        EmitUnique(L"coverage.image_permissions", L"image:permissions:identity:" + ImageKey(path, base, identity),
+            path, L"image", L"image permission scan unavailable", L"process address-space identity unavailable", identity.ProcessId);
+        return;
+    }
+    uint32_t checked = 0;
+    uint32_t failed = 0;
+    uint32_t candidates = 0;
+    bool complete = false;
+    for (uint32_t visited = 0; visited < 4096 && checked < 4 && !StopRequested.load(); ++visited)
+    {
+        const uint64_t rva = work->PermissionCursor;
+        if (rva >= work->Reference.SizeOfImage || base > UINT64_MAX - rva)
+        {
+            work->PermissionCursor = 0;
+            complete = true;
+            break;
+        }
+        work->PermissionCursor += 4096;
+        if (DeclaredExecutableImagePage(work->Reference, rva))
+        {
+            continue;
+        }
+        ++checked;
+        PhysicalTranslationInfo mapping = {};
+        if (!device->TranslateVirtual(identity.ProcessId == 0 ? 0 : context.DirectoryTableBase, base + rva, 1, &mapping, nullptr))
+        {
+            ++failed;
+            continue;
+        }
+        if (KmonHardwareExecutable(mapping.Pml5e, mapping.Pml4e, mapping.Pdpte, mapping.Pde,
+            mapping.Pte, mapping.PageSize, mapping.PagingLevels, identity.ProcessId != 0))
+        {
+            QueueExecutionReference(base + rva, 0, L"image_page_candidate", identity);
+            ++candidates;
+        }
+    }
+    KmonEvent event;
+    event.Kind = L"coverage.image_permissions";
+    event.ProcessId = identity.ProcessId;
+    event.Image = path;
+    event.Observation.Identity = identity;
+    event.Observation.Source = L"image_pte_permissions";
+    event.Summary = L"non-executable PE pages checked against current hardware permissions";
+    event.Evidence[L"pages_checked"] = std::to_wstring(checked);
+    event.Evidence[L"translations_unavailable"] = std::to_wstring(failed);
+    event.Evidence[L"candidates"] = std::to_wstring(candidates);
+    event.Evidence[L"cursor_rva"] = std::to_wstring(work->PermissionCursor);
+    event.Evidence[L"cycle_finished"] = complete ? L"true" : L"false";
+    RecordEvent(std::move(event));
+}
+
 void KernelMonitor::ScanKernelExecutableImages()
 {
     DeviceClient* device = nullptr;
@@ -285,13 +381,14 @@ void KernelMonitor::ScanKernelExecutableImages()
                 device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
         };
         ScanExecutableImage(KmonNormalizeDriverPath(it->ImagePath), it->Base, ObserveProcessIdentity(0), reader, 16);
+        ScanImagePermissionCandidates(KmonNormalizeDriverPath(it->ImagePath), it->Base, ObserveProcessIdentity(0), reader);
     }
 }
 
 void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     const std::wstring& role, const ObservationIdentity& identity, uint64_t observedAt)
 {
-    if (target == 0)
+    if (target == 0 && !KmonPageRole(role))
     {
         return;
     }
@@ -363,14 +460,28 @@ void KernelMonitor::ScanExecutionReferences()
             process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         }
         const std::unique_ptr<void, decltype(&CloseHandle)> processOwner(process, &CloseHandle);
-        if (pid != 0 && !work.Identity.SameInstance(ObserveProcessIdentity(pid, process)))
+        const auto sameProcess = [&]()
+        {
+            if (pid == 0)
+            {
+                return true;
+            }
+            if (process != nullptr)
+            {
+                return work.Identity.SameInstance(ObserveProcessIdentity(pid, process));
+            }
+            ProcessAddressContext current = {};
+            return ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current);
+        };
+        if (!sameProcess())
         {
             EmitUnique(L"coverage.references", L"scan_failed:references:identity:" + std::to_wstring(pid),
                 L"", L"references", L"queued reference has stale or unknown process identity", L"", pid);
             continue;
         }
         BOOL wow64 = FALSE;
-        if (pid != 0 && (process == nullptr || !IsWow64Process(process, &wow64) || wow64))
+        const bool pageCheck = KmonPageRole(work.Role) || work.Role == L"etw_stack_return";
+        if (pid != 0 && !pageCheck && (process == nullptr || !IsWow64Process(process, &wow64) || wow64))
         {
             EmitUnique(L"coverage.references", L"scan_failed:references:architecture:" + std::to_wstring(pid),
                 L"", L"references", L"static target decoding requires a confirmed native x64 process",
@@ -378,11 +489,55 @@ void KernelMonitor::ScanExecutionReferences()
             continue;
         }
         const auto modules = pid == 0 ? symbols->CopyModules() : UserModules(pid);
-        const ObservationReader reader = [device, process, &work](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        ProcessAddressContext addressSpace = {};
+        bool addressSpaceTried = false;
+        bool addressSpaceValid = false;
+        const auto executableMapping = [&](uint64_t address, PhysicalTranslationInfo* mapping)
+        {
+            *mapping = {};
+            MEMORY_BASIC_INFORMATION region = {};
+            const bool regionKnown = pid != 0 && process != nullptr &&
+                VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &region, sizeof(region)) == sizeof(region);
+            if (pid != 0 && !addressSpaceTried)
+            {
+                addressSpaceTried = true;
+                addressSpaceValid = ResolveHuntAddressSpace(*device, *symbols, work.Identity, &addressSpace);
+            }
+            if ((pid == 0 || addressSpaceValid) &&
+                device->TranslateVirtual(pid == 0 ? 0 : addressSpace.DirectoryTableBase, address, 1, mapping, nullptr))
+            {
+                return KmonHardwareExecutable(mapping->Pml5e, mapping->Pml4e, mapping->Pdpte,
+                    mapping->Pde, mapping->Pte, mapping->PageSize, mapping->PagingLevels, pid != 0);
+            }
+            *mapping = {};
+            return regionKnown &&
+                region.State == MEM_COMMIT && (region.Protect & PAGE_GUARD) == 0 &&
+                (region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        };
+        PhysicalTranslationInfo candidateMapping = {};
+        if (KmonPageRole(work.Role) && !executableMapping(work.Target, &candidateMapping))
+        {
+            EmitUnique(L"coverage.execution_path", L"page:unavailable:" + referenceKey, L"", work.Role,
+                L"candidate page is no longer executable or its mapping is unavailable", L"current mapping revalidation failed", pid);
+            continue;
+        }
+        bool physicalPageRead = false;
+        const ObservationReader reader = [device, process, &work, &executableMapping, &physicalPageRead]
+            (uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
             if (size > 4096 || address > UINT64_MAX - size)
             {
                 return false;
+            }
+            if (KmonPageRole(work.Role) && size == 4096 && (address & 4095) == 0)
+            {
+                PhysicalTranslationInfo mapping = {};
+                if (executableMapping(address, &mapping) && mapping.PhysicalAddress != 0 &&
+                    device->ReadPhysical(mapping.PhysicalAddress, 4096, bytes, nullptr) && bytes->size() == 4096)
+                {
+                    physicalPageRead = true;
+                    return true;
+                }
             }
             if (work.Identity.ProcessId == 0)
             {
@@ -392,6 +547,12 @@ void KernelMonitor::ScanExecutionReferences()
             if (work.Role == L"instrumentation_callback" && work.Slot != 0 && address == work.Slot && size == 8)
             {
                 return device->ReadMemory(address, 8, bytes, nullptr);
+            }
+            MEMORY_BASIC_INFORMATION protection = {};
+            if (process != nullptr && VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &protection,
+                sizeof(protection)) == sizeof(protection) && (protection.Protect & PAGE_GUARD) != 0)
+            {
+                return false;
             }
             bytes->resize(size);
             SIZE_T read = 0;
@@ -415,6 +576,11 @@ void KernelMonitor::ScanExecutionReferences()
                     {
                         return CodeOwnership::OwnedUnverified;
                     }
+                    PhysicalTranslationInfo mapping = {};
+                    if (UnexpectedExecutableImageAddress(image->Reference, address - module.Base) && executableMapping(address, &mapping))
+                    {
+                        return CodeOwnership::OwnedUnexpectedExecutable;
+                    }
                     const ObservationReader captured = [&](uint64_t at, size_t count, std::vector<uint8_t>* out)
                     {
                         if (at == address && count == bytes.size())
@@ -432,29 +598,12 @@ void KernelMonitor::ScanExecutionReferences()
             {
                 return CodeOwnership::Unknown;
             }
-            if (pid == 0)
-            {
-                PhysicalTranslationInfo page = {};
-                if (device->TranslateVirtual(0, address, 1, &page, nullptr))
-                {
-                    const uint64_t nx = (page.Pml5e | page.Pml4e | page.Pdpte | page.Pde | page.Pte) >> 63;
-                    return nx == 0 ? CodeOwnership::UnownedExecutable : CodeOwnership::Unknown;
-                }
-            }
-            else
-            {
-                MEMORY_BASIC_INFORMATION page = {};
-                if (process != nullptr && VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &page, sizeof(page)) == sizeof(page) &&
-                    page.State == MEM_COMMIT && (page.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0)
-                {
-                    return CodeOwnership::UnownedExecutable;
-                }
-            }
-            return CodeOwnership::Unknown;
+            PhysicalTranslationInfo page = {};
+            return executableMapping(address, &page) ? CodeOwnership::UnownedExecutable : CodeOwnership::Unknown;
         };
         const bool pointerSlot = work.Slot != 0 && KmonPointerReference(work.Role);
         CodeTargetChain chain;
-        if (work.Role == L"etw_stack_return")
+        if (pageCheck)
         {
             CodeTargetHop hop;
             hop.Address = work.Target & ~4095ull;
@@ -463,12 +612,14 @@ void KernelMonitor::ScanExecutionReferences()
                 hop.Ownership = inspect(hop.Address, hop.Bytes);
                 chain.HasModifiedCode = hop.Ownership == CodeOwnership::OwnedModified;
                 chain.HasUnownedExecutable = hop.Ownership == CodeOwnership::UnownedExecutable;
+                chain.HasUnexpectedExecutable = hop.Ownership == CodeOwnership::OwnedUnexpectedExecutable;
                 chain.Hops.push_back(std::move(hop));
-                chain.Termination = L"historical_stack_page_checked; not_a_function_entry";
+                chain.Termination = work.Role == L"etw_stack_return" ?
+                    L"historical_stack_page_checked; not_a_function_entry" : L"executable_page_checked; no_execution_reference";
             }
             else
             {
-                chain.Termination = L"historical_stack_location_unreadable";
+                chain.Termination = L"page_location_unreadable";
             }
         }
         else
@@ -478,6 +629,14 @@ void KernelMonitor::ScanExecutionReferences()
         }
         KmonEvent event;
         event.Kind = chain.HasModifiedCode || chain.HasUnownedExecutable ? L"finding.execution_path" : L"coverage.execution_path";
+        if (KmonPageRole(work.Role) && (chain.HasModifiedCode || chain.HasUnownedExecutable))
+        {
+            event.Kind = L"finding.executable_memory";
+        }
+        if (chain.HasUnexpectedExecutable)
+        {
+            event.Kind = L"finding.executable_permission";
+        }
         event.ProcessId = pid;
         event.Summary = work.Role + L" target path: " + chain.Termination;
         event.Observation.Identity = work.Identity;
@@ -496,6 +655,7 @@ void KernelMonitor::ScanExecutionReferences()
             (chain.ReferenceStable ? L"slot_checked_before_and_after" : L"changed_or_unreadable");
         event.Evidence[L"path_read_at"] = std::to_wstring(ObservationFileTime());
         size_t captures = 0;
+        size_t acceptedReferences = 0;
         for (size_t i = 0; i < chain.Hops.size(); ++i)
         {
             const auto& hop = chain.Hops[i];
@@ -513,7 +673,9 @@ void KernelMonitor::ScanExecutionReferences()
             event.Evidence[key + L"bytes"] = BytesHex(hop.Bytes);
             event.Evidence[key + L"bytes_read"] = std::to_wstring(hop.Bytes.size());
             event.Evidence[key + L"bytes_prefix_length"] = std::to_wstring((std::min<size_t>)(hop.Bytes.size(), 64));
-            if (KmonHuntOwnership(hop.Ownership) && (!chain.ReferenceChecked || chain.ReferenceStable))
+            if ((KmonHuntOwnership(hop.Ownership) || (KmonPageRole(work.Role) &&
+                (hop.Ownership == CodeOwnership::Unknown || hop.Ownership == CodeOwnership::OwnedUnverified))) &&
+                (!chain.ReferenceChecked || chain.ReferenceStable))
             {
                 KmonHuntReference reference;
                 reference.Context.Identity = work.Identity;
@@ -528,6 +690,8 @@ void KernelMonitor::ScanExecutionReferences()
                 reference.ReferenceTimestamp = work.ObservedAt;
                 reference.SlotStable = chain.ReferenceChecked && chain.ReferenceStable;
                 const uint64_t base = hop.Address & ~4095ull;
+                PhysicalTranslationInfo beforeMapping = {};
+                const bool executableBefore = executableMapping(base, &beforeMapping);
                 std::vector<uint8_t> page;
                 bool comparable = false;
                 if (captures < 2 && reader(base, 4096, &page) && page.size() == 4096)
@@ -553,9 +717,46 @@ void KernelMonitor::ScanExecutionReferences()
                         continue;
                     }
                 }
-                if (pid != 0 && !work.Identity.SameInstance(ObserveProcessIdentity(pid, process)))
+                if (!sameProcess())
                 {
                     continue;
+                }
+                if (pid != 0 && addressSpaceValid)
+                {
+                    ProcessAddressContext current = {};
+                    if (!ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current) ||
+                        current.Eprocess != addressSpace.Eprocess ||
+                        current.DirectoryTableBase != addressSpace.DirectoryTableBase)
+                    {
+                        event.Evidence[key + L"page_mapping"] = L"address_space_changed_or_unavailable";
+                        continue;
+                    }
+                }
+                PhysicalTranslationInfo afterMapping = {};
+                const bool executableAfter = executableMapping(base, &afterMapping);
+                reference.PageExecutableVerified = executableBefore && executableAfter;
+                if ((KmonPageRole(work.Role) || hop.Ownership == CodeOwnership::OwnedUnexpectedExecutable) &&
+                    (!executableBefore || !executableAfter))
+                {
+                    event.Evidence[key + L"page_mapping"] = L"changed_or_unavailable";
+                    continue;
+                }
+                if (KmonPageRole(work.Role) && !comparable)
+                {
+                    event.Evidence[key + L"page_mapping"] = L"page_bytes_changed_or_unreadable";
+                    continue;
+                }
+                if (beforeMapping.PhysicalAddress != 0 && afterMapping.PhysicalAddress != 0)
+                {
+                    if ((beforeMapping.PhysicalAddress >> 12) != (afterMapping.PhysicalAddress >> 12) ||
+                        (KmonPageRole(work.Role) && candidateMapping.PhysicalAddress != 0 &&
+                            (candidateMapping.PhysicalAddress >> 12) != (afterMapping.PhysicalAddress >> 12)))
+                    {
+                        event.Evidence[key + L"page_mapping"] = L"physical_page_changed";
+                        continue;
+                    }
+                    reference.Context.PfnKnown = executableBefore && executableAfter;
+                    reference.Context.Pfn = afterMapping.PhysicalAddress >> 12;
                 }
                 reference.Context.Timestamp = ObservationFileTime();
                 reference.Context.MonotonicMs = GetTickCount64();
@@ -586,10 +787,20 @@ void KernelMonitor::ScanExecutionReferences()
                 }
                 if (reference.Id != 0)
                 {
+                    ++acceptedReferences;
                     event.Evidence[key + L"hunt_reference"] = KmonHuntReferenceJson(reference);
                 }
             }
         }
+        if (KmonPageRole(work.Role) && acceptedReferences == 0)
+        {
+            event.Kind = L"coverage.execution_path";
+        }
+        else if (KmonPageRole(work.Role) && !chain.HasModifiedCode && !chain.HasUnownedExecutable && !chain.HasUnexpectedExecutable)
+        {
+            event.Kind = L"coverage.executable_memory";
+        }
+        event.Evidence[L"physical_page_reader_used"] = physicalPageRead ? L"true" : L"false";
         RecordEvent(std::move(event));
     }
 }

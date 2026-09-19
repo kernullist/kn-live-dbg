@@ -2245,6 +2245,8 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
 
+The [hidden-code coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) maps 22 technique families to observed evidence and remaining boundaries. Bounded whole-range page sweeps, resumable user PTE traversal, all-process image comparison, PE/PTE permission checks, exact callback slots and WFP code candidates extend coverage beyond first-page and thread-entry checks. Runtime permissions, page contents and process/address-space identities are revalidated before retaining page evidence. Live VM and game-cheat validation is performed separately by the operator.
+
 `!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` (or `!kmon start`) arms collectors and stays on the live tail.
 
 ```text

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../user/KmonHuntingJson.h"
+#include "kmon-page-coverage-selftest.h"
 #include <iostream>
 
 inline KmonHuntReference HuntFixture(uint32_t pid, uint64_t now = 100)
@@ -155,9 +156,89 @@ inline bool KmonHuntingSelfTest()
         check(bounded.Size() <= 4 && bounded.Cases(200 + i, 2).size() <= 2, "capacity stress");
     }
     check(bounded.Evicted == 9996, "eviction accounting");
+    KmonHuntIndex priorities(2);
+    auto callback = kernel;
+    callback.Role = L"callback:registry:pre";
+    check(KmonPointerReference(callback.Role) && KmonChannelRole(callback.Role) &&
+        !KmonPointerReference(L"callback_unverified:registry:pre"), "only verified callback roles use slots");
+    priorities.Observe(callback);
+    priorities.Observe(user);
+    auto pageReference = user;
+    pageReference.Role = L"user_page_candidate";
+    check(priorities.Observe(pageReference) == 0 && priorities.Size() == 2,
+        "page candidates cannot evict execution references");
+    KmonHuntIndex pageIndex;
+    pageIndex.Observe(pageReference);
+    check(pageIndex.Cases(101)[0].Kind == L"user_executable_memory", "page candidate is not an execution reference");
+    KmonExecutablePages pages(4);
+    KmonPageWork sample;
+    check(pages.Observe(user.Context.Identity, {0x10000, 3 * 4096}, 0x10000, L"user_page_candidate", 100),
+        "full executable range accepted");
+    check(pages.Next(100, &sample) && sample.Range.Address == 0x10000, "first page scheduled");
+    pages.Observe(user.Context.Identity, {0x10000, 3 * 4096}, 0x10000, L"user_page_candidate", 101);
+    check(pages.Next(101, &sample) && sample.Range.Address == 0x11000, "refresh preserves progress");
+    check(pages.Next(102, &sample) && sample.Range.Address == 0x12000 && pages.CyclesScheduled == 1,
+        "tail page scheduled without a PE header or callback");
+    check(!pages.Next(103, &sample) && pages.Next(10102, &sample) && sample.Range.Address == 0x10000,
+        "completed range cooldown and repeat");
+    check(!pages.Observe(user.Context.Identity, {0x10000, 4096}, 0, L"user_page_candidate", 10101),
+        "scheduler rejects retrograde observations");
+    check(!pages.Observe(user.Context.Identity, {0x10001, 4096}, 0, L"user_page_candidate", 10102) &&
+        !pages.Observe(user.Context.Identity, {0x10000, UINT64_MAX}, 0, L"user_page_candidate", 10102),
+        "scheduler alignment and overflow");
+    auto newerIdentity = user.Context.Identity;
+    ++newerIdentity.CreateTime;
+    pages.Observe(newerIdentity, {0x20000, 4096}, 0x20000, L"user_page_candidate", 10103);
+    check(pages.Size() == 1 && !pages.Observe(user.Context.Identity, {0x10000, 4096}, 0,
+        L"user_page_candidate", 10104), "PID reuse retires old ranges and rejects old instances");
+    check(!pages.Next(310104, &sample) && pages.Size() == 0 && pages.Expired == 1, "unrefreshed range expiry");
+    KmonExecutablePages fairPages;
+    fairPages.Observe(user.Context.Identity, {0x10000, 64 * 4096}, 0x10000, L"user_page_candidate", 100);
+    auto secondIdentity = user.Context.Identity;
+    ++secondIdentity.ProcessId;
+    fairPages.Observe(secondIdentity, {0x100000, 4096}, 0x100000, L"user_page_candidate", 100);
+    fairPages.Next(100, &sample);
+    check(fairPages.Next(100, &sample) && sample.Identity.ProcessId == secondIdentity.ProcessId,
+        "large mappings do not starve small mappings");
+    uint64_t tail = 0;
+    for (unsigned i = 0; i < 63; ++i)
+    {
+        fairPages.Next(100, &sample);
+        tail = sample.Range.Address;
+    }
+    check(tail == 0x10000 + 63 * 4096, "all pages of a large mapping are scheduled");
+    KmonExecutablePages boundedPages(2);
+    for (uint32_t i = 0; i < 1024; ++i)
+    {
+        auto identity = user.Context.Identity;
+        identity.ProcessId += i;
+        boundedPages.Observe(identity, {0x10000, 4096}, 0, L"user_page_candidate", 100 + i);
+        check(boundedPages.Size() <= 2, "range scheduler bounded under pressure");
+    }
+    check(boundedPages.Evicted == 1022, "range eviction accounting");
+    const uint64_t presentUser = 7;
+    const uint64_t nx = 1ull << 63;
+    check(KmonHardwareExecutable(0, 7, 7, 7, 7, 4096, 4, true), "user 4K executable mapping");
+    for (unsigned level = 0; level < 4; ++level)
+    {
+        uint64_t entries[] = {presentUser, presentUser, presentUser, presentUser};
+        entries[level] |= nx;
+        check(!KmonHardwareExecutable(0, entries[0], entries[1], entries[2], entries[3], 4096, 4, true),
+            "NX at every paging level is enforced");
+        entries[level] = 3;
+        check(!KmonHardwareExecutable(0, entries[0], entries[1], entries[2], entries[3], 4096, 4, true),
+            "supervisor-only ancestor rejects user execution");
+    }
+    check(KmonHardwareExecutable(0, 3, 3, 0x83, nx, 1ull << 21, 4, false),
+        "2M leaf ignores absent child PTE");
+    check(KmonHardwareExecutable(0, 7, 0x87, nx, nx, 1ull << 30, 4, true),
+        "1G leaf ignores absent child tables");
+    check(!KmonHardwareExecutable(0, 7, 7, 7, 0, 4096, 4, true) &&
+        !KmonHardwareExecutable(7 | nx, 7, 7, 7, 7, 4096, 5, true), "nonpresent and LA57 NX rejected");
     const auto json = KmonHuntCasesJson(physical.Cases(1101), 1101, 0, 0);
     check(mcpjson::ValidateDocument(json) && json.find(L"\"communication_proven\":false") != std::wstring::npos,
         "JSON and claim boundary");
     std::cout << "[kmon.hunting] passed=" << passed << " failed=" << failed << " corpus=synthetic\n";
-    return failed == 0;
+    const bool pagesPassed = KmonPageCoverageSelfTest();
+    return failed == 0 && pagesPassed;
 }

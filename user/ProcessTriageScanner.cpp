@@ -1,4 +1,5 @@
 #include "ProcessTriageScanner.h"
+#include "UserExecutablePteWalker.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -988,29 +989,6 @@ namespace
             : target.DirectoryTableBase;
     }
 
-    uint64_t MaxUserAddressForPagingLevels(uint32_t pagingLevels)
-    {
-        return pagingLevels >= 5 ? kLa57UserAddressMax : kUserAddressMax;
-    }
-
-    uint64_t PageTableIndexShift(uint32_t level)
-    {
-        return 12ull + (static_cast<uint64_t>(level) - 1ull) * 9ull;
-    }
-
-    uint64_t DecodePageTableEntry(const std::vector<uint8_t>& page, size_t index)
-    {
-        uint64_t value = 0;
-        size_t offset = index * sizeof(uint64_t);
-
-        if (offset + sizeof(uint64_t) <= page.size())
-        {
-            memcpy(&value, page.data() + offset, sizeof(value));
-        }
-
-        return value;
-    }
-
     void AddPageTableReadWarning(ProcessVadScanResult* result, const std::wstring& warning)
     {
         if (result == nullptr)
@@ -1160,6 +1138,7 @@ namespace
                 : kDefaultHiddenPteRecordLimit;
             if (result->HiddenPteRecords.size() >= recordLimit)
             {
+                result->HiddenPteResumeAddress = startAddress;
                 result->HiddenPteTruncated = true;
                 result->Truncated = true;
                 break;
@@ -1207,6 +1186,21 @@ namespace
                    vadIntervals[index].StartAddress <= mapping.EndAddress)
             {
                 const VadInterval& interval = vadIntervals[index];
+                // Emit in VA order so a record-limit resume cannot revisit
+                // a later overlap before reaching the preceding gap.
+                if (interval.StartAddress > uncoveredStart)
+                {
+                    AppendHiddenPteRecord(
+                        options,
+                        mapping,
+                        uncoveredStart,
+                        (std::min)(mapping.EndAddress, interval.StartAddress - 1ull),
+                        result);
+                    if (result->HiddenPteTruncated)
+                    {
+                        break;
+                    }
+                }
                 bool vadLooksNonExec = false;
                 if (interval.EffectiveProtectionComplete)
                 {
@@ -1241,20 +1235,6 @@ namespace
                         }
                     }
                 }
-                if (interval.StartAddress > uncoveredStart)
-                {
-                    AppendHiddenPteRecord(
-                        options,
-                        mapping,
-                        uncoveredStart,
-                        (std::min)(mapping.EndAddress, interval.StartAddress - 1ull),
-                        result);
-                    if (result->HiddenPteTruncated)
-                    {
-                        break;
-                    }
-                }
-
                 if (interval.EndAddress == std::numeric_limits<uint64_t>::max())
                 {
                     uncoveredStart = std::numeric_limits<uint64_t>::max();
@@ -1277,148 +1257,6 @@ namespace
                 AppendHiddenPteRecord(options, mapping, uncoveredStart, mapping.EndAddress, result);
             }
         } while (false);
-    }
-
-    void WalkUserPageTableLevel(
-        DeviceClient& device,
-        uint64_t tablePhysical,
-        uint32_t level,
-        uint32_t pagingLevels,
-        uint64_t baseAddress,
-        bool writableSoFar,
-        bool userSoFar,
-        bool nxSoFar,
-        const ProcessVadScanOptions& options,
-        const std::vector<VadInterval>& vadIntervals,
-        size_t* vadCursor,
-        ProcessVadScanResult* result)
-    {
-        std::vector<uint8_t> page;
-        if (!ReadPhysicalPage(device, tablePhysical, &page, result))
-        {
-            return;
-        }
-
-        size_t lastIndex = kPageTableEntries - 1;
-        if (level == pagingLevels)
-        {
-            lastIndex = 255;
-        }
-
-        uint64_t indexShift = PageTableIndexShift(level);
-        uint64_t maxUserAddress = MaxUserAddressForPagingLevels(pagingLevels);
-        for (size_t index = 0; index <= lastIndex; ++index)
-        {
-            if (result != nullptr && result->HiddenPteTruncated)
-            {
-                break;
-            }
-
-            uint64_t entry = DecodePageTableEntry(page, index);
-            if ((entry & kPtePresent) == 0)
-            {
-                continue;
-            }
-
-            uint64_t entryBaseAddress = baseAddress + (static_cast<uint64_t>(index) << indexShift);
-            if (entryBaseAddress > maxUserAddress)
-            {
-                continue;
-            }
-
-            bool entryWritable = writableSoFar && ((entry & kPteWrite) != 0);
-            bool entryUser = userSoFar && ((entry & kPteUser) != 0);
-            bool entryNx = nxSoFar || ((entry & kPteNx) != 0);
-            uint64_t entryPhysicalAddress = (tablePhysical & kPte4KBaseMask) + index * sizeof(uint64_t);
-
-            if (!entryUser)
-            {
-                continue;
-            }
-
-            if (level == 3 && ((entry & kPteLargePage) != 0))
-            {
-                uint64_t endAddress = entryBaseAddress + 0x40000000ull - 1ull;
-                if (endAddress > maxUserAddress)
-                {
-                    endAddress = maxUserAddress;
-                }
-
-                PteLeafMapping mapping = {};
-                mapping.StartAddress = entryBaseAddress;
-                mapping.EndAddress = endAddress;
-                mapping.PageSize = 0x40000000ull;
-                mapping.PhysicalAddress = entry & kPte1GBaseMask;
-                mapping.LeafEntryAddress = entryPhysicalAddress;
-                mapping.LeafEntry = entry;
-                mapping.Writable = entryWritable;
-                mapping.Executable = !entryNx;
-                mapping.UserAccessible = entryUser;
-                mapping.LargePage = true;
-                ReportHiddenPteGaps(options, vadIntervals, mapping, vadCursor, result);
-                continue;
-            }
-
-            if (level == 2 && ((entry & kPteLargePage) != 0))
-            {
-                uint64_t endAddress = entryBaseAddress + 0x200000ull - 1ull;
-                if (endAddress > maxUserAddress)
-                {
-                    endAddress = maxUserAddress;
-                }
-
-                PteLeafMapping mapping = {};
-                mapping.StartAddress = entryBaseAddress;
-                mapping.EndAddress = endAddress;
-                mapping.PageSize = 0x200000ull;
-                mapping.PhysicalAddress = entry & kPte2MBaseMask;
-                mapping.LeafEntryAddress = entryPhysicalAddress;
-                mapping.LeafEntry = entry;
-                mapping.Writable = entryWritable;
-                mapping.Executable = !entryNx;
-                mapping.UserAccessible = entryUser;
-                mapping.LargePage = true;
-                ReportHiddenPteGaps(options, vadIntervals, mapping, vadCursor, result);
-                continue;
-            }
-
-            if (level == 1)
-            {
-                uint64_t endAddress = entryBaseAddress + kPageSize - 1ull;
-                if (endAddress > maxUserAddress)
-                {
-                    endAddress = maxUserAddress;
-                }
-
-                PteLeafMapping mapping = {};
-                mapping.StartAddress = entryBaseAddress;
-                mapping.EndAddress = endAddress;
-                mapping.PageSize = kPageSize;
-                mapping.PhysicalAddress = entry & kPte4KBaseMask;
-                mapping.LeafEntryAddress = entryPhysicalAddress;
-                mapping.LeafEntry = entry;
-                mapping.Writable = entryWritable;
-                mapping.Executable = !entryNx;
-                mapping.UserAccessible = entryUser;
-                mapping.LargePage = false;
-                ReportHiddenPteGaps(options, vadIntervals, mapping, vadCursor, result);
-                continue;
-            }
-
-            WalkUserPageTableLevel(
-                device,
-                entry & kPte4KBaseMask,
-                level - 1u,
-                pagingLevels,
-                entryBaseAddress,
-                entryWritable,
-                entryUser,
-                entryNx,
-                options,
-                vadIntervals,
-                vadCursor,
-                result);
-        }
     }
 
     uint32_t DetectPagingLevels(
@@ -1471,7 +1309,8 @@ namespace
 
             if (!detected && result != nullptr)
             {
-                result->Warnings.push_back(L"could not confirm LA57 state from translation; assuming 4-level paging");
+                result->Warnings.push_back(L"could not confirm paging mode; user PTE evidence withheld");
+                pagingLevels = 0;
             }
         } while (false);
 
@@ -1502,20 +1341,48 @@ namespace
 
             uint32_t pagingLevels = DetectPagingLevels(device, options.Target, dtb, vadIntervals, result);
             result->PagingLevels = pagingLevels;
+            if (pagingLevels == 0)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                break;
+            }
             size_t vadCursor = 0;
-            WalkUserPageTableLevel(
-                device,
-                dtb,
-                pagingLevels,
-                pagingLevels,
-                0,
-                true,
-                true,
-                false,
-                options,
-                vadIntervals,
-                &vadCursor,
-                result);
+            const auto walked = WalkUserPtes(dtb, pagingLevels, options.HiddenPteResumeAddress,
+                options.HiddenPteTableBudget, options.HiddenPteExecutableOnly,
+                [&](uint64_t physical, std::vector<uint8_t>* bytes)
+                {
+                    return ReadPhysicalPage(device, physical, bytes, result);
+                },
+                [&](const UserPteLeaf& leaf)
+                {
+                    PteLeafMapping mapping = {};
+                    mapping.StartAddress = (std::max)(leaf.Address, options.HiddenPteResumeAddress);
+                    mapping.EndAddress = leaf.Address + leaf.Size - 1;
+                    mapping.PhysicalAddress = leaf.Physical + mapping.StartAddress - leaf.Address;
+                    mapping.PageSize = leaf.Size;
+                    mapping.LeafEntryAddress = leaf.EntryAddress;
+                    mapping.LeafEntry = leaf.Entry;
+                    mapping.Writable = leaf.Writable;
+                    mapping.Executable = leaf.Executable;
+                    mapping.UserAccessible = true;
+                    mapping.LargePage = leaf.Size != 4096;
+                    ReportHiddenPteGaps(options, vadIntervals, mapping, &vadCursor, result);
+                    return !result->HiddenPteTruncated;
+                });
+            if (!result->HiddenPteTruncated)
+            {
+                result->HiddenPteResumeAddress = walked.ResumeAddress;
+            }
+            result->HiddenPteTraversalFinished = walked.Finished;
+            result->HiddenPteBudgetExhausted = walked.BudgetExhausted;
+            result->PageTableReadFailures = walked.ReadFailures;
+            if (!walked.Finished)
+            {
+                result->Incomplete = true;
+                result->CoverageComplete = false;
+                result->Warnings.push_back(L"hidden PTE pass bounded; resume address preserves unvisited mappings");
+            }
 
             if (result->PageTableReadFailures != 0)
             {
@@ -4311,6 +4178,48 @@ bool ProcessTriageVadFilterSelfTest()
         pplPte,
         &pplCursor,
         &pplResult);
+    ProcessVadScanOptions boundedOptions = mismatchOptions;
+    boundedOptions.HiddenPteLimit = 1;
+    PteLeafMapping largePte = {};
+    largePte.StartAddress = 0x200000;
+    largePte.EndAddress = 0x3fffff;
+    largePte.PhysicalAddress = 0x400000;
+    largePte.PageSize = 0x200000;
+    largePte.LargePage = true;
+    largePte.Executable = true;
+    largePte.UserAccessible = true;
+    VadInterval largeRw = pplRw;
+    largeRw.StartAddress = 0x201000;
+    largeRw.EndAddress = 0x201fff;
+    const std::vector<VadInterval> largeIntervals = {largeRw};
+    uint64_t next = largePte.StartAddress;
+    uint64_t total = 0;
+    for (unsigned pass = 0; pass < 3; ++pass)
+    {
+        PteLeafMapping clipped = largePte;
+        clipped.StartAddress = next;
+        clipped.PhysicalAddress += next - largePte.StartAddress;
+        ProcessVadScanResult partial;
+        size_t cursor = 0;
+        ReportHiddenPteGaps(boundedOptions, largeIntervals, clipped, &cursor, &partial);
+        if (partial.HiddenPteRecords.size() != 1 ||
+            partial.HiddenPteRecords[0].StartAddress != next ||
+            partial.HiddenPteRecords[0].PhysicalAddress != clipped.PhysicalAddress)
+        {
+            return false;
+        }
+        total += partial.HiddenPteRecords[0].Size;
+        next = partial.HiddenPteRecords[0].EndAddress + 1;
+        if ((pass < 2 && (!partial.HiddenPteTruncated || partial.HiddenPteResumeAddress != next)) ||
+            (pass == 2 && partial.HiddenPteTruncated))
+        {
+            return false;
+        }
+    }
+    if (total != 0x200000 || next != 0x400000)
+    {
+        return false;
+    }
     return pplResult.HiddenPteRecords.size() == 1 &&
         pplResult.HiddenPteRecords[0].Notes == L"pte_exec_vad_rw" &&
         pplResult.HiddenPteRecords[0].StartAddress == 0x30000 &&
@@ -5791,6 +5700,9 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
          << L",\"pte_leaf_mappings\":" << result.PteLeafMappings
          << L",\"page_table_pages_read\":" << result.PageTablePagesRead
          << L",\"page_table_read_failures\":" << result.PageTableReadFailures
+         << L",\"hidden_pte_resume_address\":\"" << std::to_wstring(result.HiddenPteResumeAddress) << L"\""
+         << L",\"hidden_pte_traversal_finished\":" << (result.HiddenPteTraversalFinished ? L"true" : L"false")
+         << L",\"hidden_pte_budget_exhausted\":" << (result.HiddenPteBudgetExhausted ? L"true" : L"false")
          << L",\"injection_scan\":" << (result.InjectionScan ? L"true" : L"false")
          << L",\"hidden_pte_scan_enabled\":" << (result.HiddenPteScanEnabled ? L"true" : L"false")
          << L",\"hidden_pte_truncated\":" << (result.HiddenPteTruncated ? L"true" : L"false")

@@ -3,6 +3,7 @@
 #include "FirmwareTableScanner.h"
 #include "HiveScanner.h"
 #include "ProcessTriageScanner.h"
+#include "WfpCalloutScanner.h"
 #include "KmonHuntingJson.h"
 
 #include <cstring>
@@ -29,6 +30,46 @@ std::vector<KmonHuntCase> KernelMonitor::HuntCases() const
 {
     std::lock_guard<std::mutex> lock(HuntMutex);
     return HuntIndex.Cases(GetTickCount64());
+}
+
+void KernelMonitor::QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role)
+{
+    if (observation.Executable && !observation.SessionUnverified)
+    {
+        ExecutablePages.Observe(observation.Context.Identity, observation.Range,
+            observation.Context.AllocationBase, role, GetTickCount64());
+    }
+}
+
+void KernelMonitor::ScanExecutablePageCandidates()
+{
+    const uint64_t now = GetTickCount64();
+    // Leave the reference queue available for callbacks and short-lived events.
+    for (size_t count = 0; count < 8 && ExecutionReferences.size() < 64 && !StopRequested.load(); ++count)
+    {
+        KmonPageWork page;
+        if (!ExecutablePages.Next(now, &page))
+        {
+            break;
+        }
+        QueueExecutionReference(page.Range.Address, 0, page.Role, page.Identity);
+    }
+    if (now >= NextPageCoverageTickMs)
+    {
+        NextPageCoverageTickMs = now + 5000;
+        KmonEvent event;
+        event.Kind = L"coverage.page_candidates";
+        event.Observation.Source = L"executable_page_scheduler";
+        event.Summary = L"bounded full-range page scheduling; scheduled pages are not successful reads";
+        event.Evidence[L"ranges"] = std::to_wstring(ExecutablePages.Size());
+        event.Evidence[L"pages_scheduled"] = std::to_wstring(ExecutablePages.PagesScheduled);
+        event.Evidence[L"cycles_scheduled"] = std::to_wstring(ExecutablePages.CyclesScheduled);
+        event.Evidence[L"ranges_evicted"] = std::to_wstring(ExecutablePages.Evicted);
+        event.Evidence[L"ranges_expired"] = std::to_wstring(ExecutablePages.Expired);
+        event.Evidence[L"ranges_rejected"] = std::to_wstring(ExecutablePages.Rejected);
+        event.Evidence[L"reference_backpressure"] = ExecutionReferences.size() >= 64 ? L"true" : L"false";
+        RecordEvent(std::move(event));
+    }
 }
 
 std::wstring KernelMonitor::HuntCasesJson() const
@@ -227,7 +268,7 @@ void KernelMonitor::ScanCommunicationSurfaces()
             ++verified;
         }
     };
-    switch (ChannelScanCursor++ % 4)
+    switch (ChannelScanCursor++ % 5)
     {
     case 0:
     {
@@ -283,7 +324,7 @@ void KernelMonitor::ScanCommunicationSurfaces()
         coverage.Evidence[L"scope"] = L"resolved logger slots; inventory completeness unknown";
         break;
     }
-    default:
+    case 3:
     {
         coverage.Task = L"etw_provider";
         EtwProviderScanResult result;
@@ -293,6 +334,41 @@ void KernelMonitor::ScanCommunicationSurfaces()
         observed = result.Providers.size();
         warnings = std::move(result.Warnings);
         coverage.Evidence[L"scope"] = L"heuristic diagnostics; no validated callback layout";
+        break;
+    }
+    default:
+    {
+        coverage.Task = L"wfp_callout";
+        WfpCalloutScanResult result;
+        ok = WfpCalloutScanner(*device, *symbols).Scan(&result, &error);
+        observed = result.Callouts.size();
+        warnings = std::move(result.Warnings);
+        coverage.Evidence[L"candidate_layout"] = result.LayoutSource;
+        coverage.Evidence[L"candidate_walk_complete"] = result.CoverageComplete ? L"true" : L"false";
+        size_t candidates = 0;
+        const size_t budget = (std::min<size_t>)(result.Callouts.size(), 42);
+        for (size_t index = 0; index < budget; ++index)
+        {
+            const auto& callout = result.Callouts[(WfpCalloutCursor + index) % result.Callouts.size()];
+            const std::pair<uint64_t, const wchar_t*> targets[] =
+            {
+                {callout.ClassifyFn, L"wfp_classify_candidate"},
+                {callout.NotifyFn, L"wfp_notify_candidate"},
+                {callout.FlowDeleteFn, L"wfp_flow_delete_candidate"}
+            };
+            for (const auto& target : targets)
+            {
+                if (target.first >= 0xFFFF800000000000ull && candidates < 128 && !StopRequested.load())
+                {
+                    QueueExecutionReference(target.first, 0, target.second);
+                    ++candidates;
+                }
+            }
+        }
+        coverage.Evidence[L"unverified_pointer_candidates"] = std::to_wstring(candidates);
+        WfpCalloutCursor = result.Callouts.empty() ? 0 : (WfpCalloutCursor + budget) % result.Callouts.size();
+        coverage.Evidence[L"candidate_resume_index"] = std::to_wstring(WfpCalloutCursor);
+        coverage.Evidence[L"scope"] = L"scored layout; code candidates only, callback semantics unverified";
         break;
     }
     }

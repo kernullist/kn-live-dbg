@@ -115,6 +115,20 @@ void KernelMonitor::ScanUserRegionCatalog(HANDLE process, const ObservationIdent
     // Kernel records are usable only for the same process instance.
     if (vad.Target.HasCreateTime && vad.Target.CreateTime == identity.CreateTime)
     {
+        KmonEvent coverage;
+        coverage.Kind = L"coverage.user_pages";
+        coverage.ProcessId = identity.ProcessId;
+        coverage.Observation.Identity = identity;
+        coverage.Observation.Source = L"kernel_user_pte";
+        coverage.Summary = L"bounded user PTE pass; resume cursor is process-instance specific";
+        coverage.Evidence[L"tables_read"] = std::to_wstring(vad.PageTablePagesRead);
+        coverage.Evidence[L"read_failures"] = std::to_wstring(vad.PageTableReadFailures);
+        coverage.Evidence[L"resume_address"] = std::to_wstring(vad.HiddenPteResumeAddress);
+        coverage.Evidence[L"traversal_finished"] = vad.HiddenPteTraversalFinished ? L"true" : L"false";
+        coverage.Evidence[L"budget_exhausted"] = vad.HiddenPteBudgetExhausted ? L"true" : L"false";
+        coverage.Evidence[L"source_status"] = !vad.HiddenPteScanEnabled || vad.PagingLevels == 0 ? L"unavailable" :
+            (vad.PageTableReadFailures != 0 ? L"failed" : (vad.HiddenPteTraversalFinished ? L"walk_complete" : L"partial"));
+        RecordEvent(std::move(coverage));
         for (const auto& region : vad.Records)
         {
             if (!region.Executable)
@@ -131,6 +145,10 @@ void KernelMonitor::ScanUserRegionCatalog(HANDLE process, const ObservationIdent
             observation.Context.Coverage.Reason = vad.CoverageComplete && !vad.Incomplete ?
                 L"vad_metadata_observed" : L"vad_inventory_partial";
             ObserveExecutableRegion(observation);
+            if (observation.Context.Ownership != CodeOwnership::OwnedUnverified || process == nullptr || !inventoryComplete)
+            {
+                QueueExecutableRegionPages(observation, L"user_page_candidate");
+            }
         }
         for (const auto& region : vad.HiddenPteRecords)
         {
@@ -147,6 +165,7 @@ void KernelMonitor::ScanUserRegionCatalog(HANDLE process, const ObservationIdent
             observation.Writable = region.Writable;
             observation.Context.Coverage.Reason = vad.HiddenPteTruncated ? L"pte_inventory_partial" : L"pte_mapping_observed";
             ObserveExecutableRegion(observation);
+            QueueExecutableRegionPages(observation, L"user_hidden_pte_page");
         }
     }
     if (process == nullptr || !identity.SameInstance(ObserveProcessIdentity(identity.ProcessId, process)))
@@ -197,6 +216,8 @@ void KernelMonitor::ScanUserRegionCatalog(HANDLE process, const ObservationIdent
                 observation.CopyOnWrite = true;
             }
             const uint64_t generation = ObserveExecutableRegion(observation);
+            QueueExecutableRegionPages(observation, observation.Context.Ownership == CodeOwnership::OwnedUnverified ?
+                L"image_page_candidate" : L"user_page_candidate");
             if (generation != 0 && (observation.Context.Ownership == CodeOwnership::UnownedExecutable || observation.CopyOnWrite))
             {
                 QueueCapture(L"user_exec_candidate", base, (std::min<uint64_t>)(region.RegionSize, 4096),

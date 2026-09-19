@@ -13,6 +13,7 @@
 #include "ThreatIntelSubscriber.h"
 #include "TimelineStore.h"
 #include "OrphanKernelPageScanner.h"
+#include "KmonExecutablePages.h"
 
 #include <atomic>
 #include <cstddef>
@@ -312,11 +313,15 @@ private:
     CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget);
     void ScanKernelExecutableImages();
+    void ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
+        const ObservationIdentity& identity, const ObservationReader& reader);
     void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader);
     void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
         const ObservationIdentity& identity = {}, uint64_t observedAt = 0);
     void ScanExecutionReferences();
+    void ScanExecutablePageCandidates();
+    void QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role);
     void ScanCommunicationSurfaces();
     void ScanUserExecutionSurfaces(HANDLE process, const ObservationIdentity& identity,
         const std::vector<std::pair<uint64_t, uint32_t>>& modules, bool inventoryComplete);
@@ -465,6 +470,7 @@ private:
         size_t ObjectCursor = 0;
         std::map<std::pair<uint32_t, uint32_t>, std::wstring> ObjectReports;
         std::map<uint32_t, uint64_t> ReportedHashes;
+        uint64_t PermissionCursor = 0;
     };
     ImageVerificationWork* FindImageWork(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity);
@@ -474,6 +480,7 @@ private:
     std::map<std::pair<uint32_t, uint64_t>, size_t> UserImageCursors;
     ExecutableRegionCatalog RegionCatalog;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserRegionCursors;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserPteCursors;
     std::atomic<uint64_t> CatalogRecords{0};
     std::atomic<uint64_t> CatalogEvicted{0};
     std::atomic<uint64_t> KpageResumeAddress{0};
@@ -482,8 +489,11 @@ private:
     uint64_t NextImageScanTickMs = 0;
     uint64_t NextChannelScanTickMs = 0;
     uint32_t ChannelScanCursor = 0;
+    size_t WfpCalloutCursor = 0;
     mutable std::mutex HuntMutex;
     KmonHuntIndex HuntIndex;
+    KmonExecutablePages ExecutablePages;
+    uint64_t NextPageCoverageTickMs = 0;
     std::map<std::pair<uint32_t, uint64_t>, uint32_t> UserThreadCursors;
     struct ExecutionReferenceWork
     {

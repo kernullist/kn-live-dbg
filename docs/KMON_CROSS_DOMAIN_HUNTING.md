@@ -1,6 +1,6 @@
 # 커널·유저 코드 연관 헌팅
 
-`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](KMON_HUNTING_RESEARCH_20260919.md), 기존 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
+`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_COVERAGE_MATRIX_20260919.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
 
 ```text
 !kmon start /name game.exe /background
@@ -19,15 +19,23 @@
 | Registry hive | GetCell, ReleaseCell, Allocate, Free 슬롯 검증 | PDB와 읽기 성공 여부를 기록. 요청의 실제 호출자를 관측한 것은 아님 |
 | ETW logger clock | PDB로 찾은 64비트 callback 슬롯 검증 | clock mode와 포인터를 구분. 전체 logger 목록의 완전성은 미확정 |
 | ETW provider | 기존 anchor probe의 coverage 진단 | 추정 레이아웃의 후보는 callback finding과 사건 연결에 사용하지 않음 |
+| Ps·registry·Ob·minifilter 콜백 | PDB로 확인한 실제 pre/post 함수 슬롯과 코드 경로 검증 | 객체 주소를 함수 슬롯으로 사용하지 않음. fallback 레이아웃은 재검증되지 않은 코드 후보로 구분 |
+| WFP callout | classify/notify/flow-delete 후보를 42개 callout씩 순환 코드 검사 | 내부 레이아웃은 추정값. 검증된 채널 슬롯이나 통신 관계로 사용하지 않음 |
 | 유저 instrumentation callback | 커널 객체와 프로세스 생성 시각을 확인한 뒤 callback 슬롯 재검증 | native x64 대상. 슬롯은 커널에서, 대상 코드는 해당 프로세스에서 읽음 |
 | 스레드·APC | StartAddress, Win32StartAddress, 대기 APC의 NormalRoutine/UserRoutine 후보를 코드 검증기로 전달 | 실행 관측이 아님. APC가 처리되거나 목록이 바뀔 수 있음 |
 | ETW 스택 | 최근 이벤트의 반환 주소가 놓인 페이지 비교 | 반환 주소를 함수 시작점으로 디코딩하지 않음. 과거 실행 시점의 코드 내용은 미확정 |
 
-kernel channel source는 분석 루프에서 5초 간격으로 하나씩 돌아간다. 네 source가 있으므로 지연이 없을 때 재방문 간격은 약 20초다. 전체 분석이 늦어지면 간격도 늘어난다. firmware/hive/ETW handler를 호출해서 반응을 확인하지 않는다.
+firmware/hive/ETW logger/ETW provider/WFP source는 분석 루프에서 5초 간격으로 하나씩 돌아간다. 다섯 source가 있으므로 지연이 없을 때 재방문 간격은 약 25초다. 전체 분석이 늦어지면 간격도 늘어난다. handler를 호출해서 반응을 확인하지 않는다.
 
 유저 검사 후보는 이름·설치 경로에 관계없이 모든 프로세스를 포함한다. 기존 우선 대상 6개/배경 대상 2개 순환 예산을 유지하므로 동시에 전부 검사하지는 않는다. 스레드 상세 수집은 프로세스 방문당 최대 32개, 루프 경과 예산 100ms, 참조 후보 최대 128개다. 개별 장치 읽기나 PDB 작업을 시간 예산으로 선점할 수는 없다. 재개 위치는 목록 인덱스이므로 계속 생성·종료되는 스레드의 누락 가능성은 coverage로 남는다.
 
-권한 부족, boot ID/생성 시각 확인 실패, 지원하지 않는 아키텍처, 불완전한 모듈 목록은 악성 근거로 쓰지 않는다. 제한된 query 핸들로 정체성을 확인할 수 있으면 드라이버의 프로세스 읽기 경로도 사용한다. query 핸들까지 확보하지 못한 프로세스의 새 참조 수집은 제한된다.
+선택된 모든 프로세스의 EXE/DLL 실행 섹션을 비교하고 VAD/PTE를 대조한다. 감시 이름이나 Windows 기본 프로세스 목록은 비교의 필수 조건이 아니다. PTE 검사는 방문당 테이블 128개와 숨은 범위 32개로 제한하고 PID·생성 시각별 VA 커서를 재개한다. 상위 NX/U/S, 4·5단계 페이징, 1 GiB/2 MiB 큰 페이지, PAT 및 서로 다른 VA가 공유하는 페이지 테이블을 처리한다. 페이징 모드를 확인할 수 없거나 테이블 읽기가 실패하면 해당 패스의 숨은 PTE 증거를 보류한다.
+
+실행 영역은 첫 페이지만 캡처하는 경로에 더해 전체 범위를 4 KiB씩 순환한다. 최대 512개 범위, 분석 반복당 최대 8페이지이며 일반 실행 참조 큐가 64개 이상이면 기다린다. 마지막 관측 후 5분이 지난 범위는 만료하고 한 범위의 예약을 마친 뒤 10초 후 다시 시작한다. 이미지 후보는 비소유 영역 후보를 용량 부족으로 밀어내지 못한다. 이 상한을 초과하거나 관측 사이에 사라지는 코드는 누락될 수 있으며, 예약 횟수는 읽기 성공 횟수가 아니다.
+
+권한 부족, boot ID/생성 시각 확인 실패, 지원하지 않는 아키텍처, 불완전한 모듈 목록은 악성 근거로 쓰지 않는다. query 핸들을 확보하지 못해도 PDB로 EPROCESS·생성 시각·DTB를 확인한 페이지는 드라이버 경로로 읽는다. 페이지 검사는 WOW64에도 적용한다. 스레드 메타데이터와 x64 정적 분기 디코딩은 별도 제약을 유지한다.
+
+페이지 후보는 현재 PTE 권한을 확인한 물리 읽기를 우선 사용한다. 번역을 확보하지 못했지만 query가 가능한 경우 committed executable 영역을 확인하고 프로세스 읽기를 시도한다. guard 페이지의 일반 가상 읽기는 보류한다. 두 번 읽은 페이지 바이트와 캡처 전후 PFN·권한·프로세스 인스턴스를 대조하며, 사용한 DTB가 교체되면 증거를 보류한다. PE에서 실행으로 선언하지 않은 헤더·데이터 페이지가 실제로 실행 가능한 경우는 별도 권한 증거로 남긴다.
 
 ## 사건의 의미
 
@@ -35,19 +43,24 @@ kernel channel source는 분석 루프에서 5초 간격으로 하나씩 돌아�
 
 - `kernel_execution_reference`: 커널 참조 경로의 변형/비소유 실행 영역.
 - `user_execution_reference`: 특정 프로세스 인스턴스의 스레드·APC·계측·IAT·vtable·스택 등에서 참조한 영역.
+- `kernel_executable_memory`, `user_executable_memory`: 참조가 없어도 페이지 순환에서 발견한 변형/비소유 실행 영역.
+- `executable_ownership_unknown`, `executable_image_unverified`: 실행 가능한 현재 페이지를 읽었지만 모듈 목록 또는 원본 이미지 일치를 확인하지 못함.
+- `image_executable_permission`: PE에서 실행으로 선언하지 않은 페이지가 실제 실행 권한을 가짐. 바이트 변조 판정과 구분.
 - `cross_domain_content`: 검증된 kernel channel 슬롯의 경로와 유저 참조에서 읽은 **4096바이트 페이지 전체 SHA-256**이 같음. 페이지 내 참조 offset은 다를 수 있다.
 
-교차 연결은 동일 boot ID, 알려진 프로세스 생성 시각과 매핑 세대, 유효한 페이지 hash, 안정적으로 재확인한 kernel 슬롯을 요구한다. zero/NOP/INT3/FF 위주 padding 페이지는 내용 연결에서 제외한다. PFN을 제공한 관측은 1초 이내의 동일 PFN과 내용 일치를 별도로 표시할 수 있다. 현재 참조 경로 수집기는 PFN을 채우지 않으므로 live cases는 주소/내용 관계만 만든다. PFN 처리는 replay 관측에서 검증하며 동시 매핑이나 통신을 증명하지 않는다.
+교차 연결은 동일 boot ID, 알려진 프로세스 생성 시각과 매핑 세대, 유효한 페이지 hash, 안정적으로 재확인한 kernel 슬롯을 요구한다. zero/NOP/INT3/FF 위주 padding 페이지는 내용 연결에서 제외한다. live 수집기는 캡처 전후 번역이 모두 성공하고 PFN·실행 권한이 유지됐을 때 PFN을 남긴다. 두 관측이 1초 이내이고 PFN과 내용이 같으면 물리 페이지 관계를 표시한다. 관측 사이의 재사용, 동시 매핑 또는 통신을 증명하지는 않는다.
 
 프로토콜, 전송 방향, 치트 행위자, 현재 RIP는 확정하지 않는다. `claim=investigation_leads`, `communication_proven=false`, `execution_observed=false`가 이 경계를 나타낸다. 스택의 원본 이벤트 시각과 현재 코드를 읽은 시각도 별도로 보존한다.
 
-인덱스는 최대 512개 참조, 출력은 최대 128개 사건이다. PID 재사용, 관측한 매핑 세대 교체, 동일 슬롯의 대상 변경과 재검증 실패를 처리한다. 만료된 참조는 조회에서 빠지고 `!kmon clear`는 인덱스도 비운다. 수집 중이면 이후 관측으로 다시 채워질 수 있다. 관측 세대는 실제 allocation ID가 아니므로 관측 사이의 주소 재사용을 모두 배제할 수 없다.
+인덱스는 최대 512개 참조, 출력은 최대 128개 사건이다. 일반 페이지 후보보다 실행 참조를 먼저 보존·표시한다. PID 재사용, 관측한 매핑 세대 교체, 동일 슬롯의 대상 변경과 재검증 실패를 처리한다. 만료된 참조는 조회에서 빠지고 `!kmon clear`는 인덱스도 비운다. 수집 중이면 이후 관측으로 다시 채워질 수 있다. 관측 세대는 실제 allocation ID가 아니므로 관측 사이의 주소 재사용을 모두 배제할 수 없다.
 
 ## 원본 기록과 replay
 
 `coverage.channel`은 source별 상태·레이아웃·레코드 수·검증 후보 수를, `coverage.user_references`는 프로세스 인스턴스·스레드/참조 수·재개 위치를 기록한다. 실패 외의 정기 coverage는 기본 화면에서 숨겨지며 JSONL에는 남는다.
 
-`finding.execution_path`의 `hop_N_hunt_reference`는 JSON 문자열로 저장한 관측이다. `hop_N_capture_id`는 비동기 캡처 저장 결과와 연결한다. 저장 완료는 별도 `coverage.capture`에서 확인한다. `cases /json`의 주소·FILETIME은 정밀도 손실을 막기 위해 십진 문자열이다.
+`coverage.page_candidates`는 범위·페이지 예약·만료·퇴출·거부·참조 큐 압력을, `coverage.user_pages`는 PTE 읽기 실패와 재개 VA를 기록한다. `coverage.image_permissions`는 비실행 PE 페이지의 검사 커서와 번역 실패를 남긴다. `coverage.executable_memory`는 소유권을 확인하지 못한 실행 페이지의 읽기 증거다.
+
+`finding.execution_path`, `finding.executable_memory`, `finding.executable_permission`과 관련 coverage의 `hop_N_hunt_reference`는 JSON 문자열로 저장한 관측이다. `hop_N_capture_id`는 비동기 캡처 저장 결과와 연결한다. 저장 완료는 별도 `coverage.capture`에서 확인한다. `cases /json`의 주소·FILETIME은 정밀도 손실을 막기 위해 십진 문자열이다. session 확인 여부와 페이지 권한 확인 여부도 보존한다.
 
 ```powershell
 .\tools\validate-kmon-hunting.ps1 -Sanitize
@@ -83,7 +96,7 @@ PE-sieve 옵션은 `/shellc 3 /iat 3 /report 7 /ofilter 2 /quiet /json`이다. �
 
 ASan 합성 검사는 boot/PID/생성 시각, stale/future 관측, hash/슬롯/세대 변경, padding, capacity와 불완전 근거를 확인한다. 변형과 stress 반복을 독립적인 게임핵 표본으로 세지 않는다.
 
-2026-09-19 실행 결과의 바이너리·보고서 hash와 비교 요약은 [검증 기록](../research/kmon-hunting-validation-20260919.json)에 있다. source hash는 UTF-8/LF로 정규화했다. Release/Debug 각각 합성 assertion 10,275개, 명령 1,992개, 파서 ASan 275,002개를 통과했다. 일반 `--self-test all`의 console 524, timeline 28, MCP 75, remote 52 검사도 통과했다. 이 숫자는 독립적인 악성 표본 수가 아니다.
+초기 연관 헌팅 릴리스 `0905f56`의 바이너리·보고서 hash는 [초기 검증 기록](../research/kmon-hunting-validation-20260919.json)에 보존했다. 이후 전체 페이지·PTE 확장의 검증은 [확장 검증 기록](../research/kmon-coverage-validation-20260920.json)에 분리한다. source hash는 UTF-8/LF로 정규화했다. 합성 assertion과 반복 스트레스 횟수는 독립적인 악성 표본 수가 아니다.
 
 적대적 리뷰에서는 슬롯 대상 변경 후 이전 사건 잔존, 제한 query 핸들에서의 검사 누락, 포인터 field 폭/overflow, 읽기 실패 시 coverage, firmware 목록 링크 검증, replay·증거 파일 증가 중 입력 상한, 과도한 JSON 중첩, 스택 페이지의 과도한 hex 로그와 cases 자동완성을 수정했다. 수정한 범위의 재검토에서 추가 조치가 필요한 문제는 발견하지 못했으며, 실전 kernel lifetime/OS 호환성은 아래 VM 검증 범위에 남는다.
 
@@ -91,7 +104,7 @@ ASan 합성 검사는 boot/PID/생성 시각, stale/future 관측, hash/슬롯/�
 
 ## 실전 검증에 남은 작업
 
-이번 환경에는 실행 중인 KnLiveDbg 서비스나 연결된 VM 실행 도구가 확인되지 않았다. 커널 채널 통합은 빌드·리뷰까지 수행했으며 OS 빌드별 등록 목록 관측은 미실행이다. [공개 memory sample 목록](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples)의 이전 Windows/범용 악성코드 자료는 현재 Windows 10/11 게임핵의 커널·유저 채널 ground truth를 대신하지 않는다.
+실제 VM·게임핵 표본 검증은 사용자 담당이다. 커널 채널 통합의 빌드·컴포넌트 검증과 OS 빌드별 실제 등록 목록 검증을 구분한다. [공개 memory sample 목록](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples)의 이전 Windows/범용 악성코드 자료는 현재 Windows 10/11 게임핵의 커널·유저 채널 ground truth를 대신하지 않는다.
 
 1. VM의 커널/PDB/CI/HVCI 상태와 바이너리 SHA-256을 기록하고 정상 시스템의 한 source 순회 이상을 관측한다. coverage와 reference drop도 확인한다.
 2. 기존 `KnLiveDbgProbe.sys`의 정상 KNFW provider를 등록/해제하며 `!fwtable`과 `coverage.channel`을 대조한다. 비표준 이름만으로 악성 사건을 만들면 실패다. PDB가 없으면 partial과 withheld slot을 기대한다.

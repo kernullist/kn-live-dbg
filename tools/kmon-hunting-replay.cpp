@@ -68,6 +68,23 @@ namespace
             return false;
         }
         context.Identity.ProcessId = static_cast<uint32_t>(pid);
+        std::wstring pageVerified;
+        if (mcpjson::FindRawValue(json, L"page_executable_verified", &pageVerified) &&
+            !Boolean(json, L"page_executable_verified", &row->PageExecutableVerified))
+        {
+            return false;
+        }
+        std::wstring sessionRaw;
+        const bool hasSession = mcpjson::FindRawValue(json, L"session_id", &sessionRaw);
+        const bool hasSessionKnown = mcpjson::FindRawValue(json, L"session_known", &sessionRaw);
+        uint64_t session = 0;
+        if (hasSession != hasSessionKnown || (hasSession &&
+            (!Number(json, L"session_id", &session) || session > UINT32_MAX ||
+                !Boolean(json, L"session_known", &context.Identity.SessionKnown))))
+        {
+            return false;
+        }
+        context.Identity.SessionId = static_cast<uint32_t>(session);
         if (ownership == L"owned_modified")
         {
             context.Ownership = CodeOwnership::OwnedModified;
@@ -79,6 +96,18 @@ namespace
         else if (ownership == L"owned_verified")
         {
             context.Ownership = CodeOwnership::OwnedVerified;
+        }
+        else if (ownership == L"unknown")
+        {
+            context.Ownership = CodeOwnership::Unknown;
+        }
+        else if (ownership == L"owned_unverified")
+        {
+            context.Ownership = CodeOwnership::OwnedUnverified;
+        }
+        else if (ownership == L"owned_unexpected_executable")
+        {
+            context.Ownership = CodeOwnership::OwnedUnexpectedExecutable;
         }
         else
         {

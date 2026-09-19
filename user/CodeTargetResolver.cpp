@@ -136,6 +136,7 @@ CodeTargetChain ResolveCodeTarget(uint64_t address, const ObservationReader& rea
         hop.Ownership = inspect ? inspect(address, hop.Bytes) : CodeOwnership::Unknown;
         result.HasModifiedCode = result.HasModifiedCode || hop.Ownership == CodeOwnership::OwnedModified;
         result.HasUnownedExecutable = result.HasUnownedExecutable || hop.Ownership == CodeOwnership::UnownedExecutable;
+        result.HasUnexpectedExecutable = result.HasUnexpectedExecutable || hop.Ownership == CodeOwnership::OwnedUnexpectedExecutable;
         size_t prefix = 0;
         if (hop.Bytes.size() >= 4 && std::memcmp(hop.Bytes.data(), "\xF3\x0F\x1E\xFA", 4) == 0)
         {
@@ -199,6 +200,7 @@ CodeTargetChain ResolveReferencedCodeTarget(uint64_t address, uint64_t slot,
     {
         result.HasModifiedCode = false;
         result.HasUnownedExecutable = false;
+        result.HasUnexpectedExecutable = false;
         result.Termination = L"reference_changed_or_unreadable";
     }
     return result;
@@ -269,5 +271,19 @@ bool CodeTargetResolverSelfTest()
     chain = ResolveReferencedCodeTarget(target, 0x9000, reader, changing);
     ok = ok && !chain.ReferenceStable && !chain.HasUnownedExecutable &&
         chain.Termination == L"reference_changed_or_unreadable";
+    std::memcpy(memory[0x9000].data(), &target, sizeof(target));
+    const CodeTargetInspector unexpected = [](uint64_t, const std::vector<uint8_t>&)
+    {
+        return CodeOwnership::OwnedUnexpectedExecutable;
+    };
+    chain = ResolveReferencedCodeTarget(target, 0x9000, reader, unexpected);
+    ok = ok && chain.ReferenceStable && chain.HasUnexpectedExecutable && !chain.HasModifiedCode;
+    const CodeTargetInspector changingPermission = [&](uint64_t address, const std::vector<uint8_t>& bytes)
+    {
+        memory[0x9000][0] ^= 1;
+        return unexpected(address, bytes);
+    };
+    chain = ResolveReferencedCodeTarget(target, 0x9000, reader, changingPermission);
+    ok = ok && !chain.ReferenceStable && !chain.HasUnexpectedExecutable;
     return ok;
 }

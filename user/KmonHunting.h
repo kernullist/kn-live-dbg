@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ObservationModel.h"
+#include "KmonExecutablePages.h"
 #include <algorithm>
 #include <array>
 
@@ -16,6 +17,7 @@ struct KmonHuntReference
     std::wstring PageSha256;
     bool PageComparable = false;
     bool SlotStable = false;
+    bool PageExecutableVerified = false;
 };
 
 struct KmonHuntCase
@@ -29,7 +31,8 @@ struct KmonHuntCase
 
 inline bool KmonHuntOwnership(CodeOwnership ownership)
 {
-    return ownership == CodeOwnership::OwnedModified || ownership == CodeOwnership::UnownedExecutable;
+    return ownership == CodeOwnership::OwnedModified || ownership == CodeOwnership::UnownedExecutable ||
+        ownership == CodeOwnership::OwnedUnexpectedExecutable;
 }
 
 inline bool KmonComparablePage(const std::vector<uint8_t>& bytes)
@@ -68,7 +71,12 @@ inline bool KmonChannelRole(const std::wstring& role)
 {
     return role == L"firmware_table_handler" || role == L"hive_get_cell" ||
         role == L"hive_release_cell" || role == L"hive_allocate" ||
-        role == L"hive_free" || role == L"etw_logger_clock";
+        role == L"hive_free" || role == L"etw_logger_clock" ||
+        role == L"callback:process:pre" || role == L"callback:thread:pre" ||
+        role == L"callback:imageload:pre" || role == L"callback:registry:pre" ||
+        role == L"callback:registry:post" || role == L"callback:ob:pre" ||
+        role == L"callback:ob:post" || role == L"callback:minifilter:pre" ||
+        role == L"callback:minifilter:post";
 }
 
 inline bool KmonPointerReference(const std::wstring& role)
@@ -103,10 +111,13 @@ public:
         const auto& context = reference.Context;
         const auto& identity = context.Identity;
         if (identity.BootId.empty() || identity.BootId.size() > 128 || reference.Role.empty() || reference.Role.size() > 64 ||
-            context.MonotonicMs < LastMs || context.MonotonicMs == 0 || reference.Address == 0 ||
+            context.MonotonicMs < LastMs || context.MonotonicMs == 0 || (reference.Address == 0 && !KmonPageRole(reference.Role)) ||
             (identity.ProcessId == 0 && reference.Address < 0xFFFF800000000000ull) ||
-            (identity.ProcessId != 0 && (reference.Address < 0x10000 || reference.Address >= 0x0000800000000000ull)) ||
-            !KmonHuntOwnership(context.Ownership) ||
+            (identity.ProcessId != 0 && ((reference.Address < 0x10000 && !KmonPageRole(reference.Role)) ||
+                reference.Address >= 0x0000800000000000ull)) ||
+            (!KmonHuntOwnership(context.Ownership) && !((context.Ownership == CodeOwnership::Unknown ||
+                context.Ownership == CodeOwnership::OwnedUnverified) &&
+                KmonPageRole(reference.Role) && reference.PageExecutableVerified && context.MappingGeneration != 0)) ||
             (identity.ProcessId != 0 && (identity.ProcessId <= 4 || identity.CreateTime == 0)))
         {
             ++Rejected;
@@ -149,8 +160,17 @@ public:
         {
             const auto oldest = std::min_element(References.begin(), References.end(), [](const auto& a, const auto& b)
             {
+                if (KmonPageRole(a.Role) != KmonPageRole(b.Role))
+                {
+                    return KmonPageRole(a.Role);
+                }
                 return a.Context.MonotonicMs < b.Context.MonotonicMs;
             });
+            if (KmonPageRole(reference.Role) && !KmonPageRole(oldest->Role))
+            {
+                ++Rejected;
+                return 0;
+            }
             References.erase(oldest);
             ++Evicted;
         }
@@ -190,11 +210,31 @@ public:
                     *kernel, *user, true});
             }
         }
-        for (auto row = References.rbegin(); row != References.rend() && result.size() < limit; ++row)
+        for (unsigned priority = 0; priority < 2 && result.size() < limit; ++priority)
         {
-            if (fresh(*row))
+            for (auto row = References.rbegin(); row != References.rend() && result.size() < limit; ++row)
             {
-                result.push_back({row->Context.Identity.ProcessId == 0 ? L"kernel_execution_reference" : L"user_execution_reference",
+                if (!fresh(*row) || KmonPageRole(row->Role) != (priority == 1))
+                {
+                    continue;
+                }
+                const bool kernel = row->Context.Identity.ProcessId == 0;
+                std::wstring kind = KmonPageRole(row->Role) ?
+                    (kernel ? L"kernel_executable_memory" : L"user_executable_memory") :
+                    (kernel ? L"kernel_execution_reference" : L"user_execution_reference");
+                if (row->Context.Ownership == CodeOwnership::Unknown)
+                {
+                    kind = L"executable_ownership_unknown";
+                }
+                else if (row->Context.Ownership == CodeOwnership::OwnedUnverified)
+                {
+                    kind = L"executable_image_unverified";
+                }
+                else if (row->Context.Ownership == CodeOwnership::OwnedUnexpectedExecutable)
+                {
+                    kind = L"image_executable_permission";
+                }
+                result.push_back({kind,
                     ObservationRelation::Address, *row, {}, false});
             }
         }

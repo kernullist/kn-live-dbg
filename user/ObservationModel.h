@@ -12,7 +12,8 @@ enum class CodeOwnership
     OwnedUnverified,
     OwnedVerified,
     OwnedModified,
-    UnownedExecutable
+    UnownedExecutable,
+    OwnedUnexpectedExecutable
 };
 
 inline const wchar_t* CodeOwnershipName(CodeOwnership state)
@@ -27,6 +28,8 @@ inline const wchar_t* CodeOwnershipName(CodeOwnership state)
         return L"owned_modified";
     case CodeOwnership::UnownedExecutable:
         return L"unowned_executable";
+    case CodeOwnership::OwnedUnexpectedExecutable:
+        return L"owned_unexpected_executable";
     default:
         return L"unknown";
     }

@@ -1230,18 +1230,21 @@ namespace
             {
                 break;
             }
+            TypeFieldInfo pcbField = {};
             TypeFieldInfo dtbField = {};
             std::wstring ignored;
-            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
-                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
-                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            if (!symbols->FindField(L"nt!_EPROCESS", L"Pcb", &pcbField, &ignored) ||
+                !symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
+                pcbField.IsBitField || dtbField.IsBitField || dtbField.Length != 8 ||
+                pcbField.Offset >= 0x10000 || dtbField.Offset >= 0x10000 ||
+                pcbField.Offset + dtbField.Offset > 0x10000 - 8)
             {
                 break;
             }
             ProcessAddressContext ctx = {};
             if (!device->ResolveProcess(
                     pid,
-                    static_cast<uint32_t>(dtbField.Offset),
+                    static_cast<uint32_t>(pcbField.Offset + dtbField.Offset),
                     0,
                     &ctx,
                     &ignored) ||
@@ -2169,7 +2172,9 @@ namespace
         ProcessVadScanResult* vadResult,
         bool* scanned,
         bool scanHiddenPtes,
-        bool probePe)
+        bool probePe,
+        uint64_t resumeAddress,
+        uint64_t expectedCreateTime)
     {
         bool ok = false;
         do
@@ -2191,11 +2196,14 @@ namespace
                 break;
             }
 
+            TypeFieldInfo pcbField = {};
             TypeFieldInfo dtbField = {};
             std::wstring ignored;
-            if (!symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) &&
-                !symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) &&
-                !symbols->FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored))
+            if (!symbols->FindField(L"nt!_EPROCESS", L"Pcb", &pcbField, &ignored) ||
+                !symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
+                pcbField.IsBitField || dtbField.IsBitField || dtbField.Length != 8 ||
+                pcbField.Offset >= 0x10000 || dtbField.Offset >= 0x10000 ||
+                pcbField.Offset + dtbField.Offset > 0x10000 - 8)
             {
                 break;
             }
@@ -2203,7 +2211,7 @@ namespace
             ProcessAddressContext ctx = {};
             if (!device->ResolveProcess(
                     pid,
-                    static_cast<uint32_t>(dtbField.Offset),
+                    static_cast<uint32_t>(pcbField.Offset + dtbField.Offset),
                     0,
                     &ctx,
                     &ignored) ||
@@ -2220,15 +2228,19 @@ namespace
             options.Target.CreateTime =
                 QueryEprocessCreateTime(device, symbols, nullptr, ctx.Eprocess);
             options.Target.HasCreateTime = options.Target.CreateTime != 0;
+            if (!options.Target.HasCreateTime || options.Target.CreateTime != expectedCreateTime)
+            {
+                break;
+            }
             // Probe private and section-mapped VADs for MZ so header-intact
             // manual maps still classify when VirtualQueryEx is denied.
             options.ProbePe = probePe;
-            // Full user page-table walks are expensive. Hidden PTEs follow
-            // the caller's kernel-VAD gate (watched games, or builtin/PPL
-            // hosts whose usermode walks already failed).
+            // Resume across bounded passes so every selected process gets PTE coverage.
             options.ScanHiddenPtes = scanHiddenPtes;
             options.HiddenPteExecutableOnly = scanHiddenPtes;
             options.HiddenPteLimit = scanHiddenPtes ? 32u : 0u;
+            options.HiddenPteTableBudget = 128;
+            options.HiddenPteResumeAddress = resumeAddress;
 
             ProcessTriageScanner scanner(*device, *symbols);
             if (!scanner.ScanVad(options, vadResult, &ignored))
@@ -6772,7 +6784,10 @@ bool KernelMonitor::Start(
             NextImageScanTickMs = 0;
             NextChannelScanTickMs = 0;
             ChannelScanCursor = 0;
+            WfpCalloutCursor = 0;
             UserThreadCursors.clear();
+            ExecutablePages = KmonExecutablePages{};
+            NextPageCoverageTickMs = 0;
             {
                 std::lock_guard<std::mutex> huntLock(HuntMutex);
                 HuntIndex = KmonHuntIndex{};
@@ -6780,6 +6795,7 @@ bool KernelMonitor::Start(
             KernelImageCursor = 0;
             RegionCatalog = ExecutableRegionCatalog{};
             UserRegionCursors.clear();
+            UserPteCursors.clear();
             CatalogRecords.store(0);
             CatalogEvicted.store(0);
             KpageResumeAddress.store(0);
@@ -7224,6 +7240,7 @@ void KernelMonitor::WorkerLoop()
             ScanKernelExecutableImages();
             NextImageScanTickMs = GetTickCount64() + 500;
         }
+        ScanExecutablePageCandidates();
         ScanExecutionReferences();
 
         AnalysisLastCompleteMs.store(GetTickCount64());
@@ -11344,6 +11361,7 @@ void KernelMonitor::ScanOrphanMappedPages()
         const uint64_t generation = ObserveExecutableRegion(observation);
         if (generation != 0 && region.Classification != L"mmio" && !region.SessionSpace)
         {
+            QueueExecutableRegionPages(observation, L"kernel_page_candidate");
             QueueCapture(L"kernel_exec_candidate", region.Start, (std::min<uint64_t>)(region.Size, 4096),
                 observation.Context.Identity, ObservationFileTime(), nullptr, generation);
         }
@@ -11586,10 +11604,17 @@ void KernelMonitor::ScanHookCallbacks()
         bool emittedUnbacked = false;
         auto emitCallbackIfUnbacked = [&](
             uint64_t fn,
+            uint64_t slot,
+            bool slotVerified,
             const std::wstring& moduleName,
             const wchar_t* which)
         {
-            QueueExecutionReference(fn, record.Entry, L"callback:" + record.Kind + which);
+            if (!record.Poisoned)
+            {
+                const auto role = (slotVerified ? L"callback:" : L"callback_unverified:") + record.Kind +
+                    (which[0] == L'\0' ? L":pre" : L":post");
+                QueueExecutionReference(fn, slotVerified ? slot : 0, role);
+            }
             if (fn == 0 || AddressNotConfirmedOutsideLoadedModules(symbols, fn))
             {
                 return;
@@ -11616,9 +11641,11 @@ void KernelMonitor::ScanHookCallbacks()
                 record.Notes);
             emittedUnbacked = true;
         };
-        emitCallbackIfUnbacked(record.Function, record.FunctionModule, L"");
+        emitCallbackIfUnbacked(record.Function, record.FunctionSlot, record.FunctionSlotVerified, record.FunctionModule, L"");
         emitCallbackIfUnbacked(
             record.PostFunction,
+            record.PostFunctionSlot,
+            record.PostFunctionSlotVerified,
             record.PostFunctionModule,
             L"post:");
         if (record.Poisoned && !emittedUnbacked)
@@ -13405,20 +13432,15 @@ void KernelMonitor::ScanUserModeHostility()
             ProcessVadScanResult kernelVad = {};
             ProcessVadRecord exeVad = {};
             bool kernelVadScanned = false;
-            // VirtualQueryEx can succeed while Toolhelp module enumeration
-            // fails (ObCallback / PPL). The usermode orphan walk needs a
-            // module list, so those targets still need kernel private-VAD
-            // PE probes. Hidden PTEs follow the same kernel-VAD gate so PPL
-            // builtin hosts are covered when usermode walks cannot run.
-            const bool needKernelPrivateImplants =
-                (hostileHost) &&
-                (!queried || !moduleInventoryComplete);
-            const bool wantKernelVad =
-                watched || dropHost || defaultWatched || needKernelPrivateImplants;
-            // Watched/drop hosts still need private-VAD PE probes when the
-            // usermode module list is complete; header-intact and wiped
-            // manual maps would otherwise hide behind the JIT skip.
-            const bool probePrivatePe = wantKernelVad;
+            // A successful user-mode inventory does not exclude VAD/PTE hiding.
+            const bool wantKernelVad = true;
+            const bool probePrivatePe = watched || dropHost || defaultWatched || !queried || !moduleInventoryComplete;
+            const uint64_t vadCreateTime = QueryPidCreateTime(device, symbols, processHandle, pid);
+            const auto pteKey = std::make_pair(pid, vadCreateTime);
+            if (UserPteCursors.size() >= 4096 && UserPteCursors.count(pteKey) == 0)
+            {
+                UserPteCursors.erase(UserPteCursors.begin());
+            }
             const bool hasKernelVadScan =
                 wantKernelVad &&
                 QueryKernelVadScan(
@@ -13428,7 +13450,13 @@ void KernelMonitor::ScanUserModeHostility()
                     &kernelVad,
                     &kernelVadScanned,
                     wantKernelVad,
-                    probePrivatePe);
+                    probePrivatePe,
+                    UserPteCursors[pteKey],
+                    vadCreateTime);
+            if (hasKernelVadScan)
+            {
+                UserPteCursors[pteKey] = kernelVad.HiddenPteResumeAddress;
+            }
             const std::wstring vadFailKey =
                 L"scan_failed:userhostility:vad:" + std::to_wstring(pid);
             if (wantKernelVad && !kernelVadScanned)
@@ -14856,14 +14884,14 @@ void KernelMonitor::ScanUserModeHostility()
                         : 0;
                 const bool selectedImage = modulePaths.size() != 0 &&
                     ((moduleIndex + modulePaths.size() - imageStart) % modulePaths.size()) < imageBudget;
-                const bool compareGameText = (watched || dropHost || defaultWatched) &&
-                    selectedImage && loadedModuleBase != 0 && PathLooksLikeWin32File(modulePath);
+                const bool compareGameText = selectedImage && loadedModuleBase != 0 && PathLooksLikeWin32File(modulePath);
                 const bool compareSystemText = compareGameText && windowsModule &&
                     KmonLooksLikeHookableSystemDll(moduleLeaf);
                 const bool compareBuiltinImageText = compareGameText && moduleLeaf == leaf;
                 if (compareGameText)
                 {
                     ScanExecutableImage(modulePath, loadedModuleBase, codeIdentity, imageReader, 16);
+                    ScanImagePermissionCandidates(modulePath, loadedModuleBase, codeIdentity, imageReader);
                     if (GameManifestActive && loadedModuleBase == exeRegion)
                     {
                         ScanGameObjectManifest(modulePath, loadedModuleBase, codeIdentity, imageReader);
@@ -16155,10 +16183,12 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
-        ((event.Kind == L"coverage.channel" || event.Kind == L"coverage.user_references") &&
+        event.Kind == L"coverage.page_candidates" ||
+        event.Kind == L"coverage.image_permissions" ||
+        ((event.Kind == L"coverage.channel" || event.Kind == L"coverage.user_references" || event.Kind == L"coverage.user_pages") &&
             event.Evidence[L"source_status"] != L"failed") ||
         (event.Kind == L"coverage.execution_path" && (event.Evidence[L"termination"] == L"no_supported_head_transfer" ||
-            event.Evidence[L"reference_role"] == L"etw_stack_return"));
+            event.Evidence[L"reference_role"] == L"etw_stack_return" || KmonPageRole(event.Evidence[L"reference_role"])));
     if (quietOverlay || quietFile || quietCoverage)
     {
         event.Evidence[L"display_suppressed"] = L"true";

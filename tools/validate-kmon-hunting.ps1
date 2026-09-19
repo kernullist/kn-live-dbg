@@ -84,6 +84,9 @@ $badRows = @(
     '{"pid":1,"pid":2}',
     $rows[1].Replace('"pid":45', '"pid":4294967296'),
     $rows[1].Replace('"observed_ms":101', '"observed_ms":18446744073709551616'),
+    $rows[1].Replace('"session_id":0', '"session_id":4294967296'),
+    $rows[1].Replace('"session_known":false', '"session_known":"false"'),
+    $rows[1].Replace('"page_executable_verified":false', '"page_executable_verified":1'),
     ('x' * 8193)
 )
 foreach ($bad in $badRows)
