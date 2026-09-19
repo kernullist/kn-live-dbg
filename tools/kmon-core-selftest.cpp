@@ -10,6 +10,7 @@
 #include "../user/KmonWorkQueue.h"
 #include "../user/KmonHunting.h"
 #include "kmon-hunting-selftest.h"
+#include "kmon-fp-selftest.h"
 
 #include <iostream>
 
@@ -89,5 +90,6 @@ int main()
     const bool actualImage = ArbitraryImageSelfTest();
     std::cout << "[kmon.core] arbitrary-name EXE, second executable page and mid-page change: " << (actualImage ? "PASS" : "FAIL") << "\n";
     const bool hunting = KmonHuntingSelfTest();
-    return pure && found && image && branches && catalog && manifest && actualImage && hunting ? 0 : 1;
+    const bool falsePositives = KmonFalsePositiveSelfTest();
+    return pure && found && image && branches && catalog && manifest && actualImage && hunting && falsePositives ? 0 : 1;
 }

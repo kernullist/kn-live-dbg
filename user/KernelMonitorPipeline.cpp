@@ -856,6 +856,27 @@ bool KmonPipelineSelfTest()
                 std::fprintf(stderr, "FAIL layout copy-on-write catalog metadata\n");
             }
             ok = cowReady && cowRecorded && ok;
+            // Classification is applied at the publication boundary, including
+            // events with an older or overconfident producer-supplied category.
+            KmonEvent normal;
+            normal.Kind = L"finding.layout_change";
+            normal.Evidence[L"event_category"] = L"finding";
+            normal.Evidence[L"maliciousness"] = L"confirmed";
+            monitor.RecordEvent(std::move(normal));
+            KmonEvent lead;
+            lead.Kind = L"driver.tampered";
+            monitor.RecordEvent(std::move(lead));
+            const auto published = monitor.Recent(2, true);
+            const bool claims = published.size() == 2 &&
+                published[0].Evidence.at(L"event_category") == L"lead" &&
+                published[1].Evidence.at(L"event_category") == L"observation" &&
+                published[0].Evidence.at(L"maliciousness") == L"not_established" &&
+                published[1].Evidence.at(L"maliciousness") == L"not_established";
+            if (!claims)
+            {
+                std::fprintf(stderr, "FAIL kmon event evidence classification\n");
+            }
+            ok = claims && ok;
         } while (false);
     }
     catch (...)

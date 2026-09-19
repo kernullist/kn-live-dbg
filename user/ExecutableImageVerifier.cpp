@@ -223,13 +223,34 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
             rva >= metadata.SizeOfImage || size > metadata.SizeOfImage - rva ||
             static_cast<uint64_t>(rva) + size > static_cast<uint64_t>(section->VirtualAddress) +
                 (std::max)(section->VirtualSize, section->SizeOfRawData) ||
-            !metadata.DynamicRelocationTableComplete ||
-            !NormalizeRange(path, metadata, imageBase, rva, size, &result.Expected) ||
-            !ReadExact(reader, imageBase, rva, size, &result.Observed))
+            !metadata.DynamicRelocationTableComplete)
         {
             break;
         }
         result.Coverage.InventoryAvailable = true;
+        // INIT and other discardable sections have no persistent byte contract.
+        if ((section->Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+        {
+            result.Coverage.SkippedBytes = size;
+            result.Coverage.Skipped.push_back({imageBase + rva, size});
+            result.Coverage.TraversalComplete = true;
+            result.Coverage.Reason = L"discardable_section";
+            break;
+        }
+        if (!NormalizeRange(path, metadata, imageBase, rva, size, &result.Expected) ||
+            !ReadExact(reader, imageBase, rva, size, &result.Observed))
+        {
+            break;
+        }
+        if (result.Expected != result.Observed)
+        {
+            std::vector<uint8_t> confirmed;
+            if (!ReadExact(reader, imageBase, rva, size, &confirmed) || confirmed != result.Observed)
+            {
+                result.Coverage.Reason = L"live_bytes_unstable_or_unreadable";
+                break;
+            }
+        }
         std::vector<bool> mutableBytes(size, false);
         const auto mask = [&](const std::vector<DiskPeMutableRange>& ranges)
         {
@@ -337,6 +358,36 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         }
         sweep->Coverage.RangesTruncated = sweep->Coverage.RangesTruncated || page.Coverage.RangesTruncated;
         results.push_back(std::move(page));
+    }
+    const bool hasChanges = std::any_of(results.begin(), results.end(), [](const ExecutablePageResult& page)
+    {
+        return page.Ownership == CodeOwnership::OwnedModified;
+    });
+    if (hasChanges && !QualifyExecutableReference(metadata, imageBase, reader, &reason))
+    {
+        // The mapping may have changed after the initial identity read.
+        for (auto& page : results)
+        {
+            const uint64_t requested = page.Coverage.RequestedBytes;
+            page.Ownership = CodeOwnership::OwnedUnverified;
+            page.Changes.clear();
+            page.Coverage = {};
+            page.Coverage.Attempted = true;
+            page.Coverage.RequestedBytes = requested;
+            page.Coverage.FailedBytes = requested;
+            page.Coverage.Failed.push_back({imageBase + page.Rva, requested});
+            page.Coverage.Reason = L"image_identity_changed_during_compare";
+        }
+        const uint64_t requested = sweep->Coverage.RequestedBytes;
+        sweep->Coverage = {};
+        sweep->Coverage.Attempted = true;
+        sweep->Coverage.RequestedBytes = requested;
+        sweep->Coverage.FailedBytes = requested;
+        sweep->Coverage.Reason = L"image_identity_changed_during_compare";
+        sweep->Pages.clear();
+        sweep->NextRange = 0;
+        ++sweep->Cycle;
+        return results;
     }
     sweep->Coverage.TraversalComplete = sweep->NextRange == sweep->Ranges.size();
     sweep->Coverage.ResumeAddress = sweep->Coverage.TraversalComplete ? 0 : imageBase + sweep->Ranges[sweep->NextRange].Address;
@@ -476,6 +527,45 @@ bool ExecutableImageVerifierSelfTest()
         {
             break;
         }
+        // A loader or hotpatch transition must not become a stable difference.
+        size_t changingReads = 0;
+        const ObservationReader changingReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        {
+            if (!reader(address, size, bytes))
+            {
+                return false;
+            }
+            if (address == loadedBase + 0x1000 && ++changingReads == 1)
+            {
+                (*bytes)[0] ^= 1;
+            }
+            return true;
+        };
+        const auto transient = CompareExecutableRange(path, metadata, loadedBase, 0x1000, 4096, changingReader);
+        if (transient.Ownership != CodeOwnership::OwnedUnverified || !transient.Changes.empty() ||
+            transient.Coverage.Complete())
+        {
+            break;
+        }
+        auto discardable = metadata;
+        discardable.Sections[0].Characteristics |= IMAGE_SCN_MEM_DISCARDABLE;
+        const auto discarded = CompareExecutableRange(path, discardable, loadedBase, 0x3000, 4096, reader);
+        if (discarded.Ownership != CodeOwnership::OwnedUnverified || !discarded.Changes.empty() ||
+            discarded.Coverage.SkippedBytes != 4096 || discarded.Coverage.ComparedBytes != 0)
+        {
+            break;
+        }
+        // A second read failure cannot confirm the first mismatching read.
+        size_t failedReads = 0;
+        const ObservationReader failingReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        {
+            return ++failedReads == 1 && reader(address, size, bytes);
+        };
+        const auto unconfirmed = CompareExecutableRange(path, metadata, loadedBase, 0x3000, 4096, failingReader);
+        if (unconfirmed.Ownership != CodeOwnership::OwnedUnverified || !unconfirmed.Changes.empty())
+        {
+            break;
+        }
         unreadable = loadedBase + 0x2000;
         AdvanceExecutableSweep(path, metadata, loadedBase, reader, 8, 6, &sweep);
         if (sweep.Coverage.Complete() || sweep.Coverage.FailedBytes != 4096 || !sweep.Coverage.TraversalComplete)
@@ -502,6 +592,28 @@ bool ExecutableImageVerifierSelfTest()
         const auto restarted = AdvanceExecutableSweep(path, metadata, loadedBase, reader, 1, 9, &sweep);
         if (restarted.size() != 1 || restarted[0].Rva != 0x1000 ||
             restarted[0].Ownership != CodeOwnership::OwnedModified)
+        {
+            break;
+        }
+        size_t readsBeforeReuse = 0;
+        const ObservationReader reusedReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+        {
+            if (!reader(address, count, bytes))
+            {
+                return false;
+            }
+            if (address == loadedBase + 0x1000 && ++readsBeforeReuse == 2)
+            {
+                live[0] = 0;
+            }
+            return true;
+        };
+        ExecutableSweep reusedSweep;
+        reusedSweep.Initialize(metadata);
+        const auto reused = AdvanceExecutableSweep(path, metadata, loadedBase, reusedReader, 1, 10, &reusedSweep);
+        live[0] = 'M';
+        if (reused.size() != 1 || reused[0].Ownership != CodeOwnership::OwnedUnverified ||
+            !reused[0].Changes.empty() || reusedSweep.NextRange != 0 || !reusedSweep.Pages.empty())
         {
             break;
         }

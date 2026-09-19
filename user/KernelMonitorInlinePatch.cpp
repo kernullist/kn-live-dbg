@@ -183,12 +183,8 @@ namespace
         {
             return false;
         }
-        if (!symbols->CopyModules().empty())
-        {
-            return true;
-        }
         std::wstring ignored;
-        if (!symbols->LoadKernelModules(&ignored) || symbols->CopyModules().empty())
+        if (!symbols->LoadKernelModules(&ignored) || !KmonKernelModuleRangesKnown(symbols->CopyModules()))
         {
             return false;
         }
@@ -377,7 +373,7 @@ void KernelMonitor::ScanKernelInlinePatches()
 
     std::vector<PatchModule> modules;
     BuildPatchModules(symbols, &modules);
-    if (modules.empty())
+    if (modules.empty() || symbols->CopyModules().size() > kMaxModuleEntries)
     {
         // An empty module view cannot tell an in-image hotpatch from a hook,
         // so it is a deferral, the same rule AddressOwnedByLoadedModule uses
@@ -500,7 +496,7 @@ void KernelMonitor::ScanKernelInlinePatches()
 
         std::vector<uint8_t> prologue;
         if (!ReadKernelBytes(device, target.Address, kPrologueBytes, &prologue) ||
-            prologue.size() < 6)
+            prologue.size() != kPrologueBytes)
         {
             // A prologue that cannot be read proves nothing: the entry is a
             // deferral for this pass and the scan continues with the rest.
@@ -508,6 +504,7 @@ void KernelMonitor::ScanKernelInlinePatches()
             continue;
         }
         ++readable;
+        input.PrologueKnown = true;
 
         const KmonInlinePatchDecode decode =
             KmonDecodeInlinePatchHead(prologue.data(), prologue.size(), target.Address);
@@ -552,12 +549,15 @@ void KernelMonitor::ScanKernelInlinePatches()
             if (destination == nullptr)
             {
                 std::vector<uint8_t> stub;
+                std::vector<uint8_t> confirmedStub;
                 if (ReadKernelBytes(
                         device,
                         input.TransferTarget,
                         kStubBytes,
                         &stub) &&
-                    stub.size() >= 6)
+                    stub.size() == kStubBytes &&
+                    ReadKernelBytes(device, input.TransferTarget, kStubBytes, &confirmedStub) &&
+                    stub == confirmedStub)
                 {
                     input.StubKnown = true;
                     uint64_t destinationAddress = 0;
@@ -581,10 +581,25 @@ void KernelMonitor::ScanKernelInlinePatches()
             continue;
         }
 
-        // Two-scan confirmation: a page-in or a hotpatch transition lands in
-        // the first pass only, and a single pass must not print a verdict.
-        const std::wstring strikeKey =
-            std::wstring(target.Symbol) + L":" + KmonInlinePatchKindName(kind);
+        std::vector<uint8_t> confirmedPrologue;
+        uint64_t confirmedSlot = 0;
+        if (!ReadKernelBytes(device, target.Address, kPrologueBytes, &confirmedPrologue) ||
+            confirmedPrologue != prologue ||
+            (decode.Shape == KmonInlinePatchShape::RipIndirect &&
+                (!ReadKernelU64(device, decode.SlotAddress, &confirmedSlot) || confirmedSlot != input.TransferTarget)))
+        {
+            ++skipped;
+            continue;
+        }
+        // Different addresses, bytes or targets must not accumulate confirmation.
+        std::wstring strikeKey = std::wstring(target.Symbol) + L":" + KmonInlinePatchKindName(kind) +
+            L":" + PatchHex(target.Address) + L":" + PatchHex(input.TransferTarget) +
+            L":" + PatchHex(input.StubDestination) + L":" + PatchHex(target.Owner->Base) +
+            L":" + PatchHex(target.Owner->End);
+        for (uint8_t byte : prologue)
+        {
+            strikeKey += L":" + std::to_wstring(byte);
+        }
         candidates.insert(strikeKey);
         uint32_t strikes = 0;
         {
@@ -593,7 +608,7 @@ void KernelMonitor::ScanKernelInlinePatches()
             {
                 InlinePatchStrikes.clear();
             }
-            strikes = ++InlinePatchStrikes[strikeKey];
+            strikes = InlinePatchStrikes[strikeKey].Observe(strikeKey, GetTickCount64(), 60000);
         }
         if (strikes < kStrikeThreshold)
         {
@@ -617,7 +632,8 @@ void KernelMonitor::ScanKernelInlinePatches()
         {
             notes += L" stub_destination=" + PatchHex(input.StubDestination);
         }
-        notes += L" strikes=" + std::to_wstring(kStrikeThreshold);
+        notes += L" strikes=" + std::to_wstring(kStrikeThreshold) +
+            L" evidence=entry_shape original_bytes=unknown execution=not_established";
         if (!target.Owner->Leaf.empty())
         {
             notes += L" owner=" + target.Owner->Leaf;
@@ -630,13 +646,13 @@ void KernelMonitor::ScanKernelInlinePatches()
             kindName = L"hook.breakpoint";
             summary = label + L" (" + function +
                 L") starts with an int3 trap at " + PatchHex(target.Address) +
-                L"; the real prologue is not reachable";
+                L"; breakpoint ownership and purpose are unknown";
         }
         else if (kind == KmonInlinePatchKind::TrampolineStub)
         {
             kindName = L"hook.inline";
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer into an unbacked trampoline stub at " +
+                L") has a head transfer into an unowned trampoline-shaped stub at " +
                 PatchHex(input.TransferTarget) + L" that continues to " +
                 PatchHex(input.StubDestination);
         }
@@ -644,8 +660,8 @@ void KernelMonitor::ScanKernelInlinePatches()
         {
             kindName = L"hook.inline";
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer at " + PatchHex(target.Address) +
-                L" into code no loaded module owns (" +
+                L") has a head transfer at " + PatchHex(target.Address) +
+                L" into an address no loaded module owns (" +
                 PatchHex(input.TransferTarget) + L")";
         }
         else
@@ -657,13 +673,13 @@ void KernelMonitor::ScanKernelInlinePatches()
                 ? destination->Leaf
                 : std::wstring(L"<unknown>");
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer into non-inbox module " +
+                L") has a head transfer into non-inbox module " +
                 destinationLeaf + L" (" + PatchHex(input.TransferTarget) + L")";
         }
 
         EmitUnique(
             kindName,
-            std::wstring(L"inline_patch:") + KmonInlinePatchKindName(kind) + L":" + function,
+            std::wstring(L"inline_patch:") + strikeKey,
             target.Owner->Leaf,
             kLayer,
             summary,
@@ -694,7 +710,7 @@ void KernelMonitor::ScanKernelInlinePatches()
             std::wstring(),
             kLayer,
             L"inline patch scan capped at " + std::to_wstring(kEmitCap) +
-                L" findings; more patched entries exist in this pass",
+                L" leads; more entry-shape candidates exist in this pass",
             L"reattach after the mapper watch window or raise the pass budget");
     }
     else

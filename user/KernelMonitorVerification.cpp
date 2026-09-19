@@ -602,20 +602,25 @@ void KernelMonitor::ScanExecutionReferences()
                     {
                         return CodeOwnership::OwnedUnexpectedExecutable;
                     }
+                    bool reusedCapture = false;
                     const ObservationReader captured = [&](uint64_t at, size_t count, std::vector<uint8_t>* out)
                     {
-                        if (at == address && count == bytes.size())
+                        if (!reusedCapture && at == address && count == bytes.size())
                         {
+                            reusedCapture = true;
                             *out = bytes;
                             return true;
                         }
                         return reader(at, count, out);
                     };
-                    return CompareExecutableRange(path, image->Reference, module.Base,
-                        static_cast<uint32_t>(address - module.Base), static_cast<uint32_t>(bytes.size()), captured).Ownership;
+                    const auto result = CompareExecutableRange(path, image->Reference, module.Base,
+                        static_cast<uint32_t>(address - module.Base), static_cast<uint32_t>(bytes.size()), captured);
+                    return result.Ownership == CodeOwnership::OwnedModified &&
+                        !QualifyExecutableReference(image->Reference, module.Base, reader, nullptr)
+                        ? CodeOwnership::OwnedUnverified : result.Ownership;
                 }
             }
-            if (modules.empty())
+            if (!KmonKernelModuleRangesKnown(modules))
             {
                 return CodeOwnership::Unknown;
             }
@@ -807,6 +812,7 @@ void KernelMonitor::ScanExecutionReferences()
         }
         referenceSnapshotValid = referenceSnapshotValid && sameProcess() &&
             ObservationAnchorsMatch(work.Anchors, reader) &&
+            (pageCheck || CodeTargetChainMatches(chain, reader)) &&
             (!pointerSlot || CodeTargetSlotMatches(work.Target, work.Slot, reader));
         if (referenceSnapshotValid && pid != 0 && addressSpaceValid)
         {

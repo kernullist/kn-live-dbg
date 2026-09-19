@@ -1,5 +1,7 @@
 #pragma once
 
+#include "KmonEvidencePolicy.h"
+
 #include "DeviceClient.h"
 #include "KmonHandleTracking.h"
 #include "ObservationWindows.h"
@@ -142,6 +144,7 @@ struct KmonDriverIdentitySnapshot
     uint64_t DriverSize = 0;
     uint64_t DriverSection = 0;
     uint64_t DeviceObject = 0;
+    uint64_t DriverObject = 0;
     bool HasImage = false;
     bool HasFields = false;
 };
@@ -154,6 +157,7 @@ enum KmonTamperMask : uint32_t
 };
 
 uint64_t KmonHashBytes64(const uint8_t* data, size_t size);
+bool KmonKernelModuleRangesKnown(const std::vector<KernelModuleInfo>& modules);
 
 // Returns the subset of KmonTamperMask that the live snapshot contradicts.
 // Pure so the self-test can drive it with synthetic snapshots.
@@ -610,7 +614,12 @@ private:
     // on first sight and compares them on every later pass. Worker thread
     // only; guarded by WatchMutex.
     std::map<std::wstring, KmonDriverIdentitySnapshot> DriverTamperBaselines;
-    std::map<std::wstring, uint32_t> DriverTamperStrikes;
+    struct DriverConfirmation
+    {
+        KmonRepeatObservation Image;
+        KmonRepeatObservation Fields;
+    };
+    std::map<std::wstring, DriverConfirmation> DriverTamperStrikes;
     std::map<std::wstring, uint64_t> DriverTamperLastCheckMs;
     std::vector<std::wstring> DriverTamperOrder;
     uint64_t DriverTamperCursor = 0;
@@ -641,7 +650,7 @@ private:
     // R1/R2: two-scan confirmation for the kernel-context cross-view and the
     // loader link integrity, so a load/unload race inside one scan can neither
     // print a verdict nor corroborate the host-side diff.
-    std::map<std::wstring, uint32_t> KernelViewPending;
+    std::map<std::wstring, KmonRepeatObservation> KernelViewPending;
     uint64_t NextKernelViewScanTickMs = 0;
     // P0 follow-up: the driver object type-list sweep costs a chain walk plus
     // one read per unknown candidate, so it runs on its own cadence and only
@@ -756,10 +765,10 @@ private:
     // Stage 1: kernel-thread scan cadence and the two-scan confirmation that
     // keeps a thread-creation race from printing a hidden-thread verdict.
     uint64_t NextThreadScanTickMs = 0;
-    std::map<uint32_t, uint32_t> ThreadHiddenStrikes;
+    std::map<uint32_t, KmonRepeatObservation> ThreadHiddenStrikes;
     // Stage 1b: ETHREAD-list DKOM confirmation, keyed by pid because the
     // verdict compares a whole process thread list against its accounting.
-    std::map<uint32_t, uint32_t> ThreadListDkomStrikes;
+    std::map<uint32_t, KmonRepeatObservation> ThreadListDkomStrikes;
     std::atomic<uint64_t> ThreadScans{0};
     // Stage 2: inline-patch scan cadence plus the two-scan confirmation that
     // keeps a page-in or a hotpatch transition from printing a patch verdict.
@@ -768,7 +777,7 @@ private:
     static constexpr uint32_t kInlinePatchScanIntervalMs = 20000;
     static constexpr uint32_t kInlinePatchWatchScanIntervalMs = 10000;
     uint64_t NextInlinePatchScanTickMs = 0;
-    std::map<std::wstring, uint32_t> InlinePatchStrikes;
+    std::map<std::wstring, KmonRepeatObservation> InlinePatchStrikes;
 };
 
 std::wstring KmonBasenameLower(const std::wstring& path);
@@ -948,6 +957,8 @@ struct KmonKernelThreadInput
 {
     uint32_t ProcessId = 0;
     uint32_t ThreadId = 0;
+    uint64_t ThreadObject = 0;
+    uint64_t ThreadCreateTime = 0;
     uint64_t StartAddress = 0;
     bool StartAddressKnown = false;
     bool StartInLoadedModule = false;
@@ -969,6 +980,8 @@ struct KmonKernelThreadInput
 struct KmonKernelThreadListInput
 {
     uint32_t ProcessId = 0;
+    uint64_t ProcessObject = 0;
+    uint64_t ProcessCreateTime = 0;
     uint32_t WalkedThreads = 0;
     uint32_t AccountingBefore = 0;
     uint32_t AccountingAfter = 0;

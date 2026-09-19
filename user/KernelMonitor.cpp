@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "KmonImportResolver.h"
 
 #include "ByovdScanner.h"
 #include "CallbackScanner.h"
@@ -90,7 +91,7 @@ namespace
             {
                 modules = symbols->CopyModules();
             }
-            if (modules.empty())
+            if (!KmonKernelModuleRangesKnown(modules))
             {
                 owned = true;
                 break;
@@ -147,19 +148,13 @@ namespace
             std::wstring ignored;
             if (!symbols->LoadKernelModules(&ignored) || symbols->CopyModules().empty())
             {
-                // EnumKernelModules failure does not clear modules_. Keep
-                // the last good inventory instead of skipping every kmon
-                // kernel scan until the next successful reload.
-                if (!symbols->CopyModules().empty())
-                {
-                    ok = true;
-                }
+                // A stale inventory cannot prove that a new module is absent.
                 break;
             }
             gLastKernelModuleReloadMs = GetTickCount64();
             ok = true;
         } while (false);
-        return ok;
+        return ok && KmonKernelModuleRangesKnown(symbols->CopyModules());
     }
 
     std::wstring ToLowerCopy(std::wstring value)
@@ -693,72 +688,7 @@ namespace
         return ok;
     }
 
-    void ApplyRelocsToSlice(
-        std::vector<uint8_t>* slice,
-        uint32_t sliceRva,
-        uint64_t delta,
-        const std::vector<uint8_t>& relocs,
-        bool is64)
-    {
-        if (slice == nullptr || slice->empty() || relocs.size() < sizeof(IMAGE_BASE_RELOCATION) || delta == 0)
-        {
-            return;
-        }
-        size_t cursor = 0;
-        while (cursor + sizeof(IMAGE_BASE_RELOCATION) <= relocs.size())
-        {
-            IMAGE_BASE_RELOCATION block = {};
-            std::memcpy(&block, relocs.data() + cursor, sizeof(block));
-            if (block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                cursor + block.SizeOfBlock > relocs.size())
-            {
-                break;
-            }
-            const uint32_t count =
-                (block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
-            for (uint32_t i = 0; i < count; ++i)
-            {
-                uint16_t entry = 0;
-                std::memcpy(
-                    &entry,
-                    relocs.data() + cursor + sizeof(IMAGE_BASE_RELOCATION) + i * sizeof(uint16_t),
-                    sizeof(entry));
-                const uint16_t type = static_cast<uint16_t>(entry >> 12);
-                const uint16_t offset = static_cast<uint16_t>(entry & 0x0fff);
-                if (offset > (std::numeric_limits<uint32_t>::max)() - block.VirtualAddress)
-                {
-                    continue;
-                }
-                const uint32_t rva = block.VirtualAddress + offset;
-                if (slice->size() > (std::numeric_limits<uint32_t>::max)() ||
-                    sliceRva > (std::numeric_limits<uint32_t>::max)() -
-                        static_cast<uint32_t>(slice->size()) ||
-                    rva < sliceRva ||
-                    rva >= sliceRva + static_cast<uint32_t>(slice->size()))
-                {
-                    continue;
-                }
-                const uint32_t local = rva - sliceRva;
-                if (type == IMAGE_REL_BASED_DIR64 && is64 && local + 8 <= slice->size())
-                {
-                    uint64_t value = 0;
-                    std::memcpy(&value, slice->data() + local, 8);
-                    value += delta;
-                    std::memcpy(slice->data() + local, &value, 8);
-                }
-                else if (type == IMAGE_REL_BASED_HIGHLOW &&
-                    !is64 &&
-                    local + 4 <= slice->size())
-                {
-                    uint32_t value = 0;
-                    std::memcpy(&value, slice->data() + local, 4);
-                    value += static_cast<uint32_t>(delta);
-                    std::memcpy(slice->data() + local, &value, 4);
-                }
-            }
-            cursor += block.SizeOfBlock;
-        }
-    }
+
 
     bool ReadDiskRange(const std::wstring& path, uint32_t fileOffset, uint32_t length, std::vector<uint8_t>* bytes)
     {
@@ -1265,9 +1195,13 @@ namespace
         return ok;
     }
 
-    bool QueryMappedImagePath(HANDLE process, uint64_t address, std::wstring* path)
+    bool QueryMappedImagePath(HANDLE process, uint64_t address, std::wstring* path, DWORD* queryError = nullptr)
     {
         bool ok = false;
+        if (queryError != nullptr)
+        {
+            *queryError = ERROR_INVALID_PARAMETER;
+        }
         do
         {
             if (path != nullptr)
@@ -1288,7 +1222,12 @@ namespace
                     capacity);
                 if (copied == 0)
                 {
-                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+                    const DWORD error = GetLastError();
+                    if (queryError != nullptr)
+                    {
+                        *queryError = error;
+                    }
+                    if (error == ERROR_INSUFFICIENT_BUFFER)
                     {
                         continue;
                     }
@@ -1298,7 +1237,15 @@ namespace
                 {
                     path->assign(buffer.data(), copied);
                     ok = true;
+                    if (queryError != nullptr)
+                    {
+                        *queryError = ERROR_SUCCESS;
+                    }
                     break;
+                }
+                if (queryError != nullptr)
+                {
+                    *queryError = ERROR_INSUFFICIENT_BUFFER;
                 }
             }
         } while (false);
@@ -2339,120 +2286,12 @@ namespace
         SliceMismatch
     };
 
-    bool LastRelocBlockVa(const std::vector<uint8_t>& relocs, uint32_t* lastVa)
+    struct KmonSliceReference
     {
-        bool any = false;
-        if (lastVa != nullptr)
-        {
-            *lastVa = 0;
-        }
-        size_t cursor = 0;
-        while (cursor + sizeof(IMAGE_BASE_RELOCATION) <= relocs.size())
-        {
-            IMAGE_BASE_RELOCATION block = {};
-            std::memcpy(&block, relocs.data() + cursor, sizeof(block));
-            if (block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                cursor + block.SizeOfBlock > relocs.size())
-            {
-                break;
-            }
-            if (lastVa != nullptr)
-            {
-                *lastVa = block.VirtualAddress;
-            }
-            any = true;
-            cursor += block.SizeOfBlock;
-        }
-        return any;
-    }
-
-    bool ReadRelocDirectory(
-        const std::wstring& imagePath,
-        const std::vector<uint8_t>& diskHeaders,
-        const KmonPeLayout& layout,
-        HANDLE processHandle,
-        DeviceClient* device,
-        SymbolEngine* symbols,
-        uint32_t pid,
-        uint64_t imageBase,
-        std::vector<uint8_t>* relocs,
-        bool* complete)
-    {
-        bool ok = false;
-        if (relocs != nullptr)
-        {
-            relocs->clear();
-        }
-        if (complete != nullptr)
-        {
-            *complete = false;
-        }
-        do
-        {
-            if (relocs == nullptr || layout.RelocSize == 0 || layout.RelocRva == 0)
-            {
-                break;
-            }
-            constexpr uint32_t kMaxRelocBytes = 0x100000u;
-            constexpr uint32_t kChunk = 0x10000u;
-            const uint32_t toRead =
-                (layout.RelocSize < kMaxRelocBytes) ? layout.RelocSize : kMaxRelocBytes;
-            uint32_t relocFile = 0;
-            const bool haveFile = RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile);
-            relocs->reserve(toRead);
-            uint32_t offset = 0;
-            while (offset < toRead)
-            {
-                const uint32_t chunk = (std::min)(kChunk, toRead - offset);
-                std::vector<uint8_t> part;
-                bool got = false;
-                if (haveFile &&
-                    offset <= (std::numeric_limits<uint32_t>::max)() - relocFile)
-                {
-                    got = ReadDiskRange(imagePath, relocFile + offset, chunk, &part);
-                }
-                if (!got)
-                {
-                    if (imageBase == 0 ||
-                        layout.RelocRva >
-                            (std::numeric_limits<uint64_t>::max)() - imageBase)
-                    {
-                        break;
-                    }
-                    const uint64_t relocVa = imageBase + layout.RelocRva;
-                    if (static_cast<uint64_t>(offset) >
-                        (std::numeric_limits<uint64_t>::max)() - relocVa)
-                    {
-                        break;
-                    }
-                    got = ReadProcessBytes(
-                        device,
-                        symbols,
-                        processHandle,
-                        pid,
-                        relocVa + offset,
-                        chunk,
-                        &part);
-                }
-                if (!got || part.size() < chunk)
-                {
-                    break;
-                }
-                relocs->insert(relocs->end(), part.begin(), part.end());
-                offset += chunk;
-            }
-            if (relocs->empty())
-            {
-                break;
-            }
-            if (complete != nullptr)
-            {
-                *complete = (offset >= layout.RelocSize);
-            }
-            ok = true;
-        } while (false);
-        return ok;
-    }
+        bool Attempted = false;
+        bool Available = false;
+        executable_image::DiskPeMetadata Metadata;
+    };
 
     SliceCompare RelocatedSliceCompare(
         const std::wstring& imagePath,
@@ -2466,122 +2305,55 @@ namespace
         uint32_t rva,
         uint32_t fileOffset,
         uint32_t length,
-        std::vector<uint8_t>* relocCache = nullptr,
-        bool* relocCacheComplete = nullptr)
+        KmonSliceReference* referenceCache = nullptr)
     {
         SliceCompare result = SliceUnknown;
         do
         {
-            if (length < 16 || imageBase == 0 || fileOffset == 0)
+            if (length < 16 || length > 4096 || imageBase == 0 || diskHeaders.empty())
             {
                 break;
             }
-            if (rva > (std::numeric_limits<uint64_t>::max)() - imageBase)
+            KmonSliceReference local;
+            KmonSliceReference& reference = referenceCache != nullptr ? *referenceCache : local;
+            if (!reference.Attempted)
+            {
+                reference.Attempted = true;
+                reference.Available = executable_image::ReadDiskPeMetadata(imagePath, &reference.Metadata, nullptr);
+            }
+            const auto& metadata = reference.Metadata;
+            uint64_t rawOffset = 0;
+            if (!reference.Available || metadata.SizeOfImage != layout.SizeOfImage ||
+                metadata.Machine != layout.Machine || metadata.TimeDateStamp != layout.TimeDateStamp ||
+                metadata.EntryPointRva != layout.EntryPointRva || metadata.CheckSum != layout.CheckSum ||
+                !executable_image::RvaToRawOffset(metadata, rva, &rawOffset) || rawOffset != fileOffset)
             {
                 break;
             }
-            std::vector<uint8_t> diskText;
-            std::vector<uint8_t> liveText;
-            if (!ReadDiskRange(imagePath, fileOffset, length, &diskText) ||
-                !ReadProcessBytes(
-                    device,
-                    symbols,
-                    processHandle,
-                    pid,
-                    imageBase + rva,
-                    length,
-                    &liveText) ||
-                diskText.size() < 16 ||
-                liveText.size() < 16)
+            const ObservationReader reader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+            {
+                return ReadProcessBytes(device, symbols, processHandle, pid, address,
+                    static_cast<uint32_t>(count), bytes);
+            };
+            if (!QualifyExecutableReference(metadata, imageBase, reader, nullptr))
             {
                 break;
             }
-            const uint64_t delta = imageBase - layout.PreferredBase;
-            const bool aslr = layout.PreferredBase != 0 && imageBase != layout.PreferredBase;
-            bool compared = !aslr;
-            if (aslr && layout.RelocRva != 0 && layout.RelocSize != 0)
-            {
-                std::vector<uint8_t> localRelocs;
-                const std::vector<uint8_t>* activeRelocs = nullptr;
-                bool relocComplete = false;
-                if (relocCache != nullptr && !relocCache->empty())
-                {
-                    // Reuse a reloc directory that the caller already loaded
-                    // for this same image. Export prologue loops would
-                    // otherwise reread the whole directory from disk for
-                    // every single 24-byte slice.
-                    activeRelocs = relocCache;
-                    relocComplete = (relocCacheComplete != nullptr)
-                        ? *relocCacheComplete
-                        : false;
-                }
-                else if (ReadRelocDirectory(
-                             imagePath,
-                             diskHeaders,
-                             layout,
-                             processHandle,
-                             device,
-                             symbols,
-                             pid,
-                             imageBase,
-                             &localRelocs,
-                             &relocComplete))
-                {
-                    if (relocCache != nullptr)
-                    {
-                        *relocCache = localRelocs;
-                        if (relocCacheComplete != nullptr)
-                        {
-                            *relocCacheComplete = relocComplete;
-                        }
-                    }
-                    activeRelocs = &localRelocs;
-                }
-                if (activeRelocs != nullptr)
-                {
-                    uint32_t lastVa = 0;
-                    const bool haveBlock = LastRelocBlockVa(*activeRelocs, &lastVa);
-                    uint32_t sliceLastPage = rva & ~0xFFFu;
-                    if (length != 0 &&
-                        rva <= (std::numeric_limits<uint32_t>::max)() - (length - 1u))
-                    {
-                        sliceLastPage = (rva + length - 1u) & ~0xFFFu;
-                    }
-                    // Reloc blocks are sorted. A truncated prefix is only
-                    // safe when it already extends past this slice, or the
-                    // directory was read in full (no relocs on this page).
-                    if (relocComplete || (haveBlock && lastVa >= sliceLastPage))
-                    {
-                        ApplyRelocsToSlice(
-                            &diskText,
-                            rva,
-                            delta,
-                            *activeRelocs,
-                            layout.Is64);
-                        compared = true;
-                    }
-                }
-            }
-            if (!compared)
+            // Shared normalization handles cross-window relocations, loader writes,
+            // file identity, unsupported relocation tables and stable live reads.
+            const auto compared = CompareExecutableRange(imagePath, metadata, imageBase, rva, length, reader);
+            if (!QualifyExecutableReference(metadata, imageBase, reader, nullptr))
             {
                 break;
             }
-            size_t n = (std::min)(diskText.size(), liveText.size());
-            // A DIR64/HIGHLOW reloc that straddles the window end cannot be
-            // applied; comparing those tail bytes FPs every ASLR'd image.
-            // A slice smaller than 24 bytes cannot drop an 8-byte tail and
-            // still compare 16 bytes, so ASLR'd tiny slices stay unknown.
-            if (aslr)
+            if (compared.Ownership == CodeOwnership::OwnedModified)
             {
-                if (n < 24)
-                {
-                    break;
-                }
-                n -= 8;
+                result = SliceMismatch;
             }
-            result = (std::memcmp(diskText.data(), liveText.data(), n) == 0)
-                ? SliceMatch
-                : SliceMismatch;
+            else if (compared.Ownership == CodeOwnership::OwnedVerified)
+            {
+                result = SliceMatch;
+            }
         } while (false);
         return result;
     }
@@ -2890,8 +2662,7 @@ namespace
             uint32_t checked = 0;
             // Every prologue check below targets the same image, so one
             // reloc directory load is shared across all export checks.
-            std::vector<uint8_t> relocCache;
-            bool relocCacheComplete = false;
+            KmonSliceReference referenceCache;
             const uint32_t exportBegin = layout.ExportRva;
             const uint32_t exportEnd = layout.ExportRva + layout.ExportSize;
             auto nameIsPriority = [&](const std::string& name) -> bool
@@ -2936,8 +2707,7 @@ namespace
                     funcRva,
                     funcFile,
                     kPrologue,
-                    &relocCache,
-                    &relocCacheComplete);
+                    &referenceCache);
                 if (cmp == SliceUnknown)
                 {
                     return false;
@@ -3267,6 +3037,91 @@ namespace
         const std::vector<ProcessVadRecord>* records,
         uint64_t address);
 
+    bool KmonImportForwarderMatches(const KmonRvaReader& importRead,
+        uint32_t lookupRva, uint32_t index, bool is64, const std::wstring& importedModule,
+        uint64_t target, const ObservationReader& reader,
+        const std::vector<std::wstring>& paths, const std::vector<std::pair<uint64_t, uint32_t>>& ranges)
+    {
+        const uint32_t width = is64 ? 8u : 4u;
+        std::vector<uint8_t> bytes;
+        if (lookupRva == 0 || index > (UINT32_MAX - lookupRva) / width ||
+            !importRead(lookupRva + index * width, width, &bytes) || bytes.size() != width)
+        {
+            return false;
+        }
+        uint64_t thunk = 0;
+        std::memcpy(&thunk, bytes.data(), width);
+        KmonImportSymbol symbol;
+        symbol.ByOrdinal = (thunk & (is64 ? IMAGE_ORDINAL_FLAG64 : IMAGE_ORDINAL_FLAG32)) != 0;
+        if (symbol.ByOrdinal)
+        {
+            symbol.Ordinal = static_cast<uint16_t>(thunk);
+        }
+        else
+        {
+            if (thunk == 0 || thunk > UINT32_MAX - 2 ||
+                !KmonReadImportString(importRead, static_cast<uint32_t>(thunk) + 2, &symbol.Name))
+            {
+                return false;
+            }
+        }
+        const KmonExportLookup lookup = [&](const std::wstring& leaf, const KmonImportSymbol& requested,
+            uint64_t* address, std::string* forwarder)
+        {
+            size_t found = paths.size();
+            for (size_t i = 0; i < paths.size() && i < ranges.size(); ++i)
+            {
+                if (KmonBasenameLower(paths[i]) == leaf)
+                {
+                    if (found != paths.size())
+                    {
+                        return false;
+                    }
+                    found = i;
+                }
+            }
+            if (found == paths.size())
+            {
+                return false;
+            }
+            executable_image::DiskPeMetadata metadata;
+            KmonPeLayout layout;
+            std::vector<uint8_t> head;
+            if (!executable_image::ReadDiskPeMetadata(paths[found], &metadata, nullptr) ||
+                !QualifyExecutableReference(metadata, ranges[found].first, reader, nullptr))
+            {
+                return false;
+            }
+            HANDLE file = CreateFileW(paths[found].c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+            const KmonRvaReader read = [&](uint32_t rva, uint32_t count, std::vector<uint8_t>* out)
+            {
+                return rva < metadata.SizeOfImage && count <= metadata.SizeOfImage - rva &&
+                    executable_image::ReadDiskBytesForRva(file, metadata, rva, count, out);
+            };
+            uint32_t rva = 0;
+            const bool resolved = executable_image::DiskFileIdentityMatches(file, metadata) &&
+                executable_image::ReadFileBytesAt(file, 0, (std::min)(metadata.SizeOfHeaders, 0x10000u), &head) &&
+                ParseKmonPeLayout(head, &layout) &&
+                KmonReadExport(read, metadata.SizeOfImage, layout.ExportRva, layout.ExportSize, requested, &rva, forwarder) &&
+                executable_image::DiskFileIdentityMatches(file, metadata);
+            CloseHandle(file);
+            if (!resolved || !QualifyExecutableReference(metadata, ranges[found].first, reader, nullptr) ||
+                ranges[found].first > UINT64_MAX - rva)
+            {
+                return false;
+            }
+            *address = rva == 0 ? 0 : ranges[found].first + rva;
+            return true;
+        };
+        uint64_t expected = 0;
+        return KmonResolveImportTarget(importedModule, symbol, lookup, &expected) && expected == target;
+    }
+
     void ScanLiveImportThunks(
         const std::wstring& imagePath,
         const std::vector<uint8_t>& headers,
@@ -3287,29 +3142,50 @@ namespace
         uint32_t* hits,
         const std::function<void(uint64_t, uint64_t)>& observe = {})
     {
+        HANDLE referenceFile = INVALID_HANDLE_VALUE;
+        const uint32_t originalHits = hits != nullptr ? *hits : 0;
+        bool referenceStable = false;
         do
         {
             if (hits == nullptr ||
                 imageBase == 0 ||
                 dirRva == 0 ||
                 dirSize == 0 ||
-                descriptorSize < 20 ||
+                (descriptorSize != 20 && descriptorSize != 32) ||
                 nameFieldOffset + 4 > descriptorSize ||
                 iatFieldOffset + 4 > descriptorSize ||
                 modulePaths.empty() ||
-                moduleRanges.empty())
+                moduleRanges.empty() || sizeOfImage == 0 || imageBase > UINT64_MAX - sizeOfImage ||
+                dirRva >= sizeOfImage || dirSize > sizeOfImage - dirRva)
             {
                 break;
             }
-            uint32_t fileOff = 0;
-            if (!RvaToFileOffset(headers, dirRva, &fileOff))
+            executable_image::DiskPeMetadata reference;
+            const ObservationReader imageReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+            {
+                return ReadProcessBytes(device, symbols, processHandle, pid, address, static_cast<uint32_t>(count), bytes);
+            };
+            referenceFile = CreateFileW(imagePath.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+            std::vector<uint8_t> currentHeaders;
+            if (!executable_image::ReadDiskPeMetadata(imagePath, &reference, nullptr) ||
+                referenceFile == INVALID_HANDLE_VALUE || headers.empty() || headers.size() > 0x10000 ||
+                !executable_image::DiskFileIdentityMatches(referenceFile, reference) ||
+                !executable_image::ReadFileBytesAt(referenceFile, 0, static_cast<uint32_t>(headers.size()), &currentHeaders) ||
+                currentHeaders != headers || reference.SizeOfImage != sizeOfImage ||
+                !QualifyExecutableReference(reference, imageBase, imageReader, nullptr))
             {
                 break;
             }
+            const KmonRvaReader importRead = [&](uint32_t rva, uint32_t count, std::vector<uint8_t>* out)
+            {
+                return rva < reference.SizeOfImage && count <= reference.SizeOfImage - rva &&
+                    executable_image::ReadDiskBytesForRva(referenceFile, reference, rva, count, out);
+            };
             constexpr uint32_t kMaxDirBytes = 64u * 1024u;
             const uint32_t toRead = (std::min)(dirSize, kMaxDirBytes);
             std::vector<uint8_t> table;
-            if (!ReadDiskRange(imagePath, fileOff, toRead, &table) ||
+            if (!importRead(dirRva, toRead, &table) ||
                 table.size() < descriptorSize)
             {
                 break;
@@ -3326,6 +3202,12 @@ namespace
                 }
                 uint32_t nameRva = 0;
                 uint32_t iatRva = 0;
+                uint32_t lookupRva = 0;
+                if (descriptorSize == 20 || descriptorSize == 32)
+                {
+                    std::memcpy(&lookupRva, table.data() + i * descriptorSize +
+                        (descriptorSize == 20 ? 0 : 16), sizeof(lookupRva));
+                }
                 std::memcpy(
                     &nameRva,
                     table.data() + (i * descriptorSize) + nameFieldOffset,
@@ -3334,37 +3216,32 @@ namespace
                     &iatRva,
                     table.data() + (i * descriptorSize) + iatFieldOffset,
                     sizeof(iatRva));
+                if (descriptorSize == 32 && (table[i * descriptorSize] & 1) == 0)
+                {
+                    // VA-based delay descriptors contain preferred-base VAs on disk.
+                    const auto relative = [&](uint32_t value)
+                    {
+                        return value >= reference.ImageBase && value - reference.ImageBase < sizeOfImage
+                            ? static_cast<uint32_t>(value - reference.ImageBase) : 0u;
+                    };
+                    nameRva = relative(nameRva);
+                    iatRva = relative(iatRva);
+                    lookupRva = relative(lookupRva);
+                }
                 if (nameRva == 0)
                 {
                     break;
                 }
-                if (iatRva == 0)
+                if (iatRva == 0 || iatRva >= sizeOfImage || nameRva >= sizeOfImage)
                 {
                     continue;
                 }
-                uint32_t nameFile = 0;
-                if (!RvaToFileOffset(headers, nameRva, &nameFile))
+                std::string importName;
+                if (!KmonReadImportString(importRead, nameRva, &importName))
                 {
                     continue;
                 }
-                std::vector<uint8_t> nameBytes;
-                if (!ReadDiskRange(imagePath, nameFile, 256, &nameBytes) ||
-                    nameBytes.empty())
-                {
-                    continue;
-                }
-                std::wstring wide;
-                for (uint8_t byte : nameBytes)
-                {
-                    if (byte == 0)
-                    {
-                        break;
-                    }
-                    if (byte >= 0x20 && byte < 0x7f)
-                    {
-                        wide.push_back(static_cast<wchar_t>(byte));
-                    }
-                }
+                const std::wstring wide(importName.begin(), importName.end());
                 const std::wstring importLeaf = KmonBasenameLower(wide);
                 if (importLeaf.empty())
                 {
@@ -3419,6 +3296,11 @@ namespace
                     }
                     const uint64_t thunkVa = iatTableVa +
                         (static_cast<uint64_t>(t) * thunkSize);
+                    if (thunkVa < imageBase || thunkVa - imageBase >= sizeOfImage ||
+                        thunkSize > sizeOfImage - (thunkVa - imageBase))
+                    {
+                        break;
+                    }
                     std::vector<uint8_t> live;
                     if (!ReadProcessBytes(
                             device,
@@ -3450,6 +3332,12 @@ namespace
                     if (observe)
                     {
                         observe(target, thunkVa);
+                    }
+                    std::vector<uint8_t> confirmed;
+                    if (!ReadProcessBytes(device, symbols, processHandle, pid, thunkVa, thunkSize, &confirmed) ||
+                        confirmed != live)
+                    {
+                        continue;
                     }
                     if ((is64 && (target & 0x8000000000000000ull) != 0) ||
                         (!is64 && (target & 0x80000000u) != 0))
@@ -3493,10 +3381,30 @@ namespace
                     {
                         continue;
                     }
+                    const ObservationReader reader = [&](uint64_t address, size_t count, std::vector<uint8_t>* out)
+                    {
+                        return ReadProcessBytes(device, symbols, processHandle, pid, address,
+                            static_cast<uint32_t>(count), out);
+                    };
+                    if (KmonImportForwarderMatches(importRead, lookupRva, t, is64,
+                        importLeaf, target, reader, modulePaths, moduleRanges))
+                    {
+                        continue;
+                    }
                     ++(*hits);
                 }
             }
+            referenceStable = executable_image::DiskFileIdentityMatches(referenceFile, reference) &&
+                QualifyExecutableReference(reference, imageBase, imageReader, nullptr);
         } while (false);
+        if (!referenceStable && hits != nullptr)
+        {
+            *hits = originalHits;
+        }
+        if (referenceFile != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(referenceFile);
+        }
     }
 
     void ScanLiveCallTablePointers(
@@ -6731,6 +6639,16 @@ bool KernelMonitor::Start(
                 EmittedMapperKeys.clear();
                 RecentLoads.clear();
                 RecentUnloads.clear();
+                DriverTamperBaselines.clear();
+                DriverTamperStrikes.clear();
+                DriverTamperLastCheckMs.clear();
+                DriverTamperOrder.clear();
+                DriverTamperCursor = 0;
+                DriverTamperChecks = 0;
+                ThreadHiddenStrikes.clear();
+                ThreadListDkomStrikes.clear();
+                InlinePatchStrikes.clear();
+                gLastKernelModuleReloadMs = 0;
                 ModuleBaseline.clear();
                 ModuleBaselineValid = false;
                 ModuleBaselineTickMs = 0;
@@ -7994,6 +7912,22 @@ std::wstring KmonDriverNameStem(const std::wstring& name)
     return stem;
 }
 
+bool KmonKernelModuleRangesKnown(const std::vector<KernelModuleInfo>& modules)
+{
+    if (modules.empty())
+    {
+        return false;
+    }
+    for (const auto& module : modules)
+    {
+        if (module.Base == 0 || module.Size == 0 || module.Base > UINT64_MAX - module.Size)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 uint32_t KmonDriverTamperMask(
     const KmonDriverIdentitySnapshot& baseline,
     const KmonDriverIdentitySnapshot& live)
@@ -8017,10 +7951,10 @@ uint32_t KmonDriverTamperMask(
         }
     }
 
-    if (baseline.HasFields && live.HasFields)
+    if (baseline.HasFields && live.HasFields && baseline.DriverObject != 0 &&
+        baseline.DriverObject == live.DriverObject)
     {
-        // The I/O manager fills DriverStart/DriverSize/DriverSection at load
-        // and never rewrites them, so any change is post-load field tampering.
+        // Compare only readable fields on the same observed object instance.
         const bool identityChanged =
             baseline.DriverStart != live.DriverStart ||
             baseline.DriverSize != live.DriverSize ||
@@ -8123,20 +8057,23 @@ namespace
     // sanity check is required before the entry-point offset is trusted, so
     // garbage bytes cannot produce a bogus hash pair.
     bool KmonSnapshotDriverImage(
-        DeviceClient* device,
+        const ObservationReader& reader,
         uint64_t base,
         uint64_t size,
         KmonDriverIdentitySnapshot* snapshot)
     {
-        if (device == nullptr || snapshot == nullptr || base == 0 || size == 0)
+        if (!reader || snapshot == nullptr || base == 0 || size < 0x400 || base > UINT64_MAX - size)
         {
             return false;
         }
         std::vector<uint8_t> header;
-        if (!KmonReadKernelBytes(device, base, 0x400, &header))
+        std::vector<uint8_t> confirmed;
+        if (!reader(base, 0x400, &header) || header.size() != 0x400 ||
+            !reader(base, 0x400, &confirmed) || confirmed != header)
         {
             return false;
         }
+        *snapshot = {};
         snapshot->Base = base;
         snapshot->Size = size;
         snapshot->HeaderHash = KmonHashBytes64(header.data(), header.size());
@@ -8155,9 +8092,31 @@ namespace
                         &entryOffset,
                         header.data() + peOffset + 0x28,
                         sizeof(entryOffset));
+                    IMAGE_FILE_HEADER file = {};
+                    std::memcpy(&file, header.data() + peOffset + 4, sizeof(file));
+                    const size_t sectionOffset = peOffset + 4 + sizeof(file) + file.SizeOfOptionalHeader;
+                    bool persistentEntry = false;
+                    if (file.SizeOfOptionalHeader >= 20 && sectionOffset <= header.size() &&
+                        file.NumberOfSections <= (header.size() - sectionOffset) / sizeof(IMAGE_SECTION_HEADER))
+                    {
+                        for (size_t i = 0; i < file.NumberOfSections; ++i)
+                        {
+                            IMAGE_SECTION_HEADER section = {};
+                            std::memcpy(&section, header.data() + sectionOffset + i * sizeof(section), sizeof(section));
+                            const uint64_t span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+                            if (entryOffset >= section.VirtualAddress && entryOffset - section.VirtualAddress < span)
+                            {
+                                persistentEntry = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
+                                    (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0 &&
+                                    span - (entryOffset - section.VirtualAddress) >= 0x100;
+                                break;
+                            }
+                        }
+                    }
                     std::vector<uint8_t> entry;
-                    if (entryOffset != 0 &&
-                        KmonReadKernelBytes(device, base + entryOffset, 0x100, &entry))
+                    if (persistentEntry && entryOffset != 0 && entryOffset <= size - 0x100 &&
+                        reader(base + entryOffset, 0x100, &entry) && entry.size() == 0x100 &&
+                        reader(base + entryOffset, 0x100, &confirmed) && confirmed == entry)
                     {
                         snapshot->EntryOffset = entryOffset;
                         snapshot->EntryHash = KmonHashBytes64(entry.data(), entry.size());
@@ -8296,11 +8255,7 @@ bool KmonImageFileStateForDriver(
         return true;
     }
     const DWORD error = GetLastError();
-    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
-    {
-        return true;
-    }
-    return false;
+    return KmonFileQueryKnown(attributes, error);
 }
 
 // \Windows\System32 holds the keyless core images Windows always has loaded
@@ -8900,6 +8855,10 @@ void KernelMonitor::NoteDriverUnload(const KmonEvent& event)
         return;
     }
     std::lock_guard<std::mutex> lock(WatchMutex);
+    const std::wstring stem = KmonDriverNameStem(base);
+    DriverTamperBaselines.erase(stem);
+    DriverTamperStrikes.erase(stem);
+    DriverTamperLastCheckMs.erase(stem);
     RecentDriverUnload unload = {};
     unload.Base = std::move(base);
     unload.Timestamp = event.Timestamp;
@@ -10069,11 +10028,13 @@ void KernelMonitor::ScanModuleInventory()
                         rawKeys.insert(
                             std::wstring(L"div:") +
                             KmonModuleDivergenceDirectionName(divergence.Direction) +
-                            L":" + divergence.Name);
+                            L":" + divergence.Name + L":" + HexU64(divergence.Base) + L":" + HexU64(divergence.Size));
                     }
                     for (const KmonModuleChainBreakRecord& chainBreak : rawBreaks)
                     {
-                        rawKeys.insert(L"chain:" + HexU64(chainBreak.Entry));
+                        rawKeys.insert(L"chain:" + HexU64(chainBreak.Entry) + L":" + HexU64(chainBreak.Flink) +
+                            L":" + HexU64(chainBreak.Blink) + L":" + std::to_wstring(chainBreak.ForwardBreak) +
+                            L":" + std::to_wstring(chainBreak.BackwardBreak));
                     }
 
                     // Two-scan confirmation: a module that loads between the
@@ -10083,11 +10044,7 @@ void KernelMonitor::ScanModuleInventory()
                         std::lock_guard<std::mutex> lock(WatchMutex);
                         for (const std::wstring& key : rawKeys)
                         {
-                            uint32_t& strikes = KernelViewPending[key];
-                            if (strikes < kModuleDiffStrikeCap)
-                            {
-                                ++strikes;
-                            }
+                            KernelViewPending[key].Observe(key, kernelViewNow, 180000);
                         }
                         for (auto it = KernelViewPending.begin();
                              it != KernelViewPending.end();)
@@ -10097,7 +10054,7 @@ void KernelMonitor::ScanModuleInventory()
                                 it = KernelViewPending.erase(it);
                                 continue;
                             }
-                            if (it->second >= kModuleDiffStrikeThreshold)
+                            if (it->second.Count >= kModuleDiffStrikeThreshold)
                             {
                                 confirmedKeys.insert(it->first);
                             }
@@ -10110,7 +10067,7 @@ void KernelMonitor::ScanModuleInventory()
                         const std::wstring key =
                             std::wstring(L"div:") +
                             KmonModuleDivergenceDirectionName(divergence.Direction) +
-                            L":" + divergence.Name;
+                            L":" + divergence.Name + L":" + HexU64(divergence.Base) + L":" + HexU64(divergence.Size);
                         if (confirmedKeys.count(key) != 0)
                         {
                             divergences.push_back(divergence);
@@ -10118,7 +10075,9 @@ void KernelMonitor::ScanModuleInventory()
                     }
                     for (const KmonModuleChainBreakRecord& chainBreak : rawBreaks)
                     {
-                        if (confirmedKeys.count(L"chain:" + HexU64(chainBreak.Entry)) != 0)
+                        if (confirmedKeys.count(L"chain:" + HexU64(chainBreak.Entry) + L":" + HexU64(chainBreak.Flink) +
+                            L":" + HexU64(chainBreak.Blink) + L":" + std::to_wstring(chainBreak.ForwardBreak) +
+                            L":" + std::to_wstring(chainBreak.BackwardBreak)) != 0)
                         {
                             chainBreaks.push_back(chainBreak);
                         }
@@ -10174,8 +10133,10 @@ void KernelMonitor::ScanModuleInventory()
                 std::wstring(KmonModuleDiffKindName(record.Kind)) + L":" + record.Name;
             observed.insert(key);
             PendingModuleAnomaly& pending = ModulePending[key];
-            if (pending.Strikes == 0)
+            if (pending.Strikes == 0 || pending.Base != record.Base || pending.Size != record.Size ||
+                pending.PreviousBase != record.PreviousBase)
             {
+                pending.Strikes = 0;
                 pending.Kind = record.Kind;
                 pending.Name = record.Name;
                 pending.Base = record.Base;
@@ -10217,7 +10178,9 @@ void KernelMonitor::ScanModuleInventory()
             else if (pending.Kind == KmonModuleDiffKind::UnnotifiedLoad)
             {
                 // Still present, and still no load event to explain it.
-                stillHolds = currentNames.count(pending.Name) != 0 &&
+                const auto rangeIt = currentByNameRange.find(pending.Name);
+                stillHolds = rangeIt != currentByNameRange.end() &&
+                    rangeIt->second == std::make_pair(pending.Base, pending.Size) &&
                     recentLoads.count(pending.Name) == 0;
             }
             else if (pending.Kind == KmonModuleDiffKind::Remap)
@@ -10225,6 +10188,7 @@ void KernelMonitor::ScanModuleInventory()
                 const auto rangeIt = currentByNameRange.find(pending.Name);
                 stillHolds =
                     rangeIt != currentByNameRange.end() &&
+                    rangeIt->second == std::make_pair(pending.Base, pending.Size) &&
                     rangeIt->second.first != pending.PreviousBase &&
                     recentLoads.count(pending.Name) == 0 &&
                     recentUnloads.count(pending.Name) == 0;
@@ -10305,7 +10269,8 @@ void KernelMonitor::ScanModuleInventory()
         std::lock_guard<std::mutex> lock(WatchMutex);
         for (const auto& entry : DriverTamperStrikes)
         {
-            if (entry.second >= kDriverTamperStrikeThreshold)
+            if (entry.second.Image.Count >= kDriverTamperStrikeThreshold ||
+                entry.second.Fields.Count >= kDriverTamperStrikeThreshold)
             {
                 tamperStems.insert(entry.first);
             }
@@ -10563,7 +10528,11 @@ bool KernelMonitor::RecordDriverImageBaseline(
         return false;
     }
     KmonDriverIdentitySnapshot snapshot = {};
-    if (!KmonSnapshotDriverImage(device, base, size, &snapshot))
+    const ObservationReader reader = [device](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+    {
+        return KmonReadKernelBytes(device, address, count, bytes);
+    };
+    if (!KmonSnapshotDriverImage(reader, base, size, &snapshot))
     {
         return false;
     }
@@ -10572,24 +10541,17 @@ bool KernelMonitor::RecordDriverImageBaseline(
     auto it = DriverTamperBaselines.find(stem);
     if (it != DriverTamperBaselines.end())
     {
-        // A reload of the same name is a lifecycle event, so the image
-        // identity is re-baselined; the DRIVER_OBJECT fields already merged
-        // into the table survive.
-        if (it->second.HasFields)
-        {
-            snapshot.DriverStart = it->second.DriverStart;
-            snapshot.DriverSize = it->second.DriverSize;
-            snapshot.DriverSection = it->second.DriverSection;
-            snapshot.DeviceObject = it->second.DeviceObject;
-            snapshot.HasFields = true;
-        }
+        // A load boundary invalidates the old object's identity, even at the same VA.
         it->second = snapshot;
         DriverTamperStrikes.erase(stem);
         DriverTamperLastCheckMs.erase(stem);
         return true;
     }
     DriverTamperBaselines[stem] = snapshot;
-    DriverTamperOrder.push_back(stem);
+    if (std::find(DriverTamperOrder.begin(), DriverTamperOrder.end(), stem) == DriverTamperOrder.end())
+    {
+        DriverTamperOrder.push_back(stem);
+    }
     return true;
 }
 
@@ -10674,24 +10636,30 @@ void KernelMonitor::ScanDriverTamper()
         }
 
         KmonDriverIdentitySnapshot live = {};
-        if (!KmonSnapshotDriverImage(device, entry.second.Base, entry.second.Size, &live))
+        const ObservationReader reader = [device](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
         {
-            // Fail-closed: an unreadable image (paged out, device busy) is
-            // never a tamper verdict and does not advance the strike counter.
+            return KmonReadKernelBytes(device, address, count, bytes);
+        };
+        if (!KmonSnapshotDriverImage(reader, entry.second.Base, entry.second.Size, &live))
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            DriverTamperStrikes[entry.first].Image = {};
             continue;
         }
         const uint32_t mask = KmonDriverTamperMask(entry.second, live);
         if ((mask & static_cast<uint32_t>(KmonTamperImage)) == 0)
         {
             std::lock_guard<std::mutex> lock(WatchMutex);
-            DriverTamperStrikes.erase(entry.first);
+            DriverTamperStrikes[entry.first].Image = {};
             continue;
         }
 
         uint32_t strikes = 0;
         {
             std::lock_guard<std::mutex> lock(WatchMutex);
-            strikes = ++DriverTamperStrikes[entry.first];
+            const std::wstring fingerprint = HexU64(live.Base) + L":" + HexU64(live.Size) + L":" +
+                HexU64(live.HeaderHash) + L":" + HexU64(live.EntryHash) + L":" + HexU64(live.EntryOffset);
+            strikes = DriverTamperStrikes[entry.first].Image.Observe(fingerprint, GetTickCount64(), 180000);
         }
         if (strikes < kDriverTamperStrikeThreshold)
         {
@@ -10837,13 +10805,19 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 if (baselineIt != DriverTamperBaselines.end())
                 {
                     KmonDriverIdentitySnapshot& baseline = baselineIt->second;
-                    if (!baseline.HasFields)
+                    if (!record.IdentityFieldsKnown)
                     {
+                        DriverTamperStrikes[fieldStem].Fields = {};
+                    }
+                    else if (!baseline.HasFields || baseline.DriverObject != record.DriverObject)
+                    {
+                        baseline.DriverObject = record.DriverObject;
                         baseline.DriverStart = record.DriverStart;
                         baseline.DriverSize = record.DriverSize;
                         baseline.DriverSection = record.DriverSection;
                         baseline.DeviceObject = record.DeviceObject;
                         baseline.HasFields = true;
+                        DriverTamperStrikes[fieldStem].Fields = {};
                     }
                     else
                     {
@@ -10856,13 +10830,17 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                         if ((mask & static_cast<uint32_t>(KmonTamperFields)) != 0)
                         {
                             fieldBaseline = baseline;
-                            fieldStrikes = ++DriverTamperStrikes[fieldStem];
+                            const std::wstring fingerprint = HexU64(record.DriverObject) + L":" +
+                                HexU64(record.DriverStart) + L":" + HexU64(record.DriverSize) + L":" +
+                                HexU64(record.DriverSection);
+                            fieldStrikes = DriverTamperStrikes[fieldStem].Fields.Observe(
+                                fingerprint, GetTickCount64(), 180000);
                             fieldVerdict =
                                 fieldStrikes >= kDriverTamperFieldStrikeThreshold;
                         }
                         else
                         {
-                            DriverTamperStrikes.erase(fieldStem);
+                            DriverTamperStrikes[fieldStem].Fields = {};
                         }
                     }
                 }
@@ -10923,7 +10901,7 @@ void KernelMonitor::ScanUnbackedDriverObjects()
             }
             if (KmonReadKernelU64(device, record.DriverSection + 0x40, &value))
             {
-                sectionSize = value;
+                sectionSize = static_cast<uint32_t>(value);
             }
         }
         const bool unbackedSection =
@@ -10955,7 +10933,7 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 sectionNotes);
         }
 
-        if (!unbackedSection && !hasStart && !hasSectionImage && record.OwningModule.empty())
+        if (record.IdentityFieldsKnown && !unbackedSection && !hasStart && !hasSection && record.OwningModule.empty())
         {
             uint32_t inModuleDispatch = 0;
             uint32_t unbackedDispatch = 0;
@@ -13664,9 +13642,10 @@ void KernelMonitor::ScanUserModeHostility()
 
                 std::wstring mappedPath;
                 bool mappedQueryOk = false;
+                DWORD mappedQueryError = ERROR_SUCCESS;
                 if (hasVmRead && processHandle != nullptr)
                 {
-                    mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
+                    mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath, &mappedQueryError);
                 }
                 bool mappedFromKernelVad = false;
                 if (mappedPath.empty() &&
@@ -13759,20 +13738,14 @@ void KernelMonitor::ScanUserModeHostility()
                     mbi.Type == MEM_IMAGE &&
                     !mappedQueryOk)
                 {
-                    const DWORD mappedErr = GetLastError();
-                    if (mappedErr != ERROR_ACCESS_DENIED &&
-                        mappedErr != ERROR_INSUFFICIENT_BUFFER)
-                    {
-                        EmitUnique(
-                            L"process.hollow",
-                            L"exe_unbacked:" + std::to_wstring(pid),
-                            imagePath,
-                            L"exe_unbacked",
-                            L"main EXE image mapping has no file name pid=" +
-                                std::to_wstring(pid) + L" " + leaf,
-                            L"unbacked_image",
-                            pid);
-                    }
+                    EmitUnique(
+                        L"coverage.image_name",
+                        L"scan_failed:image_name:" + std::to_wstring(pid),
+                        imagePath,
+                        L"image_name",
+                        L"main EXE mapped-name query failed pid=" + std::to_wstring(pid) + L" " + leaf,
+                        L"error=" + std::to_wstring(mappedQueryError) + L" file_backing=unknown",
+                        pid);
                 }
 
                 if (wxExe)
@@ -13798,8 +13771,8 @@ void KernelMonitor::ScanUserModeHostility()
                     0x400,
                     &live);
                 const bool diskPathUsable = PathLooksLikeWin32File(imagePath);
-                const bool diskExists = diskPathUsable &&
-                    GetFileAttributesW(imagePath.c_str()) != INVALID_FILE_ATTRIBUTES;
+                bool diskExists = false;
+                const bool diskStateKnown = diskPathUsable && KmonImageFileStateForDriver(imagePath, &diskExists, nullptr);
                 const bool liveMz =
                     liveOk && live.size() >= 2 && live[0] == 'M' && live[1] == 'Z';
                 if (liveOk && live.size() >= 2 && !liveMz)
@@ -13816,7 +13789,7 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 else if (liveMz)
                 {
-                    if (!diskExists && diskPathUsable)
+                    if (!diskExists && diskStateKnown)
                     {
                         EmitUnique(
                             L"process.hollow",
@@ -16195,10 +16168,9 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
         event.Observation.Source = event.Observation.Source.empty() ? L"event" : event.Observation.Source;
     }
     AppendObservationEvidence(event.Observation, &event.Evidence);
-    event.Evidence.emplace(L"event_category",
-        event.Kind.rfind(L"sensor.", 0) == 0 ? L"sensor" :
-        (event.Kind.rfind(L"coverage.", 0) == 0 ? L"coverage" :
-        (event.Kind == L"driver.handle" || event.Kind == L"hook.window" ? L"observation" : L"finding")));
+    event.Evidence[L"event_category"] = KmonEventCategory(event.Kind);
+    event.Evidence[L"maliciousness"] = L"not_established";
+    event.Evidence[L"assessment_policy"] = L"evidence_v1";
     const bool quietOverlay = event.Kind == L"hook.window" &&
         KmonLooksLikeOverlayRuntimeDll(KmonBasenameLower(event.Image));
     const bool quietFile = event.Kind == L"driver.handle" &&
@@ -17603,6 +17575,7 @@ bool KernelMonitorHiddenDriverSelfTest()
         baseline.DriverSize = 0x100000ull;
         baseline.DriverSection = 0xFFFF900000001000ull;
         baseline.DeviceObject = 0xFFFF900000002000ull;
+        baseline.DriverObject = 0xFFFF900000003000ull;
         baseline.HasImage = true;
         baseline.HasFields = true;
 
@@ -17650,6 +17623,76 @@ bool KernelMonitorHiddenDriverSelfTest()
         KmonDriverIdentitySnapshot empty = {};
         ok = ok && KmonDriverTamperMask(empty, baseline) == KmonTamperNone;
         ok = ok && KmonDriverTamperMask(baseline, empty) == KmonTamperNone;
+        KmonDriverIdentitySnapshot unreadFields = startWiped;
+        unreadFields.HasFields = false;
+        ok = ok && KmonDriverTamperMask(baseline, unreadFields) == KmonTamperNone;
+        KmonDriverIdentitySnapshot replacedObject = startWiped;
+        ++replacedObject.DriverObject;
+        ok = ok && KmonDriverTamperMask(baseline, replacedObject) == KmonTamperNone;
+
+        std::vector<uint8_t> image(0x3000, 0);
+        IMAGE_DOS_HEADER dos = {};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        std::memcpy(image.data(), &dos, sizeof(dos));
+        IMAGE_NT_HEADERS64 nt = {};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.NumberOfSections = 1;
+        nt.FileHeader.SizeOfOptionalHeader = sizeof(nt.OptionalHeader);
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.AddressOfEntryPoint = 0x1000;
+        std::memcpy(image.data() + 0x80, &nt, sizeof(nt));
+        IMAGE_SECTION_HEADER section = {};
+        section.VirtualAddress = 0x1000;
+        section.Misc.VirtualSize = 0x1000;
+        section.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_DISCARDABLE;
+        std::memcpy(image.data() + 0x80 + sizeof(nt), &section, sizeof(section));
+        bool shortRead = false;
+        const ObservationReader read = [&](uint64_t at, size_t count, std::vector<uint8_t>* bytes)
+        {
+            if (at < baseline.Base || at - baseline.Base >= image.size() ||
+                count > image.size() - (at - baseline.Base))
+            {
+                return false;
+            }
+            bytes->assign(image.begin() + static_cast<size_t>(at - baseline.Base),
+                image.begin() + static_cast<size_t>(at - baseline.Base) + count - (shortRead ? 1 : 0));
+            return true;
+        };
+        KmonDriverIdentitySnapshot initial;
+        KmonDriverIdentitySnapshot changed;
+        ok = ok && KmonSnapshotDriverImage(read, baseline.Base, image.size(), &initial) && initial.EntryHash == 0;
+        image[0x1010] = 0xA5;
+        ok = ok && KmonSnapshotDriverImage(read, baseline.Base, image.size(), &changed) &&
+            KmonDriverTamperMask(initial, changed) == KmonTamperNone;
+        section.Characteristics &= ~IMAGE_SCN_MEM_DISCARDABLE;
+        std::memcpy(image.data() + 0x80 + sizeof(nt), &section, sizeof(section));
+        ok = ok && KmonSnapshotDriverImage(read, baseline.Base, image.size(), &initial) && initial.EntryHash != 0;
+        image[0x1010] ^= 1;
+        ok = ok && KmonSnapshotDriverImage(read, baseline.Base, image.size(), &changed) &&
+            (KmonDriverTamperMask(initial, changed) & KmonTamperImage) != 0;
+        shortRead = true;
+        ok = ok && !KmonSnapshotDriverImage(read, baseline.Base, image.size(), &changed);
+        shortRead = false;
+        size_t unstableReads = 0;
+        const ObservationReader unstable = [&](uint64_t at, size_t count, std::vector<uint8_t>* bytes)
+        {
+            if (!read(at, count, bytes))
+            {
+                return false;
+            }
+            (*bytes)[0] = static_cast<uint8_t>(++unstableReads);
+            return true;
+        };
+        ok = ok && !KmonSnapshotDriverImage(unstable, baseline.Base, image.size(), &changed);
+
+        KernelModuleInfo validModule = {};
+        validModule.Base = baseline.Base;
+        validModule.Size = 0x3000;
+        KernelModuleInfo unknownModule = validModule;
+        unknownModule.Size = 0;
+        ok = ok && KmonKernelModuleRangesKnown({validModule}) &&
+            !KmonKernelModuleRangesKnown({validModule, unknownModule}) && !KmonKernelModuleRangesKnown({});
 
         // Hash determinism, sensitivity, and the empty-input sentinel.
         const uint8_t sample[8] = { 0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00 };
@@ -17777,9 +17820,9 @@ namespace
         entry.dwSize = sizeof(entry);
         size_t count = 0;
         bool truncated = false;
-        for (BOOL more = Thread32First(snapshot, &entry);
-             more != FALSE;
-             more = Thread32Next(snapshot, &entry))
+        BOOL more = Thread32First(snapshot, &entry);
+        DWORD enumerationError = more ? ERROR_SUCCESS : GetLastError();
+        while (more != FALSE)
         {
             out->insert(static_cast<uint32_t>(entry.th32ThreadID));
             if (++count >= kMaxHostThreads)
@@ -17787,9 +17830,11 @@ namespace
                 truncated = true;
                 break;
             }
+            more = Thread32Next(snapshot, &entry);
+            enumerationError = more ? ERROR_SUCCESS : GetLastError();
         }
         CloseHandle(snapshot);
-        return !out->empty() && !truncated;
+        return !out->empty() && !truncated && enumerationError == ERROR_NO_MORE_FILES;
     }
 }
 
@@ -17912,6 +17957,8 @@ void KernelMonitor::ScanKernelThreads()
         return;
     }
     ClearEmittedKey(L"scan_failed:thread:offsets");
+    uint32_t threadCreateOffset = 0;
+    const bool threadCreateKnown = KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"CreateTime", &threadCreateOffset);
     const bool hasImageName = KmonFindKernelFieldOffset(
         symbols,
         L"_EPROCESS",
@@ -17976,7 +18023,7 @@ void KernelMonitor::ScanKernelThreads()
 
     std::vector<KmonThreadModuleRange> ranges;
     KmonBuildThreadModuleRanges(symbols, &ranges);
-    if (ranges.empty())
+    if (ranges.empty() || !KmonKernelModuleRangesKnown(symbols->CopyModules()))
     {
         // An empty inventory must not mark every kernel thread as unbacked;
         // this is the same rule AddressNotConfirmedOutsideLoadedModules follows for
@@ -18111,6 +18158,11 @@ void KernelMonitor::ScanKernelThreads()
             KmonKernelThreadInput input = {};
             input.ProcessId = pid;
             input.ThreadId = static_cast<uint32_t>(tidValue & 0xFFFFFFFFu);
+            input.ThreadObject = thread;
+            if (threadCreateKnown)
+            {
+                KmonReadKernelU64(device, thread + threadCreateOffset, &input.ThreadCreateTime);
+            }
             input.StartAddress = startKnown ? startAddress : 0;
             input.StartAddressKnown = startKnown;
             input.StartIsKernelAddress = startKnown && startAddress >= kThreadVaFloor;
@@ -18142,8 +18194,8 @@ void KernelMonitor::ScanKernelThreads()
             break;
         }
 
-        // Stage 1b: this process thread list was walked to its head, so a
-        // short list against the kernel accounting is an unlinked thread.
+        // A completed walk with fewer entries than stable accounting is a
+        // candidate cross-view mismatch, not proof of an unlinked thread.
         if (accountingKnown)
         {
             uint64_t rawAccounting = 0;
@@ -18153,6 +18205,8 @@ void KernelMonitor::ScanKernelThreads()
                 &rawAccounting);
             KmonKernelThreadListInput listInput = {};
             listInput.ProcessId = pid;
+            listInput.ProcessObject = process;
+            listInput.ProcessCreateTime = QueryEprocessCreateTime(device, symbols, nullptr, process);
             listInput.WalkedThreads = static_cast<uint32_t>(walkedThreads);
             listInput.AccountingBefore = static_cast<uint32_t>(accountingBefore);
             listInput.AccountingAfter = accountingAfterKnown
@@ -18163,7 +18217,6 @@ void KernelMonitor::ScanKernelThreads()
             if (KmonClassifyKernelThreadList(listInput) ==
                 KmonKernelThreadKind::UnlinkedFromThreadList)
             {
-                dkomCandidates.insert(pid);
                 dkomVerdicts.push_back(listInput);
             }
         }
@@ -18185,6 +18238,7 @@ void KernelMonitor::ScanKernelThreads()
     uint32_t emitted = 0;
     bool capped = false;
     std::set<uint32_t> hiddenCandidates;
+    size_t identityGaps = 0;
     for (const KmonKernelThreadInput& raw : collected)
     {
         KmonKernelThreadInput input = raw;
@@ -18201,6 +18255,17 @@ void KernelMonitor::ScanKernelThreads()
         }
         if (kind == KmonKernelThreadKind::HiddenFromHostView)
         {
+            uint64_t confirmedTid = 0;
+            uint64_t confirmedCreated = 0;
+            if (input.ThreadCreateTime == 0 ||
+                !KmonReadKernelU64(device, input.ThreadObject + cidOffset + 8, &confirmedTid) ||
+                confirmedTid != input.ThreadId ||
+                !KmonReadKernelU64(device, input.ThreadObject + threadCreateOffset, &confirmedCreated) ||
+                confirmedCreated != input.ThreadCreateTime)
+            {
+                ++identityGaps;
+                continue;
+            }
             hiddenCandidates.insert(input.ThreadId);
             uint32_t strikes = 0;
             {
@@ -18209,7 +18274,9 @@ void KernelMonitor::ScanKernelThreads()
                 {
                     ThreadHiddenStrikes.clear();
                 }
-                strikes = ++ThreadHiddenStrikes[input.ThreadId];
+                const std::wstring fingerprint = std::to_wstring(input.ProcessId) + L":" +
+                    HexU64(input.ThreadObject) + L":" + HexU64(input.ThreadCreateTime);
+                strikes = ThreadHiddenStrikes[input.ThreadId].Observe(fingerprint, GetTickCount64(), 180000);
             }
             if (strikes < kThreadStrikeThreshold)
             {
@@ -18270,6 +18337,13 @@ void KernelMonitor::ScanKernelThreads()
 
     for (const KmonKernelThreadListInput& raw : dkomVerdicts)
     {
+        if (raw.ProcessCreateTime == 0 ||
+            QueryEprocessCreateTime(device, symbols, nullptr, raw.ProcessObject) != raw.ProcessCreateTime)
+        {
+            ++identityGaps;
+            continue;
+        }
+        dkomCandidates.insert(raw.ProcessId);
         uint32_t strikes = 0;
         {
             std::lock_guard<std::mutex> lock(WatchMutex);
@@ -18277,7 +18351,10 @@ void KernelMonitor::ScanKernelThreads()
             {
                 ThreadListDkomStrikes.clear();
             }
-            strikes = ++ThreadListDkomStrikes[raw.ProcessId];
+            const std::wstring fingerprint = HexU64(raw.ProcessObject) + L":" + HexU64(raw.ProcessCreateTime) +
+                L":" + std::to_wstring(raw.AccountingBefore) + L":" + std::to_wstring(raw.AccountingAfter) +
+                L":" + std::to_wstring(raw.WalkedThreads);
+            strikes = ThreadListDkomStrikes[raw.ProcessId].Observe(fingerprint, GetTickCount64(), 180000);
         }
         if (strikes < kThreadStrikeThreshold)
         {
@@ -18334,6 +18411,16 @@ void KernelMonitor::ScanKernelThreads()
         }
     }
 
+    if (identityGaps != 0)
+    {
+        EmitUnique(L"coverage.thread_identity", L"scan_failed:thread:identity", L"", L"thread_identity",
+            L"thread cross-view candidates could not be tied to a stable object instance",
+            L"candidates=" + std::to_wstring(identityGaps));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:identity");
+    }
     if (capped)
     {
         EmitUnique(
@@ -19877,37 +19964,6 @@ bool KernelMonitorSelfTest()
             icUnknown != 0)
         {
             break;
-        }
-        {
-            uint32_t lastVa = 1;
-            if (LastRelocBlockVa(std::vector<uint8_t>(), &lastVa) || lastVa != 0)
-            {
-                break;
-            }
-            std::vector<uint8_t> relocBytes(
-                sizeof(IMAGE_BASE_RELOCATION) + sizeof(uint16_t),
-                0);
-            IMAGE_BASE_RELOCATION block = {};
-            block.VirtualAddress = 0x1000;
-            block.SizeOfBlock =
-                static_cast<DWORD>(sizeof(IMAGE_BASE_RELOCATION) + sizeof(uint16_t));
-            std::memcpy(relocBytes.data(), &block, sizeof(block));
-            uint16_t entry = static_cast<uint16_t>(IMAGE_REL_BASED_DIR64 << 12);
-            std::memcpy(
-                relocBytes.data() + sizeof(block),
-                &entry,
-                sizeof(entry));
-            lastVa = 0;
-            if (!LastRelocBlockVa(relocBytes, &lastVa) || lastVa != 0x1000)
-            {
-                break;
-            }
-            const uint32_t sliceLastEarly = 0x1000;
-            const uint32_t sliceLastLate = 0x1FF000;
-            if (lastVa < sliceLastEarly || lastVa >= sliceLastLate)
-            {
-                break;
-            }
         }
         {
             std::vector<uint8_t> stubBuf(0x80, 0xCC);

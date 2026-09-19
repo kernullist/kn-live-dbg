@@ -2255,6 +2255,8 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 ## Kernel-cheat monitor (`!kmon`)
 
+Console events display `kind [observation|lead|coverage|sensor]`; JSONL uses the same `evidence.event_category` policy. A code difference, private executable page, or layout transition does not establish maliciousness. Raw evidence and investigation leads are retained. See the [false-positive audit](docs/KMON_FALSE_POSITIVE_AUDIT_20260920.md) for read/identity guards, normal controls, and validation limits.
+
 Without `/pid` or `/name`, a dedicated reader inventories existing and new processes, retains first/latest complete virtual-memory layouts, and compares allocation, mapping and protection changes. Discovery targets one second; periodic layout sweeps default to five seconds (`/layout-ms 1000..60000` on first start). `!kmon layouts` exposes coverage and per-process JSON snapshots. Initial observations are not trusted clean baselines, and executable/image changes feed the existing verification pipeline. See the [layout guide](docs/KMON_PROCESS_LAYOUTS.md) for budgets, process identity, partial scans and detection limits.
 
 The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.

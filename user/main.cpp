@@ -25129,6 +25129,7 @@ static void PrintKmonEventLine(const KmonEvent& event)
 {
     std::wcout << L"[" << FormatTimestampLocal(event.Timestamp) << L"] ";
     PrintColoredText(event.Kind, KNDBG_COLOR_TITLE);
+    std::wcout << L" [" << KmonEventCategory(event.Kind) << L"]";
     std::wcout << L" pid=" << event.ProcessId;
     if (event.TargetProcessId != 0)
     {
@@ -25137,7 +25138,7 @@ static void PrintKmonEventLine(const KmonEvent& event)
     if (!event.Driver.empty())
     {
         std::wcout << L" driver=";
-        PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_FAIL);
+        PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_TITLE);
         if (event.Driver.find(L'\\') != std::wstring::npos ||
             event.Driver.find(L'/') != std::wstring::npos)
         {

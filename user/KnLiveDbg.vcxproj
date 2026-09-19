@@ -270,6 +270,8 @@
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="KernelMonitor.h" />
+    <ClInclude Include="KmonEvidencePolicy.h" />
+    <ClInclude Include="KmonImportResolver.h" />
     <ClInclude Include="ProcessLayoutCore.h" />
     <ClInclude Include="ProcessLayoutMonitor.h" />
     <ClInclude Include="TimelineDashboard.h" />

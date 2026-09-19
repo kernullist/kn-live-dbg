@@ -187,6 +187,31 @@ bool CodeTargetSlotMatches(uint64_t address, uint64_t slot, const ObservationRea
     return target == address;
 }
 
+bool CodeTargetChainMatches(const CodeTargetChain& chain, const ObservationReader& reader)
+{
+    if (!reader || chain.Hops.empty() || chain.Hops.size() > 16)
+    {
+        return false;
+    }
+    bool observed = false;
+    for (const auto& hop : chain.Hops)
+    {
+        if (hop.Bytes.empty())
+        {
+            continue;
+        }
+        std::vector<uint8_t> confirmed;
+        if (hop.Bytes.size() > 32 || hop.Address > UINT64_MAX - hop.Bytes.size() ||
+            !reader(hop.Address, hop.Bytes.size(), &confirmed) || confirmed != hop.Bytes ||
+            (hop.Slot != 0 && !CodeTargetSlotMatches(hop.Target, hop.Slot, reader)))
+        {
+            return false;
+        }
+        observed = true;
+    }
+    return observed;
+}
+
 CodeTargetChain ResolveReferencedCodeTarget(uint64_t address, uint64_t slot,
     const ObservationReader& reader, const CodeTargetInspector& inspect, size_t depthLimit)
 {
@@ -194,7 +219,7 @@ CodeTargetChain ResolveReferencedCodeTarget(uint64_t address, uint64_t slot,
     if (CodeTargetSlotMatches(address, slot, reader))
     {
         result = ResolveCodeTarget(address, reader, inspect, depthLimit);
-        result.ReferenceStable = CodeTargetSlotMatches(address, slot, reader);
+        result.ReferenceStable = CodeTargetSlotMatches(address, slot, reader) && CodeTargetChainMatches(result, reader);
     }
     result.ReferenceChecked = true;
     if (!result.ReferenceStable)
@@ -289,5 +314,24 @@ bool CodeTargetResolverSelfTest()
     };
     chain = ResolveReferencedCodeTarget(target, 0x9000, reader, changingPermission);
     ok = ok && !chain.ReferenceStable && !chain.HasUnexpectedExecutable;
+    std::memcpy(memory[0x9000].data(), &target, sizeof(target));
+    const CodeTargetInspector changingCode = [&](uint64_t address, const std::vector<uint8_t>& bytes)
+    {
+        memory[address][0] ^= 1;
+        return inspect(address, bytes);
+    };
+    chain = ResolveReferencedCodeTarget(target, 0x9000, reader, changingCode);
+    ok = ok && !chain.ReferenceStable && !chain.HasUnownedExecutable;
+    memory[0x4000] = std::vector<uint8_t>(32, 0x90);
+    memory[0x4000][0] = 0xFF;
+    memory[0x4000][1] = 0x25;
+    const int32_t slotOffset = 0x12;
+    std::memcpy(memory[0x4000].data() + 2, &slotOffset, 4);
+    memory[0x4018].resize(8);
+    std::memcpy(memory[0x4018].data(), &target, 8);
+    chain = ResolveCodeTarget(0x4000, reader, inspect);
+    ok = ok && CodeTargetChainMatches(chain, reader) && chain.HasUnownedExecutable;
+    memory[0x4018][0] ^= 1;
+    ok = ok && !CodeTargetChainMatches(chain, reader);
     return ok;
 }

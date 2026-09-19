@@ -1761,16 +1761,20 @@ namespace
             record->DriverObject = object.Body;
 
             uint64_t value = 0;
-            if (ReadFieldInteger(device, object.Body, driverStartField, sizeof(uint64_t), &value, nullptr))
+            const bool startKnown = ReadFieldInteger(device, object.Body, driverStartField, sizeof(uint64_t), &value, nullptr);
+            if (startKnown)
             {
                 record->DriverStart = value;
                 record->HasDriverStart = value != 0;
             }
-            if (ReadFieldInteger(device, object.Body, driverSizeField, sizeof(uint32_t), &value, nullptr))
+            const bool sizeKnown = ReadFieldInteger(device, object.Body, driverSizeField, sizeof(uint32_t), &value, nullptr);
+            if (sizeKnown)
             {
                 record->DriverSize = value;
             }
-            ReadFieldInteger(device, object.Body, driverSectionField, sizeof(uint64_t), &record->DriverSection, nullptr);
+            const bool sectionKnown = ReadFieldInteger(device, object.Body, driverSectionField,
+                sizeof(uint64_t), &record->DriverSection, nullptr);
+            record->IdentityFieldsKnown = startKnown && sizeKnown && sectionKnown;
             ReadFieldInteger(device, object.Body, deviceObjectField, sizeof(uint64_t), &record->DeviceObject, nullptr);
             ReadFieldInteger(device, object.Body, fastIoField, sizeof(uint64_t), &record->FastIoDispatch, nullptr);
             ReadFieldInteger(device, object.Body, unloadField, sizeof(uint64_t), &record->DriverUnload, nullptr);
