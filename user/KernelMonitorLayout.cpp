@@ -119,14 +119,7 @@ void KernelMonitor::DrainLayoutCandidates()
         const std::unique_ptr<void, decltype(&CloseHandle)> handle(process, &CloseHandle);
         const auto current = [&]()
         {
-            MEMORY_BASIC_INFORMATION mbi{};
-            FILETIME created{}, exited{}, kernel{}, user{};
-            return process != nullptr && GetTickCount64() - item.ObservedMs <= 30000 &&
-                item.Identity.SameInstance(ObserveProcessIdentity(pid, process)) &&
-                GetProcessTimes(process, &created, &exited, &kernel, &user) &&
-                exited.dwHighDateTime == 0 && exited.dwLowDateTime == 0 &&
-                VirtualQueryEx(process, reinterpret_cast<void*>(item.Region.Base), &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                ProcessLayoutRegionMatches(item.Region, mbi);
+            return ProcessLayoutCandidateCurrent(process, item);
         };
         if (!current())
         {
@@ -171,6 +164,7 @@ void KernelMonitor::DrainLayoutCandidates()
         observation.Range = {item.Region.Base, item.Region.Size};
         observation.Executable = item.Region.Executable();
         observation.Writable = (item.Region.Protect & (PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        observation.CopyOnWrite = (item.Region.Protect & (PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0;
         observation.ImageMapping = item.Region.Type == MEM_IMAGE;
         ObserveExecutableRegion(observation);
         QueueExecutableRegionPages(observation, observation.ImageMapping ? L"image_page_candidate" : L"user_page_candidate");

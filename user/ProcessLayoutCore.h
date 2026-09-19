@@ -14,6 +14,7 @@ namespace process_layout
     constexpr uint32_t Mapped = 0x40000;
     constexpr uint32_t Image = 0x1000000;
     constexpr size_t MaxRegions = 32768;
+    constexpr uint64_t MaxSweepMs = 30000;
 
     struct Region
     {
@@ -56,7 +57,7 @@ namespace process_layout
         {
             if (!Complete || Limit == 0 || Limit > 0x800000000000ull || Cursor != Limit ||
                 Identity.ProcessId <= 4 || Identity.CreateTime == 0 || Identity.BootId.empty() ||
-                FinishedMs < StartedMs || Regions.size() > MaxRegions)
+                FinishedMs < StartedMs || FinishedMs - StartedMs > MaxSweepMs || Regions.size() > MaxRegions)
             {
                 return false;
             }

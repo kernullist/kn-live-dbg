@@ -8,6 +8,7 @@
 #include <random>
 #include <thread>
 #include <filesystem>
+#include <Psapi.h>
 
 namespace
 {
@@ -64,6 +65,13 @@ int wmain(int argc, wchar_t** argv)
     next.StartedMs = 3;
     next.FinishedMs = 4;
     Check(Compare(first, next).ChangedRanges == 0, "unchanged");
+    auto expired = first;
+    expired.FinishedMs = expired.StartedMs + 30001;
+    Check(!expired.Valid(), "late final query cannot publish an expired sweep");
+    History expiredHistory;
+    Check(!expiredHistory.Accept(std::make_shared<Snapshot>(expired)), "expired baseline rejected");
+    --expired.FinishedMs;
+    Check(expired.Valid(), "maximum sweep window accepted");
     next.Regions = {{0x10000, 0x1000, 0x10000, Commit, 4, 4, Private},
         {0x11000, 0x2000, 0x10000, Commit, 4, 4, Private}};
     Check(Compare(first, next).ChangedRanges == 0, "equivalent split");
@@ -187,6 +195,7 @@ int wmain(int argc, wchar_t** argv)
         Check(Compare(a, b, 0).Changes.empty(), "zero delta capacity");
     }
     Check(WindowsFixture(), "Windows layout fixture");
+    Check(ProcessLayoutMonitorSelfTest(), "reused PID rechecks name scope");
     ImageIdentityFixture();
     std::cout << "[layout.core] checks=" << Checks << " failures=" << Failures << '\n';
     return Failures == 0 ? 0 : 1;
@@ -218,6 +227,28 @@ namespace
             Check(QualifyExecutableReference(metadata, base, reader, &reason), "unmodified mapped image identity");
             MEMORY_BASIC_INFORMATION before{}, after{};
             VirtualQuery(view, &before, sizeof(before));
+            ProcessLayoutCandidate candidate;
+            candidate.Identity = ObserveProcessIdentity(GetCurrentProcessId());
+            candidate.Region = {reinterpret_cast<uint64_t>(before.BaseAddress), before.RegionSize,
+                reinterpret_cast<uint64_t>(before.AllocationBase), before.State, before.Protect, before.AllocationProtect, before.Type};
+            candidate.ObservedMs = GetTickCount64();
+            wchar_t mappedName[1024]{};
+            const auto length = GetMappedFileNameW(GetCurrentProcess(), view, mappedName, 1024);
+            Check(length != 0 && length < 1024, "owned image mapped name");
+            candidate.ImageName.assign(mappedName, (std::min<DWORD>)(length, 1023));
+            Check(ProcessLayoutCandidateCurrent(GetCurrentProcess(), candidate), "current image candidate accepted");
+            auto stale = candidate;
+            stale.ImageName += L".replaced";
+            Check(!ProcessLayoutCandidateCurrent(GetCurrentProcess(), stale), "same attributes with stale image name rejected");
+            stale = candidate;
+            ++stale.Identity.CreateTime;
+            Check(!ProcessLayoutCandidateCurrent(GetCurrentProcess(), stale), "stale candidate process instance rejected");
+            stale = candidate;
+            stale.ObservedMs = GetTickCount64() + 60000;
+            Check(!ProcessLayoutCandidateCurrent(GetCurrentProcess(), stale), "future candidate observation rejected");
+            stale = candidate;
+            stale.ObservedMs = GetTickCount64() - 30001;
+            Check(!ProcessLayoutCandidateCurrent(GetCurrentProcess(), stale), "old candidate rejected");
             DWORD previous = 0;
             const bool writable = VirtualProtect(view, 4096, PAGE_READWRITE, &previous) != FALSE;
             Check(writable, "owned image copy-on-write header");

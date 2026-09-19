@@ -2,7 +2,9 @@
 
 검증 대상은 `40c5739` 이후 추가한 전체 프로세스 layout 수집·변화 비교·이미지 검증 연결이다. 날짜는 2026-09-20이며, [사용·연구 가이드](KMON_PROCESS_LAYOUTS.md)에 수집 범위와 해석을 정리했다. 드라이버 로드나 실게임핵 실행 없이 로컬 빌드, 합성 데이터, 소유한 프로세스와 비실행 이미지 매핑으로 확인했다.
 
-## 검증 경로
+## 초기 구현 검증
+
+다음 표와 원래 산출물 목록은 `5704044` 구현 시 수행한 검사다. 후속 리뷰에서 발견한 문제와 수정 검증은 아래 별도 기록을 따른다.
 
 | 명령 | 결과 |
 | --- | --- |
@@ -52,7 +54,33 @@ Release와 Debug 전체 빌드는 다음 명령으로 수행했다. 버전 증�
 | RX→RW/NX 전환이 원시 diff에만 남고 조사 후보에서 빠짐 | 할당이 남는 실행 권한 상실을 후보에 포함; 일반 해제 음성 대조 |
 | `/initial` 화면 요약이 최신 영역 수·나이를 표시 | 요약과 영역 목록이 같은 초기 스냅샷을 사용 |
 
-수정 후 코드·스레드 수명·실패 경로·export 경계를 다시 검토했고, 이번 검토 범위에서 추가로 재현 가능한 수정 대상은 발견하지 못했다. 완전 순회가 코드 전체 검증 완료로 표시되지 않도록 별도 queue/counter와 `verification_coverage`를 제공한다. 짧은 실행 구간, 보호 프로세스, 동일한 형태로 되돌아온 매핑 및 센서 자체의 신뢰 한계는 가이드에 남긴 관측 제약이다.
+완전 순회가 코드 전체 검증 완료로 표시되지 않도록 별도 queue/counter와 `verification_coverage`를 제공한다. 짧은 실행 구간, 보호 프로세스, 동일한 형태로 되돌아온 매핑 및 센서 자체의 신뢰 한계는 가이드에 남긴 관측 제약이다.
+
+## 후속 적대적 리뷰
+
+`5704044`를 기준으로 수집기와 공통 검증·영역 기록의 연결을 다시 검토했다. 아래 네 문제를 발견했고, 수정 전 코드에 회귀 검사를 먼저 추가해 실패를 확인했다.
+
+| 심각도 | 문제와 영향 | 수정·회귀 근거 |
+| --- | --- | --- |
+| P1 | 큐에 들어간 뒤 같은 VA가 다른 이미지로 교체되어도 MBI 속성만 같으면 이전 파일 경로로 검증해 이미지 변조 오탐 가능 | `ProcessLayoutCandidateCurrent`가 같은 프로세스 핸들로 현재 mapped name을 확인한다. 검증 읽기 전후에도 재확인한다. 자체 실행파일 영역에 다른 모듈 이름을 붙인 stale 후보는 거부하고, 실제 이름의 후보는 기존 이미지 검증으로 전달한다. |
+| P2 | 조각 시작 시에만 만료를 확인해 마지막 질의가 늦게 끝난 30초 초과 순회도 완전 스냅샷으로 승인 가능 | 게시 직전과 `Snapshot::Valid` 양쪽에서 관측 구간을 검사한다. 30,001ms 스냅샷과 초기 이력 승인은 거부하고 30,000ms 경계는 허용한다. |
+| P2 | 발견 단계에서 이름으로 선택한 PID가 수집 전에 재사용되면 범위 밖의 새 인스턴스도 수집 가능 | 동일 핸들에서 얻은 이름으로 현재 범위를 다시 검사한다. 생성 시각이 다른 이전 항목을 주입한 fixture로 범위 밖 이름은 거부하고 명시적 PID 선택은 허용함을 확인한다. 실제 OS의 PID 재사용을 강제한 시험은 아니다. |
+| P2 | `PAGE_EXECUTE_WRITECOPY`의 COW 속성이 공통 영역 기록에 전달되지 않아 writable/COW 증거가 불일치 | 실제 소유한 page-file 매핑을 `FILE_MAP_COPY | FILE_MAP_EXECUTE`로 열고, 분석 큐를 거친 catalog에서 writable·COW가 모두 보존되는지 확인한다. 해당 메모리의 코드는 실행하지 않는다. |
+
+매핑 이름의 의미와 길이·실패 처리는 [Microsoft의 GetMappedFileNameW 정의](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getmappedfilenamew)를 대조했다. 이름 일치는 현재 경로 관측이며 원래 section 파일 객체의 신원을 증명하지는 않는다.
+
+수정 전에는 layout harness의 만료·범위 검사 3개가 실패했고, 실행파일 통합 검사에서는 stale mapped name과 COW 전달 검사가 실패했다. 수정 후에는 정상 이미지, 잘못된 생성 시각, 미래·만료된 후보의 대조 검사도 실행했다. 코드·잠금 순서·스레드 종료·기준 보존·경로 재확인 경계를 다시 검토했고, 이번 범위에서 추가로 재현 가능한 수정 대상은 발견하지 못했다.
+
+| 최종 검증 | 결과 |
+| --- | --- |
+| Layout ASan·Debug | 각 105,075 검사, 실패 0 |
+| Release·Debug 전체 빌드 | 두 구성 성공, 컴파일러·링커 경고 및 오류 없음 |
+| Release·Debug `--self-test all` | 각 구성에서 timeline 28·MCP 75·console 524·명령 2,037·remote 52 및 connect 인자 검사 통과, 종료 코드 0 |
+| 변경 경계 | `git diff --check`와 문서 상대 링크 확인 통과; 드라이버 로드·실게임핵 실행 없음 |
+
+수정 후 스냅샷 근거는 `.build/process-layout/Release-asan/run-8077960da2b84bc5901132498b8018bf/`와 `.build/process-layout/Debug/run-6c1b06dbc831474bbbfb5ead38339382/`의 `initial.json`·`changed.json`이다.
+
+후속 리뷰 산출물은 `.build/layout-review-before-{layout,build,console}.log`, `.build/layout-review-{asan,debug}.log`, `.build/layout-review-build-{release,debug}.log`, `.build/layout-review-selftest-{release,debug}.log`에 남긴다. 이 파일들은 커밋하지 않는다.
 
 ## 로컬 근거
 

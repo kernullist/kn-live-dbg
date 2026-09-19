@@ -81,6 +81,7 @@ public:
     void RequestDiscovery();
 
 private:
+    friend bool ProcessLayoutMonitorSelfTest();
     struct Entry
     {
         uint32_t Pid = 0;
@@ -98,7 +99,8 @@ private:
     };
 
     void Discover(const ProcessLayoutScope& scope, uint64_t now);
-    void Advance(Entry& entry, const std::atomic<bool>& stop, const NoticeSink& notice, const CandidateSink& candidate);
+    void Advance(Entry& entry, const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
+        const NoticeSink& notice, const CandidateSink& candidate);
     void Fail(Entry& entry, const wchar_t* reason, uint32_t error, const NoticeSink& notice);
     size_t StoredRows() const;
     size_t StoredNames() const;
@@ -112,4 +114,6 @@ private:
 };
 
 bool ProcessLayoutRegionMatches(const process_layout::Region& expected, const MEMORY_BASIC_INFORMATION& current);
+bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate& candidate);
 std::wstring ProcessLayoutReferencePath(const std::wstring& mappedName);
+bool ProcessLayoutMonitorSelfTest();

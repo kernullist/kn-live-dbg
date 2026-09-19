@@ -7,6 +7,8 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <Psapi.h>
+#include <cstdio>
 
 namespace
 {
@@ -778,6 +780,82 @@ bool KmonPipelineSelfTest()
             work->LastReferenceCheckMs = 0;
             work = monitor.FindImageWork(referencePath, 0x140000000ull, identity);
             ok = ok && appended && work != nullptr && !work->ManifestChecked;
+
+            // A queued image name must still describe the live allocation.
+            monitor.StopRequested.store(false);
+            ProcessLayoutCandidate candidate;
+            candidate.Identity = identity;
+            candidate.Role = L"layout_selftest";
+            candidate.ObservedAt = ObservationFileTime();
+            candidate.ObservedMs = GetTickCount64();
+            MEMORY_BASIC_INFORMATION imageRegion{};
+            wchar_t otherImage[1024]{};
+            const DWORD otherLength = GetMappedFileNameW(GetCurrentProcess(), GetModuleHandleW(L"ntdll.dll"), otherImage, 1024);
+            const bool imageReady = VirtualQuery(reinterpret_cast<void*>(&KmonPipelineSelfTest),
+                &imageRegion, sizeof(imageRegion)) == sizeof(imageRegion) && otherLength != 0 && otherLength < 1024;
+            if (imageReady)
+            {
+                candidate.Region = {reinterpret_cast<uint64_t>(imageRegion.BaseAddress), imageRegion.RegionSize,
+                    reinterpret_cast<uint64_t>(imageRegion.AllocationBase), imageRegion.State, imageRegion.Protect,
+                    imageRegion.AllocationProtect, imageRegion.Type};
+                candidate.ImageName.assign(otherImage, otherLength);
+                monitor.LayoutCandidates.Push(candidate);
+                monitor.DrainLayoutCandidates();
+            }
+            const bool staleRejected = imageReady && monitor.LayoutRejected.load() == 1 && monitor.LayoutChecked.load() == 0;
+            if (!staleRejected)
+            {
+                std::fprintf(stderr, "FAIL layout stale mapped-name revalidation\n");
+            }
+            ok = staleRejected && ok;
+
+            const DWORD currentLength = imageReady ? GetMappedFileNameW(GetCurrentProcess(),
+                imageRegion.BaseAddress, otherImage, 1024) : 0;
+            if (currentLength != 0 && currentLength < 1024)
+            {
+                candidate.ImageName.assign(otherImage, currentLength);
+                candidate.ObservedMs = GetTickCount64();
+                monitor.LayoutCandidates.Push(candidate);
+                monitor.DrainLayoutCandidates();
+            }
+            const bool imageChecked = currentLength != 0 && currentLength < 1024 &&
+                monitor.LayoutChecked.load() == 1 && monitor.LayoutRejected.load() == 1;
+            if (!imageChecked)
+            {
+                std::fprintf(stderr, "FAIL layout current mapped-name positive control\n");
+            }
+            ok = imageChecked && ok;
+
+            // A passive COW mapping exercises the actual catalog projection.
+            HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 4096, nullptr);
+            const std::unique_ptr<void, decltype(&CloseHandle)> sectionOwner(section, &CloseHandle);
+            void* view = section == nullptr ? nullptr : MapViewOfFile(section, FILE_MAP_COPY | FILE_MAP_EXECUTE, 0, 0, 4096);
+            const std::unique_ptr<void, decltype(&UnmapViewOfFile)> viewOwner(view, &UnmapViewOfFile);
+            MEMORY_BASIC_INFORMATION cowRegion{};
+            const bool cowReady = view != nullptr && VirtualQuery(view, &cowRegion, sizeof(cowRegion)) == sizeof(cowRegion) &&
+                cowRegion.Protect == PAGE_EXECUTE_WRITECOPY;
+            if (cowReady)
+            {
+                candidate.Region = {reinterpret_cast<uint64_t>(cowRegion.BaseAddress), cowRegion.RegionSize,
+                    reinterpret_cast<uint64_t>(cowRegion.AllocationBase), cowRegion.State, cowRegion.Protect,
+                    cowRegion.AllocationProtect, cowRegion.Type};
+                candidate.ImageName.clear();
+                candidate.ObservedMs = GetTickCount64();
+                monitor.LayoutCandidates.Push(candidate);
+                monitor.DrainLayoutCandidates();
+            }
+            bool cowRecorded = false;
+            for (const auto& record : monitor.RegionCatalog.Snapshot())
+            {
+                const auto& observed = record.second.Latest;
+                cowRecorded = cowRecorded || (observed.Range.Address == reinterpret_cast<uint64_t>(view) &&
+                    observed.Context.Source == L"layout_selftest" && observed.CopyOnWrite && observed.Writable);
+            }
+            if (!cowReady || !cowRecorded)
+            {
+                std::fprintf(stderr, "FAIL layout copy-on-write catalog metadata\n");
+            }
+            ok = cowReady && cowRecorded && ok;
         } while (false);
     }
     catch (...)

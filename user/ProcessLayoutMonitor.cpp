@@ -13,7 +13,6 @@ namespace
     constexpr size_t MaxProcesses = 4096;
     constexpr size_t MaxStoredRows = 262144;
     constexpr size_t MaxStoredNames = 8192;
-    constexpr uint64_t MaxSweepMs = 30000;
 
     struct Handle
     {
@@ -77,6 +76,38 @@ bool ProcessLayoutRegionMatches(const process_layout::Region& expected, const ME
     return expected.Size != 0 && expected.Base <= UINT64_MAX - expected.Size && row.Size != 0 &&
         row.Base <= expected.Base && row.Base <= UINT64_MAX - row.Size &&
         expected.Base + expected.Size <= row.Base + row.Size && expected.SameAttributes(row);
+}
+
+bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate& candidate)
+{
+    bool current = false;
+    do
+    {
+        MEMORY_BASIC_INFORMATION region{};
+        const uint64_t now = GetTickCount64();
+        if (process == nullptr || candidate.Identity.ProcessId <= 4 || now < candidate.ObservedMs ||
+            now - candidate.ObservedMs > process_layout::MaxSweepMs ||
+            !candidate.Identity.SameInstance(ObserveProcessIdentity(candidate.Identity.ProcessId, process)) || !Alive(process) ||
+            VirtualQueryEx(process, reinterpret_cast<void*>(candidate.Region.Base), &region, sizeof(region)) != sizeof(region) ||
+            !ProcessLayoutRegionMatches(candidate.Region, region))
+        {
+            break;
+        }
+        if (!candidate.ImageName.empty())
+        {
+            // Equal MBI attributes do not identify the section at a reused VA.
+            wchar_t name[1024]{};
+            const DWORD length = GetMappedFileNameW(process, reinterpret_cast<void*>(candidate.Region.Base), name, 1024);
+            if (candidate.Region.Type != MEM_IMAGE || length == 0 || length >= 1024 ||
+                candidate.ImageName != std::wstring(name, length))
+            {
+                break;
+            }
+        }
+        current = true;
+    }
+    while (false);
+    return current;
 }
 
 std::wstring ProcessLayoutReferencePath(const std::wstring& mappedName)
@@ -219,7 +250,7 @@ void ProcessLayoutMonitor::Fail(Entry& entry, const wchar_t* reason, uint32_t er
     entry.Error = error;
 }
 
-void ProcessLayoutMonitor::Advance(Entry& entry, const std::atomic<bool>& stop,
+void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
     const NoticeSink& notice, const CandidateSink& candidate)
 {
     using namespace process_layout;
@@ -266,6 +297,11 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const std::atomic<bool>& stop,
         }
     }
     entry.Identity = identity;
+    if (!scope.Matches(entry.Pid, entry.Name))
+    {
+        Fail(entry, L"process_outside_scope", 0, notice);
+        return;
+    }
     if (!entry.Pending)
     {
         entry.Pending = std::make_shared<Snapshot>();
@@ -332,6 +368,11 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const std::atomic<bool>& stop,
     sweep.Complete = true;
     sweep.FinishedMs = GetTickCount64();
     sweep.ObservedAt = ObservationFileTime();
+    if (sweep.FinishedMs - sweep.StartedMs > MaxSweepMs)
+    {
+        Fail(entry, L"sweep_expired", 0, notice);
+        return;
+    }
     if (!entry.History.Accept(entry.Pending))
     {
         Fail(entry, L"snapshot_rejected", 0, notice);
@@ -430,7 +471,7 @@ void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atom
         ++visited;
         if (GetTickCount64() >= entry.NextScanMs)
         {
-            Advance(entry, stop, notice, candidate);
+            Advance(entry, scope, stop, notice, candidate);
         }
     }
 }
@@ -638,4 +679,34 @@ std::wstring ProcessLayoutMonitor::Text(uint32_t pid, bool initial) const
     }
     out << L"  first_observed_is_not_clean; non_atomic; deltas_are_leads; polling_gaps_possible\n";
     return out.str();
+}
+
+bool ProcessLayoutMonitorSelfTest()
+{
+    ProcessLayoutMonitor monitor;
+    monitor.Reset();
+    ProcessLayoutMonitor::Entry entry;
+    entry.Pid = GetCurrentProcessId();
+    entry.Name = L"previous-instance-only.exe";
+    entry.Identity = ObserveProcessIdentity(entry.Pid);
+    if (entry.Identity.CreateTime == 0)
+    {
+        return false;
+    }
+    --entry.Identity.CreateTime;
+    ProcessLayoutScope scope;
+    scope.All = false;
+    scope.Names.push_back(entry.Name);
+    std::atomic<bool> stop{false};
+    const auto notice = [](ProcessLayoutNotice)
+    {
+    };
+    const auto candidate = [](ProcessLayoutCandidate)
+    {
+    };
+    monitor.Advance(entry, scope, stop, notice, candidate);
+    const bool rejected = entry.Status == L"process_outside_scope" && !entry.Pending && !entry.History.Current;
+    scope.Pids.insert(entry.Pid);
+    monitor.Advance(entry, scope, stop, notice, candidate);
+    return rejected && entry.Status != L"process_outside_scope";
 }
