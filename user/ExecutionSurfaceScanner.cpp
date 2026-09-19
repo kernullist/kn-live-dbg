@@ -198,6 +198,10 @@ namespace
             row.Stable = query(raw, 7, &after, sizeof(after), &returned) >= 0 && returned == sizeof(after) &&
                 before.ProcessId == after.ProcessId && before.StartRoutine == after.StartRoutine &&
                 before.StartParameter == after.StartParameter;
+            if (!row.Stable)
+            {
+                ++failures;
+            }
             row.Status = row.Stable ? L"queried_twice" : L"changed_or_unreadable_on_recheck";
             DescribeTarget(process, modules, result->ModuleInventoryComplete, &row);
             result->Rows.push_back(std::move(row));
@@ -279,14 +283,19 @@ ExecutionSurfaceResult ScanExecutionSurfaces(uint32_t pid, const ExecutionSurfac
             {
                 return false;
             }
-            MEMORY_BASIC_INFORMATION mbi = {};
-            if (VirtualQueryEx(process.get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) != sizeof(mbi) ||
-                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
-                address < reinterpret_cast<uintptr_t>(mbi.BaseAddress) ||
-                address - reinterpret_cast<uintptr_t>(mbi.BaseAddress) >= mbi.RegionSize ||
-                size > mbi.RegionSize - (address - reinterpret_cast<uintptr_t>(mbi.BaseAddress)))
+            for (size_t offset = 0; offset < size;)
             {
-                return false;
+                const uint64_t current = address + offset;
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (stopped() || VirtualQueryEx(process.get(), reinterpret_cast<LPCVOID>(current), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+                    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+                    current < reinterpret_cast<uintptr_t>(mbi.BaseAddress) ||
+                    current - reinterpret_cast<uintptr_t>(mbi.BaseAddress) >= mbi.RegionSize)
+                {
+                    return false;
+                }
+                offset += (std::min)(size - offset,
+                    mbi.RegionSize - (current - reinterpret_cast<uintptr_t>(mbi.BaseAddress)));
             }
             bytes->resize(size);
             SIZE_T read = 0;

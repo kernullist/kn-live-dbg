@@ -879,6 +879,7 @@ $documentationPaths = @(
     "docs\FEATURE_PLAN.md",
     "docs\HUNT_TEST_TARGET.md",
     "docs\KMON_ADVERSARIAL_REVIEW_20260920.md",
+    "docs\KMON_ANALYST_REVIEW_20260920.md",
     "docs\KMON_ANALYST_SURFACES.md",
     "docs\KMON_ANALYST_VALIDATION_20260920.md",
     "docs\KMON_COVERAGE_MATRIX_20260919.md",

@@ -121,7 +121,7 @@ identification (code stomping detection). TI requests ETW stack capture with EVE
 - `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
 - [Command audit](docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
 - [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe current collection and evidence semantics. The [2026-09-20 review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) records the latest fixes and regression evidence.
-- [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [validation evidence](docs/KMON_ANALYST_VALIDATION_20260920.md).
+- [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [initial validation](docs/KMON_ANALYST_VALIDATION_20260920.md) and the [follow-up adversarial review](docs/KMON_ANALYST_REVIEW_20260920.md).
 
 ## Build
 

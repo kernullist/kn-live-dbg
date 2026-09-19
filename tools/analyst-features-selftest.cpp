@@ -247,6 +247,53 @@ namespace
         const auto flag = malformed.find(L"\"communication_proven\":false");
         malformed.replace(flag, std::wstring(L"\"communication_proven\":false").size(), L"\"communication_proven\":true");
         Check(!CompareAnalystSnapshots(malformed, a, &result, &error), "inflated input claim rejected");
+        const auto withFields = [&](const std::wstring& fields)
+        {
+            return a.substr(0, a.size() - 1) + L"," + fields + L"}";
+        };
+        Check(CompareAnalystSnapshots(withFields(L"\"filter_pid\":55"), withFields(L"\"candidate_limit\":55"),
+            &result, &error) && result.CoverageChanged, "coverage keys distinguish PID filter from candidate cap");
+        Check(CompareAnalystSnapshots(withFields(L"\"filter_pid\":55,\"filter_role\":\"tls_callback\",\"candidate_limit\":256"),
+            withFields(L"\"filter_pid\":\"055\",\"filter_role\":\"tls_\\u0063allback\",\"candidate_limit\":\"0256\""),
+            &result, &error) && !result.CoverageChanged, "coverage scalar encodings normalize by field");
+        for (const auto& fields : {L"\"filter_pid\":4294967296", L"\"filter_pid\":-1", L"\"filter_pid\":true",
+            L"\"filter_role\":false", L"\"filter_role\":\"tls\\u0000_callback\"", L"\"candidate_limit\":0",
+            L"\"candidate_limit\":257", L"\"candidate_limit\":[]"})
+        {
+            Check(!CompareAnalystSnapshots(withFields(fields), a, &result, &error), "invalid coverage options rejected");
+        }
+        for (const auto& escaped : {L"\\ud800", L"\\udfff", L"\\ud800x", L"\\ud800\\ud800\\udc00"})
+        {
+            auto invalidIdentity = a;
+            invalidIdentity.replace(invalidIdentity.find(L"boot-a"), 6, escaped);
+            Check(!CompareAnalystSnapshots(invalidIdentity, a, &result, &error), "lossy UTF-16 identity is rejected");
+        }
+        std::wstring unicodeRole;
+        unicodeRole.push_back(static_cast<wchar_t>(0xd83d));
+        unicodeRole.push_back(static_cast<wchar_t>(0xde80));
+        Check(CompareAnalystSnapshots(withFields(L"\"filter_role\":\"\\ud83d\\ude80\""),
+            withFields(L"\"filter_role\":\"" + unicodeRole + L"\""), &result, &error) && !result.CoverageChanged,
+            "valid supplementary Unicode escapes preserve identity");
+        Check(!CompareAnalystSnapshots(withFields(L"\"bad\\u0000key\":\"x\""), a, &result, &error),
+            "embedded NUL in member names is rejected");
+        Check(!CompareAnalystSnapshots(withFields(L"\"unknown\":\"\\ud800\""), a, &result, &error),
+            "unknown fields cannot hide malformed Unicode");
+        const wchar_t unicodeEdges[] = {0x20, 0x22, 0x5c, 0x7f, 0x7ff, 0x800, 0xd7ff,
+            0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xfffd};
+        for (const wchar_t first : unicodeEdges)
+        {
+            for (const wchar_t second : unicodeEdges)
+            {
+                const wchar_t units[] = {first, second};
+                const bool valid = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, units, 2,
+                    nullptr, 0, nullptr, nullptr) > 0;
+                wchar_t escaped[13] = {};
+                swprintf_s(escaped, L"\\u%04x\\u%04x", static_cast<unsigned>(first), static_cast<unsigned>(second));
+                const auto input = withFields(L"\"filter_role\":\"" + std::wstring(escaped) + L"\"");
+                Check(CompareAnalystSnapshots(input, input, &result, &error) == valid,
+                    "Unicode boundary pairs agree with strict Windows UTF-8 conversion");
+            }
+        }
         std::mt19937 random(123);
         for (size_t i = 0; i < 300; ++i)
         {
@@ -268,6 +315,60 @@ namespace
     void CALLBACK BenignWork(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WORK)
     {
         SetEvent(static_cast<HANDLE>(context));
+    }
+
+    void RegionBoundaryFixture()
+    {
+        void* candidate = VirtualAlloc(nullptr, 0x4000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        Check(candidate != nullptr, "boundary fixture allocated");
+        if (candidate == nullptr)
+        {
+            return;
+        }
+        const auto base = reinterpret_cast<uintptr_t>(candidate);
+        ExecutionSurfaceOptions options;
+        options.TimeBudgetMs = 10000;
+        options.HandleBudget = 1;
+        options.ImageCandidates.push_back({base, 0x4000});
+        const auto found = [&](const ExecutionSurfaceResult& result)
+        {
+            return std::any_of(result.Rows.begin(), result.Rows.end(), [&](const auto& row)
+            {
+                return row.Kind == L"tls_callback" && row.ModuleBase == base && row.Stable &&
+                    row.Target == reinterpret_cast<uintptr_t>(&BenignTls);
+            });
+        };
+        auto data = Image();
+        Put<uint32_t>(&data, 0x98 + 112 + 9 * 8, 0xff0);
+        Put<uint64_t>(&data, 0xff0 + 24, base + 0x2100);
+        Put<uint64_t>(&data, 0x2100, reinterpret_cast<uintptr_t>(&BenignTls));
+        Put<uint64_t>(&data, 0x2108, 0);
+        std::memcpy(candidate, data.data(), data.size());
+        DWORD previous = 0;
+        const bool protectedHeader = VirtualProtect(candidate, 4096, PAGE_READONLY, &previous) != FALSE;
+        Check(protectedHeader, "boundary fixture header protection");
+        Check(found(ScanExecutionSurfaces(GetCurrentProcessId(), options)), "TLS directory spans readable protection regions");
+        const bool restored = VirtualProtect(candidate, 4096, PAGE_READWRITE, &previous) != FALSE;
+        Check(restored, "boundary fixture header restored");
+        if (restored)
+        {
+            data = Image();
+            Put<uint64_t>(&data, 0x2018, base + 0xffc);
+            Put<uint64_t>(&data, 0xffc, reinterpret_cast<uintptr_t>(&BenignTls));
+            Put<uint64_t>(&data, 0x1004, 0);
+            std::memcpy(candidate, data.data(), data.size());
+            Check(VirtualProtect(candidate, 4096, PAGE_READONLY, &previous) != FALSE, "boundary fixture split callback protection");
+            Check(found(ScanExecutionSurfaces(GetCurrentProcessId(), options)), "TLS callback pointer spans readable regions");
+            auto second = reinterpret_cast<void*>(base + 4096);
+            Check(VirtualProtect(second, 4096, PAGE_READWRITE | PAGE_GUARD, &previous) != FALSE, "boundary fixture guard protection");
+            const auto guarded = ScanExecutionSurfaces(GetCurrentProcessId(), options);
+            MEMORY_BASIC_INFORMATION mbi = {};
+            Check(!found(guarded) && VirtualQuery(second, &mbi, sizeof(mbi)) == sizeof(mbi) && (mbi.Protect & PAGE_GUARD) != 0,
+                "cross-region guard is preserved and no callback is accepted");
+            Check(VirtualProtect(second, 4096, PAGE_NOACCESS, &previous) != FALSE, "boundary fixture no-access protection");
+            Check(!found(ScanExecutionSurfaces(GetCurrentProcessId(), options)), "cross-region no-access callback is rejected");
+        }
+        VirtualFree(candidate, 0, MEM_RELEASE);
     }
 
     void LiveFixture(const std::wstring& directory)
@@ -383,6 +484,7 @@ int wmain(int argc, wchar_t** argv)
     const std::wstring directory = argv[1];
     CoreTests();
     SnapshotTests(directory);
+    RegionBoundaryFixture();
     LiveFixture(directory);
     std::cout << "[analyst.selftest] passed=" << Passed << " failed=" << Failed << "\n";
     return Failed == 0 ? 0 : 1;

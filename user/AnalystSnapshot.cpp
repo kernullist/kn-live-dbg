@@ -37,6 +37,10 @@ namespace
                 return false;
             }
             auto name = mcpjson::Unescape(json.substr(pos, end - pos));
+            if (name.find(L'\0') != std::wstring::npos)
+            {
+                return false;
+            }
             pos = end;
             mcpjson::SkipWhitespace(json, &pos);
             if (pos >= json.size() || json[pos++] != L':')
@@ -197,6 +201,63 @@ namespace
         std::map<std::wstring, std::wstring> Rows;
     };
 
+    bool SnapshotStringsValid(const std::wstring& json)
+    {
+        bool inString = false;
+        bool highSurrogate = false;
+        for (size_t i = 0; i < json.size(); ++i)
+        {
+            wchar_t unit = json[i];
+            if (!inString)
+            {
+                inString = unit == L'"';
+                continue;
+            }
+            if (unit == L'"')
+            {
+                if (highSurrogate)
+                {
+                    return false;
+                }
+                inString = false;
+                continue;
+            }
+            if (unit == L'\\')
+            {
+                if (++i >= json.size())
+                {
+                    return false;
+                }
+                unit = 0;
+                if (json[i] == L'u')
+                {
+                    if (json.size() - i <= 4)
+                    {
+                        return false;
+                    }
+                    for (size_t n = 0; n < 4; ++n)
+                    {
+                        const wchar_t digit = json[++i];
+                        const uint32_t value = digit >= L'0' && digit <= L'9' ? digit - L'0' :
+                            (digit >= L'a' && digit <= L'f' ? digit - L'a' + 10 : digit - L'A' + 10);
+                        if (value > 15)
+                        {
+                            return false;
+                        }
+                        unit = static_cast<wchar_t>((unit << 4) | value);
+                    }
+                }
+            }
+            const bool lowSurrogate = unit >= 0xdc00 && unit <= 0xdfff;
+            if (highSurrogate != lowSurrogate)
+            {
+                return false;
+            }
+            highSurrogate = unit >= 0xd800 && unit <= 0xdbff;
+        }
+        return !inString && !highSurrogate;
+    }
+
     bool Parse(const std::wstring& json, Snapshot* snapshot)
     {
         Fields fields;
@@ -204,7 +265,7 @@ namespace
         uint64_t number = 0;
         std::wstring claim, array, processKey, boot;
         bool unknownIdentity = false;
-        if (json.size() > MaxSnapshotBytes || !mcpjson::ValidateDocument(json) || !Object(json, &fields) ||
+        if (json.size() > MaxSnapshotBytes || !mcpjson::ValidateDocument(json) || !SnapshotStringsValid(json) || !Object(json, &fields) ||
             !Text(fields, L"schema", &snapshot->Schema, 64) || !Text(fields, L"claim", &claim, 64))
         {
             return false;
@@ -251,20 +312,43 @@ namespace
         }
         else
         {
-            snapshot->Coverage = fields.at(L"evidence_evicted") + L":" + fields.at(L"evidence_rejected");
             std::wstring inputMode;
             if (!Text(fields, L"input_mode", &inputMode, 64))
             {
                 return false;
             }
-            snapshot->Coverage += L":" + mcpjson::Quote(inputMode);
+            Fields coverage;
+            for (const auto name : {L"evidence_evicted", L"evidence_rejected", L"input_mode"})
+            {
+                coverage.emplace(name, fields.at(name));
+            }
             for (const auto name : {L"filter_pid", L"filter_role", L"candidate_limit"})
             {
                 if (fields.count(name) != 0)
                 {
-                    snapshot->Coverage += L":" + fields.at(name);
+                    if (std::wstring(name) == L"filter_role")
+                    {
+                        std::wstring role;
+                        if (!Text(fields, name, &role, 128))
+                        {
+                            return false;
+                        }
+                    }
+                    else if (std::wstring(name) == L"filter_pid")
+                    {
+                        if (fields.at(name) != L"null" && (!Number(fields, name, &number) || number > UINT32_MAX))
+                        {
+                            return false;
+                        }
+                    }
+                    else if (!Number(fields, name, &number) || number == 0 || number > 256)
+                    {
+                        return false;
+                    }
+                    coverage.emplace(name, fields.at(name));
                 }
             }
+            snapshot->Coverage = Canonical(coverage);
         }
         const auto found = fields.find(surfaces ? L"rows" : L"cases");
         if (found == fields.end())
