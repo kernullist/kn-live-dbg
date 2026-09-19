@@ -134,6 +134,8 @@
     <ClCompile Include="KernelMonitorCatalog.cpp" />
     <ClCompile Include="KernelMonitorHunting.cpp" />
     <ClCompile Include="KernelMonitorPipeline.cpp" />
+    <ClCompile Include="ExecutionSurfaceScanner.cpp" />
+    <ClCompile Include="AnalystSnapshot.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
     <ClCompile Include="GameBuildManifestGenerator.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
@@ -192,6 +194,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AddressInspector.h" />
+    <ClInclude Include="AnalystSnapshot.h" />
+    <ClInclude Include="ExecutionSurfaceCore.h" />
+    <ClInclude Include="ExecutionSurfaceScanner.h" />
     <ClInclude Include="AiCapabilityCatalog.h" />
     <ClInclude Include="AiModelCatalog.h" />
     <ClInclude Include="AiProvider.h" />

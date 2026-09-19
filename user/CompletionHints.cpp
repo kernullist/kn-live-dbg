@@ -715,7 +715,9 @@ namespace
         { L"off", L"!kmon iotrace off", L"restore the interposed dispatch entry" },
         { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
-        { L"cases", L"!kmon cases [/json]", L"recent kernel/user investigation leads; no communication verdict" },
+        { L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent kernel/user investigation leads" },
+        { L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"TLS, KCT and WorkerFactory references" },
+        { L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
         { L"clear", L"!kmon clear", L"empty the derived ring" },
         { L"help", nullptr, L"show !kmon usage" },
@@ -724,6 +726,17 @@ namespace
     const CompletionHint kKmonCaseTokens[] =
     {
         { L"/json", L"!kmon cases /json", L"structured observations and claim boundaries" },
+        { L"/pid", L"/pid <PID>", L"match either endpoint with this process ID" },
+        { L"/role", L"/role <name>", L"exact reference role on the matching endpoint" },
+        { L"/save", L"/save <path>", L"persist UTF-8 JSON to a new file" },
+    };
+
+    const CompletionHint kKmonSurfaceTokens[] =
+    {
+        { L"/json", L"/json", L"print all reference and coverage rows" },
+        { L"/save", L"/save <path>", L"persist UTF-8 JSON to a new file" },
+        { L"/module-start", L"/module-start <N>", L"resume at the reported module index" },
+        { L"/handle-start", L"/handle-start <N>", L"resume at the reported handle value" },
     };
 
     const CompletionHint kKmonOptTokens[] =
@@ -1504,7 +1517,8 @@ namespace
     const CompletionScopeTable kKmonScopes[] =
     {
         SCOPE(L"", L"!kmon [start] | stop | status | recent | cases | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
-        SCOPE(L"cases", L"!kmon cases [/json]", L"recent investigation leads", kKmonCaseTokens),
+        SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent investigation leads", kKmonCaseTokens),
+        SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"static callback references", kKmonSurfaceTokens),
         SCOPE(L"opts", L"!kmon [/name] [/verbose] [/background] [/driver] [/pid] [/log]", L"kmon start options", kKmonOptTokens),
     };
 
@@ -1930,9 +1944,9 @@ namespace
         }
         else if (command == L"!kmon")
         {
-            if (first == L"cases")
+            if (first == L"cases" || first == L"surfaces")
             {
-                scope = L"cases";
+                scope = first;
             }
             else if (!first.empty() && first != L"help")
             {

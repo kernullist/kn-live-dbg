@@ -81,7 +81,8 @@ inline bool KmonChannelRole(const std::wstring& role)
 
 inline bool KmonPointerReference(const std::wstring& role)
 {
-    return KmonChannelRole(role) || role == L"iat" || role == L"vtable_candidate" ||
+    return KmonChannelRole(role) || role == L"iat" || role == L"tls_callback" ||
+        role == L"kernel_callback_candidate" || role == L"vtable_candidate" ||
         role == L"manifest_vtable" || role == L"cfg_dispatch_slot" ||
         role == L"graphics_data_pointer_candidate" || role == L"instrumentation_callback";
 }

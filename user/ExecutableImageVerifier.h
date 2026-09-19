@@ -8,6 +8,24 @@
 
 using ObservationReader = std::function<bool(uint64_t, size_t, std::vector<uint8_t>*)>;
 
+inline bool ObservationAnchorsMatch(const std::vector<ObservationAnchor>& anchors, const ObservationReader& reader)
+{
+    if (anchors.size() > 8)
+    {
+        return false;
+    }
+    for (const auto& anchor : anchors)
+    {
+        std::vector<uint8_t> bytes;
+        if (anchor.Bytes.empty() || anchor.Bytes.size() > 4096 || anchor.Address > UINT64_MAX - anchor.Bytes.size() ||
+            !reader || !reader(anchor.Address, anchor.Bytes.size(), &bytes) || bytes != anchor.Bytes)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct ExecutablePageResult
 {
     uint32_t Rva = 0;
@@ -35,6 +53,11 @@ bool QualifyExecutableReference(
     uint64_t imageBase,
     const ObservationReader& reader,
     std::wstring* reason);
+
+// Reads reference bytes with base relocations applied, including non-code metadata.
+bool ReadNormalizedImageRange(const std::wstring& path,
+    const executable_image::DiskPeMetadata& metadata, uint64_t imageBase,
+    uint32_t rva, uint32_t size, std::vector<uint8_t>* bytes);
 
 ExecutablePageResult CompareExecutableRange(
     const std::wstring& path,

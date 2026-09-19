@@ -376,7 +376,9 @@ Detection layers (run in this order when the goal is mapper-family coverage):
 6. Before publishing references, the collector checks the pointer slot, process instance and available EPROCESS/DTB again. Physical-read PFNs are compared with surrounding translations. A late identity/slot failure withholds the path, while already captured historical bytes can remain.
 7. `KmonHuntIndex` derives `!kmon cases [/json]` from at most 512 recent references. Matching full-page hashes and tightly spaced PFN observations describe content/address relationships; they do not identify a communication protocol, current RIP or malicious actor.
 
-The [verification guide](KMON_DETECTION_VERIFICATION.md), [hunting guide](KMON_CROSS_DOMAIN_HUNTING.md), [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md) and [adversarial review](KMON_ADVERSARIAL_REVIEW_20260920.md) give limits and local test evidence. The [v0.0.33 notes](RELEASE_NOTES_0.0.33.md) compare these changes with the previous public release.
+`ExecutionSurfaceScanner` adds read-only TLS, qualified native KCT-prefix and WorkerFactory metadata after v0.0.33. Its native references join the existing verification queue with PE/directory/root bytes that must still match before and after decoding. `AnalystSnapshot` preserves JSON evidence and compares it using boot/process-instance identity; missing rows never imply remediation. The direct command can collect TLS and WorkerFactory metadata without the driver. See the [analyst guide](KMON_ANALYST_SURFACES.md) for bounds, collection failures and file formats.
+
+The [verification guide](KMON_DETECTION_VERIFICATION.md), [hunting guide](KMON_CROSS_DOMAIN_HUNTING.md), [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md) and [adversarial review](KMON_ADVERSARIAL_REVIEW_20260920.md) give limits and local test evidence. The [v0.0.33 notes](RELEASE_NOTES_0.0.33.md) remain the historical release comparison; subsequent analyst features have their own [validation record](KMON_ANALYST_VALIDATION_20260920.md).
 
 ## Timeline Flow
 

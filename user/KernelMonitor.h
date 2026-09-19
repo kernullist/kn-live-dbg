@@ -7,6 +7,7 @@
 #include "ExecutableImageVerifier.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
+#include "AnalystSnapshot.h"
 #include "KmonWorkQueue.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
@@ -248,8 +249,8 @@ public:
 
     KmonStats SnapshotStats() const;
     KmonOptions CurrentOptions() const;
-    std::vector<KmonHuntCase> HuntCases() const;
-    std::wstring HuntCasesJson() const;
+    std::vector<KmonHuntCase> HuntCases(const AnalystCaseFilter& filter = {}) const;
+    std::wstring HuntCasesJson(const AnalystCaseFilter& filter = {}, std::vector<KmonHuntCase>* cases = nullptr) const;
     bool IsMapperWatchActive() const;
     std::vector<uint32_t> SnapshotWatchPids() const;
     std::wstring SnapshotMapperWatchId() const;
@@ -318,13 +319,16 @@ private:
     void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader);
     void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
-        const ObservationIdentity& identity = {}, uint64_t observedAt = 0);
+        const ObservationIdentity& identity = {}, uint64_t observedAt = 0,
+        const std::vector<ObservationAnchor>& anchors = {}, uint64_t expectedPeb = 0);
     void ScanExecutionReferences();
     void ScanExecutablePageCandidates();
     void QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role);
     void ScanCommunicationSurfaces();
     void ScanUserExecutionSurfaces(HANDLE process, const ObservationIdentity& identity,
         const std::vector<std::pair<uint64_t, uint32_t>>& modules, bool inventoryComplete);
+    void ScanUserCallbackSurfaces(const ObservationIdentity& identity,
+        const std::vector<std::pair<uint64_t, uint32_t>>& modules);
     void QueueObservedStack(const TiEventRecord& record);
     uint64_t ObserveExecutableRegion(ExecutableRegionObservation observation);
     void ScanUserRegionCatalog(HANDLE process, const ObservationIdentity& identity,
@@ -495,6 +499,7 @@ private:
     KmonExecutablePages ExecutablePages;
     uint64_t NextPageCoverageTickMs = 0;
     std::map<std::pair<uint32_t, uint64_t>, uint32_t> UserThreadCursors;
+    std::map<std::pair<uint32_t, uint64_t>, std::pair<size_t, uint64_t>> UserCallbackCursors;
     struct ExecutionReferenceWork
     {
         uint64_t Target = 0;
@@ -503,6 +508,8 @@ private:
         uint64_t ObservedMs = 0;
         ObservationIdentity Identity;
         std::wstring Role;
+        std::vector<ObservationAnchor> Anchors;
+        uint64_t ExpectedPeb = 0;
     };
     std::deque<ExecutionReferenceWork> ExecutionReferences;
     std::set<std::wstring> ExecutionReferenceKeys;

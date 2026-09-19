@@ -25,6 +25,8 @@
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
 #include "KernelMonitor.h"
+#include "ExecutionSurfaceScanner.h"
+#include "AnalystSnapshot.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -4981,6 +4983,9 @@ static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std:
                     L"iotrace",
                     L"watch",
                     L"recent",
+                    L"cases",
+                    L"surfaces",
+                    L"diff",
                     L"save",
                     L"clear",
                     L"help"
@@ -24991,7 +24996,10 @@ static void PrintKmonHelp()
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
-    std::wcout << L"  !kmon cases [/json]  bounded recent kernel/user investigation leads (30s expiry)\n";
+    std::wcout << L"  !kmon cases [/pid N] [/role name] [/json] [/save path]  recent leads (30s expiry)\n";
+    std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
+    std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
+    std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
     std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
     std::wcout << L"  /log /verbose /manifest /throttle apply on the first start; later start extends watches.\n";
@@ -25816,17 +25824,79 @@ static void HandleKmonCommand(
 
         if (action == L"cases")
         {
-            if (args.size() > 3 || (args.size() == 3 && ToLower(args[2]) != L"/json"))
+            AnalystCaseFilter filter;
+            bool jsonOutput = false;
+            bool valid = true;
+            std::wstring savePath;
+            std::set<std::wstring> seen;
+            for (size_t i = 2; i < args.size(); ++i)
             {
-                std::wcerr << L"!kmon cases: usage: !kmon cases [/json]\n";
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if ((option == L"/pid" || option == L"/role" || option == L"/save") &&
+                    i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    if (option == L"/pid")
+                    {
+                        uint64_t pid = 0;
+                        valid = ParseUnsigned(value, 10, &pid) && pid <= UINT32_MAX;
+                        filter.HasPid = true;
+                        filter.ProcessId = static_cast<uint32_t>(pid);
+                    }
+                    else if (option == L"/role")
+                    {
+                        valid = value.size() <= 128 && value.front() != L'/';
+                        filter.Role = value;
+                    }
+                    else
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+                if (!valid)
+                {
+                    break;
+                }
+            }
+            if (!valid)
+            {
+                std::wcerr << L"!kmon cases: usage: !kmon cases [/pid N] [/role name] [/json] [/save path]\n";
                 break;
             }
-            if (args.size() == 3)
+            std::vector<KmonHuntCase> cases;
+            const auto json = kmon.HuntCasesJson(filter, &cases);
+            if (!savePath.empty())
             {
-                std::wcout << kmon.HuntCasesJson() << L"\n";
+                std::wstring error;
+                if (!SaveAnalystSnapshot(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon cases: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
                 break;
             }
-            const auto cases = kmon.HuntCases();
+            if (!savePath.empty())
+            {
+                std::wcout << L"[kmon.snapshot] wrote " << savePath << L"\n";
+            }
             for (const auto& item : cases)
             {
                 std::wcout << L"[kmon.case] " << item.Kind << L" relation=" << ObservationRelationName(item.Relation)
@@ -25840,6 +25910,140 @@ static void HandleKmonCommand(
                 std::wcout << L"\n";
             }
             std::wcout << L"[kmon.cases] returned=" << cases.size() << L" claim=investigation_leads communication_proven=false\n";
+            break;
+        }
+
+        if (action == L"surfaces")
+        {
+            ExecutionSurfaceOptions options;
+            bool jsonOutput = false;
+            std::wstring savePath;
+            uint64_t pid = 0;
+            bool valid = args.size() >= 3 && ParseUnsigned(args[2], 10, &pid) && pid > 4 && pid <= UINT32_MAX;
+            std::set<std::wstring> seen;
+            for (size_t i = 3; valid && i < args.size(); ++i)
+            {
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if ((option == L"/save" || option == L"/module-start" || option == L"/handle-start") &&
+                    i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    uint64_t number = 0;
+                    if (option == L"/save")
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                    else if (!ParseUnsigned(value, 10, &number))
+                    {
+                        valid = false;
+                    }
+                    else if (option == L"/module-start")
+                    {
+                        valid = number < 4096;
+                        options.ModuleStart = static_cast<size_t>(number);
+                    }
+                    else
+                    {
+                        options.HandleStart = number;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+            }
+            if (!valid)
+            {
+                std::wcerr << L"!kmon surfaces: usage: !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
+                break;
+            }
+            TypeFieldInfo callback = {};
+            if (symbols.IsReady() && symbols.FindField(L"nt!_PEB", L"KernelCallbackTable", &callback, nullptr) &&
+                callback.Length == 8 && !callback.IsBitField && callback.Offset <= 0x1000 - 8)
+            {
+                options.HasKernelCallbackOffset = true;
+                options.KernelCallbackOffset = callback.Offset;
+            }
+            const auto result = ScanExecutionSurfaces(static_cast<uint32_t>(pid), options);
+            const auto json = ExecutionSurfacesJson(result);
+            if (!savePath.empty())
+            {
+                std::wstring error;
+                if (!SaveAnalystSnapshot(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon surfaces: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
+                break;
+            }
+            for (const auto& item : result.Coverage)
+            {
+                std::wcout << L"[kmon.surfaces.coverage] " << item.first << L"=" << item.second << L"\n";
+            }
+            size_t printed = 0;
+            for (const auto& row : result.Rows)
+            {
+                if (row.Status == L"absent" && row.Baseline == L"match")
+                {
+                    continue;
+                }
+                if (printed++ >= 128)
+                {
+                    break;
+                }
+                std::wcout << L"[kmon.surface] " << row.Kind << L" index=" << row.Index
+                    << L" slot=" << HexText(row.Slot) << L" target=" << HexText(row.Target)
+                    << L" stable=" << row.Stable << L" executable=" << row.Executable << L" unowned=" << row.Unowned
+                    << L" baseline=" << row.Baseline << L" status=" << row.Status << L"\n";
+            }
+            std::wcout << L"[kmon.surfaces] rows=" << result.Rows.size() << L" next_module=" << result.NextModule
+                << L" next_handle=" << result.NextHandle << L" execution_observed=false; /json shows all rows\n";
+            break;
+        }
+
+        if (action == L"diff")
+        {
+            if (args.size() < 4 || args.size() > 5 || args[2].empty() || args[3].empty() ||
+                (args.size() == 5 && ToLower(args[4]) != L"/json"))
+            {
+                std::wcerr << L"!kmon diff: usage: !kmon diff <before.json> <after.json> [/json]\n";
+                break;
+            }
+            std::wstring before, after, error;
+            AnalystSnapshotDiff result;
+            if (!ReadAnalystSnapshot(args[2], &before, &error) || !ReadAnalystSnapshot(args[3], &after, &error) ||
+                !CompareAnalystSnapshots(before, after, &result, &error))
+            {
+                std::wcerr << L"!kmon diff: " << error << L"\n";
+                break;
+            }
+            if (args.size() == 5)
+            {
+                std::wcout << AnalystSnapshotDiffJson(result) << L"\n";
+                break;
+            }
+            for (size_t i = 0; i < result.Changes.size() && i < 64; ++i)
+            {
+                std::wcout << L"[kmon.diff] " << result.Changes[i].Kind << L" " << result.Changes[i].Identity << L"\n";
+            }
+            std::wcout << L"[kmon.diff.summary] new=" << result.Added << L" changed=" << result.Changed
+                << L" no_longer_observed=" << result.NoLongerObserved << L" unchanged=" << result.Unchanged
+                << L" boot=" << result.BootRelation << L" coverage_changed=" << result.CoverageChanged
+                << L" absence_is_resolution=false; /json shows all differences\n";
             break;
         }
 
@@ -33961,6 +34165,22 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
                 {
                     writeLike = true;
                     break;
+                }
+            }
+            break;
+        }
+
+        if (command == L"!kmon" && args.size() >= 2)
+        {
+            const auto action = ToLower(args[1]);
+            if (action == L"cases" || action == L"surfaces")
+            {
+                for (size_t i = 2; i < args.size(); ++i)
+                {
+                    if (ToLower(args[i]) == L"/save")
+                    {
+                        writeLike = true;
+                    }
                 }
             }
             break;

@@ -121,6 +121,7 @@ identification (code stomping detection). TI requests ETW stack capture with EVE
 - `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
 - [Command audit](docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
 - [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe current collection and evidence semantics. The [2026-09-20 review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) records the latest fixes and regression evidence.
+- [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [validation evidence](docs/KMON_ANALYST_VALIDATION_20260920.md).
 
 ## Build
 
@@ -405,7 +406,9 @@ set-ppl-antimalware [on|off|status]
 !kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background|/nowatch] [/log <dir>]
 !kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
 !kmon iotrace <driver-name> on|off|status   # lab-only IOCTL interposition (ABI 17)
-!kmon cases [/json]                       # recent kernel/user investigation leads
+!kmon cases [/pid N] [/role name] [/json] [/save path]  # recent investigation leads
+!kmon surfaces <pid> [/json] [/save path]   # TLS, qualified KCT, WorkerFactory metadata
+!kmon diff <before.json> <after.json> [/json]  # saved observations; no remediation claim
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 ai <goal> [/verbose]
 ai chat <goal> [/verbose]
@@ -2253,7 +2256,7 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
 
-The [hidden-code coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) maps 22 technique families to observed evidence and remaining boundaries. Bounded whole-range page sweeps, resumable user PTE traversal, all-process image comparison, PE/PTE permission checks, exact callback slots and WFP code candidates extend coverage beyond first-page and thread-entry checks. Runtime permissions, page contents and process/address-space identities are revalidated before retaining page evidence. Live VM and game-cheat validation is performed separately by the operator.
+The [hidden-code coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) maps 23 technique families to observed evidence and remaining boundaries. Bounded whole-range page sweeps, resumable user PTE traversal, all-process image comparison, PE/PTE permission checks, exact callback slots and WFP code candidates extend coverage beyond first-page and thread-entry checks. Runtime permissions, page contents and process/address-space identities are revalidated before retaining page evidence. Live VM and game-cheat validation is performed separately by the operator.
 
 `!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` (or `!kmon start`) arms collectors and stays on the live tail.
 

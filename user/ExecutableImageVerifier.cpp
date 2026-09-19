@@ -139,6 +139,12 @@ bool ExecutableSweep::Initialize(const DiskPeMetadata& metadata)
     return !Ranges.empty();
 }
 
+bool ReadNormalizedImageRange(const std::wstring& path, const DiskPeMetadata& metadata,
+    uint64_t imageBase, uint32_t rva, uint32_t size, std::vector<uint8_t>* bytes)
+{
+    return NormalizeRange(path, metadata, imageBase, rva, size, bytes);
+}
+
 bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBase,
     const ObservationReader& reader, std::wstring* reason)
 {

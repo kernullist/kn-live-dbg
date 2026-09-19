@@ -64,6 +64,31 @@ static int RunCommandAuditSelfTest()
         const auto invalidCases = run(line);
         check(invalidCases.Error.find(L"usage") != std::wstring::npos, L"kmon cases rejects invalid arguments");
     }
+    for (const auto& line : {L"!kmon cases /pid 0 /json", L"!kmon cases /role tls_callback /json",
+        L"!kmon cases /pid 55 /role tls_callback /json"})
+    {
+        const auto result = run(line);
+        check(result.Error.empty() && result.Output.find(L"kmon.hunt.v1") != std::wstring::npos,
+            L"case filters accept valid options");
+    }
+    for (const auto& line : {L"!kmon cases /pid", L"!kmon cases /pid -1", L"!kmon cases /pid 4294967296",
+        L"!kmon cases /pid 1 /pid 2", L"!kmon cases /json /json", L"!kmon cases /role /json",
+        L"!kmon cases /save /json", L"!kmon surfaces", L"!kmon surfaces 0", L"!kmon surfaces 4",
+        L"!kmon surfaces 4294967296", L"!kmon surfaces 55 /unknown", L"!kmon surfaces 55 /json /json",
+        L"!kmon surfaces 55 /module-start 4096", L"!kmon surfaces 55 /handle-start -1",
+        L"!kmon diff", L"!kmon diff x", L"!kmon diff x y /unknown", L"!kmon diff x y /json extra"})
+    {
+        const auto result = run(line);
+        check(result.Error.find(L"usage") != std::wstring::npos, L"analyst command rejects invalid arguments before work");
+    }
+    check(IsWriteLikeCommandLine(L"!kmon cases /save x.json") &&
+        IsWriteLikeCommandLine(L"!kmon surfaces 55 /SAVE x.json") &&
+        !IsWriteLikeCommandLine(L"!kmon cases /pid 55 /json") &&
+        !IsWriteLikeCommandLine(L"!kmon diff x.json y.json /json"), L"analyst file exports require write authorization");
+    const auto ownSurfaces = run(L"!kmon surfaces " + std::to_wstring(GetCurrentProcessId()) + L" /json");
+    check(ownSurfaces.Error.empty() && ownSurfaces.Output.find(L"kmon.surfaces.v1") != std::wstring::npos &&
+        ownSurfaces.Output.find(L"\"execution_observed\":false") != std::wstring::npos && !device.IsOpen(),
+        L"owned-process surfaces command works without opening a driver");
     for (const auto& line : std::vector<std::wstring>
         { L"q extra", L"qq extra", L"qd extra", L"quit extra", L"exit extra", L"unload extra",
           L"write on extra", L"setfield nt!TYPE 0 Field 1 extra", L"c 0 1 2 extra", L"query 0 1 extra",

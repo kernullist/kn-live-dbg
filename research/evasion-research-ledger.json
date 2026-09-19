@@ -177,6 +177,54 @@
       "primitive": "PE TLS-directory modification and hollowing can redirect execution before the nominal entry point"
     },
     {
+      "id": "tlscheck2-2026",
+      "title": "TLSCheck 2.0: An Enhanced Memory Forensics Approach to Efficiently Detect TLS Callbacks",
+      "publisher": "Kartik N. Iyer and Parag H. Rughani",
+      "published_on": "2026-04-22",
+      "verified_on": "2026-09-20",
+      "url": "https://arxiv.org/abs/2604.20378",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "arXiv v1; methodology and stated limitations read; experiments not reproduced.",
+      "primitive": "PE32/PE32+ TLS callback extraction and code inspection provide static memory-forensics leads"
+    },
+    {
+      "id": "microsoft-pe-tls-format",
+      "title": "PE Format: The TLS Section",
+      "publisher": "Microsoft",
+      "published_on": "2025-07-14",
+      "verified_on": "2026-09-20",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "MicrosoftDocs win32 source ms.date is 07/14/2025; living format specification checked on 2026-09-20.",
+      "primitive": "TLS directory pointer fields are VAs; callback arrays use architecture-sized entries and a null terminator"
+    },
+    {
+      "id": "phnt-worker-factory-2026",
+      "title": "phnt worker factory native query declarations",
+      "publisher": "System Informer",
+      "published_on": "2026-03-26",
+      "verified_on": "2026-09-20",
+      "url": "https://github.com/winsiderss/phnt/blob/53fbbdc5b5d2b08761db1c7b26bfa8c820924356/ntexapi.h",
+      "source_type": "reference-source",
+      "primary": true,
+      "version_note": "Pinned repository revision dated 2026-03-26; query-only x64 ABI validated on the owned fixture.",
+      "primitive": "WorkerFactoryBasicInformation exposes a start routine, start parameter and process identity"
+    },
+    {
+      "id": "elastic-callstacks-2025",
+      "title": "Call Stacks: No More Free Passes For Malware",
+      "publisher": "Elastic Security Labs",
+      "published_on": "2025-06-12",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/call-stacks-no-more-free-passes-for-malware",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Primary research article; recovered stacks distinguished from hardware execution traces.",
+      "primitive": "Call-stack context and executable ownership support investigation but are subject to reconstruction and spoofing limits"
+    },
+    {
       "id": "springer-byovd-detector-2026",
       "title": "Finding vulnerable drivers with hooking and reading result verification",
       "publisher": "Springer Cybersecurity",
@@ -742,7 +790,8 @@
       "release_gate": "backlog",
       "source_ids": [
         "arxiv-rx-int-2025",
-        "arxiv-lase-2025"
+        "arxiv-lase-2025",
+        "elastic-callstacks-2025"
       ],
       "observable": "Executable VAD/page state, loader and backing-file cross-views, thread/APC/stack provenance, and live-versus-disk bytes disagree.",
       "detector_anchors": [
@@ -877,22 +926,31 @@
       "id": "poolparty-dormant-threadpool-objects",
       "title": "Dormant Windows thread-pool object graph injection",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P1",
       "release_gate": "backlog",
       "source_ids": [
-        "safebreach-poolparty-2023"
+        "safebreach-poolparty-2023",
+        "phnt-worker-factory-2026"
       ],
       "observable": "Worker-factory start routines, TP task/timer queues, IOCP completion keys, and ALPC/job/wait callbacks point to unowned executable memory before execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Current executable-memory inspection can flag resident code before execution, but does not enumerate the dormant thread-pool object graph or prove which queued callback will invoke it."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceScanner.cpp", "contains": "NtQueryInformationWorkerFactory" },
+        { "path": "user/KernelMonitorHunting.cpp", "contains": "ScanUserCallbackSurfaces" }
       ],
-      "next_action": "Build a read-only worker-factory and thread-pool object graph collector with benign thread-pool negative controls."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "owned WorkerFactory start routine observed" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "BenignWork" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "Read-only WorkerFactory start-routine queries are implemented and linked to existing native code verification; access failures and handle/time budgets remain explicit.",
+        "Dormant TP_WORK, TP_IO, TP_TIMER, ALPC, job and wait object graphs are not enumerated. The owned benign fixture validates collection, not malicious PoolParty recall."
+      ],
+      "next_action": "Qualify build-specific dormant thread-pool layouts and independent graph controls before expanding the claim beyond start-routine metadata."
     },
     {
       "id": "unknown-byovd-semantic-reachability",
@@ -942,43 +1000,63 @@
       "id": "kernelcallbacktable-invariant",
       "title": "KernelCallbackTable ownership invariant",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P2",
       "release_gate": "backlog",
       "source_ids": [
         "mitre-kernelcallbacktable-det0577"
       ],
       "observable": "A GUI process PEB callback entry changes or points outside the expected executable module ownership and correlates with write or message execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Generic VAD and write provenance do not enumerate or baseline the KernelCallbackTable itself."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceCore.h", "contains": "KernelCallbacks" },
+        { "path": "user/KernelMonitorVerification.cpp", "contains": "ObservationAnchorsMatch(work.Anchors, reader)" }
       ],
-      "next_action": "Add a per-process PEB callback-table snapshot with module ownership and same-identity temporal controls."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "KCT replaced root invalidates old stable slots" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "KCT null root" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "Only a PDB-qualified native x64 PEB root and a bounded 64-entry candidate prefix are read; full table extent, WOW64 KCT and message execution are not established.",
+        "Root replacement and malformed reads are covered by synthetic readers; live PDB-qualified KCT/VM validation remains with the operator."
+      ],
+      "next_action": "Validate qualified GUI-process fixtures across supported Windows builds, then add independently established table extents and message provenance."
     },
     {
       "id": "tls-callback-invariant",
       "title": "TLS callback directory ownership invariant",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P2",
       "release_gate": "backlog",
       "source_ids": [
-        "mitre-tls-callback-det0467"
+        "mitre-tls-callback-det0467",
+        "tlscheck2-2026",
+        "microsoft-pe-tls-format"
       ],
       "observable": "A loaded image TLS directory or callback array changes after load, points outside expected executable ownership, or precedes anomalous thread execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Generic PE/VAD integrity does not retain a dedicated TLS callback baseline."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceCore.h", "contains": "CompareTls" },
+        { "path": "user/ExecutionSurfaceScanner.cpp", "contains": "ReadNormalizedImageRange" },
+        { "path": "user/KernelMonitorHunting.cpp", "contains": "finding.tls_metadata" }
       ],
-      "next_action": "Add bounded TLS-directory parsing and same-image baseline controls with ordinary static TLS as negatives."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "TLS directory removal" },
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "TLS callback target change" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "clean owned fixture has no TLS baseline mismatches" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "PE32/PE32+ directory/array parsing and relocation-aware qualified file comparison are implemented, with root/PE anchors revalidated before native code-path evidence is retained.",
+        "The 64-callback budget, denied handles, vanished images, absent file references and transient changes limit coverage; no pre-entry execution or malware-recall claim is made."
+      ],
+      "next_action": "Run operator-owned cross-build/WOW64 and transient callback corpora; calibrate legitimate runtime mutation before assigning a malicious verdict."
     },
     {
       "id": "transient-kernel-hook-timing",

@@ -31,7 +31,8 @@
 | 정상 프로세스 위장·정상 DLL 내부 implant | 선택된 모든 프로세스의 EXE/DLL 실행 섹션 비교 | 감시 이름·Windows 기본 프로세스 여부로 비교를 제외하지 않음 |
 | hollowing·stomping·ghosted/replaced backing | 이미지 바이트 비교, 매핑 대조, 참조를 검증할 수 없는 실행 페이지 보존 | 정확한 기법명은 별도 분석. 참조 파일/헤더 확인 실패를 정상 일치로 취급하지 않음 |
 | VAD unlink·VAD 권한 위장·PTE 직접 매핑 | 모든 선택 프로세스의 재개 가능한 사용자 페이지 테이블 순회 | VAD가 불완전하면 DKOM 확정은 제한되지만 현재 실행 페이지 읽기는 별도 재검증 |
-| threadless·APC·thread-pool·TLS·VEH·WNF 기반 실행 | 전체 실행 메모리/이미지 검사, APC·instrumentation·ETW 스택 참조 | 모든 내부 객체의 callback 레이아웃을 해석한다는 뜻은 아님 |
+| threadless·APC·thread-pool·TLS·VEH·WNF 기반 실행 | 전체 실행 메모리/이미지 검사, APC·instrumentation·ETW 스택 참조; TLS 배열·재배치 기준 비교와 WorkerFactory 시작 루틴 | 휴면 TP 객체 그래프, VEH/WNF 전용 실행 추적은 미지원; 메타데이터는 실행 증거가 아님 |
+| PEB KernelCallbackTable 변조 | PDB로 확인한 native x64 루트와 64개 후보, 루트 교체 재검증, 저장 스냅샷 비교 | 전체 테이블 길이·WOW64 KCT·GUI 메시지 실행은 미확정. [분석가용 가이드](KMON_ANALYST_SURFACES.md) 참고 |
 | sleep encryption·NX/RX 변동·짧은 실행 구간 | 기존 이벤트 캡처와 주기적 페이지 검사의 병행 | 스캔 사이에만 복호화되거나 이벤트가 손실된 구간은 미관측 가능 |
 | WOW64 payload | 아키텍처에 독립적인 페이지·이미지 검사 | x64 정적 분기 디코더를 x86 반환 주소에 적용하지 않음 |
 | PPL·프로세스 query 핸들 제한 | 생성 시각·EPROCESS를 확인한 드라이버 읽기와 물리 페이지 읽기 | 모듈 소유권을 확인하지 못하면 `unknown`을 보존; 일부 스레드 메타데이터 수집은 제한 |

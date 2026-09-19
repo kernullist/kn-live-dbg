@@ -2,6 +2,7 @@
 #include "ContentHash.h"
 #include "KmonHuntingJson.h"
 #include "ExecutableImagePermissions.h"
+#include "ExecutionSurfaceScanner.h"
 
 #include <TlHelp32.h>
 #include <algorithm>
@@ -386,9 +387,10 @@ void KernelMonitor::ScanKernelExecutableImages()
 }
 
 void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
-    const std::wstring& role, const ObservationIdentity& identity, uint64_t observedAt)
+    const std::wstring& role, const ObservationIdentity& identity, uint64_t observedAt,
+    const std::vector<ObservationAnchor>& anchors, uint64_t expectedPeb)
 {
-    if (target == 0 && !KmonPageRole(role))
+    if ((target == 0 && !KmonPageRole(role)) || anchors.size() > 8)
     {
         return;
     }
@@ -416,7 +418,7 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     }
     ExecutionReferenceKeys.insert(key);
     ExecutionReferences.push_back({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
-        GetTickCount64(), actual, role});
+        GetTickCount64(), actual, role, anchors, expectedPeb});
 }
 
 void KernelMonitor::ScanExecutionReferences()
@@ -465,6 +467,14 @@ void KernelMonitor::ScanExecutionReferences()
             if (pid == 0)
             {
                 return true;
+            }
+            if (work.ExpectedPeb != 0)
+            {
+                uint64_t peb = 0;
+                if (!QueryExecutionSurfacePeb(process, pid, &peb) || peb != work.ExpectedPeb)
+                {
+                    return false;
+                }
             }
             if (process != nullptr)
             {
@@ -568,6 +578,12 @@ void KernelMonitor::ScanExecutionReferences()
             return device->ReadProcessVirtual(work.Identity.ProcessId, work.Identity.Eprocess,
                 work.Identity.CreateTime, address, static_cast<uint32_t>(size), bytes, nullptr);
         };
+        if (!ObservationAnchorsMatch(work.Anchors, reader))
+        {
+            EmitUnique(L"coverage.references", L"reference:anchor_changed:" + referenceKey, L"", work.Role,
+                L"reference root or PE metadata changed before decoding", L"queued reference withheld", pid);
+            continue;
+        }
         const CodeTargetInspector inspect = [&](uint64_t address, const std::vector<uint8_t>& bytes)
         {
             for (const auto& module : modules)
@@ -789,6 +805,7 @@ void KernelMonitor::ScanExecutionReferences()
             }
         }
         referenceSnapshotValid = referenceSnapshotValid && sameProcess() &&
+            ObservationAnchorsMatch(work.Anchors, reader) &&
             (!pointerSlot || CodeTargetSlotMatches(work.Target, work.Slot, reader));
         if (referenceSnapshotValid && pid != 0 && addressSpaceValid)
         {

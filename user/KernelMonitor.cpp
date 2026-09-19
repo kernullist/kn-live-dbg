@@ -6786,6 +6786,7 @@ bool KernelMonitor::Start(
             ChannelScanCursor = 0;
             WfpCalloutCursor = 0;
             UserThreadCursors.clear();
+            UserCallbackCursors.clear();
             ExecutablePages = KmonExecutablePages{};
             NextPageCoverageTickMs = 0;
             {

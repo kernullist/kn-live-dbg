@@ -22,6 +22,12 @@
     <ClCompile Include="AiCapabilityCatalog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AnalystSnapshot.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ExecutionSurfaceScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="AiModelCatalog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -229,6 +235,15 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AiCapabilityCatalog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AnalystSnapshot.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExecutionSurfaceCore.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExecutionSurfaceScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AiModelCatalog.h">

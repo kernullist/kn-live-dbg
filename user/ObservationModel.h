@@ -72,6 +72,12 @@ struct ObservationRange
     }
 };
 
+struct ObservationAnchor
+{
+    uint64_t Address = 0;
+    std::vector<uint8_t> Bytes;
+};
+
 struct ObservationCoverage
 {
     uint64_t RequestedBytes = 0;

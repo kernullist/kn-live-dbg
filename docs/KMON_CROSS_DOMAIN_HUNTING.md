@@ -2,6 +2,8 @@
 
 `!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_COVERAGE_MATRIX_20260919.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
 
+v0.0.33 이후에는 TLS 기준 비교, PDB로 확인한 KCT 후보, WorkerFactory 시작 루틴이 추가됐다. `!kmon surfaces`, 사건 필터·JSON 저장, `!kmon diff` 사용법과 제한은 [분석가용 가이드](KMON_ANALYST_SURFACES.md)를 참고한다. 메타데이터 차이와 실제 실행은 별도 증거다.
+
 ```text
 !kmon start /name game.exe /background
 !kmon status

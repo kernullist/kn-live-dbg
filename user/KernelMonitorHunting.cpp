@@ -5,6 +5,7 @@
 #include "ProcessTriageScanner.h"
 #include "WfpCalloutScanner.h"
 #include "KmonHuntingJson.h"
+#include "ExecutionSurfaceScanner.h"
 
 #include <cstring>
 
@@ -26,10 +27,10 @@ namespace
     }
 }
 
-std::vector<KmonHuntCase> KernelMonitor::HuntCases() const
+std::vector<KmonHuntCase> KernelMonitor::HuntCases(const AnalystCaseFilter& filter) const
 {
     std::lock_guard<std::mutex> lock(HuntMutex);
-    return HuntIndex.Cases(GetTickCount64());
+    return FilterAnalystCases(HuntIndex.Cases(GetTickCount64(), 256), filter);
 }
 
 void KernelMonitor::QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role)
@@ -73,11 +74,21 @@ void KernelMonitor::ScanExecutablePageCandidates()
     }
 }
 
-std::wstring KernelMonitor::HuntCasesJson() const
+std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::vector<KmonHuntCase>* cases) const
 {
     std::lock_guard<std::mutex> lock(HuntMutex);
     const uint64_t now = GetTickCount64();
-    return KmonHuntCasesJson(HuntIndex.Cases(now), now, HuntIndex.Evicted, HuntIndex.Rejected);
+    auto filtered = FilterAnalystCases(HuntIndex.Cases(now, 256), filter);
+    auto json = KmonHuntCasesJson(filtered, now, HuntIndex.Evicted, HuntIndex.Rejected);
+    if (cases != nullptr)
+    {
+        *cases = std::move(filtered);
+    }
+    json.pop_back();
+    json += L",\"candidate_limit\":256,\"filter_pid\":" +
+        (filter.HasPid ? std::to_wstring(filter.ProcessId) : L"null");
+    json += L",\"filter_role\":" + mcpjson::Quote(filter.Role) + L"}";
+    return json;
 }
 
 void KernelMonitor::QueueObservedStack(const TiEventRecord& record)
@@ -102,6 +113,7 @@ void KernelMonitor::QueueObservedStack(const TiEventRecord& record)
 void KernelMonitor::ScanUserExecutionSurfaces(HANDLE process, const ObservationIdentity& identity,
     const std::vector<std::pair<uint64_t, uint32_t>>& modules, bool inventoryComplete)
 {
+    ScanUserCallbackSurfaces(identity, modules);
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     if (StopRequested.load() || !GetLiveTargets(&device, &symbols))
@@ -236,6 +248,89 @@ void KernelMonitor::ScanUserExecutionSurfaces(HANDLE process, const ObservationI
             coverage.Evidence[L"warning_" + std::to_wstring(i)] = result.Warnings[i];
         }
     } while (false);
+    RecordEvent(std::move(coverage));
+}
+
+void KernelMonitor::ScanUserCallbackSurfaces(const ObservationIdentity& identity,
+    const std::vector<std::pair<uint64_t, uint32_t>>& modules)
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    if (StopRequested.load() || !GetLiveTargets(&device, &symbols) || identity.CreateTime == 0)
+    {
+        return;
+    }
+    ExecutionSurfaceOptions options;
+    options.ModuleBudget = 8;
+    options.HandleBudget = 128;
+    options.TimeBudgetMs = 300;
+    options.ImageCandidates = modules;
+    options.Cancelled = [this]()
+    {
+        return StopRequested.load();
+    };
+    TypeFieldInfo callback = {};
+    if (symbols->FindField(L"nt!_PEB", L"KernelCallbackTable", &callback, nullptr) &&
+        callback.Length == 8 && !callback.IsBitField && callback.Offset <= 0x1000 - 8)
+    {
+        options.HasKernelCallbackOffset = true;
+        options.KernelCallbackOffset = callback.Offset;
+    }
+    const auto key = std::make_pair(identity.ProcessId, identity.CreateTime);
+    if (UserCallbackCursors.size() >= 4096 && UserCallbackCursors.count(key) == 0)
+    {
+        UserCallbackCursors.erase(UserCallbackCursors.begin());
+    }
+    options.ModuleStart = UserCallbackCursors[key].first;
+    options.HandleStart = UserCallbackCursors[key].second;
+    auto result = ScanExecutionSurfaces(identity.ProcessId, options);
+    UserCallbackCursors[key] = {result.NextModule, result.NextHandle};
+    const bool sameIdentity = result.IdentityStable && identity.SameInstance(result.Identity);
+    KmonEvent coverage;
+    coverage.Kind = L"coverage.user_callbacks";
+    coverage.ProcessId = identity.ProcessId;
+    coverage.Observation.Identity = identity;
+    coverage.Observation.Source = L"user_callback_inventory";
+    coverage.Observation.DependencyGroup = L"user_registration_metadata";
+    coverage.Evidence = result.Coverage;
+    coverage.Evidence[L"execution_observed"] = L"false";
+    coverage.Evidence[L"identity_stable"] = sameIdentity ? L"true" : L"false";
+    coverage.Evidence[L"next_module"] = std::to_wstring(result.NextModule);
+    coverage.Evidence[L"next_handle"] = std::to_wstring(result.NextHandle);
+    coverage.Evidence[L"rows"] = std::to_wstring(result.Rows.size());
+    size_t queued = 0;
+    if (sameIdentity)
+    {
+        for (const auto& row : result.Rows)
+        {
+            if (row.Kind == L"tls_callback_table" && row.Baseline == L"mismatch" && row.Stable)
+            {
+                KmonEvent event;
+                event.Kind = L"finding.tls_metadata";
+                event.ProcessId = identity.ProcessId;
+                event.Image = row.Name;
+                event.Summary = L"TLS callback metadata differs from qualified relocated disk reference";
+                event.Observation.Identity = identity;
+                event.Observation.Source = L"tls_metadata";
+                event.Observation.DependencyGroup = L"image_reference";
+                event.Evidence[L"module_base"] = std::to_wstring(row.ModuleBase);
+                event.Evidence[L"root_slot"] = std::to_wstring(row.RootSlot);
+                event.Evidence[L"callback_table"] = std::to_wstring(row.Table);
+                event.Evidence[L"execution_observed"] = L"false";
+                event.Evidence[L"claim"] = L"metadata_difference; legitimate_runtime_changes_possible";
+                RecordEvent(std::move(event));
+            }
+            if (queued < 128 && row.Stable && row.PointerSize == 8 &&
+                execution_surface::UserRange(row.Target, 1) &&
+                (row.Kind == L"tls_callback" || row.Kind == L"kernel_callback_candidate" || row.Kind == L"worker_factory_start"))
+            {
+                QueueExecutionReference(row.Target, row.Slot, row.Kind, identity, result.ObservedAt, row.Anchors, row.ProcessPeb);
+                ++queued;
+            }
+        }
+    }
+    coverage.Evidence[L"native_reference_candidates"] = std::to_wstring(queued);
+    coverage.Evidence[L"reference_candidate_budget_reached"] = queued == 128 ? L"true" : L"false";
     RecordEvent(std::move(coverage));
 }
 
