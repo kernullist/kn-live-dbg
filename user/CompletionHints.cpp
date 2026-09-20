@@ -5,10 +5,15 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <initializer_list>
+#include <iterator>
 #include <sstream>
 
 namespace
 {
+    std::vector<std::wstring> CompletionTopicArgs(std::vector<std::wstring> args);
+    std::wstring HintCanonicalCommand(const std::wstring& value);
+
     std::wstring HintLower(const std::wstring& value)
     {
         std::wstring lowered = value;
@@ -39,21 +44,6 @@ namespace
         const wchar_t* Command;
         const CompletionScopeTable* Scopes;
         size_t ScopeCount;
-    };
-
-    const CompletionHint kGenericTokens[] =
-    {
-        { L"help", nullptr, L"show detailed usage for this command" },
-        { L"/json", L"/json <path>", L"write structured JSON to a file" },
-        { L"/limit", L"/limit <n>", L"cap printed records" },
-        { L"/process", L"/process <pid>", L"use that process DTB for the VA" },
-        { L"/module", L"/module <name>", L"filter by owning module name or stem" },
-        { L"/tag", L"/tag <ABCD>", L"filter by 4-character pool tag" },
-        { L"/min", L"/min <bytes>", L"keep entries at least this size" },
-        { L"/max", L"/max <bytes>", L"keep entries at most this size" },
-        { L"/verbose", nullptr, L"print extra detail" },
-        { L"/summary", nullptr, L"print aggregate counts only" },
-        { L"all", nullptr, L"include every supported surface or target" },
     };
 
     const CompletionHint kHelpTokens[] =
@@ -91,7 +81,11 @@ namespace
         { L"on", L"mcp on [port] [--allow-write] [--loopback] [--bind <addr>]", L"start MCP on 0.0.0.0; prompts for a session password" },
         { L"off", L"mcp off", L"stop the MCP server" },
         { L"status", L"mcp status", L"show listen address, password mode, and write-allow state" },
-        { L"client-setup", L"mcp client-setup [all|claude|cursor|codex|grok|legacy]", L"print client config snippets" },
+        { L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"print client config snippets" },
+        { L"start", L"mcp start [port] [options]", L"alias for mcp on" },
+        { L"stop", L"mcp stop", L"alias for mcp off" },
+        { L"setup", L"mcp setup [client]", L"alias for mcp client-setup" },
+        { L"connect", L"mcp connect [client]", L"alias for mcp client-setup" },
         { L"endpoint", L"mcp endpoint", L"show the live endpoint file path and summary" },
         { L"help", nullptr, L"show mcp usage" },
     };
@@ -101,6 +95,8 @@ namespace
         { L"on", L"remote on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]", L"start remote operator session on 0.0.0.0:51767" },
         { L"off", L"remote off", L"stop the remote listener" },
         { L"status", L"remote status", L"show listen address and peer" },
+        { L"start", L"remote start [port] [options]", L"alias for remote on" },
+        { L"stop", L"remote stop", L"alias for remote off" },
         { L"disconnect", L"remote disconnect", L"drop the current remote client" },
         { L"help", nullptr, L"show remote usage" },
     };
@@ -237,6 +233,7 @@ namespace
     {
         { L"/user", L"dump-live <path> /user [pid|eprocess]", L"include that process user+kernel address space" },
         { L"/compress", L"dump-live <path> /compress", L"ask the OS for a compressed live dump" },
+        { L"/hypervisor", nullptr, L"alias for /hv" },
         { L"/hv", L"dump-live <path> /hv", L"include hypervisor pages when the OS supports it" },
         { L"help", nullptr, L"show dump-live usage" },
     };
@@ -254,7 +251,7 @@ namespace
         { L"enable", L"!callbacks enable <scope> <module>", L"restore same-session callback backups" },
         { L"disable-all", L"!callbacks disable-all <module>", L"disable every callback type for that module" },
         { L"enable-all", L"!callbacks enable-all <module>", L"restore every same-session backup for that module" },
-        { L"/module", L"!callbacks [scope] /module <module>", L"keep records owned by that module name or stem" },
+        { L"/module", L"!callbacks [scope] [module|/module <module>]", L"keep records owned by that module name or stem" },
         { L"help", nullptr, L"show !callbacks usage" },
     };
 
@@ -300,6 +297,8 @@ namespace
         { L"/wx", nullptr, L"keep effective W+X VADs" },
         { L"/pe", nullptr, L"keep PE-like VADs" },
         { L"/hiddenpte", nullptr, L"keep hidden-PTE / DKOM candidates" },
+        { L"/hidden", nullptr, L"alias for /hiddenpte" },
+        { L"/dkom", nullptr, L"alias for /hiddenpte" },
         { L"/scan", nullptr, L"same as the scan subcommand" },
         { L"/modules", nullptr, L"same as the modules subcommand" },
         { L"/mappedpe", nullptr, L"same as the mappedpe subcommand" },
@@ -341,7 +340,8 @@ namespace
         { L"kpage", L"!diff baseline /domain kpage /risk high", L"executable kernel memory outside modules; catches mapper code hidden in pool" },
         { L"pool", L"!diff baseline /domain pool /risk high", L"non-paged big pool entries and pool PE hits" },
         { L"leftover-mapper", L"!diff baseline /domain leftover-mapper", L"unloaded-driver / PiDDB / CI-hash remnants" },
-        { L"/risk", L"/risk high|all", L"filter by finding risk" },
+        { L"/memory", nullptr, L"skip current-snapshot and diff report file writes" },
+        { L"/risk", L"/risk <high|all>", L"filter by finding risk" },
         { L"/limit", L"/limit <n>", L"cap printed findings" },
         { L"help", nullptr, L"show !diff usage" },
     };
@@ -353,7 +353,7 @@ namespace
         { L"callouts", L"!wfp callouts [/module <name>]", L"user-mode callout registrations" },
         { L"kernelcallouts", L"!wfp kernelcallouts", L"kernel callout entries from netio" },
         { L"kernel-callouts", L"!wfp kernel-callouts", L"same as kernelcallouts" },
-        { L"filters", L"!wfp filters [/layer] [/provider]", L"BFE filters" },
+        { L"filters", L"!wfp filters [/layer <name|GUID>] [/provider <name|GUID>]", L"BFE filters" },
         { L"layers", L"!wfp layers", L"BFE layers" },
         { L"help", nullptr, L"show !wfp usage" },
     };
@@ -590,7 +590,9 @@ namespace
     {
         { L"big", L"!pool big [options]", L"enumerate nt!PoolBigPageTable allocations" },
         { L"find", L"!pool find /tag <TAG> [options]", L"filtered search; needs /tag, /addr, /min, /max, or /wx" },
-        { L"tags", L"!pool tags [/tag] [/limit]", L"per-tag usage via SystemPoolTagInformation (no VA)" },
+        { L"tags", L"!pool tags [/tag <ABCD>] [/limit <n>]", L"per-tag usage via SystemPoolTagInformation (no VA)" },
+        { L"bigpool", L"!pool bigpool [options]", L"alias for !pool big" },
+        { L"tag", L"!pool tag [/tag <ABCD>] [/limit <n>]", L"alias for !pool tags" },
         { L"summary", L"!pool summary", L"totals only, no per-entry list" },
         { L"pe", L"!pool pe [options]", L"hunt intact or signature-wiped PE images in big pool" },
         { L"help", nullptr, L"show !pool usage" },
@@ -670,6 +672,7 @@ namespace
     {
         { L"list", L"!minifilter list", L"enumerate registered filters" },
         { L"show", L"!minifilter show <name|addr>", L"one filter and its IRP slots" },
+        { L"status", L"!minifilter status <name|address> <IRP_MJ_*|all>", L"alias for !minifilter irp" },
         { L"irp", L"!minifilter irp <name|addr> <mj>", L"print one IRP pre/post slot" },
         { L"disable", L"!minifilter disable <name|addr> <mj|all>", L"NULL one or every slot (needs write on)" },
         { L"enable", L"!minifilter enable <name|addr> <mj|all>", L"restore a slot saved in this session" },
@@ -705,18 +708,16 @@ namespace
 
     const CompletionHint kKmonRootTokens[] =
     {
-        { L"start", L"!kmon start [/name] [/pid] [/driver] [/verbose] [/background] [/log] [/manifest] [/throttle]", L"arm TI+live and stay on the tail (filename not required)" },
+        { L"start", L"!kmon start [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background] [/log <dir>] [/manifest <path>] [/throttle <N>] [/layout-ms <N>]", L"arm TI+live and stay on the tail (filename not required)" },
         { L"stop", L"!kmon stop", L"stop derived logging; leaves TI/live running" },
         { L"status", L"!kmon status", L"session counters and watch set" },
         { L"add", L"!kmon add /pid|/name|/driver <v>", L"while collecting; extend inject.remote or highlight set" },
         { L"remove", L"!kmon remove /pid|/name|/driver <v>", L"while collecting; drop a watch target" },
-        { L"iotrace", L"!kmon iotrace <driver> on|off|status", L"lab-only: interpose a driver's IOCTL dispatch and print driver.ioctl" },
-        { L"on", L"!kmon iotrace <driver> on", L"interpose the named driver's IRP_MJ_DEVICE_CONTROL (lab-only)" },
-        { L"off", L"!kmon iotrace off", L"restore the interposed dispatch entry" },
-        { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
+        { L"iotrace", L"!kmon iotrace <driver> on | !kmon iotrace off|status", L"lab-only: interpose a driver's IOCTL dispatch and print driver.ioctl" },
+                { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent kernel/user investigation leads" },
-        { L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"TLS, KCT and WorkerFactory references" },
+        { L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"TLS, KCT and WorkerFactory references" },
         { L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"process memory layout history and changes" },
         { L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations" },
         { L"save", L"!kmon save <path>", L"export derived ring as JSONL" },
@@ -764,9 +765,69 @@ namespace
         { L"help", nullptr, L"show !kmon option usage" },
     };
 
+    const CompletionHint kKmonIoTokens[] =
+    {
+        { L"on", L"!kmon iotrace <driver> on", L"interpose the named driver IOCTL dispatch (lab-only)" },
+        { L"off", L"!kmon iotrace off", L"restore the interposed dispatch entry" },
+        { L"status", L"!kmon iotrace status", L"show interposition state" },
+        { L"help", nullptr, L"show iotrace usage" },
+    };
+
+    const CompletionHint kKmonDiffTokens[] =
+    {
+        { L"/json", L"/json", L"print the observation comparison as JSON" },
+        { L"help", nullptr, L"show observation diff usage" },
+    };
+
+    const CompletionHint kDiffDomainTokens[] =
+    {
+        { L"kpage", L"/domain kpage", L"kpage snapshot evidence" },
+        { L"pool", L"/domain pool", L"pool snapshot evidence" },
+        { L"leftover-mapper", L"/domain leftover-mapper", L"leftover-mapper snapshot evidence" },
+        { L"process", L"/domain process", L"process snapshot evidence" },
+        { L"process-security", L"/domain process-security", L"process-security snapshot evidence" },
+        { L"modules", L"/domain modules", L"modules snapshot evidence" },
+        { L"drivers", L"/domain drivers", L"drivers snapshot evidence" },
+        { L"callbacks", L"/domain callbacks", L"callbacks snapshot evidence" },
+        { L"etw", L"/domain etw", L"etw snapshot evidence" },
+        { L"nmi", L"/domain nmi", L"nmi snapshot evidence" },
+        { L"cpu-state", L"/domain cpu-state", L"cpu-state snapshot evidence" },
+        { L"hal", L"/domain hal", L"hal snapshot evidence" },
+        { L"hive", L"/domain hive", L"hive snapshot evidence" },
+        { L"dpc-timer", L"/domain dpc-timer", L"dpc-timer snapshot evidence" },
+        { L"fwtable", L"/domain fwtable", L"fwtable snapshot evidence" },
+        { L"wfp", L"/domain wfp", L"wfp snapshot evidence" },
+        { L"alpc", L"/domain alpc", L"alpc snapshot evidence" },
+        { L"wnf", L"/domain wnf", L"wnf snapshot evidence" },
+        { L"vbs", L"/domain vbs", L"vbs snapshot evidence" },
+        { L"byovd", L"/domain byovd", L"byovd snapshot evidence" },
+        { L"vad-dkom", L"/domain vad-dkom", L"vad-dkom snapshot evidence" },
+    };
+
+    const CompletionHint kDiffRiskTokens[] =
+    {
+        { L"high", L"/risk high", L"keep high-risk findings" },
+        { L"all", L"/risk all", L"include every risk level" },
+    };
+
+    const CompletionHint kTiWatchTokens[] =
+    {
+        { L"/pid", L"/pid <PID>", L"one process watch target" },
+        { L"/name", L"/name <image>", L"one process image watch target" },
+        { L"help", nullptr, L"show watch target usage" },
+    };
+
+    const CompletionHint kKmonWatchTokens[] =
+    {
+        { L"/pid", L"/pid <PID>", L"one process watch target" },
+        { L"/name", L"/name <image>", L"one process image watch target" },
+        { L"/driver", L"/driver <sys>", L"one driver highlight target" },
+        { L"help", nullptr, L"show watch target usage" },
+    };
+
     const CompletionHint kTiRootTokens[] =
     {
-        { L"start", L"!ti start [/pid] [/name] [/throttle] [/ring] [/log]", L"subscribe to TI ETW (needs PPL Antimalware)" },
+        { L"start", L"!ti start [/pid <PID>] [/name <image>] [/throttle <N>] [/ring <N>] [/log <dir>]", L"subscribe to TI ETW (needs PPL Antimalware)" },
         { L"stop", L"!ti stop", L"unsubscribe" },
         { L"status", L"!ti status", L"subscription and ring state" },
         { L"add", L"!ti add /pid <PID> | /name <image>", L"add a watch target" },
@@ -893,7 +954,7 @@ namespace
 
     const CompletionHint kTimelineExportTokens[] =
     {
-        { L"/jsonl", L"!timeline export <path> /jsonl", L"write JSONL instead of the default format" },
+        { L"/jsonl", L"!timeline export <path> /jsonl", L"explicit JSONL export (also the default)" },
     };
 
     const CompletionHint kAiRootTokens[] =
@@ -1180,14 +1241,14 @@ namespace
     const CompletionScopeTable kMcpScopes[] =
     {
         SCOPE(L"", L"mcp on|off|status|client-setup|endpoint", L"native HTTP MCP server", kMcpRootTokens),
-        SCOPE(L"on", L"mcp on [port] [--allow-write] [--loopback] [--bind]", L"start the MCP server", kMcpOnTokens),
-        SCOPE(L"client-setup", L"mcp client-setup [all|claude|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
+        SCOPE(L"on", L"mcp on [port] [--allow-write] [--loopback] [--bind <ipv4>]", L"start the MCP server", kMcpOnTokens),
+        SCOPE(L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
     };
 
     const CompletionScopeTable kRemoteScopes[] =
     {
         SCOPE(L"", L"remote on|off|status|disconnect", L"LAN operator session", kRemoteRootTokens),
-        SCOPE(L"on", L"remote on [port] [--loopback] [--bind] [--peer]", L"start the remote listener", kRemoteOnTokens),
+        SCOPE(L"on", L"remote on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]", L"start the remote listener", kRemoteOnTokens),
     };
 
     const CompletionScopeTable kLogScopes[] =
@@ -1227,7 +1288,7 @@ namespace
 
     const CompletionScopeTable kEnterScopes[] =
     {
-        SCOPE(L"", L"e* [/process <pid>] <addr|symbol> <value...>", L"enter virtual memory (needs write on)", kProcessOptTokens),
+        SCOPE(L"", L"e* [/process <pid>] <addr|symbol> [value...]", L"enter virtual memory (needs write on)", kProcessOptTokens),
     };
 
     const CompletionScopeTable kPhysicalDisplayScopes[] =
@@ -1237,7 +1298,7 @@ namespace
 
     const CompletionScopeTable kPhysicalEnterScopes[] =
     {
-        SCOPE(L"", L"!eb|peb <pa> <value...>", L"enter physical memory (needs write on)", kHelpOnlyTokens),
+        SCOPE(L"", L"!eb|peb <pa> [value...]", L"enter physical memory (needs write on)", kHelpOnlyTokens),
     };
 
     const CompletionScopeTable kVtopScopes[] =
@@ -1277,30 +1338,36 @@ namespace
 
     const CompletionScopeTable kDumpLiveScopes[] =
     {
-        SCOPE(L"", L"dump-live <path> [/user [pid]] [/compress] [/hv]", L"OS live dump via NtSystemDebugControl", kDumpLiveTokens),
+        SCOPE(L"", L"dump-live <path> [/user [pid|eprocess]] [/compress] [/hv|/hypervisor]", L"OS live dump via NtSystemDebugControl", kDumpLiveTokens),
     };
 
     const CompletionScopeTable kUnassembleScopes[] =
     {
-        SCOPE(L"", L"u|uf [/process <pid>] <addr|symbol> [count]", L"native Zydis disassembly through the driver", kProcessOptTokens),
+        SCOPE(L"", L"u|uf [/process <pid>] [addr|symbol] [count]", L"native Zydis disassembly through the driver", kProcessOptTokens),
+    };
+
+    const CompletionScopeTable kUfScopes[] =
+    {
+        SCOPE(L"", L"uf [/process <pid>] <addr|symbol> [max-instructions]", L"disassemble a function until a terminal instruction", kProcessOptTokens),
     };
 
     const CompletionScopeTable kCallbackScopes[] =
     {
+        SCOPE(L"write-module", L"!callbacks disable|enable <scope> <module|/module <module>>", L"module target for per-type callback control", kCallbackWriteAllTokens),
         SCOPE(L"", L"!callbacks [all|object|registry|process|thread|imageload|minifilter] [module] | disable|enable <scope> <module>", L"list callbacks; disable/enable one module per type", kCallbackTokens),
-        SCOPE(L"filter", L"!callbacks [scope] /module <module>", L"module-filtered callback listing", kCallbackTokens),
+        SCOPE(L"filter", L"!callbacks [scope] [module|/module <module>]", L"module-filtered callback listing", kCallbackWriteAllTokens),
         SCOPE(L"write", L"!callbacks disable|enable <scope> <module>", L"per-type callback control (needs write on)", kCallbackWriteTokens),
         SCOPE(L"write-all", L"!callbacks disable-all|enable-all <module>", L"all callback types for one module (needs write on)", kCallbackWriteAllTokens),
     };
 
     const CompletionScopeTable kDmlProcScopes[] =
     {
-        SCOPE(L"", L"!dml_proc [pid|name|eprocess]", L"walk _EPROCESS.ActiveProcessLinks", kHelpOnlyTokens),
+        SCOPE(L"", L"!dml_proc [pid|name]", L"walk _EPROCESS.ActiveProcessLinks", kHelpOnlyTokens),
     };
 
     const CompletionScopeTable kHuntScopes[] =
     {
-        SCOPE(L"", L"!hunt [/quick|/deep|/summary|/details] [/pid] [/limit] [/json]", L"whole-system user-mode anomaly hunt", kHuntTokens),
+        SCOPE(L"", L"!hunt [/quick|/deep] [/summary|/details] [/pid <PID>] [/limit <n>] [/json <path>]", L"whole-system user-mode anomaly hunt", kHuntTokens),
     };
 
     const CompletionScopeTable kVadScopes[] =
@@ -1310,7 +1377,7 @@ namespace
 
     const CompletionScopeTable kThreadsScopes[] =
     {
-        SCOPE(L"", L"!threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit] [/json]", L"thread list, start addresses, APC evidence", kThreadsTokens),
+        SCOPE(L"", L"!threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit <n>] [/json <path>]", L"thread list, start addresses, APC evidence", kThreadsTokens),
     };
 
     const CompletionScopeTable kSnapshotScopes[] =
@@ -1320,24 +1387,33 @@ namespace
 
     const CompletionScopeTable kDiffScopes[] =
     {
+        SCOPE(L"domain", L"!diff baseline|<old.json> <new.json> /domain <name>", L"snapshot domain filter", kDiffDomainTokens),
+        SCOPE(L"risk", L"!diff baseline|<old.json> <new.json> /risk <high|all>", L"finding risk filter", kDiffRiskTokens),
         SCOPE(L"", L"!diff baseline|<old.json> <new.json> [options]", L"same-boot snapshot comparison", kDiffTokens),
     };
 
     const CompletionScopeTable kWfpScopes[] =
     {
+        SCOPE(L"providers", L"!wfp providers", L"providers command", kHelpOnlyTokens),
+        SCOPE(L"sublayers", L"!wfp sublayers", L"sublayers command", kHelpOnlyTokens),
+        SCOPE(L"layers", L"!wfp layers", L"layers command", kHelpOnlyTokens),
+        SCOPE(L"kernelcallouts", L"!wfp kernelcallouts", L"kernelcallouts command", kHelpOnlyTokens),
         SCOPE(L"", L"!wfp [providers|sublayers|callouts|kernelcallouts|filters|layers]", L"WFP / BFE inventory", kWfpRootTokens),
         SCOPE(L"callouts", L"!wfp callouts [/module <name|GUID>]", L"user-mode callouts", kWfpCalloutTokens),
-        SCOPE(L"filters", L"!wfp filters [/layer] [/provider]", L"BFE filters", kWfpFilterTokens),
+        SCOPE(L"filters", L"!wfp filters [/layer <name|GUID>] [/provider <name|GUID>]", L"BFE filters", kWfpFilterTokens),
     };
 
     const CompletionScopeTable kAlpcScopes[] =
     {
+        SCOPE(L"port", L"!alpc port <address>", L"port command", kHelpOnlyTokens),
+        SCOPE(L"queues", L"!alpc queues <address>", L"queues command", kHelpOnlyTokens),
         SCOPE(L"", L"!alpc [ports|port|connections|queues] [options]", L"ALPC ports and queues", kAlpcRootTokens),
-        SCOPE(L"filter", L"!alpc ports|connections [/name] [/pid]", L"filtered ALPC listing", kAlpcFilterTokens),
+        SCOPE(L"filter", L"!alpc ports|connections [/name <pattern>] [/pid <PID>]", L"filtered ALPC listing", kAlpcFilterTokens),
     };
 
     const CompletionScopeTable kByovdScopes[] =
     {
+        SCOPE(L"status", L"!byovd status", L"status command", kHelpOnlyTokens),
         SCOPE(L"", L"!byovd [scan|update|status|fixture] [options]", L"loaded BYOVD catalog scan", kByovdRootTokens),
         SCOPE(L"fixture", L"!byovd fixture [status|load|unload|path]", L"benign name/version fixture driver", kByovdFixtureTokens),
         SCOPE(L"update", L"!byovd update [/force]", L"refresh the local catalog", kByovdUpdateTokens),
@@ -1361,6 +1437,10 @@ namespace
 
     const CompletionScopeTable kEtwScopes[] =
     {
+        SCOPE(L"loggers", L"!etw loggers", L"loggers command", kHelpOnlyTokens),
+        SCOPE(L"logger", L"!etw logger <index|name>", L"logger command", kHelpOnlyTokens),
+        SCOPE(L"integrity", L"!etw integrity", L"integrity command", kHelpOnlyTokens),
+        SCOPE(L"ti-cross", L"!etw ti-cross", L"ti-cross command", kHelpOnlyTokens),
         SCOPE(L"", L"!etw [loggers|logger|integrity|providers|ti-cross]", L"ETW loggers, integrity, providers, TI cross-view", kEtwRootTokens),
         SCOPE(L"providers", L"!etw providers [/limit <n>]", L"provider-registration candidates", kEtwProviderTokens),
     };
@@ -1407,17 +1487,17 @@ namespace
 
     const CompletionScopeTable kDpcScopes[] =
     {
-        SCOPE(L"", L"!dpc [/verbose] [/limit]", L"sampled DPC deferred routines", kDpcTokens),
+        SCOPE(L"", L"!dpc [/verbose] [/limit <n>]", L"sampled DPC deferred routines", kDpcTokens),
     };
 
     const CompletionScopeTable kTimerScopes[] =
     {
-        SCOPE(L"", L"!timer [/verbose] [/limit]", L"kernel timer DPC routines", kDpcTokens),
+        SCOPE(L"", L"!timer [/verbose] [/limit <n>]", L"kernel timer DPC routines", kDpcTokens),
     };
 
     const CompletionScopeTable kWorkitemScopes[] =
     {
-        SCOPE(L"", L"!workitem [/verbose] [/limit]", L"best-effort work-item coverage (incomplete)", kDpcTokens),
+        SCOPE(L"", L"!workitem [/verbose] [/limit <n>]", L"best-effort work-item coverage (incomplete)", kDpcTokens),
     };
 
     const CompletionScopeTable kFwtableScopes[] =
@@ -1442,55 +1522,55 @@ namespace
 
     const CompletionScopeTable kDrvobjScopes[] =
     {
-        SCOPE(L"", L"!drvobj <name|address> [/dispatch] [/devices] [/json]", L"inspect one DRIVER_OBJECT", kDrvobjTokens),
+        SCOPE(L"", L"!drvobj <name|address> [/dispatch] [/devices] [/json <path>]", L"inspect one DRIVER_OBJECT", kDrvobjTokens),
     };
 
     const CompletionScopeTable kDevstackScopes[] =
     {
-        SCOPE(L"", L"!devstack <device-address|driver-name> [/json]", L"walk a DEVICE_OBJECT stack", kDevstackTokens),
+        SCOPE(L"", L"!devstack <device-address|driver-name> [/json <path>]", L"walk a DEVICE_OBJECT stack", kDevstackTokens),
     };
 
     const CompletionScopeTable kHandlesScopes[] =
     {
-        SCOPE(L"", L"!handles [pid] [/target pid] [/process|/all] [/suspicious] [/limit] [/json]", L"process handle table triage", kHandlesTokens),
+        SCOPE(L"", L"!handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]", L"process handle table triage", kHandlesTokens),
     };
 
     const CompletionScopeTable kHiddenProcScopes[] =
     {
-        SCOPE(L"", L"!hiddenproc [/json]", L"cross-view hidden process", kHiddenProcTokens),
+        SCOPE(L"", L"!hiddenproc [/json <path>]", L"cross-view hidden process", kHiddenProcTokens),
     };
 
     const CompletionScopeTable kWdFilterScopes[] =
     {
-        SCOPE(L"", L"!wdfilter [/json]", L"WdFilter RuntimeDriver leftovers", kWdFilterTokens),
+        SCOPE(L"", L"!wdfilter [/json <path>]", L"WdFilter RuntimeDriver leftovers", kWdFilterTokens),
     };
 
     const CompletionScopeTable kInputStackScopes[] =
     {
-        SCOPE(L"", L"!inputstack [/json]", L"keyboard/mouse device stacks", kInputStackTokens),
+        SCOPE(L"", L"!inputstack [/json <path>]", L"keyboard/mouse device stacks", kInputStackTokens),
     };
 
     const CompletionScopeTable kDmaScopes[] =
     {
-        SCOPE(L"", L"!dma [/json]", L"IOMMU / Kernel DMA Protection posture", kDmaTokens),
+        SCOPE(L"", L"!dma [/json <path>]", L"IOMMU / Kernel DMA Protection posture", kDmaTokens),
     };
 
     const CompletionScopeTable kHvScopes[] =
     {
-        SCOPE(L"", L"!hv [/json]", L"hypervisor presence posture", kHvTokens),
+        SCOPE(L"", L"!hv [/json <path>]", L"hypervisor presence posture", kHvTokens),
     };
 
     const CompletionScopeTable kDumpAnalyzeScopes[] =
     {
-        SCOPE(L"", L"dump-analyze <path> [/json]", L"parse DUMP_HEADER64 and walk modules (PML4 or LA57 PML5)", kDumpAnalyzeTokens),
+        SCOPE(L"", L"dump-analyze <path> [/json <path>]", L"parse DUMP_HEADER64 and walk modules (PML4 or LA57 PML5)", kDumpAnalyzeTokens),
     };
 
     const CompletionScopeTable kPoolScopes[] =
     {
         SCOPE(L"", L"!pool [big|find|tags|summary|pe] [options]", L"big-pool triage and staged PE hunt", kPoolRootTokens),
         SCOPE(L"list", L"!pool big|find [options]", L"PoolBigPageTable listing", kPoolListTokens),
-        SCOPE(L"tags", L"!pool tags [/tag] [/limit]", L"per-tag usage (no VA)", kPoolTagsTokens),
-        SCOPE(L"pe", L"!pool pe [/tag] [/min] [/max] [/limit] [/suspicious] [/dump]", L"intact or signature-wiped PE in big pool", kPoolPeTokens),
+        SCOPE(L"tags", L"!pool tags [/tag <ABCD>] [/limit <n>]", L"per-tag usage (no VA)", kPoolTagsTokens),
+        SCOPE(L"pe", L"!pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]", L"intact or signature-wiped PE in big pool", kPoolPeTokens),
     };
 
     const CompletionScopeTable kAddressScopes[] =
@@ -1505,43 +1585,79 @@ namespace
 
     const CompletionScopeTable kMapperScopes[] =
     {
-        SCOPE(L"", L"!mapper [all|unloaded|piddb|cihash] [/limit] [/json]", L"bookkeeping remnants (unload / PiDDB / ci hash)", kMapperTokens),
+        SCOPE(L"", L"!mapper [all|unloaded|piddb|cihash] [/limit <n>] [/json <path>]", L"bookkeeping remnants (unload / PiDDB / ci hash)", kMapperTokens),
     };
 
     const CompletionScopeTable kKpageScopes[] =
     {
-        SCOPE(L"", L"!kpage [/deep] [/wx] [/pe] [/session|/nosession] [/limit] [/json]", L"orphan executable kernel pages", kKpageTokens),
+        SCOPE(L"", L"!kpage [/deep] [/wx] [/pe] [/session|/nosession] [/limit <n>] [/json <path>]", L"orphan executable kernel pages", kKpageTokens),
     };
 
     const CompletionScopeTable kMinifilterScopes[] =
     {
         SCOPE(L"", L"!minifilter [list|show|irp|disable|enable|disable-all|enable-all]", L"list filters; enable/disable IRP slots", kMinifilterRootTokens),
-        SCOPE(L"action", L"!minifilter disable|enable <name> <mj|all> [/pre|/post|/both]", L"IRP slot control (needs write on)", kMinifilterActionTokens),
+        SCOPE(L"show", L"!minifilter show <name|address> [/json <path>]", L"show filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"irp", L"!minifilter irp <name|address> <IRP_MJ_*|all> [/json <path>]", L"irp filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"status", L"!minifilter status <name|address> <IRP_MJ_*|all> [/json <path>]", L"status filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"disable", L"!minifilter disable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"disable filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"enable", L"!minifilter enable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"enable filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"disable-all", L"!minifilter disable-all <name|address> [/pre|/post|/both] [/json <path>]", L"disable-all filter IRP callbacks", kMinifilterActionTokens),
+        SCOPE(L"enable-all", L"!minifilter enable-all <name|address> [/pre|/post|/both] [/json <path>]", L"enable-all filter IRP callbacks", kMinifilterActionTokens),
     };
 
     const CompletionScopeTable kWnfScopes[] =
     {
+        SCOPE(L"decode", L"!wnf decode <state-name>", L"decode command", kHelpOnlyTokens),
+        SCOPE(L"instances", L"!wnf instances", L"instances command", kHelpOnlyTokens),
+        SCOPE(L"instance", L"!wnf instance <state-name|address>", L"instance command", kHelpOnlyTokens),
+        SCOPE(L"data", L"!wnf data <state-name|address>", L"data command", kHelpOnlyTokens),
+        SCOPE(L"candidates", L"!wnf candidates", L"candidates command", kHelpOnlyTokens),
+        SCOPE(L"lists", L"!wnf lists", L"lists command", kHelpOnlyTokens),
         SCOPE(L"", L"!wnf [decode|instances|instance|data|candidates|lists]", L"WNF state names and live instances", kWnfTokens),
     };
 
     const CompletionScopeTable kKmonScopes[] =
     {
-        SCOPE(L"", L"!kmon [start] | stop | status | recent | cases | save", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
+        SCOPE(L"add", L"!kmon add /pid <PID> | /name <image> | /driver <sys>", L"add one watch target", kKmonWatchTokens),
+        SCOPE(L"remove", L"!kmon remove /pid <PID> | /name <image> | /driver <sys>", L"remove one watch target", kKmonWatchTokens),
+        SCOPE(L"stop", L"!kmon stop", L"stop command", kHelpOnlyTokens),
+        SCOPE(L"status", L"!kmon status", L"status command", kHelpOnlyTokens),
+        SCOPE(L"recent", L"!kmon recent [N]", L"recent command", kHelpOnlyTokens),
+        SCOPE(L"watch", L"!kmon watch", L"watch command", kHelpOnlyTokens),
+        SCOPE(L"save", L"!kmon save <path>", L"save command", kHelpOnlyTokens),
+        SCOPE(L"clear", L"!kmon clear", L"clear command", kHelpOnlyTokens),
+        SCOPE(L"iotrace", L"!kmon iotrace <driver> on | !kmon iotrace off|status", L"lab-only IOCTL dispatch interposition", kKmonIoTokens),
+        SCOPE(L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations", kKmonDiffTokens),
+        SCOPE(L"", L"!kmon [start] [options] | stop | status | add | remove | iotrace | watch | recent | cases | surfaces | layouts | diff | save | clear", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
         SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent investigation leads", kKmonCaseTokens),
-        SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save path]", L"static callback references", kKmonSurfaceTokens),
+        SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"static callback references", kKmonSurfaceTokens),
         SCOPE(L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"memory layout observations", kKmonLayoutTokens),
-        SCOPE(L"opts", L"!kmon [/name] [/verbose] [/background] [/driver] [/pid] [/log]", L"kmon start options", kKmonOptTokens),
+        SCOPE(L"opts", L"!kmon [start] [/pid <PID>] [/name <image>] [/driver <sys>] [/verbose] [/background] [/throttle <N>] [/log <dir>] [/manifest <path>] [/layout-ms <1000..60000>]", L"kmon start options", kKmonOptTokens),
     };
 
     const CompletionScopeTable kTiScopes[] =
     {
-        SCOPE(L"", L"!ti start|stop|status|watch|recent|stats|by|grep|save|clear", L"Microsoft-Windows-Threat-Intelligence ETW", kTiRootTokens),
+        SCOPE(L"add", L"!ti add /pid <PID> | /name <image>", L"add one watch target", kTiWatchTokens),
+        SCOPE(L"remove", L"!ti remove /pid <PID> | /name <image>", L"remove one watch target", kTiWatchTokens),
+        SCOPE(L"watch", L"!ti watch", L"watch command", kHelpOnlyTokens),
+        SCOPE(L"recent", L"!ti recent [N]", L"recent command", kHelpOnlyTokens),
+        SCOPE(L"stats", L"!ti stats", L"stats command", kHelpOnlyTokens),
+        SCOPE(L"stop", L"!ti stop", L"stop command", kHelpOnlyTokens),
+        SCOPE(L"status", L"!ti status", L"status command", kHelpOnlyTokens),
+        SCOPE(L"clear", L"!ti clear", L"clear command", kHelpOnlyTokens),
+        SCOPE(L"save", L"!ti save <path>", L"save command", kHelpOnlyTokens),
+        SCOPE(L"grep", L"!ti grep <pattern>", L"grep command", kHelpOnlyTokens),
+        SCOPE(L"", L"!ti start|stop|status|add|remove|watch|recent|stats|by|grep|save|clear", L"Microsoft-Windows-Threat-Intelligence ETW", kTiRootTokens),
         SCOPE(L"by", L"!ti by pid <PID> | !ti by task <name>", L"filter the TI ring", kTiByTokens),
-        SCOPE(L"opts", L"!ti start|add|remove [/pid] [/name] [/throttle] [/ring] [/log]", L"subscription and watch options", kTiOptTokens),
+        SCOPE(L"opts", L"!ti start [/pid <PID>] [/name <image>] [/throttle <N>] [/ring <N>] [/log <dir>]", L"subscription and watch options", kTiOptTokens),
     };
 
     const CompletionScopeTable kTimelineScopes[] =
     {
+        SCOPE(L"dashboard", L"!timeline dashboard", L"dashboard command", kHelpOnlyTokens),
+        SCOPE(L"reset", L"!timeline reset", L"reset command", kHelpOnlyTokens),
+        SCOPE(L"status", L"!timeline status", L"status command", kHelpOnlyTokens),
+        SCOPE(L"clear", L"!timeline clear", L"clear command", kHelpOnlyTokens),
         SCOPE(L"", L"!timeline | !timeline dashboard | !timeline reset | !timeline help", L"time-ordered TI/snapshot/live evidence", kTimelineRootTokens),
         SCOPE(L"help", L"!timeline help [advanced]", L"compact or advanced help", kTimelineHelpTokens),
         SCOPE(L"ingest", L"!timeline ingest ti|snapshot ...", L"pull TI or a snapshot into the store", kTimelineIngestTokens),
@@ -1651,7 +1767,7 @@ namespace
 
     const CompletionScopeTable kCompareScopes[] =
     {
-        SCOPE(L"", L"c <addr1> <addr2> <length>", L"compare two virtual ranges", kProcessOptTokens),
+        SCOPE(L"", L"c <addr1> <addr2> <length>", L"compare two virtual ranges", kHelpOnlyTokens),
     };
 
     const CompletionScopeTable kFillScopes[] =
@@ -1833,7 +1949,7 @@ namespace
         CMD(L"dump-live", kDumpLiveScopes),
         CMD(L"dump-analyze", kDumpAnalyzeScopes),
         CMD(L"u", kUnassembleScopes),
-        CMD(L"uf", kUnassembleScopes),
+        CMD(L"uf", kUfScopes),
         CMD(L"!callbacks", kCallbackScopes),
         CMD(L"!dml_proc", kDmlProcScopes),
         CMD(L"!hunt", kHuntScopes),
@@ -1888,7 +2004,10 @@ namespace
 
     const CompletionCommandTable* FindCommandTable(const std::wstring& command)
     {
-        const std::wstring lowered = HintLower(command);
+        const CommandInfo* info = CommandRegistry::Find(command);
+        const std::wstring resolved = info != nullptr && info->Support == CommandSupport::Alias
+            ? info->Canonical : command;
+        const std::wstring lowered = HintLower(resolved);
         for (size_t i = 0; i < sizeof(kCommands) / sizeof(kCommands[0]); ++i)
         {
             if (SameToken(kCommands[i].Command, lowered))
@@ -1911,7 +2030,11 @@ namespace
         const std::wstring first = HintLower(argsBefore[1]);
         const std::wstring second = argsBefore.size() >= 3 ? HintLower(argsBefore[2]) : std::wstring();
 
-        if (command == L"!pool")
+        if (command == L"!diff" && (HintLower(argsBefore.back()) == L"/domain" || HintLower(argsBefore.back()) == L"/risk"))
+        {
+            scope = HintLower(argsBefore.back()).substr(1);
+        }
+        else if (command == L"!pool")
         {
             if (first == L"pe")
             {
@@ -1921,7 +2044,7 @@ namespace
             {
                 scope = L"tags";
             }
-            else if (first == L"big" || first == L"bigpool" || first == L"find" || first == L"summary")
+            else if (first == L"big" || first == L"bigpool" || first == L"find" || first == L"summary" || (!first.empty() && first[0] == L'/'))
             {
                 scope = L"list";
             }
@@ -1936,7 +2059,7 @@ namespace
             {
                 scope = L"update";
             }
-            else if (first == L"scan")
+            else if (first == L"scan" || (!first.empty() && first[0] == L'/'))
             {
                 scope = L"scan";
             }
@@ -1947,22 +2070,15 @@ namespace
             {
                 scope = L"by";
             }
-            else if (!first.empty() && first != L"help")
+            else
             {
-                // watch/recent/stats/grep/save/clear also complete /pid /name /...
-                scope = L"opts";
+                scope = first == L"start" ? L"opts" : first;
             }
         }
         else if (command == L"!kmon")
         {
-            if (first == L"cases" || first == L"surfaces" || first == L"layouts")
-            {
-                scope = first;
-            }
-            else if (!first.empty() && first != L"help")
-            {
-                scope = L"opts";
-            }
+            scope = first == L"start" || (!first.empty() && first[0] == L'/')
+                ? L"opts" : first;
         }
         else if (command == L"!etw")
         {
@@ -1973,7 +2089,11 @@ namespace
         }
         else if (command == L"!wfp")
         {
-            if (first == L"callouts")
+            if (first == L"kernel-callouts")
+            {
+                scope = L"kernelcallouts";
+            }
+            else if (first == L"callouts")
             {
                 scope = L"callouts";
             }
@@ -2004,7 +2124,7 @@ namespace
         {
             if (first == L"disable" || first == L"enable")
             {
-                scope = L"write";
+                scope = argsBefore.size() == 2 ? L"write" : L"write-module";
             }
             else if (first == L"disable-all" || first == L"enable-all")
             {
@@ -2017,10 +2137,10 @@ namespace
         }
         else if (command == L"!minifilter" || command == L"!fltmgr")
         {
-            if (first == L"disable" || first == L"enable" || first == L"irp" ||
+            if (first == L"disable" || first == L"enable" || first == L"irp" || first == L"status" ||
                 first == L"show" || first == L"disable-all" || first == L"enable-all")
             {
-                scope = L"action";
+                scope = first;
             }
         }
         else if (command == L"!timeline")
@@ -2195,7 +2315,7 @@ namespace
         }
         else if (command == L"mcp")
         {
-            if (first == L"on")
+            if (first == L"on" || first == L"start")
             {
                 scope = L"on";
             }
@@ -2206,7 +2326,7 @@ namespace
         }
         else if (command == L"remote")
         {
-            if (first == L"on")
+            if (first == L"on" || first == L"start")
             {
                 scope = L"on";
             }
@@ -2257,7 +2377,7 @@ namespace
             }
         }
 
-        return fallback;
+        return scopeKey.empty() ? fallback : nullptr;
     }
 
     bool FillHintFromTable(const CompletionHint* tokens, size_t count, const std::wstring& token, CompletionHint* hint)
@@ -2379,23 +2499,19 @@ namespace
         const CompletionCommandTable* table = FindCommandTable(command);
         if (table != nullptr)
         {
-            const std::wstring scopeKey = SelectScopeKey(HintLower(command), argsBefore);
+            const std::wstring scopeKey = SelectScopeKey(HintCanonicalCommand(command), argsBefore);
             const CompletionScopeTable* scope = FindScopeTable(*table, scopeKey);
             if (scope != nullptr &&
                 FillHintFromTable(scope->Tokens, scope->TokenCount, token, hint))
             {
                 found = true;
             }
-            else if (!scopeKey.empty())
-            {
-                const CompletionScopeTable* root = FindScopeTable(*table, L"");
-                if (root != nullptr &&
-                    root != scope &&
-                    FillHintFromTable(root->Tokens, root->TokenCount, token, hint))
-                {
-                    found = true;
-                }
-            }
+
+        }
+
+        if (!found && HintLower(command) == L"!kmon" && argsBefore.size() <= 1)
+        {
+            found = FillHintFromTable(kKmonOptTokens, std::size(kKmonOptTokens), token, hint);
         }
 
         if (!found && hint != nullptr && HintLower(command) == L"ai")
@@ -2438,7 +2554,7 @@ bool FindCompletionCommandGuide(
             break;
         }
 
-        const std::wstring scopeKey = SelectScopeKey(HintLower(command), argsBefore);
+        const std::wstring scopeKey = SelectScopeKey(HintCanonicalCommand(command), argsBefore);
         const CompletionScopeTable* scope = FindScopeTable(*table, scopeKey);
         if (scope == nullptr)
         {
@@ -2507,46 +2623,12 @@ bool FindCompletionTokenHint(
             }
         }
 
-        if (FillTokenHintFromCommand(command, argsBefore, token, hint))
+        const auto topics = CompletionTopicArgs(argsBefore);
+        const std::wstring topicCommand = topics.empty() ? command : HintCanonicalCommand(topics[0]);
+        found = FillTokenHintFromCommand(topicCommand, topics, token, hint);
+        if (!found && token == L"help" && CommandRegistry::Find(topicCommand) != nullptr)
         {
-            found = true;
-            break;
-        }
-
-        // "ai explain !callbacks <tab>" offers callback scopes while the
-        // current command is still ai. Walk trailing command tokens before
-        // the generic /json|/limit|all fallback, which would mislabel "all".
-        for (size_t index = argsBefore.size(); index > 1; --index)
-        {
-            const size_t nestedIndex = index - 1;
-            const std::wstring nested = HintCanonicalCommand(argsBefore[nestedIndex]);
-            if (FindCommandTable(nested) == nullptr)
-            {
-                continue;
-            }
-
-            std::vector<std::wstring> nestedArgs;
-            for (size_t copy = nestedIndex; copy < argsBefore.size(); ++copy)
-            {
-                nestedArgs.push_back(argsBefore[copy]);
-            }
-
-            if (FillTokenHintFromCommand(nested, nestedArgs, token, hint))
-            {
-                found = true;
-                break;
-            }
-        }
-
-        if (found)
-        {
-            break;
-        }
-
-        if (FillHintFromTable(kGenericTokens, sizeof(kGenericTokens) / sizeof(kGenericTokens[0]), token, hint))
-        {
-            found = true;
-            break;
+            found = FillHintFromTable(kHelpOnlyTokens, std::size(kHelpOnlyTokens), token, hint);
         }
     } while (false);
 
@@ -2558,6 +2640,11 @@ std::wstring BuildCompletionListing(
     const std::wstring& command,
     const std::vector<std::wstring>& argsBefore)
 {
+    const auto topics = CompletionTopicArgs(argsBefore);
+    if (topics != argsBefore)
+    {
+        return BuildCompletionListing(matches, topics.empty() ? L"" : HintCanonicalCommand(topics[0]), topics);
+    }
     std::wostringstream out;
     out << L"\n";
 
@@ -2655,266 +2742,4 @@ std::wstring BuildCompletionListing(
     return out.str();
 }
 
-namespace
-{
-    void AddUniqueToken(std::vector<std::wstring>* out, const wchar_t* token)
-    {
-        do
-        {
-            if (out == nullptr || token == nullptr || token[0] == L'\0')
-            {
-                break;
-            }
-
-            std::wstring item = token;
-            if (std::find(out->begin(), out->end(), item) == out->end())
-            {
-                out->push_back(item);
-            }
-        } while (false);
-    }
-
-    void AddHintTableTokens(
-        std::vector<std::wstring>* out,
-        const CompletionHint* tokens,
-        size_t count)
-    {
-        if (out == nullptr || tokens == nullptr)
-        {
-            return;
-        }
-
-        for (size_t i = 0; i < count; ++i)
-        {
-            AddUniqueToken(out, tokens[i].Token);
-        }
-    }
-
-    void AddScopeTokens(
-        std::vector<std::wstring>* out,
-        const std::wstring& command,
-        const std::vector<std::wstring>& argsBefore)
-    {
-        const CompletionCommandTable* table = FindCommandTable(command);
-        if (table == nullptr)
-        {
-            return;
-        }
-
-        const std::wstring scopeKey = SelectScopeKey(HintLower(command), argsBefore);
-        const CompletionScopeTable* scope = FindScopeTable(*table, scopeKey);
-        if (scope != nullptr)
-        {
-            AddHintTableTokens(out, scope->Tokens, scope->TokenCount);
-        }
-        if (!scopeKey.empty())
-        {
-            const CompletionScopeTable* root = FindScopeTable(*table, L"");
-            if (root != nullptr && root != scope)
-            {
-                AddHintTableTokens(out, root->Tokens, root->TokenCount);
-            }
-        }
-    }
-}
-
-std::vector<std::wstring> CollectCompletionCandidates(
-    const std::vector<std::wstring>& argsBefore)
-{
-    std::vector<std::wstring> out;
-
-    do
-    {
-        if (argsBefore.empty())
-        {
-            for (const CommandInfo& info : CommandRegistry::Commands())
-            {
-                AddUniqueToken(&out, info.Name);
-            }
-            break;
-        }
-
-        const std::wstring command = HintCanonicalCommand(argsBefore[0]);
-        if (command == L"help" || command == L"?")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddUniqueToken(&out, L"all");
-                for (const CommandInfo& info : CommandRegistry::Commands())
-                {
-                    AddUniqueToken(&out, info.Name);
-                }
-            }
-            else
-            {
-                std::vector<std::wstring> topic(argsBefore.begin() + 1, argsBefore.end());
-                out = CollectCompletionCandidates(topic);
-            }
-            break;
-        }
-
-        AddScopeTokens(&out, command, argsBefore);
-
-        for (size_t index = argsBefore.size(); index > 1; --index)
-        {
-            const size_t nestedIndex = index - 1;
-            const std::wstring nested = HintCanonicalCommand(argsBefore[nestedIndex]);
-            if (FindCommandTable(nested) == nullptr)
-            {
-                continue;
-            }
-
-            std::vector<std::wstring> nestedArgs;
-            for (size_t copy = nestedIndex; copy < argsBefore.size(); ++copy)
-            {
-                nestedArgs.push_back(argsBefore[copy]);
-            }
-            AddScopeTokens(&out, nested, nestedArgs);
-        }
-
-        AddHintTableTokens(
-            &out,
-            kGenericTokens,
-            sizeof(kGenericTokens) / sizeof(kGenericTokens[0]));
-
-        if (command == L"ai")
-        {
-            for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
-            {
-                AddUniqueToken(&out, token.c_str());
-            }
-        }
-    } while (false);
-
-    return out;
-}
-
-bool ApplyTabCompletion(
-    std::wstring* line,
-    size_t* cursor,
-    bool* listed,
-    std::wstring* listing)
-{
-    bool changed = false;
-
-    do
-    {
-        if (listed != nullptr)
-        {
-            *listed = false;
-        }
-        if (listing != nullptr)
-        {
-            listing->clear();
-        }
-        if (line == nullptr || cursor == nullptr)
-        {
-            break;
-        }
-        if (*cursor > line->size())
-        {
-            *cursor = line->size();
-        }
-
-        size_t tokenStart = *cursor;
-        size_t tokenEnd = *cursor;
-        while (tokenStart > 0 && std::iswspace((*line)[tokenStart - 1]) == 0)
-        {
-            --tokenStart;
-        }
-        while (tokenEnd < line->size() && std::iswspace((*line)[tokenEnd]) == 0)
-        {
-            ++tokenEnd;
-        }
-
-        const std::wstring prefix = line->substr(tokenStart, *cursor - tokenStart);
-        std::wstring left = line->substr(0, tokenStart);
-        std::vector<std::wstring> argsBefore;
-        std::wstring word;
-        for (wchar_t ch : left)
-        {
-            if (ch == L' ' || ch == L'\t')
-            {
-                if (!word.empty())
-                {
-                    argsBefore.push_back(word);
-                    word.clear();
-                }
-            }
-            else
-            {
-                word.push_back(ch);
-            }
-        }
-        if (!word.empty())
-        {
-            argsBefore.push_back(word);
-        }
-
-        const std::vector<std::wstring> candidates = CollectCompletionCandidates(argsBefore);
-        std::vector<std::wstring> matches;
-        const std::wstring prefixLower = HintLower(prefix);
-        for (const std::wstring& item : candidates)
-        {
-            if (prefixLower.empty() || HintLower(item).rfind(prefixLower, 0) == 0)
-            {
-                matches.push_back(item);
-            }
-        }
-        if (matches.empty())
-        {
-            break;
-        }
-
-        std::wstring replacement;
-        bool appendSpace = false;
-        if (matches.size() == 1)
-        {
-            replacement = matches[0];
-            appendSpace = true;
-        }
-        else
-        {
-            replacement = matches[0];
-            for (size_t i = 1; i < matches.size(); ++i)
-            {
-                size_t n = 0;
-                while (n < replacement.size() &&
-                       n < matches[i].size() &&
-                       replacement[n] == matches[i][n])
-                {
-                    ++n;
-                }
-                replacement.resize(n);
-            }
-            if (HintLower(replacement).size() <= prefixLower.size())
-            {
-                std::wstring command;
-                if (!argsBefore.empty())
-                {
-                    command = HintCanonicalCommand(argsBefore[0]);
-                }
-                if (listing != nullptr)
-                {
-                    *listing = BuildCompletionListing(matches, command, argsBefore);
-                }
-                if (listed != nullptr)
-                {
-                    *listed = true;
-                }
-                break;
-            }
-        }
-
-        line->replace(tokenStart, tokenEnd - tokenStart, replacement);
-        *cursor = tokenStart + replacement.size();
-        if (appendSpace && *cursor == line->size())
-        {
-            line->insert(*cursor, L" ");
-            ++(*cursor);
-        }
-        changed = true;
-    } while (false);
-
-    return changed;
-}
+#include "CompletionEngine.inl"

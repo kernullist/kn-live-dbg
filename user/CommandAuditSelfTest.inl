@@ -50,6 +50,79 @@ static int RunCommandAuditSelfTest()
         }
     }
     check(!device.IsOpen() && !dbgeng.IsReady(), L"registry sweep did not initialize an execution backend");
+    {
+        auto has = [](const std::vector<std::wstring>& args, const wchar_t* token)
+        {
+            const auto candidates = CollectCompletionCandidates(args);
+            return std::find(candidates.begin(), candidates.end(), token) != candidates.end();
+        };
+        for (const auto& info : CommandRegistry::Commands())
+        {
+            check(BuildInteractiveCompletionCandidates({info.Name}) == CollectCompletionCandidates({info.Name}),
+                L"local and remote completion agree: " + std::wstring(info.Name));
+        }
+        check(has({L"!kmon", L"start"}, L"/layout-ms") &&
+            CompletionCandidateExists({L"!kmon", L"start"}, L"/layout-ms"), L"kmon layout interval completion");
+        check(CompletionCandidateExists({L"!kmon", L"start"}, L"/manifest"), L"kmon manifest completion");
+        check(CompletionCandidateExists({L"!kmon", L"cases"}, L"/role") &&
+            CompletionCandidateExists({L"!kmon", L"layouts", L"/pid", L"55"}, L"/initial") &&
+            CompletionCandidateExists({L"!kmon", L"surfaces", L"55"}, L"/handle-start"), L"kmon analyst completion");
+        check(!has({L"!kmon", L"stop"}, L"/pid") && !has({L"!kmon"}, L"on"), L"kmon action boundaries");
+        check(has({L"!kmon", L"iotrace", L"driver"}, L"on") &&
+            !has({L"!kmon", L"iotrace"}, L"on"), L"iotrace driver precedes action");
+        check(!has({L"!kmon", L"layouts"}, L"/initial"), L"initial layout requires a PID");
+        check(!has({L"!ti", L"watch"}, L"/pid") && !has({L"!ti", L"recent"}, L"/ring"), L"TI leaf completion");
+        check(has({L"!ti", L"add"}, L"/pid") && !has({L"!ti", L"add"}, L"/ring"), L"TI watch mutation options");
+        check(!has({L"remote", L"on"}, L"/json") && !has({L"c"}, L"/process"), L"no generic invalid switches");
+        check(CollectCompletionCandidates({L"unknown-command"}).empty(), L"unknown command has no options");
+        check(has({L"!timeline", L"help"}, L"advanced") &&
+            CompletionCandidateExists({L"!timeline", L"help"}, L"advanced"), L"nested timeline help discovery");
+        check(has({L"ai", L"help"}, L"config") && has({L"help", L"ai", L"config"}, L"model"), L"nested AI help discovery");
+        check(has({L"!diff", L"/domain"}, L"callbacks") &&
+            !has({L"!diff"}, L"kpage"), L"diff domain values stay in their value slot");
+        check(has({L"!diff"}, L"/memory") && has({L"!threads"}, L"/summary"), L"missing diff and thread options");
+        check(has({L"!vad"}, L"/hidden") && has({L"dump-live"}, L"/hypervisor"), L"documented option aliases");
+        check(!has({L"!driver", L"list"}, L"/dispatch") &&
+            !has({L"!callbacks", L"object"}, L"disable"), L"scope-specific options");
+        check(!has({L"!unloaded"}, L"piddb"), L"mapper alias keeps its fixed scope");
+        check(!has({L"!kmon", L"start", L"/log"}, L"/pid") &&
+            has({L"!kmon", L"start", L"/log", L"my logs"}, L"/pid"), L"option values are not options");
+        for (const auto& input : {L"!kmon start /log \"my /pi", L"ai chat \"help !kmon /pi"})
+        {
+            std::wstring line = input;
+            const std::wstring original = line;
+            size_t cursor = line.size();
+            bool listed = true;
+            std::wstring listing;
+            check(!ApplyTabCompletion(&line, &cursor, &listed, &listing) && line == original && !listed,
+                L"Tab preserves quoted input");
+        }
+        std::wstring line = L"!kmon start /log \"my logs\" /lay";
+        size_t cursor = line.size();
+        bool listed = false;
+        std::wstring listing;
+        check(ApplyTabCompletion(&line, &cursor, &listed, &listing) &&
+            line == L"!kmon start /log \"my logs\" /layout-ms ", L"Tab after a quoted option value");
+        CompletionHint hint = {};
+        check(FindCompletionTokenHint(L"!kmon", {L"!kmon", L"diff", L"before", L"after"}, L"/json", &hint) &&
+            std::wstring(hint.Syntax) == L"/json", L"kmon diff JSON does not take a path");
+        const auto topic = run(L"help ??");
+        check(topic.Error.empty() && topic.Output.find(L"<expression>") != std::wstring::npos,
+            L"expression help includes syntax");
+        check(run(L"help !threads").Output.find(L"/summary") != std::wstring::npos, L"threads summary help");
+        for (const auto& helpLine : {L"!kmon start help", L"!kmon iotrace driver help", L"!minifilter disable help",
+            L"!callbacks disable help", L"!vad scan help", L"!wfp filters help", L"!timeline query help",
+            L"!timeline live on help", L"remote on help", L"mcp on help", L"probe load help", L"write on help"})
+        {
+            const auto result = run(helpLine);
+            check(result.KeepRunning && result.Error.empty() && !result.Output.empty() &&
+                !device.IsOpen() && !dbgeng.IsReady(), L"scoped help is read-only: " + std::wstring(helpLine));
+        }
+        check(run(L"help dump-raw").Output.find(L"/pid") != std::wstring::npos &&
+            run(L"help dump-pe").Output.find(L"/name") != std::wstring::npos, L"user process dump help");
+        check(run(L"help !diff").Output.find(L"/memory") != std::wstring::npos &&
+            run(L"help !snapshot").Output.find(L"/memory") != std::wstring::npos, L"memory-only snapshot help");
+    }
     const auto remoteStatus = run(L"remote status");
     check(remoteStatus.Error.empty() && remoteStatus.Output.find(L"remote server:") != std::wstring::npos &&
         !dbgeng.IsReady(), L"remote stays native in dbgeng mode");

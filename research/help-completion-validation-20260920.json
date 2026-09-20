@@ -1,0 +1,144 @@
+{
+  "schema": "kn-live-dbg.help-completion-validation.v1",
+  "date": "2026-09-20",
+  "base_commit": "4e27256cf0796137efe241306f7127dd1aead66d",
+  "scope": {
+    "registered_commands": 261,
+    "native": 151,
+    "aliases": 17,
+    "dbgeng_routes": 93
+  },
+  "before": {
+    "commands_selftest": {
+      "passed": 2041,
+      "failed": 281
+    },
+    "note": "Failures include per-command local/remote candidate mismatches; not 281 distinct bugs."
+  },
+  "builds": {
+    "Release": {
+      "exit_code": 0,
+      "compiler_warnings": 0
+    },
+    "Debug": {
+      "exit_code": 0,
+      "compiler_warnings": 0
+    }
+  },
+  "integration": {
+    "Release": {
+      "timeline.selftest": {
+        "passed": 28,
+        "failed": 0
+      },
+      "mcp.selftest": {
+        "passed": 75,
+        "failed": 0
+      },
+      "console.selftest": {
+        "passed": 524,
+        "failed": 0
+      },
+      "commands.selftest": {
+        "passed": 2336,
+        "failed": 0,
+        "registered": 261
+      },
+      "remote.selftest": {
+        "passed": 52,
+        "failed": 0
+      }
+    },
+    "Debug": {
+      "timeline.selftest": {
+        "passed": 28,
+        "failed": 0
+      },
+      "mcp.selftest": {
+        "passed": 75,
+        "failed": 0
+      },
+      "console.selftest": {
+        "passed": 524,
+        "failed": 0
+      },
+      "commands.selftest": {
+        "passed": 2336,
+        "failed": 0,
+        "registered": 261
+      },
+      "remote.selftest": {
+        "passed": 52,
+        "failed": 0
+      }
+    }
+  },
+  "asan": {
+    "configuration": "Release",
+    "compiler_flags": [
+      "/O2",
+      "/MD",
+      "/W4",
+      "/WX",
+      "/fsanitize=address"
+    ],
+    "scope": [
+      "standalone command parser",
+      "real shared completion engine, registry and model catalog"
+    ],
+    "results": {
+      "command-parser.selftest": {
+        "passed": 275002,
+        "failed": 0
+      },
+      "completion.selftest": {
+        "passed": 25954,
+        "failed": 0
+      },
+      "commands.selftest": {
+        "passed": 2336,
+        "failed": 0,
+        "registered": 261
+      }
+    },
+    "application_integration_executable": "x64/Debug/KnLiveDbg.exe (not ASan-instrumented)",
+    "generated_completion_inputs": 300,
+    "cursor_positions": "every position plus one beyond the end; separate SIZE_MAX case",
+    "superseded_run": "An initial 1200-input run was stopped when the final corpus was reduced to 300; it is not counted as a completed validation."
+  },
+  "cli_help": {
+    "--help": 0,
+    "-h": 0,
+    "/?": 0,
+    "--help all": {
+      "exit_code": 0,
+      "registered_commands": 261
+    }
+  },
+  "commands": [
+    "tools/build.ps1 -Configuration Release -WindowsTargetPlatformVersion 10.0.22621.0 -TestCertificateThumbprint 8EEA6021C3DA39C71E8F998B8F6E77F572EE054C",
+    "tools/build.ps1 -Configuration Debug -WindowsTargetPlatformVersion 10.0.22621.0 -TestCertificateThumbprint 8EEA6021C3DA39C71E8F998B8F6E77F572EE054C",
+    "x64/Release/KnLiveDbg.exe --self-test all",
+    "x64/Debug/KnLiveDbg.exe --self-test all",
+    "tools/validate-command-audit.ps1 -Configuration Release -Sanitize -Executable x64/Debug/KnLiveDbg.exe",
+    "x64/Release/KnLiveDbg.exe --help all"
+  ],
+  "source_sha256": {
+    "user/CompletionHints.cpp": "0ddad5de73b0eff3676ca702a4a22d8de1346dd7304d3988414e35ea45fd3078",
+    "user/CompletionHints.h": "6cd19e31a8cd624b459f7021a6bcb3cd37d138ac2b8b02cc8ed803c85226de49",
+    "user/CompletionEngine.inl": "681a45e56a5a912bca0cfeb6e4d11eb42140e1ea998b20520e8c9daf0e4a7efd",
+    "user/CommandRegistry.cpp": "52389602f232f8308840f37c1295943137dfb0b2f33b6839df560c9937c7a12f",
+    "user/main.cpp": "f4f6f891ea66bb0b60831a5fa8580f086459131372511381e61a82df60966d07",
+    "user/RemoteServer.cpp": "27eba46697a85bfacd5db765a6b428e0f4a97a50fa38f00ebe1f72d5fe39a012",
+    "user/CommandAuditSelfTest.inl": "095e6dc905eb1a5a26a51e3046426a0eacc17e9ef6e79246cbcf57cfbcf592b4",
+    "tools/completion-selftest.cpp": "4bdb71415356933d7e561737e677aed8bfedb5e99d2d6f11ab9dfc3a7a5db154",
+    "tools/validate-command-audit.ps1": "5f26a849da571a615f0d1ab5b142368884127ae3dc28ae231a60d20416d1683c"
+  },
+  "limits": [
+    "No live kernel target or driver-load validation.",
+    "No interactive local/remote GUI keypress session.",
+    "External DbgEng implementations and extensions were not executed.",
+    "ASan covers the two standalone test executables, not the whole application."
+  ],
+  "source_hash_normalization": "UTF-8 text with LF line endings"
+}

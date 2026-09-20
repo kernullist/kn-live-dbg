@@ -212,6 +212,7 @@
     <ClInclude Include="CommandInput.h" />
     <ClInclude Include="CommandAuditSelfTest.inl" />
     <ClInclude Include="CompletionHints.h" />
+    <ClInclude Include="CompletionEngine.inl" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />

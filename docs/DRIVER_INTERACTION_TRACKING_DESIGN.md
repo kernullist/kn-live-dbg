@@ -47,7 +47,7 @@ records. An open and close wholly between snapshots can still be missed;
 
 ## Phase B — kernel-side IOCTL observability (B.1 implemented as `!kmon iotrace`)
 
-Opt-in, lab-only: `!kmon iotrace <driver-name> on|off|status` resolves the
+Opt-in, lab-only: `!kmon iotrace <driver-name> on | !kmon iotrace off|status` resolves the
 named driver's DRIVER_OBJECT via the `\Driver` object-directory walk
 (`IntegrityScanner`, user mode — the driver never does name lookups), then
 arms the main `KnLiveDbg.sys` driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
