@@ -1130,15 +1130,10 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
                 {
                     cursor = static_cast<int64_t>(line.size());
                 }
-                size_t pos = static_cast<size_t>(cursor);
-                size_t tokenStart = pos;
-                while (tokenStart > 0 && iswspace(line[tokenStart - 1]) == 0)
-                {
-                    --tokenStart;
-                }
-                const std::wstring prefix = line.substr(tokenStart, pos - tokenStart);
-                const std::vector<std::wstring> argsBefore = knremote::SplitLine(line.substr(0, tokenStart));
-                const std::vector<std::wstring> candidates = CollectCompletionCandidates(argsBefore);
+                const CompletionContext context = BuildCompletionContext(line, static_cast<size_t>(cursor));
+                const std::wstring& prefix = context.Prefix;
+                const std::vector<std::wstring> candidates = context.CanComplete
+                    ? CollectCompletionCandidates(context.ArgsBefore) : std::vector<std::wstring>{};
                 std::wstring matchesJson = L"[";
                 bool first = true;
                 std::wstring prefixLower = prefix;
