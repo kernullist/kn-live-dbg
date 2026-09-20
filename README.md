@@ -2,7 +2,7 @@
 
 Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the useful part of LiveKD: the kernel driver exposes narrow memory primitives, while the user-mode console owns service lifecycle, symbol loading, type interpretation, and operator UX.
 
-Changes since v0.0.32 are collected in the [v0.0.33 release notes](docs/RELEASE_NOTES_0.0.33.md): bounded executable-code hunting, passive kernel/user references, driver-hiding evidence, and command/transport fixes. The [GitHub release](https://github.com/kernullist/kn-live-dbg/releases/tag/v0.0.33) provides the x64 package and its checksums.
+Changes since v0.0.33 are collected in the [v0.0.34 release notes](docs/RELEASE_NOTES_0.0.34.md): callback inspection, process memory layout history, stricter evidence validation, and shared local/remote help and completion. The [GitHub release](https://github.com/kernullist/kn-live-dbg/releases/tag/v0.0.34) provides the x64 package and its checksums.
 
 ## Demo
 
