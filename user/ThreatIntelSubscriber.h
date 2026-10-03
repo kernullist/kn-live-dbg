@@ -35,6 +35,7 @@ struct TiEventRecord
     uint64_t Sequence = 0;
     uint64_t Timestamp = 0;       // FILETIME (100-ns ticks since 1601 UTC)
     uint32_t ProcessId = 0;
+    uint64_t ProcessCreateTime = 0; // Same-handle image/generation validation; zero means unknown.
     uint32_t ThreadId = 0;
     uint16_t TaskId = 0;
     uint16_t Version = 0;
@@ -44,7 +45,7 @@ struct TiEventRecord
     uint64_t Keyword = 0;
     std::wstring TaskName;        // resolved via TDH if available
     std::wstring OpcodeName;
-    std::wstring ImagePath;       // best-effort process image (basename)
+    std::wstring ImagePath;       // Generation-validated process image path, or empty.
     std::vector<TiPayloadField> Payload;
     std::wstring RawPayloadHex;   // fallback when TDH/manifest can't decode
     bool DecodedByTdh = false;
@@ -53,7 +54,34 @@ struct TiEventRecord
     // its resolved image basename. Populated once during ingest so the
     // matcher and the printer don't have to walk the payload again.
     uint32_t TargetProcessId = 0;
+    uint64_t TargetProcessCreateTime = 0;
     std::wstring TargetImageBase;
+};
+
+struct TiTraceLifecycle
+{
+    uint64_t Generation = 0;
+    uint64_t FirstSequence = 1;
+    uint64_t ExitTickMs = 0;
+    uint32_t ExitStatus = 0;
+    uint32_t StartStatus = ERROR_IO_PENDING;
+    bool ThreadRunning = false;
+    bool ExitStatusKnown = false;
+    bool StopRequested = false;
+    bool ExitAfterStopRequest = false;
+};
+
+struct TiSequenceSnapshot
+{
+    std::vector<TiEventRecord> Records;
+    uint64_t Generation = 0;
+    uint64_t GenerationFirstSequence = 1;
+    uint64_t EarliestAvailableSequence = 0;
+    uint64_t LatestAssignedSequence = 0;
+    // A zero cursor establishes a baseline and does not claim prior loss.
+    uint64_t MissingBeforeFirst = 0;
+    bool CursorAhead = false;
+    bool HasMore = false;
 };
 
 struct TiSubscriberStats
@@ -71,6 +99,9 @@ struct TiSubscriberStats
     uint64_t MatchAllKeyword = 0;
     uint64_t StartTickMs = 0;          // GetTickCount64 at Start
     uint64_t LastEventTickMs = 0;
+    TiTraceLifecycle Trace;
+    uint64_t EarliestAvailableSequence = 0;
+    uint64_t LatestAssignedSequence = 0;
 };
 
 // Internal atomic mirror to keep increments on the ETW callback thread
@@ -141,6 +172,8 @@ public:
     // Chronological events with Sequence > minSequenceExclusive (preferred
     // for timeline recent ingest; avoids timestamp-reorder skips).
     std::vector<TiEventRecord> RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const;
+    // The records and sequence bounds are captured under the same ring lock.
+    TiSequenceSnapshot RecentAfterSequenceWithStatus(uint64_t minSequenceExclusive, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByPid(uint32_t pid, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByTask(const std::wstring& taskName, size_t maxCount) const;
     std::vector<TiEventRecord> Grep(const std::wstring& pattern, size_t maxCount) const;
@@ -175,14 +208,13 @@ private:
     static VOID WINAPI EventRecordCallbackThunk(PEVENT_RECORD eventRecord);
     static ULONG WINAPI BufferCallbackThunk(PEVENT_TRACE_LOGFILEW buffer);
     void OnEventRecord(PEVENT_RECORD eventRecord);
-    void ProcessTraceThread();
+    void ProcessTraceThread(TRACEHANDLE processHandle, uint64_t generation);
+    bool StopLocked(std::wstring* error);
     bool DecodeEvent(PEVENT_RECORD eventRecord, TiEventRecord* out);
     bool DecodePayloadViaTdh(PEVENT_RECORD eventRecord, TiEventRecord* out);
     void DecodePayloadAsRawHex(PEVENT_RECORD eventRecord, TiEventRecord* out);
     void RecordKeep(TiEventRecord&& record);
-    // Not const: may mutate WatchPromotedPids when a name match promotes a
-    // (possibly target-side) PID into the hot path, and may touch the image
-    // cache to resolve target PIDs referenced by payload fields.
+    // Name watches use generation-validated event names without PID promotion.
     bool MatchesWatch(const TiEventRecord& record);
     bool WriteLogLine(const TiEventRecord& record);
     void RotateLogLocked();
@@ -197,6 +229,9 @@ private:
     TiOptions Options;
     TiSubscriberStatsAtomic Stats;
     std::atomic<bool> Active{false};
+    // Never held while joining ProcessThread. The worker does not take StateMutex.
+    mutable std::mutex TraceMutex;
+    TiTraceLifecycle TraceLifecycle;
     std::atomic<uint32_t> SelfPidSnapshot{0};
     std::atomic<bool> ExcludeSelfSnapshot{true};
 
@@ -214,7 +249,6 @@ private:
     mutable std::mutex WatchMutex;
     std::unordered_set<uint32_t> WatchPids;
     std::vector<std::wstring> WatchNamesLower;
-    std::unordered_set<uint32_t> WatchPromotedPids;
 
     // Ring buffer (mutex-protected; deque keeps insertion order).
     mutable std::mutex RingMutex;
@@ -238,17 +272,21 @@ private:
     int LogActiveRotation = 0;
     std::vector<std::wstring> OpenedLogPaths;
 
-    // PID -> image path cache to avoid OpenProcess on every ETW event.
+    // Cached paths avoid repeat path queries; each use revalidates CreateTime.
     struct ImageCacheEntry
     {
         std::wstring Path;
         uint64_t TickMs = 0;
+        uint64_t CreateTime = 0;
         bool Failed = false;
     };
     mutable std::mutex ImageCacheMutex;
     std::unordered_map<uint32_t, ImageCacheEntry> ImageCache;
-    std::wstring GetCachedImageOrResolve(uint32_t pid);
+    std::wstring GetCachedImageOrResolve(uint32_t pid, uint64_t eventTimestamp = 0,
+        uint64_t* validatedCreateTime = nullptr);
     static bool PayloadBasenameMatchesWatch(
         const TiEventRecord& record,
         const std::vector<std::wstring>& watchNamesLower);
 };
+
+bool ThreatIntelSubscriberSelfTest();

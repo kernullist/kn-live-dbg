@@ -64,6 +64,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(SolutionDir).build\generated;$(ProjectDir)..\shared;$(ProjectDir)..\third_party\zydis\amalgamated;$(DebuggingToolsIncludeDir);$(DiaSdkIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;ZYDIS_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -152,6 +153,10 @@
     <ClCompile Include="QosPolicyScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
+    <ClCompile Include="KmonUserEvidence.cpp" />
+    <ClCompile Include="PendingIrpScanner.cpp" />
+    <ClCompile Include="KmonTemporalEvidence.cpp" />
+    <ClCompile Include="KmonPlatformEvidence.cpp" />
     <ClCompile Include="KernelMonitor.cpp" />    <ClCompile Include="KernelMonitorInlinePatch.cpp" />
     <ClCompile Include="KernelMonitorMapperPool.cpp" />
     <ClCompile Include="TimelineDashboard.cpp" />
@@ -233,6 +238,11 @@
     <ClInclude Include="QosPolicyScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
+    <ClInclude Include="KmonUserEvidence.h" />
+    <ClInclude Include="PendingIrpScanner.h" />
+    <ClInclude Include="ScannerListWindow.h" />
+    <ClInclude Include="KmonTemporalEvidence.h" />
+    <ClInclude Include="KmonPlatformEvidence.h" />
     <ClInclude Include="KernelMonitor.h" />
     <ClInclude Include="TimelineDashboard.h" />
     <ClInclude Include="TimelineModel.h" />
@@ -251,6 +261,7 @@
     <ClInclude Include="WfpCalloutScanner.h" />
     <ClInclude Include="WnfScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
+    <ClInclude Include="..\shared\KnLiveDbgPaging.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
     <ClInclude Include="..\third_party\zydis\amalgamated\Zydis.h" />

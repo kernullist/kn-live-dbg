@@ -238,6 +238,8 @@ struct AnonymousTypeListDriverRecord
     std::wstring DriverName;
     std::wstring ModuleName;
     bool HasDriverStart = false;
+    bool ObjectTypeValidated = false;
+    bool NameKnown = false;
 };
 
 struct DriverTypeListResult
@@ -254,6 +256,11 @@ struct DriverTypeListResult
     uint64_t AnonymousDropped = 0;
     uint64_t DriverObjectsKnown = 0;
     uint64_t DeviceObjectsKnown = 0;
+    uint64_t CandidateReadFailures = 0;
+    uint64_t RejectedCandidates = 0;
+    uint64_t NextReportAfter = 0;
+    bool OutputTruncated = false;
+    bool TypeValidationAvailable = false;
     bool Truncated = false;
     bool Complete = false;
 };
@@ -344,7 +351,8 @@ public:
         const std::set<uint64_t>& knownDriverObjects,
         const std::set<uint64_t>& deviceDriverObjects,
         DriverTypeListResult* result,
-        std::wstring* error);
+        std::wstring* error,
+        uint64_t reportAfter = 0);
 
 private:
     DeviceClient& device_;
@@ -358,6 +366,7 @@ std::wstring BuildDeviceStackJson(const DeviceStackResult& result);
 bool IntegrityIatOwnerSelfTest();
 bool IntegrityDiscardedSectionSelfTest();
 bool IntegrityProloguePatternSelfTest();
+bool IntegrityRelocationSelfTest();
 bool DeviceStackWalkSelfTest();
 // P0 follow-up: deterministic regression for the driver object type-list
 // sweep. Drives the link-offset calibration and the candidate shape predicate

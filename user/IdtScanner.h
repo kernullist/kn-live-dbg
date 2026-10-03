@@ -60,3 +60,4 @@ private:
 };
 
 std::wstring BuildIdtJson(const IdtScanResult& result);
+bool IdtScannerSelfTest();

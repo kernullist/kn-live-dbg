@@ -107,6 +107,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
+    <ClInclude Include="..\shared\KnLiveDbgPaging.h" />
     <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
   </ItemGroup>
   <ItemGroup>

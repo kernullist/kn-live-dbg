@@ -1,4 +1,5 @@
 #include "PoolScanner.h"
+#include "LeftoverCommon.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "McpJson.h"
@@ -181,6 +182,14 @@ namespace
             }
             if (!fetched)
             {
+                break;
+            }
+            if (returnLengthLocal > bufferSize)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"system info returned length exceeds the allocated buffer";
+                }
                 break;
             }
 
@@ -708,11 +717,12 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
         }
 
         const SIZE_T headerBytes = FIELD_OFFSET(SYSTEM_BIGPOOL_INFORMATION_LOCAL, Entries);
-        if (returnLength < headerBytes)
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), 0))
         {
             if (error != nullptr)
             {
-                *error = L"big pool buffer smaller than header; got " +
+                *error = L"big pool buffer has an invalid length; got " +
                          std::to_wstring(returnLength) + L" bytes";
             }
             break;
@@ -723,17 +733,35 @@ bool PoolScanner::Scan(const Options& options, PoolScanResult* result, std::wstr
         const ULONG totalEntries = info->Count;
         result->TotalEntries = totalEntries;
 
-        const SIZE_T expectedBytes = headerBytes +
-            static_cast<SIZE_T>(totalEntries) * sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL);
-        if (expectedBytes > returnLength)
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), totalEntries))
         {
-            result->Warnings.push_back(L"reported entry count exceeds returned buffer; clamping");
+            if (error != nullptr)
+            {
+                *error = L"big pool entry count exceeds the returned buffer; scan deferred";
+            }
+            break;
         }
-
-        const ULONG safeCount = static_cast<ULONG>(
-            (expectedBytes > returnLength)
-                ? (returnLength - headerBytes) / sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL)
-                : totalEntries);
+        const ULONG safeCount = totalEntries;
+        bool rangesValid = true;
+        for (ULONG index = 0; index < safeCount; ++index)
+        {
+            const auto& entry = info->Entries[index];
+            const uint64_t address = reinterpret_cast<uint64_t>(entry.VirtualAddress) & ~1ull;
+            if (!LeftoverValidateBigPoolRange(address, entry.SizeInBytes))
+            {
+                rangesValid = false;
+                break;
+            }
+        }
+        if (!rangesValid)
+        {
+            if (error != nullptr)
+            {
+                *error = L"big pool contains an invalid allocation range; scan deferred";
+            }
+            break;
+        }
 
         result->AttributesAttempted = options.AnnotateAttributes;
         bool limitNoted = false;

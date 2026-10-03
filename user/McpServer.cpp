@@ -45,6 +45,65 @@ static std::wstring TrimCopy(const std::wstring& raw)
     return raw.substr(begin, end - begin);
 }
 
+template<typename Reader>
+static ULONG ReadMcpRequestBody(Reader&& read, std::string* body)
+{
+    constexpr size_t maxBodyBytes = 1024u * 1024u;
+    body->clear();
+    char chunk[8192];
+    for (;;)
+    {
+        ULONG got = 0;
+        const ULONG status = read(chunk, static_cast<ULONG>(sizeof(chunk)), &got);
+        // BytesReturned is undefined at EOF; only NO_ERROR carries bytes.
+        if (status == ERROR_HANDLE_EOF)
+        {
+            return NO_ERROR;
+        }
+        if (status != NO_ERROR)
+        {
+            return status;
+        }
+        if (got == 0 || got > sizeof(chunk))
+        {
+            return ERROR_INVALID_DATA;
+        }
+        if (got > maxBodyBytes - body->size())
+        {
+            return ERROR_FILE_TOO_LARGE;
+        }
+        body->append(chunk, got);
+    }
+}
+
+bool McpRequestBodySelfTest()
+{
+    const auto check = [](size_t length, ULONG terminal, ULONG terminalBytes, ULONG expected)
+    {
+        size_t remaining = length;
+        std::string body;
+        const ULONG status = ReadMcpRequestBody([&](char* buffer, ULONG capacity, ULONG* got) -> ULONG
+        {
+            if (remaining == 0)
+            {
+                *got = terminalBytes;
+                return terminal;
+            }
+            *got = static_cast<ULONG>((std::min)(remaining, static_cast<size_t>(capacity)));
+            memset(buffer, 'x', *got);
+            remaining -= *got;
+            return NO_ERROR;
+        }, &body);
+        return status == expected && (status != NO_ERROR || body.size() == length);
+    };
+    return check(0, ERROR_HANDLE_EOF, MAXDWORD, NO_ERROR) &&
+        check(8193, ERROR_HANDLE_EOF, MAXDWORD, NO_ERROR) &&
+        check(1024u * 1024u, ERROR_HANDLE_EOF, 0, NO_ERROR) &&
+        check(1024u * 1024u + 1, ERROR_HANDLE_EOF, 0, ERROR_FILE_TOO_LARGE) &&
+        check(8, ERROR_CONNECTION_ABORTED, 0, ERROR_CONNECTION_ABORTED) &&
+        check(8, NO_ERROR, 0, ERROR_INVALID_DATA);
+}
+
 static std::wstring FormatIpv4(const in_addr& address)
 {
     const unsigned char* bytes =
@@ -1854,37 +1913,12 @@ void McpServer::ListenerThreadMain()
         HttpSendHttpResponse(requestQueue_, requestId, 0, &response, nullptr, &bytesSent, nullptr, 0, nullptr, nullptr);
     };
 
-    auto readBody = [&](HTTP_REQUEST_ID requestId) -> std::string
+    auto readBody = [&](HTTP_REQUEST_ID requestId, std::string* body) -> ULONG
     {
-        std::string body;
-        char chunk[8192];
-        for (;;)
+        return ReadMcpRequestBody([&](char* chunk, ULONG capacity, ULONG* got)
         {
-            ULONG got = 0;
-            ULONG status = HttpReceiveRequestEntityBody(requestQueue_, requestId, 0, chunk, sizeof(chunk), &got, nullptr);
-            if (status == NO_ERROR)
-            {
-                if (got > 0)
-                {
-                    body.append(chunk, got);
-                }
-                if (got == 0)
-                {
-                    break;
-                }
-                continue;
-            }
-            if (status == ERROR_HANDLE_EOF)
-            {
-                if (got > 0)
-                {
-                    body.append(chunk, got);
-                }
-                break;
-            }
-            break;
-        }
-        return body;
+            return HttpReceiveRequestEntityBody(requestQueue_, requestId, 0, chunk, capacity, got, nullptr);
+        }, body);
     };
 
     // Append one forensic JSONL record per data-bearing MCP request. Always on
@@ -1962,8 +1996,20 @@ void McpServer::ListenerThreadMain()
             return;
         }
 
-        std::string bodyUtf8 = readBody(requestId);
+        std::string bodyUtf8;
+        const ULONG bodyStatus = readBody(requestId, &bodyUtf8);
+        if (bodyStatus != NO_ERROR)
+        {
+            const bool tooLarge = bodyStatus == ERROR_FILE_TOO_LARGE;
+            sendResponse(requestId, tooLarge ? 413 : 400, tooLarge ? "Content Too Large" : "Bad Request", L"");
+            return;
+        }
         std::wstring body = mcpjson::Utf8ToWide(bodyUtf8);
+        if (!mcpjson::IsObject(body))
+        {
+            sendResponse(requestId, 200, "OK", RpcError(L"", -32700, L"invalid JSON object"));
+            return;
+        }
 
         std::wstring method;
         std::wstring idRaw;
@@ -1973,6 +2019,20 @@ void McpServer::ListenerThreadMain()
         if (!mcpjson::FindRawValue(body, L"params", &params))
         {
             params = L"{}";
+        }
+
+        std::wstring version;
+        if (!mcpjson::GetString(body, L"jsonrpc", &version) || version != L"2.0" ||
+            (!idRaw.empty() && idRaw != L"null" && idRaw.front() != L'\"' &&
+                idRaw.front() != L'-' && (idRaw.front() < L'0' || idRaw.front() > L'9')))
+        {
+            sendResponse(requestId, 200, "OK", RpcError(L"", -32600, L"invalid JSON-RPC version or id"));
+            return;
+        }
+        if (!mcpjson::IsObject(params))
+        {
+            sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, L"params must be an object"));
+            return;
         }
 
         if (method.empty())
@@ -2035,6 +2095,11 @@ void McpServer::ListenerThreadMain()
             if (!mcpjson::FindRawValue(params, L"arguments", &argsRaw) || argsRaw.empty())
             {
                 argsRaw = L"{}";
+            }
+            if (!mcpjson::IsObject(argsRaw))
+            {
+                sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, L"arguments must be an object"));
+                return;
             }
 
             const McpToolDef* tool = FindTool(name);
@@ -2212,9 +2277,17 @@ void McpServer::ListenerThreadMain()
                 {
                     break;
                 }
-                continue;
+                if (overlappedError != ERROR_MORE_DATA)
+                {
+                    continue;
+                }
+                // Preserve oversized-header completion for the common 431 path.
+                status = overlappedError;
             }
-            status = NO_ERROR;
+            else
+            {
+                status = NO_ERROR;
+            }
         }
 
         if (status == NO_ERROR)

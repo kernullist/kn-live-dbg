@@ -15,6 +15,18 @@ namespace
         return value >= kKernelSpaceMin;
     }
 
+    bool IdtTableShapeValid(const IdtInfo& idt, uint32_t expectedCount = 0)
+    {
+        return IsKernelAddress(idt.Base) && idt.Limit < kIdtEntrySize * kMaxIdtEntries &&
+            (idt.Limit + 1u) % kIdtEntrySize == 0 && idt.Base <= ~0ull - idt.Limit &&
+            (expectedCount == 0 || (idt.Limit + 1u) / kIdtEntrySize == expectedCount);
+    }
+
+    bool IdtHandlerDiffers(const IdtEntry& baseline, bool present, uint64_t handler)
+    {
+        return baseline.Present != present || (present && baseline.Handler != handler);
+    }
+
     std::wstring FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
         const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
@@ -102,9 +114,7 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
             }
         }
 
-        // Read the IDTR for the boot processor. Per-processor IDT comparison is
-        // a future enhancement; the BSP table is representative for handler
-        // ownership validation.
+        // Read the first processor's table before comparing the other CPUs.
         IdtInfo idt = {};
         if (!device_.ReadIdt(0, &idt, error))
         {
@@ -115,29 +125,16 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
         result->IdtBase = idt.Base;
         result->IdtLimit = idt.Limit;
 
-        if (!IsKernelAddress(idt.Base))
+        if (!IdtTableShapeValid(idt) || idt.ProcessorNumber != 0)
         {
             if (error != nullptr)
             {
-                *error = L"implausible IDT base";
+                *error = L"invalid IDT base, table length, or processor identity";
             }
             break;
         }
 
         uint32_t entryCount = (idt.Limit + 1u) / kIdtEntrySize;
-        if (entryCount == 0)
-        {
-            if (error != nullptr)
-            {
-                *error = L"IDT limit yields zero entries";
-            }
-            break;
-        }
-        if (entryCount > kMaxIdtEntries)
-        {
-            result->Warnings.push_back(L"IDT entry count exceeds 256; clamping");
-            entryCount = kMaxIdtEntries;
-        }
         result->EntryCount = entryCount;
 
         std::vector<uint8_t> bytes;
@@ -196,11 +193,20 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
         // handler divergence is a single-core interrupt-hook signal. Per-CPU
         // IDT bases legitimately differ, so only handler values are compared.
         uint32_t cpuCount = static_cast<uint32_t>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
-        if (cpuCount > 256)
+        if (cpuCount == 0)
         {
-            cpuCount = 256;
+            if (error != nullptr)
+            {
+                *error = L"could not query active processors for IDT coverage";
+            }
+            break;
         }
         result->ProcessorCount = cpuCount;
+        if (cpuCount > 256)
+        {
+            result->Warnings.push_back(L"IDT processor scan capped at 256; coverage is incomplete");
+            cpuCount = 256;
+        }
 
         for (uint32_t cpu = 1; cpu < cpuCount; ++cpu)
         {
@@ -212,20 +218,14 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
                 continue;
             }
 
-            if (!IsKernelAddress(other.Base))
+            if (!IdtTableShapeValid(other, entryCount) || other.ProcessorNumber != cpu)
             {
+                result->Warnings.push_back(L"IDT base, table length, or processor identity mismatch on cpu " +
+                    std::to_wstring(cpu) + L"; comparison is incomplete");
                 continue;
             }
 
-            uint32_t otherCount = (other.Limit + 1u) / kIdtEntrySize;
-            if (otherCount == 0)
-            {
-                continue;
-            }
-            if (otherCount > entryCount)
-            {
-                otherCount = entryCount;
-            }
+            const uint32_t otherCount = (other.Limit + 1u) / kIdtEntrySize;
 
             std::vector<uint8_t> otherBytes;
             uint32_t otherTableBytes = otherCount * kIdtEntrySize;
@@ -250,17 +250,7 @@ bool IdtScanner::Scan(IdtScanResult* result, std::wstring* error)
                                    (static_cast<uint64_t>(offsetMid) << 16) |
                                    (static_cast<uint64_t>(offsetHigh) << 32);
 
-                if (!base.Present && !otherPresent)
-                {
-                    continue;
-                }
-                if (base.Present &&
-                    otherPresent &&
-                    handler == base.Handler)
-                {
-                    continue;
-                }
-                if (!base.Present && (!otherPresent || handler == 0))
+                if (!IdtHandlerDiffers(base, otherPresent, handler))
                 {
                     continue;
                 }
@@ -310,6 +300,7 @@ std::wstring BuildIdtJson(const IdtScanResult& result)
     out += L",\"idtBase\":" + mcpjson::Quote(IdtJsonHex(result.IdtBase));
     out += L",\"idtLimit\":" + std::to_wstring(result.IdtLimit);
     out += L",\"entryCount\":" + std::to_wstring(result.EntryCount);
+    out += L",\"processorCount\":" + std::to_wstring(result.ProcessorCount);
     out += L",\"processorsCompared\":" + std::to_wstring(result.ProcessorsCompared);
     out += L",\"divergentCount\":" + std::to_wstring(result.DivergentCount);
     out += L",\"anySuspicious\":";
@@ -366,4 +357,53 @@ std::wstring BuildIdtJson(const IdtScanResult& result)
     out += L"]}";
 
     return out;
+}
+
+
+bool IdtScannerSelfTest()
+{
+    IdtEntry baseline;
+    if (IdtHandlerDiffers(baseline, false, 0x1234) || !IdtHandlerDiffers(baseline, true, 0))
+    {
+        return false;
+    }
+    baseline.Present = true;
+    baseline.Handler = 0xfffff80000100000ull;
+    if (IdtHandlerDiffers(baseline, true, baseline.Handler) ||
+        !IdtHandlerDiffers(baseline, false, baseline.Handler) ||
+        !IdtHandlerDiffers(baseline, true, baseline.Handler + 1))
+    {
+        return false;
+    }
+    IdtScanResult coverage;
+    coverage.ProcessorCount = 512;
+    coverage.ProcessorsCompared = 255;
+    std::wstring count;
+    if (!mcpjson::FindRawValue(BuildIdtJson(coverage), L"processorCount", &count) || count != L"512")
+    {
+        return false;
+    }
+    IdtInfo info = {};
+    info.Base = 0xffff800000001000ull;
+    info.Limit = 4095;
+    if (!IdtTableShapeValid(info, 256) || IdtTableShapeValid(info, 255))
+    {
+        return false;
+    }
+    for (uint32_t limit : {0u, 14u, 4094u, 4096u, 0xffffffffu})
+    {
+        info.Limit = limit;
+        if (IdtTableShapeValid(info))
+        {
+            return false;
+        }
+    }
+    info.Limit = 4095;
+    info.Base = ~0ull - 4094;
+    if (IdtTableShapeValid(info))
+    {
+        return false;
+    }
+    info.Base = 0x1000;
+    return !IdtTableShapeValid(info);
 }

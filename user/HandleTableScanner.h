@@ -20,6 +20,14 @@ struct HandleTableRecord
     std::wstring AccessText;
     std::wstring Notes;
     bool PointsToProcess = false;
+    bool TypeResolved = false;
+    bool ObjectTypeValidated = false;
+    bool RelationshipResolved = false;
+    bool TargetIdentityKnown = false;
+    uint64_t TargetCreateTime = 0;
+    uint64_t DeviceObject = 0;
+    uint64_t DriverObject = 0;
+    uint32_t DeviceType = 0;
     uint32_t TargetPid = 0;
     uint64_t TargetEprocess = 0;
     std::wstring TargetImage;
@@ -40,6 +48,9 @@ struct HandleTableScanOptions
     bool SuspiciousOnly = false;
     bool CollectRecords = true;
     uint32_t Limit = 0;
+    bool ContinueHandles = false;
+    uint64_t HandleAfter = 0;
+    uint32_t MaxHandlesPerPass = 4096;
 };
 
 struct HandleTableScanResult
@@ -53,6 +64,20 @@ struct HandleTableScanResult
     uint64_t SuspiciousHandles = 0;
     bool Truncated = false;
     bool CoverageComplete = false;
+    bool ObjectTypeCoverageComplete = false;
+    uint64_t ObjectTypeReadFailures = 0;
+    bool ProcessInventoryRequested = false;
+    bool ProcessInventoryComplete = false;
+    bool RelationshipCoverageComplete = false;
+    uint64_t RelationshipReadFailures = 0;
+    uint64_t RelationshipUnsupported = 0;
+    uint64_t HandleCandidates = 0;
+    uint64_t HandlesVisited = 0;
+    uint64_t InvalidHandleEntries = 0;
+    uint64_t NextHandleAfter = 0;
+    uint64_t RelationshipReadAttempts = 0;
+    bool HandleCoveragePartial = false;
+    bool RelationshipBudgetExhausted = false;
 };
 
 class HandleTableScanner
@@ -68,4 +93,6 @@ private:
 };
 
 std::wstring BuildHandleTableJson(const HandleTableScanResult& result);
+std::wstring HandleTableRecordIdentity(const HandleTableRecord& record);
 bool HandleTableAccessMaskSelfTest();
+std::vector<uint32_t> SelectHandleOwnerBatch(std::vector<uint32_t> pids, uint64_t* afterPid, size_t limit);

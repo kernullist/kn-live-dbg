@@ -1,12 +1,14 @@
 #include "LeftoverCommon.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/KnLiveDbgPaging.h"
 
 #include <Windows.h>
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <utility>
 
 #ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((LONG)0xC0000004L)
@@ -52,6 +54,78 @@ namespace
         SYSTEM_BIGPOOL_ENTRY_LOCAL Entries[1];
     } SYSTEM_BIGPOOL_INFORMATION_LOCAL;
 #pragma pack(pop)
+
+    template <typename Range, typename GetBounds>
+    bool SortedRangesDisjoint(const std::vector<Range>& ranges, GetBounds getBounds)
+    {
+        uint64_t previousEnd = 0;
+        for (const Range& range : ranges)
+        {
+            const auto bounds = getBounds(range);
+            if (bounds.first >= bounds.second || bounds.first < previousEnd)
+            {
+                return false;
+            }
+            previousEnd = bounds.second;
+        }
+        return true;
+    }
+
+    bool ModuleRangesDisjoint(const std::vector<LeftoverModuleRange>& ranges)
+    {
+        return SortedRangesDisjoint(ranges, [](const LeftoverModuleRange& range)
+        {
+            return std::make_pair(range.Base, range.End);
+        });
+    }
+
+    bool BigPoolRangesDisjoint(const std::vector<LeftoverBigPoolEntry>& entries)
+    {
+        return SortedRangesDisjoint(entries, [](const LeftoverBigPoolEntry& entry)
+        {
+            uint64_t end = 0;
+            LeftoverTryAdd(entry.VirtualAddress, entry.SizeInBytes, &end);
+            return std::make_pair(entry.VirtualAddress, end);
+        });
+    }
+
+    bool DecodePagePermissions(
+        const PhysicalTranslationInfo& info,
+        bool* writable,
+        bool* executable)
+    {
+        *writable = false;
+        *executable = false;
+        const bool la57 = (info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0;
+        if (info.PagingLevels != (la57 ? 5u : 4u))
+        {
+            return false;
+        }
+
+        const uint64_t entries[] =
+        {
+            info.Pml5e, info.Pml4e, info.Pdpte, info.Pde, info.Pte
+        };
+        bool writeOk = true;
+        bool nxClear = true;
+        for (size_t index = la57 ? 0 : 1; index < 5; ++index)
+        {
+            const uint64_t entry = entries[index];
+            if (!KnDbgPresentPagingEntryValid(entry, static_cast<unsigned int>(5 - index)))
+            {
+                return false;
+            }
+            writeOk = writeOk && (entry & 2ull) != 0;
+            nxClear = nxClear && (entry & (1ull << 63)) == 0;
+            if (index == 4 || ((index == 2 || index == 3) && (entry & 0x80ull) != 0))
+            {
+                *writable = writeOk;
+                *executable = nxClear;
+                return true;
+            }
+        }
+        return false;
+    }
 
     std::wstring ToLowerCopy(const std::wstring& value)
     {
@@ -147,9 +221,9 @@ bool LeftoverTryAdd(uint64_t left, uint64_t right, uint64_t* result)
     return ok;
 }
 
-bool LeftoverIsKernelCanonical(uint64_t address)
+bool LeftoverIsKernelCanonical(uint64_t address, bool la57)
 {
-    return address >= kLeftoverKernelMinLa48;
+    return address >= (la57 ? 0xFF00000000000000ull : kLeftoverKernelMinLa48);
 }
 
 bool LeftoverIsLikelyUserAddress(uint64_t address)
@@ -230,61 +304,24 @@ bool LeftoverProbePagePermissions(
             break;
         }
 
-        const bool la57 = (info.Flags & KNDBG_TRANSLATE_FLAG_LA57_ACTIVE) != 0;
-        const uint64_t levels[5] = {
-            info.Pml5e,
-            info.Pml4e,
-            info.Pdpte,
-            info.Pde,
-            info.Pte
-        };
-        const size_t startIndex = la57 ? 0 : 1;
-        size_t walkCount = info.PagingLevels;
-        if (walkCount > 5)
+        bool writeOk = false;
+        bool nxClear = false;
+        if (!DecodePagePermissions(info, &writeOk, &nxClear))
         {
-            walkCount = 5;
-        }
-
-        bool mapped = walkCount > 0;
-        bool writeOk = walkCount > 0;
-        bool nxClear = walkCount > 0;
-        for (size_t step = 0; step < walkCount; ++step)
-        {
-            const size_t levelIdx = startIndex + step;
-            if (levelIdx >= 5)
-            {
-                break;
-            }
-            const uint64_t pte = levels[levelIdx];
-            if ((pte & 1ull) == 0)
-            {
-                mapped = false;
-            }
-            if ((pte & (1ull << 1)) == 0)
-            {
-                writeOk = false;
-            }
-            if ((pte & (1ull << 63)) != 0)
-            {
-                nxClear = false;
-            }
-            if ((levelIdx == 2 || levelIdx == 3) && (pte & (1ull << 7)) != 0)
-            {
-                break;
-            }
+            break;
         }
 
         if (present != nullptr)
         {
-            *present = mapped;
+            *present = true;
         }
         if (writable != nullptr)
         {
-            *writable = mapped && writeOk;
+            *writable = writeOk;
         }
         if (executable != nullptr)
         {
-            *executable = mapped && nxClear;
+            *executable = nxClear;
         }
         if (physicalAddress != nullptr)
         {
@@ -302,7 +339,7 @@ bool LeftoverIsPageTableSelfMap(uint64_t address, uint64_t pteBase, bool la57)
 
     do
     {
-        if (pteBase == 0 || !LeftoverIsKernelCanonical(pteBase))
+        if (pteBase == 0 || !LeftoverIsKernelCanonical(pteBase, la57))
         {
             // Classic Win10 LA48 self-map window when MmPteBase is unresolved.
             if (!la57 &&
@@ -314,15 +351,10 @@ bool LeftoverIsPageTableSelfMap(uint64_t address, uint64_t pteBase, bool la57)
             break;
         }
 
-        // LA48 PTE array is 512 GB; LA57 is much larger. Use a conservative
-        // window that still covers PDE/PPE/PXE layers above the PTE base.
-        const uint64_t window = la57 ? (1ull << 48) : (1ull << 40);
-        uint64_t end = 0;
-        if (!LeftoverTryAdd(pteBase, window, &end))
-        {
-            break;
-        }
-        if (address >= pteBase && address < end)
+        // One PTE per virtual page, including the recursive upper levels.
+        // Extending past this array suppresses unrelated executable mappings.
+        const uint64_t window = la57 ? (1ull << 48) : (1ull << 39);
+        if (address >= pteBase && address - pteBase < window)
         {
             inside = true;
         }
@@ -347,7 +379,7 @@ uint64_t LeftoverDecodeVaFromPteAddress(uint64_t pteAddress, uint64_t pteBase, b
         {
             break;
         }
-        if (delta > (la57 ? (1ull << 48) : (1ull << 40)))
+        if (delta >= (la57 ? (1ull << 48) : (1ull << 39)))
         {
             break;
         }
@@ -635,24 +667,33 @@ bool LeftoverReadUnicodeString(
 
 void LeftoverBuildModuleRanges(
     const SymbolEngine& symbols,
-    std::vector<LeftoverModuleRange>* ranges)
+    std::vector<LeftoverModuleRange>* ranges,
+    bool* complete)
 {
+    if (complete != nullptr)
+    {
+        *complete = false;
+    }
     if (ranges == nullptr)
     {
         return;
     }
 
     ranges->clear();
-    ranges->reserve(symbols.Modules().size());
-    for (const KernelModuleInfo& module : symbols.Modules())
+    const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
+    bool allValid = !modules.empty();
+    ranges->reserve(modules.size());
+    for (const KernelModuleInfo& module : modules)
     {
         uint64_t end = 0;
-        if (module.Base == 0 || module.Size == 0)
+        if (!LeftoverIsKernelCanonical(module.Base, true) || module.Size == 0)
         {
+            allValid = false;
             continue;
         }
         if (!LeftoverTryAdd(module.Base, module.Size, &end))
         {
+            allValid = false;
             continue;
         }
 
@@ -670,6 +711,15 @@ void LeftoverBuildModuleRanges(
         {
             return left.Base < right.Base;
         });
+    if (!ModuleRangesDisjoint(*ranges))
+    {
+        ranges->clear();
+        allValid = false;
+    }
+    if (complete != nullptr)
+    {
+        *complete = allValid;
+    }
 }
 
 const LeftoverModuleRange* LeftoverFindModule(
@@ -776,6 +826,26 @@ bool LeftoverLooksLikeDriverName(const std::wstring& name)
     } while (false);
 
     return ok;
+}
+
+bool LeftoverValidateBigPoolRange(uint64_t address, uint64_t size)
+{
+    uint64_t end = 0;
+    return LeftoverIsKernelCanonical(address) && size != 0 &&
+        LeftoverTryAdd(address, size, &end);
+}
+
+bool LeftoverValidateCountedBuffer(
+    uint64_t allocatedBytes,
+    uint64_t returnedBytes,
+    uint64_t headerBytes,
+    uint64_t entryBytes,
+    uint64_t declaredCount)
+{
+    return entryBytes != 0 &&
+        headerBytes <= returnedBytes &&
+        returnedBytes <= allocatedBytes &&
+        declaredCount <= (returnedBytes - headerBytes) / entryBytes;
 }
 
 bool LeftoverQueryBigPool(LeftoverBigPoolSnapshot* snapshot, std::wstring* error)
@@ -900,24 +970,30 @@ bool LeftoverQueryBigPool(LeftoverBigPoolSnapshot* snapshot, std::wstring* error
             break;
         }
 
-        auto info = reinterpret_cast<SYSTEM_BIGPOOL_INFORMATION_LOCAL*>(raw);
-        snapshot->TotalEntries = info->Count;
-        snapshot->Entries.reserve(info->Count);
-        const uint8_t* base = reinterpret_cast<const uint8_t*>(raw);
-        const uint8_t* end = base + returnLength;
-        const uint8_t* first = reinterpret_cast<const uint8_t*>(&info->Entries[0]);
-        if (first > end)
+        const uint64_t headerBytes = FIELD_OFFSET(SYSTEM_BIGPOOL_INFORMATION_LOCAL, Entries);
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), 0))
         {
             if (error != nullptr)
             {
-                *error = L"SystemBigPoolInformation buffer is truncated";
+                *error = L"SystemBigPoolInformation returned an invalid buffer length";
             }
             break;
         }
 
-        const size_t maxEntries =
-            static_cast<size_t>(end - first) / sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL);
-        const ULONG count = (info->Count < maxEntries) ? info->Count : static_cast<ULONG>(maxEntries);
+        const auto info = reinterpret_cast<const SYSTEM_BIGPOOL_INFORMATION_LOCAL*>(raw);
+        const ULONG count = info->Count;
+        snapshot->TotalEntries = count;
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), count))
+        {
+            if (error != nullptr)
+            {
+                *error = L"SystemBigPoolInformation count exceeds the returned buffer; table view is incomplete";
+            }
+            break;
+        }
+        snapshot->Entries.reserve(count);
         for (ULONG index = 0; index < count; ++index)
         {
             const SYSTEM_BIGPOOL_ENTRY_LOCAL& src = info->Entries[index];
@@ -927,10 +1003,20 @@ bool LeftoverQueryBigPool(LeftoverBigPoolSnapshot* snapshot, std::wstring* error
             entry.VirtualAddress = static_cast<uint64_t>(packed & ~static_cast<ULONG_PTR>(1));
             entry.SizeInBytes = src.SizeInBytes;
             entry.TagRaw = src.TagUlong;
-            if (entry.VirtualAddress != 0 && entry.SizeInBytes != 0)
+            if (!LeftoverValidateBigPoolRange(entry.VirtualAddress, entry.SizeInBytes))
             {
-                snapshot->Entries.push_back(entry);
+                snapshot->Entries.clear();
+                if (error != nullptr)
+                {
+                    *error = L"SystemBigPoolInformation contains an invalid allocation range";
+                }
+                break;
             }
+            snapshot->Entries.push_back(entry);
+        }
+        if (snapshot->Entries.size() != count)
+        {
+            break;
         }
 
         std::sort(
@@ -940,6 +1026,15 @@ bool LeftoverQueryBigPool(LeftoverBigPoolSnapshot* snapshot, std::wstring* error
             {
                 return left.VirtualAddress < right.VirtualAddress;
             });
+        if (!BigPoolRangesDisjoint(snapshot->Entries))
+        {
+            snapshot->Entries.clear();
+            if (error != nullptr)
+            {
+                *error = L"SystemBigPoolInformation contains overlapping allocation ranges";
+            }
+            break;
+        }
         snapshot->Queried = true;
         ok = true;
     } while (false);
@@ -1060,6 +1155,121 @@ bool LeftoverCommonSelfTest()
             break;
         }
 
+        for (unsigned int level = 1; level <= 5; ++level)
+        {
+            if (!KnDbgPresentPagingEntryValid(3, level) ||
+                !KnDbgPresentPagingEntryValid((1ull << 63) | 3ull, level) ||
+                KnDbgPresentPagingEntryValid(2, level))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok || KnDbgPresentPagingEntryValid(3, 0) ||
+            KnDbgPresentPagingEntryValid(3, 6) ||
+            KnDbgPresentPagingEntryValid(0x83, 4) ||
+            KnDbgPresentPagingEntryValid(0x83, 5) ||
+            !KnDbgPresentPagingEntryValid(0x1083, 1) ||
+            !KnDbgPresentPagingEntryValid(0x201083, 2) ||
+            !KnDbgPresentPagingEntryValid(0x40001083, 3))
+        {
+            ok = false;
+            break;
+        }
+        for (unsigned int bit = 13; bit <= 29; ++bit)
+        {
+            const uint64_t entry = 0x83ull | (1ull << bit);
+            if (KnDbgPresentPagingEntryValid(entry, 3) ||
+                (bit <= 20 && KnDbgPresentPagingEntryValid(entry, 2)))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+        {
+            break;
+        }
+
+        PhysicalTranslationInfo permissions = {};
+        permissions.PagingLevels = 4;
+        permissions.Pml4e = 3;
+        permissions.Pdpte = 3;
+        permissions.Pde = 3;
+        permissions.Pte = 0x1083;
+        bool writable = false;
+        bool executable = false;
+        if (!DecodePagePermissions(permissions, &writable, &executable) ||
+            !writable || !executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pml4e = (1ull << 63) | 1ull;
+        if (!DecodePagePermissions(permissions, &writable, &executable) ||
+            writable || executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pml4e = 3;
+        permissions.Pde = 0x201083;
+        permissions.Pte = 0;
+        if (!DecodePagePermissions(permissions, &writable, &executable) ||
+            !writable || !executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pde |= 1ull << 13;
+        if (DecodePagePermissions(permissions, &writable, &executable) ||
+            writable || executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pdpte = (1ull << 63) | 0x40001083ull;
+        permissions.Pde = 0;
+        if (!DecodePagePermissions(permissions, &writable, &executable) ||
+            !writable || executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pdpte |= 1ull << 29;
+        if (DecodePagePermissions(permissions, &writable, &executable))
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pdpte = 0x40001083;
+        permissions.PagingLevels = 3;
+        if (DecodePagePermissions(permissions, &writable, &executable))
+        {
+            ok = false;
+            break;
+        }
+        permissions.PagingLevels = 5;
+        permissions.Pml5e = 3;
+        if (DecodePagePermissions(permissions, &writable, &executable))
+        {
+            ok = false;
+            break;
+        }
+        permissions.Flags = KNDBG_TRANSLATE_FLAG_LA57_ACTIVE;
+        if (!DecodePagePermissions(permissions, &writable, &executable) ||
+            !writable || !executable)
+        {
+            ok = false;
+            break;
+        }
+        permissions.Pml5e |= 0x80;
+        if (DecodePagePermissions(permissions, &writable, &executable))
+        {
+            ok = false;
+            break;
+        }
+
         const uint64_t pteBase = 0xFFFFF68000000000ull;
         const uint64_t va = 0xFFFFF80012345000ull;
         const uint64_t va48 = va & 0x0000FFFFFFFFFFFFull;
@@ -1075,12 +1285,39 @@ bool LeftoverCommonSelfTest()
             ok = false;
             break;
         }
+        if (LeftoverDecodeVaFromPteAddress(pteBase + (1ull << 39) + 8, pteBase, false) != 0 ||
+            LeftoverIsKernelCanonical(0xFF00000000000000ull) ||
+            !LeftoverIsKernelCanonical(0xFF00000000000000ull, true) ||
+            !LeftoverIsKernelCanonical(0xFFFF000000000000ull, true) ||
+            LeftoverIsKernelCanonical(0xFEFFFFFFFFFFFFFFull, true))
+        {
+            ok = false;
+            break;
+        }
         if (!LeftoverIsPageTableSelfMap(pteBase + 0x1000, pteBase, false))
         {
             ok = false;
             break;
         }
         if (LeftoverIsPageTableSelfMap(0xFFFFF80000000000ull, pteBase, false))
+        {
+            ok = false;
+            break;
+        }
+        if (!LeftoverIsPageTableSelfMap(pteBase + (1ull << 39) - 1, pteBase, false) ||
+            LeftoverIsPageTableSelfMap(pteBase + (1ull << 39), pteBase, false) ||
+            LeftoverIsPageTableSelfMap(pteBase + (1ull << 39) + 0x1000, pteBase, false))
+        {
+            ok = false;
+            break;
+        }
+        if (!LeftoverValidateCountedBuffer(0x1000, 56, 8, 24, 2) ||
+            !LeftoverValidateCountedBuffer(0x1000, 8, 8, 24, 0) ||
+            LeftoverValidateCountedBuffer(0x1000, 0x1001, 8, 24, 2) ||
+            LeftoverValidateCountedBuffer(0x1000, 7, 8, 24, 0) ||
+            LeftoverValidateCountedBuffer(0x1000, 55, 8, 24, 2) ||
+            LeftoverValidateCountedBuffer(0x1000, 56, 8, 24, ~0ull) ||
+            LeftoverValidateCountedBuffer(0x1000, 56, 8, 0, 2))
         {
             ok = false;
             break;
@@ -1110,6 +1347,29 @@ bool LeftoverCommonSelfTest()
             ok = false;
             break;
         }
+        if (!ModuleRangesDisjoint(ranges) || ModuleRangesDisjoint({ first, first }))
+        {
+            ok = false;
+            break;
+        }
+        LeftoverModuleRange nested = first;
+        nested.Base += 0x1000;
+        nested.End = nested.Base + 0x1000;
+        if (ModuleRangesDisjoint({ first, nested }))
+        {
+            ok = false;
+            break;
+        }
+        LeftoverModuleRange adjacent = first;
+        adjacent.Base = first.End;
+        adjacent.End = adjacent.Base + 0x1000;
+        const std::vector<LeftoverModuleRange> adjacentModules = { first, adjacent };
+        if (!ModuleRangesDisjoint(adjacentModules) ||
+            LeftoverFindModule(adjacentModules, first.End) != &adjacentModules[1])
+        {
+            ok = false;
+            break;
+        }
 
         if (!LeftoverNamesMatch(L"\\SystemRoot\\System32\\drivers\\Foo.SYS", L"foo.sys") ||
             !LeftoverLooksLikeDriverName(L"capcom.sys") ||
@@ -1135,6 +1395,28 @@ bool LeftoverCommonSelfTest()
         pool.Entries.push_back(entry);
         if (LeftoverFindBigPool(pool, 0xFFFFC08000001000ull) == nullptr ||
             LeftoverFindBigPool(pool, 0xFFFFC08000004000ull) != nullptr)
+        {
+            ok = false;
+            break;
+        }
+        if (!BigPoolRangesDisjoint(pool.Entries) || BigPoolRangesDisjoint({ entry, entry }))
+        {
+            ok = false;
+            break;
+        }
+        LeftoverBigPoolEntry nestedPool = entry;
+        nestedPool.VirtualAddress += 0x1000;
+        nestedPool.SizeInBytes = 0x1000;
+        if (BigPoolRangesDisjoint({ entry, nestedPool }))
+        {
+            ok = false;
+            break;
+        }
+        LeftoverBigPoolEntry adjacentPool = entry;
+        adjacentPool.VirtualAddress += entry.SizeInBytes;
+        pool.Entries.push_back(adjacentPool);
+        if (!BigPoolRangesDisjoint(pool.Entries) ||
+            LeftoverFindBigPool(pool, adjacentPool.VirtualAddress) != &pool.Entries[1])
         {
             ok = false;
             break;

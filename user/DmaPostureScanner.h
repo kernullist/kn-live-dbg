@@ -31,8 +31,11 @@ struct DmaPostureScanResult
     bool DmarPresent = false;
     bool IvrsPresent = false;
     bool IommuFirmwarePresent = false;
+    bool FirmwareInventoryComplete = false;
     bool KernelDmaProtectionEnabled = false;
     bool KernelDmaProtectionResolved = false;
+    bool DmaGuardConfigurationKnown = false;
+    uint32_t DmaGuardConfigurationValue = 0;
     std::wstring DmaSecurityPath;
     std::wstring DmaSecurityValue;
     uint32_t RemovableBusCount = 0;

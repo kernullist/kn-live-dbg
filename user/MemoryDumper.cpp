@@ -12,6 +12,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1265,6 +1266,15 @@ bool DumpPeToFileWithReader(
         result->ImageBase = imageBase;
         result->SizeOfImage = sizeOfImage;
 
+        if (sizeOfImage == 0 || address > UINT64_MAX - (sizeOfImage - 1))
+        {
+            if (error != nullptr)
+            {
+                *error = L"PE image address range overflows";
+            }
+            break;
+        }
+
         // Keep in-memory OptionalHeader/reloc metadata as-is. After ASLR the
         // ImageBase field usually equals the dump VA and no longer matches the
         // on-disk preferred base; say so before offline tools mis-read it.
@@ -1306,6 +1316,9 @@ bool DumpPeToFileWithReader(
         // Re-read the entire header region if SizeOfHeaders > initial read.
         if (sizeOfHeaders > headerBytes.size())
         {
+            const size_t ntHeaderSize = is64 ? sizeof(IMAGE_NT_HEADERS64) : sizeof(IMAGE_NT_HEADERS32);
+            const std::vector<uint8_t> originalNt(headerBytes.begin() + ntOffset,
+                headerBytes.begin() + ntOffset + ntHeaderSize);
             std::wstring rereadError;
             if (!ReadRangeWithReader(reader,
                                  address,
@@ -1356,6 +1369,14 @@ bool DumpPeToFileWithReader(
                 }
                 break;
             }
+            if (std::memcmp(originalNt.data(), headerBytes.data() + ntOffset, ntHeaderSize) != 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"NT header changed between header reads; aborting inconsistent PE dump";
+                }
+                break;
+            }
         }
 
         size_t sectionTableEnd =
@@ -1374,7 +1395,8 @@ bool DumpPeToFileWithReader(
             reinterpret_cast<const IMAGE_SECTION_HEADER*>(headerBytes.data() + sectionTableOffset);
 
         // Compute output file size: max of (SizeOfHeaders, max(PointerToRawData + SizeOfRawData)).
-        uint64_t outputFileSize = sizeOfHeaders;
+        uint64_t outputFileSize = (std::max)(static_cast<uint64_t>(sizeOfHeaders),
+            static_cast<uint64_t>(sectionTableEnd));
         for (uint16_t i = 0; i < numberOfSections; ++i)
         {
             uint64_t end = static_cast<uint64_t>(sections[i].PointerToRawData) +
@@ -1403,7 +1425,7 @@ bool DumpPeToFileWithReader(
         // section table end, bump the copy length so the section table makes
         // it into the on-disk image -- otherwise IDA/Ghidra will refuse to
         // parse the result. outputFileSize already includes max(SizeOfHeaders,
-        // ...), so the output buffer is large enough.
+        // ...), plus sectionTableEnd, so the output buffer is large enough.
         size_t headerCopyBytes = sizeOfHeaders;
         if (sectionTableEnd > headerCopyBytes)
         {
@@ -1625,6 +1647,109 @@ bool FindPidsByImageName(
 // handle-first reader (no driver, no elevation), raw range write, and the
 // PE rebuild all run against this process's ntdll and the output files must
 // carry a real MZ image. Self-test only.
+static bool DumpPeHeaderMutationSelfTest(const std::wstring& path)
+{
+    constexpr uint64_t base = 0x180000000ull;
+    std::vector<uint8_t> image(0x2000, 0);
+    IMAGE_DOS_HEADER dos = {};
+    dos.e_magic = IMAGE_DOS_SIGNATURE;
+    dos.e_lfanew = 0x80;
+    memcpy(image.data(), &dos, sizeof(dos));
+    IMAGE_NT_HEADERS64 nt = {};
+    nt.Signature = IMAGE_NT_SIGNATURE;
+    nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt.FileHeader.NumberOfSections = 1;
+    nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt.OptionalHeader.ImageBase = base;
+    nt.OptionalHeader.SizeOfHeaders = 0x2000;
+    nt.OptionalHeader.SizeOfImage = 0x4000;
+    memcpy(image.data() + dos.e_lfanew, &nt, sizeof(nt));
+    for (unsigned mutation = 0; mutation < 4; ++mutation)
+    {
+        unsigned reads = 0;
+        MemoryChunkReader reader = [&](uint64_t address, uint32_t length,
+            std::vector<uint8_t>* bytes, std::wstring*)
+        {
+            if (address != base || length > image.size())
+            {
+                return false;
+            }
+            bytes->assign(image.begin(), image.begin() + length);
+            if (++reads == 2 && mutation != 0)
+            {
+                IMAGE_NT_HEADERS64 changed = nt;
+                if (mutation == 1)
+                {
+                    changed.OptionalHeader.SizeOfImage += 0x1000;
+                }
+                else if (mutation == 2)
+                {
+                    changed.FileHeader.NumberOfSections = 2;
+                }
+                else
+                {
+                    changed.OptionalHeader.SizeOfHeaders += 0x1000;
+                }
+                memcpy(bytes->data() + dos.e_lfanew, &changed, sizeof(changed));
+            }
+            return true;
+        };
+        DumpPeResult result;
+        std::wstring error;
+        const bool dumped = DumpPeToFileWithReader(reader, base, path, &result, &error);
+        if (dumped != (mutation == 0) || reads != 2)
+        {
+            return false;
+        }
+        // A rejected capture must preserve the previous complete artifact.
+        std::ifstream file(path, std::ios::binary);
+        const std::vector<uint8_t> written((std::istreambuf_iterator<char>(file)),
+            std::istreambuf_iterator<char>());
+        if (written != image)
+        {
+            return false;
+        }
+    }
+
+    // A readable header near the VA limit must never wrap a section read.
+    unsigned reads = 0;
+    MemoryChunkReader boundaryReader = [&](uint64_t, uint32_t length,
+        std::vector<uint8_t>* bytes, std::wstring*)
+    {
+        ++reads;
+        if (length > image.size())
+        {
+            return false;
+        }
+        bytes->assign(image.begin(), image.begin() + length);
+        return true;
+    };
+    DumpPeResult result;
+    std::wstring error;
+    if (DumpPeToFileWithReader(boundaryReader, UINT64_MAX - 0x1fffull, path, &result, &error) || reads != 1)
+    {
+        return false;
+    }
+
+    // Header recovery must retain a section table beyond SizeOfHeaders.
+    nt.OptionalHeader.SizeOfHeaders = 0x100;
+    memcpy(image.data() + dos.e_lfanew, &nt, sizeof(nt));
+    if (!DumpPeToFileWithReader(boundaryReader, base, path, &result, &error))
+    {
+        return false;
+    }
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<uint8_t> written((std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+    const size_t tableEnd = dos.e_lfanew + sizeof(nt) + sizeof(IMAGE_SECTION_HEADER);
+    if (written.size() != tableEnd || !std::equal(written.begin(), written.end(), image.begin()))
+    {
+        return false;
+    }
+    return true;
+}
+
 bool DumpUserModeSelfTest()
 {
     bool ok = false;
@@ -1654,12 +1779,22 @@ bool DumpUserModeSelfTest()
         }
 
         wchar_t tempDir[MAX_PATH] = {};
-        if (GetTempPathW(MAX_PATH, tempDir) == 0)
+        const DWORD tempLength = GetTempPathW(MAX_PATH, tempDir);
+        if (tempLength == 0 || tempLength >= MAX_PATH)
         {
             break;
         }
-        rawPath = std::wstring(tempDir) + L"knlivedbg-dumpuser-raw-selftest.bin";
-        pePath = std::wstring(tempDir) + L"knlivedbg-dumpuser-pe-selftest.bin";
+        wchar_t tempFile[MAX_PATH] = {};
+        if (GetTempFileNameW(tempDir, L"knr", 0, tempFile) == 0)
+        {
+            break;
+        }
+        rawPath = tempFile;
+        if (GetTempFileNameW(tempDir, L"knp", 0, tempFile) == 0)
+        {
+            break;
+        }
+        pePath = tempFile;
 
         DumpRawResult raw = {};
         std::wstring rawError;
@@ -1719,7 +1854,7 @@ bool DumpUserModeSelfTest()
         {
             break;
         }
-        ok = true;
+        ok = DumpPeHeaderMutationSelfTest(pePath);
     } while (false);
 
     if (!rawPath.empty())
@@ -1916,19 +2051,24 @@ namespace
             _wcsicmp(imageName.c_str(), L"ntkrpamp.exe") == 0;
     }
 
-    const KernelModuleInfo* FindNtModule(SymbolEngine& symbols)
+    std::optional<KernelModuleInfo> FindNtModule(const std::vector<KernelModuleInfo>& modules)
     {
-        const KernelModuleInfo* nt = nullptr;
-        for (const KernelModuleInfo& module : symbols.Modules())
+        std::optional<KernelModuleInfo> nt;
+        for (const KernelModuleInfo& module : modules)
         {
             if (ModuleNameIsNt(module.ImageName))
             {
-                nt = &module;
+                nt = module;
                 break;
             }
         }
 
         return nt;
+    }
+
+    std::optional<KernelModuleInfo> FindNtModule(SymbolEngine& symbols)
+    {
+        return FindNtModule(symbols.CopyModules());
     }
 
     bool KdbgLooksPlausible(DeviceClient& device, uint64_t address, uint64_t ntBase)
@@ -2053,11 +2193,11 @@ namespace
         std::vector<std::wstring>* warnings)
     {
         uint64_t kdBlock = 0;
-        const KernelModuleInfo* nt = FindNtModule(symbols);
+        const std::optional<KernelModuleInfo> nt = FindNtModule(symbols);
 
         uint64_t symbolBlock = 0;
         if (ResolveOptionalSymbol(symbols, L"nt!KdDebuggerDataBlock", &symbolBlock, warnings) &&
-            KdbgLooksPlausible(device, symbolBlock, nt != nullptr ? nt->Base : 0))
+            KdbgLooksPlausible(device, symbolBlock, nt.has_value() ? nt->Base : 0))
         {
             kdBlock = symbolBlock;
         }
@@ -2082,7 +2222,7 @@ namespace
             }
         }
 
-        if (kdBlock == 0 && nt != nullptr)
+        if (kdBlock == 0 && nt.has_value())
         {
             uint64_t scanned = 0;
             if (ScanNtForUnencodedKdbg(device, nt->Base, nt->Size, &scanned))
@@ -5655,8 +5795,8 @@ namespace
 
         if (context.Rip == 0)
         {
-            const KernelModuleInfo* nt = FindNtModule(symbols);
-            if (nt != nullptr && IsKernelCanonicalVa(nt->Base))
+            const std::optional<KernelModuleInfo> nt = FindNtModule(symbols);
+            if (nt.has_value() && IsKernelCanonicalVa(nt->Base))
             {
                 context.Rip = nt->Base;
             }
@@ -7799,8 +7939,8 @@ bool DumpProcessVisibleMemoryToCrashDump(
                 L"PsLoadedModuleList");
         }
 
-        const KernelModuleInfo* nt = FindNtModule(symbols);
-        if (nt != nullptr)
+        const std::optional<KernelModuleInfo> nt = FindNtModule(symbols);
+        if (nt.has_value())
         {
             AddTranslatedVirtualPage(
                 device,
@@ -8183,6 +8323,20 @@ bool DecodeKdbgSelfTest()
 
     do
     {
+        KernelModuleInfo fixture = {};
+        fixture.Base = 0xfffff804afa00000ull;
+        fixture.Size = 0x100000;
+        fixture.ImageName = L"ntoskrnl.exe";
+        fixture.ImagePath = L"\\SystemRoot\\System32\\ntoskrnl.exe";
+        const auto ntCopy = FindNtModule(std::vector<KernelModuleInfo>{fixture});
+        fixture.ImageName.assign(128, L'X');
+        if (!ntCopy.has_value() || ntCopy->Base != fixture.Base ||
+            ntCopy->ImageName != L"ntoskrnl.exe" ||
+            ntCopy->ImagePath != L"\\SystemRoot\\System32\\ntoskrnl.exe" ||
+            FindNtModule(std::vector<KernelModuleInfo>{}).has_value())
+        {
+            break;
+        }
         std::vector<uint8_t> plain(64, 0);
         const uint32_t tag = kKdbgOwnerTag;
         const uint32_t size = 0x380;

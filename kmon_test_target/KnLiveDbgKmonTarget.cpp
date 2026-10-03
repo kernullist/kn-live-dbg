@@ -320,6 +320,54 @@ namespace
         return true;
     }
 
+    bool ApplyMappedSection(bool executable)
+    {
+        bool ok = false;
+        HANDLE mapping = nullptr;
+        void* view = nullptr;
+        do
+        {
+            mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                PAGE_EXECUTE_READWRITE, 0, 0x1000, nullptr);
+            if (mapping == nullptr)
+            {
+                break;
+            }
+            view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE,
+                0, 0, 0x1000);
+            if (view == nullptr)
+            {
+                break;
+            }
+            auto* bytes = static_cast<uint8_t*>(view);
+            for (size_t index = 0; index < 0x1000; ++index)
+            {
+                bytes[index] = static_cast<uint8_t>(index & 0xff);
+            }
+            // Inert bytes only: the fixture never calls or jumps into this view.
+            DWORD oldProtection = 0;
+            const DWORD finalProtection = executable ? PAGE_EXECUTE_READ : PAGE_READONLY;
+            if (!VirtualProtect(view, 0x1000, finalProtection, &oldProtection))
+            {
+                break;
+            }
+            MEMORY_BASIC_INFORMATION region = {};
+            ok = VirtualQuery(view, &region, sizeof(region)) == sizeof(region) &&
+                region.Type == MEM_MAPPED &&
+                region.Protect == finalProtection;
+        } while (false);
+        if (!ok && view != nullptr)
+        {
+            UnmapViewOfFile(view);
+        }
+        if (mapping != nullptr)
+        {
+            CloseHandle(mapping);
+        }
+        // Successful views remain observable until this child exits.
+        return ok;
+    }
+
     std::vector<uint8_t> MinimalPeImage()
     {
         std::vector<uint8_t> pe(0x400, 0);
@@ -668,6 +716,10 @@ namespace
         {
             ok = ApplyOrphanImage();
         }
+        else if (scenario == L"orphan-mapped-rx" || scenario == L"mapped-readonly")
+        {
+            ok = ApplyMappedSection(scenario == L"orphan-mapped-rx");
+        }
         else if (scenario == L"hold" || scenario == L"masquerade" || scenario == L"ghost")
         {
             ok = true;
@@ -718,6 +770,8 @@ int wmain(int argc, wchar_t** argv)
         std::wprintf(L"  /nomz             wipe MZ at ImageBase (exe_no_mz)\n");
         std::wprintf(L"  /orphan-private   private RX page with MZ (exe_orphan_private)\n");
         std::wprintf(L"  /orphan-image     delete-pending SEC_IMAGE map (exe_orphan_image)\n");
+        std::wprintf(L"  /orphan-mapped-rx headerless executable section, never executed\n");
+        std::wprintf(L"  /mapped-readonly same bytes without execute permission (negative control)\n");
         std::wprintf(L"  /replace-main     suspended self-copy, unmap EXE, private MZ (exe_private)\n");
         std::wprintf(L"  /ghost            running image then delete the file (ghost)\n");
         std::wprintf(L"  /seconds N        hold time (default 45; 0 = until killed)\n");

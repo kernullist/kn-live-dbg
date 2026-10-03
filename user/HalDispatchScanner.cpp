@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <optional>
 #include <sstream>
 
 namespace
@@ -30,7 +31,7 @@ namespace
         return true;
     }
 
-    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    std::optional<KernelModuleInfo> FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
         for (const KernelModuleInfo& module : symbols.Modules())
         {
@@ -41,10 +42,10 @@ namespace
             }
             if (address >= module.Base && address < end)
             {
-                return &module;
+                return module;
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     std::wstring NearestSymbolText(SymbolEngine& symbols, uint64_t address)
@@ -310,11 +311,11 @@ namespace
                 }
 
                 ++table->NonNullCount;
-                const KernelModuleInfo* owner = FindOwningModule(symbols, routine);
-                slot.Module = owner != nullptr ? owner->ImageName : std::wstring();
+                const std::optional<KernelModuleInfo> owner = FindOwningModule(symbols, routine);
+                slot.Module = owner.has_value() ? owner->ImageName : std::wstring();
                 slot.Symbol = NearestSymbolText(symbols, routine);
 
-                if (!IsKernelAddress(routine) || slot.Module.empty() || owner == nullptr)
+                if (!IsKernelAddress(routine) || slot.Module.empty() || !owner.has_value())
                 {
                     slot.Suspicious = true;
                     slot.Notes = L"HAL dispatch routine outside loaded kernel modules";

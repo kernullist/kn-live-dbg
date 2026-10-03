@@ -1,7 +1,12 @@
 #include "PoolPeHunter.h"
+#include "LeftoverCommon.h"
 #include "McpJson.h"
 
 #include <Windows.h>
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <set>
 #include <sstream>
 #include <iomanip>
 #include <cstdio>
@@ -51,6 +56,98 @@ namespace
         SYSTEM_BIGPOOL_ENTRY_LOCAL Entries[1];
     } SYSTEM_BIGPOOL_INFORMATION_LOCAL;
 #pragma pack(pop)
+
+    bool ValidatePoolPeEntries(const SYSTEM_BIGPOOL_ENTRY_LOCAL* entries, uint32_t count)
+    {
+        if (entries == nullptr && count != 0)
+        {
+            return false;
+        }
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const uint64_t address = reinterpret_cast<uint64_t>(entries[index].VirtualAddress) & ~1ull;
+            if (!LeftoverValidateBigPoolRange(address, entries[index].SizeInBytes))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool PoolPeAddressExcluded(
+        uint64_t address,
+        const std::vector<std::pair<uint64_t, uint64_t>>& ranges)
+    {
+        for (const auto& range : ranges)
+        {
+            if (address >= range.first && address < range.second)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint64_t PoolPePageOffset(uint64_t size, uint64_t round)
+    {
+        const uint64_t pages = size / kHeadBytesToRead + (size % kHeadBytesToRead != 0 ? 1 : 0);
+        return pages == 0 ? 0 : (round % pages) * kHeadBytesToRead;
+    }
+
+    bool ProbePoolPeSample(const uint8_t* bytes, size_t length, uint64_t remaining, PeHeaderProbe* probe)
+    {
+        return ProbeForPeHeader(bytes, length, probe) && PeProbeLooksLikeImage(*probe, remaining);
+    }
+
+    class PoolPeEntryWindow
+    {
+    public:
+        PoolPeEntryWindow(uint32_t count, const PoolPeHunter::Options& options) :
+            Total(count),
+            Next(options.ContinueScan && options.EntryOffset < count
+                ? static_cast<uint32_t>(options.EntryOffset) : 0),
+            Budget(count - Next),
+            HitLimit(options.LimitHits),
+            Bounded(options.ContinueScan)
+        {
+            if (Bounded && options.MaxEntries != 0)
+            {
+                Budget = (std::min)(Budget, options.MaxEntries);
+            }
+        }
+
+        bool Take(size_t retainedHits, uint32_t* index)
+        {
+            bool selected = false;
+            if (index != nullptr && Next < Total && Visited < Budget)
+            {
+                if (Bounded && HitLimit != 0 && retainedHits >= HitLimit)
+                {
+                    HitLimited = true;
+                }
+                else
+                {
+                    *index = Next++;
+                    ++Visited;
+                    selected = true;
+                }
+            }
+            return selected;
+        }
+
+        uint64_t NextOffset() const
+        {
+            return Next < Total ? Next : 0;
+        }
+
+        uint32_t Total = 0;
+        uint32_t Next = 0;
+        uint32_t Budget = 0;
+        uint32_t Visited = 0;
+        uint32_t HitLimit = 0;
+        bool Bounded = false;
+        bool HitLimited = false;
+    };
 
     bool EnableDebugPrivilege(std::wstring* warning)
     {
@@ -317,11 +414,12 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
         }
 
         const SIZE_T headerBytes = FIELD_OFFSET(SYSTEM_BIGPOOL_INFORMATION_LOCAL, Entries);
-        if (returnLength < headerBytes)
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), 0))
         {
             if (error != nullptr)
             {
-                *error = L"big pool response smaller than header";
+                *error = L"big pool response has an invalid returned buffer length";
             }
             break;
         }
@@ -331,16 +429,23 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
         const ULONG totalEntries = info->Count;
         result->TotalEntries = totalEntries;
 
-        const SIZE_T expectedBytes = headerBytes +
-            static_cast<SIZE_T>(totalEntries) * sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL);
-        const ULONG safeCount = static_cast<ULONG>(
-            (expectedBytes > returnLength)
-                ? (returnLength - headerBytes) / sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL)
-                : totalEntries);
-
-        if (expectedBytes > returnLength)
+        if (!LeftoverValidateCountedBuffer(
+                bufferSize, returnLength, headerBytes, sizeof(SYSTEM_BIGPOOL_ENTRY_LOCAL), totalEntries))
         {
-            result->Warnings.push_back(L"reported entry count exceeds returned buffer; clamping");
+            if (error != nullptr)
+            {
+                *error = L"big pool entry count exceeds the returned buffer; PE scan deferred";
+            }
+            break;
+        }
+        const ULONG safeCount = totalEntries;
+        if (!ValidatePoolPeEntries(info->Entries, safeCount))
+        {
+            if (error != nullptr)
+            {
+                *error = L"big pool contains an invalid allocation range; PE scan deferred";
+            }
+            break;
         }
 
         // Optionally ensure the dump directory exists up-front.
@@ -353,12 +458,44 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
             }
         }
 
-        for (ULONG i = 0; i < safeCount; ++i)
+        std::vector<uint32_t> order;
+        PoolPeHunter::Options windowOptions = options;
+        if (options.ScanInteriorPages && options.ContinueScan)
         {
-            const SYSTEM_BIGPOOL_ENTRY_LOCAL& src = info->Entries[i];
+            order.reserve(safeCount);
+            for (uint32_t index = 0; index < safeCount; ++index)
+            {
+                order.push_back(index);
+            }
+            const auto allocationAddress = [info](uint32_t index)
+            {
+                return reinterpret_cast<uint64_t>(info->Entries[index].VirtualAddress) & ~1ull;
+            };
+            std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right)
+            {
+                return allocationAddress(left) < allocationAddress(right);
+            });
+            const auto next = std::upper_bound(order.begin(), order.end(), options.AllocationAfter,
+                [&](uint64_t address, uint32_t index)
+                {
+                    return address < allocationAddress(index);
+                });
+            windowOptions.EntryOffset = static_cast<uint64_t>(next - order.begin());
+            if (next == order.end())
+            {
+                windowOptions.EntryOffset = 0;
+            }
+        }
+        PoolPeEntryWindow window(safeCount, windowOptions);
+        uint64_t lastAllocation = 0;
+        uint32_t i = 0;
+        while (window.Take(result->Hits.size(), &i))
+        {
+            const SYSTEM_BIGPOOL_ENTRY_LOCAL& src = info->Entries[order.empty() ? i : order[i]];
             ULONG_PTR raw = reinterpret_cast<ULONG_PTR>(src.VirtualAddress);
             bool nonPaged = (raw & 1ULL) != 0;
             ULONG_PTR address = raw & ~static_cast<ULONG_PTR>(1);
+            lastAllocation = static_cast<uint64_t>(address);
 
             if (nonPaged)
             {
@@ -367,6 +504,11 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
             else
             {
                 ++result->PagedCount;
+            }
+
+            if (PoolPeAddressExcluded(address, options.ExcludedAddressRanges))
+            {
+                continue;
             }
 
             if (!AppliesPagedFilter(options.Paged, nonPaged))
@@ -389,10 +531,14 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
                 continue;
             }
 
-            // Only NonPaged entries reliably support kernel-VA reads; allow Paged
-            // when explicitly requested but skip on failure quietly.
-            uint32_t readLength = (entrySize < kHeadBytesToRead)
-                ? static_cast<uint32_t>(entrySize)
+            // Paged allocations can disappear from the readable view between
+            // the table snapshot and this probe; preserve partial coverage.
+            const uint64_t pageOffset = options.ScanInteriorPages
+                ? PoolPePageOffset(entrySize, options.InteriorPageRound) : 0;
+            const uint64_t remaining = entrySize - pageOffset;
+            result->InteriorCoveragePartial = result->InteriorCoveragePartial || entrySize > kHeadBytesToRead;
+            uint32_t readLength = (remaining < kHeadBytesToRead)
+                ? static_cast<uint32_t>(remaining)
                 : kHeadBytesToRead;
             if (readLength < sizeof(IMAGE_DOS_HEADER))
             {
@@ -401,17 +547,21 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
 
             std::vector<uint8_t> head;
             std::wstring readError;
-            if (!device_.ReadMemory(static_cast<uint64_t>(address), readLength, &head, &readError))
+            const bool headRead = device_.ReadMemory(
+                static_cast<uint64_t>(address) + pageOffset, readLength, &head, &readError);
+            if (!headRead || head.size() != readLength)
             {
                 ++result->ReadFailures;
+            }
+            if (!headRead || head.size() < sizeof(IMAGE_DOS_HEADER))
+            {
                 continue;
             }
 
             ++result->Scanned;
 
             PeHeaderProbe probe;
-            if (!ProbeForPeHeader(head.data(), head.size(), &probe) ||
-                !PeProbeLooksLikeImage(probe, entrySize))
+            if (!ProbePoolPeSample(head.data(), head.size(), remaining, &probe))
             {
                 continue;
             }
@@ -427,6 +577,7 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
             // result->Hits.size(), suspicious == count of pushed wiped hits).
             if (options.LimitHits != 0 && result->Hits.size() >= options.LimitHits)
             {
+                result->HitLimitReached = true;
                 result->Diagnostics.push_back(L"hit limit reached; remaining entries elided");
                 break;
             }
@@ -437,8 +588,11 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
             }
 
             PoolPeHit hit;
-            hit.Address = static_cast<uint64_t>(address);
-            hit.SizeInBytes = entrySize;
+            hit.Address = static_cast<uint64_t>(address) + pageOffset;
+            hit.AllocationBase = static_cast<uint64_t>(address);
+            hit.AllocationSize = entrySize;
+            hit.PageOffset = pageOffset;
+            hit.SizeInBytes = remaining;
             hit.TagRaw = src.TagUlong;
             hit.TagText = FormatTagAscii(src.TagUlong);
             hit.NonPaged = nonPaged;
@@ -480,7 +634,33 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
 
             result->Hits.push_back(std::move(hit));
         }
+        result->EntriesVisited = window.Visited;
+        result->NextEntryOffset = window.NextOffset();
+        result->NextAllocationAfter = window.NextOffset() == 0 ? 0 : lastAllocation;
+        result->NextInteriorPageRound = options.InteriorPageRound;
+        if (options.ScanInteriorPages && window.NextOffset() == 0 && safeCount != 0)
+        {
+            ++result->NextInteriorPageRound;
+        }
+        result->EntriesTruncated = window.Visited < safeCount;
+        result->HitLimitReached = result->HitLimitReached || window.HitLimited;
+        if (options.ContinueScan && result->EntriesTruncated)
+        {
+            result->Diagnostics.push_back(
+                L"pool PE scan retained a bounded table window; next entry=" +
+                std::to_wstring(result->NextEntryOffset));
+        }
 
+        if (result->ReadFailures != 0)
+        {
+            result->Warnings.push_back(
+                L"pool PE candidate reads failed: " + std::to_wstring(result->ReadFailures) +
+                L"; absence of hits is not complete coverage");
+        }
+        if (result->InteriorCoveragePartial)
+        {
+            result->Warnings.push_back(L"pool allocation bodies are sampled by page; interior continuation is required");
+        }
         ok = true;
     } while (false);
 
@@ -488,6 +668,193 @@ bool PoolPeHunter::Scan(const Options& options, PoolPeHunterResult* result, std:
     {
         HeapFree(GetProcessHeap(), 0, buffer);
     }
+    return ok;
+}
+
+bool PoolPeHunterSelfTest()
+{
+    bool ok = false;
+    do
+    {
+        std::set<uint64_t> pageOffsets;
+        for (uint64_t round = 0; round < 5; ++round)
+        {
+            pageOffsets.insert(PoolPePageOffset(0x4001, round));
+        }
+        if (pageOffsets.size() != 5 || *pageOffsets.rbegin() != 0x4000 ||
+            PoolPePageOffset(0x4001, 5) != 0 || PoolPePageOffset(0, ~0ull) != 0 ||
+            PoolPePageOffset(~0ull, ~0ull) >= ~0ull)
+        {
+            break;
+        }
+        // PE probing is independent of execute permissions, including NX
+        // storage. Only the third interior page contains a valid image.
+        std::vector<uint8_t> allocation(0x5000, 0);
+        IMAGE_DOS_HEADER dos = {};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        IMAGE_NT_HEADERS64 nt = {};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt.FileHeader.NumberOfSections = 1;
+        nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.SizeOfHeaders = 0x400;
+        nt.OptionalHeader.SizeOfImage = 0x2000;
+        std::memcpy(allocation.data() + 0x3000, &dos, sizeof(dos));
+        std::memcpy(allocation.data() + 0x3080, &nt, sizeof(nt));
+        uint64_t imageOffset = ~0ull;
+        size_t positivePages = 0;
+        for (uint64_t round = 0; round < 5; ++round)
+        {
+            const uint64_t offset = PoolPePageOffset(allocation.size(), round);
+            PeHeaderProbe probe = {};
+            if (ProbePoolPeSample(allocation.data() + offset, 0x1000, allocation.size() - offset, &probe))
+            {
+                imageOffset = offset;
+                ++positivePages;
+            }
+        }
+        PeHeaderProbe malformed = {};
+        if (imageOffset != 0x3000 || positivePages != 1 ||
+            ProbePoolPeSample(allocation.data() + 0x3000, 0x40, 0x2000, &malformed) ||
+            !ProbePoolPeSample(allocation.data() + 0x3000, 0x1000, 0x1000, &malformed))
+        {
+            break;
+        }
+        nt.OptionalHeader.SizeOfImage = 0x123;
+        std::memcpy(allocation.data() + 0x3080, &nt, sizeof(nt));
+        if (ProbePoolPeSample(allocation.data() + 0x3000, 0x1000, 0x2000, &malformed))
+        {
+            break;
+        }
+        constexpr uint64_t base = 0xFFFF800010000000ull;
+        if (!LeftoverValidateBigPoolRange(base, 0x1000) ||
+            LeftoverValidateBigPoolRange(0, 0x1000) ||
+            LeftoverValidateBigPoolRange(0x10000, 0x1000) ||
+            LeftoverValidateBigPoolRange(0xFFFF000000000000ull, 0x1000) ||
+            LeftoverValidateBigPoolRange(base, 0) ||
+            LeftoverValidateBigPoolRange((std::numeric_limits<uint64_t>::max)() - 0x7FF, 0x1000))
+        {
+            break;
+        }
+        std::vector<SYSTEM_BIGPOOL_ENTRY_LOCAL> entries(33);
+        for (size_t index = 0; index < entries.size(); ++index)
+        {
+            entries[index].VirtualAddress = reinterpret_cast<PVOID>(base + index * 0x2000 + 1);
+            entries[index].SizeInBytes = 0x1000;
+        }
+        if (!ValidatePoolPeEntries(entries.data(), static_cast<uint32_t>(entries.size())) ||
+            !ValidatePoolPeEntries(nullptr, 0) || ValidatePoolPeEntries(nullptr, 1))
+        {
+            break;
+        }
+        entries.back().SizeInBytes = 0;
+        if (ValidatePoolPeEntries(entries.data(), static_cast<uint32_t>(entries.size())))
+        {
+            break;
+        }
+        entries.back().SizeInBytes = 0x1000;
+
+        PoolPeHunter::Options options;
+        options.ContinueScan = true;
+        options.MaxEntries = 4096;
+        options.LimitHits = 32;
+        std::set<uint32_t> observed;
+        bool valid = true;
+        for (uint32_t pass = 0; pass < 2; ++pass)
+        {
+            PoolPeEntryWindow window(static_cast<uint32_t>(entries.size()), options);
+            size_t hits = 0;
+            uint32_t index = 0;
+            while (window.Take(hits, &index))
+            {
+                observed.insert(index);
+                ++hits;
+            }
+            if ((pass == 0 && (hits != 32 || window.NextOffset() != 32 || !window.HitLimited)) ||
+                (pass == 1 && (hits != 1 || window.NextOffset() != 0 || window.HitLimited)))
+            {
+                valid = false;
+                break;
+            }
+            options.EntryOffset = window.NextOffset();
+        }
+        if (!valid || observed.size() != entries.size())
+        {
+            break;
+        }
+
+        // Loaded images are excluded before they can use the retained-hit
+        // budget. The only orphan after 32 owned PE rows must be read now.
+        options.EntryOffset = 0;
+        options.ExcludedAddressRanges.emplace_back(base, base + 32 * 0x2000);
+        PoolPeEntryWindow excluded(static_cast<uint32_t>(entries.size()), options);
+        size_t orphanHits = 0;
+        uint32_t index = 0;
+        uint32_t lastOrphan = 0;
+        while (excluded.Take(orphanHits, &index))
+        {
+            const uint64_t address = reinterpret_cast<uint64_t>(entries[index].VirtualAddress) & ~1ull;
+            if (PoolPeAddressExcluded(address, options.ExcludedAddressRanges))
+            {
+                continue;
+            }
+            ++orphanHits;
+            lastOrphan = index;
+        }
+        if (orphanHits != 1 || lastOrphan != 32 || excluded.Visited != 33 ||
+            excluded.HitLimited || excluded.NextOffset() != 0)
+        {
+            break;
+        }
+
+        options.EntryOffset = 0;
+        options.MaxEntries = 8;
+        PoolPeEntryWindow budgeted(33, options);
+        uint32_t visits = 0;
+        while (budgeted.Take(0, &index))
+        {
+            ++visits;
+        }
+        if (visits != 8 || budgeted.NextOffset() != 8 || budgeted.HitLimited)
+        {
+            break;
+        }
+        options.EntryOffset = (std::numeric_limits<uint64_t>::max)();
+        PoolPeEntryWindow resetOffset(33, options);
+        if (!resetOffset.Take(0, &index) || index != 0)
+        {
+            break;
+        }
+        PoolPeEntryWindow empty(0, options);
+        if (empty.Take(0, &index) || empty.NextOffset() != 0)
+        {
+            break;
+        }
+
+        // Standalone callers retain prefix ordering and the existing PE-hit
+        // limit. Continuation-only fields must not alter their enumeration.
+        options.ContinueScan = false;
+        options.EntryOffset = 17;
+        options.MaxEntries = 1;
+        PoolPeEntryWindow standalone(33, options);
+        visits = 0;
+        while (standalone.Take(32, &index))
+        {
+            if (index != visits)
+            {
+                valid = false;
+                break;
+            }
+            ++visits;
+        }
+        if (!valid || visits != 33 || standalone.HitLimited)
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
     return ok;
 }
 
@@ -507,6 +874,16 @@ std::wstring BuildPoolPeJson(const PoolPeHunterResult& result)
     out += std::to_wstring(result.Hits.size());
     out += L",\"totalEntries\":" + std::to_wstring(result.TotalEntries);
     out += L",\"scanned\":" + std::to_wstring(result.Scanned);
+    out += L",\"readFailures\":" + std::to_wstring(result.ReadFailures);
+    out += L",\"entriesVisited\":" + std::to_wstring(result.EntriesVisited);
+    out += L",\"nextEntryOffset\":" + std::to_wstring(result.NextEntryOffset);
+    out += L",\"nextAllocationAfter\":" + std::to_wstring(result.NextAllocationAfter);
+    out += L",\"nextInteriorPageRound\":" + std::to_wstring(result.NextInteriorPageRound);
+    out += L",\"interiorCoveragePartial\":" + std::wstring(result.InteriorCoveragePartial ? L"true" : L"false");
+    out += L",\"entriesTruncated\":";
+    out += result.EntriesTruncated ? L"true" : L"false";
+    out += L",\"hitLimitReached\":";
+    out += result.HitLimitReached ? L"true" : L"false";
     out += L",\"suspiciousWipes\":" + std::to_wstring(result.SuspiciousWipes);
     out += L",\"hits\":[";
 
@@ -519,6 +896,9 @@ std::wstring BuildPoolPeJson(const PoolPeHunterResult& result)
         }
 
         out += L"{\"address\":" + mcpjson::Quote(PoolPeJsonHex(hit.Address));
+        out += L",\"allocationBase\":" + mcpjson::Quote(PoolPeJsonHex(hit.AllocationBase));
+        out += L",\"allocationSize\":" + std::to_wstring(hit.AllocationSize);
+        out += L",\"pageOffset\":" + std::to_wstring(hit.PageOffset);
         out += L",\"sizeInBytes\":" + std::to_wstring(hit.SizeInBytes);
         out += L",\"tag\":" + mcpjson::Quote(hit.TagText);
         out += L",\"nonPaged\":";

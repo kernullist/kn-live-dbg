@@ -126,7 +126,7 @@ public:
     void Close();
     bool IsOpen() const;
 
-    // Boot-stable type index of "Device" objects, learned by matching this
+    // Boot-stable type index of "File" objects, learned by matching this
     // client's own device handle in a SystemExtendedHandleInformation walk
     // (no NtQueryObject name query, which can block on device objects).
     // Returns false when the index cannot be resolved.

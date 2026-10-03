@@ -83,6 +83,9 @@ public:
     static std::vector<std::wstring> SupportedProviderNames();
     static bool NormalizeProviderName(const std::wstring& value, AiProviderKind* provider, std::wstring* normalized);
     static bool ParseAssistantSelfTest();
+    static bool ProcessCaptureSelfTest();
+    static bool HttpResponseBodySelfTest();
+    static bool HttpRedirectSelfTest();
 
 private:
     struct ConfigEntry

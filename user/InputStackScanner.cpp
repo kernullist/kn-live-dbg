@@ -63,8 +63,7 @@ namespace
             stem == L"vmhid" ||
             stem == L"spldr" ||
             stem == L"acpi" ||
-            stem == L"pci" ||
-            stem.empty();
+            stem == L"pci";
     }
 }
 
@@ -113,7 +112,8 @@ bool InputStackScanner::Scan(InputStackScanResult* result, std::wstring* error)
                     false,
                     true,
                     &record.Driver,
-                    &inspectError))
+                    &inspectError,
+                    true))
             {
                 inspectFailed = true;
                 result->Warnings.push_back(
@@ -123,13 +123,31 @@ bool InputStackScanner::Scan(InputStackScanResult* result, std::wstring* error)
             }
 
             ++found;
+            if (!record.Driver.Warnings.empty())
+            {
+                inspectFailed = true;
+                result->Warnings.insert(result->Warnings.end(),
+                    record.Driver.Warnings.begin(), record.Driver.Warnings.end());
+            }
             for (const DeviceStackResult& stack : record.Driver.Stacks)
             {
+                if (!stack.CoverageComplete || !stack.Warnings.empty())
+                {
+                    inspectFailed = true;
+                    result->Warnings.push_back(record.DriverFilter + L": device stack walk was incomplete");
+                    result->Warnings.insert(result->Warnings.end(),
+                        stack.Warnings.begin(), stack.Warnings.end());
+                }
                 for (const DeviceObjectRecord& device : stack.Stack)
                 {
                     const std::wstring owner =
                         !device.DriverModule.empty() ? device.DriverModule : device.DriverName;
-                    if (!IsKnownInputDriver(owner))
+                    if (owner.empty())
+                    {
+                        inspectFailed = true;
+                        result->Warnings.push_back(record.DriverFilter + L": input device driver ownership was unavailable");
+                    }
+                    else if (!IsKnownInputDriver(owner))
                     {
                         record.Suspicious = true;
                         if (record.Notes.empty())
@@ -212,6 +230,7 @@ bool InputStackKnownDriverSelfTest()
     {
         if (!IsKnownInputDriver(L"kbdclass.sys") ||
             !IsKnownInputDriver(L"\\Driver\\mouclass") ||
+            IsKnownInputDriver(L"") ||
             IsKnownInputDriver(L"keylogger.sys"))
         {
             break;

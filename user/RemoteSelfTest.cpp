@@ -224,6 +224,32 @@ int RunRemoteProtocolSelfTest()
     Check(&ctx, !knremote::SanitizeRemotePassword(L"abcd", &password, &error), L"password-min");
     Check(&ctx, knremote::SanitizeRemotePassword(L"abcde", &password, &error), L"password-ok");
     {
+        std::wstring value;
+        int64_t number = 0;
+        bool flag = false;
+        Check(&ctx, knremote::GetStringField(
+            LR"({"nested":{"type":"cmd"},"type":"ping"})", L"type", &value) && value == L"ping",
+            L"json-top-level-field-only");
+        Check(&ctx, knremote::GetStringField(
+            LR"({"t\u0079pe":"ping"})", L"type", &value) && value == L"ping",
+            L"json-escaped-member-name");
+        Check(&ctx, knremote::GetStringField(
+            L"{\"type\":\n\"ping\"}", L"type", &value) && value == L"ping",
+            L"json-newline-whitespace");
+        Check(&ctx, !knremote::GetStringField(
+            LR"({"type":"cmd"} trailing)", L"type", &value), L"json-reject-trailing-data");
+        Check(&ctx, !knremote::GetStringField(
+            LR"({"type":"cmd","type":"ping"})", L"type", &value), L"json-reject-duplicate-field");
+        Check(&ctx, !knremote::GetStringField(
+            LR"({"type":"c\qmd"})", L"type", &value), L"json-reject-invalid-escape");
+        Check(&ctx, !knremote::GetNumberField(
+            LR"({"id":9223372036854775808})", L"id", &number), L"json-reject-int64-overflow");
+        Check(&ctx, !knremote::GetNumberField(
+            LR"({"id":1.5})", L"id", &number), L"json-reject-fractional-integer");
+        Check(&ctx, !knremote::GetBoolField(
+            LR"({"ok":truejunk})", L"ok", &flag), L"json-reject-bool-suffix");
+    }
+    {
         const std::wstring colored = L"\x1b[92mok\x1b[0m";
         const std::wstring quoted = knremote::Quote(colored);
         std::wstring json = L"{\"stdout\":" + quoted + L"}";

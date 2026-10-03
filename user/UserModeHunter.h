@@ -4,6 +4,7 @@
 #include "ProcessTriageScanner.h"
 #include "SnapshotModel.h"
 #include "SymbolEngine.h"
+#include "KmonUserEvidence.h"
 
 #include <cstdint>
 #include <map>
@@ -145,6 +146,7 @@ struct HuntProcessRecord
     std::vector<ProcessHiddenVadPteRecord> HiddenPteRecords;
     std::vector<ProcessThreadRecord> ThreadRecords;
     std::vector<HuntModuleRecord> Modules;
+    KmonUserEvidenceResult UserEvidence;
     std::vector<std::wstring> Warnings;
     uint64_t VadNodesVisited = 0;
     uint64_t ExecutableVadCount = 0;

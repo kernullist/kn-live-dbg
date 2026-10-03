@@ -2,6 +2,7 @@
 
 #include "McpJson.h"
 #include "MemoryDumper.h"
+#include "KnLiveDbgPaging.h"
 
 #include <Windows.h>
 #include <mindumpdef.h>
@@ -21,8 +22,8 @@ namespace
     constexpr uint64_t kKernelSpaceMin4 = 0xffff800000000000ull;
     constexpr uint64_t kKernelSpaceMin5 = 0xff00000000000000ull;
     constexpr uint64_t kPtePhysMask = 0x000ffffffffff000ull;
-    constexpr uint64_t kPdeLargePhysMask = 0x000fffffffffe00000ull;
-    constexpr uint64_t kPdpteLargePhysMask = 0x000fffffffc0000000ull;
+    constexpr uint64_t kPdeLargePhysMask = 0x000fffffffe00000ull;
+    constexpr uint64_t kPdpteLargePhysMask = 0x000fffffc0000000ull;
     constexpr uint64_t kCr4Pae = 1ull << 5;
     constexpr uint64_t kCr4La57 = 1ull << 12;
     constexpr uint32_t kDumpAmd64ContextBytes = 0x4D0;
@@ -280,7 +281,7 @@ namespace
             if (pagingLevels >= 5)
             {
                 uint64_t pml5e = 0;
-                if (!readPte(table, pml5Index, &pml5e))
+                if (!readPte(table, pml5Index, &pml5e) || !KnDbgPresentPagingEntryValid(pml5e, 5))
                 {
                     break;
                 }
@@ -295,7 +296,7 @@ namespace
             uint64_t pdpte = 0;
             uint64_t pde = 0;
             uint64_t pte = 0;
-            if (!readPte(table, pml4Index, &pml4e))
+            if (!readPte(table, pml4Index, &pml4e) || !KnDbgPresentPagingEntryValid(pml4e, 4))
             {
                 break;
             }
@@ -304,7 +305,7 @@ namespace
             {
                 break;
             }
-            if (!readPte(table, pdptIndex, &pdpte))
+            if (!readPte(table, pdptIndex, &pdpte) || !KnDbgPresentPagingEntryValid(pdpte, 3))
             {
                 break;
             }
@@ -319,7 +320,7 @@ namespace
             {
                 break;
             }
-            if (!readPte(table, pdIndex, &pde))
+            if (!readPte(table, pdIndex, &pde) || !KnDbgPresentPagingEntryValid(pde, 2))
             {
                 break;
             }
@@ -334,7 +335,7 @@ namespace
             {
                 break;
             }
-            if (!readPte(table, ptIndex, &pte))
+            if (!readPte(table, ptIndex, &pte) || !KnDbgPresentPagingEntryValid(pte, 1))
             {
                 break;
             }
@@ -984,9 +985,84 @@ namespace
         return runs;
     }
 
+    bool RunDumpPagingEntrySelfTest()
+    {
+        // Exercise the file-backed walker with ignored bits, PAT, and malformed entries.
+        for (uint32_t levels : {4u, 5u})
+        {
+            for (uint32_t leafLevel : {1u, 2u, 3u})
+            {
+                for (uint32_t invalidLevel = 0; invalidLevel <= levels; ++invalidLevel)
+                {
+                    if (invalidLevel != 0 && (invalidLevel < leafLevel || invalidLevel == 1))
+                    {
+                        continue;
+                    }
+                    std::vector<uint8_t> tables(0x6000, 0);
+                    const uint64_t va = kSelfTestListVa + 0x234;
+                    const uint64_t pageBase = leafLevel == 3 ? 0x40000000ull :
+                        (leafLevel == 2 ? 0x200000ull : 0x6000ull);
+                    const uint64_t root = levels == 5 ? 0x1000ull : 0x2000ull;
+                    for (uint32_t level = levels; level >= leafLevel; --level)
+                    {
+                        const uint64_t table = (6ull - level) * kPageSize;
+                        uint64_t entry = (level == leafLevel ? pageBase : table + kPageSize) | 3ull;
+                        entry |= (1ull << 52) | (1ull << 58) | (1ull << 63);
+                        if (level == leafLevel)
+                        {
+                            entry |= 0x80ull;
+                            if (leafLevel > 1)
+                            {
+                                entry |= 0x1000ull;
+                            }
+                        }
+                        if (level == invalidLevel)
+                        {
+                            entry |= level >= 4 ? 0x80ull : (0x80ull | 0x2000ull);
+                        }
+                        WritePte(&tables, table, (va >> (12 + 9 * (level - 1))) & 0x1ffull, entry);
+                    }
+                    DumpRunBlob tableRun;
+                    tableRun.BaseAddress = 0;
+                    tableRun.Bytes = std::move(tables);
+                    DumpRunBlob leafRun;
+                    leafRun.BaseAddress = pageBase;
+                    leafRun.Bytes.resize(kPageSize, 0);
+                    const uint64_t marker = 0x1122334455667788ull;
+                    memcpy(leafRun.Bytes.data() + 0x234, &marker, sizeof(marker));
+                    std::vector<DumpRunBlob> blobs;
+                    blobs.push_back(std::move(tableRun));
+                    blobs.push_back(std::move(leafRun));
+                    ScopedTempDump temp;
+                    if (!MakeTempDumpPath(&temp.Path) || !WriteSyntheticDumpFile(temp.Path, root,
+                        kSelfTestListVa, kCr4Pae | (levels == 5 ? kCr4La57 : 0), true,
+                        kKdSecondaryAmd64Context, blobs))
+                    {
+                        return false;
+                    }
+                    std::ifstream file(temp.Path, std::ios::binary);
+                    const auto runs = RunsFromBlobs(blobs);
+                    uint64_t physical = 0;
+                    const bool translated = TranslateVa(file, runs, root, va, levels, &physical);
+                    if (translated != (invalidLevel == 0))
+                    {
+                        return false;
+                    }
+                    uint64_t value = 0;
+                    if (translated && (physical != pageBase + 0x234 ||
+                        !ReadVirtualU64(file, runs, root, va, levels, &value) || value != marker))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     bool RunDumpPagingWalkSelfTest()
     {
-        bool ok = true;
+        bool ok = RunDumpPagingEntrySelfTest();
 
         do
         {

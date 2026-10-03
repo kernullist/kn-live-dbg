@@ -269,6 +269,7 @@ while (!g_StopRequested)
 
 - TCP accept 후 첫 애플리케이션 메시지가 `auth` (password). `ConstantTimeEqual`.
 - 불완전 frame **60s** deadline. max frame 1 MiB.
+- JSON은 공통 파서로 전체 문법을 검증하고, 디코딩한 최상위 키만 조회한다. 중복 키, 잘못된 escape, 뒤따르는 값, 128단계를 넘는 중첩을 거부한다. 정수 필드는 소수/지수 표기와 int64 범위 초과를 거부하고 bool 필드는 `true`/`false`만 허용한다.
 - 평문 kernel-command traffic임을 `remote on` 배너에 명시 (isolated lab). `--loopback`이 아니면 listen IP 목록을 인쇄한다.
 
 **v1 JSON 스키마 (동결).** `user/RemoteProtocol.h` 주석과 이 표가 계약이다. 공통 envelope:

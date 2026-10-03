@@ -43,6 +43,12 @@ struct ByovdModuleRecord
     uint64_t Base = 0;
     uint32_t Size = 0;
     bool FileHashed = false;
+    uint64_t HashSnapshotBytes = 0;
+    uint64_t HashBytesRead = 0;
+    bool HashBudgetExceeded = false;
+    bool HashGenerationStable = false;
+    bool FileIdentityStable = false;
+    std::wstring FileIdentityScope;
     bool VersionRead = false;
     bool YaraScanned = false;
     bool YaraTimedOut = false;
@@ -64,6 +70,11 @@ struct ByovdScanOptions
     bool Verbose = false;
     bool SummaryOnly = false;
     uint32_t Limit = 0;
+    uint32_t MaxModules = 0;
+    uint64_t ModuleAfterBase = 0;
+    // Zero preserves an unlimited standalone budget. Reads still use one initial length.
+    uint64_t MaxHashBytes = 0;
+    uint32_t HashBudgetMs = 0;
     uint32_t YaraTimeoutSeconds = 30;
     std::wstring YaraExecutable;
 };
@@ -76,6 +87,11 @@ struct ByovdScanResult
     uint64_t ModulesScanned = 0;
     uint64_t FilesHashed = 0;
     uint64_t FileReadFailures = 0;
+    uint64_t HashBudgetFailures = 0;
+    uint64_t HashGenerationFailures = 0;
+    uint64_t MaxHashBytes = 0;
+    uint32_t HashBudgetMs = 0;
+    std::wstring HashCoverageScope = L"initial file length and same-handle size/timestamps; concurrent writes and ABA not excluded; time checked between reads, not a synchronous ReadFile hard timeout";
     uint64_t MatchedModules = 0;
     uint64_t ExactMatches = 0;
     uint64_t HintMatches = 0;
@@ -90,6 +106,8 @@ struct ByovdScanResult
     bool CatalogUpdated = false;
     bool CatalogUpdateAttempted = false;
     bool Truncated = false;
+    bool ModuleCoverageComplete = false;
+    uint64_t NextModuleBase = 0;
     std::wstring YaraExecutable;
     std::vector<std::wstring> YaraRuleFiles;
 };
@@ -136,3 +154,5 @@ private:
 };
 
 std::wstring BuildByovdScanJson(const ByovdScanResult& result);
+bool ByovdHashBudgetSelfTest();
+bool ByovdCatalogFreshnessSelfTest();

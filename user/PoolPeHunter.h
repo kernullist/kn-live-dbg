@@ -5,11 +5,15 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct PoolPeHit
 {
     uint64_t Address = 0;
+    uint64_t AllocationBase = 0;
+    uint64_t AllocationSize = 0;
+    uint64_t PageOffset = 0;
     uint64_t SizeInBytes = 0;
     uint32_t TagRaw = 0;
     std::wstring TagText;
@@ -27,6 +31,13 @@ struct PoolPeHunterResult
     uint64_t PagedCount = 0;
     uint64_t Scanned = 0;             // entries passed to ProbeForPeHeader
     uint64_t ReadFailures = 0;        // entries whose head bytes could not be read
+    uint64_t EntriesVisited = 0;
+    uint64_t NextEntryOffset = 0;
+    uint64_t NextAllocationAfter = 0;
+    uint64_t NextInteriorPageRound = 0;
+    bool InteriorCoveragePartial = false;
+    bool EntriesTruncated = false;
+    bool HitLimitReached = false;
     uint64_t SuspiciousWipes = 0;     // hits where any signature was wiped
     uint64_t QueryBufferBytes = 0;
     uint32_t QueryRetries = 0;
@@ -61,6 +72,13 @@ public:
         std::wstring DumpDirectory;         // optional: dump each hit
         bool         DumpEnabled = false;
         bool         OnlySuspicious = false; // only report hits with wiped signatures
+        bool         ContinueScan = false; // Opt-in bounded monitor continuation.
+        uint64_t     EntryOffset = 0;
+        uint32_t     MaxEntries = 0;
+        bool         ScanInteriorPages = false;
+        uint64_t     AllocationAfter = 0;
+        uint64_t     InteriorPageRound = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> ExcludedAddressRanges;
     };
 
     PoolPeHunter(DeviceClient& device);
@@ -72,3 +90,4 @@ private:
 };
 
 std::wstring BuildPoolPeJson(const PoolPeHunterResult& result);
+bool PoolPeHunterSelfTest();

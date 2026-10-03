@@ -42,7 +42,7 @@ struct LeftoverBigPoolSnapshot
 };
 
 bool LeftoverTryAdd(uint64_t left, uint64_t right, uint64_t* result);
-bool LeftoverIsKernelCanonical(uint64_t address);
+bool LeftoverIsKernelCanonical(uint64_t address, bool la57 = false);
 bool LeftoverIsLikelyUserAddress(uint64_t address);
 uint64_t LeftoverSignExtendVa(uint64_t address, bool la57);
 bool LeftoverIsSessionSpace(uint64_t address);
@@ -81,7 +81,8 @@ bool LeftoverReadUnicodeString(
 
 void LeftoverBuildModuleRanges(
     const SymbolEngine& symbols,
-    std::vector<LeftoverModuleRange>* ranges);
+    std::vector<LeftoverModuleRange>* ranges,
+    bool* complete = nullptr);
 const LeftoverModuleRange* LeftoverFindModule(
     const std::vector<LeftoverModuleRange>& ranges,
     uint64_t address);
@@ -90,6 +91,13 @@ bool LeftoverNamesMatch(const std::wstring& left, const std::wstring& right);
 bool LeftoverLooksLikeDriverName(const std::wstring& name);
 
 bool LeftoverQueryBigPool(LeftoverBigPoolSnapshot* snapshot, std::wstring* error);
+bool LeftoverValidateBigPoolRange(uint64_t address, uint64_t size);
+bool LeftoverValidateCountedBuffer(
+    uint64_t allocatedBytes,
+    uint64_t returnedBytes,
+    uint64_t headerBytes,
+    uint64_t entryBytes,
+    uint64_t declaredCount);
 const LeftoverBigPoolEntry* LeftoverFindBigPool(
     const LeftoverBigPoolSnapshot& snapshot,
     uint64_t address);

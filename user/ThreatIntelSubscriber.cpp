@@ -15,6 +15,7 @@
 #include <sstream>
 #include <chrono>
 #include <ctime>
+#include <exception>
 
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -35,6 +36,60 @@ static constexpr ULONGLONG kThreatIntelMatchAllKeyword = 0;
 
 namespace
 {
+    bool AppendTiStackFrames(const uint8_t* data, size_t bytes, size_t addressBytes,
+        std::vector<uint64_t>* frames)
+    {
+        constexpr size_t headerBytes = sizeof(ULONG64);
+        constexpr size_t maximumFrames = 64;
+        if (data == nullptr || frames == nullptr || (addressBytes != 4 && addressBytes != 8) ||
+            bytes < headerBytes || (bytes - headerBytes) % addressBytes != 0)
+        {
+            return false;
+        }
+        // MatchId precedes Address[] in both SDK stack-extension formats.
+        for (size_t offset = headerBytes; offset < bytes && frames->size() < maximumFrames; offset += addressBytes)
+        {
+            uint64_t address = 0;
+            memcpy(&address, data + offset, addressBytes);
+            if (address != 0)
+            {
+                frames->push_back(address);
+            }
+        }
+        return true;
+    }
+
+    size_t TiScalarBytes(USHORT type, USHORT eventFlags)
+    {
+        switch (type)
+        {
+        case TDH_INTYPE_UINT8:
+        case TDH_INTYPE_INT8:
+            return 1;
+        case TDH_INTYPE_UINT16:
+        case TDH_INTYPE_INT16:
+            return 2;
+        case TDH_INTYPE_UINT32:
+        case TDH_INTYPE_INT32:
+        case TDH_INTYPE_HEXINT32:
+        case TDH_INTYPE_BOOLEAN:
+            return 4;
+        case TDH_INTYPE_POINTER:
+            return (eventFlags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0 ? 4 : 8;
+        case TDH_INTYPE_UINT64:
+        case TDH_INTYPE_INT64:
+        case TDH_INTYPE_HEXINT64:
+        case TDH_INTYPE_FILETIME:
+            return 8;
+        case TDH_INTYPE_GUID:
+            return sizeof(GUID);
+        case TDH_INTYPE_SYSTEMTIME:
+            return sizeof(SYSTEMTIME);
+        default:
+            return 0;
+        }
+    }
+
     std::wstring FormatGuid(const GUID& g)
     {
         wchar_t buf[64] = {};
@@ -56,6 +111,13 @@ namespace
         return ss.str();
     }
 
+    void AppendTiGenerationJson(std::wostream& line, const TiEventRecord& record)
+    {
+        // Strings preserve all FILETIME bits in consumers using JSON doubles.
+        line << L",\"process_create_time\":\"0x" << FormatHex64(record.ProcessCreateTime) << L"\""
+             << L",\"target_create_time\":\"0x" << FormatHex64(record.TargetProcessCreateTime) << L"\"";
+    }
+
     std::wstring ToLowerInPlace(std::wstring s)
     {
         for (wchar_t& c : s)
@@ -68,30 +130,79 @@ namespace
         return s;
     }
 
-    std::wstring ResolveProcessImage(uint32_t pid)
+    template<typename Cache, typename IdentityReader, typename PathReader, typename LivenessReader>
+    std::wstring ResolveTiImageGeneration(Cache* cache, uint32_t pid, uint64_t timestamp, uint64_t now,
+        IdentityReader& identity, PathReader& path, LivenessReader& alive, uint64_t* validatedCreateTime = nullptr)
     {
-        if (pid == 0)
+        if (validatedCreateTime != nullptr)
         {
-            return L"<idle>";
+            *validatedCreateTime = 0;
         }
-        if (pid == 4)
+        uint64_t created = 0;
+        if (!identity(&created) || created == 0)
         {
-            return L"System";
+            cache->erase(pid);
+            return {};
         }
-        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (h == nullptr)
+        auto found = cache->find(pid);
+        if (found != cache->end() && found->second.CreateTime != created)
         {
-            return L"";
+            cache->erase(found);
+            found = cache->end();
         }
-        std::wstring result;
-        wchar_t buf[MAX_PATH] = {};
-        DWORD size = static_cast<DWORD>(ARRAYSIZE(buf));
-        if (QueryFullProcessImageNameW(h, 0, buf, &size) && size > 0)
+        if (timestamp != 0 && timestamp < created)
         {
-            result.assign(buf, size);
+            return {};
         }
-        CloseHandle(h);
-        return result;
+        std::wstring resolved;
+        if (found != cache->end() && (!found->second.Failed ||
+            (now >= found->second.TickMs && now - found->second.TickMs < 1000)))
+        {
+            resolved = found->second.Path;
+        }
+        else
+        {
+            if (!path(&resolved))
+            {
+                resolved.clear();
+            }
+            typename Cache::mapped_type entry;
+            entry.Path = resolved;
+            entry.TickMs = now;
+            entry.CreateTime = created;
+            entry.Failed = resolved.empty();
+            if (cache->size() >= 16384 && found == cache->end())
+            {
+                cache->clear();
+            }
+            (*cache)[pid] = std::move(entry);
+        }
+        if (!alive())
+        {
+            cache->erase(pid);
+            resolved.clear();
+        }
+        if (validatedCreateTime != nullptr && !resolved.empty())
+        {
+            *validatedCreateTime = created;
+        }
+        return resolved;
+    }
+
+    bool TiImageMatchesNames(const std::wstring& path, const std::vector<std::wstring>& names)
+    {
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring base = ToLowerInPlace(path.substr(slash == std::wstring::npos ? 0 : slash + 1));
+        return !base.empty() && std::find(names.begin(), names.end(), base) != names.end();
+    }
+
+    bool TiProcessSelectionMatches(const TiEventRecord& record,
+        const std::unordered_set<uint32_t>& pids, const std::vector<std::wstring>& names)
+    {
+        return (pids.empty() && names.empty()) || pids.count(record.ProcessId) != 0 ||
+            (record.TargetProcessId != 0 && pids.count(record.TargetProcessId) != 0) ||
+            TiImageMatchesNames(record.ImagePath, names) ||
+            (record.TargetProcessId != 0 && TiImageMatchesNames(record.TargetImageBase, names));
     }
 
     std::wstring ExeDirectory()
@@ -222,6 +333,61 @@ namespace
         std::memcpy(blob->data() + p->LoggerNameOffset, sessionName.c_str(), nameBytes);
         return true;
     }
+
+    bool CompleteTraceGeneration(
+        TiTraceLifecycle* lifecycle,
+        uint64_t generation,
+        uint32_t status,
+        uint64_t tickMs)
+    {
+        if (lifecycle == nullptr || lifecycle->Generation != generation)
+        {
+            return false;
+        }
+        lifecycle->ThreadRunning = false;
+        lifecycle->ExitStatusKnown = true;
+        lifecycle->ExitStatus = status;
+        lifecycle->ExitTickMs = tickMs;
+        lifecycle->ExitAfterStopRequest = lifecycle->StopRequested;
+        return true;
+    }
+
+    TiSequenceSnapshot SnapshotTiSequenceRange(
+        const std::deque<TiEventRecord>& ring,
+        uint64_t latestAssigned,
+        uint64_t cursor,
+        size_t maxCount)
+    {
+        TiSequenceSnapshot out;
+        out.LatestAssignedSequence = latestAssigned;
+        out.EarliestAvailableSequence = ring.empty() ? 0 : ring.front().Sequence;
+        out.CursorAhead = cursor > latestAssigned;
+        if (cursor != 0 && !out.CursorAhead)
+        {
+            if (ring.empty())
+            {
+                out.MissingBeforeFirst = latestAssigned - cursor;
+            }
+            else if (out.EarliestAvailableSequence > cursor)
+            {
+                out.MissingBeforeFirst = out.EarliestAvailableSequence - cursor - 1;
+            }
+        }
+        for (const TiEventRecord& record : ring)
+        {
+            if (record.Sequence <= cursor)
+            {
+                continue;
+            }
+            if (maxCount != 0 && out.Records.size() >= maxCount)
+            {
+                out.HasMore = true;
+                break;
+            }
+            out.Records.push_back(record);
+        }
+        return out;
+    }
 }
 
 TiSubscriber::TiSubscriber() = default;
@@ -237,47 +403,68 @@ bool TiSubscriber::IsActive() const
     return Active.load();
 }
 
-std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid)
+std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid, uint64_t eventTimestamp,
+    uint64_t* validatedCreateTime)
 {
+    if (validatedCreateTime != nullptr)
+    {
+        *validatedCreateTime = 0;
+    }
     if (pid == 0)
     {
         return L"<idle>";
     }
-
-    const uint64_t nowMs = GetTickCount64();
-    constexpr uint64_t kNegativeTtlMs = 1000;
+    if (pid == 4)
     {
-        std::lock_guard<std::mutex> lock(ImageCacheMutex);
-        auto it = ImageCache.find(pid);
-        if (it != ImageCache.end())
+        return L"System";
+    }
+
+    struct ProcessHandleScope
+    {
+        HANDLE Value = nullptr;
+
+        ~ProcessHandleScope()
         {
-            if (!it->second.Failed)
+            if (Value != nullptr)
             {
-                return it->second.Path;
-            }
-            if ((nowMs - it->second.TickMs) < kNegativeTtlMs)
-            {
-                return it->second.Path;
+                CloseHandle(Value);
             }
         }
-    }
-
-    std::wstring resolved = ResolveProcessImage(pid);
-    ImageCacheEntry entry;
-    entry.Path = resolved;
-    entry.TickMs = nowMs;
-    entry.Failed = resolved.empty();
-
-    std::lock_guard<std::mutex> lock(ImageCacheMutex);
-    // Cheap, bounded cache: when oversized, drop everything. PIDs are
-    // recycled by the kernel anyway so a stale entry is acceptable
-    // forensically for short windows but should not grow unbounded.
-    if (ImageCache.size() > 16384)
+    } process;
+    auto readIdentity = [&](uint64_t* created)
     {
-        ImageCache.clear();
-    }
-    ImageCache[pid] = std::move(entry);
-    return resolved;
+        process.Value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+        FILETIME create = {}, exit = {}, kernel = {}, user = {};
+        const bool known = process.Value != nullptr &&
+            GetProcessTimes(process.Value, &create, &exit, &kernel, &user) != FALSE &&
+            WaitForSingleObject(process.Value, 0) == WAIT_TIMEOUT;
+        if (known)
+        {
+            *created = (static_cast<uint64_t>(create.dwHighDateTime) << 32) | create.dwLowDateTime;
+        }
+        return known;
+    };
+    auto readPath = [&](std::wstring* path)
+    {
+        std::vector<wchar_t> buffer(32768, L'\0');
+        DWORD length = static_cast<DWORD>(buffer.size());
+        const bool known = QueryFullProcessImageNameW(process.Value, 0, buffer.data(), &length) != FALSE &&
+            length != 0 && length < buffer.size();
+        if (known)
+        {
+            path->assign(buffer.data(), length);
+        }
+        return known;
+    };
+    auto stillAlive = [&]()
+    {
+        return WaitForSingleObject(process.Value, 0) == WAIT_TIMEOUT;
+    };
+
+    // Every cache hit requires the current generation from this same handle.
+    std::lock_guard<std::mutex> lock(ImageCacheMutex);
+    return ResolveTiImageGeneration(&ImageCache, pid, eventTimestamp, GetTickCount64(),
+        readIdentity, readPath, stillAlive, validatedCreateTime);
 }
 
 TiOptions TiSubscriber::CurrentOptions() const
@@ -308,6 +495,33 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         return false;
     }
 
+    // An exited ProcessTrace thread is still joinable and owns its handles.
+    // Join and release it before replacing the thread or resetting counters.
+    if (ProcessThread.joinable() || SessionHandle != 0 ||
+        ProcessHandle != INVALID_PROCESSTRACE_HANDLE)
+    {
+        StopLocked(nullptr);
+    }
+
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> traceLock(TraceMutex);
+        generation = TraceLifecycle.Generation + 1;
+        if (generation == 0)
+        {
+            generation = 1;
+        }
+        TraceLifecycle = TiTraceLifecycle{};
+        TraceLifecycle.Generation = generation;
+        std::lock_guard<std::mutex> ringLock(RingMutex);
+        TraceLifecycle.FirstSequence = NextRingSequence;
+    }
+    const auto setStartStatus = [&](uint32_t status)
+    {
+        std::lock_guard<std::mutex> traceLock(TraceMutex);
+        TraceLifecycle.StartStatus = status;
+    };
+
     Options = options;
     if (Options.LogBaseName.empty())
     {
@@ -333,7 +547,6 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         WatchPids.clear();
         WatchNamesLower.clear();
-        WatchPromotedPids.clear();
         for (uint32_t p : Options.WatchPids)
         {
             WatchPids.insert(p);
@@ -398,6 +611,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     }
     if (status != ERROR_SUCCESS)
     {
+        setStartStatus(status);
         if (error != nullptr)
         {
             *error = L"StartTraceW failed: " + std::to_wstring(status);
@@ -431,6 +645,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
 
     if (status != ERROR_SUCCESS)
     {
+        setStartStatus(status);
         ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
         SessionHandle = 0;
         if (error != nullptr)
@@ -458,6 +673,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     if (ProcessHandle == INVALID_PROCESSTRACE_HANDLE)
     {
         DWORD gle = GetLastError();
+        setStartStatus(gle);
         EnableTraceEx2(SessionHandle, &kThreatIntelligenceProviderGuid,
                        EVENT_CONTROL_CODE_DISABLE_PROVIDER,
                        TRACE_LEVEL_VERBOSE, 0, 0, 0, nullptr);
@@ -471,8 +687,31 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     }
 
     ProcessTraceShouldExit.store(false);
-    Active.store(true);
-    ProcessThread = std::thread(&TiSubscriber::ProcessTraceThread, this);
+    {
+        std::lock_guard<std::mutex> traceLock(TraceMutex);
+        TraceLifecycle.StartStatus = ERROR_SUCCESS;
+        TraceLifecycle.ThreadRunning = true;
+        Active.store(true);
+    }
+    try
+    {
+        ProcessThread = std::thread(&TiSubscriber::ProcessTraceThread, this, ProcessHandle, generation);
+    }
+    catch (const std::exception&)
+    {
+        {
+            std::lock_guard<std::mutex> traceLock(TraceMutex);
+            TraceLifecycle.StartStatus = ERROR_NOT_ENOUGH_MEMORY;
+            TraceLifecycle.ThreadRunning = false;
+            Active.store(false);
+        }
+        StopLocked(nullptr);
+        if (error != nullptr)
+        {
+            *error = L"could not create TI trace consumer thread";
+        }
+        return false;
+    }
 
     return true;
 }
@@ -484,10 +723,21 @@ bool TiSubscriber::Stop(std::wstring* error)
     // dedicated lock so concurrent Stop calls serialize on resource cleanup.
     std::lock_guard<std::mutex> stateLock(StateMutex);
 
-    const bool wasActive = Active.exchange(false);
+    return StopLocked(error);
+}
+
+bool TiSubscriber::StopLocked(std::wstring* error)
+{
+
+    bool wasActive = false;
+    {
+        std::lock_guard<std::mutex> traceLock(TraceMutex);
+        TraceLifecycle.StopRequested = true;
+        wasActive = Active.exchange(false);
+        ProcessTraceShouldExit.store(true);
+    }
 
     // Closing the process handle causes ProcessTrace to return.
-    ProcessTraceShouldExit.store(true);
     if (ProcessHandle != INVALID_PROCESSTRACE_HANDLE)
     {
         CloseTrace(ProcessHandle);
@@ -579,11 +829,16 @@ ULONG WINAPI TiSubscriber::BufferCallbackThunk(PEVENT_TRACE_LOGFILEW buffer)
     return self->ProcessTraceShouldExit.load() ? FALSE : TRUE;
 }
 
-void TiSubscriber::ProcessTraceThread()
+void TiSubscriber::ProcessTraceThread(TRACEHANDLE processHandle, uint64_t generation)
 {
     // ProcessTrace blocks until CloseTrace is called or BufferCallback
     // returns FALSE. All event delivery happens via EventRecordCallback.
-    ProcessTrace(&ProcessHandle, 1, nullptr, nullptr);
+    const ULONG status = ProcessTrace(&processHandle, 1, nullptr, nullptr);
+    std::lock_guard<std::mutex> traceLock(TraceMutex);
+    if (CompleteTraceGeneration(&TraceLifecycle, generation, status, GetTickCount64()))
+    {
+        Active.store(false);
+    }
 }
 
 void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
@@ -604,47 +859,22 @@ void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
     TiEventRecord record;
     DecodeEvent(eventRecord, &record);
 
-    // Extract ETW-captured callstack: when stack tracing is enabled the
-    // kernel appends the return addresses after the event payload in the
-    // user data region. The stack blob starts at the first 8-byte-aligned
-    // offset after the TDH-decoded payload and consists of sequential
-    // ULONG_PTR (user-mode return addresses) terminated by the user data
-    // boundary. We read them from the extended data if available.
-    if (Options.EnableCallstacks)
+    // Stack extensions contain a MatchId followed by 32-bit or 64-bit addresses.
+    if (Options.EnableCallstacks && eventRecord->ExtendedData != nullptr)
     {
         for (USHORT ei = 0; ei < eventRecord->ExtendedDataCount; ++ei)
         {
             EVENT_HEADER_EXTENDED_DATA_ITEM* ext =
                 &eventRecord->ExtendedData[ei];
-            if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 &&
-                ext->DataPtr != 0 && ext->DataSize >= sizeof(ULONG))
+            if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 && ext->DataPtr != 0)
             {
-                // 32-bit stack: array of ULONG addresses
-                const ULONG* addr32 = reinterpret_cast<const ULONG*>(
-                    ext->DataPtr);
-                USHORT count = ext->DataSize / sizeof(ULONG);
-                for (USHORT ai = 0; ai < count && ai < 32; ++ai)
-                {
-                    if (addr32[ai] != 0)
-                    {
-                        record.CallstackAddresses.push_back(addr32[ai]);
-                    }
-                }
+                AppendTiStackFrames(reinterpret_cast<const uint8_t*>(ext->DataPtr),
+                    ext->DataSize, sizeof(ULONG), &record.CallstackAddresses);
             }
-            else if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64 &&
-                ext->DataPtr != 0 && ext->DataSize >= sizeof(ULONGLONG))
+            else if (ext->ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64 && ext->DataPtr != 0)
             {
-                // 64-bit stack: array of ULONGLONG addresses
-                const ULONGLONG* addr64 = reinterpret_cast<const ULONGLONG*>(
-                    ext->DataPtr);
-                USHORT count = ext->DataSize / sizeof(ULONGLONG);
-                for (USHORT ai = 0; ai < count && ai < 32; ++ai)
-                {
-                    if (addr64[ai] != 0)
-                    {
-                        record.CallstackAddresses.push_back(addr64[ai]);
-                    }
-                }
+                AppendTiStackFrames(reinterpret_cast<const uint8_t*>(ext->DataPtr),
+                    ext->DataSize, sizeof(ULONGLONG), &record.CallstackAddresses);
             }
         }
     }
@@ -740,7 +970,9 @@ void TiSubscriber::OnEventRecord(PEVENT_RECORD eventRecord)
     if (preferredTarget != 0)
     {
         record.TargetProcessId = preferredTarget;
-        record.TargetImageBase = BasenameLower(GetCachedImageOrResolve(preferredTarget));
+        record.TargetImageBase = record.Timestamp != 0 ?
+            BasenameLower(GetCachedImageOrResolve(preferredTarget, record.Timestamp,
+                &record.TargetProcessCreateTime)) : std::wstring{};
     }
 
     RecordKeep(std::move(record));
@@ -758,7 +990,9 @@ bool TiSubscriber::DecodeEvent(PEVENT_RECORD eventRecord, TiEventRecord* out)
     out->Opcode = hdr.EventDescriptor.Opcode;
     out->Channel = hdr.EventDescriptor.Channel;
     out->Keyword = hdr.EventDescriptor.Keyword;
-    out->ImagePath = GetCachedImageOrResolve(out->ProcessId);
+    out->ProcessCreateTime = 0;
+    out->ImagePath = out->Timestamp != 0 ?
+        GetCachedImageOrResolve(out->ProcessId, out->Timestamp, &out->ProcessCreateTime) : std::wstring{};
 
     bool tdhOk = DecodePayloadViaTdh(eventRecord, out);
     if (!tdhOk)
@@ -871,6 +1105,15 @@ bool TiSubscriber::DecodePayloadViaTdh(PEVENT_RECORD eventRecord, TiEventRecord*
             }
 
             const USHORT inType = pi.nonStructType.InType;
+            const size_t scalarBytes = TiScalarBytes(inType, eventRecord->EventHeader.Flags);
+            if (propBuf.size() < scalarBytes)
+            {
+                TiPayloadField field;
+                field.Name = propName;
+                field.Value = L"<short-scalar>";
+                out->Payload.push_back(std::move(field));
+                continue;
+            }
         std::wstring value;
         std::wstring typeName;
 
@@ -960,7 +1203,8 @@ bool TiSubscriber::DecodePayloadViaTdh(PEVENT_RECORD eventRecord, TiEventRecord*
             case TDH_INTYPE_HEXINT64:
             case TDH_INTYPE_POINTER:
             {
-                uint64_t v = *reinterpret_cast<const uint64_t*>(propBuf.data());
+                uint64_t v = 0;
+                memcpy(&v, propBuf.data(), scalarBytes);
                 if (inType == TDH_INTYPE_UINT64)
                 {
                     value = std::to_wstring(v);
@@ -1067,7 +1311,7 @@ void TiSubscriber::RecordKeep(TiEventRecord&& record)
     // ETW timestamps (which may arrive out of order).
     {
         std::lock_guard<std::mutex> ringLock(RingMutex);
-        if (Ring.size() >= Options.RingCapacity)
+        while (Ring.size() >= Options.RingCapacity)
         {
             Ring.pop_front();
             Stats.EventsDropped.fetch_add(1, std::memory_order_relaxed);
@@ -1094,85 +1338,15 @@ void TiSubscriber::RecordKeep(TiEventRecord&& record)
 bool TiSubscriber::MatchesWatch(const TiEventRecord& record)
 {
     std::lock_guard<std::mutex> lock(WatchMutex);
-
-    // "No targets specified" means "no filter" -- match every event. This
-    // is what the operator expects when running '!ti watch' without any
-    // /pid or /name; otherwise the watch loop would scroll nothing and
-    // look broken. The ring + log decision is independent (we always
-    // capture); this only gates the live print queue.
-    if (WatchPids.empty() && WatchNamesLower.empty())
+    // Empty selection matches all events. Numeric PID watches intentionally
+    // follow that PID; name watches use only the event's validated identity.
+    if (TiProcessSelectionMatches(record, WatchPids, WatchNamesLower))
     {
         return true;
     }
 
-    // Caller-side checks: did THIS process generate the event?
-    if (WatchPids.count(record.ProcessId) != 0)
-    {
-        return true;
-    }
-    if (WatchPromotedPids.count(record.ProcessId) != 0)
-    {
-        return true;
-    }
-
-    if (!WatchNamesLower.empty())
-    {
-        std::wstring base = BasenameLower(record.ImagePath);
-        if (!base.empty())
-        {
-            for (const std::wstring& n : WatchNamesLower)
-            {
-                if (base == n)
-                {
-                    WatchPromotedPids.insert(record.ProcessId);
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Target-side checks: many TI events fire from the CALLER but operate
-    // on a different target process (cross-process VirtualAllocEx,
-    // WriteProcessMemory, SetThreadContext, etc.). OnEventRecord already
-    // extracted the first non-CallingProcessId target PID and resolved its
-    // image basename, so we read them directly instead of walking the
-    // payload again.
-    if (record.TargetProcessId != 0)
-    {
-        if (WatchPids.count(record.TargetProcessId) != 0)
-        {
-            return true;
-        }
-        if (WatchPromotedPids.count(record.TargetProcessId) != 0)
-        {
-            return true;
-        }
-        if (!WatchNamesLower.empty() && !record.TargetImageBase.empty())
-        {
-            for (const std::wstring& n : WatchNamesLower)
-            {
-                if (record.TargetImageBase == n)
-                {
-                    // Promote the TARGET pid so the next event referencing
-                    // it (either as caller or as target) hits the O(1)
-                    // path without re-extracting from the payload.
-                    WatchPromotedPids.insert(record.TargetProcessId);
-                    return true;
-                }
-            }
-        }
-    }
-
-    // DriverObjectLoad/DeviceObjectLoad usually fire as System (pid 4).
-    // Match payload driver/device/file names against /name without promoting
-    // pid 4 into the hot path (that would live-print every System event).
-    if (!WatchNamesLower.empty() &&
-        PayloadBasenameMatchesWatch(record, WatchNamesLower))
-    {
-        return true;
-    }
-
-    return false;
+    // Driver/device payload names are event evidence, not PID promotions.
+    return !WatchNamesLower.empty() && PayloadBasenameMatchesWatch(record, WatchNamesLower);
 }
 
 bool TiSubscriber::PayloadBasenameMatchesWatch(
@@ -1321,27 +1495,18 @@ std::vector<TiEventRecord> TiSubscriber::RecentSince(uint64_t minTimestampInclus
 
 std::vector<TiEventRecord> TiSubscriber::RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const
 {
-    std::vector<TiEventRecord> out;
+    return RecentAfterSequenceWithStatus(minSequenceExclusive, maxCount).Records;
+}
+
+TiSequenceSnapshot TiSubscriber::RecentAfterSequenceWithStatus(uint64_t minSequenceExclusive, size_t maxCount) const
+{
+    std::lock_guard<std::mutex> stateLock(StateMutex);
+    std::lock_guard<std::mutex> traceLock(TraceMutex);
     std::lock_guard<std::mutex> lock(RingMutex);
-    for (const TiEventRecord& item : Ring)
-    {
-        if (item.Sequence != 0 && item.Sequence <= minSequenceExclusive)
-        {
-            continue;
-        }
-        // Unsequenced records (Sequence==0) are only returned when the caller
-        // has no cursor yet (minSequenceExclusive==0).
-        if (item.Sequence == 0 && minSequenceExclusive != 0)
-        {
-            continue;
-        }
-        out.push_back(item);
-        if (maxCount != 0 && out.size() >= maxCount)
-        {
-            break;
-        }
-    }
-    return out;
+    TiSequenceSnapshot snapshot = SnapshotTiSequenceRange(Ring, NextRingSequence - 1, minSequenceExclusive, maxCount);
+    snapshot.Generation = TraceLifecycle.Generation;
+    snapshot.GenerationFirstSequence = TraceLifecycle.FirstSequence;
+    return snapshot;
 }
 
 std::vector<TiEventRecord> TiSubscriber::Recent(size_t maxCount, bool newestFirst) const
@@ -1488,6 +1653,7 @@ bool TiSubscriber::SaveTo(const std::wstring& path, std::wstring* error) const
               << L",\"level\":" << static_cast<unsigned>(r.Level)
               << L",\"keyword\":\"0x" << FormatHex64(r.Keyword) << L"\""
               << L",\"version\":" << r.Version;
+        AppendTiGenerationJson(line, r);
 
         if (!r.Payload.empty())
         {
@@ -1571,6 +1737,7 @@ void TiSubscriber::Histogram(
 
 TiSubscriberStats TiSubscriber::SnapshotStats() const
 {
+    std::lock_guard<std::mutex> stateLock(StateMutex);
     TiSubscriberStats s;
     s.EventsReceived = Stats.EventsReceived.load(std::memory_order_relaxed);
     s.EventsKept = Stats.EventsKept.load(std::memory_order_relaxed);
@@ -1585,7 +1752,264 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
     s.MatchAllKeyword = kThreatIntelMatchAllKeyword;
     s.StartTickMs = Stats.StartTickMs.load(std::memory_order_relaxed);
     s.LastEventTickMs = Stats.LastEventTickMs.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> traceLock(TraceMutex);
+        s.Trace = TraceLifecycle;
+    }
+    {
+        std::lock_guard<std::mutex> ringLock(RingMutex);
+        s.EarliestAvailableSequence = Ring.empty() ? 0 : Ring.front().Sequence;
+        s.LatestAssignedSequence = NextRingSequence - 1;
+    }
     return s;
+}
+
+bool ThreatIntelSubscriberSelfTest()
+{
+    struct FixtureImageCacheEntry
+    {
+        std::wstring Path;
+        uint64_t TickMs = 0;
+        uint64_t CreateTime = 0;
+        bool Failed = false;
+    };
+    std::unordered_map<uint32_t, FixtureImageCacheEntry> imageCache;
+    uint64_t created = 100;
+    uint64_t now = 1000;
+    bool identityKnown = true;
+    bool pathKnown = true;
+    bool processAlive = true;
+    size_t identityReads = 0;
+    size_t pathReads = 0;
+    size_t liveReads = 0;
+    uint64_t validatedCreated = 0;
+    std::wstring currentPath = L"C:\\Games\\game.exe";
+    auto readIdentity = [&](uint64_t* value)
+    {
+        ++identityReads;
+        *value = created;
+        return identityKnown;
+    };
+    auto readPath = [&](std::wstring* value)
+    {
+        ++pathReads;
+        *value = currentPath;
+        return pathKnown;
+    };
+    auto stillAlive = [&]()
+    {
+        ++liveReads;
+        return processAlive;
+    };
+    auto resolve = [&](uint64_t timestamp)
+    {
+        validatedCreated = ~0ull;
+        return ResolveTiImageGeneration(&imageCache, 100, timestamp, now, readIdentity, readPath, stillAlive,
+            &validatedCreated);
+    };
+    const std::unordered_set<uint32_t> noPids;
+    const std::unordered_set<uint32_t> explicitPids{100};
+    const std::vector<std::wstring> names{L"game.exe"};
+    TiEventRecord caller;
+    caller.ProcessId = 100;
+    caller.ImagePath = resolve(150);
+    if (caller.ImagePath != currentPath || validatedCreated != 100 ||
+        !TiProcessSelectionMatches(caller, noPids, names))
+    {
+        return false;
+    }
+    caller.ImagePath = resolve(175);
+    if (pathReads != 1 || identityReads != 2 || liveReads != 2 || caller.ImagePath != currentPath ||
+        validatedCreated != 100)
+    {
+        return false;
+    }
+
+    // Watched -> unwatched PID reuse must replace both path and name selection.
+    created = 200;
+    currentPath = L"C:\\Tools\\tool.exe";
+    caller.ImagePath = resolve(250);
+    TiEventRecord target;
+    target.ProcessId = 999;
+    target.TargetProcessId = 100;
+    target.TargetImageBase = caller.ImagePath;
+    if (caller.ImagePath != currentPath || pathReads != 2 || validatedCreated != 200 ||
+        TiProcessSelectionMatches(caller, noPids, names) || TiProcessSelectionMatches(target, noPids, names))
+    {
+        return false;
+    }
+
+    // Unwatched -> watched reuse must work without a permanent PID promotion.
+    created = 300;
+    currentPath = L"C:\\Games\\game.exe";
+    caller.ImagePath = resolve(350);
+    target.TargetImageBase = caller.ImagePath;
+    if (caller.ImagePath != currentPath || pathReads != 3 || validatedCreated != 300 ||
+        !TiProcessSelectionMatches(caller, noPids, names) || !TiProcessSelectionMatches(target, noPids, names) ||
+        TiProcessSelectionMatches(caller, noPids, std::vector<std::wstring>{L"other.exe"}))
+    {
+        return false;
+    }
+
+    caller.ProcessCreateTime = validatedCreated;
+    caller.TargetProcessCreateTime = validatedCreated;
+    std::wstringstream generationJson;
+    AppendTiGenerationJson(generationJson, caller);
+    if (generationJson.str() != L",\"process_create_time\":\"0x12c\",\"target_create_time\":\"0x12c\"")
+    {
+        return false;
+    }
+
+    // A delayed event from an older generation cannot borrow the current name.
+    caller.ImagePath = resolve(250);
+    target.TargetImageBase = caller.ImagePath;
+    if (!caller.ImagePath.empty() || pathReads != 3 || validatedCreated != 0 ||
+        TiProcessSelectionMatches(caller, noPids, names) || TiProcessSelectionMatches(target, noPids, names) ||
+        !TiProcessSelectionMatches(caller, explicitPids, names) ||
+        !TiProcessSelectionMatches(target, explicitPids, names))
+    {
+        return false;
+    }
+    identityKnown = false;
+    caller.ImagePath = resolve(350);
+    if (!caller.ImagePath.empty() || !imageCache.empty() || validatedCreated != 0 ||
+        TiProcessSelectionMatches(caller, noPids, names))
+    {
+        return false;
+    }
+
+    identityKnown = true;
+    caller.ImagePath = resolve(350);
+    if (caller.ImagePath != currentPath || validatedCreated != 300)
+    {
+        return false;
+    }
+    created = 400;
+    pathKnown = false;
+    caller.ImagePath = resolve(450);
+    if (!caller.ImagePath.empty() || validatedCreated != 0 || imageCache.size() != 1 || !imageCache.at(100).Failed ||
+        imageCache.at(100).CreateTime != 400 || TiProcessSelectionMatches(caller, noPids, names))
+    {
+        return false;
+    }
+    const size_t failedPathReads = pathReads;
+    pathKnown = true;
+    ++now;
+    if (!resolve(450).empty() || pathReads != failedPathReads || validatedCreated != 0)
+    {
+        return false;
+    }
+    now += 1000;
+    if (resolve(450) != currentPath || pathReads != failedPathReads + 1 || validatedCreated != 400)
+    {
+        return false;
+    }
+
+    // Exit after identity/path capture invalidates even a positive cache hit.
+    processAlive = false;
+    if (!resolve(450).empty() || !imageCache.empty() || validatedCreated != 0)
+    {
+        return false;
+    }
+    processAlive = true;
+    if (resolve(450) != currentPath || validatedCreated != 400)
+    {
+        return false;
+    }
+    created = 0;
+    if (!resolve(450).empty() || !imageCache.empty() || validatedCreated != 0)
+    {
+        return false;
+    }
+    caller.ProcessCreateTime = validatedCreated;
+    caller.TargetProcessCreateTime = validatedCreated;
+    std::wstringstream unknownGenerationJson;
+    AppendTiGenerationJson(unknownGenerationJson, caller);
+    if (unknownGenerationJson.str() != L",\"process_create_time\":\"0x0\",\"target_create_time\":\"0x0\"")
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> extension(8 + 65 * 8, 0);
+    const uint64_t matchId = 0x00007fff12340000ull;
+    memcpy(extension.data(), &matchId, 8);
+    for (uint64_t index = 0; index < 65; ++index)
+    {
+        const uint64_t address = 0x100000 + index;
+        memcpy(extension.data() + 8 + index * 8, &address, 8);
+    }
+    std::vector<uint64_t> frames;
+    if (!AppendTiStackFrames(extension.data(), extension.size(), 8, &frames) || frames.size() != 64 ||
+        frames.front() != 0x100000 || frames.back() != 0x10003f)
+    {
+        return false;
+    }
+    frames.clear();
+    const uint32_t frame32 = 0x87654321;
+    memcpy(extension.data() + 8, &frame32, 4);
+    if (!AppendTiStackFrames(extension.data(), 12, 4, &frames) || frames != std::vector<uint64_t>{frame32} ||
+        AppendTiStackFrames(extension.data(), 7, 4, &frames) ||
+        AppendTiStackFrames(extension.data(), 13, 4, &frames) || frames.size() != 1 ||
+        TiScalarBytes(TDH_INTYPE_POINTER, EVENT_HEADER_FLAG_32_BIT_HEADER) != 4 ||
+        TiScalarBytes(TDH_INTYPE_POINTER, EVENT_HEADER_FLAG_64_BIT_HEADER) != 8 ||
+        TiScalarBytes(TDH_INTYPE_GUID, 0) != 16)
+    {
+        return false;
+    }
+    TiTraceLifecycle trace;
+    trace.Generation = 2;
+    trace.ThreadRunning = true;
+    if (CompleteTraceGeneration(&trace, 1, ERROR_CANCELLED, 100) || !trace.ThreadRunning)
+    {
+        return false;
+    }
+    if (!CompleteTraceGeneration(&trace, 2, ERROR_WMI_INSTANCE_NOT_FOUND, 200) ||
+        trace.ThreadRunning || !trace.ExitStatusKnown || trace.ExitAfterStopRequest ||
+        trace.ExitStatus != ERROR_WMI_INSTANCE_NOT_FOUND || trace.ExitTickMs != 200)
+    {
+        return false;
+    }
+    trace.Generation = 3;
+    trace.ThreadRunning = true;
+    trace.StopRequested = true;
+    if (!CompleteTraceGeneration(&trace, 3, ERROR_CANCELLED, 300) || !trace.ExitAfterStopRequest)
+    {
+        return false;
+    }
+
+    std::deque<TiEventRecord> ring;
+    for (uint64_t sequence = 8; sequence <= 12; ++sequence)
+    {
+        TiEventRecord record;
+        record.Sequence = sequence;
+        ring.push_back(record);
+    }
+    TiSequenceSnapshot snapshot = SnapshotTiSequenceRange(ring, 12, 5, 2);
+    if (snapshot.MissingBeforeFirst != 2 || snapshot.Records.size() != 2 ||
+        snapshot.Records[0].Sequence != 8 || snapshot.Records[1].Sequence != 9 ||
+        !snapshot.HasMore || snapshot.CursorAhead || snapshot.EarliestAvailableSequence != 8)
+    {
+        return false;
+    }
+    snapshot = SnapshotTiSequenceRange(ring, 12, 9, 0);
+    if (snapshot.MissingBeforeFirst != 0 || snapshot.Records.size() != 3 || snapshot.HasMore)
+    {
+        return false;
+    }
+    snapshot = SnapshotTiSequenceRange(ring, 12, 0, 1);
+    if (snapshot.MissingBeforeFirst != 0 || snapshot.Records.size() != 1)
+    {
+        return false;
+    }
+    snapshot = SnapshotTiSequenceRange(ring, 12, 13, 1);
+    if (!snapshot.CursorAhead || !snapshot.Records.empty() || snapshot.MissingBeforeFirst != 0)
+    {
+        return false;
+    }
+    ring.clear();
+    snapshot = SnapshotTiSequenceRange(ring, 12, 9, 1);
+    return snapshot.MissingBeforeFirst == 3 && snapshot.Records.empty() &&
+        snapshot.EarliestAvailableSequence == 0 && snapshot.LatestAssignedSequence == 12;
 }
 
 bool TiSubscriber::AddWatchPid(uint32_t pid)
@@ -1603,7 +2027,6 @@ bool TiSubscriber::RemoveWatchPid(uint32_t pid)
 {
     std::lock_guard<std::mutex> lock(WatchMutex);
     size_t erased = WatchPids.erase(pid);
-    WatchPromotedPids.erase(pid);
     return erased > 0;
 }
 
@@ -1636,9 +2059,6 @@ bool TiSubscriber::RemoveWatchName(const std::wstring& imageBase)
         return false;
     }
     WatchNamesLower.erase(it);
-    // Drop promoted PIDs whose name no longer matches anything. We cannot
-    // re-evaluate cheaply here, so just clear and let lazy re-match rebuild.
-    WatchPromotedPids.clear();
     return true;
 }
 
@@ -1769,6 +2189,7 @@ bool TiSubscriber::WriteLogLine(const TiEventRecord& record)
           << L",\"level\":" << static_cast<unsigned>(record.Level)
           << L",\"keyword\":\"0x" << FormatHex64(record.Keyword) << L"\""
           << L",\"version\":" << record.Version;
+    AppendTiGenerationJson(line, record);
 
     if (!record.Payload.empty())
     {

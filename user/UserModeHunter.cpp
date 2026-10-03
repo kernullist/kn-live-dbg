@@ -5428,6 +5428,42 @@ namespace
         return diskSize != liveSize || diskEntry != liveEntry;
     }
 
+    bool HuntAddressHasRuntimeProvenance(const HuntProcessRecord& process, uint64_t address)
+    {
+        bool observed = false;
+        if (!process.UserEvidence.IdentityStable)
+        {
+            return false;
+        }
+        for (const KmonRuntimeCodeRange& range : process.UserEvidence.RuntimeRanges)
+        {
+            if (range.Size != 0 && address >= range.Start && address - range.Start < range.Size)
+            {
+                observed = true;
+                break;
+            }
+        }
+        return observed;
+    }
+
+    bool HuntAddressHasSnapshotExecution(const HuntProcessRecord& process, uint64_t address)
+    {
+        bool observed = false;
+        if (!process.UserEvidence.IdentityStable)
+        {
+            return false;
+        }
+        for (const KmonThreadContextRecord& context : process.UserEvidence.Snapshot.Threads)
+        {
+            if (context.ControlValid && context.InstructionPointer == address)
+            {
+                observed = true;
+                break;
+            }
+        }
+        return observed;
+    }
+
     bool ProcessLooksLikeJitHost(const HuntProcessRecord& process)
     {
         bool jit = false;
@@ -19296,7 +19332,7 @@ namespace
                     for (const ProcessApcEntryRecord& apc : queue.Entries)
                     {
                         if (matchesProtection(apc.NormalRoutine) ||
-                            matchesProtection(apc.UserRoutine) ||
+                            (!ProcessApcUserRoutineIsArgumentCandidate(apc) && matchesProtection(apc.UserRoutine)) ||
                             matchesProtection(apc.KernelRoutine))
                         {
                             observed = true;
@@ -20127,12 +20163,23 @@ namespace
             !IsKernelAddress(apc.KernelRoutine);
     }
 
+    bool ApcHasOnlyArgumentCandidate(const ProcessApcEntryRecord& apc)
+    {
+        return ProcessApcUserRoutineIsArgumentCandidate(apc) && !HasNonCanonicalKernelApcRoutine(apc) &&
+            !apc.NormalRoutineInPrivateExecVad && !apc.NormalRoutineInWxVad;
+    }
+
     uint64_t SelectApcFindingAddress(
         const ProcessApcEntryRecord& apc)
     {
         if (HasNonCanonicalKernelApcRoutine(apc))
         {
             return apc.KernelRoutine;
+        }
+        if (ProcessApcUserRoutineIsArgumentCandidate(apc) &&
+            (apc.NormalRoutineInPrivateExecVad || apc.NormalRoutineInWxVad))
+        {
+            return apc.NormalRoutine;
         }
         if (apc.UserRoutine != 0)
         {
@@ -20149,6 +20196,11 @@ namespace
         if (HasNonCanonicalKernelApcRoutine(apc))
         {
             return apc.KernelRoutineModule;
+        }
+        if (ProcessApcUserRoutineIsArgumentCandidate(apc) &&
+            (apc.NormalRoutineInPrivateExecVad || apc.NormalRoutineInWxVad))
+        {
+            return apc.NormalRoutineModule;
         }
         if (apc.UserRoutine != 0)
         {
@@ -20267,7 +20319,7 @@ namespace
 
     bool ApcLooksLikeRemoteLoader(const ProcessApcEntryRecord& apc)
     {
-        return ModuleLeafIsKernel32Family(apc.UserRoutineModule) ||
+        return (!ProcessApcUserRoutineIsArgumentCandidate(apc) && ModuleLeafIsKernel32Family(apc.UserRoutineModule)) ||
             ModuleLeafIsKernel32Family(apc.NormalRoutineModule);
     }
 
@@ -20386,8 +20438,8 @@ namespace
                                 L"medium",
                                 L"process_injection",
                                 L"queued APC routine lands in kernel32/kernelbase (threadless LoadLibrary injection)",
-                                apc.UserRoutine != 0 ? apc.UserRoutine : apc.NormalRoutine,
-                                !apc.UserRoutineModule.empty()
+                                !ProcessApcUserRoutineIsArgumentCandidate(apc) && apc.UserRoutine != 0 ? apc.UserRoutine : apc.NormalRoutine,
+                                !ProcessApcUserRoutineIsArgumentCandidate(apc) && !apc.UserRoutineModule.empty()
                                     ? apc.UserRoutineModule
                                     : apc.NormalRoutineModule,
                                 reasons,
@@ -20515,7 +20567,8 @@ namespace
                     bool waitingThreadHijack =
                         ref.ValueInPrivateExecVad &&
                         ref.ValueOutsideUserModules &&
-                        !ProcessLooksLikeJitHost(process);
+                        HuntAddressHasSnapshotExecution(process, ref.Value) &&
+                        !HuntAddressHasRuntimeProvenance(process, ref.Value);
                     if (!strongStackEvidence && !identityCorroborated && !waitingThreadHijack)
                     {
                         // Preserve the raw stack-reference record and counters,
@@ -20525,7 +20578,7 @@ namespace
                     }
                     if (waitingThreadHijack)
                     {
-                        AddUnique(&reasons, L"waiting_thread_hijack");
+                        AddUnique(&reasons, L"captured_private_execution_and_stack_reference");
                     }
                     AddBuiltinInjectionReasonIfNeeded(
                         process,
@@ -20563,6 +20616,7 @@ namespace
 
                         const bool nonCanonicalKernelRoutine =
                             HasNonCanonicalKernelApcRoutine(apc);
+                        const bool argumentOnly = ApcHasOnlyArgumentCandidate(apc);
                         uint64_t findingAddress =
                             SelectApcFindingAddress(apc);
                         std::wstring findingModule =
@@ -20597,7 +20651,8 @@ namespace
                             apc.UserRoutineInWxVad ? L"true" : L"false";
                         evidence[L"notes"] = apc.Notes;
 
-                        std::vector<std::wstring> reasons = {L"suspicious_apc_routine"};
+                        std::vector<std::wstring> reasons =
+                            {argumentOnly ? L"unverified_apc_argument_candidate" : L"suspicious_apc_routine"};
                         if (nonCanonicalKernelRoutine)
                         {
                             AddUnique(
@@ -20617,10 +20672,11 @@ namespace
                         AddFinding(
                             result,
                             process,
-                            L"high",
-                            L"medium",
-                            L"apc_redirection",
-                            L"queued APC has suspicious user or kernel routine provenance",
+                            argumentOnly ? L"low" : L"high",
+                            argumentOnly ? L"low" : L"medium",
+                            argumentOnly ? L"apc_argument_candidate" : L"apc_redirection",
+                            argumentOnly ? L"queued APC argument points to executable memory; dispatch is unverified" :
+                                L"queued APC has suspicious user or kernel routine provenance",
                             findingAddress,
                             findingModule,
                             reasons,
@@ -21935,9 +21991,7 @@ namespace
         return found;
     }
 
-    void AddTrapFrameRipFindings(
-        DeviceClient& device,
-        SymbolEngine& symbols,
+    void AddExecutionEvidenceFindings(
         HuntResult* result,
         const HuntProcessRecord& process)
     {
@@ -21945,85 +21999,56 @@ namespace
         {
             if (result == nullptr ||
                 process.ProcessId <= 4 ||
-                process.ThreadRecords.empty())
+                !process.UserEvidence.IdentityStable)
             {
                 break;
             }
-            if (ProcessLooksLikeJitHost(process))
-            {
-                break;
-            }
-            if (ProcessHasGraphicsApiModule(process) &&
-                !HuntProcessHasCallTableHook(*result, process.ProcessId))
-            {
-                break;
-            }
-
-            TypeFieldInfo trapField = {};
-            TypeFieldInfo ripField = {};
-            if (!symbols.FindField(L"nt!_KTHREAD", L"TrapFrame", &trapField, nullptr) &&
-                !FindFieldRecursive(
-                    symbols,
-                    {L"nt!_KTHREAD", L"_KTHREAD", L"nt!_ETHREAD"},
-                    L"TrapFrame",
-                    &trapField))
-            {
-                break;
-            }
-            if (!symbols.FindField(L"nt!_KTRAP_FRAME", L"Rip", &ripField, nullptr) &&
-                !FindFieldRecursive(
-                    symbols,
-                    {L"nt!_KTRAP_FRAME", L"_KTRAP_FRAME"},
-                    L"Rip",
-                    &ripField))
-            {
-                break;
-            }
-
             size_t findings = 0;
-            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            for (const KmonUserAddressEvidence& record : process.UserEvidence.Addresses)
             {
-                if (findings >= 4 || thread.Ethread == 0)
+                if (findings >= 8 || record.Kind == KmonUserEvidenceKind::HardwareBreakpoint ||
+                    record.Kind == KmonUserEvidenceKind::UserApcRoutine ||
+                    record.Kind == KmonUserEvidenceKind::UserApcArgumentCandidate || !record.OwnershipKnown ||
+                    record.InLoaderModule || !record.PrivateExecutable)
                 {
                     continue;
                 }
-
-                uint64_t trapFrame = 0;
-                if (!ReadKernelU64(device, thread.Ethread + trapField.Offset, &trapFrame) ||
-                    trapFrame == 0 ||
-                    !IsKernelAddress(trapFrame))
-                {
-                    continue;
-                }
-
-                uint64_t rip = 0;
-                if (!ReadKernelU64(device, trapFrame + ripField.Offset, &rip) ||
-                    rip == 0 ||
-                    !IsUserAddress(rip))
-                {
-                    continue;
-                }
-                if (LoaderModuleCoversAddress(process, rip, nullptr) ||
-                    !AddressInPrivateExecutableVad(process, rip))
-                {
-                    continue;
-                }
-
                 std::map<std::wstring, std::wstring> evidence;
-                evidence[L"ethread"] = HuntHex(thread.Ethread, 16);
-                evidence[L"tid"] = std::to_wstring(thread.ThreadId);
-                evidence[L"trap_frame"] = HuntHex(trapFrame, 16);
-                evidence[L"rip"] = HuntHex(rip, 16);
+                evidence[L"tid"] = std::to_wstring(record.ThreadId);
+                evidence[L"record"] = HuntHex(record.RecordAddress, 16);
+                evidence[L"address"] = HuntHex(record.Address, 16);
+                evidence[L"provenance"] = record.Provenance;
+                evidence[L"runtime_range_observed"] = record.RuntimeRangeObserved ? L"true" : L"false";
+                const ProcessVadRecord* vad = FindVadContaining(process, record.Address);
+                const bool strong = vad != nullptr && VadClassificationHasStrongCodeEvidence(vad->Classification);
+                std::wstring reason = L"captured_instruction_pointer_private_exec";
+                std::wstring title = L"captured instruction pointer is in private executable memory outside loader modules";
+                if (record.Kind == KmonUserEvidenceKind::SavedTrapInstructionPointer)
+                {
+                    reason = L"trap_frame_rip_private_exec";
+                    title = L"revalidated saved trap RIP is in private executable memory outside loader modules";
+                }
+                else if (record.Kind == KmonUserEvidenceKind::TlsCallback)
+                {
+                    reason = L"tls_callback_private_exec";
+                    title = L"TLS callback points into private executable memory outside loader modules";
+                }
+                else if (record.Kind == KmonUserEvidenceKind::VectoredExceptionHandler ||
+                    record.Kind == KmonUserEvidenceKind::VectoredContinueHandler)
+                {
+                    reason = L"vectored_handler_private_exec";
+                    title = L"exact-symbol vectored handler points into private executable memory outside loader modules";
+                }
                 AddFinding(
                     result,
                     process,
-                    L"high",
-                    L"medium",
-                    L"process_injection",
-                    L"thread TrapFrame RIP is in private executable memory (thread hijack)",
-                    rip,
+                    strong ? L"high" : L"low",
+                    strong ? L"medium" : L"low",
+                    L"execution_provenance",
+                    title,
+                    record.Address,
                     L"",
-                    {L"trap_frame_rip_private_exec", L"thread_execution_hijack"},
+                    {reason, L"private_executable_vad"},
                     evidence);
                 ++findings;
             }
@@ -22038,8 +22063,7 @@ namespace
         do
         {
             if (result == nullptr ||
-                process.ProcessId <= 4 ||
-                ProcessLooksLikeJitHost(process))
+                process.ProcessId <= 4)
             {
                 break;
             }
@@ -22120,6 +22144,7 @@ namespace
                 evidence[L"vad"] = HuntHex(vad.VadAddress, 16);
                 evidence[L"start"] = HuntHex(vad.StartAddress, 16);
                 evidence[L"size"] = std::to_wstring(vad.Size);
+                evidence[L"runtime_range_observed"] = HuntAddressHasRuntimeProvenance(process, vad.StartAddress) ? L"true" : L"false";
                 std::vector<std::wstring> reasons = {L"private_executable_vad"};
                 std::wstring title =
                     L"private executable VAD contains a direct syscall stub (Hell's Gate / Tartarus)";
@@ -22281,8 +22306,7 @@ namespace
                 const bool scanRdata =
                     ModuleLooksLikeGraphicsApiDll(leaf) ||
                     overlayLeaf ||
-                    (IsMainImageModule(process, module) &&
-                        !ProcessLooksLikeJitHost(process));
+                    IsMainImageModule(process, module);
 
                 auto emitHook =
                     [&](uint64_t target,
@@ -22589,7 +22613,6 @@ namespace
     }
 
     void AddHardwareBreakpointFindings(
-        DeviceClient& device,
         HuntResult* result,
         const HuntProcessRecord& process)
     {
@@ -22597,64 +22620,24 @@ namespace
         {
             if (result == nullptr ||
                 process.ProcessId <= 4 ||
-                !process.Kernel.HasPeb ||
-                process.Kernel.Peb == 0)
+                !process.UserEvidence.IdentityStable ||
+                !process.UserEvidence.Snapshot.Coverage.Available)
             {
                 break;
             }
-
-            uint8_t beingDebugged = 0;
-            std::vector<uint8_t> flagBytes;
-            std::wstring ignored;
-            if (ReadHuntProcessMemory(
-                    device,
-                    process.Kernel,
-                    process.Kernel.Peb + 2,
-                    1,
-                    &flagBytes,
-                    &ignored) &&
-                !flagBytes.empty())
-            {
-                beingDebugged = flagBytes[0];
-            }
-            if (beingDebugged != 0)
-            {
-                break;
-            }
-
             size_t findings = 0;
-            for (const ProcessThreadRecord& thread : process.ThreadRecords)
+            for (const KmonThreadContextRecord& thread : process.UserEvidence.Snapshot.Threads)
             {
                 if (findings >= 4 ||
-                    !thread.HasThreadId ||
-                    thread.ThreadId == 0 ||
-                    thread.ThreadId > 0xFFFFFFFFull)
+                    !thread.DebugValid || thread.ThreadId == 0)
                 {
                     continue;
                 }
-
-                HANDLE threadHandle = OpenThread(
-                    THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
-                    FALSE,
-                    static_cast<DWORD>(thread.ThreadId));
-                if (threadHandle == nullptr)
-                {
-                    continue;
-                }
-
-                alignas(16) CONTEXT ctx = {};
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                const BOOL gotContext = GetThreadContext(threadHandle, &ctx);
-                CloseHandle(threadHandle);
-                if (!gotContext)
-                {
-                    continue;
-                }
-
-                const uint64_t dr[] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+                const auto& dr = thread.DebugAddress;
                 for (uint32_t index = 0; index < 4; ++index)
                 {
-                    if (!HardwareBreakpointEnabled(ctx.Dr7, index) ||
+                    if (!HardwareBreakpointEnabled(thread.DebugControl, index) ||
+                        ((thread.DebugControl >> (16 + index * 4)) & 3) != 0 ||
                         dr[index] == 0 ||
                         !IsUserAddress(dr[index]))
                     {
@@ -22678,7 +22661,10 @@ namespace
                     evidence[L"tid"] = std::to_wstring(thread.ThreadId);
                     evidence[L"dr_index"] = std::to_wstring(index);
                     evidence[L"dr_address"] = HuntHex(dr[index], 16);
-                    evidence[L"dr7"] = HuntHex(ctx.Dr7, 16);
+                    evidence[L"dr7"] = HuntHex(thread.DebugControl, 16);
+                    evidence[L"context_source"] = thread.Wow64 ? L"PSS WOW64" : L"PSS AMD64";
+                    evidence[L"thread_create_time"] = std::to_wstring(thread.CreateTime);
+                    evidence[L"interpretation"] = L"execution breakpoint observed; legitimate debugging is possible";
                     std::vector<std::wstring> reasons = {L"hardware_breakpoint"};
                     if (inPrivate)
                     {
@@ -22691,9 +22677,9 @@ namespace
                     AddFinding(
                         result,
                         process,
-                        L"high",
                         L"medium",
-                        L"process_injection",
+                        L"medium",
+                        L"execution_provenance",
                         L"thread debug register is armed on private or core-OS executable memory",
                         dr[index],
                         owner != nullptr ? owner->Name : L"",
@@ -23536,7 +23522,7 @@ namespace
                     {
                         const uint64_t apcTargets[] =
                         {
-                            apc.UserRoutine,
+                            ProcessApcUserRoutineIsArgumentCandidate(apc) ? 0 : apc.UserRoutine,
                             apc.NormalRoutine,
                             apc.KernelRoutine
                         };
@@ -25907,6 +25893,62 @@ bool HuntInProcessHookSelfTest()
             break;
         }
 
+        game.UserEvidence.IdentityStable = true;
+        game.UserEvidence.Snapshot.Coverage.Available = true;
+        KmonThreadContextRecord captured;
+        captured.ThreadId = 123;
+        captured.DebugValid = true;
+        captured.ControlValid = true;
+        captured.InstructionPointer = 0x200100;
+        captured.DebugAddress[0] = 0x200100;
+        captured.DebugControl = 1;
+        game.UserEvidence.Snapshot.Threads.push_back(captured);
+        HuntResult executionResult;
+        AddHardwareBreakpointFindings(&executionResult, game);
+        if (executionResult.Findings.size() != 1 || !HuntAddressHasSnapshotExecution(game, 0x200100))
+        {
+            break;
+        }
+        executionResult = {};
+        game.UserEvidence.Snapshot.Threads[0].DebugControl |= 1ULL << 16;
+        AddHardwareBreakpointFindings(&executionResult, game);
+        if (!executionResult.Findings.empty())
+        {
+            break;
+        }
+        KmonUserAddressEvidence callback;
+        callback.Kind = KmonUserEvidenceKind::TlsCallback;
+        callback.Address = 0x200100;
+        callback.OwnershipKnown = true;
+        callback.PrivateExecutable = true;
+        game.UserEvidence.Addresses.push_back(callback);
+        game.ApiImagePath = L"C:\\Program Files\\Browser\\chrome.exe";
+        AddExecutionEvidenceFindings(&executionResult, game);
+        if (executionResult.Findings.size() != 1 || executionResult.Findings[0].Risk != L"low")
+        {
+            break;
+        }
+        executionResult = {};
+        game.UserEvidence.Addresses.back().Kind = KmonUserEvidenceKind::UserApcArgumentCandidate;
+        AddExecutionEvidenceFindings(&executionResult, game);
+        if (!executionResult.Findings.empty())
+        {
+            break;
+        }
+        KmonRuntimeCodeRange runtime;
+        runtime.Start = 0x200000;
+        runtime.Size = 0x1000;
+        game.UserEvidence.RuntimeRanges.push_back(runtime);
+        if (!HuntAddressHasRuntimeProvenance(game, 0x200100) || HuntAddressHasRuntimeProvenance(game, 0x201000))
+        {
+            break;
+        }
+        game.UserEvidence.IdentityStable = false;
+        if (HuntAddressHasRuntimeProvenance(game, 0x200100) || HuntAddressHasSnapshotExecution(game, 0x200100))
+        {
+            break;
+        }
+
         ok = true;
     } while (false);
 
@@ -27433,10 +27475,41 @@ bool HuntEffectiveVadProtectionSelfTest()
     userApc.KernelRoutine = 0xfffff80000001000ull;
     userApc.UserRoutine = 0x00007fff00002000ull;
     userApc.UserRoutineModule = L"user.dll";
-    return SelectApcFindingAddress(userApc) ==
-            userApc.UserRoutine &&
-        SelectApcFindingModule(userApc) ==
-            userApc.UserRoutineModule;
+    if (SelectApcFindingAddress(userApc) != userApc.UserRoutine ||
+        SelectApcFindingModule(userApc) != userApc.UserRoutineModule)
+    {
+        return false;
+    }
+    userApc.HasNormalRoutine = true;
+    userApc.NormalRoutine = 0x00007fff00001000ull;
+    userApc.NormalRoutineModule = L"ntdll.dll";
+    userApc.UserRoutineSource = L"system_argument1";
+    userApc.UserRoutineModule = L"kernel32.dll";
+    userApc.Suspicious = true;
+    userApc.UserRoutineInPrivateExecVad = true;
+    if (!ApcHasOnlyArgumentCandidate(userApc) || ApcLooksLikeRemoteLoader(userApc))
+    {
+        return false;
+    }
+    HuntProcessRecord apcProcess;
+    apcProcess.ProcessId = 100;
+    apcProcess.ThreadRecords.resize(1);
+    apcProcess.ThreadRecords[0].ApcQueues.resize(1);
+    apcProcess.ThreadRecords[0].ApcQueues[0].Entries.push_back(userApc);
+    HuntResult apcResult;
+    AddThreadFindings(&apcResult, apcProcess);
+    if (apcResult.Findings.size() != 1 || apcResult.Findings[0].Risk != L"low")
+    {
+        return false;
+    }
+    userApc.NormalRoutineInPrivateExecVad = true;
+    if (ApcHasOnlyArgumentCandidate(userApc) || SelectApcFindingAddress(userApc) != userApc.NormalRoutine)
+    {
+        return false;
+    }
+    userApc.NormalRoutineInPrivateExecVad = false;
+    userApc.KernelRoutine = 0x1234;
+    return !ApcHasOnlyArgumentCandidate(userApc) && SelectApcFindingAddress(userApc) == userApc.KernelRoutine;
 }
 
 bool HuntEdrKillerProfileSelfTest()
@@ -28693,6 +28766,7 @@ UserModeHunter::UserModeHunter(
 bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::wstring* error)
 {
     bool ok = false;
+    KmonUserRuntimeTracker runtimeTracker;
     if (error != nullptr)
     {
         error->clear();
@@ -28718,6 +28792,22 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
         result->ThreatIntelActive = options.ThreatIntelActive;
         result->ThreatIntelAvailable = options.ThreatIntelAvailable || !options.ThreatIntelEvents.empty();
         result->Warnings.push_back(L"builtin process signer verification is not implemented; publisher evidence unavailable");
+
+        if (options.Mode != HuntMode::Quick)
+        {
+            std::wstring runtimeWarning;
+            if (!runtimeTracker.Start(&runtimeWarning))
+            {
+                result->Warnings.push_back(runtimeWarning);
+            }
+            for (const SnapshotProcessRecord& process : options.Processes)
+            {
+                if (process.HasCreateTime)
+                {
+                    runtimeTracker.WatchProcess(process.ProcessId, process.CreateTime);
+                }
+            }
+        }
 
         std::map<uint32_t, HuntProcessRecord> processes;
         for (const SnapshotProcessRecord& process : options.Processes)
@@ -29525,6 +29615,25 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                     result->CoverageComplete = false;
                 }
 
+                KmonUserEvidenceOptions executionOptions;
+                executionOptions.Target = BuildTriageTarget(process.Kernel);
+                executionOptions.UserModules = threadOptions.UserModules;
+                executionOptions.UserModulesComplete = threadOptions.UserModuleEnumerationComplete;
+                executionOptions.VadRecords = process.VadRecords;
+                executionOptions.ImagePath = BestProcessImagePath(process);
+                executionOptions.MaxThreads = 256;
+                executionOptions.RuntimeTracker = &runtimeTracker;
+                executionOptions.CaptureContexts = options.Mode != HuntMode::Quick;
+                if (!CollectKmonUserEvidence(device_, symbols_, executionOptions, &process.UserEvidence, &scanError) ||
+                    !process.UserEvidence.Snapshot.Coverage.Complete || !process.UserEvidence.ApcCoverage.Complete ||
+                    !process.UserEvidence.SavedContextCoverage.Complete || !process.UserEvidence.TlsCoverage.Complete ||
+                    !process.UserEvidence.HandlerCoverage.Complete)
+                {
+                    result->ProcessTriageCoverageIncomplete = true;
+                    result->CoverageComplete = false;
+                    AddUnique(&process.Warnings, L"execution evidence is partial; unsupported contexts, handlers, and runtime ranges remain unknown");
+                }
+
                 AddIdentityFindings(result, process);
                 AddEdrKillerProcessProfileFindings(result, process);
                 AddEsetFileHashProcessFinding(result, process, &processSha1Cache);
@@ -29538,10 +29647,10 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 AddKernelCallbackTableFindings(device_, symbols_, result, process);
                 AddInstrumentationCallbackFinding(device_, symbols_, result, process);
                 AddCallTableHookFindings(device_, result, process);
-                AddTrapFrameRipFindings(device_, symbols_, result, process);
+                AddExecutionEvidenceFindings(result, process);
                 AddDirectSyscallStubFindings(device_, result, process);
                 AddClonedVtableFindings(device_, result, process);
-                AddHardwareBreakpointFindings(device_, result, process);
+                AddHardwareBreakpointFindings(result, process);
                 AddMainImageHerpaderpFinding(device_, result, process);
                 AddMainImageVadFinding(device_, symbols_, result, &process);
 
@@ -30217,6 +30326,28 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"main_section_backing_path\":\"" << HuntJsonEscape(process.MainSectionBackingPath) << L"\"";
         json << L",\"main_section_backing_state\":\"" << HuntJsonEscape(process.MainSectionBackingState) << L"\"";
         json << L",\"disk_path\":\"" << HuntJsonEscape(process.DiskPath) << L"\"";
+        json << L",\"execution_evidence\":{\"identity_stable\":"
+             << (process.UserEvidence.IdentityStable ? L"true" : L"false");
+        json << L",\"address_records\":" << process.UserEvidence.Addresses.size();
+        json << L",\"snapshot_contexts\":" << process.UserEvidence.Snapshot.Threads.size();
+        json << L",\"context_complete\":" << (process.UserEvidence.Snapshot.Coverage.Complete ? L"true" : L"false");
+        json << L",\"apc_complete\":" << (process.UserEvidence.ApcCoverage.Complete ? L"true" : L"false");
+        json << L",\"saved_context_complete\":" << (process.UserEvidence.SavedContextCoverage.Complete ? L"true" : L"false");
+        json << L",\"tls_complete\":" << (process.UserEvidence.TlsCoverage.Complete ? L"true" : L"false");
+        json << L",\"handlers_available\":" << (process.UserEvidence.HandlerCoverage.Available ? L"true" : L"false");
+        json << L",\"handlers_complete\":" << (process.UserEvidence.HandlerCoverage.Complete ? L"true" : L"false");
+        json << L",\"runtime_ranges\":" << process.UserEvidence.RuntimeRanges.size();
+        json << L",\"runtime_detail\":\"" << HuntJsonEscape(process.UserEvidence.RuntimeCoverage.Detail) << L"\"}";
+        const KmonFileIdentity& identity = process.UserEvidence.ImageIdentity;
+        json << L",\"opened_image_identity\":{\"stable\":" << (identity.Stable ? L"true" : L"false");
+        json << L",\"volume\":\"" << HuntHex(identity.VolumeSerial, 16) << L"\",\"file_id\":\"";
+        for (uint8_t byte : identity.FileId)
+        {
+            json << HuntHex(byte, 2).substr(2);
+        }
+        json << L"\",\"final_path\":\"" << HuntJsonEscape(identity.FinalPath) << L"\"";
+        json << L",\"change_time\":" << identity.ChangeTime << L",\"size\":" << identity.Size;
+        json << L",\"hardlink_count\":" << identity.Links << L",\"path_reparse_tag\":" << identity.PathReparseTag << L"}";
         json << L",\"parent_pid\":";
         if (process.HasParentProcessId)
         {

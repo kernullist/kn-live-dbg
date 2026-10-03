@@ -1,16 +1,19 @@
 #include "AiProvider.h"
 #include "AiModelCatalog.h"
 
+#include <winsock2.h>
 #include <Windows.h>
 #include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cwchar>
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <thread>
 
 static const wchar_t* kDefaultCodexBaseUrl = L"https://chatgpt.com/backend-api/codex";
 static const wchar_t* kDefaultDeepSeekBaseUrl = L"https://api.deepseek.com";
@@ -1276,6 +1279,210 @@ struct HttpResult
     std::wstring Body;
 };
 
+static constexpr size_t kMaxHttpResponseBytes = 8u * 1024u * 1024u;
+
+// The caller and the request each hold one reference. HANDLE_CLOSING releases
+// the request reference, keeping buffers alive after timeout cancellation.
+struct HttpAsyncState
+{
+    std::atomic<unsigned> References{1};
+    std::atomic<DWORD> Status{0};
+    std::atomic<DWORD> Error{0};
+    std::atomic<DWORD> Bytes{0};
+    HANDLE Completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    char Buffer[8192] = {};
+    std::string UploadBody;
+    std::wstring Headers;
+
+    ~HttpAsyncState()
+    {
+        if (Completed != nullptr)
+        {
+            CloseHandle(Completed);
+        }
+    }
+
+    void Release()
+    {
+        if (References.fetch_sub(1) == 1)
+        {
+            delete this;
+        }
+    }
+
+    void Reset()
+    {
+        ResetEvent(Completed);
+        Status.store(0);
+        Error.store(0);
+        Bytes.store(0);
+    }
+};
+
+static void CALLBACK HttpStatusCallback(HINTERNET, DWORD_PTR context, DWORD status,
+    void* information, DWORD informationLength)
+{
+    auto* state = reinterpret_cast<HttpAsyncState*>(context);
+    if (state == nullptr)
+    {
+        return;
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING)
+    {
+        state->Release();
+        return;
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR)
+    {
+        const auto* result = static_cast<const WINHTTP_ASYNC_RESULT*>(information);
+        state->Error.store(result != nullptr && informationLength >= sizeof(*result) ?
+            result->dwError : ERROR_GEN_FAILURE);
+    }
+    else if (status != WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE &&
+        status != WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE && status != WINHTTP_CALLBACK_STATUS_READ_COMPLETE)
+    {
+        return;
+    }
+    state->Bytes.store(status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE ? informationLength : 0);
+    state->Status.store(status);
+    SetEvent(state->Completed);
+}
+
+static bool WaitHttpOperation(HttpAsyncState* state, ULONGLONG started, ULONGLONG timeoutMs,
+    DWORD expected, std::wstring* error)
+{
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    const DWORD wait = elapsed >= timeoutMs ? WAIT_TIMEOUT : WaitForSingleObject(state->Completed,
+        static_cast<DWORD>((std::min)(timeoutMs - elapsed, static_cast<ULONGLONG>(MAXDWORD - 1))));
+    if (wait != WAIT_OBJECT_0 || GetTickCount64() - started >= timeoutMs)
+    {
+        if (error != nullptr)
+        {
+            *error = L"AI HTTP response timed out or wait failed";
+        }
+        return false;
+    }
+    if (state->Status.load() != expected)
+    {
+        if (error != nullptr)
+        {
+            *error = L"AI HTTP operation failed: " + std::to_wstring(state->Error.load());
+        }
+        return false;
+    }
+    return true;
+}
+
+template<typename Reader, typename Clock>
+static bool ReadHttpResponseBody(Reader&& reader, Clock&& clock, ULONGLONG started,
+    ULONGLONG timeoutMs, std::string* body, std::wstring* error,
+    size_t maxBytes = kMaxHttpResponseBytes, size_t expectedBytes = static_cast<size_t>(-1))
+{
+    body->clear();
+    for (;;)
+    {
+        const ULONGLONG elapsed = clock() - started;
+        if (elapsed >= timeoutMs)
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI HTTP response timed out";
+            }
+            return false;
+        }
+        const int remaining = static_cast<int>((std::min)(timeoutMs - elapsed, 0x7fffffffull));
+        char chunk[8192];
+        DWORD read = 0;
+        if (!reader(chunk, static_cast<DWORD>(sizeof(chunk)), &read, remaining))
+        {
+            return false;
+        }
+        if (clock() - started >= timeoutMs)
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI HTTP response timed out";
+            }
+            return false;
+        }
+        if (read > sizeof(chunk) || body->size() > maxBytes || read > maxBytes - body->size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"AI HTTP response exceeded capture limit";
+            }
+            return false;
+        }
+        if (read == 0)
+        {
+            if (expectedBytes != static_cast<size_t>(-1) && body->size() != expectedBytes)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"AI HTTP response body is incomplete";
+                }
+                return false;
+            }
+            return true;
+        }
+        body->append(chunk, read);
+    }
+}
+
+bool AiProviderRuntime::HttpResponseBodySelfTest()
+{
+    for (unsigned scenario = 0; scenario < 7; ++scenario)
+    {
+        ULONGLONG now = 0;
+        unsigned reads = 0;
+        std::string body;
+        std::wstring error;
+        auto reader = [&](char* chunk, DWORD capacity, DWORD* read, int remaining)
+        {
+            if (remaining <= 0 || remaining > 1000)
+            {
+                return false;
+            }
+            ++reads;
+            *read = reads == 1 && scenario != 0 ? 8u : 0u;
+            if (scenario == 2 && reads == 2)
+            {
+                *read = 1;
+            }
+            if (scenario == 3 && reads == 2)
+            {
+                return false;
+            }
+            if (scenario == 4)
+            {
+                now += 1000;
+            }
+            if (scenario == 5)
+            {
+                *read = capacity + 1;
+            }
+            if (scenario == 6 && reads == 1)
+            {
+                *read = 7;
+            }
+            memset(chunk, 'x', capacity);
+            return true;
+        };
+        const auto clock = [&]()
+        {
+            return now;
+        };
+        const bool ok = ReadHttpResponseBody(reader, clock, 0, 1000, &body, &error, 8,
+            scenario == 6 ? 8 : static_cast<size_t>(-1));
+        if (ok != (scenario < 2) || body.size() > 8 || reads > 2 ||
+            (scenario == 0 && !body.empty()) || (scenario == 1 && body != std::string(8, 'x')))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool HttpRequest(
     const wchar_t* method,
     const std::wstring& url,
@@ -1289,6 +1496,7 @@ static bool HttpRequest(
     HINTERNET session = nullptr;
     HINTERNET connect = nullptr;
     HINTERNET request = nullptr;
+    HttpAsyncState* async = nullptr;
     std::wstring mutableUrl = url;
 
     do
@@ -1325,7 +1533,8 @@ static bool HttpRequest(
             path = L"/";
         }
 
-        session = WinHttpOpen(L"KnLiveDbg/ai", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        session = WinHttpOpen(L"KnLiveDbg/ai", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
         if (session == nullptr)
         {
             if (error != nullptr)
@@ -1335,8 +1544,16 @@ static bool HttpRequest(
             break;
         }
 
-        int timeout = static_cast<int>(std::max<uint32_t>(timeoutSeconds, 1) * 1000);
-        WinHttpSetTimeouts(session, timeout, timeout, timeout, timeout);
+        const ULONGLONG timeoutMs = static_cast<ULONGLONG>((std::max)(timeoutSeconds, 1u)) * 1000;
+        const int timeout = static_cast<int>((std::min)(timeoutMs, 0x7fffffffull));
+        if (!WinHttpSetTimeouts(session, timeout, timeout, timeout, timeout))
+        {
+            if (error != nullptr)
+            {
+                *error = L"WinHttpSetTimeouts failed";
+            }
+            break;
+        }
 
         connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
         if (connect == nullptr)
@@ -1360,9 +1577,50 @@ static bool HttpRequest(
             break;
         }
 
-        DWORD bodySize = static_cast<DWORD>(body.size());
-        const void* bodyData = body.empty() ? nullptr : body.data();
-        if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()), const_cast<void*>(bodyData), bodySize, bodySize, 0))
+        // A redirect must not forward provider credentials or request bodies.
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+            &redirectPolicy, sizeof(redirectPolicy)))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not disable AI HTTP redirects";
+            }
+            break;
+        }
+
+        async = new HttpAsyncState();
+        if (async->Completed == nullptr || body.size() > MAXDWORD || headers.size() > MAXDWORD ||
+            WinHttpSetStatusCallback(request, HttpStatusCallback,
+                WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE | WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
+                WINHTTP_CALLBACK_FLAG_READ_COMPLETE | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
+                WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not initialize AI HTTP completion state";
+            }
+            break;
+        }
+        DWORD_PTR context = reinterpret_cast<DWORD_PTR>(async);
+        async->References.fetch_add(1);
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)))
+        {
+            async->Release();
+            if (error != nullptr)
+            {
+                *error = L"Could not bind AI HTTP completion state";
+            }
+            break;
+        }
+        async->UploadBody = body;
+        async->Headers = headers;
+        const DWORD bodySize = static_cast<DWORD>(async->UploadBody.size());
+        void* bodyData = async->UploadBody.empty() ? nullptr : async->UploadBody.data();
+        const ULONGLONG started = GetTickCount64();
+        async->Reset();
+        if (!WinHttpSendRequest(request, async->Headers.c_str(), static_cast<DWORD>(async->Headers.size()),
+            bodyData, bodySize, bodySize, context))
         {
             if (error != nullptr)
             {
@@ -1370,7 +1628,12 @@ static bool HttpRequest(
             }
             break;
         }
+        if (!WaitHttpOperation(async, started, timeoutMs, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, error))
+        {
+            break;
+        }
 
+        async->Reset();
         if (!WinHttpReceiveResponse(request, nullptr))
         {
             if (error != nullptr)
@@ -1379,52 +1642,89 @@ static bool HttpRequest(
             }
             break;
         }
+        if (!WaitHttpOperation(async, started, timeoutMs, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, error))
+        {
+            break;
+        }
 
         DWORD statusCode = 0;
         DWORD statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &statusCode, &statusSize, nullptr);
-
-        std::string responseBytes;
-        bool readOk = true;
-        for (;;)
+        if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            nullptr, &statusCode, &statusSize, nullptr))
         {
-            DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(request, &available))
+            if (error != nullptr)
             {
-                readOk = false;
+                *error = L"WinHttpQueryHeaders failed";
+            }
+            break;
+        }
+
+        size_t expectedBytes = static_cast<size_t>(-1);
+        wchar_t lengthText[32] = {};
+        DWORD lengthSize = sizeof(lengthText);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH, nullptr, lengthText, &lengthSize, nullptr))
+        {
+            const std::wstring declared = Trim(lengthText);
+            uint64_t parsed = 0;
+            bool valid = !declared.empty();
+            for (wchar_t digit : declared)
+            {
+                if (digit < L'0' || digit > L'9' || parsed > kMaxHttpResponseBytes / 10)
+                {
+                    valid = false;
+                    break;
+                }
+                parsed = parsed * 10 + (digit - L'0');
+            }
+            if (!valid || parsed > kMaxHttpResponseBytes)
+            {
                 if (error != nullptr)
                 {
-                    *error = L"WinHttpQueryDataAvailable failed";
+                    *error = L"AI HTTP Content-Length is invalid or exceeds capture limit";
                 }
                 break;
             }
-
-            if (available == 0)
+            if (_wcsicmp(verb, L"HEAD") != 0 && statusCode != 204 && statusCode != 304)
             {
-                break;
+                expectedBytes = static_cast<size_t>(parsed);
             }
-
-            std::string chunk;
-            chunk.resize(available);
-            DWORD read = 0;
-            if (!WinHttpReadData(request, &chunk[0], available, &read))
+        }
+        else if (GetLastError() != ERROR_WINHTTP_HEADER_NOT_FOUND)
+        {
+            if (error != nullptr)
             {
-                readOk = false;
+                *error = L"Could not read AI HTTP Content-Length";
+            }
+            break;
+        }
+
+        std::string responseBytes;
+        const bool readOk = ReadHttpResponseBody([&](char* chunk, DWORD capacity, DWORD* read, int)
+        {
+            async->Reset();
+            if (!WinHttpReadData(request, async->Buffer, static_cast<DWORD>(sizeof(async->Buffer)), nullptr))
+            {
                 if (error != nullptr)
                 {
                     *error = L"WinHttpReadData failed";
                 }
-                break;
+                return false;
             }
-
-            if (read == 0)
+            if (!WaitHttpOperation(async, started, timeoutMs, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, error))
             {
-                break;
+                return false;
             }
-
-            chunk.resize(read);
-            responseBytes += chunk;
-        }
+            *read = async->Bytes.load();
+            if (*read > capacity)
+            {
+                return false;
+            }
+            memcpy(chunk, async->Buffer, *read);
+            return true;
+        }, []()
+        {
+            return GetTickCount64();
+        }, started, timeoutMs, &responseBytes, error, kMaxHttpResponseBytes, expectedBytes);
 
         if (!readOk)
         {
@@ -1448,8 +1748,174 @@ static bool HttpRequest(
     {
         WinHttpCloseHandle(session);
     }
+    if (async != nullptr)
+    {
+        async->Release();
+    }
 
     return ok;
+}
+
+bool AiProviderRuntime::HttpRedirectSelfTest()
+{
+    WSADATA data = {};
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+    {
+        return false;
+    }
+    bool passed = false;
+    {
+        struct Fixture
+        {
+            SOCKET Listener = INVALID_SOCKET;
+            std::atomic<bool> Stop{false};
+            std::atomic<bool> Healthy{true};
+            std::atomic<unsigned> Requests{0};
+            std::atomic<unsigned> Status{200};
+            std::thread Worker;
+
+            ~Fixture()
+            {
+                Stop.store(true);
+                if (Worker.joinable())
+                {
+                    Worker.join();
+                }
+                if (Listener != INVALID_SOCKET)
+                {
+                    closesocket(Listener);
+                }
+            }
+        } fixture;
+        do
+        {
+            fixture.Listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in address = {};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            BOOL exclusive = TRUE;
+            u_long nonblocking = 1;
+            int addressSize = sizeof(address);
+            if (fixture.Listener == INVALID_SOCKET ||
+                setsockopt(fixture.Listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                    reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0 ||
+                bind(fixture.Listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+                getsockname(fixture.Listener, reinterpret_cast<sockaddr*>(&address), &addressSize) != 0 ||
+                listen(fixture.Listener, SOMAXCONN) != 0 ||
+                ioctlsocket(fixture.Listener, FIONBIO, &nonblocking) != 0)
+            {
+                break;
+            }
+            const std::string port = std::to_string(ntohs(address.sin_port));
+            try
+            {
+                fixture.Worker = std::thread([&fixture, port]()
+                {
+                    while (!fixture.Stop.load())
+                    {
+                        fd_set ready;
+                        FD_ZERO(&ready);
+                        FD_SET(fixture.Listener, &ready);
+                        timeval wait = {0, 50000};
+                        const int selected = select(0, &ready, nullptr, nullptr, &wait);
+                        if (selected <= 0)
+                        {
+                            if (selected == SOCKET_ERROR)
+                            {
+                                fixture.Healthy.store(false);
+                                break;
+                            }
+                            continue;
+                        }
+                        SOCKET client = accept(fixture.Listener, nullptr, nullptr);
+                        if (client == INVALID_SOCKET)
+                        {
+                            continue;
+                        }
+                        u_long blocking = 0;
+                        const DWORD timeout = 1000;
+                        bool valid = ioctlsocket(client, FIONBIO, &blocking) == 0 &&
+                            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                                reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0 &&
+                            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO,
+                                reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+                        std::string request;
+                        const ULONGLONG started = GetTickCount64();
+                        while (valid && request.size() < 8192 && GetTickCount64() - started < 1000)
+                        {
+                            const size_t headerEnd = request.find("\r\n\r\n");
+                            const size_t bodySize = request.compare(0, 5, "POST ") == 0 ? 11 : 0;
+                            if (headerEnd != std::string::npos && request.size() >= headerEnd + 4 + bodySize)
+                            {
+                                break;
+                            }
+                            char buffer[1024];
+                            const int received = recv(client, buffer, sizeof(buffer), 0);
+                            if (received <= 0)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            request.append(buffer, received);
+                        }
+                        valid = valid && request.find("\r\n\r\n") != std::string::npos &&
+                            request.find("Authorization: Bearer review-only\r\n") != std::string::npos;
+                        if (request.compare(0, 5, "POST ") == 0)
+                        {
+                            valid = valid && request.size() >= 11 &&
+                                request.compare(request.size() - 11, 11, "review-body") == 0;
+                        }
+                        fixture.Requests.fetch_add(1);
+                        const unsigned status = request.find(" /redirected ") != std::string::npos ?
+                            200 : fixture.Status.load();
+                        const std::string response = "HTTP/1.1 " + std::to_string(status) +
+                            " Test\r\nConnection: close\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:" +
+                            port + "/redirected\r\n\r\n";
+                        size_t sent = 0;
+                        while (valid && sent < response.size())
+                        {
+                            const int count = send(client, response.data() + sent,
+                                static_cast<int>(response.size() - sent), 0);
+                            if (count <= 0)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            sent += count;
+                        }
+                        closesocket(client);
+                        if (!valid)
+                        {
+                            fixture.Healthy.store(false);
+                        }
+                    }
+                });
+                passed = true;
+                for (const wchar_t* verb : {L"GET", L"POST"})
+                {
+                    for (unsigned status : {200u, 301u, 302u, 303u, 307u, 308u})
+                    {
+                        fixture.Status.store(status);
+                        const unsigned before = fixture.Requests.load();
+                        HttpResult result = {};
+                        std::wstring error;
+                        const bool ok = HttpRequest(verb, L"http://127.0.0.1:" +
+                            std::to_wstring(ntohs(address.sin_port)) + L"/original",
+                            L"Authorization: Bearer review-only\r\nContent-Type: text/plain\r\n",
+                            wcscmp(verb, L"POST") == 0 ? "review-body" : "", 2, &result, &error);
+                        passed = passed && ok && result.StatusCode == status && result.Body.empty() &&
+                            fixture.Requests.load() == before + 1 && fixture.Healthy.load();
+                    }
+                }
+            }
+            catch (...)
+            {
+                passed = false;
+            }
+        } while (false);
+    }
+    WSACleanup();
+    return passed;
 }
 
 static bool HttpPost(
@@ -1884,46 +2350,54 @@ static bool CreatePromptArgument(const std::wstring& prompt, std::wstring* argum
     return ok;
 }
 
-static bool ReadPipeAvailable(HANDLE pipe, std::string* output)
+static bool ReadPipeAvailable(HANDLE pipe, std::string* output, size_t maxBytes,
+    bool* drained, std::wstring* error)
 {
-    bool ok = true;
-
-    do
+    *drained = false;
+    // Bound each drain so continuous output cannot starve the deadline check.
+    for (unsigned batch = 0; batch < 16; ++batch)
     {
-        if (pipe == INVALID_HANDLE_VALUE || output == nullptr)
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr))
         {
-            ok = false;
-            break;
+            if (GetLastError() == ERROR_BROKEN_PIPE)
+            {
+                *drained = true;
+                return true;
+            }
+            if (error != nullptr)
+            {
+                *error = L"Could not inspect process output pipe";
+            }
+            return false;
         }
-
-        for (;;)
+        if (available == 0)
         {
-            DWORD available = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr))
-            {
-                ok = false;
-                break;
-            }
-
-            if (available == 0)
-            {
-                break;
-            }
-
-            char buffer[4096] = {};
-            DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(sizeof(buffer)));
-            DWORD read = 0;
-            if (!ReadFile(pipe, buffer, toRead, &read, nullptr))
-            {
-                ok = false;
-                break;
-            }
-
-            output->append(buffer, buffer + read);
+            *drained = true;
+            return true;
         }
-    } while (false);
-
-    return ok;
+        char buffer[4096];
+        DWORD read = 0;
+        const DWORD toRead = (std::min)(available, static_cast<DWORD>(sizeof(buffer)));
+        if (!ReadFile(pipe, buffer, toRead, &read, nullptr) || read == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not read process output pipe";
+            }
+            return false;
+        }
+        if (output->size() > maxBytes || read > maxBytes - output->size())
+        {
+            if (error != nullptr)
+            {
+                *error = L"Process output exceeded capture limit";
+            }
+            return false;
+        }
+        output->append(buffer, read);
+    }
+    return true;
 }
 
 static bool RunProcessCapture(
@@ -1931,13 +2405,19 @@ static bool RunProcessCapture(
     uint32_t timeoutSeconds,
     std::wstring* output,
     uint32_t* exitCode,
-    std::wstring* error)
+    std::wstring* error,
+    size_t maxOutputBytes = 8u * 1024u * 1024u)
 {
     bool ok = false;
     HANDLE readPipe = INVALID_HANDLE_VALUE;
     HANDLE writePipe = INVALID_HANDLE_VALUE;
+    HANDLE input = INVALID_HANDLE_VALUE;
     HANDLE process = nullptr;
     HANDLE thread = nullptr;
+    HANDLE job = nullptr;
+    STARTUPINFOEXW startup = {};
+    bool attributesInitialized = false;
+    std::vector<uint8_t> attributes;
 
     do
     {
@@ -1945,30 +2425,67 @@ static bool RunProcessCapture(
         {
             break;
         }
-
+        output->clear();
+        *exitCode = ERROR_GEN_FAILURE;
         SECURITY_ATTRIBUTES sa = {};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
-        if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
+        if (!CreatePipe(&readPipe, &writePipe, &sa, 0) ||
+            !SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0))
         {
             if (error != nullptr)
             {
-                *error = L"CreatePipe failed";
+                *error = L"Could not create process output pipe";
             }
             break;
         }
-        SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-        STARTUPINFOW startup = {};
-        startup.cb = sizeof(startup);
-        startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdOutput = writePipe;
-        startup.hStdError = writePipe;
-        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
+        input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (input == INVALID_HANDLE_VALUE || job == nullptr ||
+            !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not create isolated process capture resources";
+            }
+            break;
+        }
+        SIZE_T attributeBytes = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
+        attributes.resize(attributeBytes);
+        startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+        if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attributeBytes))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not initialize process handle list";
+            }
+            break;
+        }
+        attributesInitialized = true;
+        HANDLE inherited[] = {writePipe, input};
+        if (!UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited, sizeof(inherited), nullptr, nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = L"Could not restrict inherited process handles";
+            }
+            break;
+        }
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdOutput = writePipe;
+        startup.StartupInfo.hStdError = writePipe;
+        startup.StartupInfo.hStdInput = input;
         PROCESS_INFORMATION info = {};
         std::wstring mutableCommand = commandLine;
-        if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info))
+        if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+            &startup.StartupInfo, &info))
         {
             if (error != nullptr)
             {
@@ -1976,57 +2493,100 @@ static bool RunProcessCapture(
             }
             break;
         }
-
         process = info.hProcess;
         thread = info.hThread;
-        CloseHandle(writePipe);
-        writePipe = INVALID_HANDLE_VALUE;
-
-        std::string bytes;
-        DWORD waitResult = WAIT_TIMEOUT;
-        DWORD timeoutMs = std::max<uint32_t>(timeoutSeconds, 1) * 1000;
-        DWORD elapsed = 0;
-        while (elapsed < timeoutMs)
+        if (!AssignProcessToJobObject(job, process) || ResumeThread(thread) == static_cast<DWORD>(-1))
         {
-            ReadPipeAvailable(readPipe, &bytes);
-            waitResult = WaitForSingleObject(process, 50);
-            if (waitResult != WAIT_TIMEOUT)
-            {
-                break;
-            }
-            elapsed += 50;
-        }
-
-        if (waitResult == WAIT_TIMEOUT)
-        {
-            TerminateProcess(process, ERROR_TIMEOUT);
             if (error != nullptr)
             {
-                *error = L"Codex CLI timed out";
+                *error = L"Could not start process in capture job";
             }
             break;
         }
-
-        ReadPipeAvailable(readPipe, &bytes);
-
-        DWORD processExit = 0;
-        if (!GetExitCodeProcess(process, &processExit))
+        CloseHandle(writePipe);
+        writePipe = INVALID_HANDLE_VALUE;
+        const ULONGLONG started = GetTickCount64();
+        const ULONGLONG timeoutMs = static_cast<ULONGLONG>((std::max)(timeoutSeconds, 1u)) * 1000;
+        std::string bytes;
+        for (;;)
         {
-            processExit = 1;
+            bool drained = false;
+            if (!ReadPipeAvailable(readPipe, &bytes, maxOutputBytes, &drained, error))
+            {
+                break;
+            }
+            const DWORD waitResult = WaitForSingleObject(process, 10);
+            if (waitResult == WAIT_FAILED)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Could not wait for captured process";
+                }
+                break;
+            }
+            if (waitResult == WAIT_OBJECT_0 && drained)
+            {
+                // The process may have written after the preceding empty peek.
+                if (!ReadPipeAvailable(readPipe, &bytes, maxOutputBytes, &drained, error))
+                {
+                    break;
+                }
+                if (drained)
+                {
+                    DWORD processExit = 0;
+                    if (!GetExitCodeProcess(process, &processExit))
+                    {
+                        if (error != nullptr)
+                        {
+                            *error = L"Could not read captured process exit status";
+                        }
+                        break;
+                    }
+                    *exitCode = processExit;
+                    *output = Trim(Utf8ToWide(bytes));
+                    ok = true;
+                    break;
+                }
+            }
+            if (GetTickCount64() - started >= timeoutMs)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"Codex CLI timed out";
+                }
+                break;
+            }
         }
-
-        *exitCode = processExit;
-        *output = Trim(Utf8ToWide(bytes));
-        ok = true;
     } while (false);
 
+    if (!ok && process != nullptr)
+    {
+        TerminateProcess(process, ERROR_CANCELLED);
+    }
+    if (job != nullptr)
+    {
+        // Also terminate descendants that inherited the capture pipe.
+        CloseHandle(job);
+    }
+    if (process != nullptr)
+    {
+        if (!ok)
+        {
+            WaitForSingleObject(process, 1000);
+        }
+        CloseHandle(process);
+    }
     if (thread != nullptr)
     {
         CloseHandle(thread);
     }
-    if (process != nullptr)
+    if (attributesInitialized)
     {
-        CloseHandle(process);
+        DeleteProcThreadAttributeList(startup.lpAttributeList);
+    }
+    if (input != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(input);
     }
     if (writePipe != INVALID_HANDLE_VALUE)
     {
@@ -2036,8 +2596,35 @@ static bool RunProcessCapture(
     {
         CloseHandle(readPipe);
     }
-
     return ok;
+}
+
+bool AiProviderRuntime::ProcessCaptureSelfTest()
+{
+    wchar_t systemDirectory[MAX_PATH] = {};
+    const UINT length = GetSystemDirectoryW(systemDirectory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+    {
+        return false;
+    }
+    const std::wstring shell = L"\"" + std::wstring(systemDirectory) + L"\\cmd.exe\" /d /c ";
+    std::wstring output;
+    std::wstring error;
+    uint32_t code = 0;
+    if (!RunProcessCapture(shell + L"\"echo capture-ok& exit /b 7\"", 5, &output, &code, &error) ||
+        output != L"capture-ok" || code != 7)
+    {
+        return false;
+    }
+    if (RunProcessCapture(shell + L"\"for /L %n in (0,0,1) do @echo capture\"", 5,
+        &output, &code, &error, 64 * 1024) || error != L"Process output exceeded capture limit")
+    {
+        return false;
+    }
+    const ULONGLONG started = GetTickCount64();
+    return !RunProcessCapture(shell + L"\"for /L %n in (0,0,1) do @rem\"", 1,
+        &output, &code, &error) && error == L"Codex CLI timed out" &&
+        GetTickCount64() - started < 5000;
 }
 
 static std::wstring RenderPrompt(const AiCompletionRequest& request)

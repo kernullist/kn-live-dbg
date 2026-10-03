@@ -48,6 +48,8 @@ struct KernelCallbackRecord
     uint64_t RawValue = 0;
     bool Poisoned = false;
     bool SessionDisabled = false;
+    bool RegistrationEnabledKnown = false;
+    bool RegistrationEnabled = false;
 };
 
 enum class KernelCallbackSetAction
@@ -89,8 +91,23 @@ struct KernelCallbackSetResult
 
 struct KernelCallbackScanResult
 {
+    struct SurfaceSnapshot
+    {
+        std::wstring Name;
+        bool CoverageComplete = false;
+        uint32_t RecordCount = 0;
+    };
     std::vector<KernelCallbackRecord> Records;
     std::vector<std::wstring> Warnings;
+    std::vector<SurfaceSnapshot> Surfaces;
+    uint64_t SnapshotTickMs = 0;
+    uint64_t NotifyEnableMaskAddress = 0;
+    uint32_t NotifyEnableMaskRaw = 0;
+    bool NotifyEnableMaskKnown = false;
+    // The raw scalar is observed; build-specific delivery bits are not inferred.
+    bool NotifyEnableMaskBitsDecoded = false;
+    bool ExecutiveLayoutFromPdb = false;
+    uint32_t ExecutiveObjectsObserved = 0;
     // True when at least one list/table walk was partial (poisoned entries,
     // unreadable links, entry cap). Empty Records with Incomplete=false means
     // "no callbacks observed"; Incomplete=true means "coverage is not clean".
@@ -119,6 +136,7 @@ private:
     bool ScanRegistryCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanObjectCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanMinifilterCallbacks(KernelCallbackScanResult* result, std::wstring* error);
+    bool ScanExecutiveCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanObjectTypeCallbacks(
         const std::wstring& target,
         uint64_t objectTypeAddress,
@@ -139,3 +157,4 @@ bool KernelCallbackRecordHasSessionBackup(const KernelCallbackRecord& record, co
 void OverlayCallbackSessionDisabled(KernelCallbackScanResult* result);
 bool IsCallbackWriteAction(const std::wstring& text);
 bool KernelCallbackScannerSelfTest();
+bool ExecutiveCallbackScannerSelfTest();
