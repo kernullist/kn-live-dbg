@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <netfw.h>
 #include <oleauto.h>
+#include <thread>
 
 namespace
 {
@@ -14,6 +15,44 @@ namespace
         {
             object->Release();
         }
+    }
+
+    HRESULT ConfigureFirewallRule(INetFwRule* rule, BSTR name, BSTR ports, BSTR remote, BSTR description)
+    {
+        HRESULT status = rule->put_Name(name);
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Description(description);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Protocol(NET_FW_IP_PROTOCOL_TCP);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_LocalPorts(ports);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_RemoteAddresses(remote);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Direction(NET_FW_RULE_DIR_IN);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Action(NET_FW_ACTION_ALLOW);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Enabled(VARIANT_TRUE);
+        }
+        if (SUCCEEDED(status))
+        {
+            status = rule->put_Profiles(NET_FW_PROFILE2_DOMAIN | NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_PUBLIC);
+        }
+        return status;
     }
 }
 
@@ -75,14 +114,6 @@ bool AddRemoteFirewallRule(
             break;
         }
 
-        hr = rules->Item(name, &existing);
-        if (SUCCEEDED(hr) && existing != nullptr)
-        {
-            rules->Remove(name);
-            existing->Release();
-            existing = nullptr;
-        }
-
         hr = CoCreateInstance(
             __uuidof(NetFwRule),
             nullptr,
@@ -116,18 +147,19 @@ bool AddRemoteFirewallRule(
             break;
         }
 
-        rule->put_Name(name);
-        rule->put_Description(desc);
-        rule->put_Protocol(NET_FW_IP_PROTOCOL_TCP);
-        rule->put_LocalPorts(ports);
-        rule->put_RemoteAddresses(remote);
-        rule->put_Direction(NET_FW_RULE_DIR_IN);
-        rule->put_Action(NET_FW_ACTION_ALLOW);
-        rule->put_Enabled(VARIANT_TRUE);
-        rule->put_Profiles(
-            NET_FW_PROFILE2_DOMAIN | NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_PUBLIC);
-
-        hr = rules->Add(rule);
+        hr = ConfigureFirewallRule(rule, name, ports, remote, desc);
+        if (SUCCEEDED(hr))
+        {
+            const HRESULT found = rules->Item(name, &existing);
+            if (SUCCEEDED(found) && existing != nullptr)
+            {
+                hr = rules->Remove(name);
+            }
+        }
+        if (SUCCEEDED(hr))
+        {
+            hr = rules->Add(rule);
+        }
         SysFreeString(name);
         SysFreeString(ports);
         SysFreeString(remote);
@@ -136,7 +168,7 @@ bool AddRemoteFirewallRule(
         {
             if (error != nullptr)
             {
-                *error = L"INetFwRules.Add failed";
+                *error = L"firewall rule configuration or publication failed";
             }
             break;
         }
@@ -148,7 +180,7 @@ bool AddRemoteFirewallRule(
     ReleaseFw(existing);
     ReleaseFw(rules);
     ReleaseFw(policy);
-    if (hrInit == S_OK)
+    if (SUCCEEDED(hrInit))
     {
         CoUninitialize();
     }
@@ -189,8 +221,52 @@ void RemoveRemoteFirewallRule()
 
     ReleaseFw(rules);
     ReleaseFw(policy);
-    if (hrInit == S_OK)
+    if (SUCCEEDED(hrInit))
     {
         CoUninitialize();
     }
+}
+
+bool RemoteFirewallSelfTest()
+{
+    bool passed = false;
+    std::thread isolated([&]()
+    {
+        const HRESULT first = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (FAILED(first))
+        {
+            return;
+        }
+        std::wstring error;
+        // Port zero fails before policy access and must balance S_FALSE too.
+        const bool invalidRejected = !AddRemoteFirewallRule(0, L"", &error);
+        CoUninitialize();
+        const HRESULT second = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(second))
+        {
+            CoUninitialize();
+            return;
+        }
+        INetFwRule* rule = nullptr;
+        const HRESULT created = CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER,
+            __uuidof(INetFwRule), reinterpret_cast<void**>(&rule));
+        BSTR name = SysAllocString(L"KnLiveDbg self-test unpublished rule");
+        BSTR ports = SysAllocString(L"51767");
+        BSTR remote = SysAllocString(L"invalid[address");
+        BSTR description = SysAllocString(L"Unpublished fixture");
+        if (invalidRejected && SUCCEEDED(created) && rule != nullptr && name != nullptr &&
+            ports != nullptr && remote != nullptr && description != nullptr)
+        {
+            // This object is never passed to INetFwRules::Add.
+            passed = FAILED(ConfigureFirewallRule(rule, name, ports, remote, description));
+        }
+        SysFreeString(name);
+        SysFreeString(ports);
+        SysFreeString(remote);
+        SysFreeString(description);
+        ReleaseFw(rule);
+        CoUninitialize();
+    });
+    isolated.join();
+    return passed;
 }

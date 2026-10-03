@@ -24,7 +24,8 @@ namespace knremote
     static constexpr uint16_t kMcpPort = 51766;
     static constexpr uint32_t kMaxFrameBytes = 1024u * 1024u;
     static constexpr uint32_t kMaxCommandChars = 8192;
-    static constexpr uint32_t kResultChunkBytes = 256u * 1024u;
+    // Two streams can each expand sixfold when JSON escapes control bytes.
+    static constexpr uint32_t kResultChunkBytes = 64u * 1024u;
     static constexpr uint32_t kInlineTruncateBytes = 8u * 1024u * 1024u;
     static constexpr DWORD kHeartbeatMs = 15000;
     static constexpr DWORD kDeadPeerMs = 60000;
@@ -48,6 +49,73 @@ namespace knremote
     {
         return static_cast<int32_t>(GetTickCount() - startTick) >=
                static_cast<int32_t>(intervalMs);
+    }
+
+    inline bool SendFrameBytes(SOCKET sock, const std::string& bytes, DWORD deadlineTick, std::wstring* error)
+    {
+        bool ok = false;
+        do
+        {
+            u_long nonblocking = 1;
+            if (sock == INVALID_SOCKET || bytes.empty() || bytes.size() > kMaxFrameBytes + 8 ||
+                ioctlsocket(sock, FIONBIO, &nonblocking) == SOCKET_ERROR)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not prepare bounded frame send";
+                }
+                break;
+            }
+            // Receivers already poll before recv; keep the socket nonblocking.
+            size_t sent = 0;
+            while (sent < bytes.size())
+            {
+                const DWORD now = GetTickCount();
+                if (static_cast<int32_t>(now - deadlineTick) >= 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"send-timeout";
+                    }
+                    break;
+                }
+                const DWORD remaining = deadlineTick - now;
+                const DWORD waitMs = remaining < 200 ? remaining : 200;
+                fd_set writeSet;
+                FD_ZERO(&writeSet);
+                FD_SET(sock, &writeSet);
+                timeval timeout = {};
+                timeout.tv_usec = static_cast<long>(waitMs * 1000);
+                const int ready = select(0, nullptr, &writeSet, nullptr, &timeout);
+                if (ready == 0)
+                {
+                    continue;
+                }
+                const int count = ready == SOCKET_ERROR ? SOCKET_ERROR :
+                    send(sock, bytes.data() + sent, static_cast<int>(bytes.size() - sent), 0);
+                if (ready != SOCKET_ERROR && count == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+                {
+                    continue;
+                }
+                if (count <= 0)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = L"send failed";
+                    }
+                    break;
+                }
+                sent += static_cast<size_t>(count);
+            }
+            ok = sent == bytes.size();
+        }
+        while (false);
+        if (!ok && sock != INVALID_SOCKET)
+        {
+            // A partial frame cannot be resumed as a fresh protocol message.
+            shutdown(sock, SD_BOTH);
+        }
+        return ok;
     }
 
     inline void EnableTcpNoDelay(SOCKET sock)

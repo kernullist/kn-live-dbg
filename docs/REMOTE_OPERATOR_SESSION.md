@@ -320,11 +320,17 @@ while (!g_StopRequested)
 | Write-confirm wait | `WaitForMultipleObjects({confirm, stop, writeOff}, FALSE, 60000)` |
 | Remote pending | 4; one in-flight |
 | Command line | 8192 wchar |
-| Result chunk | 256 KiB UTF-8 |
+| Result chunk | stdout/stderr 각각 최대 64 KiB UTF-8; JSON escape 뒤에도 1 MiB 프레임 안에 유지 |
 | Max frame | 1 MiB |
-| Inline truncate | 8 MiB transcript then marker + path if any |
+| Inline truncate | stdout/stderr 각각 8 MiB 초과 시 UTF-8 경계를 지킨 4 KiB 앞부분과 `[truncated]` 표시 |
 | Engine wait (remote command) | until complete (MCP 30s 복사 금지) |
 | Password min | 5 |
+
+송신도 프레임당 60초 마감 시간을 적용한다. 소켓을 nonblocking 모드로 두고
+쓰기 가능 상태를 기다리므로, 상대가 읽기를 멈춰도 `send`에 무기한 머물지 않는다.
+인코딩 또는 전송이 실패하면 연결을 닫아 불완전한 응답을 계속 기다리지 않게 한다.
+`stdout`과 `stderr`는 모두 여러 `command-result` 프레임으로 나뉠 수 있으며,
+두 스트림이 끝난 마지막 프레임에만 `last=true`를 쓴다.
 
 ### Concurrency
 

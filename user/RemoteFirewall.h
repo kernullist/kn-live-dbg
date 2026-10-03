@@ -9,3 +9,4 @@ bool AddRemoteFirewallRule(
     std::wstring* error);
 
 void RemoveRemoteFirewallRule();
+bool RemoteFirewallSelfTest();

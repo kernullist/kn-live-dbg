@@ -114,6 +114,66 @@ synchronous client with closed handles and awaited unload notifications.
 Application completion events and handle-close errors did not account for
 that growth; its host-level cause remains unresolved.
 
+## 2026-10-04 repository follow-up
+
+The next review started from the published `9bd5b94` main. It reconciled the
+285 source/build inputs in the integration manifest, revisited failure paths
+across the driver, scanners, CLI, transports, persistence and fixture tools,
+and repeated review after each repair. It found additional defects outside
+the earlier Kmon integration work:
+
+- A raw dump crossing `UINT64_MAX` wrapped into low addresses and reported a
+  complete transfer. The shared range reader now rejects it before any read
+  or output-file truncation, including when zero-fill is requested.
+- Cloak configuration accepted cleanup paths outside its session directory.
+  Validation now binds the identity, service/device names and artifact paths,
+  rejects malformed or duplicate fields, and bounds the file to 64 KiB.
+  Relative configuration arguments and UNC original EXE paths remain usable;
+  copied artifacts require local drive paths. A partial build records its
+  owned directory before copying, and an existing directory is not reused.
+  Startup and cleanup check an existing service's image before changing it.
+  Failed stops and artifact removal propagate errors. Missing or conflicting
+  cloak arguments no longer fall through into ordinary startup.
+- TI export ignored `WriteFile` failure. A fault-injected `ERROR_DISK_FULL`
+  returned success before the fix and failure afterward. Partial writes are
+  completed, zero progress fails, and flush/close errors are checked. Snapshot
+  and cloak text writers also check buffered errors when closing their streams.
+- Remote sends could block past the receive deadline when the peer stopped
+  reading. Nonblocking sends now share a frame deadline and failed frames
+  shut down the connection. The local backpressure fixture returned after
+  219 ms with a 200 ms deadline. Both stdout and stderr are chunked at 64 KiB
+  each so control-byte JSON escaping stays within the frame budget; oversized
+  streams retain a bounded UTF-8 prefix and an explicit truncation marker.
+- Firewall helpers failed to balance `CoInitializeEx` returning `S_FALSE`.
+  A nested-apartment repro could not initialize MTA after the caller released
+  its STA reference; it succeeds after the fix. Rule property failures now
+  prevent publication, and the replacement is configured before removing an
+  existing rule. The regression uses an unpublished COM rule object and does
+  not change firewall policy.
+
+Final Debug and Release builds with native analysis passed; existing warnings
+remain. Each final executable passed 3,075 reported self-test checks and nine
+loopback MCP HTTP checks, including the new cloak, firewall, backpressure and
+stdout/stderr framing regressions. Both missing cloak-path CLI cases exited
+with usage status 2 before startup. The dump/cloak boundary oracle also passed
+with ASan.
+
+Release ASan gates passed for Kmon core/hunting (11,326 hunting, 54 page and
+49 false-positive fixture checks), analyst features (6,560), process layout
+(105,075), command parsing (275,002), and completion (25,954). The analyst run
+reported 45 unavailable worker-handle queries out of 114 attempted; that is a
+coverage limit, not a successful query. The final executable command corpus
+passed 2,336 checks across 261 entries. Readiness with `-SkipSmoke`, native
+manifest/PDB mismatch controls, and parsing all 43 scripts under Windows
+PowerShell 5.1 passed. All 285 frozen source/build hashes still matched after
+validation. A fresh review of the final changes found no additional actionable
+defect within this scope.
+
+Reproduction logs and the final source/artifact/test manifest are retained in
+`.build/adversarial-review-20261004/`. Live kernel and detection-quality limits
+below still apply. These fixes do not establish safety against a privileged
+process concurrently replacing SCM entries or filesystem namespace components.
+
 ## Remaining limits
 
 No live kernel positive, Driver Verifier run, Windows/private-PDB compatibility

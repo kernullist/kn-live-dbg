@@ -1,4 +1,5 @@
 #include "CloakSession.h"
+#include "DriverService.h"
 
 #include <Windows.h>
 #include <bcrypt.h>
@@ -15,6 +16,7 @@ namespace
     constexpr size_t kMinLeafChars = 8;
     constexpr size_t kMaxLeafChars = 16;
     constexpr wchar_t kSessionFileName[] = L"cfg.dat";
+    constexpr size_t kMaxSessionBytes = 64 * 1024;
 
     const wchar_t* kPrefixes[] = {
         L"Aux", L"Cap", L"Mon", L"Tel", L"Bus", L"Hub", L"Io", L"Dev"
@@ -126,6 +128,119 @@ namespace
         return path.substr(slash + 1);
     }
 
+    bool CanonicalDiskPath(const std::wstring& path, std::wstring* canonical, bool allowRelative = false)
+    {
+        if (path.empty() || path.size() > 32760 || path.find_first_of(L"\r\n\"") != std::wstring::npos ||
+            path.find(L'\0') != std::wstring::npos || (!allowRelative &&
+                (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))))
+        {
+            return false;
+        }
+        const DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (needed == 0 || needed > 32768)
+        {
+            return false;
+        }
+        std::vector<wchar_t> buffer(needed);
+        const DWORD copied = GetFullPathNameW(path.c_str(), needed, buffer.data(), nullptr);
+        if (copied == 0 || copied >= needed)
+        {
+            return false;
+        }
+        canonical->assign(buffer.data(), copied);
+        const auto& full = *canonical;
+        return full.size() >= 3 && ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
+            full[1] == L':' && full[2] == L'\\' && full.find(L':', 2) == std::wstring::npos;
+    }
+
+    bool SameDiskPath(const std::wstring& left, const std::wstring& right)
+    {
+        std::wstring a;
+        std::wstring b;
+        return CanonicalDiskPath(left, &a) && CanonicalDiskPath(right, &b) && EqualsIgnoreCase(a, b);
+    }
+
+    bool ValidateCloakSession(const CloakSession& session, std::wstring* error)
+    {
+        std::wstring directory;
+        const auto& original = session.OriginalExePath;
+        bool valid = IsValidCloakLeafName(session.Id) && session.ServiceName == session.Id &&
+            session.DisplayName == session.Id && session.DeviceNtName == L"\\Device\\" + session.Id &&
+            session.SymbolicLinkName == L"\\DosDevices\\" + session.Id &&
+            session.UserDeviceName == L"\\\\.\\" + session.Id &&
+            !original.empty() && original.find_first_of(L"\r\n\"") == std::wstring::npos &&
+            original.find(L'\0') == std::wstring::npos &&
+            CanonicalDiskPath(session.WorkDirectory, &directory) &&
+            EqualsIgnoreCase(FileNameOnly(directory), session.Id) &&
+            SameDiskPath(session.SessionFilePath, directory + L"\\" + kSessionFileName) &&
+            SameDiskPath(session.CopiedExePath, directory + L"\\" + session.Id + L".exe") &&
+            SameDiskPath(session.CopiedSysPath, directory + L"\\" + session.Id + L".sys");
+        const DWORD attributes = GetFileAttributesW(directory.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0))
+        {
+            valid = false;
+        }
+        std::set<std::wstring> paths;
+        for (const auto& sidecar : session.CopiedSidecarFiles)
+        {
+            const auto leaf = FileNameOnly(sidecar);
+            const auto lower = ToLowerCopy(leaf);
+            if (!SameDiskPath(sidecar, directory + L"\\" + leaf) ||
+                !(CloakCopiesRuntimeSidecar(leaf) ||
+                    (lower.size() > 4 && lower.substr(lower.size() - 4) == L".dll")) ||
+                !paths.insert(lower).second)
+            {
+                valid = false;
+            }
+        }
+        if (!valid && error != nullptr)
+        {
+            *error = L"cloak session identity or artifact paths are unsafe";
+        }
+        return valid;
+    }
+
+    bool ServiceMatchesSession(SC_HANDLE service, const CloakSession& session, std::wstring* error)
+    {
+        DWORD needed = 0;
+        QueryServiceConfigW(service, nullptr, 0, &needed);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(QUERY_SERVICE_CONFIGW) || needed > 65536)
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not query cloak service ownership";
+            }
+            return false;
+        }
+        std::vector<uint8_t> buffer(needed);
+        auto config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+        if (!QueryServiceConfigW(service, config, needed, &needed))
+        {
+            if (error != nullptr)
+            {
+                *error = L"could not read cloak service ownership";
+            }
+            return false;
+        }
+        std::wstring binary = config->lpBinaryPathName != nullptr ? config->lpBinaryPathName : L"";
+        if (binary.size() >= 2 && binary.front() == L'"' && binary.back() == L'"')
+        {
+            binary = binary.substr(1, binary.size() - 2);
+        }
+        if (binary.rfind(L"\\??\\", 0) == 0)
+        {
+            binary.erase(0, 4);
+        }
+        const bool matches = config->dwServiceType == SERVICE_KERNEL_DRIVER &&
+            SameDiskPath(binary, session.CopiedSysPath);
+        if (!matches && error != nullptr)
+        {
+            *error = L"service name belongs to a different driver image";
+        }
+        return matches;
+    }
+
     bool GetSelfPath(std::wstring* path, std::wstring* error)
     {
         bool ok = false;
@@ -167,7 +282,7 @@ namespace
         bool ok = false;
         do
         {
-            if (!CopyFileW(source.c_str(), dest.c_str(), FALSE))
+            if (!CopyFileW(source.c_str(), dest.c_str(), TRUE))
             {
                 if (error != nullptr)
                 {
@@ -342,28 +457,39 @@ namespace
         return ok;
     }
 
-    void TryDeleteFile(const std::wstring& path)
+    bool TryDeleteFile(const std::wstring& path)
     {
         if (path.empty())
         {
-            return;
+            return true;
         }
 
-        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+        {
+            const DWORD error = GetLastError();
+            return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+        }
+        if ((attributes & FILE_ATTRIBUTE_READONLY) != 0)
+        {
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
         if (DeleteFileW(path.c_str()))
         {
-            return;
+            return true;
         }
 
-        MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        return MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) != FALSE;
     }
 
-    void TryRemoveDirectory(const std::wstring& path)
+    bool TryRemoveDirectory(const std::wstring& path)
     {
-        if (!path.empty())
+        if (path.empty() || RemoveDirectoryW(path.c_str()))
         {
-            RemoveDirectoryW(path.c_str());
+            return true;
         }
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
 
     bool WriteUtf8File(const std::wstring& path, const std::string& text, std::wstring* error)
@@ -381,6 +507,7 @@ namespace
                 break;
             }
             out.write(text.data(), static_cast<std::streamsize>(text.size()));
+            out.close();
             if (!out.good())
             {
                 if (error != nullptr)
@@ -438,7 +565,7 @@ namespace
 
         const int needed = MultiByteToWideChar(
             CP_UTF8,
-            0,
+            MB_ERR_INVALID_CHARS,
             value.c_str(),
             static_cast<int>(value.size()),
             nullptr,
@@ -451,7 +578,7 @@ namespace
         std::wstring out(static_cast<size_t>(needed), L'\0');
         MultiByteToWideChar(
             CP_UTF8,
-            0,
+            MB_ERR_INVALID_CHARS,
             value.c_str(),
             static_cast<int>(value.size()),
             out.data(),
@@ -564,18 +691,20 @@ bool ParseCloakArgs(int argc, const wchar_t* const* argv, CloakArgs* args)
             std::wstring lowered = ToLowerCopy(token);
             if (lowered == L"--cloak")
             {
-                if (args->Mode == CloakMode::None)
+                if (args->Mode != CloakMode::None)
                 {
-                    args->Mode = CloakMode::Launch;
+                    return false;
                 }
+                args->Mode = CloakMode::Launch;
                 continue;
             }
 
             if (lowered == L"--cloak-resume")
             {
-                if (index + 1 >= argc)
+                if (args->Mode != CloakMode::None || index + 1 >= argc ||
+                    argv[index + 1] == nullptr || argv[index + 1][0] == L'\0' || argv[index + 1][0] == L'-')
                 {
-                    break;
+                    return false;
                 }
                 args->Mode = CloakMode::Resume;
                 args->SessionPath = argv[index + 1];
@@ -585,12 +714,14 @@ bool ParseCloakArgs(int argc, const wchar_t* const* argv, CloakArgs* args)
 
             if (lowered == L"--cloak-cleanup")
             {
-                args->Mode = CloakMode::Cleanup;
-                if (index + 1 < argc && argv[index + 1][0] != L'-')
+                if (args->Mode != CloakMode::None || index + 1 >= argc ||
+                    argv[index + 1] == nullptr || argv[index + 1][0] == L'\0' || argv[index + 1][0] == L'-')
                 {
-                    args->SessionPath = argv[index + 1];
-                    ++index;
+                    return false;
                 }
+                args->Mode = CloakMode::Cleanup;
+                args->SessionPath = argv[index + 1];
+                ++index;
                 continue;
             }
         }
@@ -658,14 +789,11 @@ bool BuildCloakSession(CloakSession* session, std::wstring* error)
         if (!CreateDirectoryW(workDir.c_str(), nullptr))
         {
             const DWORD lastError = GetLastError();
-            if (lastError != ERROR_ALREADY_EXISTS)
+            if (error != nullptr)
             {
-                if (error != nullptr)
-                {
-                    *error = L"CreateDirectoryW failed (gle=" + std::to_wstring(lastError) + L")";
-                }
-                break;
+                *error = L"CreateDirectoryW failed (gle=" + std::to_wstring(lastError) + L")";
             }
+            break;
         }
 
         const std::wstring exeDir = ParentDirectory(originalExe);
@@ -673,20 +801,7 @@ bool BuildCloakSession(CloakSession* session, std::wstring* error)
         const std::wstring copiedSys = workDir + L"\\" + leaf + L".sys";
         const std::wstring sourceSys = exeDir + L"\\KnLiveDbg.sys";
 
-        if (!CopyOneFile(originalExe, copiedExe, error))
-        {
-            break;
-        }
-        if (!CopyOneFile(sourceSys, copiedSys, error))
-        {
-            break;
-        }
-
-        if (!CopySidecarsFromExeDir(exeDir, workDir, &session->CopiedSidecarFiles, error))
-        {
-            break;
-        }
-
+        // Record ownership before copying so the caller can clean up a partial build.
         session->Id = leaf;
         session->ServiceName = leaf;
         session->DisplayName = leaf;
@@ -698,6 +813,12 @@ bool BuildCloakSession(CloakSession* session, std::wstring* error)
         session->CopiedSysPath = copiedSys;
         session->OriginalExePath = originalExe;
         session->SessionFilePath = workDir + L"\\" + kSessionFileName;
+        if (!CopyOneFile(originalExe, copiedExe, error) ||
+            !CopyOneFile(sourceSys, copiedSys, error) ||
+            !CopySidecarsFromExeDir(exeDir, workDir, &session->CopiedSidecarFiles, error))
+        {
+            break;
+        }
         ok = true;
     } while (false);
 
@@ -706,6 +827,10 @@ bool BuildCloakSession(CloakSession* session, std::wstring* error)
 
 bool SaveCloakSession(const CloakSession& session, std::wstring* error)
 {
+    if (!ValidateCloakSession(session, error))
+    {
+        return false;
+    }
     std::ostringstream stream;
     stream << "id=" << WideToUtf8(session.Id) << "\n";
     stream << "service=" << WideToUtf8(session.ServiceName) << "\n";
@@ -722,7 +847,16 @@ bool SaveCloakSession(const CloakSession& session, std::wstring* error)
         stream << "sidecar=" << WideToUtf8(sidecar) << "\n";
     }
 
-    return WriteUtf8File(session.SessionFilePath, stream.str(), error);
+    const auto contents = stream.str();
+    if (contents.size() > kMaxSessionBytes)
+    {
+        if (error != nullptr)
+        {
+            *error = L"cloak session file exceeds its size limit";
+        }
+        return false;
+    }
+    return WriteUtf8File(session.SessionFilePath, contents, error);
 }
 
 bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstring* error)
@@ -741,7 +875,16 @@ bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstr
         }
 
         *session = CloakSession{};
-        std::ifstream in(path.c_str(), std::ios::binary);
+        std::wstring resolvedPath;
+        if (!CanonicalDiskPath(path, &resolvedPath, true))
+        {
+            if (error != nullptr)
+            {
+                *error = L"cloak session file requires a local disk path";
+            }
+            break;
+        }
+        std::ifstream in(resolvedPath.c_str(), std::ios::binary);
         if (!in.is_open())
         {
             if (error != nullptr)
@@ -751,8 +894,33 @@ bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstr
             break;
         }
 
+        in.seekg(0, std::ios::end);
+        const std::streamoff size = in.tellg();
+        if (size <= 0 || static_cast<uint64_t>(size) > kMaxSessionBytes)
+        {
+            if (error != nullptr)
+            {
+                *error = L"cloak session file has an invalid size";
+            }
+            break;
+        }
+        in.seekg(0, std::ios::beg);
+        std::string contents(static_cast<size_t>(size), '\0');
+        if (!in.read(contents.data(), static_cast<std::streamsize>(contents.size())) ||
+            in.peek() != std::char_traits<char>::eof())
+        {
+            if (error != nullptr)
+            {
+                *error = L"cloak session file changed or could not be read";
+            }
+            break;
+        }
+        std::istringstream input(contents);
+
         std::string line;
-        while (std::getline(in, line))
+        std::set<std::string> fields;
+        bool invalid = false;
+        while (std::getline(input, line))
         {
             if (!line.empty() && line.back() == '\r')
             {
@@ -761,11 +929,18 @@ bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstr
             const size_t eq = line.find('=');
             if (eq == std::string::npos || eq == 0)
             {
-                continue;
+                invalid = true;
+                break;
             }
 
             const std::string key = line.substr(0, eq);
             const std::wstring value = Utf8ToWide(line.substr(eq + 1));
+            if (value.empty() || value.find_first_of(L"\r\n") != std::wstring::npos ||
+                value.find(L'\0') != std::wstring::npos || (key != "sidecar" && !fields.insert(key).second))
+            {
+                invalid = true;
+                break;
+            }
             if (key == "id")
             {
                 session->Id = value;
@@ -810,15 +985,15 @@ bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstr
             {
                 session->CopiedSidecarFiles.push_back(value);
             }
+            else
+            {
+                invalid = true;
+                break;
+            }
         }
 
-        session->SessionFilePath = path;
-        if (!IsValidCloakLeafName(session->ServiceName) ||
-            session->DeviceNtName.rfind(L"\\Device\\", 0) != 0 ||
-            session->SymbolicLinkName.rfind(L"\\DosDevices\\", 0) != 0 ||
-            session->UserDeviceName.rfind(L"\\\\.\\", 0) != 0 ||
-            session->CopiedSysPath.empty() ||
-            session->CopiedExePath.empty())
+        session->SessionFilePath = resolvedPath;
+        if (invalid || in.bad() || !ValidateCloakSession(*session, error))
         {
             if (error != nullptr)
             {
@@ -833,6 +1008,40 @@ bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstr
     return ok;
 }
 
+bool ValidateCloakServiceOwnership(const CloakSession& session, std::wstring* error)
+{
+    if (!ValidateCloakSession(session, error))
+    {
+        return false;
+    }
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (manager == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = L"could not open service manager for cloak ownership check";
+        }
+        return false;
+    }
+    SC_HANDLE service = OpenServiceW(manager, session.ServiceName.c_str(), SERVICE_QUERY_CONFIG);
+    const DWORD serviceError = service == nullptr ? GetLastError() : ERROR_SUCCESS;
+    const bool serviceOwned = service != nullptr && ServiceMatchesSession(service, session, error);
+    if (service != nullptr)
+    {
+        CloseServiceHandle(service);
+    }
+    CloseServiceHandle(manager);
+    if (!serviceOwned && serviceError != ERROR_SERVICE_DOES_NOT_EXIST)
+    {
+        if (error != nullptr && error->empty())
+        {
+            *error = L"cloak service ownership is not established";
+        }
+        return false;
+    }
+    return true;
+}
+
 bool WriteCloakServiceParameters(const CloakSession& session, std::wstring* error)
 {
     bool ok = false;
@@ -840,6 +1049,10 @@ bool WriteCloakServiceParameters(const CloakSession& session, std::wstring* erro
 
     do
     {
+        if (!ValidateCloakServiceOwnership(session, error))
+        {
+            break;
+        }
         const std::wstring path =
             L"SYSTEM\\CurrentControlSet\\Services\\" + session.ServiceName + L"\\Parameters";
         DWORD disposition = 0;
@@ -991,28 +1204,172 @@ bool LaunchCloakChild(const CloakSession& session, int argc, const wchar_t* cons
 
 bool CleanupCloakArtifacts(const CloakSession& session, bool runningFromCopy, std::wstring* error)
 {
+    if (!ValidateCloakSession(session, error))
+    {
+        return false;
+    }
     bool ok = true;
-    (void)error;
 
     for (const std::wstring& sidecar : session.CopiedSidecarFiles)
     {
-        TryDeleteFile(sidecar);
+        ok = TryDeleteFile(sidecar) && ok;
     }
 
-    TryDeleteFile(session.CopiedSysPath);
-    TryDeleteFile(session.SessionFilePath);
+    ok = TryDeleteFile(session.CopiedSysPath) && ok;
 
     if (!runningFromCopy)
     {
-        TryDeleteFile(session.CopiedExePath);
-        TryRemoveDirectory(session.WorkDirectory);
+        ok = TryDeleteFile(session.CopiedExePath) && ok;
     }
     else
     {
-        MoveFileExW(session.CopiedExePath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-        MoveFileExW(session.WorkDirectory.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        ok = MoveFileExW(session.CopiedExePath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) != FALSE && ok;
+        ok = MoveFileExW(session.WorkDirectory.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) != FALSE && ok;
+    }
+    if (ok)
+    {
+        ok = TryDeleteFile(session.SessionFilePath);
+        if (!runningFromCopy && ok)
+        {
+            ok = TryRemoveDirectory(session.WorkDirectory);
+        }
+    }
+    if (!ok && error != nullptr)
+    {
+        *error = L"could not remove or schedule removal of all cloak artifacts";
     }
 
+    return ok;
+}
+
+bool CloakSessionSelfTest()
+{
+    std::wstring current;
+    if (!CanonicalDiskPath(L".", &current, true) || !SameDiskPath(current, current + L"\\."))
+    {
+        return false;
+    }
+    for (const auto mode : {L"--cloak-resume", L"--cloak-cleanup"})
+    {
+        CloakArgs args;
+        const wchar_t* missing[] = {L"KnLiveDbg.exe", mode};
+        if (ParseCloakArgs(2, missing, &args))
+        {
+            return false;
+        }
+        for (const auto path : {L"", L"--help", static_cast<const wchar_t*>(nullptr)})
+        {
+            const wchar_t* invalid[] = {L"KnLiveDbg.exe", mode, path};
+            if (ParseCloakArgs(3, invalid, &args))
+            {
+                return false;
+            }
+        }
+        const wchar_t* conflict[] = {L"KnLiveDbg.exe", L"--cloak", mode, L"C:\\temp\\cfg.dat"};
+        if (ParseCloakArgs(4, conflict, &args))
+        {
+            return false;
+        }
+    }
+
+    wchar_t temp[MAX_PATH] = {};
+    wchar_t root[MAX_PATH] = {};
+    const DWORD length = GetTempPathW(MAX_PATH, temp);
+    if (length == 0 || length >= MAX_PATH || GetTempFileNameW(temp, L"knc", 0, root) == 0)
+    {
+        return false;
+    }
+    DeleteFileW(root);
+    if (!CreateDirectoryW(root, nullptr))
+    {
+        return false;
+    }
+    CloakSession session;
+    session.Id = L"AuxMonkari";
+    session.ServiceName = session.Id;
+    session.DisplayName = session.Id;
+    session.DeviceNtName = L"\\Device\\" + session.Id;
+    session.SymbolicLinkName = L"\\DosDevices\\" + session.Id;
+    session.UserDeviceName = L"\\\\.\\" + session.Id;
+    session.WorkDirectory = std::wstring(root) + L"\\" + session.Id;
+    session.SessionFilePath = session.WorkDirectory + L"\\cfg.dat";
+    session.CopiedExePath = session.WorkDirectory + L"\\" + session.Id + L".exe";
+    session.CopiedSysPath = session.WorkDirectory + L"\\" + session.Id + L".sys";
+    session.OriginalExePath = std::wstring(root) + L"\\original.exe";
+    session.CopiedSidecarFiles = {session.WorkDirectory + L"\\dbghelp.dll"};
+    const std::wstring outside = std::wstring(root) + L"\\outside.dll";
+    bool ok = false;
+    std::wstring error;
+    do
+    {
+        if (!CreateDirectoryW(session.WorkDirectory.c_str(), nullptr) ||
+            !WriteUtf8File(outside, "keep", &error) ||
+            !WriteUtf8File(session.CopiedExePath, "fixture", &error) ||
+            !WriteUtf8File(session.CopiedSysPath, "fixture", &error) ||
+            !WriteUtf8File(session.CopiedSidecarFiles.front(), "fixture", &error) ||
+            !SaveCloakSession(session, &error))
+        {
+            break;
+        }
+        CloakSession loaded;
+        if (!LoadCloakSession(session.SessionFilePath, &loaded, &error) || loaded.Id != session.Id)
+        {
+            break;
+        }
+        bool mutationsRejected = true;
+        for (const auto path : {outside, session.WorkDirectory + L"\\..\\outside.dll",
+            session.WorkDirectory + L"\\dbghelp.dll:stream", session.CopiedExePath,
+            session.WorkDirectory + L"\\dbghelp.dll" + std::wstring(1, L'\0')})
+        {
+            auto invalid = session;
+            invalid.CopiedSidecarFiles = {path};
+            mutationsRejected = !ValidateCloakSession(invalid, &error) &&
+                !CleanupCloakArtifacts(invalid, false, &error) && mutationsRejected;
+        }
+        auto invalid = session;
+        invalid.ServiceName = L"OtherSvc";
+        mutationsRejected = !ValidateCloakSession(invalid, &error) && mutationsRejected;
+        invalid = session;
+        invalid.CopiedSysPath = outside;
+        mutationsRejected = !ValidateCloakSession(invalid, &error) && mutationsRejected;
+        auto networkSource = session;
+        networkSource.OriginalExePath = L"\\\\fixture-host\\share\\KnLiveDbg.exe";
+        mutationsRejected = ValidateCloakSession(networkSource, &error) && mutationsRejected;
+        if (!mutationsRejected || GetFileAttributesW(outside.c_str()) == INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW(session.CopiedExePath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            break;
+        }
+        std::ifstream saved(session.SessionFilePath, std::ios::binary);
+        const std::string valid((std::istreambuf_iterator<char>(saved)), std::istreambuf_iterator<char>());
+        saved.close();
+        for (const auto& contents : {valid + "service=OtherSvc\n", valid + "sidecar=\xff\n",
+            valid + "unexpected=value\n", std::string(kMaxSessionBytes + 1, 'x')})
+        {
+            if (!WriteUtf8File(session.SessionFilePath, contents, &error) ||
+                LoadCloakSession(session.SessionFilePath, &loaded, &error))
+            {
+                mutationsRejected = false;
+            }
+        }
+        if (!mutationsRejected || !SaveCloakSession(session, &error) ||
+            !CleanupCloakArtifacts(session, false, &error) ||
+            GetFileAttributesW(session.WorkDirectory.c_str()) != INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW(outside.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            break;
+        }
+        ok = true;
+    }
+    while (false);
+    // These paths were created by this test; never clean up a parsed mutation.
+    DeleteFileW(session.SessionFilePath.c_str());
+    DeleteFileW(session.CopiedExePath.c_str());
+    DeleteFileW(session.CopiedSysPath.c_str());
+    DeleteFileW(session.CopiedSidecarFiles.front().c_str());
+    RemoveDirectoryW(session.WorkDirectory.c_str());
+    DeleteFileW(outside.c_str());
+    RemoveDirectoryW(root);
     return ok;
 }
 
@@ -1037,20 +1394,33 @@ int RunCloakCleanup(const std::wstring& sessionPath)
         }
 
         SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-        if (manager != nullptr)
+        if (manager == nullptr)
         {
-            SC_HANDLE service = OpenServiceW(
-                manager,
-                session.ServiceName.c_str(),
-                SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
-            if (service != nullptr)
+            std::wcerr << L"cloak cleanup failed: could not open service manager\n";
+            break;
+        }
+        SC_HANDLE service = OpenServiceW(manager, session.ServiceName.c_str(), SERVICE_QUERY_CONFIG);
+        const DWORD serviceError = service == nullptr ? GetLastError() : ERROR_SUCCESS;
+        const bool serviceOwned = service != nullptr && ServiceMatchesSession(service, session, &error);
+        if (service != nullptr)
+        {
+            CloseServiceHandle(service);
+        }
+        CloseServiceHandle(manager);
+        if (!serviceOwned && serviceError != ERROR_SERVICE_DOES_NOT_EXIST)
+        {
+            std::wcerr << L"cloak cleanup failed: service ownership is not established: " << error << L"\n";
+            break;
+        }
+        if (serviceOwned)
+        {
+            DriverService ownedService(session.ServiceName.c_str(), session.DisplayName.c_str());
+            DriverUnloadResult result;
+            if (!ownedService.StopAndDelete(&result, &error))
             {
-                SERVICE_STATUS status = {};
-                ControlService(service, SERVICE_CONTROL_STOP, &status);
-                DeleteService(service);
-                CloseServiceHandle(service);
+                std::wcerr << L"cloak cleanup failed: " << error << L"\n";
+                break;
             }
-            CloseServiceHandle(manager);
         }
 
         if (!CleanupCloakArtifacts(session, false, &error))

@@ -36,6 +36,59 @@ static constexpr ULONGLONG kThreatIntelMatchAllKeyword = 0;
 
 namespace
 {
+    template <typename Writer>
+    bool WriteTiBytes(HANDLE file, const std::string& bytes, Writer write, std::wstring* error)
+    {
+        size_t offset = 0;
+        while (offset < bytes.size())
+        {
+            const DWORD chunk = static_cast<DWORD>((std::min)(bytes.size() - offset, size_t{0x100000}));
+            DWORD written = 0;
+            if (!write(file, bytes.data() + offset, chunk, &written) || written == 0 || written > chunk)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"could not write complete TI export (gle=" + std::to_wstring(GetLastError()) + L")";
+                }
+                return false;
+            }
+            offset += written;
+        }
+        return true;
+    }
+
+    bool TiWriteSelfTest()
+    {
+        const std::string expected = "complete export bytes";
+        std::string output;
+        std::wstring error;
+        auto shortWrite = [&](HANDLE, const char* bytes, DWORD length, DWORD* written)
+        {
+            *written = (std::min)(length, DWORD{3});
+            output.append(bytes, *written);
+            return TRUE;
+        };
+        if (!WriteTiBytes(nullptr, expected, shortWrite, &error) || output != expected)
+        {
+            return false;
+        }
+        for (int mode = 0; mode != 3; ++mode)
+        {
+            auto failedWrite = [mode](HANDLE, const char*, DWORD length, DWORD* written)
+            {
+                *written = mode == 2 ? length + 1 : 0;
+                SetLastError(ERROR_DISK_FULL);
+                return mode == 0 ? FALSE : TRUE;
+            };
+            error.clear();
+            if (WriteTiBytes(nullptr, expected, failedWrite, &error) || error.empty())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool AppendTiStackFrames(const uint8_t* data, size_t bytes, size_t addressBytes,
         std::vector<uint64_t>* frames)
     {
@@ -1617,6 +1670,10 @@ std::vector<TiEventRecord> TiSubscriber::Grep(const std::wstring& pattern, size_
 
 bool TiSubscriber::SaveTo(const std::wstring& path, std::wstring* error) const
 {
+    if (error != nullptr)
+    {
+        error->clear();
+    }
     HANDLE h = CreateFileW(path.c_str(),
                             GENERIC_WRITE,
                             FILE_SHARE_READ,
@@ -1646,6 +1703,7 @@ bool TiSubscriber::SaveTo(const std::wstring& path, std::wstring* error) const
         }
     }
 
+    bool ok = true;
     for (const TiEventRecord& r : snapshot)
     {
         std::wstringstream line;
@@ -1686,11 +1744,32 @@ bool TiSubscriber::SaveTo(const std::wstring& path, std::wstring* error) const
         line << L"}\n";
 
         std::string utf8 = WideToUtf8(line.str());
-        DWORD written = 0;
-        WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+        if (!WriteTiBytes(h, utf8, [](HANDLE file, const char* bytes, DWORD length, DWORD* written)
+            {
+                return WriteFile(file, bytes, length, written, nullptr);
+            }, error))
+        {
+            ok = false;
+            break;
+        }
     }
-    CloseHandle(h);
-    return true;
+    if (ok && !FlushFileBuffers(h))
+    {
+        ok = false;
+        if (error != nullptr)
+        {
+            *error = L"could not flush TI export (gle=" + std::to_wstring(GetLastError()) + L")";
+        }
+    }
+    if (!CloseHandle(h))
+    {
+        ok = false;
+        if (error != nullptr)
+        {
+            *error = L"could not close TI export (gle=" + std::to_wstring(GetLastError()) + L")";
+        }
+    }
+    return ok;
 }
 
 void TiSubscriber::Clear()
@@ -1772,6 +1851,10 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
 
 bool ThreatIntelSubscriberSelfTest()
 {
+    if (!TiWriteSelfTest())
+    {
+        return false;
+    }
     struct FixtureImageCacheEntry
     {
         std::wstring Path;

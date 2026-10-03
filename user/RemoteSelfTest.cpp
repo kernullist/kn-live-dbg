@@ -1,4 +1,5 @@
 #include "RemoteServer.h"
+#include "RemoteFirewall.h"
 
 #include "CompletionHints.h"
 #include "McpJson.h"
@@ -187,6 +188,64 @@ namespace
         }
         return true;
     }
+    bool BackpressureSelfTest()
+    {
+        SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET sender = INVALID_SOCKET;
+        SOCKET receiver = INVALID_SOCKET;
+        bool ok = false;
+        do
+        {
+            if (listener == INVALID_SOCKET)
+            {
+                break;
+            }
+            int small = 1024;
+            setsockopt(listener, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&small), sizeof(small));
+            sockaddr_in address = {};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 1) != 0)
+            {
+                break;
+            }
+            int addressSize = sizeof(address);
+            if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &addressSize) != 0)
+            {
+                break;
+            }
+            sender = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (sender == INVALID_SOCKET || connect(sender, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+            {
+                break;
+            }
+            receiver = accept(listener, nullptr, nullptr);
+            if (receiver == INVALID_SOCKET)
+            {
+                break;
+            }
+            setsockopt(sender, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&small), sizeof(small));
+            std::string frame(knremote::kMaxFrameBytes + 8, 'x');
+            std::wstring error;
+            const ULONGLONG start = GetTickCount64();
+            const DWORD deadline = GetTickCount() + 200;
+            bool sent = true;
+            for (size_t i = 0; i < 64 && sent; ++i)
+            {
+                sent = knremote::SendFrameBytes(sender, frame, deadline, &error);
+            }
+            ok = !sent && error == L"send-timeout" && GetTickCount64() - start < 5000;
+        }
+        while (false);
+        for (const SOCKET socket : {sender, receiver, listener})
+        {
+            if (socket != INVALID_SOCKET)
+            {
+                closesocket(socket);
+            }
+        }
+        return ok;
+    }
 }
 
 int RunRemoteConnectArgvSelfTest()
@@ -348,6 +407,8 @@ int RunRemoteProtocolSelfTest()
     WSADATA clientWsa = {};
     const bool clientWsaStarted = WSAStartup(MAKEWORD(2, 2), &clientWsa) == 0;
     Check(&ctx, clientWsaStarted, L"client-winsock-start");
+    Check(&ctx, RemoteFirewallSelfTest(), L"firewall-com-lifetime-and-configuration-failure");
+    Check(&ctx, clientWsaStarted && BackpressureSelfTest(), L"nonreading-peer-send-deadline");
     RemoteServer server;
     RemoteServerConfig config;
     config.Port = 51767;
@@ -421,6 +482,53 @@ int RunRemoteProtocolSelfTest()
                 std::wstring helloType;
                 knremote::GetStringField(hello, L"type", &helloType);
                 Check(&ctx, gotHello && helloType == L"hello", L"auth-ok-hello");
+                const auto resultRoundTrip = [&](const std::wstring& expectedOut, const std::wstring& expectedErr)
+                {
+                    if (!SendTestJson(okSock, knremote::MakeObject(L"command-submit", L"c-output", L"\"line\":\"version\"")) ||
+                        WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0)
+                    {
+                        return false;
+                    }
+                    const auto job = server.TryPopJob();
+                    if (!job)
+                    {
+                        return false;
+                    }
+                    RemoteEngineResult result;
+                    result.Stdout = expectedOut;
+                    result.Stderr = expectedErr;
+                    job->ResultPromise.set_value(std::move(result));
+                    std::wstring actualOut;
+                    std::wstring actualErr;
+                    for (int64_t sequence = 0; sequence < 256; ++sequence)
+                    {
+                        std::wstring json;
+                        std::wstring out;
+                        std::wstring err;
+                        int64_t receivedSequence = -1;
+                        bool last = false;
+                        if (!RecvAuthJson(okSock, &json, &recvError) ||
+                            !knremote::GetStringField(json, L"stdout", &out) ||
+                            !knremote::GetStringField(json, L"stderr", &err) ||
+                            !knremote::GetNumberField(json, L"seq", &receivedSequence) || receivedSequence != sequence ||
+                            !knremote::GetBoolField(json, L"last", &last))
+                        {
+                            return false;
+                        }
+                        actualOut += out;
+                        actualErr += err;
+                        if (last)
+                        {
+                            return actualOut == expectedOut && actualErr == expectedErr;
+                        }
+                    }
+                    return false;
+                };
+                Check(&ctx, resultRoundTrip(std::wstring(256 * 1024, L'\x01'), std::wstring(256 * 1024, L'\x02')),
+                    L"result-escaped-streams-fit-frames");
+                Check(&ctx, resultRoundTrip(L"", std::wstring(1024 * 1024 + 17, L'x')),
+                    L"result-stderr-spans-frames");
+                Check(&ctx, resultRoundTrip(L"", L""), L"result-empty-streams-terminate");
                 Check(&ctx, SendTestJson(okSock, knremote::MakeObject(L"command-submit", L"c-2", L"\"line\":\"version\"")),
                     L"queued-command-send");
                 Check(&ctx, WaitForSingleObject(server.JobReadyEvent(), 5000) == WAIT_OBJECT_0, L"queued-command-arrived");
