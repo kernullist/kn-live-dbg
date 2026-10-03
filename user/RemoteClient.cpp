@@ -46,6 +46,10 @@ namespace
                 continue;
             }
             const int n = recv(sock, buffer + received, length - received, 0);
+            if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+            {
+                continue;
+            }
             if (n <= 0)
             {
                 if (error != nullptr)
@@ -89,23 +93,10 @@ namespace
         std::string bytes;
         if (!knremote::EncodeFrame(json, &bytes, error))
         {
+            shutdown(sock, SD_BOTH);
             return false;
         }
-        int sent = 0;
-        while (sent < static_cast<int>(bytes.size()))
-        {
-            const int n = send(sock, bytes.data() + sent, static_cast<int>(bytes.size()) - sent, 0);
-            if (n <= 0)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"send failed";
-                }
-                return false;
-            }
-            sent += n;
-        }
-        return true;
+        return knremote::SendFrameBytes(sock, bytes, GetTickCount() + knremote::kFrameDeadlineMs, error);
     }
 
     bool ReadHiddenLine(const wchar_t* prompt, std::wstring* line)

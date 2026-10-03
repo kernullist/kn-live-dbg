@@ -359,6 +359,15 @@ namespace
                 break;
             }
 
+            if (address > UINT64_MAX - (length - 1))
+            {
+                if (error != nullptr)
+                {
+                    *error = L"requested address range wraps the address space";
+                }
+                break;
+            }
+
             out->resize(static_cast<size_t>(length), 0);
 
             uint64_t remaining = length;
@@ -1758,6 +1767,36 @@ bool DumpUserModeSelfTest()
 
     do
     {
+        // Reject wrapping ranges before reading or truncating an output file.
+        size_t boundaryReads = 0;
+        MemoryChunkReader boundaryReader = [&boundaryReads](
+            uint64_t, uint32_t length, std::vector<uint8_t>* bytes, std::wstring*)
+        {
+            ++boundaryReads;
+            bytes->assign(length, 0x41);
+            return true;
+        };
+        for (bool zeroFill : {false, true})
+        {
+            std::vector<uint8_t> bytes;
+            std::wstring error;
+            uint64_t read = 0;
+            uint64_t zero = 0;
+            if (ReadRangeWithReader(boundaryReader, UINT64_MAX - 0x1ffff, 0x40001,
+                    zeroFill, &bytes, nullptr, nullptr, &read, &zero, &error) ||
+                boundaryReads != 0 || !bytes.empty() || error.empty() || read != 0 || zero != 0)
+            {
+                return false;
+            }
+            if (!ReadRangeWithReader(boundaryReader, UINT64_MAX - 15, 16,
+                    zeroFill, &bytes, nullptr, nullptr, &read, &zero, &error) ||
+                boundaryReads != 1 || bytes.size() != 16 || read != 16 || zero != 0)
+            {
+                return false;
+            }
+            boundaryReads = 0;
+        }
+
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll == nullptr)
         {

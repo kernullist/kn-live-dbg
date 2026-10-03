@@ -638,6 +638,10 @@ bool RemoteServer::RecvAll(
             }
 
             const int n = recv(sock, buffer + received, length - received, 0);
+            if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK)
+            {
+                continue;
+            }
             if (n <= 0)
             {
                 if (error != nullptr)
@@ -691,31 +695,13 @@ bool RemoteServer::RecvFrame(
 
 bool RemoteServer::SendJson(SOCKET sock, const std::wstring& json, std::wstring* error)
 {
-    bool ok = false;
-    do
+    std::string bytes;
+    if (!knremote::EncodeFrame(json, &bytes, error))
     {
-        std::string bytes;
-        if (!knremote::EncodeFrame(json, &bytes, error))
-        {
-            break;
-        }
-        int sent = 0;
-        while (sent < static_cast<int>(bytes.size()))
-        {
-            const int n = send(sock, bytes.data() + sent, static_cast<int>(bytes.size()) - sent, 0);
-            if (n <= 0)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"send failed";
-                }
-                break;
-            }
-            sent += n;
-        }
-        ok = sent == static_cast<int>(bytes.size());
-    } while (false);
-    return ok;
+        shutdown(sock, SD_BOTH);
+        return false;
+    }
+    return knremote::SendFrameBytes(sock, bytes, GetTickCount() + knremote::kFrameDeadlineMs, error);
 }
 
 bool RemoteServer::EnqueueAndWait(
@@ -1207,59 +1193,54 @@ void RemoteServer::HandleClient(SOCKET client, const std::wstring& peerIp, uint3
             lastActivity = GetTickCount();
             lastHeartbeat = lastActivity;
 
-            std::wstring stdoutText = result.Stdout;
-            std::wstring marker;
-            if (mcpjson::WideToUtf8(stdoutText).size() > knremote::kInlineTruncateBytes)
+            auto boundedOutput = [](const std::wstring& text)
             {
-                stdoutText = stdoutText.substr(0, 4096);
-                marker = L"\n[truncated]\n";
-                stdoutText += marker;
-            }
-
-            const std::string utf8 = mcpjson::WideToUtf8(stdoutText);
-            size_t offset = 0;
+                std::string bytes = mcpjson::WideToUtf8(text);
+                if (bytes.size() > knremote::kInlineTruncateBytes)
+                {
+                    bytes.resize(knremote::ColorSafeChunkEnd(bytes, 0, 4096));
+                    bytes += "\n[truncated]\n";
+                }
+                return bytes;
+            };
+            const std::string stdoutBytes = boundedOutput(result.Stdout);
+            const std::string stderrBytes = boundedOutput(result.Stderr);
+            size_t outOffset = 0;
+            size_t errOffset = 0;
             int seq = 0;
-            if (utf8.empty())
+            bool sent = true;
+            do
             {
-                std::wstring emptyExtra = L"\"seq\":0,\"last\":true,\"stdout\":\"\",\"stderr\":";
-                emptyExtra += knremote::Quote(result.Stderr);
-                emptyExtra += L",\"keepRunning\":";
-                emptyExtra += result.KeepRunning ? L"true" : L"false";
-                emptyExtra += L",\"isError\":";
-                emptyExtra += result.IsError ? L"true" : L"false";
+                const size_t outEnd = knremote::ColorSafeChunkEnd(stdoutBytes, outOffset, knremote::kResultChunkBytes);
+                const size_t errEnd = knremote::ColorSafeChunkEnd(stderrBytes, errOffset, knremote::kResultChunkBytes);
+                const auto out = mcpjson::Utf8ToWide(stdoutBytes.substr(outOffset, outEnd - outOffset));
+                const auto err = mcpjson::Utf8ToWide(stderrBytes.substr(errOffset, errEnd - errOffset));
+                outOffset = outEnd;
+                errOffset = errEnd;
+                const bool last = outOffset == stdoutBytes.size() && errOffset == stderrBytes.size();
+                std::wstring chunkExtra = L"\"seq\":" + std::to_wstring(seq++);
+                chunkExtra += L",\"last\":";
+                chunkExtra += last ? L"true" : L"false";
+                chunkExtra += L",\"stdout\":" + knremote::Quote(out);
+                chunkExtra += L",\"stderr\":" + knremote::Quote(err);
+                chunkExtra += L",\"keepRunning\":";
+                chunkExtra += result.KeepRunning ? L"true" : L"false";
+                chunkExtra += L",\"isError\":";
+                chunkExtra += result.IsError ? L"true" : L"false";
                 if (result.IsError && !result.Code.empty())
                 {
-                    emptyExtra += L",\"code\":" + knremote::Quote(result.Code);
+                    chunkExtra += L",\"code\":" + knremote::Quote(result.Code);
                 }
-                SendJson(client, knremote::MakeObject(L"command-result", msgId, emptyExtra), nullptr);
-            }
-            else
-            {
-                while (offset < utf8.size())
+                sent = SendJson(client, knremote::MakeObject(L"command-result", msgId, chunkExtra), nullptr);
+                if (!sent || last)
                 {
-                    const size_t end = knremote::ColorSafeChunkEnd(
-                        utf8,
-                        offset,
-                        knremote::kResultChunkBytes);
-                    const size_t chunk = end > offset ? (end - offset) : (utf8.size() - offset);
-                    const std::string part = utf8.substr(offset, chunk);
-                    offset += chunk;
-                    const bool last = offset >= utf8.size();
-                    std::wstring chunkExtra = L"\"seq\":" + std::to_wstring(seq++);
-                    chunkExtra += L",\"last\":";
-                    chunkExtra += last ? L"true" : L"false";
-                    chunkExtra += L",\"stdout\":" + knremote::Quote(mcpjson::Utf8ToWide(part));
-                    chunkExtra += L",\"stderr\":" + knremote::Quote(last ? result.Stderr : L"");
-                    chunkExtra += L",\"keepRunning\":";
-                    chunkExtra += result.KeepRunning ? L"true" : L"false";
-                    chunkExtra += L",\"isError\":";
-                    chunkExtra += result.IsError ? L"true" : L"false";
-                    if (result.IsError && !result.Code.empty())
-                    {
-                        chunkExtra += L",\"code\":" + knremote::Quote(result.Code);
-                    }
-                    SendJson(client, knremote::MakeObject(L"command-result", msgId, chunkExtra), nullptr);
+                    break;
                 }
+            }
+            while (outOffset < stdoutBytes.size() || errOffset < stderrBytes.size());
+            if (!sent)
+            {
+                break;
             }
         }
     } while (false);

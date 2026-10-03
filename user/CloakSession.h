@@ -40,6 +40,8 @@ std::wstring GenerateCloakLeafName();
 bool BuildCloakSession(CloakSession* session, std::wstring* error);
 bool SaveCloakSession(const CloakSession& session, std::wstring* error);
 bool LoadCloakSession(const std::wstring& path, CloakSession* session, std::wstring* error);
+bool CloakSessionSelfTest();
+bool ValidateCloakServiceOwnership(const CloakSession& session, std::wstring* error);
 bool WriteCloakServiceParameters(const CloakSession& session, std::wstring* error);
 bool LaunchCloakChild(const CloakSession& session, int argc, const wchar_t* const* argv, std::wstring* error);
 bool CleanupCloakArtifacts(const CloakSession& session, bool runningFromCopy, std::wstring* error);

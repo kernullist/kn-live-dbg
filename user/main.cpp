@@ -10565,6 +10565,12 @@ static bool LoadDriverServiceWithUx(
         }
         PrintLifecycleOk(L"query service", DriverStatusSummary(before));
 
+        if (cloakSession != nullptr && !ValidateCloakServiceOwnership(*cloakSession, error))
+        {
+            PrintLifecycleFail(L"cloak service ownership", error != nullptr ? *error : L"unknown error");
+            break;
+        }
+
         PrintLifecycleStep(L"install/update service", L"kernel driver demand-start entry");
         if (!service.Install(driverPath, error))
         {
@@ -10690,6 +10696,11 @@ static bool CleanupMainDriverOnExit(DebuggerState& state, DeviceClient& device, 
         }
 
         DriverUnloadResult unloadResult = {};
+        if (state.CloakActive && !ValidateCloakServiceOwnership(state.Cloak, &error))
+        {
+            std::wcerr << L"automatic cloak cleanup refused: " << error << L"\n";
+            break;
+        }
         if (!UnloadDriverServiceWithUx(service, L"Main driver automatic unload", &unloadResult, &error))
         {
             std::wcerr << L"automatic driver unload failed: " << error << L"\n";
@@ -30746,6 +30757,10 @@ static int RunConsoleSurfaceSelfTest()
                 &context,
                 ParseCloakArgs(3, cloakCleanup, &parsed) && parsed.Mode == CloakMode::Cleanup,
                 L"cloak-args-parse-cleanup");
+            CheckConsoleSurfaceSelfTest(
+                &context,
+                CloakSessionSelfTest(),
+                L"cloak-session-artifact-boundaries");
             CheckConsoleSurfaceSelfTest(
                 &context,
                 IsValidCloakLeafName(L"AuxMonkari") &&

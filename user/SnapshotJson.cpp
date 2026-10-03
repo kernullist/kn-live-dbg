@@ -2101,6 +2101,7 @@ bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, s
         }
 
         file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+        file.close();
         ok = file.good();
         if (!ok && error != nullptr)
         {
