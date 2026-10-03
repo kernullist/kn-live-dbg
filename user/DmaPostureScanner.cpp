@@ -13,6 +13,59 @@ namespace
 {
     constexpr DWORD kAcpiProvider = 'ACPI';
 
+    bool FirmwareListSizeValid(DWORD returned, size_t capacity)
+    {
+        return returned != 0 && returned <= capacity && returned % sizeof(uint32_t) == 0;
+    }
+
+    bool BoundedPropertyString(const wchar_t* data, size_t capacity, DWORD type,
+        DWORD bytes, bool multi, std::wstring* output)
+    {
+        output->clear();
+        if (data == nullptr || type != (multi ? REG_MULTI_SZ : REG_SZ) ||
+            bytes == 0 || bytes % sizeof(wchar_t) != 0 || bytes / sizeof(wchar_t) > capacity)
+        {
+            return false;
+        }
+        const size_t characters = bytes / sizeof(wchar_t);
+        if (data[characters - 1] != L'\0' || (multi &&
+            (characters < 2 || data[characters - 2] != L'\0')))
+        {
+            return false;
+        }
+        for (size_t index = 0; index < characters; ++index)
+        {
+            if (data[index] == L'\0')
+            {
+                if (!multi || index + 1 >= characters || data[index + 1] == L'\0')
+                {
+                    break;
+                }
+                output->push_back(L';');
+            }
+            else
+            {
+                output->push_back(data[index]);
+            }
+        }
+        return true;
+    }
+
+    std::wstring ReadDeviceProperty(HDEVINFO devices, SP_DEVINFO_DATA* device,
+        DWORD property, bool multi)
+    {
+        wchar_t buffer[1024] = {};
+        DWORD type = 0;
+        DWORD bytes = 0;
+        std::wstring value;
+        if (SetupDiGetDeviceRegistryPropertyW(devices, device, property, &type,
+            reinterpret_cast<PBYTE>(buffer), sizeof(buffer), &bytes))
+        {
+            BoundedPropertyString(buffer, std::size(buffer), type, bytes, multi, &value);
+        }
+        return value;
+    }
+
     std::wstring FourCcText(uint32_t signature)
     {
         wchar_t text[5] = {};
@@ -71,18 +124,21 @@ namespace
             DWORD type = 0;
             DWORD bytes = 0;
             if (RegQueryValueExW(key, valueName, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS ||
-                bytes == 0)
+                bytes == 0 || bytes > 16384 || bytes % sizeof(wchar_t) != 0 ||
+                (type != REG_SZ && type != REG_EXPAND_SZ))
             {
                 break;
             }
             std::vector<wchar_t> buffer((bytes / sizeof(wchar_t)) + 1);
+            const DWORD capacityBytes = bytes;
             if (RegQueryValueExW(
                     key,
                     valueName,
                     nullptr,
                     &type,
                     reinterpret_cast<LPBYTE>(buffer.data()),
-                    &bytes) != ERROR_SUCCESS)
+                    &bytes) != ERROR_SUCCESS || bytes == 0 || bytes > capacityBytes ||
+                bytes % sizeof(wchar_t) != 0 || (type != REG_SZ && type != REG_EXPAND_SZ))
             {
                 break;
             }
@@ -127,7 +183,7 @@ namespace
                     &type,
                     reinterpret_cast<LPBYTE>(&data),
                     &bytes) != ERROR_SUCCESS ||
-                type != REG_DWORD)
+                type != REG_DWORD || bytes != sizeof(data))
             {
                 break;
             }
@@ -160,7 +216,7 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
 
         *result = DmaPostureScanResult{};
         DWORD tableBytes = EnumSystemFirmwareTables(kAcpiProvider, nullptr, 0);
-        if (tableBytes == 0)
+        if (tableBytes == 0 || tableBytes % sizeof(uint32_t) != 0)
         {
             result->Warnings.push_back(L"EnumSystemFirmwareTables(ACPI) returned no signatures");
         }
@@ -177,9 +233,15 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
                 kAcpiProvider,
                 signatures.data(),
                 static_cast<DWORD>(signatures.size() * sizeof(uint32_t)));
-            if (written == 0)
+            if (!FirmwareListSizeValid(written, signatures.size() * sizeof(uint32_t)))
             {
-                result->Warnings.push_back(L"ACPI firmware-table signature enumeration failed");
+                result->Warnings.push_back(L"ACPI firmware-table signature enumeration failed or changed size");
+                signatures.clear();
+            }
+            else
+            {
+                signatures.resize(written / sizeof(uint32_t));
+                result->FirmwareInventoryComplete = true;
             }
             for (uint32_t signature : signatures)
             {
@@ -217,8 +279,8 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
                 L"DmaGuardOptIn",
                 &dmaProtection))
         {
-            result->KernelDmaProtectionResolved = true;
-            result->KernelDmaProtectionEnabled = dmaProtection != 0;
+            result->DmaGuardConfigurationKnown = true;
+            result->DmaGuardConfigurationValue = dmaProtection;
             result->DmaSecurityPath = L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\DmaSecurity\\DmaGuardOptIn";
             result->DmaSecurityValue = std::to_wstring(dmaProtection);
         }
@@ -237,6 +299,8 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
                 L"DmaGuardOptIn was not readable; Kernel DMA Protection state is unknown");
         }
 
+        result->Warnings.push_back(
+            L"Registry configuration and ACPI tables do not establish active or pre-boot DMA enforcement");
         HDEVINFO devs = SetupDiGetClassDevsW(
             nullptr,
             L"PCI",
@@ -258,35 +322,15 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
                     break;
                 }
 
-                wchar_t hardwareId[1024] = {};
-                wchar_t description[512] = {};
                 wchar_t instanceId[512] = {};
-                wchar_t className[128] = {};
-                SetupDiGetDeviceRegistryPropertyW(
-                    devs,
-                    &info,
-                    SPDRP_HARDWAREID,
-                    nullptr,
-                    reinterpret_cast<PBYTE>(hardwareId),
-                    sizeof(hardwareId),
-                    nullptr);
-                SetupDiGetDeviceRegistryPropertyW(
-                    devs,
-                    &info,
-                    SPDRP_DEVICEDESC,
-                    nullptr,
-                    reinterpret_cast<PBYTE>(description),
-                    sizeof(description),
-                    nullptr);
-                SetupDiGetDeviceRegistryPropertyW(
-                    devs,
-                    &info,
-                    SPDRP_CLASS,
-                    nullptr,
-                    reinterpret_cast<PBYTE>(className),
-                    sizeof(className),
-                    nullptr);
-                SetupDiGetDeviceInstanceIdW(devs, &info, instanceId, 512, nullptr);
+                const std::wstring hardwareId = ReadDeviceProperty(devs, &info, SPDRP_HARDWAREID, true);
+                const std::wstring description = ReadDeviceProperty(devs, &info, SPDRP_DEVICEDESC, false);
+                const std::wstring className = ReadDeviceProperty(devs, &info, SPDRP_CLASS, false);
+                if (!SetupDiGetDeviceInstanceIdW(devs, &info, instanceId, 512, nullptr))
+                {
+                    instanceId[0] = L'\0';
+                }
+                instanceId[511] = L'\0';
 
                 if (!LooksLikeRemovableBus(hardwareId, description))
                 {
@@ -306,7 +350,7 @@ bool DmaPostureScanner::Scan(DmaPostureScanResult* result, std::wstring* error)
             SetupDiDestroyDeviceInfoList(devs);
         }
 
-        result->CoverageComplete = true;
+        result->CoverageComplete = false;
         ok = true;
     } while (false);
 
@@ -320,11 +364,16 @@ std::wstring BuildDmaPostureJson(const DmaPostureScanResult& result)
     json << L",\"dmar\":" << (result.DmarPresent ? L"true" : L"false");
     json << L",\"ivrs\":" << (result.IvrsPresent ? L"true" : L"false");
     json << L",\"iommu_firmware\":" << (result.IommuFirmwarePresent ? L"true" : L"false");
+    json << L",\"firmware_inventory_complete\":" << (result.FirmwareInventoryComplete ? L"true" : L"false");
     json << L",\"kernel_dma_protection_enabled\":"
          << (result.KernelDmaProtectionEnabled ? L"true" : L"false");
     json << L",\"kernel_dma_protection_resolved\":"
          << (result.KernelDmaProtectionResolved ? L"true" : L"false");
     json << L",\"removable_buses\":" << result.RemovableBusCount;
+    json << L",\"dma_guard_configuration_known\":" << (result.DmaGuardConfigurationKnown ? L"true" : L"false");
+    json << L",\"dma_guard_configuration_value\":" << result.DmaGuardConfigurationValue;
+    json << L",\"enforcement_scope\":\"unknown; same-OS configuration inventory\"";
+    json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L",\"acpi\":[";
     for (size_t i = 0; i < result.AcpiTables.size(); ++i)
     {
@@ -367,6 +416,23 @@ bool DmaAcpiSignatureSelfTest()
 
     do
     {
+        if (!FirmwareListSizeValid(8, 8) || FirmwareListSizeValid(12, 8) ||
+            FirmwareListSizeValid(7, 8) || FirmwareListSizeValid(0, 8))
+        {
+            break;
+        }
+        const wchar_t property[] = L"PCI\\VEN_8086\0PCI\\CC_0C03\0";
+        std::wstring propertyText;
+        if (!BoundedPropertyString(property, std::size(property), REG_MULTI_SZ,
+                sizeof(property), true, &propertyText) ||
+            !LooksLikeRemovableBus(propertyText, L"") ||
+            BoundedPropertyString(property, 2, REG_MULTI_SZ, sizeof(property), true, &propertyText) ||
+            BoundedPropertyString(property, std::size(property), REG_BINARY, sizeof(property), true, &propertyText) ||
+            BoundedPropertyString(property, std::size(property), REG_MULTI_SZ,
+                sizeof(property) - sizeof(wchar_t), true, &propertyText))
+        {
+            break;
+        }
         const uint32_t dmar = 'RAMD';
         std::wstring text = FourCcText(dmar);
         if (text != L"DMAR")
@@ -378,6 +444,14 @@ bool DmaAcpiSignatureSelfTest()
             break;
         }
         if (LooksLikeRemovableBus(L"PCI\\VEN_8086&CC_0300", L"VGA"))
+        {
+            break;
+        }
+        DmaPostureScanResult configured;
+        configured.DmaGuardConfigurationKnown = true;
+        configured.DmaGuardConfigurationValue = 1;
+        if (configured.KernelDmaProtectionResolved || configured.KernelDmaProtectionEnabled ||
+            BuildDmaPostureJson(configured).find(L"\"kernel_dma_protection_resolved\":false") == std::wstring::npos)
         {
             break;
         }

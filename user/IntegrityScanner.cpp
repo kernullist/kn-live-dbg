@@ -155,389 +155,373 @@ namespace
         return value != 0 && (value & (value - 1)) == 0;
     }
 
-    bool MapRvaToRawOffset(
-        const IMAGE_SECTION_HEADER* sections,
-        uint16_t sectionCount,
-        uint32_t rva,
-        uint32_t* rawOffset)
+    constexpr uint32_t kMaxIntegrityRelocBytes = 4u * 1024u * 1024u;
+
+    struct IntegrityRelocation
     {
-        bool ok = false;
+        uint32_t Rva = 0;
+        uint32_t Width = 0;
+    };
 
-        do
+    struct IntegrityDiskLayout
+    {
+        uint16_t Machine = 0;
+        uint64_t PreferredBase = 0;
+        uint32_t ImageSize = 0;
+        uint32_t HeaderSize = 0;
+        uint32_t RelocRva = 0;
+        uint32_t RelocSize = 0;
+        std::vector<IMAGE_SECTION_HEADER> Sections;
+    };
+
+    bool ParseIntegrityDiskLayout(const std::vector<uint8_t>& headers, IntegrityDiskLayout* layout)
+    {
+        *layout = {};
+        if (headers.size() < sizeof(IMAGE_DOS_HEADER) || headers.size() > kMaxRawRead)
         {
-            if (sections == nullptr || rawOffset == nullptr)
+            return false;
+        }
+        IMAGE_DOS_HEADER dos = {};
+        std::memcpy(&dos, headers.data(), sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
+        {
+            return false;
+        }
+        const uint64_t nt = static_cast<uint32_t>(dos.e_lfanew);
+        if (nt + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER) > headers.size())
+        {
+            return false;
+        }
+        uint32_t signature = 0;
+        IMAGE_FILE_HEADER file = {};
+        std::memcpy(&signature, headers.data() + nt, sizeof(signature));
+        std::memcpy(&file, headers.data() + nt + sizeof(signature), sizeof(file));
+        const uint64_t optionalOffset = nt + sizeof(signature) + sizeof(file);
+        const uint64_t sectionOffset = optionalOffset + file.SizeOfOptionalHeader;
+        const uint64_t sectionEnd = sectionOffset +
+            static_cast<uint64_t>(file.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+        if (signature != IMAGE_NT_SIGNATURE || file.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+            file.NumberOfSections == 0 || file.NumberOfSections > 96 ||
+            file.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) || sectionEnd > headers.size())
+        {
+            return false;
+        }
+        IMAGE_OPTIONAL_HEADER64 optional = {};
+        std::memcpy(&optional, headers.data() + optionalOffset, sizeof(optional));
+        if (optional.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || optional.SizeOfImage == 0 ||
+            optional.SizeOfHeaders < sectionEnd || optional.SizeOfHeaders > optional.SizeOfImage ||
+            optional.NumberOfRvaAndSizes > IMAGE_NUMBEROF_DIRECTORY_ENTRIES)
+        {
+            return false;
+        }
+        IntegrityDiskLayout candidate;
+        candidate.Machine = file.Machine;
+        candidate.PreferredBase = optional.ImageBase;
+        candidate.ImageSize = optional.SizeOfImage;
+        candidate.HeaderSize = optional.SizeOfHeaders;
+        if (optional.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC)
+        {
+            candidate.RelocRva = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+            candidate.RelocSize = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        }
+        candidate.Sections.resize(file.NumberOfSections);
+        std::memcpy(candidate.Sections.data(), headers.data() + sectionOffset,
+            candidate.Sections.size() * sizeof(IMAGE_SECTION_HEADER));
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        for (const IMAGE_SECTION_HEADER& section : candidate.Sections)
+        {
+            const uint64_t span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+            if (span == 0)
             {
-                break;
+                continue;
             }
-
-            // Headers region (before first section) maps 1:1 to file offset.
-            if (sectionCount == 0)
+            const uint64_t end = static_cast<uint64_t>(section.VirtualAddress) + span;
+            const uint64_t rawEnd = static_cast<uint64_t>(section.PointerToRawData) + section.SizeOfRawData;
+            if (section.VirtualAddress < candidate.HeaderSize || end > candidate.ImageSize ||
+                rawEnd > 0x100000000ull ||
+                (section.SizeOfRawData != 0 && section.PointerToRawData < candidate.HeaderSize))
             {
-                *rawOffset = rva;
-                ok = true;
-                break;
+                return false;
             }
-
-            for (uint16_t index = 0; index < sectionCount; ++index)
+            ranges.emplace_back(section.VirtualAddress, end);
+        }
+        std::sort(ranges.begin(), ranges.end());
+        for (size_t index = 1; index < ranges.size(); ++index)
+        {
+            if (ranges[index - 1].second > ranges[index].first)
             {
-                const uint32_t sectionRva = sections[index].VirtualAddress;
-                const uint32_t virtualSize = sections[index].Misc.VirtualSize != 0
-                    ? sections[index].Misc.VirtualSize
-                    : sections[index].SizeOfRawData;
-                const uint32_t rawSize = sections[index].SizeOfRawData;
-                if (rva < sectionRva)
-                {
-                    continue;
-                }
-
-                const uint32_t delta = rva - sectionRva;
-                if (delta >= virtualSize && delta >= rawSize)
-                {
-                    continue;
-                }
-
-                if (delta >= rawSize || sections[index].PointerToRawData == 0)
-                {
-                    break;
-                }
-
-                *rawOffset = sections[index].PointerToRawData + delta;
-                ok = true;
-                break;
+                return false;
             }
-        } while (false);
-
-        return ok;
+        }
+        *layout = std::move(candidate);
+        return true;
     }
 
-    // Populate page-aligned RVAs that contain base relocation fixups.
-    void CollectRelocationPagesFromDisk(
-        HANDLE file,
-        const IMAGE_SECTION_HEADER* sections,
-        uint16_t sectionCount,
-        uint32_t relocRva,
-        uint32_t relocSize,
-        std::set<uint32_t>* pages)
+    bool IntegrityDiskPlansMatch(const IntegrityDiskLayout& observed, const IntegrityDiskLayout& disk)
     {
-        do
-        {
-            if (file == INVALID_HANDLE_VALUE ||
-                pages == nullptr ||
-                relocRva == 0 ||
-                relocSize < sizeof(IMAGE_BASE_RELOCATION))
-            {
-                break;
-            }
-
-            uint32_t parsed = 0;
-            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= relocSize)
-            {
-                uint32_t blockRaw = 0;
-                if (!MapRvaToRawOffset(sections, sectionCount, relocRva + parsed, &blockRaw))
-                {
-                    break;
-                }
-
-                IMAGE_BASE_RELOCATION block = {};
-                LARGE_INTEGER seek = {};
-                seek.QuadPart = static_cast<LONGLONG>(blockRaw);
-                DWORD got = 0;
-                if (!SetFilePointerEx(file, seek, nullptr, FILE_BEGIN) ||
-                    !ReadFile(file, &block, sizeof(block), &got, nullptr) ||
-                    got != sizeof(block))
-                {
-                    break;
-                }
-
-                if (block.VirtualAddress == 0 ||
-                    block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                    parsed + block.SizeOfBlock > relocSize)
-                {
-                    break;
-                }
-
-                const uint32_t entryBytes = block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
-                if (entryBytes == 0)
-                {
-                    parsed += block.SizeOfBlock;
-                    continue;
-                }
-
-                std::vector<uint8_t> entries(entryBytes);
-                if (!ReadFile(file, entries.data(), entryBytes, &got, nullptr) || got != entryBytes)
-                {
-                    break;
-                }
-
-                const size_t entryCount = entryBytes / sizeof(uint16_t);
-                for (size_t index = 0; index < entryCount; ++index)
-                {
-                    uint16_t entry = 0;
-                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
-                    const uint16_t type = static_cast<uint16_t>(entry >> 12);
-                    const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
-                    if (type == IMAGE_REL_BASED_ABSOLUTE)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t fixupRva = block.VirtualAddress + offset;
-                    pages->insert(fixupRva & 0xfffff000u);
-                    uint32_t fixupWidth = 0;
-                    if (type == IMAGE_REL_BASED_DIR64)
-                    {
-                        fixupWidth = sizeof(uint64_t);
-                    }
-                    else if (type == IMAGE_REL_BASED_HIGHLOW)
-                    {
-                        fixupWidth = sizeof(uint32_t);
-                    }
-                    if (fixupWidth != 0 &&
-                        ((fixupRva & 0xfffu) + fixupWidth) > 0x1000u)
-                    {
-                        pages->insert((fixupRva & 0xfffff000u) + 0x1000u);
-                    }
-                }
-
-                parsed += block.SizeOfBlock;
-            }
-        } while (false);
+        return observed.Machine == disk.Machine && observed.PreferredBase == disk.PreferredBase &&
+            observed.ImageSize == disk.ImageSize && observed.HeaderSize == disk.HeaderSize &&
+            observed.RelocRva == disk.RelocRva && observed.RelocSize == disk.RelocSize &&
+            !observed.Sections.empty() && observed.Sections.size() == disk.Sections.size() &&
+            std::memcmp(observed.Sections.data(), disk.Sections.data(),
+                observed.Sections.size() * sizeof(IMAGE_SECTION_HEADER)) == 0;
     }
 
-    bool ApplyIntegerDeltaAcrossPages(
-        std::vector<uint8_t>* pageBytes,
-        std::vector<uint8_t>* nextPageBytes,
-        uint32_t pageOffset,
-        uint32_t width,
-        uint64_t imageDelta,
-        std::wstring* error)
+    bool ReadIntegrityDiskLayout(HANDLE file, IntegrityDiskLayout* layout)
     {
-        bool ok = false;
-
-        do
+        *layout = {};
+        LARGE_INTEGER size = {};
+        LARGE_INTEGER start = {};
+        if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+            !SetFilePointerEx(file, start, nullptr, FILE_BEGIN))
         {
-            if (pageBytes == nullptr || width == 0 || width > sizeof(uint64_t) ||
-                pageOffset >= pageBytes->size())
+            return false;
+        }
+        const DWORD count = static_cast<DWORD>((std::min<uint64_t>)(
+            static_cast<uint64_t>(size.QuadPart), kMaxRawRead));
+        std::vector<uint8_t> bytes(count);
+        DWORD received = 0;
+        return ReadFile(file, bytes.data(), count, &received, nullptr) && received == count &&
+            ParseIntegrityDiskLayout(bytes, layout);
+    }
+
+    bool MapIntegrityRvaExtent(
+        const IMAGE_SECTION_HEADER* sections, uint16_t sectionCount,
+        uint32_t headerSize, uint32_t rva, uint64_t* raw, uint32_t* available)
+    {
+        if (sections == nullptr || sectionCount == 0 || sectionCount > 96 ||
+            raw == nullptr || available == nullptr)
+        {
+            return false;
+        }
+        bool found = rva < headerSize;
+        uint64_t candidate = rva;
+        uint32_t remaining = found ? headerSize - rva : 0;
+        for (uint16_t index = 0; index < sectionCount; ++index)
+        {
+            const IMAGE_SECTION_HEADER& section = sections[index];
+            if (rva < section.VirtualAddress)
             {
-                if (error != nullptr)
+                continue;
+            }
+            const uint32_t delta = rva - section.VirtualAddress;
+            if (delta >= section.SizeOfRawData)
+            {
+                continue;
+            }
+            const uint64_t rawEnd = static_cast<uint64_t>(section.PointerToRawData) + section.SizeOfRawData;
+            const uint64_t virtualEnd = static_cast<uint64_t>(section.VirtualAddress) + section.SizeOfRawData;
+            if (found || section.PointerToRawData == 0 || rawEnd > 0x100000000ull ||
+                virtualEnd > 0x100000000ull)
+            {
+                return false;
+            }
+            found = true;
+            candidate = static_cast<uint64_t>(section.PointerToRawData) + delta;
+            remaining = section.SizeOfRawData - delta;
+        }
+        if (found)
+        {
+            *raw = candidate;
+            *available = remaining;
+        }
+        return found;
+    }
+
+    template<typename Read>
+    bool ReadIntegrityRvaBytes(
+        Read read, uint64_t fileSize, const IMAGE_SECTION_HEADER* sections, uint16_t sectionCount,
+        uint32_t headerSize, uint32_t rva, uint32_t length, std::vector<uint8_t>* output)
+    {
+        output->clear();
+        if (length == 0 || length > kMaxIntegrityRelocBytes ||
+            static_cast<uint64_t>(rva) + length > 0x100000000ull)
+        {
+            return false;
+        }
+        std::vector<uint8_t> bytes(length);
+        uint32_t consumed = 0;
+        while (consumed < length)
+        {
+            uint64_t raw = 0;
+            uint32_t available = 0;
+            if (!MapIntegrityRvaExtent(sections, sectionCount, headerSize, rva + consumed, &raw, &available))
+            {
+                return false;
+            }
+            const uint32_t chunk = (std::min)((std::min)(length - consumed, available), 0x10000u);
+            if (chunk == 0 || raw > fileSize || chunk > fileSize - raw ||
+                !read(raw, chunk, bytes.data() + consumed))
+            {
+                return false;
+            }
+            consumed += chunk;
+        }
+        *output = std::move(bytes);
+        return true;
+    }
+
+    bool ReadIntegrityDiskRva(
+        HANDLE file, const IMAGE_SECTION_HEADER* sections, uint16_t sectionCount,
+        uint32_t headerSize, uint32_t rva, uint32_t length, std::vector<uint8_t>* bytes)
+    {
+        LARGE_INTEGER fileSize = {};
+        if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &fileSize) || fileSize.QuadPart < 0)
+        {
+            bytes->clear();
+            return false;
+        }
+        return ReadIntegrityRvaBytes([&](uint64_t raw, uint32_t count, uint8_t* output)
+        {
+            LARGE_INTEGER seek = {};
+            seek.QuadPart = static_cast<LONGLONG>(raw);
+            DWORD received = 0;
+            return SetFilePointerEx(file, seek, nullptr, FILE_BEGIN) &&
+                ReadFile(file, output, count, &received, nullptr) && received == count;
+        }, static_cast<uint64_t>(fileSize.QuadPart), sections, sectionCount, headerSize, rva, length, bytes);
+    }
+
+    bool ParseIntegrityRelocations(
+        const std::vector<uint8_t>& bytes, uint32_t imageSize,
+        std::vector<IntegrityRelocation>* relocations)
+    {
+        relocations->clear();
+        if (bytes.empty() || bytes.size() > kMaxIntegrityRelocBytes || imageSize == 0)
+        {
+            return false;
+        }
+        std::vector<IntegrityRelocation> parsed;
+        size_t cursor = 0;
+        while (cursor < bytes.size())
+        {
+            if ((cursor & 3u) != 0 || bytes.size() - cursor < sizeof(IMAGE_BASE_RELOCATION))
+            {
+                return false;
+            }
+            IMAGE_BASE_RELOCATION block = {};
+            std::memcpy(&block, bytes.data() + cursor, sizeof(block));
+            if (block.SizeOfBlock < sizeof(block) || block.SizeOfBlock > bytes.size() - cursor ||
+                (block.SizeOfBlock - sizeof(block)) % sizeof(uint16_t) != 0 ||
+                (block.VirtualAddress & 0xFFFu) != 0 || block.VirtualAddress >= imageSize)
+            {
+                return false;
+            }
+            const size_t count = (block.SizeOfBlock - sizeof(block)) / sizeof(uint16_t);
+            for (size_t index = 0; index < count; ++index)
+            {
+                uint16_t entry = 0;
+                std::memcpy(&entry, bytes.data() + cursor + sizeof(block) + index * sizeof(entry), sizeof(entry));
+                const uint16_t type = entry >> 12;
+                if (type == IMAGE_REL_BASED_ABSOLUTE)
                 {
-                    *error = L"invalid cross-page reloc apply";
+                    continue;
                 }
-                break;
-            }
-
-            const uint32_t first = static_cast<uint32_t>(pageBytes->size() - pageOffset);
-            if (first >= width)
-            {
-                uint64_t value = 0;
-                std::memcpy(&value, pageBytes->data() + pageOffset, width);
-                value += imageDelta;
-                std::memcpy(pageBytes->data() + pageOffset, &value, width);
-                ok = true;
-                break;
-            }
-
-            const uint32_t second = width - first;
-            if (nextPageBytes == nullptr || nextPageBytes->size() < second)
-            {
-                if (error != nullptr)
+                const uint32_t width = type == IMAGE_REL_BASED_DIR64 ? 8u :
+                    type == IMAGE_REL_BASED_HIGHLOW ? 4u : 0u;
+                const uint64_t rva = static_cast<uint64_t>(block.VirtualAddress) + (entry & 0xFFFu);
+                if (width == 0 || rva >= imageSize || width > imageSize - rva ||
+                    parsed.size() >= 1024u * 1024u)
                 {
-                    *error = L"cross-page reloc fixup requires next page bytes";
+                    return false;
                 }
-                break;
+                parsed.push_back({static_cast<uint32_t>(rva), width});
             }
+            cursor += block.SizeOfBlock;
+        }
+        std::sort(parsed.begin(), parsed.end(), [](const IntegrityRelocation& left, const IntegrityRelocation& right)
+        {
+            return left.Rva < right.Rva;
+        });
+        for (size_t index = 1; index < parsed.size(); ++index)
+        {
+            if (static_cast<uint64_t>(parsed[index - 1].Rva) + parsed[index - 1].Width > parsed[index].Rva)
+            {
+                // Overlapping fixups need loader-order emulation, not independent normalization.
+                return false;
+            }
+        }
+        *relocations = std::move(parsed);
+        return true;
+    }
 
-            uint8_t raw[8] = {};
-            std::memcpy(raw, pageBytes->data() + pageOffset, first);
-            std::memcpy(raw + first, nextPageBytes->data(), second);
+    bool LoadIntegrityRelocations(
+        HANDLE file, const IMAGE_SECTION_HEADER* sections, uint16_t sectionCount,
+        uint32_t headerSize, uint32_t imageSize, uint32_t relocRva, uint32_t relocSize,
+        std::vector<IntegrityRelocation>* relocations)
+    {
+        relocations->clear();
+        if (relocRva == 0 || relocSize == 0 || relocRva >= imageSize || relocSize > imageSize - relocRva)
+        {
+            return false;
+        }
+        std::vector<uint8_t> bytes;
+        return ReadIntegrityDiskRva(file, sections, sectionCount, headerSize, relocRva, relocSize, &bytes) &&
+            ParseIntegrityRelocations(bytes, imageSize, relocations);
+    }
+
+    template<typename ReadOriginal>
+    bool ApplyIntegrityRelocationsToPage(
+        const std::vector<IntegrityRelocation>& relocations, uint32_t pageRva, uint64_t delta,
+        std::vector<uint8_t>* bytes, ReadOriginal readOriginal, uint32_t* appliedCount)
+    {
+        *appliedCount = 0;
+        if (bytes == nullptr || bytes->empty() || bytes->size() > 0x1000 ||
+            static_cast<uint64_t>(pageRva) + bytes->size() > 0x100000000ull)
+        {
+            return false;
+        }
+        const uint64_t pageEnd = static_cast<uint64_t>(pageRva) + bytes->size();
+        std::vector<uint8_t> normalized = *bytes;
+        uint32_t applied = 0;
+        for (const IntegrityRelocation& fixup : relocations)
+        {
+            const uint64_t fixupEnd = static_cast<uint64_t>(fixup.Rva) + fixup.Width;
+            if (fixup.Width != 4 && fixup.Width != 8)
+            {
+                return false;
+            }
+            if (fixup.Rva >= pageEnd || fixupEnd <= pageRva)
+            {
+                continue;
+            }
             uint64_t value = 0;
-            std::memcpy(&value, raw, width);
-            value += imageDelta;
-            std::memcpy(raw, &value, width);
-            std::memcpy(pageBytes->data() + pageOffset, raw, first);
-            std::memcpy(nextPageBytes->data(), raw + first, second);
-            ok = true;
-        } while (false);
-
-        return ok;
+            if (fixup.Rva >= pageRva && fixupEnd <= pageEnd)
+            {
+                std::memcpy(&value, bytes->data() + (fixup.Rva - pageRva), fixup.Width);
+            }
+            else
+            {
+                std::vector<uint8_t> original;
+                if (!readOriginal(fixup.Rva, fixup.Width, &original) || original.size() != fixup.Width)
+                {
+                    return false;
+                }
+                std::memcpy(&value, original.data(), fixup.Width);
+            }
+            value += delta;
+            const uint64_t first = (std::max<uint64_t>)(fixup.Rva, pageRva);
+            const uint64_t last = (std::min)(fixupEnd, pageEnd);
+            const uint8_t* adjusted = reinterpret_cast<const uint8_t*>(&value);
+            std::memcpy(normalized.data() + (first - pageRva), adjusted + (first - fixup.Rva),
+                static_cast<size_t>(last - first));
+            ++applied;
+        }
+        *bytes = std::move(normalized);
+        *appliedCount = applied;
+        return true;
     }
 
-    // Apply base relocations that land inside [pageRva, pageRva+pageBytes).
-    // Cross-page DIR64/HIGHLOW fixups use nextPageBytes (must hold at least the
-    // spilled tail). Missing next-page storage is a hard failure, not a skip.
-    bool ApplyBaseRelocationsToPage(
-        HANDLE file,
-        const IMAGE_SECTION_HEADER* sections,
-        uint16_t sectionCount,
-        uint32_t relocRva,
-        uint32_t relocSize,
-        uint32_t pageRva,
-        uint64_t imageDelta,
-        std::vector<uint8_t>* pageBytes,
-        std::vector<uint8_t>* nextPageBytes,
-        uint32_t* appliedCount,
-        std::wstring* error)
+    void FinalizeIntegrityDiskComparison(ModuleIntegritySectionRecord* section, uint32_t comparedPages,
+        uint32_t relocationFailures)
     {
-        bool ok = false;
-
-        do
+        if (relocationFailures != 0 || comparedPages == 0)
         {
-            if (appliedCount != nullptr)
-            {
-                *appliedCount = 0;
-            }
-
-            if (file == INVALID_HANDLE_VALUE ||
-                sections == nullptr ||
-                pageBytes == nullptr ||
-                pageBytes->empty() ||
-                relocRva == 0 ||
-                relocSize < sizeof(IMAGE_BASE_RELOCATION))
-            {
-                if (error != nullptr)
-                {
-                    *error = L"invalid reloc apply inputs";
-                }
-                break;
-            }
-
-            const uint32_t pageEnd = pageRva + static_cast<uint32_t>(pageBytes->size());
-            uint32_t parsed = 0;
-            uint32_t applied = 0;
-            bool failed = false;
-
-            while (parsed + sizeof(IMAGE_BASE_RELOCATION) <= relocSize)
-            {
-                uint32_t blockRaw = 0;
-                if (!MapRvaToRawOffset(sections, sectionCount, relocRva + parsed, &blockRaw))
-                {
-                    failed = true;
-                    if (error != nullptr)
-                    {
-                        *error = L"reloc block RVA map failed";
-                    }
-                    break;
-                }
-
-                IMAGE_BASE_RELOCATION block = {};
-                LARGE_INTEGER seek = {};
-                seek.QuadPart = static_cast<LONGLONG>(blockRaw);
-                DWORD got = 0;
-                if (!SetFilePointerEx(file, seek, nullptr, FILE_BEGIN) ||
-                    !ReadFile(file, &block, sizeof(block), &got, nullptr) ||
-                    got != sizeof(block))
-                {
-                    failed = true;
-                    if (error != nullptr)
-                    {
-                        *error = L"reloc block read failed";
-                    }
-                    break;
-                }
-
-                if (block.VirtualAddress == 0 ||
-                    block.SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                    parsed + block.SizeOfBlock > relocSize)
-                {
-                    break;
-                }
-
-                const uint32_t entryBytes = block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
-                if (entryBytes == 0)
-                {
-                    parsed += block.SizeOfBlock;
-                    continue;
-                }
-
-                std::vector<uint8_t> entries(entryBytes);
-                if (!ReadFile(file, entries.data(), entryBytes, &got, nullptr) || got != entryBytes)
-                {
-                    failed = true;
-                    if (error != nullptr)
-                    {
-                        *error = L"reloc entry read failed";
-                    }
-                    break;
-                }
-
-                const size_t entryCount = entryBytes / sizeof(uint16_t);
-                for (size_t index = 0; index < entryCount; ++index)
-                {
-                    uint16_t entry = 0;
-                    std::memcpy(&entry, entries.data() + index * sizeof(uint16_t), sizeof(entry));
-                    const uint16_t type = static_cast<uint16_t>(entry >> 12);
-                    const uint16_t offset = static_cast<uint16_t>(entry & 0x0fffu);
-                    if (type == IMAGE_REL_BASED_ABSOLUTE)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t fixupRva = block.VirtualAddress + offset;
-                    if (fixupRva < pageRva || fixupRva >= pageEnd)
-                    {
-                        continue;
-                    }
-
-                    const uint32_t pageOffset = fixupRva - pageRva;
-                    uint32_t width = 0;
-                    if (type == IMAGE_REL_BASED_DIR64)
-                    {
-                        width = sizeof(uint64_t);
-                    }
-                    else if (type == IMAGE_REL_BASED_HIGHLOW)
-                    {
-                        width = sizeof(uint32_t);
-                    }
-                    else
-                    {
-                        failed = true;
-                        if (error != nullptr)
-                        {
-                            *error = L"unsupported reloc type in compared page";
-                        }
-                        break;
-                    }
-
-                    std::wstring applyError;
-                    if (!ApplyIntegerDeltaAcrossPages(
-                            pageBytes,
-                            nextPageBytes,
-                            pageOffset,
-                            width,
-                            imageDelta,
-                            &applyError))
-                    {
-                        failed = true;
-                        if (error != nullptr)
-                        {
-                            *error = applyError;
-                        }
-                        break;
-                    }
-                    ++applied;
-                }
-
-                if (failed)
-                {
-                    break;
-                }
-
-                parsed += block.SizeOfBlock;
-            }
-
-            if (failed)
-            {
-                break;
-            }
-
-            if (appliedCount != nullptr)
-            {
-                *appliedCount = applied;
-            }
-            ok = true;
-        } while (false);
-
-        return ok;
+            section->DiskCompareFailed = true;
+        }
+        if (section->DiskCompareFailed || section->DiskCompareMismatch)
+        {
+            section->DiskCompareMatched = false;
+        }
     }
 
     uint64_t DecodeInteger(const uint8_t* bytes, size_t width)
@@ -2145,6 +2129,45 @@ namespace
         return added;
     }
 
+    struct DeviceChainObservation
+    {
+        std::vector<uint64_t> Addresses;
+        bool Complete = false;
+        bool Cycle = false;
+    };
+
+    template<typename Reader>
+    DeviceChainObservation WalkDeviceAddressChain(
+        uint64_t first,
+        uint32_t limit,
+        Reader& readNext)
+    {
+        DeviceChainObservation observed;
+        std::set<uint64_t> visited;
+        uint64_t current = first;
+        while (current != 0)
+        {
+            if (!IsKernelAddress(current) || observed.Addresses.size() >= limit)
+            {
+                break;
+            }
+            if (!visited.insert(current).second)
+            {
+                observed.Cycle = true;
+                break;
+            }
+            uint64_t next = 0;
+            if (!readNext(current, &next))
+            {
+                break;
+            }
+            observed.Addresses.push_back(current);
+            current = next;
+        }
+        observed.Complete = current == 0;
+        return observed;
+    }
+
     bool ReadAsciiZ(
         DeviceClient& device,
         uint64_t address,
@@ -2655,17 +2678,18 @@ namespace
 
             *record = DeviceObjectRecord{};
             record->DeviceObject = deviceObject;
-            ReadFieldInteger(device, deviceObject, layout.DriverObject, sizeof(uint64_t), &record->DriverObject, nullptr);
-            ReadFieldInteger(device, deviceObject, layout.NextDevice, sizeof(uint64_t), &record->NextDevice, nullptr);
-            ReadFieldInteger(device, deviceObject, layout.AttachedDevice, sizeof(uint64_t), &record->AttachedDevice, nullptr);
+            if (!ReadFieldInteger(device, deviceObject, layout.DriverObject,
+                    sizeof(uint64_t), &record->DriverObject, nullptr) ||
+                !ReadFieldInteger(device, deviceObject, layout.NextDevice,
+                    sizeof(uint64_t), &record->NextDevice, nullptr) ||
+                !ReadFieldInteger(device, deviceObject, layout.AttachedDevice,
+                    sizeof(uint64_t), &record->AttachedDevice, nullptr) ||
+                !ReadFieldInteger(device, deviceObject, layout.DeviceObjectExtension,
+                    sizeof(uint64_t), &record->DeviceObjectExtension, nullptr))
+            {
+                break;
+            }
             ReadFieldInteger(device, deviceObject, layout.DeviceExtension, sizeof(uint64_t), &record->DeviceExtension, nullptr);
-            ReadFieldInteger(
-                device,
-                deviceObject,
-                layout.DeviceObjectExtension,
-                sizeof(uint64_t),
-                &record->DeviceObjectExtension,
-                nullptr);
 
             uint64_t value = 0;
             if (ReadFieldInteger(device, deviceObject, layout.DeviceType, sizeof(uint32_t), &value, nullptr))
@@ -2685,17 +2709,14 @@ namespace
                 record->StackSize = static_cast<int32_t>(static_cast<int8_t>(value));
             }
 
-            if (layout.HasAttachedTo &&
-                record->DeviceObjectExtension != 0 &&
-                IsKernelAddress(record->DeviceObjectExtension))
+            if (layout.HasAttachedTo)
             {
-                ReadFieldInteger(
-                    device,
-                    record->DeviceObjectExtension,
-                    layout.AttachedTo,
-                    sizeof(uint64_t),
-                    &record->AttachedTo,
-                    nullptr);
+                if (!IsKernelAddress(record->DeviceObjectExtension) ||
+                    !ReadFieldInteger(device, record->DeviceObjectExtension,
+                        layout.AttachedTo, sizeof(uint64_t), &record->AttachedTo, nullptr))
+                {
+                    break;
+                }
             }
 
             if (record->DriverObject != 0 && IsKernelAddress(record->DriverObject))
@@ -2771,54 +2792,48 @@ namespace
                 break;
             }
 
-            std::vector<uint64_t> upward;
-            bool cycle = false;
-            uint64_t current = startDevice;
-            while (current != 0 &&
-                IsKernelAddress(current) &&
-                PushUniqueAddress(&upward, current, kMaxDeviceChain, &cycle))
+            auto readUp = [&](uint64_t current, uint64_t* next)
             {
                 DeviceObjectRecord record = {};
                 if (!ReadDeviceObjectRecord(device, symbols, layout, current, &record))
                 {
-                    result->Warnings.push_back(L"failed to read a device object on the attached-device walk");
-                    break;
+                    return false;
                 }
-                current = record.AttachedDevice;
-            }
-            if (cycle)
+                *next = record.AttachedDevice;
+                return true;
+            };
+            const DeviceChainObservation up = WalkDeviceAddressChain(startDevice, kMaxDeviceChain, readUp);
+            const std::vector<uint64_t>& upward = up.Addresses;
+            if (!up.Complete)
             {
-                result->CycleDetected = true;
-                result->Warnings.push_back(L"AttachedDevice walk hit a cycle");
+                result->Warnings.push_back(L"AttachedDevice walk stopped before a verified NULL link");
             }
 
-            std::vector<uint64_t> downward;
-            cycle = false;
-            current = startDevice;
+            DeviceChainObservation down;
             if (layout.HasAttachedTo)
             {
-                while (current != 0 &&
-                    IsKernelAddress(current) &&
-                    PushUniqueAddress(&downward, current, kMaxDeviceChain, &cycle))
+                auto readDown = [&](uint64_t current, uint64_t* next)
                 {
                     DeviceObjectRecord record = {};
                     if (!ReadDeviceObjectRecord(device, symbols, layout, current, &record))
                     {
-                        result->Warnings.push_back(L"failed to read a device object on the AttachedTo walk");
-                        break;
+                        return false;
                     }
-                    current = record.AttachedTo;
-                }
-                if (cycle)
+                    *next = record.AttachedTo;
+                    return true;
+                };
+                down = WalkDeviceAddressChain(startDevice, kMaxDeviceChain, readDown);
+                if (!down.Complete)
                 {
-                    result->CycleDetected = true;
-                    result->Warnings.push_back(L"AttachedTo walk hit a cycle");
+                    result->Warnings.push_back(L"AttachedTo walk stopped before a verified NULL link");
                 }
             }
             else
             {
                 result->Warnings.push_back(L"_DEVOBJ_EXTENSION.AttachedTo was not resolved; lower stack is incomplete");
             }
+            const std::vector<uint64_t>& downward = down.Addresses;
+            result->CycleDetected = up.Cycle || down.Cycle;
 
             std::vector<uint64_t> ordered;
             if (!upward.empty())
@@ -2854,11 +2869,17 @@ namespace
             }
 
             std::vector<uint64_t> seen;
+            bool recordsComplete = true;
             for (uint64_t deviceAddress : ordered)
             {
                 bool localCycle = false;
                 if (!PushUniqueAddress(&seen, deviceAddress, kMaxDeviceChain, &localCycle))
                 {
+                    if (recordsComplete)
+                    {
+                        result->Warnings.push_back(L"combined device stack records exceeded the limit or repeated an address");
+                    }
+                    recordsComplete = false;
                     if (localCycle)
                     {
                         result->CycleDetected = true;
@@ -2871,12 +2892,17 @@ namespace
                 {
                     result->Stack.push_back(record);
                 }
+                else
+                {
+                    recordsComplete = false;
+                    result->Warnings.push_back(L"device stack record changed or became unreadable during collection");
+                }
             }
 
             result->CoverageComplete =
                 !result->Stack.empty() &&
                 layout.HasAttachedTo &&
-                !result->CycleDetected;
+                !result->CycleDetected && up.Complete && down.Complete && recordsComplete;
             ok = !result->Stack.empty();
         } while (false);
 
@@ -3259,11 +3285,14 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                     reinterpret_cast<const IMAGE_SECTION_HEADER*>(headerBytes.data() + sectionTable);
 
                                 // Optional live-vs-disk compare: open once per module and
-                                // collect basereloc page RVAs so those pages can be
-                                // reloc-normalized before compare (not skipped).
+                                // validate the whole relocation directory before any
+                                // page can be normalized or reported as matching.
                                 HANDLE diskCompareFile = INVALID_HANDLE_VALUE;
-                                std::set<uint32_t> relocPages;
+                                std::vector<IntegrityRelocation> relocations;
+                                const bool diskImageBaseMismatch = module.Base != record.PreferredImageBase;
+                                bool relocationsReady = !diskImageBaseMismatch;
                                 bool diskCompareFileReady = false;
+                                bool diskLayoutReady = false;
                                 if (options.CompareDiskPages && !record.ImagePath.empty())
                                 {
                                     diskCompareFile = CreateFileW(
@@ -3277,17 +3306,35 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                     if (diskCompareFile != INVALID_HANDLE_VALUE)
                                     {
                                         diskCompareFileReady = true;
-                                        if (record.ImageBaseMismatch &&
+                                        IntegrityDiskLayout observedLayout;
+                                        observedLayout.Machine = record.Machine;
+                                        observedLayout.PreferredBase = record.PreferredImageBase;
+                                        observedLayout.ImageSize = record.SizeOfImage;
+                                        observedLayout.HeaderSize = record.SizeOfHeaders;
+                                        observedLayout.RelocRva = baserelocRva;
+                                        observedLayout.RelocSize = baserelocSize;
+                                        observedLayout.Sections.assign(sections, sections + record.NumberOfSections);
+                                        IntegrityDiskLayout diskLayout;
+                                        diskLayoutReady = ReadIntegrityDiskLayout(diskCompareFile, &diskLayout) &&
+                                            IntegrityDiskPlansMatch(observedLayout, diskLayout);
+                                        if (!diskLayoutReady)
+                                        {
+                                            result->Warnings.push_back(record.ImageName +
+                                                L": disk compare unavailable: live plan does not match a complete disk PE layout");
+                                        }
+                                        if (diskLayoutReady && diskImageBaseMismatch &&
                                             baserelocRva != 0 &&
                                             baserelocSize != 0)
                                         {
-                                            CollectRelocationPagesFromDisk(
+                                            relocationsReady = LoadIntegrityRelocations(
                                                 diskCompareFile,
                                                 sections,
                                                 record.NumberOfSections,
+                                                record.SizeOfHeaders,
+                                                record.SizeOfImage,
                                                 baserelocRva,
                                                 baserelocSize,
-                                                &relocPages);
+                                                &relocations);
                                         }
                                     }
                                 }
@@ -3531,10 +3578,21 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 L"disk_open_failed",
                                                 L"could not open module image on disk for page compare");
                                         }
+                                        else if (!diskLayoutReady)
+                                        {
+                                            section.DiskCompareFailed = true;
+                                            AddSectionReason(&section, L"disk_layout_unavailable_or_changed",
+                                                L"live comparison plan does not match a complete independent disk PE layout");
+                                        }
+                                        else if (!relocationsReady)
+                                        {
+                                            section.DiskCompareFailed = true;
+                                            AddSectionReason(&section, L"disk_relocations_unavailable",
+                                                L"complete bounded disk relocation metadata could not be validated");
+                                        }
                                         else
                                         {
-                                            const uint64_t pageSpan =
-                                                (span > 0) ? (span / 0x1000) : 0;
+                                            const uint64_t pageSpan = span / 0x1000 + (span % 0x1000 != 0 ? 1 : 0);
                                             std::set<uint32_t> sampledOffsets;
                                             uint32_t comparedPages = 0;
                                             uint32_t relocNormalizedPages = 0;
@@ -3571,34 +3629,17 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     continue;
                                                 }
 
-                                                const uint32_t pageRva =
-                                                    (section.VirtualAddress + pageRvaOffset) & 0xfffff000u;
-                                                const uint32_t fileOffset = section.PointerToRawData + pageRvaOffset;
-                                                const uint32_t readLen = static_cast<uint32_t>(
-                                                    (section.RawSize - pageRvaOffset) < 0x1000
-                                                        ? (section.RawSize - pageRvaOffset)
-                                                        : 0x1000);
+                                                const uint32_t pageRva = section.VirtualAddress + pageRvaOffset;
+                                                const uint32_t readLen = static_cast<uint32_t>((std::min<uint64_t>)(
+                                                    (std::min)(section.RawSize - pageRvaOffset, 0x1000u), span - pageRvaOffset));
                                                 if (readLen == 0)
                                                 {
                                                     continue;
                                                 }
 
-                                                LARGE_INTEGER seek = {};
-                                                seek.QuadPart = static_cast<LONGLONG>(fileOffset);
-                                                if (!SetFilePointerEx(diskCompareFile, seek, nullptr, FILE_BEGIN))
-                                                {
-                                                    section.DiskCompareFailed = true;
-                                                    AddSectionReason(
-                                                        &section,
-                                                        L"disk_seek_failed",
-                                                        L"disk page seek failed");
-                                                    break;
-                                                }
-
-                                                std::vector<uint8_t> diskPage(readLen);
-                                                DWORD got = 0;
-                                                if (!ReadFile(diskCompareFile, diskPage.data(), readLen, &got, nullptr) ||
-                                                    got != readLen)
+                                                std::vector<uint8_t> diskPage;
+                                                if (!ReadIntegrityDiskRva(diskCompareFile, sections, record.NumberOfSections,
+                                                        record.SizeOfHeaders, pageRva, readLen, &diskPage))
                                                 {
                                                     section.DiskCompareFailed = true;
                                                     AddSectionReason(
@@ -3608,74 +3649,29 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     break;
                                                 }
 
-                                                if (record.ImageBaseMismatch &&
-                                                    relocPages.find(pageRva) != relocPages.end() &&
-                                                    baserelocRva != 0 &&
-                                                    baserelocSize != 0 &&
-                                                    record.PreferredImageBase != 0)
+                                                if (diskImageBaseMismatch)
                                                 {
                                                     const uint64_t imageDelta =
                                                         module.Base - record.PreferredImageBase;
-                                                    // Prefetch next page prefix so DIR64/HIGHLOW fixups
-                                                    // that spill past this page are not silently skipped.
-                                                    std::vector<uint8_t> diskNextPage;
-                                                    if (pageRvaOffset + readLen < section.RawSize)
-                                                    {
-                                                        const uint32_t nextLen = static_cast<uint32_t>(
-                                                            (section.RawSize - (pageRvaOffset + readLen)) < 0x1000
-                                                                ? (section.RawSize - (pageRvaOffset + readLen))
-                                                                : 0x1000);
-                                                        if (nextLen != 0)
-                                                        {
-                                                            LARGE_INTEGER nextSeek = {};
-                                                            nextSeek.QuadPart = static_cast<LONGLONG>(
-                                                                fileOffset + readLen);
-                                                            DWORD nextGot = 0;
-                                                            diskNextPage.resize(nextLen);
-                                                            if (!SetFilePointerEx(
-                                                                    diskCompareFile,
-                                                                    nextSeek,
-                                                                    nullptr,
-                                                                    FILE_BEGIN) ||
-                                                                !ReadFile(
-                                                                    diskCompareFile,
-                                                                    diskNextPage.data(),
-                                                                    nextLen,
-                                                                    &nextGot,
-                                                                    nullptr) ||
-                                                                nextGot != nextLen)
-                                                            {
-                                                                diskNextPage.clear();
-                                                            }
-                                                        }
-                                                    }
-
                                                     uint32_t applied = 0;
-                                                    std::wstring relocError;
-                                                    if (!ApplyBaseRelocationsToPage(
-                                                            diskCompareFile,
-                                                            sections,
-                                                            record.NumberOfSections,
-                                                            baserelocRva,
-                                                            baserelocSize,
-                                                            pageRva,
-                                                            imageDelta,
-                                                            &diskPage,
-                                                            diskNextPage.empty() ? nullptr : &diskNextPage,
-                                                            &applied,
-                                                            &relocError))
+                                                    if (!ApplyIntegrityRelocationsToPage(
+                                                            relocations, pageRva, imageDelta, &diskPage,
+                                                            [&](uint32_t fixupRva, uint32_t width, std::vector<uint8_t>* original)
+                                                            {
+                                                                return ReadIntegrityDiskRva(diskCompareFile, sections,
+                                                                    record.NumberOfSections, record.SizeOfHeaders,
+                                                                    fixupRva, width, original);
+                                                            }, &applied))
                                                     {
                                                         ++relocApplyFailures;
-                                                        AddSectionReason(
-                                                            &section,
-                                                            L"disk_compare_reloc_apply_failed",
-                                                            relocError.empty()
-                                                                ? L"failed to apply base relocations to disk page"
-                                                                : relocError);
-                                                        // Do not treat as match; keep scanning other pages.
+                                                        AddSectionReason(&section, L"disk_compare_reloc_apply_failed",
+                                                            L"complete relocation fixup bytes could not be normalized");
                                                         continue;
                                                     }
-                                                    ++relocNormalizedPages;
+                                                    if (applied != 0)
+                                                    {
+                                                        ++relocNormalizedPages;
+                                                    }
                                                 }
 
                                                 uint64_t liveAddress = 0;
@@ -3714,9 +3710,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 section.DiskCompareMatched = true;
                                             }
 
-                                            if (relocApplyFailures != 0 &&
-                                                !section.DiskCompareMismatch &&
-                                                !section.DiskCompareMatched)
+                                            if (relocApplyFailures != 0)
                                             {
                                                 section.DiskCompareFailed = true;
                                                 result->Warnings.push_back(
@@ -3741,6 +3735,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     L"disk_compare_reloc_normalized",
                                                     L"compared pages after applying base relocation deltas to disk bytes");
                                             }
+                                            FinalizeIntegrityDiskComparison(&section, comparedPages, relocApplyFailures);
                                         }
                                     }
 
@@ -4553,20 +4548,49 @@ static bool DeriveTypeListLinkDelta(
 // reported. A candidate that reads as unnamed is either an object with a wiped
 // name (documented as out of scope for this sweep) or a mis-derived address,
 // and the two cannot be told apart from the body alone.
-static bool TypeListDriverCandidateIsNamed(const std::wstring& name)
+static bool TypeListDriverStructureValid(
+    uint64_t actualObjectType, uint64_t expectedObjectType,
+    uint64_t bodyType, uint64_t bodySize, uint64_t pdbSize)
 {
-    if (name.size() < 9)
+    // IO_TYPE_DRIVER is a documented WDK object type, not a guessed offset.
+    constexpr uint16_t kIoTypeDriver = 4;
+    return expectedObjectType != 0 && actualObjectType == expectedObjectType &&
+        bodyType == kIoTypeDriver && pdbSize != 0 && pdbSize <= 0xFFFF && bodySize == pdbSize;
+}
+
+static void SelectAnonymousDriverReports(DriverTypeListResult* result, uint64_t after, size_t limit)
+{
+    auto& reports = result->AnonymousDrivers;
+    std::sort(reports.begin(), reports.end(), [](const AnonymousTypeListDriverRecord& left,
+        const AnonymousTypeListDriverRecord& right)
     {
-        return false;
+        return left.DriverObject < right.DriverObject;
+    });
+    const auto following = std::upper_bound(reports.begin(), reports.end(), after,
+        [](uint64_t address, const AnonymousTypeListDriverRecord& record)
+        {
+            return address < record.DriverObject;
+        });
+    const size_t start = following == reports.end() ? 0 : static_cast<size_t>(following - reports.begin());
+    const size_t count = (std::min)(limit, reports.size());
+    std::vector<AnonymousTypeListDriverRecord> selected;
+    selected.reserve(count);
+    for (size_t index = 0; index < count; ++index)
+    {
+        selected.push_back(std::move(reports[(start + index) % reports.size()]));
     }
-    return EqualsNoCaseLocal(name.substr(0, 8), L"\\Driver\\");
+    result->AnonymousDropped = reports.size() - count;
+    result->OutputTruncated = result->AnonymousDropped != 0;
+    result->NextReportAfter = selected.empty() ? 0 : selected.back().DriverObject;
+    reports = std::move(selected);
 }
 
 bool IntegrityScanner::ScanTypeListDriverObjects(
     const std::set<uint64_t>& knownDriverObjects,
     const std::set<uint64_t>& deviceDriverObjects,
     DriverTypeListResult* result,
-    std::wstring* error)
+    std::wstring* error,
+    uint64_t reportAfter)
 {
     // The chain is walked to the list head or the cycle guard; the cap keeps a
     // corrupted list from turning the sweep into an unbounded loop.
@@ -4668,6 +4692,54 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
             break;
         }
         ctx.FindField(L"nt!_DRIVER_OBJECT", {L"DriverName"}, &driverName);
+        ObjectHeaderLayout objectHeader = {};
+        TypeFieldInfo bodyTypeField = {};
+        TypeFieldInfo bodySizeField = {};
+        TypeLayoutInfo bodyLayout = {};
+        uint64_t typeIndexTable = 0;
+        uint8_t objectCookie = 0;
+        bool cookieKnown = false;
+        ReadObHeaderCookie(ctx, &objectCookie, &cookieKnown);
+        if (!cookieKnown || !ResolveObjectHeaderLayout(ctx, &objectHeader) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"Type"}, &bodyTypeField) ||
+            !ctx.FindField(L"nt!_DRIVER_OBJECT", {L"Size"}, &bodySizeField) ||
+            !symbols_.GetTypeLayout(L"nt!_DRIVER_OBJECT", &bodyLayout, nullptr) ||
+            bodyTypeField.Length != sizeof(uint16_t) || bodySizeField.Length != sizeof(uint16_t) ||
+            bodyLayout.Size == 0 || bodyLayout.Size > 0xFFFF ||
+            (!ctx.ResolveSymbol(L"nt!ObTypeIndexTable", &typeIndexTable) &&
+             !ctx.ResolveSymbol(L"nt!ObpTypeIndexTable", &typeIndexTable)))
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver object type/cookie/body layout unavailable; type-list validation withheld";
+            }
+            break;
+        }
+        const auto fieldWithinBody = [&](const TypeFieldInfo& field, uint64_t width)
+        {
+            return !field.IsBitField && field.Length == width && field.Offset <= bodyLayout.Size &&
+                width <= bodyLayout.Size - field.Offset;
+        };
+        if (objectHeader.Body.Offset == 0 || objectHeader.Body.Offset > 0x1000 ||
+            objectHeader.TypeIndex.Length != sizeof(uint8_t) ||
+            objectHeader.TypeIndex.Offset >= objectHeader.Body.Offset ||
+            !fieldWithinBody(bodyTypeField, sizeof(uint16_t)) ||
+            !fieldWithinBody(bodySizeField, sizeof(uint16_t)) ||
+            !fieldWithinBody(driverStart, sizeof(uint64_t)) ||
+            !fieldWithinBody(driverSize, sizeof(uint32_t)) ||
+            !fieldWithinBody(driverSection, sizeof(uint64_t)) ||
+            !fieldWithinBody(deviceObject, sizeof(uint64_t)) ||
+            majorFunction.Length == 0 || majorFunction.Length % sizeof(uint64_t) != 0 ||
+            majorFunction.Length / sizeof(uint64_t) > 32 ||
+            !fieldWithinBody(majorFunction, majorFunction.Length))
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver object fields exceed the validated PDB body";
+            }
+            break;
+        }
+        result->TypeValidationAvailable = true;
 
         uint64_t headField = 0;
         uint64_t firstNode = 0;
@@ -4731,6 +4803,7 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
         }
         result->CalibrationMatches = calibrationMatches;
 
+        const std::vector<KernelModuleInfo> modules = symbols_.CopyModules();
         for (const uint64_t candidateNode : nodes)
         {
             const uint64_t body = static_cast<uint64_t>(
@@ -4754,53 +4827,93 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
             DirectoryObjectRecord object = {};
             object.Body = body;
             object.Path = L"\\Driver";
+            uint64_t header = 0;
+            uint64_t typeIndexAddress = 0;
+            uint64_t slot = 0;
+            uint64_t actualType = 0;
+            uint64_t bodyType = 0;
+            uint64_t bodySize = 0;
+            uint8_t rawType = 0;
+            if (!TrySub(body, objectHeader.Body.Offset, &header) ||
+                !TryAdd(header, objectHeader.TypeIndex.Offset, &typeIndexAddress) ||
+                !ctx.ReadU8(typeIndexAddress, &rawType) ||
+                !TryAdd(typeIndexTable, static_cast<uint64_t>(DecodeTypeIndex(rawType, header, objectCookie, true)) * sizeof(uint64_t), &slot) ||
+                !ctx.ReadU64(slot, &actualType) ||
+                !ReadFieldInteger(device_, body, bodyTypeField, sizeof(uint16_t), &bodyType, nullptr) ||
+                !ReadFieldInteger(device_, body, bodySizeField, sizeof(uint16_t), &bodySize, nullptr))
+            {
+                ++result->CandidateReadFailures;
+                continue;
+            }
+            if (!TypeListDriverStructureValid(actualType, typeAddress, bodyType, bodySize, bodyLayout.Size))
+            {
+                ++result->RejectedCandidates;
+                continue;
+            }
+            std::vector<uint8_t> verifiedBody;
+            if (!ReadKernelBytes(device_, body, static_cast<uint32_t>(bodyLayout.Size), &verifiedBody, nullptr) ||
+                verifiedBody.size() != bodyLayout.Size)
+            {
+                ++result->CandidateReadFailures;
+                continue;
+            }
+            uint16_t snapshotType = 0;
+            uint16_t snapshotBodySize = 0;
+            std::memcpy(&snapshotType, verifiedBody.data() + bodyTypeField.Offset, sizeof(snapshotType));
+            std::memcpy(&snapshotBodySize, verifiedBody.data() + bodySizeField.Offset, sizeof(snapshotBodySize));
+            uint8_t typeAfter = 0;
+            uint64_t actualTypeAfter = 0;
+            if (!ctx.ReadU8(typeIndexAddress, &typeAfter) || !ctx.ReadU64(slot, &actualTypeAfter))
+            {
+                ++result->CandidateReadFailures;
+                continue;
+            }
+            if (rawType != typeAfter || actualType != actualTypeAfter ||
+                !TypeListDriverStructureValid(actualTypeAfter, typeAddress, snapshotType, snapshotBodySize, bodyLayout.Size))
+            {
+                ++result->RejectedCandidates;
+                continue;
+            }
+            bool nameKnown = false;
             if (driverName.Length != 0)
             {
                 uint64_t nameAddress = 0;
                 if (TryAdd(body, driverName.Offset, &nameAddress))
                 {
-                    ctx.ReadUnicodeStringAt(nameAddress, &object.Name);
+                    nameKnown = ctx.ReadUnicodeStringAt(nameAddress, &object.Name);
                 }
             }
-            if (!TypeListDriverCandidateIsNamed(object.Name))
+            if (object.Name.empty())
             {
                 ++result->UnnamedCandidates;
-                continue;
-            }
-
-            DriverIntegrityRecord record = {};
-            if (!ReadDriverRecord(
-                    device_,
-                    symbols_,
-                    object,
-                    driverStart,
-                    driverSize,
-                    driverSection,
-                    deviceObject,
-                    fastIoDispatch,
-                    driverUnload,
-                    majorFunction,
-                    &record))
-            {
-                continue;
             }
 
             AnonymousTypeListDriverRecord anonymous = {};
-            anonymous.DriverObject = record.DriverObject;
-            anonymous.DriverName = record.Name;
-            anonymous.DriverStart = record.DriverStart;
-            anonymous.DriverSize = record.DriverSize;
-            anonymous.DriverSection = record.DriverSection;
-            anonymous.DeviceObject = record.DeviceObject;
-            anonymous.HasDriverStart = record.HasDriverStart;
-            anonymous.ModuleName = record.OwningModule;
-            for (const DriverDispatchRecord& dispatch : record.Dispatch)
+            anonymous.DriverObject = body;
+            anonymous.DriverName = object.Name;
+            std::memcpy(&anonymous.DriverStart, verifiedBody.data() + driverStart.Offset, sizeof(uint64_t));
+            uint32_t snapshotSize = 0;
+            std::memcpy(&snapshotSize, verifiedBody.data() + driverSize.Offset, sizeof(snapshotSize));
+            anonymous.DriverSize = snapshotSize;
+            std::memcpy(&anonymous.DriverSection, verifiedBody.data() + driverSection.Offset, sizeof(uint64_t));
+            std::memcpy(&anonymous.DeviceObject, verifiedBody.data() + deviceObject.Offset, sizeof(uint64_t));
+            anonymous.HasDriverStart = anonymous.DriverStart != 0;
+            anonymous.ObjectTypeValidated = true;
+            anonymous.NameKnown = nameKnown;
+            const KernelModuleInfo* owner = FindModuleForAddress(modules, anonymous.DriverStart);
+            if (owner != nullptr)
             {
-                if (dispatch.Function == 0)
+                anonymous.ModuleName = owner->ImageName;
+            }
+            for (uint64_t index = 0; index < majorFunction.Length / sizeof(uint64_t); ++index)
+            {
+                uint64_t target = 0;
+                std::memcpy(&target, verifiedBody.data() + majorFunction.Offset + index * sizeof(uint64_t), sizeof(target));
+                if (target == 0)
                 {
                     continue;
                 }
-                if (dispatch.InLoadedModule)
+                if (FindModuleForAddress(modules, target) != nullptr)
                 {
                     ++anonymous.BackedDispatch;
                 }
@@ -4810,17 +4923,17 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
                 }
             }
             ++result->AnonymousFound;
-            if (result->AnonymousDrivers.size() < kMaxAnonymousReports)
-            {
-                result->AnonymousDrivers.push_back(std::move(anonymous));
-            }
-            else
-            {
-                ++result->AnonymousDropped;
-            }
+            result->AnonymousDrivers.push_back(std::move(anonymous));
         }
 
-        result->Complete = !truncated;
+        SelectAnonymousDriverReports(result, reportAfter, kMaxAnonymousReports);
+
+        result->Complete = !truncated && result->CandidateReadFailures == 0;
+        if (result->CandidateReadFailures != 0)
+        {
+            result->Truncated = true;
+            result->Warnings.push_back(L"driver type-list candidate reads failed; coverage incomplete");
+        }
         ok = true;
     } while (false);
 
@@ -4830,6 +4943,29 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
 bool DriverTypeListSweepSelfTest()
 {
     bool ok = true;
+
+    {
+        DriverTypeListResult all;
+        for (uint64_t index = 1; index <= 65; ++index)
+        {
+            AnonymousTypeListDriverRecord record;
+            record.DriverObject = index * 0x100;
+            all.AnonymousDrivers.push_back(record);
+        }
+        DriverTypeListResult first = all;
+        SelectAnonymousDriverReports(&first, 0, 64);
+        DriverTypeListResult next = all;
+        SelectAnonymousDriverReports(&next, first.NextReportAfter, 64);
+        ok = ok && first.OutputTruncated && first.AnonymousDropped == 1 &&
+            first.NextReportAfter == 64 * 0x100 && next.AnonymousDrivers.front().DriverObject == 65 * 0x100;
+        all.AnonymousDrivers.erase(all.AnonymousDrivers.begin());
+        all.AnonymousDrivers.pop_back();
+        SelectAnonymousDriverReports(&all, 65 * 0x100, 1);
+        ok = ok && all.AnonymousDrivers.size() == 1 && all.AnonymousDrivers.front().DriverObject == 2 * 0x100;
+        DriverTypeListResult empty;
+        SelectAnonymousDriverReports(&empty, ~0ull, 64);
+        ok = ok && !empty.OutputTruncated && empty.NextReportAfter == 0;
+    }
 
     // --- link-offset calibration (pure) ------------------------------------
     {
@@ -4899,13 +5035,13 @@ bool DriverTypeListSweepSelfTest()
 
     // --- anonymous candidate shape (pure) ----------------------------------
     {
-        ok = ok && TypeListDriverCandidateIsNamed(L"\\Driver\\jrvwfjhdyprtjeaf");
-        ok = ok && TypeListDriverCandidateIsNamed(L"\\DRIVER\\ntfs");
-        ok = ok && !TypeListDriverCandidateIsNamed(L"");
-        ok = ok && !TypeListDriverCandidateIsNamed(L"\\Driver");
-        ok = ok && !TypeListDriverCandidateIsNamed(L"\\Driver\\");
-        ok = ok && !TypeListDriverCandidateIsNamed(L"\\FileSystem\\ntfs");
-        ok = ok && !TypeListDriverCandidateIsNamed(L"jrvwfjhdyprtjeaf");
+        // Name is not part of structural identity, including unnamed objects.
+        ok = ok && TypeListDriverStructureValid(0x1000, 0x1000, 4, 0x150, 0x150);
+        ok = ok && !TypeListDriverStructureValid(0x2000, 0x1000, 4, 0x150, 0x150);
+        ok = ok && !TypeListDriverStructureValid(0, 0, 4, 0x150, 0x150);
+        ok = ok && !TypeListDriverStructureValid(0x1000, 0x1000, 3, 0x150, 0x150);
+        ok = ok && !TypeListDriverStructureValid(0x1000, 0x1000, 4, 0x148, 0x150);
+        ok = ok && !TypeListDriverStructureValid(0x1000, 0x1000, 4, 0, 0);
     }
 
     // --- chain termination rules (pure, injected reader) -------------------
@@ -5118,18 +5254,13 @@ bool IntegrityScanner::InspectDriverObject(
             {
                 for (const DriverIntegrityRecord& driver : result->Drivers)
                 {
-                    std::vector<uint64_t> visited;
-                    bool cycle = false;
-                    uint64_t current = driver.DeviceObject;
-                    while (current != 0 &&
-                        IsKernelAddress(current) &&
-                        PushUniqueAddress(&visited, current, kMaxDeviceChain, &cycle))
+                    auto readNext = [&](uint64_t current, uint64_t* next)
                     {
                         DeviceObjectRecord device = {};
                         if (!ReadDeviceObjectRecord(device_, symbols_, layout, current, &device))
                         {
                             result->Warnings.push_back(L"failed to read a DEVICE_OBJECT on the NextDevice chain");
-                            break;
+                            return false;
                         }
                         result->Devices.push_back(device);
 
@@ -5138,11 +5269,21 @@ bool IntegrityScanner::InspectDriverObject(
                         {
                             result->Stacks.push_back(stack);
                         }
-                        current = device.NextDevice;
-                    }
-                    if (cycle)
+                        else
+                        {
+                            result->Warnings.push_back(L"failed to inspect a device stack on the NextDevice chain");
+                        }
+                        *next = device.NextDevice;
+                        return true;
+                    };
+                    const DeviceChainObservation chain =
+                        WalkDeviceAddressChain(driver.DeviceObject, kMaxDeviceChain, readNext);
+                    if (!chain.Complete)
                     {
-                        result->Warnings.push_back(L"DRIVER_OBJECT.NextDevice walk hit a cycle");
+                        result->Warnings.push_back(
+                            chain.Cycle
+                                ? L"DRIVER_OBJECT.NextDevice walk hit a cycle"
+                                : L"DRIVER_OBJECT.NextDevice walk stopped before a verified NULL link");
                     }
                 }
             }
@@ -5455,6 +5596,216 @@ std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result)
     return json.str();
 }
 
+bool IntegrityRelocationSelfTest()
+{
+    std::vector<uint8_t> diskHeaders(0x400, 0);
+    IMAGE_DOS_HEADER dos = {};
+    dos.e_magic = IMAGE_DOS_SIGNATURE;
+    dos.e_lfanew = 0x80;
+    std::memcpy(diskHeaders.data(), &dos, sizeof(dos));
+    const uint32_t signature = IMAGE_NT_SIGNATURE;
+    std::memcpy(diskHeaders.data() + 0x80, &signature, sizeof(signature));
+    IMAGE_FILE_HEADER fileHeader = {};
+    fileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    fileHeader.NumberOfSections = 2;
+    fileHeader.SizeOfOptionalHeader = static_cast<uint16_t>(sizeof(IMAGE_OPTIONAL_HEADER64));
+    std::memcpy(diskHeaders.data() + 0x84, &fileHeader, sizeof(fileHeader));
+    IMAGE_OPTIONAL_HEADER64 optional = {};
+    optional.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    optional.ImageBase = 0x140000000ull;
+    optional.SizeOfImage = 0x3000;
+    optional.SizeOfHeaders = 0x400;
+    optional.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FF8, 12};
+    const size_t optionalOffset = 0x84 + sizeof(fileHeader);
+    std::memcpy(diskHeaders.data() + optionalOffset, &optional, sizeof(optional));
+    IMAGE_SECTION_HEADER diskSections[2] = {};
+    diskSections[0].VirtualAddress = 0x1000;
+    diskSections[0].Misc.VirtualSize = 0x1000;
+    diskSections[0].SizeOfRawData = 0x1000;
+    diskSections[0].PointerToRawData = 0x400;
+    diskSections[0].Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    diskSections[1] = diskSections[0];
+    diskSections[1].VirtualAddress = 0x2000;
+    diskSections[1].PointerToRawData = 0x2000;
+    const size_t sectionOffset = optionalOffset + sizeof(optional);
+    std::memcpy(diskHeaders.data() + sectionOffset, diskSections, sizeof(diskSections));
+    IntegrityDiskLayout diskLayout;
+    if (!ParseIntegrityDiskLayout(diskHeaders, &diskLayout) ||
+        !IntegrityDiskPlansMatch(diskLayout, diskLayout))
+    {
+        return false;
+    }
+    IntegrityDiskLayout changed = diskLayout;
+    changed.Sections[0].PointerToRawData = 0x2000;
+    if (IntegrityDiskPlansMatch(changed, diskLayout))
+    {
+        return false;
+    }
+    changed = diskLayout;
+    changed.PreferredBase += 0x10000;
+    if (IntegrityDiskPlansMatch(changed, diskLayout))
+    {
+        return false;
+    }
+    changed = diskLayout;
+    changed.RelocRva += 8;
+    if (IntegrityDiskPlansMatch(changed, diskLayout))
+    {
+        return false;
+    }
+    changed = diskLayout;
+    changed.RelocSize -= 2;
+    if (IntegrityDiskPlansMatch(changed, diskLayout))
+    {
+        return false;
+    }
+    std::vector<uint8_t> truncatedHeaders = diskHeaders;
+    truncatedHeaders.resize(sectionOffset + sizeof(diskSections) - 1);
+    if (ParseIntegrityDiskLayout(truncatedHeaders, &changed) || !changed.Sections.empty())
+    {
+        return false;
+    }
+
+    const auto directory = [](uint32_t page, uint32_t size, uint16_t entry)
+    {
+        std::vector<uint8_t> bytes(12, 0);
+        const IMAGE_BASE_RELOCATION block = {page, size};
+        std::memcpy(bytes.data(), &block, sizeof(block));
+        std::memcpy(bytes.data() + sizeof(block), &entry, sizeof(entry));
+        return bytes;
+    };
+    const std::vector<uint8_t> valid = directory(0x1000, 12, 0xAFFC);
+    std::vector<IntegrityRelocation> fixups;
+    if (!ParseIntegrityRelocations(valid, 0x3000, &fixups) || fixups.size() != 1 ||
+        fixups[0].Rva != 0x1FFC || fixups[0].Width != 8)
+    {
+        return false;
+    }
+    for (uint32_t size : {0u, 7u, 9u, 13u, 0xFFFFFFFFu})
+    {
+        if (ParseIntegrityRelocations(directory(0x1000, size, 0xA000), 0x3000, &fixups) || !fixups.empty())
+        {
+            return false;
+        }
+    }
+    std::vector<uint8_t> malformedTail = valid;
+    malformedTail.insert(malformedTail.end(), 8, 0);
+    if (ParseIntegrityRelocations(malformedTail, 0x3000, &fixups) || !fixups.empty() ||
+        ParseIntegrityRelocations(directory(0x1001, 12, 0xA000), 0x3000, &fixups) ||
+        ParseIntegrityRelocations(directory(0xFFFFF000, 12, 0xAFFF), UINT32_MAX, &fixups) ||
+        ParseIntegrityRelocations(directory(0x1000, 12, 0x6000), 0x3000, &fixups) ||
+        !ParseIntegrityRelocations(directory(0, 12, 0xA100), 0x3000, &fixups))
+    {
+        return false;
+    }
+    std::vector<uint8_t> duplicate = valid;
+    duplicate.insert(duplicate.end(), valid.begin(), valid.end());
+    if (ParseIntegrityRelocations(duplicate, 0x3000, &fixups) || !fixups.empty())
+    {
+        return false;
+    }
+
+    IMAGE_SECTION_HEADER sections[2] = {};
+    sections[0].VirtualAddress = 0x1000;
+    sections[0].SizeOfRawData = 0x1000;
+    sections[0].PointerToRawData = 0x400;
+    sections[1].VirtualAddress = 0x2000;
+    sections[1].SizeOfRawData = 0x1000;
+    sections[1].PointerToRawData = 0x2000;
+    std::vector<uint8_t> file(0x3000, 0);
+    std::copy(valid.begin(), valid.begin() + 8, file.begin() + 0x13F8);
+    std::copy(valid.begin() + 8, valid.end(), file.begin() + 0x2000);
+    uint32_t reads = 0;
+    bool failSecond = false;
+    const auto read = [&](uint64_t offset, uint32_t length, uint8_t* output)
+    {
+        ++reads;
+        if ((failSecond && reads == 2) || offset > file.size() || length > file.size() - offset)
+        {
+            return false;
+        }
+        std::memcpy(output, file.data() + offset, length);
+        return true;
+    };
+    std::vector<uint8_t> loaded;
+    if (!ReadIntegrityRvaBytes(read, file.size(), sections, 2, 0x400, 0x1FF8, 12, &loaded) ||
+        loaded != valid || reads != 2)
+    {
+        return false;
+    }
+    reads = 0;
+    failSecond = true;
+    if (ReadIntegrityRvaBytes(read, file.size(), sections, 2, 0x400, 0x1FF8, 12, &loaded) || !loaded.empty())
+    {
+        return false;
+    }
+    failSecond = false;
+    uint64_t raw = 0;
+    uint32_t available = 0;
+    sections[1].PointerToRawData = 0xFFFFFFF0;
+    if (MapIntegrityRvaExtent(sections, 2, 0x400, 0x2000, &raw, &available))
+    {
+        return false;
+    }
+    sections[1].PointerToRawData = 0x2000;
+    sections[1].VirtualAddress = 0x1FF0;
+    if (MapIntegrityRvaExtent(sections, 2, 0x400, 0x1FF8, &raw, &available) ||
+        ReadIntegrityRvaBytes(read, file.size(), sections, 2, 0x400, UINT32_MAX - 3, 8, &loaded) ||
+        ReadIntegrityRvaBytes(read, file.size(), sections, 2, 0x400, 0x1000, kMaxIntegrityRelocBytes + 1, &loaded))
+    {
+        return false;
+    }
+
+    if (!ParseIntegrityRelocations(valid, 0x3000, &fixups))
+    {
+        return false;
+    }
+    const uint64_t original = 0x00000000FFFFFFFCull;
+    const uint64_t relocated = original + 8;
+    const auto originalWord = [&](uint32_t rva, uint32_t width, std::vector<uint8_t>* output)
+    {
+        if (rva != 0x1FFC || width != sizeof(original))
+        {
+            return false;
+        }
+        output->resize(sizeof(original));
+        std::memcpy(output->data(), &original, sizeof(original));
+        return true;
+    };
+    std::vector<uint8_t> left(0x1000, 0), right(0x1000, 0);
+    std::memcpy(left.data() + 0xFFC, &original, 4);
+    std::memcpy(right.data(), reinterpret_cast<const uint8_t*>(&original) + 4, 4);
+    uint32_t applied = 0;
+    if (!ApplyIntegrityRelocationsToPage(fixups, 0x1000, 8, &left, originalWord, &applied) || applied != 1 ||
+        !ApplyIntegrityRelocationsToPage(fixups, 0x2000, 8, &right, originalWord, &applied) || applied != 1 ||
+        std::memcmp(left.data() + 0xFFC, &relocated, 4) != 0 ||
+        std::memcmp(right.data(), reinterpret_cast<const uint8_t*>(&relocated) + 4, 4) != 0)
+    {
+        return false;
+    }
+    const std::vector<uint8_t> unchanged = right;
+    if (ApplyIntegrityRelocationsToPage(fixups, 0x2000, 8, &right,
+        [](uint32_t, uint32_t, std::vector<uint8_t>*)
+        {
+            return false;
+        }, &applied) || right != unchanged || applied != 0)
+    {
+        return false;
+    }
+    ModuleIntegritySectionRecord section;
+    section.DiskCompareMatched = true;
+    FinalizeIntegrityDiskComparison(&section, 1, 1);
+    if (!section.DiskCompareFailed || section.DiskCompareMatched)
+    {
+        return false;
+    }
+    section = {};
+    section.DiskCompareMatched = true;
+    FinalizeIntegrityDiskComparison(&section, 2, 0);
+    return !section.DiskCompareFailed && section.DiskCompareMatched;
+}
+
 bool IntegrityDiscardedSectionSelfTest()
 {
     return SectionLooksDiscarded(L"INIT", 0, L"ntoskrnl.exe") &&
@@ -5540,6 +5891,51 @@ bool DeviceStackWalkSelfTest()
             break;
         }
         if (visited.size() != 2)
+        {
+            break;
+        }
+        constexpr uint64_t base = 0xFFFF900000001000ull;
+        std::map<uint64_t, uint64_t> links;
+        for (uint64_t index = 0; index < 33; ++index)
+        {
+            links[base + index * 0x1000] = index == 32 ? 0 : base + (index + 1) * 0x1000;
+        }
+        auto readNext = [&](uint64_t address, uint64_t* next)
+        {
+            const auto found = links.find(address);
+            if (found == links.end())
+            {
+                return false;
+            }
+            *next = found->second;
+            return true;
+        };
+        DeviceChainObservation chain = WalkDeviceAddressChain(base, 32, readNext);
+        if (chain.Complete || chain.Cycle || chain.Addresses.size() != 32)
+        {
+            break;
+        }
+        links[base + 31 * 0x1000] = 0;
+        chain = WalkDeviceAddressChain(base, 32, readNext);
+        if (!chain.Complete || chain.Cycle || chain.Addresses.size() != 32)
+        {
+            break;
+        }
+        links.erase(base + 7 * 0x1000);
+        chain = WalkDeviceAddressChain(base, 32, readNext);
+        if (chain.Complete || chain.Cycle || chain.Addresses.size() != 7)
+        {
+            break;
+        }
+        links[base + 7 * 0x1000] = base;
+        chain = WalkDeviceAddressChain(base, 32, readNext);
+        if (chain.Complete || !chain.Cycle)
+        {
+            break;
+        }
+        links[base + 7 * 0x1000] = 0x1234;
+        chain = WalkDeviceAddressChain(base, 32, readNext);
+        if (chain.Complete || chain.Cycle)
         {
             break;
         }

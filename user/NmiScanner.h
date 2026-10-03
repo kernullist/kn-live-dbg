@@ -29,6 +29,7 @@ struct NmiScanResult
     std::wstring ListHeadSymbol;
     bool     ListHeadResolved = false;
     bool     Incomplete = false;
+    bool     LayoutFromPdb = false;
 };
 
 class NmiScanner
@@ -44,3 +45,4 @@ private:
 };
 
 std::wstring BuildNmiJson(const NmiScanResult& result);
+bool NmiScannerSelfTest();

@@ -1,4 +1,5 @@
 #include "ByovdScanner.h"
+#include "KmonUserEvidence.h"
 
 #include <Windows.h>
 #include <wincrypt.h>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 
@@ -20,6 +22,27 @@ namespace
     constexpr uint32_t kHashReadChunk = 1024 * 1024;
     constexpr DWORD kUpdaterTimeoutMs = 5u * 60u * 1000u;
     constexpr DWORD kDefaultYaraTimeoutSeconds = 30u;
+
+    bool EvaluateCatalogAge(uint64_t now, uint64_t written, uint64_t maxAgeSeconds,
+        bool* stale, uint64_t* ageSeconds)
+    {
+        *stale = true;
+        if (ageSeconds != nullptr)
+        {
+            *ageSeconds = 0;
+        }
+        if (now == 0 || written == 0 || written > now)
+        {
+            return false;
+        }
+        const uint64_t seconds = (now - written) / 10000000ull;
+        if (ageSeconds != nullptr)
+        {
+            *ageSeconds = seconds;
+        }
+        *stale = seconds > maxAgeSeconds;
+        return true;
+    }
 
     struct VersionQuad
     {
@@ -33,6 +56,120 @@ namespace
         std::wstring Sha1;
         std::wstring Sha256;
     };
+
+    struct HashFileGeneration
+    {
+        uint64_t Size = 0;
+        int64_t CreationTime = 0;
+        int64_t LastWriteTime = 0;
+        int64_t ChangeTime = 0;
+    };
+
+    struct HashReadProgress
+    {
+        uint64_t SnapshotBytes = 0;
+        uint64_t BytesRead = 0;
+        bool BudgetExceeded = false;
+        bool GenerationStable = false;
+        bool GenerationFailed = false;
+    };
+
+    bool SameHashGeneration(const HashFileGeneration& before, const HashFileGeneration& after)
+    {
+        return before.Size == after.Size && before.CreationTime == after.CreationTime &&
+            before.LastWriteTime == after.LastWriteTime && before.ChangeTime == after.ChangeTime;
+    }
+
+    bool QueryHashGeneration(HANDLE file, HashFileGeneration* result)
+    {
+        FILE_STANDARD_INFO standard = {};
+        FILE_BASIC_INFO basic = {};
+        if (GetFileType(file) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) ||
+            !GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) ||
+            standard.Directory || standard.EndOfFile.QuadPart < 0)
+        {
+            return false;
+        }
+        result->Size = static_cast<uint64_t>(standard.EndOfFile.QuadPart);
+        result->CreationTime = basic.CreationTime.QuadPart;
+        result->LastWriteTime = basic.LastWriteTime.QuadPart;
+        result->ChangeTime = basic.ChangeTime.QuadPart;
+        return true;
+    }
+
+    template<typename Read, typename Consume, typename CurrentTick, typename ValidateGeneration>
+    bool ReadHashSnapshot(uint64_t initialBytes, uint64_t maxBytes, uint32_t budgetMs,
+        Read read, Consume consume, CurrentTick currentTick, ValidateGeneration validateGeneration,
+        HashReadProgress* progress, std::wstring* error)
+    {
+        *progress = {};
+        progress->SnapshotBytes = initialBytes;
+        if (error != nullptr)
+        {
+            error->clear();
+        }
+        const auto fail = [&](const wchar_t* reason)
+        {
+            if (error != nullptr && error->empty())
+            {
+                *error = reason;
+            }
+            return false;
+        };
+        if (initialBytes > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
+        {
+            return fail(L"File snapshot length exceeds the supported signed file size");
+        }
+        if (maxBytes != 0 && initialBytes > maxBytes)
+        {
+            progress->BudgetExceeded = true;
+            return fail(L"File snapshot exceeds the hash byte budget");
+        }
+        const uint64_t started = currentTick();
+        const auto expired = [&]()
+        {
+            const uint64_t now = currentTick();
+            return budgetMs != 0 && (now < started || now - started >= budgetMs);
+        };
+        while (progress->BytesRead < initialBytes)
+        {
+            if (expired())
+            {
+                progress->BudgetExceeded = true;
+                return fail(L"Hash time budget elapsed between reads; single synchronous reads are not timed out");
+            }
+            const DWORD request = static_cast<DWORD>((std::min)(
+                initialBytes - progress->BytesRead, static_cast<uint64_t>(kHashReadChunk)));
+            DWORD received = 0;
+            if (!read(request, &received))
+            {
+                return fail(L"File snapshot read failed");
+            }
+            if (received == 0 || received > request)
+            {
+                progress->GenerationFailed = received == 0;
+                return fail(L"File snapshot ended early or returned an invalid read length");
+            }
+            progress->BytesRead += received;
+            if (!consume(received))
+            {
+                return fail(L"File hash update failed");
+            }
+        }
+        if (expired())
+        {
+            progress->BudgetExceeded = true;
+            return fail(L"Hash time budget elapsed after the final read");
+        }
+        if (!validateGeneration())
+        {
+            progress->GenerationFailed = true;
+            return fail(L"File size or generation changed, or final metadata could not be read");
+        }
+        progress->GenerationStable = true;
+        return true;
+    }
 
     struct FileVersionMetadata
     {
@@ -515,7 +652,8 @@ namespace
         return stream.str();
     }
 
-    bool ComputeFileHashes(const std::wstring& path, FileHashes* hashes, std::wstring* error)
+    bool ComputeFileHashes(const std::wstring& path, const ByovdScanOptions& options,
+        FileHashes* hashes, HashReadProgress* progress, std::wstring* error)
     {
         bool ok = false;
         HANDLE file = INVALID_HANDLE_VALUE;
@@ -523,12 +661,49 @@ namespace
         HCRYPTHASH md5 = 0;
         HCRYPTHASH sha1 = 0;
         HCRYPTHASH sha256 = 0;
+        struct HashResources
+        {
+            HANDLE& File;
+            HCRYPTPROV& Provider;
+            HCRYPTHASH& Md5;
+            HCRYPTHASH& Sha1;
+            HCRYPTHASH& Sha256;
+            ~HashResources()
+            {
+                if (Md5 != 0)
+                {
+                    CryptDestroyHash(Md5);
+                }
+                if (Sha1 != 0)
+                {
+                    CryptDestroyHash(Sha1);
+                }
+                if (Sha256 != 0)
+                {
+                    CryptDestroyHash(Sha256);
+                }
+                if (Provider != 0)
+                {
+                    CryptReleaseContext(Provider, 0);
+                }
+                if (File != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(File);
+                }
+            }
+        } resources{file, provider, md5, sha1, sha256};
 
         do
         {
-            if (hashes == nullptr)
+            if (hashes == nullptr || progress == nullptr)
             {
                 break;
+            }
+            *hashes = {};
+            *progress = {};
+            if (error != nullptr)
+            {
+                error->clear();
             }
 
             file = CreateFileW(
@@ -547,6 +722,18 @@ namespace
                 }
                 break;
             }
+
+            HashFileGeneration initialGeneration;
+            if (!QueryHashGeneration(file, &initialGeneration))
+            {
+                progress->GenerationFailed = true;
+                if (error != nullptr)
+                {
+                    *error = L"Initial disk file size and generation could not be established";
+                }
+                break;
+            }
+            progress->SnapshotBytes = initialGeneration.Size;
 
             if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
             {
@@ -569,38 +756,47 @@ namespace
             }
 
             std::vector<BYTE> buffer(kHashReadChunk);
-            DWORD read = 0;
-            for (;;)
-            {
-                if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr))
+            const bool snapshotRead = ReadHashSnapshot(
+                initialGeneration.Size, options.MaxHashBytes, options.HashBudgetMs,
+                [&](DWORD request, DWORD* received)
                 {
-                    if (error != nullptr)
+                    if (!ReadFile(file, buffer.data(), request, received, nullptr))
                     {
-                        *error = FormatWin32Text(L"ReadFile failed", GetLastError());
+                        if (error != nullptr)
+                        {
+                            *error = FormatWin32Text(L"ReadFile failed", GetLastError());
+                        }
+                        return false;
                     }
-                    break;
-                }
-
-                if (read == 0)
+                    return true;
+                },
+                [&](DWORD received)
                 {
-                    ok = true;
-                    break;
-                }
-
-                if (!CryptHashData(md5, buffer.data(), read, 0) ||
-                    !CryptHashData(sha1, buffer.data(), read, 0) ||
-                    !CryptHashData(sha256, buffer.data(), read, 0))
-                {
-                    if (error != nullptr)
+                    if (!CryptHashData(md5, buffer.data(), received, 0) ||
+                        !CryptHashData(sha1, buffer.data(), received, 0) ||
+                        !CryptHashData(sha256, buffer.data(), received, 0))
                     {
-                        *error = FormatWin32Text(L"CryptHashData failed", GetLastError());
+                        if (error != nullptr)
+                        {
+                            *error = FormatWin32Text(L"CryptHashData failed", GetLastError());
+                        }
+                        return false;
                     }
-                    ok = false;
-                    break;
-                }
-            }
+                    return true;
+                },
+                []()
+                {
+                    return GetTickCount64();
+                },
+                [&]()
+                {
+                    HashFileGeneration finalGeneration;
+                    return QueryHashGeneration(file, &finalGeneration) &&
+                        SameHashGeneration(initialGeneration, finalGeneration);
+                },
+                progress, error);
 
-            if (!ok)
+            if (!snapshotRead)
             {
                 break;
             }
@@ -627,28 +823,8 @@ namespace
             hashes->Md5 = HexBytes(md5Bytes, md5Size);
             hashes->Sha1 = HexBytes(sha1Bytes, sha1Size);
             hashes->Sha256 = HexBytes(sha256Bytes, sha256Size);
+            ok = true;
         } while (false);
-
-        if (md5 != 0)
-        {
-            CryptDestroyHash(md5);
-        }
-        if (sha1 != 0)
-        {
-            CryptDestroyHash(sha1);
-        }
-        if (sha256 != 0)
-        {
-            CryptDestroyHash(sha256);
-        }
-        if (provider != 0)
-        {
-            CryptReleaseContext(provider, 0);
-        }
-        if (file != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(file);
-        }
 
         return ok;
     }
@@ -1668,19 +1844,11 @@ bool ByovdScanner::CatalogIsStale(uint64_t maxAgeSeconds, bool* stale, uint64_t*
         write.LowPart = data.ftLastWriteTime.dwLowDateTime;
         write.HighPart = data.ftLastWriteTime.dwHighDateTime;
 
-        uint64_t seconds = 0;
-        if (now.QuadPart >= write.QuadPart)
+        ok = EvaluateCatalogAge(now.QuadPart, write.QuadPart, maxAgeSeconds, stale, ageSeconds);
+        if (!ok && error != nullptr)
         {
-            seconds = (now.QuadPart - write.QuadPart) / 10000000ull;
+            *error = L"Catalog timestamp is unavailable or ahead of the local clock; freshness is unknown";
         }
-
-        if (ageSeconds != nullptr)
-        {
-            *ageSeconds = seconds;
-        }
-
-        *stale = seconds > maxAgeSeconds;
-        ok = true;
     } while (false);
 
     return ok;
@@ -1919,6 +2087,8 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
         }
 
         *result = ByovdScanResult{};
+        result->MaxHashBytes = options.MaxHashBytes;
+        result->HashBudgetMs = options.HashBudgetMs;
 
         bool stale = true;
         uint64_t age = 0;
@@ -2016,8 +2186,24 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
             }
         }
 
-        for (const KernelModuleInfo& module : symbols_.Modules())
+        std::vector<KernelModuleInfo> modules = symbols_.CopyModules();
+        std::sort(modules.begin(), modules.end(), [](const KernelModuleInfo& a, const KernelModuleInfo& b)
         {
+            return a.Base < b.Base;
+        });
+        const auto after = std::upper_bound(modules.begin(), modules.end(), options.ModuleAfterBase,
+            [](uint64_t base, const KernelModuleInfo& module)
+            {
+                return base < module.Base;
+            });
+        const size_t start = after == modules.end() ? 0 : static_cast<size_t>(after - modules.begin());
+        const size_t count = options.MaxModules == 0 ? modules.size() :
+            (std::min)(modules.size(), static_cast<size_t>(options.MaxModules));
+        result->ModuleCoverageComplete = count == modules.size() && !modules.empty();
+        for (size_t step = 0; step < count; ++step)
+        {
+            const KernelModuleInfo& module = modules[(start + step) % modules.size()];
+            result->NextModuleBase = module.Base;
             ++result->ModulesScanned;
 
             ByovdModuleRecord record = {};
@@ -2028,8 +2214,11 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
             record.Size = module.Size;
 
             std::wstring hashError;
+            KmonFileIdentity identityBefore;
+            const bool identityBeforeKnown = QueryKmonFileIdentity(record.DiskPath, &identityBefore, nullptr);
             FileHashes hashes = {};
-            if (ComputeFileHashes(record.DiskPath, &hashes, &hashError))
+            HashReadProgress hashProgress;
+            if (ComputeFileHashes(record.DiskPath, options, &hashes, &hashProgress, &hashError))
             {
                 record.FileHashed = true;
                 record.Md5 = hashes.Md5;
@@ -2045,6 +2234,18 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
             {
                 record.Error = hashError;
                 ++result->FileReadFailures;
+            }
+            record.HashSnapshotBytes = hashProgress.SnapshotBytes;
+            record.HashBytesRead = hashProgress.BytesRead;
+            record.HashBudgetExceeded = hashProgress.BudgetExceeded;
+            record.HashGenerationStable = hashProgress.GenerationStable;
+            if (hashProgress.BudgetExceeded)
+            {
+                ++result->HashBudgetFailures;
+            }
+            if (hashProgress.GenerationFailed)
+            {
+                ++result->HashGenerationFailures;
             }
 
             if (options.CheckAuthenticode)
@@ -2151,6 +2352,15 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
                 }
             }
 
+            KmonFileIdentity identityAfter;
+            record.FileIdentityStable = identityBeforeKnown &&
+                QueryKmonFileIdentity(record.DiskPath, &identityAfter, nullptr) &&
+                KmonSameFileGeneration(identityBefore, identityAfter);
+            record.FileIdentityScope = L"pathname file identity before and after collection; loaded image binding and ABA not proven";
+            if (!record.FileIdentityStable)
+            {
+                result->Warnings.push_back(L"File identity changed or could not be established: " + record.DiskPath);
+            }
             if (!record.Matches.empty())
             {
                 ++result->MatchedModules;
@@ -2168,6 +2378,12 @@ bool ByovdScanner::Scan(const ByovdScanOptions& options, ByovdScanResult* result
             }
         }
 
+        if (result->HashBudgetFailures != 0 || result->HashGenerationFailures != 0)
+        {
+            result->Warnings.push_back(L"Hash coverage incomplete: budget_failures=" +
+                std::to_wstring(result->HashBudgetFailures) + L" generation_failures=" +
+                std::to_wstring(result->HashGenerationFailures) + L"; " + result->HashCoverageScope);
+        }
         ok = true;
     } while (false);
 
@@ -2181,8 +2397,15 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
     stream << L"{\"schema\":\"kn-live-dbg.byovd-scan.v1\",";
     stream << L"\"summary\":{";
     stream << L"\"modules_scanned\":" << result.ModulesScanned << L",";
+    stream << L"\"module_coverage_complete\":" << (result.ModuleCoverageComplete ? L"true" : L"false") << L",";
+    stream << L"\"next_module_base\":" << result.NextModuleBase << L",";
     stream << L"\"files_hashed\":" << result.FilesHashed << L",";
     stream << L"\"file_read_failures\":" << result.FileReadFailures << L",";
+    stream << L"\"hash_budget_failures\":" << result.HashBudgetFailures << L",";
+    stream << L"\"hash_generation_failures\":" << result.HashGenerationFailures << L",";
+    stream << L"\"max_hash_bytes\":" << result.MaxHashBytes << L",";
+    stream << L"\"hash_budget_ms\":" << result.HashBudgetMs << L",";
+    stream << L"\"hash_coverage_scope\":\"" << JsonEscape(result.HashCoverageScope) << L"\",";
     stream << L"\"matched_modules\":" << result.MatchedModules << L",";
     stream << L"\"exact_matches\":" << result.ExactMatches << L",";
     stream << L"\"hint_matches\":" << result.HintMatches << L",";
@@ -2244,6 +2467,13 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
         stream << L"\"md5\":\"" << JsonEscape(record.Md5) << L"\",";
         stream << L"\"sha1\":\"" << JsonEscape(record.Sha1) << L"\",";
         stream << L"\"sha256\":\"" << JsonEscape(record.Sha256) << L"\",";
+        stream << L"\"file_hashed\":" << (record.FileHashed ? L"true" : L"false") << L",";
+        stream << L"\"hash_snapshot_bytes\":" << record.HashSnapshotBytes << L",";
+        stream << L"\"hash_bytes_read\":" << record.HashBytesRead << L",";
+        stream << L"\"hash_budget_exceeded\":" << (record.HashBudgetExceeded ? L"true" : L"false") << L",";
+        stream << L"\"hash_generation_stable\":" << (record.HashGenerationStable ? L"true" : L"false") << L",";
+        stream << L"\"file_identity_stable\":" << (record.FileIdentityStable ? L"true" : L"false") << L",";
+        stream << L"\"file_identity_scope\":\"" << JsonEscape(record.FileIdentityScope) << L"\",";
         stream << L"\"error\":\"" << JsonEscape(record.Error) << L"\",";
         stream << L"\"yara_error\":\"" << JsonEscape(record.YaraError) << L"\",";
         stream << L"\"yara_scanned\":" << (record.YaraScanned ? L"true" : L"false") << L",";
@@ -2279,4 +2509,209 @@ std::wstring BuildByovdScanJson(const ByovdScanResult& result)
     stream << L"]}";
 
     return stream.str();
+}
+
+bool ByovdHashBudgetSelfTest()
+{
+    struct Fixture
+    {
+        uint64_t InitialBytes = 2ull * kHashReadChunk + 3;
+        uint64_t MaxBytes = 128ull * 1024 * 1024;
+        uint32_t BudgetMs = 250;
+        uint64_t Tick = 100;
+        uint64_t AdvanceAfterStart = 0;
+        uint64_t AdvancePerRead = 0;
+        uint64_t AppendPerRead = 0;
+        uint64_t AppendedBytes = 0;
+        uint64_t ConsumedBytes = 0;
+        uint32_t Ticks = 0;
+        uint32_t Reads = 0;
+        uint32_t Validations = 0;
+        DWORD LastRequest = 0;
+        DWORD MaxRead = kHashReadChunk;
+        bool EarlyEof = false;
+        bool InvalidReadLength = false;
+        bool ReadFails = false;
+        bool ConsumeFails = false;
+        bool GenerationChanges = false;
+        bool FinalMetadataKnown = true;
+        HashReadProgress Progress;
+        std::wstring Error;
+    };
+    const auto run = [](Fixture* fixture)
+    {
+        HashFileGeneration before;
+        before.Size = fixture->InitialBytes;
+        return ReadHashSnapshot(fixture->InitialBytes, fixture->MaxBytes, fixture->BudgetMs,
+            [&](DWORD request, DWORD* received)
+            {
+                ++fixture->Reads;
+                fixture->LastRequest = request;
+                fixture->AppendedBytes += fixture->AppendPerRead;
+                fixture->Tick += fixture->AdvancePerRead;
+                *received = fixture->EarlyEof ? 0 : (std::min)(request, fixture->MaxRead);
+                if (fixture->InvalidReadLength)
+                {
+                    *received = request + 1;
+                }
+                return !fixture->ReadFails;
+            },
+            [&](DWORD received)
+            {
+                fixture->ConsumedBytes += received;
+                return !fixture->ConsumeFails;
+            },
+            [&]()
+            {
+                const uint64_t tick = fixture->Tick;
+                if (++fixture->Ticks == 1)
+                {
+                    fixture->Tick += fixture->AdvanceAfterStart;
+                }
+                return tick;
+            },
+            [&]()
+            {
+                ++fixture->Validations;
+                HashFileGeneration after = before;
+                after.Size += fixture->AppendedBytes;
+                after.ChangeTime = fixture->GenerationChanges ? 1 : 0;
+                return fixture->FinalMetadataKnown && SameHashGeneration(before, after);
+            },
+            &fixture->Progress, &fixture->Error);
+    };
+
+    Fixture fixture;
+    if (!run(&fixture) || fixture.Reads != 3 || fixture.LastRequest != 3 ||
+        fixture.ConsumedBytes != fixture.InitialBytes || fixture.Validations != 1 ||
+        !fixture.Progress.GenerationStable || fixture.Progress.BytesRead != fixture.InitialBytes)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.AppendPerRead = kHashReadChunk;
+    if (run(&fixture) || fixture.Reads != 3 || fixture.ConsumedBytes != fixture.InitialBytes ||
+        !fixture.Progress.GenerationFailed || fixture.Progress.GenerationStable)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InitialBytes = (std::numeric_limits<uint64_t>::max)();
+    fixture.MaxBytes = 0;
+    if (run(&fixture) || fixture.Reads != 0 || fixture.Validations != 0 || fixture.Error.empty())
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InitialBytes = fixture.MaxBytes + 1;
+    if (run(&fixture) || fixture.Reads != 0 || !fixture.Progress.BudgetExceeded)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.AdvanceAfterStart = fixture.BudgetMs;
+    if (run(&fixture) || fixture.Reads != 0 || !fixture.Progress.BudgetExceeded)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InitialBytes = 1;
+    fixture.AdvancePerRead = fixture.BudgetMs;
+    if (run(&fixture) || fixture.Reads != 1 || fixture.Progress.BytesRead != 1 ||
+        !fixture.Progress.BudgetExceeded || fixture.Validations != 0)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.EarlyEof = true;
+    if (run(&fixture) || fixture.Progress.BytesRead != 0 ||
+        !fixture.Progress.GenerationFailed || fixture.ConsumedBytes != 0)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InvalidReadLength = true;
+    if (run(&fixture) || fixture.Progress.BytesRead != 0 || fixture.ConsumedBytes != 0)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.GenerationChanges = true;
+    if (run(&fixture) || !fixture.Progress.GenerationFailed || fixture.Progress.GenerationStable)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.FinalMetadataKnown = false;
+    if (run(&fixture) || !fixture.Progress.GenerationFailed)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InitialBytes = 9;
+    fixture.MaxRead = 2;
+    fixture.MaxBytes = 0;
+    fixture.BudgetMs = 0;
+    fixture.AdvancePerRead = 1000;
+    if (!run(&fixture) || fixture.Reads != 5 || fixture.ConsumedBytes != 9 ||
+        fixture.Progress.BytesRead != 9 || fixture.Progress.BudgetExceeded)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.InitialBytes = 0;
+    if (!run(&fixture) || fixture.Reads != 0 || fixture.Validations != 1 ||
+        !fixture.Progress.GenerationStable)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.ReadFails = true;
+    if (run(&fixture) || fixture.Progress.BytesRead != 0 || fixture.Validations != 0)
+    {
+        return false;
+    }
+
+    fixture = {};
+    fixture.ConsumeFails = true;
+    return !run(&fixture) && fixture.Progress.BytesRead == kHashReadChunk && fixture.Validations == 0;
+}
+
+bool ByovdCatalogFreshnessSelfTest()
+{
+    constexpr uint64_t now = 134300000000000000ull;
+    bool stale = false;
+    uint64_t age = 123;
+    if (EvaluateCatalogAge(now, now + 1, kCatalogMaxAgeSeconds, &stale, &age) || !stale || age != 0)
+    {
+        return false;
+    }
+    if (EvaluateCatalogAge(0, 1, kCatalogMaxAgeSeconds, &stale, &age) || !stale ||
+        EvaluateCatalogAge(now, 0, kCatalogMaxAgeSeconds, &stale, &age) || !stale)
+    {
+        return false;
+    }
+    if (!EvaluateCatalogAge(now, now, kCatalogMaxAgeSeconds, &stale, &age) || stale || age != 0)
+    {
+        return false;
+    }
+    if (!EvaluateCatalogAge(now, now - kCatalogMaxAgeSeconds * 10000000ull,
+            kCatalogMaxAgeSeconds, &stale, &age) || stale || age != kCatalogMaxAgeSeconds)
+    {
+        return false;
+    }
+    return EvaluateCatalogAge(now, now - (kCatalogMaxAgeSeconds + 1) * 10000000ull,
+        kCatalogMaxAgeSeconds, &stale, &age) && stale && age == kCatalogMaxAgeSeconds + 1;
 }

@@ -27,8 +27,8 @@ will miss the console self-test lookup next to `KnLiveDbg.exe`.
 ## Scenarios
 
 Each parent mode copies the fixture to `%TEMP%\kn-live-dbg-kmon\notepad.exe` so
-`KmonIsWindowsBuiltinLeaf` is true (reloc-aware `.text` / COW layers only run
-for Windows builtin leaves). Sequential runs retry `DeleteFile` + `CopyFile`
+`KmonIsWindowsBuiltinLeaf` is true (this selects the default builtin `.text` /
+CoW policy without adding a watch). Sequential runs retry `DeleteFile` + `CopyFile`
 when the previous copy is still in use. `/seconds N` holds the artifact
 (default 45). `/seconds 0` holds until the process is killed. Child processes
 use `CREATE_NO_WINDOW` so the parent stdout is a single `KMON_FIXTURE` line.
@@ -46,10 +46,13 @@ instead of leaving PEB ImageBase unmapped.
 | `/nomz` | ImageBase MZ wiped | `exe_no_mz` |
 | `/orphan-private` | `VirtualAlloc` RX page with MZ | `exe_orphan_private` |
 | `/orphan-image` | delete-pending `SEC_IMAGE` map, not in the loader | `exe_orphan_image` |
+| `/orphan-mapped-rx` | anonymous headerless `MEM_MAPPED` section with inert RX bytes, never executed | `mapped_exec` on the builtin-named copy |
+| `/mapped-readonly` | same section bytes with `PAGE_READONLY` | no executable-orphan finding (negative control) |
 | `/replace-main` | suspended self-copy, EXE unmapped, private MZ, **never resumed** | `exe_private` |
 | `/ghost` | running copy then delete the file | `ghost` |
 
-`/ghost` needs `GetFileAttributesW` to fail (path gone). A delete-pending file
+`/ghost` needs `GetFileAttributesW` to fail with file/path not found. Access
+denied remains a coverage gap. A delete-pending file
 that is still visible is not `layer=ghost`; the fixture prints a warning in
 that case.
 
@@ -83,7 +86,8 @@ Other console:
 
 Then `!kmon` to attach the tail. User-mode hostility scans every ~8s (first
 tick ~1.5s after start). Repeat with `/stamp`, `/nomz`, `/orphan-private`,
-`/orphan-image`, `/replace-main`, `/ghost`, `/masquerade`.
+`/orphan-image`, `/orphan-mapped-rx`, `/mapped-readonly`, `/replace-main`,
+`/ghost`, `/masquerade`.
 
 `/replace-main` leaves a suspended process; the fixture terminates it when the
 hold expires.
@@ -114,8 +118,21 @@ hold expires.
 
 That gate does not require `write on` or `!kmon`. It does **not** assert that
 an unmodified `KnLiveDbg.exe` `.text` matches disk: reloc-aware compare of the
-TUI image is not a stable negative control, which is why live `exe_text` is
-builtin-only.
+TUI image is not a stable negative control. Ordinary third-party hosts do not
+receive the broad main-image text policy unless watched or classified as a
+drop-path host.
+
+The independent `kmon-mapped-section-artifact` console gate creates a real
+anonymous section, verifies `MEM_MAPPED` plus executable protection and readable
+sample bytes with the production candidate helpers, changes it to read-only,
+and verifies rejection. The bytes are never executed. This gate does not depend
+on a process-name alias or on loading the driver.
+
+`kmon-user-memory-regression` checks independent kernel-section identity,
+unreadable samples, ghost/path failure distinctions, CoW page selection,
+bounded process scheduling, and live thread-start query primitives. Neither
+this gate nor launching a fixture proves that a running `!kmon` emitted an
+event; that requires the live pass above.
 
 ## Not covered here
 
@@ -124,3 +141,6 @@ builtin-only.
 - Game + anti-cheat idle FP soak (manual on the game machine).
 - Kernel mapper / pool PE / unbacked hook positives (those stay on `!pool pe`,
   `!kpage`, `!mapper`, `!callbacks`).
+
+The implemented observations, current research, and remaining gaps are listed
+in [KMON_DETECTION_COVERAGE.md](KMON_DETECTION_COVERAGE.md).

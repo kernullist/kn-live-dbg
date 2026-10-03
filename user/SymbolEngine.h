@@ -30,24 +30,24 @@ struct TypeFieldInfo
 {
     std::wstring Name;
     std::wstring TypeName;
-    uint64_t ModuleBase;
-    ULONG TypeId;
-    ULONG ChildTypeId;
-    ULONG Offset;
-    ULONG64 Length;
-    DWORD Tag;
-    DWORD ChildTag;
-    DWORD BaseType;
-    bool IsBitField;
-    ULONG BitPosition;
+    uint64_t ModuleBase = 0;
+    ULONG TypeId = 0;
+    ULONG ChildTypeId = 0;
+    ULONG Offset = 0;
+    ULONG64 Length = 0;
+    DWORD Tag = 0;
+    DWORD ChildTag = 0;
+    DWORD BaseType = 0;
+    bool IsBitField = false;
+    ULONG BitPosition = 0;
 };
 
 struct TypeLayoutInfo
 {
     std::wstring Name;
-    uint64_t ModuleBase;
-    ULONG TypeId;
-    ULONG64 Size;
+    uint64_t ModuleBase = 0;
+    ULONG TypeId = 0;
+    ULONG64 Size = 0;
     std::vector<TypeFieldInfo> Fields;
 };
 

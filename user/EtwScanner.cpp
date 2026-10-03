@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cwctype>
 #include <iomanip>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -1218,7 +1219,7 @@ namespace
         return result;
     }
 
-    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    std::optional<KernelModuleInfo> FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
         for (const KernelModuleInfo& module : symbols.Modules())
         {
@@ -1229,10 +1230,10 @@ namespace
             }
             if (address >= module.Base && address < end)
             {
-                return &module;
+                return module;
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     void AnalyzeIntegrityFunction(
@@ -1302,8 +1303,8 @@ namespace
         {
             finding->HasTarget = true;
             finding->Target = target;
-            const KernelModuleInfo* module = FindOwningModule(symbols, target);
-            if (module != nullptr)
+            const std::optional<KernelModuleInfo> module = FindOwningModule(symbols, target);
+            if (module.has_value())
             {
                 finding->TargetModule = module->ImageName;
                 finding->TargetInLoadedModule = true;
@@ -1431,8 +1432,8 @@ namespace
                 {
                     if (target >= 0xffff800000000000ull)
                     {
-                        const KernelModuleInfo* module = FindOwningModule(symbols, target);
-                        if (module == nullptr)
+                        const std::optional<KernelModuleInfo> module = FindOwningModule(symbols, target);
+                        if (!module.has_value())
                         {
                             bool alreadyReported = (i == 0 && mn == ZYDIS_MNEMONIC_JMP);
                             if (!alreadyReported)
@@ -1503,8 +1504,8 @@ bool EtwScanner::ScanIntegrity(EtwIntegrityResult* result, std::wstring* error)
             record.SymbolResolved = true;
             record.Address = address;
 
-            const KernelModuleInfo* owning = FindOwningModule(symbols_, address);
-            if (owning != nullptr)
+            const std::optional<KernelModuleInfo> owning = FindOwningModule(symbols_, address);
+            if (owning.has_value())
             {
                 record.OwningModule = owning->ImageName;
             }
@@ -1966,11 +1967,24 @@ bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult
         result->TiActive = input.TiActive;
         result->EventsReceived = input.EventsReceived;
         result->EventsDropped = input.EventsDropped;
+        result->EventsLost = input.EventsLost;
+        result->ConsumerMissingSequence = input.ConsumerMissingSequence;
+
+        if (input.TraceStateKnown && input.TraceExitStatusKnown && !input.TraceThreadRunning)
+        {
+            result->Status = L"stopped";
+            result->Reason = input.TraceExitAfterStopRequest
+                ? L"TI consumer ended after a stop request"
+                : L"TI consumer exited without a stop request";
+            result->Notes.push_back(L"ProcessTrace status=" + std::to_wstring(input.TraceExitStatus));
+            ok = true;
+            break;
+        }
 
         if (!input.TiActive)
         {
             result->Skipped = true;
-            result->Status = L"skipped";
+            result->Status = L"inactive";
             result->Reason = L"Threat-Intelligence subscription is not active";
             ok = true;
             break;
@@ -1999,6 +2013,20 @@ bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult
                 static_cast<double>(input.EventsReceived) / static_cast<double>(result->ElapsedSeconds);
         }
 
+        if (input.EventsDropped != 0)
+        {
+            result->Notes.push_back(
+                L"ring evictions are retention pressure; consumer loss is measured by sequence gaps");
+        }
+
+        if (input.EventsLost != 0 || input.ConsumerMissingSequence != 0)
+        {
+            result->Status = L"loss_observed";
+            result->Reason = L"ETW loss or this consumer's sequence gap was observed; counts are cumulative";
+            ok = true;
+            break;
+        }
+
         if (result->ElapsedSeconds < input.MinSilentSeconds)
         {
             result->Status = L"starting";
@@ -2008,43 +2036,106 @@ bool EtwScanner::BuildTiCrossView(const EtwTiCrossInput& input, EtwTiCrossResult
             break;
         }
 
-        if (input.EventsDropped > 0 &&
-            input.EventsReceived > 0 &&
-            input.EventsDropped > input.EventsReceived / 2)
-        {
-            result->Status = L"dropping";
-            result->Reason = L"high TI ring drop rate relative to received events";
-            result->Suspicious = false; // operational, not DKOM by itself
-            result->Notes.push_back(L"increase ring size or reduce host load before treating as attack");
-            ok = true;
-            break;
-        }
+        const bool validLastEvent = input.EventsReceived != 0 &&
+            input.LastEventTickMs >= input.StartTickMs && input.LastEventTickMs != 0 &&
+            input.LastEventTickMs <= input.NowTickMs;
+        const bool recentEvent = validLastEvent &&
+            result->SecondsSinceLastEvent < input.MinSilentSeconds;
+        const bool expectedWindow = input.ExpectedActivityKnown &&
+            input.ExpectedActivitySinceTickMs >= input.StartTickMs &&
+            input.ExpectedActivitySinceTickMs <= input.NowTickMs &&
+            (input.NowTickMs - input.ExpectedActivitySinceTickMs) / 1000ull >= input.MinSilentSeconds;
 
-        if (input.EventsReceived == 0)
+        if (expectedWindow && (!validLastEvent || input.LastEventTickMs < input.ExpectedActivitySinceTickMs))
         {
-            result->Status = L"silent";
-            result->Reason =
-                L"TI subscription active past threshold with zero received events";
-            result->Suspicious = false;
-            if (!input.PplAntimalware)
-            {
-                result->Notes.push_back(L"confirm set-ppl-antimalware on before escalating");
-            }
+            result->Status = L"expected_activity_missing";
+            result->Reason = L"no event followed independently established TI-generating activity";
             result->Notes.push_back(
-                L"silence alone is inconclusive without expected TI-generating activity "
-                L"or an independent kernel contradiction");
-            result->Notes.push_back(L"correlate with !etw providers and !etw integrity");
+                L"delivery lag, privileges and session configuration must be checked before inferring tampering");
             ok = true;
             break;
         }
 
-        result->Status = L"healthy";
-        result->Reason = L"TI events are being received";
-        result->Suspicious = false;
+        if (recentEvent)
+        {
+            result->Status = L"receiving";
+            result->Reason = L"recent TI delivery observed; this does not prove all events are delivered";
+        }
+        else
+        {
+            result->Status = L"unknown";
+            result->Reason = L"no_expected_activity: idle delivery cannot establish sensor health";
+            if (input.EventsReceived != 0)
+            {
+                result->Notes.push_back(L"past receipt does not establish current delivery");
+            }
+        }
         ok = true;
     } while (false);
 
     return ok;
+}
+
+bool EtwTiCrossSelfTest()
+{
+    EtwTiCrossInput input;
+    input.TiActive = true;
+    input.TraceStateKnown = true;
+    input.TraceThreadRunning = true;
+    input.PplAntimalware = true;
+    input.StartTickMs = 1000;
+    input.NowTickMs = 60000;
+    EtwTiCrossResult result;
+    const auto expect = [&](const wchar_t* status)
+    {
+        return EtwScanner::BuildTiCrossView(input, &result, nullptr) &&
+            result.Status == status && !result.Suspicious;
+    };
+    if (!expect(L"unknown"))
+    {
+        return false;
+    }
+    input.EventsReceived = 1;
+    input.LastEventTickMs = 2000;
+    if (!expect(L"unknown"))
+    {
+        return false;
+    }
+    input.LastEventTickMs = 59000;
+    input.EventsDropped = 100;
+    if (!expect(L"receiving") || result.ConsumerMissingSequence != 0)
+    {
+        return false;
+    }
+    input.ConsumerMissingSequence = 3;
+    if (!expect(L"loss_observed"))
+    {
+        return false;
+    }
+    input.ConsumerMissingSequence = 0;
+    input.EventsLost = 1;
+    if (!expect(L"loss_observed"))
+    {
+        return false;
+    }
+    input.EventsLost = 0;
+    input.LastEventTickMs = 2000;
+    input.ExpectedActivityKnown = true;
+    input.ExpectedActivitySinceTickMs = 3000;
+    if (!expect(L"expected_activity_missing"))
+    {
+        return false;
+    }
+    input.TraceThreadRunning = false;
+    input.TraceExitStatusKnown = true;
+    input.TraceExitStatus = ERROR_WMI_INSTANCE_NOT_FOUND;
+    input.TiActive = false;
+    if (!expect(L"stopped"))
+    {
+        return false;
+    }
+    input.TraceExitStatusKnown = false;
+    return expect(L"inactive");
 }
 
 std::wstring BuildEtwProvidersJson(const EtwProviderScanResult& result)
@@ -2110,6 +2201,8 @@ std::wstring BuildEtwTiCrossJson(const EtwTiCrossResult& result)
     out += L",\"reason\":" + mcpjson::Quote(result.Reason);
     out += L",\"eventsReceived\":" + std::to_wstring(result.EventsReceived);
     out += L",\"eventsDropped\":" + std::to_wstring(result.EventsDropped);
+    out += L",\"eventsLost\":" + std::to_wstring(result.EventsLost);
+    out += L",\"consumerMissingSequence\":" + std::to_wstring(result.ConsumerMissingSequence);
     out += L",\"elapsedSeconds\":" + std::to_wstring(result.ElapsedSeconds);
     out += L",\"secondsSinceLastEvent\":" + std::to_wstring(result.SecondsSinceLastEvent);
     wchar_t rateBuf[64];

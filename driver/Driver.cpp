@@ -2,6 +2,7 @@
 #include <wdmsec.h>
 #include <intrin.h>
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/KnLiveDbgPaging.h"
 
 extern "C"
 NTKERNELAPI
@@ -61,7 +62,9 @@ static UNICODE_STRING g_KnDbgSymbolicLink = RTL_CONSTANT_STRING(KNDBG_DOS_DEVICE
 static FAST_MUTEX g_KnDbgOwnerLock;
 static ULONG g_KnDbgOwnerPid = 0;
 static ULONG g_KnDbgOwnerOpenCount = 0;
-static FAST_MUTEX g_KnDbgTimelineControlLock;
+static BOOLEAN g_KnDbgOwnerClosing = FALSE;
+// Callback registration/removal requires PASSIVE_LEVEL; fast mutexes raise IRQL.
+static KMUTEX g_KnDbgTimelineControlLock;
 static KSPIN_LOCK g_KnDbgTimelineLock;
 static volatile LONG g_KnDbgTimelineEnabled = 0;
 static BOOLEAN g_KnDbgTimelineProcessRegistered = FALSE;
@@ -489,10 +492,8 @@ static void KnDbgTimelinePushEvent(const KNDBG_TIMELINE_EVENT_RECORD* Event)
 
 static void KnDbgTimelineClearLocked()
 {
-    if (g_KnDbgTimelineRing != nullptr && g_KnDbgTimelineCapacity != 0)
-    {
-        RtlZeroMemory(g_KnDbgTimelineRing, sizeof(KNDBG_TIMELINE_EVENT_RECORD) * g_KnDbgTimelineCapacity);
-    }
+    // Count hides old slots; PushEvent fully overwrites a slot before exposure.
+    // Do not zero megabytes of nonpaged memory while holding the spin lock.
     g_KnDbgTimelineHead = 0;
     g_KnDbgTimelineCount = 0;
     g_KnDbgTimelineDropped = 0;
@@ -551,6 +552,7 @@ static NTSTATUS KnDbgTimelineEnsureRing(ULONG Capacity)
     return status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static void KnDbgTimelineUnregisterCallbacks()
 {
     InterlockedExchange(&g_KnDbgTimelineEnabled, 0);
@@ -572,6 +574,7 @@ static void KnDbgTimelineUnregisterCallbacks()
     }
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static NTSTATUS KnDbgTimelineRegisterCallbacks()
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -643,6 +646,8 @@ static VOID KnDbgTimelineProcessNotify(
     {
         record.Type = KNDBG_TIMELINE_EVENT_PROCESS_CREATE;
         record.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+        record.CreatorProcessId = HandleToULong(CreateInfo->CreatingThreadId.UniqueProcess);
+        record.CreatorThreadId = HandleToULong(CreateInfo->CreatingThreadId.UniqueThread);
         KnDbgTimelineCopyPath(&record, CreateInfo->ImageFileName);
     }
     else
@@ -803,13 +808,18 @@ static NTSTATUS KnDbgReadVirtualAddressViaMdl(PVOID Address, PVOID Output, SIZE_
             break;
         }
 
-        // After probing-and-locking, the pages are guaranteed resident and the
-        // original kernel VA can be read directly without aliasing through
-        // MmGetSystemAddressForMdlSafe. Wrap in __try for the rare case where
-        // the underlying mapping changes mid-copy (e.g. a concurrent unload).
+        // Locking pins physical pages, not the original virtual mapping.
+        // Use an MDL mapping so a concurrent unload cannot redirect the copy.
+        PVOID mapped = MmGetSystemAddressForMdlSafe(
+            mdl, NormalPagePriority | MdlMappingNoWrite | MdlMappingNoExecute);
+        if (mapped == nullptr)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
         __try
         {
-            RtlCopyMemory(Output, Address, Length);
+            RtlCopyMemory(Output, mapped, Length);
             if (BytesCopied != nullptr)
             {
                 *BytesCopied = Length;
@@ -1106,7 +1116,7 @@ static NTSTATUS KnDbgAcquireController(PKNDBG_FILE_CONTEXT FileContext)
         ULONG currentPid = HandleToULong(PsGetCurrentProcessId());
         ExAcquireFastMutex(&g_KnDbgOwnerLock);
 
-        if (g_KnDbgOwnerPid != 0 && g_KnDbgOwnerPid != currentPid)
+        if (g_KnDbgOwnerClosing || (g_KnDbgOwnerPid != 0 && g_KnDbgOwnerPid != currentPid))
         {
             status = STATUS_DEVICE_BUSY;
         }
@@ -1125,8 +1135,9 @@ static NTSTATUS KnDbgAcquireController(PKNDBG_FILE_CONTEXT FileContext)
     return status;
 }
 
-static void KnDbgReleaseController(PKNDBG_FILE_CONTEXT FileContext)
+static BOOLEAN KnDbgReleaseController(PKNDBG_FILE_CONTEXT FileContext)
 {
+    BOOLEAN lastController = FALSE;
     do
     {
         if (FileContext == nullptr || FileContext->OwnsController == FALSE)
@@ -1145,13 +1156,16 @@ static void KnDbgReleaseController(PKNDBG_FILE_CONTEXT FileContext)
 
             if (g_KnDbgOwnerOpenCount == 0)
             {
-                g_KnDbgOwnerPid = 0;
+                // Keep new opens out until this owner's collectors are stopped.
+                g_KnDbgOwnerClosing = TRUE;
+                lastController = TRUE;
             }
         }
 
         ExReleaseFastMutex(&g_KnDbgOwnerLock);
         FileContext->OwnsController = FALSE;
     } while (false);
+    return lastController;
 }
 
 static NTSTATUS KnDbgReadPhysicalAddress(ULONGLONG PhysicalAddress, PVOID Output, SIZE_T Length, PSIZE_T BytesCopied)
@@ -1380,7 +1394,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
                 break;
             }
 
-            if ((Response->Pml5e & KNDBG_PTE_PRESENT) == 0)
+            if (!KnDbgPresentPagingEntryValid(Response->Pml5e, 5))
             {
                 status = STATUS_ACCESS_VIOLATION;
                 break;
@@ -1402,7 +1416,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
             break;
         }
 
-        if ((Response->Pml4e & KNDBG_PTE_PRESENT) == 0)
+        if (!KnDbgPresentPagingEntryValid(Response->Pml4e, 4))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -1416,7 +1430,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
             break;
         }
 
-        if ((Response->Pdpte & KNDBG_PTE_PRESENT) == 0)
+        if (!KnDbgPresentPagingEntryValid(Response->Pdpte, 3))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -1446,7 +1460,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
             break;
         }
 
-        if ((Response->Pde & KNDBG_PTE_PRESENT) == 0)
+        if (!KnDbgPresentPagingEntryValid(Response->Pde, 2))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -1476,7 +1490,7 @@ static NTSTATUS KnDbgTranslateVirtualAddress(
             break;
         }
 
-        if ((Response->Pte & KNDBG_PTE_PRESENT) == 0)
+        if (!KnDbgPresentPagingEntryValid(Response->Pte, 1))
         {
             status = STATUS_ACCESS_VIOLATION;
             break;
@@ -1579,10 +1593,20 @@ static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, P
 
     do
     {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
         ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
         if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_TIMELINE_CONTROL_REQUEST)))
         {
             status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_TIMELINE_CONTROL_REQUEST))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
 
@@ -1601,7 +1625,12 @@ static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, P
             break;
         }
 
-        ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
+        status = KeWaitForSingleObject(
+            &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
+        if (status != STATUS_SUCCESS)
+        {
+            break;
+        }
         if (request.Action == KNDBG_TIMELINE_CONTROL_START)
         {
             status = KnDbgTimelineEnsureRing(request.Capacity);
@@ -1627,7 +1656,7 @@ static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, P
         {
             status = STATUS_INVALID_PARAMETER;
         }
-        ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
+        KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
 
         if (NT_SUCCESS(status))
         {
@@ -2472,6 +2501,11 @@ static NTSTATUS KnDbgHandleWriteVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
             status = STATUS_INVALID_PARAMETER;
             break;
         }
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < FIELD_OFFSET(KNDBG_WRITE_REQUEST, Data))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
 
         PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
         if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
@@ -2523,6 +2557,11 @@ static NTSTATUS KnDbgHandleWriteMode(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID B
         if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_WRITE_MODE_REQUEST)))
         {
             status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_WRITE_MODE_REQUEST))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
 
@@ -2725,6 +2764,11 @@ static NTSTATUS KnDbgHandleWritePhysical(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
             status = STATUS_INVALID_PARAMETER;
             break;
         }
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < FIELD_OFFSET(KNDBG_PHYSICAL_WRITE_REQUEST, Data))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
 
         PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
         if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
@@ -2777,6 +2821,11 @@ static NTSTATUS KnDbgHandleFlushVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOI
         if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST)))
         {
             status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_FLUSH_VIRTUAL_REQUEST))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
 
@@ -3370,10 +3419,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         }
 
         ExInitializeFastMutex(&g_KnDbgOwnerLock);
-        ExInitializeFastMutex(&g_KnDbgTimelineControlLock);
+        KeInitializeMutex(&g_KnDbgTimelineControlLock, 0);
         KeInitializeSpinLock(&g_KnDbgTimelineLock);
         g_KnDbgOwnerPid = 0;
         g_KnDbgOwnerOpenCount = 0;
+        g_KnDbgOwnerClosing = FALSE;
         g_KnDbgTimelineEnabled = 0;
         g_KnDbgTimelineProcessRegistered = FALSE;
         g_KnDbgTimelineImageRegistered = FALSE;
@@ -3473,9 +3523,10 @@ static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
         }
     }
 
-    ExAcquireFastMutex(&g_KnDbgTimelineControlLock);
+    KeWaitForSingleObject(
+        &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
     KnDbgTimelineUnregisterCallbacks();
-    ExReleaseFastMutex(&g_KnDbgTimelineControlLock);
+    KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
 
     if (g_KnDbgTimelineRing != nullptr)
     {
@@ -3531,20 +3582,31 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         else
         {
+            BOOLEAN lastController = FALSE;
             PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(stack->FileObject->FsContext);
             if (fileContext != nullptr)
             {
                 stack->FileObject->FsContext = nullptr;
-                KnDbgReleaseController(fileContext);
+                lastController = KnDbgReleaseController(fileContext);
                 ExFreePoolWithTag(fileContext, 'gDnK');
             }
 
-            // The controlling client is going away (including abrupt
-            // process termination): never leave an interposed dispatch
-            // entry behind pointing into this driver.
-            ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
-            KnDbgIotraceDisarmLocked(TRUE);
-            ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
+            if (lastController)
+            {
+                // Closing a secondary handle must not stop the live owner.
+                // New owners remain blocked across the final cleanup boundary.
+                ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
+                KnDbgIotraceDisarmLocked(TRUE);
+                ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
+                KeWaitForSingleObject(
+                    &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
+                KnDbgTimelineUnregisterCallbacks();
+                KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
+                ExAcquireFastMutex(&g_KnDbgOwnerLock);
+                g_KnDbgOwnerPid = 0;
+                g_KnDbgOwnerClosing = FALSE;
+                ExReleaseFastMutex(&g_KnDbgOwnerLock);
+            }
         }
     } while (false);
 

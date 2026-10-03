@@ -885,6 +885,12 @@ namespace
             warning);
     }
 
+    bool ToolhelpProcessWalkComplete(size_t count, bool more, DWORD terminalError)
+    {
+        return count > 0 && count < kMaxProcesses && !more &&
+            terminalError == ERROR_NO_MORE_FILES;
+    }
+
     bool CollectToolhelpProcesses(UserInventory* inventory, std::wstring* warning)
     {
         if (inventory == nullptr)
@@ -934,9 +940,7 @@ namespace
                     *warning = L"CreateToolhelp32Snapshot was truncated";
                 }
             }
-            else if (!more &&
-                nextError != ERROR_NO_MORE_FILES &&
-                nextError != ERROR_SUCCESS)
+            else if (!ToolhelpProcessWalkComplete(parsed.Count, more != FALSE, nextError))
             {
                 if (warning != nullptr)
                 {
@@ -945,7 +949,7 @@ namespace
             }
             else
             {
-                ok = parsed.Count > 0;
+                ok = true;
             }
         }
         CloseHandle(snap);
@@ -1363,6 +1367,8 @@ bool HiddenProcessScanner::Scan(
         }
 
         const bool userInventoryComplete =
+            spiBeforeOk && spiAfterOk &&
+            toolhelpBeforeOk && toolhelpAfterOk &&
             result->SystemProcessInfoCount > 0 &&
             result->ToolhelpCount > 0;
 
@@ -1637,6 +1643,15 @@ bool HiddenProcessViewSelfTest()
 
     do
     {
+        if (!ToolhelpProcessWalkComplete(20, false, ERROR_NO_MORE_FILES) ||
+            ToolhelpProcessWalkComplete(20, false, ERROR_SUCCESS) ||
+            ToolhelpProcessWalkComplete(20, false, ERROR_ACCESS_DENIED) ||
+            ToolhelpProcessWalkComplete(20, true, ERROR_NO_MORE_FILES) ||
+            ToolhelpProcessWalkComplete(0, false, ERROR_NO_MORE_FILES) ||
+            ToolhelpProcessWalkComplete(kMaxProcesses, false, ERROR_NO_MORE_FILES))
+        {
+            break;
+        }
         HiddenProcessClassifyInput hidden = {};
         hidden.Pid = 1234;
         hidden.Kernel = true;

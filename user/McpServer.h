@@ -116,6 +116,7 @@ struct McpToolCatalogEntry
 
 std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
 bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
+bool McpRequestBodySelfTest();
 
 class McpServer
 {

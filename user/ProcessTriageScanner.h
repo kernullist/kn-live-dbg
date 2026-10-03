@@ -33,6 +33,9 @@ struct ProcessVadProtectionRange
 {
     uint64_t StartAddress = 0;
     uint64_t EndAddress = 0;
+    // FILETIME interval around the query; zero means collection time is unknown.
+    uint64_t CollectionStartTimestamp = 0;
+    uint64_t CollectionEndTimestamp = 0;
     uint32_t Protection = 0;
     uint32_t Type = 0;
     bool Committed = false;
@@ -93,6 +96,7 @@ struct ProcessVadRecord
     uint32_t MappedViews = 0;
     std::wstring SectionFileName;
     bool PeProbeAttempted = false;
+    uint32_t MetadataReadFailures = 0;
     bool PeProbeReadSucceeded = false;
     bool PeHeaderFound = false;
     bool PeHeaderSuspicious = false;
@@ -153,6 +157,8 @@ struct ProcessVadScanResult
     uint64_t PrivateExecutableCount = 0;
     uint64_t WxCount = 0;
     uint64_t PeLikeCount = 0;
+    uint64_t MetadataReadFailures = 0;
+    uint64_t PeProbeReadFailures = 0;
     uint64_t SuspiciousCount = 0;
     uint64_t PteLeafMappings = 0;
     uint64_t PageTablePagesRead = 0;
@@ -275,6 +281,11 @@ struct ProcessApcEntryRecord
     bool Suspicious = false;
 };
 
+inline bool ProcessApcUserRoutineIsArgumentCandidate(const ProcessApcEntryRecord& record)
+{
+    return !record.UserRoutineSource.empty() && record.UserRoutineSource != L"normal_routine";
+}
+
 struct ProcessApcQueueRecord
 {
     std::wstring Name;
@@ -338,6 +349,32 @@ struct ProcessThreadRecord
     bool SuspiciousStart = false;
     std::vector<ProcessApcQueueRecord> ApcQueues;
     std::vector<ProcessStackReferenceRecord> StackReferences;
+    uint64_t TrapFrame = 0;
+    uint64_t SavedInstructionPointer = 0;
+    bool SavedContextStable = false;
+};
+
+struct ProcessExecutionScanOptions
+{
+    ProcessTriageTarget Target;
+    std::vector<ProcessUserModuleRange> UserModules;
+    bool UserModuleEnumerationComplete = false;
+    std::vector<ProcessVadRecord> VadRecords;
+    uint32_t ThreadBudget = 64;
+    uint32_t AfterThreadId = 0;
+};
+
+struct ProcessExecutionScanResult
+{
+    std::vector<ProcessThreadRecord> Records;
+    uint32_t NextThreadCursor = 0;
+    uint32_t ApcFailures = 0;
+    uint32_t SavedContextFailures = 0;
+    bool InventoryComplete = false;
+    bool Truncated = false;
+    bool ApcLayoutAvailable = false;
+    bool SavedContextLayoutAvailable = false;
+    bool IdentityStable = false;
 };
 
 struct ProcessThreadScanOptions
@@ -391,6 +428,10 @@ public:
     bool ScanVad(const ProcessVadScanOptions& options, ProcessVadScanResult* result, std::wstring* error);
     bool ScanMappedPe(const ProcessMappedPeScanOptions& options, ProcessMappedPeScanResult* result, std::wstring* error);
     bool ScanThreads(const ProcessThreadScanOptions& options, ProcessThreadScanResult* result, std::wstring* error);
+    bool ScanExecutionEvidence(
+        const ProcessExecutionScanOptions& options,
+        ProcessExecutionScanResult* result,
+        std::wstring* error);
 
 private:
     DeviceClient& device_;

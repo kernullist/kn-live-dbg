@@ -5,6 +5,12 @@
 #include "ThreatIntelSubscriber.h"
 #include "TimelineStore.h"
 #include "OrphanKernelPageScanner.h"
+#include "KmonUserEvidence.h"
+#include "CallbackScanner.h"
+#include "PendingIrpScanner.h"
+#include "KmonTemporalEvidence.h"
+#include "DpcTimerScanner.h"
+#include "WnfScanner.h"
 
 #include <atomic>
 #include <cstddef>
@@ -15,9 +21,37 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+struct KernelCallbackRecord;
+
+struct KmonImageScanCursor
+{
+    struct SliceObservation
+    {
+        uint32_t Rva = 0;
+        uint64_t MaskHash = 0;
+        bool Changed = false;
+    };
+
+    uint64_t HeaderHash = 0;
+    uint64_t NextSlice = 0;
+    uint64_t SliceCount = 0;
+    uint64_t SlicesAttempted = 0;
+    uint64_t Sweeps = 0;
+    uint64_t LastObservedMs = 0;
+    uint64_t ImageBase = 0;
+    uint64_t CreateTime = 0;
+    uint32_t ProcessId = 0;
+    uint32_t Compared = 0;
+    uint32_t ReadFailures = 0;
+    uint32_t RelocationBoundaryBytes = 0;
+    bool SweepComplete = false;
+    std::vector<SliceObservation> Observations;
+};
 
 struct KmonOptions
 {
@@ -185,7 +219,8 @@ public:
         DeviceClient* device,
         SymbolEngine* symbols,
         std::wstring* error);
-    bool Stop(std::wstring* error);
+    // Final shutdown releases borrowed dependencies even when cleanup fails.
+    bool Stop(std::wstring* error, bool finalShutdown = false);
     bool IsActive() const;
 
     // Session artifact inventory for the exit summary: kmon log files for
@@ -223,13 +258,56 @@ public:
     std::vector<uint64_t> SnapshotResiduePfns() const;
 
 private:
+    friend bool KernelMonitorSelfTest();
+    friend bool KernelMonitorThreadSelfTest();
+    friend bool KernelMonitorLifecycleSelfTest();
+    friend bool KernelMonitorInlinePatchSelfTest();
+    class CallbackConfirmationAttempt
+    {
+    public:
+        explicit CallbackConfirmationAttempt(KernelMonitor* owner) noexcept : Owner(owner)
+        {
+        }
+        ~CallbackConfirmationAttempt() noexcept;
+        void Complete() noexcept
+        {
+            Completed = true;
+        }
+        CallbackConfirmationAttempt(const CallbackConfirmationAttempt&) = delete;
+        CallbackConfirmationAttempt& operator=(const CallbackConfirmationAttempt&) = delete;
+
+    private:
+        KernelMonitor* Owner = nullptr;
+        bool Completed = false;
+    };
+    class InlineConfirmationAttempt
+    {
+    public:
+        explicit InlineConfirmationAttempt(KernelMonitor* owner) noexcept : Owner(owner)
+        {
+        }
+        ~InlineConfirmationAttempt() noexcept;
+        void Complete() noexcept
+        {
+            Completed = true;
+        }
+        InlineConfirmationAttempt(const InlineConfirmationAttempt&) = delete;
+        InlineConfirmationAttempt& operator=(const InlineConfirmationAttempt&) = delete;
+
+    private:
+        KernelMonitor* Owner = nullptr;
+        bool Completed = false;
+    };
+    void ResetTemporalDetections();
+    void InvalidateCallbackRedirectConfirmations() noexcept;
+    void InvalidateInlinePatchConfirmations() noexcept;
+    bool ScanCallbackInlineTargets(const std::vector<KernelCallbackRecord>& records);
     void WorkerLoop();
     void IngestThreatIntel();
     void IngestLiveTimeline();
-    void NoteCredscanRead(
-        const struct TiEventRecord& record,
-        DeviceClient* device,
-        SymbolEngine* symbols);
+    void NoteCredscanRead(const struct TiEventRecord& record);
+    void NoteRegionObservation(const KmonRegionObservation& observation, const wchar_t* source);
+    void NoteTiRegionEvent(const TiEventRecord& record, DeviceClient* device, SymbolEngine* symbols);
     // Auto-capture turns a mapper/user-mode detection into preserved
     // evidence: both the Berkan kernel arena and its explorer stub pages
     // were detected while resident but lost before a human could dump.
@@ -245,8 +323,18 @@ private:
         SymbolEngine* symbols,
         HANDLE processHandle,
         uint64_t maxBytes,
-        std::wstring* captureNote);
+        std::wstring* captureNote,
+        uint64_t rootCr3 = 0,
+        uint64_t rootCreateTime = 0);
     void ScanHiddenProcesses();
+    void ScanConcealedUserProcess(uint32_t pid, uint64_t eprocess, uint64_t createTime, const std::wstring& image);
+    void ScanUserExecutionEvidence(
+        const ProcessTriageTarget& target,
+        const std::vector<ProcessUserModuleRange>& modules,
+        bool modulesComplete,
+        const ProcessVadScanResult* vad,
+        const std::wstring& image,
+        bool captureContexts);
     void ScanMapperRemnants();
     void ScanPoolMappedImages();
     void ScanUnbackedDriverObjects();
@@ -255,9 +343,14 @@ private:
     void ScanModuleInventory();
     void ScanOrphanMappedPages();
     void ScanHookCallbacks();
+    void ScanCallbackLifecycleSurfaces();
+    void RememberExecutionCallbacks(const std::wstring& surface, const std::vector<KernelCallbackRecord>& records);
+    void CompareEvidenceSurface(const std::wstring& surface, const std::map<std::wstring, std::wstring>& state,
+        bool complete, const std::wstring& scope);
     // dxgkrnl/GPU kernel driver writable data sections: per-adapter DDI
     // dispatch tables that no callback/FastIo/IDT scan reaches.
     void ScanGraphicsDispatchTables();
+    void ScanPlatformEvidence();
     void ScanHookInput();
     void ScanCpuIntegrityHooks();
     void ScanHookDataPointers();
@@ -277,7 +370,7 @@ private:
     void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
-    void EmitUnique(
+    bool EmitUnique(
         const std::wstring& kind,
         const std::wstring& key,
         const std::wstring& driver,
@@ -285,6 +378,16 @@ private:
         const std::wstring& summary,
         const std::wstring& notes,
         uint32_t processId = 0);
+    bool EmitUniqueBounded(
+        size_t limit,
+        size_t* emitted,
+        size_t* deferred,
+        const std::wstring& kind,
+        const std::wstring& key,
+        const std::wstring& driver,
+        const std::wstring& layer,
+        const std::wstring& summary,
+        const std::wstring& notes);
     void EmitMappedResidue(
         const std::wstring& key,
         const std::wstring& driver,
@@ -316,6 +419,8 @@ private:
     void RotateLogLocked();
     std::wstring BuildLogFilePath(int rotationIndex) const;
 
+    // Stop calls DisarmIotrace while holding the same lifecycle lock.
+    mutable std::recursive_mutex LifecycleMutex;
     mutable std::mutex StateMutex;
     KmonOptions Options;
     std::atomic<bool> Active{false};
@@ -343,7 +448,7 @@ private:
     // Handle-table diff state for watched pids: pid -> known (handle,object)
     // pairs. First pass per pid is a silent baseline; later passes emit
     // driver.handle for new Device-typed handles.
-    std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> WatchKnownHandles;
+    std::map<uint32_t, std::set<std::tuple<uint64_t, uint64_t, uint32_t>>> WatchKnownHandles;
     uint32_t WatchDeviceTypeIndex = 0;
     bool WatchDeviceTypeKnown = false;
     // Iotrace state (guard with WatchMutex): armed flag for the worker
@@ -404,6 +509,7 @@ private:
     uint64_t DriverTamperCursor = 0;
     uint64_t DriverTamperChecks = 0;
     void ScanDriverTamper();
+    void ScanKernelImageIntegrity();
     bool RecordDriverImageBaseline(
         const std::wstring& stem,
         uint64_t base,
@@ -493,18 +599,12 @@ private:
     struct KmonCredscanWindow
     {
         uint64_t Count = 0;
-        uint64_t WindowStartMs = 0;
+        uint64_t WindowStartTimestamp = 0;
+        uint64_t CallerCreateTime = 0;
+        uint64_t TargetCreateTime = 0;
         bool Emitted = false;
     };
     std::map<uint64_t, KmonCredscanWindow> CredscanWindows;
-
-    // TI caller/target image resolution cache, keyed by pid plus the
-    // event's own image basename when present: the console-write flood
-    // re-resolved the same pid through kernel queries thousands of times
-    // and starved driver-lifecycle ingest, while a bare pid key would
-    // misattribute after pid reuse. Worker thread only; reset on Start().
-    std::map<std::wstring, std::wstring> TiResolvedImageCache;
-    std::map<std::wstring, uint64_t> TiResolvedImageTickMs;
 
     // Detection-time evidence capture state: per-session (layer, address)
     // dedupe plus a byte budget so auto-capture can never fill the disk.
@@ -537,18 +637,86 @@ private:
     std::atomic<uint64_t> LastEventTickMs{0};
 
     uint64_t TiCursorSequence = 0;
+    uint64_t TiTraceGeneration = 0;
+    uint64_t TiMissingSequences = 0;
+    std::wstring TiHealthState;
+    uint64_t LastTiIngestTickMs = 0;
+    uint64_t MaxTiIngestGapMs = 0;
+    KmonRegionHistory RegionHistory;
     uint64_t LiveCursorEventId = 0;
     uint64_t NextHiddenScanTickMs = 0;
     uint64_t NextMapperScanTickMs = 0;
     uint64_t NextKpageScanTickMs = 0;
+    uint64_t KpageRegionOffset = 0;
+    OrphanKernelPageContinuation KpageContinuation;
+    uint64_t PoolPeEntryOffset = 0;
+    uint64_t PoolPeAllocationAfter = 0;
+    uint64_t PoolPeInteriorRound = 0;
+    uint64_t MapperUnloadedAfter = 0;
+    uint64_t MapperPiddbAfter = 0;
+    uint64_t MapperHashAfter = 0;
+    uint64_t DriverTypeListReportAfter = 0;
+    DeferredQueueCursor WorkItemCursor;
+    DeferredQueueCursor DpcQueueCursor;
+    DeferredQueueCursor TimerQueueCursor;
+    ::WnfCallbackCursor WnfCallbackCursor;
+    PendingIrpCursor IrpCompletionCursor;
+    uint64_t ByovdModuleAfter = 0;
+    uint64_t NextPlatformEvidenceTickMs = 0;
+    uint64_t CfgDataPtrInventoryIdentity = 0;
+    uint64_t CfgDataPtrNextBuildTickMs = 0;
+    std::map<std::wstring, std::pair<uint64_t, std::vector<KernelCallbackRecord>>> ExecutionCallbackCache;
+    std::map<std::wstring, std::map<std::wstring, std::wstring>> EvidenceSurfaceBaselines;
+    // (Root, region start) -> (last probed target address, last use tick). WatchMutex.
+    std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>> MapperTargetCursors;
     uint64_t NextUserScanTickMs = 0;
+    // Exact process generation -> next VirtualQueryEx address. WatchMutex.
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserVmWalkCursors;
+    // Exact process generation -> last attempted thread ID. WatchMutex.
+    std::map<std::pair<uint32_t, uint64_t>, uint32_t> UserThreadStartCursors;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserModuleWalkCursors;
+    std::map<std::wstring, KmonImageScanCursor> ImagePageCursors;
+    uint64_t KernelImageCursor = 0;
+    struct GraphicsDispatchCursor
+    {
+        uint64_t Base = 0;
+        uint64_t HeaderHash = 0;
+        uint32_t Size = 0;
+        uint32_t NextRva = 0;
+    };
+    std::map<std::wstring, GraphicsDispatchCursor> GraphicsDispatchCursors;
+    struct SuspectProcess
+    {
+        uint32_t Pid = 0;
+        uint64_t Eprocess = 0;
+        uint64_t CreateTime = 0;
+        uint64_t LastObservedMs = 0;
+        std::wstring Image;
+    };
+    std::map<uint32_t, SuspectProcess> SuspectProcesses;
+    KmonUserRuntimeTracker UserRuntimeTracker;
+    struct ExecutionCursor
+    {
+        uint32_t Thread = 0;
+        uint32_t KernelThread = 0;
+        uint64_t Module = 0;
+        KmonUserCallbackContinuation Callbacks;
+        uint64_t LastObservedMs = 0;
+    };
+    std::map<std::pair<uint32_t, uint64_t>, ExecutionCursor> UserEvidenceCursors;
+    std::map<std::pair<uint32_t, uint64_t>, KmonFileIdentity> UserFileIdentities;
+    uint64_t WatchedHandleCursor = 0;
+    uint64_t NextRegionFollowupTickMs = 0;
+    bool RegionFollowupPending = false;
+    std::map<uint32_t, uint64_t> WatchedHandleGenerations;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> WatchedHandleAfter;
     // Stage 1: kernel-thread scan cadence and the two-scan confirmation that
     // keeps a thread-creation race from printing a hidden-thread verdict.
     uint64_t NextThreadScanTickMs = 0;
-    std::map<uint32_t, uint32_t> ThreadHiddenStrikes;
+    std::map<std::wstring, uint32_t> ThreadHiddenStrikes;
     // Stage 1b: ETHREAD-list DKOM confirmation, keyed by pid because the
     // verdict compares a whole process thread list against its accounting.
-    std::map<uint32_t, uint32_t> ThreadListDkomStrikes;
+    std::map<std::wstring, uint32_t> ThreadListDkomStrikes;
     std::atomic<uint64_t> ThreadScans{0};
     // Stage 2: inline-patch scan cadence plus the two-scan confirmation that
     // keeps a page-in or a hotpatch transition from printing a patch verdict.
@@ -558,8 +726,15 @@ private:
     static constexpr uint32_t kInlinePatchWatchScanIntervalMs = 10000;
     uint64_t NextInlinePatchScanTickMs = 0;
     std::map<std::wstring, uint32_t> InlinePatchStrikes;
+    std::map<std::wstring, uint32_t> CallbackRedirectStrikes;
+    // Last completed batch address; resolved against the next live inventory.
+    uint64_t CallbackRedirectCursor = 0;
+    std::vector<uint64_t> CallbackRedirectBatch;
 };
 
+bool KmonEnsureKernelModuleView(SymbolEngine* symbols);
+bool KernelMonitorLifecycleSelfTest();
+bool KmonWindowsModulePathLooksInbox(const std::wstring& path);
 std::wstring KmonBasenameLower(const std::wstring& path);
 // P1: driver name stem -- basename lower case with a trailing ".sys"
 // removed, so a TI load event ("\SystemRoot\...\x.sys") and a DRIVER_OBJECT
@@ -737,9 +912,11 @@ struct KmonKernelThreadInput
 {
     uint32_t ProcessId = 0;
     uint32_t ThreadId = 0;
+    uint64_t ThreadObject = 0;
     uint64_t StartAddress = 0;
     bool StartAddressKnown = false;
     bool StartInLoadedModule = false;
+    bool ModuleViewKnown = false;
     bool StartIsKernelAddress = false;
     bool KernelListComplete = false;
     bool HostViewKnown = false;
@@ -758,6 +935,7 @@ struct KmonKernelThreadInput
 struct KmonKernelThreadListInput
 {
     uint32_t ProcessId = 0;
+    uint64_t ProcessObject = 0;
     uint32_t WalkedThreads = 0;
     uint32_t AccountingBefore = 0;
     uint32_t AccountingAfter = 0;
@@ -770,6 +948,8 @@ KmonKernelThreadKind KmonClassifyKernelThread(const KmonKernelThreadInput& input
 const wchar_t* KmonKernelThreadKindName(KmonKernelThreadKind kind);
 // Stage 1 regression: drives the thread verdict through synthetic inputs.
 bool KernelMonitorThreadSelfTest();
+bool KernelMonitorUserModeSelfTest();
+bool KernelMonitorMappedSectionSelfTest();
 // Stage 2: inline patches on hot ntoskrnl/win32k entry points. A mapper or
 // BYOVD driver that hides a process, reads a game, or blinds a syscall query
 // usually rewrites the first bytes of a hot entry point with a transfer or an

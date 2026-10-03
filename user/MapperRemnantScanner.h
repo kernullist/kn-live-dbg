@@ -19,6 +19,7 @@ struct MapperUnloadedRecord
     std::wstring Notes;
     bool StillPresent = false;
     bool StillExecutable = false;
+    bool PageProbeKnown = false;
     bool OverlapsLoadedModule = false;
     bool RangeReused = false;
     bool SameImageReload = false;
@@ -58,6 +59,10 @@ struct MapperScanOptions
     bool IncludePiddb = true;
     bool IncludeHash = true;
     uint32_t Limit = 0;
+    bool ContinueReports = false;
+    uint64_t UnloadedAfter = 0;
+    uint64_t PiddbAfter = 0;
+    uint64_t HashAfter = 0;
 };
 
 struct MapperScanResult
@@ -71,6 +76,7 @@ struct MapperScanResult
     uint64_t MmUnloadedArray = 0;
     uint32_t MmLastUnloadedDriver = 0;
     uint32_t UnloadedSlotCount = 0;
+    uint64_t UnloadedPageProbeFailures = 0;
     uint64_t PiDDBCacheTable = 0;
     uint32_t PiddbElementCount = 0;
     uint64_t HashListSymbol = 0;
@@ -84,6 +90,16 @@ struct MapperScanResult
     bool HashResolved = false;
     bool HashComplete = false;
     bool AnySuspicious = false;
+    uint64_t UnloadedCollected = 0;
+    uint64_t PiddbCollected = 0;
+    uint64_t HashCollected = 0;
+    uint64_t NextUnloadedAfter = 0;
+    uint64_t NextPiddbAfter = 0;
+    uint64_t NextHashAfter = 0;
+    bool OutputTruncated = false;
+    bool UnloadedOutputTruncated = false;
+    bool PiddbOutputTruncated = false;
+    bool HashOutputTruncated = false;
 };
 
 class MapperRemnantScanner

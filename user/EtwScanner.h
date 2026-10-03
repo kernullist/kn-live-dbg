@@ -119,6 +119,16 @@ struct EtwTiCrossInput
     uint64_t LastEventTickMs = 0;
     uint64_t NowTickMs = 0;
     uint64_t MinSilentSeconds = 15;
+    bool TraceStateKnown = false;
+    bool TraceThreadRunning = false;
+    bool TraceExitStatusKnown = false;
+    bool TraceExitAfterStopRequest = false;
+    uint32_t TraceExitStatus = 0;
+    uint64_t EventsLost = 0;
+    uint64_t ConsumerMissingSequence = 0;
+    // Set only for independently established activity covered by this session.
+    bool ExpectedActivityKnown = false;
+    uint64_t ExpectedActivitySinceTickMs = 0;
 };
 
 struct EtwTiCrossResult
@@ -126,11 +136,13 @@ struct EtwTiCrossResult
     bool TiActive = false;
     bool Skipped = false;
     bool Suspicious = false;
-    std::wstring Status; // skipped | silent | healthy | dropping | starting
+    std::wstring Status; // inactive | stopped | starting | unknown | receiving | loss_observed | expected_activity_missing
     std::wstring Reason;
     double EventsPerSecond = 0.0;
     uint64_t EventsReceived = 0;
     uint64_t EventsDropped = 0;
+    uint64_t EventsLost = 0;
+    uint64_t ConsumerMissingSequence = 0;
     uint64_t ElapsedSeconds = 0;
     uint64_t SecondsSinceLastEvent = 0;
     std::vector<std::wstring> Warnings;
@@ -173,3 +185,4 @@ private:
 std::wstring BuildEtwIntegrityJson(const EtwIntegrityResult& result);
 std::wstring BuildEtwProvidersJson(const EtwProviderScanResult& result);
 std::wstring BuildEtwTiCrossJson(const EtwTiCrossResult& result);
+bool EtwTiCrossSelfTest();

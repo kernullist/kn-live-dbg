@@ -21,9 +21,20 @@ struct MinifilterAttachmentRecord
 
 struct MinifilterAttachmentScanResult
 {
+    struct VolumeSnapshot
+    {
+        std::wstring Name;
+        bool Complete = false;
+        uint32_t RecordCount = 0;
+    };
     std::vector<std::wstring> Volumes;
     std::vector<MinifilterAttachmentRecord> Records;
     std::vector<std::wstring> Warnings;
+    std::vector<VolumeSnapshot> VolumeSnapshots;
+    uint64_t SnapshotTickMs = 0;
+    bool VolumeEnumerationComplete = false;
+    bool SnapshotStable = false;
+    bool CoverageComplete = false;
     bool Incomplete = false;
 };
 
@@ -38,3 +49,5 @@ public:
 };
 
 bool MinifilterAttachmentScannerSelfTest();
+std::wstring MinifilterAttachmentIdentity(const MinifilterAttachmentRecord& record);
+std::wstring MinifilterAttachmentStateKey(const MinifilterAttachmentRecord& record);

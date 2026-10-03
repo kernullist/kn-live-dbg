@@ -24,6 +24,7 @@
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
 #include "KernelMonitor.h"
+#include "KmonPlatformEvidence.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -814,7 +815,7 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
         if (kmon != nullptr)
         {
             std::wstring stopError;
-            kmon->Stop(&stopError);
+            kmon->Stop(&stopError, true);
             g_KmonForShutdown.store(nullptr);
         }
         TiSubscriber* sub = g_TiSubscriberForShutdown.load();
@@ -15722,6 +15723,12 @@ static void HandleEtwCommand(
             input.EventsDropped = stats.EventsDropped;
             input.StartTickMs = stats.StartTickMs;
             input.LastEventTickMs = stats.LastEventTickMs;
+            input.EventsLost = stats.EventsLost;
+            input.TraceStateKnown = stats.Trace.Generation != 0;
+            input.TraceThreadRunning = stats.Trace.ThreadRunning;
+            input.TraceExitStatusKnown = stats.Trace.ExitStatusKnown;
+            input.TraceExitAfterStopRequest = stats.Trace.ExitAfterStopRequest;
+            input.TraceExitStatus = stats.Trace.ExitStatus;
             input.NowTickMs = GetTickCount64();
             uint8_t protection = 0;
             std::wstring gateError;
@@ -17937,7 +17944,7 @@ static void HandleIdtCommand(
             std::wcout << L"  all present interrupt handlers resolve into loaded kernel modules";
             if (result.ProcessorsCompared > 0)
             {
-                std::wcout << L" and match across all " << std::dec << (result.ProcessorsCompared + 1) << L" processors";
+                std::wcout << L" and match across the " << std::dec << (result.ProcessorsCompared + 1) << L" sampled processors";
             }
             std::wcout << L"\n";
         }
@@ -21972,7 +21979,8 @@ static void HandleDmaCommand(
         std::wcout << L" dmar=" << (result.DmarPresent ? L"y" : L"n")
                    << L" ivrs=" << (result.IvrsPresent ? L"y" : L"n")
                    << L" iommu=" << (result.IommuFirmwarePresent ? L"y" : L"n")
-                   << L" kdma=" << (result.KernelDmaProtectionEnabled ? L"on" : L"off/unknown")
+                   << L" kdma_enforcement=unknown dma_guard_config="
+                   << (result.DmaGuardConfigurationKnown ? std::to_wstring(result.DmaGuardConfigurationValue) : L"unknown")
                    << L" removable_pci=" << result.RemovableBusCount << L"\n";
         for (const DmaPciDeviceRecord& deviceRecord : result.PciDevices)
         {
@@ -23643,7 +23651,8 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     {
         event.Summary += L" tid=" + std::to_wstring(live.ThreadId);
     }
-    if (event.Domain == L"thread" && live.CreatorProcessId != 0)
+    if ((event.Domain == L"thread" || event.Domain == L"process") &&
+        live.CreatorProcessId != 0)
     {
         event.Summary += L" creator_pid=" + std::to_wstring(live.CreatorProcessId);
         event.Evidence[L"creator_pid"] = std::to_wstring(live.CreatorProcessId);
@@ -23653,7 +23662,8 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
             event.Summary += L" creator_tid=" + std::to_wstring(live.CreatorThreadId);
             event.Evidence[L"creator_tid"] = std::to_wstring(live.CreatorThreadId);
         }
-        if (live.CreatorProcessId != 0 && live.CreatorProcessId != live.ProcessId)
+        if (event.Domain == L"thread" &&
+            live.CreatorProcessId != live.ProcessId)
         {
             event.Risk = L"warning";
             event.Evidence[L"remote_thread"] = L"true";
@@ -23667,6 +23677,11 @@ static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& li
     {
         event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
         event.Evidence[L"parent_pid"] = std::to_wstring(live.ParentProcessId);
+        if (event.Domain == L"process" && live.CreatorProcessId != 0)
+        {
+            event.Evidence[L"parent_differs_from_creator"] =
+                live.ParentProcessId != live.CreatorProcessId ? L"true" : L"false";
+        }
     }
     if (!live.ImagePath.empty())
     {
@@ -25072,6 +25087,8 @@ std::wcout << L"                          into code no loaded module owns, into 
 std::wcout << L"                          pool stub body (2 passes must agree); an in-module hotpatch, an inbox\n";
 std::wcout << L"                          win32k forwarder, and a register-indirect head stay deferrals, and a\n";
 std::wcout << L"                          destination below the canonical kernel floor is not reported\n";
+std::wcout << L"                          callback_redirect follows up to 4 static hops from 64 rotating\n";
+std::wcout << L"                          callback entries per pass; 2 observations must name the same target\n";
 std::wcout << L"  hook.breakpoint         int3 trap on the same hot entry points (2 passes)\n";
 std::wcout << L"  hook.scan               entry prologue or thunk slot that could not be read (deferral)\n";
 std::wcout << L"  thread.unbacked         kernel thread whose start address no loaded module owns\n";
@@ -25091,11 +25108,14 @@ std::wcout << L"  mapper.stub             same stub body inside an allocation th
     std::wcout << L"                          mapped-path mismatch, W+X (builtin and /name|/pid), no MZ, stamp/arch,\n";
     std::wcout << L"                          COW/.text/EP vs disk (Windows builtins and /name|/pid targets),\n";
     std::wcout << L"                          extra PE (private/image/mapped), ghosting; PPL uses kernel VAD\n";
+    std::wcout << L"                          kernel section base independently checks PEB/loader image identity\n";
     std::wcout << L"  process.implant         drop-dir module in a builtin or /name|/pid target,\n";
     std::wcout << L"                          unknown module outside the image dir on a watch target,\n";
     std::wcout << L"                          extra non-inbox module in a Windows builtin,\n";
     std::wcout << L"                          signed-host + hijack DLL in the image dir (dll_proxy_host),\n";
     std::wcout << L"                          private W+X / PE VAD / hidden executable PTEs on watch or PPL,\n";
+    std::wcout << L"                          thread_private_exec / thread_mapped_exec across scanned hosts require\n";
+    std::wcout << L"                          a live same-generation thread start and readable orphan code\n";
     std::wcout << L"                          IAT thunks in the main image, game DLLs, or hookable system DLLs,\n";
     std::wcout << L"                          plus dxgi/d3d*/opengl/vulkan and overlay (Steam/OBS/Discord/RTSS) .rdata slots,\n";
     std::wcout << L"                          that point at private/mapped RX\n";
@@ -25544,13 +25564,18 @@ static void HandleKmonCommand(
 
         if (action == L"stop")
         {
-            if (!kmon.IsActive())
+            if (!kmon.IsActive() && !kmon.IotraceArmed())
             {
                 std::wcerr << L"!kmon: not active.\n";
                 break;
             }
             std::wstring stopError;
-            kmon.Stop(&stopError);
+            if (!kmon.Stop(&stopError))
+            {
+                std::wcerr << L"!kmon: worker stopped; I/O trace cleanup failed: "
+                           << stopError << L". Retry !kmon stop.\n";
+                break;
+            }
             g_KmonForShutdown.store(nullptr);
             PrintColoredText(L"[kmon]", KNDBG_COLOR_TITLE);
             std::wcout << L" stopped. TI and timeline live are left running.\n";
@@ -31378,6 +31403,10 @@ static int RunConsoleSurfaceSelfTest()
             L"module-prologue-address-filter");
         CheckConsoleSurfaceSelfTest(
             &context,
+            IntegrityRelocationSelfTest(),
+            L"integrity-relocation-validation");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             DeviceStackWalkSelfTest(),
             L"device-stack-cycle-guard");
         CheckConsoleSurfaceSelfTest(
@@ -31565,8 +31594,91 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"help", L"!kmon"}, L"watch", L"help-kmon-watch-completion");
         CheckConsoleSurfaceSelfTest(
             &context,
+            ThreatIntelSubscriberSelfTest(),
+            L"ti-consumer-lifecycle");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            EtwTiCrossSelfTest(),
+            L"ti-health-evidence");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WorkItemScannerSelfTest(),
+            L"work-item-continuation");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ExecutiveCallbackScannerSelfTest(),
+            L"executive-callback-layout");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WnfCallbackScannerSelfTest(),
+            L"wnf-kernel-callback-layout");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            NmiScannerSelfTest(),
+            L"nmi-exact-layout-evidence");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WfpPolicyScannerSelfTest(),
+            L"wfp-policy-inventory");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            PendingIrpScannerSelfTest(),
+            L"pending-irp-continuation");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KmonUserEvidenceSelfTest(),
+            L"user-execution-provenance");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KmonTemporalEvidenceSelfTest(),
+            L"region-temporal-evidence");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KmonPlatformEvidenceSelfTest(),
+            L"platform-trust-evidence");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ByovdHashBudgetSelfTest(),
+            L"byovd-hash-budget");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ByovdCatalogFreshnessSelfTest(),
+            L"byovd-catalog-freshness");
+        CheckConsoleSurfaceSelfTest(
+            &context,
             KernelMonitorSelfTest(),
             L"kmon-classification");
+        {
+            TimelineLiveEvent live = {};
+            live.Type = KNDBG_TIMELINE_EVENT_PROCESS_CREATE;
+            live.ProcessId = 100;
+            live.ParentProcessId = 50;
+            live.CreatorProcessId = 60;
+            live.CreatorThreadId = 61;
+            const TimelineEvent projected = BuildTimelineEventFromLiveEvent(live);
+            CheckConsoleSurfaceSelfTest(&context,
+                projected.Domain == L"process" && projected.Evidence.at(L"parent_pid") == L"50" &&
+                projected.Evidence.at(L"creator_pid") == L"60" && projected.Evidence.at(L"creator_tid") == L"61" &&
+                projected.Evidence.at(L"parent_differs_from_creator") == L"true" &&
+                projected.Evidence.find(L"remote_thread") == projected.Evidence.end(),
+                L"process-parent-creator-distinct-projection");
+        }
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorLifecycleSelfTest(),
+            L"kmon-lifecycle-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            PoolPeHunterSelfTest(),
+            L"pool-pe-window-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorInlinePatchSelfTest(),
+            L"kmon-inline-runtime-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorMapperPoolSelfTest(),
+            L"kmon-mapper-stub-regression");
         {
             KmonArtifactSkipReason artifactSkip = KmonArtifactSkipReason::None;
             CheckConsoleSurfaceSelfTest(
@@ -31593,6 +31705,18 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             KernelMonitorThreadSelfTest(),
             L"kmon-thread-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorUserModeSelfTest(),
+            L"kmon-user-memory-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            KernelMonitorMappedSectionSelfTest(),
+            L"kmon-mapped-section-artifact");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            DpcTimerScannerSelfTest(),
+            L"kmon-dpc-list-regression");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"!kmon"),
@@ -31637,7 +31761,9 @@ static int RunConsoleSurfaceSelfTest()
                     kmonHelp.find(L"thread.dkom") != std::wstring::npos &&
                     kmonHelp.find(L"thread.scan") != std::wstring::npos &&
                     kmonHelp.find(L"pool.hidden") != std::wstring::npos &&
-                    kmonHelp.find(L"mapper.stub") != std::wstring::npos,
+                    kmonHelp.find(L"mapper.stub") != std::wstring::npos &&
+                    kmonHelp.find(L"callback_redirect") != std::wstring::npos &&
+                    kmonHelp.find(L"thread_mapped_exec") != std::wstring::npos,
                 L"kmon-help-covers-drop-load-and-live-tail");
         }
         CheckCompletionCandidate(&context, {L"help", L"!byovd"}, L"fixture", L"help-byovd-fixture-completion");
@@ -32040,6 +32166,11 @@ static int RunConsoleSurfaceSelfTest()
                 L"pool-pe-dump-is-write-like");
         }
         CheckConsoleSurfaceSelfTest(&context, LeftoverCommonSelfTest(), L"leftover-common-self-test");
+        CheckConsoleSurfaceSelfTest(&context, MsrScannerSelfTest(), L"msr-kva-shadow-entry");
+        CheckConsoleSurfaceSelfTest(&context, IdtScannerSelfTest(), L"idt-table-shape-and-coverage");
+        CheckConsoleSurfaceSelfTest(&context, AiProviderRuntime::ProcessCaptureSelfTest(), L"ai-process-capture-bounds-and-timeout");
+        CheckConsoleSurfaceSelfTest(&context, AiProviderRuntime::HttpResponseBodySelfTest(), L"ai-http-capture-bounds-and-timeout");
+        CheckConsoleSurfaceSelfTest(&context, AiProviderRuntime::HttpRedirectSelfTest(), L"ai-http-redirect-credential-boundary");
         CheckConsoleSurfaceSelfTest(&context, PayloadTracerSelfTest(), L"payload-tracer-self-test");
         CheckConsoleSurfaceSelfTest(&context, MapperRemnantSelfTest(), L"mapper-remnant-self-test");
         CheckConsoleSurfaceSelfTest(&context, OrphanKernelPageSelfTest(), L"orphan-kpage-self-test");
@@ -54400,6 +54531,39 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunConsoleSurfaceSelfTest();
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"platform-query")
+        {
+            KmonPlatformEvidenceResult result;
+            std::wstring error;
+            const bool collected = CollectKmonPlatformEvidence(&result, &error);
+            std::wcout << L"{\"schema\":\"kn-live-dbg.platform-evidence-query.v1\",\"collected\":"
+                << (collected ? L"true" : L"false") << L",\"local_collection_complete\":"
+                << (result.Complete ? L"true" : L"false") << L",\"fields\":{";
+            bool first = true;
+            for (const auto& field : result.Fields)
+            {
+                if (!first)
+                {
+                    std::wcout << L",";
+                }
+                first = false;
+                std::wcout << L"\"" << mcpjson::Escape(field.first) << L"\":\""
+                    << mcpjson::Escape(field.second) << L"\"";
+            }
+            std::wcout << L"},\"warnings\":[";
+            first = true;
+            for (const auto& warning : result.Warnings)
+            {
+                if (!first)
+                {
+                    std::wcout << L",";
+                }
+                first = false;
+                std::wcout << L"\"" << mcpjson::Escape(warning) << L"\"";
+            }
+            std::wcout << L"],\"error\":\"" << mcpjson::Escape(error) << L"\"}\n";
+            return collected ? 0 : 1;
+        }
         if (argc >= 4 &&
             ToLower(argv[2]) ==
                 L"cloudfiles-query")
@@ -54419,10 +54583,13 @@ int wmain(int argc, wchar_t** argv)
             int timelineExit = RunTimelineSelfTest();
             int mcpExit = RunMcpToolCatalogSelfTest();
             int consoleExit = RunConsoleSurfaceSelfTest();
-            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0) ? 0 : 1;
+            int remoteExit = RunRemoteProtocolSelfTest();
+            int connectExit = RunRemoteConnectArgvSelfTest();
+            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0 &&
+                remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
         return 2;
     }
 
@@ -54753,6 +54920,22 @@ int wmain(int argc, wchar_t** argv)
     StopTimelineAutoDrainWorker();
     dbgeng.Shutdown();
     bool cleanupOk = true;
+    // Collectors borrow the device and must stop before its handle is closed.
+    {
+        std::wstring stopError;
+        if (!GetKmonInstance().Stop(&stopError, true))
+        {
+            std::wcerr << L"kmon shutdown cleanup failed: " << stopError << L"\n";
+            cleanupOk = false;
+        }
+        g_KmonForShutdown.store(nullptr);
+        if (!GetTiSubscriberInstance().Stop(&stopError))
+        {
+            std::wcerr << L"TI shutdown cleanup failed: " << stopError << L"\n";
+            cleanupOk = false;
+        }
+        g_TiSubscriberForShutdown.store(nullptr);
+    }
     if (!CleanupByovdFixtureDriverOnExit(state))
     {
         cleanupOk = false;

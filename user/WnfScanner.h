@@ -2,6 +2,7 @@
 
 #include "DeviceClient.h"
 #include "SymbolEngine.h"
+#include "ScannerListWindow.h"
 
 #include <cstdint>
 #include <string>
@@ -137,6 +138,37 @@ struct WnfScanResult
 
 WnfStateNameDecoded DecodeWnfStateName(uint64_t raw);
 
+struct WnfCallbackRecord
+{
+    uint64_t Subscription = 0;
+    uint64_t ProcessContext = 0;
+    uint64_t Callback = 0;
+    uint64_t CallbackSlot = 0;
+    uint64_t Context = 0;
+    std::wstring Module;
+    std::wstring Symbol;
+    bool Suspicious = false;
+};
+
+struct WnfCallbackCursor
+{
+    ScannerListCursor Processes;
+    ScannerListCursor Subscriptions;
+    uint64_t PendingProcessNode = 0;
+};
+
+struct WnfCallbackScanResult
+{
+    std::vector<WnfCallbackRecord> Records;
+    std::vector<std::wstring> Warnings;
+    std::wstring CoverageScope = L"ExpWnfProcessesListHead kernel subscription callback fields";
+    bool LayoutFromPdb = false;
+    bool CoverageComplete = false;
+    uint32_t ProcessContextsVisited = 0;
+    uint32_t SubscriptionsVisited = 0;
+    WnfCallbackCursor NextCursor;
+};
+
 class WnfScanner
 {
 public:
@@ -159,6 +191,7 @@ public:
 
     WnfScanner(DeviceClient& device, SymbolEngine& symbols);
     bool Scan(const Options& options, WnfScanResult* result, std::wstring* error);
+    bool ScanCallbacks(uint32_t limit, const WnfCallbackCursor& cursor, WnfCallbackScanResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
@@ -166,3 +199,4 @@ private:
 };
 
 std::wstring BuildWnfInstancesJson(const WnfScanResult& result);
+bool WnfCallbackScannerSelfTest();

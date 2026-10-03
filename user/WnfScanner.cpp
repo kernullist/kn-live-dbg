@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cwctype>
 #include <iomanip>
+#include <map>
 #include <sstream>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2313,6 +2315,441 @@ WnfScanner::WnfScanner(DeviceClient& device, SymbolEngine& symbols) :
     device_(device),
     symbols_(symbols)
 {
+}
+
+namespace
+{
+    bool WnfExactField(SymbolEngine& symbols, const wchar_t* type, const wchar_t* name,
+        uint64_t bytes, TypeLayoutInfo* layout, TypeFieldInfo* field)
+    {
+        return symbols.GetTypeLayout(type, layout, nullptr) && layout->Size != 0 && layout->Size <= 0x1000 &&
+            symbols.FindField(type, name, field, nullptr) && !field->IsBitField && field->Length == bytes &&
+            field->Offset <= layout->Size && bytes <= layout->Size - field->Offset;
+    }
+
+    template<typename Reader>
+    bool WalkExactWnfList(Reader& read, uint64_t head, size_t limit, std::vector<uint64_t>* nodes)
+    {
+        nodes->clear();
+        uint64_t first = 0;
+        uint64_t last = 0;
+        if (!IsKernelAddress(head) || head > ~0ull - 8 || !read(head, &first) || !read(head + 8, &last))
+        {
+            return false;
+        }
+        std::set<uint64_t> visited;
+        uint64_t current = first;
+        uint64_t previous = head;
+        while (current != head)
+        {
+            uint64_t next = 0;
+            uint64_t back = 0;
+            if (!IsKernelAddress(current) || (current & 7) != 0 || current > ~0ull - 8 ||
+                visited.size() >= limit || !visited.insert(current).second ||
+                !read(current, &next) || !read(current + 8, &back) || back != previous)
+            {
+                return false;
+            }
+            nodes->push_back(current);
+            previous = current;
+            current = next;
+        }
+        uint64_t afterFirst = 0;
+        uint64_t afterLast = 0;
+        return previous == last && read(head, &afterFirst) && read(head + 8, &afterLast) &&
+            afterFirst == first && afterLast == last;
+    }
+
+    bool WnfHeaderMatches(uint16_t code, uint16_t bytes, uint16_t expectedCode, uint64_t expectedBytes)
+    {
+        return expectedBytes != 0 && expectedBytes <= 0xffff && code == expectedCode && bytes == expectedBytes;
+    }
+
+    template<typename Reader, typename HeadReader, typename Collector>
+    bool CollectWnfCallbackWindows(Reader& read, HeadReader& getHead, Collector& collect,
+        uint64_t root, size_t limit, const WnfCallbackCursor& cursor, WnfCallbackScanResult* result)
+    {
+        WnfCallbackCursor position = cursor;
+        bool complete = cursor.Processes.Entry == 0 && cursor.PendingProcessNode == 0;
+        bool reachedEnd = false;
+        bool anyWindow = false;
+        size_t subscriptionsWalked = 0;
+        std::vector<ScannerListWindow> processWindows;
+        for (size_t step = 0; step < 32 && subscriptionsWalked < limit; ++step)
+        {
+            ScannerListWindow processWindow;
+            if (!ReadScannerListWindow(read, root, root + 8, false, 1, position.Processes, &processWindow))
+            {
+                complete = false;
+                position = {};
+                break;
+            }
+            anyWindow = true;
+            processWindows.push_back(processWindow);
+            complete = complete && !processWindow.Restarted;
+            if (processWindow.Nodes.empty())
+            {
+                reachedEnd = processWindow.ReachedEnd;
+                position = {};
+                break;
+            }
+            const uint64_t processNode = processWindow.Nodes.front().Address;
+            ++result->ProcessContextsVisited;
+            uint64_t head = 0;
+            ScannerListWindow subscriptions;
+            const ScannerListCursor subscriptionCursor = position.PendingProcessNode == processNode
+                ? position.Subscriptions : ScannerListCursor{};
+            const bool captured = getHead(processNode, &head) &&
+                ReadScannerListWindow(read, head, head + 8, false, limit - subscriptionsWalked,
+                    subscriptionCursor, &subscriptions);
+            subscriptionsWalked += subscriptions.NodesVisited;
+            result->SubscriptionsVisited += static_cast<uint32_t>(subscriptions.NodesVisited);
+            std::vector<WnfCallbackRecord> local;
+            if (captured)
+            {
+                for (const ScannerListNode& node : subscriptions.Nodes)
+                {
+                    WnfCallbackRecord record;
+                    if (!collect(processNode, node.Address, &record))
+                    {
+                        complete = false;
+                    }
+                    else if (record.Callback != 0)
+                    {
+                        local.push_back(std::move(record));
+                    }
+                }
+            }
+            uint64_t headAfter = 0;
+            const bool stable = captured && getHead(processNode, &headAfter) && headAfter == head &&
+                ValidateScannerListWindow(read, subscriptions) && ValidateScannerListWindow(read, processWindow);
+            if (stable)
+            {
+                result->Records.insert(result->Records.end(), local.begin(), local.end());
+                complete = complete && subscriptions.Complete;
+            }
+            else
+            {
+                complete = false;
+            }
+            const bool singleProcess = processWindow.First == processNode && processWindow.Last == processNode;
+            if (stable && !subscriptions.ReachedEnd && (!subscriptions.Restarted || singleProcess))
+            {
+                position.PendingProcessNode = processNode;
+                position.Subscriptions = subscriptions.Next;
+                break;
+            }
+            // A repeatedly removed inner anchor must not pin later process contexts.
+            position.Processes = processWindow.Next;
+            position.Subscriptions = {};
+            position.PendingProcessNode = 0;
+            if (processWindow.ReachedEnd)
+            {
+                reachedEnd = true;
+                break;
+            }
+        }
+        for (const ScannerListWindow& window : processWindows)
+        {
+            if (!ValidateScannerListWindow(read, window))
+            {
+                complete = false;
+                result->Records.clear();
+                position = {};
+                break;
+            }
+        }
+        result->NextCursor = position;
+        result->CoverageComplete = complete && reachedEnd;
+        return anyWindow;
+    }
+}
+
+bool WnfScanner::ScanCallbacks(uint32_t limit, const WnfCallbackCursor& cursor, WnfCallbackScanResult* result, std::wstring* error)
+{
+    if (result == nullptr)
+    {
+        return false;
+    }
+    *result = WnfCallbackScanResult{};
+    TypeLayoutInfo processLayout = {};
+    TypeLayoutInfo subscriptionLayout = {};
+    TypeLayoutInfo contextHeaderLayout = {};
+    TypeFieldInfo processLink = {};
+    TypeFieldInfo subscriptionHead = {};
+    TypeFieldInfo processHeader = {};
+    TypeFieldInfo subscriptionLink = {};
+    TypeFieldInfo subscriptionHeader = {};
+    TypeFieldInfo callback = {};
+    TypeFieldInfo callbackContext = {};
+    TypeFieldInfo nodeCode = {};
+    TypeFieldInfo nodeBytes = {};
+    uint64_t root = 0;
+    bool ok = false;
+    do
+    {
+        if (!symbols_.ResolveSymbol(L"nt!ExpWnfProcessesListHead", &root, nullptr) || !IsKernelAddress(root) ||
+            !WnfExactField(symbols_, L"nt!_WNF_CONTEXT_HEADER", L"NodeTypeCode", 2, &contextHeaderLayout, &nodeCode) ||
+            !WnfExactField(symbols_, L"nt!_WNF_CONTEXT_HEADER", L"NodeByteSize", 2, &contextHeaderLayout, &nodeBytes) ||
+            !WnfExactField(symbols_, L"nt!_WNF_PROCESS_CONTEXT", L"WnfProcessListEntry", 16, &processLayout, &processLink) ||
+            !WnfExactField(symbols_, L"nt!_WNF_PROCESS_CONTEXT", L"ProcessSubscriptionListHead", 16, &processLayout, &subscriptionHead) ||
+            !WnfExactField(symbols_, L"nt!_WNF_PROCESS_CONTEXT", L"Header", contextHeaderLayout.Size, &processLayout, &processHeader) ||
+            !WnfExactField(symbols_, L"nt!_WNF_SUBSCRIPTION", L"ProcessSubscriptionListEntry", 16, &subscriptionLayout, &subscriptionLink) ||
+            !WnfExactField(symbols_, L"nt!_WNF_SUBSCRIPTION", L"Header", contextHeaderLayout.Size, &subscriptionLayout, &subscriptionHeader) ||
+            !WnfExactField(symbols_, L"nt!_WNF_SUBSCRIPTION", L"CallbackRoutine", 8, &subscriptionLayout, &callback) ||
+            !WnfExactField(symbols_, L"nt!_WNF_SUBSCRIPTION", L"CallbackContext", 8, &subscriptionLayout, &callbackContext))
+        {
+            if (error != nullptr)
+            {
+                *error = L"exact WNF process/subscription PDB callback layout unavailable";
+            }
+            break;
+        }
+        result->LayoutFromPdb = true;
+        auto read = [&](uint64_t address, uint64_t* value)
+        {
+            return IsKernelAddress(address) && address <= ~0ull - 8 && ReadU64(device_, address, value, nullptr);
+        };
+        auto headerValid = [&](uint64_t object, const TypeFieldInfo& header, uint16_t code, uint64_t objectBytes)
+        {
+            uint64_t headerAddress = 0;
+            uint64_t codeAddress = 0;
+            uint64_t sizeAddress = 0;
+            std::vector<uint8_t> codeData;
+            std::vector<uint8_t> sizeData;
+            uint16_t actualCode = 0;
+            uint16_t actualBytes = 0;
+            if (!TryAdd(object, header.Offset, &headerAddress) ||
+                !TryAdd(headerAddress, nodeCode.Offset, &codeAddress) ||
+                !TryAdd(headerAddress, nodeBytes.Offset, &sizeAddress) ||
+                !device_.ReadMemory(codeAddress, 2, &codeData, nullptr) || codeData.size() != 2 ||
+                !device_.ReadMemory(sizeAddress, 2, &sizeData, nullptr) || sizeData.size() != 2)
+            {
+                return false;
+            }
+            memcpy(&actualCode, codeData.data(), 2);
+            memcpy(&actualBytes, sizeData.data(), 2);
+            return WnfHeaderMatches(actualCode, actualBytes, code, objectBytes);
+        };
+        const std::vector<KernelModuleInfo> modules = symbols_.Modules();
+        auto getHead = [&](uint64_t processNode, uint64_t* head)
+        {
+            if (processNode < processLink.Offset)
+            {
+                return false;
+            }
+            const uint64_t process = processNode - processLink.Offset;
+            return IsKernelAddress(process) && headerValid(process, processHeader, 0x906, processLayout.Size) &&
+                TryAdd(process, subscriptionHead.Offset, head);
+        };
+        auto collect = [&](uint64_t processNode, uint64_t subscriptionNode, WnfCallbackRecord* record)
+        {
+            if (subscriptionNode < subscriptionLink.Offset)
+            {
+                return false;
+            }
+            record->Subscription = subscriptionNode - subscriptionLink.Offset;
+            record->ProcessContext = processNode - processLink.Offset;
+            uint64_t contextAddress = 0;
+            uint64_t callbackAfter = 0;
+            uint64_t contextAfter = 0;
+            if (!IsKernelAddress(record->Subscription) ||
+                !headerValid(record->Subscription, subscriptionHeader, 0x905, subscriptionLayout.Size) ||
+                !TryAdd(record->Subscription, callback.Offset, &record->CallbackSlot) ||
+                !TryAdd(record->Subscription, callbackContext.Offset, &contextAddress) ||
+                !read(record->CallbackSlot, &record->Callback) || !read(contextAddress, &record->Context) ||
+                !read(record->CallbackSlot, &callbackAfter) || callbackAfter != record->Callback ||
+                !read(contextAddress, &contextAfter) || contextAfter != record->Context ||
+                !headerValid(record->Subscription, subscriptionHeader, 0x905, subscriptionLayout.Size))
+            {
+                return false;
+            }
+            if (record->Callback != 0)
+            {
+                for (const KernelModuleInfo& module : modules)
+                {
+                    if (module.Size != 0 && record->Callback >= module.Base && record->Callback - module.Base < module.Size)
+                    {
+                        record->Module = module.ImageName;
+                        break;
+                    }
+                }
+                uint64_t displacement = 0;
+                symbols_.FindNearestSymbol(record->Callback, &record->Symbol, &displacement, nullptr);
+                record->Suspicious = !IsKernelAddress(record->Callback) || record->Module.empty();
+            }
+            return true;
+        };
+        const size_t budget = (std::min)(limit == 0 ? 4096u : limit, 4096u);
+        ok = CollectWnfCallbackWindows(read, getHead, collect, root, budget, cursor, result);
+        result->Warnings.push_back(L"bounded WNF list windows do not reference registration lifetime or exclude interior splice/ABA");
+    } while (false);
+    if (!result->CoverageComplete)
+    {
+        result->Warnings.push_back(L"WNF kernel callback snapshot incomplete; unsupported layouts and changes are not clean absence");
+    }
+    return ok;
+}
+
+bool WnfCallbackScannerSelfTest()
+{
+    const uint64_t root = 0xffff800010000000ull;
+    std::map<uint64_t, uint64_t> memory;
+    const size_t processCount = 1025;
+    const uint64_t firstProcess = root + 0x10000;
+    memory[root] = firstProcess;
+    memory[root + 8] = firstProcess + (processCount - 1) * 0x100;
+    for (size_t process = 0; process < processCount; ++process)
+    {
+        const uint64_t node = firstProcess + process * 0x100;
+        memory[node] = process + 1 == processCount ? root : node + 0x100;
+        memory[node + 8] = process == 0 ? root : node - 0x100;
+        const uint64_t subscriptions = node + 0x20;
+        const size_t count = process == 0 ? 4097 : 1;
+        const uint64_t first = process == 0 ? root + 0x100000 : root + 0x300000 + process * 0x40;
+        memory[subscriptions] = first;
+        memory[subscriptions + 8] = first + (count - 1) * 0x20;
+        for (size_t index = 0; index < count; ++index)
+        {
+            const uint64_t entry = first + index * 0x20;
+            memory[entry] = index + 1 == count ? subscriptions : entry + 0x20;
+            memory[entry + 8] = index == 0 ? subscriptions : entry - 0x20;
+        }
+    }
+    auto readMemory = [&](uint64_t address, uint64_t* value)
+    {
+        const auto found = memory.find(address);
+        if (found != memory.end())
+        {
+            *value = found->second;
+        }
+        return found != memory.end();
+    };
+    auto getHead = [&](uint64_t process, uint64_t* value)
+    {
+        *value = process + 0x20;
+        return true;
+    };
+    auto collect = [&](uint64_t process, uint64_t entry, WnfCallbackRecord* record)
+    {
+        record->ProcessContext = process;
+        record->Subscription = entry;
+        record->Callback = root + 0x900000;
+        return true;
+    };
+    WnfCallbackCursor cursor;
+    std::set<uint64_t> observed;
+    for (size_t pass = 0; pass < 128 && observed.size() != 5121; ++pass)
+    {
+        WnfCallbackScanResult result;
+        if (!CollectWnfCallbackWindows(readMemory, getHead, collect, root, 64, cursor, &result) ||
+            result.SubscriptionsVisited > 64 || result.ProcessContextsVisited > 32)
+        {
+            return false;
+        }
+        for (const auto& record : result.Records)
+        {
+            observed.insert(record.Subscription);
+        }
+        cursor = result.NextCursor;
+    }
+    if (observed.size() != 5121 || cursor.PendingProcessNode != 0 || cursor.Processes.Entry != 0)
+    {
+        return false;
+    }
+
+    // Repeated removal of the first owner's inner cursor must not starve a stable later owner.
+    memory.clear();
+    memory[root] = firstProcess;
+    memory[root + 8] = firstProcess + 0x100;
+    for (size_t process = 0; process < 2; ++process)
+    {
+        const uint64_t node = firstProcess + process * 0x100;
+        memory[node] = process == 0 ? node + 0x100 : root;
+        memory[node + 8] = process == 0 ? root : firstProcess;
+        const uint64_t subscriptions = node + 0x20;
+        const size_t count = process == 0 ? 129 : 1;
+        const uint64_t first = root + 0x100000 + process * 0x100000;
+        memory[subscriptions] = first;
+        memory[subscriptions + 8] = first + (count - 1) * 0x20;
+        for (size_t index = 0; index < count; ++index)
+        {
+            const uint64_t entry = first + index * 0x20;
+            memory[entry] = index + 1 == count ? subscriptions : entry + 0x20;
+            memory[entry + 8] = index == 0 ? subscriptions : entry - 0x20;
+        }
+    }
+    cursor = {};
+    size_t laterOwnerObservations = 0;
+    for (size_t pass = 0; pass < 9; ++pass)
+    {
+        const bool removed = cursor.PendingProcessNode == firstProcess && cursor.Subscriptions.Entry != 0;
+        if (removed)
+        {
+            const uint64_t anchor = cursor.Subscriptions.Entry;
+            const uint64_t next = memory[anchor];
+            const uint64_t previous = memory[anchor + 8];
+            memory[previous] = next;
+            memory[next + 8] = previous;
+            memory[anchor] = anchor;
+            memory[anchor + 8] = anchor;
+        }
+        WnfCallbackScanResult churn;
+        if (!CollectWnfCallbackWindows(readMemory, getHead, collect, root, 64, cursor, &churn) ||
+            churn.CoverageComplete || churn.ProcessContextsVisited > 2 || churn.SubscriptionsVisited > 64 ||
+            (removed && (churn.NextCursor.PendingProcessNode != 0 || churn.NextCursor.Subscriptions.Entry != 0 ||
+                churn.NextCursor.Processes.Entry != firstProcess)))
+        {
+            return false;
+        }
+        for (const WnfCallbackRecord& record : churn.Records)
+        {
+            laterOwnerObservations += record.ProcessContext == firstProcess + 0x100 ? 1 : 0;
+        }
+        cursor = churn.NextCursor;
+    }
+    if (laterOwnerObservations < 3)
+    {
+        return false;
+    }
+    const uint64_t head = 0xffff800000001000ull;
+    const uint64_t node = head + 0x1000;
+    auto empty = [&](uint64_t address, uint64_t* value)
+    {
+        if (address != head && address != head + 8)
+        {
+            return false;
+        }
+        *value = head;
+        return true;
+    };
+    std::vector<uint64_t> nodes;
+    if (!WalkExactWnfList(empty, head, 4, &nodes) || !nodes.empty())
+    {
+        return false;
+    }
+    auto one = [&](uint64_t address, uint64_t* value)
+    {
+        if (address == head || address == head + 8)
+        {
+            *value = node;
+            return true;
+        }
+        if (address == node || address == node + 8)
+        {
+            *value = head;
+            return true;
+        }
+        return false;
+    };
+    if (!WalkExactWnfList(one, head, 1, &nodes) || nodes != std::vector<uint64_t>{node} ||
+        WalkExactWnfList(one, head, 0, &nodes))
+    {
+        return false;
+    }
+    return WnfHeaderMatches(0x905, 0x88, 0x905, 0x88) &&
+        !WnfHeaderMatches(0x906, 0x88, 0x905, 0x88) &&
+        !WnfHeaderMatches(0x905, 0x80, 0x905, 0x88);
 }
 
 bool WnfScanner::Scan(const Options& options, WnfScanResult* result, std::wstring* error)

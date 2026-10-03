@@ -37,7 +37,7 @@ struct MsrScanResult
 
 // Reads the SYSCALL-configuration MSRs (LSTAR/CSTAR/STAR/FMASK/EFER) through
 // the driver's read-only IOCTL_KNDBG_READ_MSR primitive, on every active
-// processor in group 0, and validates the entry pointers against the loaded
+// processor across all groups, and validates the entry pointers against the loaded
 // kernel image. Requires the driver device to be open.
 class MsrScanner
 {
@@ -52,3 +52,4 @@ private:
 };
 
 std::wstring BuildMsrJson(const MsrScanResult& result);
+bool MsrScannerSelfTest();

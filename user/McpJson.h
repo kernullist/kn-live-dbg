@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <set>
 #include <string>
 
 namespace mcpjson
@@ -84,14 +85,14 @@ namespace mcpjson
             return result;
         }
 
-        int needed = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+        int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
         if (needed <= 0)
         {
             return result;
         }
 
         result.resize(static_cast<size_t>(needed));
-        MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &result[0], needed);
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), &result[0], needed);
         return result;
     }
 
@@ -182,127 +183,186 @@ namespace mcpjson
         }
     }
 
-    // Given pos at the first character of a JSON value, returns the index just
-    // past the end of that value. Handles strings (with escapes), objects,
-    // arrays, and bare tokens (numbers/true/false/null). Returns false on a
-    // structurally unterminated value.
-    inline bool ScanValue(const std::wstring& text, size_t pos, size_t* endOut)
+    inline std::wstring Unescape(const std::wstring& quoted);
+
+    // Validate one value, including nested grammar and duplicate member names.
+    // Bound recursion before accepting network-controlled nesting.
+    inline bool ScanValue(const std::wstring& text, size_t pos, size_t* endOut, unsigned depth = 0)
     {
-        bool ok = false;
-        do
+        if (endOut == nullptr || pos >= text.size() || depth > 128)
         {
-            if (pos >= text.size())
+            return false;
+        }
+        const wchar_t first = text[pos];
+        if (first == L'\"')
+        {
+            size_t cursor = pos + 1;
+            while (cursor < text.size())
             {
-                break;
-            }
-
-            wchar_t first = text[pos];
-            if (first == L'\"')
-            {
-                size_t i = pos + 1;
-                bool terminated = false;
-                while (i < text.size())
+                const wchar_t ch = text[cursor++];
+                if (ch == L'\"')
                 {
-                    wchar_t ch = text[i];
-                    if (ch == L'\\')
-                    {
-                        i += 2;
-                        continue;
-                    }
-                    if (ch == L'\"')
-                    {
-                        terminated = true;
-                        ++i;
-                        break;
-                    }
-                    ++i;
+                    *endOut = cursor;
+                    return true;
                 }
-                if (!terminated)
+                if (ch < 0x20)
                 {
-                    break;
+                    return false;
                 }
-                *endOut = i;
-                ok = true;
-                break;
-            }
-
-            if (first == L'{' || first == L'[')
-            {
-                wchar_t open = first;
-                wchar_t close = (first == L'{') ? L'}' : L']';
-                int depth = 0;
-                size_t i = pos;
-                bool inString = false;
-                bool terminated = false;
-                while (i < text.size())
+                if (ch == L'\\')
                 {
-                    wchar_t ch = text[i];
-                    if (inString)
+                    if (cursor == text.size())
                     {
-                        if (ch == L'\\')
+                        return false;
+                    }
+                    const wchar_t escaped = text[cursor++];
+                    if (escaped == L'u')
+                    {
+                        if (text.size() - cursor < 4)
                         {
-                            i += 2;
-                            continue;
+                            return false;
                         }
-                        if (ch == L'\"')
+                        for (unsigned index = 0; index < 4; ++index)
                         {
-                            inString = false;
-                        }
-                        ++i;
-                        continue;
-                    }
-                    if (ch == L'\"')
-                    {
-                        inString = true;
-                        ++i;
-                        continue;
-                    }
-                    if (ch == open)
-                    {
-                        ++depth;
-                    }
-                    else if (ch == close)
-                    {
-                        --depth;
-                        if (depth == 0)
-                        {
-                            terminated = true;
-                            ++i;
-                            break;
+                            const wchar_t hex = text[cursor++];
+                            if (!((hex >= L'0' && hex <= L'9') || (hex >= L'a' && hex <= L'f') ||
+                                (hex >= L'A' && hex <= L'F')))
+                            {
+                                return false;
+                            }
                         }
                     }
-                    ++i;
+                    else if (escaped != L'\"' && escaped != L'\\' && escaped != L'/' &&
+                        escaped != L'b' && escaped != L'f' && escaped != L'n' && escaped != L'r' && escaped != L't')
+                    {
+                        return false;
+                    }
                 }
-                if (!terminated)
-                {
-                    break;
-                }
-                *endOut = i;
-                ok = true;
-                break;
             }
-
-            // Bare token: number, true, false, null. Stops at structural chars.
-            size_t i = pos;
-            while (i < text.size())
+            return false;
+        }
+        if (first == L'{' || first == L'[')
+        {
+            const bool object = first == L'{';
+            const wchar_t close = object ? L'}' : L']';
+            size_t cursor = pos + 1;
+            SkipWhitespace(text, &cursor);
+            if (cursor < text.size() && text[cursor] == close)
             {
-                wchar_t ch = text[i];
-                if (ch == L',' || ch == L'}' || ch == L']' || ch == L' ' ||
-                    ch == L'\t' || ch == L'\r' || ch == L'\n')
-                {
-                    break;
-                }
-                ++i;
+                *endOut = cursor + 1;
+                return true;
             }
-            if (i == pos)
+            std::set<std::wstring> keys;
+            while (cursor < text.size())
             {
-                break;
+                if (object)
+                {
+                    size_t keyEnd = 0;
+                    if (text[cursor] != L'\"' || !ScanValue(text, cursor, &keyEnd, depth + 1) ||
+                        !keys.insert(Unescape(text.substr(cursor, keyEnd - cursor))).second)
+                    {
+                        return false;
+                    }
+                    cursor = keyEnd;
+                    SkipWhitespace(text, &cursor);
+                    if (cursor == text.size() || text[cursor++] != L':')
+                    {
+                        return false;
+                    }
+                    SkipWhitespace(text, &cursor);
+                }
+                if (!ScanValue(text, cursor, &cursor, depth + 1))
+                {
+                    return false;
+                }
+                SkipWhitespace(text, &cursor);
+                if (cursor == text.size())
+                {
+                    return false;
+                }
+                if (text[cursor] == close)
+                {
+                    *endOut = cursor + 1;
+                    return true;
+                }
+                if (text[cursor++] != L',')
+                {
+                    return false;
+                }
+                SkipWhitespace(text, &cursor);
             }
-            *endOut = i;
-            ok = true;
-        } while (false);
+            return false;
+        }
+        for (const wchar_t* literal : {L"true", L"false", L"null"})
+        {
+            const size_t length = wcslen(literal);
+            if (text.compare(pos, length, literal) == 0)
+            {
+                *endOut = pos + length;
+                return true;
+            }
+        }
+        size_t cursor = pos;
+        if (text[cursor] == L'-')
+        {
+            ++cursor;
+        }
+        const auto digit = [&](size_t index)
+        {
+            return index < text.size() && text[index] >= L'0' && text[index] <= L'9';
+        };
+        if (!digit(cursor))
+        {
+            return false;
+        }
+        if (text[cursor++] != L'0')
+        {
+            while (digit(cursor))
+            {
+                ++cursor;
+            }
+        }
+        if (cursor < text.size() && text[cursor] == L'.')
+        {
+            if (!digit(++cursor))
+            {
+                return false;
+            }
+            while (digit(cursor))
+            {
+                ++cursor;
+            }
+        }
+        if (cursor < text.size() && (text[cursor] == L'e' || text[cursor] == L'E'))
+        {
+            ++cursor;
+            if (cursor < text.size() && (text[cursor] == L'+' || text[cursor] == L'-'))
+            {
+                ++cursor;
+            }
+            if (!digit(cursor))
+            {
+                return false;
+            }
+            while (digit(cursor))
+            {
+                ++cursor;
+            }
+        }
+        *endOut = cursor;
+        return true;
+    }
 
-        return ok;
+    inline bool IsObject(const std::wstring& text)
+    {
+        size_t pos = 0;
+        SkipWhitespace(text, &pos);
+        if (pos == text.size() || text[pos] != L'{' || !ScanValue(text, pos, &pos))
+        {
+            return false;
+        }
+        SkipWhitespace(text, &pos);
+        return pos == text.size();
     }
 
     // Finds a top-level member named key inside a JSON object and returns its
@@ -310,6 +370,10 @@ namespace mcpjson
     // objects). Only scans the outermost object level.
     inline bool FindRawValue(const std::wstring& object, const std::wstring& key, std::wstring* rawValue)
     {
+        if (rawValue == nullptr || !IsObject(object))
+        {
+            return false;
+        }
         bool found = false;
         do
         {
@@ -338,7 +402,7 @@ namespace mcpjson
                 {
                     break;
                 }
-                std::wstring memberKey = object.substr(pos + 1, keyEnd - pos - 2);
+                std::wstring memberKey = Unescape(object.substr(pos, keyEnd - pos));
                 pos = keyEnd;
 
                 SkipWhitespace(object, &pos);
@@ -476,7 +540,7 @@ namespace mcpjson
     inline bool GetString(const std::wstring& object, const std::wstring& key, std::wstring* value)
     {
         std::wstring raw;
-        if (!FindRawValue(object, key, &raw))
+        if (value == nullptr || !FindRawValue(object, key, &raw))
         {
             return false;
         }

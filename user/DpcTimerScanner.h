@@ -6,6 +6,14 @@
 
 #include "DeviceClient.h"
 #include "SymbolEngine.h"
+#include "ScannerListWindow.h"
+
+struct DeferredQueueCursor
+{
+    uint64_t RootAddress = 0;
+    uint32_t QueueIndex = 0;
+    ScannerListCursor List;
+};
 
 struct DpcRoutineRecord
 {
@@ -38,6 +46,8 @@ struct WorkItemRecord
     uint32_t Index = 0;
     uint64_t EntryAddress = 0;
     uint64_t Routine = 0;
+    uint64_t Parameter = 0;
+    uint64_t QueueAddress = 0;
     std::wstring Module;
     std::wstring Symbol;
     bool Suspicious = false;
@@ -54,6 +64,13 @@ struct DpcTimerScanResult
     bool TimerCoverageComplete = false;
     bool WorkItemCoverageComplete = false;
     bool WorkItemAttempted = false;
+    bool WorkItemLayoutFromPdb = false;
+    uint32_t WorkItemQueuesVisited = 0;
+    uint32_t WorkItemNodesVisited = 0;
+    std::wstring WorkItemCoverageScope;
+    DeferredQueueCursor NextWorkItemCursor;
+    DeferredQueueCursor NextDpcCursor;
+    DeferredQueueCursor NextTimerCursor;
     uint32_t SuspiciousDpcCount = 0;
     uint32_t SuspiciousTimerCount = 0;
     uint32_t SuspiciousWorkItemCount = 0;
@@ -80,6 +97,9 @@ public:
         bool Verbose = false;
         uint32_t Limit = 0;
         uint32_t MaxProcessors = 0;
+        DeferredQueueCursor WorkItemCursor;
+        DeferredQueueCursor DpcCursor;
+        DeferredQueueCursor TimerCursor;
     };
 
     DpcTimerScanner(DeviceClient& device, SymbolEngine& symbols);
@@ -94,3 +114,5 @@ private:
 std::wstring BuildDpcJson(const DpcTimerScanResult& result);
 std::wstring BuildTimerJson(const DpcTimerScanResult& result);
 std::wstring BuildWorkItemJson(const DpcTimerScanResult& result);
+bool DpcTimerScannerSelfTest();
+bool WorkItemScannerSelfTest();

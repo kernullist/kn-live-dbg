@@ -1,9 +1,13 @@
 #include "KernelMonitor.h"
 
 #include "ByovdScanner.h"
+#include "KmonPlatformEvidence.h"
+#include "DmaPostureScanner.h"
+#include "HvPostureScanner.h"
 #include "CallbackScanner.h"
 #include "CrScanner.h"
 #include "DpcTimerScanner.h"
+#include "EtwScanner.h"
 #include "HalDispatchScanner.h"
 #include "HiddenProcessScanner.h"
 #include "HandleTableScanner.h"
@@ -13,6 +17,7 @@
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "MinifilterIrpScanner.h"
+#include "MinifilterAttachmentScanner.h"
 #include "MsrScanner.h"
 #include "NmiScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -21,8 +26,11 @@
 #include "SsdtScanner.h"
 #include "VbsScanner.h"
 #include "WfpCalloutScanner.h"
+#include "WnfScanner.h"
+#include "KmonUserEvidence.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/KnLiveDbgPaging.h"
 #include "../kmon_test_target/KmonTestTargetContract.h"
 
 #include <Windows.h>
@@ -30,6 +38,7 @@
 #include <TlHelp32.h>
 #include <WinTrust.h>
 #include <fstream>
+#include <future>
 #include <Softpub.h>
 
 #include <algorithm>
@@ -39,6 +48,7 @@
 #include <limits>
 #include <cwctype>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -73,6 +83,36 @@ namespace
         return buf;
     }
 
+    bool KmonModuleSnapshotComplete(const std::vector<KernelModuleInfo>& modules)
+    {
+        bool complete = !modules.empty();
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        ranges.reserve(modules.size());
+        for (const KernelModuleInfo& module : modules)
+        {
+            if (module.Base < 0xFFFF800000000000ull || module.Size == 0 ||
+                module.Base > (std::numeric_limits<uint64_t>::max)() - module.Size)
+            {
+                complete = false;
+                break;
+            }
+            ranges.emplace_back(module.Base, module.Base + module.Size);
+        }
+        if (complete)
+        {
+            std::sort(ranges.begin(), ranges.end());
+            for (size_t index = 1; index < ranges.size(); ++index)
+            {
+                if (ranges[index].first < ranges[index - 1].second)
+                {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        return complete;
+    }
+
     bool AddressOwnedByLoadedModule(SymbolEngine* symbols, uint64_t address)
     {
         bool owned = false;
@@ -82,13 +122,13 @@ namespace
             {
                 break;
             }
-            // Empty module inventory must not mark every pointer unbacked.
+            // An incomplete inventory cannot prove a pointer is unbacked.
             std::vector<KernelModuleInfo> modules;
             if (symbols != nullptr)
             {
                 modules = symbols->CopyModules();
             }
-            if (modules.empty())
+            if (!KmonModuleSnapshotComplete(modules))
             {
                 owned = true;
                 break;
@@ -115,7 +155,85 @@ namespace
         return owned;
     }
 
-    uint64_t gLastKernelModuleReloadMs = 0;
+    struct KmonModuleRefreshState
+    {
+        const void* Owner = nullptr;
+        uint64_t LastAttemptMs = 0;
+        bool Attempted = false;
+        bool Complete = false;
+    };
+
+    struct KmonTiIngestPage
+    {
+        TiSequenceSnapshot Snapshot;
+        TiSubscriberStats Stats;
+        uint64_t Cursor = 0;
+    };
+
+    template<typename ReadSequence, typename ReadStats>
+    bool KmonReadStableTiIngestPage(uint64_t generation, uint64_t cursor,
+        ReadSequence readSequence, ReadStats readStats, KmonTiIngestPage* result)
+    {
+        // A restart can occur between either query. Commit no consumer state
+        // until the ring page and health counters describe the same generation.
+        for (unsigned attempt = 0; attempt < 3; ++attempt)
+        {
+            TiSequenceSnapshot snapshot = readSequence(cursor);
+            if (snapshot.Generation != generation)
+            {
+                generation = snapshot.Generation;
+                cursor = snapshot.GenerationFirstSequence == 0 ? snapshot.LatestAssignedSequence :
+                    snapshot.GenerationFirstSequence - 1;
+                continue;
+            }
+            TiSubscriberStats stats = readStats();
+            if (stats.Trace.Generation != generation)
+            {
+                generation = stats.Trace.Generation;
+                cursor = stats.Trace.FirstSequence == 0 ? stats.LatestAssignedSequence :
+                    stats.Trace.FirstSequence - 1;
+                continue;
+            }
+            result->Snapshot = std::move(snapshot);
+            result->Stats = std::move(stats);
+            result->Cursor = cursor;
+            return true;
+        }
+        return false;
+    }
+
+    std::mutex gKernelModuleRefreshMutex;
+    KmonModuleRefreshState gKernelModuleRefresh;
+
+    template<typename Reload>
+    bool KmonRefreshModuleSnapshot(
+        KmonModuleRefreshState* state,
+        const void* owner,
+        uint64_t nowMs,
+        bool snapshotComplete,
+        bool forceReload,
+        Reload reload)
+    {
+        if (state->Owner != owner)
+        {
+            *state = {};
+            state->Owner = owner;
+        }
+        if (state->Attempted && nowMs >= state->LastAttemptMs &&
+            nowMs - state->LastAttemptMs < 2000)
+        {
+            return state->Complete && snapshotComplete;
+        }
+        if (!forceReload && state->Complete && snapshotComplete)
+        {
+            return true;
+        }
+        state->Attempted = true;
+        state->LastAttemptMs = nowMs;
+        state->Complete = false;
+        state->Complete = reload();
+        return state->Complete;
+    }
 
     bool EnsureLoadedKernelModules(SymbolEngine* symbols, bool forceReload = false)
     {
@@ -126,36 +244,16 @@ namespace
             {
                 break;
             }
-            if (!symbols->CopyModules().empty())
-            {
-                if (!forceReload)
+            std::lock_guard<std::mutex> lock(gKernelModuleRefreshMutex);
+            ok = KmonRefreshModuleSnapshot(
+                &gKernelModuleRefresh, symbols, GetTickCount64(),
+                KmonModuleSnapshotComplete(symbols->CopyModules()), forceReload,
+                [&]()
                 {
-                    ok = true;
-                    break;
-                }
-                const uint64_t nowMs = GetTickCount64();
-                if (gLastKernelModuleReloadMs != 0 &&
-                    nowMs >= gLastKernelModuleReloadMs &&
-                    (nowMs - gLastKernelModuleReloadMs) < 2000)
-                {
-                    ok = true;
-                    break;
-                }
-            }
-            std::wstring ignored;
-            if (!symbols->LoadKernelModules(&ignored) || symbols->CopyModules().empty())
-            {
-                // EnumKernelModules failure does not clear modules_. Keep
-                // the last good inventory instead of skipping every kmon
-                // kernel scan until the next successful reload.
-                if (!symbols->CopyModules().empty())
-                {
-                    ok = true;
-                }
-                break;
-            }
-            gLastKernelModuleReloadMs = GetTickCount64();
-            ok = true;
+                    std::wstring ignored;
+                    return symbols->LoadKernelModules(&ignored) &&
+                        KmonModuleSnapshotComplete(symbols->CopyModules());
+                });
         } while (false);
         return ok;
     }
@@ -758,6 +856,79 @@ namespace
         }
     }
 
+    bool KmonRelocateComparableSlice(
+        std::vector<uint8_t>* bytes,
+        uint32_t rva,
+        uint64_t delta,
+        const std::vector<uint8_t>& relocs,
+        bool is64,
+        std::vector<uint8_t>* comparisonMask = nullptr)
+    {
+        if (bytes == nullptr || bytes->empty() ||
+            bytes->size() > UINT32_MAX - static_cast<uint64_t>(rva))
+        {
+            return false;
+        }
+        if (comparisonMask != nullptr)
+        {
+            comparisonMask->assign(bytes->size(), 1);
+        }
+        size_t offset = 0;
+        while (offset < relocs.size())
+        {
+            IMAGE_BASE_RELOCATION block = {};
+            if (relocs.size() - offset < sizeof(block))
+            {
+                return false;
+            }
+            std::memcpy(&block, relocs.data() + offset, sizeof(block));
+            if (block.SizeOfBlock < sizeof(block) ||
+                block.SizeOfBlock > relocs.size() - offset ||
+                (block.SizeOfBlock - sizeof(block)) % sizeof(uint16_t) != 0)
+            {
+                return false;
+            }
+            for (size_t entryOffset = sizeof(block); entryOffset < block.SizeOfBlock;
+                entryOffset += sizeof(uint16_t))
+            {
+                uint16_t entry = 0;
+                std::memcpy(&entry, relocs.data() + offset + entryOffset, sizeof(entry));
+                const uint32_t type = entry >> 12;
+                if (type == IMAGE_REL_BASED_ABSOLUTE)
+                {
+                    continue;
+                }
+                const uint32_t width = type == IMAGE_REL_BASED_DIR64 && is64 ? 8u :
+                    type == IMAGE_REL_BASED_HIGHLOW && !is64 ? 4u : 0u;
+                if (width == 0)
+                {
+                    return false;
+                }
+                const uint64_t address = static_cast<uint64_t>(block.VirtualAddress) + (entry & 0xFFFu);
+                const uint64_t end = static_cast<uint64_t>(rva) + bytes->size();
+                if (address >= end || address + width <= rva)
+                {
+                    continue;
+                }
+                // A boundary relocation needs its complete original value.
+                // The overlapping neighboring window will inspect it instead.
+                if (address < rva || address + width > end)
+                {
+                    if (comparisonMask == nullptr)
+                    {
+                        return false;
+                    }
+                    const size_t begin = static_cast<size_t>((std::max)(address, static_cast<uint64_t>(rva)) - rva);
+                    const size_t finish = static_cast<size_t>((std::min)(address + width, end) - rva);
+                    std::fill(comparisonMask->begin() + begin, comparisonMask->begin() + finish, uint8_t{0});
+                }
+            }
+            offset += block.SizeOfBlock;
+        }
+        ApplyRelocsToSlice(bytes, rva, delta, relocs, is64);
+        return true;
+    }
+
     bool ReadDiskRange(const std::wstring& path, uint32_t fileOffset, uint32_t length, std::vector<uint8_t>* bytes)
     {
         bool ok = false;
@@ -1319,6 +1490,61 @@ namespace
     bool IsUserModeImageBase(uint64_t address)
     {
         return address >= 0x10000ull && address <= 0x00007FFFFFFEFFFFull;
+    }
+
+    bool KmonUserModuleRangeValid(uint64_t base, uint64_t size)
+    {
+        return IsUserModeImageBase(base) && size != 0 &&
+            size - 1 <= (std::numeric_limits<uint64_t>::max)() - base &&
+            IsUserModeImageBase(base + size - 1);
+    }
+
+    bool KmonUserModuleWalkComplete(
+        size_t count,
+        bool more,
+        bool rangesValid,
+        DWORD terminalError)
+    {
+        return count != 0 && !more && rangesValid && terminalError == ERROR_NO_MORE_FILES;
+    }
+
+    struct KmonMainImageViews
+    {
+        uint64_t ScanBase = 0;
+        bool KernelMismatch = false;
+    };
+
+    KmonMainImageViews KmonReconcileMainImageViews(
+        uint64_t sectionBase,
+        uint64_t pebBase,
+        uint64_t loaderBase)
+    {
+        KmonMainImageViews views = {};
+        if (!IsUserModeImageBase(sectionBase))
+        {
+            sectionBase = 0;
+        }
+        if (!IsUserModeImageBase(pebBase))
+        {
+            pebBase = 0;
+        }
+        if (!IsUserModeImageBase(loaderBase))
+        {
+            loaderBase = 0;
+        }
+        views.ScanBase = sectionBase != 0
+            ? sectionBase
+            : (pebBase != 0 ? pebBase : loaderBase);
+        views.KernelMismatch = sectionBase != 0 &&
+            ((pebBase != 0 && pebBase != sectionBase) ||
+             (loaderBase != 0 && loaderBase != sectionBase));
+        return views;
+    }
+
+    bool KmonImageFileMissing(DWORD attributes, DWORD error)
+    {
+        return attributes == INVALID_FILE_ATTRIBUTES &&
+            (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND);
     }
 
     bool QuerySectionBaseAddress(
@@ -2160,6 +2386,50 @@ namespace
         return covers;
     }
 
+    bool KmonVadCallbackOwnershipKnown(
+        const ProcessVadScanResult& view,
+        uint64_t address,
+        bool* owned)
+    {
+        if (owned == nullptr)
+        {
+            return false;
+        }
+        *owned = true;
+        if (!IsUserModeImageBase(address))
+        {
+            return false;
+        }
+        const ProcessVadRecord* covering = nullptr;
+        for (const ProcessVadRecord& record : view.Records)
+        {
+            if (!VadCoversUserAddress(record, address))
+            {
+                continue;
+            }
+            if (covering != nullptr)
+            {
+                return false;
+            }
+            covering = &record;
+        }
+        if (covering != nullptr)
+        {
+            if (!covering->HasPrivateMemory)
+            {
+                return false;
+            }
+            *owned = !covering->PrivateMemory;
+            return true;
+        }
+        if (!view.CoverageComplete || view.Incomplete || view.Truncated)
+        {
+            return false;
+        }
+        *owned = false;
+        return true;
+    }
+
     bool QueryKernelVadScan(
         DeviceClient* device,
         SymbolEngine* symbols,
@@ -2325,6 +2595,146 @@ namespace
         SliceMismatch
     };
 
+    bool KmonBuildImageSliceBaseline(
+        std::vector<uint8_t>* bytes,
+        uint32_t backedLength,
+        uint32_t length)
+    {
+        const bool valid = bytes != nullptr && length != 0 &&
+            backedLength <= length && bytes->size() == backedLength;
+        if (valid)
+        {
+            bytes->resize(length, 0);
+        }
+        return valid;
+    }
+
+    SliceCompare KmonCompareImageSliceBytes(
+        const std::vector<uint8_t>& expected,
+        const std::vector<uint8_t>& observed,
+        const std::vector<uint8_t>& mask,
+        uint32_t* excludedBytes,
+        uint64_t* maskHash)
+    {
+        SliceCompare result = SliceUnknown;
+        if (excludedBytes != nullptr)
+        {
+            *excludedBytes = 0;
+        }
+        if (maskHash != nullptr)
+        {
+            *maskHash = 0;
+        }
+        if (!expected.empty() && expected.size() == observed.size() &&
+            expected.size() == mask.size() && expected.size() <= UINT32_MAX)
+        {
+            uint32_t excluded = 0;
+            bool mismatch = false;
+            for (size_t index = 0; index < expected.size(); ++index)
+            {
+                if (mask[index] == 0)
+                {
+                    ++excluded;
+                }
+                else if (expected[index] != observed[index])
+                {
+                    mismatch = true;
+                }
+            }
+            if (excludedBytes != nullptr)
+            {
+                *excludedBytes = excluded;
+            }
+            if (maskHash != nullptr)
+            {
+                *maskHash = KmonHashBytes64(mask.data(), mask.size());
+            }
+            if (excluded != expected.size())
+            {
+                result = mismatch ? SliceMismatch : SliceMatch;
+            }
+        }
+        return result;
+    }
+
+    std::wstring KmonImageSliceEvidenceKey(
+        const std::wstring& prefix,
+        const std::wstring& imageIdentity,
+        uint64_t headerHash,
+        uint32_t rva,
+        uint64_t maskHash = 0)
+    {
+        return prefix + imageIdentity + L":" + HexU64(headerHash) + L":" +
+            HexU64(rva) + L":" + HexU64(maskHash);
+    }
+
+    template<typename Emit, typename Clear>
+    void KmonApplyImageSliceObservation(
+        SliceCompare result,
+        const std::wstring& key,
+        Emit emit,
+        Clear clear)
+    {
+        if (result == SliceMismatch)
+        {
+            emit(key);
+        }
+        else if (result == SliceMatch)
+        {
+            clear(key);
+        }
+    }
+
+    std::vector<size_t> KmonOrderImageModules(
+        const std::vector<uint64_t>& bases,
+        uint64_t afterAddress)
+    {
+        std::vector<size_t> order;
+        order.reserve(bases.size());
+        for (size_t index = 0; index < bases.size(); ++index)
+        {
+            order.push_back(index);
+        }
+        std::sort(order.begin(), order.end(), [&bases](size_t left, size_t right)
+        {
+            if ((bases[left] == 0) != (bases[right] == 0))
+            {
+                return bases[left] != 0;
+            }
+            return bases[left] != bases[right] ? bases[left] < bases[right] : left < right;
+        });
+        const auto validEnd = std::find_if(order.begin(), order.end(), [&bases](size_t index)
+        {
+            return bases[index] == 0;
+        });
+        const auto first = std::upper_bound(order.begin(), validEnd, afterAddress,
+            [&bases](uint64_t address, size_t index)
+        {
+            return address < bases[index];
+        });
+        if (first != validEnd)
+        {
+            std::rotate(order.begin(), first, validEnd);
+        }
+        return order;
+    }
+
+    uint64_t KmonAdvanceImageModuleAnchor(
+        const std::vector<uint64_t>& bases,
+        const std::vector<size_t>& order,
+        size_t budget,
+        uint64_t previous)
+    {
+        for (size_t index = 0; index < order.size() && index < budget; ++index)
+        {
+            if (order[index] < bases.size() && bases[order[index]] != 0)
+            {
+                previous = bases[order[index]];
+            }
+        }
+        return previous;
+    }
+
     bool LastRelocBlockVa(const std::vector<uint8_t>& relocs, uint32_t* lastVa)
     {
         bool any = false;
@@ -2352,92 +2762,143 @@ namespace
         return any;
     }
 
-    bool ReadRelocDirectory(
-        const std::wstring& imagePath,
+    template<typename ReadDisk>
+    bool KmonReadDiskRelocationBytes(
         const std::vector<uint8_t>& diskHeaders,
         const KmonPeLayout& layout,
-        HANDLE processHandle,
-        DeviceClient* device,
-        SymbolEngine* symbols,
-        uint32_t pid,
-        uint64_t imageBase,
-        std::vector<uint8_t>* relocs,
-        bool* complete)
+        ReadDisk readDisk,
+        std::vector<uint8_t>* relocs)
     {
         bool ok = false;
         if (relocs != nullptr)
         {
             relocs->clear();
         }
-        if (complete != nullptr)
-        {
-            *complete = false;
-        }
         do
         {
-            if (relocs == nullptr || layout.RelocSize == 0 || layout.RelocRva == 0)
+            constexpr uint32_t kMaxRelocBytes = 0x100000u;
+            constexpr uint32_t kChunk = 0x10000u;
+            if (relocs == nullptr || layout.RelocSize == 0 || layout.RelocRva == 0 ||
+                layout.RelocSize > kMaxRelocBytes || layout.RelocRva >= layout.SizeOfImage ||
+                layout.RelocSize > layout.SizeOfImage - layout.RelocRva ||
+                diskHeaders.size() < sizeof(IMAGE_DOS_HEADER))
             {
                 break;
             }
-            constexpr uint32_t kMaxRelocBytes = 0x100000u;
-            constexpr uint32_t kChunk = 0x10000u;
-            const uint32_t toRead =
-                (layout.RelocSize < kMaxRelocBytes) ? layout.RelocSize : kMaxRelocBytes;
-            uint32_t relocFile = 0;
-            const bool haveFile = RvaToFileOffset(diskHeaders, layout.RelocRva, &relocFile);
-            relocs->reserve(toRead);
-            uint32_t offset = 0;
-            while (offset < toRead)
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, diskHeaders.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
             {
-                const uint32_t chunk = (std::min)(kChunk, toRead - offset);
-                std::vector<uint8_t> part;
-                bool got = false;
-                if (haveFile &&
-                    offset <= (std::numeric_limits<uint32_t>::max)() - relocFile)
+                break;
+            }
+            const uint64_t nt = static_cast<uint32_t>(dos.e_lfanew);
+            if (nt + 4 + sizeof(IMAGE_FILE_HEADER) > diskHeaders.size())
+            {
+                break;
+            }
+            uint32_t signature = 0;
+            IMAGE_FILE_HEADER file = {};
+            std::memcpy(&signature, diskHeaders.data() + nt, sizeof(signature));
+            std::memcpy(&file, diskHeaders.data() + nt + 4, sizeof(file));
+            const uint64_t sectionOffset = nt + 4 + sizeof(file) + file.SizeOfOptionalHeader;
+            if (signature != IMAGE_NT_SIGNATURE || file.NumberOfSections == 0 ||
+                file.NumberOfSections > 96 || sectionOffset +
+                    static_cast<uint64_t>(file.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER) > diskHeaders.size())
+            {
+                break;
+            }
+            std::vector<IMAGE_SECTION_HEADER> sections(file.NumberOfSections);
+            std::memcpy(sections.data(), diskHeaders.data() + sectionOffset,
+                sections.size() * sizeof(IMAGE_SECTION_HEADER));
+            std::sort(sections.begin(), sections.end(), [](const auto& left, const auto& right)
+            {
+                return left.VirtualAddress < right.VirtualAddress;
+            });
+            uint64_t previousEnd = 0;
+            bool valid = true;
+            for (const auto& section : sections)
+            {
+                const uint64_t span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+                if (span == 0)
                 {
-                    got = ReadDiskRange(imagePath, relocFile + offset, chunk, &part);
+                    continue;
                 }
-                if (!got)
+                const uint64_t end = static_cast<uint64_t>(section.VirtualAddress) + span;
+                const uint64_t rawEnd = static_cast<uint64_t>(section.PointerToRawData) + section.SizeOfRawData;
+                if (section.VirtualAddress < previousEnd || end > layout.SizeOfImage || rawEnd > 0x100000000ull)
                 {
-                    if (imageBase == 0 ||
-                        layout.RelocRva >
-                            (std::numeric_limits<uint64_t>::max)() - imageBase)
+                    valid = false;
+                    break;
+                }
+                previousEnd = end;
+            }
+            if (!valid)
+            {
+                break;
+            }
+            std::vector<uint8_t> candidate;
+            candidate.reserve(layout.RelocSize);
+            uint32_t offset = 0;
+            while (offset < layout.RelocSize)
+            {
+                const uint32_t rva = layout.RelocRva + offset;
+                const IMAGE_SECTION_HEADER* found = nullptr;
+                for (const auto& section : sections)
+                {
+                    if (rva >= section.VirtualAddress &&
+                        static_cast<uint64_t>(rva) - section.VirtualAddress < section.SizeOfRawData)
                     {
+                        found = &section;
                         break;
                     }
-                    const uint64_t relocVa = imageBase + layout.RelocRva;
-                    if (static_cast<uint64_t>(offset) >
-                        (std::numeric_limits<uint64_t>::max)() - relocVa)
-                    {
-                        break;
-                    }
-                    got = ReadProcessBytes(
-                        device,
-                        symbols,
-                        processHandle,
-                        pid,
-                        relocVa + offset,
-                        chunk,
-                        &part);
                 }
-                if (!got || part.size() < chunk)
+                if (found == nullptr)
                 {
                     break;
                 }
-                relocs->insert(relocs->end(), part.begin(), part.end());
+                const uint32_t delta = rva - found->VirtualAddress;
+                const uint32_t chunk = (std::min)({kChunk, layout.RelocSize - offset,
+                    static_cast<uint32_t>(found->SizeOfRawData - delta)});
+                std::vector<uint8_t> part;
+                if (!readDisk(found->PointerToRawData + delta, chunk, &part) || part.size() != chunk)
+                {
+                    break;
+                }
+                candidate.insert(candidate.end(), part.begin(), part.end());
                 offset += chunk;
             }
-            if (relocs->empty())
+            if (offset != layout.RelocSize)
             {
                 break;
             }
-            if (complete != nullptr)
-            {
-                *complete = (offset >= layout.RelocSize);
-            }
+            *relocs = std::move(candidate);
             ok = true;
         } while (false);
         return ok;
+    }
+
+    bool ReadRelocDirectory(
+        const std::wstring& imagePath,
+        const std::vector<uint8_t>& diskHeaders,
+        const KmonPeLayout& layout,
+        std::vector<uint8_t>* relocs,
+        bool* complete)
+    {
+        const bool ok = KmonReadDiskRelocationBytes(diskHeaders, layout,
+            [&imagePath](uint32_t offset, uint32_t length, std::vector<uint8_t>* bytes)
+            {
+                return ReadDiskRange(imagePath, offset, length, bytes);
+            }, relocs);
+        if (complete != nullptr)
+        {
+            *complete = ok;
+        }
+        return ok;
+    }
+
+    bool KmonImageNeedsRelocation(uint64_t imageBase, const KmonPeLayout& layout)
+    {
+        return imageBase != layout.PreferredBase;
     }
 
     SliceCompare RelocatedSliceCompare(
@@ -2453,12 +2914,24 @@ namespace
         uint32_t fileOffset,
         uint32_t length,
         std::vector<uint8_t>* relocCache = nullptr,
-        bool* relocCacheComplete = nullptr)
+        bool* relocCacheComplete = nullptr,
+        uint32_t* excludedBytes = nullptr,
+        uint32_t diskByteCount = UINT32_MAX,
+        uint64_t* maskHash = nullptr)
     {
         SliceCompare result = SliceUnknown;
         do
         {
-            if (length < 16 || imageBase == 0 || fileOffset == 0)
+            if (excludedBytes != nullptr)
+            {
+                *excludedBytes = 0;
+            }
+            if (maskHash != nullptr)
+            {
+                *maskHash = 0;
+            }
+            const uint32_t diskLength = (std::min)(length, diskByteCount);
+            if (length == 0 || imageBase == 0 || (diskLength != 0 && fileOffset == 0))
             {
                 break;
             }
@@ -2468,22 +2941,24 @@ namespace
             }
             std::vector<uint8_t> diskText;
             std::vector<uint8_t> liveText;
-            if (!ReadDiskRange(imagePath, fileOffset, length, &diskText) ||
-                !ReadProcessBytes(
-                    device,
-                    symbols,
-                    processHandle,
-                    pid,
-                    imageBase + rva,
-                    length,
-                    &liveText) ||
-                diskText.size() < 16 ||
-                liveText.size() < 16)
+            const bool liveRead = pid == 0
+                ? device != nullptr && device->ReadMemory(
+                    imageBase + rva, length, &liveText, nullptr)
+                : ReadProcessBytes(device, symbols, processHandle, pid,
+                    imageBase + rva, length, &liveText);
+            if ((diskLength != 0 && !ReadDiskRange(imagePath, fileOffset, diskLength, &diskText)) ||
+                diskText.size() != diskLength ||
+                !liveRead || liveText.size() != length)
             {
                 break;
             }
+            if (!KmonBuildImageSliceBaseline(&diskText, diskLength, length))
+            {
+                break;
+            }
+            std::vector<uint8_t> comparisonMask(length, 1);
             const uint64_t delta = imageBase - layout.PreferredBase;
-            const bool aslr = layout.PreferredBase != 0 && imageBase != layout.PreferredBase;
+            const bool aslr = KmonImageNeedsRelocation(imageBase, layout);
             bool compared = !aslr;
             if (aslr && layout.RelocRva != 0 && layout.RelocSize != 0)
             {
@@ -2505,11 +2980,6 @@ namespace
                              imagePath,
                              diskHeaders,
                              layout,
-                             processHandle,
-                             device,
-                             symbols,
-                             pid,
-                             imageBase,
                              &localRelocs,
                              &relocComplete))
                 {
@@ -2525,26 +2995,16 @@ namespace
                 }
                 if (activeRelocs != nullptr)
                 {
-                    uint32_t lastVa = 0;
-                    const bool haveBlock = LastRelocBlockVa(*activeRelocs, &lastVa);
-                    uint32_t sliceLastPage = rva & ~0xFFFu;
-                    if (length != 0 &&
-                        rva <= (std::numeric_limits<uint32_t>::max)() - (length - 1u))
+                    // An incomplete directory cannot prove that a later block
+                    // does not refer back to this window.
+                    if (relocComplete)
                     {
-                        sliceLastPage = (rva + length - 1u) & ~0xFFFu;
-                    }
-                    // Reloc blocks are sorted. A truncated prefix is only
-                    // safe when it already extends past this slice, or the
-                    // directory was read in full (no relocs on this page).
-                    if (relocComplete || (haveBlock && lastVa >= sliceLastPage))
-                    {
-                        ApplyRelocsToSlice(
+                        compared = KmonRelocateComparableSlice(
                             &diskText,
                             rva,
                             delta,
                             *activeRelocs,
-                            layout.Is64);
-                        compared = true;
+                            layout.Is64, &comparisonMask);
                     }
                 }
             }
@@ -2552,24 +3012,127 @@ namespace
             {
                 break;
             }
-            size_t n = (std::min)(diskText.size(), liveText.size());
-            // A DIR64/HIGHLOW reloc that straddles the window end cannot be
-            // applied; comparing those tail bytes FPs every ASLR'd image.
-            // A slice smaller than 24 bytes cannot drop an 8-byte tail and
-            // still compare 16 bytes, so ASLR'd tiny slices stay unknown.
-            if (aslr)
+            result = KmonCompareImageSliceBytes(
+                diskText, liveText, comparisonMask, excludedBytes, maskHash);
+        } while (false);
+        return result;
+    }
+
+    struct KmonImageSlice
+    {
+        uint32_t Rva = 0;
+        uint32_t FileOffset = 0;
+        uint32_t Length = 0;
+        uint32_t BackedLength = 0;
+        uint32_t PermissionRva = 0;
+        bool CompareBytes = true;
+        bool ExpectedExecutable = true;
+    };
+
+    bool KmonPlanImageSlices(
+        const std::vector<uint8_t>& headers,
+        uint32_t imageSize,
+        std::vector<KmonImageSlice>* slices,
+        bool includeData = false)
+    {
+        bool ok = false;
+        do
+        {
+            if (slices == nullptr || headers.size() < sizeof(IMAGE_DOS_HEADER))
             {
-                if (n < 24)
+                break;
+            }
+            slices->clear();
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, headers.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
+            {
+                break;
+            }
+            const uint64_t nt = static_cast<uint32_t>(dos.e_lfanew);
+            if (nt + 4 + sizeof(IMAGE_FILE_HEADER) > headers.size())
+            {
+                break;
+            }
+            uint32_t signature = 0;
+            std::memcpy(&signature, headers.data() + nt, sizeof(signature));
+            if (signature != IMAGE_NT_SIGNATURE)
+            {
+                break;
+            }
+            IMAGE_FILE_HEADER file = {};
+            std::memcpy(&file, headers.data() + nt + 4, sizeof(file));
+            const uint64_t sectionOffset = nt + 4 + sizeof(file) + file.SizeOfOptionalHeader;
+            if (file.NumberOfSections == 0 || file.NumberOfSections > 96 ||
+                sectionOffset + static_cast<uint64_t>(file.NumberOfSections) *
+                    sizeof(IMAGE_SECTION_HEADER) > headers.size())
+            {
+                break;
+            }
+            bool valid = true;
+            for (uint32_t index = 0; index < file.NumberOfSections; ++index)
+            {
+                IMAGE_SECTION_HEADER section = {};
+                std::memcpy(&section, headers.data() + sectionOffset +
+                    index * sizeof(section), sizeof(section));
+                const bool code = (section.Characteristics &
+                    (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) != 0;
+                if (!code && !includeData)
+                {
+                    continue;
+                }
+                const uint32_t bytes = section.Misc.VirtualSize == 0
+                    ? section.SizeOfRawData : section.Misc.VirtualSize;
+                if (bytes == 0)
+                {
+                    continue;
+                }
+                if ((section.SizeOfRawData != 0 && section.PointerToRawData == 0) ||
+                    section.VirtualAddress >= imageSize ||
+                    bytes > imageSize - section.VirtualAddress ||
+                    section.PointerToRawData > UINT32_MAX - bytes)
+                {
+                    valid = false;
+                    break;
+                }
+                for (uint32_t offset = 0; offset < bytes;)
+                {
+                    if (slices->size() >= 65536)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    // Overlap covers relocations crossing the previous window end.
+                    const uint32_t begin = offset >= 16 ? offset - 16 : 0;
+                    const uint32_t length = (std::min)(0x1000u + 16u, bytes - begin);
+                    KmonImageSlice slice;
+                    slice.Rva = section.VirtualAddress + begin;
+                    slice.FileOffset = section.PointerToRawData + begin;
+                    slice.Length = length;
+                    slice.BackedLength = begin < section.SizeOfRawData
+                        ? (std::min)(length, static_cast<uint32_t>(section.SizeOfRawData - begin)) : 0;
+                    slice.PermissionRva = section.VirtualAddress + offset;
+                    slice.CompareBytes = code;
+                    slice.ExpectedExecutable = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+                    slices->push_back(slice);
+                    if (bytes - offset <= 0x1000)
+                    {
+                        break;
+                    }
+                    offset += 0x1000;
+                }
+                if (!valid)
                 {
                     break;
                 }
-                n -= 8;
             }
-            result = (std::memcmp(diskText.data(), liveText.data(), n) == 0)
-                ? SliceMatch
-                : SliceMismatch;
+            ok = valid && !slices->empty();
         } while (false);
-        return result;
+        if (!ok && slices != nullptr)
+        {
+            slices->clear();
+        }
+        return ok;
     }
 
     SliceCompare CompareLoadedModuleText(
@@ -2578,119 +3141,477 @@ namespace
         DeviceClient* device,
         SymbolEngine* symbols,
         uint32_t pid,
-        uint64_t imageBase)
+        uint64_t imageBase,
+        KmonImageScanCursor* cursor,
+        uint32_t pageBudget = 4)
     {
         SliceCompare result = SliceUnknown;
+        if (cursor != nullptr)
+        {
+            cursor->Compared = 0;
+            cursor->ReadFailures = 0;
+            cursor->RelocationBoundaryBytes = 0;
+            cursor->SweepComplete = false;
+            cursor->Observations.clear();
+        }
         do
         {
-            if (imageBase == 0 || !PathLooksLikeWin32File(imagePath))
+            if (cursor == nullptr || pageBudget == 0 || imageBase == 0 ||
+                !PathLooksLikeWin32File(imagePath))
             {
                 break;
             }
             std::vector<uint8_t> headers;
             KmonPeLayout layout = {};
+            std::vector<KmonImageSlice> slices;
             if (!ReadDiskPeHead(imagePath, &headers) ||
                 !ParseKmonPeLayout(headers, &layout) ||
-                layout.ExecSize < 16 ||
-                layout.ExecFileOffset == 0)
+                !KmonPlanImageSlices(headers, layout.SizeOfImage, &slices))
             {
+                cursor->ReadFailures = 1;
                 break;
             }
-            result = RelocatedSliceCompare(
-                imagePath,
-                headers,
-                layout,
-                processHandle,
-                device,
-                symbols,
-                pid,
-                imageBase,
-                layout.ExecRva,
-                layout.ExecFileOffset,
-                layout.ExecSize);
-            if (result == SliceMismatch || result == SliceUnknown)
+            const uint64_t hash = KmonHashBytes64(headers.data(), headers.size());
+            if (cursor->HeaderHash != hash)
             {
-                break;
+                *cursor = {};
+                cursor->HeaderHash = hash;
             }
-            if (layout.ExecVirtSize <= 0x1000)
+            cursor->SliceCount = slices.size();
+            const size_t start = static_cast<size_t>(cursor->NextSlice % slices.size());
+            const size_t count = (std::min)(static_cast<size_t>(pageBudget), slices.size());
+            std::vector<uint8_t> relocs;
+            bool relocComplete = false;
+            result = SliceMatch;
+            for (size_t step = 0; step < count; ++step)
             {
-                break;
-            }
-            uint32_t samples[3] = {};
-            uint32_t sampleCount = 0;
-            auto addSample = [&](uint32_t pageRva)
-            {
-                if (pageRva <= layout.ExecRva || sampleCount >= 3)
+                const KmonImageSlice& slice = slices[(start + step) % slices.size()];
+                uint32_t excluded = 0;
+                uint64_t maskHash = 0;
+                const SliceCompare comparison = RelocatedSliceCompare(
+                    imagePath, headers, layout, processHandle, device, symbols,
+                    pid, imageBase, slice.Rva, slice.FileOffset, slice.Length,
+                    &relocs, &relocComplete, &excluded, slice.BackedLength, &maskHash);
+                cursor->RelocationBoundaryBytes += excluded;
+                if (comparison == SliceUnknown)
                 {
-                    return;
+                    ++cursor->ReadFailures;
                 }
-                for (uint32_t i = 0; i < sampleCount; ++i)
+                else
                 {
-                    if (samples[i] == pageRva)
+                    ++cursor->Compared;
+                    KmonImageScanCursor::SliceObservation observation;
+                    observation.Rva = slice.Rva;
+                    observation.MaskHash = maskHash;
+                    observation.Changed = comparison == SliceMismatch;
+                    cursor->Observations.push_back(observation);
+                    if (comparison == SliceMismatch)
                     {
-                        return;
-                    }
-                }
-                samples[sampleCount++] = pageRva;
-            };
-            if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - 0x1000)
-            {
-                addSample(layout.ExecRva + 0x1000);
-            }
-            if (layout.ExecVirtSize > 0x2000)
-            {
-                const uint32_t midOff = (layout.ExecVirtSize / 2) & ~0xFFFu;
-                if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - midOff)
-                {
-                    addSample(layout.ExecRva + midOff);
-                }
-                if (layout.ExecVirtSize >= 0x100)
-                {
-                    const uint32_t lastOff = (layout.ExecVirtSize - 0x100) & ~0xFFFu;
-                    if (layout.ExecRva <= (std::numeric_limits<uint32_t>::max)() - lastOff)
-                    {
-                        addSample(layout.ExecRva + lastOff);
+                        result = SliceMismatch;
                     }
                 }
             }
-            bool laterUnknown = false;
-            for (uint32_t i = 0; i < sampleCount; ++i)
+            cursor->NextSlice = (start + count) % slices.size();
+            cursor->SlicesAttempted += count;
+            if (start + count >= slices.size())
             {
-                uint32_t laterFile = 0;
-                if (!RvaToFileOffset(headers, samples[i], &laterFile))
-                {
-                    laterUnknown = true;
-                    continue;
-                }
-                const SliceCompare laterCmp = RelocatedSliceCompare(
-                    imagePath,
-                    headers,
-                    layout,
-                    processHandle,
-                    device,
-                    symbols,
-                    pid,
-                    imageBase,
-                    samples[i],
-                    laterFile,
-                    0x100);
-                if (laterCmp == SliceMismatch)
-                {
-                    result = SliceMismatch;
-                    laterUnknown = false;
-                    break;
-                }
-                if (laterCmp == SliceUnknown)
-                {
-                    laterUnknown = true;
-                }
+                ++cursor->Sweeps;
+                cursor->SweepComplete = cursor->ReadFailures == 0 &&
+                    cursor->RelocationBoundaryBytes == 0 && count == slices.size();
             }
-            if (result == SliceMatch && laterUnknown)
+            if (result != SliceMismatch && cursor->ReadFailures != 0)
             {
                 result = SliceUnknown;
             }
         } while (false);
         return result;
+    }
+
+    bool KmonDiskRelocationSourceSelfTest()
+    {
+        std::vector<uint8_t> headers(0x400, 0);
+        IMAGE_DOS_HEADER dos = {};
+        dos.e_magic = IMAGE_DOS_SIGNATURE;
+        dos.e_lfanew = 0x80;
+        std::memcpy(headers.data(), &dos, sizeof(dos));
+        const uint32_t signature = IMAGE_NT_SIGNATURE;
+        std::memcpy(headers.data() + 0x80, &signature, sizeof(signature));
+        IMAGE_FILE_HEADER file = {};
+        file.Machine = IMAGE_FILE_MACHINE_AMD64;
+        file.NumberOfSections = 2;
+        file.SizeOfOptionalHeader = static_cast<uint16_t>(sizeof(IMAGE_OPTIONAL_HEADER64));
+        std::memcpy(headers.data() + 0x84, &file, sizeof(file));
+        IMAGE_OPTIONAL_HEADER64 optional = {};
+        optional.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        optional.SizeOfImage = 0x4000;
+        optional.SizeOfHeaders = 0x400;
+        optional.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FF8, 16};
+        std::memcpy(headers.data() + 0x84 + sizeof(file), &optional, sizeof(optional));
+        const size_t sectionOffset = 0x84 + sizeof(file) + file.SizeOfOptionalHeader;
+        IMAGE_SECTION_HEADER first = {};
+        first.VirtualAddress = 0x1000;
+        first.Misc.VirtualSize = 0x1000;
+        first.SizeOfRawData = 0x1000;
+        first.PointerToRawData = 0x400;
+        IMAGE_SECTION_HEADER second = first;
+        second.VirtualAddress = 0x2000;
+        second.PointerToRawData = 0x5000;
+        const auto writeSections = [&]()
+        {
+            std::memcpy(headers.data() + sectionOffset, &first, sizeof(first));
+            std::memcpy(headers.data() + sectionOffset + sizeof(first), &second, sizeof(second));
+        };
+        writeSections();
+        KmonPeLayout layout;
+        if (!ParseKmonPeLayout(headers, &layout) || layout.PreferredBase != 0 ||
+            !KmonImageNeedsRelocation(0x140000000ull, layout))
+        {
+            return false;
+        }
+        std::vector<uint8_t> disk(0x6000, 0);
+        std::fill(disk.begin() + 0x13F8, disk.begin() + 0x1400, 0x11);
+        std::fill(disk.begin() + 0x5000, disk.begin() + 0x5008, 0x22);
+        std::vector<std::pair<uint32_t, uint32_t>> reads;
+        bool failSecond = false;
+        bool shortRead = false;
+        const auto read = [&](uint32_t offset, uint32_t length, std::vector<uint8_t>* bytes)
+        {
+            reads.emplace_back(offset, length);
+            if ((failSecond && offset == 0x5000) || offset > disk.size() || length > disk.size() - offset)
+            {
+                return false;
+            }
+            bytes->assign(disk.begin() + offset, disk.begin() + offset + length);
+            if (shortRead)
+            {
+                bytes->pop_back();
+            }
+            return true;
+        };
+        std::vector<uint8_t> relocs;
+        if (!KmonReadDiskRelocationBytes(headers, layout, read, &relocs) ||
+            reads != std::vector<std::pair<uint32_t, uint32_t>>({{0x13F8, 8}, {0x5000, 8}}) ||
+            relocs.size() != 16 || relocs.front() != 0x11 || relocs.back() != 0x22)
+        {
+            return false;
+        }
+        failSecond = true;
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs) || !relocs.empty())
+        {
+            return false;
+        }
+        failSecond = false;
+        shortRead = true;
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs) || !relocs.empty())
+        {
+            return false;
+        }
+        shortRead = false;
+        first.SizeOfRawData = 0xFF8;
+        writeSections();
+        reads.clear();
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs) || !reads.empty())
+        {
+            return false;
+        }
+        first.SizeOfRawData = 0x1000;
+        second.VirtualAddress = 0x1800;
+        writeSections();
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs))
+        {
+            return false;
+        }
+        second.VirtualAddress = 0x2000;
+        first.PointerToRawData = UINT32_MAX - 4;
+        writeSections();
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs))
+        {
+            return false;
+        }
+        first.PointerToRawData = 0x400;
+        writeSections();
+        layout.RelocRva = UINT32_MAX - 4;
+        if (KmonReadDiskRelocationBytes(headers, layout, read, &relocs))
+        {
+            return false;
+        }
+        layout.RelocRva = 0x1000;
+        layout.RelocSize = 0x100001;
+        layout.SizeOfImage = 0x200000;
+        reads.clear();
+        return !KmonReadDiskRelocationBytes(headers, layout, read, &relocs) &&
+            reads.empty() && relocs.empty();
+    }
+
+    bool KmonImageSliceSelfTest()
+    {
+        bool ok = false;
+        do
+        {
+            std::vector<uint8_t> headers(0x1000, 0);
+            IMAGE_DOS_HEADER dos = {};
+            dos.e_magic = IMAGE_DOS_SIGNATURE;
+            dos.e_lfanew = 0x80;
+            std::memcpy(headers.data(), &dos, sizeof(dos));
+            const uint32_t signature = IMAGE_NT_SIGNATURE;
+            std::memcpy(headers.data() + dos.e_lfanew, &signature, sizeof(signature));
+            IMAGE_FILE_HEADER file = {};
+            file.NumberOfSections = 2;
+            file.SizeOfOptionalHeader = static_cast<uint16_t>(sizeof(IMAGE_OPTIONAL_HEADER64));
+            std::memcpy(headers.data() + dos.e_lfanew + 4, &file, sizeof(file));
+            const size_t sectionOffset = dos.e_lfanew + 4 + sizeof(file) + file.SizeOfOptionalHeader;
+            IMAGE_SECTION_HEADER code = {};
+            code.VirtualAddress = 0x1000;
+            code.Misc.VirtualSize = 0x3000;
+            code.SizeOfRawData = 0x1800;
+            code.PointerToRawData = 0x400;
+            code.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+            IMAGE_SECTION_HEADER data = {};
+            data.VirtualAddress = 0x5000;
+            data.Misc.VirtualSize = 0x2000;
+            data.Characteristics = IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+            std::memcpy(headers.data() + sectionOffset, &code, sizeof(code));
+            std::memcpy(headers.data() + sectionOffset + sizeof(code), &data, sizeof(data));
+            std::vector<KmonImageSlice> slices;
+            if (!KmonPlanImageSlices(headers, 0x8000, &slices, true) || slices.size() != 5 ||
+                slices[0].Rva != 0x1000 || slices[0].Length != 0x1010 ||
+                slices[1].Rva != 0x1FF0 || slices[1].BackedLength != 0x810 ||
+                slices[2].Rva != 0x2FF0 || slices[2].BackedLength != 0 ||
+                slices[2].Rva + slices[2].Length != 0x4000 ||
+                slices[3].CompareBytes || slices[4].CompareBytes ||
+                slices[3].PermissionRva != 0x5000 || slices[4].PermissionRva != 0x6000 ||
+                slices[4].Rva != 0x5FF0 || slices[4].ExpectedExecutable)
+            {
+                break;
+            }
+            std::vector<uint8_t> zeroTail(slices[1].BackedLength, 0x90);
+            if (!KmonBuildImageSliceBaseline(&zeroTail, slices[1].BackedLength, slices[1].Length) ||
+                zeroTail[0x80F] != 0x90 || zeroTail[0x810] != 0 || zeroTail.back() != 0)
+            {
+                break;
+            }
+            std::vector<uint8_t> observed = zeroTail;
+            std::vector<uint8_t> mask(zeroTail.size(), 1);
+            uint32_t excluded = 0;
+            uint64_t maskHash = 0;
+            if (KmonCompareImageSliceBytes(zeroTail, observed, mask, &excluded, &maskHash) != SliceMatch ||
+                excluded != 0 || maskHash == 0)
+            {
+                break;
+            }
+            observed.back() = 0xCC;
+            if (KmonCompareImageSliceBytes(zeroTail, observed, mask, &excluded, &maskHash) != SliceMismatch)
+            {
+                break;
+            }
+            std::vector<uint8_t> unbacked;
+            if (!KmonBuildImageSliceBaseline(&unbacked, 0, slices[2].Length) ||
+                unbacked.back() != 0 || KmonBuildImageSliceBaseline(&unbacked, 0, slices[2].Length))
+            {
+                break;
+            }
+            code.Misc.VirtualSize = 0x2017;
+            std::memcpy(headers.data() + sectionOffset, &code, sizeof(code));
+            if (!KmonPlanImageSlices(headers, 0x8000, &slices) || slices.size() != 3 ||
+                slices.back().Length != 0x27 || slices.back().Rva + slices.back().Length != 0x3017)
+            {
+                break;
+            }
+            code.Misc.VirtualSize = 0x8000;
+            std::memcpy(headers.data() + sectionOffset, &code, sizeof(code));
+            if (KmonPlanImageSlices(headers, 0x8000, &slices) || !slices.empty())
+            {
+                break;
+            }
+            code.Misc.VirtualSize = 0x3000;
+            std::memcpy(headers.data() + sectionOffset, &code, sizeof(code));
+            if (!KmonPlanImageSlices(headers, 0x8000, &slices))
+            {
+                break;
+            }
+
+            std::vector<uint8_t> original(code.Misc.VirtualSize, 0);
+            const uint64_t originalPointer = 0x140005555ull;
+            const uint64_t delta = 0x200000;
+            const uint64_t relocatedPointer = originalPointer + delta;
+            std::memcpy(original.data() + 0x100C, &originalPointer, sizeof(originalPointer));
+            std::vector<uint8_t> mapped = original;
+            std::memcpy(mapped.data() + 0x100C, &relocatedPointer, sizeof(relocatedPointer));
+            IMAGE_BASE_RELOCATION block = {};
+            block.VirtualAddress = 0x2000;
+            block.SizeOfBlock = sizeof(block) + 2 * sizeof(uint16_t);
+            std::vector<uint8_t> relocs(block.SizeOfBlock, 0);
+            std::memcpy(relocs.data(), &block, sizeof(block));
+            const uint16_t relocation = (IMAGE_REL_BASED_DIR64 << 12) | 0xC;
+            std::memcpy(relocs.data() + sizeof(block), &relocation, sizeof(relocation));
+            std::vector<uint8_t> expected(original.begin(), original.begin() + slices[0].Length);
+            observed.assign(mapped.begin(), mapped.begin() + slices[0].Length);
+            if (!KmonRelocateComparableSlice(&expected, slices[0].Rva, delta, relocs, true, &mask) ||
+                KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceMatch ||
+                excluded != 4)
+            {
+                break;
+            }
+            const uint64_t boundaryMaskHash = maskHash;
+            observed[0x500] = 0xCC;
+            if (KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceMismatch ||
+                excluded != 4 || maskHash != boundaryMaskHash)
+            {
+                break;
+            }
+            const size_t secondOffset = slices[1].Rva - code.VirtualAddress;
+            expected.assign(original.begin() + secondOffset,
+                original.begin() + secondOffset + slices[1].Length);
+            observed.assign(mapped.begin() + secondOffset,
+                mapped.begin() + secondOffset + slices[1].Length);
+            if (!KmonRelocateComparableSlice(&expected, slices[1].Rva, delta, relocs, true, &mask) ||
+                KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceMatch ||
+                excluded != 0)
+            {
+                break;
+            }
+            observed[0x100C - secondOffset] ^= 1;
+            if (KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceMismatch)
+            {
+                break;
+            }
+            mask.assign(expected.size(), 0);
+            if (KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceUnknown ||
+                excluded != expected.size())
+            {
+                break;
+            }
+            observed.pop_back();
+            if (KmonCompareImageSliceBytes(expected, observed, mask, &excluded, &maskHash) != SliceUnknown ||
+                maskHash != 0)
+            {
+                break;
+            }
+            std::vector<uint8_t> truncatedRelocs = relocs;
+            truncatedRelocs.pop_back();
+            if (KmonRelocateComparableSlice(&expected, slices[1].Rva, delta, truncatedRelocs, true, &mask) ||
+                KmonRelocateComparableSlice(&expected, UINT32_MAX - 1, delta, relocs, true, &mask))
+            {
+                break;
+            }
+            std::vector<uint8_t> expected32(16, 0);
+            const uint32_t preferred32 = 0x400123;
+            std::memcpy(expected32.data() + 8, &preferred32, sizeof(preferred32));
+            block.VirtualAddress = 0x1000;
+            std::memcpy(relocs.data(), &block, sizeof(block));
+            const uint16_t relocation32 = (IMAGE_REL_BASED_HIGHLOW << 12) | 8;
+            std::memcpy(relocs.data() + sizeof(block), &relocation32, sizeof(relocation32));
+            uint32_t relocated32 = 0;
+            if (!KmonRelocateComparableSlice(&expected32, 0x1000,
+                    uint64_t(0) - 0x100000, relocs, false, &mask))
+            {
+                break;
+            }
+            std::memcpy(&relocated32, expected32.data() + 8, sizeof(relocated32));
+            if (relocated32 != 0x300123 || std::find(mask.begin(), mask.end(), uint8_t(0)) != mask.end())
+            {
+                break;
+            }
+
+            bool rotationOk = true;
+            for (const size_t budget : {size_t(4), size_t(16)})
+            {
+                uint64_t anchor = 0;
+                std::set<uint64_t> stableObserved;
+                for (size_t pass = 0; pass < 16; ++pass)
+                {
+                    std::vector<uint64_t> bases;
+                    for (size_t index = 0; index < budget; ++index)
+                    {
+                        bases.push_back(0x10000 + index * 0x1000);
+                        bases.push_back((pass % 2 == 0 ? 0x1000 : 0x100000) + index * 0x100);
+                    }
+                    if (pass % 2 != 0)
+                    {
+                        std::reverse(bases.begin(), bases.end());
+                    }
+                    const std::vector<size_t> order = KmonOrderImageModules(bases, anchor);
+                    for (size_t index = 0; index < budget; ++index)
+                    {
+                        const uint64_t base = bases[order[index]];
+                        if (base >= 0x10000 && base < 0x100000)
+                        {
+                            stableObserved.insert(base);
+                        }
+                    }
+                    anchor = KmonAdvanceImageModuleAnchor(bases, order, budget, anchor);
+                }
+                rotationOk = rotationOk && stableObserved.size() == budget;
+            }
+            const std::vector<uint64_t> unorderedBases = {0x3000, 0, 0x1000, 0x2000};
+            const std::vector<size_t> ordered = KmonOrderImageModules(unorderedBases, 0x1000);
+            const std::vector<size_t> wrapped = KmonOrderImageModules(unorderedBases, 0x4000);
+            std::vector<uint64_t> mostlyUnknownBases(32, 0);
+            mostlyUnknownBases.push_back(0x1000);
+            const std::vector<size_t> knownFirst = KmonOrderImageModules(mostlyUnknownBases, 0x2000);
+            if (!rotationOk || ordered != std::vector<size_t>({3, 0, 2, 1}) ||
+                wrapped != std::vector<size_t>({2, 3, 0, 1}) ||
+                knownFirst.front() != 32 ||
+                KmonAdvanceImageModuleAnchor(mostlyUnknownBases, knownFirst, 16, 0x2000) != 0x1000 ||
+                !KmonOrderImageModules({}, 0x1000).empty() ||
+                KmonAdvanceImageModuleAnchor({}, {}, 16, 0x1000) != 0x1000)
+            {
+                break;
+            }
+
+            std::set<std::wstring> emitted;
+            uint32_t alerts = 0;
+            const auto emit = [&emitted, &alerts](const std::wstring& key)
+            {
+                if (emitted.insert(key).second)
+                {
+                    ++alerts;
+                }
+            };
+            const auto clear = [&emitted](const std::wstring& key)
+            {
+                emitted.erase(key);
+            };
+            const std::wstring key = KmonImageSliceEvidenceKey(L"module_text:", L"pid:time:base:path",
+                1, 0x1000, boundaryMaskHash);
+            const std::wstring otherPage = KmonImageSliceEvidenceKey(L"module_text:", L"pid:time:base:path",
+                1, 0x2000, boundaryMaskHash);
+            const std::wstring otherMask = KmonImageSliceEvidenceKey(L"module_text:", L"pid:time:base:path",
+                1, 0x1000, boundaryMaskHash ^ 1);
+            KmonApplyImageSliceObservation(SliceMismatch, key, emit, clear);
+            KmonApplyImageSliceObservation(SliceUnknown, key, emit, clear);
+            KmonApplyImageSliceObservation(SliceMatch, otherPage, emit, clear);
+            KmonApplyImageSliceObservation(SliceMatch, otherMask, emit, clear);
+            KmonApplyImageSliceObservation(SliceMismatch, key, emit, clear);
+            if (alerts != 1 || emitted.count(key) != 1)
+            {
+                break;
+            }
+            KmonApplyImageSliceObservation(SliceMatch, key, emit, clear);
+            KmonApplyImageSliceObservation(SliceMismatch, key, emit, clear);
+            const std::wstring permissions = KmonImageSliceEvidenceKey(L"image_data_exec:", L"kernel", 1, 0x6000);
+            KmonApplyImageSliceObservation(SliceMismatch, permissions, emit, clear);
+            KmonApplyImageSliceObservation(SliceUnknown, permissions, emit, clear);
+            KmonApplyImageSliceObservation(SliceMismatch, permissions, emit, clear);
+            KmonApplyImageSliceObservation(SliceMatch, permissions, emit, clear);
+            KmonApplyImageSliceObservation(SliceMismatch, permissions, emit, clear);
+            if (alerts != 4 || key == KmonImageSliceEvidenceKey(L"module_text:", L"pid:time:base:path",
+                    2, 0x1000, boundaryMaskHash))
+            {
+                break;
+            }
+            KmonImageScanCursor stale;
+            stale.Compared = 4;
+            stale.Observations.push_back({});
+            if (CompareLoadedModuleText(L"", nullptr, nullptr, nullptr, 1, 1, &stale) != SliceUnknown ||
+                stale.Compared != 0 || !stale.Observations.empty())
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
     }
 
     uint32_t CountNtExportPrologueMismatches(
@@ -3241,7 +4162,7 @@ namespace
         const std::unordered_set<uint32_t>& guardIatRvas,
         std::vector<uint32_t>* slotRvas,
         uint32_t maxSites);
-    bool KmonVaLooksLikePagingOrFirmware(uint64_t va);
+    bool KmonCfgTargetIsKernelAddress(uint64_t va);
     bool KmonLooksLikeCfgHostModule(const std::wstring& leaf);
     bool ProtectHasExecute(DWORD protect);
     bool AddressInModuleRanges(
@@ -3721,6 +4642,15 @@ namespace
     // (\Device\HarddiskVolume3\...). Map them onto drive letters so the
     // existing disk-read and path-classification helpers keep working;
     // keep the \\?\GLOBALROOT spelling when no DOS device matches.
+    bool KmonDevicePrefixMatches(
+        const std::wstring& path,
+        const std::wstring& prefix)
+    {
+        return !prefix.empty() && path.size() >= prefix.size() &&
+            path.compare(0, prefix.size(), prefix) == 0 &&
+            (path.size() == prefix.size() || path[prefix.size()] == L'\\');
+    }
+
     std::wstring KmonDevicePathToWin32(const std::wstring& devicePath)
     {
         if (devicePath.compare(0, 8, L"\\Device\\") != 0)
@@ -3760,14 +4690,7 @@ namespace
                             // must not match a drive mapped to
                             // HarddiskVolume3, or the converted path eats
                             // the trailing digit.
-                            const bool boundaryIsSeparator =
-                                deviceLower.size() == targetLower.size() ||
-                                deviceLower[targetLower.size()] == L'\\';
-                            if (boundaryIsSeparator &&
-                                deviceLower.compare(
-                                    0,
-                                    targetLower.size(),
-                                    targetLower) == 0)
+                            if (KmonDevicePrefixMatches(deviceLower, targetLower))
                             {
                                 return drive.substr(0, 2) +
                                     devicePath.substr(targetLower.size());
@@ -4289,17 +5212,111 @@ namespace
             region.Type == MEM_PRIVATE ||
             region.Type == MEM_IMAGE ||
             region.Type == MEM_MAPPED;
+        // LDR entries are writable user data. A claimed range cannot turn a
+        // private/section allocation into an image or own another allocation.
+        const bool loaderImage = region.Type == MEM_IMAGE &&
+            std::any_of(moduleRanges.begin(), moduleRanges.end(),
+                [alloc](const std::pair<uint64_t, uint32_t>& module)
+                {
+                    return module.first == alloc && module.second != 0;
+                });
         return
             region.State == MEM_COMMIT &&
             region.RegionSize >= 0x1000 &&
             alloc != 0 &&
             alloc != exeRegion &&
-            !AddressInModuleRanges(
-                alloc,
-                moduleRanges) &&
+            !loaderImage &&
             mappedOrPrivate &&
             ProtectHasExecute(region.Protect);
     }
+
+    bool KmonOrphanCodeCandidate(
+        const MEMORY_BASIC_INFORMATION& region,
+        bool requiresThreadEvidence = false)
+    {
+        // Pagefile-backed section views keep MEM_MAPPED even after an RW
+        // producer writes code through another view. No PE header is needed.
+        return region.State == MEM_COMMIT &&
+            ProtectHasExecute(region.Protect) &&
+            (region.Protect & PAGE_GUARD) == 0 &&
+            region.RegionSize >= 0x1000 &&
+            (region.Type == MEM_MAPPED ||
+             (region.Type == MEM_PRIVATE &&
+              (region.RegionSize <= 0x10000 || requiresThreadEvidence)));
+    }
+
+    bool KmonCodeProbeSupportsCandidate(
+        bool readSucceeded,
+        const std::vector<uint8_t>& bytes)
+    {
+        return readSucceeded && bytes.size() >= 0x40 &&
+            KmonBytesLookLikeCode(bytes.data(), bytes.size());
+    }
+
+    bool KmonAdvanceUserVmCursor(
+        uint64_t current,
+        uint64_t regionBase,
+        uint64_t regionSize,
+        uint64_t* next)
+    {
+        bool advanced = false;
+        if (next != nullptr && regionBase <= current && regionSize != 0 &&
+            regionSize <= (std::numeric_limits<uint64_t>::max)() - regionBase)
+        {
+            const uint64_t candidate = regionBase + regionSize;
+            if (candidate > current)
+            {
+                *next = candidate;
+                advanced = true;
+            }
+        }
+        return advanced;
+    }
+
+    bool KmonCollectUniqueCowPages(
+        uint64_t imageBase,
+        const uint32_t* rvas,
+        uint32_t rvaCount,
+        std::vector<uint64_t>* pages)
+    {
+        bool ok = false;
+        do
+        {
+            if (pages == nullptr)
+            {
+                break;
+            }
+            pages->clear();
+            if (imageBase == 0 || rvas == nullptr ||
+                rvaCount == 0 || rvaCount > 8)
+            {
+                break;
+            }
+            bool overflow = false;
+            for (uint32_t index = 0; index < rvaCount; ++index)
+            {
+                if (rvas[index] >
+                    (std::numeric_limits<uint64_t>::max)() - imageBase)
+                {
+                    overflow = true;
+                    break;
+                }
+                const uint64_t page = (imageBase + rvas[index]) & ~0xFFFull;
+                if (std::find(pages->begin(), pages->end(), page) == pages->end())
+                {
+                    pages->push_back(page);
+                }
+            }
+            if (overflow)
+            {
+                pages->clear();
+                break;
+            }
+            ok = !pages->empty();
+        } while (false);
+        return ok;
+    }
+
     bool CountPrivateCowImagePages(
         HANDLE process,
         DeviceClient* device,
@@ -4320,38 +5337,50 @@ namespace
             }
             *privateCount = 0;
             *validCount = 0;
-            if (process == nullptr || imageBase == 0 || rvas == nullptr || rvaCount == 0 || rvaCount > 8)
+            if (process == nullptr)
+            {
+                break;
+            }
+            std::vector<uint64_t> pages;
+            if (!KmonCollectUniqueCowPages(imageBase, rvas, rvaCount, &pages))
             {
                 break;
             }
             PSAPI_WORKING_SET_EX_INFORMATION info[8] = {};
-            bool overflow = false;
-            for (uint32_t i = 0; i < rvaCount; ++i)
+            uint32_t pageCount = 0;
+            for (uint64_t page : pages)
             {
-                if (rvas[i] > (std::numeric_limits<uint64_t>::max)() - imageBase)
+                MEMORY_BASIC_INFORMATION mapping = {};
+                if (VirtualQueryEx(
+                        process,
+                        reinterpret_cast<LPCVOID>(page),
+                        &mapping,
+                        sizeof(mapping)) != sizeof(mapping) ||
+                    mapping.State != MEM_COMMIT || mapping.Type != MEM_IMAGE ||
+                    reinterpret_cast<uint64_t>(mapping.AllocationBase) != imageBase ||
+                    !ProtectHasExecute(mapping.Protect) ||
+                    (mapping.Protect & PAGE_GUARD) != 0)
                 {
-                    overflow = true;
-                    break;
+                    continue;
                 }
-                const uint64_t page = (imageBase + rvas[i]) & ~0xFFFull;
-                info[i].VirtualAddress = reinterpret_cast<PVOID>(page);
+                info[pageCount++].VirtualAddress = reinterpret_cast<PVOID>(page);
                 std::vector<uint8_t> touch;
                 ReadProcessBytes(device, symbols, process, pid, page, 8, &touch);
             }
-            if (overflow)
+            if (pageCount == 0)
             {
                 break;
             }
             if (!QueryWorkingSetEx(
                     process,
                     info,
-                    static_cast<DWORD>(sizeof(info[0]) * rvaCount)))
+                    static_cast<DWORD>(sizeof(info[0]) * pageCount)))
             {
                 break;
             }
             uint32_t priv = 0;
             uint32_t valid = 0;
-            for (uint32_t i = 0; i < rvaCount; ++i)
+            for (uint32_t i = 0; i < pageCount; ++i)
             {
                 if (info[i].VirtualAttributes.Valid == 0)
                 {
@@ -4370,14 +5399,447 @@ namespace
         return ok;
     }
 
+    bool KmonUserSnapshotGenerationMatches(
+        uint64_t inventoryGeneration,
+        uint64_t beforeSnapshot,
+        uint64_t afterSnapshot,
+        bool processPinned)
+    {
+        return processPinned && beforeSnapshot != 0 &&
+            afterSnapshot == beforeSnapshot &&
+            (inventoryGeneration == 0 || inventoryGeneration == beforeSnapshot);
+    }
+
     struct KmonUserTarget
     {
         uint32_t Pid = 0;
+        uint64_t CreateTime = 0;
+        uint64_t Eprocess = 0;
+        uint32_t ThreadQueryQuota = 0;
         std::wstring ImagePath;
         std::wstring Leaf;
         bool HighPriority = false;
         bool Interesting = false;
+        bool Suspect = false;
     };
+
+    using KmonUserGenerationInventory = std::map<uint32_t, uint64_t>;
+    constexpr size_t kMaxUserCursorGenerations = 4096;
+
+    template<typename Cursor>
+    void KmonPruneUserCursors(
+        const KmonUserGenerationInventory& inventory,
+        bool inventoryComplete,
+        std::map<std::pair<uint32_t, uint64_t>, Cursor>* cursors)
+    {
+        if (cursors == nullptr)
+        {
+            return;
+        }
+        for (auto current = cursors->begin(); current != cursors->end();)
+        {
+            const auto observed = inventory.find(current->first.first);
+            const bool absent = observed == inventory.end();
+            const bool replaced = !absent && observed->second != 0 &&
+                observed->second != current->first.second;
+            if (replaced || (absent && inventoryComplete))
+            {
+                current = cursors->erase(current);
+            }
+            else
+            {
+                ++current;
+            }
+        }
+    }
+
+    template<typename Cursor>
+    bool KmonRememberUserCursor(
+        const KmonUserGenerationInventory& inventory,
+        const std::pair<uint32_t, uint64_t>& generation,
+        Cursor next,
+        std::map<std::pair<uint32_t, uint64_t>, Cursor>* cursors)
+    {
+        bool retainedAll = true;
+        if (cursors == nullptr || generation.second == 0)
+        {
+            return false;
+        }
+        // The deep handle established this generation even if the earlier
+        // inventory could not read its creation time.
+        auto previous = cursors->lower_bound({generation.first, 0});
+        while (previous != cursors->end() && previous->first.first == generation.first)
+        {
+            if (previous->first != generation)
+            {
+                previous = cursors->erase(previous);
+            }
+            else
+            {
+                ++previous;
+            }
+        }
+        const auto existing = cursors->find(generation);
+        if (existing != cursors->end())
+        {
+            existing->second = next;
+        }
+        else
+        {
+            if (cursors->size() >= kMaxUserCursorGenerations)
+            {
+                // Never evict a current candidate to admit another one.
+                // Stable inventories fit the same 4096-process bound.
+                const auto victim = std::find_if(cursors->begin(), cursors->end(),
+                    [&inventory](const auto& entry)
+                    {
+                        return inventory.count(entry.first.first) == 0;
+                    });
+                if (victim == cursors->end())
+                {
+                    return false;
+                }
+                cursors->erase(victim);
+                retainedAll = false;
+            }
+            cursors->emplace(generation, next);
+        }
+        return retainedAll;
+    }
+
+    void KmonAssignUserThreadQueryQuotas(
+        std::vector<KmonUserTarget>* targets,
+        uint32_t passBudget)
+    {
+        if (targets == nullptr || targets->empty())
+        {
+            return;
+        }
+        const size_t baseQuota = passBudget / targets->size();
+        const size_t remainder = passBudget % targets->size();
+        for (size_t index = 0; index < targets->size(); ++index)
+        {
+            (*targets)[index].ThreadQueryQuota = static_cast<uint32_t>(
+                (std::min)(size_t(64), baseQuota + (index < remainder ? 1 : 0)));
+        }
+    }
+
+    struct KmonUserThreadInventory
+    {
+        bool Attempted = false;
+        bool Complete = false;
+        std::map<uint32_t, std::vector<uint32_t>> ThreadIds;
+    };
+
+    struct KmonUserThreadStart
+    {
+        uint32_t ThreadId = 0;
+        uint64_t Address = 0;
+    };
+
+    bool KmonUserThreadStartInsideRange(
+        const KmonUserThreadStart& start,
+        uint64_t base,
+        uint64_t size)
+    {
+        return start.ThreadId != 0 && base != 0 && size != 0 &&
+            start.Address >= base && start.Address - base < size;
+    }
+
+    struct KmonUserThreadCodeCandidate
+    {
+        KmonUserThreadStart Start;
+        MEMORY_BASIC_INFORMATION Region = {};
+    };
+
+    template<typename QueryRegion, typename ReadBytes>
+    void KmonCollectUserThreadCodeCandidates(
+        const std::vector<KmonUserThreadStart>& starts,
+        uint64_t exeRegion,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        QueryRegion queryRegion,
+        ReadBytes readBytes,
+        std::vector<KmonUserThreadCodeCandidate>* candidates,
+        uint32_t* queryFailures,
+        uint32_t* probeFailures)
+    {
+        if (candidates == nullptr || queryFailures == nullptr || probeFailures == nullptr)
+        {
+            return;
+        }
+        candidates->clear();
+        for (const KmonUserThreadStart& start : starts)
+        {
+            if (start.ThreadId == 0 || !IsUserModeImageBase(start.Address))
+            {
+                continue;
+            }
+            MEMORY_BASIC_INFORMATION region = {};
+            // Query each start directly. A separate VAD walk may be in a
+            // different bounded slice when this thread is selected again.
+            if (!queryRegion(start.Address, &region))
+            {
+                ++(*queryFailures);
+                continue;
+            }
+            const uint64_t base = reinterpret_cast<uint64_t>(region.BaseAddress);
+            if (!KmonOrphanCodeCandidate(region, true) ||
+                !KmonOrphanRegionInteresting(region, exeRegion, moduleRanges) ||
+                !KmonUserThreadStartInsideRange(start, base, region.RegionSize))
+            {
+                continue;
+            }
+            const uint32_t count = static_cast<uint32_t>(
+                (std::min<uint64_t>)(0x200, region.RegionSize - (start.Address - base)));
+            std::vector<uint8_t> bytes;
+            const bool read = readBytes(start.Address, count, &bytes);
+            if (!read || bytes.size() < count || bytes.size() < 0x40)
+            {
+                ++(*probeFailures);
+            }
+            if (KmonCodeProbeSupportsCandidate(read, bytes))
+            {
+                KmonUserThreadCodeCandidate candidate;
+                candidate.Start = start;
+                candidate.Region = region;
+                candidates->push_back(candidate);
+            }
+        }
+    }
+
+    void KmonCollectUserThreadInventory(KmonUserThreadInventory* inventory)
+    {
+        if (inventory == nullptr || inventory->Attempted)
+        {
+            return;
+        }
+        inventory->Attempted = true;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+        THREADENTRY32 entry = {};
+        entry.dwSize = sizeof(entry);
+        BOOL more = Thread32First(snapshot, &entry);
+        size_t rows = 0;
+        while (more)
+        {
+            if (++rows > 65536)
+            {
+                break;
+            }
+            if (entry.th32OwnerProcessID > 4 && entry.th32ThreadID != 0)
+            {
+                inventory->ThreadIds[entry.th32OwnerProcessID].push_back(entry.th32ThreadID);
+            }
+            entry.dwSize = sizeof(entry);
+            more = Thread32Next(snapshot, &entry);
+            if (!more)
+            {
+                inventory->Complete = GetLastError() == ERROR_NO_MORE_FILES;
+            }
+        }
+        CloseHandle(snapshot);
+        for (auto& owner : inventory->ThreadIds)
+        {
+            std::vector<uint32_t>& tids = owner.second;
+            std::sort(tids.begin(), tids.end());
+            tids.erase(std::unique(tids.begin(), tids.end()), tids.end());
+        }
+    }
+
+    bool KmonTakeNextUserThreadQuery(
+        const std::vector<uint32_t>& sortedTids,
+        uint32_t* afterTid,
+        uint32_t* remainingQuota,
+        uint32_t* tid)
+    {
+        bool selected = false;
+        if (!sortedTids.empty() && afterTid != nullptr &&
+            remainingQuota != nullptr && *remainingQuota != 0 && tid != nullptr)
+        {
+            auto next = std::upper_bound(sortedTids.begin(), sortedTids.end(), *afterTid);
+            if (next == sortedTids.end())
+            {
+                next = sortedTids.begin();
+            }
+            *tid = *next;
+            *afterTid = *next;
+            --(*remainingQuota);
+            selected = true;
+        }
+        return selected;
+    }
+
+    bool KmonCollectLiveUserThreadStarts(
+        KmonUserThreadInventory* inventory,
+        uint32_t pid,
+        uint64_t createTime,
+        uint32_t* afterTid,
+        uint32_t* remainingQuota,
+        std::vector<KmonUserThreadStart>* starts)
+    {
+        bool complete = false;
+        HANDLE process = nullptr;
+        do
+        {
+            if (inventory == nullptr || starts == nullptr ||
+                afterTid == nullptr || remainingQuota == nullptr || createTime == 0)
+            {
+                break;
+            }
+            starts->clear();
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+            if (process == nullptr || QueryProcessCreateTicks(process) != createTime ||
+                WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+            {
+                break;
+            }
+            using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+            const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            const auto query = ntdll != nullptr
+                ? reinterpret_cast<NtQueryInformationThreadFn>(
+                    GetProcAddress(ntdll, "NtQueryInformationThread"))
+                : nullptr;
+            if (query == nullptr)
+            {
+                break;
+            }
+            KmonCollectUserThreadInventory(inventory);
+            const auto found = inventory->ThreadIds.find(pid);
+            if (found == inventory->ThreadIds.end() || found->second.empty())
+            {
+                break;
+            }
+            const std::vector<uint32_t>& tids = found->second;
+            const size_t count = (std::min)(tids.size(),
+                (std::min)(size_t(64), static_cast<size_t>(*remainingQuota)));
+            complete = inventory->Complete && count == tids.size();
+            for (size_t index = 0; index < count; ++index)
+            {
+                uint32_t tid = 0;
+                if (!KmonTakeNextUserThreadQuery(tids, afterTid, remainingQuota, &tid))
+                {
+                    complete = false;
+                    break;
+                }
+                HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION | SYNCHRONIZE, FALSE, tid);
+                if (thread == nullptr)
+                {
+                    complete = false;
+                    continue;
+                }
+                PVOID address = nullptr;
+                ULONG returned = 0;
+                constexpr ULONG kThreadQuerySetWin32StartAddress = 9;
+                const bool queried = GetProcessIdOfThread(thread) == pid &&
+                    WaitForSingleObject(thread, 0) == WAIT_TIMEOUT &&
+                    query(thread, kThreadQuerySetWin32StartAddress, &address,
+                        sizeof(address), &returned) >= 0 && returned == sizeof(address) &&
+                    WaitForSingleObject(thread, 0) == WAIT_TIMEOUT;
+                if (queried)
+                {
+                    KmonUserThreadStart start;
+                    start.ThreadId = tid;
+                    start.Address = reinterpret_cast<uint64_t>(address);
+                    if (IsUserModeImageBase(start.Address))
+                    {
+                        starts->push_back(start);
+                    }
+                }
+                else
+                {
+                    complete = false;
+                }
+                CloseHandle(thread);
+            }
+            if (QueryProcessCreateTicks(process) != createTime ||
+                WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+            {
+                starts->clear();
+                complete = false;
+            }
+        } while (false);
+        if (process != nullptr)
+        {
+            CloseHandle(process);
+        }
+        return complete;
+    }
+
+    void KmonScheduleUserTargets(
+        std::vector<KmonUserTarget>* targets,
+        uint64_t pass,
+        size_t budget)
+    {
+        if (targets == nullptr || targets->empty() || budget == 0)
+        {
+            return;
+        }
+        std::stable_sort(
+            targets->begin(),
+            targets->end(),
+            [](const KmonUserTarget& left, const KmonUserTarget& right)
+            {
+                if (left.HighPriority != right.HighPriority)
+                {
+                    return left.HighPriority;
+                }
+                if (left.Interesting != right.Interesting)
+                {
+                    return left.Interesting;
+                }
+                return left.Pid < right.Pid;
+            });
+        const auto highEnd = std::find_if(
+            targets->begin(),
+            targets->end(),
+            [](const KmonUserTarget& target)
+            {
+                return !target.HighPriority;
+            });
+        const size_t highCount = static_cast<size_t>(highEnd - targets->begin());
+        const size_t otherCount = targets->size() - highCount;
+        if (targets->size() <= budget)
+        {
+            if (highCount != 0)
+            {
+                std::rotate(targets->begin(),
+                    targets->begin() + static_cast<size_t>(pass % highCount), highEnd);
+            }
+            if (otherCount != 0)
+            {
+                std::rotate(highEnd,
+                    highEnd + static_cast<size_t>(pass % otherCount), targets->end());
+            }
+            return;
+        }
+        // Reserve a quarter of a bounded pass for the remaining hosts. Both
+        // tiers advance so a fixed Toolhelp order cannot permanently hide a PID.
+        const size_t reserveOther = (std::min)(otherCount, (std::max)(size_t(1), budget / 4));
+        const size_t highBudget = (std::min)(highCount, budget - reserveOther);
+        const size_t otherBudget = (std::min)(otherCount, budget - highBudget);
+        const size_t spareHigh = (std::min)(highCount - highBudget,
+            budget - highBudget - otherBudget);
+        std::vector<KmonUserTarget> scheduled;
+        scheduled.reserve(budget);
+        auto appendTier = [&](size_t first, size_t count, size_t take)
+        {
+            if (count == 0 || take == 0)
+            {
+                return;
+            }
+            const size_t start = static_cast<size_t>(pass % count) * take % count;
+            for (size_t index = 0; index < take; ++index)
+            {
+                scheduled.push_back(std::move((*targets)[first + (start + index) % count]));
+            }
+        };
+        appendTier(0, highCount, highBudget + spareHigh);
+        appendTier(highCount, otherCount, otherBudget);
+        *targets = std::move(scheduled);
+    }
 
     bool NameEqualsWatch(const std::wstring& baseLower, const std::vector<std::wstring>& watchLower)
     {
@@ -4420,38 +5882,6 @@ namespace
             }
         }
         return matched;
-    }
-
-    bool QueryProcessImagePathByPid(uint32_t pid, std::wstring* path)
-    {
-        bool ok = false;
-        HANDLE process = nullptr;
-        do
-        {
-            if (path == nullptr || pid <= 4)
-            {
-                break;
-            }
-            path->clear();
-            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (process == nullptr)
-            {
-                break;
-            }
-            wchar_t buf[32768] = {};
-            DWORD n = ARRAYSIZE(buf);
-            if (!QueryFullProcessImageNameW(process, 0, buf, &n) || n == 0)
-            {
-                break;
-            }
-            path->assign(buf, n);
-            ok = true;
-        } while (false);
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-        return ok;
     }
 
     bool PathHasDirectorySeparator(const std::wstring& path)
@@ -4601,124 +6031,25 @@ namespace
         uint64_t regionVa,
         const std::vector<KernelModuleInfo>& modules)
     {
-        uint32_t hits = 0;
-        if (bytes == nullptr || size < 14)
+        std::vector<KmonStubModuleRange> ranges;
+        ranges.reserve(modules.size());
+        for (const KernelModuleInfo& module : modules)
         {
-            return 0;
+            if (module.Base == 0 || module.Size == 0 ||
+                module.Base > ~0ull - module.Size)
+            {
+                continue;
+            }
+            KmonStubModuleRange range;
+            range.Base = module.Base;
+            range.End = module.Base + module.Size;
+            range.KernelImport = KmonLooksLikeKernelImportTarget(KmonBasenameLower(
+                module.ImageName.empty() ? module.ImagePath : module.ImageName));
+            ranges.push_back(std::move(range));
         }
-
-        auto targetIsKernelImport = [&](uint64_t target) -> bool
-        {
-            if (target < 0xFFFF800000000000ull)
-            {
-                return false;
-            }
-            for (const KernelModuleInfo& module : modules)
-            {
-                if (module.Base == 0 || module.Size == 0)
-                {
-                    continue;
-                }
-                if (target < module.Base)
-                {
-                    continue;
-                }
-                const uint64_t end = module.Base + module.Size;
-                if (end < module.Base || target >= end)
-                {
-                    continue;
-                }
-                const std::wstring leaf = KmonBasenameLower(
-                    module.ImageName.empty() ? module.ImagePath : module.ImageName);
-                return KmonLooksLikeKernelImportTarget(leaf);
-            }
-            return false;
-        };
-
-        auto isIndirectBranchOpcode = [](uint8_t b) -> bool
-        {
-            return b == 0x25 || b == 0x15;
-        };
-        for (size_t i = 0; i + 6 <= size; ++i)
-        {
-            if (bytes[i] != 0xFF || !isIndirectBranchOpcode(bytes[i + 1]))
-            {
-                continue;
-            }
-            int32_t disp = 0;
-            std::memcpy(&disp, bytes + i + 2, sizeof(disp));
-            const uint64_t insnEnd = regionVa + static_cast<uint64_t>(i) + 6ull;
-            const uint64_t slotVa = static_cast<uint64_t>(
-                static_cast<int64_t>(insnEnd) + static_cast<int64_t>(disp));
-            if (slotVa < regionVa)
-            {
-                continue;
-            }
-            const uint64_t slotOff = slotVa - regionVa;
-            if (slotOff > size - 8)
-            {
-                continue;
-            }
-            uint64_t target = 0;
-            std::memcpy(&target, bytes + slotOff, sizeof(target));
-            if (target == 0)
-            {
-                continue;
-            }
-            if (target >= regionVa &&
-                size > 0 &&
-                target < regionVa + size)
-            {
-                continue;
-            }
-            if (targetIsKernelImport(target))
-            {
-                ++hits;
-                i += 5;
-            }
-        }
-        // Absolute-target thunks: mov rax, <imm64> followed within a few
-        // bytes by jmp rax (FF E0) or call rax (FF D0). Mappers that skip
-        // IAT-style slots resolve imports this way.
-        for (size_t i = 0; i + 12 <= size; ++i)
-        {
-            if (bytes[i] != 0x48 || bytes[i + 1] != 0xB8)
-            {
-                continue;
-            }
-            uint64_t target = 0;
-            std::memcpy(&target, bytes + i + 2, sizeof(target));
-            if (target == 0)
-            {
-                continue;
-            }
-            if (target >= regionVa &&
-                size > 0 &&
-                target < regionVa + size)
-            {
-                continue;
-            }
-            bool branchesThroughRax = false;
-            for (size_t j = i + 10; j + 1 < size && j <= i + 13; ++j)
-            {
-                if (bytes[j] == 0xFF &&
-                    (bytes[j + 1] == 0xE0 || bytes[j + 1] == 0xD0))
-                {
-                    branchesThroughRax = true;
-                    break;
-                }
-            }
-            if (!branchesThroughRax)
-            {
-                continue;
-            }
-            if (targetIsKernelImport(target))
-            {
-                ++hits;
-                i += 11;
-            }
-        }
-        return hits;
+        KmonMapperStubStats stats = {};
+        KmonCountMapperStubs(bytes, size, regionVa, ranges, &stats);
+        return stats.KernelImport;
     }
 
     bool KmonLooksLikeCfgHostModule(const std::wstring& leaf)
@@ -4729,25 +6060,15 @@ namespace
             leaf.compare(0, 6, L"win32k") == 0;
     }
 
-    bool KmonVaLooksLikePagingOrFirmware(uint64_t va)
+    bool KmonCfgTargetIsKernelAddress(uint64_t va)
     {
-        if (va < 0xFFFF800000000000ull)
-        {
-            return true;
-        }
-        if (va >= 0xFFFFF68000000000ull && va < 0xFFFFF70000000000ull)
-        {
-            return true;
-        }
-        if (va >= 0xFFFFF78000000000ull && va < 0xFFFFF80000000000ull)
-        {
-            return true;
-        }
-        if (va >= 0xFFFFF90000000000ull && va < 0xFFFFF98000000000ull)
-        {
-            return true;
-        }
-        return false;
+        return LeftoverIsKernelCanonical(va);
+    }
+
+    bool KmonCfgCacheNeedsRefresh(uint64_t savedNtos, uint64_t savedIdentity,
+        uint64_t nextAttempt, uint64_t ntos, uint64_t identity, uint64_t now)
+    {
+        return savedNtos != ntos || savedIdentity != identity || now >= nextAttempt;
     }
 
     uint32_t CollectCfgDataPtrSlotRvas(
@@ -4761,14 +6082,18 @@ namespace
         uint32_t maxSites)
     {
         uint32_t hits = 0;
+        if (slotRvas != nullptr)
+        {
+            slotRvas->clear();
+        }
         if (text == nullptr ||
             textSize < 12 ||
             slotRvas == nullptr ||
-            maxSites == 0)
+            maxSites == 0 || textRva >= sizeOfImage || textSize > sizeOfImage - textRva)
         {
             return 0;
         }
-        slotRvas->clear();
+        std::unordered_set<uint32_t> observedSlots;
         for (size_t i = 0; i + 12 <= textSize && hits < maxSites; ++i)
         {
             if (text[i] != 0x48 || text[i + 1] != 0x8B || text[i + 2] != 0x05)
@@ -4777,13 +6102,13 @@ namespace
             }
             int32_t disp = 0;
             std::memcpy(&disp, text + i + 3, sizeof(disp));
-            const uint32_t movEnd = textRva + static_cast<uint32_t>(i) + 7u;
-            const uint32_t slotRva = static_cast<uint32_t>(
-                static_cast<int64_t>(movEnd) + disp);
-            if (slotRva < 0x200 ||
-                slotRva >= sizeOfImage ||
-                (slotRva >= textRva &&
-                    slotRva < textRva + static_cast<uint32_t>(textSize)))
+            const int64_t slot = static_cast<int64_t>(textRva) + static_cast<int64_t>(i) + 7 + disp;
+            if (slot < 0x200 || slot > static_cast<int64_t>(sizeOfImage) - 8)
+            {
+                continue;
+            }
+            const uint32_t slotRva = static_cast<uint32_t>(slot);
+            if (slotRva >= textRva && slotRva < textRva + static_cast<uint32_t>(textSize))
             {
                 continue;
             }
@@ -4799,11 +6124,9 @@ namespace
                 {
                     int32_t callDisp = 0;
                     std::memcpy(&callDisp, text + i + k + 1, sizeof(callDisp));
-                    const uint32_t callEnd =
-                        textRva + static_cast<uint32_t>(i + k) + 5u;
-                    const uint32_t dest = static_cast<uint32_t>(
-                        static_cast<int64_t>(callEnd) + callDisp);
-                    if (guardCallRvas.find(dest) != guardCallRvas.end())
+                    const int64_t dest = static_cast<int64_t>(textRva) + static_cast<int64_t>(i + k) + 5 + callDisp;
+                    if (dest >= 0 && dest < sizeOfImage &&
+                        guardCallRvas.find(static_cast<uint32_t>(dest)) != guardCallRvas.end())
                     {
                         matched = true;
                     }
@@ -4811,13 +6134,15 @@ namespace
                 }
                 if (op == 0xFF && text[i + k + 1] == 0x15)
                 {
+                    if (i + k + 6 > textSize || k + 6 > 16)
+                    {
+                        break;
+                    }
                     int32_t iatDisp = 0;
                     std::memcpy(&iatDisp, text + i + k + 2, sizeof(iatDisp));
-                    const uint32_t callEnd =
-                        textRva + static_cast<uint32_t>(i + k) + 6u;
-                    const uint32_t iatRva = static_cast<uint32_t>(
-                        static_cast<int64_t>(callEnd) + iatDisp);
-                    if (guardIatRvas.find(iatRva) != guardIatRvas.end())
+                    const int64_t iatRva = static_cast<int64_t>(textRva) + static_cast<int64_t>(i + k) + 6 + iatDisp;
+                    if (iatRva >= 0 && iatRva <= static_cast<int64_t>(sizeOfImage) - 8 &&
+                        guardIatRvas.find(static_cast<uint32_t>(iatRva)) != guardIatRvas.end())
                     {
                         matched = true;
                     }
@@ -4825,7 +6150,7 @@ namespace
                 }
                 break;
             }
-            if (!matched)
+            if (!matched || !observedSlots.insert(slotRva).second)
             {
                 continue;
             }
@@ -5016,20 +6341,6 @@ namespace
         }
     }
 
-    std::wstring KmonImageForClassify(uint32_t pid, const std::wstring& maybePath)
-    {
-        if (PathHasDirectorySeparator(maybePath))
-        {
-            return maybePath;
-        }
-        std::wstring resolved;
-        if (QueryProcessImagePathByPid(pid, &resolved) && !resolved.empty())
-        {
-            return resolved;
-        }
-        return maybePath;
-    }
-
     std::wstring FormatKmonJsonLine(const KmonEvent& event)
     {
         std::wstringstream line;
@@ -5209,6 +6520,11 @@ namespace
     }
 }
 
+bool KmonEnsureKernelModuleView(SymbolEngine* symbols)
+{
+    return EnsureLoadedKernelModules(symbols, true);
+}
+
 std::wstring KmonBasenameLower(const std::wstring& path)
 {
     if (path.empty())
@@ -5294,6 +6610,38 @@ std::wstring KmonNormalizeDriverPath(const std::wstring& path)
     return n;
 }
 
+static bool KmonRootedPathStartsWith(
+    const std::wstring& normalized,
+    const std::wstring& directory,
+    bool exact = false)
+{
+    bool matches = false;
+    do
+    {
+        if (normalized.empty() || normalized.find(L'\0') != std::wstring::npos ||
+            normalized.find(L"\\.\\") != std::wstring::npos ||
+            normalized.find(L"\\..\\") != std::wstring::npos ||
+            normalized.find(L':', 2) != std::wstring::npos)
+        {
+            break;
+        }
+        size_t root = 0;
+        if (normalized.size() >= 3 && normalized[1] == L':' &&
+            normalized[0] >= L'a' && normalized[0] <= L'z' && normalized[2] == L'\\')
+        {
+            root = 2;
+        }
+        else if (normalized[0] != L'\\' ||
+            (normalized.size() > 1 && normalized[1] == L'\\'))
+        {
+            break;
+        }
+        matches = normalized.compare(root, directory.size(), directory) == 0 &&
+            (!exact || normalized.size() == root + directory.size());
+    } while (false);
+    return matches;
+}
+
 std::wstring KmonClassifyDriverPath(const std::wstring& path)
 {
     std::wstring n = KmonNormalizeDriverPath(path);
@@ -5302,10 +6650,10 @@ std::wstring KmonClassifyDriverPath(const std::wstring& path)
         return L"unknown";
     }
 
-    if (n.find(L"\\windows\\system32\\drivers\\") != std::wstring::npos ||
-        n.find(L"\\windows\\system32\\driverstore\\") != std::wstring::npos ||
-        n.find(L"\\windows\\winsxs\\") != std::wstring::npos ||
-        n.find(L"\\windows\\system32\\codeintegrity\\") != std::wstring::npos)
+    if (KmonRootedPathStartsWith(n, L"\\windows\\system32\\drivers\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\system32\\driverstore\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\winsxs\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\system32\\codeintegrity\\"))
     {
         return L"inbox";
     }
@@ -5361,13 +6709,13 @@ std::wstring KmonClassifyDriverPath(const std::wstring& path)
 
     // win32k.sys lives in System32, not drivers. Still inbox.
     // SysWOW64 is the 32-bit OS tree, not a drop directory.
-    if (n.find(L"\\windows\\system32\\") != std::wstring::npos ||
-        n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
-        n.find(L"\\windows\\sysnative\\") != std::wstring::npos ||
-        n.find(L"\\windows\\microsoft.net\\") != std::wstring::npos ||
-        n.find(L"\\windows\\assembly\\") != std::wstring::npos ||
-        n.find(L"\\windows\\systemapps\\") != std::wstring::npos ||
-        n.find(L"\\windows\\servicing\\") != std::wstring::npos)
+    if (KmonRootedPathStartsWith(n, L"\\windows\\system32\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\syswow64\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\sysnative\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\microsoft.net\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\assembly\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\systemapps\\") ||
+        KmonRootedPathStartsWith(n, L"\\windows\\servicing\\"))
     {
         return L"inbox";
     }
@@ -5550,32 +6898,32 @@ bool KmonWindowsBuiltinPathLooksInbox(const std::wstring& path)
         }
         if (leaf == L"explorer.exe")
         {
-            inbox = n.find(L"\\windows\\explorer.exe") != std::wstring::npos;
+            inbox = KmonRootedPathStartsWith(n, L"\\windows\\explorer.exe", true);
             break;
         }
         if (leaf == L"notepad.exe")
         {
-            inbox = n.find(L"\\windows\\system32\\") != std::wstring::npos ||
-                n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
-                n.find(L"\\windowsapps\\") != std::wstring::npos;
+            inbox = KmonRootedPathStartsWith(n, L"\\windows\\system32\\") ||
+                KmonRootedPathStartsWith(n, L"\\windows\\syswow64\\") ||
+                KmonRootedPathStartsWith(n, L"\\program files\\windowsapps\\");
             break;
         }
         if (leaf == L"pwsh.exe")
         {
-            inbox = n.find(L"\\windows\\system32\\") != std::wstring::npos ||
-                n.find(L"\\program files\\powershell\\") != std::wstring::npos ||
-                n.find(L"\\program files (x86)\\powershell\\") != std::wstring::npos;
+            inbox = KmonRootedPathStartsWith(n, L"\\windows\\system32\\") ||
+                KmonRootedPathStartsWith(n, L"\\program files\\powershell\\") ||
+                KmonRootedPathStartsWith(n, L"\\program files (x86)\\powershell\\");
             break;
         }
         if (leaf == L"wmiprvse.exe")
         {
-            inbox = n.find(L"\\windows\\system32\\wbem\\") != std::wstring::npos ||
-                n.find(L"\\windows\\syswow64\\wbem\\") != std::wstring::npos;
+            inbox = KmonRootedPathStartsWith(n, L"\\windows\\system32\\wbem\\") ||
+                KmonRootedPathStartsWith(n, L"\\windows\\syswow64\\wbem\\");
             break;
         }
-        inbox = n.find(L"\\windows\\system32\\") != std::wstring::npos ||
-            n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
-            n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
+        inbox = KmonRootedPathStartsWith(n, L"\\windows\\system32\\") ||
+            KmonRootedPathStartsWith(n, L"\\windows\\syswow64\\") ||
+            KmonRootedPathStartsWith(n, L"\\windows\\winsxs\\");
     } while (false);
     return inbox;
 }
@@ -5798,10 +7146,8 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
 
         if (KmonTaskLooksLikeWindowHook(out->Task))
         {
-            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
-            out->TargetImage = KmonImageForClassify(
-                record.TargetProcessId,
-                record.TargetImageBase);
+            out->Image = record.ImagePath;
+            out->TargetImage = record.TargetImageBase;
             out->Kind = L"hook.window";
             out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId);
             if (record.TargetProcessId != 0 &&
@@ -5816,10 +7162,8 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
 
         if (KmonTaskLooksLikeProcessImpairTask(out->Task))
         {
-            out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
-            out->TargetImage = KmonImageForClassify(
-                record.TargetProcessId,
-                record.TargetImageBase);
+            out->Image = record.ImagePath;
+            out->TargetImage = record.TargetImageBase;
             out->Kind = L"process.impair";
             out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId);
             if (record.TargetProcessId != 0 &&
@@ -5854,15 +7198,15 @@ bool KmonClassifyTiEvent(const TiEventRecord& record, KmonEvent* out)
                 injectTaskLower.find(L"setthreadcontext") == std::wstring::npos;
             const bool osWriteNoise =
                 writeVmOnly &&
+                KmonWindowsBuiltinPathLooksInbox(record.ImagePath) &&
                 (injectCallerLeaf == L"csrss.exe" ||
                     (KmonIsWindowsBuiltinLeaf(injectCallerLeaf) &&
-                        KmonIsWindowsBuiltinLeaf(injectTargetLeaf)));
+                        KmonIsWindowsBuiltinLeaf(injectTargetLeaf) &&
+                        KmonWindowsBuiltinPathLooksInbox(record.TargetImageBase)));
             if (!osWriteNoise)
             {
-                out->Image = KmonImageForClassify(record.ProcessId, record.ImagePath);
-                out->TargetImage = KmonImageForClassify(
-                    record.TargetProcessId,
-                    record.TargetImageBase);
+                out->Image = record.ImagePath;
+                out->TargetImage = record.TargetImageBase;
                 out->Kind = L"inject.remote";
                 out->Summary = out->Task + L" pid=" + std::to_wstring(record.ProcessId) +
                     L" -> pid=" + std::to_wstring(record.TargetProcessId);
@@ -5902,9 +7246,36 @@ static bool KmonParseHexU64(const std::wstring& text, uint64_t* value)
             break;
         }
 
-        wchar_t* end = nullptr;
-        unsigned long long parsed = wcstoull(start, &end, 16);
-        if (end == start)
+        uint64_t parsed = 0;
+        bool valid = true;
+        for (const wchar_t* digit = start; *digit != L'\0'; ++digit)
+        {
+            uint32_t valueAtDigit = 0;
+            if (*digit >= L'0' && *digit <= L'9')
+            {
+                valueAtDigit = static_cast<uint32_t>(*digit - L'0');
+            }
+            else if (*digit >= L'a' && *digit <= L'f')
+            {
+                valueAtDigit = static_cast<uint32_t>(*digit - L'a') + 10;
+            }
+            else if (*digit >= L'A' && *digit <= L'F')
+            {
+                valueAtDigit = static_cast<uint32_t>(*digit - L'A') + 10;
+            }
+            else
+            {
+                valid = false;
+                break;
+            }
+            if (parsed > ((std::numeric_limits<uint64_t>::max)() - valueAtDigit) / 16)
+            {
+                valid = false;
+                break;
+            }
+            parsed = parsed * 16 + valueAtDigit;
+        }
+        if (!valid)
         {
             break;
         }
@@ -6121,6 +7492,15 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
         }
 
         if (event.Kind == L"gap.kernel_rw" ||
+            event.Kind == L"sensor.ti" ||
+            event.Kind == L"sensor.posture" ||
+            event.Kind == L"sensor.coverage" ||
+            event.Kind == L"driver.integrity" ||
+            event.Kind == L"memory.executable_unowned" ||
+            event.Kind == L"memory.transition" ||
+            event.Kind == L"process.execution" ||
+            event.Kind == L"process.provenance" ||
+            event.Kind == L"hook.lifecycle" ||
             event.Kind == L"process.hidden" ||
             event.Kind == L"process.syscall_unnamed" ||
             event.Kind == L"driver.drop_load" ||
@@ -6560,6 +7940,7 @@ bool KernelMonitor::Start(
     SymbolEngine* symbols,
     std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool ok = false;
 
     do
@@ -6580,6 +7961,15 @@ bool KernelMonitor::Start(
                 if (error != nullptr)
                 {
                     *error = L"kmon already active";
+                }
+                break;
+            }
+
+            if (IotraceArmed())
+            {
+                if (error != nullptr)
+                {
+                    *error = L"previous I/O trace cleanup is incomplete; retry stop first";
                 }
                 break;
             }
@@ -6685,6 +8075,7 @@ bool KernelMonitor::Start(
                 ModulePending.clear();
                 KernelViewPending.clear();
                 NextKernelViewScanTickMs = 0;
+                ResetTemporalDetections();
                 ModuleScans = 0;
                 MapperWatchLast = MapperWatchFingerprint{};
                 MapperWatchDriver.clear();
@@ -6711,10 +8102,13 @@ bool KernelMonitor::Start(
             // Cursor 0 re-dumps the ring on stop+start and on first start
             // after a standalone !ti session.
             TiCursorSequence = 0;
+            TiTraceGeneration = ti->SnapshotStats().Trace.Generation;
+            TiMissingSequences = 0;
+            TiHealthState.clear();
+            LastTiIngestTickMs = 0;
+            MaxTiIngestGapMs = 0;
             LiveCursorEventId = 0;
             CredscanWindows.clear();
-            TiResolvedImageCache.clear();
-            TiResolvedImageTickMs.clear();
             {
                 std::lock_guard<std::mutex> capturesLock(CapturesMutex);
                 CapturedKeys.clear();
@@ -6846,8 +8240,75 @@ bool KernelMonitor::Start(
     return ok;
 }
 
-bool KernelMonitor::Stop(std::wstring* error)
+void KernelMonitor::ResetTemporalDetections()
 {
+    // Start holds StateMutex and WatchMutex before publishing a new worker.
+    DriverTamperBaselines.clear();
+    UserVmWalkCursors.clear();
+    UserThreadStartCursors.clear();
+    UserModuleWalkCursors.clear();
+    ImagePageCursors.clear();
+    KernelImageCursor = 0;
+    GraphicsDispatchCursors.clear();
+    SuspectProcesses.clear();
+    UserEvidenceCursors.clear();
+    UserFileIdentities.clear();
+    RegionHistory.Clear();
+    NextRegionFollowupTickMs = 0;
+    RegionFollowupPending = false;
+    WatchedHandleCursor = 0;
+    WatchedHandleGenerations.clear();
+    WatchedHandleAfter.clear();
+    DriverTamperStrikes.clear();
+    DriverTamperLastCheckMs.clear();
+    DriverTamperOrder.clear();
+    DriverTamperCursor = 0;
+    DriverTamperChecks = 0;
+    EvidenceAsymmetryCursor = 0;
+    NextTypeListScanTickMs = 0;
+    ThreadHiddenStrikes.clear();
+    ThreadListDkomStrikes.clear();
+    ThreadScans.store(0);
+    NextThreadScanTickMs = 0;
+    InlinePatchStrikes.clear();
+    CallbackRedirectStrikes.clear();
+    CallbackRedirectCursor = 0;
+    CallbackRedirectBatch.clear();
+    KpageRegionOffset = 0;
+    KpageContinuation = {};
+    PoolPeAllocationAfter = 0;
+    PoolPeInteriorRound = 0;
+    MapperUnloadedAfter = 0;
+    MapperPiddbAfter = 0;
+    MapperHashAfter = 0;
+    DriverTypeListReportAfter = 0;
+    WorkItemCursor = {};
+    DpcQueueCursor = {};
+    TimerQueueCursor = {};
+    WnfCallbackCursor = {};
+    IrpCompletionCursor = {};
+    ByovdModuleAfter = 0;
+    NextPlatformEvidenceTickMs = 0;
+    CfgDataPtrInventoryIdentity = 0;
+    CfgDataPtrNextBuildTickMs = 0;
+    ExecutionCallbackCache.clear();
+    EvidenceSurfaceBaselines.clear();
+    PoolPeEntryOffset = 0;
+    MapperTargetCursors.clear();
+    NextInlinePatchScanTickMs = 0;
+}
+
+bool KmonWindowsModulePathLooksInbox(const std::wstring& path)
+{
+    const std::wstring normalized = KmonNormalizeDriverPath(path);
+    return KmonRootedPathStartsWith(normalized, L"\\windows\\system32\\") ||
+        KmonRootedPathStartsWith(normalized, L"\\windows\\syswow64\\") ||
+        KmonRootedPathStartsWith(normalized, L"\\windows\\winsxs\\");
+}
+
+bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
+{
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     std::thread worker;
     DeviceClient* device = nullptr;
     std::vector<uint32_t> loggingPids;
@@ -6861,11 +8322,16 @@ bool KernelMonitor::Stop(std::wstring* error)
         {
             worker = std::move(Worker);
         }
-        Ti = nullptr;
-        Timeline = nullptr;
-        Device = nullptr;
-        Symbols = nullptr;
     }
+    if (worker.joinable())
+    {
+        worker.join();
+    }
+    UserRuntimeTracker.Stop();
+
+    // Keep dependencies alive through cleanup, including a retry after failure.
+    std::wstring cleanupError;
+    const bool cleanupComplete = !IotraceArmed() || DisarmIotrace(&cleanupError);
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         loggingPids.reserve(LoggingEnabledPids.size());
@@ -6878,18 +8344,25 @@ bool KernelMonitor::Stop(std::wstring* error)
         LoggingEnabledCount.store(0);
     }
 
-    if (worker.joinable())
-    {
-        worker.join();
-    }
-
-    // Leaving an interposed dispatch in place after the session ends would
-    // keep pointing at this process's IOCTL channel; disarm it now.
-    DisarmIotrace(nullptr);
-
     for (uint32_t pid : loggingPids)
     {
         DisableProcessLogging(device, pid);
+    }
+
+    if (finalShutdown && !cleanupComplete)
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        IotraceActive = false;
+        IotraceDriverName.clear();
+        IotraceSeen.clear();
+    }
+    if (cleanupComplete || finalShutdown)
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        Ti = nullptr;
+        Timeline = nullptr;
+        Device = nullptr;
+        Symbols = nullptr;
     }
 
     {
@@ -6899,13 +8372,14 @@ bool KernelMonitor::Stop(std::wstring* error)
 
     if (error != nullptr)
     {
-        error->clear();
+        *error = cleanupComplete ? std::wstring() : cleanupError;
     }
-    return true;
+    return cleanupComplete;
 }
 
 void KernelMonitor::WorkerLoop()
 {
+    uint64_t nextRuntimeCheckMs = 0;
     while (!StopRequested.load())
     {
         // One failing scan tick must never take the process down: this
@@ -6914,6 +8388,25 @@ void KernelMonitor::WorkerLoop()
         // let the next tick retry.
         try
         {
+            if (GetTickCount64() >= nextRuntimeCheckMs)
+            {
+                nextRuntimeCheckMs = GetTickCount64() + 2000;
+                std::wstring runtimeError;
+                bool realDevice = false;
+                {
+                    std::lock_guard<std::mutex> lock(StateMutex);
+                    realDevice = Device != nullptr && Device->IsOpen();
+                }
+                if (realDevice && !UserRuntimeTracker.Start(&runtimeError))
+                {
+                    EmitUnique(L"process.execution", L"scan_failed:runtime_provider", L"", L"runtime",
+                        L"runtime provenance subscription unavailable", runtimeError);
+                }
+                else if (realDevice)
+                {
+                    ClearEmittedKey(L"scan_failed:runtime_provider");
+                }
+            }
             IngestLiveTimeline();
             IngestThreatIntel();
             DrainIotraceEvents();
@@ -6991,6 +8484,7 @@ void KernelMonitor::WorkerLoop()
                 // P1: re-check the load-time image baselines on the same tick
                 // so a self-patching driver is reported while it is resident.
                 // Bounded to a few drivers per pass with a 60s recheck floor.
+                ScanKernelImageIntegrity();
                 ScanDriverTamper();
             }
             IngestLiveTimeline();
@@ -6998,6 +8492,8 @@ void KernelMonitor::WorkerLoop()
             if (!StopRequested.load())
             {
                 ScanHookCallbacks();
+                ScanCallbackLifecycleSurfaces();
+                ScanPlatformEvidence();
             }
             IngestLiveTimeline();
             IngestThreatIntel();
@@ -7041,8 +8537,10 @@ void KernelMonitor::WorkerLoop()
         {
             NextUserScanTickMs = nowMs + 1500;
         }
-        else if (nowMs >= NextUserScanTickMs)
+        if (nowMs >= NextUserScanTickMs || (RegionFollowupPending && nowMs >= NextRegionFollowupTickMs))
         {
+            RegionFollowupPending = false;
+            NextRegionFollowupTickMs = GetTickCount64() + 2000;
             PruneStalePromotedWatches();
             EnableLoggingForWatchTargets();
             ScanUserModeHostility();
@@ -7116,21 +8614,21 @@ void KernelMonitor::WorkerLoop()
     }
 }
 
-void KernelMonitor::NoteCredscanRead(
-    const TiEventRecord& record,
-    DeviceClient* device,
-    SymbolEngine* symbols)
+void KernelMonitor::NoteCredscanRead(const TiEventRecord& record)
 {
     // 256 remote reads of lsass inside a 60s window from a drop/unknown
     // caller is scraping volume (the Berkan loader issued 36k-40k reads per
     // run). Signed/Program Files callers stay outside this gate: TavernWorker
     // legitimately mass-reads lsass while hunting cheats hiding there.
     constexpr uint64_t kCredscanWindowMs = 60000;
+    constexpr uint64_t kCredscanWindowTicks = kCredscanWindowMs * 10000;
     constexpr uint64_t kCredscanThreshold = 256;
 
     if (record.ProcessId == 0 ||
         record.TargetProcessId == 0 ||
-        record.TargetProcessId == record.ProcessId)
+        record.TargetProcessId == record.ProcessId ||
+        record.ProcessCreateTime == 0 || record.TargetProcessCreateTime == 0 ||
+        record.Timestamp < record.ProcessCreateTime || record.Timestamp < record.TargetProcessCreateTime)
     {
         return;
     }
@@ -7162,13 +8660,20 @@ void KernelMonitor::NoteCredscanRead(
     const uint64_t windowKey =
         (static_cast<uint64_t>(record.ProcessId) << 32) |
         static_cast<uint64_t>(record.TargetProcessId);
-    const uint64_t nowMs = GetTickCount64();
     KmonCredscanWindow& window = CredscanWindows[windowKey];
-    if (window.WindowStartMs == 0 ||
-        nowMs - window.WindowStartMs > kCredscanWindowMs)
+    if (window.WindowStartTimestamp != 0 && record.Timestamp < window.WindowStartTimestamp)
+    {
+        return;
+    }
+    if (window.WindowStartTimestamp == 0 ||
+        record.Timestamp - window.WindowStartTimestamp > kCredscanWindowTicks ||
+        window.CallerCreateTime != record.ProcessCreateTime ||
+        window.TargetCreateTime != record.TargetProcessCreateTime)
     {
         window.Count = 0;
-        window.WindowStartMs = nowMs;
+        window.WindowStartTimestamp = record.Timestamp;
+        window.CallerCreateTime = record.ProcessCreateTime;
+        window.TargetCreateTime = record.TargetProcessCreateTime;
         window.Emitted = false;
     }
     ++window.Count;
@@ -7180,19 +8685,6 @@ void KernelMonitor::NoteCredscanRead(
     // Confirm the target really is lsass before firing; an unresolvable
     // target stays silent rather than guessing.
     std::wstring targetImage = record.TargetImageBase;
-    if (!PathLooksLikeWin32File(targetImage))
-    {
-        std::wstring resolved;
-        if (QueryKernelImagePath(
-                device,
-                symbols,
-                record.TargetProcessId,
-                &resolved) &&
-            PathHasDirectorySeparator(resolved))
-        {
-            targetImage = std::move(resolved);
-        }
-    }
     if (KmonBasenameLower(targetImage) != L"lsass.exe")
     {
         return;
@@ -7212,7 +8704,130 @@ void KernelMonitor::NoteCredscanRead(
     event.Evidence[L"reads"] = std::to_wstring(window.Count);
     event.Evidence[L"window_ms"] = std::to_wstring(kCredscanWindowMs);
     event.Evidence[L"target"] = L"lsass";
+    event.Evidence[L"caller_create_time"] = HexU64(record.ProcessCreateTime);
+    event.Evidence[L"target_create_time"] = HexU64(record.TargetProcessCreateTime);
     RecordEvent(std::move(event));
+}
+
+void KernelMonitor::NoteRegionObservation(const KmonRegionObservation& observation, const wchar_t* source)
+{
+    const KmonRegionTransition transition = RegionHistory.Observe(observation);
+    if (transition.ObservationTimeUnknown || transition.CollectionIntervalsOverlap || transition.LifetimeDiscontinuity)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:region_history:observation_order:" +
+            std::to_wstring(observation.ProcessId) + L":" + HexU64(observation.CreateTime),
+            L"", L"memory_history", L"memory observation ordering or lifetime is unknown",
+            L"source=" + std::wstring(source) + L" timestamp=" + HexU64(observation.Timestamp) +
+                L" collection_start=" + HexU64(observation.CollectionStartTimestamp) +
+                L" collection_end=" + HexU64(observation.CollectionEndTimestamp) +
+                L" intervals_overlap=" + std::to_wstring(transition.CollectionIntervalsOverlap) +
+                L" lifetime_discontinuity=" + std::to_wstring(transition.LifetimeDiscontinuity) +
+                L" snapshot and TI histories remain separate; no transition inferred", observation.ProcessId);
+    }
+    if (transition.CapacityEvicted)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:region_history:capacity", L"", L"memory_history",
+            L"memory history reached retention capacity", L"oldest observation evicted; continuity is partial");
+    }
+    if (KmonRegionNeedsFollowup(observation, transition))
+    {
+        bool retained = false;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            for (auto it = SuspectProcesses.begin(); it != SuspectProcesses.end();)
+            {
+                if (observation.ReceiveTickMs >= it->second.LastObservedMs &&
+                    observation.ReceiveTickMs - it->second.LastObservedMs > 120000)
+                {
+                    it = SuspectProcesses.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+            auto found = SuspectProcesses.find(observation.ProcessId);
+            if (found != SuspectProcesses.end() || SuspectProcesses.size() < 4096)
+            {
+                SuspectProcess& suspect = SuspectProcesses[observation.ProcessId];
+                if (suspect.CreateTime <= observation.CreateTime)
+                {
+                    if (suspect.CreateTime != observation.CreateTime)
+                    {
+                        suspect = {};
+                    }
+                    suspect.Pid = observation.ProcessId;
+                    suspect.CreateTime = observation.CreateTime;
+                    suspect.LastObservedMs = observation.ReceiveTickMs;
+                    RegionFollowupPending = true;
+                    retained = true;
+                }
+            }
+        }
+        if (!retained)
+        {
+            EmitUnique(L"sensor.coverage", L"scan_failed:region_followup:capacity", L"", L"memory_history",
+                L"memory event follow-up could not retain its process generation",
+                L"active target capacity or newer generation already present", observation.ProcessId);
+        }
+    }
+    if (!transition.Accepted || (observation.Action == KmonRegionAction::Snapshot &&
+        !transition.NxToRx && !transition.RxToNx))
+    {
+        return;
+    }
+    KmonEvent event;
+    event.Timestamp = observation.Timestamp;
+    event.Kind = L"memory.transition";
+    event.ProcessId = observation.ProcessId;
+    event.Task = L"memory_history";
+    event.Summary = transition.NxToRx ? L"memory protection observation changed NX to RX" :
+        transition.RxToNx ? L"memory protection observation changed RX to NX" : L"memory lifecycle operation observed";
+    event.Evidence[L"source"] = source;
+    event.Evidence[L"comparison_scope"] = observation.Action == KmonRegionAction::Snapshot
+        ? L"protection_snapshot_history" : L"TI_operation_history";
+    event.Evidence[L"collection_start"] = HexU64(observation.CollectionStartTimestamp);
+    event.Evidence[L"collection_end"] = HexU64(observation.CollectionEndTimestamp);
+    event.Evidence[L"base"] = HexU64(observation.Base);
+    event.Evidence[L"size"] = HexU64(observation.Size);
+    event.Evidence[L"create_time"] = HexU64(observation.CreateTime);
+    event.Evidence[L"action"] = std::to_wstring(static_cast<uint32_t>(observation.Action));
+    event.Evidence[L"protection"] = HexU64(observation.Protection);
+    event.Evidence[L"protection_applied_known"] = std::to_wstring(observation.ProtectionKnown);
+    event.Evidence[L"previous_observation_known"] = std::to_wstring(transition.PreviousKnown);
+    event.Evidence[L"range_unknown"] = std::to_wstring(transition.RangeUnknown);
+    event.Evidence[L"observed_interval_100ns"] = std::to_wstring(transition.ObservedInterval100ns);
+    event.Evidence[L"observed_interval_min_100ns"] = std::to_wstring(transition.ObservedIntervalMin100ns);
+    event.Evidence[L"observed_interval_max_100ns"] = std::to_wstring(transition.ObservedIntervalMax100ns);
+    event.Evidence[L"max_ingest_gap_ms"] = std::to_wstring(MaxTiIngestGapMs);
+    event.Evidence[L"claim"] = L"observed operation/state; mappings between observations may be missed";
+    FILETIME now = {};
+    GetSystemTimeAsFileTime(&now);
+    const uint64_t nowTime = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (nowTime >= observation.Timestamp)
+    {
+        event.Evidence[L"delivery_delay_ms"] = std::to_wstring((nowTime - observation.Timestamp) / 10000);
+    }
+    RecordEvent(std::move(event));
+}
+
+void KernelMonitor::NoteTiRegionEvent(const TiEventRecord& record, DeviceClient* device, SymbolEngine* symbols)
+{
+    KmonRegionObservation observation;
+    if (!KmonDecodeRegionEvent(record, &observation))
+    {
+        return;
+    }
+    observation.CreateTime = QueryPidCreateTime(device, symbols, nullptr, observation.ProcessId);
+    observation.ReceiveTickMs = GetTickCount64();
+    if (observation.CreateTime == 0 || record.Timestamp < observation.CreateTime)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:region_history:identity:" + std::to_wstring(observation.ProcessId),
+            L"", L"memory_history", L"memory operation could not be bound to a live process generation",
+            L"exited process or reused PID; no state transition inferred", observation.ProcessId);
+        return;
+    }
+    NoteRegionObservation(observation, L"etw_ti");
 }
 
 void KernelMonitor::IngestThreatIntel()
@@ -7226,12 +8841,90 @@ void KernelMonitor::IngestThreatIntel()
         device = Device;
         symbols = Symbols;
     }
-    if (ti == nullptr || !ti->IsActive())
+    if (ti == nullptr)
     {
         return;
     }
 
-    std::vector<TiEventRecord> batch = ti->RecentAfterSequence(TiCursorSequence, 512);
+    const uint64_t now = GetTickCount64();
+    if (LastTiIngestTickMs != 0)
+    {
+        MaxTiIngestGapMs = (std::max)(MaxTiIngestGapMs, now - LastTiIngestTickMs);
+    }
+    LastTiIngestTickMs = now;
+    KmonTiIngestPage page;
+    if (!KmonReadStableTiIngestPage(TiTraceGeneration, TiCursorSequence,
+        [&](uint64_t cursor)
+        {
+            return ti->RecentAfterSequenceWithStatus(cursor, 512);
+        }, [&]()
+        {
+            return ti->SnapshotStats();
+        }, &page))
+    {
+        EmitUnique(L"sensor.ti", L"scan_failed:ti_generation", L"", L"ti_health",
+            L"TI session changed during bounded snapshot retries; consumption deferred",
+            L"consumer cursor retained; mixed-generation health and events rejected");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:ti_generation");
+    TiSequenceSnapshot& snapshot = page.Snapshot;
+    if (snapshot.Generation != TiTraceGeneration)
+    {
+        TiTraceGeneration = snapshot.Generation;
+        TiMissingSequences = 0;
+        TiHealthState.clear();
+        EmitUnique(L"sensor.ti", L"ti_generation:" + std::to_wstring(TiTraceGeneration), L"", L"ti_health",
+            L"TI session generation changed; event continuity restarted",
+            L"generation=" + std::to_wstring(TiTraceGeneration));
+    }
+    TiCursorSequence = page.Cursor;
+    if (snapshot.CursorAhead)
+    {
+        TiCursorSequence = snapshot.LatestAssignedSequence;
+        EmitUnique(L"sensor.ti", L"ti_cursor_reset:" + std::to_wstring(TiTraceGeneration), L"", L"ti_health",
+            L"TI cursor was ahead of the producer; continuity is unknown", L"cursor resynchronized");
+    }
+    if (snapshot.MissingBeforeFirst != 0)
+    {
+        TiMissingSequences += snapshot.MissingBeforeFirst;
+        if (snapshot.Records.empty())
+        {
+            TiCursorSequence = snapshot.LatestAssignedSequence;
+        }
+    }
+    const TiSubscriberStats& stats = page.Stats;
+    EtwTiCrossInput health;
+    health.TiActive = stats.Trace.ThreadRunning && !stats.Trace.StopRequested;
+    health.EventsReceived = stats.EventsReceived;
+    health.EventsKept = stats.EventsKept;
+    health.EventsDropped = stats.EventsDropped;
+    health.EventsLost = stats.EventsLost;
+    health.StartTickMs = stats.StartTickMs;
+    health.LastEventTickMs = stats.LastEventTickMs;
+    health.NowTickMs = GetTickCount64();
+    health.TraceStateKnown = stats.Trace.Generation != 0;
+    health.TraceThreadRunning = stats.Trace.ThreadRunning;
+    health.TraceExitStatusKnown = stats.Trace.ExitStatusKnown;
+    health.TraceExitAfterStopRequest = stats.Trace.ExitAfterStopRequest;
+    health.TraceExitStatus = stats.Trace.ExitStatus;
+    health.ConsumerMissingSequence = TiMissingSequences;
+    EtwTiCrossResult healthResult;
+    if (EtwScanner::BuildTiCrossView(health, &healthResult, nullptr) && TiHealthState != healthResult.Status)
+    {
+        TiHealthState = healthResult.Status;
+        KmonEvent event;
+        event.Kind = L"sensor.ti";
+        event.Task = L"ti_health";
+        event.Summary = L"TI delivery state=" + healthResult.Status;
+        event.Evidence[L"reason"] = healthResult.Reason;
+        event.Evidence[L"missing_sequences"] = std::to_wstring(TiMissingSequences);
+        event.Evidence[L"etw_events_lost"] = std::to_wstring(stats.EventsLost);
+        event.Evidence[L"trace_exit_status"] = std::to_wstring(stats.Trace.ExitStatus);
+        event.Evidence[L"max_ingest_gap_ms"] = std::to_wstring(MaxTiIngestGapMs);
+        RecordEvent(std::move(event));
+    }
+    const std::vector<TiEventRecord>& batch = snapshot.Records;
     uint32_t activityEvents = 0;
     for (const TiEventRecord& record : batch)
     {
@@ -7242,7 +8935,8 @@ void KernelMonitor::IngestThreatIntel()
         TiIngested.fetch_add(1);
         // Runs before classification: remote reads never classify, and the
         // credscan window needs to see every one of them.
-        NoteCredscanRead(record, device, symbols);
+        NoteCredscanRead(record);
+        NoteTiRegionEvent(record, device, symbols);
 
         KmonEvent classified = {};
         if (KmonClassifyTiEvent(record, &classified))
@@ -7336,93 +9030,6 @@ void KernelMonitor::IngestThreatIntel()
                 classified.Kind == L"hook.window" ||
                 classified.Kind == L"process.impair")
             {
-                auto resolveInjectImage = [&](uint32_t pid, std::wstring* image)
-                {
-                    if (image == nullptr || pid <= 4)
-                    {
-                        return;
-                    }
-                    if (PathLooksLikeWin32File(*image))
-                    {
-                        return;
-                    }
-                    // The console-write storm re-resolved the same pids
-                    // through kernel queries thousands of times and starved
-                    // driver-lifecycle ingest; a short-TTL cache caps that.
-                    // The key carries the event's own basename so a reused
-                    // pid with a different image cannot inherit the
-                    // previous process's resolved path.
-                    constexpr uint64_t kImageCacheTtlMs = 30000;
-                    const uint64_t nowTickMs = GetTickCount64();
-                    const std::wstring cacheKey =
-                        std::to_wstring(pid) + L"|" + KmonBasenameLower(*image);
-                    auto cached = TiResolvedImageCache.find(cacheKey);
-                    if (cached != TiResolvedImageCache.end() &&
-                        !cached->second.empty())
-                    {
-                        auto tick = TiResolvedImageTickMs.find(cacheKey);
-                        if (tick != TiResolvedImageTickMs.end() &&
-                            nowTickMs - tick->second < kImageCacheTtlMs)
-                        {
-                            *image = cached->second;
-                            return;
-                        }
-                    }
-                    if (PathHasDirectorySeparator(*image))
-                    {
-                        std::wstring win32 = Win32PathFromKernelImagePath(*image);
-                        if (PathLooksLikeWin32File(win32))
-                        {
-                            *image = std::move(win32);
-                            if (TiResolvedImageCache.size() > 512)
-                            {
-                                TiResolvedImageCache.clear();
-                                TiResolvedImageTickMs.clear();
-                            }
-                            TiResolvedImageCache[cacheKey] = *image;
-                            TiResolvedImageTickMs[cacheKey] = nowTickMs;
-                            return;
-                        }
-                    }
-                    std::wstring resolved;
-                    if (QueryKernelImagePath(
-                            device,
-                            symbols,
-                            pid,
-                            &resolved) &&
-                        PathHasDirectorySeparator(resolved))
-                    {
-                        *image = resolved;
-                        if (TiResolvedImageCache.size() > 512)
-                        {
-                            TiResolvedImageCache.clear();
-                            TiResolvedImageTickMs.clear();
-                        }
-                        TiResolvedImageCache[cacheKey] = std::move(resolved);
-                        TiResolvedImageTickMs[cacheKey] = nowTickMs;
-                    }
-                    else
-                    {
-                        // Kernel resolution can lag or miss short-lived
-                        // processes; the user-mode toolhelp query is cheap
-                        // and usually answers for anything still alive.
-                        std::wstring userResolved;
-                        if (QueryProcessImagePathByPid(pid, &userResolved) &&
-                            !userResolved.empty())
-                        {
-                            *image = userResolved;
-                            if (TiResolvedImageCache.size() > 512)
-                            {
-                                TiResolvedImageCache.clear();
-                                TiResolvedImageTickMs.clear();
-                            }
-                            TiResolvedImageCache[cacheKey] = std::move(userResolved);
-                            TiResolvedImageTickMs[cacheKey] = nowTickMs;
-                        }
-                    }
-                };
-                resolveInjectImage(classified.TargetProcessId, &classified.TargetImage);
-                resolveInjectImage(classified.ProcessId, &classified.Image);
                 // The summary historically carried only pids; append the
                 // resolved leaves so console/log readers do not have to
                 // cross-reference the image fields.
@@ -7766,6 +9373,19 @@ void KernelMonitor::ScanHiddenProcesses()
         bool already = false;
         {
             std::lock_guard<std::mutex> watchLock(WatchMutex);
+            if (record.ProcessId > 4 && record.Eprocess != 0 && created != 0)
+            {
+                if (SuspectProcesses.size() < 4096 ||
+                    SuspectProcesses.find(record.ProcessId) != SuspectProcesses.end())
+                {
+                    SuspectProcess& suspect = SuspectProcesses[record.ProcessId];
+                    suspect.Pid = record.ProcessId;
+                    suspect.Eprocess = record.Eprocess;
+                    suspect.CreateTime = created;
+                    suspect.LastObservedMs = GetTickCount64();
+                    suspect.Image = record.ImageName;
+                }
+            }
             const std::wstring hideKey =
                 L"hidden:" + std::to_wstring(record.ProcessId) + L":" +
                 HexU64(record.Eprocess) + L":" + std::to_wstring(created);
@@ -8165,8 +9785,7 @@ bool KmonImagePathIsInbox(const std::wstring& win32Path)
     {
         return false;
     }
-    const std::wstring lowered = ToLowerCopy(win32Path);
-    return lowered.find(L"\\windows\\system32\\") != std::wstring::npos;
+    return KmonRootedPathStartsWith(KmonNormalizeDriverPath(win32Path), L"\\windows\\system32\\");
 }
 
 // Pure verdict: the service-key view and the image-file view disagree about a
@@ -9153,7 +10772,7 @@ std::wstring KernelMonitor::MakeEmittedKey(const std::wstring& key, uint32_t pro
     return uniqueKey;
 }
 
-void KernelMonitor::EmitUnique(
+bool KernelMonitor::EmitUnique(
     const std::wstring& kind,
     const std::wstring& key,
     const std::wstring& driver,
@@ -9170,7 +10789,7 @@ void KernelMonitor::EmitUnique(
     }
     if (!claimed)
     {
-        return;
+        return false;
     }
 
     FILETIME now = {};
@@ -9211,6 +10830,61 @@ void KernelMonitor::EmitUnique(
             L"!callbacks; !inputstack; !ssdt; !idt; !msrcheck; !mapper; !kpage /pe; !pool pe";
     }
     RecordEvent(std::move(event));
+    return true;
+}
+
+namespace
+{
+    template <typename Emit, typename AlreadyEmitted>
+    bool KmonTryBoundedEmission(
+        size_t limit,
+        size_t* emitted,
+        size_t* deferred,
+        Emit emit,
+        AlreadyEmitted alreadyEmitted)
+    {
+        bool published = false;
+        if (*emitted < limit)
+        {
+            published = emit();
+            if (published)
+            {
+                ++*emitted;
+            }
+        }
+        else if (!alreadyEmitted())
+        {
+            // Count candidates withheld by this pass, not prior detections.
+            ++*deferred;
+        }
+        return published;
+    }
+}
+
+bool KernelMonitor::EmitUniqueBounded(
+    size_t limit,
+    size_t* emitted,
+    size_t* deferred,
+    const std::wstring& kind,
+    const std::wstring& key,
+    const std::wstring& driver,
+    const std::wstring& layer,
+    const std::wstring& summary,
+    const std::wstring& notes)
+{
+    return KmonTryBoundedEmission(
+        limit,
+        emitted,
+        deferred,
+        [&]()
+        {
+            return EmitUnique(kind, key, driver, layer, summary, notes);
+        },
+        [&]()
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            return EmittedMapperKeys.count(key) != 0;
+        });
 }
 
 void KernelMonitor::EmitMappedResidue(
@@ -9233,18 +10907,27 @@ bool KernelMonitor::CaptureRegion(
     SymbolEngine* symbols,
     HANDLE processHandle,
     uint64_t maxBytes,
-    std::wstring* captureNote)
+    std::wstring* captureNote,
+    uint64_t rootCr3,
+    uint64_t rootCreateTime)
 {
     constexpr uint64_t kCaptureBudgetBytes = 256ull * 1024ull * 1024ull;
     constexpr uint64_t kCaptureDefaultMaxBytes = 256ull * 1024ull;
     const uint64_t cap = maxBytes != 0 ? maxBytes : kCaptureDefaultMaxBytes;
 
-    if (layer == nullptr || address == 0 || sizeBytes == 0)
+    if (layer == nullptr || address == 0 || sizeBytes == 0 ||
+        address > UINT64_MAX - (std::min)(sizeBytes, cap))
     {
         return false;
     }
     const std::wstring key = std::wstring(layer) + L":" + HexU64(address) +
-        L":" + (processId != 0 ? std::to_wstring(processId) : L"k");
+        L":" + (processId != 0 ? std::to_wstring(processId) : L"k") +
+        L":" + HexU64(rootCr3) + L":" + HexU64(rootCreateTime);
+    if (rootCreateTime != 0 &&
+        QueryPidCreateTime(device, symbols, processHandle, processId) != rootCreateTime)
+    {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(CapturesMutex);
         if (CapturedBytes >= kCaptureBudgetBytes ||
@@ -9276,7 +10959,12 @@ bool KernelMonitor::CaptureRegion(
             remaining > kCaptureChunkBytes ? kCaptureChunkBytes : remaining);
         std::vector<uint8_t> chunkBytes;
         bool chunkRead = false;
-        if (userMode)
+        if (rootCr3 != 0)
+        {
+            chunkRead = device != nullptr && ReadOrphanRootMemory(*device, rootCr3,
+                address + offset, chunk, &chunkBytes, nullptr);
+        }
+        else if (userMode)
         {
             chunkRead = ReadProcessBytes(
                 device,
@@ -9319,7 +11007,8 @@ bool KernelMonitor::CaptureRegion(
             break;
         }
     }
-    if (!anyRead || bytes.size() < 0x40)
+    if (!anyRead || bytes.size() < 0x40 || (rootCreateTime != 0 &&
+        QueryPidCreateTime(device, symbols, processHandle, processId) != rootCreateTime))
     {
         // Transient failure: release the key so a later scan can retry.
         std::lock_guard<std::mutex> lock(CapturesMutex);
@@ -9342,7 +11031,7 @@ bool KernelMonitor::CaptureRegion(
     swprintf_s(stamp, L"%02u%02u%02u", now.wHour, now.wMinute, now.wSecond);
     const std::wstring path = captureDir + L"\\capture-" + layer + L"-" +
         (processId != 0 ? std::to_wstring(processId) : L"k") + L"-" +
-        HexU64(address) + L"-" + stamp + L".bin";
+        HexU64(address) + L"-" + HexU64(rootCr3) + L"-" + HexU64(rootCreateTime) + L"-" + stamp + L".bin";
 
     HANDLE file = CreateFileW(
         path.c_str(),
@@ -9425,7 +11114,13 @@ void KernelMonitor::ClearEmittedKey(const std::wstring& key)
 
 void KernelMonitor::ClearEmittedKeyForPid(const std::wstring& key, uint32_t processId)
 {
-    ClearEmittedKey(MakeEmittedKey(key, processId));
+    const std::wstring uniqueKey = MakeEmittedKey(key, processId);
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    EmittedMapperKeys.erase(uniqueKey);
+    if (processId > 4)
+    {
+        EmittedMapperKeys.erase(key + L":gone");
+    }
 }
 
 void KernelMonitor::ScanMapperRemnants()
@@ -9464,6 +11159,10 @@ void KernelMonitor::ScanMapperRemnants()
     MapperScanOptions options;
     const bool mapperWatch = IsMapperWatchActive();
     options.Limit = mapperWatch ? 256 : 64;
+    options.ContinueReports = true;
+    options.UnloadedAfter = MapperUnloadedAfter;
+    options.PiddbAfter = MapperPiddbAfter;
+    options.HashAfter = MapperHashAfter;
     MapperScanResult result = {};
     std::wstring error;
     if (!scanner.Scan(options, &result, &error))
@@ -9477,6 +11176,20 @@ void KernelMonitor::ScanMapperRemnants()
         return;
     }
     MapperScans.fetch_add(1);
+    MapperUnloadedAfter = result.NextUnloadedAfter;
+    MapperPiddbAfter = result.NextPiddbAfter;
+    MapperHashAfter = result.NextHashAfter;
+    if (result.OutputTruncated)
+    {
+        EmitMappedResidue(L"scan_failed:mapper:reportcap", L"", L"mapper_scan",
+            L"mapper report is partial; address cursors continue on later passes",
+            L"unloaded=" + std::to_wstring(result.UnloadedCollected) + L" piddb=" +
+            std::to_wstring(result.PiddbCollected) + L" hash=" + std::to_wstring(result.HashCollected));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:mapper:reportcap");
+    }
     ClearEmittedKey(L"scan_failed:mapper");
     if (!result.UnloadedComplete)
     {
@@ -9492,6 +11205,16 @@ void KernelMonitor::ScanMapperRemnants()
     else
     {
         ClearEmittedKey(L"scan_failed:mapper:unloaded");
+    }
+    if (result.UnloadedPageProbeFailures != 0)
+    {
+        EmitMappedResidue(L"scan_failed:mapper:unloaded_pages", L"", L"mapper_scan",
+            L"Unloaded driver page state is unknown for some records",
+            L"page_probe_failures=" + std::to_wstring(result.UnloadedPageProbeFailures));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:mapper:unloaded_pages");
     }
     if (!result.PiddbComplete)
     {
@@ -9572,8 +11295,8 @@ void KernelMonitor::ScanMapperRemnants()
         current.Complete = true;
         current.PiddbElementCount = result.PiddbElementCount;
         current.UnloadedSlotCount = result.UnloadedSlotCount;
-        current.PiddbTruncated = result.Piddb.size() >= options.Limit;
-        current.HashTruncated = result.HashEntries.size() >= options.Limit;
+        current.PiddbTruncated = result.PiddbOutputTruncated;
+        current.HashTruncated = result.HashOutputTruncated;
         for (const MapperUnloadedRecord& record : result.Unloaded)
         {
             current.Unloaded.insert(MapperUnloadedFingerprint(record));
@@ -9678,12 +11401,35 @@ void KernelMonitor::ScanPoolMappedImages()
             L"LoadKernelModules failed or empty");
         return;
     }
-    ClearEmittedKey(L"scan_failed:pool_pe:inventory");
-
     PoolPeHunter hunter(*device);
     PoolPeHunter::Options options;
     options.Paged = PoolPeHunter::PagedFilter::Any;
-    options.LimitHits = IsMapperWatchActive() ? 128 : 32;
+    const bool mapperWatch = IsMapperWatchActive();
+    options.LimitHits = mapperWatch ? 128 : 32;
+    options.ContinueScan = true;
+    options.EntryOffset = PoolPeEntryOffset;
+    options.ScanInteriorPages = true;
+    options.AllocationAfter = PoolPeAllocationAfter;
+    options.InteriorPageRound = PoolPeInteriorRound;
+    options.MaxEntries = mapperWatch ? 8192 : 4096;
+    std::vector<LeftoverModuleRange> moduleRanges;
+    bool moduleRangesComplete = false;
+    LeftoverBuildModuleRanges(*symbols, &moduleRanges, &moduleRangesComplete);
+    if (!moduleRangesComplete)
+    {
+        EmitMappedResidue(
+            L"scan_failed:pool_pe:inventory",
+            std::wstring(),
+            L"pool_pe",
+            L"pool PE scan skipped; kernel module ranges are incomplete",
+            L"every excluded module range must be valid");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:pool_pe:inventory");
+    for (const LeftoverModuleRange& module : moduleRanges)
+    {
+        options.ExcludedAddressRanges.emplace_back(module.Base, module.End);
+    }
     PoolPeHunterResult result = {};
     std::wstring error;
     if (!hunter.Scan(options, &result, &error))
@@ -9697,15 +11443,36 @@ void KernelMonitor::ScanPoolMappedImages()
         return;
     }
     PoolPeScans.fetch_add(1);
+    PoolPeEntryOffset = result.NextEntryOffset;
+    PoolPeAllocationAfter = result.NextAllocationAfter;
+    PoolPeInteriorRound = result.NextInteriorPageRound;
     ClearEmittedKey(L"scan_failed:pool_pe");
-    if (options.LimitHits != 0 && result.Hits.size() >= options.LimitHits)
+    if (result.ReadFailures != 0)
+    {
+        EmitMappedResidue(
+            L"scan_failed:pool_pe:reads",
+            std::wstring(),
+            L"pool_pe",
+            L"pool PE coverage is partial; some candidate pages were unreadable",
+            L"read_failures=" + std::to_wstring(result.ReadFailures));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:pool_pe:reads");
+    }
+    if (result.EntriesTruncated || result.HitLimitReached || result.InteriorCoveragePartial)
     {
         EmitMappedResidue(
             L"scan_failed:pool_pe:truncated",
             std::wstring(),
             L"pool_pe",
-            L"pool PE scan hit the hit cap; extra mapped images may be missed",
-            L"LimitHits=" + std::to_wstring(options.LimitHits));
+            L"pool PE scan is partial; deferred allocations resume on later passes",
+            L"visited=" + std::to_wstring(result.EntriesVisited) +
+                L" total=" + std::to_wstring(result.TotalEntries) +
+                L" next_entry=" + std::to_wstring(result.NextEntryOffset) +
+                L" allocation_after=" + HexU64(result.NextAllocationAfter) +
+                L" interior_round=" + std::to_wstring(result.NextInteriorPageRound) +
+                L" LimitHits=" + std::to_wstring(options.LimitHits));
     }
     else
     {
@@ -9982,6 +11749,7 @@ void KernelMonitor::ScanModuleInventory()
     // costs a few reads per module, so it is throttled by its own cadence.
     std::vector<KmonModuleDivergenceRecord> divergences;
     std::vector<KmonModuleChainBreakRecord> chainBreaks;
+    bool kernelViewReportComplete = false;
     {
         const uint64_t kernelViewNow = GetTickCount64();
         bool kernelViewDue = false;
@@ -10035,6 +11803,7 @@ void KernelMonitor::ScanModuleInventory()
                     }
                     else
                     {
+                        kernelViewReportComplete = true;
                         ClearEmittedKey(L"scan_failed:modinv:kernelview");
                         rawDivergences = KmonCompareModuleViews(current, kernelView);
                     }
@@ -10297,13 +12066,9 @@ void KernelMonitor::ScanModuleInventory()
     // showed (filtered from its first scan) still prints.
     {
         size_t divergenceEmits = 0;
+        size_t divergenceDeferred = 0;
         for (const KmonModuleDivergenceRecord& divergence : divergences)
         {
-            if (divergenceEmits >= kKernelViewEmitCap)
-            {
-                break;
-            }
-            ++divergenceEmits;
             const std::wstring direction =
                 KmonModuleDivergenceDirectionName(divergence.Direction);
             std::wstring notes =
@@ -10313,25 +12078,23 @@ void KernelMonitor::ScanModuleInventory()
                 L" scans=" + std::to_wstring(kModuleDiffStrikeThreshold) +
                 L" view=kernel_ldr_walk+system_module_information";
             notes += L" followup=!module integrity; !driver; !pool pe /suspicious";
-            EmitUnique(
+            EmitUniqueBounded(
+                kKernelViewEmitCap,
+                &divergenceEmits,
+                &divergenceDeferred,
                 L"driver.inventory_divergence",
                 L"moddiv:" + direction + L":" + divergence.Name,
                 divergence.Name,
                 L"module_list",
                 L"kernel-context PsLoadedModuleList walk and the host module inventory disagree about " +
                     divergence.Name,
-                notes,
-                0);
+                notes);
         }
 
         size_t chainEmits = 0;
+        size_t chainDeferred = 0;
         for (const KmonModuleChainBreakRecord& chainBreak : chainBreaks)
         {
-            if (chainEmits >= kKernelViewEmitCap)
-            {
-                break;
-            }
-            ++chainEmits;
             const std::wstring label = chainBreak.Name.empty()
                 ? HexU64(chainBreak.Entry)
                 : chainBreak.Name;
@@ -10344,15 +12107,31 @@ void KernelMonitor::ScanModuleInventory()
                 L" scans=" + std::to_wstring(kModuleDiffStrikeThreshold) +
                 L" view=kernel_ldr_walk";
             notes += L" followup=!module integrity; !driver; !driverobj; !kpage /pe";
-            EmitUnique(
+            EmitUniqueBounded(
+                kKernelViewEmitCap,
+                &chainEmits,
+                &chainDeferred,
                 L"driver.module_chain_broken",
                 L"modchain:" + HexU64(chainBreak.Entry),
                 label,
                 L"module_list",
                 L"loader list link of " + label +
                     L" is not reciprocal; an entry was unlinked from PsLoadedModuleList",
-                notes,
-                0);
+                notes);
+        }
+        if (divergenceDeferred != 0 || chainDeferred != 0)
+        {
+            EmitMappedResidue(
+                L"scan_failed:modinv:reportcap",
+                std::wstring(),
+                L"module_list",
+                L"module cross-view reports were deferred by the per-pass event limit",
+                L"divergence_deferred=" + std::to_wstring(divergenceDeferred) +
+                    L" chain_deferred=" + std::to_wstring(chainDeferred));
+        }
+        else if (kernelViewReportComplete)
+        {
+            ClearEmittedKey(L"scan_failed:modinv:reportcap");
         }
     }
 
@@ -10571,6 +12350,281 @@ bool KernelMonitor::RecordDriverImageBaseline(
     return true;
 }
 
+void KernelMonitor::ScanKernelImageIntegrity()
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen() ||
+        !EnsureLoadedKernelModules(symbols))
+    {
+        EmitUnique(L"driver.integrity", L"scan_failed:image_pages:inventory", L"", L"image_pages",
+            L"kernel image inventory unavailable", L"page comparison was not performed");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:image_pages:inventory");
+    std::vector<KernelModuleInfo> modules = symbols->CopyModules();
+    std::vector<uint64_t> moduleBases;
+    std::set<uint64_t> liveBases;
+    for (const KernelModuleInfo& module : modules)
+    {
+        moduleBases.push_back(module.Base);
+        liveBases.insert(module.Base);
+    }
+    {
+        const uint64_t now = GetTickCount64();
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        for (auto cursor = ImagePageCursors.begin(); cursor != ImagePageCursors.end();)
+        {
+            if (cursor->second.ProcessId == 0 &&
+                (liveBases.find(cursor->second.ImageBase) == liveBases.end() ||
+                    now - cursor->second.LastObservedMs > 600000))
+            {
+                cursor = ImagePageCursors.erase(cursor);
+            }
+            else
+            {
+                ++cursor;
+            }
+        }
+    }
+    if (modules.empty())
+    {
+        return;
+    }
+    ControlRegisters control = {};
+    const bool haveRoot = device->ReadControlRegisters(0, &control, nullptr) && control.Cr3 != 0;
+    const size_t count = (std::min)(size_t(4), modules.size());
+    const std::vector<size_t> moduleOrder = KmonOrderImageModules(moduleBases, KernelImageCursor);
+    for (size_t step = 0; step < count && !StopRequested.load(); ++step)
+    {
+        const KernelModuleInfo& module = modules[moduleOrder[step]];
+        if (module.Base != 0)
+        {
+            KernelImageCursor = module.Base;
+        }
+        const std::wstring stem = KmonDriverNameStem(module.ImageName);
+        bool baselineMissing = false;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            const auto found = DriverTamperBaselines.find(stem);
+            baselineMissing = found == DriverTamperBaselines.end() ||
+                !found->second.HasImage || found->second.Base != module.Base ||
+                found->second.Size != module.Size;
+        }
+        if (baselineMissing)
+        {
+            RecordDriverImageBaseline(stem, module.Base, module.Size, device);
+        }
+        const std::wstring path = Win32PathFromKernelImagePath(module.ImagePath);
+        const std::wstring key = L"kernel:" + HexU64(module.Base) + L":" +
+            std::to_wstring(module.Size) + L":" + KmonNormalizeDriverPath(path);
+        std::vector<uint8_t> headers;
+        KmonPeLayout layout = {};
+        std::vector<KmonImageSlice> pages;
+        if (module.Base == 0 || module.Size == 0 ||
+            module.Base > UINT64_MAX - module.Size ||
+            !ReadDiskPeHead(path, &headers) || !ParseKmonPeLayout(headers, &layout) ||
+            layout.SizeOfImage != module.Size || !KmonPlanImageSlices(headers, module.Size, &pages, true))
+        {
+            EmitUnique(L"driver.integrity", L"scan_failed:image_pages:" + key, module.ImagePath,
+                L"image_pages", L"kernel image page plan unavailable", L"disk image/layout mismatch or inaccessible");
+            continue;
+        }
+        KmonImageScanCursor cursor;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            const auto previous = ImagePageCursors.find(key);
+            if (previous != ImagePageCursors.end())
+            {
+                cursor = previous->second;
+            }
+        }
+        const uint64_t hash = KmonHashBytes64(headers.data(), headers.size());
+        if (cursor.HeaderHash != hash)
+        {
+            cursor = {};
+            cursor.HeaderHash = hash;
+        }
+        cursor.ImageBase = module.Base;
+        cursor.LastObservedMs = GetTickCount64();
+        cursor.SliceCount = pages.size();
+        cursor.Compared = 0;
+        cursor.ReadFailures = 0;
+        cursor.RelocationBoundaryBytes = 0;
+        cursor.SweepComplete = false;
+        cursor.Observations.clear();
+        const size_t pageStart = static_cast<size_t>(cursor.NextSlice % pages.size());
+        const size_t pageCount = (std::min)(size_t(16), pages.size());
+        std::vector<uint8_t> relocs;
+        bool relocsComplete = false;
+        uint32_t permissionReads = 0;
+        for (size_t pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+        {
+            const KmonImageSlice& page = pages[(pageStart + pageIndex) % pages.size()];
+            if (page.CompareBytes)
+            {
+                uint32_t excluded = 0;
+                uint64_t maskHash = 0;
+                const SliceCompare comparison = RelocatedSliceCompare(path, headers, layout,
+                    nullptr, device, symbols, 0, module.Base, page.Rva, page.FileOffset,
+                    page.Length, &relocs, &relocsComplete, &excluded, page.BackedLength, &maskHash);
+                cursor.RelocationBoundaryBytes += excluded;
+                if (comparison == SliceUnknown)
+                {
+                    ++cursor.ReadFailures;
+                }
+                else
+                {
+                    ++cursor.Compared;
+                    const std::wstring observationKey = KmonImageSliceEvidenceKey(
+                        L"image_page_changed:", key, hash, page.Rva, maskHash);
+                    KmonApplyImageSliceObservation(comparison, observationKey,
+                        [&](const std::wstring& eventKey)
+                    {
+                        EmitUnique(L"driver.integrity", eventKey,
+                            module.ImagePath, L"image_pages", L"loaded kernel image code differs from disk",
+                            L"base=" + HexU64(module.Base) + L" rva=" + HexU64(page.Rva) +
+                            L" bytes=" + std::to_wstring(page.Length) +
+                            L" observation=code_mismatch; hotpatch/file replacement requires correlation");
+                    }, [&](const std::wstring& eventKey)
+                    {
+                        ClearEmittedKey(eventKey);
+                    });
+                }
+            }
+            PhysicalTranslationInfo translation = {};
+            if (haveRoot && device->TranslateVirtual(control.Cr3, module.Base + page.PermissionRva,
+                    1, &translation, nullptr))
+            {
+                const uint64_t entries[] = {translation.Pml5e, translation.Pml4e,
+                    translation.Pdpte, translation.Pde, translation.Pte};
+                const uint32_t first = translation.PagingLevels == 5 ? 0u : 1u;
+                bool executable = true;
+                bool valid = translation.PagingLevels == 4 || translation.PagingLevels == 5;
+                for (uint32_t level = first; level < 5 && valid; ++level)
+                {
+                    valid = KnDbgPresentPagingEntryValid(entries[level], 5 - level);
+                    executable = executable && (entries[level] & (1ull << 63)) == 0;
+                    if ((level == 2 || level == 3) && (entries[level] & 0x80) != 0)
+                    {
+                        break;
+                    }
+                }
+                if (valid)
+                {
+                    ++permissionReads;
+                    const std::wstring observationKey = KmonImageSliceEvidenceKey(
+                        L"image_data_exec:", key, hash, page.PermissionRva);
+                    KmonApplyImageSliceObservation(!page.ExpectedExecutable && executable
+                            ? SliceMismatch : SliceMatch, observationKey,
+                        [&](const std::wstring& eventKey)
+                    {
+                        EmitUnique(L"driver.integrity", eventKey,
+                            module.ImagePath, L"image_permissions", L"kernel data section has executable effective mapping",
+                            L"rva=" + HexU64(page.PermissionRva) + L" cr3=" + HexU64(control.Cr3) +
+                            L" page_size=" + HexU64(translation.PageSize) + L" observation=permission_mismatch");
+                    }, [&](const std::wstring& eventKey)
+                    {
+                        ClearEmittedKey(eventKey);
+                    });
+                }
+            }
+        }
+        cursor.NextSlice = (pageStart + pageCount) % pages.size();
+        cursor.SlicesAttempted += pageCount;
+        if (pageStart + pageCount >= pages.size())
+        {
+            ++cursor.Sweeps;
+            cursor.SweepComplete = cursor.ReadFailures == 0 && cursor.RelocationBoundaryBytes == 0 &&
+                permissionReads == pageCount && pageCount == pages.size();
+        }
+        bool cursorCapacityLimited = false;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            if (ImagePageCursors.size() < 32768 || ImagePageCursors.find(key) != ImagePageCursors.end())
+            {
+                ImagePageCursors[key] = cursor;
+            }
+            else
+            {
+                cursorCapacityLimited = true;
+            }
+        }
+        const std::wstring coverage = L"planned_pages=" + std::to_wstring(pages.size()) +
+            L" next_page=" + std::to_wstring(cursor.NextSlice) + L" compared=" +
+            std::to_wstring(cursor.Compared) + L" permission_reads=" + std::to_wstring(permissionReads) +
+            L" unreadable=" + std::to_wstring(cursor.ReadFailures) + L" boundary_bytes_deferred=" +
+            std::to_wstring(cursor.RelocationBoundaryBytes) + L" cursor_capacity_limited=" +
+            std::to_wstring(cursorCapacityLimited ? 1 : 0) + L" temporal_sample=1";
+        if (cursor.ReadFailures != 0 || cursor.RelocationBoundaryBytes != 0 ||
+            permissionReads != pageCount || cursorCapacityLimited)
+        {
+            EmitUnique(L"driver.integrity", L"scan_failed:image_pages:" + key, module.ImagePath,
+                L"image_pages", L"kernel image page inspection is partial", coverage);
+        }
+        else
+        {
+            ClearEmittedKey(L"scan_failed:image_pages:" + key);
+        }
+    }
+}
+
+void KernelMonitor::ScanPlatformEvidence()
+{
+    DeviceClient* device = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+    }
+    const uint64_t now = GetTickCount64();
+    if (device == nullptr || !device->IsOpen() || now < NextPlatformEvidenceTickMs || StopRequested.load())
+    {
+        return;
+    }
+    NextPlatformEvidenceTickMs = now + 300000;
+    KmonPlatformEvidenceResult result;
+    std::wstring error;
+    const bool collected = CollectKmonPlatformEvidence(&result, &error);
+    KmonEvent event;
+    event.Kind = L"sensor.posture";
+    event.Task = L"platform_evidence";
+    event.Summary = L"platform policy, boot evidence, and external trust requirements";
+    event.Evidence = result.Fields;
+    event.Evidence[L"collector_ok"] = collected ? L"true" : L"false";
+    event.Evidence[L"complete"] = result.Complete ? L"true" : L"false";
+    event.Evidence[L"error"] = error;
+    DmaPostureScanner dmaScanner;
+    DmaPostureScanResult dma;
+    if (dmaScanner.Scan(&dma, nullptr))
+    {
+        event.Evidence[L"dma.configuration_known"] = dma.DmaGuardConfigurationKnown ? L"true" : L"false";
+        event.Evidence[L"dma.configuration_value"] = std::to_wstring(dma.DmaGuardConfigurationValue);
+        event.Evidence[L"dma.iommu_firmware_table_present"] = dma.IommuFirmwarePresent ? L"true" :
+            dma.FirmwareInventoryComplete ? L"false" : L"unknown";
+        event.Evidence[L"dma.firmware_inventory_complete"] = dma.FirmwareInventoryComplete ? L"true" : L"false";
+    }
+    event.Evidence[L"dma.active_and_preboot_enforcement"] = L"unknown; configuration is not enforcement";
+    HvPostureScanner hvScanner(device);
+    HvPostureScanResult hv;
+    if (hvScanner.Scan(&hv, nullptr))
+    {
+        event.Evidence[L"hv.cpuid_present"] = hv.CpuidHypervisorPresent ? L"true" : L"false";
+        event.Evidence[L"hv.cpuid_vendor"] = hv.VendorSignature;
+        event.Evidence[L"hv.cr4_queried"] = hv.Cr4Queried ? L"true" : L"false";
+    }
+    event.Evidence[L"hv.untrusted_hypervisor_absence"] = L"not established by same-OS observations";
+    for (size_t index = 0; index < result.Warnings.size(); ++index)
+    {
+        event.Evidence[L"warning." + std::to_wstring(index)] = result.Warnings[index];
+    }
+    RecordEvent(std::move(event));
+}
+
 void KernelMonitor::ScanDriverTamper()
 {
     constexpr size_t kDriverTamperPerPass = 4;
@@ -10707,13 +12761,10 @@ void KernelMonitor::ScanDriverTamper()
     }
 }
 
-// A found-but-unreported anonymous object is a silent truncation unless the
-// count reaches the output, so the reporting cap is a pure predicate that the
-// self-test can drive without a live kernel.
-static bool KmonTypeListReportCapped(uint64_t found, uint64_t dropped, uint64_t reported)
+// Previously emitted and evidence-ineligible objects are not report-cap loss.
+static bool KmonTypeListReportCapped(uint64_t dropped, uint64_t deferred)
 {
-    const uint64_t unreported = found > reported ? found - reported : 0;
-    return dropped > 0 || unreported > 0;
+    return dropped > 0 || deferred > 0;
 }
 
 void KernelMonitor::ScanUnbackedDriverObjects()
@@ -11124,7 +13175,8 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 DriverTypeListResult typeList = {};
                 std::wstring typeListError;
                 if (!scanner.ScanTypeListDriverObjects(
-                        knownDriverObjects, backrefs.DeviceDriverObjects, &typeList, &typeListError))
+                        knownDriverObjects, backrefs.DeviceDriverObjects, &typeList, &typeListError,
+                        DriverTypeListReportAfter))
                 {
                     EmitMappedResidue(
                         L"scan_failed:drvobj:typelist",
@@ -11137,15 +13189,20 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                 }
                 else
                 {
+                    DriverTypeListReportAfter = typeList.NextReportAfter;
                     ClearEmittedKey(L"scan_failed:drvobj:typelist");
-                    if (typeList.Truncated)
+                    if (typeList.Truncated || typeList.OutputTruncated || typeList.CandidateReadFailures != 0 ||
+                        !typeList.TypeValidationAvailable)
                     {
                         EmitMappedResidue(
                             L"scan_failed:drvobj:typelist:truncated",
                             std::wstring(),
                             L"driver_object",
                             L"driver object type-list walk was truncated; extra anonymous objects may be missed",
-                            L"the walk stopped at the entry cap or on a cycle");
+                            L"output_truncated=" + std::to_wstring(typeList.OutputTruncated) +
+                                L" read_failures=" + std::to_wstring(typeList.CandidateReadFailures) +
+                                L" type_validation=" + std::to_wstring(typeList.TypeValidationAvailable) +
+                                L" next=" + HexU64(typeList.NextReportAfter));
                     }
                     else
                     {
@@ -11153,12 +13210,9 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                     }
 
                     size_t typeListEmits = 0;
+                    size_t typeListDeferred = 0;
                     for (const AnonymousTypeListDriverRecord& anonymous : typeList.AnonymousDrivers)
                     {
-                        if (typeListEmits >= kTypeListEmitCap)
-                        {
-                            break;
-                        }
                         // An object that owns a device but is missing from the
                         // \Device walk is only "unreachable" when that walk
                         // completed; otherwise the device view is unavailable
@@ -11167,8 +13221,6 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                         {
                             continue;
                         }
-                        ++typeListEmits;
-
                         const std::wstring label = anonymous.DriverName.empty()
                             ? HexU64(anonymous.DriverObject)
                             : anonymous.DriverName;
@@ -11208,7 +13260,11 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                             L" scan=driver_object_type_list" +
                             L" followup=!driverobj " + label +
                             L"; !driver; !devstack; !module integrity";
-                        EmitMappedResidue(
+                        EmitUniqueBounded(
+                            kTypeListEmitCap,
+                            &typeListEmits,
+                            &typeListDeferred,
+                            L"driver.mapped_residue",
                             L"drvobj_typelist:" + HexU64(anonymous.DriverObject),
                             label,
                             L"driver_object",
@@ -11218,9 +13274,8 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                     }
 
                     const bool typeListCapped = KmonTypeListReportCapped(
-                        typeList.AnonymousFound,
                         typeList.AnonymousDropped,
-                        static_cast<uint64_t>(typeListEmits));
+                        static_cast<uint64_t>(typeListDeferred));
                     if (typeListCapped)
                     {
                         EmitMappedResidue(
@@ -11230,7 +13285,8 @@ void KernelMonitor::ScanUnbackedDriverObjects()
                             L"anonymous driver object reports were capped; extra objects were not reported",
                             L"anonymous_found=" + std::to_wstring(typeList.AnonymousFound) +
                                 L" anonymous_dropped=" + std::to_wstring(typeList.AnonymousDropped) +
-                                L" reported=" + std::to_wstring(typeListEmits));
+                                L" emitted_this_pass=" + std::to_wstring(typeListEmits) +
+                                L" deferred_candidates=" + std::to_wstring(typeListDeferred));
                     }
                     else
                     {
@@ -11278,7 +13334,7 @@ void KernelMonitor::ScanOrphanMappedPages()
     OrphanKernelPageOptions options;
     const bool mapperWatch = IsMapperWatchActive();
     bool deepPfn = false;
-    if (mapperWatch && MapperWatchDeepPfnPending.exchange(false))
+    if (MapperWatchDeepPfnPending.exchange(false))
     {
         deepPfn = true;
     }
@@ -11286,7 +13342,71 @@ void KernelMonitor::ScanOrphanMappedPages()
     options.PeOnly = false;
     options.WxOnly = false;
     options.IncludeSession = true;
-    options.Limit = mapperWatch ? 96 : 32;
+    options.Limit = mapperWatch ? 128 : 64;
+    options.MaxRegionBytes = 0x4000;
+    options.RegionOffset = KpageRegionOffset;
+    options.Continuation = &KpageContinuation;
+    std::set<uint32_t> rootPids;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        rootPids.insert(WatchPids.begin(), WatchPids.end());
+        for (const auto& candidate : SuspectProcesses)
+        {
+            rootPids.insert(candidate.first);
+        }
+    }
+    std::set<DWORD> sessions;
+    HANDLE processes = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    bool rootsComplete = processes != INVALID_HANDLE_VALUE;
+    if (processes != INVALID_HANDLE_VALUE)
+    {
+        PROCESSENTRY32W process = {};
+        process.dwSize = sizeof(process);
+        BOOL next = Process32FirstW(processes, &process);
+        rootsComplete = next != FALSE;
+        while (next)
+        {
+            DWORD session = 0;
+            if (process.th32ProcessID > 4 && ProcessIdToSessionId(process.th32ProcessID, &session) &&
+                sessions.insert(session).second)
+            {
+                rootPids.insert(process.th32ProcessID);
+            }
+            next = Process32NextW(processes, &process);
+        }
+        rootsComplete = rootsComplete && GetLastError() == ERROR_NO_MORE_FILES;
+        CloseHandle(processes);
+    }
+    TypeFieldInfo dtb = {};
+    TypeFieldInfo udtb = {};
+    const bool dtbKnown = symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtb, nullptr);
+    const bool udtbKnown = symbols->FindField(L"nt!_KPROCESS", L"UserDirectoryTableBase", &udtb, nullptr);
+    for (uint32_t pid : rootPids)
+    {
+        if (pid <= 4)
+        {
+            continue;
+        }
+        ProcessAddressContext context = {};
+        if (options.Roots.size() >= 512 || !dtbKnown || !device->ResolveProcess(pid, dtb.Offset,
+                udtbKnown ? udtb.Offset : 0, &context, nullptr))
+        {
+            rootsComplete = false;
+            continue;
+        }
+        const uint64_t created = QueryEprocessCreateTime(device, symbols, nullptr, context.Eprocess);
+        if (created == 0 || context.DirectoryTableBase == 0)
+        {
+            rootsComplete = false;
+            continue;
+        }
+        OrphanKernelPageRoot root;
+        root.Cr3 = context.DirectoryTableBase;
+        root.ProcessId = pid;
+        root.CreateTime = created;
+        options.Roots.push_back(root);
+    }
+    options.RootInventoryComplete = rootsComplete;
     if (mapperWatch)
     {
         options.MaxTablePages = 65536;
@@ -11295,7 +13415,7 @@ void KernelMonitor::ScanOrphanMappedPages()
     std::wstring error;
     if (!scanner.Scan(options, &result, &error))
     {
-        if (deepPfn && IsMapperWatchActive())
+        if (deepPfn)
         {
             MapperWatchDeepPfnPending.store(true);
         }
@@ -11308,15 +13428,32 @@ void KernelMonitor::ScanOrphanMappedPages()
         return;
     }
     KpageScans.fetch_add(1);
+    KpageRegionOffset = result.NextRegionOffset;
     ClearEmittedKey(L"scan_failed:kpage");
-    if (!result.PageWalkComplete)
+    if (!result.PageWalkComplete || result.RegionsTruncated || !result.RootInventoryComplete || result.BodyCursorEvicted ||
+        (result.PfnWalkAttempted && !result.PfnWalkComplete))
     {
         EmitMappedResidue(
             L"scan_failed:kpage:coverage",
             std::wstring(),
             L"orphan_page",
-            L"orphan kpage walk was incomplete; extra mapped PE / W+X may be missed",
-            L"PageWalkComplete is false");
+            L"orphan kpage coverage is partial; retained windows rotate across later passes",
+            L"page_walk_complete=" + std::to_wstring(result.PageWalkComplete ? 1 : 0) +
+                L" table_read_failures=" + std::to_wstring(result.TableReadFailures) +
+                L" pfn_read_failures=" + std::to_wstring(result.PfnReadFailures) +
+                L" pfn_validation_failures=" + std::to_wstring(result.PfnValidationFailures) +
+                L" sample_validation_failures=" + std::to_wstring(result.SampleValidationFailures) +
+                L" windows=" + std::to_wstring(result.RegionsDiscovered) +
+                L" retained=" + std::to_wstring(result.Regions.size()) +
+                L" next_window=" + std::to_wstring(result.NextRegionOffset) +
+                L" body_after=" + HexU64(result.NextBodyRegionAfter) +
+                L" body_round=" + std::to_wstring(result.NextBodyWindowRound) +
+                L" root_pid=" + std::to_wstring(result.RootProcessId) +
+                L" root_generation=" + HexU64(result.RootCreateTime) +
+                L" root_count=" + std::to_wstring(result.RootCount) +
+                L" next_page=" + HexU64(result.NextPageAddress) + L" next_pfn=" + HexU64(result.NextPfnAddress) +
+                L" pfn_pending=" + std::to_wstring(result.PfnContinuationPending) +
+                L" body_cursor_evicted=" + std::to_wstring(result.BodyCursorEvicted));
     }
     else
     {
@@ -11341,12 +13478,6 @@ void KernelMonitor::ScanOrphanMappedPages()
             region.Writable &&
             region.Executable &&
             region.Risk == L"high";
-        // Session space is full of win32k scratch W+X; keep PE hits so a
-        // session-mapped image still shows, but drop the W+X noise.
-        if (region.SessionSpace && !peHit)
-        {
-            continue;
-        }
 
         // Stage 3: mapper-stub / pool-table-hiding residual verdict. It runs
         // before the generic stub and W+X emits so a stub body that transfers
@@ -11365,14 +13496,12 @@ void KernelMonitor::ScanOrphanMappedPages()
         uint32_t stubHits = 0;
         const bool idlePoolCandidate =
             region.Executable &&
-            !region.SessionSpace &&
             !peHit &&
             region.InBigPool &&
             region.PoolNonPaged;
         const bool stubCandidate =
             (mapperWatch &&
              region.Executable &&
-             !region.SessionSpace &&
              !peHit) ||
             idlePoolCandidate;
         const bool idleScan = !mapperWatch && idlePoolCandidate;
@@ -11382,7 +13511,7 @@ void KernelMonitor::ScanOrphanMappedPages()
             // first page. NonPaged pool reads are reliable, so one bulk
             // read is enough for the slot-in-buffer heuristics.
             constexpr uint32_t kWatchStubSample = 0x4000;
-            constexpr uint32_t kIdleStubSample = 0x2000;
+            constexpr uint32_t kIdleStubSample = 0x4000;
             const uint32_t sampleCap = mapperWatch ? kWatchStubSample : kIdleStubSample;
             const uint32_t sampleLen =
                 region.Size > sampleCap
@@ -11392,11 +13521,11 @@ void KernelMonitor::ScanOrphanMappedPages()
             {
                 std::vector<uint8_t> sample;
                 std::wstring ignored;
-                if (device->ReadMemory(
+                if (ReadOrphanRootMemory(*device, region.Cr3,
                         region.Start,
                         sampleLen,
                         &sample,
-                        &ignored) &&
+                        &ignored, true) &&
                     sample.size() >= 14)
                 {
                     stubHits = CountKernelImportStubs(
@@ -11413,12 +13542,20 @@ void KernelMonitor::ScanOrphanMappedPages()
         const bool stubHit = stubHits >= stubThreshold;
         if (!peHit && !wxStub && !stubHit)
         {
+            EmitUnique(L"memory.executable_unowned",
+                L"unattributed_rx:" + HexU64(region.Cr3) + L":" + HexU64(region.RootCreateTime) + L":" + HexU64(region.Start),
+                L"", L"orphan_page", L"executable kernel memory lacks loaded-module attribution",
+                L"va=" + HexU64(region.Start) + L" cr3=" + HexU64(region.Cr3) +
+                L" pa=" + HexU64(region.PhysicalAddress) + L" session=" + std::to_wstring(region.SessionSpace) +
+                L" classification=unattributed; headerless code requires execution/ownership correlation",
+                region.RootProcessId);
             continue;
         }
 
         std::wstring notes = L"class=" + region.Classification +
             L" risk=" + region.Risk +
-            L" size=" + HexU64(region.Size);
+            L" size=" + HexU64(region.Size) + L" cr3=" + HexU64(region.Cr3) +
+            L" root_pid=" + std::to_wstring(region.RootProcessId) + L" root_create=" + HexU64(region.RootCreateTime);
         if (stubCandidate)
         {
             notes += L" scan=";
@@ -11450,15 +13587,15 @@ void KernelMonitor::ScanOrphanMappedPages()
                 layer,
                 region.Start,
                 region.Size,
-                0,
+                region.RootProcessId,
                 false,
                 device,
                 symbols,
                 nullptr,
                 0,
-                &captureNote);
+                &captureNote, region.Cr3, region.RootCreateTime);
             EmitMappedResidue(
-                std::wstring(layer) + L":" + HexU64(region.Start),
+                std::wstring(layer) + L":" + HexU64(region.Cr3) + L":" + HexU64(region.RootCreateTime) + L":" + HexU64(region.Start),
                 region.Classification,
                 layer,
                 (region.InBigPool
@@ -11475,15 +13612,15 @@ void KernelMonitor::ScanOrphanMappedPages()
             orphanLayer,
             region.Start,
             region.Size,
-            0,
+            region.RootProcessId,
             false,
             device,
             symbols,
             nullptr,
             peHit ? (8ull * 1024ull * 1024ull) : (2ull * 1024ull * 1024ull),
-            &orphanCaptureNote);
+            &orphanCaptureNote, region.Cr3, region.RootCreateTime);
         EmitMappedResidue(
-            L"kpage:" + HexU64(region.Start),
+            L"kpage:" + HexU64(region.Cr3) + L":" + HexU64(region.RootCreateTime) + L":" + HexU64(region.Start),
             region.Classification,
             orphanLayer,
             (peHit
@@ -11495,6 +13632,7 @@ void KernelMonitor::ScanOrphanMappedPages()
 
 void KernelMonitor::ScanHookCallbacks()
 {
+    CallbackConfirmationAttempt attempt(this);
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
@@ -11610,16 +13748,113 @@ void KernelMonitor::ScanHookCallbacks()
                 record.Notes);
         }
     }
+    for (const auto& surface : result.Surfaces)
+    {
+        std::map<std::wstring, std::wstring> snapshot;
+        for (const KernelCallbackRecord& record : result.Records)
+        {
+            if (record.Kind == surface.Name)
+            {
+                snapshot[HexU64(record.Entry) + L":" + std::to_wstring(record.Slot) + L":" + record.Target] =
+                    HexU64(record.Function) + L":" + HexU64(record.PostFunction) + L":" +
+                    std::to_wstring(record.RegistrationEnabledKnown) + L":" +
+                    std::to_wstring(record.RegistrationEnabled) + L":" + std::to_wstring(record.SessionDisabled);
+            }
+        }
+        CompareEvidenceSurface(L"callback:" + surface.Name, snapshot, surface.CoverageComplete,
+            L"registration pointer and known enable state; callback delivery is not proven");
+    }
+    if (result.NotifyEnableMaskKnown)
+    {
+        CompareEvidenceSurface(L"notify_mask", {{L"raw", HexU64(result.NotifyEnableMaskRaw)}}, true,
+            L"exact symbol scalar; bit meanings unavailable");
+    }
+    else
+    {
+        CompareEvidenceSurface(L"notify_mask", {}, false, L"notify enable mask unavailable");
+    }
+    RememberExecutionCallbacks(L"registered", result.Records);
+    std::vector<KernelCallbackRecord> targets;
+    const uint64_t now = GetTickCount64();
+    for (auto it = ExecutionCallbackCache.begin(); it != ExecutionCallbackCache.end();)
+    {
+        if (now - it->second.first > 60000)
+        {
+            it = ExecutionCallbackCache.erase(it);
+        }
+        else
+        {
+            targets.insert(targets.end(), it->second.second.begin(), it->second.second.end());
+            ++it;
+        }
+    }
+    if (ScanCallbackInlineTargets(targets))
+    {
+        attempt.Complete();
+    }
 }
 
-void KernelMonitor::ScanGraphicsDispatchTables()
+void KernelMonitor::RememberExecutionCallbacks(
+    const std::wstring& surface, const std::vector<KernelCallbackRecord>& records)
 {
-    // dxgkrnl.sys and the GPU kernel driver (nvlddmkm/amdkmdag) carry DDI
-    // dispatch tables in their .data sections. The Berkan renderer hooked
-    // a present-path entry that no existing callback scan reached because
-    // these are per-adapter arrays of function pointers, not global
-    // registry callbacks. Scan both drivers' writable data for kernel-VA
-    // pointers that land outside every loaded module.
+    ExecutionCallbackCache[surface] = {GetTickCount64(), records};
+}
+
+void KernelMonitor::CompareEvidenceSurface(
+    const std::wstring& surface, const std::map<std::wstring, std::wstring>& state,
+    bool complete, const std::wstring& scope)
+{
+    const std::wstring key = L"scan_failed:lifecycle:" + surface;
+    if (!complete)
+    {
+        EvidenceSurfaceBaselines.erase(surface);
+        EmitUnique(L"sensor.coverage", key, L"", surface,
+            L"surface snapshot is partial; absence comparisons reset", scope);
+        return;
+    }
+    ClearEmittedKey(key);
+    const auto previous = EvidenceSurfaceBaselines.find(surface);
+    if (previous != EvidenceSurfaceBaselines.end())
+    {
+        const auto emitChange = [&](const std::wstring& identity, const std::wstring& before,
+            const std::wstring& after, const wchar_t* action)
+        {
+            KmonEvent event;
+            event.Kind = L"hook.lifecycle";
+            event.Task = surface;
+            event.Summary = surface + L" observed state " + action;
+            event.Evidence[L"identity"] = identity;
+            event.Evidence[L"before"] = before;
+            event.Evidence[L"after"] = after;
+            event.Evidence[L"scope"] = scope;
+            event.Evidence[L"attribution"] = L"state change; intent and global visibility not inferred";
+            RecordEvent(std::move(event));
+        };
+        for (const auto& current : state)
+        {
+            const auto old = previous->second.find(current.first);
+            if (old == previous->second.end())
+            {
+                emitChange(current.first, L"unobserved", current.second, L"appeared");
+            }
+            else if (old->second != current.second)
+            {
+                emitChange(current.first, old->second, current.second, L"changed");
+            }
+        }
+        for (const auto& old : previous->second)
+        {
+            if (state.find(old.first) == state.end())
+            {
+                emitChange(old.first, old.second, L"unobserved", L"disappeared from view");
+            }
+        }
+    }
+    EvidenceSurfaceBaselines[surface] = state;
+}
+
+void KernelMonitor::ScanCallbackLifecycleSurfaces()
+{
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
@@ -11627,12 +13862,551 @@ void KernelMonitor::ScanGraphicsDispatchTables()
         device = Device;
         symbols = Symbols;
     }
-    if (device == nullptr || !device->IsOpen())
+    if (device == nullptr || symbols == nullptr || !device->IsOpen())
     {
         return;
     }
-    if (!EnsureLoadedKernelModules(symbols, true))
+    WnfScanner wnf(*device, *symbols);
+    WnfCallbackScanResult callbacks;
+    std::wstring error;
+    std::vector<KernelCallbackRecord> targets;
+    const bool wnfOk = wnf.ScanCallbacks(64, WnfCallbackCursor, &callbacks, &error);
+    WnfCallbackCursor = callbacks.NextCursor;
+    for (const WnfCallbackRecord& record : callbacks.Records)
     {
+        KernelCallbackRecord target;
+        target.Kind = L"wnf";
+        target.Entry = record.Subscription;
+        target.Function = record.Callback;
+        target.FunctionSlot = record.CallbackSlot;
+        target.FunctionModule = record.Module;
+        targets.push_back(std::move(target));
+        if (record.Suspicious && !AddressOwnedByLoadedModule(symbols, record.Callback))
+        {
+            EmitUnique(L"hook.unbacked", L"wnf:" + HexU64(record.Subscription) + L":" + HexU64(record.Callback),
+                record.Module, L"wnf", L"WNF subscription callback lacks module ownership",
+                L"callback=" + HexU64(record.Callback) + L" subscription=" + HexU64(record.Subscription));
+        }
+    }
+    RememberExecutionCallbacks(L"wnf", targets);
+    if (!wnfOk || !callbacks.CoverageComplete)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:wnf_callbacks", L"", L"wnf",
+            L"WNF callback surface is partial or unavailable", callbacks.CoverageScope + L" " + error);
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:wnf_callbacks");
+    }
+    MinifilterAttachmentScanner attachments;
+    MinifilterAttachmentScanResult attachmentResult;
+    std::map<std::wstring, std::wstring> attachmentState;
+    const bool attachmentOk = attachments.Scan(&attachmentResult, &error);
+    for (const MinifilterAttachmentRecord& record : attachmentResult.Records)
+    {
+        attachmentState[MinifilterAttachmentIdentity(record)] = MinifilterAttachmentStateKey(record);
+    }
+    CompareEvidenceSurface(L"minifilter_attachment", attachmentState,
+        attachmentOk && attachmentResult.CoverageComplete && attachmentResult.SnapshotStable,
+        L"Filter Manager instance/volume attachment snapshot; attach/detach may be legitimate");
+
+    WfpPolicyScanResult policy;
+    const bool policyOk = WfpCalloutScanner::ScanPolicy(&policy, &error);
+    std::map<std::wstring, std::wstring> policyState;
+    for (const WfpPolicyRecord& record : policy.Records)
+    {
+        policyState[record.Kind + L":" + record.Key] = record.State;
+    }
+    CompareEvidenceSurface(L"wfp_policy", policyState,
+        policyOk && policy.InventoryComplete && policy.ReadOnlyTransaction && policy.CoverageComplete,
+        policy.CoverageScope + L"; ACL visibility changes do not prove deletion; global_visibility=unknown");
+}
+
+namespace
+{
+    struct KmonGraphicsSection
+    {
+        uint32_t Rva = 0;
+        uint32_t Size = 0;
+    };
+
+    bool KmonGraphicsHeaderLength(
+        const std::vector<uint8_t>& headers,
+        uint32_t imageSize,
+        uint32_t* length)
+    {
+        bool ok = false;
+        do
+        {
+            if (length == nullptr || headers.size() < sizeof(IMAGE_DOS_HEADER))
+            {
+                break;
+            }
+            *length = 0;
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, headers.data(), sizeof(dos));
+            if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < static_cast<LONG>(sizeof(dos)))
+            {
+                break;
+            }
+            const uint64_t fileEnd = static_cast<uint32_t>(dos.e_lfanew) +
+                uint64_t(4) + sizeof(IMAGE_FILE_HEADER);
+            if (fileEnd > 0x10000 || fileEnd > imageSize)
+            {
+                break;
+            }
+            if (fileEnd > headers.size())
+            {
+                *length = static_cast<uint32_t>(fileEnd);
+                ok = true;
+                break;
+            }
+            uint32_t signature = 0;
+            std::memcpy(&signature, headers.data() + dos.e_lfanew, sizeof(signature));
+            IMAGE_FILE_HEADER file = {};
+            std::memcpy(&file, headers.data() + dos.e_lfanew + 4, sizeof(file));
+            const uint64_t sectionEnd = fileEnd + file.SizeOfOptionalHeader +
+                static_cast<uint64_t>(file.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+            if (signature != IMAGE_NT_SIGNATURE || file.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+                file.NumberOfSections == 0 || file.NumberOfSections > 96 ||
+                file.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+                sectionEnd > 0x10000 || sectionEnd > imageSize)
+            {
+                break;
+            }
+            *length = static_cast<uint32_t>(sectionEnd);
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool KmonParseGraphicsSections(
+        const std::vector<uint8_t>& headers,
+        uint32_t imageSize,
+        std::vector<KmonGraphicsSection>* sections,
+        uint64_t* headerHash)
+    {
+        bool ok = false;
+        do
+        {
+            if (sections == nullptr || headerHash == nullptr)
+            {
+                break;
+            }
+            sections->clear();
+            *headerHash = 0;
+            uint32_t headerLength = 0;
+            if (!KmonGraphicsHeaderLength(headers, imageSize, &headerLength) ||
+                headerLength > headers.size())
+            {
+                break;
+            }
+            IMAGE_DOS_HEADER dos = {};
+            std::memcpy(&dos, headers.data(), sizeof(dos));
+            IMAGE_FILE_HEADER file = {};
+            std::memcpy(&file, headers.data() + dos.e_lfanew + 4, sizeof(file));
+            const size_t optionalOffset = static_cast<size_t>(dos.e_lfanew) + 4 + sizeof(file);
+            IMAGE_OPTIONAL_HEADER64 optional = {};
+            std::memcpy(&optional, headers.data() + optionalOffset, sizeof(optional));
+            if (optional.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || optional.SizeOfImage != imageSize)
+            {
+                break;
+            }
+            const size_t sectionOffset = optionalOffset + file.SizeOfOptionalHeader;
+            bool valid = true;
+            for (uint32_t index = 0; index < file.NumberOfSections; ++index)
+            {
+                IMAGE_SECTION_HEADER section = {};
+                std::memcpy(&section, headers.data() + sectionOffset + index * sizeof(section), sizeof(section));
+                const uint32_t size = section.Misc.VirtualSize != 0
+                    ? section.Misc.VirtualSize : section.SizeOfRawData;
+                if (size != 0 && (section.VirtualAddress >= imageSize ||
+                        size > imageSize - section.VirtualAddress))
+                {
+                    valid = false;
+                    break;
+                }
+                char name[9] = {};
+                std::memcpy(name, section.Name, sizeof(section.Name));
+                if (_stricmp(name, ".data") != 0 || size < sizeof(uint64_t) ||
+                    (section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0 ||
+                    (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+                {
+                    continue;
+                }
+                if ((section.VirtualAddress & 7) != 0)
+                {
+                    valid = false;
+                    break;
+                }
+                KmonGraphicsSection range;
+                range.Rva = section.VirtualAddress;
+                range.Size = size;
+                sections->push_back(range);
+            }
+            std::sort(sections->begin(), sections->end(),
+                [](const KmonGraphicsSection& left, const KmonGraphicsSection& right)
+            {
+                return left.Rva < right.Rva;
+            });
+            for (size_t index = 1; index < sections->size(); ++index)
+            {
+                if ((*sections)[index].Rva < (*sections)[index - 1].Rva + (*sections)[index - 1].Size)
+                {
+                    valid = false;
+                }
+            }
+            if (!valid)
+            {
+                break;
+            }
+            *headerHash = KmonHashBytes64(headers.data(), headerLength);
+            ok = true;
+        } while (false);
+        if (!ok && sections != nullptr)
+        {
+            sections->clear();
+        }
+        return ok;
+    }
+
+    bool KmonPlanGraphicsChunk(
+        const std::vector<KmonGraphicsSection>& sections,
+        uint32_t afterRva,
+        uint32_t* rva,
+        uint32_t* length)
+    {
+        bool found = false;
+        if (rva != nullptr && length != nullptr && !sections.empty())
+        {
+            const KmonGraphicsSection* selected = &sections.front();
+            for (const KmonGraphicsSection& section : sections)
+            {
+                if (afterRva < static_cast<uint64_t>(section.Rva) + section.Size)
+                {
+                    selected = &section;
+                    break;
+                }
+            }
+            const uint32_t offset = afterRva >= selected->Rva &&
+                afterRva < static_cast<uint64_t>(selected->Rva) + selected->Size
+                    ? (afterRva - selected->Rva) & ~7u : 0;
+            *rva = selected->Rva + offset;
+            *length = (std::min)(0x1000u - (*rva & 0xFFFu), selected->Size - offset);
+            found = *length != 0;
+        }
+        return found;
+    }
+
+    bool KmonGraphicsEffectiveExecutable(const PhysicalTranslationInfo& translation, bool* executable)
+    {
+        bool known = false;
+        if (executable != nullptr)
+        {
+            *executable = false;
+            const uint64_t entries[] = {translation.Pml5e, translation.Pml4e,
+                translation.Pdpte, translation.Pde, translation.Pte};
+            bool valid = translation.PagingLevels == 4 || translation.PagingLevels == 5;
+            bool canExecute = true;
+            for (uint32_t index = translation.PagingLevels == 5 ? 0 : 1; index < 5 && valid; ++index)
+            {
+                valid = KnDbgPresentPagingEntryValid(entries[index], 5 - index);
+                canExecute = canExecute && (entries[index] & (1ull << 63)) == 0;
+                if ((index == 2 || index == 3) && (entries[index] & 0x80) != 0)
+                {
+                    valid = valid && translation.PageSize == (index == 2 ? 0x40000000ull : 0x200000ull);
+                    break;
+                }
+                if (index == 4)
+                {
+                    valid = valid && translation.PageSize == 0x1000;
+                }
+            }
+            known = valid;
+            *executable = valid && canExecute;
+        }
+        return known;
+    }
+
+    struct KmonGraphicsChunkResult
+    {
+        uint32_t ConsumedBytes = 0;
+        uint32_t Probes = 0;
+        uint32_t Failures = 0;
+        bool Deferred = false;
+        std::vector<std::pair<uint32_t, uint64_t>> Observations;
+    };
+
+    template<typename Owner, typename Probe, typename Slot>
+    KmonGraphicsChunkResult KmonInspectGraphicsChunk(
+        const std::vector<uint8_t>& bytes,
+        uint32_t rva,
+        uint32_t requested,
+        uint64_t kernelFloor,
+        uint32_t probeBudget,
+        Owner owned,
+        Probe probe,
+        Slot stableSlot)
+    {
+        KmonGraphicsChunkResult result;
+        if (requested == 0 || requested > 0x1000 || rva > UINT32_MAX - requested)
+        {
+            result.Failures = 1;
+            return result;
+        }
+        const size_t readable = (std::min)(bytes.size(), static_cast<size_t>(requested));
+        if (bytes.size() != requested)
+        {
+            ++result.Failures;
+        }
+        for (size_t offset = 0; offset + sizeof(uint64_t) <= readable; offset += sizeof(uint64_t))
+        {
+            uint64_t value = 0;
+            std::memcpy(&value, bytes.data() + offset, sizeof(value));
+            if (value >= kernelFloor && !owned(value))
+            {
+                if (result.Probes >= probeBudget)
+                {
+                    result.Deferred = true;
+                    break;
+                }
+                ++result.Probes;
+                bool executable = false;
+                if (!probe(value, &executable))
+                {
+                    ++result.Failures;
+                }
+                else if (executable)
+                {
+                    const uint32_t slot = rva + static_cast<uint32_t>(offset);
+                    if (stableSlot(slot, value))
+                    {
+                        result.Observations.emplace_back(slot, value);
+                    }
+                    else
+                    {
+                        ++result.Failures;
+                    }
+                }
+            }
+            result.ConsumedBytes = static_cast<uint32_t>(offset + sizeof(uint64_t));
+        }
+        if (!result.Deferred)
+        {
+            // Retry failed bytes on the next rotation, without pinning the cursor.
+            result.ConsumedBytes = requested;
+        }
+        return result;
+    }
+
+    bool KmonGraphicsDispatchSelfTest()
+    {
+        bool ok = false;
+        do
+        {
+            std::vector<uint8_t> headers(0x400, 0);
+            IMAGE_DOS_HEADER dos = {};
+            dos.e_magic = IMAGE_DOS_SIGNATURE;
+            dos.e_lfanew = 0x80;
+            std::memcpy(headers.data(), &dos, sizeof(dos));
+            const uint32_t signature = IMAGE_NT_SIGNATURE;
+            std::memcpy(headers.data() + dos.e_lfanew, &signature, sizeof(signature));
+            IMAGE_FILE_HEADER file = {};
+            file.Machine = IMAGE_FILE_MACHINE_AMD64;
+            file.NumberOfSections = 1;
+            file.SizeOfOptionalHeader = static_cast<uint16_t>(sizeof(IMAGE_OPTIONAL_HEADER64));
+            std::memcpy(headers.data() + dos.e_lfanew + 4, &file, sizeof(file));
+            IMAGE_OPTIONAL_HEADER64 optional = {};
+            optional.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+            optional.SizeOfImage = 0xA00000;
+            const size_t optionalOffset = dos.e_lfanew + 4 + sizeof(file);
+            std::memcpy(headers.data() + optionalOffset, &optional, sizeof(optional));
+            IMAGE_SECTION_HEADER data = {};
+            std::memcpy(data.Name, ".data", 6);
+            data.VirtualAddress = 0x1000;
+            data.Misc.VirtualSize = 0x900000;
+            data.Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+            const size_t sectionOffset = optionalOffset + file.SizeOfOptionalHeader;
+            std::memcpy(headers.data() + sectionOffset, &data, sizeof(data));
+            std::vector<KmonGraphicsSection> sections;
+            uint64_t hash = 0;
+            if (!KmonParseGraphicsSections(headers, optional.SizeOfImage, &sections, &hash) ||
+                sections.size() != 1 || sections.front().Size != 0x900000 || hash == 0)
+            {
+                break;
+            }
+            uint32_t next = 0;
+            uint32_t rva = 0;
+            uint32_t length = 0;
+            bool bounded = true;
+            for (uint32_t visit = 0; visit < 0x900; ++visit)
+            {
+                if (!KmonPlanGraphicsChunk(sections, next, &rva, &length) ||
+                    rva != 0x1000 + visit * 0x1000 || length != 0x1000)
+                {
+                    bounded = false;
+                    break;
+                }
+                next = rva + length;
+            }
+            if (!bounded || !KmonPlanGraphicsChunk(sections, next, &rva, &length) || rva != 0x1000 ||
+                !KmonPlanGraphicsChunk(sections, 0x1110, &rva, &length) ||
+                rva != 0x1110 || length != 0xEF0)
+            {
+                break;
+            }
+            const uint64_t generationHash = hash;
+            file.TimeDateStamp = 1;
+            std::memcpy(headers.data() + dos.e_lfanew + 4, &file, sizeof(file));
+            if (!KmonParseGraphicsSections(headers, optional.SizeOfImage, &sections, &hash) ||
+                hash == generationHash)
+            {
+                break;
+            }
+            data.Misc.VirtualSize = optional.SizeOfImage;
+            std::memcpy(headers.data() + sectionOffset, &data, sizeof(data));
+            if (KmonParseGraphicsSections(headers, optional.SizeOfImage, &sections, &hash) || !sections.empty())
+            {
+                break;
+            }
+            data.Misc.VirtualSize = 0x900000;
+            std::memcpy(headers.data() + sectionOffset, &data, sizeof(data));
+            std::vector<uint8_t> partialHeaders(headers.begin(), headers.begin() + sectionOffset);
+            uint32_t required = 0;
+            if (!KmonGraphicsHeaderLength(partialHeaders, optional.SizeOfImage, &required) ||
+                required != sectionOffset + sizeof(data) ||
+                KmonParseGraphicsSections(partialHeaders, optional.SizeOfImage, &sections, &hash))
+            {
+                break;
+            }
+            headers[dos.e_lfanew] = 0;
+            if (KmonParseGraphicsSections(headers, optional.SizeOfImage, &sections, &hash))
+            {
+                break;
+            }
+
+            PhysicalTranslationInfo mapping = {};
+            mapping.PagingLevels = 4;
+            mapping.PageSize = 0x1000;
+            mapping.Pml4e = 3;
+            mapping.Pdpte = 3;
+            mapping.Pde = 3;
+            mapping.Pte = 3;
+            bool executable = false;
+            if (!KmonGraphicsEffectiveExecutable(mapping, &executable) || !executable)
+            {
+                break;
+            }
+            mapping.Pml4e |= 1ull << 63;
+            if (!KmonGraphicsEffectiveExecutable(mapping, &executable) || executable)
+            {
+                break;
+            }
+            mapping.Pml4e = 0x83;
+            if (KmonGraphicsEffectiveExecutable(mapping, &executable) || executable)
+            {
+                break;
+            }
+            mapping.Pml4e = 3;
+            mapping.Pdpte = 0x83;
+            mapping.PageSize = 0x40000000;
+            mapping.Pde = 0;
+            mapping.Pte = 0;
+            if (!KmonGraphicsEffectiveExecutable(mapping, &executable) || !executable)
+            {
+                break;
+            }
+            mapping.PagingLevels = 5;
+            mapping.Pml5e = 3 | (1ull << 63);
+            if (!KmonGraphicsEffectiveExecutable(mapping, &executable) || executable)
+            {
+                break;
+            }
+
+            constexpr uint64_t floor = 0xFFFF800000000000ull;
+            constexpr uint64_t code = floor + 0x1000000;
+            std::vector<uint8_t> pointers(33 * sizeof(uint64_t), 0);
+            for (uint32_t index = 0; index < 33; ++index)
+            {
+                const uint64_t target = index == 32 ? code : floor + 0x1000 + index * 0x1000;
+                std::memcpy(pointers.data() + index * sizeof(target), &target, sizeof(target));
+            }
+            const auto unowned = [](uint64_t)
+            {
+                return false;
+            };
+            const auto probe = [](uint64_t address, bool* value)
+            {
+                *value = address == code;
+                return true;
+            };
+            const auto stable = [](uint32_t, uint64_t)
+            {
+                return true;
+            };
+            KmonGraphicsChunkResult first = KmonInspectGraphicsChunk(pointers, 0x1000,
+                static_cast<uint32_t>(pointers.size()), floor, 32, unowned, probe, stable);
+            if (!first.Deferred || first.ConsumedBytes != 32 * sizeof(uint64_t) || first.Probes != 32 ||
+                first.Failures != 0 || !first.Observations.empty())
+            {
+                break;
+            }
+            std::vector<uint8_t> last(pointers.begin() + first.ConsumedBytes, pointers.end());
+            KmonGraphicsChunkResult second = KmonInspectGraphicsChunk(last, 0x1100,
+                static_cast<uint32_t>(last.size()), floor, 32, unowned, probe, stable);
+            if (second.Deferred || second.Probes != 1 || second.Failures != 0 ||
+                second.Observations.size() != 1 || second.Observations.front().first != 0x1100 ||
+                second.Observations.front().second != code)
+            {
+                break;
+            }
+            const KmonGraphicsChunkResult owned = KmonInspectGraphicsChunk(last, 0x1100, 8,
+                floor, 32, [](uint64_t)
+            {
+                return true;
+            }, probe, stable);
+            const KmonGraphicsChunkResult changed = KmonInspectGraphicsChunk(last, 0x1100, 8,
+                floor, 32, unowned, probe, [](uint32_t, uint64_t)
+            {
+                return false;
+            });
+            const KmonGraphicsChunkResult unknown = KmonInspectGraphicsChunk(last, 0x1100, 8,
+                floor, 32, unowned, [](uint64_t, bool*)
+            {
+                return false;
+            }, stable);
+            const KmonGraphicsChunkResult partial = KmonInspectGraphicsChunk(last, 0x1100, 16,
+                floor, 32, unowned, probe, stable);
+            const KmonGraphicsChunkResult unreadable = KmonInspectGraphicsChunk({}, 0x1100, 16,
+                floor, 32, unowned, probe, stable);
+            if (!owned.Observations.empty() || owned.Probes != 0 ||
+                !changed.Observations.empty() || changed.Failures != 1 ||
+                !unknown.Observations.empty() || unknown.Failures != 1 ||
+                partial.Observations.size() != 1 || partial.Failures != 1 ||
+                unreadable.Failures != 1 || unreadable.ConsumedBytes != 16)
+            {
+                break;
+            }
+            ok = true;
+        } while (false);
+        return ok;
+    }
+}
+
+void KernelMonitor::ScanGraphicsDispatchTables()
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen() ||
+        !EnsureLoadedKernelModules(symbols, true))
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:graphics_dispatch:inventory", L"",
+            L"graphics_dispatch", L"graphics pointer scan unavailable", L"kernel device/module inventory unavailable");
         return;
     }
 
@@ -11647,13 +14421,37 @@ void KernelMonitor::ScanGraphicsDispatchTables()
     };
 
     const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
-    if (modules.empty())
+    ControlRegisters control = {};
+    if (modules.empty() || !device->ReadControlRegisters(0, &control, nullptr) || control.Cr3 == 0)
     {
+        EmitUnique(L"sensor.coverage", L"scan_failed:graphics_dispatch:inventory", L"",
+            L"graphics_dispatch", L"graphics pointer scan unavailable", L"module inventory or page-table root unavailable");
         return;
     }
+    const uint64_t kernelFloor = (control.Cr4 & (1ull << 12)) != 0
+        ? 0xFF00000000000000ull : 0xFFFF800000000000ull;
+    bool rangesValid = true;
+    for (const KernelModuleInfo& module : modules)
+    {
+        if (module.Base < kernelFloor || module.Size == 0 || module.Base > UINT64_MAX - module.Size)
+        {
+            rangesValid = false;
+        }
+    }
+    if (!rangesValid)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:graphics_dispatch:inventory", L"",
+            L"graphics_dispatch", L"graphics pointer scan unavailable", L"module ownership contains invalid ranges");
+        return;
+    }
+    ClearEmittedKey(L"scan_failed:graphics_dispatch:inventory");
 
     for (const wchar_t* driverName : kGraphicsDrivers)
     {
+        if (StopRequested.load())
+        {
+            break;
+        }
         const KernelModuleInfo* target = nullptr;
         for (const KernelModuleInfo& mod : modules)
         {
@@ -11663,154 +14461,170 @@ void KernelMonitor::ScanGraphicsDispatchTables()
                 break;
             }
         }
-        if (target == nullptr || target->Base == 0)
+        if (target == nullptr)
         {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            GraphicsDispatchCursors.erase(driverName);
             continue;
         }
-
-        // Read the PE headers to find .data and KERNEL data sections
+        const std::wstring coverageKey = std::wstring(L"scan_failed:graphics_dispatch:") + driverName;
         std::vector<uint8_t> headers;
-        std::wstring readError;
-        if (!device->ReadMemory(target->Base, 0x400, &headers, &readError) ||
-            headers.size() < 0x200)
+        std::vector<KmonGraphicsSection> sections;
+        uint32_t headerLength = (std::min)(0x1000u, target->Size);
+        uint64_t headerHash = 0;
+        bool headerKnown = false;
+        for (uint32_t attempt = 0; attempt < 3; ++attempt)
         {
-            continue;
-        }
-        // Parse section table for writable, non-discardable data sections
-        IMAGE_DOS_HEADER dos = {};
-        std::memcpy(&dos, headers.data(), sizeof(dos));
-        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0)
-        {
-            continue;
-        }
-        const size_t nt = static_cast<size_t>(dos.e_lfanew);
-        if (nt + 4 + sizeof(IMAGE_FILE_HEADER) > headers.size())
-        {
-            continue;
-        }
-        IMAGE_FILE_HEADER file = {};
-        std::memcpy(&file, headers.data() + nt + 4, sizeof(file));
-        const size_t sectionOffset =
-            nt + 4 + sizeof(IMAGE_FILE_HEADER) + file.SizeOfOptionalHeader;
-
-        for (uint16_t i = 0; i < file.NumberOfSections && i < 32; ++i)
-        {
-            const size_t off = sectionOffset + i * sizeof(IMAGE_SECTION_HEADER);
-            if (off + sizeof(IMAGE_SECTION_HEADER) > headers.size())
+            if ((target->Base & 0xFFF) != 0 || headerLength < sizeof(IMAGE_DOS_HEADER) ||
+                !device->ReadMemory(target->Base, headerLength, &headers, nullptr) ||
+                headers.size() != headerLength ||
+                !KmonGraphicsHeaderLength(headers, target->Size, &headerLength))
             {
                 break;
             }
-            IMAGE_SECTION_HEADER section = {};
-            std::memcpy(&section, headers.data() + off, sizeof(section));
-
-            char sectionName[9] = {};
-            std::memcpy(sectionName, section.Name, 8);
-
-            // Only scan .data: other writable sections carry import
-            // strings and resource pointers that are legitimate non-module
-            // kernel VAs (pool allocations, DPC objects, spin locks).
-            if (_stricmp(sectionName, ".data") != 0)
+            if (headerLength <= headers.size())
             {
-                continue;
+                headerKnown = KmonParseGraphicsSections(headers, target->Size, &sections, &headerHash);
+                break;
             }
-
-            // Skip non-writable or discardable sections
-            if ((section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0 ||
-                (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+        }
+        if (!headerKnown)
+        {
+            EmitUnique(L"sensor.coverage", coverageKey, driverName, L"graphics_dispatch",
+                L"graphics data-section layout unavailable", L"PE header/section bounds or exact read failed");
+            continue;
+        }
+        GraphicsDispatchCursor cursor;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            const auto found = GraphicsDispatchCursors.find(driverName);
+            if (found != GraphicsDispatchCursors.end() && found->second.Base == target->Base &&
+                found->second.Size == target->Size && found->second.HeaderHash == headerHash)
             {
-                continue;
+                cursor = found->second;
             }
-            // dxgkrnl .data is typically 1-4MB; bound cost at 8MB
-            const uint32_t sectionSize = section.Misc.VirtualSize != 0
-                ? section.Misc.VirtualSize
-                : section.SizeOfRawData;
-            if (sectionSize == 0 || sectionSize > 0x800000)
+        }
+        cursor.Base = target->Base;
+        cursor.Size = target->Size;
+        cursor.HeaderHash = headerHash;
+        std::vector<std::pair<uint32_t, uint64_t>> observations;
+        uint32_t probes = 0;
+        uint32_t failures = 0;
+        uint32_t chunks = 0;
+        uint32_t firstRva = 0;
+        bool cycleComplete = sections.empty();
+        for (; chunks < 4 && probes < 32 && !StopRequested.load(); ++chunks)
+        {
+            uint32_t rva = 0;
+            uint32_t length = 0;
+            if (!KmonPlanGraphicsChunk(sections, cursor.NextRva, &rva, &length))
             {
-                continue;
+                break;
             }
-
-            // Read the section and scan for kernel-VA function pointers
-            std::vector<uint8_t> sectionData;
-            if (!device->ReadMemory(
-                    target->Base + section.VirtualAddress,
-                    sectionSize,
-                    &sectionData,
-                    &readError) ||
-                sectionData.size() < 8)
+            if (chunks != 0 && rva == firstRva)
             {
-                continue;
+                cycleComplete = true;
+                break;
             }
-
-            uint32_t unbacked = 0;
-            uint64_t firstUnbacked = 0;
-            const size_t slots = sectionData.size() / 8;
-            for (size_t slot = 0; slot < slots && unbacked < 16; ++slot)
+            if (chunks == 0)
             {
-                uint64_t value = 0;
-                std::memcpy(&value, sectionData.data() + slot * 8, sizeof(value));
-
-                // Kernel VA range check (canonical, above user space)
-                if (value < 0xFFFFF80000000000ull || value > 0xFFFFFFFFFFFFFFFFull)
+                firstRva = rva;
+            }
+            std::vector<uint8_t> bytes;
+            if (!device->ReadMemory(target->Base + rva, length, &bytes, nullptr))
+            {
+                ++failures;
+            }
+            const KmonGraphicsChunkResult inspected = KmonInspectGraphicsChunk(
+                bytes, rva, length, kernelFloor, 32 - probes,
+                [&modules](uint64_t address)
+            {
+                bool owned = false;
+                for (const KernelModuleInfo& module : modules)
                 {
-                    continue;
-                }
-
-                // Check against loaded modules
-                bool backed = false;
-                for (const KernelModuleInfo& mod : modules)
-                {
-                    if (mod.Base != 0 &&
-                        value >= mod.Base &&
-                        value < mod.Base + mod.Size)
+                    if (address >= module.Base && address - module.Base < module.Size)
                     {
-                        backed = true;
+                        owned = true;
                         break;
                     }
                 }
-                if (!backed)
-                {
-                    ++unbacked;
-                    if (firstUnbacked == 0)
-                    {
-                        firstUnbacked = value;
-                    }
-                }
-            }
-
-            // .data contains legitimate non-module kernel VAs (pool
-            // pointers, spin locks, DPC objects). 1-3 is noise; 4+ in
-            // .data suggests a dispatch table entry was redirected.
-            if (unbacked >= 4)
+                return owned;
+            }, [&](uint64_t address, bool* executable)
             {
-                std::wstring captureNote;
-                CaptureRegion(
-                    L"graphics_dispatch",
-                    target->Base + section.VirtualAddress,
-                    0x1000,
-                    0,
-                    false,
-                    device,
-                    symbols,
-                    nullptr,
-                    0,
-                    &captureNote);
-                EmitUnique(
-                    L"hook.unbacked",
-                    std::wstring(L"graphics_dispatch:") + driverName +
-                        L":" + std::to_wstring(section.VirtualAddress),
-                    driverName,
-                    L"graphics_dispatch",
-                    std::wstring(driverName) + L" writable data section " +
-                        L"contains " + std::to_wstring(unbacked) +
-                        L" kernel-VA pointer(s) outside loaded modules" +
-                        (firstUnbacked != 0
-                            ? L" first=" + HexU64(firstUnbacked)
-                            : L""),
-                    L"section_rva=0x" + HexU64(section.VirtualAddress) +
-                        L" size=0x" + HexU64(sectionSize) +
-                        L" unbacked=" + std::to_wstring(unbacked) +
-                        captureNote);
+                PhysicalTranslationInfo translation = {};
+                return device->TranslateVirtual(control.Cr3, address, 1, &translation, nullptr) &&
+                    KmonGraphicsEffectiveExecutable(translation, executable);
+            }, [&](uint32_t slot, uint64_t expected)
+            {
+                std::vector<uint8_t> current;
+                uint64_t value = 0;
+                const bool read = device->ReadMemory(target->Base + slot, sizeof(value), &current, nullptr) &&
+                    current.size() == sizeof(value);
+                if (read)
+                {
+                    std::memcpy(&value, current.data(), sizeof(value));
+                }
+                return read && value == expected;
+            });
+            probes += inspected.Probes;
+            failures += inspected.Failures;
+            observations.insert(observations.end(), inspected.Observations.begin(), inspected.Observations.end());
+            cursor.NextRva = rva + inspected.ConsumedBytes;
+            if (inspected.ConsumedBytes == 0 || inspected.Deferred)
+            {
+                ++chunks;
+                break;
             }
+        }
+        if (StopRequested.load())
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            GraphicsDispatchCursors[driverName] = cursor;
+            break;
+        }
+        uint32_t nextRva = 0;
+        uint32_t nextLength = 0;
+        if (chunks != 0 && KmonPlanGraphicsChunk(sections, cursor.NextRva, &nextRva, &nextLength) &&
+            nextRva == firstRva)
+        {
+            cycleComplete = true;
+        }
+        std::vector<uint8_t> finalHeader;
+        const bool stableImage = device->ReadMemory(target->Base, headerLength, &finalHeader, nullptr) &&
+            finalHeader.size() == headerLength &&
+            KmonHashBytes64(finalHeader.data(), finalHeader.size()) == headerHash;
+        if (stableImage)
+        {
+            const std::wstring imageIdentity = std::wstring(driverName) + L":" +
+                HexU64(target->Base) + L":" + HexU64(headerHash);
+            for (const auto& observation : observations)
+            {
+                EmitUnique(L"hook.unbacked", L"graphics_dispatch:" + imageIdentity + L":" +
+                    HexU64(observation.first) + L":" + HexU64(observation.second), driverName,
+                    L"graphics_dispatch", L"graphics driver data points to executable memory outside loaded modules",
+                    L"slot=" + HexU64(target->Base + observation.first) + L" target=" +
+                    HexU64(observation.second) + L" root=" + HexU64(control.Cr3) +
+                    L" observation=unowned_executable_pointer; dispatch_role_unproven; temporal_sample=1");
+            }
+        }
+        else
+        {
+            ++failures;
+        }
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            GraphicsDispatchCursors[driverName] = cursor;
+        }
+        if (failures != 0 || !cycleComplete)
+        {
+            EmitUnique(L"sensor.coverage", coverageKey, driverName, L"graphics_dispatch",
+                L"graphics data-pointer scan is partial", L"chunks=" + std::to_wstring(chunks) +
+                    L" probes=" + std::to_wstring(probes) + L" failures=" + std::to_wstring(failures) +
+                    L" next_rva=" + HexU64(cursor.NextRva) + L" rotating_data_sections=1");
+        }
+        else
+        {
+            ClearEmittedKey(coverageKey);
         }
     }
 }
@@ -11881,11 +14695,11 @@ void KernelMonitor::ScanHookInput()
         ClearEmittedKey(L"scan_failed:input:coverage");
     }
 
-    bool hitCap = false;
     uint32_t suspicious = 0;
+    size_t deferred = 0;
     for (const InputStackRecord& record : result.Records)
     {
-        uint32_t emitted = 0;
+        size_t emitted = 0;
         for (const DeviceStackResult& stack : record.Driver.Stacks)
         {
             for (const DeviceObjectRecord& attached : stack.Stack)
@@ -11902,18 +14716,16 @@ void KernelMonitor::ScanHookInput()
                     continue;
                 }
                 ++suspicious;
-                if (emitted >= 8)
-                {
-                    hitCap = true;
-                    continue;
-                }
                 const uint64_t unbackedObject = attached.DriverObject != 0
                     ? attached.DriverObject
                     : attached.DeviceObject;
                 const std::wstring notes = attached.Notes.empty()
                     ? record.Notes
                     : attached.Notes;
-                EmitUnique(
+                EmitUniqueBounded(
+                    8,
+                    &emitted,
+                    &deferred,
                     L"hook.unbacked",
                     L"input:" + record.Role + L":" + HexU64(unbackedObject),
                     ownerPath.empty() ? record.DriverFilter : ownerPath,
@@ -11922,11 +14734,10 @@ void KernelMonitor::ScanHookInput()
                         ? (L"unbacked driver on " + record.Role + L" stack")
                         : (L"non-inbox driver on " + record.Role + L" stack"),
                     notes);
-                ++emitted;
             }
         }
     }
-    if (hitCap)
+    if (deferred != 0)
     {
         EmitUnique(
             L"hook.unbacked",
@@ -11934,7 +14745,8 @@ void KernelMonitor::ScanHookInput()
             std::wstring(),
             L"input",
             L"input stack scan hit the emit cap; extra attached drivers may be missed",
-            L"suspicious=" + std::to_wstring(suspicious));
+            L"suspicious=" + std::to_wstring(suspicious) +
+                L" deferred_candidates=" + std::to_wstring(deferred));
     }
     else
     {
@@ -11984,7 +14796,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:ssdt");
-            uint32_t emitted = 0;
+            size_t emitted = 0;
+            size_t deferred = 0;
             uint32_t suspicious = 0;
             for (const SsdtTable& table : result.Tables)
             {
@@ -11995,11 +14808,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         continue;
                     }
                     ++suspicious;
-                    if (emitted >= 16)
-                    {
-                        continue;
-                    }
-                    EmitUnique(
+                    EmitUniqueBounded(
+                        16,
+                        &emitted,
+                        &deferred,
                         L"hook.unbacked",
                         L"ssdt:" + table.Name + L":" + std::to_wstring(entry.Index),
                         table.ExpectedModule,
@@ -12007,10 +14819,9 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         L"SSDT " + table.Name + L"[" + std::to_wstring(entry.Index) +
                             L"] outside " + table.ExpectedModule + L" " + HexU64(entry.Routine),
                         entry.Notes);
-                    ++emitted;
                 }
             }
-            if (suspicious > 16)
+            if (deferred != 0)
             {
                 EmitUnique(
                     L"hook.unbacked",
@@ -12018,7 +14829,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"ssdt",
                     L"SSDT scan hit the emit cap; extra hooked slots may be missed",
-                    L"suspicious=" + std::to_wstring(suspicious));
+                    L"suspicious=" + std::to_wstring(suspicious) +
+                        L" deferred_candidates=" + std::to_wstring(deferred));
             }
             else
             {
@@ -12114,7 +14926,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             {
                 ClearEmittedKey(L"scan_failed:idt:coverage");
             }
-            uint32_t emitted = 0;
+            size_t emitted = 0;
+            size_t deferred = 0;
             uint32_t suspicious = 0;
             for (const IdtEntry& entry : result.Entries)
             {
@@ -12125,18 +14938,17 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 if (entry.Divergent)
                 {
                     ++suspicious;
-                    if (emitted < 16)
-                    {
-                        EmitUnique(
-                            L"hook.unbacked",
-                            L"idt:" + std::to_wstring(entry.Vector) + L":divergent",
-                            entry.Module,
-                            L"idt",
-                            L"IDT vector " + std::to_wstring(entry.Vector) +
-                                L" handler diverges across processors",
-                            entry.Notes);
-                        ++emitted;
-                    }
+                    EmitUniqueBounded(
+                        16,
+                        &emitted,
+                        &deferred,
+                        L"hook.unbacked",
+                        L"idt:" + std::to_wstring(entry.Vector) + L":divergent",
+                        entry.Module,
+                        L"idt",
+                        L"IDT vector " + std::to_wstring(entry.Vector) +
+                            L" handler diverges across processors",
+                        entry.Notes);
                 }
                 if (!entry.Suspicious)
                 {
@@ -12147,11 +14959,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     continue;
                 }
                 ++suspicious;
-                if (emitted >= 16)
-                {
-                    continue;
-                }
-                EmitUnique(
+                EmitUniqueBounded(
+                    16,
+                    &emitted,
+                    &deferred,
                     L"hook.unbacked",
                     L"idt:" + std::to_wstring(entry.Vector),
                     entry.Module,
@@ -12159,9 +14970,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"IDT vector " + std::to_wstring(entry.Vector) +
                         L" handler outside modules " + HexU64(entry.Handler),
                     entry.Notes);
-                ++emitted;
             }
-            if (suspicious > 16)
+            if (deferred != 0)
             {
                 EmitUnique(
                     L"hook.unbacked",
@@ -12169,7 +14979,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"idt",
                     L"IDT scan hit the emit cap; extra hooked vectors may be missed",
-                    L"suspicious=" + std::to_wstring(suspicious));
+                    L"suspicious=" + std::to_wstring(suspicious) +
+                        L" deferred_candidates=" + std::to_wstring(deferred));
             }
             else
             {
@@ -12383,7 +15194,22 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:nmi");
-            if (result.Incomplete)
+            std::vector<KernelCallbackRecord> targets;
+            for (const NmiCallbackRecord& record : result.Callbacks)
+            {
+                if (!result.LayoutFromPdb)
+                {
+                    continue;
+                }
+                KernelCallbackRecord target;
+                target.Kind = L"nmi_observed";
+                target.Entry = record.NodeAddress;
+                target.Function = record.Callback;
+                target.FunctionModule = record.CallbackModule;
+                targets.push_back(std::move(target));
+            }
+            RememberExecutionCallbacks(L"nmi", targets);
+            if (result.Incomplete || !result.LayoutFromPdb)
             {
                 EmitUnique(
                     L"hook.unbacked",
@@ -12401,7 +15227,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             }
             for (const NmiCallbackRecord& record : result.Callbacks)
             {
-                if (!record.Suspicious)
+                if (!result.LayoutFromPdb || !record.Suspicious)
                 {
                     continue;
                 }
@@ -12420,6 +15246,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         }
         else
         {
+            RememberExecutionCallbacks(L"nmi", {});
             EmitUnique(
                 L"hook.unbacked",
                 L"scan_failed:nmi",
@@ -12441,23 +15268,54 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         DpcTimerScanner::Options options;
         options.Target = DpcTimerScanner::Scope::All;
         options.Limit = 32;
+        options.WorkItemCursor = WorkItemCursor;
+        options.DpcCursor = DpcQueueCursor;
+        options.TimerCursor = TimerQueueCursor;
         DpcTimerScanResult result = {};
         std::wstring error;
         if (scanner.Scan(options, &result, &error))
         {
             ClearEmittedKey(L"scan_failed:dpc");
-            if (!result.DpcCoverageComplete || !result.TimerCoverageComplete)
+            WorkItemCursor = result.NextWorkItemCursor;
+            DpcQueueCursor = result.NextDpcCursor;
+            TimerQueueCursor = result.NextTimerCursor;
+            std::vector<KernelCallbackRecord> targets;
+            const auto addTarget = [&](const wchar_t* kind, uint64_t entry, uint64_t routine, const std::wstring& module)
+            {
+                KernelCallbackRecord target;
+                target.Kind = kind;
+                target.Entry = entry;
+                target.Function = routine;
+                target.FunctionModule = module;
+                targets.push_back(std::move(target));
+            };
+            for (const DpcRoutineRecord& record : result.Dpcs)
+            {
+                addTarget(L"dpc_observed", record.ObjectAddress, record.Routine, record.Module);
+            }
+            for (const TimerRoutineRecord& record : result.Timers)
+            {
+                addTarget(L"timer_observed", record.TimerAddress, record.Routine, record.Module);
+            }
+            for (const WorkItemRecord& record : result.WorkItems)
+            {
+                addTarget(L"workitem_observed", record.EntryAddress, record.Routine, record.Module);
+            }
+            RememberExecutionCallbacks(L"deferred_execution", targets);
+            if (!result.DpcCoverageComplete || !result.TimerCoverageComplete || !result.WorkItemCoverageComplete)
             {
                 EmitUnique(
                     L"hook.unbacked",
                     L"scan_failed:dpc:coverage",
                     std::wstring(),
                     L"dpc",
-                    L"DPC/timer walk was incomplete; extra unbacked routines may be missed",
+                    L"DPC/timer/work-item inspection has incomplete surfaces",
                     L"dpc_complete=" +
                         std::to_wstring(result.DpcCoverageComplete ? 1 : 0) +
                         L" timer_complete=" +
-                        std::to_wstring(result.TimerCoverageComplete ? 1 : 0));
+                        std::to_wstring(result.TimerCoverageComplete ? 1 : 0) +
+                        L" workitem_complete=" + std::to_wstring(result.WorkItemCoverageComplete) +
+                        L" workitem_scope=" + result.WorkItemCoverageScope);
             }
             else
             {
@@ -12520,6 +15378,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         }
         else
         {
+            RememberExecutionCallbacks(L"deferred_execution", {});
             EmitUnique(
                 L"hook.unbacked",
                 L"scan_failed:dpc",
@@ -12543,6 +15402,21 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         if (scanner.Scan(&result, &error))
         {
             ClearEmittedKey(L"scan_failed:wfp");
+            std::vector<KernelCallbackRecord> targets;
+            for (const WfpKernelCallout& callout : result.Callouts)
+            {
+                const uint64_t functions[] = {callout.ClassifyFn, callout.NotifyFn, callout.FlowDeleteFn};
+                for (uint64_t function : functions)
+                {
+                    KernelCallbackRecord target;
+                    target.Kind = L"wfp_observed";
+                    target.Entry = callout.EntryAddress;
+                    target.Function = function;
+                    target.Target = std::to_wstring(callout.CalloutId);
+                    targets.push_back(std::move(target));
+                }
+            }
+            RememberExecutionCallbacks(L"wfp", targets);
             if (!result.CoverageComplete || result.Incomplete)
             {
                 EmitUnique(
@@ -12559,7 +15433,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
             {
                 ClearEmittedKey(L"scan_failed:wfp:coverage");
             }
-            uint32_t emitted = 0;
+            size_t emitted = 0;
+            size_t deferred = 0;
             uint32_t suspicious = 0;
             auto emitWfpIfUnbacked = [&](
                 bool hookSuspicious,
@@ -12576,11 +15451,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     return;
                 }
                 ++suspicious;
-                if (emitted >= 16)
-                {
-                    return;
-                }
-                EmitUnique(
+                EmitUniqueBounded(
+                    16,
+                    &emitted,
+                    &deferred,
                     L"hook.unbacked",
                     L"wfp:" + std::to_wstring(callout.CalloutId) + L":" + which,
                     callout.Name,
@@ -12588,7 +15462,6 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     L"WFP callout " + callout.Name + L" " + which +
                         L" outside modules " + HexU64(fn),
                     callout.Notes);
-                ++emitted;
             };
             for (const WfpKernelCallout& callout : result.Callouts)
             {
@@ -12608,7 +15481,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     callout,
                     L"flowdelete");
             }
-            if (suspicious > 16)
+            if (deferred != 0)
             {
                 EmitUnique(
                     L"hook.unbacked",
@@ -12616,7 +15489,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"wfp",
                     L"WFP scan hit the emit cap; extra unbacked callouts may be missed",
-                    L"suspicious=" + std::to_wstring(suspicious));
+                    L"suspicious=" + std::to_wstring(suspicious) +
+                        L" deferred_candidates=" + std::to_wstring(deferred));
             }
             else
             {
@@ -12625,6 +15499,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         }
         else
         {
+            RememberExecutionCallbacks(L"wfp", {});
             EmitUnique(
                 L"hook.unbacked",
                 L"scan_failed:wfp",
@@ -12663,7 +15538,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 ClearEmittedKey(L"scan_failed:minifilter:coverage");
             }
             uint32_t minifilterHits = 0;
-            uint32_t minifilterEmitted = 0;
+            size_t minifilterEmitted = 0;
+            size_t minifilterDeferred = 0;
             for (const MinifilterFilterRecord& filter : result.Filters)
             {
                 const bool startUnbacked =
@@ -12672,18 +15548,17 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                 if (startUnbacked)
                 {
                     ++minifilterHits;
-                    if (minifilterEmitted < 16)
-                    {
-                        EmitUnique(
-                            L"hook.unbacked",
-                            L"minifilter:" + HexU64(filter.Filter),
-                            filter.Name,
-                            L"minifilter",
-                            L"minifilter " + filter.Name +
-                                L" is not backed by a loaded module",
-                            filter.Notes);
-                        ++minifilterEmitted;
-                    }
+                    EmitUniqueBounded(
+                        16,
+                        &minifilterEmitted,
+                        &minifilterDeferred,
+                        L"hook.unbacked",
+                        L"minifilter:" + HexU64(filter.Filter),
+                        filter.Name,
+                        L"minifilter",
+                        L"minifilter " + filter.Name +
+                            L" is not backed by a loaded module",
+                        filter.Notes);
                 }
                 auto emitMinifilterFn = [&](
                     uint64_t fn,
@@ -12695,11 +15570,10 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         return;
                     }
                     ++minifilterHits;
-                    if (minifilterEmitted >= 16)
-                    {
-                        return;
-                    }
-                    EmitUnique(
+                    EmitUniqueBounded(
+                        16,
+                        &minifilterEmitted,
+                        &minifilterDeferred,
                         L"hook.unbacked",
                         L"minifilter:" + HexU64(filter.Filter) + L":" +
                             which + L":" + HexU64(fn),
@@ -12708,7 +15582,6 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                         L"minifilter " + filter.Name + L" " + which +
                             L" callback outside loaded modules " + HexU64(fn),
                         majorName.empty() ? filter.Notes : (majorName + L" " + filter.Notes));
-                    ++minifilterEmitted;
                 };
                 for (const MinifilterIrpSlot& slot : filter.OperationsTable)
                 {
@@ -12721,7 +15594,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     emitMinifilterFn(slot.Post, L"post", slot.MajorName);
                 }
             }
-            if (minifilterHits > 16)
+            if (minifilterDeferred != 0)
             {
                 EmitUnique(
                     L"hook.unbacked",
@@ -12729,7 +15602,8 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"minifilter",
                     L"minifilter scan hit the emit cap; extra unbacked callbacks may be missed",
-                    L"hits=" + std::to_wstring(minifilterHits));
+                    L"hits=" + std::to_wstring(minifilterHits) +
+                        L" deferred_candidates=" + std::to_wstring(minifilterDeferred));
             }
             else
             {
@@ -12825,24 +15699,73 @@ void KernelMonitor::ScanCpuIntegrityHooks()
         ByovdScanOptions options;
         options.AutoUpdate = false;
         options.EnableYara = false;
-        options.CheckAuthenticode = false;
+        options.CheckAuthenticode = true;
+        options.MaxModules = 8;
+        options.ModuleAfterBase = ByovdModuleAfter;
+        options.MaxHashBytes = 128ull * 1024 * 1024;
+        options.HashBudgetMs = 250;
+        options.Verbose = true;
+        ByovdCatalogStatus catalog;
+        std::wstring catalogError;
+        if (!scanner.QueryCatalogStatus(&catalog, &catalogError) || !catalog.HasCatalog || catalog.Stale)
+        {
+            EmitUnique(L"sensor.coverage", L"scan_failed:byovd:freshness", L"", L"byovd",
+                L"vulnerable-driver catalog is missing, stale, or unreadable",
+                L"age_seconds=" + std::to_wstring(catalog.AgeSeconds) + L" entries=" +
+                std::to_wstring(catalog.EntryCount) + L" " + catalogError);
+        }
+        else
+        {
+            ClearEmittedKey(L"scan_failed:byovd:freshness");
+        }
         ByovdScanResult result = {};
         std::wstring error;
         if (scanner.Scan(options, &result, &error))
         {
             ClearEmittedKey(L"scan_failed:byovd");
+            ByovdModuleAfter = result.NextModuleBase;
+            if (result.FileReadFailures != 0 || result.Truncated || !result.ModuleCoverageComplete)
+            {
+                EmitUnique(L"sensor.coverage", L"scan_failed:byovd:coverage", L"", L"byovd",
+                    L"driver provenance scan is partial; module address cursor continues",
+                    L"scanned=" + std::to_wstring(result.ModulesScanned) + L" unreadable=" +
+                    std::to_wstring(result.FileReadFailures) + L" hash_budget_failures=" +
+                    std::to_wstring(result.HashBudgetFailures) + L" hash_generation_failures=" +
+                    std::to_wstring(result.HashGenerationFailures) + L" hash_max_bytes=" +
+                    std::to_wstring(result.MaxHashBytes) + L" hash_budget_ms=" +
+                    std::to_wstring(result.HashBudgetMs) + L" next_base=" + HexU64(result.NextModuleBase) +
+                    L"; " + result.HashCoverageScope);
+            }
+            else
+            {
+                ClearEmittedKey(L"scan_failed:byovd:coverage");
+            }
             for (const ByovdModuleRecord& record : result.Records)
             {
+                if (!record.FileIdentityStable)
+                {
+                    EmitUnique(L"sensor.coverage", L"scan_failed:byovd:identity:" + HexU64(record.Base),
+                        record.ImageName, L"byovd", L"driver pathname file identity could not be held consistent",
+                        record.FileIdentityScope);
+                }
+                else
+                {
+                    ClearEmittedKey(L"scan_failed:byovd:identity:" + HexU64(record.Base));
+                }
                 if (record.Matches.empty())
                 {
                     continue;
                 }
-                std::wstring notes = record.Matches.front().Reason;
+                std::wstring notes = record.Matches.front().Reason + L" confidence=" +
+                    record.Matches.front().Confidence + L" sha256=" + record.Sha256 + L" signer=" +
+                    record.AuthenticodeSigner + L" offline_chain_trusted=" + std::to_wstring(record.AuthenticodeTrusted) +
+                    L" file_identity_stable=" + std::to_wstring(record.FileIdentityStable) +
+                    L" revocation_freshness=unknown; signing is not a benign verdict; loaded image binding not proven";
                 EmitMappedResidue(
                     L"byovd:" + KmonBasenameLower(record.ImageName),
                     record.ImageName,
                     L"byovd",
-                    L"known-vulnerable driver loaded " + record.ImageName,
+                    L"driver pathname has vulnerable-driver catalog evidence " + record.ImageName,
                     notes);
             }
         }
@@ -12898,10 +15821,24 @@ void KernelMonitor::ScanHookDataPointers()
         return;
     }
 
-    if (CfgDataPtrNtosBase != ntosBase)
+    uint64_t inventoryIdentity = 14695981039346656037ull;
+    for (const auto& module : modules)
     {
+        inventoryIdentity = (inventoryIdentity ^ module.Base) * 1099511628211ull;
+        inventoryIdentity = (inventoryIdentity ^ module.Size) * 1099511628211ull;
+        for (const wchar_t ch : module.ImagePath)
+        {
+            inventoryIdentity = (inventoryIdentity ^ static_cast<uint64_t>(ch)) * 1099511628211ull;
+        }
+    }
+    const uint64_t buildNow = GetTickCount64();
+    if (KmonCfgCacheNeedsRefresh(CfgDataPtrNtosBase, CfgDataPtrInventoryIdentity,
+        CfgDataPtrNextBuildTickMs, ntosBase, inventoryIdentity, buildNow))
+    {
+        bool buildComplete = true;
         CfgDataPtrSites.clear();
         CfgDataPtrNtosBase = ntosBase;
+        CfgDataPtrInventoryIdentity = inventoryIdentity;
         std::unordered_set<uint32_t> ntosGuardRvas;
         if (ntosModule != nullptr)
         {
@@ -12925,10 +15862,15 @@ void KernelMonitor::ScanHookDataPointers()
             }
         }
 
+        if (ntosGuardRvas.empty())
+        {
+            buildComplete = false;
+        }
         for (const KernelModuleInfo& module : modules)
         {
             if (CfgDataPtrSites.size() >= 192)
             {
+                buildComplete = false;
                 break;
             }
             const std::wstring leaf = KmonBasenameLower(
@@ -12946,29 +15888,35 @@ void KernelMonitor::ScanHookDataPointers()
             }
             if (!PathLooksLikeWin32File(diskPath))
             {
+                buildComplete = false;
                 continue;
             }
             std::vector<uint8_t> headers;
             if (!ReadDiskPeHead(diskPath, &headers))
             {
+                buildComplete = false;
                 continue;
             }
             KmonPeLayout layout = {};
-            if (!ParseKmonPeLayout(headers, &layout) || !layout.Is64)
+            if (!ParseKmonPeLayout(headers, &layout) || !layout.Is64 || layout.SizeOfImage != module.Size)
             {
+                buildComplete = false;
                 continue;
             }
             uint32_t textRva = 0;
             uint32_t textFile = 0;
             uint32_t textSize = 0;
-            if (!ParseFirstExecSection(headers, &textRva, &textFile, &textSize))
+            if (!ParseFirstExecSection(headers, &textRva, &textFile, &textSize) ||
+                textRva >= layout.SizeOfImage || textSize > layout.SizeOfImage - textRva)
             {
+                buildComplete = false;
                 continue;
             }
             std::vector<uint8_t> text;
             if (!ReadDiskFileRange(diskPath, textFile, textSize, &text) ||
                 text.size() < 16)
             {
+                buildComplete = false;
                 continue;
             }
             std::unordered_set<uint32_t> guardCall = ntosGuardRvas;
@@ -12980,6 +15928,7 @@ void KernelMonitor::ScanHookDataPointers()
             }
             if (guardCall.empty() && guardIat.empty())
             {
+                buildComplete = false;
                 continue;
             }
             std::vector<uint32_t> slotRvas;
@@ -12992,10 +15941,15 @@ void KernelMonitor::ScanHookDataPointers()
                 guardIat,
                 &slotRvas,
                 48);
+            if (slotRvas.size() >= 48 || textSize >= 0x40000)
+            {
+                buildComplete = false;
+            }
             for (uint32_t slotRva : slotRvas)
             {
                 if (CfgDataPtrSites.size() >= 192)
                 {
+                    buildComplete = false;
                     break;
                 }
                 CfgDataPtrSite site = {};
@@ -13004,12 +15958,26 @@ void KernelMonitor::ScanHookDataPointers()
                 CfgDataPtrSites.push_back(std::move(site));
             }
         }
+        CfgDataPtrNextBuildTickMs = buildNow + (buildComplete ? 30000 : 5000);
+        if (!buildComplete)
+        {
+            EmitUnique(L"sensor.coverage", L"scan_failed:dataptr:build", L"", L"dataptr",
+                L"CFG candidate discovery is partial; a bounded retry is scheduled",
+                L"known hosts; first executable section, 256 KiB, 48 unique slots per image, 192 total");
+        }
+        else
+        {
+            ClearEmittedKey(L"scan_failed:dataptr:build");
+        }
     }
 
-    uint32_t emitted = 0;
+    size_t emitted = 0;
+    size_t deferred = 0;
+    size_t unreadable = 0;
+    std::vector<KernelCallbackRecord> routingTargets;
     for (const CfgDataPtrSite& site : CfgDataPtrSites)
     {
-        if (emitted >= 4 || StopRequested.load())
+        if (StopRequested.load())
         {
             break;
         }
@@ -13018,25 +15986,323 @@ void KernelMonitor::ScanHookDataPointers()
         if (!device->ReadMemory(site.SlotVa, 8, &live, &ignored) ||
             live.size() < 8)
         {
+            ++unreadable;
             continue;
         }
         uint64_t target = 0;
         std::memcpy(&target, live.data(), sizeof(target));
-        if (target == 0 ||
-            KmonVaLooksLikePagingOrFirmware(target) ||
+        if (KmonCfgTargetIsKernelAddress(target))
+        {
+            KernelCallbackRecord routing;
+            routing.Kind = L"cfg_dispatch";
+            routing.Entry = site.SlotVa;
+            routing.Function = target;
+            routing.FunctionSlot = site.SlotVa;
+            routing.FunctionModule = site.ModuleLeaf;
+            routingTargets.push_back(std::move(routing));
+        }
+        if (!KmonCfgTargetIsKernelAddress(target) ||
             AddressOwnedByLoadedModule(symbols, target))
         {
             continue;
         }
+        bool present = false;
+        bool writable = false;
+        bool executable = false;
+        uint64_t physical = 0;
+        uint64_t confirmed = 0;
+        if (!LeftoverProbePagePermissions(*device, target, &present, &writable, &executable, &physical) ||
+            !KmonReadKernelU64(device, site.SlotVa, &confirmed) || confirmed != target)
+        {
+            ++unreadable;
+            continue;
+        }
+        if (!present || !executable)
+        {
+            continue;
+        }
         NoteMapperWatchResidue(L"dataptr", 0);
-        EmitUnique(
+        EmitUniqueBounded(
+            4,
+            &emitted,
+            &deferred,
             L"hook.dataptr",
-            L"dataptr:" + site.ModuleLeaf + L":" + HexU64(site.SlotVa),
+            L"dataptr:" + site.ModuleLeaf + L":" + HexU64(site.SlotVa) + L":" + HexU64(target),
             site.ModuleLeaf,
             L"dataptr",
             L"CFG dispatch slot outside loaded modules " + HexU64(target),
-            L"slot=" + HexU64(site.SlotVa) + L" module=" + site.ModuleLeaf);
-        ++emitted;
+            L"slot=" + HexU64(site.SlotVa) + L" module=" + site.ModuleLeaf +
+                L" effective_executable=1 physical=" + HexU64(physical));
+    }
+    RememberExecutionCallbacks(L"cfg_dispatch", routingTargets);
+    if (unreadable != 0)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:dataptr:read", L"", L"dataptr",
+            L"CFG pointer or effective page permissions could not be verified",
+            L"unreadable_or_changed=" + std::to_wstring(unreadable));
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:dataptr:read");
+    }
+    if (deferred != 0)
+    {
+        EmitUnique(
+            L"hook.dataptr",
+            L"scan_failed:dataptr:reportcap",
+            std::wstring(),
+            L"dataptr",
+            L"CFG data-pointer reports were deferred by the per-pass event limit",
+            L"deferred_candidates=" + std::to_wstring(deferred));
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:dataptr:reportcap");
+    }
+}
+
+void KernelMonitor::ScanConcealedUserProcess(
+    uint32_t pid, uint64_t eprocess, uint64_t createTime, const std::wstring& image)
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    const std::wstring key = L"scan_failed:concealed_followup:" + std::to_wstring(pid);
+    ProcessVadScanResult result;
+    std::wstring error;
+    bool collected = false;
+    do
+    {
+        if (device == nullptr || symbols == nullptr || !device->IsOpen() ||
+            eprocess < 0xFFFF800000000000ull || createTime == 0)
+        {
+            break;
+        }
+        TypeFieldInfo pidField = {};
+        TypeFieldInfo dtbField = {};
+        if (!symbols->FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &error) ||
+            (!symbols->FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &error) &&
+             !symbols->FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &error)))
+        {
+            break;
+        }
+        const auto sameGeneration = [&]()
+        {
+            uint64_t currentPid = 0;
+            return KmonReadKernelU64(device, eprocess + pidField.Offset, &currentPid) &&
+                currentPid == pid && QueryEprocessCreateTime(device, symbols, nullptr, eprocess) == createTime;
+        };
+        if (!sameGeneration())
+        {
+            error = L"EPROCESS identity changed";
+            break;
+        }
+        ProcessVadScanOptions options;
+        options.Target.ProcessId = pid;
+        options.Target.Eprocess = eprocess;
+        options.Target.CreateTime = createTime;
+        options.Target.HasCreateTime = true;
+        options.Target.ImageName = image;
+        if (!KmonReadKernelU64(device, eprocess + dtbField.Offset, &options.Target.DirectoryTableBase))
+        {
+            break;
+        }
+        TypeFieldInfo userDtb = {};
+        if (symbols->FindField(L"nt!_KPROCESS", L"UserDirectoryTableBase", &userDtb, nullptr))
+        {
+            KmonReadKernelU64(device, eprocess + userDtb.Offset, &options.Target.UserDirectoryTableBase);
+        }
+        options.ProbePe = true;
+        options.InjectionScan = true;
+        options.ScanHiddenPtes = true;
+        options.HiddenPteExecutableOnly = true;
+        options.HiddenPteLimit = 64;
+        options.Limit = 4096;
+        ProcessTriageScanner scanner(*device, *symbols);
+        if (!scanner.ScanVad(options, &result, &error) || !sameGeneration())
+        {
+            break;
+        }
+        collected = true;
+        for (const ProcessVadRecord& record : result.Records)
+        {
+            if (!(record.PrivateMemory && record.Executable) && !record.PeHeaderSuspicious)
+            {
+                continue;
+            }
+            EmitUnique(L"process.implant", L"concealed_vad:" + std::to_wstring(pid) + L":" +
+                HexU64(createTime) + L":" + HexU64(record.StartAddress), image, L"concealed_followup",
+                L"concealed process has private executable or inconsistent PE memory",
+                L"eprocess=" + HexU64(eprocess) + L" create_time=" + HexU64(createTime) +
+                L" va=" + HexU64(record.StartAddress) + L" size=" + HexU64(record.Size) +
+                L" observation=memory_evidence; process_handle_unavailable", pid);
+        }
+        ScanUserExecutionEvidence(options.Target, {}, false, &result, image, false);
+    } while (false);
+    if (!collected || !result.CoverageComplete || result.Incomplete || result.Truncated)
+    {
+        EmitUnique(L"process.implant", key, image, L"concealed_followup",
+            L"concealed-process follow-up has incomplete coverage",
+            L"eprocess=" + HexU64(eprocess) + L" create_time=" + HexU64(createTime) +
+            L" collected=" + std::to_wstring(collected ? 1 : 0) + L" " + error, pid);
+    }
+    else
+    {
+        ClearEmittedKeyForPid(key, pid);
+    }
+}
+
+void KernelMonitor::ScanUserExecutionEvidence(
+    const ProcessTriageTarget& target,
+    const std::vector<ProcessUserModuleRange>& modules,
+    bool modulesComplete,
+    const ProcessVadScanResult* vad,
+    const std::wstring& image,
+    bool captureContexts)
+{
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device;
+        symbols = Symbols;
+    }
+    if (device == nullptr || symbols == nullptr || !device->IsOpen() ||
+        !target.HasCreateTime || target.CreateTime == 0)
+    {
+        return;
+    }
+    const auto generation = std::make_pair(target.ProcessId, target.CreateTime);
+    KmonUserEvidenceOptions options;
+    options.Target = target;
+    options.UserModules = modules;
+    options.UserModulesComplete = modulesComplete;
+    options.ImagePath = image;
+    options.CaptureContexts = captureContexts;
+    options.MaxThreads = 16;
+    options.MaxModules = 8;
+    options.RuntimeTracker = &UserRuntimeTracker;
+    KmonUserCallbackContinuation callbackContinuation;
+    options.CallbackContinuation = &callbackContinuation;
+    if (vad != nullptr)
+    {
+        options.VadRecords = vad->Records;
+        options.VadCoverageComplete = vad->CoverageComplete && !vad->Incomplete && !vad->Truncated;
+    }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        const uint64_t now = GetTickCount64();
+        KmonPruneExecutionHistory(generation, now, &UserEvidenceCursors, &UserFileIdentities);
+        const auto cursor = UserEvidenceCursors.find(generation);
+        if (cursor != UserEvidenceCursors.end())
+        {
+            cursor->second.LastObservedMs = now;
+            options.ThreadCursor = cursor->second.Thread;
+            options.KernelThreadCursor = cursor->second.KernelThread;
+            options.ModuleCursor = cursor->second.Module;
+            callbackContinuation = cursor->second.Callbacks;
+        }
+    }
+    UserRuntimeTracker.WatchProcess(target.ProcessId, target.CreateTime);
+    KmonUserEvidenceResult evidence;
+    std::wstring error;
+    const std::wstring key = L"scan_failed:execution_evidence:" + std::to_wstring(target.ProcessId);
+    if (!CollectKmonUserEvidence(*device, *symbols, options, &evidence, &error) || !evidence.IdentityStable)
+    {
+        EmitUnique(L"process.implant", key, image, L"execution_evidence",
+            L"execution evidence unavailable or process identity changed", error, target.ProcessId);
+        return;
+    }
+    bool fileChanged = false;
+    bool stateFull = false;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        stateFull = UserEvidenceCursors.size() >= 4096 && UserEvidenceCursors.find(generation) == UserEvidenceCursors.end();
+        if (!stateFull)
+        {
+            UserEvidenceCursors[generation] = {evidence.NextThreadCursor, evidence.NextKernelThreadCursor,
+                evidence.NextModuleCursor, std::move(callbackContinuation), GetTickCount64()};
+            if (evidence.FileCoverage.Complete && evidence.ImageIdentity.Stable)
+            {
+                const auto previous = UserFileIdentities.find(generation);
+                fileChanged = previous != UserFileIdentities.end() &&
+                    !KmonSameFileGeneration(previous->second, evidence.ImageIdentity);
+                UserFileIdentities[generation] = evidence.ImageIdentity;
+            }
+        }
+    }
+    if (fileChanged)
+    {
+        EmitUnique(L"process.provenance", L"image_file_changed:" + std::to_wstring(target.ProcessId) +
+            L":" + HexU64(target.CreateTime), image, L"file_identity",
+            L"process image pathname now resolves to a different file generation",
+            L"final_path=" + evidence.ImageIdentity.FinalPath +
+            L" observation=path_file_generation; original section file identity is not established", target.ProcessId);
+    }
+    if (vad != nullptr)
+    {
+        for (const ProcessVadRecord& region : vad->Records)
+        {
+            for (const ProcessVadProtectionRange& range : region.EffectiveProtectionRanges)
+            {
+                KmonRegionObservation observation;
+                if (!BuildKmonRegionSnapshot(target.ProcessId, target.CreateTime,
+                        range, GetTickCount64(), &observation))
+                {
+                    continue;
+                }
+                NoteRegionObservation(observation, L"effective_protection_snapshot");
+            }
+        }
+    }
+    for (const KmonUserAddressEvidence& address : evidence.Addresses)
+    {
+        const bool apcArgument = address.Kind == KmonUserEvidenceKind::UserApcArgumentCandidate;
+        const bool debugOrGuard = address.Kind == KmonUserEvidenceKind::HardwareBreakpoint || address.GuardPage;
+        const bool unowned = address.OwnershipKnown && !address.InLoaderModule;
+        if (!debugOrGuard && !unowned && !address.PrivateExecutable)
+        {
+            continue;
+        }
+        EmitUnique(apcArgument ? L"process.provenance" : L"process.execution",
+            L"execution:" + std::to_wstring(target.ProcessId) + L":" +
+            HexU64(target.CreateTime) + L":" + std::to_wstring(static_cast<uint32_t>(address.Kind)) +
+            L":" + std::to_wstring(address.ThreadId) + L":" + HexU64(address.Address), image,
+            L"execution_evidence", apcArgument ? L"APC argument address candidate; dispatch role is unverified" :
+                L"process execution or exception-routing observation",
+            L"kind=" + std::to_wstring(static_cast<uint32_t>(address.Kind)) + L" address=" + HexU64(address.Address) +
+            L" tid=" + std::to_wstring(address.ThreadId) + L" private_exec=" + std::to_wstring(address.PrivateExecutable) +
+            L" loader_owned=" + std::to_wstring(address.InLoaderModule) + L" ownership_known=" +
+            std::to_wstring(address.OwnershipKnown) + L" guard=" + std::to_wstring(address.GuardPage) +
+            L" debug_condition=" + std::to_wstring(address.DebugCondition) +
+            L" runtime_range_observed=" + std::to_wstring(address.RuntimeRangeObserved) + L" " + address.Provenance,
+            target.ProcessId);
+    }
+    const KmonEvidenceCoverage* coverages[] = {&evidence.Snapshot.Coverage, &evidence.ApcCoverage,
+        &evidence.SavedContextCoverage, &evidence.TlsCoverage, &evidence.HandlerCoverage,
+        &evidence.FileCoverage, &evidence.RuntimeCoverage};
+    const wchar_t* names[] = {L"context", L"apc", L"saved_rip", L"tls", L"veh_vch", L"file", L"runtime"};
+    bool complete = !stateFull;
+    std::wstring notes = L"cursor_retained=" + std::to_wstring(!stateFull) + L" ";
+    for (size_t index = 0; index < _countof(coverages); ++index)
+    {
+        complete = complete && coverages[index]->Complete;
+        notes += std::wstring(names[index]) + L"=" +
+            (coverages[index]->Complete ? L"complete" : coverages[index]->Available ? L"partial" : L"unavailable") +
+            L"(" + coverages[index]->Detail.substr(0, 160) + L"); ";
+    }
+    if (!complete)
+    {
+        EmitUnique(L"process.execution", key, image, L"execution_evidence",
+            L"execution evidence has partial or unavailable surfaces", notes, target.ProcessId);
+    }
+    else
+    {
+        ClearEmittedKeyForPid(key, target.ProcessId);
     }
 }
 
@@ -13051,25 +16317,28 @@ void KernelMonitor::ScanUserModeHostility()
     }
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
-    {
-        EmitUnique(
-            L"process.implant",
-            L"scan_failed:userhostility",
-            std::wstring(),
-            L"user",
-            L"user-mode hostility scan failed to snapshot processes",
-            std::wstring());
-        return;
-    }
-    UserHostilityScans.fetch_add(1);
+    const uint64_t scanPass = UserHostilityScans.fetch_add(1);
 
     std::unordered_set<uint32_t> watchPids;
     std::vector<std::wstring> watchNames;
+    std::vector<SuspectProcess> suspects;
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         watchPids = WatchPids;
         watchNames = WatchNamesLower;
+        const uint64_t now = GetTickCount64();
+        for (auto it = SuspectProcesses.begin(); it != SuspectProcesses.end();)
+        {
+            if (now - it->second.LastObservedMs > 120000)
+            {
+                it = SuspectProcesses.erase(it);
+            }
+            else
+            {
+                suspects.push_back(it->second);
+                ++it;
+            }
+        }
     }
 
     std::vector<KmonUserTarget> targets;
@@ -13079,7 +16348,7 @@ void KernelMonitor::ScanUserModeHostility()
     BOOL more = FALSE;
     DWORD nextError = ERROR_SUCCESS;
     bool snapshotCapped = false;
-    const bool firstOk = Process32FirstW(snap, &entry) != FALSE;
+    const bool firstOk = snap != INVALID_HANDLE_VALUE && Process32FirstW(snap, &entry) != FALSE;
     if (firstOk)
     {
         more = TRUE;
@@ -13099,6 +16368,7 @@ void KernelMonitor::ScanUserModeHostility()
                 HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
                 if (process != nullptr)
                 {
+                    target.CreateTime = QueryProcessCreateTicks(process);
                     std::vector<wchar_t> pathBuf(32768, L'\0');
                     DWORD pathLen = static_cast<DWORD>(pathBuf.size());
                     if (QueryFullProcessImageNameW(process, 0, pathBuf.data(), &pathLen) && pathLen > 0)
@@ -13136,10 +16406,13 @@ void KernelMonitor::ScanUserModeHostility()
             }
         } while (more);
     }
-    CloseHandle(snap);
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(snap);
+    }
     const bool walkIncomplete =
         !firstOk ||
-        (nextError != ERROR_NO_MORE_FILES && nextError != ERROR_SUCCESS);
+        nextError != ERROR_NO_MORE_FILES;
 
     {
         std::unordered_set<uint32_t> have;
@@ -13154,8 +16427,9 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 continue;
             }
-            if (targets.size() >= 4096)
+            if (targets.size() >= 8192)
             {
+                snapshotCapped = true;
                 break;
             }
             KmonUserTarget target;
@@ -13163,6 +16437,7 @@ void KernelMonitor::ScanUserModeHostility()
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
             if (process != nullptr)
             {
+                target.CreateTime = QueryProcessCreateTicks(process);
                 std::vector<wchar_t> pathBuf(32768, L'\0');
                 DWORD pathLen = static_cast<DWORD>(pathBuf.size());
                 if (QueryFullProcessImageNameW(process, 0, pathBuf.data(), &pathLen) && pathLen > 0)
@@ -13176,6 +16451,47 @@ void KernelMonitor::ScanUserModeHostility()
             target.HighPriority = true;
             target.Interesting = true;
             targets.push_back(std::move(target));
+        }
+        for (const SuspectProcess& suspect : suspects)
+        {
+            if (suspect.Pid <= 4 || suspect.Pid == selfPid || suspect.CreateTime == 0)
+            {
+                continue;
+            }
+            auto existing = std::find_if(targets.begin(), targets.end(),
+                [&suspect](const KmonUserTarget& candidate)
+                {
+                    return candidate.Pid == suspect.Pid;
+                });
+            if (existing != targets.end())
+            {
+                if (existing->CreateTime != 0 && existing->CreateTime != suspect.CreateTime)
+                {
+                    continue;
+                }
+                existing->CreateTime = suspect.CreateTime;
+                existing->Eprocess = suspect.Eprocess;
+                existing->Suspect = true;
+                existing->HighPriority = true;
+                existing->Interesting = true;
+            }
+            else if (targets.size() < 12288)
+            {
+                KmonUserTarget target;
+                target.Pid = suspect.Pid;
+                target.Eprocess = suspect.Eprocess;
+                target.CreateTime = suspect.CreateTime;
+                target.ImagePath = suspect.Image;
+                target.Leaf = KmonBasenameLower(suspect.Image);
+                target.HighPriority = true;
+                target.Interesting = true;
+                target.Suspect = true;
+                targets.push_back(std::move(target));
+            }
+            else
+            {
+                snapshotCapped = true;
+            }
         }
     }
 
@@ -13198,24 +16514,46 @@ void KernelMonitor::ScanUserModeHostility()
         ClearEmittedKey(L"scan_failed:userhostility");
     }
 
-    auto highEnd = std::stable_partition(
-        targets.begin(),
-        targets.end(),
-        [](const KmonUserTarget& item)
-        {
-            return item.HighPriority;
-        });
-    std::stable_partition(
-        highEnd,
-        targets.end(),
-        [](const KmonUserTarget& item)
-        {
-            return item.Interesting;
-        });
-
     constexpr uint32_t kMaxDeepScans = 1024;
+    KmonUserGenerationInventory userGenerations;
+    for (const KmonUserTarget& target : targets)
+    {
+        userGenerations[target.Pid] = target.CreateTime;
+    }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        const bool inventoryComplete = !walkIncomplete && !snapshotCapped;
+        KmonRefreshExecutionHistory(userGenerations, GetTickCount64(), &UserEvidenceCursors);
+        KmonPruneUserCursors(userGenerations, inventoryComplete, &UserVmWalkCursors);
+        KmonPruneUserCursors(userGenerations, inventoryComplete, &UserThreadStartCursors);
+        KmonPruneUserCursors(userGenerations, inventoryComplete, &UserModuleWalkCursors);
+        KmonPruneUserCursors(userGenerations, inventoryComplete, &UserEvidenceCursors);
+        KmonPruneUserCursors(userGenerations, inventoryComplete, &UserFileIdentities);
+        const uint64_t now = GetTickCount64();
+        for (auto it = ImagePageCursors.begin(); it != ImagePageCursors.end();)
+        {
+            const auto generation = userGenerations.find(it->second.ProcessId);
+            const bool replaced = generation != userGenerations.end() && generation->second != 0 &&
+                generation->second != it->second.CreateTime;
+            if (it->second.ProcessId != 0 &&
+                (replaced || (inventoryComplete && generation == userGenerations.end()) ||
+                    now - it->second.LastObservedMs > 600000))
+            {
+                it = ImagePageCursors.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+    KmonUserThreadInventory userThreadInventory;
+    const bool scheduledCap = targets.size() > kMaxDeepScans;
+    KmonScheduleUserTargets(&targets, scanPass, kMaxDeepScans);
+    KmonAssignUserThreadQueryQuotas(&targets, 1024);
     uint32_t scanned = 0;
-    bool deepCapped = false;
+    bool deepCapped = scheduledCap;
+    bool cursorCapacityLimited = false;
     for (const KmonUserTarget& target : targets)
     {
         if (StopRequested.load())
@@ -13239,14 +16577,77 @@ void KernelMonitor::ScanUserModeHostility()
         }
 
         const uint32_t pid = target.Pid;
-        const std::wstring& imagePath = target.ImagePath;
-        const std::wstring& leaf = target.Leaf;
+        HANDLE processHandle = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            FALSE,
+            pid);
+        if (processHandle == nullptr)
+        {
+            processHandle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                FALSE,
+                pid);
+        }
+        const bool hasVmRead = processHandle != nullptr;
+        if (processHandle == nullptr)
+        {
+            processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        }
+        if (processHandle == nullptr)
+        {
+            // Even a zero-access handle pins the process object and its PID.
+            // Kernel-only readers can obtain CreateTime from that same object.
+            processHandle = OpenProcess(0, FALSE, pid);
+        }
+        const std::unique_ptr<void, decltype(&CloseHandle)> processHandleOwner(
+            processHandle, &CloseHandle);
+        if (processHandle == nullptr && target.Suspect)
+        {
+            ScanConcealedUserProcess(pid, target.Eprocess, target.CreateTime, target.ImagePath);
+            continue;
+        }
+        const uint64_t processCreateTime =
+            QueryPidCreateTime(device, symbols, processHandle, pid);
+        const std::wstring generationKey =
+            L"scan_failed:userhostility:generation:" + std::to_wstring(pid);
+        if (!KmonUserSnapshotGenerationMatches(
+                target.CreateTime,
+                processCreateTime,
+                processCreateTime,
+                processHandle != nullptr))
+        {
+            EmitUnique(
+                L"process.implant", generationKey, std::wstring(), L"user",
+                L"user-mode cross-view skipped; process generation is unavailable or changed pid=" +
+                    std::to_wstring(pid),
+                L"inventory_generation=" + HexU64(target.CreateTime) +
+                    L" current_generation=" + HexU64(processCreateTime) +
+                    L" pinned=" + std::to_wstring(processHandle != nullptr ? 1 : 0),
+                pid);
+            continue;
+        }
+
+        // Unknown inventory identity cannot carry its old path into a new
+        // process. Read the pinned object's path before using name-based rules.
+        std::wstring imagePath = target.CreateTime != 0
+            ? target.ImagePath
+            : std::wstring();
+        std::vector<wchar_t> currentPath(32768, L'\0');
+        DWORD currentPathLength = static_cast<DWORD>(currentPath.size());
+        if (QueryFullProcessImageNameW(
+                processHandle, 0, currentPath.data(), &currentPathLength) &&
+            currentPathLength != 0)
+        {
+            imagePath.assign(currentPath.data(), currentPathLength);
+        }
+        EnrichProcessImagePath(device, symbols, pid, &imagePath);
+        const std::wstring leaf = KmonBasenameLower(imagePath);
         const bool builtin = KmonIsWindowsBuiltinLeaf(leaf);
         const bool nameWatched = NameEqualsWatch(leaf, watchNames);
         const bool watched = nameWatched || watchPids.count(pid) != 0;
         const bool defaultWatched = KmonIsDefaultWatchLeaf(leaf);
         const bool dropHost = KmonClassifyDriverPath(imagePath) == L"drop";
-        const bool hostileHost = watched || builtin || dropHost;
+        const bool hostileHost = watched || builtin || dropHost || target.Suspect;
         if (watched && pid > 4)
         {
             if (nameWatched)
@@ -13282,36 +16683,43 @@ void KernelMonitor::ScanUserModeHostility()
             size_t moduleCount = 0;
             constexpr size_t kMaxModuleRows = 1024;
             bool moduleWalkOk = false;
+            bool moduleRangesValid = true;
+            DWORD modError = modSnap == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
             if (modSnap != INVALID_HANDLE_VALUE)
             {
+                const std::unique_ptr<void, decltype(&CloseHandle)> moduleSnapshotOwner(
+                    modSnap, &CloseHandle);
                 MODULEENTRY32W moduleEntry = {};
                 moduleEntry.dwSize = sizeof(moduleEntry);
                 BOOL moreMod = FALSE;
-                DWORD modError = ERROR_SUCCESS;
                 if (Module32FirstW(modSnap, &moduleEntry))
                 {
                     moreMod = TRUE;
                     do
                     {
+                        if (moduleCount >= kMaxModuleRows)
+                        {
+                            modError = ERROR_MORE_DATA;
+                            break;
+                        }
                         ++moduleCount;
+                        const uint64_t rangeBase = reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr);
+                        if (!KmonUserModuleRangeValid(rangeBase, moduleEntry.modBaseSize))
+                        {
+                            moduleRangesValid = false;
+                            modError = ERROR_INVALID_DATA;
+                            break;
+                        }
                         const std::wstring moduleLeaf = KmonBasenameLower(moduleEntry.szExePath);
                         const bool isExe =
                             moduleLeaf == leaf ||
                             KmonBasenameLower(moduleEntry.szModule) == leaf;
                         if (isExe && moduleBase == 0)
                         {
-                            moduleBase = reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr);
+                            moduleBase = rangeBase;
                         }
-                        if (modulePaths.size() < kMaxModuleRows)
-                        {
-                            modulePaths.push_back(moduleEntry.szExePath);
-                        }
-                        if (moduleRanges.size() < kMaxModuleRows)
-                        {
-                            moduleRanges.push_back(std::make_pair(
-                                reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr),
-                                moduleEntry.modBaseSize));
-                        }
+                        modulePaths.push_back(moduleEntry.szExePath);
+                        moduleRanges.emplace_back(rangeBase, moduleEntry.modBaseSize);
                         moduleEntry.dwSize = sizeof(moduleEntry);
                         moreMod = Module32NextW(modSnap, &moduleEntry);
                         if (!moreMod)
@@ -13319,33 +16727,53 @@ void KernelMonitor::ScanUserModeHostility()
                             modError = GetLastError();
                         }
                     } while (moreMod);
-                    moduleWalkOk =
-                        moduleCount > 0 &&
-                        moduleCount <= kMaxModuleRows &&
-                        (modError == ERROR_NO_MORE_FILES ||
-                            modError == ERROR_SUCCESS);
+                    moduleWalkOk = KmonUserModuleWalkComplete(
+                        moduleCount, moreMod != FALSE, moduleRangesValid, modError);
                 }
-                CloseHandle(modSnap);
+                else
+                {
+                    modError = GetLastError();
+                }
             }
-            const bool moduleInventoryComplete = moduleWalkOk;
-            std::unordered_set<std::wstring> importedDlls;
-
-            HANDLE processHandle = OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                FALSE,
-                pid);
-            if (processHandle == nullptr)
+            const uint64_t afterModuleSnapshot =
+                QueryPidCreateTime(device, symbols, processHandle, pid);
+            if (!KmonUserSnapshotGenerationMatches(
+                    target.CreateTime,
+                    processCreateTime,
+                    afterModuleSnapshot,
+                    processHandle != nullptr))
             {
-                processHandle = OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                    FALSE,
+                EmitUnique(
+                    L"process.implant", generationKey, std::wstring(), L"user",
+                    L"user-mode cross-view discarded; process generation changed or became unreadable pid=" +
+                        std::to_wstring(pid),
+                    L"before_generation=" + HexU64(processCreateTime) +
+                        L" after_generation=" + HexU64(afterModuleSnapshot),
+                    pid);
+                continue;
+            }
+            ClearEmittedKeyForPid(generationKey, pid);
+            userGenerations[pid] = processCreateTime;
+            const bool moduleInventoryComplete = moduleWalkOk;
+            const std::wstring moduleInventoryKey =
+                L"scan_failed:userhostility:modules:" + std::to_wstring(pid);
+            if (!moduleInventoryComplete)
+            {
+                EmitUnique(
+                    L"process.implant", moduleInventoryKey, imagePath, L"user",
+                    L"Toolhelp module inventory was incomplete pid=" +
+                        std::to_wstring(pid) + L" " + leaf,
+                    L"rows=" + std::to_wstring(moduleCount) +
+                        L" error=" + std::to_wstring(modError) +
+                        L" absence-based user-mode verdicts are unavailable",
                     pid);
             }
-            const bool hasVmRead = processHandle != nullptr;
-            if (processHandle == nullptr)
+            else
             {
-                processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                ClearEmittedKeyForPid(moduleInventoryKey, pid);
             }
+            std::unordered_set<std::wstring> importedDlls;
+
             bool wow64 = false;
             const bool wow64Known = QueryProcessIsWow64(
                 processHandle,
@@ -13356,13 +16784,33 @@ void KernelMonitor::ScanUserModeHostility()
             uint64_t pebImageBase = 0;
             QueryPebImageBase(processHandle, device, symbols, pid, &pebImageBase);
             uint64_t sectionBase = 0;
-            if (pebImageBase == 0 && moduleBase == 0)
-            {
+            const bool sectionBaseKnown =
                 QuerySectionBaseAddress(device, symbols, pid, &sectionBase);
+            const KmonMainImageViews imageViews = KmonReconcileMainImageViews(
+                sectionBaseKnown ? sectionBase : 0,
+                pebImageBase,
+                moduleBase);
+            const uint64_t exeRegion = imageViews.ScanBase;
+            const std::wstring sectionViewKey =
+                L"exe_kernel_base:" + std::to_wstring(pid);
+            if (imageViews.KernelMismatch)
+            {
+                EmitUnique(
+                    L"process.hollow",
+                    sectionViewKey,
+                    imagePath,
+                    L"exe_kernel_base",
+                    L"main EXE user views differ from kernel section base pid=" +
+                        std::to_wstring(pid) + L" " + leaf,
+                    L"section=" + HexU64(sectionBase) +
+                        L" peb=" + HexU64(pebImageBase) +
+                        L" ldr=" + HexU64(moduleBase),
+                    pid);
             }
-            const uint64_t exeRegion = pebImageBase != 0
-                ? pebImageBase
-                : (moduleBase != 0 ? moduleBase : sectionBase);
+            else if (sectionBaseKnown)
+            {
+                ClearEmittedKeyForPid(sectionViewKey, pid);
+            }
             if (pebImageBase != 0 &&
                 moduleBase != 0 &&
                 pebImageBase != moduleBase)
@@ -13398,10 +16846,10 @@ void KernelMonitor::ScanUserModeHostility()
             // PE probes. Hidden PTEs follow the same kernel-VAD gate so PPL
             // builtin hosts are covered when usermode walks cannot run.
             const bool needKernelPrivateImplants =
-                (hostileHost) &&
-                (!queried || !moduleInventoryComplete);
+                !queried || !moduleInventoryComplete;
             const bool wantKernelVad =
-                watched || dropHost || defaultWatched || needKernelPrivateImplants;
+                hostileHost || defaultWatched || needKernelPrivateImplants ||
+                ((pid & 15u) == (scanPass & 15u));
             // Watched/drop hosts still need private-VAD PE probes when the
             // usermode module list is complete; header-intact and wiped
             // manual maps would otherwise hide behind the JIT skip.
@@ -13597,9 +17045,14 @@ void KernelMonitor::ScanUserModeHostility()
 
                 std::wstring mappedPath;
                 bool mappedQueryOk = false;
+                DWORD mappedQueryError = ERROR_SUCCESS;
                 if (hasVmRead && processHandle != nullptr)
                 {
                     mappedQueryOk = QueryMappedImagePath(processHandle, exeRegion, &mappedPath);
+                    if (!mappedQueryOk)
+                    {
+                        mappedQueryError = GetLastError();
+                    }
                 }
                 bool mappedFromKernelVad = false;
                 if (mappedPath.empty() &&
@@ -13692,20 +17145,25 @@ void KernelMonitor::ScanUserModeHostility()
                     mbi.Type == MEM_IMAGE &&
                     !mappedQueryOk)
                 {
-                    const DWORD mappedErr = GetLastError();
-                    if (mappedErr != ERROR_ACCESS_DENIED &&
-                        mappedErr != ERROR_INSUFFICIENT_BUFFER)
-                    {
-                        EmitUnique(
-                            L"process.hollow",
-                            L"exe_unbacked:" + std::to_wstring(pid),
-                            imagePath,
-                            L"exe_unbacked",
-                            L"main EXE image mapping has no file name pid=" +
-                                std::to_wstring(pid) + L" " + leaf,
-                            L"unbacked_image",
-                            pid);
-                    }
+                    // An API failure does not prove that a backing file is
+                    // absent. Preserve the error before any kernel fallback
+                    // calls and report the missing observation as coverage.
+                    EmitUnique(
+                        L"process.implant",
+                        L"scan_failed:userhostility:mapped_path:" + std::to_wstring(pid),
+                        imagePath,
+                        L"user",
+                        L"main EXE mapped file name could not be queried pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"error=" + std::to_wstring(mappedQueryError),
+                        pid);
+                }
+
+                if (!mappedPath.empty())
+                {
+                    ClearEmittedKeyForPid(
+                        L"scan_failed:userhostility:mapped_path:" + std::to_wstring(pid),
+                        pid);
                 }
 
                 if (wxExe)
@@ -13731,8 +17189,18 @@ void KernelMonitor::ScanUserModeHostility()
                     0x400,
                     &live);
                 const bool diskPathUsable = PathLooksLikeWin32File(imagePath);
+                DWORD diskAttributes = INVALID_FILE_ATTRIBUTES;
+                DWORD diskPathError = ERROR_SUCCESS;
+                if (diskPathUsable)
+                {
+                    diskAttributes = GetFileAttributesW(imagePath.c_str());
+                    if (diskAttributes == INVALID_FILE_ATTRIBUTES)
+                    {
+                        diskPathError = GetLastError();
+                    }
+                }
                 const bool diskExists = diskPathUsable &&
-                    GetFileAttributesW(imagePath.c_str()) != INVALID_FILE_ATTRIBUTES;
+                    diskAttributes != INVALID_FILE_ATTRIBUTES;
                 const bool liveMz =
                     liveOk && live.size() >= 2 && live[0] == 'M' && live[1] == 'Z';
                 if (liveOk && live.size() >= 2 && !liveMz)
@@ -13749,7 +17217,8 @@ void KernelMonitor::ScanUserModeHostility()
                 }
                 else if (liveMz)
                 {
-                    if (!diskExists && diskPathUsable)
+                    if (diskPathUsable &&
+                        KmonImageFileMissing(diskAttributes, diskPathError))
                     {
                         EmitUnique(
                             L"process.hollow",
@@ -13761,8 +17230,23 @@ void KernelMonitor::ScanUserModeHostility()
                             L"ghosting",
                             pid);
                     }
+                    else if (diskPathUsable && !diskExists)
+                    {
+                        EmitUnique(
+                            L"process.implant",
+                            L"scan_failed:userhostility:disk_path:" + std::to_wstring(pid),
+                            imagePath,
+                            L"user",
+                            L"process image file presence could not be checked pid=" +
+                                std::to_wstring(pid) + L" " + leaf,
+                            L"error=" + std::to_wstring(diskPathError),
+                            pid);
+                    }
                     else if (diskExists)
                     {
+                        ClearEmittedKeyForPid(
+                            L"scan_failed:userhostility:disk_path:" + std::to_wstring(pid),
+                            pid);
                         std::vector<uint8_t> diskHeaders;
                         KmonPeLayout diskLayout = {};
                         KmonPeIdentity liveId = {};
@@ -13848,8 +17332,7 @@ void KernelMonitor::ScanUserModeHostility()
                             KmonWindowsBuiltinPathLooksInbox(imagePath);
                         if (compareText &&
                             parsedDisk &&
-                            diskLayout.PreferredBase != 0 &&
-                            exeRegion != diskLayout.PreferredBase &&
+                            KmonImageNeedsRelocation(exeRegion, diskLayout) &&
                             diskLayout.RelocRva == 0 &&
                             diskLayout.RelocSize == 0)
                         {
@@ -13941,8 +17424,7 @@ void KernelMonitor::ScanUserModeHostility()
                             }
                             else if (
                                 textCmp == SliceUnknown &&
-                                diskLayout.PreferredBase != 0 &&
-                                exeRegion != diskLayout.PreferredBase &&
+                                KmonImageNeedsRelocation(exeRegion, diskLayout) &&
                                 diskLayout.RelocRva != 0 &&
                                 diskLayout.RelocSize != 0)
                             {
@@ -14234,10 +17716,116 @@ void KernelMonitor::ScanUserModeHostility()
                 !moduleRanges.empty())
             {
                 uint64_t cursor = 0;
+                uint32_t afterThreadId = 0;
+                const std::pair<uint32_t, uint64_t> generation(pid, processCreateTime);
+                SYSTEM_INFO userAddressInfo = {};
+                GetNativeSystemInfo(&userAddressInfo);
+                const uint64_t maximumUserAddress = reinterpret_cast<uint64_t>(
+                    userAddressInfo.lpMaximumApplicationAddress);
+                if (processCreateTime != 0)
+                {
+                    std::lock_guard<std::mutex> lock(WatchMutex);
+                    const auto previous = UserVmWalkCursors.find(generation);
+                    if (previous != UserVmWalkCursors.end() && previous->second <= maximumUserAddress)
+                    {
+                        cursor = previous->second;
+                    }
+                    const auto previousThread = UserThreadStartCursors.find(generation);
+                    if (previousThread != UserThreadStartCursors.end())
+                    {
+                        afterThreadId = previousThread->second;
+                    }
+                }
                 uint32_t orphans = 0;
+                uint32_t codeProbeFailures = 0;
+                uint32_t threadRegionQueryFailures = 0;
+                const bool threadStartsAttempted = true;
+                bool threadStartsComplete = false;
+                bool vmWalkFinished = false;
+                bool vmWalkQueryFailed = false;
+                DWORD vmWalkError = ERROR_SUCCESS;
+                std::unordered_set<uint64_t> reportedOrphanAllocations;
+                if (threadStartsAttempted)
+                {
+                    std::vector<KmonUserThreadStart> threadStarts;
+                    uint32_t remainingQuota = target.ThreadQueryQuota;
+                    threadStartsComplete = KmonCollectLiveUserThreadStarts(
+                        &userThreadInventory, pid, processCreateTime,
+                        &afterThreadId, &remainingQuota, &threadStarts);
+                    if (processCreateTime != 0 && afterThreadId != 0)
+                    {
+                        std::lock_guard<std::mutex> lock(WatchMutex);
+                        if (!KmonRememberUserCursor(userGenerations, generation,
+                                afterThreadId, &UserThreadStartCursors))
+                        {
+                            cursorCapacityLimited = true;
+                        }
+                    }
+                    std::vector<KmonUserThreadCodeCandidate> candidates;
+                    KmonCollectUserThreadCodeCandidates(
+                        threadStarts, exeRegion, moduleRanges,
+                        [&](uint64_t address, MEMORY_BASIC_INFORMATION* mapping)
+                        {
+                            return VirtualQueryEx(processHandle,
+                                reinterpret_cast<LPCVOID>(address), mapping,
+                                sizeof(*mapping)) == sizeof(*mapping);
+                        },
+                        [&](uint64_t address, uint32_t count, std::vector<uint8_t>* bytes)
+                        {
+                            return ReadProcessBytes(device, symbols, processHandle,
+                                pid, address, count, bytes);
+                        },
+                        &candidates, &threadRegionQueryFailures, &codeProbeFailures);
+                    for (const KmonUserThreadCodeCandidate& candidate : candidates)
+                    {
+                        if (StopRequested.load())
+                        {
+                            break;
+                        }
+                        const MEMORY_BASIC_INFORMATION& mapping = candidate.Region;
+                        const KmonUserThreadStart& execution = candidate.Start;
+                        const uint64_t alloc = reinterpret_cast<uint64_t>(mapping.AllocationBase);
+                        if (!reportedOrphanAllocations.insert(alloc).second)
+                        {
+                            continue;
+                        }
+                        const uint64_t base = reinterpret_cast<uint64_t>(mapping.BaseAddress);
+                        const bool mappedCode = mapping.Type == MEM_MAPPED;
+                        const wchar_t* layer = mappedCode
+                            ? L"thread_mapped_exec" : L"thread_private_exec";
+                        std::wstring captureNote;
+                        CaptureRegion(layer, execution.Address,
+                            mapping.RegionSize - (execution.Address - base), pid,
+                            true, device, symbols, processHandle, 0x1000, &captureNote);
+                        EmitUnique(
+                            L"process.implant",
+                            std::wstring(layer) + L":" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                            imagePath,
+                            layer,
+                            (mappedCode
+                                ? L"live thread starts in mapped executable orphan pid="
+                                : L"live thread starts in private executable orphan pid=") +
+                                std::to_wstring(pid) + L" " + leaf,
+                            L"base=" + HexU64(base) +
+                                L" size=" + std::to_wstring(
+                                    static_cast<unsigned long long>(mapping.RegionSize)) +
+                                L" protect=" + std::to_wstring(mapping.Protect) +
+                                L" type=" + std::to_wstring(mapping.Type) +
+                                L" sample=entropy_candidate" +
+                                L" loader_range_claim=" + std::to_wstring(
+                                    AddressInModuleRanges(execution.Address, moduleRanges) ? 1 : 0) +
+                                L" tid=" + std::to_wstring(execution.ThreadId) +
+                                L" thread_start=" + HexU64(execution.Address) + captureNote,
+                            pid);
+                    }
+                }
                 int step = 0;
                 for (; step < 4096 && orphans < 4; ++step)
                 {
+                    if (StopRequested.load())
+                    {
+                        break;
+                    }
                     MEMORY_BASIC_INFORMATION region = {};
                     if (VirtualQueryEx(
                             processHandle,
@@ -14245,12 +17833,22 @@ void KernelMonitor::ScanUserModeHostility()
                             &region,
                             sizeof(region)) != sizeof(region))
                     {
+                        vmWalkQueryFailed = true;
+                        vmWalkError = GetLastError();
                         break;
                     }
                     const uint64_t alloc = reinterpret_cast<uint64_t>(region.AllocationBase);
-                    const uint64_t next =
-                        reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+                    uint64_t next = 0;
+                    if (!KmonAdvanceUserVmCursor(cursor,
+                            reinterpret_cast<uint64_t>(region.BaseAddress),
+                            region.RegionSize, &next))
+                    {
+                        vmWalkQueryFailed = true;
+                        vmWalkError = ERROR_INVALID_DATA;
+                        break;
+                    }
                     const bool interesting =
+                        reportedOrphanAllocations.count(alloc) == 0 &&
                         KmonOrphanRegionInteresting(
                             region,
                             exeRegion,
@@ -14295,7 +17893,7 @@ void KernelMonitor::ScanUserModeHostility()
                                 L"exe_orphan:" + std::to_wstring(pid) + L":" + HexU64(alloc),
                                 imagePath,
                                 layer,
-                                L"extra PE mapping is not in the module list pid=" +
+                                L"extra executable PE allocation lacks a matching loader image pid=" +
                                     std::to_wstring(pid) + L" " + leaf,
                                 L"base=" + HexU64(alloc) +
                                     L" type=" + std::to_wstring(region.Type) +
@@ -14303,112 +17901,152 @@ void KernelMonitor::ScanUserModeHostility()
                                         ? std::wstring()
                                         : (L" mapped=" + mappedOrphan)),
                                 pid);
+                            reportedOrphanAllocations.insert(alloc);
                             ++orphans;
                         }
                         else if (rwx)
                         {
+                            const bool mappedCode = region.Type == MEM_MAPPED;
+                            const wchar_t* layer = mappedCode ? L"mapped_wx" : L"private_wx";
                             EmitUnique(
                                 L"process.implant",
-                                L"private_wx:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                std::wstring(layer) + L":" + std::to_wstring(pid) + L":" + HexU64(alloc),
                                 imagePath,
-                                L"private_wx",
-                                L"private W+X region is not in the module list pid=" +
+                                layer,
+                                (mappedCode
+                                    ? L"mapped W+X region lacks a matching loader image pid="
+                                    : L"private W+X region lacks a matching loader image pid=") +
                                     std::to_wstring(pid) + L" " + leaf,
                                 L"base=" + HexU64(alloc) +
                                     L" size=" + std::to_wstring(
                                         static_cast<unsigned long long>(region.RegionSize)) +
                                     L" type=" + std::to_wstring(region.Type),
                                 pid);
+                            reportedOrphanAllocations.insert(alloc);
                             ++orphans;
                         }
-                        else if (
-                            hostileHost &&
-                            region.Type == MEM_PRIVATE &&
-                            ProtectHasExecute(region.Protect) &&
-                            region.RegionSize <= 0x10000)
+                        else if (hostileHost && KmonOrphanCodeCandidate(region))
                         {
-                            // dwm maps small graphics tables (gradient
-                            // LUTs, stride grids) into RX-classified private
-                            // pages; drop data pages before reporting so the
-                            // orphan list only carries code-shaped regions.
-                            // Sample the flagged region's own base page:
-                            // AllocationBase can point at a different
-                            // (data) page inside the same allocation.
-                            // ReadProcessBytes falls back to kernel reads
-                            // when the handle lacks PROCESS_VM_READ, so the
-                            // entropy gate stays effective on restricted
-                            // targets instead of silently failing open.
                             const uint64_t execRegionBase =
                                 reinterpret_cast<uint64_t>(region.BaseAddress);
-                            bool looksLikeCode = true;
+                            const uint32_t probeBytes = static_cast<uint32_t>(
+                                (std::min<uint64_t>)(0x200, region.RegionSize));
                             std::vector<uint8_t> codeProbe;
-                            if (ReadProcessBytes(
-                                    device,
-                                    symbols,
-                                    processHandle,
-                                    pid,
-                                    execRegionBase,
-                                    0x200,
-                                    &codeProbe) &&
-                                codeProbe.size() >= 0x40)
+                            const bool codeRead = ReadProcessBytes(
+                                device, symbols, processHandle, pid,
+                                execRegionBase, probeBytes, &codeProbe);
+                            if (!codeRead || codeProbe.size() < probeBytes || codeProbe.size() < 0x40)
                             {
-                                looksLikeCode =
-                                    KmonBytesLookLikeCode(
-                                        codeProbe.data(),
-                                        codeProbe.size());
+                                ++codeProbeFailures;
                             }
-                            if (looksLikeCode)
+                            if (KmonCodeProbeSupportsCandidate(codeRead, codeProbe))
                             {
+                                const bool mappedCode = region.Type == MEM_MAPPED;
+                                const wchar_t* layer = mappedCode ? L"mapped_exec" : L"private_exec";
                                 std::wstring captureNote;
                                 CaptureRegion(
-                                    L"private_exec",
-                                    execRegionBase,
-                                    region.RegionSize,
-                                    pid,
-                                    true,
-                                    device,
-                                    symbols,
-                                    processHandle,
-                                    0,
-                                    &captureNote);
+                                    layer, execRegionBase, region.RegionSize, pid,
+                                    true, device, symbols, processHandle, 0, &captureNote);
                                 EmitUnique(
                                     L"process.implant",
-                                    L"private_exec:" + std::to_wstring(pid) + L":" + HexU64(alloc),
+                                    std::wstring(layer) + L":" + std::to_wstring(pid) + L":" + HexU64(alloc),
                                     imagePath,
-                                    L"private_exec",
-                                    L"private executable region is not in the module list pid=" +
+                                    layer,
+                                    (mappedCode
+                                        ? L"mapped executable region lacks a matching loader image pid="
+                                        : L"private executable region lacks a matching loader image pid=") +
                                         std::to_wstring(pid) + L" " + leaf,
                                     L"base=" + HexU64(execRegionBase) +
                                         L" size=" + std::to_wstring(
                                             static_cast<unsigned long long>(region.RegionSize)) +
                                         L" protect=" + std::to_wstring(region.Protect) +
-                                        captureNote,
+                                        L" type=" + std::to_wstring(region.Type) +
+                                        L" sample=entropy_candidate" + captureNote,
                                     pid);
+                                reportedOrphanAllocations.insert(alloc);
                                 ++orphans;
                             }
                         }
                     }
-                    if (next <= cursor)
-                    {
-                        break;
-                    }
                     cursor = next;
-                    if (cursor >= 0x00007FFFFFFEFFFFull)
+                    if (cursor > maximumUserAddress)
                     {
+                        vmWalkFinished = true;
                         break;
                     }
                 }
-                if (hostileHost && step >= 4096)
+                if (processCreateTime != 0)
+                {
+                    std::lock_guard<std::mutex> lock(WatchMutex);
+                    if (vmWalkFinished)
+                    {
+                        UserVmWalkCursors.erase(generation);
+                    }
+                    else
+                    {
+                        if (!KmonRememberUserCursor(userGenerations, generation,
+                                cursor, &UserVmWalkCursors))
+                        {
+                            cursorCapacityLimited = true;
+                        }
+                    }
+                }
+                const std::wstring vmWalkKey =
+                    L"scan_failed:userhostility:vmwalk:" + std::to_wstring(pid);
+                if (!vmWalkFinished && (step >= 4096 || orphans >= 4 || vmWalkQueryFailed))
                 {
                     EmitUnique(
                         L"process.implant",
-                        L"scan_failed:userhostility:vmwalk:" + std::to_wstring(pid),
+                        vmWalkKey,
                         imagePath,
                         L"user",
-                        L"usermode VAD walk hit the region cap pid=" +
+                        L"usermode VAD walk remains incomplete for pid=" +
                             std::to_wstring(pid) + L" " + leaf,
-                        L"VirtualQueryEx stopped at 4096 regions",
+                        L"regions=" + std::to_wstring(step) +
+                            L" findings=" + std::to_wstring(orphans) +
+                            L" error=" + std::to_wstring(vmWalkError) +
+                            L" resume=" + HexU64(processCreateTime != 0 ? cursor : 0),
                         pid);
+                }
+                else if (vmWalkFinished)
+                {
+                    ClearEmittedKeyForPid(vmWalkKey, pid);
+                }
+                const std::wstring threadStartKey =
+                    L"scan_failed:userhostility:thread_start:" + std::to_wstring(pid);
+                if (threadStartsAttempted && (!threadStartsComplete || threadRegionQueryFailures != 0))
+                {
+                    EmitUnique(
+                        L"process.implant", threadStartKey, imagePath, L"user",
+                        L"orphan executable thread-start correlation was incomplete pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"thread inventory, identity, access, or sampling budget was incomplete" +
+                            std::wstring(L" mapping_query_failures=") +
+                            std::to_wstring(threadRegionQueryFailures),
+                        pid);
+                }
+                else if (threadStartsAttempted)
+                {
+                    ClearEmittedKeyForPid(threadStartKey, pid);
+                }
+                const std::wstring probeFailureKey =
+                    L"scan_failed:userhostility:code_probe:" + std::to_wstring(pid);
+                if (codeProbeFailures != 0)
+                {
+                    EmitUnique(
+                        L"process.implant",
+                        probeFailureKey,
+                        imagePath,
+                        L"user",
+                        L"executable orphan code samples were unreadable pid=" +
+                            std::to_wstring(pid) + L" " + leaf,
+                        L"failed=" + std::to_wstring(codeProbeFailures) +
+                            L" code classification is incomplete",
+                        pid);
+                }
+                else
+                {
+                    ClearEmittedKeyForPid(probeFailureKey, pid);
                 }
             }
             if (hasKernelVadScan && hostileHost)
@@ -14668,25 +18306,10 @@ void KernelMonitor::ScanUserModeHostility()
                             haveOwnershipView = true;
                             owned = AddressInModuleRanges(ic, moduleRanges);
                         }
-                        else if (hasKernelVadScan && !kernelVad.Records.empty())
+                        else if (hasKernelVadScan)
                         {
-                            haveOwnershipView = true;
-                            owned = false;
-                            bool covered = false;
-                            for (const ProcessVadRecord& record : kernelVad.Records)
-                            {
-                                if (!VadCoversUserAddress(record, ic))
-                                {
-                                    continue;
-                                }
-                                covered = true;
-                                owned = !(record.HasPrivateMemory && record.PrivateMemory);
-                                break;
-                            }
-                            if (!covered)
-                            {
-                                owned = false;
-                            }
+                            haveOwnershipView = KmonVadCallbackOwnershipKnown(
+                                kernelVad, ic, &owned);
                         }
                         if (haveOwnershipView && !owned)
                         {
@@ -14728,15 +18351,29 @@ void KernelMonitor::ScanUserModeHostility()
                 size_t slash = dir.find_last_of(L'\\');
                 return (slash == std::wstring::npos) ? std::wstring() : dir.substr(0, slash + 1);
             }();
-            for (size_t moduleIndex = 0; moduleIndex < modulePaths.size(); ++moduleIndex)
+            uint64_t moduleWalkStart = 0;
+            const auto moduleGeneration = std::make_pair(pid, processCreateTime);
             {
+                std::lock_guard<std::mutex> lock(WatchMutex);
+                const auto cursor = UserModuleWalkCursors.find(moduleGeneration);
+                if (cursor != UserModuleWalkCursors.end())
+                {
+                    moduleWalkStart = cursor->second;
+                }
+            }
+            std::vector<uint64_t> moduleBases(modulePaths.size(), 0);
+            for (size_t index = 0; index < modulePaths.size() && index < moduleRanges.size(); ++index)
+            {
+                moduleBases[index] = moduleRanges[index].first;
+            }
+            const std::vector<size_t> moduleOrder = KmonOrderImageModules(moduleBases, moduleWalkStart);
+            for (size_t moduleVisit = 0; moduleVisit < moduleOrder.size(); ++moduleVisit)
+            {
+                const size_t moduleIndex = moduleOrder[moduleVisit];
                 const std::wstring& modulePath = modulePaths[moduleIndex];
                 const std::wstring moduleClass = KmonClassifyDriverPath(modulePath);
                 const std::wstring n = KmonNormalizeDriverPath(modulePath);
-                const bool windowsModule =
-                    n.find(L"\\windows\\system32\\") != std::wstring::npos ||
-                    n.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
-                    n.find(L"\\windows\\winsxs\\") != std::wstring::npos;
+                const bool windowsModule = KmonWindowsModulePathLooksInbox(modulePath);
                 std::wstring moduleLower = ToLowerCopy(modulePath);
                 for (wchar_t& ch : moduleLower)
                 {
@@ -14792,16 +18429,14 @@ void KernelMonitor::ScanUserModeHostility()
                         ? moduleRanges[moduleIndex].first
                         : 0;
                 const bool compareGameText =
-                    (watched || dropHost) &&
+                    (hostileHost || target.Interesting) &&
                     !windowsModule &&
-                    moduleLeaf != leaf &&
                     gameTextHits < 16 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
                 const bool compareSystemText =
-                    (watched || dropHost) &&
+                    (hostileHost || target.Interesting) &&
                     windowsModule &&
-                    KmonLooksLikeHookableSystemDll(moduleLeaf) &&
                     systemTextHits < 16 &&
                     loadedModuleBase != 0 &&
                     PathLooksLikeWin32File(modulePath);
@@ -14832,45 +18467,87 @@ void KernelMonitor::ScanUserModeHostility()
                     {
                         ++builtinTextHits;
                     }
+                    const std::wstring imageCursorKey = std::to_wstring(pid) + L":" +
+                        HexU64(processCreateTime) + L":" + HexU64(loadedModuleBase) + L":" + n;
                     const std::wstring textFailKey =
-                        L"scan_failed:userhostility:module_text:" +
-                        std::to_wstring(pid) + L":" + moduleLeaf;
+                        L"scan_failed:userhostility:module_text:" + imageCursorKey;
+                    KmonImageScanCursor pageCursor;
+                    {
+                        std::lock_guard<std::mutex> lock(WatchMutex);
+                        const auto previous = ImagePageCursors.find(imageCursorKey);
+                        if (previous != ImagePageCursors.end())
+                        {
+                            pageCursor = previous->second;
+                        }
+                    }
                     const SliceCompare textCmp = CompareLoadedModuleText(
                         modulePath,
                         processHandle,
                         device,
                         symbols,
                         pid,
-                        loadedModuleBase);
-                    if (textCmp == SliceMismatch)
+                        loadedModuleBase,
+                        &pageCursor);
+                    pageCursor.ProcessId = pid;
+                    pageCursor.CreateTime = processCreateTime;
+                    pageCursor.ImageBase = loadedModuleBase;
+                    pageCursor.LastObservedMs = GetTickCount64();
                     {
-                        EmitUnique(
-                            L"process.implant",
-                            (compareBuiltinImageText
-                                ? L"main_image_text:"
-                                : L"module_text:") +
-                                std::to_wstring(pid) + L":" + moduleLeaf,
-                            imagePath,
-                            compareBuiltinImageText ? L"main_image_text" : L"module_text",
-                            (compareBuiltinImageText
-                                ? L"main image code bytes differ from disk pid="
-                                : L"module code bytes differ from disk pid=") +
-                                std::to_wstring(pid) + L" " + leaf +
-                                L" module=" + moduleLeaf,
-                            modulePath + moduleSourceNote,
-                            pid);
+                        std::lock_guard<std::mutex> lock(WatchMutex);
+                        if (ImagePageCursors.size() < 32768 ||
+                            ImagePageCursors.find(imageCursorKey) != ImagePageCursors.end())
+                        {
+                            ImagePageCursors[imageCursorKey] = pageCursor;
+                        }
+                        else
+                        {
+                            cursorCapacityLimited = true;
+                        }
                     }
-                    else if (textCmp == SliceUnknown)
+                    const std::wstring pageCoverage = L" compared_pages=" +
+                        std::to_wstring(pageCursor.Compared) + L" planned_pages=" +
+                        std::to_wstring(pageCursor.SliceCount) + L" next_page=" +
+                        std::to_wstring(pageCursor.NextSlice) + L" read_failures=" +
+                        std::to_wstring(pageCursor.ReadFailures) + L" completed_rotations=" +
+                        std::to_wstring(pageCursor.Sweeps) + L" boundary_bytes_deferred=" +
+                        std::to_wstring(pageCursor.RelocationBoundaryBytes) + L" temporal_sample=1";
+                    for (const KmonImageScanCursor::SliceObservation& observation : pageCursor.Observations)
+                    {
+                        const std::wstring observationKey = KmonImageSliceEvidenceKey(
+                            compareBuiltinImageText ? L"main_image_text:" : L"module_text:",
+                            imageCursorKey, pageCursor.HeaderHash, observation.Rva, observation.MaskHash);
+                        KmonApplyImageSliceObservation(observation.Changed ? SliceMismatch : SliceMatch,
+                            observationKey, [&](const std::wstring& eventKey)
+                        {
+                            EmitUnique(
+                                L"process.implant", eventKey,
+                                imagePath,
+                                compareBuiltinImageText ? L"main_image_text" : L"module_text",
+                                (compareBuiltinImageText
+                                    ? L"main image code bytes differ from disk pid="
+                                    : L"module code bytes differ from disk pid=") +
+                                    std::to_wstring(pid) + L" " + leaf +
+                                    L" module=" + moduleLeaf + L" rva=" + HexU64(observation.Rva),
+                                modulePath + moduleSourceNote + pageCoverage +
+                                    L" runtime_patching_or_file_replacement_must_be_correlated",
+                                pid);
+                        }, [&](const std::wstring& eventKey)
+                        {
+                            ClearEmittedKeyForPid(eventKey, pid);
+                        });
+                    }
+                    if (textCmp == SliceUnknown || pageCursor.ReadFailures != 0 ||
+                        pageCursor.RelocationBoundaryBytes != 0)
                     {
                         EmitUnique(
                             L"process.implant",
                             textFailKey,
                             imagePath,
                             L"user",
-                            L"module text compare could not run pid=" +
+                            L"module text comparison is partial pid=" +
                                 std::to_wstring(pid) + L" " + leaf +
                                 L" module=" + moduleLeaf,
-                            L"disk or relocated bytes were not readable",
+                            L"some disk/live bytes were unreadable or deferred at a relocation boundary" + pageCoverage,
                             pid);
                     }
                     else
@@ -15049,6 +18726,34 @@ void KernelMonitor::ScanUserModeHostility()
                 ++implants;
             }
 
+            if (!modulePaths.empty())
+            {
+                std::lock_guard<std::mutex> lock(WatchMutex);
+                if (!KmonRememberUserCursor(userGenerations, moduleGeneration,
+                        KmonAdvanceImageModuleAnchor(moduleBases, moduleOrder, 16, moduleWalkStart),
+                        &UserModuleWalkCursors))
+                {
+                    cursorCapacityLimited = true;
+                }
+            }
+
+            if (hasKernelVadScan && kernelVad.Target.HasCreateTime &&
+                kernelVad.Target.CreateTime == processCreateTime)
+            {
+                std::vector<ProcessUserModuleRange> evidenceModules;
+                for (size_t index = 0; index < modulePaths.size() && index < moduleRanges.size(); ++index)
+                {
+                    ProcessUserModuleRange module;
+                    module.Base = moduleRanges[index].first;
+                    module.Size = moduleRanges[index].second;
+                    module.ImagePath = modulePaths[index];
+                    module.ImageName = KmonBasenameLower(modulePaths[index]);
+                    evidenceModules.push_back(std::move(module));
+                }
+                ScanUserExecutionEvidence(kernelVad.Target, evidenceModules, moduleInventoryComplete,
+                    &kernelVad, imagePath, true);
+            }
+
             // Per-object vtable clones live in private heap, not in module
             // tables, so the module loop above cannot see them. dwm.exe gets
             // this scan through defaultWatched; other hosts need watch or a
@@ -15122,12 +18827,22 @@ void KernelMonitor::ScanUserModeHostility()
                         pid);
                 }
             }
-            if (processHandle != nullptr)
-            {
-                CloseHandle(processHandle);
-            }
     }
 
+    if (!StopRequested.load() && cursorCapacityLimited)
+    {
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility:cursor_capacity",
+            std::wstring(),
+            L"user",
+            L"user-mode cursor retention reached its process limit",
+            L"state_limit=4096; an unobserved generation lost its continuation or a new continuation was deferred");
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:userhostility:cursor_capacity");
+    }
     if (!StopRequested.load() && (snapshotCapped || deepCapped))
     {
         EmitUnique(
@@ -15138,7 +18853,7 @@ void KernelMonitor::ScanUserModeHostility()
             L"user-mode hostility scan hit a process cap; extra hosts may be missed",
             snapshotCapped
                 ? L"toolhelp snapshot capped at 4096"
-                : L"deep scan capped at 1024");
+                : L"deep scan capped at 1024; deferred hosts rotate across passes");
     }
     else if (!StopRequested.load())
     {
@@ -15265,10 +18980,7 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
 }
 
-// Handle-table diff for watched pids: report new Device-typed handles as
-// driver.handle so a loader acquiring a driver/device channel (BYOVD
-// precondition) shows up on the tail. First pass per pid is a silent
-// baseline; handle closes are not tracked.
+// Compare generation-bound object relationships, including initial handles.
 void KernelMonitor::ScanWatchedHandleTables()
 {
     DeviceClient* device = nullptr;
@@ -15287,6 +18999,17 @@ void KernelMonitor::ScanWatchedHandleTables()
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         pids.assign(WatchPids.begin(), WatchPids.end());
+        for (auto it = WatchedHandleAfter.begin(); it != WatchedHandleAfter.end();)
+        {
+            if (WatchPids.find(it->first.first) == WatchPids.end())
+            {
+                it = WatchedHandleAfter.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
     }
     if (pids.empty())
     {
@@ -15294,10 +19017,7 @@ void KernelMonitor::ScanWatchedHandleTables()
     }
     std::sort(pids.begin(), pids.end());
     constexpr size_t kMaxWatchedHandleScans = 8;
-    if (pids.size() > kMaxWatchedHandleScans)
-    {
-        pids.resize(kMaxWatchedHandleScans);
-    }
+    pids = SelectHandleOwnerBatch(std::move(pids), &WatchedHandleCursor, kMaxWatchedHandleScans);
 
     if (!WatchDeviceTypeKnown)
     {
@@ -15311,24 +19031,55 @@ void KernelMonitor::ScanWatchedHandleTables()
                 L"scan_failed:handles:type_index",
                 std::wstring(),
                 L"handle",
-                L"device object type index could not be learned; driver.handle diffing is inactive",
+                L"File object type index could not be learned; typed graph scan will use PDB evidence",
                 typeError.empty() ? L"QueryDeviceObjectTypeIndex failed" : typeError,
                 0);
-            return;
         }
-        WatchDeviceTypeIndex = index;
-        WatchDeviceTypeKnown = true;
-        ClearEmittedKey(L"scan_failed:handles:type_index");
+        else
+        {
+            WatchDeviceTypeIndex = index;
+            WatchDeviceTypeKnown = true;
+            ClearEmittedKey(L"scan_failed:handles:type_index");
+        }
     }
 
     HandleTableScanner scanner(*device, *symbols);
     for (uint32_t pid : pids)
     {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+        const std::unique_ptr<void, decltype(&CloseHandle)> pinned(process, &CloseHandle);
+        const uint64_t created = process != nullptr ? QueryProcessCreateTicks(process) : 0;
+        const std::wstring generationKey = L"scan_failed:handles:generation:" + std::to_wstring(pid);
+        if (process == nullptr || created == 0 || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+        {
+            EmitUnique(L"driver.handle", generationKey, L"", L"handle",
+                L"handle graph owner identity could not be pinned", L"owner pid=" + std::to_wstring(pid), pid);
+            continue;
+        }
+        ClearEmittedKeyForPid(generationKey, pid);
         HandleTableScanOptions options = {};
         options.HasOwnerPid = true;
         options.OwnerPid = pid;
         options.ProcessHandlesOnly = false;
         options.CollectRecords = true;
+        options.ContinueHandles = true;
+        options.MaxHandlesPerPass = 4096;
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            auto it = WatchedHandleAfter.lower_bound({pid, 0});
+            while (it != WatchedHandleAfter.end() && it->first.first == pid)
+            {
+                if (it->first.second != created)
+                {
+                    it = WatchedHandleAfter.erase(it);
+                }
+                else
+                {
+                    options.HandleAfter = it->second;
+                    ++it;
+                }
+            }
+        }
         HandleTableScanResult result = {};
         std::wstring error;
         const std::wstring failKey =
@@ -15345,51 +19096,81 @@ void KernelMonitor::ScanWatchedHandleTables()
                 pid);
             continue;
         }
-        ClearEmittedKey(failKey);
-
-        std::set<std::pair<uint64_t, uint64_t>> known;
+        if (QueryProcessCreateTicks(process) != created || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
         {
-            std::lock_guard<std::mutex> watchLock(WatchMutex);
-            auto it = WatchKnownHandles.find(pid);
-            if (it != WatchKnownHandles.end())
-            {
-                known = it->second;
-            }
+            EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph discarded after owner generation change", L"", pid);
+            continue;
+        }
+        if (!result.CoverageComplete || result.Truncated || !result.ObjectTypeCoverageComplete ||
+            !result.RelationshipCoverageComplete || (result.ProcessInventoryRequested && !result.ProcessInventoryComplete))
+        {
+            EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph coverage is partial",
+                L"records=" + std::to_wstring(result.Records.size()) + L" truncated=" +
+                std::to_wstring(result.Truncated) + L" type_failures=" + std::to_wstring(result.ObjectTypeReadFailures) +
+                L" relationship_failures=" + std::to_wstring(result.RelationshipReadFailures) +
+                L" relationship_unsupported=" + std::to_wstring(result.RelationshipUnsupported) +
+                L" process_inventory_requested=" + std::to_wstring(result.ProcessInventoryRequested) +
+                L" process_inventory_complete=" + std::to_wstring(result.ProcessInventoryComplete) +
+                L" handles_visited=" + std::to_wstring(result.HandlesVisited) +
+                L" handle_candidates=" + std::to_wstring(result.HandleCandidates) +
+                L" relationship_reads=" + std::to_wstring(result.RelationshipReadAttempts) +
+                L" read_budget_exhausted=" + std::to_wstring(result.RelationshipBudgetExhausted) +
+                L" next_handle_after=" + HexU64(result.NextHandleAfter), pid);
+        }
+        else
+        {
+            ClearEmittedKeyForPid(failKey, pid);
         }
 
-        bool firstBaseline = known.empty();
+        bool firstBaseline = false;
+        {
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            firstBaseline = WatchedHandleGenerations.find(pid) == WatchedHandleGenerations.end() ||
+                WatchedHandleGenerations[pid] != created;
+        }
+
         for (const HandleTableRecord& record : result.Records)
         {
-            const std::pair<uint64_t, uint64_t> key(
-                static_cast<uint64_t>(record.HandleValue),
-                record.Object);
-            if (known.find(key) != known.end())
-            {
-                continue;
-            }
-            known.insert(key);
-            if (firstBaseline ||
-                record.ObjectTypeIndex != WatchDeviceTypeIndex)
+            const bool processAccess = record.TypeName == L"Process" &&
+                (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle);
+            const bool threadAccess = record.TypeName == L"Thread" && (record.GrantedAccess & 0x0033u) != 0;
+            const bool queueAccess = (record.TypeName == L"IoCompletion" || record.TypeName == L"TpWorkerFactory") &&
+                record.GrantedAccess != 0;
+            const bool fileHandle = record.TypeName == L"File" ||
+                (WatchDeviceTypeKnown && record.ObjectTypeIndex == WatchDeviceTypeIndex);
+            const bool deviceChannel = fileHandle && record.DeviceObject != 0 &&
+                (record.DeviceType == 0x22 || record.DeviceType >= 0x8000);
+            if (!processAccess && !threadAccess && !queueAccess && !deviceChannel)
             {
                 continue;
             }
             EmitUnique(
                 L"driver.handle",
                 L"driver_handle:" + std::to_wstring(pid) + L":" +
-                    HexU64(record.HandleValue),
+                    HexU64(created) + L":" + HandleTableRecordIdentity(record),
                 std::wstring(),
                 L"handle",
-                L"watched process opened a device handle pid=" +
+                L"watched process holds a capability-bearing object handle pid=" +
                     std::to_wstring(pid),
                 L"handle=" + HexU64(record.HandleValue) +
                     L" object=" + HexU64(record.Object) +
-                    L" access=" + HexU64(record.GrantedAccess),
+                    L" access=" + HexU64(record.GrantedAccess) + L" type=" + record.TypeName +
+                    L" first_owner_scan=" + std::to_wstring(firstBaseline) +
+                    L" target_pid=" + std::to_wstring(record.TargetPid) +
+                    L" target_create_time=" + HexU64(record.TargetCreateTime) +
+                    L" target_identity_known=" + std::to_wstring(record.TargetIdentityKnown) +
+                    L" object_type_validated=" + std::to_wstring(record.ObjectTypeValidated) +
+                    L" relationship_resolved=" + std::to_wstring(record.RelationshipResolved) +
+                    L" device_object=" + HexU64(record.DeviceObject) + L" driver_object=" + HexU64(record.DriverObject) +
+                    L" source=snapshot; handle_origin_not_proven; target_object_lifetime_not_pinned",
                 pid);
         }
 
         {
             std::lock_guard<std::mutex> watchLock(WatchMutex);
-            WatchKnownHandles[pid] = std::move(known);
+            WatchedHandleGenerations[pid] = created;
+            WatchedHandleAfter[{pid, created}] = result.NextHandleAfter;
+            WatchKnownHandles.erase(pid);
         }
     }
 }
@@ -15399,10 +19180,19 @@ void KernelMonitor::ScanWatchedHandleTables()
 // (first seen per caller pid + ioctl code).
 bool KernelMonitor::ArmIotrace(uint64_t driverObjectAddress, const std::wstring& driverName, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool ok = false;
 
     do
     {
+        if (!Active.load() || StopRequested.load())
+        {
+            if (error != nullptr)
+            {
+                *error = L"kmon is not active";
+            }
+            break;
+        }
         DeviceClient* device = nullptr;
         {
             std::lock_guard<std::mutex> lock(StateMutex);
@@ -15457,6 +19247,7 @@ bool KernelMonitor::ArmIotrace(uint64_t driverObjectAddress, const std::wstring&
 
 bool KernelMonitor::DisarmIotrace(std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool ok = false;
 
     do
@@ -15813,6 +19604,12 @@ void KernelMonitor::PruneStalePromotedWatches()
                 WatchChildPids.erase(pid);
                 WatchActivityTasks.erase(pid);
                 WatchKnownHandles.erase(pid);
+                WatchedHandleGenerations.erase(pid);
+                auto handleCursor = WatchedHandleAfter.lower_bound({pid, 0});
+                while (handleCursor != WatchedHandleAfter.end() && handleCursor->first.first == pid)
+                {
+                    handleCursor = WatchedHandleAfter.erase(handleCursor);
+                }
                 if (WatchExplicitPids.count(pid) == 0)
                 {
                     WatchPids.erase(pid);
@@ -16062,6 +19859,12 @@ bool KernelMonitor::ResolveKernelImageName(uint32_t pid, std::wstring* name)
 
 void KernelMonitor::RecordEvent(KmonEvent&& event)
 {
+    if (event.Timestamp == 0)
+    {
+        FILETIME now = {};
+        GetSystemTimeAsFileTime(&now);
+        event.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    }
     NoteWatchTiWriteIfNeeded(event);
 
     KmonOptions options;
@@ -16354,6 +20157,7 @@ void KernelMonitor::Clear()
 
 bool KernelMonitor::AddWatchPid(uint32_t pid)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool inserted = false;
 
     do
@@ -16375,6 +20179,7 @@ bool KernelMonitor::AddWatchPid(uint32_t pid)
 
 bool KernelMonitor::RemoveWatchPid(uint32_t pid)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool removed = false;
     bool wasLogging = false;
     {
@@ -16406,6 +20211,7 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
 
 bool KernelMonitor::AddWatchName(const std::wstring& imageBase)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool added = false;
     std::vector<uint32_t> pids;
 
@@ -16446,6 +20252,7 @@ bool KernelMonitor::AddWatchName(const std::wstring& imageBase)
 
 bool KernelMonitor::RemoveWatchName(const std::wstring& imageBase)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     std::wstring lower = KmonBasenameLower(imageBase);
     bool removed = false;
     {
@@ -16464,6 +20271,7 @@ bool KernelMonitor::RemoveWatchName(const std::wstring& imageBase)
 
 bool KernelMonitor::AddWatchDriver(const std::wstring& driverBase)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     std::wstring lower = KmonBasenameLower(driverBase);
     if (lower.empty())
     {
@@ -16483,6 +20291,7 @@ bool KernelMonitor::AddWatchDriver(const std::wstring& driverBase)
 
 bool KernelMonitor::RemoveWatchDriver(const std::wstring& driverBase)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     std::wstring lower = KmonBasenameLower(driverBase);
     std::lock_guard<std::mutex> lock(WatchMutex);
     auto it = std::remove(WatchDriversLower.begin(), WatchDriversLower.end(), lower);
@@ -16632,6 +20441,636 @@ const wchar_t* KmonArtifactSkipReasonText(KmonArtifactSkipReason reason)
     default:
         return L"";
     }
+}
+
+bool KernelMonitorUserModeSelfTest()
+{
+    bool ok = false;
+    do
+    {
+        if (!KmonDiskRelocationSourceSelfTest() || !KmonImageSliceSelfTest() || !KmonGraphicsDispatchSelfTest())
+        {
+            break;
+        }
+        if (KmonDevicePrefixMatches(L"\\device\\mup\\a", L"\\device\\harddiskvolume3") ||
+            KmonDevicePrefixMatches(L"\\device\\harddiskvolume30\\a", L"\\device\\harddiskvolume3") ||
+            KmonDevicePrefixMatches(L"x", L"") ||
+            !KmonDevicePrefixMatches(L"\\device\\harddiskvolume3", L"\\device\\harddiskvolume3") ||
+            !KmonDevicePrefixMatches(L"\\device\\harddiskvolume3\\a", L"\\device\\harddiskvolume3"))
+        {
+            break;
+        }
+        if (!KmonWindowsModulePathLooksInbox(L"C:\\Windows\\System32\\ntdll.dll") ||
+            !KmonWindowsModulePathLooksInbox(L"C:\\Windows\\WinSxS\\amd64_test\\test.dll") ||
+            KmonWindowsModulePathLooksInbox(L"C:\\Program Files\\Vendor\\Windows\\System32\\helper.dll") ||
+            KmonWindowsModulePathLooksInbox(L"C:\\Windows\\System32\\..\\Temp\\helper.dll"))
+        {
+            break;
+        }
+        struct GenerationCase
+        {
+            uint64_t Inventory;
+            uint64_t Before;
+            uint64_t After;
+            bool Pinned;
+            bool Accepted;
+        };
+        const GenerationCase generationCases[] =
+        {
+            {
+                123, 123, 456, true, false
+            },
+            {
+                123, 123, 0, true, false
+            },
+            {
+                123, 123, 123, true, true
+            },
+            {
+                0, 123, 123, true, true
+            },
+            {
+                0, 123, 456, true, false
+            },
+            {
+                0, 0, 123, true, false
+            },
+            {
+                123, 456, 456, true, false
+            },
+            {
+                123, 123, 123, false, false
+            },
+            {
+                0, 0, 0, false, false
+            },
+        };
+        bool generationCasesOk = true;
+        for (const GenerationCase& item : generationCases)
+        {
+            if (KmonUserSnapshotGenerationMatches(
+                    item.Inventory, item.Before, item.After, item.Pinned) != item.Accepted)
+            {
+                generationCasesOk = false;
+            }
+        }
+        if (!generationCasesOk)
+        {
+            break;
+        }
+
+        constexpr uint64_t original = 0x140000000ull;
+        constexpr uint64_t decoy = 0x180000000ull;
+        ProcessVadScanResult callbackView;
+        ProcessVadRecord callbackVad;
+        callbackVad.StartAddress = original;
+        callbackVad.EndAddress = original + 0x1FFF;
+        callbackVad.HasPrivateMemory = true;
+        callbackView.Records.push_back(callbackVad);
+        callbackView.Incomplete = true;
+        bool callbackOwned = false;
+        if (KmonVadCallbackOwnershipKnown(callbackView, decoy, &callbackOwned) ||
+            !callbackOwned ||
+            !KmonVadCallbackOwnershipKnown(callbackView, original + 1, &callbackOwned) ||
+            !callbackOwned)
+        {
+            break;
+        }
+        callbackView.Records[0].PrivateMemory = true;
+        if (!KmonVadCallbackOwnershipKnown(callbackView, original + 1, &callbackOwned) ||
+            callbackOwned)
+        {
+            break;
+        }
+        callbackView.Records[0].HasPrivateMemory = false;
+        if (KmonVadCallbackOwnershipKnown(callbackView, original + 1, &callbackOwned) ||
+            !callbackOwned)
+        {
+            break;
+        }
+        callbackView.Incomplete = false;
+        callbackView.Truncated = true;
+        if (KmonVadCallbackOwnershipKnown(callbackView, decoy, &callbackOwned))
+        {
+            break;
+        }
+        callbackView.Truncated = false;
+        callbackView.CoverageComplete = false;
+        if (KmonVadCallbackOwnershipKnown(callbackView, decoy, &callbackOwned))
+        {
+            break;
+        }
+        callbackView.CoverageComplete = true;
+        if (!KmonVadCallbackOwnershipKnown(callbackView, decoy, &callbackOwned) ||
+            callbackOwned ||
+            KmonVadCallbackOwnershipKnown(callbackView, original + 1, &callbackOwned))
+        {
+            break;
+        }
+        callbackView.Records[0].HasPrivateMemory = true;
+        callbackView.Records.push_back(callbackVad);
+        if (KmonVadCallbackOwnershipKnown(callbackView, original + 1, &callbackOwned))
+        {
+            break;
+        }
+        callbackView.Records.clear();
+        if (!KmonVadCallbackOwnershipKnown(callbackView, original, &callbackOwned) ||
+            callbackOwned)
+        {
+            break;
+        }
+        const KmonMainImageViews spoofed =
+            KmonReconcileMainImageViews(original, decoy, decoy);
+        const KmonMainImageViews clean =
+            KmonReconcileMainImageViews(original, original, original);
+        const KmonMainImageViews denied =
+            KmonReconcileMainImageViews(original, 0, 0);
+        const KmonMainImageViews noKernel =
+            KmonReconcileMainImageViews(0, decoy, decoy);
+        if (!spoofed.KernelMismatch || spoofed.ScanBase != original ||
+            clean.KernelMismatch || clean.ScanBase != original ||
+            denied.KernelMismatch || denied.ScanBase != original ||
+            noKernel.KernelMismatch || noKernel.ScanBase != decoy ||
+            KmonReconcileMainImageViews(1, 2, 3).ScanBase != 0)
+        {
+            break;
+        }
+        if (!KmonUserModuleRangeValid(original, 0x10000) ||
+            !KmonUserModuleRangeValid(0x00007FFFFFFEF000ull, 0x1000) ||
+            KmonUserModuleRangeValid(0, 0x1000) ||
+            KmonUserModuleRangeValid(original, 0) ||
+            KmonUserModuleRangeValid(original, (std::numeric_limits<uint64_t>::max)()) ||
+            KmonUserModuleRangeValid(0x00007FFFFFFEF000ull, 0x2000) ||
+            KmonUserModuleRangeValid(0xFFFF800000010000ull, 0x1000) ||
+            !KmonUserModuleWalkComplete(1024, false, true, ERROR_NO_MORE_FILES) ||
+            KmonUserModuleWalkComplete(0, false, true, ERROR_NO_MORE_FILES) ||
+            KmonUserModuleWalkComplete(1024, true, true, ERROR_NO_MORE_FILES) ||
+            KmonUserModuleWalkComplete(2, false, false, ERROR_NO_MORE_FILES) ||
+            KmonUserModuleWalkComplete(2, false, true, ERROR_SUCCESS) ||
+            KmonUserModuleWalkComplete(2, false, true, ERROR_ACCESS_DENIED))
+        {
+            break;
+        }
+
+        const uint32_t duplicatedRvas[] = {0x1000, 0x2000, 0x2345};
+        std::vector<uint64_t> pages;
+        if (!KmonCollectUniqueCowPages(original, duplicatedRvas, 3, &pages) ||
+            pages.size() != 2 || pages[0] != original + 0x1000 ||
+            pages[1] != original + 0x2000)
+        {
+            break;
+        }
+        if (KmonCollectUniqueCowPages(
+                (std::numeric_limits<uint64_t>::max)() - 0x100,
+                duplicatedRvas,
+                3,
+                &pages) || !pages.empty() ||
+            KmonCollectUniqueCowPages(original, nullptr, 1, &pages))
+        {
+            break;
+        }
+
+        if (!KmonImageFileMissing(INVALID_FILE_ATTRIBUTES, ERROR_FILE_NOT_FOUND) ||
+            !KmonImageFileMissing(INVALID_FILE_ATTRIBUTES, ERROR_PATH_NOT_FOUND) ||
+            KmonImageFileMissing(INVALID_FILE_ATTRIBUTES, ERROR_ACCESS_DENIED) ||
+            KmonImageFileMissing(INVALID_FILE_ATTRIBUTES, ERROR_SHARING_VIOLATION) ||
+            KmonImageFileMissing(FILE_ATTRIBUTE_NORMAL, ERROR_FILE_NOT_FOUND))
+        {
+            break;
+        }
+
+        MEMORY_BASIC_INFORMATION mapped = {};
+        mapped.State = MEM_COMMIT;
+        mapped.Type = MEM_MAPPED;
+        mapped.Protect = PAGE_EXECUTE_READ;
+        mapped.RegionSize = 0x20000;
+        if (!KmonOrphanCodeCandidate(mapped))
+        {
+            break;
+        }
+        mapped.Protect |= PAGE_GUARD;
+        if (KmonOrphanCodeCandidate(mapped))
+        {
+            break;
+        }
+        mapped.Protect = PAGE_READONLY;
+        if (KmonOrphanCodeCandidate(mapped))
+        {
+            break;
+        }
+        mapped.Type = MEM_PRIVATE;
+        mapped.Protect = PAGE_EXECUTE_READ;
+        if (KmonOrphanCodeCandidate(mapped) || !KmonOrphanCodeCandidate(mapped, true))
+        {
+            break;
+        }
+        mapped.RegionSize = 0x1000;
+        if (!KmonOrphanCodeCandidate(mapped))
+        {
+            break;
+        }
+        std::vector<uint8_t> candidate(0x200);
+        for (size_t index = 0; index < candidate.size(); ++index)
+        {
+            candidate[index] = static_cast<uint8_t>(index & 0xff);
+        }
+        const std::vector<uint8_t> zeroPage(0x200, 0);
+        if (!KmonCodeProbeSupportsCandidate(true, candidate) ||
+            KmonCodeProbeSupportsCandidate(false, candidate) ||
+            KmonCodeProbeSupportsCandidate(true, zeroPage) ||
+            KmonCodeProbeSupportsCandidate(true, std::vector<uint8_t>(0x20, 0x90)))
+        {
+            break;
+        }
+
+        KmonUserThreadStart start;
+        start.ThreadId = 123;
+        start.Address = original + 0x20000;
+        if (!KmonUserThreadStartInsideRange(start, original, 0x30000) ||
+            KmonUserThreadStartInsideRange(start, original, 0x20000) ||
+            KmonUserThreadStartInsideRange(start, original + 0x21000, 0x1000))
+        {
+            break;
+        }
+        start.ThreadId = 0;
+        if (KmonUserThreadStartInsideRange(start, original, 0x30000))
+        {
+            break;
+        }
+        std::vector<KmonUserThreadStart> sampledStarts(4);
+        sampledStarts[0].ThreadId = 101;
+        sampledStarts[0].Address = original + 0x20000;
+        sampledStarts[1].ThreadId = 102;
+        sampledStarts[1].Address = original + 0x20100;
+        sampledStarts[2].ThreadId = 103;
+        sampledStarts[2].Address = original + 0x40000;
+        sampledStarts[3].ThreadId = 104;
+        sampledStarts[3].Address = original + 0x20200;
+        const std::vector<std::pair<uint64_t, uint32_t>> knownModules = {{original, 0x10000}};
+        std::vector<KmonUserThreadCodeCandidate> threadCandidates;
+        std::vector<uint64_t> queriedStarts;
+        uint32_t regionFailures = 0;
+        uint32_t probeFailures = 0;
+        uint32_t sampleReads = 0;
+        KmonCollectUserThreadCodeCandidates(
+            sampledStarts, original, knownModules,
+            [&](uint64_t address, MEMORY_BASIC_INFORMATION* region)
+            {
+                queriedStarts.push_back(address);
+                if (address == sampledStarts[2].Address)
+                {
+                    return false;
+                }
+                *region = mapped;
+                region->AllocationBase = reinterpret_cast<PVOID>(original + 0x20000);
+                region->BaseAddress = region->AllocationBase;
+                return true;
+            },
+            [&](uint64_t address, uint32_t count, std::vector<uint8_t>* bytes)
+            {
+                ++sampleReads;
+                if (address == sampledStarts[0].Address)
+                {
+                    bytes->assign(0x20, 0x90);
+                }
+                else if (address == sampledStarts[3].Address)
+                {
+                    bytes->assign(candidate.begin(), candidate.begin() + 0x80);
+                }
+                else
+                {
+                    bytes->assign(candidate.begin(), candidate.begin() + count);
+                }
+                return true;
+            },
+            &threadCandidates, &regionFailures, &probeFailures);
+        // Starts are queried even when their region is outside the current
+        // sequential VAD slice. A short first sample must not hide another
+        // start in the same allocation. A useful partial sample keeps its
+        // positive evidence while still reporting incomplete coverage.
+        if (queriedStarts.size() != 4 || queriedStarts[0] != sampledStarts[0].Address ||
+            queriedStarts[1] != sampledStarts[1].Address ||
+            queriedStarts[2] != sampledStarts[2].Address ||
+            queriedStarts[3] != sampledStarts[3].Address || sampleReads != 3 ||
+            threadCandidates.size() != 2 ||
+            threadCandidates[0].Start.ThreadId != sampledStarts[1].ThreadId ||
+            threadCandidates[1].Start.ThreadId != sampledStarts[3].ThreadId ||
+            regionFailures != 1 || probeFailures != 2)
+        {
+            break;
+        }
+        std::vector<KmonUserThreadStart> claimedStarts(3);
+        claimedStarts[0].ThreadId = 201;
+        claimedStarts[0].Address = original + 0x20000;
+        claimedStarts[1].ThreadId = 202;
+        claimedStarts[1].Address = original + 0x40000;
+        claimedStarts[2].ThreadId = 203;
+        claimedStarts[2].Address = original + 0x2000;
+        const std::vector<std::pair<uint64_t, uint32_t>> inflatedModules = {{original, 0x100000}};
+        uint32_t actualMappingQueries = 0;
+        regionFailures = 0;
+        probeFailures = 0;
+        KmonCollectUserThreadCodeCandidates(
+            claimedStarts, original, inflatedModules,
+            [&](uint64_t address, MEMORY_BASIC_INFORMATION* region)
+            {
+                ++actualMappingQueries;
+                *region = mapped;
+                region->BaseAddress = reinterpret_cast<PVOID>(address & ~0xFFFull);
+                region->AllocationBase = region->BaseAddress;
+                if (address == claimedStarts[1].Address)
+                {
+                    region->Type = MEM_MAPPED;
+                }
+                else if (address == claimedStarts[2].Address)
+                {
+                    region->Type = MEM_IMAGE;
+                    region->AllocationBase = reinterpret_cast<PVOID>(original);
+                }
+                return true;
+            },
+            [&](uint64_t, uint32_t count, std::vector<uint8_t>* bytes)
+            {
+                bytes->assign(candidate.begin(), candidate.begin() + count);
+                return true;
+            },
+            &threadCandidates, &regionFailures, &probeFailures);
+        if (actualMappingQueries != 3 || threadCandidates.size() != 2 ||
+            threadCandidates[0].Start.ThreadId != 201 || threadCandidates[1].Start.ThreadId != 202 ||
+            regionFailures != 0 || probeFailures != 0)
+        {
+            break;
+        }
+        MEMORY_BASIC_INFORMATION claimedImage = mapped;
+        claimedImage.Type = MEM_IMAGE;
+        claimedImage.BaseAddress = reinterpret_cast<PVOID>(original + 0x60000);
+        claimedImage.AllocationBase = claimedImage.BaseAddress;
+        if (!KmonOrphanRegionInteresting(claimedImage, original, inflatedModules))
+        {
+            break;
+        }
+        uint64_t resumed = 0;
+        if (!KmonAdvanceUserVmCursor(0, 0, 0x10000, &resumed) ||
+            resumed != 0x10000 ||
+            !KmonAdvanceUserVmCursor(0x11000, 0x10000, 0x3000, &resumed) ||
+            resumed != 0x13000 ||
+            KmonAdvanceUserVmCursor(0x10000, 0x11000, 0x1000, &resumed) ||
+            KmonAdvanceUserVmCursor(0x10000, 0x10000, 0, &resumed) ||
+            KmonAdvanceUserVmCursor(0x10000, 0x10000,
+                (std::numeric_limits<uint64_t>::max)(), &resumed))
+        {
+            break;
+        }
+
+        const std::pair<uint32_t, uint64_t> stableGeneration(100, 123);
+        std::map<std::pair<uint32_t, uint64_t>, uint64_t> vmCursors;
+        std::map<std::pair<uint32_t, uint64_t>, uint32_t> sampledThreadCursors;
+        std::set<uint64_t> visitedVmSlices;
+        for (uint32_t pass = 0; pass < 6; ++pass)
+        {
+            const KmonUserGenerationInventory inventory = {{100, (pass & 1u) == 0 ? 123ull : 0ull}};
+            KmonPruneUserCursors(inventory, true, &vmCursors);
+            KmonPruneUserCursors(inventory, true, &sampledThreadCursors);
+            uint64_t nextVm = vmCursors[stableGeneration];
+            visitedVmSlices.insert(nextVm / 4096);
+            nextVm = (nextVm + 4096) % 12288;
+            const uint32_t nextThread = sampledThreadCursors[stableGeneration] + 1;
+            if (!KmonRememberUserCursor(inventory, stableGeneration, nextVm, &vmCursors) ||
+                !KmonRememberUserCursor(inventory, stableGeneration, nextThread, &sampledThreadCursors))
+            {
+                break;
+            }
+        }
+        if (visitedVmSlices.size() != 3 || sampledThreadCursors[stableGeneration] != 6)
+        {
+            break;
+        }
+        KmonPruneUserCursors(KmonUserGenerationInventory{}, false, &vmCursors);
+        if (vmCursors.count(stableGeneration) == 0)
+        {
+            break;
+        }
+        KmonPruneUserCursors(KmonUserGenerationInventory{{100, 124}}, false, &vmCursors);
+        if (!vmCursors.empty())
+        {
+            break;
+        }
+        KmonPruneUserCursors(KmonUserGenerationInventory{}, true, &sampledThreadCursors);
+        if (!sampledThreadCursors.empty())
+        {
+            break;
+        }
+        KmonUserGenerationInventory fullInventory;
+        for (uint32_t pid = 1; pid <= kMaxUserCursorGenerations; ++pid)
+        {
+            vmCursors[{pid, 123}] = 0x10000ull + pid;
+            fullInventory[pid + 1] = 123;
+        }
+        if (KmonRememberUserCursor(fullInventory, {4097, 123}, uint64_t(0x20000), &vmCursors) ||
+            vmCursors.size() != kMaxUserCursorGenerations || vmCursors.count({1, 123}) != 0 ||
+            vmCursors.count({2, 123}) != 1 || vmCursors.count({4097, 123}) != 1 ||
+            vmCursors.at({2, 123}) != 0x10002 || vmCursors.at({4097, 123}) != 0x20000)
+        {
+            break;
+        }
+        // A confirmed new generation replaces its own old slot at capacity.
+        if (!KmonRememberUserCursor(fullInventory, {2, 124}, uint64_t(0x30000), &vmCursors) ||
+            vmCursors.size() != kMaxUserCursorGenerations || vmCursors.count({2, 123}) != 0 ||
+            vmCursors.count({2, 124}) != 1 ||
+            vmCursors.at({2, 124}) != 0x30000 ||
+            KmonRememberUserCursor(fullInventory, {5000, 123}, uint64_t(0), &vmCursors) ||
+            vmCursors.size() != kMaxUserCursorGenerations || vmCursors.count({5000, 123}) != 0)
+        {
+            break;
+        }
+
+        KmonUserThreadInventory ownThreadInventory;
+        std::vector<KmonUserThreadStart> ownStarts;
+        uint32_t queryBudget = 64;
+        uint32_t afterThreadId = 0;
+        const uint64_t ownCreateTime = QueryProcessCreateTicks(GetCurrentProcess());
+        KmonCollectLiveUserThreadStarts(&ownThreadInventory, GetCurrentProcessId(),
+            ownCreateTime, &afterThreadId, &queryBudget, &ownStarts);
+        if (ownStarts.empty())
+        {
+            break;
+        }
+        queryBudget = 64;
+        const uint32_t previousThreadId = afterThreadId;
+        if (KmonCollectLiveUserThreadStarts(&ownThreadInventory, GetCurrentProcessId(),
+                ownCreateTime + 1, &afterThreadId, &queryBudget, &ownStarts) ||
+            !ownStarts.empty() || queryBudget != 64 || afterThreadId != previousThreadId)
+        {
+            break;
+        }
+
+        std::vector<KmonUserTarget> population;
+        for (uint32_t pid = 8; pid < 2208; ++pid)
+        {
+            KmonUserTarget target;
+            target.Pid = pid;
+            target.HighPriority = pid < 1408;
+            target.Interesting = true;
+            population.push_back(std::move(target));
+        }
+        std::unordered_set<uint32_t> visited;
+        bool scheduleValid = true;
+        for (uint64_t pass = 0; pass < 4; ++pass)
+        {
+            std::vector<KmonUserTarget> scheduled = population;
+            KmonScheduleUserTargets(&scheduled, pass, 1024);
+            std::unordered_set<uint32_t> thisPass;
+            uint32_t high = 0;
+            uint32_t other = 0;
+            for (const KmonUserTarget& target : scheduled)
+            {
+                thisPass.insert(target.Pid);
+                visited.insert(target.Pid);
+                if (target.HighPriority)
+                {
+                    ++high;
+                }
+                else
+                {
+                    ++other;
+                }
+            }
+            if (scheduled.size() != 1024 || thisPass.size() != 1024 ||
+                high != 768 || other != 256)
+            {
+                scheduleValid = false;
+                break;
+            }
+        }
+        if (!scheduleValid || visited.size() != population.size())
+        {
+            break;
+        }
+
+        population.clear();
+        for (uint32_t pid = 8; pid < 2056; ++pid)
+        {
+            KmonUserTarget target;
+            target.Pid = pid;
+            target.CreateTime = 0x10000ull + pid;
+            population.push_back(std::move(target));
+        }
+        std::map<std::pair<uint32_t, uint64_t>, uint32_t> threadCursors;
+        std::set<std::pair<uint32_t, uint32_t>> visitedThreads;
+        for (uint64_t pass = 0; pass < 4 && scheduleValid; ++pass)
+        {
+            std::vector<KmonUserTarget> scheduled = population;
+            KmonScheduleUserTargets(&scheduled, pass, 1024);
+            KmonAssignUserThreadQueryQuotas(&scheduled, 1024);
+            uint32_t passQueries = 0;
+            for (const KmonUserTarget& target : scheduled)
+            {
+                const std::vector<uint32_t> tids = {target.Pid * 2, target.Pid * 2 + 1};
+                uint32_t remaining = target.ThreadQueryQuota;
+                uint32_t& after = threadCursors[{target.Pid, target.CreateTime}];
+                uint32_t tid = 0;
+                if (remaining != 1 ||
+                    !KmonTakeNextUserThreadQuery(tids, &after, &remaining, &tid) ||
+                    remaining != 0 || !visitedThreads.emplace(target.Pid, tid).second)
+                {
+                    scheduleValid = false;
+                    break;
+                }
+                ++passQueries;
+            }
+            if (passQueries != 1024)
+            {
+                scheduleValid = false;
+            }
+        }
+        // Host selection and thread quotas must be exercised together: the
+        // previous shared budget queried only the first half of each group.
+        if (!scheduleValid || visitedThreads.size() != 4096 || threadCursors.size() != 2048)
+        {
+            break;
+        }
+        std::vector<uint32_t> manyThreads;
+        for (uint32_t tid = 1; tid <= 128; ++tid)
+        {
+            manyThreads.push_back(tid);
+        }
+        std::set<uint32_t> visitedManyThreads;
+        uint32_t afterMany = 0;
+        for (uint32_t visit = 0; visit < 2; ++visit)
+        {
+            uint32_t remaining = 64;
+            uint32_t tid = 0;
+            while (KmonTakeNextUserThreadQuery(manyThreads, &afterMany, &remaining, &tid))
+            {
+                visitedManyThreads.insert(tid);
+            }
+        }
+        if (visitedManyThreads.size() != manyThreads.size())
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+    return ok;
+}
+
+bool KernelMonitorMappedSectionSelfTest()
+{
+    bool ok = false;
+    HANDLE mapping = nullptr;
+    void* view = nullptr;
+    do
+    {
+        mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+            PAGE_EXECUTE_READWRITE, 0, 0x1000, nullptr);
+        if (mapping == nullptr)
+        {
+            break;
+        }
+        view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE,
+            0, 0, 0x1000);
+        if (view == nullptr)
+        {
+            break;
+        }
+        auto* bytes = static_cast<uint8_t*>(view);
+        for (size_t index = 0; index < 0x1000; ++index)
+        {
+            bytes[index] = static_cast<uint8_t>(index & 0xFF);
+        }
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(view, 0x1000, PAGE_EXECUTE_READ, &oldProtection))
+        {
+            break;
+        }
+        MEMORY_BASIC_INFORMATION region = {};
+        std::vector<uint8_t> observed(0x200);
+        SIZE_T bytesRead = 0;
+        if (VirtualQueryEx(GetCurrentProcess(), view, &region, sizeof(region)) != sizeof(region) ||
+            region.Type != MEM_MAPPED || !KmonOrphanCodeCandidate(region) ||
+            !ReadProcessMemory(GetCurrentProcess(), view, observed.data(), observed.size(), &bytesRead) ||
+            bytesRead != observed.size() || !KmonCodeProbeSupportsCandidate(true, observed))
+        {
+            break;
+        }
+        // Same section and bytes, but no execute permission: negative control.
+        if (!VirtualProtect(view, 0x1000, PAGE_READONLY, &oldProtection) ||
+            VirtualQueryEx(GetCurrentProcess(), view, &region, sizeof(region)) != sizeof(region) ||
+            KmonOrphanCodeCandidate(region))
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+    if (view != nullptr)
+    {
+        UnmapViewOfFile(view);
+    }
+    if (mapping != nullptr)
+    {
+        CloseHandle(mapping);
+    }
+    return ok;
 }
 
 bool KernelMonitorArtifactSelfTest(KmonArtifactSkipReason* skipReason)
@@ -17238,17 +21677,102 @@ bool KernelMonitorHiddenDriverSelfTest()
 
     // --- type-list reporting cap (silent truncation must be surfaced) ------
     {
-        // Everything that was found reached the caller.
-        ok = ok && !KmonTypeListReportCapped(3, 0, 3);
+        // Deduplicated or evidence-ineligible rows do not exhaust a report cap.
+        ok = ok && !KmonTypeListReportCapped(0, 0);
         // The result cap dropped objects before the emit loop saw them.
-        ok = ok && KmonTypeListReportCapped(65, 1, 16);
-        // The emit cap stopped early even though the result held every object.
-        ok = ok && KmonTypeListReportCapped(64, 0, 16);
-        // fail-closed: nothing found is nothing to warn about.
-        ok = ok && !KmonTypeListReportCapped(0, 0, 0);
-        // A reported count above the found count cannot happen and must not
-        // turn into a warning on its own.
-        ok = ok && !KmonTypeListReportCapped(2, 0, 5);
+        ok = ok && KmonTypeListReportCapped(1, 0);
+        // An unseen eligible row was withheld by the event limit.
+        ok = ok && KmonTypeListReportCapped(0, 1);
+        ok = ok && KmonTypeListReportCapped(1, 1);
+    }
+
+    // All capped scanners share this production admission helper. Repeated
+    // prefixes must drain the full candidate set over later passes.
+    {
+        const size_t limits[] =
+        {
+            4, 8, 16
+        };
+        for (size_t limit : limits)
+        {
+            const size_t candidates = limit * 2 + 2;
+            std::set<size_t> published;
+            for (size_t pass = 0; pass < 4; ++pass)
+            {
+                size_t emitted = 0;
+                size_t deferred = 0;
+                for (size_t candidate = 0; candidate < candidates; ++candidate)
+                {
+                    const bool wasPublished = published.count(candidate) != 0;
+                    const bool didPublish = KmonTryBoundedEmission(
+                        limit,
+                        &emitted,
+                        &deferred,
+                        [&]()
+                        {
+                            return published.insert(candidate).second;
+                        },
+                        [&]()
+                        {
+                            return published.count(candidate) != 0;
+                        });
+                    ok = ok && (!didPublish || !wasPublished);
+
+                    // Repeated views of the same emitted slot do not consume
+                    // quota or inflate deferred counts even at the cap.
+                    if (published.count(candidate) != 0)
+                    {
+                        const size_t beforeEmitted = emitted;
+                        const size_t beforeDeferred = deferred;
+                        ok = ok && !KmonTryBoundedEmission(
+                            limit,
+                            &emitted,
+                            &deferred,
+                            [&]()
+                            {
+                                return published.insert(candidate).second;
+                            },
+                            [&]()
+                            {
+                                return published.count(candidate) != 0;
+                            });
+                        ok = ok && emitted == beforeEmitted && deferred == beforeDeferred;
+                    }
+                }
+                const size_t expectedEmitted = pass < 2 ? limit : (pass == 2 ? 2 : 0);
+                const size_t expectedDeferred = pass == 0 ? limit + 2 : (pass == 1 ? 2 : 0);
+                ok = ok && emitted == expectedEmitted && deferred == expectedDeferred;
+            }
+            ok = ok && published.size() == candidates;
+        }
+
+        // A failed or concurrent deduplicated emission is not a publication.
+        size_t emitted = 0;
+        size_t deferred = 0;
+        ok = ok && !KmonTryBoundedEmission(
+            1, &emitted, &deferred,
+            []()
+            {
+                return false;
+            },
+            []()
+            {
+                return false;
+            });
+        ok = ok && emitted == 0 && deferred == 0;
+        bool attempted = false;
+        ok = ok && !KmonTryBoundedEmission(
+            0, &emitted, &deferred,
+            [&]()
+            {
+                attempted = true;
+                return true;
+            },
+            []()
+            {
+                return false;
+            });
+        ok = ok && !attempted && emitted == 0 && deferred == 1;
     }
 
     // --- kernel-context cross-view (driver.inventory_divergence) ----------
@@ -17552,20 +22076,63 @@ namespace
         uint64_t End = 0;
     };
 
-    void KmonBuildThreadModuleRanges(
-        SymbolEngine* symbols,
+    struct KmonThreadStartLayout
+    {
+        uint32_t StartOffset = 0;
+        uint32_t Win32StartOffset = 0;
+        bool HasStart = false;
+        bool HasWin32Start = false;
+    };
+
+    template <typename Resolver>
+    KmonThreadStartLayout KmonResolveThreadStartLayout(Resolver resolve)
+    {
+        KmonThreadStartLayout layout;
+        layout.HasStart = resolve(L"_ETHREAD", L"StartAddress", &layout.StartOffset);
+        layout.HasWin32Start = resolve(L"_ETHREAD", L"Win32StartAddress", &layout.Win32StartOffset);
+        return layout;
+    }
+
+    bool KmonHostThreadWalkComplete(size_t count, bool capped, DWORD terminalError)
+    {
+        return count != 0 && !capped && terminalError == ERROR_NO_MORE_FILES;
+    }
+
+    std::wstring KmonThreadIdentityKey(const KmonKernelThreadInput& input)
+    {
+        return std::to_wstring(input.ProcessId) + L":" +
+            std::to_wstring(input.ThreadId) + L":" + HexU64(input.ThreadObject);
+    }
+
+    std::wstring KmonThreadListIdentityKey(const KmonKernelThreadListInput& input)
+    {
+        return std::to_wstring(input.ProcessId) + L":" + HexU64(input.ProcessObject);
+    }
+
+    bool KmonReadKernelU32(DeviceClient* device, uint64_t address, uint32_t* value)
+    {
+        std::vector<uint8_t> bytes;
+        const bool known = value != nullptr &&
+            KmonReadKernelBytes(device, address, sizeof(*value), &bytes) &&
+            bytes.size() == sizeof(*value);
+        if (known)
+        {
+            std::memcpy(value, bytes.data(), sizeof(*value));
+        }
+        return known;
+    }
+
+    bool KmonBuildThreadModuleRanges(
+        const std::vector<KernelModuleInfo>& modules,
         std::vector<KmonThreadModuleRange>* ranges)
     {
+        bool complete = !modules.empty();
         ranges->clear();
-        if (symbols == nullptr)
-        {
-            return;
-        }
-        const std::vector<KernelModuleInfo> modules = symbols->CopyModules();
         for (const KernelModuleInfo& module : modules)
         {
-            if (module.Base == 0 || module.Size == 0)
+            if (module.Base < kThreadVaFloor || module.Size == 0)
             {
+                complete = false;
                 continue;
             }
             KmonThreadModuleRange range = {};
@@ -17573,10 +22140,12 @@ namespace
             range.End = module.Base + static_cast<uint64_t>(module.Size);
             if (range.End <= range.Base)
             {
+                complete = false;
                 continue;
             }
             ranges->push_back(range);
         }
+        return complete && !ranges->empty();
     }
 
     // A plain range scan: the module list is short and the walk only tests one
@@ -17600,7 +22169,7 @@ namespace
     // and one after: a thread created between the two only ever appears in the
     // kernel list, so a single snapshot would report every new thread as
     // hidden. Empty or capped snapshots are not a verdict input.
-    bool KmonCollectHostThreads(std::unordered_set<uint32_t>* out)
+    bool KmonCollectHostThreads(std::unordered_set<uint64_t>* out)
     {
         if (out == nullptr)
         {
@@ -17616,19 +22185,26 @@ namespace
         entry.dwSize = sizeof(entry);
         size_t count = 0;
         bool truncated = false;
-        for (BOOL more = Thread32First(snapshot, &entry);
-             more != FALSE;
-             more = Thread32Next(snapshot, &entry))
+        BOOL more = Thread32First(snapshot, &entry);
+        DWORD terminalError = more ? ERROR_SUCCESS : GetLastError();
+        while (more)
         {
-            out->insert(static_cast<uint32_t>(entry.th32ThreadID));
+            out->insert((static_cast<uint64_t>(entry.th32OwnerProcessID) << 32) |
+                entry.th32ThreadID);
             if (++count >= kMaxHostThreads)
             {
                 truncated = true;
                 break;
             }
+            entry.dwSize = sizeof(entry);
+            more = Thread32Next(snapshot, &entry);
+            if (!more)
+            {
+                terminalError = GetLastError();
+            }
         }
         CloseHandle(snapshot);
-        return !out->empty() && !truncated;
+        return KmonHostThreadWalkComplete(count, truncated, terminalError);
     }
 }
 
@@ -17638,7 +22214,7 @@ KmonKernelThreadKind KmonClassifyKernelThread(const KmonKernelThreadInput& input
     // start address that no loaded image owns is a thread whose code the loader
     // list cannot explain, and that verdict does not depend on either view
     // being complete.
-    if (input.StartAddressKnown &&
+    if (input.ModuleViewKnown && input.StartAddressKnown &&
         input.StartIsKernelAddress &&
         input.StartAddress != 0 &&
         !input.StartInLoadedModule)
@@ -17679,6 +22255,7 @@ KmonKernelThreadKind KmonClassifyKernelThreadList(
     // a thread that exits inside the walk window into an unlinked thread.
     if (input.AccountingKnown &&
         input.ListComplete &&
+        input.AccountingBefore == input.AccountingAfter &&
         input.AccountingBefore > input.WalkedThreads &&
         input.AccountingAfter > input.WalkedThreads)
     {
@@ -17690,6 +22267,13 @@ KmonKernelThreadKind KmonClassifyKernelThreadList(
 void KernelMonitor::ScanKernelThreads()
 {
     ThreadScans.fetch_add(1);
+    std::map<std::wstring, uint32_t> previousHidden;
+    std::map<std::wstring, uint32_t> previousDkom;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        previousHidden.swap(ThreadHiddenStrikes);
+        previousDkom.swap(ThreadListDkomStrikes);
+    }
 
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
@@ -17710,18 +22294,21 @@ void KernelMonitor::ScanKernelThreads()
         return;
     }
     ClearEmittedKey(L"scan_failed:thread:device");
-    if (!EnsureLoadedKernelModules(symbols, true))
+    const bool moduleInventoryKnown = EnsureLoadedKernelModules(symbols, true);
+    if (!moduleInventoryKnown)
     {
         EmitUnique(
             L"thread.scan",
             L"scan_failed:thread:inventory",
             std::wstring(),
             L"thread_list",
-            L"kernel thread scan skipped; kernel module inventory unavailable",
+            L"kernel thread starts cannot be classified; kernel module inventory unavailable",
             L"EnsureLoadedKernelModules returned false");
-        return;
     }
-    ClearEmittedKey(L"scan_failed:thread:inventory");
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:inventory");
+    }
 
     uint32_t processLinksOffset = 0;
     uint32_t pidOffset = 0;
@@ -17729,16 +22316,12 @@ void KernelMonitor::ScanKernelThreads()
     uint32_t imageNameOffset = 0;
     uint32_t threadEntryOffset = 0;
     uint32_t cidOffset = 0;
-    uint32_t tcbOffset = 0;
-    uint32_t startOffset = 0;
     const bool offsetsResolved =
         KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ActiveProcessLinks", &processLinksOffset) &&
         KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"UniqueProcessId", &pidOffset) &&
         KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ThreadListHead", &threadListOffset) &&
         KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"ThreadListEntry", &threadEntryOffset) &&
-        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"Cid", &cidOffset) &&
-        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"Tcb", &tcbOffset) &&
-        KmonFindKernelFieldOffset(symbols, L"_KTHREAD", L"StartAddress", &startOffset);
+        KmonFindKernelFieldOffset(symbols, L"_ETHREAD", L"Cid", &cidOffset);
     if (!offsetsResolved)
     {
         EmitUnique(
@@ -17746,11 +22329,30 @@ void KernelMonitor::ScanKernelThreads()
             L"scan_failed:thread:offsets",
             std::wstring(),
             L"thread_list",
-            L"kernel thread scan skipped; _EPROCESS/_ETHREAD/_KTHREAD field offsets were not resolvable",
+            L"kernel thread scan skipped; _EPROCESS/_ETHREAD list field offsets were not resolvable",
             L"SymbolEngine::FindField could not resolve the thread walk fields");
         return;
     }
     ClearEmittedKey(L"scan_failed:thread:offsets");
+    const KmonThreadStartLayout startLayout = KmonResolveThreadStartLayout(
+        [symbols](const wchar_t* type, const wchar_t* field, uint32_t* offset)
+        {
+            return KmonFindKernelFieldOffset(symbols, type, field, offset);
+        });
+    if (!startLayout.HasStart && !startLayout.HasWin32Start)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:start_offsets",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread start fields unavailable; only thread-view checks remain active",
+            L"_ETHREAD.StartAddress and _ETHREAD.Win32StartAddress were not resolvable");
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:start_offsets");
+    }
     const bool hasImageName = KmonFindKernelFieldOffset(
         symbols,
         L"_EPROCESS",
@@ -17763,8 +22365,7 @@ void KernelMonitor::ScanKernelThreads()
     // whole layer.
     uint32_t activeThreadsOffset = 0;
     const bool hasThreadAccounting =
-        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ActiveThreads", &activeThreadsOffset) ||
-        KmonFindKernelFieldOffset(symbols, L"_KPROCESS", L"ActiveThreads", &activeThreadsOffset);
+        KmonFindKernelFieldOffset(symbols, L"_EPROCESS", L"ActiveThreads", &activeThreadsOffset);
     if (!hasThreadAccounting)
     {
         EmitUnique(
@@ -17773,14 +22374,14 @@ void KernelMonitor::ScanKernelThreads()
             std::wstring(),
             L"thread_list",
             L"kernel thread scan has no ActiveThreads offset; the ETHREAD list DKOM verdict is withheld",
-            L"_EPROCESS.ActiveThreads and _KPROCESS.ActiveThreads were not resolvable");
+            L"_EPROCESS.ActiveThreads was not resolvable");
     }
     else
     {
         ClearEmittedKey(L"scan_failed:thread:counts");
     }
 
-    std::unordered_set<uint32_t> hostBefore;
+    std::unordered_set<uint64_t> hostBefore;
     const bool hostBeforeKnown = KmonCollectHostThreads(&hostBefore);
 
     uint64_t head = 0;
@@ -17814,8 +22415,9 @@ void KernelMonitor::ScanKernelThreads()
     ClearEmittedKey(L"scan_failed:thread:list");
 
     std::vector<KmonThreadModuleRange> ranges;
-    KmonBuildThreadModuleRanges(symbols, &ranges);
-    if (ranges.empty())
+    const bool moduleRangesComplete = moduleInventoryKnown &&
+        KmonBuildThreadModuleRanges(symbols->CopyModules(), &ranges);
+    if (!moduleRangesComplete)
     {
         // An empty inventory must not mark every kernel thread as unbacked;
         // this is the same rule AddressOwnedByLoadedModule follows for
@@ -17825,20 +22427,23 @@ void KernelMonitor::ScanKernelThreads()
             L"scan_failed:thread:modules",
             std::wstring(),
             L"thread_list",
-            L"kernel thread scan skipped; no kernel module range with a known size was available",
-            L"SymbolEngine::CopyModules returned no sized module");
-        return;
+            L"kernel thread start verdict deferred; complete kernel module ranges were unavailable",
+            L"the module inventory was empty or contained an invalid range");
     }
-    ClearEmittedKey(L"scan_failed:thread:modules");
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:modules");
+    }
 
     std::vector<KmonKernelThreadInput> collected;
     collected.reserve(1024);
-    std::set<uint32_t> dkomCandidates;
+    std::set<std::wstring> dkomCandidates;
     std::vector<KmonKernelThreadListInput> dkomVerdicts;
     std::set<uint64_t> visitedProcesses;
     std::set<uint64_t> visitedThreads;
     uint64_t link = firstProcess;
     bool walkComplete = true;
+    uint32_t unreadableStarts = 0;
     while (link != head)
     {
         // Shutdown: the walk is abandoned and the partial list is never used
@@ -17859,7 +22464,8 @@ void KernelMonitor::ScanKernelThreads()
         const uint64_t process = link - processLinksOffset;
 
         uint64_t pidValue = 0;
-        if (!KmonReadKernelU64(device, process + pidOffset, &pidValue))
+        if (!KmonReadKernelU64(device, process + pidOffset, &pidValue) ||
+            pidValue > (std::numeric_limits<uint32_t>::max)())
         {
             walkComplete = false;
             break;
@@ -17891,24 +22497,22 @@ void KernelMonitor::ScanKernelThreads()
 
         const uint64_t threadHead = process + threadListOffset;
         uint64_t threadFirst = 0;
+        uint32_t accountingBefore = 0;
+        bool accountingKnown = false;
+        if (hasThreadAccounting)
+        {
+            if (KmonReadKernelU32(
+                    device,
+                    process + activeThreadsOffset,
+                    &accountingBefore))
+            {
+                accountingKnown = true;
+            }
+        }
         if (!KmonReadKernelU64(device, threadHead, &threadFirst))
         {
             walkComplete = false;
             break;
-        }
-        uint64_t accountingBefore = 0;
-        bool accountingKnown = false;
-        if (hasThreadAccounting)
-        {
-            uint64_t rawAccounting = 0;
-            if (KmonReadKernelU64(
-                    device,
-                    process + activeThreadsOffset,
-                    &rawAccounting))
-            {
-                accountingBefore = rawAccounting & 0xFFFFFFFFu;
-                accountingKnown = true;
-            }
         }
         uint64_t threadLink = threadFirst;
         size_t perProcess = 0;
@@ -17936,20 +22540,43 @@ void KernelMonitor::ScanKernelThreads()
 
             const uint64_t thread = threadLink - threadEntryOffset;
             uint64_t tidValue = 0;
+            uint64_t ownerPid = 0;
             uint64_t startAddress = 0;
-            if (!KmonReadKernelU64(device, thread + cidOffset + 8, &tidValue))
+            if (!KmonReadKernelU64(device, thread + cidOffset, &ownerPid) ||
+                !KmonReadKernelU64(device, thread + cidOffset + 8, &tidValue) ||
+                ownerPid != pidValue || tidValue > (std::numeric_limits<uint32_t>::max)())
             {
                 walkComplete = false;
                 break;
             }
-            const bool startKnown = KmonReadKernelU64(
+            bool startKnown = startLayout.HasStart && KmonReadKernelU64(
                 device,
-                thread + tcbOffset + startOffset,
+                thread + startLayout.StartOffset,
                 &startAddress);
+            const bool primaryStartKnown = startKnown;
+            uint64_t win32Start = 0;
+            const bool win32StartKnown = startLayout.HasWin32Start && KmonReadKernelU64(
+                device,
+                thread + startLayout.Win32StartOffset,
+                &win32Start);
+            if (win32StartKnown &&
+                (!startKnown ||
+                 (win32Start >= kThreadVaFloor && !KmonThreadRangeCovers(ranges, win32Start))))
+            {
+                startAddress = win32Start;
+                startKnown = true;
+            }
+            if ((startLayout.HasStart && !primaryStartKnown) ||
+                (startLayout.HasWin32Start && !win32StartKnown))
+            {
+                ++unreadableStarts;
+            }
 
             KmonKernelThreadInput input = {};
             input.ProcessId = pid;
             input.ThreadId = static_cast<uint32_t>(tidValue & 0xFFFFFFFFu);
+            input.ThreadObject = thread;
+            input.ModuleViewKnown = moduleRangesComplete;
             input.StartAddress = startKnown ? startAddress : 0;
             input.StartAddressKnown = startKnown;
             input.StartIsKernelAddress = startKnown && startAddress >= kThreadVaFloor;
@@ -17985,13 +22612,14 @@ void KernelMonitor::ScanKernelThreads()
         // short list against the kernel accounting is an unlinked thread.
         if (accountingKnown)
         {
-            uint64_t rawAccounting = 0;
-            const bool accountingAfterKnown = KmonReadKernelU64(
+            uint32_t rawAccounting = 0;
+            const bool accountingAfterKnown = KmonReadKernelU32(
                 device,
                 process + activeThreadsOffset,
                 &rawAccounting);
             KmonKernelThreadListInput listInput = {};
             listInput.ProcessId = pid;
+            listInput.ProcessObject = process;
             listInput.WalkedThreads = static_cast<uint32_t>(walkedThreads);
             listInput.AccountingBefore = static_cast<uint32_t>(accountingBefore);
             listInput.AccountingAfter = accountingAfterKnown
@@ -18002,7 +22630,7 @@ void KernelMonitor::ScanKernelThreads()
             if (KmonClassifyKernelThreadList(listInput) ==
                 KmonKernelThreadKind::UnlinkedFromThreadList)
             {
-                dkomCandidates.insert(pid);
+                dkomCandidates.insert(KmonThreadListIdentityKey(listInput));
                 dkomVerdicts.push_back(listInput);
             }
         }
@@ -18017,21 +22645,70 @@ void KernelMonitor::ScanKernelThreads()
         link = nextProcess;
     }
 
-    std::unordered_set<uint32_t> hostAfter;
+    if (StopRequested.load())
+    {
+        return;
+    }
+    std::unordered_set<uint64_t> hostAfter;
     const bool hostAfterKnown = KmonCollectHostThreads(&hostAfter);
     const bool hostViewKnown = hostBeforeKnown && hostAfterKnown;
 
+    std::vector<PendingIrpThreadInput> irpThreads;
+    for (const KmonKernelThreadInput& thread : collected)
+    {
+        irpThreads.push_back({thread.ThreadObject, thread.ProcessId, thread.ThreadId});
+    }
+    PendingIrpScanner irpScanner(*device, *symbols);
+    PendingIrpScanOptions irpOptions;
+    irpOptions.Cursor = IrpCompletionCursor;
+    irpOptions.ThreadInventoryComplete = walkComplete;
+    PendingIrpScanResult irpResult;
+    std::vector<KernelCallbackRecord> irpTargets;
+    if (irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored))
+    {
+        IrpCompletionCursor = irpResult.NextCursor;
+        for (const PendingIrpCompletionRecord& record : irpResult.Records)
+        {
+            KernelCallbackRecord target;
+            target.Kind = L"irp_completion_observed";
+            target.Entry = record.Irp;
+            target.Function = record.CompletionRoutine;
+            target.FunctionSlot = record.CompletionSlot;
+            target.FunctionModule = record.Module;
+            irpTargets.push_back(std::move(target));
+            if (record.Suspicious && record.StableObservation)
+            {
+                EmitUnique(L"hook.unbacked", L"irp_completion:" + HexU64(record.Irp) + L":" + HexU64(record.CompletionRoutine),
+                    record.Module, L"irp_completion", L"outstanding IRP completion lacks loaded-module attribution",
+                    L"irp=" + HexU64(record.Irp) + L" routine=" + HexU64(record.CompletionRoutine) +
+                    L" tid=" + std::to_wstring(record.ThreadId) + L" referenced_lifetime=0; stable repeated snapshot only",
+                    record.ProcessId);
+            }
+        }
+    }
+    RememberExecutionCallbacks(L"irp_completion", irpTargets);
+    if (!irpResult.CoverageComplete)
+    {
+        EmitUnique(L"sensor.coverage", L"scan_failed:irp_completion", L"", L"irp_completion",
+            L"outstanding IRP inspection is partial", irpResult.CoverageScope + L" " + ignored);
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:irp_completion");
+    }
+
     uint32_t emitted = 0;
     bool capped = false;
-    std::set<uint32_t> hiddenCandidates;
+    std::set<std::wstring> hiddenCandidates;
     for (const KmonKernelThreadInput& raw : collected)
     {
         KmonKernelThreadInput input = raw;
         input.KernelListComplete = walkComplete;
         input.HostViewKnown = hostViewKnown;
+        const uint64_t hostIdentity = (static_cast<uint64_t>(raw.ProcessId) << 32) | raw.ThreadId;
         input.HostViewHasThread =
             raw.ThreadId != 0 &&
-            (hostBefore.count(raw.ThreadId) != 0 || hostAfter.count(raw.ThreadId) != 0);
+            (hostBefore.count(hostIdentity) != 0 || hostAfter.count(hostIdentity) != 0);
 
         const KmonKernelThreadKind kind = KmonClassifyKernelThread(input);
         if (kind == KmonKernelThreadKind::None)
@@ -18040,7 +22717,8 @@ void KernelMonitor::ScanKernelThreads()
         }
         if (kind == KmonKernelThreadKind::HiddenFromHostView)
         {
-            hiddenCandidates.insert(input.ThreadId);
+            const std::wstring identity = KmonThreadIdentityKey(input);
+            hiddenCandidates.insert(identity);
             uint32_t strikes = 0;
             {
                 std::lock_guard<std::mutex> lock(WatchMutex);
@@ -18048,7 +22726,8 @@ void KernelMonitor::ScanKernelThreads()
                 {
                     ThreadHiddenStrikes.clear();
                 }
-                strikes = ++ThreadHiddenStrikes[input.ThreadId];
+                strikes = (std::min)(previousHidden[identity] + 1, kThreadStrikeThreshold);
+                ThreadHiddenStrikes[identity] = strikes;
             }
             if (strikes < kThreadStrikeThreshold)
             {
@@ -18093,8 +22772,9 @@ void KernelMonitor::ScanKernelThreads()
         }
 
         const std::wstring key = std::wstring(L"thread:") +
-            KmonKernelThreadKindName(kind) + L":" + pidText + L":" + tidText;
-        EmitUnique(
+            KmonKernelThreadKindName(kind) + L":" + KmonThreadIdentityKey(input) +
+            (kind == KmonKernelThreadKind::UnbackedStart ? L":" + HexU64(input.StartAddress) : L"");
+        if (EmitUnique(
             kind == KmonKernelThreadKind::UnbackedStart
                 ? L"thread.unbacked"
                 : L"thread.hidden",
@@ -18103,10 +22783,17 @@ void KernelMonitor::ScanKernelThreads()
             layer,
             summary,
             notes,
-            input.ProcessId);
-        emitted += 1;
+            input.ProcessId))
+        {
+            emitted += 1;
+        }
     }
 
+    if (!walkComplete || StopRequested.load())
+    {
+        dkomCandidates.clear();
+        dkomVerdicts.clear();
+    }
     for (const KmonKernelThreadListInput& raw : dkomVerdicts)
     {
         uint32_t strikes = 0;
@@ -18116,7 +22803,9 @@ void KernelMonitor::ScanKernelThreads()
             {
                 ThreadListDkomStrikes.clear();
             }
-            strikes = ++ThreadListDkomStrikes[raw.ProcessId];
+            const std::wstring identity = KmonThreadListIdentityKey(raw);
+            strikes = (std::min)(previousDkom[identity] + 1, kThreadStrikeThreshold);
+            ThreadListDkomStrikes[identity] = strikes;
         }
         if (strikes < kThreadStrikeThreshold)
         {
@@ -18129,9 +22818,9 @@ void KernelMonitor::ScanKernelThreads()
         }
 
         const std::wstring pidText = std::to_wstring(raw.ProcessId);
-        EmitUnique(
+        if (EmitUnique(
             L"thread.dkom",
-            std::wstring(L"thread:unlinked_from_thread_list:") + pidText,
+            std::wstring(L"thread:unlinked_from_thread_list:") + KmonThreadListIdentityKey(raw),
             std::wstring(),
             L"thread_list",
             L"process pid=" + pidText + L" accounts for " +
@@ -18141,8 +22830,10 @@ void KernelMonitor::ScanKernelThreads()
             L"walked=" + std::to_wstring(raw.WalkedThreads) +
                 L" accounted_before=" + std::to_wstring(raw.AccountingBefore) +
                 L" accounted_after=" + std::to_wstring(raw.AccountingAfter),
-            raw.ProcessId);
-        emitted += 1;
+            raw.ProcessId))
+        {
+            emitted += 1;
+        }
     }
 
     {
@@ -18182,7 +22873,7 @@ void KernelMonitor::ScanKernelThreads()
             L"thread_list",
             L"kernel thread scan capped at " + std::to_wstring(kThreadEmitCap) +
                 L" findings; more hidden threads or thread-list divergences exist in this pass",
-            L"reattach after the mapper watch window or raise the pass budget");
+            L"new findings beyond the cap are retried on the next scan");
     }
     else
     {
@@ -18203,6 +22894,21 @@ void KernelMonitor::ScanKernelThreads()
     {
         ClearEmittedKey(L"scan_failed:thread:truncated");
     }
+    if (!hostViewKnown || unreadableStarts != 0)
+    {
+        EmitUnique(
+            L"thread.scan",
+            L"scan_failed:thread:observations",
+            std::wstring(),
+            L"thread_list",
+            L"kernel thread scan has unavailable observations",
+            L"host_view_known=" + std::to_wstring(hostViewKnown ? 1 : 0) +
+                L" unreadable_starts=" + std::to_wstring(unreadableStarts));
+    }
+    else
+    {
+        ClearEmittedKey(L"scan_failed:thread:observations");
+    }
 }
 
 bool KernelMonitorThreadSelfTest()
@@ -18211,6 +22917,119 @@ bool KernelMonitorThreadSelfTest()
 
     do
     {
+        const KmonThreadStartLayout startLayout = KmonResolveThreadStartLayout(
+            [](const wchar_t* type, const wchar_t* field, uint32_t* offset)
+            {
+                bool found = false;
+                if (std::wstring(type) == L"_ETHREAD")
+                {
+                    if (std::wstring(field) == L"StartAddress")
+                    {
+                        *offset = 0x450;
+                        found = true;
+                    }
+                    else if (std::wstring(field) == L"Win32StartAddress")
+                    {
+                        *offset = 0x4D0;
+                        found = true;
+                    }
+                }
+                return found;
+            });
+        if (!startLayout.HasStart || startLayout.StartOffset != 0x450 ||
+            !startLayout.HasWin32Start || startLayout.Win32StartOffset != 0x4D0)
+        {
+            break;
+        }
+        if (!KmonHostThreadWalkComplete(10, false, ERROR_NO_MORE_FILES) ||
+            KmonHostThreadWalkComplete(10, false, ERROR_ACCESS_DENIED) ||
+            KmonHostThreadWalkComplete(10, false, ERROR_SUCCESS) ||
+            KmonHostThreadWalkComplete(10, true, ERROR_NO_MORE_FILES) ||
+            KmonHostThreadWalkComplete(0, false, ERROR_NO_MORE_FILES))
+        {
+            break;
+        }
+        KernelMonitor restarted;
+        restarted.ThreadHiddenStrikes[L"4:100:ffff800000010000"] = 1;
+        restarted.ThreadListDkomStrikes[L"4:ffff800000020000"] = 1;
+        restarted.InlinePatchStrikes[L"old_target"] = 1;
+        restarted.CallbackRedirectStrikes[L"old_callback"] = 1;
+        restarted.CallbackRedirectCursor = 123;
+        restarted.CallbackRedirectBatch.push_back(0xFFFF800010000000ull);
+        restarted.KpageRegionOffset = 456;
+        restarted.WorkItemCursor = {0xFFFF800040000000ull, 0, {9, 10, 11, 12}};
+        restarted.DpcQueueCursor = {0xFFFF800020000000ull, 7, {1, 2, 3, 4}};
+        restarted.TimerQueueCursor = {0xFFFF800030000000ull, 9, {5, 6, 7, 8}};
+        restarted.WnfCallbackCursor = {{1, 2, 3, 4}, {5, 6, 7, 8}, 9};
+        restarted.IrpCompletionCursor = {10, 11, 12, {13, 14, 15, 16}};
+        restarted.MapperTargetCursors[{0, 0xFFFF800010000000ull}] = {32, 123};
+        restarted.UserVmWalkCursors[{4, 100}] = 0x10000;
+        restarted.UserThreadStartCursors[{4, 100}] = 1234;
+        restarted.GraphicsDispatchCursors[L"old_driver"].NextRva = 0x1238;
+        restarted.DriverTamperBaselines[L"old_driver"] = KmonDriverIdentitySnapshot{};
+        restarted.NextThreadScanTickMs = 999;
+        restarted.NextInlinePatchScanTickMs = 999;
+        restarted.ResetTemporalDetections();
+        if (!restarted.ThreadHiddenStrikes.empty() ||
+            !restarted.ThreadListDkomStrikes.empty() ||
+            !restarted.InlinePatchStrikes.empty() ||
+            !restarted.CallbackRedirectStrikes.empty() ||
+            restarted.CallbackRedirectCursor != 0 ||
+            !restarted.CallbackRedirectBatch.empty() ||
+            restarted.KpageRegionOffset != 0 ||
+            restarted.WorkItemCursor.RootAddress != 0 || restarted.WorkItemCursor.List.Entry != 0 ||
+            restarted.DpcQueueCursor.RootAddress != 0 || restarted.DpcQueueCursor.QueueIndex != 0 ||
+            restarted.DpcQueueCursor.List.Entry != 0 || restarted.TimerQueueCursor.RootAddress != 0 ||
+            restarted.TimerQueueCursor.QueueIndex != 0 || restarted.TimerQueueCursor.List.Entry != 0 ||
+            restarted.WnfCallbackCursor.Processes.Entry != 0 || restarted.WnfCallbackCursor.Subscriptions.Entry != 0 ||
+            restarted.WnfCallbackCursor.PendingProcessNode != 0 || restarted.IrpCompletionCursor.ThreadObject != 0 ||
+            restarted.IrpCompletionCursor.List.Entry != 0 ||
+            !restarted.MapperTargetCursors.empty() ||
+            !restarted.UserVmWalkCursors.empty() ||
+            !restarted.UserThreadStartCursors.empty() ||
+            !restarted.GraphicsDispatchCursors.empty() ||
+            !restarted.DriverTamperBaselines.empty() ||
+            restarted.NextThreadScanTickMs != 0 ||
+            restarted.NextInlinePatchScanTickMs != 0)
+        {
+            break;
+        }
+        KernelMonitor emission;
+        const uint32_t selfPid = GetCurrentProcessId();
+        const std::wstring recoveryKey = L"scan_failed:handles:" + std::to_wstring(selfPid);
+        emission.EmittedMapperKeys.insert(recoveryKey + L":gone");
+        if (!emission.EmitUnique(L"driver.handle", recoveryKey, L"", L"handle", L"partial", L"", selfPid) ||
+            emission.EmitUnique(L"driver.handle", recoveryKey, L"", L"handle", L"duplicate", L"", selfPid))
+        {
+            break;
+        }
+        emission.ClearEmittedKeyForPid(recoveryKey, selfPid);
+        if (emission.EmittedMapperKeys.count(recoveryKey + L":gone") != 0 ||
+            !emission.EmitUnique(L"driver.handle", recoveryKey, L"", L"handle", L"partial again", L"", selfPid))
+        {
+            break;
+        }
+        emission.Clear();
+        for (uint32_t pass = 0; pass < 2; ++pass)
+        {
+            uint32_t emitted = 0;
+            for (uint32_t index = 0; index < 18 && emitted < 16; ++index)
+            {
+                if (emission.EmitUnique(
+                    index < 17 ? L"thread.unbacked" : L"thread.dkom",
+                    L"budget_regression:" + std::to_wstring(index),
+                    L"system", L"thread_list", L"budget regression", L"", 4))
+                {
+                    ++emitted;
+                }
+            }
+        }
+        if (emission.Recent(32, false).size() != 18 ||
+            emission.EmitUnique(L"thread.dkom", L"budget_regression:17",
+                L"system", L"thread_list", L"duplicate", L"", 4))
+        {
+            break;
+        }
         KmonKernelThreadInput normal = {};
         normal.ProcessId = 4;
         normal.ThreadId = 0x1234;
@@ -18218,6 +23037,7 @@ bool KernelMonitorThreadSelfTest()
         normal.StartAddressKnown = true;
         normal.StartIsKernelAddress = true;
         normal.StartInLoadedModule = true;
+        normal.ModuleViewKnown = true;
         normal.KernelListComplete = true;
         normal.HostViewKnown = true;
         normal.HostViewHasThread = true;
@@ -18235,6 +23055,35 @@ bool KernelMonitorThreadSelfTest()
         unbacked.HostViewKnown = false;
         unbacked.HostViewHasThread = false;
         if (KmonClassifyKernelThread(unbacked) != KmonKernelThreadKind::UnbackedStart)
+        {
+            break;
+        }
+        KmonKernelThreadInput noModules = unbacked;
+        noModules.ModuleViewKnown = false;
+        if (KmonClassifyKernelThread(noModules) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
+        KernelModuleInfo sizedModule = {};
+        sizedModule.Base = 0xFFFFF80200000000ull;
+        sizedModule.Size = 0x100000;
+        std::vector<KmonThreadModuleRange> testRanges;
+        if (!KmonBuildThreadModuleRanges({sizedModule}, &testRanges) ||
+            !KmonThreadRangeCovers(testRanges, sizedModule.Base + 0x1000))
+        {
+            break;
+        }
+        KernelModuleInfo unknownModule = sizedModule;
+        unknownModule.Base += 0x200000;
+        unknownModule.Size = 0;
+        if (KmonBuildThreadModuleRanges({sizedModule, unknownModule}, &testRanges) ||
+            KmonBuildThreadModuleRanges({}, &testRanges))
+        {
+            break;
+        }
+        KmonKernelThreadInput reused = normal;
+        reused.ThreadObject = 0xFFFF800000001000ull;
+        if (KmonThreadIdentityKey(reused) == KmonThreadIdentityKey(normal))
         {
             break;
         }
@@ -18326,6 +23175,12 @@ bool KernelMonitorThreadSelfTest()
         {
             break;
         }
+        KmonKernelThreadListInput changing = dkom;
+        changing.AccountingAfter = dkom.AccountingBefore + 1;
+        if (KmonClassifyKernelThreadList(changing) != KmonKernelThreadKind::None)
+        {
+            break;
+        }
 
         // Fail-closed: an unresolved accounting field and a truncated walk
         // both withhold the verdict instead of guessing.
@@ -18367,12 +23222,217 @@ bool KernelMonitorThreadSelfTest()
     return ok;
 }
 
+bool KernelMonitorLifecycleSelfTest()
+{
+    bool ok = false;
+    DeviceClient closedDevice;
+    KernelMonitor monitor;
+
+    do
+    {
+        monitor.Device = &closedDevice;
+        monitor.IotraceActive = true;
+        std::wstring error;
+        if (monitor.Stop(&error) || error.empty() ||
+            !monitor.IotraceArmed() || monitor.Device != &closedDevice ||
+            monitor.ArmIotrace(1, L"test", &error))
+        {
+            break;
+        }
+        if (monitor.Stop(&error, true) || monitor.Device != nullptr ||
+            monitor.IotraceArmed())
+        {
+            break;
+        }
+        if (!monitor.Stop(&error))
+        {
+            break;
+        }
+
+        monitor.Device = &closedDevice;
+        monitor.StopRequested.store(false);
+        monitor.Active.store(true);
+        std::promise<void> workerObservedStop;
+        std::promise<void> releaseWorker;
+        auto observed = workerObservedStop.get_future();
+        auto released = releaseWorker.get_future();
+        bool dependenciesRetained = false;
+        monitor.Worker = std::thread([&]()
+        {
+            while (!monitor.StopRequested.load())
+            {
+                std::this_thread::yield();
+            }
+            {
+                std::lock_guard<std::mutex> lock(monitor.StateMutex);
+                dependenciesRetained = monitor.Device == &closedDevice;
+            }
+            workerObservedStop.set_value();
+            released.wait();
+        });
+        auto stop = std::async(std::launch::async, [&]()
+        {
+            return monitor.Stop(nullptr);
+        });
+        if (observed.wait_for(std::chrono::seconds(2)) != std::future_status::ready)
+        {
+            releaseWorker.set_value();
+            stop.wait();
+            break;
+        }
+        std::promise<void> startAttempted;
+        auto attempted = startAttempted.get_future();
+        auto start = std::async(std::launch::async, [&]()
+        {
+            startAttempted.set_value();
+            return monitor.Start(KmonOptions{}, nullptr, nullptr, nullptr, nullptr, nullptr);
+        });
+        attempted.wait();
+        const bool startWaited =
+            start.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
+        releaseWorker.set_value();
+        const bool stopped = stop.get();
+        const bool started = start.get();
+        if (!startWaited || !stopped || started || !dependenciesRetained ||
+            monitor.Worker.joinable() || monitor.Device != nullptr)
+        {
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    monitor.IotraceActive = false;
+    monitor.Stop(nullptr);
+    return ok;
+}
+
 bool KernelMonitorSelfTest()
 {
     bool ok = false;
 
     do
     {
+        {
+            KmonTiIngestPage page;
+            unsigned reads = 0;
+            std::vector<uint64_t> cursors;
+            const bool stable = KmonReadStableTiIngestPage(1, 4, [&](uint64_t cursor)
+            {
+                cursors.push_back(cursor);
+                TiSequenceSnapshot snapshot;
+                snapshot.Generation = ++reads == 1 ? 2 : 3;
+                snapshot.GenerationFirstSequence = snapshot.Generation == 2 ? 10 : 20;
+                TiEventRecord record;
+                record.Sequence = 20;
+                snapshot.Records.push_back(record);
+                return snapshot;
+            }, [&]()
+            {
+                TiSubscriberStats stats;
+                stats.Trace.Generation = 3;
+                stats.Trace.FirstSequence = 20;
+                return stats;
+            }, &page);
+            if (!stable || page.Snapshot.Generation != 3 || page.Cursor != 19 ||
+                page.Snapshot.Records.size() != 1 || cursors != std::vector<uint64_t>({4, 9, 19}))
+            {
+                break;
+            }
+            reads = 0;
+            cursors.clear();
+            if (!KmonReadStableTiIngestPage(1, 4, [&](uint64_t cursor)
+            {
+                cursors.push_back(cursor);
+                TiSequenceSnapshot snapshot;
+                snapshot.Generation = ++reads == 1 ? 1 : 2;
+                snapshot.GenerationFirstSequence = snapshot.Generation == 1 ? 1 : 30;
+                return snapshot;
+            }, [&]()
+            {
+                TiSubscriberStats stats;
+                stats.Trace.Generation = 2;
+                stats.Trace.FirstSequence = 30;
+                return stats;
+            }, &page) || page.Snapshot.Generation != 2 || page.Cursor != 29 ||
+                cursors != std::vector<uint64_t>({4, 29}))
+            {
+                break;
+            }
+            reads = 0;
+            page.Cursor = 777;
+            if (KmonReadStableTiIngestPage(1, 4, [&](uint64_t)
+            {
+                TiSequenceSnapshot snapshot;
+                snapshot.Generation = 10 + reads++;
+                snapshot.GenerationFirstSequence = 100;
+                return snapshot;
+            }, []()
+            {
+                return TiSubscriberStats{};
+            }, &page) || reads != 3 || page.Cursor != 777)
+            {
+                break;
+            }
+        }
+        KernelModuleInfo module = {};
+        module.Base = 0xFFFFF80000000000ull;
+        module.Size = 0x10000;
+        KernelModuleInfo malformedModule = module;
+        malformedModule.Size = 0;
+        KernelModuleInfo adjacentModule = module;
+        adjacentModule.Base += module.Size;
+        KernelModuleInfo overlapModule = module;
+        overlapModule.Base += module.Size / 2;
+        if (!KmonModuleSnapshotComplete({module}) ||
+            !KmonModuleSnapshotComplete({adjacentModule, module}) ||
+            KmonModuleSnapshotComplete({module, overlapModule}) ||
+            KmonModuleSnapshotComplete({module, module}) ||
+            KmonModuleSnapshotComplete({module, malformedModule}) ||
+            KmonModuleSnapshotComplete({}))
+        {
+            break;
+        }
+        KmonModuleRefreshState refresh;
+        int ownerA = 0;
+        int ownerB = 0;
+        uint32_t reloadCount = 0;
+        bool reloadResult = true;
+        auto reload = [&]()
+        {
+            ++reloadCount;
+            return reloadResult;
+        };
+        if (!KmonRefreshModuleSnapshot(&refresh, &ownerA, 100, false, true, reload) ||
+            !KmonRefreshModuleSnapshot(&refresh, &ownerA, 200, true, true, reload) ||
+            reloadCount != 1)
+        {
+            break;
+        }
+        reloadResult = false;
+        if (KmonRefreshModuleSnapshot(&refresh, &ownerA, 2100, true, true, reload) ||
+            KmonRefreshModuleSnapshot(&refresh, &ownerA, 2200, true, true, reload) ||
+            reloadCount != 2)
+        {
+            break;
+        }
+        reloadResult = true;
+        if (!KmonRefreshModuleSnapshot(&refresh, &ownerA, 4100, true, true, reload) ||
+            !KmonRefreshModuleSnapshot(&refresh, &ownerB, 4101, true, true, reload) ||
+            KmonRefreshModuleSnapshot(&refresh, &ownerB, 4102, false, true, reload) ||
+            reloadCount != 4)
+        {
+            break;
+        }
+        uint64_t parsedAddress = 0;
+        if (!KmonParseHexU64(L"0xFFFF800000001000", &parsedAddress) ||
+            parsedAddress != 0xFFFF800000001000ull ||
+            KmonParseHexU64(L"0xFFFF800000001000junk", &parsedAddress) ||
+            KmonParseHexU64(L"10000000000000000", &parsedAddress) ||
+            KmonParseHexU64(L"-1", &parsedAddress) ||
+            KmonParseHexU64(L"0x", &parsedAddress))
+        {
+            break;
+        }
         if (KmonBasenameLower(L"C:\\Windows\\cheat.SYS") != L"cheat.sys")
         {
             break;
@@ -18428,9 +23488,14 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
-        // Module-listed bases and the main EXE allocation never fire.
+        // Only actual image allocations accept a loader ownership claim.
         std::vector<std::pair<uint64_t, uint32_t>> listedRanges;
         listedRanges.emplace_back(0x7ff000010000ull, 0x10000);
+        if (!KmonOrphanRegionInteresting(orphanRegion, otherImage, listedRanges))
+        {
+            break;
+        }
+        orphanRegion.Type = MEM_IMAGE;
         if (KmonOrphanRegionInteresting(
                 orphanRegion,
                 otherImage,
@@ -18656,6 +23721,17 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
+        if (KmonClassifyDriverPath(L"C:\\Users\\a\\Windows\\System32\\drivers\\x.sys") == L"inbox" ||
+            KmonClassifyDriverPath(L"C:\\Windows\\System32\\..\\Temp\\x.sys") == L"inbox" ||
+            KmonClassifyDriverPath(L"C:\\Windows\\System32\\drivers\\a.sys:payload") == L"inbox" ||
+            KmonWindowsBuiltinPathLooksInbox(L"C:\\Games\\Windows\\System32\\svchost.exe") ||
+            KmonWindowsBuiltinPathLooksInbox(L"C:\\Games\\WindowsApps\\notepad.exe") ||
+            !KmonWindowsBuiltinPathLooksInbox(L"C:\\Windows\\explorer.exe") ||
+            KmonWindowsBuiltinPathLooksInbox(L"C:\\Windows\\explorer.exe\\explorer.exe") ||
+            KmonWindowsBuiltinPathLooksInbox(L"\\\\server\\Windows\\System32\\svchost.exe"))
+        {
+            break;
+        }
 
         TiEventRecord unnamedLoad = {};
         unnamedLoad.ProcessId = 4;
@@ -18685,7 +23761,74 @@ bool KernelMonitorSelfTest()
             break;
         }
 
+        TiEventRecord unknownGeneration = inject;
+        unknownGeneration.ProcessId = GetCurrentProcessId();
+        unknownGeneration.TargetProcessId = unknownGeneration.ProcessId + 1;
+        unknownGeneration.ImagePath.clear();
+        unknownGeneration.TargetImageBase.clear();
+        if (!KmonClassifyTiEvent(unknownGeneration, &classified) ||
+            classified.Kind != L"inject.remote" || !classified.Image.empty() || !classified.TargetImage.empty())
+        {
+            break;
+        }
+
         TiEventRecord localAlloc = {};
+        {
+            KernelMonitor credscan;
+            TiEventRecord read;
+            read.ProcessId = 1000;
+            read.TargetProcessId = 2000;
+            read.ProcessCreateTime = 100;
+            read.TargetProcessCreateTime = 200;
+            read.Timestamp = 1000;
+            read.TaskName = L"ReadVM";
+            read.ImagePath = L"C:\\Users\\test\\AppData\\Local\\Temp\\reader.exe";
+            read.TargetImageBase = L"lsass.exe";
+            const uint64_t pair = (1000ull << 32) | 2000;
+            for (uint32_t index = 0; index < 255; ++index)
+            {
+                credscan.NoteCredscanRead(read);
+            }
+            read.ProcessCreateTime = 300;
+            credscan.NoteCredscanRead(read);
+            if (credscan.CredscanWindows[pair].Count != 1 || credscan.CredscanWindows[pair].Emitted)
+            {
+                break;
+            }
+            for (uint32_t index = 0; index < 255; ++index)
+            {
+                credscan.NoteCredscanRead(read);
+            }
+            if (!credscan.CredscanWindows[pair].Emitted)
+            {
+                break;
+            }
+            read.TargetProcessCreateTime = 400;
+            credscan.NoteCredscanRead(read);
+            read.ProcessCreateTime = 0;
+            credscan.NoteCredscanRead(read);
+            read.ProcessCreateTime = 1001;
+            credscan.NoteCredscanRead(read);
+            if (credscan.CredscanWindows[pair].Count != 1 || credscan.CredscanWindows[pair].Emitted)
+            {
+                break;
+            }
+            KernelMonitor spaced;
+            read.ProcessCreateTime = 300;
+            for (uint32_t index = 0; index < 256; ++index)
+            {
+                read.Timestamp = 1000 + static_cast<uint64_t>(index) * 610000000ull;
+                spaced.NoteCredscanRead(read);
+            }
+            const uint64_t latest = spaced.CredscanWindows[pair].WindowStartTimestamp;
+            read.Timestamp -= 610000000ull;
+            spaced.NoteCredscanRead(read);
+            if (spaced.CredscanWindows[pair].Count != 1 || spaced.CredscanWindows[pair].Emitted ||
+                spaced.CredscanWindows[pair].WindowStartTimestamp != latest)
+            {
+                break;
+            }
+        }
         localAlloc.ProcessId = 1000;
         localAlloc.TargetProcessId = 1000;
         localAlloc.TaskName = L"AllocVM";
@@ -18717,13 +23860,24 @@ bool KernelMonitorSelfTest()
         {
             break;
         }
+        TiEventRecord fakeCsrss = csrssWrite;
+        fakeCsrss.ImagePath = L"C:\\Users\\a\\csrss.exe";
+        if (!KmonClassifyTiEvent(fakeCsrss, &classified) || classified.Kind != L"inject.remote")
+        {
+            break;
+        }
         TiEventRecord builtinWrite = {};
         builtinWrite.ProcessId = 1192;
         builtinWrite.TargetProcessId = 4608;
         builtinWrite.TaskName = L"WriteVM";
         builtinWrite.ImagePath = L"C:\\Windows\\System32\\lsass.exe";
-        builtinWrite.TargetImageBase = L"explorer.exe";
+        builtinWrite.TargetImageBase = L"C:\\Windows\\explorer.exe";
         if (KmonClassifyTiEvent(builtinWrite, &classified))
+        {
+            break;
+        }
+        builtinWrite.TargetImageBase = L"explorer.exe";
+        if (!KmonClassifyTiEvent(builtinWrite, &classified))
         {
             break;
         }
@@ -19226,10 +24380,14 @@ bool KernelMonitorSelfTest()
             !KmonLooksLikeCfgHostModule(L"win32kfull.sys") ||
             !KmonLooksLikeCfgHostModule(L"dxgkrnl.sys") ||
             KmonLooksLikeCfgHostModule(L"acpi.sys") ||
-            !KmonVaLooksLikePagingOrFirmware(0x00007FF800000000ull) ||
-            !KmonVaLooksLikePagingOrFirmware(0xFFFFF68000000000ull) ||
-            !KmonVaLooksLikePagingOrFirmware(0xFFFFF78000000000ull) ||
-            KmonVaLooksLikePagingOrFirmware(0xFFFFF80000000000ull))
+            KmonCfgTargetIsKernelAddress(0x00007FF800000000ull) ||
+            !KmonCfgTargetIsKernelAddress(0xFFFFF68000000000ull) ||
+            !KmonCfgTargetIsKernelAddress(0xFFFFF78000000000ull) ||
+            !KmonCfgTargetIsKernelAddress(0xFFFFF90000000000ull) ||
+            !KmonCfgTargetIsKernelAddress(0xFFFFF80000000000ull) ||
+            KmonCfgCacheNeedsRefresh(1, 2, 5000, 1, 2, 4999) ||
+            !KmonCfgCacheNeedsRefresh(1, 2, 5000, 1, 2, 5000) ||
+            !KmonCfgCacheNeedsRefresh(1, 2, 5000, 1, 3, 4999))
         {
             break;
         }
@@ -19822,8 +24980,8 @@ bool KernelMonitorSelfTest()
             stubBuf[0x20] = 0x48;
             stubBuf[0x21] = 0xB8;
             std::memcpy(stubBuf.data() + 0x22, &halTarget, sizeof(halTarget));
-            stubBuf[0x2C] = 0xFF;
-            stubBuf[0x2D] = 0xD0;
+            stubBuf[0x2A] = 0xFF;
+            stubBuf[0x2B] = 0xD0;
             if (CountKernelImportStubs(
                     stubBuf.data(),
                     stubBuf.size(),
@@ -19881,7 +25039,7 @@ bool KernelMonitorSelfTest()
                     cfgText,
                     sizeof(cfgText),
                     0,
-                    0x3000,
+                    0x6000,
                     guardCall,
                     guardIat,
                     &slotRvas,
@@ -19897,7 +25055,7 @@ bool KernelMonitorSelfTest()
                     cfgText,
                     sizeof(cfgText),
                     0,
-                    0x3000,
+                    0x6000,
                     guardCall,
                     guardIat,
                     &slotRvas,
@@ -19905,21 +25063,49 @@ bool KernelMonitorSelfTest()
             {
                 break;
             }
+            uint8_t indirect[13] = {0x48, 0x8b, 0x05};
+            std::memcpy(indirect + 3, &slotDisp, sizeof(slotDisp));
+            indirect[7] = 0xff;
+            indirect[8] = 0x15;
+            const int32_t indirectDisp = 0x5000 - 13;
+            std::memcpy(indirect + 9, &indirectDisp, sizeof(indirectDisp));
+            guardIat.insert(0x5000);
+            if (CollectCfgDataPtrSlotRvas(indirect, 12, 0, 0x6000, {}, guardIat, &slotRvas, 8) != 0 ||
+                CollectCfgDataPtrSlotRvas(indirect, 13, 0, 0x6000, {}, guardIat, &slotRvas, 8) != 1)
+            {
+                break;
+            }
+            const int32_t crossingSlot = 0x6000 - 7 - 7;
+            std::memcpy(indirect + 3, &crossingSlot, sizeof(crossingSlot));
+            if (CollectCfgDataPtrSlotRvas(indirect, 13, 0, 0x6000, {}, guardIat, &slotRvas, 8) != 0 ||
+                CollectCfgDataPtrSlotRvas(cfgText, sizeof(cfgText), 0xfffffff0, 0x6000,
+                    guardCall, {}, &slotRvas, 8) != 0 || !slotRvas.empty())
+            {
+                break;
+            }
+            uint8_t repeated[48] = {};
+            for (size_t index = 0; index < 3; ++index)
+            {
+                const size_t offset = index * 16;
+                repeated[offset] = 0x48;
+                repeated[offset + 1] = 0x8b;
+                repeated[offset + 2] = 0x05;
+                const int32_t desiredSlot = index < 2 ? 0x4000 : 0x4800;
+                const int32_t relativeSlot = desiredSlot - static_cast<int32_t>(0x1000 + offset + 7);
+                const int32_t relativeCall = 0x5000 - static_cast<int32_t>(0x1000 + offset + 12);
+                std::memcpy(repeated + offset + 3, &relativeSlot, sizeof(relativeSlot));
+                repeated[offset + 7] = 0xe8;
+                std::memcpy(repeated + offset + 8, &relativeCall, sizeof(relativeCall));
+            }
+            if (CollectCfgDataPtrSlotRvas(repeated, sizeof(repeated), 0x1000, 0x6000,
+                guardCall, {}, &slotRvas, 2) != 2 || slotRvas != std::vector<uint32_t>({0x4000, 0x4800}))
+            {
+                break;
+            }
         }
 
         ok = true;
 
-        // Stage 2: inline-patch regression (entry decode + verdicts).
-        if (!KernelMonitorInlinePatchSelfTest())
-        {
-            ok = false;
-        }
-
-        // Stage 3: mapper-stub / pool-table-hiding residual regression.
-        if (!KernelMonitorMapperPoolSelfTest())
-        {
-            ok = false;
-        }
     } while (false);
 
     return ok;

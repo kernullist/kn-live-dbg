@@ -56,6 +56,30 @@ struct WfpCalloutScanResult
     uint32_t SuspiciousCount = 0;
 };
 
+struct WfpPolicyRecord
+{
+    std::wstring Kind;
+    std::wstring Key;
+    std::wstring Name;
+    std::wstring State;
+    uint64_t Id = 0;
+    uint32_t Flags = 0;
+    bool StateComplete = false;
+};
+
+struct WfpPolicyScanResult
+{
+    std::vector<WfpPolicyRecord> Records;
+    std::vector<std::wstring> Warnings;
+    uint64_t SnapshotTickMs = 0;
+    bool ReadOnlyTransaction = false;
+    bool InventoryComplete = false;
+    bool CoverageComplete = false;
+    // BFE returns only objects readable by this caller. Global visibility is unknown.
+    bool VisibilityComplete = false;
+    std::wstring CoverageScope = L"BFE filters, callouts, providers and sublayers readable by this caller";
+};
+
 // Resolves the kernel-mode WFP callout table from live kernel memory and
 // recovers each callout's classify/notify/flowDelete function pointers. The
 // table location and per-slot layout are not in public PDBs and drift across
@@ -71,8 +95,11 @@ public:
     WfpCalloutScanner(DeviceClient& device, SymbolEngine& symbols);
 
     bool Scan(WfpCalloutScanResult* result, std::wstring* error);
+    static bool ScanPolicy(WfpPolicyScanResult* result, std::wstring* error);
 
 private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+bool WfpPolicyScannerSelfTest();

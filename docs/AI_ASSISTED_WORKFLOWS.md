@@ -40,6 +40,24 @@ The runtime automatically loads `.env` only from the executable directory. Real 
 
 `ai test [prompt]` / `ai config test [prompt]` is the provider round-trip smoke check. Without a custom prompt, it asks the selected provider/model to return `kn-live-dbg-ai-ok`, then prints the configured provider, model, remote policy, credential status, transport result, HTTP status when available, elapsed time, and marker match result.
 
+Provider HTTP responses and CLI stdout/stderr captures are capped at 8 MiB; an
+exceeded limit or transport error fails the request without using a partial result.
+HTTP send, header receipt, and body reads share one elapsed-time deadline.
+Timeout closes the asynchronous request while its callback-owned buffers remain
+alive through final handle closure. A declared Content-Length must match the
+received body; incomplete responses fail. Automatic HTTP redirects are disabled
+so provider credentials and prompts cannot be forwarded to a redirect target.
+A 3xx response remains an API error; configure the final provider endpoint directly.
+CLI capture checks actual elapsed time
+even under continuous output. A CLI child inherits only its redirected standard handles, runs in a job
+with kill-on-close, and its descendants are terminated when capture ends. If a
+host job policy prevents assignment, the suspended child is terminated and the
+request fails explicitly.
+
+`--self-test all` exercises these limits with synthetic HTTP readers, local
+`cmd.exe` children, and a loopback HTTP server that checks GET/POST redirects
+with synthetic credentials. It does not perform a provider request or validate credentials.
+
 ## Provider Presets and Model Catalog
 
 Operator-facing setup is a preset plus an optional OpenRouter model id. The four HTTP/CLI transports stay under `AiProviderRuntime`. `user/AiModelCatalog.cpp` is the name table: presets, aliases, curated frontier IDs, live OpenRouter cache, and resolve/search.

@@ -112,6 +112,37 @@ namespace
             IdentityPart(record.Altitude);
     }
 
+    std::wstring AttachmentStateKey(const MinifilterAttachmentRecord& record)
+    {
+        return RecordIdentity(record) + L":" + std::to_wstring(record.AggregateFlags) +
+            L":" + std::to_wstring(record.InstanceFlags) + L":" + std::to_wstring(record.FrameId) +
+            L":" + std::to_wstring(record.VolumeFileSystemType) + L":" + std::to_wstring(record.SupportedFeatures) +
+            L":" + std::to_wstring(record.DetachedVolume ? 1 : 0);
+    }
+
+    bool SameAttachmentSnapshot(
+        const std::vector<MinifilterAttachmentRecord>& first,
+        const std::vector<MinifilterAttachmentRecord>& second)
+    {
+        std::set<std::wstring> firstKeys;
+        std::set<std::wstring> secondKeys;
+        for (const MinifilterAttachmentRecord& record : first)
+        {
+            if (!firstKeys.insert(AttachmentStateKey(record)).second)
+            {
+                return false;
+            }
+        }
+        for (const MinifilterAttachmentRecord& record : second)
+        {
+            if (!secondKeys.insert(AttachmentStateKey(record)).second)
+            {
+                return false;
+            }
+        }
+        return firstKeys == secondKeys;
+    }
+
     template<typename Callback>
     bool InvokeGrowingBuffer(
         Callback&& callback,
@@ -1081,17 +1112,20 @@ bool MinifilterAttachmentScanner::Scan(
 
     *result =
         MinifilterAttachmentScanResult{};
+    result->SnapshotTickMs = GetTickCount64();
     std::wstring volumeError;
     if (!EnumerateVolumes(
             &result->Volumes,
             &volumeError))
     {
+        result->Incomplete = true;
         if (error != nullptr)
         {
             *error = volumeError;
         }
         return false;
     }
+    result->VolumeEnumerationComplete = true;
 
     std::vector<MinifilterAttachmentRecord>
         collected;
@@ -1099,18 +1133,43 @@ bool MinifilterAttachmentScanner::Scan(
          result->Volumes)
     {
         std::wstring localError;
-        if (!EnumerateVolumeInstances(
-                volume,
-                &collected,
-                &localError))
+        std::vector<MinifilterAttachmentRecord> first;
+        std::vector<MinifilterAttachmentRecord> second;
+        MinifilterAttachmentScanResult::VolumeSnapshot snapshot;
+        snapshot.Name = volume;
+        snapshot.Complete = EnumerateVolumeInstances(volume, &first, &localError) &&
+            EnumerateVolumeInstances(volume, &second, &localError) &&
+            SameAttachmentSnapshot(first, second);
+        snapshot.RecordCount = static_cast<uint32_t>(first.size());
+        if (first.size() > kMaximumRecords || collected.size() > kMaximumRecords - first.size())
+        {
+            snapshot.Complete = false;
+            localError = L"combined Filter Manager attachment cap exceeded";
+        }
+        else
+        {
+            collected.insert(collected.end(), first.begin(), first.end());
+        }
+        if (!snapshot.Complete)
         {
             result->Incomplete = true;
             result->Warnings.push_back(
                 localError.empty()
-                    ? L"Filter Manager instance enumeration failed for " +
+                    ? L"Filter Manager instance enumeration changed or failed for " +
                           volume
                     : localError);
         }
+        result->VolumeSnapshots.push_back(std::move(snapshot));
+    }
+
+    std::vector<std::wstring> volumesAfter;
+    if (!EnumerateVolumes(&volumesAfter, &volumeError) ||
+        std::set<std::wstring>(volumesAfter.begin(), volumesAfter.end()) !=
+            std::set<std::wstring>(result->Volumes.begin(), result->Volumes.end()))
+    {
+        result->VolumeEnumerationComplete = false;
+        result->Incomplete = true;
+        result->Warnings.push_back(L"Filter Manager volume inventory changed or could not be revalidated");
     }
 
     std::set<std::wstring> seen;
@@ -1130,11 +1189,37 @@ bool MinifilterAttachmentScanner::Scan(
         result->Records.push_back(
             std::move(record));
     }
+    result->SnapshotStable = !result->Incomplete;
+    result->CoverageComplete = result->VolumeEnumerationComplete && result->SnapshotStable;
     return true;
+}
+
+std::wstring MinifilterAttachmentIdentity(const MinifilterAttachmentRecord& record)
+{
+    return RecordIdentity(record);
+}
+
+std::wstring MinifilterAttachmentStateKey(const MinifilterAttachmentRecord& record)
+{
+    return AttachmentStateKey(record);
 }
 
 bool MinifilterAttachmentScannerSelfTest()
 {
+    MinifilterAttachmentRecord stable;
+    stable.IsMinifilter = true;
+    stable.FilterName = L"fixture";
+    stable.InstanceName = L"instance";
+    stable.VolumeName = L"volume";
+    MinifilterAttachmentRecord changed = stable;
+    changed.DetachedVolume = true;
+    if (!SameAttachmentSnapshot({stable}, {stable}) ||
+        SameAttachmentSnapshot({stable}, {changed}) ||
+        SameAttachmentSnapshot({stable}, {}) ||
+        SameAttachmentSnapshot({stable, stable}, {stable}))
+    {
+        return false;
+    }
     INSTANCE_AGGREGATE_STANDARD_INFORMATION
         info = {};
     info.Flags =

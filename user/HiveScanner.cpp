@@ -3,6 +3,7 @@
 #include "McpJson.h"
 
 #include <cstring>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -29,9 +30,11 @@ namespace
         return true;
     }
 
-    const KernelModuleInfo* FindOwningModule(SymbolEngine& symbols, uint64_t address)
+    std::optional<KernelModuleInfo> FindOwningModule(
+        const std::vector<KernelModuleInfo>& modules,
+        uint64_t address)
     {
-        for (const KernelModuleInfo& module : symbols.Modules())
+        for (const KernelModuleInfo& module : modules)
         {
             uint64_t end = module.Base + module.Size;
             if (end < module.Base)
@@ -40,15 +43,20 @@ namespace
             }
             if (address >= module.Base && address < end)
             {
-                return &module;
+                return module;
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
-    std::wstring ModuleImageName(const KernelModuleInfo* module)
+    std::optional<KernelModuleInfo> FindOwningModule(SymbolEngine& symbols, uint64_t address)
     {
-        return module != nullptr ? module->ImageName : std::wstring();
+        return FindOwningModule(symbols.CopyModules(), address);
+    }
+
+    std::wstring ModuleImageName(const std::optional<KernelModuleInfo>& module)
+    {
+        return module.has_value() ? module->ImageName : std::wstring();
     }
 
     std::wstring NearestSymbolText(SymbolEngine& symbols, uint64_t address)
@@ -497,11 +505,11 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
             else
             {
                 record.GetCellRoutine = getCell;
-                const KernelModuleInfo* getCellOwner = FindOwningModule(symbols_, getCell);
+                const std::optional<KernelModuleInfo> getCellOwner = FindOwningModule(symbols_, getCell);
                 record.GetCellModule = ModuleImageName(getCellOwner);
                 record.GetCellSymbol = NearestSymbolText(symbols_, getCell);
 
-                if (getCell == 0 || !IsKernelAddress(getCell) || getCellOwner == nullptr)
+                if (getCell == 0 || !IsKernelAddress(getCell) || !getCellOwner.has_value())
                 {
                     record.Suspicious = true;
                     record.Notes = L"GetCellRoutine outside loaded kernel modules";
@@ -529,11 +537,11 @@ bool HiveScanner::Scan(const Options& options, HiveScanResult* result, std::wstr
                 {
                     record.HasReleaseCell = true;
                     record.ReleaseCellRoutine = releaseCell;
-                    const KernelModuleInfo* releaseOwner = FindOwningModule(symbols_, releaseCell);
+                    const std::optional<KernelModuleInfo> releaseOwner = FindOwningModule(symbols_, releaseCell);
                     record.ReleaseCellModule = ModuleImageName(releaseOwner);
                     record.ReleaseCellSymbol = NearestSymbolText(symbols_, releaseCell);
                     if (!IsKernelAddress(releaseCell) ||
-                        releaseOwner == nullptr ||
+                        !releaseOwner.has_value() ||
                         !ModuleLooksLikeNt(releaseOwner->ImageName, releaseOwner->ImagePath))
                     {
                         record.Suspicious = true;
@@ -660,6 +668,19 @@ bool HiveNtOwnershipSelfTest()
 
     do
     {
+        KernelModuleInfo fixture = {};
+        fixture.Base = 0xfffff80000000000ull;
+        fixture.Size = 0x10000;
+        fixture.ImageName = L"ntoskrnl.exe";
+        fixture.ImagePath = L"\\SystemRoot\\System32\\ntoskrnl.exe";
+        const auto owner = FindOwningModule(std::vector<KernelModuleInfo>{fixture}, fixture.Base + 0x100);
+        fixture.ImageName.assign(128, L'X');
+        if (!owner.has_value() || owner->ImageName != L"ntoskrnl.exe" ||
+            owner->ImagePath != L"\\SystemRoot\\System32\\ntoskrnl.exe" ||
+            FindOwningModule(std::vector<KernelModuleInfo>{}, fixture.Base).has_value())
+        {
+            break;
+        }
         if (!ModuleLooksLikeNt(L"ntoskrnl.exe") ||
             !ModuleLooksLikeNt(L"ntkrnlmp.exe") ||
             !ModuleLooksLikeNt(L"ntoskrnl.exe", L"\\SystemRoot\\System32\\ntoskrnl.exe") ||

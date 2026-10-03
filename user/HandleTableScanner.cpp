@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -51,10 +52,111 @@ namespace
         SystemHandleTableEntryEx Handles[1];
     };
 
+    struct HandleRecordBatch
+    {
+        std::vector<size_t> Indices;
+        uint64_t Candidates = 0;
+        uint64_t InvalidEntries = 0;
+    };
+
+    HandleRecordBatch SelectHandleRecordBatch(const SystemHandleTableEntryEx* entries, size_t count,
+        const HandleTableScanOptions& options)
+    {
+        HandleRecordBatch batch;
+        for (size_t index = 0; index < count; ++index)
+        {
+            if (entries[index].UniqueProcessId != options.OwnerPid)
+            {
+                continue;
+            }
+            if (entries[index].HandleValue > UINT32_MAX)
+            {
+                ++batch.InvalidEntries;
+                continue;
+            }
+            batch.Indices.push_back(index);
+        }
+        std::sort(batch.Indices.begin(), batch.Indices.end(), [&](size_t left, size_t right)
+        {
+            return entries[left].HandleValue < entries[right].HandleValue;
+        });
+        size_t retained = 0;
+        for (size_t first = 0; first < batch.Indices.size();)
+        {
+            size_t next = first + 1;
+            while (next < batch.Indices.size() &&
+                entries[batch.Indices[first]].HandleValue == entries[batch.Indices[next]].HandleValue)
+            {
+                ++next;
+            }
+            if (next - first == 1)
+            {
+                batch.Indices[retained++] = batch.Indices[first];
+            }
+            else
+            {
+                batch.InvalidEntries += next - first;
+            }
+            first = next;
+        }
+        batch.Indices.resize(retained);
+        batch.Candidates = retained;
+        const auto start = std::upper_bound(batch.Indices.begin(), batch.Indices.end(), options.HandleAfter,
+            [&](uint64_t after, size_t index)
+            {
+                return after < entries[index].HandleValue;
+            });
+        std::rotate(batch.Indices.begin(), start, batch.Indices.end());
+        size_t limit = (std::min)(size_t(4096),
+            options.MaxHandlesPerPass == 0 ? size_t(4096) : static_cast<size_t>(options.MaxHandlesPerPass));
+        if (options.CollectRecords && options.Limit != 0)
+        {
+            limit = (std::min)(limit, static_cast<size_t>(options.Limit));
+        }
+        batch.Indices.resize((std::min)(limit, batch.Indices.size()));
+        return batch;
+    }
+
+    struct HandleReadBudget
+    {
+        uint64_t Limit = 0;
+        uint64_t Attempts = 0;
+        bool Denied = false;
+
+        bool Acquire()
+        {
+            if (Limit != 0 && Attempts >= Limit)
+            {
+                Denied = true;
+                return false;
+            }
+            ++Attempts;
+            return true;
+        }
+    };
+
+    bool CompleteHandleVisit(uint64_t handle, bool continued, const HandleReadBudget& budget,
+        HandleTableScanResult* result)
+    {
+        if (budget.Denied)
+        {
+            result->RelationshipBudgetExhausted = true;
+            result->HandleCoveragePartial = true;
+            return false;
+        }
+        ++result->HandlesVisited;
+        if (continued)
+        {
+            result->NextHandleAfter = handle;
+        }
+        return true;
+    }
+
     struct ProcessIdentity
     {
         uint32_t Pid = 0;
         uint64_t Eprocess = 0;
+        uint64_t CreateTime = 0;
         std::wstring Image;
         std::wstring ImagePath;
     };
@@ -64,17 +166,153 @@ namespace
         return value >= kKernelSpaceMin;
     }
 
-    bool ReadU16(DeviceClient& device, uint64_t address, uint16_t* value)
+    bool ValidHandleField(const TypeFieldInfo& field, uint64_t width)
     {
-        std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(address, sizeof(uint16_t), &bytes, nullptr) ||
-            bytes.size() != sizeof(uint16_t))
+        return field.Length == width && field.Offset <= 0x10000 - width;
+    }
+
+    struct HandleObjectLayout
+    {
+        uint64_t BodyOffset = 0;
+        uint64_t TypeOffset = 0;
+        uint8_t Cookie = 0;
+        bool Known = false;
+    };
+
+    template<typename Read>
+    bool ReadHandleObjectType(Read read, const HandleObjectLayout& layout, uint64_t object, uint32_t* type)
+    {
+        if (!layout.Known || !IsKernelAddress(object) || object > UINT64_MAX - 0x10000 ||
+            layout.BodyOffset == 0 || object < layout.BodyOffset)
         {
             return false;
         }
+        const uint64_t header = object - layout.BodyOffset;
+        uint8_t raw = 0;
+        if (!read(header + layout.TypeOffset, &raw, sizeof(raw)))
+        {
+            return false;
+        }
+        *type = raw ^ layout.Cookie ^ static_cast<uint8_t>(header >> 8);
+        return *type != 0;
+    }
 
-        memcpy(value, bytes.data(), sizeof(uint16_t));
+    template<typename Read, typename CheckType>
+    bool ReadStableHandleProcess(Read read, CheckType checkType, uint64_t object,
+        uint64_t pidOffset, uint64_t createOffset, uint32_t* pid, uint64_t* created)
+    {
+        uint64_t beforePid = 0, beforeCreated = 0, afterPid = 0, afterCreated = 0;
+        if (!IsKernelAddress(object) || object > UINT64_MAX - 0x10000 ||
+            !checkType(object, L"Process") ||
+            !read(object + pidOffset, &beforePid, sizeof(beforePid)) ||
+            !read(object + createOffset, &beforeCreated, sizeof(beforeCreated)) ||
+            !read(object + createOffset, &afterCreated, sizeof(afterCreated)) ||
+            !read(object + pidOffset, &afterPid, sizeof(afterPid)) ||
+            !checkType(object, L"Process") || beforePid == 0 || beforePid > UINT32_MAX ||
+            beforeCreated == 0 || beforePid != afterPid || beforeCreated != afterCreated)
+        {
+            return false;
+        }
+        *pid = static_cast<uint32_t>(beforePid);
+        *created = beforeCreated;
         return true;
+    }
+
+    struct HandleRelationshipLayout
+    {
+        bool ProcessKnown = false;
+        uint64_t Pid = 0;
+        uint64_t Created = 0;
+        bool ThreadKnown = false;
+        uint64_t ThreadProcess = 0;
+        uint64_t ThreadProcessAdjustment = 0;
+        bool WorkerKnown = false;
+        uint64_t WorkerProcess = 0;
+        bool FileKnown = false;
+        uint64_t FileDevice = 0;
+        uint64_t DeviceDriver = 0;
+        uint64_t DeviceType = 0;
+    };
+
+    enum class HandleRelationshipStatus
+    {
+        NotApplicable,
+        Unsupported,
+        Unreadable,
+        Resolved
+    };
+
+    template<typename Read, typename CheckType>
+    HandleRelationshipStatus ReadHandleRelationship(Read read, CheckType checkType,
+        const HandleRelationshipLayout& layout, HandleTableRecord* record)
+    {
+        const bool process = record->TypeName == L"Process";
+        const bool thread = record->TypeName == L"Thread";
+        const bool worker = record->TypeName == L"TpWorkerFactory";
+        const bool file = record->TypeName == L"File";
+        if (!process && !thread && !worker && !file)
+        {
+            return HandleRelationshipStatus::NotApplicable;
+        }
+        if (((process || thread || worker) && !layout.ProcessKnown) ||
+            (thread && !layout.ThreadKnown) || (worker && !layout.WorkerKnown) || (file && !layout.FileKnown))
+        {
+            return HandleRelationshipStatus::Unsupported;
+        }
+        if (!checkType(record->Object, record->TypeName.c_str()))
+        {
+            return HandleRelationshipStatus::Unreadable;
+        }
+        if (process || thread || worker)
+        {
+            uint64_t target = record->Object, related = 0, relatedAfter = 0;
+            const uint64_t relationOffset = thread ? layout.ThreadProcess : layout.WorkerProcess;
+            if (!process)
+            {
+                if (!read(record->Object + relationOffset, &related, sizeof(related)) ||
+                    related < (thread ? layout.ThreadProcessAdjustment : 0))
+                {
+                    return HandleRelationshipStatus::Unreadable;
+                }
+                target = related - (thread ? layout.ThreadProcessAdjustment : 0);
+            }
+            uint32_t pid = 0;
+            uint64_t created = 0;
+            if (!ReadStableHandleProcess(read, checkType, target, layout.Pid, layout.Created, &pid, &created) ||
+                (!process && (!read(record->Object + relationOffset, &relatedAfter, sizeof(relatedAfter)) ||
+                    related != relatedAfter)) || !checkType(record->Object, record->TypeName.c_str()))
+            {
+                return HandleRelationshipStatus::Unreadable;
+            }
+            record->TargetPid = pid;
+            record->TargetEprocess = target;
+            record->TargetCreateTime = created;
+            record->TargetIdentityKnown = true;
+            record->PointsToProcess = process;
+        }
+        else
+        {
+            uint64_t device = 0, driver = 0, deviceAfter = 0, driverAfter = 0;
+            uint32_t deviceType = 0, deviceTypeAfter = 0;
+            if (!read(record->Object + layout.FileDevice, &device, sizeof(device)) ||
+                !checkType(device, L"Device") ||
+                !read(device + layout.DeviceDriver, &driver, sizeof(driver)) ||
+                !checkType(driver, L"Driver") ||
+                !read(device + layout.DeviceType, &deviceType, sizeof(deviceType)) ||
+                !read(record->Object + layout.FileDevice, &deviceAfter, sizeof(deviceAfter)) || device != deviceAfter ||
+                !read(device + layout.DeviceDriver, &driverAfter, sizeof(driverAfter)) || driver != driverAfter ||
+                !read(device + layout.DeviceType, &deviceTypeAfter, sizeof(deviceTypeAfter)) || deviceType != deviceTypeAfter ||
+                !checkType(device, L"Device") || !checkType(driver, L"Driver") ||
+                !checkType(record->Object, L"File"))
+            {
+                return HandleRelationshipStatus::Unreadable;
+            }
+            record->DeviceObject = device;
+            record->DriverObject = driver;
+            record->DeviceType = deviceType;
+        }
+        record->RelationshipResolved = true;
+        return HandleRelationshipStatus::Resolved;
     }
 
     bool ReadU64(DeviceClient& device, uint64_t address, uint64_t* value)
@@ -263,7 +501,8 @@ namespace
         return path.find_last_of(L"\\/") != std::wstring::npos;
     }
 
-    bool ReadKernelUnicodeString(DeviceClient& device, uint64_t address, std::wstring* value)
+    template<typename Read>
+    bool ReadHandleUnicodeString(Read read, uint64_t address, std::wstring* value)
     {
         bool ok = false;
 
@@ -275,15 +514,17 @@ namespace
             }
 
             value->clear();
-            uint16_t length = 0;
+            uint8_t header[16] = {}, verified[16] = {};
+            uint16_t length = 0, maximum = 0;
             uint64_t buffer = 0;
-            if (!ReadU16(device, address, &length))
+            if (!read(address, header, sizeof(header)))
             {
                 break;
             }
-            uint16_t maximum = 0;
-            ReadU16(device, address + 2, &maximum);
-            if (!ReadU64(device, address + 8, &buffer))
+            std::memcpy(&length, header, sizeof(length));
+            std::memcpy(&maximum, header + 2, sizeof(maximum));
+            std::memcpy(&buffer, header + 8, sizeof(buffer));
+            if ((length & 1u) != 0 || (maximum & 1u) != 0 || length > maximum || length > 2048)
             {
                 break;
             }
@@ -292,38 +533,37 @@ namespace
                 ok = true;
                 break;
             }
-            if (maximum != 0 && maximum < length)
-            {
-                length = maximum;
-            }
-            length = static_cast<uint16_t>(length & ~static_cast<uint16_t>(1));
-            if (length == 0)
-            {
-                ok = true;
-                break;
-            }
-            if (buffer == 0 || !IsKernelAddress(buffer))
+            if (!IsKernelAddress(buffer) || buffer > UINT64_MAX - length)
             {
                 break;
             }
-            if (length > 2048)
-            {
-                length = 2048;
-            }
-
-            std::vector<uint8_t> bytes;
-            if (!device.ReadMemory(buffer, length, &bytes, nullptr) || bytes.size() < 2)
+            std::wstring complete(length / sizeof(wchar_t), L'\0');
+            if (!read(buffer, &complete[0], length) || !read(address, verified, sizeof(verified)) ||
+                std::memcmp(header, verified, sizeof(header)) != 0 || complete.find(L'\0') != std::wstring::npos)
             {
                 break;
             }
 
-            value->assign(
-                reinterpret_cast<const wchar_t*>(bytes.data()),
-                bytes.size() / sizeof(wchar_t));
+            *value = std::move(complete);
             ok = !value->empty();
         } while (false);
 
         return ok;
+    }
+
+    bool ReadKernelUnicodeString(DeviceClient& device, uint64_t address, std::wstring* value)
+    {
+        return ReadHandleUnicodeString([&](uint64_t at, void* output, size_t length)
+        {
+            std::vector<uint8_t> bytes;
+            if (length > UINT32_MAX || !device.ReadMemory(at, static_cast<uint32_t>(length), &bytes, nullptr) ||
+                bytes.size() != length)
+            {
+                return false;
+            }
+            std::memcpy(output, bytes.data(), length);
+            return true;
+        }, address, value);
     }
 
     bool ReadProcessImagePath(
@@ -759,9 +999,11 @@ namespace
             TypeFieldInfo linksField = {};
             TypeFieldInfo pidField = {};
             TypeFieldInfo imageField = {};
+            TypeFieldInfo createdField = {};
             std::wstring ignored;
             if (!symbols.FindField(L"nt!_EPROCESS", L"ActiveProcessLinks", &linksField, &ignored) ||
-                !symbols.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &ignored))
+                !symbols.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &ignored) ||
+                !ValidHandleField(linksField, 16) || !ValidHandleField(pidField, 8))
             {
                 if (warnings != nullptr)
                 {
@@ -771,6 +1013,8 @@ namespace
             }
 
             symbols.FindField(L"nt!_EPROCESS", L"ImageFileName", &imageField, &ignored);
+            const bool creationKnown = symbols.FindField(L"nt!_EPROCESS", L"CreateTime", &createdField, &ignored) &&
+                ValidHandleField(createdField, 8);
 
             uint64_t listHead = 0;
             if (!symbols.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored) ||
@@ -816,7 +1060,7 @@ namespace
                     break;
                 }
                 uint64_t eprocess = current - linksField.Offset;
-                if (pidField.Offset > (~0ull - eprocess))
+                if (!IsKernelAddress(eprocess) || eprocess > UINT64_MAX - 0x10000)
                 {
                     break;
                 }
@@ -850,6 +1094,10 @@ namespace
                 ProcessIdentity identity = {};
                 identity.Pid = static_cast<uint32_t>(pidValue);
                 identity.Eprocess = eprocess;
+                if (creationKnown && !ReadU64(device, eprocess + createdField.Offset, &identity.CreateTime))
+                {
+                    break;
+                }
                 if (imageField.Offset != 0 &&
                     imageField.Length >= 1 &&
                     imageField.Offset <= (~0ull - eprocess))
@@ -871,6 +1119,13 @@ namespace
                 }
 
                 ReadProcessImagePath(device, symbols, eprocess, &identity.ImagePath);
+                uint64_t verifiedPid = 0, verifiedCreated = 0;
+                if (!ReadU64(device, eprocess + pidField.Offset, &verifiedPid) || verifiedPid != pidValue ||
+                    (creationKnown && (!ReadU64(device, eprocess + createdField.Offset, &verifiedCreated) ||
+                    verifiedCreated != identity.CreateTime)))
+                {
+                    break;
+                }
                 processes->push_back(identity);
 
                 uint64_t next = 0;
@@ -881,7 +1136,11 @@ namespace
                 current = next;
             }
 
-            ok = !processes->empty();
+            ok = current == listHead;
+            if (!ok && warnings != nullptr)
+            {
+                warnings->push_back(L"ActiveProcessLinks inventory was incomplete or changed during collection");
+            }
         } while (false);
 
         return ok;
@@ -913,6 +1172,15 @@ bool HandleTableScanner::Scan(
         }
 
         *result = HandleTableScanResult{};
+        result->NextHandleAfter = options.HandleAfter;
+        if (options.ContinueHandles && !options.HasOwnerPid)
+        {
+            if (error != nullptr)
+            {
+                *error = L"handle continuation requires one owner PID";
+            }
+            break;
+        }
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll == nullptr)
         {
@@ -935,7 +1203,11 @@ bool HandleTableScanner::Scan(
         }
 
         std::vector<ProcessIdentity> processes;
-        EnumerateKernelProcesses(device_, symbols_, &processes, &result->Warnings);
+        result->ProcessInventoryRequested = !options.ContinueHandles;
+        if (result->ProcessInventoryRequested)
+        {
+            result->ProcessInventoryComplete = EnumerateKernelProcesses(device_, symbols_, &processes, &result->Warnings);
+        }
         std::unordered_map<uint64_t, ProcessIdentity> byEprocess;
         std::unordered_map<uint32_t, ProcessIdentity> byPid;
         bool duplicatePidWarned = false;
@@ -1001,7 +1273,8 @@ bool HandleTableScanner::Scan(
             break;
         }
 
-        if (buffer.size() < sizeof(ULONG_PTR) * 2)
+        const size_t returnedBytes = needed != 0 && needed <= buffer.size() ? needed : 0;
+        if (returnedBytes < sizeof(ULONG_PTR) * 2)
         {
             if (error != nullptr)
             {
@@ -1014,7 +1287,7 @@ bool HandleTableScanner::Scan(
             reinterpret_cast<const SystemHandleInformationEx*>(buffer.data());
         const size_t headerBytes = offsetof(SystemHandleInformationEx, Handles);
         const uint64_t count = static_cast<uint64_t>(table->NumberOfHandles);
-        const uint64_t maxCount = (buffer.size() - headerBytes) / sizeof(SystemHandleTableEntryEx);
+        const uint64_t maxCount = (returnedBytes - headerBytes) / sizeof(SystemHandleTableEntryEx);
         const uint64_t useCount = count < maxCount ? count : maxCount;
         if (count > maxCount)
         {
@@ -1023,32 +1296,139 @@ bool HandleTableScanner::Scan(
 
         result->HandlesEnumerated = useCount;
         result->CoverageComplete = count <= maxCount && status >= 0;
+        HandleRecordBatch batch;
+        if (options.ContinueHandles)
+        {
+            batch = SelectHandleRecordBatch(table->Handles, static_cast<size_t>(useCount), options);
+            result->HandleCandidates = batch.Candidates;
+            result->InvalidHandleEntries = batch.InvalidEntries;
+            result->HandleCoveragePartial = batch.Indices.size() < batch.Candidates || batch.InvalidEntries != 0;
+        }
         std::unordered_set<uint32_t> owners;
         bool storeCapWarned = false;
-
-        for (uint64_t index = 0; index < useCount; ++index)
+        uint64_t typeTable = 0;
+        TypeFieldInfo typeName = {};
+        TypeFieldInfo typeIndex = {};
+        const bool typeLayout = symbols_.ResolveSymbol(L"nt!ObTypeIndexTable", &typeTable, nullptr) &&
+            IsKernelAddress(typeTable) && symbols_.FindField(L"nt!_OBJECT_TYPE", L"Name", &typeName, nullptr) &&
+            symbols_.FindField(L"nt!_OBJECT_TYPE", L"Index", &typeIndex, nullptr) &&
+            ValidHandleField(typeIndex, 1) && ValidHandleField(typeName, 16);
+        std::unordered_map<uint32_t, std::wstring> typeNames;
+        HandleReadBudget relationshipBudget;
+        relationshipBudget.Limit = options.ContinueHandles ? 4096 : 0;
+        const auto read = [&](uint64_t address, void* output, size_t length)
         {
+            std::vector<uint8_t> bytes;
+            if (!IsKernelAddress(address) || length > UINT32_MAX || address > UINT64_MAX - length ||
+                !relationshipBudget.Acquire() ||
+                !device_.ReadMemory(address, static_cast<uint32_t>(length), &bytes, nullptr) || bytes.size() != length)
+            {
+                return false;
+            }
+            std::memcpy(output, bytes.data(), length);
+            return true;
+        };
+        const auto resolveTypeName = [&](uint32_t index) -> const std::wstring&
+        {
+            auto found = typeNames.find(index);
+            if (found == typeNames.end())
+            {
+                std::wstring name;
+                uint64_t objectType = 0;
+                uint8_t actualIndex = 0;
+                if (typeLayout && index > 0 && index < 256 &&
+                    read(typeTable + index * sizeof(uint64_t), &objectType, sizeof(objectType)) &&
+                    IsKernelAddress(objectType) && objectType <= UINT64_MAX - 0x10000 &&
+                    read(objectType + typeIndex.Offset, &actualIndex, sizeof(actualIndex)) && actualIndex == index)
+                {
+                    ReadHandleUnicodeString(read, objectType + typeName.Offset, &name);
+                }
+                found = typeNames.emplace(index, std::move(name)).first;
+            }
+            return found->second;
+        };
+        HandleObjectLayout objectLayout;
+        TypeFieldInfo objectBody = {}, objectIndex = {};
+        uint64_t cookieAddress = 0;
+        objectLayout.Known = symbols_.FindField(L"nt!_OBJECT_HEADER", L"Body", &objectBody, nullptr) &&
+            symbols_.FindField(L"nt!_OBJECT_HEADER", L"TypeIndex", &objectIndex, nullptr) &&
+            objectBody.Offset > 0 && objectBody.Offset <= 0x1000 && objectIndex.Offset < objectBody.Offset &&
+            objectIndex.Length == 1 && symbols_.ResolveSymbol(L"nt!ObHeaderCookie", &cookieAddress, nullptr) &&
+            read(cookieAddress, &objectLayout.Cookie, sizeof(objectLayout.Cookie));
+        objectLayout.BodyOffset = objectBody.Offset;
+        objectLayout.TypeOffset = objectIndex.Offset;
+        const auto checkType = [&](uint64_t object, const wchar_t* expected)
+        {
+            uint32_t index = 0;
+            return ReadHandleObjectType(read, objectLayout, object, &index) && resolveTypeName(index) == expected;
+        };
+        TypeFieldInfo threadProcess = {}, processPcb = {}, workerProcess = {}, processCreated = {}, processPid = {};
+        TypeFieldInfo fileDevice = {}, deviceDriver = {}, deviceType = {};
+        HandleRelationshipLayout relationship;
+        relationship.ProcessKnown = symbols_.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &processPid, nullptr) &&
+            symbols_.FindField(L"nt!_EPROCESS", L"CreateTime", &processCreated, nullptr) &&
+            ValidHandleField(processPid, 8) && ValidHandleField(processCreated, 8);
+        relationship.Pid = processPid.Offset;
+        relationship.Created = processCreated.Offset;
+        relationship.ThreadKnown = symbols_.FindField(L"nt!_ETHREAD", L"ThreadsProcess", &threadProcess, nullptr) &&
+            ValidHandleField(threadProcess, 8);
+        if (!relationship.ThreadKnown)
+        {
+            relationship.ThreadKnown = symbols_.FindField(L"nt!_ETHREAD", L"Tcb.Process", &threadProcess, nullptr) &&
+                ValidHandleField(threadProcess, 8) && symbols_.FindField(L"nt!_EPROCESS", L"Pcb", &processPcb, nullptr) &&
+                processPcb.Offset < 0x10000;
+            relationship.ThreadProcessAdjustment = processPcb.Offset;
+        }
+        relationship.ThreadProcess = threadProcess.Offset;
+        relationship.WorkerKnown = symbols_.FindField(L"nt!_WORKER_FACTORY", L"Process", &workerProcess, nullptr) &&
+            ValidHandleField(workerProcess, 8);
+        relationship.WorkerProcess = workerProcess.Offset;
+        relationship.FileKnown = symbols_.FindField(L"nt!_FILE_OBJECT", L"DeviceObject", &fileDevice, nullptr) &&
+            symbols_.FindField(L"nt!_DEVICE_OBJECT", L"DriverObject", &deviceDriver, nullptr) &&
+            symbols_.FindField(L"nt!_DEVICE_OBJECT", L"DeviceType", &deviceType, nullptr) &&
+            ValidHandleField(fileDevice, 8) && ValidHandleField(deviceDriver, 8) && ValidHandleField(deviceType, 4);
+        relationship.FileDevice = fileDevice.Offset;
+        relationship.DeviceDriver = deviceDriver.Offset;
+        relationship.DeviceType = deviceType.Offset;
+
+        const size_t visitCount = options.ContinueHandles ? batch.Indices.size() : static_cast<size_t>(useCount);
+        for (size_t visit = 0; visit < visitCount; ++visit)
+        {
+            const size_t index = options.ContinueHandles ? batch.Indices[visit] : visit;
             const SystemHandleTableEntryEx& entry = table->Handles[index];
+            const uint64_t typeFailuresBefore = result->ObjectTypeReadFailures;
+            const uint64_t relationshipFailuresBefore = result->RelationshipReadFailures;
+            const uint64_t unsupportedBefore = result->RelationshipUnsupported;
             HandleTableRecord record = {};
             if (static_cast<uint64_t>(entry.UniqueProcessId) > 0xFFFFFFFFull)
             {
                 continue;
             }
             record.OwnerPid = static_cast<uint32_t>(entry.UniqueProcessId);
+            if (options.HasOwnerPid && record.OwnerPid != options.OwnerPid)
+            {
+                continue;
+            }
             if (static_cast<uint64_t>(entry.HandleValue) > 0xFFFFFFFFull)
             {
                 continue;
             }
             record.HandleValue = static_cast<uint32_t>(entry.HandleValue);
+            if (!options.ContinueHandles)
+            {
+                ++result->HandleCandidates;
+            }
             record.GrantedAccess = entry.GrantedAccess;
             record.ObjectTypeIndex = entry.ObjectTypeIndex;
             record.HandleAttributes = entry.HandleAttributes;
             record.Object = reinterpret_cast<uint64_t>(entry.Object);
-            record.AccessText = AccessTextFromMask(record.GrantedAccess);
-            record.VmRead = (record.GrantedAccess & kProcessVmRead) != 0;
-            record.VmWrite = (record.GrantedAccess & kProcessVmWrite) != 0;
-            record.VmOperation = (record.GrantedAccess & kProcessVmOperation) != 0;
-            record.DupHandle = (record.GrantedAccess & kProcessDupHandle) != 0;
+            record.AccessText = JsonHex(record.GrantedAccess);
+            record.TypeName = resolveTypeName(record.ObjectTypeIndex);
+            record.TypeResolved = !record.TypeName.empty();
+            if (!record.TypeResolved)
+            {
+                ++result->ObjectTypeReadFailures;
+            }
 
             std::wstring ownerPath;
             auto ownerIt = byPid.find(record.OwnerPid);
@@ -1058,15 +1438,62 @@ bool HandleTableScanner::Scan(
                 ownerPath = ownerIt->second.ImagePath;
             }
 
-            auto objectIt = byEprocess.find(record.Object);
-            if (objectIt != byEprocess.end())
+            if (record.TypeName == L"Process")
             {
-                record.PointsToProcess = true;
-                record.TypeName = L"Process";
-                record.TargetPid = objectIt->second.Pid;
-                record.TargetEprocess = objectIt->second.Eprocess;
-                record.TargetImage = objectIt->second.Image;
+                record.AccessText = AccessTextFromMask(record.GrantedAccess);
+                record.VmRead = (record.GrantedAccess & kProcessVmRead) != 0;
+                record.VmWrite = (record.GrantedAccess & kProcessVmWrite) != 0;
+                record.VmOperation = (record.GrantedAccess & kProcessVmOperation) != 0;
+                record.DupHandle = (record.GrantedAccess & kProcessDupHandle) != 0;
+            }
+            if (record.TypeResolved)
+            {
+                uint32_t beforeType = 0, afterType = 0;
+                const bool typeMatches = ReadHandleObjectType(read, objectLayout, record.Object, &beforeType) &&
+                    beforeType == record.ObjectTypeIndex;
+                const auto relationshipStatus = typeMatches ? ReadHandleRelationship(read, checkType, relationship, &record) :
+                    objectLayout.Known ? HandleRelationshipStatus::Unreadable : HandleRelationshipStatus::Unsupported;
+                record.ObjectTypeValidated = typeMatches &&
+                    ReadHandleObjectType(read, objectLayout, record.Object, &afterType) && beforeType == afterType;
+                if (!record.ObjectTypeValidated || relationshipStatus == HandleRelationshipStatus::Unreadable ||
+                    relationshipStatus == HandleRelationshipStatus::Unsupported)
+                {
+                    if (relationshipStatus == HandleRelationshipStatus::Unsupported)
+                    {
+                        ++result->RelationshipUnsupported;
+                    }
+                    else
+                    {
+                        ++result->RelationshipReadFailures;
+                    }
+                    record.RelationshipResolved = false;
+                    record.PointsToProcess = false;
+                    record.TargetIdentityKnown = false;
+                    record.TargetPid = 0;
+                    record.TargetEprocess = 0;
+                    record.TargetCreateTime = 0;
+                    record.DeviceObject = 0;
+                    record.DriverObject = 0;
+                    record.DeviceType = 0;
+                }
+            }
+            if (!CompleteHandleVisit(record.HandleValue, options.ContinueHandles, relationshipBudget, result))
+            {
+                result->ObjectTypeReadFailures = typeFailuresBefore;
+                result->RelationshipReadFailures = relationshipFailuresBefore;
+                result->RelationshipUnsupported = unsupportedBefore;
+                break;
+            }
+            record.PointsToProcess = record.TypeResolved && record.TypeName == L"Process";
+            if (record.PointsToProcess)
+            {
                 ++result->ProcessHandles;
+            }
+            const auto targetIdentity = byEprocess.find(record.TargetEprocess);
+            if (record.TargetIdentityKnown && targetIdentity != byEprocess.end() &&
+                targetIdentity->second.Pid == record.TargetPid && targetIdentity->second.CreateTime == record.TargetCreateTime)
+            {
+                record.TargetImage = targetIdentity->second.Image;
             }
 
             if (options.HasOwnerPid && record.OwnerPid != options.OwnerPid)
@@ -1075,7 +1502,7 @@ bool HandleTableScanner::Scan(
             }
             if (options.HasTargetPid)
             {
-                if (!record.PointsToProcess || record.TargetPid != options.TargetPid)
+                if (!record.TargetIdentityKnown || record.TargetPid != options.TargetPid)
                 {
                     continue;
                 }
@@ -1086,6 +1513,7 @@ bool HandleTableScanner::Scan(
             }
 
             if (record.PointsToProcess &&
+                record.TargetIdentityKnown &&
                 record.OwnerPid != record.TargetPid &&
                 (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle))
             {
@@ -1153,6 +1581,12 @@ bool HandleTableScanner::Scan(
         }
 
         result->OwnerPids.assign(owners.begin(), owners.end());
+        result->RelationshipReadAttempts = relationshipBudget.Attempts;
+        result->ObjectTypeCoverageComplete = typeLayout && result->ObjectTypeReadFailures == 0;
+        result->RelationshipCoverageComplete = objectLayout.Known && result->ObjectTypeCoverageComplete &&
+            result->RelationshipReadFailures == 0 && result->RelationshipUnsupported == 0 &&
+            !result->RelationshipBudgetExhausted && !result->HandleCoveragePartial;
+        result->CoverageComplete = result->CoverageComplete && !result->Truncated && !result->HandleCoveragePartial;
         ok = true;
     } while (false);
 
@@ -1169,6 +1603,20 @@ std::wstring BuildHandleTableJson(const HandleTableScanResult& result)
     json << L",\"suspicious\":" << result.SuspiciousHandles;
     json << L",\"truncated\":" << (result.Truncated ? L"true" : L"false");
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
+    json << L",\"process_inventory_requested\":" << (result.ProcessInventoryRequested ? L"true" : L"false");
+    json << L",\"process_inventory_complete\":" << (result.ProcessInventoryComplete ? L"true" : L"false");
+    json << L",\"object_type_coverage_complete\":" << (result.ObjectTypeCoverageComplete ? L"true" : L"false");
+    json << L",\"object_type_read_failures\":" << result.ObjectTypeReadFailures;
+    json << L",\"relationship_coverage_complete\":" << (result.RelationshipCoverageComplete ? L"true" : L"false");
+    json << L",\"relationship_read_failures\":" << result.RelationshipReadFailures;
+    json << L",\"relationship_unsupported\":" << result.RelationshipUnsupported;
+    json << L",\"handle_candidates\":" << result.HandleCandidates;
+    json << L",\"handles_visited\":" << result.HandlesVisited;
+    json << L",\"invalid_handle_entries\":" << result.InvalidHandleEntries;
+    json << L",\"next_handle_after\":\"" << JsonHex(result.NextHandleAfter) << L"\"";
+    json << L",\"relationship_read_attempts\":" << result.RelationshipReadAttempts;
+    json << L",\"handle_coverage_partial\":" << (result.HandleCoveragePartial ? L"true" : L"false");
+    json << L",\"relationship_budget_exhausted\":" << (result.RelationshipBudgetExhausted ? L"true" : L"false");
     json << L",\"records\":[";
     bool first = true;
     for (const HandleTableRecord& record : result.Records)
@@ -1184,6 +1632,15 @@ std::wstring BuildHandleTableJson(const HandleTableScanResult& result)
         json << L",\"access\":\"" << mcpjson::Escape(record.AccessText) << L"\"";
         json << L",\"object\":\"" << JsonHex(record.Object) << L"\"";
         json << L",\"type\":\"" << mcpjson::Escape(record.TypeName) << L"\"";
+        json << L",\"type_resolved\":" << (record.TypeResolved ? L"true" : L"false");
+        json << L",\"object_type_validated\":" << (record.ObjectTypeValidated ? L"true" : L"false");
+        json << L",\"relationship_resolved\":" << (record.RelationshipResolved ? L"true" : L"false");
+        json << L",\"target_identity_known\":" << (record.TargetIdentityKnown ? L"true" : L"false");
+        json << L",\"target_eprocess\":\"" << JsonHex(record.TargetEprocess) << L"\"";
+        json << L",\"target_create_time\":\"" << JsonHex(record.TargetCreateTime) << L"\"";
+        json << L",\"device_object\":\"" << JsonHex(record.DeviceObject) << L"\"";
+        json << L",\"driver_object\":\"" << JsonHex(record.DriverObject) << L"\"";
+        json << L",\"device_type\":" << record.DeviceType;
         json << L",\"target_pid\":" << record.TargetPid;
         json << L",\"target_image\":\"" << mcpjson::Escape(record.TargetImage) << L"\"";
         json << L",\"vm_read\":" << (record.VmRead ? L"true" : L"false");
@@ -1206,12 +1663,289 @@ std::wstring BuildHandleTableJson(const HandleTableScanResult& result)
     return json.str();
 }
 
+std::wstring HandleTableRecordIdentity(const HandleTableRecord& record)
+{
+    return JsonHex(record.HandleValue) + L":" + JsonHex(record.Object) + L":" + JsonHex(record.GrantedAccess) +
+        L":" + std::to_wstring(record.ObjectTypeIndex) + L":" + std::to_wstring(record.ObjectTypeValidated) +
+        L":" + std::to_wstring(record.RelationshipResolved) + L":" + std::to_wstring(record.TargetPid) +
+        L":" + JsonHex(record.TargetEprocess) + L":" + JsonHex(record.TargetCreateTime) +
+        L":" + JsonHex(record.DeviceObject) + L":" + JsonHex(record.DriverObject) + L":" + JsonHex(record.DeviceType);
+}
+
+std::vector<uint32_t> SelectHandleOwnerBatch(std::vector<uint32_t> pids, uint64_t* afterPid, size_t limit)
+{
+    std::sort(pids.begin(), pids.end());
+    pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
+    if (afterPid != nullptr && !pids.empty() && limit != 0)
+    {
+        const auto start = std::upper_bound(pids.begin(), pids.end(), *afterPid);
+        std::rotate(pids.begin(), start, pids.end());
+        pids.resize((std::min)(limit, pids.size()));
+        *afterPid = pids.back();
+    }
+
+    else
+    {
+        pids.clear();
+    }
+    return pids;
+}
+
 bool HandleTableAccessMaskSelfTest()
 {
     bool ok = false;
 
     do
     {
+        std::vector<SystemHandleTableEntryEx> inventory(4097);
+        for (size_t index = 0; index < inventory.size(); ++index)
+        {
+            inventory[index].UniqueProcessId = 100;
+            inventory[index].HandleValue = (index + 1) * 4;
+        }
+        HandleTableScanOptions continued;
+        continued.HasOwnerPid = true;
+        continued.OwnerPid = 100;
+        continued.ContinueHandles = true;
+        continued.MaxHandlesPerPass = UINT32_MAX;
+        const auto firstHandles = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        if (firstHandles.Indices.size() != 4096 || firstHandles.Candidates != 4097 || firstHandles.InvalidEntries != 0)
+        {
+            break;
+        }
+        continued.HandleAfter = inventory[firstHandles.Indices.back()].HandleValue;
+        inventory.erase(inventory.begin() + 4095);
+        SystemHandleTableEntryEx prefix = {};
+        prefix.UniqueProcessId = 100;
+        prefix.HandleValue = 1;
+        inventory.insert(inventory.begin(), prefix);
+        const auto tailHandles = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        if (tailHandles.Indices.empty() || inventory[tailHandles.Indices.front()].HandleValue != 4097 * 4)
+        {
+            break;
+        }
+        continued.HandleAfter = UINT64_MAX;
+        continued.Limit = 1;
+        const auto wrappedHandles = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        if (wrappedHandles.Indices.size() != 1 || inventory[wrappedHandles.Indices.front()].HandleValue != 1)
+        {
+            break;
+        }
+        prefix.HandleValue = UINT64_MAX;
+        inventory.push_back(prefix);
+        inventory.push_back(inventory.front());
+        const auto ambiguous = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        if (ambiguous.InvalidEntries != 3 || ambiguous.Indices.empty() ||
+            inventory[ambiguous.Indices.front()].HandleValue == 1)
+        {
+            break;
+        }
+        HandleReadBudget strictBudget;
+        strictBudget.Limit = 4096;
+        for (uint32_t attempt = 0; attempt < 4096; ++attempt)
+        {
+            if (!strictBudget.Acquire())
+            {
+                return false;
+            }
+        }
+        HandleTableScanResult exactFit;
+        if (!CompleteHandleVisit(12, true, strictBudget, &exactFit) || exactFit.RelationshipBudgetExhausted ||
+            exactFit.HandleCoveragePartial || exactFit.NextHandleAfter != 12)
+        {
+            break;
+        }
+        if (strictBudget.Acquire() || strictBudget.Attempts != 4096 || !strictBudget.Denied)
+        {
+            break;
+        }
+        HandleTableScanResult pending;
+        pending.NextHandleAfter = 12;
+        if (CompleteHandleVisit(16, true, strictBudget, &pending) || pending.NextHandleAfter != 12 ||
+            !pending.RelationshipBudgetExhausted || !pending.HandleCoveragePartial || pending.HandlesVisited != 0)
+        {
+            break;
+        }
+        inventory.clear();
+        for (uint32_t handle : {4, 8, 12, 16})
+        {
+            prefix.HandleValue = handle;
+            inventory.push_back(prefix);
+        }
+        continued.HandleAfter = pending.NextHandleAfter;
+        const auto retry = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        HandleReadBudget freshBudget;
+        freshBudget.Limit = 4096;
+        if (retry.Indices.empty() || inventory[retry.Indices.front()].HandleValue != 16 ||
+            !freshBudget.Acquire() || !CompleteHandleVisit(16, true, freshBudget, &pending) || pending.NextHandleAfter != 16)
+        {
+            break;
+        }
+        const uint64_t oldProcess = 0xffff800000100000ull;
+        const uint64_t newProcess = 0xffff800000200000ull;
+        const uint64_t thread = 0xffff800000300000ull;
+        const uint64_t file = 0xffff800000400000ull;
+        const uint64_t device = 0xffff800000500000ull;
+        const uint64_t driver = 0xffff800000600000ull;
+        std::map<uint64_t, std::vector<uint8_t>> memory;
+        std::map<uint64_t, std::wstring> types = {{oldProcess, L"Process"}, {newProcess, L"Process"},
+            {thread, L"Thread"}, {file, L"File"}, {device, L"Device"}, {driver, L"Driver"}};
+        const auto put = [&](uint64_t address, auto value)
+        {
+            memory[address].resize(sizeof(value));
+            std::memcpy(memory[address].data(), &value, sizeof(value));
+        };
+        uint64_t failRead = 0;
+        bool mutatePid = false;
+        uint32_t pidReads = 0;
+        const auto read = [&](uint64_t address, void* output, size_t length)
+        {
+            const auto found = memory.find(address);
+            if (address == failRead || found == memory.end() || found->second.size() != length)
+            {
+                return false;
+            }
+            std::memcpy(output, found->second.data(), length);
+            if (address == oldProcess + 16 && mutatePid && ++pidReads == 2)
+            {
+                const uint64_t reusedPid = 901;
+                std::memcpy(output, &reusedPid, sizeof(reusedPid));
+            }
+            return true;
+        };
+        const auto checkType = [&](uint64_t object, const wchar_t* expected)
+        {
+            const auto found = types.find(object);
+            return found != types.end() && found->second == expected;
+        };
+        HandleObjectLayout header;
+        header.Known = true;
+        header.BodyOffset = 0x30;
+        header.TypeOffset = 0x18;
+        header.Cookie = 0x5a;
+        const uint64_t headerAddress = file - header.BodyOffset;
+        put(headerAddress + header.TypeOffset, static_cast<uint8_t>(7 ^ header.Cookie ^ static_cast<uint8_t>(headerAddress >> 8)));
+        uint32_t actualType = 0;
+        if (!ReadHandleObjectType(read, header, file, &actualType) || actualType != 7)
+        {
+            break;
+        }
+        failRead = headerAddress + header.TypeOffset;
+        if (ReadHandleObjectType(read, header, file, &actualType))
+        {
+            break;
+        }
+        failRead = 0;
+        HandleRelationshipLayout layout;
+        layout.ProcessKnown = true;
+        layout.Pid = 16;
+        layout.Created = 24;
+        layout.ThreadKnown = true;
+        layout.ThreadProcess = 32;
+        layout.ThreadProcessAdjustment = 0x80;
+        layout.WorkerKnown = true;
+        layout.WorkerProcess = 32;
+        layout.FileKnown = true;
+        layout.FileDevice = 32;
+        layout.DeviceDriver = 40;
+        layout.DeviceType = 48;
+        put(oldProcess + 16, uint64_t(900));
+        put(oldProcess + 24, uint64_t(123));
+        put(newProcess + 16, uint64_t(900));
+        put(newProcess + 24, uint64_t(124));
+        put(thread + 32, oldProcess + layout.ThreadProcessAdjustment);
+        HandleTableRecord threadRecord;
+        threadRecord.Object = thread;
+        threadRecord.TypeName = L"Thread";
+        if (ReadHandleRelationship(read, checkType, layout, &threadRecord) != HandleRelationshipStatus::Resolved ||
+            threadRecord.TargetEprocess != oldProcess || threadRecord.TargetCreateTime != 123 ||
+            !threadRecord.TargetIdentityKnown)
+        {
+            break;
+        }
+        threadRecord = {};
+        threadRecord.Object = thread;
+        threadRecord.TypeName = L"Thread";
+        mutatePid = true;
+        if (ReadHandleRelationship(read, checkType, layout, &threadRecord) != HandleRelationshipStatus::Unreadable ||
+            threadRecord.TargetIdentityKnown)
+        {
+            break;
+        }
+        mutatePid = false;
+        put(file + 32, device);
+        put(device + 40, driver);
+        put(device + 48, uint32_t(0x22));
+        HandleTableRecord fileRecord;
+        fileRecord.HandleValue = 4;
+        fileRecord.Object = file;
+        fileRecord.TypeName = L"File";
+        fileRecord.ObjectTypeIndex = 7;
+        const std::wstring incompleteIdentity = HandleTableRecordIdentity(fileRecord);
+        failRead = device + 40;
+        if (ReadHandleRelationship(read, checkType, layout, &fileRecord) != HandleRelationshipStatus::Unreadable ||
+            fileRecord.DeviceObject != 0 || fileRecord.DriverObject != 0)
+        {
+            break;
+        }
+        failRead = 0;
+        if (ReadHandleRelationship(read, checkType, layout, &fileRecord) != HandleRelationshipStatus::Resolved ||
+            fileRecord.DeviceObject != device || fileRecord.DriverObject != driver || fileRecord.DeviceType != 0x22 ||
+            incompleteIdentity == HandleTableRecordIdentity(fileRecord))
+        {
+            break;
+        }
+        fileRecord = {};
+        fileRecord.Object = file;
+        fileRecord.TypeName = L"File";
+        types[device] = L"Thread";
+        if (ReadHandleRelationship(read, checkType, layout, &fileRecord) != HandleRelationshipStatus::Unreadable)
+        {
+            break;
+        }
+        types[device] = L"Device";
+        layout.FileKnown = false;
+        if (ReadHandleRelationship(read, checkType, layout, &fileRecord) != HandleRelationshipStatus::Unsupported)
+        {
+            break;
+        }
+        const uint64_t unicode = 0xffff800000700000ull;
+        const uint64_t text = unicode + 0x100;
+        memory[unicode].assign(16, uint8_t(0));
+        uint16_t length = 8;
+        std::memcpy(memory[unicode].data(), &length, sizeof(length));
+        std::memcpy(memory[unicode].data() + 2, &length, sizeof(length));
+        std::memcpy(memory[unicode].data() + 8, &text, sizeof(text));
+        memory[text].resize(length);
+        std::memcpy(memory[text].data(), L"File", length);
+        std::wstring name;
+        if (!ReadHandleUnicodeString(read, unicode, &name) || name != L"File")
+        {
+            break;
+        }
+        memory[text].pop_back();
+        if (ReadHandleUnicodeString(read, unicode, &name) || !name.empty())
+        {
+            break;
+        }
+        memory[unicode][0] = 7;
+        if (ReadHandleUnicodeString(read, unicode, &name))
+        {
+            break;
+        }
+        memory[unicode][0] = 8;
+        memory[unicode][2] = 6;
+        if (ReadHandleUnicodeString(read, unicode, &name))
+        {
+            break;
+        }
+        uint64_t anchor = 0;
+        const auto first = SelectHandleOwnerBatch({10,20,30,40,50,60,70,80,90}, &anchor, 8);
+        const auto second = SelectHandleOwnerBatch({1,2,3,10,20,30,40,50,60,70,80,90}, &anchor, 8);
+        if (first.size() != 8 || first.back() != 80 || second.empty() || second.front() != 90)
+        {
+            break;
+        }
         if (AccessTextFromMask(kProcessVmRead) != L"VM_READ")
         {
             break;

@@ -97,11 +97,11 @@ suspicious row on a clean box is a false positive to fix.
 
 ### `!msrcheck`  (commit a92d0fe)
 - Expect `msr syscall-config cpus=N` with no `[SUSPICIOUS]`.
-- `IA32_LSTAR` -> `module=ntoskrnl.exe symbol=KiSystemCall64`.
+- `IA32_LSTAR` -> `module=ntoskrnl.exe symbol=KiSystemCall64` or `KiSystemCall64Shadow` when KVA shadow is active.
 - `IA32_EFER` -> `SCE=1`.
 - All per-CPU values identical (no `per-cpu:` divergence line).
-- Confirm: (a) `nt!KiSystemCall64` resolves (otherwise the module-containment
-  fallback path is exercised - still expected clean); (b) `IA32_CSTAR` shows the
+- Confirm: (a) the active regular or KVA-shadow entry symbol resolves (when neither resolves,
+  the module-containment fallback is exercised - still expected clean); (b) `IA32_CSTAR` shows the
   `CSTAR is 0 (compat-mode SYSCALL unused)` note on Intel (no false positive);
   (c) no spurious divergence flag.
 
@@ -127,8 +127,9 @@ suspicious row on a clean box is a false positive to fix.
   `all present interrupt handlers resolve into loaded kernel modules`.
 - Confirm: (a) IDT base reads as a kernel-canonical address and `entries=256`;
   (b) no present gate is flagged on a clean box (handlers live in ntoskrnl/hal).
-- Known limitation: only the boot processor IDT is walked; per-processor
-  comparison is a future enhancement.
+- Confirm cross-processor comparison across all processor groups. A failed read,
+  mismatched processor identity, invalid/different table length, or scan cap at
+  256 processors must report incomplete coverage instead of a complete clean scan.
 
 ### CPU-state in snapshot / diff
 - `!snapshot baseline` on a clean box, then `!snapshot show baseline /domains` shows a
@@ -284,8 +285,14 @@ must stay suspended.
 ### Driver-free gate
 
 ```powershell
-.\x64\Release\KnLiveDbg.exe --self-test console
+.\x64\Release\KnLiveDbg.exe --self-test all
 ```
+
+The combined gate runs timeline, MCP, console, remote-protocol, and connect-argv tests.
+It covers malformed JSON/UTF-8, complete bounded HTTP request bodies, AI response
+and CLI output limits/deadlines, credential-preserving rejection of HTTP redirects,
+dump paging entries, PE header mutations, and
+MSR/IDT compatibility boundaries without loading the driver.
 
 `kmon-artifact-primitives` and `kmon-hidden-driver-regression` must pass. The
 COW half shares one sled-length contract with the fixture
@@ -296,6 +303,16 @@ cross-process half prints exactly one reason line (fixture missing,
 contract sled never observed, child exited before the COW sample). That does not replace the live `!kmon` pass.
 
 ### Still manual
+
+- In a disposable VM, short output buffers for timeline control, write mode,
+  virtual/physical writes, and flush must fail before changing state or memory.
+- Open two controller handles: closing the first must preserve tracing; closing
+  the last must unregister live callbacks and release ownership after cleanup.
+  Concurrent opens during cleanup must fail with `STATUS_DEVICE_BUSY`.
+- Exercise MDL fallback under mapping teardown and Driver Verifier in a VM.
+  Driver-free tests do not validate kernel races or the raw IRP hook unload limit.
+- On an HTTP.sys test host, send headers exceeding the MCP receive buffer both
+  before and after the listener starts waiting; both paths must return HTTP 431.
 
 - Game + anti-cheat idle FP soak (Program Files EAC/BE/Vanguard `drop_load` is
   expected; overlay `inject.remote` should stay off until `/name game.exe`).
@@ -359,6 +376,66 @@ Driver-free: `.\tools\validate-remote-protocol.ps1 -Configuration Release`.
 See also the plan at
 `C:\Users\kernulist\.claude\plans\crispy-sauteeing-sky.md`.
 
+## September 2026 kmon live validation gate
+
+These checks are pending for the hardening described in
+[KMON_IMPLEMENTATION_2026-09-16.md](KMON_IMPLEMENTATION_2026-09-16.md). Driver-free console,
+timeline, protocol, and fixture tests do not satisfy this gate.
+
+1. Use an isolated Windows 10 and Windows 11 test machine with a recoverable
+   snapshot. Record OS build, symbol/PDB identities, binary hashes, HVCI state,
+   scan budgets, and test-driver identity with each result.
+2. Start and stop timeline collection repeatedly under Driver Verifier in the
+   test VM. Exercise process/image/thread activity during unregister and verify
+   no IRQL or lock diagnostics. Verify reset produces no events from the old
+   ring and no old two-strike confirmations after restarting `!kmon`.
+3. Use a controlled kernel fixture with ground-truth allocation addresses to
+   validate independent pages, nonpaged pool, large-page module overlap, and
+   headerless RX bodies beyond the first 16 KB. Confirm eventual window visits,
+   correct PFN/effective permissions, and explicit partial coverage under caps
+   or unavailable pages. Do not interpret an NX negative as proof of absence.
+4. Validate each supported callback family and both available DPC layouts.
+   Compare a legitimate in-module target and a legitimate loaded-module tail
+   call against a controlled static redirect to fixture-owned orphan code.
+   Require two matching redirect observations. Change, remove, or make the
+   target unreadable between passes and confirm that previous strikes expire.
+5. Run the user fixture modes, including `/orphan-mapped-rx` and the
+   `/mapped-readonly` negative control. Save actual emitted events with PID,
+   creation time, allocation base, protection, module-view coverage, and bytes
+   read. Exercise access-denied and process-exit races; neither is a ghost or
+   an automatic implant finding.
+6. Stress process, thread, and VAD counts beyond the per-pass budgets. Confirm
+   that later targets and thread starts eventually receive work, and that VM
+   and thread sampling do not require their independent cursors to coincide.
+   Reuse PIDs/TIDs and verify generation changes cannot inherit cursor/strike
+   evidence.
+7. Run browser/.NET JIT workloads, signed overlays, game anti-cheat, driver
+   updates, and normal hotpatch activity as negative controls. Record per-layer
+   candidate counts, unexplained alerts, scan latency, and coverage gaps before
+   asserting an operational false-positive rate. Keep all unperformed cases
+   explicitly marked unverified.
+8. Exercise session/CR3 changes, repeated PFN continuation, allocation interiors,
+   executable virtual tails, and graphics slot tails with controlled ground
+   truth. Remove/reinsert modules before saved cursors and verify remaining
+   targets receive work. Record read failures and eviction coverage separately
+   from an observed clean page.
+9. Collect local/remote TI protection events together with VAD snapshots during
+   release/reallocation and delayed delivery. Preserve original event times and
+   query intervals; verify that overlapping intervals or new allocation
+   lifetimes cannot manufacture an NX-to-RX transition. Restart TI twice during
+   an ingest pass and verify generation, loss and receipt-health reporting.
+10. Populate more than 4096 handles and more than 32 TLS/VEH/VCH records in a
+    controlled process. Exercise budget-boundary retries, owner churn and PID
+    reuse. Compare the recorded target object relationships with fixture truth.
+11. Compare supported callback/attachment/WFP policy lifecycle events with
+    registrations made by controlled fixtures. Revoke access and unload the
+    fixture between reads; incomplete snapshots must not prove disappearance.
+12. Save `KnLiveDbg.exe --self-test platform-query` output and independently
+    compare CI, CiTool and TBS observations. An unconfigured external verifier
+    must keep `attestation.trusted=false`. Enrollment, TPM quote/PCR validation,
+    device/AK binding and replay controls require a separately configured
+    verifier before any trusted platform claim.
+
 ## Validation log
 
 - **2026-06-15, Windows 11 (4 logical processors), test-signing VM** -- all
@@ -366,7 +443,7 @@ See also the plan at
   - `!idt`: 256 entries, all present handlers in loaded modules.
   - `!ssdt`: native 489 routines in ntoskrnl.exe; win32k shadow 1493 in win32k*.
   - `!cr`: CR0.WP=1, CR4 SMEP/SMAP/UMIP=1, LA57=0, no per-CPU divergence.
-  - `!msrcheck`: LSTAR=KiSystemCall64, CSTAR=KiSystemCall32, EFER SCE=1.
+  - `!msrcheck`: LSTAR=KiSystemCall64 or KiSystemCall64Shadow, CSTAR=KiSystemCall32, EFER SCE=1.
   - `!wfp kernelcallouts`: 86 callouts resolved with classify symbols and
     name/layer/provider metadata (tcpip/Ndu/mpsdrv/wtd/WdNisDrv). The build's
     callout layout was engine=`*gWfpGlobal` (deref), count@+0x198, array@+0x1a0,

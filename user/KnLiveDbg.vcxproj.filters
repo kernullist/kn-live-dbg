@@ -163,6 +163,18 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="KmonUserEvidence.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PendingIrpScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="KmonTemporalEvidence.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="KmonPlatformEvidence.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KernelMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -375,6 +387,21 @@
     <ClInclude Include="ThreatIntelSubscriber.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="KmonUserEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PendingIrpScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ScannerListWindow.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="KmonTemporalEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="KmonPlatformEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="KernelMonitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -427,6 +454,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgPaging.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">

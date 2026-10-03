@@ -113,6 +113,28 @@ namespace
         const wchar_t* Name;
         bool IsPointer;
     };
+
+    bool UnexpectedLstar(uint64_t target, uint64_t regular, uint64_t shadow, bool inModule)
+    {
+        if (target != 0 && (target == regular || target == shadow))
+        {
+            return false;
+        }
+        return regular != 0 || shadow != 0 || !inModule;
+    }
+}
+
+bool MsrScannerSelfTest()
+{
+    constexpr uint64_t regular = 0xfffff80000100000ull;
+    constexpr uint64_t shadow = regular + 0x1000;
+    return !UnexpectedLstar(regular, regular, shadow, true) &&
+        !UnexpectedLstar(shadow, regular, shadow, true) &&
+        !UnexpectedLstar(shadow, 0, shadow, true) &&
+        UnexpectedLstar(regular + 1, regular, shadow, true) &&
+        UnexpectedLstar(0, regular, shadow, false) &&
+        UnexpectedLstar(shadow, 0, 0, false) &&
+        !UnexpectedLstar(shadow, 0, 0, true);
 }
 
 MsrScanner::MsrScanner(DeviceClient& device, SymbolEngine& symbols) :
@@ -150,6 +172,8 @@ bool MsrScanner::Scan(MsrScanResult* result, std::wstring* error)
 
         uint64_t kiSystemCall64 = 0;
         symbols_.ResolveSymbol(L"nt!KiSystemCall64", &kiSystemCall64, nullptr);
+        uint64_t kiSystemCall64Shadow = 0;
+        symbols_.ResolveSymbol(L"nt!KiSystemCall64Shadow", &kiSystemCall64Shadow, nullptr);
         uint64_t kiSystemCall32 = 0;
         symbols_.ResolveSymbol(L"nt!KiSystemCall32", &kiSystemCall32, nullptr);
 
@@ -221,20 +245,13 @@ bool MsrScanner::Scan(MsrScanResult* result, std::wstring* error)
 
                 if (spec.Index == KNDBG_MSR_IA32_LSTAR)
                 {
-                    if (kiSystemCall64 != 0)
-                    {
-                        if (primary != kiSystemCall64)
-                        {
-                            reading.Suspicious = true;
-                            result->AnySuspicious = true;
-                            AppendNote(&reading.Notes, L"LSTAR does not point to nt!KiSystemCall64 (possible SYSCALL hook)");
-                        }
-                    }
-                    else if (!reading.PointsIntoKernelModule)
+                    if (UnexpectedLstar(primary, kiSystemCall64, kiSystemCall64Shadow, reading.PointsIntoKernelModule))
                     {
                         reading.Suspicious = true;
                         result->AnySuspicious = true;
-                        AppendNote(&reading.Notes, L"LSTAR target outside loaded kernel modules");
+                        AppendNote(&reading.Notes, kiSystemCall64 != 0 || kiSystemCall64Shadow != 0
+                            ? L"LSTAR does not point to a resolved nt!KiSystemCall64 or nt!KiSystemCall64Shadow entry"
+                            : L"LSTAR target outside loaded kernel modules");
                     }
                 }
                 else // CSTAR

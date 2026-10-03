@@ -707,6 +707,16 @@ namespace
 
     constexpr size_t kMaxEffectiveProtectionRangesPerVad = 4096;
 
+    void SetEffectiveProtectionCollectionInterval(
+        ProcessVadProtectionRange* range,
+        uint64_t started,
+        uint64_t completed)
+    {
+        const bool known = started != 0 && completed >= started;
+        range->CollectionStartTimestamp = known ? started : 0;
+        range->CollectionEndTimestamp = known ? completed : 0;
+    }
+
     bool SameEffectiveProtection(
         const ProcessVadProtectionRange& left,
         const ProcessVadProtectionRange& right)
@@ -740,6 +750,13 @@ namespace
                 SameEffectiveProtection(previous, range))
             {
                 previous.EndAddress = range.EndAddress;
+                const bool intervalKnown = previous.CollectionStartTimestamp != 0 &&
+                    previous.CollectionEndTimestamp >= previous.CollectionStartTimestamp &&
+                    range.CollectionStartTimestamp != 0 &&
+                    range.CollectionEndTimestamp >= range.CollectionStartTimestamp;
+                SetEffectiveProtectionCollectionInterval(&previous,
+                    intervalKnown ? (std::min)(previous.CollectionStartTimestamp, range.CollectionStartTimestamp) : 0,
+                    intervalKnown ? (std::max)(previous.CollectionEndTimestamp, range.CollectionEndTimestamp) : 0);
                 return true;
             }
         }
@@ -783,11 +800,15 @@ namespace
             while (cursor <= record->EndAddress)
             {
                 MEMORY_BASIC_INFORMATION memory = {};
+                FILETIME queryStarted = {};
+                FILETIME queryCompleted = {};
+                GetSystemTimePreciseAsFileTime(&queryStarted);
                 SIZE_T returned = VirtualQueryEx(
                     process,
                     reinterpret_cast<const void*>(cursor),
                     &memory,
                     sizeof(memory));
+                GetSystemTimePreciseAsFileTime(&queryCompleted);
                 if (returned < sizeof(memory) || memory.RegionSize == 0)
                 {
                     break;
@@ -819,6 +840,9 @@ namespace
                 ProcessVadProtectionRange protectionRange = {};
                 protectionRange.StartAddress = overlapStart;
                 protectionRange.EndAddress = overlapEnd;
+                SetEffectiveProtectionCollectionInterval(&protectionRange,
+                    (static_cast<uint64_t>(queryStarted.dwHighDateTime) << 32) | queryStarted.dwLowDateTime,
+                    (static_cast<uint64_t>(queryCompleted.dwHighDateTime) << 32) | queryCompleted.dwLowDateTime);
                 protectionRange.Protection = memory.Protect;
                 protectionRange.Type = memory.Type;
                 protectionRange.Committed = memory.State == MEM_COMMIT;
@@ -2542,6 +2566,92 @@ namespace
         return outcome;
     }
 
+    template<typename Read>
+    bool ReadVadSectionFileName(
+        uint64_t nameAddress,
+        Read read,
+        std::wstring* value)
+    {
+        bool ok = false;
+        do
+        {
+            if (value == nullptr)
+            {
+                break;
+            }
+            value->clear();
+            std::vector<uint8_t> header;
+            if (!read(nameAddress, 16, &header) || header.size() != 16)
+            {
+                break;
+            }
+            uint16_t length = 0;
+            uint16_t maximumLength = 0;
+            uint64_t buffer = 0;
+            std::memcpy(&length, header.data(), sizeof(length));
+            std::memcpy(&maximumLength, header.data() + 2, sizeof(maximumLength));
+            std::memcpy(&buffer, header.data() + 8, sizeof(buffer));
+            if ((length & 1u) != 0 || (maximumLength & 1u) != 0 ||
+                length > maximumLength || length > 2048)
+            {
+                break;
+            }
+            if (length == 0)
+            {
+                ok = true;
+                break;
+            }
+            uint64_t end = 0;
+            if (!IsKernelAddress(buffer) || (buffer & 1ull) != 0 ||
+                !TryAdd(buffer, length, &end))
+            {
+                break;
+            }
+            std::vector<uint8_t> bytes;
+            if (!read(buffer, length, &bytes) || bytes.size() != length)
+            {
+                break;
+            }
+            value->resize(length / sizeof(wchar_t));
+            std::memcpy(value->data(), bytes.data(), length);
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool SetVadAddressRange(
+        uint64_t startVpn,
+        uint64_t endVpn,
+        ProcessVadRecord* record)
+    {
+        bool ok = false;
+        do
+        {
+            // A process VAD must remain in the widest supported user half.
+            // This also bounds EndAddress + 1 and the inclusive byte count.
+            constexpr uint64_t maxVpn = kLa57UserAddressMax >> 12;
+            if (record == nullptr || startVpn > maxVpn ||
+                endVpn > maxVpn || endVpn < startVpn)
+            {
+                break;
+            }
+            record->StartVpn = startVpn;
+            record->EndVpn = endVpn;
+            record->StartAddress = startVpn << 12;
+            record->EndAddress = ((endVpn + 1ull) << 12) - 1ull;
+            record->Size = record->EndAddress - record->StartAddress + 1ull;
+            ok = true;
+        } while (false);
+        return ok;
+    }
+
+    bool VadHasSectionMetadata(const ProcessVadRecord& record)
+    {
+        // Private VADs can be MMVAD_SHORT allocations. The MMVAD section
+        // extension must only be interpreted for a known section-backed VAD.
+        return record.HasPrivateMemory && !record.PrivateMemory;
+    }
+
     bool ReadVadRecord(
         DeviceClient& device,
         const VadLayout& layout,
@@ -2584,52 +2694,47 @@ namespace
             if (layout.HasStartingVpnHigh)
             {
                 uint64_t high = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.StartingVpnHigh, sizeof(uint8_t), &high, nullptr))
+                if (!ReadFieldInteger(device, record->VadAddress, layout.StartingVpnHigh, sizeof(uint8_t), &high, error))
                 {
-                    startVpn |= high << 32;
+                    break;
                 }
+                startVpn |= high << 32;
             }
 
             if (layout.HasEndingVpnHigh)
             {
                 uint64_t high = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.EndingVpnHigh, sizeof(uint8_t), &high, nullptr))
+                if (!ReadFieldInteger(device, record->VadAddress, layout.EndingVpnHigh, sizeof(uint8_t), &high, error))
                 {
-                    endVpn |= high << 32;
+                    break;
                 }
+                endVpn |= high << 32;
             }
 
-            record->StartVpn = startVpn;
-            record->EndVpn = endVpn;
-            constexpr uint64_t maxVpn = std::numeric_limits<uint64_t>::max() >> 12;
-            if (startVpn > maxVpn || endVpn > maxVpn || endVpn < startVpn)
+            if (!SetVadAddressRange(startVpn, endVpn, record))
             {
                 if (error != nullptr)
                 {
-                    *error = L"invalid VAD VPN range";
+                    *error = L"invalid user VAD VPN range";
                 }
                 break;
             }
 
-            record->StartAddress = startVpn << 12;
-            if (endVpn == maxVpn)
+            auto readMetadataField = [&](DeviceClient& reader, uint64_t base,
+                const TypeFieldInfo& field, size_t width, uint64_t* value, std::wstring* readError)
             {
-                record->EndAddress = std::numeric_limits<uint64_t>::max();
-            }
-            else
-            {
-                record->EndAddress = ((endVpn + 1ull) << 12) - 1ull;
-            }
-
-            if (record->EndAddress >= record->StartAddress)
-            {
-                record->Size = record->EndAddress - record->StartAddress + 1ull;
-            }
+                const bool read = ReadFieldInteger(reader, base, field, width, value, readError);
+                if (!read)
+                {
+                    ++record->MetadataReadFailures;
+                }
+                return read;
+            };
 
             if (layout.HasProtection)
             {
                 uint64_t protection = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.Protection, sizeof(uint32_t), &protection, nullptr))
+                if (readMetadataField(device, record->VadAddress, layout.Protection, sizeof(uint32_t), &protection, nullptr))
                 {
                     record->Protection = static_cast<uint32_t>(protection);
                     record->ProtectionText = ProtectionText(record->Protection);
@@ -2647,7 +2752,7 @@ namespace
             if (layout.HasPrivateMemory)
             {
                 uint64_t privateMemory = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.PrivateMemory, sizeof(uint32_t), &privateMemory, nullptr))
+                if (readMetadataField(device, record->VadAddress, layout.PrivateMemory, sizeof(uint32_t), &privateMemory, nullptr))
                 {
                     record->PrivateMemory = privateMemory != 0;
                     record->HasPrivateMemory = true;
@@ -2656,13 +2761,13 @@ namespace
 
             if (layout.HasCommitCharge)
             {
-                ReadFieldInteger(device, record->VadAddress, layout.CommitCharge, sizeof(uint64_t), &record->CommitCharge, nullptr);
+                readMetadataField(device, record->VadAddress, layout.CommitCharge, sizeof(uint64_t), &record->CommitCharge, nullptr);
             }
 
             if (layout.HasNoChange)
             {
                 uint64_t noChange = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.NoChange, sizeof(uint32_t), &noChange, nullptr))
+                if (readMetadataField(device, record->VadAddress, layout.NoChange, sizeof(uint32_t), &noChange, nullptr))
                 {
                     record->NoChange = noChange != 0;
                     record->HasNoChange = true;
@@ -2672,17 +2777,17 @@ namespace
             if (layout.HasLarge)
             {
                 uint64_t large = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.Large, sizeof(uint32_t), &large, nullptr))
+                if (readMetadataField(device, record->VadAddress, layout.Large, sizeof(uint32_t), &large, nullptr))
                 {
                     record->LargePage = large != 0;
                     record->HasLargePage = true;
                 }
             }
 
-            if (layout.HasSubsection)
+            if (layout.HasSubsection && VadHasSectionMetadata(*record))
             {
                 uint64_t subsection = 0;
-                if (ReadFieldInteger(device, record->VadAddress, layout.Subsection, sizeof(uint64_t), &subsection, nullptr))
+                if (readMetadataField(device, record->VadAddress, layout.Subsection, sizeof(uint64_t), &subsection, nullptr))
                 {
                     record->Subsection = subsection;
                     record->HasSubsection = subsection != 0;
@@ -2691,7 +2796,7 @@ namespace
                         subsection != 0)
                     {
                         uint64_t controlArea = 0;
-                        if (ReadFieldInteger(
+                        if (readMetadataField(
                                 device,
                                 subsection,
                                 layout.ControlArea,
@@ -2706,7 +2811,7 @@ namespace
                             if (layout.HasMappedViews)
                             {
                                 uint64_t views = 0;
-                                if (ReadFieldInteger(
+                                if (readMetadataField(
                                         device,
                                         controlArea,
                                         layout.MappedViews,
@@ -2720,7 +2825,7 @@ namespace
                             if (layout.HasFilePointer)
                             {
                                 uint64_t fileRaw = 0;
-                                if (ReadFieldInteger(
+                                if (readMetadataField(
                                         device,
                                         controlArea,
                                         layout.FilePointer,
@@ -2735,26 +2840,25 @@ namespace
                                         uint64_t nameAddress = 0;
                                         if (TryAdd(fileObject, layout.FileName.Offset, &nameAddress))
                                         {
-                                            std::vector<uint8_t> header;
-                                            if (device.ReadMemory(nameAddress, 16, &header, nullptr) &&
-                                                header.size() >= 16)
-                                            {
-                                                uint16_t length = 0;
-                                                uint64_t buffer = 0;
-                                                memcpy(&length, header.data(), sizeof(length));
-                                                memcpy(&buffer, header.data() + 8, sizeof(buffer));
-                                                if (length > 0 && length <= 2048 && buffer != 0)
-                                                {
-                                                    std::vector<uint8_t> nameBytes;
-                                                    if (device.ReadMemory(buffer, length, &nameBytes, nullptr) &&
-                                                        nameBytes.size() >= 2)
+                                            if (!ReadVadSectionFileName(
+                                                    nameAddress,
+                                                    [&device](uint64_t address, uint32_t length, std::vector<uint8_t>* bytes)
                                                     {
-                                                        record->SectionFileName.assign(
-                                                            reinterpret_cast<const wchar_t*>(nameBytes.data()),
-                                                            nameBytes.size() / sizeof(wchar_t));
-                                                    }
+                                                        return device.ReadMemory(address, length, bytes, nullptr);
+                                                    },
+                                                    &record->SectionFileName))
+                                            {
+                                                ++record->MetadataReadFailures;
+                                                if (!record->Notes.empty())
+                                                {
+                                                    record->Notes += L"; ";
                                                 }
+                                                record->Notes += L"section name unreadable or malformed";
                                             }
+                                        }
+                                        else
+                                        {
+                                            ++record->MetadataReadFailures;
                                         }
                                     }
                                 }
@@ -2777,6 +2881,29 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    void AccumulateVadReadCoverage(
+        const ProcessVadRecord& record,
+        bool peProbeRequired,
+        ProcessVadScanResult* result)
+    {
+        if (result == nullptr)
+        {
+            return;
+        }
+        const bool peReadFailed = peProbeRequired &&
+            (!record.PeProbeAttempted || !record.PeProbeReadSucceeded);
+        result->MetadataReadFailures += record.MetadataReadFailures;
+        if (peReadFailed)
+        {
+            ++result->PeProbeReadFailures;
+        }
+        if (record.MetadataReadFailures != 0 || peReadFailed)
+        {
+            result->Incomplete = true;
+            result->CoverageComplete = false;
+        }
     }
 
     bool VadMatchesOptions(const ProcessVadRecord& record, const ProcessVadScanOptions& options)
@@ -3259,11 +3386,10 @@ namespace
             }
 
             // Current Windows builds can queue a user APC through an ntdll
-            // dispatcher.  In that form KAPC.NormalRoutine belongs to ntdll
-            // and the caller-supplied callback is carried in the context or
-            // argument slots.  Only promote such a slot when it resolves to
-            // executable memory with suspicious VAD/module provenance; plain
-            // data arguments remain telemetry.
+            // dispatcher. Executable context or argument values are candidates
+            // only: module membership does not establish the dispatcher's ABI.
+            // Preserve their source so consumers do not call them verified APC
+            // routines or use them as execution proof.
             if (userQueue &&
                 EqualsNoCase(record->NormalRoutineModule, L"ntdll.dll"))
             {
@@ -3331,7 +3457,7 @@ namespace
                         record->Notes += L"; ";
                     }
                     record->Notes +=
-                        L"ntdll APC dispatcher carries an executable callback in " +
+                        L"unverified APC argument points to executable memory: " +
                         std::wstring(candidate.Source);
                     break;
                 }
@@ -3343,6 +3469,47 @@ namespace
         } while (false);
 
         return ok;
+    }
+
+    template<typename LinkReader, typename EntryReader>
+    bool ReadStableApcEntry(LinkReader readLinks, EntryReader readEntry, uint64_t current,
+        uint64_t previous, uint64_t* next, ProcessApcEntryRecord* entry)
+    {
+        *entry = {};
+        *next = 0;
+        uint64_t firstNext = 0, firstBack = 0, finalNext = 0, finalBack = 0;
+        ProcessApcEntryRecord first, second;
+        const bool stable = readLinks(current, &firstNext, &firstBack) &&
+            IsValidListEntry(firstNext, firstBack) && firstBack == previous &&
+            readEntry(current, &first) && readEntry(current, &second) &&
+            readLinks(current, &finalNext, &finalBack) &&
+            finalNext == firstNext && finalBack == firstBack &&
+            first.KapcAddress == second.KapcAddress &&
+            first.HasKernelRoutine && second.HasKernelRoutine && first.KernelRoutine == second.KernelRoutine &&
+            first.HasNormalRoutine && second.HasNormalRoutine && first.NormalRoutine == second.NormalRoutine &&
+            first.HasRundownRoutine == second.HasRundownRoutine && first.RundownRoutine == second.RundownRoutine &&
+            first.NormalContext == second.NormalContext && first.SystemArgument1 == second.SystemArgument1 &&
+            first.SystemArgument2 == second.SystemArgument2;
+        if (stable)
+        {
+            *next = firstNext;
+            *entry = std::move(first);
+        }
+        return stable;
+    }
+
+    template<typename LinkReader>
+    bool RevalidateApcQueueHead(LinkReader readLinks, uint64_t head, ProcessApcQueueRecord* queue)
+    {
+        uint64_t first = 0, last = 0;
+        const bool stable = readLinks(head, &first, &last) && first == queue->Flink && last == queue->Blink;
+        if (!stable)
+        {
+            queue->Incomplete = true;
+            queue->Notes = L"APC queue head changed or became unreadable";
+            queue->Entries.clear();
+        }
+        return stable;
     }
 
     ProcessApcQueueRecord ReadApcQueue(
@@ -3410,39 +3577,21 @@ namespace
 
                 visited.push_back(current);
                 ProcessApcEntryRecord entry = {};
-                if (ReadApcEntry(
-                        device,
-                        symbols,
-                        modules,
-                        userModuleCoverageComplete,
-                        vadRecords,
-                        layout,
-                        current,
-                        userQueue,
-                        &entry))
-                {
-                    queue.Entries.push_back(entry);
-                }
-                else
-                {
-                    queue.Incomplete = true;
-                    queue.Notes = L"APC entry routines could not be read";
-                }
-
                 uint64_t next = 0;
-                uint64_t blink = 0;
-                if (!ReadListEntry(device, current, &next, &blink, nullptr))
+                if (!ReadStableApcEntry([&](uint64_t address, uint64_t* forward, uint64_t* backward)
+                    {
+                        return ReadListEntry(device, address, forward, backward, nullptr);
+                    }, [&](uint64_t address, ProcessApcEntryRecord* output)
+                    {
+                        return ReadApcEntry(device, symbols, modules, userModuleCoverageComplete,
+                            vadRecords, layout, address, userQueue, output);
+                    }, current, previous, &next, &entry))
                 {
                     queue.Incomplete = true;
-                    queue.Notes = L"APC queue link could not be read";
+                    queue.Notes = L"APC entry contents or links could not be revalidated";
                     break;
                 }
-                if (blink != previous)
-                {
-                    queue.Incomplete = true;
-                    queue.Notes = L"APC queue backward link is inconsistent";
-                    break;
-                }
+                queue.Entries.push_back(std::move(entry));
 
                 previous = current;
                 current = next;
@@ -3466,6 +3615,14 @@ namespace
                 queue.Truncated = true;
                 queue.Incomplete = true;
                 queue.Notes = L"APC queue hit the per-queue entry limit";
+            }
+            RevalidateApcQueueHead([&](uint64_t address, uint64_t* forward, uint64_t* backward)
+            {
+                return ReadListEntry(device, address, forward, backward, nullptr);
+            }, headAddress, &queue);
+            if (queue.Incomplete && !queue.Truncated)
+            {
+                queue.Entries.clear();
             }
         } while (false);
 
@@ -3822,6 +3979,69 @@ namespace
 
 bool ProcessTriageEffectiveProtectionSelfTest()
 {
+    {
+        constexpr uint64_t head = 0xffff800000001000ULL;
+        constexpr uint64_t current = 0xffff800000002000ULL;
+        for (uint32_t scenario = 0; scenario < 6; ++scenario)
+        {
+            uint32_t linkReads = 0, entryReads = 0;
+            uint64_t next = 0;
+            ProcessApcEntryRecord output;
+            const bool stable = ReadStableApcEntry([&](uint64_t, uint64_t* forward, uint64_t* backward)
+            {
+                ++linkReads;
+                *forward = head;
+                *backward = scenario == 4 ? current : head;
+                return !(scenario == 1 && linkReads == 2);
+            }, [&](uint64_t address, ProcessApcEntryRecord* entry)
+            {
+                ++entryReads;
+                entry->KapcAddress = address - 0x10;
+                entry->HasKernelRoutine = true;
+                entry->KernelRoutine = 0xffff800000010000ULL;
+                entry->HasNormalRoutine = true;
+                entry->NormalRoutine = scenario == 2 && entryReads == 2 ? 0x300100 : 0x200100;
+                entry->SystemArgument1 = scenario == 3 && entryReads == 2 ? 0x400100 : 0;
+                return scenario != 5;
+            }, current, head, &next, &output);
+            if (stable != (scenario == 0) ||
+                (stable && (next != head || output.NormalRoutine != 0x200100)) ||
+                (!stable && (next != 0 || output.KapcAddress != 0)))
+            {
+                return false;
+            }
+        }
+        ProcessApcQueueRecord queue;
+        queue.Flink = current;
+        queue.Blink = current;
+        queue.Entries.resize(1);
+        bool mutate = false;
+        const auto links = [&](uint64_t, uint64_t* forward, uint64_t* backward)
+        {
+            *forward = mutate ? head : current;
+            *backward = current;
+            return true;
+        };
+        if (!RevalidateApcQueueHead(links, head, &queue) || queue.Entries.size() != 1)
+        {
+            return false;
+        }
+        mutate = true;
+        if (RevalidateApcQueueHead(links, head, &queue) || !queue.Incomplete || !queue.Entries.empty())
+        {
+            return false;
+        }
+        ProcessThreadScanResult threads;
+        threads.Records.resize(1);
+        threads.Records[0].ApcQueues.resize(1);
+        threads.Records[0].ApcQueues[0].Entries.resize(1);
+        threads.Records[0].ApcQueues[0].Entries[0].UserRoutineSource = L"system_argument1";
+        if (BuildProcessThreadsJson(threads).find(
+                L"\"user_routine_is_argument_candidate\":true,\"user_routine_module\"") == std::wstring::npos)
+        {
+            return false;
+        }
+    }
     ProcessTriageTarget kernelOnly = {};
     kernelOnly.ProcessId = 4;
     kernelOnly.ImageName = L"System";
@@ -3855,6 +4075,7 @@ bool ProcessTriageEffectiveProtectionSelfTest()
     first.Protection = PAGE_EXECUTE_READ;
     first.Committed = true;
     first.Executable = true;
+    SetEffectiveProtectionCollectionInterval(&first, 100, 110);
     if (!AppendEffectiveProtectionRange(&ranges, first))
     {
         return false;
@@ -3863,10 +4084,24 @@ bool ProcessTriageEffectiveProtectionSelfTest()
     ProcessVadProtectionRange adjacent = first;
     adjacent.StartAddress = 0x2000;
     adjacent.EndAddress = 0x2fff;
+    SetEffectiveProtectionCollectionInterval(&adjacent, 120, 130);
     if (!AppendEffectiveProtectionRange(&ranges, adjacent) ||
         ranges.size() != 1 ||
         ranges[0].StartAddress != 0x1000 ||
-        ranges[0].EndAddress != 0x2fff)
+        ranges[0].EndAddress != 0x2fff ||
+        ranges[0].CollectionStartTimestamp != 100 || ranges[0].CollectionEndTimestamp != 130)
+    {
+        return false;
+    }
+
+    std::vector<ProcessVadProtectionRange> unknownTiming = ranges;
+    ProcessVadProtectionRange missingTime = adjacent;
+    missingTime.StartAddress = 0x3000;
+    missingTime.EndAddress = 0x3fff;
+    SetEffectiveProtectionCollectionInterval(&missingTime, 140, 139);
+    if (missingTime.CollectionStartTimestamp != 0 || missingTime.CollectionEndTimestamp != 0 ||
+        !AppendEffectiveProtectionRange(&unknownTiming, missingTime) || unknownTiming.size() != 1 ||
+        unknownTiming.front().CollectionStartTimestamp != 0 || unknownTiming.front().CollectionEndTimestamp != 0)
     {
         return false;
     }
@@ -3976,6 +4211,152 @@ bool ProcessTriageEffectiveProtectionSelfTest()
 
 bool ProcessTriageVadTraversalSelfTest()
 {
+    constexpr uint64_t nameHeaderAddress = 0xffff800000001000ull;
+    constexpr uint64_t nameBufferAddress = 0xffff800000002000ull;
+    const std::wstring fullName = L"\\Device\\Volume\\good.dll";
+    const uint16_t nameLength = static_cast<uint16_t>(fullName.size() * sizeof(wchar_t));
+    std::vector<uint8_t> nameHeader(16, 0);
+    std::vector<uint8_t> nameBytes(nameLength, 0);
+    std::memcpy(nameBytes.data(), fullName.data(), nameLength);
+    auto setNameHeader = [&](uint16_t length, uint16_t maximumLength, uint64_t buffer)
+    {
+        std::memcpy(nameHeader.data(), &length, sizeof(length));
+        std::memcpy(nameHeader.data() + 2, &maximumLength, sizeof(maximumLength));
+        std::memcpy(nameHeader.data() + 8, &buffer, sizeof(buffer));
+    };
+    size_t nameReturned = nameBytes.size();
+    size_t headerReturned = nameHeader.size();
+    auto readName = [&](uint64_t address, uint32_t length, std::vector<uint8_t>* bytes)
+    {
+        if (address == nameHeaderAddress && length == 16)
+        {
+            bytes->assign(nameHeader.begin(), nameHeader.begin() + headerReturned);
+            return true;
+        }
+        if (address == nameBufferAddress && length == nameLength)
+        {
+            bytes->assign(nameBytes.begin(), nameBytes.begin() + nameReturned);
+            return true;
+        }
+        return false;
+    };
+    std::wstring observedName;
+    setNameHeader(nameLength, nameLength, nameBufferAddress);
+    if (!ReadVadSectionFileName(nameHeaderAddress, readName, &observedName) ||
+        observedName != fullName)
+    {
+        return false;
+    }
+
+    nameReturned = 2;
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName) ||
+        !observedName.empty())
+    {
+        return false;
+    }
+    nameReturned = nameBytes.size();
+    headerReturned = 10;
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName))
+    {
+        return false;
+    }
+    headerReturned = nameHeader.size();
+    setNameHeader(nameLength, static_cast<uint16_t>(nameLength - 2), nameBufferAddress);
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName))
+    {
+        return false;
+    }
+    setNameHeader(static_cast<uint16_t>(nameLength - 1), nameLength, nameBufferAddress);
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName))
+    {
+        return false;
+    }
+    setNameHeader(nameLength, static_cast<uint16_t>(nameLength + 1), nameBufferAddress);
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName))
+    {
+        return false;
+    }
+    setNameHeader(nameLength, nameLength, (std::numeric_limits<uint64_t>::max)() - 1);
+    if (ReadVadSectionFileName(nameHeaderAddress, readName, &observedName))
+    {
+        return false;
+    }
+    setNameHeader(0, 0, 0);
+    if (!ReadVadSectionFileName(nameHeaderAddress, readName, &observedName) ||
+        !observedName.empty())
+    {
+        return false;
+    }
+    ProcessVadRecord range = {};
+    constexpr uint64_t highVpn = 0x700000001ull;
+    constexpr uint64_t lastUserVpn = kLa57UserAddressMax >> 12;
+    if (!SetVadAddressRange(highVpn, highVpn + 1, &range) ||
+        range.StartAddress != 0x700000001000ull ||
+        range.EndAddress != 0x700000002fffull ||
+        range.Size != 0x2000 ||
+        !SetVadAddressRange(lastUserVpn, lastUserVpn, &range) ||
+        range.EndAddress != kLa57UserAddressMax || range.Size != 0x1000 ||
+        SetVadAddressRange(lastUserVpn + 1, lastUserVpn + 1, &range) ||
+        SetVadAddressRange(3, 2, &range) ||
+        SetVadAddressRange(0, (std::numeric_limits<uint64_t>::max)() >> 12, &range))
+    {
+        return false;
+    }
+    ProcessVadScanResult readCoverage = {};
+    ProcessVadRecord observedVad = {};
+    observedVad.StartAddress = 0x10000;
+    observedVad.Size = kPageSize;
+    observedVad.MetadataReadFailures = 1;
+    observedVad.PeProbeAttempted = true;
+    observedVad.PeProbeReadSucceeded = true;
+    if (VadHasSectionMetadata(observedVad))
+    {
+        return false;
+    }
+    observedVad.HasPrivateMemory = true;
+    observedVad.PrivateMemory = true;
+    if (VadHasSectionMetadata(observedVad))
+    {
+        return false;
+    }
+    observedVad.PrivateMemory = false;
+    if (!VadHasSectionMetadata(observedVad))
+    {
+        return false;
+    }
+    readCoverage.Records.push_back(observedVad);
+    AccumulateVadReadCoverage(observedVad, true, &readCoverage);
+    if (!readCoverage.Incomplete || readCoverage.CoverageComplete ||
+        readCoverage.MetadataReadFailures != 1 || readCoverage.PeProbeReadFailures != 0 ||
+        readCoverage.Records.size() != 1 || readCoverage.Records[0].StartAddress != 0x10000)
+    {
+        return false;
+    }
+    readCoverage = ProcessVadScanResult{};
+    observedVad.MetadataReadFailures = 0;
+    observedVad.PeProbeReadSucceeded = false;
+    AccumulateVadReadCoverage(observedVad, true, &readCoverage);
+    if (!readCoverage.Incomplete || readCoverage.CoverageComplete ||
+        readCoverage.MetadataReadFailures != 0 || readCoverage.PeProbeReadFailures != 1)
+    {
+        return false;
+    }
+    readCoverage = ProcessVadScanResult{};
+    observedVad.PeProbeAttempted = false;
+    AccumulateVadReadCoverage(observedVad, true, &readCoverage);
+    if (!readCoverage.Incomplete || readCoverage.PeProbeReadFailures != 1)
+    {
+        return false;
+    }
+    readCoverage = ProcessVadScanResult{};
+    // An unsupported capability is diagnosed by layout resolution. It is
+    // distinct from a failed read of a resolved field or requested PE probe.
+    AccumulateVadReadCoverage(observedVad, false, &readCoverage);
+    if (readCoverage.Incomplete || !readCoverage.CoverageComplete ||
+        readCoverage.MetadataReadFailures != 0 || readCoverage.PeProbeReadFailures != 0)
+    {
+        return false;
+    }
     const uint64_t root = 0xffff800000001000ull;
     const uint64_t unreadable =
         0xffff800000002000ull;
@@ -4738,9 +5119,11 @@ bool ProcessTriageScanner::ScanVad(
                 const bool mappedPeProbe =
                     options.ProbeAllPe &&
                     VadBasePageCommitted(record);
-                if ((legacyPrivatePeProbe || sectionPeProbe || mappedPeProbe) &&
+                const bool peProbeRequired =
+                    (legacyPrivatePeProbe || sectionPeProbe || mappedPeProbe) &&
                     record.StartAddress != 0 &&
-                    record.Size >= kPageSize &&
+                    record.Size >= kPageSize;
+                if (peProbeRequired &&
                     (dtb != 0 ||
                      HasExactProcessIdentity(options.Target)))
                 {
@@ -4756,7 +5139,7 @@ bool ProcessTriageScanner::ScanVad(
                             &firstPage,
                             &ignored))
                     {
-                        record.PeProbeReadSucceeded = true;
+                        record.PeProbeReadSucceeded = firstPage.size() == kPageSize;
                         if (ProbeForPeHeader(
                                 firstPage.data(),
                                 firstPage.size(),
@@ -4771,6 +5154,7 @@ bool ProcessTriageScanner::ScanVad(
                         }
                     }
                 }
+                AccumulateVadReadCoverage(record, peProbeRequired, result);
 
                 if (record.PeHeaderFound)
                 {
@@ -4825,6 +5209,14 @@ bool ProcessTriageScanner::ScanVad(
             result->CoverageComplete = false;
             result->Warnings.push_back(
                 L"coverage incomplete: VAD traversal had unreadable/poisoned nodes, cycles, or a node-limit stop");
+        }
+
+        if (result->MetadataReadFailures != 0 || result->PeProbeReadFailures != 0)
+        {
+            result->Warnings.push_back(
+                L"coverage incomplete: VAD metadata read failures=" +
+                std::to_wstring(result->MetadataReadFailures) +
+                L", requested PE probe failures=" + std::to_wstring(result->PeProbeReadFailures));
         }
 
         if (requiresEffectiveCoverage &&
@@ -5738,6 +6130,198 @@ bool ProcessTriageScanner::ScanThreads(
     return ok;
 }
 
+bool ProcessTriageScanner::ScanExecutionEvidence(
+    const ProcessExecutionScanOptions& options,
+    ProcessExecutionScanResult* result,
+    std::wstring* error)
+{
+    bool ok = false;
+    do
+    {
+        if (result == nullptr)
+        {
+            break;
+        }
+        *result = ProcessExecutionScanResult{};
+        if (options.Target.ProcessId <= 4 || !options.Target.HasCreateTime ||
+            options.Target.CreateTime == 0 || !IsKernelAddress(options.Target.Eprocess))
+        {
+            break;
+        }
+        ThreadLayout layout;
+        TypeFieldInfo processIdField = {}, processCreateField = {}, ownerField = {};
+        TypeFieldInfo trapField = {}, ripField = {}, threadCreateField = {};
+        if (!ResolveThreadLayout(symbols_, &layout, true, error) || !layout.HasUniqueThread ||
+            !FindFieldRecursive(symbols_, {L"nt!_EPROCESS"}, L"UniqueProcessId", &processIdField, nullptr) ||
+            !FindFieldRecursive(symbols_, {L"nt!_EPROCESS"}, L"CreateTime", &processCreateField, nullptr) ||
+            !FindFieldRecursive(symbols_, {L"nt!_ETHREAD"}, L"UniqueProcess", &ownerField, nullptr) ||
+            !FindFieldRecursive(symbols_, {L"nt!_ETHREAD"}, L"CreateTime", &threadCreateField, nullptr))
+        {
+            break;
+        }
+        auto sameProcess = [&]()
+        {
+            uint64_t pid = 0, created = 0;
+            return ReadFieldInteger(device_, options.Target.Eprocess, processIdField, sizeof(uint64_t), &pid, nullptr) &&
+                ReadFieldInteger(device_, options.Target.Eprocess, processCreateField, sizeof(uint64_t), &created, nullptr) &&
+                pid == options.Target.ProcessId && created == options.Target.CreateTime;
+        };
+        if (!sameProcess())
+        {
+            break;
+        }
+        result->ApcLayoutAvailable = layout.HasApcState && layout.HasApcListHead && layout.HasKapcLayout;
+        result->SavedContextLayoutAvailable =
+            FindFieldRecursive(symbols_, {L"nt!_ETHREAD"}, L"TrapFrame", &trapField, nullptr) &&
+            FindFieldRecursive(symbols_, {L"nt!_KTRAP_FRAME"}, L"Rip", &ripField, nullptr) &&
+            layout.HasStackBase && layout.HasStackLimit;
+        uint64_t head = 0, current = 0, headBlink = 0;
+        if (!TryAdd(options.Target.Eprocess, layout.ThreadListHead.Offset, &head) ||
+            !ReadListEntry(device_, head, &current, &headBlink, error) ||
+            !IsKernelAddress(current) || !IsKernelAddress(headBlink))
+        {
+            break;
+        }
+        struct ThreadIdentity
+        {
+            uint64_t Ethread = 0;
+            uint64_t Created = 0;
+            uint32_t Tid = 0;
+        };
+        std::vector<ThreadIdentity> inventory;
+        std::unordered_set<uint64_t> visited;
+        uint64_t previous = head;
+        bool linksValid = true;
+        while (current != head && inventory.size() < kMaxThreads)
+        {
+            uint64_t ethread = 0, next = 0, blink = 0, tid = 0, owner = 0, created = 0;
+            if (!IsKernelAddress(current) || !visited.insert(current).second ||
+                !TrySub(current, layout.ThreadListEntry.Offset, &ethread) ||
+                !ReadListEntry(device_, current, &next, &blink, nullptr) || blink != previous ||
+                !ReadFieldInteger(device_, ethread, layout.UniqueThread, sizeof(uint64_t), &tid, nullptr) ||
+                !ReadFieldInteger(device_, ethread, ownerField, sizeof(uint64_t), &owner, nullptr) ||
+                !ReadFieldInteger(device_, ethread, threadCreateField, sizeof(uint64_t), &created, nullptr) ||
+                owner != options.Target.ProcessId || tid == 0 || tid > UINT32_MAX)
+            {
+                linksValid = false;
+                break;
+            }
+            inventory.push_back({ethread, created, static_cast<uint32_t>(tid)});
+            previous = current;
+            current = next;
+        }
+        uint64_t finalFlink = 0, finalBlink = 0;
+        result->InventoryComplete = linksValid && current == head && previous == headBlink &&
+            ReadListEntry(device_, head, &finalFlink, &finalBlink, nullptr) &&
+            finalBlink == headBlink &&
+            (inventory.empty() ? finalFlink == head :
+                finalFlink == inventory.front().Ethread + layout.ThreadListEntry.Offset);
+        std::sort(inventory.begin(), inventory.end(), [](const ThreadIdentity& a, const ThreadIdentity& b)
+        {
+            return a.Tid < b.Tid;
+        });
+        const size_t budget = (std::min)(static_cast<size_t>(options.ThreadBudget), size_t{256});
+        result->Truncated = current != head || inventory.size() > budget;
+        if (!inventory.empty())
+        {
+            auto first = std::upper_bound(inventory.begin(), inventory.end(), options.AfterThreadId,
+                [](uint32_t tid, const ThreadIdentity& item)
+                {
+                    return tid < item.Tid;
+                });
+            const size_t offset = static_cast<size_t>(first - inventory.begin()) % inventory.size();
+            const size_t count = (std::min)(budget, inventory.size());
+            for (size_t i = 0; i < count; ++i)
+            {
+                const ThreadIdentity& identity = inventory[(offset + i) % inventory.size()];
+                result->NextThreadCursor = identity.Tid;
+                auto sameThread = [&]()
+                {
+                    uint64_t tid = 0, owner = 0, created = 0;
+                    return ReadFieldInteger(device_, identity.Ethread, layout.UniqueThread, sizeof(uint64_t), &tid, nullptr) &&
+                        ReadFieldInteger(device_, identity.Ethread, ownerField, sizeof(uint64_t), &owner, nullptr) &&
+                        ReadFieldInteger(device_, identity.Ethread, threadCreateField, sizeof(uint64_t), &created, nullptr) &&
+                        tid == identity.Tid && owner == options.Target.ProcessId && created == identity.Created;
+                };
+                if (!sameThread())
+                {
+                    ++result->ApcFailures;
+                    ++result->SavedContextFailures;
+                    continue;
+                }
+                ProcessThreadRecord record;
+                record.Ethread = identity.Ethread;
+                record.ThreadId = identity.Tid;
+                record.HasThreadId = true;
+                if (result->ApcLayoutAvailable)
+                {
+                    uint64_t apcState = 0, heads = 0, userHead = 0;
+                    if (TryAdd(identity.Ethread, layout.ApcState.Offset, &apcState) &&
+                        TryAdd(apcState, layout.ApcListHead.Offset, &heads) &&
+                        TryAdd(heads, sizeof(uint64_t) * 2, &userHead))
+                    {
+                        record.ApcQueues.push_back(ReadApcQueue(device_, symbols_, options.UserModules,
+                            options.UserModuleEnumerationComplete, options.VadRecords, layout, userHead, L"user", true));
+                        if (record.ApcQueues.back().Incomplete || record.ApcQueues.back().Truncated)
+                        {
+                            ++result->ApcFailures;
+                        }
+                    }
+                    else
+                    {
+                        ++result->ApcFailures;
+                    }
+                }
+                if (result->SavedContextLayoutAvailable)
+                {
+                    uint64_t trap = 0, trapAfter = 0, rip = 0, ripAfter = 0;
+                    uint64_t stackBase = 0, stackLimit = 0, ripAddress = 0;
+                    const bool trapStable =
+                        ReadFieldInteger(device_, identity.Ethread, trapField, sizeof(uint64_t), &trap, nullptr) &&
+                        ReadFieldInteger(device_, identity.Ethread, layout.StackBase, sizeof(uint64_t), &stackBase, nullptr) &&
+                        ReadFieldInteger(device_, identity.Ethread, layout.StackLimit, sizeof(uint64_t), &stackLimit, nullptr) &&
+                        IsKernelAddress(trap) && IsKernelAddress(stackLimit) && IsKernelAddress(stackBase) && stackBase > stackLimit &&
+                        TryAdd(trap, ripField.Offset, &ripAddress) && ripAddress >= stackLimit &&
+                        ripAddress <= stackBase - sizeof(uint64_t) &&
+                        ReadFieldInteger(device_, trap, ripField, sizeof(uint64_t), &rip, nullptr) &&
+                        ReadFieldInteger(device_, identity.Ethread, trapField, sizeof(uint64_t), &trapAfter, nullptr) &&
+                        ReadFieldInteger(device_, trap, ripField, sizeof(uint64_t), &ripAfter, nullptr) &&
+                        trap == trapAfter && rip == ripAfter;
+                    if (trapStable)
+                    {
+                        record.TrapFrame = trap;
+                        record.SavedInstructionPointer = rip;
+                        record.SavedContextStable = true;
+                    }
+                    else
+                    {
+                        ++result->SavedContextFailures;
+                    }
+                }
+                if (!sameThread())
+                {
+                    ++result->ApcFailures;
+                    ++result->SavedContextFailures;
+                    continue;
+                }
+                result->Records.push_back(std::move(record));
+            }
+        }
+        result->IdentityStable = sameProcess();
+        if (!result->IdentityStable)
+        {
+            result->Records.clear();
+            break;
+        }
+        ok = true;
+    } while (false);
+    if (!ok && error != nullptr && error->empty())
+    {
+        *error = L"bounded thread execution evidence requires exact process and PDB identities";
+    }
+    return ok;
+}
+
 std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
 {
     std::wstringstream json;
@@ -5756,6 +6340,8 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
          << L",\"private_executable\":" << result.PrivateExecutableCount
          << L",\"wx\":" << result.WxCount
          << L",\"pe_like\":" << result.PeLikeCount
+         << L",\"metadata_read_failures\":" << result.MetadataReadFailures
+         << L",\"pe_probe_read_failures\":" << result.PeProbeReadFailures
          << L",\"suspicious\":" << result.SuspiciousCount
          << L",\"hidden_pte_ranges\":" << result.HiddenPteRanges
          << L",\"hidden_pte_bytes\":" << result.HiddenPteBytes
@@ -5809,6 +6395,7 @@ std::wstring BuildProcessVadJson(const ProcessVadScanResult& result)
              << L",\"private\":" << (r.HasPrivateMemory && r.PrivateMemory ? L"true" : L"false")
               << L",\"commit_charge\":" << r.CommitCharge
               << L",\"pe_probe_attempted\":" << (r.PeProbeAttempted ? L"true" : L"false")
+              << L",\"metadata_read_failures\":" << r.MetadataReadFailures
               << L",\"pe_probe_read_succeeded\":" << (r.PeProbeReadSucceeded ? L"true" : L"false")
               << L",\"pe_like\":" << (r.PeHeaderFound ? L"true" : L"false")
               << L",\"pe_suspicious\":" << (r.PeHeaderSuspicious ? L"true" : L"false")
@@ -6073,7 +6660,9 @@ std::wstring BuildProcessThreadsJson(const ProcessThreadScanResult& result)
                      << L",\"normal_routine_wx\":" << (entry.NormalRoutineInWxVad ? L"true" : L"false")
                      << L",\"user_routine\":\"" << Hex(entry.UserRoutine, 16)
                      << L"\",\"user_routine_source\":\"" << JsonEscape(entry.UserRoutineSource)
-                     << L"\",\"user_routine_module\":\"" << JsonEscape(entry.UserRoutineModule)
+                     << L"\",\"user_routine_is_argument_candidate\":"
+                     << (ProcessApcUserRoutineIsArgumentCandidate(entry) ? L"true" : L"false")
+                     << L",\"user_routine_module\":\"" << JsonEscape(entry.UserRoutineModule)
                      << L"\",\"user_routine_vad\":\"" << JsonEscape(entry.UserRoutineVadClassification)
                      << L"\",\"user_routine_private_exec\":" << (entry.UserRoutineInPrivateExecVad ? L"true" : L"false")
                      << L",\"user_routine_wx\":" << (entry.UserRoutineInWxVad ? L"true" : L"false")

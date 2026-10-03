@@ -2,9 +2,11 @@
 
 #include "EtwScanner.h"
 #include "McpServer.h"
+#include "McpJson.h"
 
 #include <Aclapi.h>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -290,6 +292,34 @@ int RunMcpToolCatalogSelfTest()
     {
         std::vector<McpToolCatalogEntry> catalog = BuildMcpToolCatalogSnapshot();
         Check(&context, !catalog.empty(), L"catalog-not-empty");
+        Check(&context, McpRequestBodySelfTest(), L"http-body-bounds-eof-and-read-failure");
+        {
+            std::wstring value;
+            Check(&context, mcpjson::GetString(
+                LR"({"m\u0065thod":"ping","params":{"items":[{},[],null,true,-1.2e+3]}})",
+                L"method", &value) && value == L"ping", L"json-escaped-key-and-nested-values");
+            const wchar_t* invalid[] =
+            {
+                LR"({"method":"ping"} trailing)",
+                LR"({"method":"ping" "id":1})",
+                LR"({"method":"ping","params":[})",
+                LR"({"method":"ping","id":01})",
+                LR"({"method":"ping","id":1e})",
+                LR"({"method":"ping","params":{"x":truejunk}})",
+                LR"({"method":"ping","method":"tools/call"})",
+                LR"({"method":"p\qing"})",
+                LR"({"method":"ping",})"
+            };
+            for (size_t index = 0; index < _countof(invalid); ++index)
+            {
+                const std::wstring name = L"json-reject-malformed-" + std::to_wstring(index);
+                Check(&context, !mcpjson::GetString(invalid[index], L"method", &value), name.c_str());
+            }
+            const std::wstring deep = L"{\"x\":" + std::wstring(130, L'[') + L"0" +
+                std::wstring(130, L']') + L"}";
+            Check(&context, !mcpjson::IsObject(deep), L"json-bounded-nesting");
+            Check(&context, mcpjson::Utf8ToWide(std::string("\xc0\xaf", 2)).empty(), L"json-reject-invalid-utf8");
+        }
 
         std::set<std::wstring> names;
         bool unique = true;
@@ -360,7 +390,7 @@ int RunMcpToolCatalogSelfTest()
         Check(
             &context,
             silentOk &&
-                silentResult.Status == L"silent" &&
+                silentResult.Status == L"unknown" &&
                 !silentResult.Suspicious,
             L"ti-silence-alone-not-suspicious");
 
@@ -380,9 +410,14 @@ int RunMcpToolCatalogSelfTest()
         Check(
             &context,
             dropOk &&
-                dropResult.Status == L"dropping" &&
+                dropResult.Status == L"unknown" &&
+                dropResult.EventsDropped == dropInput.EventsDropped &&
+                dropResult.EventsLost == 0 &&
+                dropResult.ConsumerMissingSequence == 0 &&
+                std::isfinite(dropResult.EventsPerSecond) &&
+                dropResult.EventsPerSecond > 0 &&
                 !dropResult.Suspicious,
-            L"ti-drop-rate-overflow-safe");
+            L"ti-retention-pressure-is-not-consumer-loss");
 
         bool replacementOk = false;
         bool daclOk = false;

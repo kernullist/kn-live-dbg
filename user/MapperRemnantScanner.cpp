@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -600,6 +601,29 @@ namespace
         return next == 0 || next == current;
     }
 
+    bool UnloadedSlotsComplete(bool usedBulk, uint32_t readableSlots)
+    {
+        return usedBulk || readableSlots == kDefaultUnloadedSlots;
+    }
+
+    void ApplyUnloadedPageProbe(bool known, bool present, bool executable,
+        MapperUnloadedRecord* record, MapperScanResult* result)
+    {
+        record->PageProbeKnown = known;
+        record->StillPresent = known && present;
+        record->StillExecutable = known && executable;
+        if (!known)
+        {
+            ++result->UnloadedPageProbeFailures;
+            LeftoverAppendNote(&record->Notes, L"page state is unknown; the translation probe failed");
+        }
+    }
+
+    bool UnloadedNameWasWiped(uint16_t nameLength, uint64_t start)
+    {
+        return nameLength == 0 && start != 0;
+    }
+
     bool LooksLikeInlineUnloadedArrayHead(uint16_t length, uint16_t maximum, uint64_t buffer)
     {
         if (length == 0)
@@ -657,6 +681,7 @@ namespace
                     last.StartAddress == record.StartAddress)
                 {
                     last.RepeatCount += 1;
+                    last.PageProbeKnown = last.PageProbeKnown && record.PageProbeKnown;
                     if (record.EndAddress > last.EndAddress)
                     {
                         last.EndAddress = record.EndAddress;
@@ -848,6 +873,7 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             }
             else
             {
+                walkedAll = false;
                 continue;
             }
 
@@ -864,6 +890,7 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 !ReadBlobU16(*view, slot + nameOffset + 2, &nameMaximum) ||
                 !ReadBlobU64(*view, slot + nameOffset + 8, &nameBuffer))
             {
+                walkedAll = false;
                 continue;
             }
             if (start == 0 && end == 0 && nameLength == 0)
@@ -872,7 +899,12 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             }
 
             std::wstring name;
-            ReadUnicodeFromFields(device_, nameLength, nameMaximum, nameBuffer, &name);
+            const bool nameReadable =
+                ReadUnicodeFromFields(device_, nameLength, nameMaximum, nameBuffer, &name);
+            if (!nameReadable && nameLength != 0)
+            {
+                walkedAll = false;
+            }
 
             MapperUnloadedRecord record = {};
             record.Index = index;
@@ -881,6 +913,10 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             record.EndAddress = end;
             record.TimeStamp = time;
             record.Name = name;
+            if (!nameReadable && nameLength != 0)
+            {
+                LeftoverAppendNote(&record.Notes, L"driver name could not be read; wipe verdict deferred");
+            }
             if (start != 0 && end != 0 && end <= start)
             {
                 record.Suspicious = true;
@@ -914,10 +950,10 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 {
                     bool present = false;
                     bool executable = false;
-                    if (ProbeRangeStillExecutable(device_, start, &present, &executable))
+                    const bool known = ProbeRangeStillExecutable(device_, start, &present, &executable);
+                    ApplyUnloadedPageProbe(known, present, executable, &record, result);
+                    if (known)
                     {
-                        record.StillPresent = present;
-                        record.StillExecutable = executable;
                         if (executable)
                         {
                             record.Suspicious = true;
@@ -929,7 +965,7 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
                 }
             }
 
-            if (name.empty() && start != 0)
+            if (UnloadedNameWasWiped(nameLength, start))
             {
                 record.Suspicious = true;
                 LeftoverAppendNote(&record.Notes, L"name wiped but range is non-zero");
@@ -942,13 +978,23 @@ bool MapperRemnantScanner::ScanUnloaded(MapperScanResult* result, std::wstring* 
             result->Unloaded.push_back(record);
         }
 
-        if (!usedBulk && readableSlots == 0)
+        if (!UnloadedSlotsComplete(usedBulk, readableSlots))
         {
             walkedAll = false;
         }
 
         CoalesceUnloadedRecords(&result->Unloaded);
         result->UnloadedComplete = walkedAll;
+        if (!walkedAll)
+        {
+            result->Warnings.push_back(L"unloaded-driver slots or names were unreadable; coverage is partial");
+        }
+        if (result->UnloadedPageProbeFailures != 0)
+        {
+            result->Warnings.push_back(L"unloaded-range page probes were unknown: " +
+                std::to_wstring(result->UnloadedPageProbeFailures) +
+                L"; list completeness does not establish page-state coverage");
+        }
         ok = true;
     } while (false);
 
@@ -990,9 +1036,12 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
                 result->PiddbWalkMode = L"avl";
                 uint32_t declared = 0;
                 uint64_t countAddr = 0;
-                if (LeftoverTryAdd(table, avlLayout.NumberGenericTableElements, &countAddr))
+                if (!LeftoverTryAdd(table, avlLayout.NumberGenericTableElements, &countAddr) ||
+                    !LeftoverReadU32(device_, countAddr, &declared, nullptr) ||
+                    declared != nodes.size())
                 {
-                    LeftoverReadU32(device_, countAddr, &declared, nullptr);
+                    complete = false;
+                    result->Warnings.push_back(L"PiDDB declared count disagrees with the walk or was unreadable");
                 }
                 result->PiddbElementCount = declared;
             }
@@ -1089,6 +1138,7 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
                     &usedNameOffset,
                     &name))
             {
+                result->PiddbComplete = false;
                 continue;
             }
             nameOffset = usedNameOffset;
@@ -1104,13 +1154,13 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
             const uint32_t usedStatusOffset = usedNameOffset + 0x14;
             uint64_t timeAddr = 0;
             uint64_t statusAddr = 0;
-            if (LeftoverTryAdd(entry, usedTimeOffset, &timeAddr))
+            if (!LeftoverTryAdd(entry, usedTimeOffset, &timeAddr) ||
+                !LeftoverReadU32(device_, timeAddr, &record.TimeDateStamp, nullptr) ||
+                !LeftoverTryAdd(entry, usedStatusOffset, &statusAddr) ||
+                !LeftoverReadU32(device_, statusAddr, &record.LoadStatus, nullptr))
             {
-                LeftoverReadU32(device_, timeAddr, &record.TimeDateStamp, nullptr);
-            }
-            if (LeftoverTryAdd(entry, usedStatusOffset, &statusAddr))
-            {
-                LeftoverReadU32(device_, statusAddr, &record.LoadStatus, nullptr);
+                result->PiddbComplete = false;
+                continue;
             }
 
             if (!record.InLoadedModules)
@@ -1138,6 +1188,10 @@ bool MapperRemnantScanner::ScanPiddb(MapperScanResult* result, std::wstring* err
         {
             result->Warnings.push_back(
                 L"PiDDB nodes were walked but no driver names parsed");
+        }
+        else if (!result->PiddbComplete)
+        {
+            result->Warnings.push_back(L"PiDDB coverage is partial; unreadable records were withheld");
         }
 
         ok = true;
@@ -1218,6 +1272,7 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
         std::set<uint64_t> visited;
         uint32_t index = 0;
         bool truncated = false;
+        bool namesComplete = true;
         uint64_t current = 0;
         uint32_t nameOffset = 0x08;
 
@@ -1318,6 +1373,10 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
                 }
                 result->HashEntries.push_back(record);
             }
+            else
+            {
+                namesComplete = false;
+            }
 
             if (!readNext)
             {
@@ -1348,15 +1407,49 @@ bool MapperRemnantScanner::ScanHash(MapperScanResult* result, std::wstring* erro
             }
         }
 
-        result->HashComplete = !truncated;
+        result->HashComplete = !truncated && namesComplete;
         if (truncated)
         {
             result->Warnings.push_back(L"kernel hash bucket walk hit a cycle or entry cap");
+        }
+        if (!namesComplete)
+        {
+            result->Warnings.push_back(L"kernel hash bucket entries had unreadable or invalid names; coverage is partial");
         }
         ok = true;
     } while (false);
 
     return ok;
+}
+
+template<typename Record>
+static uint64_t SelectMapperReportWindow(
+    std::vector<Record>* records, uint32_t limit, uint64_t after)
+{
+    if (records == nullptr || records->empty())
+    {
+        return 0;
+    }
+    std::sort(records->begin(), records->end(), [](const Record& left, const Record& right)
+    {
+        return left.EntryAddress < right.EntryAddress;
+    });
+    const auto first = std::upper_bound(records->begin(), records->end(), after,
+        [](uint64_t address, const Record& record)
+        {
+            return address < record.EntryAddress;
+        });
+    const size_t start = first == records->end() ? 0 : static_cast<size_t>(first - records->begin());
+    const size_t count = limit == 0 ? records->size() : (std::min)(records->size(), static_cast<size_t>(limit));
+    std::vector<Record> selected;
+    selected.reserve(count);
+    for (size_t index = 0; index < count; ++index)
+    {
+        selected.push_back(std::move((*records)[(start + index) % records->size()]));
+    }
+    const uint64_t next = selected.back().EntryAddress;
+    *records = std::move(selected);
+    return next;
 }
 
 bool MapperRemnantScanner::Scan(
@@ -1390,7 +1483,16 @@ bool MapperRemnantScanner::Scan(
                 break;
             }
         }
-        LeftoverBuildModuleRanges(symbols_, &modules_);
+        bool moduleRangesComplete = false;
+        LeftoverBuildModuleRanges(symbols_, &modules_, &moduleRangesComplete);
+        if (!moduleRangesComplete)
+        {
+            if (error != nullptr)
+            {
+                *error = L"loaded-module ranges are incomplete; mapper remnant ownership cannot be classified";
+            }
+            break;
+        }
 
         const bool keepUnloaded = options.IncludeUnloaded;
         if (keepUnloaded || options.IncludePiddb || options.IncludeHash)
@@ -1434,12 +1536,31 @@ bool MapperRemnantScanner::Scan(
             result->MmUnloadedArray = 0;
             result->MmLastUnloadedDriver = 0;
             result->UnloadedSlotCount = 0;
+            result->UnloadedPageProbeFailures = 0;
             result->UnloadedResolved = false;
             result->UnloadedComplete = false;
         }
 
-        if (options.Limit != 0)
+        result->UnloadedCollected = result->Unloaded.size();
+        result->PiddbCollected = result->Piddb.size();
+        result->HashCollected = result->HashEntries.size();
+        result->UnloadedOutputTruncated = options.Limit != 0 && result->Unloaded.size() > options.Limit;
+        result->PiddbOutputTruncated = options.Limit != 0 && result->Piddb.size() > options.Limit;
+        result->HashOutputTruncated = options.Limit != 0 && result->HashEntries.size() > options.Limit;
+        result->OutputTruncated = result->UnloadedOutputTruncated || result->PiddbOutputTruncated || result->HashOutputTruncated;
+        if (options.ContinueReports)
         {
+            result->NextUnloadedAfter = SelectMapperReportWindow(&result->Unloaded, options.Limit, options.UnloadedAfter);
+            result->NextPiddbAfter = SelectMapperReportWindow(&result->Piddb, options.Limit, options.PiddbAfter);
+            result->NextHashAfter = SelectMapperReportWindow(&result->HashEntries, options.Limit, options.HashAfter);
+        }
+        else if (options.Limit != 0)
+        {
+            if (result->Unloaded.size() > options.Limit || result->Piddb.size() > options.Limit ||
+                result->HashEntries.size() > options.Limit)
+            {
+                result->Warnings.push_back(L"mapper output hit the record limit; retained rows are a partial view");
+            }
             auto keepSuspiciousFirst = [](auto* items, uint32_t limit)
             {
                 if (items == nullptr || items->size() <= limit)
@@ -1475,6 +1596,10 @@ bool MapperRemnantScanner::Scan(
             keepLeftoverFirst(&result->HashEntries, options.Limit);
         }
 
+        if (result->OutputTruncated && options.ContinueReports)
+        {
+            result->Warnings.push_back(L"mapper report window is partial; address continuation retained");
+        }
         result->AnySuspicious = false;
         for (const MapperUnloadedRecord& record : result->Unloaded)
         {
@@ -1513,6 +1638,7 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
     out += result.UnloadedResolved ? L"true" : L"false";
     out += L",\"unloadedComplete\":";
     out += result.UnloadedComplete ? L"true" : L"false";
+    out += L",\"unloadedPageProbeFailures\":" + std::to_wstring(result.UnloadedPageProbeFailures);
     out += L",\"piddbResolved\":";
     out += result.PiddbResolved ? L"true" : L"false";
     out += L",\"piddbComplete\":";
@@ -1522,6 +1648,13 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
     out += L",\"hashComplete\":";
     out += result.HashComplete ? L"true" : L"false";
     out += L",\"hashWalkMode\":" + mcpjson::Quote(result.HashWalkMode);
+    out += L",\"outputTruncated\":" + std::wstring(result.OutputTruncated ? L"true" : L"false");
+    out += L",\"unloadedCollected\":" + std::to_wstring(result.UnloadedCollected);
+    out += L",\"piddbCollected\":" + std::to_wstring(result.PiddbCollected);
+    out += L",\"hashCollected\":" + std::to_wstring(result.HashCollected);
+    out += L",\"nextUnloadedAfter\":" + std::to_wstring(result.NextUnloadedAfter);
+    out += L",\"nextPiddbAfter\":" + std::to_wstring(result.NextPiddbAfter);
+    out += L",\"nextHashAfter\":" + std::to_wstring(result.NextHashAfter);
     out += L",\"piddbWalkMode\":" + mcpjson::Quote(result.PiddbWalkMode);
     out += L",\"mmUnloadedDrivers\":" + mcpjson::Quote(LeftoverFormatHex(result.MmUnloadedDrivers, 16));
     out += L",\"piDDBCacheTable\":" + mcpjson::Quote(LeftoverFormatHex(result.PiDDBCacheTable, 16));
@@ -1543,6 +1676,8 @@ std::wstring BuildMapperJson(const MapperScanResult& result)
         out += record.StillPresent ? L"true" : L"false";
         out += L",\"stillExecutable\":";
         out += record.StillExecutable ? L"true" : L"false";
+        out += L",\"pageProbeKnown\":";
+        out += record.PageProbeKnown ? L"true" : L"false";
         out += L",\"rangeReused\":";
         out += record.RangeReused ? L"true" : L"false";
         out += L",\"sameImageReload\":";
@@ -1621,9 +1756,51 @@ bool MapperRemnantSelfTest()
 {
     bool ok = true;
 
+    MapperScanResult pageCoverage;
+    pageCoverage.UnloadedComplete = true;
+    MapperUnloadedRecord pageRecord;
+    ApplyUnloadedPageProbe(false, true, true, &pageRecord, &pageCoverage);
+    ok = ok && !pageRecord.PageProbeKnown && !pageRecord.StillPresent && !pageRecord.StillExecutable &&
+        pageCoverage.UnloadedPageProbeFailures == 1 && pageCoverage.UnloadedComplete;
+    ApplyUnloadedPageProbe(true, true, false, &pageRecord, &pageCoverage);
+    ok = ok && pageRecord.PageProbeKnown && pageRecord.StillPresent && !pageRecord.StillExecutable &&
+        pageCoverage.UnloadedPageProbeFailures == 1 && pageCoverage.UnloadedComplete;
+    ApplyUnloadedPageProbe(true, true, true, &pageRecord, &pageCoverage);
+    ok = ok && pageRecord.PageProbeKnown && pageRecord.StillExecutable &&
+        pageCoverage.UnloadedPageProbeFailures == 1;
+
+    std::vector<MapperHashRecord> all;
+    for (uint64_t index = 1; index <= 257; ++index)
+    {
+        MapperHashRecord record = {};
+        record.EntryAddress = index * 16;
+        all.push_back(record);
+    }
+    auto first = all;
+    const uint64_t anchor = SelectMapperReportWindow(&first, 256, 0);
+    auto second = all;
+    SelectMapperReportWindow(&second, 256, anchor);
+    ok = ok && first.size() == 256 && second.front().EntryAddress == 257 * 16;
+    all.erase(all.begin());
+    all.pop_back();
+    auto churn = all;
+    SelectMapperReportWindow(&churn, 1, anchor);
+    ok = ok && churn.front().EntryAddress == 32;
+    auto unlimited = all;
+    SelectMapperReportWindow(&unlimited, 0, (std::numeric_limits<uint64_t>::max)());
+    ok = ok && unlimited.size() == all.size();
+
     do
     {
         if (LeftoverLooksLikeUnicodeString(8, 16, 0x10))
+        {
+            ok = false;
+            break;
+        }
+        if (UnloadedSlotsComplete(false, 1) || UnloadedSlotsComplete(false, 49) ||
+            !UnloadedSlotsComplete(false, 50) || !UnloadedSlotsComplete(true, 0) ||
+            UnloadedNameWasWiped(8, 0xFFFF800000001000ull) ||
+            UnloadedNameWasWiped(0, 0) || !UnloadedNameWasWiped(0, 0xFFFF800000001000ull))
         {
             ok = false;
             break;
@@ -1702,15 +1879,15 @@ bool MapperRemnantSelfTest()
         }
 
         std::vector<MapperUnloadedRecord> repeats;
-        MapperUnloadedRecord first = {};
-        first.Name = L"KnLiveDbg.sys";
-        first.StartAddress = 0xFFFFF80010000000ull;
-        first.EndAddress = 0xFFFFF80010001000ull;
-        first.SameImageReload = true;
-        MapperUnloadedRecord second = first;
-        second.EndAddress = 0xFFFFF80010001400ull;
-        repeats.push_back(first);
-        repeats.push_back(second);
+        MapperUnloadedRecord firstRepeat = {};
+        firstRepeat.Name = L"KnLiveDbg.sys";
+        firstRepeat.StartAddress = 0xFFFFF80010000000ull;
+        firstRepeat.EndAddress = 0xFFFFF80010001000ull;
+        firstRepeat.SameImageReload = true;
+        MapperUnloadedRecord secondRepeat = firstRepeat;
+        secondRepeat.EndAddress = 0xFFFFF80010001400ull;
+        repeats.push_back(firstRepeat);
+        repeats.push_back(secondRepeat);
         CoalesceUnloadedRecords(&repeats);
         if (repeats.size() != 1 ||
             repeats[0].RepeatCount != 2 ||

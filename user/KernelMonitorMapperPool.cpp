@@ -2,6 +2,7 @@
 
 #include "LeftoverCommon.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -57,16 +58,14 @@
 //     alone: the immediate is only the transfer target when that same register
 //     is what the jmp or call reads, so a mismatched pair cannot report a
 //     destination it does not use;
-//   * the absolute-target form is decoded for the plain REX.W prefix (0x48)
-//     over rax..rdi, the register set a relocated import thunk writes; an
-//     r8..r15 form (a second REX prefix on both instructions) is not decoded
-//     and stays uncounted rather than guessed;
+//   * absolute-target forms include matching rax..r15 transfers and an
+//     optional single NOP; arbitrary intervening instructions are rejected;
 //   * a near jump is decoded only at the head of the body and only when it
 //     transfers to a page-aligned address: a lone 0xE9 byte occurs in ordinary
 //     data far too often to be a signal on its own, so the form is held to the
 //     shape a mapper's relocated head jump actually has;
-//   * session space and module-owned ranges never reach the verdict, and a
-//     region whose page-walk record is incomplete stays a deferral.
+//   * module-owned ranges never reach the verdict. Session candidates do not
+//     infer hidden pool ownership from absence in the global big pool table.
 //
 // The layer shares the region snapshot the orphan-page (kpage) walk already
 // produced, so it adds no second page-table walk; its only cost is one bounded
@@ -78,7 +77,9 @@ namespace
     // into kernel code, so anything below it is data.
     constexpr uint64_t kKernelVaFloor = 0xFFFF800000000000ull;
     constexpr uint32_t kMaxBodyBytes = 0x4000;
-    constexpr size_t kMinStubBytes = 14;
+    constexpr size_t kMinStubBytes = 5;
+    constexpr size_t kMaxStubTargets = 32;
+    constexpr size_t kMaxTargetCursorRegions = 4096;
     const wchar_t* const kLayer = L"mapper_pool";
     const wchar_t* const kTableDeferKey = L"scan_failed:mapperpool:table";
     const wchar_t* const kModuleRangeDeferKey = L"scan_failed:mapperpool:modules";
@@ -91,6 +92,21 @@ namespace
         }
         *result = left + right;
         return true;
+    }
+
+    bool AddRelative32(uint64_t base, int32_t delta, uint64_t* result)
+    {
+        if (delta < 0)
+        {
+            const uint64_t distance = static_cast<uint64_t>(-static_cast<int64_t>(delta));
+            if (base < distance)
+            {
+                return false;
+            }
+            *result = base - distance;
+            return true;
+        }
+        return AddNoOverflow(base, static_cast<uint32_t>(delta), result);
     }
 
     std::wstring ResidualHex(uint64_t value)
@@ -147,7 +163,8 @@ namespace
         uint64_t regionVa,
         uint64_t regionEnd,
         const std::vector<KmonStubModuleRange>& modules,
-        KmonMapperStubStats* stats)
+        KmonMapperStubStats* stats,
+        std::vector<uint64_t>* unbackedTargets)
     {
         // The caller already rejected a non-kernel destination.
         if (destination >= regionVa && destination < regionEnd)
@@ -177,21 +194,108 @@ namespace
         {
             stats->FirstUnbacked = destination;
         }
+        if (unbackedTargets != nullptr)
+        {
+            unbackedTargets->push_back(destination);
+        }
+    }
+
+    using MapperTargetCursorMap = std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>>;
+
+    struct MapperTargetProbeWindow
+    {
+        size_t First = 0;
+        size_t Count = 0;
+        bool CursorEvicted = false;
+    };
+
+    MapperTargetProbeWindow ClaimMapperTargetProbeWindow(
+        MapperTargetCursorMap* cursors,
+        uint64_t region,
+        const std::vector<uint64_t>& destinations,
+        uint64_t now,
+        uint64_t cr3 = 0)
+    {
+        const auto key = std::make_pair(cr3, region);
+        MapperTargetProbeWindow window;
+        window.Count = (std::min)(destinations.size(), kMaxStubTargets);
+        if (destinations.size() <= kMaxStubTargets)
+        {
+            cursors->erase(key);
+        }
+        else
+        {
+            auto current = cursors->find(key);
+            if (current == cursors->end())
+            {
+                if (cursors->size() >= kMaxTargetCursorRegions)
+                {
+                    const auto oldest = std::min_element(
+                        cursors->begin(), cursors->end(),
+                        [](const auto& left, const auto& right)
+                        {
+                            return left.second.second < right.second.second;
+                        });
+                    cursors->erase(oldest);
+                    window.CursorEvicted = true;
+                }
+                current = cursors->emplace(key, std::make_pair(0ull, now)).first;
+            }
+            const auto next = std::upper_bound(destinations.begin(), destinations.end(), current->second.first);
+            window.First = next == destinations.end() ? 0 : static_cast<size_t>(next - destinations.begin());
+            // Preserve address progress when lower targets appear or disappear.
+            // The claimed window is always fully attempted by the caller.
+            current->second.first = destinations[(window.First + window.Count - 1) % destinations.size()];
+            current->second.second = now;
+        }
+        return window;
+    }
+
+    template<typename Probe>
+    bool SelectExecutableStubTarget(
+        const std::vector<uint64_t>& destinations,
+        const MapperTargetProbeWindow& window,
+        Probe& probe,
+        uint64_t* verifiedTarget,
+        bool* incomplete)
+    {
+        *verifiedTarget = 0;
+        *incomplete = window.Count < destinations.size() || window.CursorEvicted;
+        for (size_t index = 0; index < window.Count; ++index)
+        {
+            const uint64_t destination = destinations[(window.First + index) % destinations.size()];
+            bool executable = false;
+            if (!probe(destination, &executable))
+            {
+                *incomplete = true;
+                continue;
+            }
+            if (executable && *verifiedTarget == 0)
+            {
+                *verifiedTarget = destination;
+            }
+        }
+        return *verifiedTarget != 0;
     }
 }
 
-void KmonCountMapperStubs(
+static void CountMapperStubsImpl(
     const uint8_t* bytes,
     size_t size,
     uint64_t regionVa,
     const std::vector<KmonStubModuleRange>& modules,
-    KmonMapperStubStats* stats)
+    KmonMapperStubStats* stats,
+    std::vector<uint64_t>* unbackedTargets)
 {
     if (stats == nullptr)
     {
         return;
     }
     *stats = KmonMapperStubStats();
+    if (unbackedTargets != nullptr)
+    {
+        unbackedTargets->clear();
+    }
     if (bytes == nullptr || size < kMinStubBytes || regionVa < kKernelVaFloor)
     {
         return;
@@ -200,19 +304,17 @@ void KmonCountMapperStubs(
     uint64_t regionEnd = regionVa;
     if (!AddNoOverflow(regionVa, static_cast<uint64_t>(size), &regionEnd))
     {
-        // A body that overflows the address space cannot be classified; keep
-        // the empty end so no destination counts as internal.
-        regionEnd = regionVa;
+        return;
     }
 
-    for (size_t i = 0; i + 6 <= size; ++i)
+    for (size_t i = 0; i + 2 <= size; ++i)
     {
         const uint8_t first = bytes[i];
         const uint8_t second = bytes[i + 1];
 
         // jmp/call qword ptr [rip+disp32]: the destination is the slot value,
         // so the slot must sit inside the sampled body to be readable at all.
-        if (first == 0xFF && (second == 0x25 || second == 0x15))
+        if (first == 0xFF && (second == 0x25 || second == 0x15) && size - i >= 6)
         {
             int32_t disp = 0;
             std::memcpy(&disp, bytes + i + 2, sizeof(disp));
@@ -221,28 +323,29 @@ void KmonCountMapperStubs(
             {
                 continue;
             }
-            const uint64_t slotVa = static_cast<uint64_t>(
-                static_cast<int64_t>(instructionEnd) + static_cast<int64_t>(disp));
+            uint64_t slotVa = 0;
             uint64_t destination = 0;
-            if (!ReadSampleU64(bytes, size, regionVa, slotVa, &destination) ||
+            if (!AddRelative32(instructionEnd, disp, &slotVa) ||
+                !ReadSampleU64(bytes, size, regionVa, slotVa, &destination) ||
                 !IsKernelDestination(destination))
             {
                 continue;
             }
             ++stats->Slots;
-            NoteStubDestination(destination, regionVa, regionEnd, modules, stats);
+            NoteStubDestination(destination, regionVa, regionEnd, modules, stats, unbackedTargets);
             i += 5;
             continue;
         }
 
-        // mov reg,imm64 (REX.W, rax..rdi) whose immediate is consumed by a
-        // jmp/call of the same register within the next two bytes: the
+        // mov reg,imm64 (REX.W, rax..r15) whose immediate is consumed by a
+        // following jmp/call of the same register, optionally after a NOP: the
         // absolute-target thunk mappers use when they resolve imports without
         // an image import table. The transfer has to name the register the load
         // wrote, because only then is the immediate what control flow reads; a
         // jump through any other register has no statically known destination,
         // so reporting this immediate as its target would be a false one.
-        if (first == 0x48 && second >= 0xB8 && second <= 0xBF && i + 12 <= size)
+        if ((first == 0x48 || first == 0x49) &&
+            second >= 0xB8 && second <= 0xBF && size - i >= 12)
         {
             uint64_t destination = 0;
             std::memcpy(&destination, bytes + i + 2, sizeof(destination));
@@ -250,25 +353,34 @@ void KmonCountMapperStubs(
             {
                 continue;
             }
-            const uint8_t loadedRegister = static_cast<uint8_t>(second - 0xB8);
-            bool transferred = false;
-            for (size_t j = i + 10; j + 2 <= size && j < i + 12; ++j)
+            const uint8_t loadedRegister = static_cast<uint8_t>(
+                (second - 0xB8) + ((first & 1) != 0 ? 8 : 0));
+            size_t transfer = i + 10;
+            if (bytes[transfer] == 0x90)
             {
-                if (bytes[j] == 0xFF &&
-                    (bytes[j + 1] == static_cast<uint8_t>(0xE0 + loadedRegister) ||
-                     bytes[j + 1] == static_cast<uint8_t>(0xD0 + loadedRegister)))
-                {
-                    transferred = true;
-                    break;
-                }
+                ++transfer;
             }
-            if (!transferred)
+            uint8_t transferExtension = 0;
+            if (transfer < size && bytes[transfer] >= 0x40 && bytes[transfer] <= 0x4F)
+            {
+                transferExtension = (bytes[transfer] & 1) != 0 ? 8 : 0;
+                ++transfer;
+            }
+            if (transfer + 2 > size || bytes[transfer] != 0xFF ||
+                ((bytes[transfer + 1] & 0xF8) != 0xE0 &&
+                 (bytes[transfer + 1] & 0xF8) != 0xD0))
+            {
+                continue;
+            }
+            const uint8_t targetRegister = static_cast<uint8_t>(
+                (bytes[transfer + 1] & 7) + transferExtension);
+            if (targetRegister != loadedRegister)
             {
                 continue;
             }
             ++stats->Slots;
-            NoteStubDestination(destination, regionVa, regionEnd, modules, stats);
-            i += 11;
+            NoteStubDestination(destination, regionVa, regionEnd, modules, stats, unbackedTargets);
+            i = transfer + 1;
             continue;
         }
 
@@ -287,30 +399,46 @@ void KmonCountMapperStubs(
             {
                 continue;
             }
-            const uint64_t destination = static_cast<uint64_t>(
-                static_cast<int64_t>(instructionEnd) + static_cast<int64_t>(rel));
-            if (!IsKernelDestination(destination) || (destination & 0xFFFull) != 0)
+            uint64_t destination = 0;
+            if (!AddRelative32(instructionEnd, rel, &destination) ||
+                !IsKernelDestination(destination) || (destination & 0xFFFull) != 0)
             {
                 continue;
             }
             ++stats->Slots;
             ++stats->NearJumps;
-            NoteStubDestination(destination, regionVa, regionEnd, modules, stats);
+            NoteStubDestination(destination, regionVa, regionEnd, modules, stats, unbackedTargets);
             i += 4;
             continue;
         }
     }
+    if (unbackedTargets != nullptr)
+    {
+        std::sort(unbackedTargets->begin(), unbackedTargets->end());
+        unbackedTargets->erase(
+            std::unique(unbackedTargets->begin(), unbackedTargets->end()),
+            unbackedTargets->end());
+    }
+}
+
+void KmonCountMapperStubs(
+    const uint8_t* bytes,
+    size_t size,
+    uint64_t regionVa,
+    const std::vector<KmonStubModuleRange>& modules,
+    KmonMapperStubStats* stats)
+{
+    CountMapperStubsImpl(bytes, size, regionVa, modules, stats, nullptr);
 }
 
 KmonResidualSignalKind KmonClassifyResidualSignal(const KmonResidualSignalInput& input)
 {
     // Every missing fact is a deferral: an incomplete page-walk record, an
     // unreadable body, an unavailable big pool view, a region that is not
-    // executable, session space, and a module-owned range all withhold the
+    // executable, and a module-owned range all withhold the
     // verdict instead of guessing.
     if (!input.RegionKnown ||
         !input.Executable ||
-        input.SessionSpace ||
         input.InLoadedModule ||
         !input.TableViewKnown ||
         !input.BodyReadKnown ||
@@ -324,7 +452,7 @@ KmonResidualSignalKind KmonClassifyResidualSignal(const KmonResidualSignalInput&
     {
         return KmonResidualSignalKind::None;
     }
-    return input.InBigPoolTable
+    return input.InBigPoolTable || input.SessionSpace
         ? KmonResidualSignalKind::MapperStub
         : KmonResidualSignalKind::PoolHidden;
 }
@@ -379,7 +507,7 @@ bool KernelMonitor::EmitMapperPoolResidual(
     {
         return false;
     }
-    if (!region.Executable || region.SessionSpace)
+    if (!region.Executable)
     {
         return false;
     }
@@ -394,16 +522,19 @@ bool KernelMonitor::EmitMapperPoolResidual(
     // the body read so an unreadable inventory is never reported as a stub.
     std::vector<KmonStubModuleRange> ranges;
     ranges.reserve(modules.size());
+    bool moduleRangesComplete = !modules.empty();
     for (const KernelModuleInfo& module : modules)
     {
-        if (module.Base == 0 || module.Size == 0)
+        if (module.Base < kKernelVaFloor || module.Size == 0)
         {
+            moduleRangesComplete = false;
             continue;
         }
         KmonStubModuleRange range;
         range.Base = module.Base;
         if (!AddNoOverflow(module.Base, module.Size, &range.End))
         {
+            moduleRangesComplete = false;
             continue;
         }
         const std::wstring leaf = KmonBasenameLower(
@@ -411,31 +542,115 @@ bool KernelMonitor::EmitMapperPoolResidual(
         range.KernelImport = ResidualIsKernelImportLeaf(leaf);
         ranges.push_back(range);
     }
-    if (ranges.empty())
+    if (!moduleRangesComplete || ranges.empty())
     {
         EmitUnique(
             L"driver.mapped_residue",
             kModuleRangeDeferKey,
             std::wstring(),
             kLayer,
-            L"mapper/pool residual verdict deferred; no kernel module range with a known size was available",
-            L"the stub destination check has no module range to compare against");
+            L"mapper/pool residual verdict deferred; kernel module ranges are incomplete",
+            L"the stub destination check requires every loaded module range");
         return false;
     }
     ClearEmittedKey(kModuleRangeDeferKey);
 
     bool bodyKnown = false;
+    bool bodyComplete = false;
+    size_t bodyReadBytes = 0;
     KmonMapperStubStats stats = {};
+    std::vector<uint64_t> unbackedTargets;
     if (bodyBytes >= kMinStubBytes)
     {
         std::vector<uint8_t> body;
         std::wstring ignored;
-        if (device->ReadMemory(region.Start, bodyBytes, &body, &ignored) &&
-            body.size() >= kMinStubBytes)
+        const bool bodyRead = ReadOrphanRootMemory(*device, region.Cr3, region.Start, bodyBytes, &body, &ignored, true);
+        bodyReadBytes = body.size();
+        bodyComplete = bodyRead && body.size() == bodyBytes;
+        if (bodyRead && body.size() >= kMinStubBytes)
         {
-            KmonCountMapperStubs(body.data(), body.size(), region.Start, ranges, &stats);
+            CountMapperStubsImpl(body.data(), body.size(), region.Start, ranges, &stats, &unbackedTargets);
             bodyKnown = true;
         }
+    }
+    const std::wstring rootKey = ResidualHex(region.Cr3) + L":" +
+        std::to_wstring(region.RootProcessId) + L":" + std::to_wstring(region.RootCreateTime) + L":";
+    const std::wstring bodyDeferKey = L"scan_failed:mapperpool:body:" + rootKey + ResidualHex(region.Start);
+    if (!bodyComplete)
+    {
+        EmitUnique(
+            L"driver.mapped_residue",
+            bodyDeferKey,
+            std::wstring(),
+            kLayer,
+            L"mapper/pool body coverage is partial; the complete sample was unreadable",
+            L"sample=" + ResidualHex(region.Start) + L" requested=" + std::to_wstring(bodyBytes) +
+                L" readable=" + std::to_wstring(bodyReadBytes));
+    }
+    else
+    {
+        ClearEmittedKey(bodyDeferKey);
+    }
+    if (!bodyKnown)
+    {
+        return false;
+    }
+
+    MapperTargetProbeWindow targetWindow;
+    size_t cursorCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        // Every claimed slot is attempted below, including unreadable targets.
+        // Small or clean samples no longer need continuation state.
+        targetWindow = ClaimMapperTargetProbeWindow(
+            &MapperTargetCursors, region.Start, unbackedTargets, GetTickCount64(), region.Cr3);
+        cursorCount = MapperTargetCursors.size();
+    }
+    const std::wstring cursorDeferKey = L"scan_failed:mapperpool:target_cursor_capacity";
+    if (targetWindow.CursorEvicted)
+    {
+        EmitUnique(L"driver.mapped_residue", cursorDeferKey, std::wstring(), kLayer,
+            L"mapper target continuation cache reached its capacity; oldest continuation was evicted",
+            L"capacity=" + std::to_wstring(kMaxTargetCursorRegions) +
+                L"; repeated scans cannot promise progress for evicted regions");
+    }
+    else if (cursorCount < kMaxTargetCursorRegions)
+    {
+        ClearEmittedKey(cursorDeferKey);
+    }
+    const std::wstring targetDeferKey = L"scan_failed:mapperpool:targets:" + rootKey + ResidualHex(region.Start);
+    if (stats.Unbacked != 0)
+    {
+        auto probe = [&](uint64_t address, bool* executable)
+        {
+            return ProbeOrphanRootExecutable(*device, region.Cr3, address, executable);
+        };
+        uint64_t verifiedTarget = 0;
+        bool incomplete = false;
+        const bool verified = SelectExecutableStubTarget(
+            unbackedTargets, targetWindow, probe, &verifiedTarget, &incomplete);
+        if (incomplete)
+        {
+            EmitUnique(L"driver.mapped_residue", targetDeferKey, std::wstring(), kLayer,
+                L"mapper/pool target validation was incomplete; deferred targets rotate on later visits",
+                L"sample=" + ResidualHex(region.Start) + L" target_limit=" + std::to_wstring(kMaxStubTargets) +
+                    L" targets=" + std::to_wstring(unbackedTargets.size()) +
+                    L" first_target=" + std::to_wstring(targetWindow.First) +
+                    L" cursor_evicted=" + std::to_wstring(targetWindow.CursorEvicted ? 1 : 0));
+        }
+        else
+        {
+            ClearEmittedKey(targetDeferKey);
+        }
+        if (!verified)
+        {
+            return false;
+        }
+        stats.FirstUnbacked = verifiedTarget;
+    }
+    else
+    {
+        ClearEmittedKey(targetDeferKey);
     }
 
     KmonResidualSignalInput input;
@@ -470,8 +685,15 @@ bool KernelMonitor::EmitMapperPoolResidual(
         L" internal=" + std::to_wstring(stats.Internal) +
         L" unbacked=" + std::to_wstring(stats.Unbacked) +
         L" first_unbacked=" + ResidualHex(stats.FirstUnbacked) +
+        L" first_unbacked_execute_verified=true" +
         L" class=" + region.Classification +
-        L" size=" + ResidualHex(region.Size);
+        L" size=" + ResidualHex(region.Size) + L" cr3=" + ResidualHex(region.Cr3) +
+        L" root_pid=" + std::to_wstring(region.RootProcessId) +
+        L" root_created=" + std::to_wstring(region.RootCreateTime);
+    if (region.SessionSpace)
+    {
+        notes += L" session=true pool_absence_not_inferred=true";
+    }
     if (region.Writable && region.Executable)
     {
         notes += L" wx=true";
@@ -492,26 +714,27 @@ bool KernelMonitor::EmitMapperPoolResidual(
         captureLayer,
         region.Start,
         region.Size,
-        0,
+        region.RootProcessId,
         false,
         device,
         symbols,
         nullptr,
         2ull * 1024ull * 1024ull,
-        &captureNote);
+        &captureNote,
+        region.Cr3,
+        region.RootCreateTime);
     NoteMapperWatchResidue(captureLayer, region.PhysicalAddress);
 
-    EmitUnique(
+    return EmitUnique(
         KmonResidualSignalKindName(kind),
-        (hidden ? L"poolhidden:" : L"mapperstub:") + ResidualHex(region.Start),
+        (hidden ? L"poolhidden:" : L"mapperstub:") + rootKey + ResidualHex(region.Start),
         region.Classification,
         kLayer,
         std::wstring(hidden
             ? L"executable region the big pool table view does not report, holding a stub body whose destination no loaded module owns "
-            : L"stub body transferring to unbacked code inside an allocation the big pool table reports ") +
+            : L"stub body transferring to code outside the observed module ranges ") +
             ResidualHex(region.Start),
         notes + captureNote);
-    return true;
 }
 
 bool KernelMonitorMapperPoolSelfTest()
@@ -526,6 +749,20 @@ bool KernelMonitorMapperPoolSelfTest()
         const uint64_t kernelImportBase = 0xFFFFF80000000000ull;
         const uint64_t kernelImportEnd = 0xFFFFF80008000000ull;
         const uint64_t unbackedTarget = 0xFFFFF88000A00000ull;
+
+        MapperTargetCursorMap rootCursors;
+        std::vector<uint64_t> rootTargets;
+        for (uint64_t index = 0; index < 70; ++index)
+        {
+            rootTargets.push_back(unbackedTarget + index * 0x1000);
+        }
+        const MapperTargetProbeWindow rootA = ClaimMapperTargetProbeWindow(&rootCursors, regionVa, rootTargets, 1, 0x1000);
+        const MapperTargetProbeWindow rootB = ClaimMapperTargetProbeWindow(&rootCursors, regionVa, rootTargets, 2, 0x2000);
+        const MapperTargetProbeWindow rootASecond = ClaimMapperTargetProbeWindow(&rootCursors, regionVa, rootTargets, 3, 0x1000);
+        if (rootA.First != 0 || rootB.First != 0 || rootASecond.First != 32 || rootCursors.size() != 2)
+        {
+            break;
+        }
 
         std::vector<KmonStubModuleRange> modules;
         KmonStubModuleRange owned;
@@ -599,6 +836,294 @@ bool KernelMonitorMapperPoolSelfTest()
         KmonCountMapperStubs(absoluteStub, sizeof(absoluteStub), regionVa, modules, &stats);
         if (stats.Slots != 1 || stats.Unbacked != 1 ||
             stats.FirstUnbacked != unbackedTarget)
+        {
+            break;
+        }
+
+        // REX.B extends both the load and the consuming transfer register.
+        bool extendedGood = true;
+        for (uint8_t reg = 8; reg < 16; ++reg)
+        {
+            uint8_t extended[13] = {};
+            extended[0] = 0x49;
+            extended[1] = static_cast<uint8_t>(0xB8 + (reg & 7));
+            std::memcpy(extended + 2, &unbackedTarget, sizeof(unbackedTarget));
+            extended[10] = 0x41;
+            extended[11] = 0xFF;
+            extended[12] = static_cast<uint8_t>(0xD0 + (reg & 7));
+            KmonCountMapperStubs(extended, sizeof(extended), regionVa, modules, &stats);
+            if (stats.Slots != 1 || stats.Unbacked != 1)
+            {
+                extendedGood = false;
+                break;
+            }
+            extended[12] = static_cast<uint8_t>(0xE0 + (reg & 7));
+            KmonCountMapperStubs(extended, sizeof(extended), regionVa, modules, &stats);
+            if (stats.Slots != 1 || stats.Unbacked != 1)
+            {
+                extendedGood = false;
+                break;
+            }
+            extended[10] = 0x40;
+            KmonCountMapperStubs(extended, sizeof(extended), regionVa, modules, &stats);
+            if (stats.Slots != 0)
+            {
+                extendedGood = false;
+                break;
+            }
+        }
+        if (!extendedGood)
+        {
+            break;
+        }
+        KmonCountMapperStubs(absoluteStub, 12, regionVa, modules, &stats);
+        if (stats.Slots != 1 || stats.Unbacked != 1)
+        {
+            break;
+        }
+        uint8_t separated[13] = {};
+        std::memcpy(separated, absoluteStub, 10);
+        separated[10] = 0x90;
+        separated[11] = 0xFF;
+        separated[12] = 0xE0;
+        KmonCountMapperStubs(separated, sizeof(separated), regionVa, modules, &stats);
+        if (stats.Slots != 1)
+        {
+            break;
+        }
+        separated[10] = 0xCC;
+        KmonCountMapperStubs(separated, sizeof(separated), regionVa, modules, &stats);
+        if (stats.Slots != 0)
+        {
+            break;
+        }
+        KmonCountMapperStubs(absoluteStub, sizeof(absoluteStub), ~0ull - 7, modules, &stats);
+        if (stats.Slots != 0)
+        {
+            break;
+        }
+
+        uint8_t multipleTargets[32] = {};
+        std::memcpy(multipleTargets, absoluteStub, 12);
+        std::memcpy(multipleTargets + 16, absoluteStub, 12);
+        const uint64_t laterTarget = unbackedTarget + 0x1000;
+        std::memcpy(multipleTargets + 18, &laterTarget, sizeof(laterTarget));
+        std::vector<uint64_t> unbackedTargets;
+        CountMapperStubsImpl(multipleTargets, sizeof(multipleTargets), regionVa, modules,
+            &stats, &unbackedTargets);
+        if (unbackedTargets.size() != 2 || unbackedTargets[0] != unbackedTarget ||
+            unbackedTargets[1] != laterTarget)
+        {
+            break;
+        }
+        auto nxThenExecute = [&](uint64_t address, bool* executable)
+        {
+            *executable = address == laterTarget;
+            return true;
+        };
+        uint64_t verifiedTarget = 0;
+        bool incomplete = false;
+        MapperTargetCursorMap targetCursors;
+        MapperTargetProbeWindow targetWindow = ClaimMapperTargetProbeWindow(
+            &targetCursors, regionVa, unbackedTargets, 1);
+        if (!SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, nxThenExecute, &verifiedTarget, &incomplete) ||
+            verifiedTarget != laterTarget || incomplete)
+        {
+            break;
+        }
+        auto unreadableThenExecute = [&](uint64_t address, bool* executable)
+        {
+            *executable = address == laterTarget;
+            return address == laterTarget;
+        };
+        if (!SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, unreadableThenExecute, &verifiedTarget, &incomplete) ||
+            verifiedTarget != laterTarget || !incomplete)
+        {
+            break;
+        }
+
+        // Reverse ordering and a duplicate must still retain all 33 distinct
+        // destinations. Only the 33rd sorted target is executable.
+        std::vector<uint8_t> manyStubs(34 * 16, 0);
+        for (size_t index = 0; index < 34; ++index)
+        {
+            const uint64_t destination = unbackedTarget +
+                (index < 33 ? 32 - index : 32) * 0x1000;
+            std::memcpy(manyStubs.data() + index * 16, absoluteStub, 12);
+            std::memcpy(manyStubs.data() + index * 16 + 2, &destination, sizeof(destination));
+        }
+        CountMapperStubsImpl(manyStubs.data(), manyStubs.size(), regionVa, modules,
+            &stats, &unbackedTargets);
+        if (stats.Unbacked != 34 || unbackedTargets.size() != 33 ||
+            unbackedTargets.front() != unbackedTarget ||
+            unbackedTargets.back() != unbackedTarget + 32 * 0x1000)
+        {
+            break;
+        }
+        size_t targetProbes = 0;
+        auto onlyLastExecutable = [&](uint64_t address, bool* executable)
+        {
+            ++targetProbes;
+            *executable = address == unbackedTargets.back();
+            return true;
+        };
+        targetWindow = ClaimMapperTargetProbeWindow(
+            &targetCursors, regionVa, unbackedTargets, 2);
+        if (targetWindow.First != 0 || targetWindow.Count != 32 ||
+            SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, onlyLastExecutable, &verifiedTarget, &incomplete) ||
+            targetProbes != 32 || !incomplete)
+        {
+            break;
+        }
+        targetProbes = 0;
+        targetWindow = ClaimMapperTargetProbeWindow(
+            &targetCursors, regionVa, unbackedTargets, 3);
+        if (targetWindow.First != 32 ||
+            !SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, onlyLastExecutable, &verifiedTarget, &incomplete) ||
+            verifiedTarget != unbackedTargets.back() || targetProbes != 32 || !incomplete)
+        {
+            break;
+        }
+
+        // If every address after the anchor disappears, wrap to the new head.
+        targetCursors.clear();
+        ClaimMapperTargetProbeWindow(&targetCursors, regionVa, rootTargets, 4);
+        ClaimMapperTargetProbeWindow(&targetCursors, regionVa, rootTargets, 5);
+        targetWindow = ClaimMapperTargetProbeWindow(&targetCursors, regionVa, unbackedTargets, 6);
+        targetProbes = 0;
+        if (targetWindow.First != 0 || targetWindow.Count != 32 ||
+            SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, onlyLastExecutable, &verifiedTarget, &incomplete) ||
+            targetProbes != 32 || !incomplete)
+        {
+            break;
+        }
+
+        // A stable executable destination alternates between sorted indices
+        // 32 and 0 as its neighbors change. Numeric 0/32 cursors miss it forever.
+        MapperTargetCursorMap changingCursors;
+        const uint64_t stableTarget = unbackedTarget + 0x400000;
+        uint32_t stableVisits = 0;
+        bool changingValid = true;
+        for (uint32_t pass = 0; pass < 8; ++pass)
+        {
+            std::vector<uint64_t> addresses;
+            if ((pass & 1) == 0)
+            {
+                for (uint64_t index = 0; index < 32; ++index)
+                {
+                    addresses.push_back(unbackedTarget + index * 0x1000);
+                }
+            }
+            addresses.push_back(stableTarget);
+            while (addresses.size() < 64)
+            {
+                addresses.push_back(stableTarget + (addresses.size() - ((pass & 1) == 0 ? 32 : 0)) * 0x1000);
+            }
+            std::vector<uint8_t> changingStubs(addresses.size() * 16, 0);
+            for (size_t index = 0; index < addresses.size(); ++index)
+            {
+                std::memcpy(changingStubs.data() + index * 16, absoluteStub, 12);
+                std::memcpy(changingStubs.data() + index * 16 + 2, &addresses[index], sizeof(uint64_t));
+            }
+            std::vector<uint64_t> changingTargets;
+            CountMapperStubsImpl(changingStubs.data(), changingStubs.size(), regionVa, modules,
+                &stats, &changingTargets);
+            if (changingTargets != addresses)
+            {
+                changingValid = false;
+                break;
+            }
+            const MapperTargetProbeWindow changingWindow = ClaimMapperTargetProbeWindow(
+                &changingCursors, regionVa, changingTargets, pass);
+            size_t changingProbes = 0;
+            auto stableOnly = [&](uint64_t address, bool* executable)
+            {
+                ++changingProbes;
+                *executable = address == stableTarget;
+                return true;
+            };
+            if (SelectExecutableStubTarget(changingTargets, changingWindow, stableOnly, &verifiedTarget, &incomplete))
+            {
+                ++stableVisits;
+                if (verifiedTarget != stableTarget)
+                {
+                    changingValid = false;
+                }
+            }
+            if (changingProbes != 32 || !incomplete)
+            {
+                changingValid = false;
+            }
+        }
+        if (!changingValid || stableVisits < 4)
+        {
+            break;
+        }
+
+        // Exactly 32 readable NX targets are complete negative evidence.
+        unbackedTargets.resize(32);
+        targetWindow = ClaimMapperTargetProbeWindow(
+            &targetCursors, regionVa, unbackedTargets, 7);
+        targetProbes = 0;
+        auto allNx = [&](uint64_t, bool* executable)
+        {
+            ++targetProbes;
+            *executable = false;
+            return true;
+        };
+        if (!targetCursors.empty() || targetWindow.First != 0 || targetWindow.Count != 32 ||
+            SelectExecutableStubTarget(unbackedTargets, targetWindow, allNx, &verifiedTarget, &incomplete) ||
+            targetProbes != 32 || incomplete || verifiedTarget != 0)
+        {
+            break;
+        }
+        targetProbes = 0;
+        if (!SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, onlyLastExecutable, &verifiedTarget, &incomplete) ||
+            targetProbes != 32 || incomplete || verifiedTarget != unbackedTargets.back())
+        {
+            break;
+        }
+        auto allUnreadable = [&](uint64_t, bool* executable)
+        {
+            *executable = false;
+            return false;
+        };
+        if (SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, allUnreadable, &verifiedTarget, &incomplete) ||
+            !incomplete)
+        {
+            break;
+        }
+
+        // Keep the cache bounded, retain recently used regions, and expose
+        // eviction rather than promising progress for forgotten regions.
+        for (size_t index = 0; index < kMaxTargetCursorRegions; ++index)
+        {
+            targetCursors.emplace(std::make_pair(0ull, regionVa + index * 0x1000),
+                std::make_pair(0ull, static_cast<uint64_t>(index)));
+        }
+        ClaimMapperTargetProbeWindow(&targetCursors, regionVa, rootTargets, kMaxTargetCursorRegions);
+        targetWindow = ClaimMapperTargetProbeWindow(&targetCursors,
+            regionVa + kMaxTargetCursorRegions * 0x1000, rootTargets, kMaxTargetCursorRegions + 1);
+        if (!targetWindow.CursorEvicted || targetCursors.size() != kMaxTargetCursorRegions ||
+            targetCursors.find(std::make_pair(0ull, regionVa)) == targetCursors.end() ||
+            targetCursors.find(std::make_pair(0ull, regionVa + 0x1000)) != targetCursors.end())
+        {
+            break;
+        }
+        unbackedTargets.clear();
+        targetWindow = ClaimMapperTargetProbeWindow(&targetCursors, regionVa, unbackedTargets, kMaxTargetCursorRegions + 2);
+        targetProbes = 0;
+        if (targetCursors.find(std::make_pair(0ull, regionVa)) != targetCursors.end() ||
+            SelectExecutableStubTarget(
+                unbackedTargets, targetWindow, onlyLastExecutable, &verifiedTarget, &incomplete) ||
+            targetProbes != 0 || incomplete)
         {
             break;
         }
@@ -887,7 +1412,7 @@ bool KernelMonitorMapperPoolSelfTest()
         }
         KmonResidualSignalInput session = stub;
         session.SessionSpace = true;
-        if (KmonClassifyResidualSignal(session) != KmonResidualSignalKind::None)
+        if (KmonClassifyResidualSignal(session) != KmonResidualSignalKind::MapperStub)
         {
             break;
         }

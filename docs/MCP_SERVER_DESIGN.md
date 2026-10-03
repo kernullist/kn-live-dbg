@@ -240,6 +240,16 @@ Activated only by an explicit flag. When activated:
 
 ### 5.4 Input guards (sealing prompt injection)
 
+The transport accepts a complete UTF-8 JSON object of at most 1 MiB. Invalid UTF-8,
+malformed nested grammar, trailing values, duplicate decoded member names, and
+nesting beyond 128 levels are rejected before dispatch. Field lookup uses decoded
+top-level names. JSON-RPC version must be `2.0`, IDs must be strings, numbers, or
+null, and params/tool arguments must be objects. Body read errors return HTTP 400;
+oversized bodies return HTTP 413. A partial prefix is never dispatched, and the
+undefined byte count accompanying `ERROR_HANDLE_EOF` is ignored.
+Oversized headers return HTTP 431 whether receipt completes immediately or
+through overlapped I/O.
+
 1. Every `tools/call` passes the existing guards **as is**: `IsSupportedAiCapabilityTool` (tool allowlist) + `ValidateAiCapabilityToolArgKeys` (per-tool argument-key whitelist) + per-value `ValidateAiCapabilityScalarText` + `ContainsUnsafeAiCommandCharacters` (rejecting `;`/CR/LF/control chars) + scope enum normalization + `IsHelpToken` rejection.
 2. **Never accept a raw command string over MCP (including writes).** Only a `tool` + typed args. In read-only mode, the worst an injected model can do is "select another read scanner with in-range arguments." In Lab write mode, write tools are reachable but go through **typed arguments + value validation + backup/verify/audit**, and raw kd/session-change/unload are not exposed in either mode.
 3. **The no-raw-command-passthrough rule still holds** (`kd`/arbitrary `u`/`uf` strings). Lab write mode's write tools are added as **typed new primitives** (`memory.write_virtual` etc., each with its own value-validator), but no path that accepts arbitrary command strings is opened.

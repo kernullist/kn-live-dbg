@@ -44,6 +44,8 @@ struct ObjectCallbackLayout
     TypeFieldInfo CallbackEntry = {};
     TypeFieldInfo PreOperation = {};
     TypeFieldInfo PostOperation = {};
+    TypeFieldInfo Enabled = {};
+    bool EnabledFromPdb = false;
     bool UsedSyntheticItemType = false;
     bool UsedSyntheticFields = false;
 };
@@ -1496,6 +1498,16 @@ static bool BuildObjectCallbackLayout(
             &usedFallback);
         usedAnyFallback = usedAnyFallback || usedFallback;
         layout->UsedSyntheticFields = usedAnyFallback;
+        if (!layout->UsedSyntheticItemType &&
+            context.FindField(layout->ItemType, {L"Enabled"}, &layout->Enabled, nullptr) &&
+            !layout->Enabled.IsBitField &&
+            (layout->Enabled.Length == 1 || layout->Enabled.Length == 4))
+        {
+            TypeLayoutInfo itemLayout;
+            layout->EnabledFromPdb = context.GetTypeLayoutInfo(layout->ItemType, &itemLayout, nullptr) &&
+                layout->Enabled.Offset <= itemLayout.Size &&
+                layout->Enabled.Length <= itemLayout.Size - layout->Enabled.Offset;
+        }
 
         ok = true;
     } while (false);
@@ -1820,6 +1832,19 @@ static void AddEnumeratedCallbackRoots(
     } while (false);
 }
 
+template<typename Reader>
+static bool NotifySlotStillReferencesBlock(
+    Reader& read,
+    uint64_t slotAddress,
+    uint64_t blockAddress)
+{
+    uint64_t current = 0;
+    // The low fast-reference count may change while the registered block
+    // remains the same. A cleared or replaced slot invalidates this sample.
+    return read(slotAddress, &current) && current != 0 &&
+        (current & ~0xFull) == blockAddress;
+}
+
 static bool ScanExCallbackTableRoot(
     CallbackScanContext& context,
     const CallbackRoot& root,
@@ -1848,6 +1873,12 @@ static bool ScanExCallbackTableRoot(
         *recordCount = 0;
         std::vector<KernelCallbackRecord> records;
         uint32_t nonZeroSlots = 0;
+        uint32_t validSlots = 0;
+        uint32_t poisonedSlots = 0;
+        uint32_t unreadableSlots = 0;
+        uint32_t changedSlots = 0;
+        uint32_t slotsRead = 0;
+        std::vector<uint64_t> observedBlocks;
         bool tableReadOk = true;
 
         for (uint32_t slot = 0; slot < 64; ++slot)
@@ -1874,6 +1905,8 @@ static bool ScanExCallbackTableRoot(
                 tableReadOk = false;
                 break;
             }
+            ++slotsRead;
+            observedBlocks.push_back(rawValue & ~0xFull);
 
             if (rawValue == 0)
             {
@@ -1883,25 +1916,64 @@ static bool ScanExCallbackTableRoot(
             ++nonZeroSlots;
 
             uint64_t blockAddress = context.DecodeFastRef(rawValue);
+            KernelCallbackRecord record = {};
+            record.Kind = kind;
+            record.Target = target;
+            record.Slot = slot;
+            record.Entry = slotAddress;
+            record.RootAddress = root.Address;
+            record.RootSource = root.Source;
+            record.RawValue = rawValue;
+            record.CallbackBlock = blockAddress;
+            auto sameBlock = [&]()
+            {
+                auto readSlot = [&](uint64_t address, uint64_t* value)
+                {
+                    return context.ReadU64(address, value, nullptr);
+                };
+                const bool stable = NotifySlotStillReferencesBlock(readSlot, slotAddress, blockAddress);
+                if (!stable)
+                {
+                    ++changedSlots;
+                }
+                return stable;
+            };
+            auto keepPoisoned = [&](const wchar_t* reason)
+            {
+                if (!sameBlock())
+                {
+                    return;
+                }
+                record.Poisoned = true;
+                record.Notes = reason;
+                records.push_back(record);
+                ++poisonedSlots;
+            };
             if (blockAddress == 0 || !context.IsKernelPointer(blockAddress))
             {
+                keepPoisoned(L"nonzero notify slot has an invalid callback-block pointer");
                 continue;
             }
 
             uint64_t functionAddressField = 0;
             if (!context.TryAdd(blockAddress, layout.Function.Offset, &functionAddressField))
             {
+                keepPoisoned(L"notify callback function field address overflow");
                 continue;
             }
+            record.FunctionSlot = functionAddressField;
 
             uint64_t functionAddress = 0;
             if (!context.ReadU64(functionAddressField, &functionAddress, &readError))
             {
+                ++unreadableSlots;
                 continue;
             }
+            record.Function = functionAddress;
 
             if (!context.IsKernelPointer(functionAddress))
             {
+                keepPoisoned(L"nonzero notify slot has a NULL or non-kernel callback function");
                 continue;
             }
 
@@ -1912,16 +1984,10 @@ static bool ScanExCallbackTableRoot(
                 context.ReadU64(contextAddressField, &callbackContext, nullptr);
             }
 
-            KernelCallbackRecord record = {};
-            record.Kind = kind;
-            record.Target = target;
-            record.Slot = slot;
-            record.RootAddress = root.Address;
-            record.RootSource = root.Source;
-            record.RawValue = rawValue;
-            record.CallbackBlock = blockAddress;
-            record.Function = functionAddress;
-            record.FunctionSlot = functionAddressField;
+            if (!sameBlock())
+            {
+                continue;
+            }
             record.Context = callbackContext;
             if (layout.UsedSyntheticFields)
             {
@@ -1933,14 +1999,15 @@ static bool ScanExCallbackTableRoot(
                 context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
             }
             records.push_back(record);
+            ++validSlots;
         }
 
-        if (!tableReadOk)
+        if (!tableReadOk && (!allowEmpty || slotsRead == 0))
         {
             break;
         }
 
-        if (!allowEmpty && records.empty())
+        if (!allowEmpty && validSlots == 0)
         {
             if (error != nullptr)
             {
@@ -1950,6 +2017,29 @@ static bool ScanExCallbackTableRoot(
                 *error = stream.str();
             }
             break;
+        }
+
+        for (size_t slot = 0; slot < observedBlocks.size(); ++slot)
+        {
+            uint64_t slotAddress = 0;
+            uint64_t after = 0;
+            if (!context.TryAdd(root.Address, slot * sizeof(uint64_t), &slotAddress) ||
+                !context.ReadU64(slotAddress, &after, nullptr) ||
+                (after & ~0xFull) != observedBlocks[slot])
+            {
+                ++changedSlots;
+            }
+        }
+
+        if (!tableReadOk || poisonedSlots != 0 || unreadableSlots != 0 || changedSlots != 0)
+        {
+            result->Incomplete = true;
+            result->PoisonedEntryCount += poisonedSlots;
+            result->Warnings.push_back(
+                root.Source + L": notify table incomplete; readable_slots=" +
+                std::to_wstring(slotsRead) + L" poisoned_slots=" + std::to_wstring(poisonedSlots) +
+                L" unreadable_slots=" + std::to_wstring(unreadableSlots) +
+                L" changed_or_unverifiable_slots=" + std::to_wstring(changedSlots));
         }
 
         result->Records.insert(result->Records.end(), records.begin(), records.end());
@@ -2025,15 +2115,18 @@ static bool ScanRegistryCallbackListRoot(
 
         std::vector<KernelCallbackRecord> records;
         uint64_t current = head.Flink;
+        uint64_t previous = root.Address;
+        std::set<uint64_t> visited;
         bool listWalkOk = true;
+        bool fieldsComplete = true;
         for (uint32_t index = 0; index < 512 && current != 0 && current != root.Address; ++index)
         {
-            if (!context.IsKernelPointer(current))
+            if (!context.IsKernelPointer(current) || !visited.insert(current).second)
             {
                 listWalkOk = false;
                 if (error != nullptr)
                 {
-                    *error = L"Registry callback list entry is not a kernel pointer";
+                    *error = L"Registry callback list entry is invalid or cyclic";
                 }
                 break;
             }
@@ -2046,6 +2139,15 @@ static bool ScanRegistryCallbackListRoot(
                 if (error != nullptr)
                 {
                     *error = readError;
+                }
+                break;
+            }
+            if (entryLinks.Blink != previous || !context.IsKernelPointer(entryLinks.Flink))
+            {
+                listWalkOk = false;
+                if (error != nullptr)
+                {
+                    *error = L"Registry callback list forward/back links are inconsistent";
                 }
                 break;
             }
@@ -2068,22 +2170,26 @@ static bool ScanRegistryCallbackListRoot(
 
             if (layout.PreCallback.Length != 0)
             {
-                ReadFieldValueByDescriptor(context, blockAddress, layout.PreCallback, &preCallback, nullptr);
+                fieldsComplete = ReadFieldValueByDescriptor(
+                    context, blockAddress, layout.PreCallback, &preCallback, nullptr) && fieldsComplete;
                 // Keep outside-module kernel pointers: they are the primary Cm
                 // hook signal (pool shellcode, manual-map drivers). Only drop
                 // non-canonical / non-kernel garbage so list noise does not
                 // become fake records. Do NOT require IsKernelImagePointer.
                 if (preCallback != 0 && !context.IsKernelPointer(preCallback))
                 {
+                    fieldsComplete = false;
                     preCallback = 0;
                 }
             }
 
             if (layout.PostCallback.Length != 0)
             {
-                ReadFieldValueByDescriptor(context, blockAddress, layout.PostCallback, &postCallback, nullptr);
+                fieldsComplete = ReadFieldValueByDescriptor(
+                    context, blockAddress, layout.PostCallback, &postCallback, nullptr) && fieldsComplete;
                 if (postCallback != 0 && !context.IsKernelPointer(postCallback))
                 {
+                    fieldsComplete = false;
                     postCallback = 0;
                 }
             }
@@ -2178,12 +2284,21 @@ static bool ScanRegistryCallbackListRoot(
                 records.push_back(record);
             }
 
+            previous = current;
             current = entryLinks.Flink;
         }
 
-        if (!listWalkOk)
+        listWalkOk = listWalkOk && current == root.Address && previous == head.Blink;
+        if (!listWalkOk && (!allowEmpty || records.empty()))
         {
             break;
+        }
+
+        if (!listWalkOk || !fieldsComplete)
+        {
+            result->Incomplete = true;
+            result->Warnings.push_back(root.Source +
+                L": registry callback list or routine fields were incomplete; validated prefix retained");
         }
 
         if (records.empty())
@@ -2994,6 +3109,269 @@ KernelCallbackScanner::KernelCallbackScanner(DeviceClient& device, SymbolEngine&
 {
 }
 
+namespace
+{
+    bool ExactCallbackField(
+        SymbolEngine& symbols,
+        const wchar_t* typeName,
+        const wchar_t* fieldName,
+        uint64_t expectedBytes,
+        TypeLayoutInfo* layout,
+        TypeFieldInfo* field)
+    {
+        return symbols.GetTypeLayout(typeName, layout, nullptr) &&
+            layout->Size != 0 && layout->Size <= 0x2000 &&
+            symbols.FindField(typeName, fieldName, field, nullptr) &&
+            !field->IsBitField && field->Length == expectedBytes &&
+            field->Offset <= layout->Size && expectedBytes <= layout->Size - field->Offset;
+    }
+
+    template<typename Reader>
+    bool WalkExactCallbackList(Reader& read, uint64_t head, size_t limit, std::vector<uint64_t>* nodes)
+    {
+        nodes->clear();
+        const auto kernelPointer = [](uint64_t value)
+        {
+            return value >= 0xffff800000000000ull && (value & 7) == 0 && value <= ~0ull - 8;
+        };
+        uint64_t first = 0;
+        uint64_t last = 0;
+        if (!kernelPointer(head) || !read(head, &first) || !read(head + 8, &last))
+        {
+            return false;
+        }
+        uint64_t current = first;
+        uint64_t previous = head;
+        std::set<uint64_t> visited;
+        while (current != head)
+        {
+            uint64_t next = 0;
+            uint64_t back = 0;
+            if (visited.size() >= limit || !kernelPointer(current) ||
+                !visited.insert(current).second || !read(current, &next) ||
+                !read(current + 8, &back) || back != previous)
+            {
+                return false;
+            }
+            nodes->push_back(current);
+            previous = current;
+            current = next;
+        }
+        uint64_t firstAfter = 0;
+        uint64_t lastAfter = 0;
+        return previous == last && read(head, &firstAfter) && read(head + 8, &lastAfter) &&
+            firstAfter == first && lastAfter == last;
+    }
+
+    bool ExecutiveObjectHeaderMatches(
+        uint64_t headerAddress,
+        uint64_t encodedType,
+        uint64_t cookie,
+        uint64_t expectedType,
+        uint64_t infoMask)
+    {
+        return expectedType != 0 && expectedType <= 0xff && (infoMask & 1) != 0 &&
+            static_cast<uint8_t>(encodedType ^ cookie ^ (headerAddress >> 8)) == expectedType;
+    }
+}
+
+bool KernelCallbackScanner::ScanExecutiveCallbacks(KernelCallbackScanResult* result, std::wstring* error)
+{
+    result->Incomplete = true;
+    CallbackScanContext context(device_, symbols_);
+    TypeLayoutInfo typeLayout = {};
+    TypeLayoutInfo initializerLayout = {};
+    TypeLayoutInfo creatorLayout = {};
+    TypeLayoutInfo headerLayout = {};
+    TypeLayoutInfo objectLayout = {};
+    TypeLayoutInfo registrationLayout = {};
+    TypeFieldInfo typeList = {};
+    TypeFieldInfo typeInfo = {};
+    TypeFieldInfo maintainList = {};
+    TypeFieldInfo typeIndex = {};
+    TypeFieldInfo typeCount = {};
+    TypeFieldInfo creatorList = {};
+    TypeFieldInfo headerBody = {};
+    TypeFieldInfo headerType = {};
+    TypeFieldInfo headerInfo = {};
+    TypeFieldInfo registered = {};
+    TypeFieldInfo registrationLink = {};
+    TypeFieldInfo registrationObject = {};
+    TypeFieldInfo registrationFunction = {};
+    TypeFieldInfo registrationContext = {};
+    uint64_t typeObject = 0;
+    uint64_t cookieAddress = 0;
+    uint64_t infoOffsets = 0;
+    bool ok = false;
+    do
+    {
+        if (!context.ResolveGlobalPointer(L"nt!ExCallbackObjectType", &typeObject, nullptr) ||
+            !context.IsKernelPointer(typeObject) ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_TYPE", L"TypeList", 16, &typeLayout, &typeList) ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_TYPE", L"Index", 1, &typeLayout, &typeIndex) ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_TYPE", L"TotalNumberOfObjects", 4, &typeLayout, &typeCount) ||
+            !symbols_.GetTypeLayout(L"nt!_OBJECT_TYPE_INITIALIZER", &initializerLayout, nullptr) ||
+            initializerLayout.Size == 0 || initializerLayout.Size > 0x1000 ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_TYPE", L"TypeInfo", initializerLayout.Size, &typeLayout, &typeInfo) ||
+            !symbols_.FindField(L"nt!_OBJECT_TYPE_INITIALIZER", L"MaintainTypeList", &maintainList, nullptr) ||
+            !maintainList.IsBitField || maintainList.BitPosition >= 8 || maintainList.Length != 1 ||
+            maintainList.Offset >= initializerLayout.Size ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_HEADER_CREATOR_INFO", L"TypeList", 16, &creatorLayout, &creatorList) ||
+            creatorLayout.Size > 0xff ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_HEADER", L"TypeIndex", 1, &headerLayout, &headerType) ||
+            !ExactCallbackField(symbols_, L"nt!_OBJECT_HEADER", L"InfoMask", 1, &headerLayout, &headerInfo) ||
+            !symbols_.FindField(L"nt!_OBJECT_HEADER", L"Body", &headerBody, nullptr) ||
+            headerBody.Offset == 0 || headerBody.Offset >= headerLayout.Size ||
+            !ExactCallbackField(symbols_, L"nt!_CALLBACK_OBJECT", L"RegisteredCallbacks", 16, &objectLayout, &registered) ||
+            !ExactCallbackField(symbols_, L"nt!_CALLBACK_REGISTRATION", L"Link", 16, &registrationLayout, &registrationLink) ||
+            !ExactCallbackField(symbols_, L"nt!_CALLBACK_REGISTRATION", L"CallbackObject", 8, &registrationLayout, &registrationObject) ||
+            !ExactCallbackField(symbols_, L"nt!_CALLBACK_REGISTRATION", L"CallbackFunction", 8, &registrationLayout, &registrationFunction) ||
+            !ExactCallbackField(symbols_, L"nt!_CALLBACK_REGISTRATION", L"CallbackContext", 8, &registrationLayout, &registrationContext) ||
+            !symbols_.ResolveSymbol(L"nt!ObHeaderCookie", &cookieAddress, nullptr) ||
+            !symbols_.ResolveSymbol(L"nt!ObpInfoMaskToOffset", &infoOffsets, nullptr))
+        {
+            if (error != nullptr)
+            {
+                *error = L"exact PDB executive callback/type-list layout unavailable";
+            }
+            break;
+        }
+        result->ExecutiveLayoutFromPdb = true;
+        std::vector<uint8_t> byte;
+        uint64_t cookie = 0;
+        uint64_t expectedIndex = 0;
+        uint64_t typeHead = 0;
+        uint64_t initializer = 0;
+        uint64_t fieldAddress = 0;
+        uint32_t expectedCount = 0;
+        if (!context.IsKernelPointer(cookieAddress) || !context.IsKernelPointer(infoOffsets) ||
+            !context.ReadBytes(cookieAddress, 1, &byte, nullptr))
+        {
+            break;
+        }
+        cookie = byte[0];
+        if (!context.TryAdd(infoOffsets, 1, &fieldAddress) ||
+            !context.ReadBytes(fieldAddress, 1, &byte, nullptr) || byte[0] != creatorLayout.Size ||
+            !context.TryAdd(typeObject, typeInfo.Offset, &initializer) ||
+            !context.TryAdd(initializer, maintainList.Offset, &fieldAddress) ||
+            !context.ReadBytes(fieldAddress, 1, &byte, nullptr) ||
+            (byte[0] & (1u << maintainList.BitPosition)) == 0 ||
+            !ReadFieldValueByDescriptor(context, typeObject, typeIndex, &expectedIndex, nullptr) ||
+            !context.TryAdd(typeObject, typeCount.Offset, &fieldAddress) ||
+            !context.ReadU32(fieldAddress, &expectedCount, nullptr) || expectedCount > 1024 ||
+            !context.TryAdd(typeObject, typeList.Offset, &typeHead))
+        {
+            if (error != nullptr)
+            {
+                *error = L"executive callback type-list maintenance, creator offset, or count unavailable";
+            }
+            break;
+        }
+        auto read = [&](uint64_t address, uint64_t* value)
+        {
+            return context.IsKernelPointer(address) && address <= ~0ull - 8 &&
+                context.ReadU64(address, value, nullptr);
+        };
+        std::vector<uint64_t> objects;
+        if (!WalkExactCallbackList(read, typeHead, 1024, &objects) || objects.size() != expectedCount)
+        {
+            break;
+        }
+        bool complete = true;
+        size_t registrationsVisited = 0;
+        for (uint64_t node : objects)
+        {
+            uint64_t header = 0;
+            uint64_t object = 0;
+            uint64_t encodedType = 0;
+            uint64_t infoMask = 0;
+            uint64_t callbackHead = 0;
+            if (!context.TrySubtract(node, creatorList.Offset, &header) ||
+                !context.TryAdd(header, creatorLayout.Size, &header) ||
+                !context.TryAdd(header, headerBody.Offset, &object) ||
+                !ReadFieldValueByDescriptor(context, header, headerType, &encodedType, nullptr) ||
+                !ReadFieldValueByDescriptor(context, header, headerInfo, &infoMask, nullptr) ||
+                !ExecutiveObjectHeaderMatches(header, encodedType, cookie, expectedIndex, infoMask) ||
+                !context.TryAdd(object, registered.Offset, &callbackHead))
+            {
+                complete = false;
+                continue;
+            }
+            ++result->ExecutiveObjectsObserved;
+            std::vector<uint64_t> registrations;
+            const bool listComplete = WalkExactCallbackList(read, callbackHead, 4096 - registrationsVisited, &registrations);
+            registrationsVisited += registrations.size();
+            if (!listComplete)
+            {
+                complete = false;
+                continue;
+            }
+            std::vector<KernelCallbackRecord> localRecords;
+            for (uint64_t registrationNode : registrations)
+            {
+                uint64_t registration = 0;
+                uint64_t owner = 0;
+                uint64_t ownerAfter = 0;
+                uint64_t functionAfter = 0;
+                KernelCallbackRecord record;
+                if (!context.TrySubtract(registrationNode, registrationLink.Offset, &registration) ||
+                    !ReadFieldValueByDescriptor(context, registration, registrationObject, &owner, nullptr) || owner != object ||
+                    !ReadFieldValueByDescriptor(context, registration, registrationFunction, &record.Function, nullptr) ||
+                    !ReadFieldValueByDescriptor(context, registration, registrationContext, &record.Context, nullptr) ||
+                    record.Function == 0 ||
+                    !ReadFieldValueByDescriptor(context, registration, registrationObject, &ownerAfter, nullptr) || ownerAfter != owner ||
+                    !ReadFieldValueByDescriptor(context, registration, registrationFunction, &functionAfter, nullptr) || functionAfter != record.Function ||
+                    !context.TryAdd(registration, registrationFunction.Offset, &record.FunctionSlot))
+                {
+                    complete = false;
+                    continue;
+                }
+                record.Kind = L"executive";
+                record.Target = L"Ex callback object";
+                record.Entry = registration;
+                record.ListEntry = registrationNode;
+                record.CallbackBlock = object;
+                record.RootAddress = callbackHead;
+                record.RootSource = L"nt!ExCallbackObjectType.TypeList (PDB)";
+                context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
+                context.AnnotateAddress(record.Context, &record.ContextModule, &record.ContextSymbol);
+                record.Poisoned = !context.IsKernelPointer(record.Function);
+                localRecords.push_back(std::move(record));
+            }
+            std::vector<uint64_t> after;
+            if (!WalkExactCallbackList(read, callbackHead, 4096, &after) || after != registrations)
+            {
+                complete = false;
+            }
+            else
+            {
+                for (const KernelCallbackRecord& record : localRecords)
+                {
+                    result->PoisonedEntryCount += record.Poisoned ? 1 : 0;
+                    result->Records.push_back(record);
+                }
+            }
+        }
+        std::vector<uint64_t> afterObjects;
+        uint32_t countAfter = 0;
+        if (!context.TryAdd(typeObject, typeCount.Offset, &fieldAddress) ||
+            !context.ReadU32(fieldAddress, &countAfter, nullptr) || countAfter != expectedCount ||
+            !WalkExactCallbackList(read, typeHead, 1024, &afterObjects) || afterObjects != objects)
+        {
+            complete = false;
+            result->Records.clear();
+            result->PoisonedEntryCount = 0;
+        }
+        result->Incomplete = !complete;
+        ok = true;
+    } while (false);
+    if (result->Incomplete)
+    {
+        result->Warnings.push_back(L"executive callbacks require a maintained type list and exact PDB layout; partial snapshots cannot prove removal");
+    }
+    return ok;
+}
+
 bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error)
 {
     bool ok = false;
@@ -3009,10 +3387,8 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
             break;
         }
 
-        result->Records.clear();
-        result->Warnings.clear();
-        result->Incomplete = false;
-        result->PoisonedEntryCount = 0;
+        *result = KernelCallbackScanResult{};
+        result->SnapshotTickMs = GetTickCount64();
 
         std::wstring normalized = ToLowerLocal(scope.empty() ? L"all" : scope);
         bool scanAll = normalized == L"all";
@@ -3022,12 +3398,13 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         bool scanThread = scanAll || normalized == L"thread";
         bool scanImageLoad = scanAll || normalized == L"imageload";
         bool scanMini = scanAll || normalized == L"minifilter";
+        bool scanExecutive = scanAll || normalized == L"executive";
 
-        if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanImageLoad && !scanMini)
+        if (!scanOb && !scanRegistry && !scanProcess && !scanThread && !scanImageLoad && !scanMini && !scanExecutive)
         {
             if (error != nullptr)
             {
-                *error = L"usage: !callbacks [all|object|registry|process|thread|imageload|minifilter]";
+                *error = L"usage: !callbacks [all|object|registry|process|thread|imageload|minifilter|executive]";
             }
             break;
         }
@@ -3041,7 +3418,20 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         {
             ++surfacesRequested;
             localError.clear();
-            if ((this->*scanner)(result, &localError))
+            KernelCallbackScanResult surfaceResult;
+            const bool succeeded = (this->*scanner)(&surfaceResult, &localError);
+            KernelCallbackScanResult::SurfaceSnapshot snapshot;
+            snapshot.Name = name;
+            snapshot.CoverageComplete = succeeded && !surfaceResult.Incomplete;
+            snapshot.RecordCount = static_cast<uint32_t>(surfaceResult.Records.size());
+            result->Surfaces.push_back(std::move(snapshot));
+            result->Records.insert(result->Records.end(), surfaceResult.Records.begin(), surfaceResult.Records.end());
+            result->Warnings.insert(result->Warnings.end(), surfaceResult.Warnings.begin(), surfaceResult.Warnings.end());
+            result->Incomplete = result->Incomplete || surfaceResult.Incomplete;
+            result->PoisonedEntryCount += surfaceResult.PoisonedEntryCount;
+            result->ExecutiveLayoutFromPdb = result->ExecutiveLayoutFromPdb || surfaceResult.ExecutiveLayoutFromPdb;
+            result->ExecutiveObjectsObserved += surfaceResult.ExecutiveObjectsObserved;
+            if (succeeded)
             {
                 anyScannerSucceeded = true;
             }
@@ -3078,6 +3468,33 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
         if (scanMini)
         {
             runSurface(L"minifilter", &KernelCallbackScanner::ScanMinifilterCallbacks);
+        }
+        if (scanExecutive)
+        {
+            runSurface(L"executive", &KernelCallbackScanner::ScanExecutiveCallbacks);
+        }
+        if (scanProcess || scanThread || scanImageLoad)
+        {
+            std::vector<SymbolMatchInfo> matches;
+            if (symbols_.EnumerateSymbols(L"nt!PspNotifyEnableMask", 2, &matches, nullptr) &&
+                matches.size() == 1 && matches[0].Size == sizeof(uint32_t))
+            {
+                CallbackScanContext context(device_, symbols_);
+                uint32_t before = 0;
+                uint32_t after = 0;
+                result->NotifyEnableMaskAddress = matches[0].Address;
+                if (context.IsKernelPointer(matches[0].Address) && matches[0].Address <= ~0ull - sizeof(uint32_t) &&
+                    context.ReadU32(matches[0].Address, &before, nullptr) &&
+                    context.ReadU32(matches[0].Address, &after, nullptr) && before == after)
+                {
+                    result->NotifyEnableMaskRaw = before;
+                    result->NotifyEnableMaskKnown = true;
+                }
+            }
+            if (!result->NotifyEnableMaskKnown)
+            {
+                result->Warnings.push_back(L"notification enable scalar unavailable or unstable; delivery state remains unknown");
+            }
         }
 
         if (!anyScannerSucceeded)
@@ -3124,6 +3541,27 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
     out += std::to_wstring(result.PoisonedEntryCount);
     out += L",\"coverageComplete\":";
     out += (!result.Incomplete) ? L"true" : L"false";
+    out += L",\"snapshotTickMs\":" + std::to_wstring(result.SnapshotTickMs);
+    out += L",\"notifyEnableMaskKnown\":";
+    out += result.NotifyEnableMaskKnown ? L"true" : L"false";
+    out += L",\"notifyEnableMaskRaw\":" + std::to_wstring(result.NotifyEnableMaskRaw);
+    out += L",\"notifyEnableMaskBitsDecoded\":false";
+    out += L",\"executiveLayoutFromPdb\":";
+    out += result.ExecutiveLayoutFromPdb ? L"true" : L"false";
+    out += L",\"executiveObjectsObserved\":" + std::to_wstring(result.ExecutiveObjectsObserved);
+    out += L",\"surfaces\":[";
+    for (size_t i = 0; i < result.Surfaces.size(); ++i)
+    {
+        if (i != 0)
+        {
+            out += L",";
+        }
+        out += L"{\"name\":" + mcpjson::Quote(result.Surfaces[i].Name);
+        out += L",\"complete\":";
+        out += result.Surfaces[i].CoverageComplete ? L"true" : L"false";
+        out += L",\"recordCount\":" + std::to_wstring(result.Surfaces[i].RecordCount) + L"}";
+    }
+    out += L"]";
     out += L",\"records\":[";
 
     for (size_t index = 0; index < result.Records.size(); ++index)
@@ -3151,6 +3589,13 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
         out += L",\"function\":" + mcpjson::Quote(CallbacksJsonHex(record.Function));
         out += L",\"functionModule\":" + mcpjson::Quote(record.FunctionModule);
         out += L",\"functionSymbol\":" + mcpjson::Quote(record.FunctionSymbol);
+        out += L",\"registrationEnabledKnown\":";
+        out += record.RegistrationEnabledKnown ? L"true" : L"false";
+        if (record.RegistrationEnabledKnown)
+        {
+            out += L",\"registrationEnabled\":";
+            out += record.RegistrationEnabled ? L"true" : L"false";
+        }
         if (record.FunctionSlot != 0)
         {
             out += L",\"functionSlot\":" + mcpjson::Quote(CallbacksJsonHex(record.FunctionSlot));
@@ -3774,6 +4219,7 @@ bool KernelCallbackScanner::ScanObjectCallbacks(KernelCallbackScanResult* result
             else
             {
                 warnings.push_back(target.Name + L": " + localError);
+                result->Incomplete = true;
             }
         }
 
@@ -3877,20 +4323,21 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
         uint64_t current = head.Flink;
         bool walkIncomplete = false;
         uint32_t poisonedEntries = 0;
+        uint64_t previous = headAddress;
+        std::set<uint64_t> visited;
         for (uint32_t index = 0; index < 512 && current != 0 && current != headAddress; ++index)
         {
-            if (!context.IsKernelPointer(current))
+            if (!context.IsKernelPointer(current) || !visited.insert(current).second)
             {
                 // Cannot recover Flink from a non-kernel link. Keep prior
                 // records and report incomplete coverage instead of failing
                 // the whole object-type walk.
                 walkIncomplete = true;
                 result->Warnings.push_back(
-                    L"ob " + target + L": non-kernel list entry at slot " + std::to_wstring(index) +
+                    L"ob " + target + L": invalid or cyclic list entry at slot " + std::to_wstring(index) +
                     L"; remaining callbacks not walked");
                 break;
             }
-
             ListEntryValue entryLinks = {};
             std::wstring readError;
             if (!context.ReadListEntry(current, &entryLinks, &readError))
@@ -3899,6 +4346,14 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 result->Warnings.push_back(
                     L"ob " + target + L": list entry read failed at slot " + std::to_wstring(index) +
                     L": " + readError + L"; remaining callbacks not walked");
+                break;
+            }
+            if (entryLinks.Blink != previous || !context.IsKernelPointer(entryLinks.Flink))
+            {
+                walkIncomplete = true;
+                result->Warnings.push_back(
+                    L"ob " + target + L": list forward/back links are inconsistent at slot " +
+                    std::to_wstring(index));
                 break;
             }
 
@@ -3910,6 +4365,7 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 result->Warnings.push_back(
                     L"ob " + target + L": item address underflow at slot " + std::to_wstring(index) +
                     L" (continuing walk)");
+                previous = current;
                 current = entryLinks.Flink;
                 continue;
             }
@@ -3920,10 +4376,21 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             uint64_t operations = 0;
             uint64_t registrationContext = 0;
 
-            ReadFieldValueByDescriptor(context, itemAddress, layout.PreOperation, &preOperation, nullptr);
-            ReadFieldValueByDescriptor(context, itemAddress, layout.PostOperation, &postOperation, nullptr);
-            ReadFieldValueByDescriptor(context, itemAddress, layout.CallbackEntry, &callbackEntry, nullptr);
-            ReadFieldValueByDescriptor(context, itemAddress, layout.Operations, &operations, nullptr);
+            const bool preRead = ReadFieldValueByDescriptor(context, itemAddress, layout.PreOperation, &preOperation, nullptr);
+            const bool postRead = ReadFieldValueByDescriptor(context, itemAddress, layout.PostOperation, &postOperation, nullptr);
+            const bool entryRead = ReadFieldValueByDescriptor(context, itemAddress, layout.CallbackEntry, &callbackEntry, nullptr);
+            const bool operationsRead = ReadFieldValueByDescriptor(context, itemAddress, layout.Operations, &operations, nullptr);
+            const bool fieldsRead = preRead && postRead && entryRead && operationsRead;
+            if (!fieldsRead)
+            {
+                walkIncomplete = true;
+                result->Warnings.push_back(
+                    L"ob " + target + L": callback fields were unreadable at slot " +
+                    std::to_wstring(index) + L"; item deferred");
+                previous = current;
+                current = entryLinks.Flink;
+                continue;
+            }
 
             if (preOperation != 0 || postOperation != 0)
             {
@@ -3964,6 +4431,18 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 context.TryAdd(itemAddress, layout.PreOperation.Offset, &record.FunctionSlot);
                 context.TryAdd(itemAddress, layout.PostOperation.Offset, &record.PostFunctionSlot);
                 record.Poisoned = !fieldsValid;
+                if (layout.EnabledFromPdb)
+                {
+                    uint64_t enabled = 0;
+                    uint64_t enabledAfter = 0;
+                    if (ReadFieldValueByDescriptor(context, itemAddress, layout.Enabled, &enabled, nullptr) &&
+                        ReadFieldValueByDescriptor(context, itemAddress, layout.Enabled, &enabledAfter, nullptr) &&
+                        enabled == enabledAfter && enabled <= 1)
+                    {
+                        record.RegistrationEnabledKnown = true;
+                        record.RegistrationEnabled = enabled != 0;
+                    }
+                }
                 if (!layout.UsedSyntheticItemType && layout.UsedSyntheticFields)
                 {
                     record.Notes = L"partial fallback object callback item fields";
@@ -3998,15 +4477,16 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 result->Records.push_back(record);
             }
 
+            previous = current;
             current = entryLinks.Flink;
         }
 
-        if (current != 0 && current != headAddress)
+        if (current != headAddress || previous != head.Blink)
         {
             // Hit the 512-entry cap without returning to the head.
             walkIncomplete = true;
             result->Warnings.push_back(
-                L"ob " + target + L": callback list walk hit entry cap without returning to head");
+                L"ob " + target + L": callback list did not return to a consistent head/tail");
         }
 
         if (walkIncomplete)
@@ -4321,7 +4801,7 @@ namespace
         bool owned = false;
         do
         {
-            if (record.Poisoned)
+            if (record.Poisoned || record.Kind == L"executive")
             {
                 break;
             }
@@ -5119,11 +5599,113 @@ bool KernelCallbackScanner::SetModuleCallbacks(
     return ok;
 }
 
+bool ExecutiveCallbackScannerSelfTest()
+{
+    const uint64_t head = 0xffff800000001000ull;
+    const uint64_t node = head + 0x1000;
+    std::map<uint64_t, uint64_t> memory;
+    auto read = [&](uint64_t address, uint64_t* value)
+    {
+        const auto found = memory.find(address);
+        if (found == memory.end())
+        {
+            return false;
+        }
+        *value = found->second;
+        return true;
+    };
+    std::vector<uint64_t> nodes;
+    memory[head] = head;
+    memory[head + 8] = head;
+    if (!WalkExactCallbackList(read, head, 4, &nodes) || !nodes.empty())
+    {
+        return false;
+    }
+    memory[head] = node;
+    memory[head + 8] = node;
+    memory[node] = head;
+    memory[node + 8] = head;
+    if (!WalkExactCallbackList(read, head, 4, &nodes) || nodes != std::vector<uint64_t>{node} ||
+        WalkExactCallbackList(read, head, 0, &nodes))
+    {
+        return false;
+    }
+    memory[node + 8] = node;
+    if (WalkExactCallbackList(read, head, 4, &nodes))
+    {
+        return false;
+    }
+    memory[node + 8] = head;
+    size_t reads = 0;
+    auto changing = [&](uint64_t address, uint64_t* value)
+    {
+        if (address == head && ++reads == 2)
+        {
+            *value = head;
+            return true;
+        }
+        return read(address, value);
+    };
+    if (WalkExactCallbackList(changing, head, 4, &nodes))
+    {
+        return false;
+    }
+    const uint8_t encoded = static_cast<uint8_t>(7 ^ 0xa5 ^ (node >> 8));
+    KernelCallbackRecord record;
+    record.Kind = L"executive";
+    record.Function = head;
+    record.FunctionModule = L"fixture.sys";
+    return ExecutiveObjectHeaderMatches(node, encoded, 0xa5, 7, 1) &&
+        !ExecutiveObjectHeaderMatches(node, encoded, 0xa5, 8, 1) &&
+        !ExecutiveObjectHeaderMatches(node, encoded, 0xa5, 7, 0) &&
+        !KernelCallbackRecordMatchesModuleForWrite(record, L"fixture.sys");
+}
+
 bool KernelCallbackScannerSelfTest()
 {
     bool ok = true;
     do
     {
+        constexpr uint64_t slotAddress = 0xFFFFF80000001000ull;
+        constexpr uint64_t blockAddress = 0xFFFF900000001000ull;
+        uint64_t observedSlot = blockAddress | 5;
+        bool slotReadable = true;
+        auto readSlot = [&](uint64_t address, uint64_t* value)
+        {
+            bool read = slotReadable && address == slotAddress;
+            if (read)
+            {
+                *value = observedSlot;
+            }
+            return read;
+        };
+        if (!NotifySlotStillReferencesBlock(readSlot, slotAddress, blockAddress))
+        {
+            ok = false;
+            break;
+        }
+        // The slot can be cleared after its block address was sampled but
+        // before the now-freed function field is read as zero or pool data.
+        observedSlot = 0;
+        if (NotifySlotStillReferencesBlock(readSlot, slotAddress, blockAddress) ||
+            NotifySlotStillReferencesBlock(readSlot, slotAddress, 0))
+        {
+            ok = false;
+            break;
+        }
+        observedSlot = (blockAddress + 0x1000) | 1;
+        if (NotifySlotStillReferencesBlock(readSlot, slotAddress, blockAddress))
+        {
+            ok = false;
+            break;
+        }
+        observedSlot = blockAddress | 1;
+        slotReadable = false;
+        if (NotifySlotStillReferencesBlock(readSlot, slotAddress, blockAddress))
+        {
+            ok = false;
+            break;
+        }
         if (!IsCallbackWriteAction(L"disable") ||
             !IsCallbackWriteAction(L"ENABLE-ALL") ||
             IsCallbackWriteAction(L"object") ||

@@ -237,8 +237,15 @@ bool PayloadTracer::TraceAddress(
                     break;
                 }
             }
-            LeftoverBuildModuleRanges(symbols_, &modules_);
-            modulesReady_ = true;
+            LeftoverBuildModuleRanges(symbols_, &modules_, &modulesReady_);
+            if (!modulesReady_)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"loaded module ranges are incomplete or invalid; payload trace deferred";
+                }
+                break;
+            }
         }
 
         if (!poolReady_)
@@ -788,8 +795,15 @@ bool PayloadTracer::Scan(
                 break;
             }
         }
-        LeftoverBuildModuleRanges(symbols_, &modules_);
-        modulesReady_ = true;
+        LeftoverBuildModuleRanges(symbols_, &modules_, &modulesReady_);
+        if (!modulesReady_)
+        {
+            if (error != nullptr)
+            {
+                *error = L"loaded module ranges are incomplete or invalid; payload trace deferred";
+            }
+            break;
+        }
 
         std::vector<PayloadHookPointer> pointers;
         CollectHookPointers(&pointers, result);
