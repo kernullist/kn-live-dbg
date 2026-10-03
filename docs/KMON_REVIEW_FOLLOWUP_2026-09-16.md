@@ -59,6 +59,9 @@ memory, synthetic file data, and injected readers rather than a loaded driver.
   COM apartment initialization now has scoped cleanup across exceptions.
   Unloaded-driver page-probe uncertainty has its own counter and coverage event,
   separate from unloaded-list completeness.
+  The Kmon fixture rejects malformed or overflowing `/seconds` values before
+  creating a child. Only an explicit zero requests an indefinite hold; the
+  maximum finite value is 4,294,967 seconds.
 
 ## Validation
 
@@ -69,10 +72,42 @@ covered 20,012 cases. Loopback WinHTTP checks covered ten body/deadline cases
 and ten redirects, with no redirected request reaching the destination.
 These results are retained in
 `.build/adversarial-review-20261003/verification.json` and apply to the
-pre-integration source hashes recorded there. Validation of the combined
-upstream and local changes must be recorded separately after integration.
+pre-integration source hashes recorded there.
 
-The local readiness gate rejected the old research ledger dated 2026-07-30.
+The 2026-10-04 integration uses main at `b42afbd` and preserves its executable
+verification, process layout monitoring, asynchronous capture, and command
+validation. Semantic merge checks corrected 64-bit handle continuation,
+repeat-observation state, independent scan cursors, TI session consumption,
+and an ingestion-gap statistic shared by the collector and analysis worker.
+Both TI capture paths require the event's target process generation to match
+the capture owner. Alternate-root captures retain the CR3, process generation,
+and page-sized mapping checks across the queue boundary.
+
+The combined Debug and Release solution builds passed with native code
+analysis; warnings remain. Each binary passed 3,069 reported self-test checks
+and nine live loopback MCP HTTP checks. The standalone Kmon core/hunting,
+analyst, and process-layout gates passed in Debug and in Release with ASan.
+These include
+11,326 hunting, 54 page-coverage, 49 false-positive fixture, 6,560 analyst, and
+105,075 layout checks per applicable run. Debug and Release with ASan passed
+275,002 parser and 25,954 completion checks. The command integration corpus passed
+2,336 checks across 261 entries. Native manifest generation accepted the exact
+binary/PDB pair and rejected changed images, malformed input, and a different PDB.
+Counts describe fixture assertions, not independent measurements of real-world
+detection quality. After the hold-time fix, both fixture builds and both
+551-check console suites passed again. The 14 hold-time cases passed through
+the readiness gate and under Windows PowerShell 5.1; inert mapped RX and
+read-only fixture startup also passed without executing their mapped bytes.
+
+The integrated JSON oracle repeated 20,012 cases without disagreement, and
+the ten HTTP body/deadline cases and ten cross-port redirects passed again.
+All 43 tool scripts parsed under Windows PowerShell 5.1. The current source
+and artifact hashes are retained locally in
+`.build/adversarial-review-20261003/integration-verification.json`.
+
+The pre-integration readiness gate rejected the old research ledger dated
+2026-07-30. Integrating main supplied its actual 2026-09-20 research update;
+the freshness and `validate-hunt-readiness -SkipSmoke` gates now pass.
 No freshness threshold or evidence date was relaxed. Repeated WinHTTP session
 creation retained Event handles on this host, including in an independent
 synchronous client with closed handles and awaited unload notifications.
@@ -94,11 +129,14 @@ of an untrusted hypervisor or pre-boot DMA.
 The existing 16-entry APC queue and 256-node NMI prefix limits remain partial
 surfaces; this review does not add continuation to those two inventories.
 
-The kmon disk relocation reader still treats header-resident directories as
-unsupported. Its chunked pathname reads do not establish an immutable single
-file generation. Those cases must not be described as a trusted atomic disk
-snapshot. The standalone integrity path holds its file handle but does not lock
-out concurrent writes by another process.
+Kmon's production slice comparison now uses main's qualified executable-image
+verifier, including disk relocation metadata and mutable-byte masks. Its disk
+identity checks and repeated live reads bound the observation; they do not
+establish an immutable atomic snapshot across a full scan. The standalone
+integrity path holds its file handle but does not lock out concurrent writes
+by another process. Asynchronous capture preserves bytes when the capture
+worker reads them. An earlier kernel-object observation does not pin that
+object until capture, and cannot establish that it survived unchanged.
 
 Experimental raw `!kmon iotrace` retains the user-accepted exception: safe unload
 is not guaranteed. This review does not change that contract. A final scoped

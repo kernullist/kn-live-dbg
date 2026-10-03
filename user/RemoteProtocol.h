@@ -4,6 +4,7 @@
 // v1 is cleartext TCP. See docs/REMOTE_OPERATOR_SESSION.md.
 
 #include "McpJson.h"
+#include "CommandInput.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -257,12 +258,12 @@ namespace knremote
     inline bool ConstantTimeEqual(const std::string& left, const std::string& right)
     {
         const size_t n = left.size() > right.size() ? left.size() : right.size();
-        unsigned char acc = static_cast<unsigned char>(left.size() ^ right.size());
+        size_t acc = left.size() ^ right.size();
         for (size_t i = 0; i < n; ++i)
         {
             const unsigned char a = i < left.size() ? static_cast<unsigned char>(left[i]) : 0;
             const unsigned char b = i < right.size() ? static_cast<unsigned char>(right[i]) : 0;
-            acc = static_cast<unsigned char>(acc | (a ^ b));
+            acc |= static_cast<size_t>(a ^ b);
         }
         return acc == 0;
     }
@@ -366,7 +367,7 @@ namespace knremote
         bool ok = false;
         do
         {
-            if (addr == nullptr || text.empty())
+            if (addr == nullptr || text.empty() || text.find(L'\0') != std::wstring::npos)
             {
                 break;
             }
@@ -421,10 +422,8 @@ namespace knremote
                 break;
             }
 
-            wchar_t* end = nullptr;
-            const unsigned long parsed = wcstoul(portText.c_str(), &end, 10);
-            if (end == portText.c_str() || (end != nullptr && *end != 0) ||
-                parsed == 0 || parsed > 65535)
+            uint16_t parsed = 0;
+            if (!commandinput::ParsePort(portText, &parsed))
             {
                 if (error != nullptr)
                 {
@@ -558,33 +557,39 @@ namespace knremote
 
     inline bool GetNumberField(const std::wstring& json, const wchar_t* key, int64_t* value)
     {
-        std::wstring raw;
-        if (value == nullptr || key == nullptr || !mcpjson::FindRawValue(json, key, &raw) ||
-            raw.empty() || raw.find_first_not_of(L"-0123456789") != std::wstring::npos)
+        bool ok = false;
+        do
         {
-            return false;
-        }
-        wchar_t* end = nullptr;
-        errno = 0;
-        const long long parsed = wcstoll(raw.c_str(), &end, 10);
-        if (errno == ERANGE || end != raw.c_str() + raw.size())
-        {
-            return false;
-        }
-        *value = parsed;
-        return true;
+            std::wstring raw;
+            if (key == nullptr || value == nullptr || !mcpjson::FindRawValue(json, key, &raw) || raw.empty())
+            {
+                break;
+            }
+            const bool negative = raw[0] == L'-';
+            uint64_t magnitude = 0;
+            const uint64_t limit = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()) + (negative ? 1ull : 0ull);
+            if (!commandinput::ParseDigits(negative ? raw.substr(1) : raw, 10, &magnitude) || magnitude > limit)
+            {
+                break;
+            }
+            *value = negative
+                ? (magnitude == limit ? (std::numeric_limits<int64_t>::min)() : -static_cast<int64_t>(magnitude))
+                : static_cast<int64_t>(magnitude);
+            ok = true;
+        } while (false);
+        return ok;
     }
 
     inline bool GetBoolField(const std::wstring& json, const wchar_t* key, bool* value)
     {
         std::wstring raw;
-        if (value == nullptr || key == nullptr || !mcpjson::FindRawValue(json, key, &raw) ||
-            (raw != L"true" && raw != L"false"))
+        const bool ok = key != nullptr && value != nullptr && mcpjson::FindRawValue(json, key, &raw) &&
+            (raw == L"true" || raw == L"false");
+        if (ok)
         {
-            return false;
+            *value = raw == L"true";
         }
-        *value = raw == L"true";
-        return true;
+        return ok;
     }
 
     inline std::vector<std::wstring> SplitLine(const std::wstring& line)

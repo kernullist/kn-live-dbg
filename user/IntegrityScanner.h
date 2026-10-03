@@ -182,6 +182,8 @@ struct DriverIntegrityRecord
     std::wstring OwningModule;
     std::wstring Notes;
     bool HasDriverStart = false;
+    // Known zero values are distinct from unreadable identity fields.
+    bool IdentityFieldsKnown = false;
     bool Suspicious = false;
     uint32_t SuspiciousDispatchCount = 0;
     std::vector<DriverDispatchRecord> Dispatch;

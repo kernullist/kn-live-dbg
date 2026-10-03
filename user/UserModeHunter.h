@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DeviceClient.h"
+#include "ObservationWindows.h"
 #include "ProcessTriageScanner.h"
 #include "SnapshotModel.h"
 #include "SymbolEngine.h"
@@ -81,6 +82,7 @@ struct HuntModuleRecord
 
 struct HuntProcessRecord
 {
+    ObservationContext Observation;
     SnapshotProcessRecord Kernel = {};
     uint32_t ProcessId = 0;
     uint32_t ParentProcessId = 0;
@@ -172,6 +174,7 @@ struct HuntProcessRecord
 
 struct HuntFinding
 {
+    ObservationContext Observation;
     std::wstring Risk;
     std::wstring Confidence;
     std::wstring ClassName;

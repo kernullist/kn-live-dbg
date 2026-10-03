@@ -10,7 +10,7 @@
 struct HandleTableRecord
 {
     uint32_t OwnerPid = 0;
-    uint32_t HandleValue = 0;
+    uint64_t HandleValue = 0;
     uint32_t GrantedAccess = 0;
     uint32_t ObjectTypeIndex = 0;
     uint32_t HandleAttributes = 0;

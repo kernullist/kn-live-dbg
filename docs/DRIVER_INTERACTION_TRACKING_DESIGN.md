@@ -26,35 +26,35 @@ Status: **Phase A and Phase B.1 are implemented** (ABI 17, IOCTL 0x816/0x817).
 
 ## Phase A — watched-PID handle-table diffing (implemented, no driver change)
 
-Observability without kernel interposition: periodically diff the watched
-process's handle table and report new handles whose kernel object is a
-Device or Driver.
+Watched File handles are parsed with the native pointer-width ABI and followed
+through `FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT`. PDB field offsets,
+object type tags, address bounds, cycle detection and a stack-depth budget
+qualify each connection. Filesystem and control-device channels remain
+separate; unreadable paths remain unknown.
 
-- Implemented as `KernelMonitor::ScanWatchedHandleTables` on the ~8 s
-  user-scan tick: `HandleTableScanner` per watched pid (max 8), silent
-  first-pass baseline per pid, then `driver.handle` events for new
-  (handle,object) pairs whose `ObjectTypeIndex` equals the Device type
-  index learned once per boot from the client's own device handle
-  (`DeviceClient::QueryDeviceObjectTypeIndex`; no NtQueryObject name
-  queries, which can block on device objects).
-- Evidence: handle value, object address, granted access, pid. Handle
-  closes are not tracked. Scan failure is a `scan_failed:handles:<pid>`
-  coverage note; a non-watched pid never emits.
-- Known v1 limits (deliberate): device NAME resolution and BYOVD-list
-  cross-referencing are follow-ups; use `!handles` / `!devstack` on the
-  reported object address for manual triage. An open+close between two
-  ticks is missed.
+`DeviceClient::QueryFileObjectTypeIndex` learns the File type index from the
+client's own `CreateFile` handle. A shared system handle snapshot is consumed
+by a rotating batch of eight watched PIDs. Per-PID pending records retain a
+128-record resolution cursor. Evidence includes process creation identity,
+full-width handle/access values, File/device/driver addresses, and observation
+generation. Complete snapshots produce `present_at_attach`, `opened`, `closed`
+and `reappeared` transitions. Closed objects are never dereferenced.
+
+Ordinary filesystem observations are retained in the ring/log while their
+console display is quiet. Snapshot or symbol failures are coverage/sensor
+records. An open and close wholly between snapshots can still be missed;
+`!kmon status` exposes the oldest PID scan age and pending work.
 
 ## Phase B — kernel-side IOCTL observability (B.1 implemented as `!kmon iotrace`)
 
-Opt-in, lab-only: `!kmon iotrace <driver-name> on|off|status` resolves the
+Opt-in, lab-only: `!kmon iotrace <driver-name> on | !kmon iotrace off|status` resolves the
 named driver's DRIVER_OBJECT via the `\Driver` object-directory walk
 (`IntegrityScanner`, user mode — the driver never does name lookups), then
-arms the probe driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
+arms the main `KnLiveDbg.sys` driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
 write ACK magic):
 
 - The target's `MajorFunction[IRP_MJ_DEVICE_CONTROL]` is swapped to the
-  probe's trampoline after SEH-validating `Type == IO_TYPE_DRIVER` and
+  driver's trampoline after SEH-validating `Type == IO_TYPE_DRIVER` and
   referencing the DRIVER_OBJECT with `ObReferenceObjectByPointer` so the
   target cannot be freed while the hook is live. The trampoline records
   caller pid, IOCTL code, and in/out lengths into a non-paged spinlocked
@@ -63,11 +63,16 @@ write ACK magic):
 - The kmon worker drains the ring (`IOCTL_KNDBG_IOTRACE_DRAIN` 0x817) and
   prints `driver.ioctl` events, first-seen per (pid, IOCTL code) with a
   256-entry cap, decoded into function/device-type/method plus lengths.
-- DISARM restores the original entry, waits (up to ~400 ms, retried on
-  unload) for in-flight trampolines to leave, and only then drops the
-  reference; `!kmon stop` and driver unload disarm forcibly. If a dispatch
-  stays stuck past the wait, disarm reports busy and keeps the reference
-  rather than freeing under a live call.
+- DISARM restores the original entry and waits for active trampolines to
+  leave (4,000 waits of nominally 100 us each). If dispatch is still active,
+  it reports `STATUS_DEVICE_BUSY` and keeps the target reference. Scheduling
+  can make the elapsed wait longer than the nominal 400 ms.
+- Normal `q`/`unload` stops kmon, TI, and timeline before closing the device.
+  If I/O-trace disarm fails, the controller keeps the device available and
+  reports failure so cleanup can be retried. Driver unload retries disarm
+  while it is busy, with no fixed retry count; a stuck target dispatch can
+  therefore delay unload indefinitely. Active dispatch code must not be
+  released just because a timeout expired.
 - Risk statement: interposing a dispatch entry tampers with live kernel
   state and can crash the host if the target driver misbehaves; it is
   gated behind an explicit per-driver arm command and is intended for lab
@@ -75,9 +80,15 @@ write ACK magic):
 
 ## Acceptance criteria (Phase A)
 
+The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) records build and
+driver-free regression evidence for the shutdown changes. It does not prove
+live dispatch/unload race behavior; those checks remain on the
+[manual checklist](MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle).
+
 - With `!kmon start /name loader.exe` and a loader that opens a device
-  handle, a `driver.handle` event appears within one user-scan tick with
-  device name and access mask; a BYOVD-listed driver name is highlighted.
+  handle, a `driver.handle` event appears after its rotating scan with
+  access mask and a qualified connection or an explicit unknown status. Device
+  names and BYOVD matching are not required for retaining the observation.
 - No `driver.handle` events for non-watched processes (watch-gated like
   `loader.activity`).
 - Handle-table walk failure surfaces as a coverage note

@@ -21,6 +21,31 @@ namespace
 {
     constexpr uint32_t kHoldSecondsDefault = 45;
 
+    bool ParseHoldSeconds(const wchar_t* text, uint32_t* seconds)
+    {
+        if (text == nullptr || *text == L'\0' || seconds == nullptr)
+        {
+            return false;
+        }
+        constexpr uint32_t maximum = (INFINITE - 1) / 1000;
+        uint32_t value = 0;
+        for (const wchar_t* digit = text; *digit != L'\0'; ++digit)
+        {
+            if (*digit < L'0' || *digit > L'9')
+            {
+                return false;
+            }
+            const uint32_t next = static_cast<uint32_t>(*digit - L'0');
+            if (value > (maximum - next) / 10)
+            {
+                return false;
+            }
+            value = value * 10 + next;
+        }
+        *seconds = value;
+        return true;
+    }
+
     using NtQueryInformationProcessFn =
         LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     using NtUnmapViewOfSectionFn = LONG(NTAPI*)(HANDLE, PVOID);
@@ -68,9 +93,9 @@ namespace
         return dir;
     }
 
-    std::wstring NotepadCopyPath()
+    std::wstring FixtureCopyPath(bool masquerade)
     {
-        return FixtureDir() + L"\\notepad.exe";
+        return FixtureDir() + (masquerade ? L"\\notepad.exe" : L"\\ordinary-kmon-target.exe");
     }
 
     bool UnlinkPathNow(const std::wstring& path)
@@ -488,7 +513,7 @@ namespace
         return ok;
     }
 
-    bool CopySelfToNotepad(std::wstring* outPath)
+    bool CopySelfToFixture(std::wstring* outPath, bool masquerade = false)
     {
         bool ok = false;
         do
@@ -498,7 +523,7 @@ namespace
                 break;
             }
             std::wstring src = SelfPath();
-            std::wstring dst = NotepadCopyPath();
+            std::wstring dst = FixtureCopyPath(masquerade);
             if (src.empty())
             {
                 break;
@@ -576,7 +601,7 @@ namespace
         do
         {
             std::wstring image;
-            if (!CopySelfToNotepad(&image))
+            if (!CopySelfToFixture(&image))
             {
                 std::fwprintf(stderr, L"copy self failed\n");
                 break;
@@ -750,9 +775,13 @@ int wmain(int argc, wchar_t** argv)
             scenario = argv[++i];
             continue;
         }
-        if (arg == L"/seconds" && i + 1 < argc)
+        if (arg == L"/seconds")
         {
-            seconds = static_cast<uint32_t>(wcstoul(argv[++i], nullptr, 10));
+            if (i + 1 == argc || !ParseHoldSeconds(argv[++i], &seconds))
+            {
+                std::fwprintf(stderr, L"invalid /seconds value: expected 0..4294967 decimal seconds\n");
+                return 1;
+            }
             continue;
         }
         if (!arg.empty() && arg[0] == L'/')
@@ -789,9 +818,9 @@ int wmain(int argc, wchar_t** argv)
     }
 
     std::wstring image;
-    if (!CopySelfToNotepad(&image))
+    if (!CopySelfToFixture(&image, scenario == L"masquerade"))
     {
-        std::fwprintf(stderr, L"failed to copy fixture to %s\n", NotepadCopyPath().c_str());
+        std::fwprintf(stderr, L"failed to copy fixture to %s\n", FixtureCopyPath(scenario == L"masquerade").c_str());
         return 1;
     }
 

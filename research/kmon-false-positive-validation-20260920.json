@@ -1,0 +1,321 @@
+{
+  "schema": "kmon.false_positive.validation.summary.v1",
+  "date_local": "2026-09-20",
+  "timezone": "Asia/Seoul",
+  "generated_utc": "2026-09-19T20:49:59.4878693Z",
+  "base_revision": "fcae00afd2a9241a57bfbbcb812e736b132534ec",
+  "source_state": "Working tree changes identified by LF-normalized UTF-8 source hashes below.",
+  "scope": "Detector evidence guards, repeat identity, qualified references, import forwarders, branch stability and event categories.",
+  "live_validation_owner": "user",
+  "live_kernel_channels_tested": false,
+  "real_cheat_samples": 0,
+  "independent_analyst_audit": false,
+  "competitive_ranking_supported": false,
+  "universal_zero_false_positive_claim_supported": false,
+  "universal_no_miss_claim_supported": false,
+  "driver_abi_changed": false,
+  "full_application_sanitized": false,
+  "result_interpretation": "Assertion counts and owned fixtures are finite correctness controls, not population false-positive or cheat detection rates.",
+  "configurations": [
+    {
+      "configuration": "Release",
+      "full_build": "passed",
+      "all_self_tests": "passed",
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "console_assertions": 524,
+      "command_assertions": 2037,
+      "registered_commands": 261,
+      "remote_assertions": 52,
+      "application": {
+        "path": "x64/Release/KnLiveDbg.exe",
+        "sha256": "f45115701f205b8d26f3d64d6030ab78e4873dde631660a89596c1ef6e686404"
+      },
+      "driver": {
+        "path": "x64/Release/KnLiveDbg.sys",
+        "sha256": "8918b152eefad520f8d0f5abc977c78554943c638454c8e1a08c2bae722b0b5c"
+      },
+      "build_log": {
+        "path": ".build/kmon-fp-build-release.log",
+        "sha256": "b08116dd2c296b2a3488925c46832241beb011b706345d094a15ed0950181410"
+      },
+      "self_test_log": {
+        "path": ".build/kmon-fp-selftest-release.log",
+        "sha256": "3d318756585e01be24ab161f4da607b4d78823a44d64f3cdd7d463d4cfef5500"
+      }
+    },
+    {
+      "configuration": "Debug",
+      "full_build": "passed",
+      "all_self_tests": "passed",
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "console_assertions": 524,
+      "command_assertions": 2037,
+      "registered_commands": 261,
+      "remote_assertions": 52,
+      "application": {
+        "path": "x64/Debug/KnLiveDbg.exe",
+        "sha256": "7a39fd8c7923cda744d2b6176d51a2f0fefc6442230c10bd2c2c4489597bdad2"
+      },
+      "driver": {
+        "path": "x64/Debug/KnLiveDbg.sys",
+        "sha256": "29167b4096466e584ef4cf11aa0228101edf0201b9013cbfae0893ad2a91aafc"
+      },
+      "build_log": {
+        "path": ".build/kmon-fp-build-debug.log",
+        "sha256": "ea6ae02932a25a5108abe93b8970d81670ff4253f71cadd64f0832076e5ae407"
+      },
+      "self_test_log": {
+        "path": ".build/kmon-fp-selftest-debug.log",
+        "sha256": "3d318756585e01be24ab161f4da607b4d78823a44d64f3cdd7d463d4cfef5500"
+      }
+    }
+  ],
+  "core": {
+    "configurations": [
+      "Debug",
+      "Release-ASan"
+    ],
+    "groups_passed_per_run": 7,
+    "false_positive_policy_and_forwarder_assertions_per_run": 49,
+    "hunting_assertions_per_run": 11326,
+    "page_assertions_per_run": 54,
+    "failures": 0,
+    "logs": [
+      {
+        "path": ".build/kmon-fp-core-debug.log",
+        "sha256": "597096a1b141619d0ab77106bced20a35d084ddee89480af0f0194d9b83757d8"
+      },
+      {
+        "path": ".build/kmon-fp-core-asan.log",
+        "sha256": "597096a1b141619d0ab77106bced20a35d084ddee89480af0f0194d9b83757d8"
+      }
+    ]
+  },
+  "layout": {
+    "configuration": "Release-ASan",
+    "assertions": 105075,
+    "failures": 0,
+    "log": {
+      "path": ".build/kmon-fp-layout-asan.log",
+      "sha256": "27ccb6276a147d43fd7036aec44db9b3ce645e3729edeaa6a674e4bb09b81c90"
+    }
+  },
+  "reproduced_before_fix": [
+    {
+      "control": "Transient executable bytes must not establish a stable modification.",
+      "result": "expected_failure",
+      "log": {
+        "path": ".build/kmon-fp-core-before.log",
+        "sha256": "bb707a7dbd5712c14894408aa097c2bea4b01910498c072be496d21812a7c34c"
+      }
+    },
+    {
+      "control": "Changed branch bytes with an unchanged root slot must invalidate the path.",
+      "result": "expected_failure",
+      "log": {
+        "path": ".build/kmon-fp-branch-before.log",
+        "sha256": "a3c3b193fb77f71a8313d3a62eed00e621f9e36972659fb5788bdfa561ac9e2b"
+      }
+    }
+  ],
+  "hunting_fixture_comparison": {
+    "report": {
+      "path": ".build/kmon-hunting/Release/validation.json",
+      "sha256": "469849df85ea216b9be6c69c995dbeb0bf73e6703fc2c0c66cb3d241d0eac260"
+    },
+    "log": {
+      "path": ".build/kmon-fp-hunting.log",
+      "sha256": "831f42ea7b4471e1b49cf58c97951741f0eecd8ed00b6649d69a2b43c8d50bbb"
+    },
+    "comparison_scope": "owned user fixture; Kmon main-image executable-page component versus PE-sieve full-process output; not a detection-rate comparison",
+    "fixture_sha256": "ef1112656ce4ae9bbef6127410b32793b51524240e4efe6ac87bf1ad319907ce",
+    "replay_sha256": "f154e377de2614ae0f2e703d7fe095337a112f56c678099aef54575577e29251",
+    "synthetic_replay_sha256": "96b6d0693ffde8062427038a5197f10eca4fb28bb8f24e1fcab655f5ce72d337",
+    "malformed_replay_inputs_rejected": 8,
+    "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+    "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+    "baseline_arguments": "/pid <owned_fixture_pid> /quiet /json /ofilter 2 /shellc 3 /iat 3 /report 7",
+    "runs": [
+      {
+        "mode": "clean",
+        "ground_truth": "clean_image",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 0,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 9,
+          "skipped": 0,
+          "modified": {
+            "total": 4,
+            "patched": 0,
+            "iat_hooked": 4,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "modified",
+        "ground_truth": "one_byte_executable_data_section_change",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 1,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 3,
+            "patched": 0,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "text",
+        "ground_truth": "one_byte_text_function_change",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 1,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 4,
+            "patched": 1,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "jit",
+        "ground_truth": "benign_private_rx",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 0,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 3,
+            "patched": 0,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      }
+    ]
+  },
+  "source_hashes": [
+    {
+      "path": "user/CodeTargetResolver.cpp",
+      "sha256_lf_utf8": "f5f5ed092d1fc233d90700c34bf50506e06bd2e8617cc38a63b17375fdb15ebd"
+    },
+    {
+      "path": "user/CodeTargetResolver.h",
+      "sha256_lf_utf8": "f56d828816ab9913347cacf7da024099e831bcb87bf6d2ce335d3587ee994b38"
+    },
+    {
+      "path": "user/ExecutableImageVerifier.cpp",
+      "sha256_lf_utf8": "c3e9dc3eb6764eae0e17ef3a4a08dda66b3fd558862c6468a10b13f06c87aa77"
+    },
+    {
+      "path": "user/IntegrityScanner.cpp",
+      "sha256_lf_utf8": "d47f8a94927481ff3d6b05bda2e390f8bed23486a48f47ac63254b1f5dbaa051"
+    },
+    {
+      "path": "user/IntegrityScanner.h",
+      "sha256_lf_utf8": "7141e7034585e15a7e1b21b78a496f4b441266ae8187044117730a27350d2eb2"
+    },
+    {
+      "path": "user/KernelMonitor.cpp",
+      "sha256_lf_utf8": "6cd8cdd65c02cd64c703b7abbb1b19279a43026a403998a8095a919296e632ce"
+    },
+    {
+      "path": "user/KernelMonitor.h",
+      "sha256_lf_utf8": "9275de8897fc4b49a9ddbba4d5a3cdcec9e0966584a551de9a610e3d37be1070"
+    },
+    {
+      "path": "user/KernelMonitorInlinePatch.cpp",
+      "sha256_lf_utf8": "51cf9f701a59c1d464eb6f983249a8391ad3416ce5cf4ce906d084c55b5a5017"
+    },
+    {
+      "path": "user/KernelMonitorMapperPool.cpp",
+      "sha256_lf_utf8": "6ecd87b56ee7c6cff3e1b9dfdf4caf1d263a1c6d1cc53793d477bf33ecabdc1c"
+    },
+    {
+      "path": "user/KernelMonitorPipeline.cpp",
+      "sha256_lf_utf8": "b7bf75eb58a1ecc224fbbcfe690d9b3530fd36862d8846d9ae236a5132111f74"
+    },
+    {
+      "path": "user/KernelMonitorVerification.cpp",
+      "sha256_lf_utf8": "df14d18d2c266e9f196cfbc0df099dadc38f5b37c8bbb62adfb004f553a9292b"
+    },
+    {
+      "path": "user/KmonEvidencePolicy.h",
+      "sha256_lf_utf8": "5c13517bd46cb964a1eb2ee93c7ef55bd8ab20e546b3373ecd02081e86afd524"
+    },
+    {
+      "path": "user/KmonImportResolver.h",
+      "sha256_lf_utf8": "f4d3b8743524a625453f14dab68da176a9a73bffc89dcfb42644655a26c905d0"
+    },
+    {
+      "path": "user/KnLiveDbg.vcxproj",
+      "sha256_lf_utf8": "478c4f46e7cda02f3edbdd5edc5f4bf82d8f08cd8e315443d49efa92b71b681d"
+    },
+    {
+      "path": "user/main.cpp",
+      "sha256_lf_utf8": "76e017d9575889049ff9ca0cd9fa070e3df43a24c6101e46f38581a3ce1dec1d"
+    },
+    {
+      "path": "tools/kmon-core-selftest.cpp",
+      "sha256_lf_utf8": "9ce099482eea2ad72429ed0f08d577fc743f143c5c0a1a52c4fe4d1ad40e58f8"
+    },
+    {
+      "path": "tools/kmon-fp-selftest.h",
+      "sha256_lf_utf8": "71db81bf364f283ffce0762b90b47fa3dc5503771a6e1a4eea4aae3917e81bbd"
+    }
+  ]
+}

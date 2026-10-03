@@ -8,6 +8,7 @@
 #include "CallbackScanner.h"
 #include "CloudFileScanner.h"
 #include "CommandRegistry.h"
+#include "CommandInput.h"
 #include "CompletionHints.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
@@ -25,6 +26,8 @@
 #include "IntegrityScanner.h"
 #include "KernelMonitor.h"
 #include "KmonPlatformEvidence.h"
+#include "ExecutionSurfaceScanner.h"
+#include "AnalystSnapshot.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -459,9 +462,8 @@ static void UninstallOutputTee()
 
 static std::wstring BuildLogFileName()
 {
-    // KnLiveDbg-YYYYMMDD-HHMMSS.log -- collation-friendly and unique
-    // per second. The user can launch multiple sessions and they
-    // will not collide unless the same second is hit twice.
+    // Keep rapid toggles and simultaneous processes from truncating a log.
+    static std::atomic<uint64_t> sequence{0};
     SYSTEMTIME st = {};
     GetLocalTime(&st);
 
@@ -474,6 +476,7 @@ static std::wstring BuildLogFileName()
        << std::setw(2) << std::setfill(L'0') << st.wHour
        << std::setw(2) << std::setfill(L'0') << st.wMinute
        << std::setw(2) << std::setfill(L'0') << st.wSecond
+       << L"-" << GetCurrentProcessId() << L"-" << sequence.fetch_add(1)
        << L".log";
     return ss.str();
 }
@@ -520,18 +523,7 @@ static bool EnableOutputLog(std::wstring* outPath, std::wstring* outError)
 
     std::wstring path = exeDir + L"\\" + BuildLogFileName();
 
-    std::string narrowPath;
-    {
-        int needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        if (needed > 0)
-        {
-            narrowPath.resize(static_cast<size_t>(needed - 1));
-            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1,
-                                narrowPath.data(), needed, nullptr, nullptr);
-        }
-    }
-
-    g_OutputLog.File.open(narrowPath, std::ios::out | std::ios::binary | std::ios::trunc);
+    g_OutputLog.File.open(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
     if (!g_OutputLog.File.is_open())
     {
         if (outError != nullptr)
@@ -596,6 +588,11 @@ static bool DisableOutputLog(std::wstring* outPath)
 
 static void HandleLogCommand(const std::vector<std::wstring>& args)
 {
+    if (args.size() > 2)
+    {
+        std::wcerr << L"log: invalid argument count\n";
+        return;
+    }
     std::wstring sub = (args.size() > 1) ? args[1] : L"status";
     std::transform(sub.begin(), sub.end(), sub.begin(),
                    [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
@@ -610,12 +607,12 @@ static void HandleLogCommand(const std::vector<std::wstring>& args)
         }
         else
         {
-            std::wcout << L"log enable failed: " << error;
+            std::wcerr << L"log enable failed: " << error;
             if (!path.empty())
             {
-                std::wcout << L" (current=" << path << L")";
+                std::wcerr << L" (current=" << path << L")";
             }
-            std::wcout << L"\n";
+            std::wcerr << L"\n";
         }
     }
     else if (sub == L"disable" || sub == L"off" || sub == L"stop")
@@ -648,8 +645,8 @@ static void HandleLogCommand(const std::vector<std::wstring>& args)
     }
     else
     {
-        std::wcout << L"unknown log subcommand: " << sub << L"\n";
-        std::wcout << L"usage: log [enable|disable|status]\n";
+        std::wcerr << L"unknown log subcommand: " << sub << L"\n";
+        std::wcerr << L"usage: log [enable|disable|status]\n";
     }
 }
 
@@ -1696,7 +1693,7 @@ static STARTUP_SYMBOL_PATH_INFO BuildStartupSymbolPath(const std::wstring& baseS
     return info;
 }
 
-static std::vector<std::wstring> Split(const std::wstring& line)
+static std::vector<std::wstring> Split(const std::wstring& line, bool* complete = nullptr)
 {
     // Whitespace-delimited tokenizer with double-quote support. We only
     // recognise '"' as a quote character, matching CMD/PowerShell convention
@@ -1708,6 +1705,10 @@ static std::vector<std::wstring> Split(const std::wstring& line)
     // segments; the quoting only affects whether interior whitespace is
     // preserved.
     std::vector<std::wstring> parts;
+    if (complete != nullptr)
+    {
+        *complete = line.find(L'\0') == std::wstring::npos;
+    }
     const size_t length = line.size();
     size_t i = 0;
 
@@ -1746,6 +1747,10 @@ static std::vector<std::wstring> Split(const std::wstring& line)
                 if (i < length)
                 {
                     ++i;
+                }
+                else if (complete != nullptr)
+                {
+                    *complete = false;
                 }
                 tokenStarted = true;
                 continue;
@@ -2372,73 +2377,7 @@ static bool ShouldRouteToDbgEng(const std::wstring& command)
 
 static bool ParseUnsigned(const std::wstring& value, uint32_t numberBase, uint64_t* output)
 {
-    bool ok = false;
-
-    do
-    {
-        if (output == nullptr || value.empty())
-        {
-            break;
-        }
-
-        if (value[0] == L'+' || value[0] == L'-')
-        {
-            break;
-        }
-
-        std::wstring text = value;
-        if (!text.empty() && (text[0] == L'L' || text[0] == L'l'))
-        {
-            text = text.substr(1);
-        }
-
-        if (!text.empty() && (text[0] == L'+' || text[0] == L'-'))
-        {
-            break;
-        }
-
-        text.erase(std::remove(text.begin(), text.end(), L'`'), text.end());
-        if (text.empty())
-        {
-            break;
-        }
-
-        int base = static_cast<int>(numberBase);
-        if (base == 0)
-        {
-            // Callers pass 0 to mean "decimal, unless the token has an explicit
-            // 0x/hex-digit hint". wcstoull base 0 would treat a leading 0 as
-            // octal, so !ti /pid 010 would become 8.
-            base = 10;
-        }
-
-        if (text.size() > 2 && text[0] == L'0' && (text[1] == L'x' || text[1] == L'X'))
-        {
-            base = 16;
-        }
-        else if (text.size() > 2 && text[0] == L'0' && (text[1] == L'n' || text[1] == L'N'))
-        {
-            text = text.substr(2);
-            base = 10;
-        }
-        else if (text.find_first_of(L"abcdefABCDEF") != std::wstring::npos)
-        {
-            base = 16;
-        }
-
-        errno = 0;
-        wchar_t* end = nullptr;
-        uint64_t parsed = wcstoull(text.c_str(), &end, base);
-        if (end == nullptr || *end != L'\0' || errno == ERANGE)
-        {
-            break;
-        }
-
-        *output = parsed;
-        ok = true;
-    } while (false);
-
-    return ok;
+    return commandinput::ParseUnsigned(value, numberBase, output);
 }
 
 static bool ContainsAddressExpressionOperator(const std::wstring& value)
@@ -2547,9 +2486,9 @@ static bool EvaluateAddressExpression(
         while (termStart <= expression.size())
         {
             size_t operatorIndex = FindAddressExpressionOperator(expression, termStart);
-            std::wstring term = expression.substr(
+            std::wstring term = TrimWhitespace(expression.substr(
                 termStart,
-                operatorIndex == std::wstring::npos ? std::wstring::npos : operatorIndex - termStart);
+                operatorIndex == std::wstring::npos ? std::wstring::npos : operatorIndex - termStart));
 
             uint64_t termValue = 0;
             if (!ResolveAddressTerm(symbols, state, term, &termValue, error))
@@ -3285,6 +3224,7 @@ static bool IsNativeOwnedCommand(const std::wstring& command)
             command == L"kd" ||
             command == L"log" ||
             command == L"mcp" ||
+            command == L"remote" ||
             command == L"query" ||
             command == L"home" ||
             command == L"dashboard" ||
@@ -3518,1003 +3458,6 @@ static bool IsWnfScopeName(const std::wstring& value)
         lowered == L"lists";
 }
 
-static void AddCompletionCandidate(std::vector<std::wstring>* candidates, const wchar_t* value)
-{
-    do
-    {
-        if (candidates == nullptr || value == nullptr || value[0] == L'\0')
-        {
-            break;
-        }
-
-        std::wstring item = value;
-        if (std::find(candidates->begin(), candidates->end(), item) == candidates->end())
-        {
-            candidates->push_back(item);
-        }
-    } while (false);
-}
-
-template <size_t Count>
-static void AddCompletionCandidates(std::vector<std::wstring>* candidates, const wchar_t* const (&values)[Count])
-{
-    for (size_t index = 0; index < Count; ++index)
-    {
-        AddCompletionCandidate(candidates, values[index]);
-    }
-}
-
-static void AddRegisteredCommandCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    do
-    {
-        if (candidates == nullptr)
-        {
-            break;
-        }
-
-        for (const CommandInfo& command : CommandRegistry::Commands())
-        {
-            AddCompletionCandidate(candidates, command.Name);
-        }
-    } while (false);
-}
-
-static void AddHelpCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"all",
-        L"!callbacks"
-    };
-
-    AddCompletionCandidates(candidates, values);
-    AddRegisteredCommandCompletionCandidates(candidates);
-}
-
-static void AddCallbackScopeCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"all",
-        L"object",
-        L"registry",
-        L"process",
-        L"thread",
-        L"imageload",
-        L"minifilter",
-        L"/module",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddCallbackModuleOptionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"/module",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddCallbackWriteActionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"disable",
-        L"enable",
-        L"disable-all",
-        L"enable-all"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddVadOptionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"scan",
-        L"modules",
-        L"mappedpe",
-        L"/summary",
-        L"/exec",
-        L"/private",
-        L"/wx",
-        L"/pe",
-        L"/hiddenpte",
-        L"/scan",
-        L"/modules",
-        L"/mappedpe",
-        L"/limit",
-        L"/json",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddHuntOptionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"/quick",
-        L"/deep",
-        L"/summary",
-        L"/details",
-        L"/pid",
-        L"/limit",
-        L"/json",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddThreadsOptionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"/apc",
-        L"/stacks",
-        L"/limit",
-        L"/json",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddSnapshotCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"baseline",
-        L"save",
-        L"show",
-        L"/all",
-        L"/name",
-        L"/memory",
-        L"/domains",
-        L"/no-domains",
-        L"/warnings",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddDiffCompletionCandidates(
-    std::vector<std::wstring>* candidates,
-    const std::vector<std::wstring>& argsBefore)
-{
-    static const wchar_t* values[] =
-    {
-        L"baseline",
-        L"/summary",
-        L"/details",
-        L"/domain",
-        L"/risk",
-        L"/limit",
-        L"help"
-    };
-
-    // Value completion right after an option token: surface the mapper
-    // hunt domains first so before/after diffs are one tab away.
-    if (argsBefore.size() >= 2)
-    {
-        const std::wstring last = ToLower(argsBefore[argsBefore.size() - 1]);
-        if (last == L"/domain")
-        {
-            static const wchar_t* domains[] =
-            {
-                L"kpage",
-                L"pool",
-                L"leftover-mapper",
-                L"process",
-                L"process-security",
-                L"modules",
-                L"drivers",
-                L"callbacks",
-                L"etw",
-                L"nmi",
-                L"cpu-state",
-                L"hal",
-                L"hive",
-                L"dpc-timer",
-                L"fwtable",
-                L"wfp",
-                L"alpc",
-                L"wnf",
-                L"vbs",
-                L"byovd",
-                L"vad-dkom"
-            };
-            AddCompletionCandidates(candidates, domains);
-            return;
-        }
-        if (last == L"/risk")
-        {
-            static const wchar_t* risks[] =
-            {
-                L"high",
-                L"all"
-            };
-            AddCompletionCandidates(candidates, risks);
-            return;
-        }
-    }
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddTimelineCompletionCandidates(
-    std::vector<std::wstring>* candidates,
-    const std::vector<std::wstring>& argsBefore)
-{
-    static const wchar_t* rootValues[] =
-    {
-        L"dashboard",
-        L"reset",
-        L"help"
-    };
-
-    do
-    {
-        if (argsBefore.size() <= 1)
-        {
-            AddCompletionCandidates(candidates, rootValues);
-            break;
-        }
-
-        std::wstring sub = ToLower(argsBefore[1]);
-        if (sub == L"help")
-        {
-            static const wchar_t* values[] =
-            {
-                L"advanced"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"ingest")
-        {
-            if (argsBefore.size() <= 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"ti",
-                    L"snapshot",
-                    L"help"
-                };
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"ti")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"recent",
-                    L"all",
-                    L"/limit"
-                };
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"snapshot")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"baseline"
-                };
-                AddCompletionCandidates(candidates, values);
-            }
-            break;
-        }
-
-        if (sub == L"update")
-        {
-            static const wchar_t* values[] =
-            {
-                L"recent",
-                L"all",
-                L"/limit",
-                L"/snapshot",
-                L"/live",
-                L"help"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"live")
-        {
-            static const wchar_t* values[] =
-            {
-                L"on",
-                L"off",
-                L"status",
-                L"start",
-                L"stop",
-                L"clear",
-                L"drain",
-                L"/capacity",
-                L"/limit",
-                L"help"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"query")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/source",
-                L"/domain",
-                L"/pid",
-                L"/limit",
-                L"/oldest",
-                L"/newest"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"graph")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/source",
-                L"/domain",
-                L"/image",
-                L"/pid",
-                L"/limit",
-                L"/oldest",
-                L"/newest"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"reconcile")
-        {
-            static const wchar_t* values[] =
-            {
-                L"snapshot",
-                L"baseline",
-                L"/source",
-                L"/domain",
-                L"/pid",
-                L"/limit"
-            };
-            AddCompletionCandidates(candidates, values);
-            break;
-        }
-
-        if (sub == L"export")
-        {
-            AddCompletionCandidate(candidates, L"/jsonl");
-            break;
-        }
-
-        if (sub == L"dashboard")
-        {
-            break;
-        }
-
-        AddCompletionCandidates(candidates, rootValues);
-    } while (false);
-}
-
-static void AddWfpScopeCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"providers",
-        L"sublayers",
-        L"callouts",
-        L"kernelcallouts",
-        L"kernel-callouts",
-        L"filters",
-        L"layers",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddWfpOptionCompletionCandidates(std::vector<std::wstring>* candidates, WfpScanner::Scope scope)
-{
-    if (scope == WfpScanner::Scope::Callouts)
-    {
-        AddCompletionCandidate(candidates, L"/module");
-    }
-    else if (scope == WfpScanner::Scope::Filters)
-    {
-        AddCompletionCandidate(candidates, L"/layer");
-        AddCompletionCandidate(candidates, L"/provider");
-    }
-
-    AddCompletionCandidate(candidates, L"help");
-}
-
-static void AddAlpcScopeCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"ports",
-        L"port",
-        L"connections",
-        L"queues",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddAlpcOptionCompletionCandidates(std::vector<std::wstring>* candidates, AlpcScanner::Scope scope)
-{
-    if (scope == AlpcScanner::Scope::Ports || scope == AlpcScanner::Scope::Connections)
-    {
-        AddCompletionCandidate(candidates, L"/name");
-        AddCompletionCandidate(candidates, L"/pid");
-    }
-
-    AddCompletionCandidate(candidates, L"help");
-}
-
-static void AddFirmwareTableCompletionCandidates(std::vector<std::wstring>* candidates, bool afterScope)
-{
-    if (!afterScope)
-    {
-        static const wchar_t* values[] =
-        {
-            L"providers",
-            L"provider",
-            L"help"
-        };
-
-        AddCompletionCandidates(candidates, values);
-    }
-    else
-    {
-        static const wchar_t* values[] =
-        {
-            L"/module",
-            L"help"
-        };
-
-        AddCompletionCandidates(candidates, values);
-    }
-}
-
-static void AddFirmwareTableCommandCompletionCandidates(
-    std::vector<std::wstring>* candidates,
-    const std::vector<std::wstring>& argsBefore)
-{
-    do
-    {
-        if (argsBefore.size() <= 1)
-        {
-            AddFirmwareTableCompletionCandidates(candidates, false);
-            break;
-        }
-
-        std::wstring scope = ToLower(argsBefore[1]);
-        if (scope == L"providers")
-        {
-            AddFirmwareTableCompletionCandidates(candidates, true);
-            break;
-        }
-
-        if (scope == L"provider")
-        {
-            if (argsBefore.size() <= 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"ACPI",
-                    L"FIRM",
-                    L"RSMB",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else
-            {
-                AddCompletionCandidate(candidates, L"help");
-            }
-            break;
-        }
-
-        AddFirmwareTableCompletionCandidates(candidates, false);
-    } while (false);
-}
-
-static bool IsAiEvidenceNestedAction(const std::wstring& action);
-
-static void AddAiActionCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"status",
-        L"help",
-        L"use",
-        L"models",
-        L"save",
-        L"test",
-        L"config",
-        L"providers",
-        L"provider",
-        L"policy",
-        L"model",
-        L"base-url",
-        L"effort",
-        L"auth",
-        L"preview",
-        L"ask",
-        L"chat",
-        L"plan",
-        L"go",
-        L"no",
-        L"run",
-        L"write",
-        L"explain",
-        L"analyze",
-        L"annotate",
-        L"diagnose",
-        L"playbook",
-        L"transcript",
-        L"audit",
-        L"show",
-        L"report"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddAiEvidenceCommandCompletionCandidates(std::vector<std::wstring>* candidates)
-{
-    static const wchar_t* values[] =
-    {
-        L"!callbacks",
-        L"dt",
-        L"dtx",
-        L"u",
-        L"uf",
-        L"ln",
-        L"lm",
-        L"x",
-        L"vtop",
-        L"!dml_proc",
-        L"!hunt",
-        L"!vad",
-        L"!threads",
-        L"!snapshot",
-        L"!diff",
-        L"!wfp",
-        L"!alpc",
-        L"!vbs",
-        L"!ci",
-        L"!securekernel",
-        L"!etw",
-        L"!nmi",
-        L"!msrcheck",
-        L"!cr",
-        L"!ssdt",
-        L"!idt",
-        L"!hal",
-        L"!hive",
-        L"!token",
-        L"!dpc",
-        L"!timer",
-        L"!workitem",
-        L"!fwtable",
-        L"!module",
-        L"!driver",
-        L"!pool",
-        L"!address",
-        L"!wnf",
-        L"!handles",
-        L"!hiddenproc",
-        L"!kmon",
-        L"!wdfilter",
-        L"!inputstack",
-        L"!dma",
-        L"!hv",
-        L"!drvobj",
-        L"!devstack",
-        L"!payload",
-        L"!mapper",
-        L"!kpage",
-        L"!minifilter",
-        L"!byovd",
-        L"dump-analyze",
-        L"help"
-    };
-
-    AddCompletionCandidates(candidates, values);
-}
-
-static void AddAiCompletionCandidates(
-    const std::vector<std::wstring>& argsBefore,
-    std::vector<std::wstring>* candidates)
-{
-    do
-    {
-        if (candidates == nullptr)
-        {
-            break;
-        }
-
-        if (argsBefore.size() <= 1)
-        {
-            AddAiActionCompletionCandidates(candidates);
-            break;
-        }
-
-        std::wstring action = ToLower(argsBefore[1]);
-        if (action == L"config")
-        {
-            if (argsBefore.size() == 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"status",
-                    L"providers",
-                    L"provider",
-                    L"policy",
-                    L"model",
-                    L"base-url",
-                    L"effort",
-                    L"auth",
-                    L"test",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"provider")
-            {
-                for (const std::wstring& provider : AiProviderRuntime::SupportedProviderNames())
-                {
-                    AddCompletionCandidate(candidates, provider.c_str());
-                }
-
-                AddCompletionCandidate(candidates, L"off");
-                AddCompletionCandidate(candidates, L"help");
-            }
-            else if (ToLower(argsBefore[2]) == L"policy")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"allow-remote",
-                    L"local-only",
-                    L"status",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"effort")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"minimal",
-                    L"low",
-                    L"medium",
-                    L"high",
-                    L"xhigh",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"model")
-            {
-                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
-                {
-                    AddCompletionCandidate(candidates, token.c_str());
-                }
-
-                AddCompletionCandidate(candidates, L"help");
-            }
-        }
-        else if (action == L"use")
-        {
-            if (argsBefore.size() == 2)
-            {
-                for (const std::wstring& token : AiModelCatalog::CompletionTokens())
-                {
-                    AddCompletionCandidate(candidates, token.c_str());
-                }
-            }
-            else
-            {
-                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
-                {
-                    AddCompletionCandidate(candidates, token.c_str());
-                }
-
-                AddCompletionCandidate(candidates, L"help");
-            }
-        }
-        else if (action == L"models")
-        {
-            static const wchar_t* values[] =
-            {
-                L"refresh",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-            for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
-            {
-                AddCompletionCandidate(candidates, token.c_str());
-            }
-        }
-        else if (action == L"provider")
-        {
-            if (argsBefore.size() == 2)
-            {
-                for (const std::wstring& provider : AiProviderRuntime::SupportedProviderNames())
-                {
-                    AddCompletionCandidate(candidates, provider.c_str());
-                }
-
-                AddCompletionCandidate(candidates, L"off");
-                AddCompletionCandidate(candidates, L"help");
-            }
-        }
-        else if (action == L"policy")
-        {
-            static const wchar_t* values[] =
-            {
-                L"allow-remote",
-                L"local-only",
-                L"status",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"effort")
-        {
-            static const wchar_t* values[] =
-            {
-                L"minimal",
-                L"low",
-                L"medium",
-                L"high",
-                L"xhigh",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"chat")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/verbose",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"run")
-        {
-            static const wchar_t* values[] =
-            {
-                L"1",
-                L"all",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"write")
-        {
-            if (argsBefore.size() == 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"1",
-                    L"confirm",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"confirm",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-        }
-        else if (action == L"status" ||
-                 action == L"go" ||
-                 action == L"no" ||
-                 action == L"report" ||
-                 action == L"diagnose" ||
-                 action == L"auth" ||
-                 action == L"preview" ||
-                 action == L"ask" ||
-                 action == L"plan" ||
-                 action == L"providers" ||
-                 action == L"model" ||
-                 action == L"base-url" ||
-                 action == L"save" ||
-                 action == L"test")
-        {
-            if (action == L"model")
-            {
-                for (const std::wstring& token : AiModelCatalog::ModelCompletionTokens())
-                {
-                    AddCompletionCandidate(candidates, token.c_str());
-                }
-            }
-
-            AddCompletionCandidate(candidates, L"help");
-        }
-        else if (action == L"analyze")
-        {
-            if (argsBefore.size() == 2)
-            {
-                AddAiEvidenceCommandCompletionCandidates(candidates);
-            }
-            else if (ToLower(argsBefore[2]) == L"!callbacks")
-            {
-                if (argsBefore.size() == 3)
-                {
-                    AddCallbackScopeCompletionCandidates(candidates);
-                }
-                else
-                {
-                    AddCallbackModuleOptionCompletionCandidates(candidates);
-                }
-            }
-        }
-        else if (action == L"explain")
-        {
-            if (argsBefore.size() == 2)
-            {
-                AddAiEvidenceCommandCompletionCandidates(candidates);
-            }
-            else if (ToLower(argsBefore[2]) == L"!callbacks")
-            {
-                if (argsBefore.size() == 3)
-                {
-                    AddCallbackScopeCompletionCandidates(candidates);
-                }
-                else
-                {
-                    AddCallbackModuleOptionCompletionCandidates(candidates);
-                }
-            }
-        }
-        else if (action == L"annotate")
-        {
-            static const wchar_t* values[] =
-            {
-                L"u",
-                L"uf",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"playbook")
-        {
-            if (argsBefore.size() == 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"callbacks",
-                    L"minifilter",
-                    L"object",
-                    L"address",
-                    L"driver",
-                    L"hidden",
-                    L"handles",
-                    L"leftover",
-                    L"integrity",
-                    L"vbs",
-                    L"dma",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"run",
-                    L"dry-run",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-        }
-        else if (action == L"show")
-        {
-            static const wchar_t* values[] =
-            {
-                L"plan",
-                L"pending",
-                L"evidence",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"transcript")
-        {
-            if (argsBefore.size() == 2)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"status",
-                    L"off",
-                    L"max",
-                    L"redact",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"max")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"off",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-            else if (ToLower(argsBefore[2]) == L"redact")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"on",
-                    L"off",
-                    L"help"
-                };
-
-                AddCompletionCandidates(candidates, values);
-            }
-        }
-        else if (action == L"audit")
-        {
-            static const wchar_t* values[] =
-            {
-                L"status",
-                L"off",
-                L"help"
-            };
-
-            AddCompletionCandidates(candidates, values);
-        }
-        else if (action == L"help")
-        {
-            AddAiActionCompletionCandidates(candidates);
-        }
-    } while (false);
-}
-
 static std::wstring CompletionCanonicalCommand(const std::wstring& value)
 {
     std::wstring command = NormalizeInputCommand(value);
@@ -4532,965 +3475,7 @@ static std::wstring CompletionCanonicalCommand(const std::wstring& value)
 
 static std::vector<std::wstring> BuildInteractiveCompletionCandidates(const std::vector<std::wstring>& argsBefore)
 {
-    std::vector<std::wstring> candidates;
-
-    do
-    {
-        if (argsBefore.empty())
-        {
-            AddRegisteredCommandCompletionCandidates(&candidates);
-            break;
-        }
-
-        // "cmd help <tab>" has nothing useful after help. "help <tab>" must still
-        // offer topic candidates (registered commands plus help meta topics).
-        if (IsHelpToken(argsBefore.back()) && argsBefore.size() > 1)
-        {
-            break;
-        }
-
-        std::wstring command = CompletionCanonicalCommand(argsBefore[0]);
-        if (command == L"help" || command == L"?")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddHelpCompletionCandidates(&candidates);
-            }
-            else
-            {
-                // Reuse the topic command's own completer. A second hand-maintained
-                // help-path table drifted (wrong tokens, missing nested scopes) and
-                // made annotated Tab headers describe a different command than the
-                // names printed underneath.
-                std::vector<std::wstring> topicArgs(argsBefore.begin() + 1, argsBefore.end());
-                candidates = BuildInteractiveCompletionCandidates(topicArgs);
-            }
-        }
-        else if (command == L"!dml_proc" ||
-                 command == L"!msrcheck" ||
-                 command == L"!cr" ||
-                 command == L"!ssdt" ||
-                 command == L"!idt")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddCompletionCandidate(&candidates, L"help");
-            }
-        }
-        else if (command == L"!callbacks")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddCallbackScopeCompletionCandidates(&candidates);
-                AddCallbackWriteActionCompletionCandidates(&candidates);
-            }
-            else if (IsCallbackWriteAction(argsBefore[1]))
-            {
-                const std::wstring action = ToLower(argsBefore[1]);
-                if ((action == L"disable" || action == L"enable") &&
-                    argsBefore.size() == 2)
-                {
-                    AddCallbackScopeCompletionCandidates(&candidates);
-                }
-                else
-                {
-                    AddCallbackModuleOptionCompletionCandidates(&candidates);
-                }
-            }
-            else
-            {
-                AddCallbackModuleOptionCompletionCandidates(&candidates);
-            }
-        }
-        else if (command == L"!wfp")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddWfpScopeCompletionCandidates(&candidates);
-            }
-            else
-            {
-                WfpScanner::Scope scope = WfpScanner::Scope::Callouts;
-                ResolveWfpScope(argsBefore[1], &scope);
-                AddWfpOptionCompletionCandidates(&candidates, scope);
-            }
-        }
-        else if (command == L"!vad")
-        {
-            AddVadOptionCompletionCandidates(&candidates);
-        }
-        else if (command == L"!hunt")
-        {
-            AddHuntOptionCompletionCandidates(&candidates);
-        }
-        else if (command == L"!threads")
-        {
-            AddThreadsOptionCompletionCandidates(&candidates);
-        }
-        else if (command == L"!snapshot")
-        {
-            AddSnapshotCompletionCandidates(&candidates);
-        }
-        else if (command == L"!diff")
-        {
-            AddDiffCompletionCandidates(&candidates, argsBefore);
-        }
-        else if (command == L"!alpc")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddAlpcScopeCompletionCandidates(&candidates);
-            }
-            else
-            {
-                AlpcScanner::Scope scope = AlpcScanner::Scope::Ports;
-                ResolveAlpcScope(argsBefore[1], &scope);
-                AddAlpcOptionCompletionCandidates(&candidates, scope);
-            }
-        }
-        else if (command == L"!ci")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"options",
-                    L"policy",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!vbs" || command == L"!securekernel")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddCompletionCandidate(&candidates, L"help");
-            }
-        }
-        else if (command == L"!etw")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"loggers",
-                    L"logger",
-                    L"integrity",
-                    L"providers",
-                    L"ti-cross",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"providers")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/limit",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (argsBefore.size() == 2 && ToLower(argsBefore[1]) == L"logger")
-            {
-                // Filter token is free-form index/name; only offer help.
-                AddCompletionCandidate(&candidates, L"help");
-            }
-        }
-        else if (command == L"!hal")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"dispatch",
-                    L"private",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!hive")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"list",
-                    L"cells",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!token")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/all",
-                L"/limit",
-                L"/system",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!dpc" || command == L"!timer" || command == L"!workitem")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/verbose",
-                L"/limit",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!nmi")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"callbacks",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!payload")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"scan",
-                    L"/limit",
-                    L"/disasm",
-                    L"/json",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/limit",
-                    L"/disasm",
-                    L"/json"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!mapper" ||
-                 command == L"!unloaded" ||
-                 command == L"!piddb" ||
-                 command == L"!cihash")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"all",
-                    L"unloaded",
-                    L"piddb",
-                    L"cihash",
-                    L"/limit",
-                    L"/json",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/limit",
-                    L"/json"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!kpage")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/deep",
-                L"/wx",
-                L"/pe",
-                L"/session",
-                L"/nosession",
-                L"/limit",
-                L"/json",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!minifilter" || command == L"!fltmgr")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"list",
-                    L"show",
-                    L"irp",
-                    L"disable",
-                    L"enable",
-                    L"disable-all",
-                    L"enable-all",
-                    L"/json",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"all",
-                    L"/pre",
-                    L"/post",
-                    L"/both",
-                    L"/json",
-                    L"IRP_MJ_CREATE",
-                    L"IRP_MJ_DIRECTORY_CONTROL",
-                    L"IRP_MJ_SET_INFORMATION"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!fwtable")
-        {
-            AddFirmwareTableCommandCompletionCandidates(&candidates, argsBefore);
-        }
-        else if (command == L"!module")
-        {
-            static const wchar_t* values[] =
-            {
-                L"integrity",
-                L"all",
-                L"/summary",
-                L"/verbose",
-                L"/headers",
-                L"/sections",
-                L"/wx",
-                L"/mismatch",
-                L"/disk",
-                L"/iat",
-                L"/prologue",
-                L"/limit",
-                L"/json",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!driver")
-        {
-            static const wchar_t* values[] =
-            {
-                L"list",
-                L"object",
-                L"integrity",
-                L"all",
-                L"/dispatch",
-                L"/devices",
-                L"/limit",
-                L"/json",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!drvobj")
-        {
-            static const wchar_t* values[] = { L"/dispatch", L"/devices", L"/json", L"help" };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!devstack" ||
-            command == L"!hiddenproc" ||
-            command == L"!wdfilter" ||
-            command == L"!inputstack" ||
-            command == L"!dma" ||
-            command == L"!hv")
-        {
-            static const wchar_t* values[] = { L"/json", L"help" };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!handles")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/target",
-                L"/process",
-                L"/all",
-                L"/suspicious",
-                L"/limit",
-                L"/json",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!byovd")
-        {
-            if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"fixture")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"status",
-                    L"load",
-                    L"unload",
-                    L"path",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"update")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/force",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (argsBefore.size() >= 2 && ToLower(argsBefore[1]) == L"status")
-            {
-                AddCompletionCandidate(&candidates, L"help");
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"scan",
-                    L"update",
-                    L"status",
-                    L"fixture",
-                    L"/no-update",
-                    L"/force-update",
-                    L"/exact",
-                    L"/sign",
-                    L"/no-sign",
-                    L"/yara",
-                    L"/yara-path",
-                    L"/yara-timeout",
-                    L"/verbose",
-                    L"/summary",
-                    L"/limit",
-                    L"/json",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"dump-raw")
-        {
-            if (argsBefore.size() >= 4)
-            {
-                AddCompletionCandidate(&candidates, L"/zerofill");
-                AddCompletionCandidate(&candidates, L"/pid");
-                AddCompletionCandidate(&candidates, L"/name");
-            }
-            AddCompletionCandidate(&candidates, L"help");
-        }
-        else if (command == L"dump-pe")
-        {
-            AddCompletionCandidate(&candidates, L"/pid");
-            AddCompletionCandidate(&candidates, L"/name");
-            AddCompletionCandidate(&candidates, L"help");
-        }
-        else if (command == L"dump-kernel")
-        {
-            static const wchar_t* values[] = { L"/max", L"/strict", L"help" };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"dump-live")
-        {
-            static const wchar_t* values[] = { L"/user", L"/compress", L"/hv", L"help" };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"dump-analyze")
-        {
-            static const wchar_t* values[] = { L"/json", L"help" };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!address")
-        {
-            AddCompletionCandidate(&candidates, L"help");
-        }
-        else if (command == L"set-ppl-antimalware")
-        {
-            static const wchar_t* values[] =
-            {
-                L"on",
-                L"off",
-                L"status",
-                L"help"
-            };
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"!kmon")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"start",
-                    L"stop",
-                    L"status",
-                    L"add",
-                    L"remove",
-                    L"iotrace",
-                    L"watch",
-                    L"recent",
-                    L"save",
-                    L"clear",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"iotrace")
-            {
-                // !kmon iotrace <driver> on|off|status
-                static const wchar_t* values[] =
-                {
-                    L"on",
-                    L"off",
-                    L"status",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/pid",
-                    L"/name",
-                    L"/driver",
-                    L"/verbose",
-                    L"/all-drivers",
-                    L"/background",
-                    L"/nowatch",
-                    L"/throttle",
-                    L"/log",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!ti")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"start",
-                    L"stop",
-                    L"status",
-                    L"add",
-                    L"remove",
-                    L"watch",
-                    L"recent",
-                    L"stats",
-                    L"by",
-                    L"grep",
-                    L"save",
-                    L"clear",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"by")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"pid",
-                    L"task",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/pid",
-                    L"/name",
-                    L"/throttle",
-                    L"/ring",
-                    L"/log",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!timeline")
-        {
-            AddTimelineCompletionCandidates(&candidates, argsBefore);
-        }
-        else if (command == L"!pool")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"big",
-                    L"find",
-                    L"tags",
-                    L"summary",
-                    L"pe",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"pe")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/tag",
-                    L"/min",
-                    L"/max",
-                    L"/limit",
-                    L"/nonpaged",
-                    L"/paged",
-                    L"/any",
-                    L"/suspicious",
-                    L"/dump",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"tags" || ToLower(argsBefore[1]) == L"tag")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/tag",
-                    L"/limit",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/tag",
-                    L"/tags",
-                    L"/with-tags",
-                    L"/min",
-                    L"/max",
-                    L"/addr",
-                    L"/limit",
-                    L"/nonpaged",
-                    L"/paged",
-                    L"/any",
-                    L"/annotate",
-                    L"/wx",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"!wnf")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"decode",
-                    L"instances",
-                    L"instance",
-                    L"data",
-                    L"candidates",
-                    L"lists",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"log")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"enable",
-                    L"disable",
-                    L"status",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"ai")
-        {
-            AddAiCompletionCandidates(argsBefore, &candidates);
-            if (argsBefore.size() >= 3 &&
-                IsAiEvidenceNestedAction(ToLower(argsBefore[1])))
-            {
-                std::vector<std::wstring> nested(argsBefore.begin() + 2, argsBefore.end());
-                const std::vector<std::wstring> nestedCandidates =
-                    BuildInteractiveCompletionCandidates(nested);
-                for (const std::wstring& token : nestedCandidates)
-                {
-                    AddCompletionCandidate(&candidates, token.c_str());
-                }
-            }
-        }
-        else if (command == L"backend")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"auto",
-                    L"native",
-                    L"dbgeng",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"kdinit")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/local",
-                    L"/remote",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"probe")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"status",
-                    L"load",
-                    L"info",
-                    L"reset",
-                    L"unload",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"mcp")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"on",
-                    L"off",
-                    L"status",
-                    L"client-setup",
-                    L"endpoint",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"on")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"--allow-write",
-                    L"--loopback",
-                    L"--bind",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-            else if (ToLower(argsBefore[1]) == L"client-setup" ||
-                     ToLower(argsBefore[1]) == L"setup" ||
-                     ToLower(argsBefore[1]) == L"connect")
-            {
-                static const wchar_t* values[] =
-                {
-                    L"all",
-                    L"claude",
-                    L"claude-code",
-                    L"claude-desktop",
-                    L"cursor",
-                    L"codex",
-                    L"grok",
-                    L"legacy",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"procctx")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"status",
-                    L"clear",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"write")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"on",
-                    L"off",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"sq")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"true",
-                    L"false",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"n")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"10",
-                    L"16",
-                    L"help"
-                };
-
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"vtop")
-        {
-            static const wchar_t* values[] =
-            {
-                L"/cr3",
-                L"/process",
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"dt" || command == L"dtx")
-        {
-            static const wchar_t* values[] =
-            {
-                L"-r",
-                L"-r1",
-                L"-r2",
-                L"-r3",
-                L"-v",
-                L"-b",
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"s")
-        {
-            static const wchar_t* values[] =
-            {
-                L"-b",
-                L"-w",
-                L"-d",
-                L"-q",
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"setfield")
-        {
-            static const wchar_t* values[] =
-            {
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-        else if (command == L"u" || command == L"uf")
-        {
-            if (argsBefore.size() <= 1)
-            {
-                static const wchar_t* values[] =
-                {
-                    L"/process",
-                    L"help"
-                };
-                AddCompletionCandidates(&candidates, values);
-            }
-        }
-        else if (command == L"query" ||
-                 command == L"kddetach" ||
-                 command == L"drvstatus" ||
-                 command == L"cls" ||
-                 command == L"home" ||
-                 command == L"dashboard" ||
-                 command == L"version" ||
-                 command == L"vertarget" ||
-                 command == L"vercommand" ||
-                 command == L"unload" ||
-                 command == L"kd" ||
-                 IsPhysicalDisplayCommand(command) ||
-                 IsPhysicalEnterCommand(command))
-        {
-            if (argsBefore.size() <= 1)
-            {
-                AddCompletionCandidate(&candidates, L"help");
-            }
-        }
-        else if (IsDisplayCommand(command) || IsEnterCommand(command))
-        {
-            static const wchar_t* values[] =
-            {
-                L"/process",
-                L"help"
-            };
-
-            AddCompletionCandidates(&candidates, values);
-        }
-    } while (false);
-
-    std::sort(
-        candidates.begin(),
-        candidates.end(),
-        [](const std::wstring& left, const std::wstring& right)
-        {
-            std::wstring lowerLeft = ToLower(left);
-            std::wstring lowerRight = ToLower(right);
-            if (lowerLeft == lowerRight)
-            {
-                return left < right;
-            }
-
-            return lowerLeft < lowerRight;
-        });
-
-    return candidates;
+    return CollectCompletionCandidates(argsBefore);
 }
 
 static bool StartsWithNoCase(const std::wstring& value, const std::wstring& prefix)
@@ -5528,48 +3513,6 @@ static std::vector<std::wstring> FilterCompletionCandidates(
     return matches;
 }
 
-static std::wstring LongestCommonCompletionPrefix(const std::vector<std::wstring>& matches)
-{
-    std::wstring prefix;
-
-    do
-    {
-        if (matches.empty())
-        {
-            break;
-        }
-
-        const std::wstring& first = matches[0];
-        size_t length = 0;
-        while (length < first.size())
-        {
-            wchar_t expected = static_cast<wchar_t>(std::towlower(first[length]));
-            bool same = true;
-
-            for (size_t index = 1; index < matches.size(); ++index)
-            {
-                if (length >= matches[index].size() ||
-                    static_cast<wchar_t>(std::towlower(matches[index][length])) != expected)
-                {
-                    same = false;
-                    break;
-                }
-            }
-
-            if (!same)
-            {
-                break;
-            }
-
-            ++length;
-        }
-
-        prefix = first.substr(0, length);
-    } while (false);
-
-    return prefix;
-}
-
 static std::vector<std::wstring> CompletionListingArgs(const std::vector<std::wstring>& argsBefore)
 {
     std::vector<std::wstring> args = argsBefore;
@@ -5593,14 +3536,6 @@ static std::wstring FormatCompletionListing(
     }
 
     return BuildCompletionListing(matches, command, hintArgs);
-}
-
-static void PrintCompletionMatches(
-    const std::vector<std::wstring>& matches,
-    const std::vector<std::wstring>& argsBefore)
-{
-    std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
-    std::wcout << FormatCompletionListing(matches, argsBefore);
 }
 
 struct InteractiveRenderState
@@ -6155,94 +4090,15 @@ static void RenderInteractiveCommandLine(
     }
 }
 
-struct InteractiveCompletionContext
-{
-    std::vector<std::wstring> ArgsBefore;
-    std::wstring Prefix;
-    size_t TokenStart;
-    size_t TokenEnd;
-};
-
-static InteractiveCompletionContext BuildInteractiveCompletionContext(
-    const std::wstring& line,
-    size_t cursor)
-{
-    InteractiveCompletionContext context = {};
-    context.TokenStart = cursor;
-    context.TokenEnd = cursor;
-
-    while (context.TokenStart > 0 && std::iswspace(line[context.TokenStart - 1]) == 0)
-    {
-        --context.TokenStart;
-    }
-
-    while (context.TokenEnd < line.size() && std::iswspace(line[context.TokenEnd]) == 0)
-    {
-        ++context.TokenEnd;
-    }
-
-    context.Prefix = line.substr(context.TokenStart, cursor - context.TokenStart);
-    context.ArgsBefore = Split(line.substr(0, context.TokenStart));
-    return context;
-}
-
 static bool ApplyInteractiveTabCompletion(std::wstring* line, size_t* cursor, bool* listed)
 {
-    bool changed = false;
-
-    do
+    std::wstring listing;
+    const bool changed = ApplyTabCompletion(line, cursor, listed, &listing);
+    if (!listing.empty())
     {
-        if (line == nullptr || cursor == nullptr)
-        {
-            break;
-        }
-
-        if (listed != nullptr)
-        {
-            *listed = false;
-        }
-
-        InteractiveCompletionContext context = BuildInteractiveCompletionContext(*line, *cursor);
-        std::vector<std::wstring> candidates = BuildInteractiveCompletionCandidates(context.ArgsBefore);
-        std::vector<std::wstring> matches = FilterCompletionCandidates(candidates, context.Prefix);
-        if (matches.empty())
-        {
-            MessageBeep(MB_OK);
-            break;
-        }
-
-        std::wstring replacement;
-        bool appendSpace = false;
-        if (matches.size() == 1)
-        {
-            replacement = matches[0];
-            appendSpace = true;
-        }
-        else
-        {
-            replacement = LongestCommonCompletionPrefix(matches);
-            if (replacement.size() <= context.Prefix.size())
-            {
-                PrintCompletionMatches(matches, context.ArgsBefore);
-                if (listed != nullptr)
-                {
-                    *listed = true;
-                }
-                break;
-            }
-        }
-
-        line->replace(context.TokenStart, context.TokenEnd - context.TokenStart, replacement);
-        *cursor = context.TokenStart + replacement.size();
-        if (appendSpace && *cursor == line->size())
-        {
-            line->insert(*cursor, L" ");
-            ++(*cursor);
-        }
-
-        changed = true;
-    } while (false);
-
+        std::lock_guard<std::recursive_mutex> lock(g_ConsoleOutputMutex);
+        std::wcout << listing;
+    }
     return changed;
 }
 
@@ -7089,7 +4945,7 @@ static uint32_t PageBoundedReadChunk(uint64_t address, size_t offset, uint32_t l
 
     do
     {
-        if (offset >= length)
+        if (offset >= length || !commandinput::IsValidAddressRange(address, length))
         {
             break;
         }
@@ -7117,7 +4973,7 @@ static bool ReadSparseVirtualMemory(
 
     do
     {
-        if (view == nullptr || length == 0)
+        if (view == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -7218,7 +5074,7 @@ static bool ReadSparsePhysicalMemory(
 
     do
     {
-        if (view == nullptr || length == 0)
+        if (view == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(physicalAddress, length))
         {
             if (error != nullptr)
             {
@@ -7725,6 +5581,15 @@ static bool ResolveProcessAddressContext(
             break;
         }
 
+        if (!device.IsOpen())
+        {
+            if (error != nullptr)
+            {
+                *error = L"driver device is not open";
+            }
+            break;
+        }
+
         uint32_t dtbOffset = 0;
         uint32_t userDtbOffset = 0;
         if (!ResolveProcessDirectoryTableBaseOffsets(symbols, &dtbOffset, &userDtbOffset, error))
@@ -7879,7 +5744,7 @@ static bool ReadKernelBytes(
 
     do
     {
-        if (bytes == nullptr || length == 0)
+        if (bytes == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -8774,13 +6639,14 @@ static bool CaptureSnapshotForCommand(
 static void PrintSnapshotHelp()
 {
     std::wcout << L"!snapshot command:\n";
-    std::wcout << L"  !snapshot baseline [/all] [/name <label>]\n";
+    std::wcout << L"  !snapshot baseline [/all] [/name <label>] [/memory]\n";
     std::wcout << L"  !snapshot save <path> [/all] [/name <label>]\n";
     std::wcout << L"  !snapshot show [baseline|<path>] [/domains|/no-domains] [/warnings]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Captures same-boot evidence snapshots over native scanners and stores a\n";
     std::wcout << L"  session baseline in memory plus JSON and Markdown files under .kn-live-dbg.\n";
+    std::wcout << L"  /memory on baseline skips the JSON and Markdown writes.\n";
     std::wcout << L"  VAD DKOM hidden-PTE scans run during !diff baseline for processes newly\n";
     std::wcout << L"  present since the baseline. Every capture includes the full kernel domain\n";
     std::wcout << L"  set (/all is accepted for compatibility and is the default). kpage records\n";
@@ -8803,10 +6669,11 @@ static void PrintSnapshotHelp()
 static void PrintDiffHelp()
 {
     std::wcout << L"!diff command:\n";
-    std::wcout << L"  !diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]\n";
-    std::wcout << L"  !diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]\n";
+    std::wcout << L"  !diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>] [/memory]\n";
+    std::wcout << L"  !diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>] [/memory]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
+    std::wcout << L"  /memory skips current-snapshot and diff report file writes.\n";
     std::wcout << L"  Compares snapshots with new-focused semantics: records absent from baseline\n";
     std::wcout << L"  but present now, plus high-risk escalations. !diff baseline captures a fresh\n";
     std::wcout << L"  current snapshot, scans VAD DKOM for newly live processes, writes JSON and\n";
@@ -9960,7 +7827,7 @@ static bool ReadProcessVirtualMemory(
 
     do
     {
-        if (bytes == nullptr || length == 0)
+        if (bytes == nullptr || length > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, length))
         {
             if (error != nullptr)
             {
@@ -10026,7 +7893,7 @@ static bool WriteProcessVirtualMemory(
 
     do
     {
-        if (bytes.empty())
+        if (bytes.size() > KNDBG_MAX_TRANSFER_SIZE || !commandinput::IsValidAddressRange(address, bytes.size()))
         {
             if (error != nullptr)
             {
@@ -10889,6 +8756,14 @@ static bool ReadEnterPromptLine(std::wstring* line, bool* cancelled, std::wstrin
 
         *line = L"";
         *cancelled = false;
+        if (g_RemoteOriginActive.load())
+        {
+            if (error != nullptr)
+            {
+                *error = L"supply values on the command line";
+            }
+            break;
+        }
         if (!std::getline(std::wcin, *line))
         {
             if (error != nullptr)
@@ -11625,7 +9500,7 @@ static void HandleMove(const std::vector<std::wstring>& args, DebuggerState& sta
             argIndex += 2;
         }
 
-        if (args.size() < argIndex + 3)
+        if (args.size() != argIndex + 3)
         {
             std::wcerr << L"usage: m [/process <process-id>] <source> <destination> <length>\n";
             break;
@@ -12101,6 +9976,12 @@ static void HandleProbeCommand(const std::vector<std::wstring>& args, DebuggerSt
         if (HasHelpToken(args, 1))
         {
             PrintProbeHelp();
+            break;
+        }
+
+        if (action != L"load" && args.size() > 2)
+        {
+            std::wcerr << L"probe: invalid argument count\n";
             break;
         }
 
@@ -19089,7 +16970,7 @@ static void HandleFirmwareTableCommand(
 static void PrintDumpRawHelp()
 {
     std::wcout << L"dump-raw command:\n";
-    std::wcout << L"  dump-raw <address> <length> <path> [/zerofill]\n";
+    std::wcout << L"  dump-raw <address> <length> <path> [/zerofill] [/pid N | /name <image>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Reads <length> bytes starting at <address> from kernel memory through the driver\n";
@@ -19104,7 +16985,9 @@ static void PrintDumpRawHelp()
     std::wcout << L"  /zerofill   continue on read failure and zero-fill the failed chunk.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Requires the KnLiveDbg.sys driver device to be open. Wrap paths that contain\n";
+    std::wcout << L"  /pid N or /name <image> selects a user process; ambiguous image names fail.\n";
+    std::wcout << L"  User reads try a process handle first, then the driver when available.\n";
+    std::wcout << L"  Kernel ranges require the driver. Wrap paths that contain\n";
     std::wcout << L"  whitespace in double quotes (\"C:\\Program Files\\foo.bin\"). Apostrophes in\n";
     std::wcout << L"  unquoted paths are kept literal (matches CMD/PowerShell convention).\n";
     std::wcout << L"\n";
@@ -19117,7 +17000,7 @@ static void PrintDumpRawHelp()
 static void PrintDumpPeHelp()
 {
     std::wcout << L"dump-pe command:\n";
-    std::wcout << L"  dump-pe <address> <path>\n";
+    std::wcout << L"  dump-pe <address> <path> [/pid N | /name <image>]\n";
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  Treats the memory region at <address> as an in-memory loaded PE image and rebuilds\n";
@@ -19132,8 +17015,9 @@ static void PrintDumpPeHelp()
     std::wcout << L"  <path>      output file path. Existing file is overwritten.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  Requires the KnLiveDbg.sys driver device to be open. PE32 (32-bit) and PE32+\n";
-    std::wcout << L"  (64-bit) are both supported.\n";
+    std::wcout << L"  /pid N or /name <image> selects a user process; ambiguous image names fail.\n";
+    std::wcout << L"  User reads try a process handle first, then the driver when available.\n";
+    std::wcout << L"  Kernel images require the driver. PE32 and PE32+ are supported.\n";
     std::wcout << L"\n";
     std::wcout << L"  Header recovery: the scanner restores wiped 'MZ' / 'PE\\0\\0' signatures and\n";
     std::wcout << L"  corrupted e_lfanew values when the surrounding FileHeader/OptionalHeader fields\n";
@@ -21764,7 +19648,7 @@ static void HandleWdFilterCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -21854,7 +19738,7 @@ static void HandleInputStackCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -21937,7 +19821,7 @@ static void HandleDmaCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -22016,7 +19900,7 @@ static void HandleHvCommand(
             break;
         }
         std::wstring jsonPath;
-        if (args.size() >= 3 && ToLower(args[1]) == L"/json")
+        if (args.size() == 3 && ToLower(args[1]) == L"/json" && !args[2].empty())
         {
             jsonPath = args[2];
         }
@@ -22874,6 +20758,15 @@ static void HandleTiCommand(
         }
 
         std::wstring action = ToLower(args[1]);
+
+        if (((action == L"stop" || action == L"status" || action == L"stats" || action == L"clear") && args.size() > 2) ||
+            (action == L"recent" && args.size() > 3) ||
+            (action == L"save" && (args.size() != 3 || args[2].empty())) ||
+            (action == L"by" && args.size() != 4))
+        {
+            std::wcerr << L"!ti: invalid argument count for " << action << L"\n";
+            break;
+        }
 
         if (action == L"start")
         {
@@ -24045,6 +21938,31 @@ static void StopTimelineAutoDrainWorker()
     g_TimelineAutoDrainWorker.Stop();
 }
 
+static bool StopCollectorsBeforeDriverRelease(bool finalShutdown = false)
+{
+    std::wstring error;
+    bool ok = GetKmonInstance().Stop(&error, finalShutdown);
+    if (ok || finalShutdown)
+    {
+        g_KmonForShutdown.store(nullptr);
+    }
+    else
+    {
+        std::wcerr << L"collector shutdown failed: " << error << L"; driver handle retained\n";
+    }
+    if (GetTiSubscriberInstance().Stop(&error))
+    {
+        g_TiSubscriberForShutdown.store(nullptr);
+    }
+    else
+    {
+        std::wcerr << L"TI shutdown failed: " << error << L"\n";
+        ok = false;
+    }
+    StopTimelineAutoDrainWorker();
+    return ok;
+}
+
 static TimelineAutoDrainSnapshot QueryTimelineAutoDrainSnapshot()
 {
     return g_TimelineAutoDrainWorker.Snapshot();
@@ -24972,28 +22890,29 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
 static void PrintKmonHelp()
 {
     std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
-    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/throttle N]\n";
+    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/manifest <path>] [/throttle N] [/layout-ms N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
-    std::wcout << L"  !kmon iotrace <driver> on|off|status lab-only: interpose the named driver's\n";
+    std::wcout << L"  !kmon iotrace <driver> on           lab-only: interpose the named driver's\n";
     std::wcout << L"                                       IRP_MJ_DEVICE_CONTROL and print driver.ioctl\n";
-    std::wcout << L"                                       (first per pid+ioctl code); off restores it\n";
+    std::wcout << L"                                       (first per pid+ioctl code)\n";
+    std::wcout << L"  !kmon iotrace off | status         restore dispatch or show its state\n";
     std::wcout << L"  !kmon watch            reattach live tail after Esc (optional)\n";
     std::wcout << L"\n";
     std::wcout << L"dwm.exe is watched by default (no /name needed): its Microsoft-signed main\n";
-    std::wcout << L"image text, graphics vtables, and heap vtable clones are compared every\n";
-    std::wcout << L"scan tick because PresentDWM/PresentMPO render hooks land there.\n";
-    std::wcout << L"Mapper and user-mode implant detections auto-capture the region to\n";
-    std::wcout << L"<log dir>\\captures (deduped, 256MB budget) so volatile evidence survives\n";
-    std::wcout << L"unmaps and reboots. Layers: driver_image (kernel driver on load),\n";
+    std::wcout << L"image text, graphics vtables, and heap vtable clones use bounded rotating scans.\n";
+    std::wcout << L"Watched EXEs and DLLs are inspected under bounded budgets and read coverage.\n";
+    std::wcout << L"Eligible mapper and user-mode implant leads auto-capture the region to\n";
+    std::wcout << L"<log dir>\\captures (bounded queues, 256MB session budget). First bytes are read\n";
+    std::wcout << L"before asynchronous chunk persistence. Read/queue failures remain visible. Layers:\n";
     std::wcout << L"orphan_wx (2MB W+X samples), pool_pe (with .sys import check),\n";
     std::wcout << L"private_exec/pe, cloned_vtable (+ hook page), apc_routine (injected\n";
     std::wcout << L"user-mode entry), hidden_eprocess (DKOM evidence), graphics_dispatch\n";
     std::wcout << L"(dxgkrnl/GPU DDI .data unbacked pointers).\n";
     std::wcout << L"TI events carry the caller callstack (ETW stack tracing, enabled via\n";
     std::wcout << L"EVENT_ENABLE_PROPERTY_STACK_TRACE on the session) as callstack evidence\n";
-    std::wcout << L"in every classified event -- the API chain identifies the exact call path.\n";
+    std::wcout << L"when the provider supplies frames; absent/truncated stacks limit attribution.\n";
     std::wcout << L"\n";
     std::wcout << L"typical hunt (driver filename is not an input):\n";
     std::wcout << L"  write on\n";
@@ -25008,7 +22927,21 @@ static void PrintKmonHelp()
     std::wcout << L"  /verbose        kept for compatibility; every driver load/unload and device\n";
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
-    std::wcout << L"  /log /verbose /throttle apply only on the first start; later start extends watches.\n";
+    std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
+    std::wcout << L"  /layout-ms N    memory layout rescan target, 1000..60000 ms (default 5000)\n";
+    std::wcout << L"  no /pid or /name: discover all processes every second, including new instances\n";
+    std::wcout << L"  !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
+    std::wcout << L"    per-PID export includes regions and recent deltas; first observed is not clean\n";
+    std::wcout << L"  !kmon cases [/pid N] [/role name] [/json] [/save path]  recent leads (30s expiry)\n";
+    std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
+    std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
+    std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
+    std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
+    std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
+    std::wcout << L"  Event categories are observation, lead, coverage, and sensor. Kind names are\n";
+    std::wcout << L"  stable identifiers; maliciousness=not_established under assessment_policy=evidence_v1.\n";
+    std::wcout << L"  /json prints JSON; /save <path> writes a new file. Neither marks a clean baseline.\n";
+    std::wcout << L"  /log /verbose /manifest /throttle /layout-ms apply on first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
@@ -25018,7 +22951,7 @@ static void PrintKmonHelp()
     std::wcout << L"          masquerade/hollow/implant (incl. cloned_vtable, main_image_text,\n";
     std::wcout << L"          resource_only_pe as a quiet downgrade note), builtin/drop inject.remote\n";
     std::wcout << L"          (System-origin APC/context always shows, routine page auto-captured),\n";
-    std::wcout << L"          process.credscan, driver.captured (image auto-dump), gap.kernel_rw,\n";
+    std::wcout << L"          process.credscan, coverage.capture (persisted bytes), gap.kernel_rw,\n";
     std::wcout << L"          driver.handle / driver.ioctl / loader.activity on watched pids,\n";
     std::wcout << L"          hook.window / process.impair from TI (see logged kinds)\n";
 std::wcout << L"          hook.inline / hook.breakpoint (hot kernel entry head transfer or int3),\n";
@@ -25068,8 +23001,8 @@ std::wcout << L"          pool.hidden / mapper.stub (pool stub bodies, see logge
     std::wcout << L"  driver.inventory_divergence  the kernel-context PsLoadedModuleList walk and the\n";
     std::wcout << L"                          host NtQuerySystemInformation view disagree about a module\n";
     std::wcout << L"                          (user_view_missing = filtered query view; fail-closed);\n";
-    std::wcout << L"  driver.module_chain_broken  loader list link is not reciprocal, so an entry was\n";
-    std::wcout << L"                          unlinked from PsLoadedModuleList (fail-closed);\n";
+    std::wcout << L"  driver.module_chain_broken  observed loader list link is not reciprocal;\n";
+    std::wcout << L"                          corroborate against live mutation and read coverage.\n";
     std::wcout << L"  mapper.watch            30s burst after ANY kernel driver load/unload (capped 90s);\n";
     std::wcout << L"                          leftover+wipe diffs,\n";
     std::wcout << L"                          400ms mapper/pool, 1.5s kpage, one DeepPfn pass per window\n";
@@ -25135,6 +23068,7 @@ static void PrintKmonEventLine(const KmonEvent& event)
 {
     std::wcout << L"[" << FormatTimestampLocal(event.Timestamp) << L"] ";
     PrintColoredText(event.Kind, KNDBG_COLOR_TITLE);
+    std::wcout << L" [" << KmonEventCategory(event.Kind) << L"]";
     std::wcout << L" pid=" << event.ProcessId;
     if (event.TargetProcessId != 0)
     {
@@ -25143,7 +23077,7 @@ static void PrintKmonEventLine(const KmonEvent& event)
     if (!event.Driver.empty())
     {
         std::wcout << L" driver=";
-        PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_FAIL);
+        PrintColoredText(KmonBasenameLower(event.Driver), KNDBG_COLOR_TITLE);
         if (event.Driver.find(L'\\') != std::wstring::npos ||
             event.Driver.find(L'/') != std::wstring::npos)
         {
@@ -25281,6 +23215,29 @@ static bool ParseKmonStartArgs(
             i += 2;
             continue;
         }
+        if (opt == L"/manifest")
+        {
+            if (i + 1 >= args.size())
+            {
+                *error = L"/manifest requires a path";
+                return false;
+            }
+            options->GameManifestPath = args[i + 1];
+            i += 2;
+            continue;
+        }
+        if (opt == L"/layout-ms")
+        {
+            uint64_t interval = 0;
+            if (i + 1 >= args.size() || !ParseUnsigned(args[i + 1], 10, &interval) || interval < 1000 || interval > 60000)
+            {
+                *error = L"/layout-ms requires 1000..60000 milliseconds";
+                return false;
+            }
+            options->LayoutScanIntervalMs = static_cast<uint32_t>(interval);
+            i += 2;
+            continue;
+        }
         if (opt == L"/log")
         {
             if (i + 1 >= args.size())
@@ -25342,6 +23299,15 @@ static void HandleKmonCommand(
             action = ToLower(args[1]);
         }
 
+        if (((action == L"stop" || action == L"status" || action == L"stats" || action == L"clear") && args.size() > 2) ||
+            (action == L"recent" && args.size() > 3) ||
+            (action == L"save" && (args.size() != 3 || args[2].empty())) ||
+            (action == L"by" && args.size() != 4))
+        {
+            std::wcerr << L"!kmon: invalid argument count for " << action << L"\n";
+            break;
+        }
+
         if (action == L"start")
         {
             if (kmon.IsActive())
@@ -25373,10 +23339,11 @@ static void HandleKmonCommand(
                 const bool firstStartOnly =
                     extra.VerboseDrivers ||
                     !extra.LogDirectory.empty() ||
+                    !extra.GameManifestPath.empty() ||
                     extra.ThrottlePerSecond != KmonOptions{}.ThrottlePerSecond;
                 if (firstStartOnly)
                 {
-                    std::wcerr << L"!kmon: /verbose, /log, and /throttle apply only on the first start";
+                    std::wcerr << L"!kmon: /verbose, /log, /manifest, and /throttle apply only on the first start";
                     if (addedWatch)
                     {
                         std::wcerr << L"; watches were updated";
@@ -25602,6 +23569,32 @@ static void HandleKmonCommand(
                        << L" hook_scans=" << stats.HookScans
                        << L" cpu_hook_scans=" << stats.CpuHookScans
                        << L" user_scans=" << stats.UserHostilityScans << L"\n";
+            std::wcout << L"  collector_last_ms=" << stats.CollectorLastMs
+                       << L" max_gap_ms=" << stats.CollectorMaxGapMs
+                       << L" lost=" << stats.CollectionLost << L" ti_lost=" << stats.TiSessionLost
+                       << L" analysis_pending=" << stats.AnalysisPending << L"\n";
+            std::wcout << L"  capture_queued=" << stats.CaptureQueued
+                       << L" pending=" << stats.CapturePending << L" failed=" << stats.CaptureFailed
+                       << L" first_max_ms=" << stats.CaptureFirstMaxMs << L"\n";
+            std::wcout << L"  user_cursor=" << stats.UserScanCursor
+                       << L" oldest_age_ms=" << stats.UserOldestScanMs
+                       << L" budget_exceeded=" << stats.AnalysisBudgetExceeded
+                       << L" last_analysis_ms=" << stats.AnalysisLastCompleteMs << L"\n";
+            std::wcout << L"  image_remaining_pages=" << stats.ImageRemainingPages
+                       << L" last_image_completion_ms=" << stats.ImageLastCompleteMs
+                       << L" kpage_resume=" << std::hex << stats.KpageResumeAddress << std::dec
+                       << L" catalog_records=" << stats.CatalogRecords << L" evicted=" << stats.CatalogEvicted << L"\n";
+            std::wcout << L"  handle_oldest_age_ms=" << stats.HandleOldestScanAgeMs
+                       << L" handle_pending=" << stats.HandlePendingRecords << L"\n";
+            std::wcout << L"  layout_scope=" << (stats.Layout.AllProcesses ? L"all_processes" : L"selected_processes")
+                       << L" tracked=" << stats.Layout.Tracked << L" completed=" << stats.Layout.Completed
+                       << L" unavailable=" << stats.Layout.Unavailable << L" pending_sweeps=" << stats.Layout.Pending
+                       << L" oldest_ms=" << stats.Layout.OldestAgeMs << L" interval_ms=" << stats.Layout.IntervalMs << L"\n";
+            std::wcout << L"  layout_inventory_complete=" << stats.Layout.InventoryComplete
+                       << L" inventory_failures=" << stats.Layout.InventoryFailures << L" over_cap=" << stats.Layout.ProcessCap
+                       << L" rows=" << stats.Layout.StoredRows << L" failed=" << stats.Layout.Failed
+                       << L" verification_pending=" << stats.LayoutPending << L" dropped=" << stats.LayoutDropped
+                       << L" checked=" << stats.LayoutChecked << L" rejected=" << stats.LayoutRejected << L"\n";
             std::wcout << L"  mapper_watch=";
             if (stats.MapperWatchRemainMs > 0)
             {
@@ -25722,7 +23715,7 @@ static void HandleKmonCommand(
                 verb = args.size() >= 4 ? ToLower(args[3]) : std::wstring();
                 if (driverName.empty() || verb != L"on")
                 {
-                    std::wcerr << L"usage: !kmon iotrace <driver-name> on|off|status\n";
+                    std::wcerr << L"usage: !kmon iotrace <driver-name> on | !kmon iotrace off|status\n";
                     break;
                 }
             }
@@ -25793,6 +23786,305 @@ static void HandleKmonCommand(
             }
             StartTimelineAutoDrainWorker(state, &device);
             RunKmonLiveTail(kmon);
+            break;
+        }
+
+        if (action == L"layouts")
+        {
+            uint32_t pid = 0;
+            bool initial = false;
+            bool jsonOutput = false;
+            bool valid = true;
+            std::wstring savePath;
+            std::set<std::wstring> seen;
+            for (size_t i = 2; valid && i < args.size(); ++i)
+            {
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if (option == L"/initial")
+                {
+                    initial = true;
+                }
+                else if ((option == L"/pid" || option == L"/save") && i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    if (option == L"/pid")
+                    {
+                        uint64_t parsed = 0;
+                        valid = ParseUnsigned(value, 10, &parsed) && parsed > 4 && parsed <= UINT32_MAX;
+                        pid = static_cast<uint32_t>(parsed);
+                    }
+                    else
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+            }
+            if (!valid || (initial && pid == 0))
+            {
+                std::wcerr << L"!kmon layouts: usage: !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
+                break;
+            }
+            const auto json = kmon.LayoutsJson(pid, initial);
+            if (!savePath.empty())
+            {
+                std::wstring error;
+                if (!SaveObservationJson(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon layouts: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
+            }
+            else
+            {
+                std::wcout << kmon.LayoutsText(pid, initial);
+                if (!savePath.empty())
+                {
+                    std::wcout << L"[kmon.snapshot] wrote " << savePath << L"\n";
+                }
+            }
+            break;
+        }
+
+        if (action == L"cases")
+        {
+            AnalystCaseFilter filter;
+            bool jsonOutput = false;
+            bool valid = true;
+            std::wstring savePath;
+            std::set<std::wstring> seen;
+            for (size_t i = 2; i < args.size(); ++i)
+            {
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if ((option == L"/pid" || option == L"/role" || option == L"/save") &&
+                    i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    if (option == L"/pid")
+                    {
+                        uint64_t pid = 0;
+                        valid = ParseUnsigned(value, 10, &pid) && pid <= UINT32_MAX;
+                        filter.HasPid = true;
+                        filter.ProcessId = static_cast<uint32_t>(pid);
+                    }
+                    else if (option == L"/role")
+                    {
+                        valid = value.size() <= 128 && value.front() != L'/';
+                        filter.Role = value;
+                    }
+                    else
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+                if (!valid)
+                {
+                    break;
+                }
+            }
+            if (!valid)
+            {
+                std::wcerr << L"!kmon cases: usage: !kmon cases [/pid N] [/role name] [/json] [/save path]\n";
+                break;
+            }
+            std::vector<KmonHuntCase> cases;
+            const auto json = kmon.HuntCasesJson(filter, &cases);
+            if (!savePath.empty())
+            {
+                std::wstring error;
+                if (!SaveAnalystSnapshot(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon cases: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
+                break;
+            }
+            if (!savePath.empty())
+            {
+                std::wcout << L"[kmon.snapshot] wrote " << savePath << L"\n";
+            }
+            for (const auto& item : cases)
+            {
+                std::wcout << L"[kmon.case] " << item.Kind << L" relation=" << ObservationRelationName(item.Relation)
+                    << L" pid=" << item.Primary.Context.Identity.ProcessId << L" address=" << item.Primary.Address
+                    << L" role=" << item.Primary.Role;
+                if (item.HasRelated)
+                {
+                    std::wcout << L" related_pid=" << item.Related.Context.Identity.ProcessId
+                        << L" related_address=" << item.Related.Address;
+                }
+                std::wcout << L"\n";
+            }
+            std::wcout << L"[kmon.cases] returned=" << cases.size() << L" claim=investigation_leads communication_proven=false\n";
+            break;
+        }
+
+        if (action == L"surfaces")
+        {
+            ExecutionSurfaceOptions options;
+            bool jsonOutput = false;
+            std::wstring savePath;
+            uint64_t pid = 0;
+            bool valid = args.size() >= 3 && ParseUnsigned(args[2], 10, &pid) && pid > 4 && pid <= UINT32_MAX;
+            std::set<std::wstring> seen;
+            for (size_t i = 3; valid && i < args.size(); ++i)
+            {
+                const auto option = ToLower(args[i]);
+                if (!seen.insert(option).second)
+                {
+                    valid = false;
+                    break;
+                }
+                if (option == L"/json")
+                {
+                    jsonOutput = true;
+                }
+                else if ((option == L"/save" || option == L"/module-start" || option == L"/handle-start") &&
+                    i + 1 < args.size() && !args[i + 1].empty())
+                {
+                    const auto value = args[++i];
+                    uint64_t number = 0;
+                    if (option == L"/save")
+                    {
+                        valid = value.front() != L'/';
+                        savePath = value;
+                    }
+                    else if (!ParseUnsigned(value, 10, &number))
+                    {
+                        valid = false;
+                    }
+                    else if (option == L"/module-start")
+                    {
+                        valid = number < 4096;
+                        options.ModuleStart = static_cast<size_t>(number);
+                    }
+                    else
+                    {
+                        options.HandleStart = number;
+                    }
+                }
+                else
+                {
+                    valid = false;
+                }
+            }
+            if (!valid)
+            {
+                std::wcerr << L"!kmon surfaces: usage: !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
+                break;
+            }
+            TypeFieldInfo callback = {};
+            if (symbols.IsReady() && symbols.FindField(L"nt!_PEB", L"KernelCallbackTable", &callback, nullptr) &&
+                callback.Length == 8 && !callback.IsBitField && callback.Offset <= 0x1000 - 8)
+            {
+                options.HasKernelCallbackOffset = true;
+                options.KernelCallbackOffset = callback.Offset;
+            }
+            const auto result = ScanExecutionSurfaces(static_cast<uint32_t>(pid), options);
+            const auto json = ExecutionSurfacesJson(result);
+            if (!savePath.empty())
+            {
+                std::wstring error;
+                if (!SaveAnalystSnapshot(savePath, json, &error))
+                {
+                    std::wcerr << L"!kmon surfaces: " << error << L"\n";
+                    break;
+                }
+            }
+            if (jsonOutput)
+            {
+                std::wcout << json << L"\n";
+                break;
+            }
+            for (const auto& item : result.Coverage)
+            {
+                std::wcout << L"[kmon.surfaces.coverage] " << item.first << L"=" << item.second << L"\n";
+            }
+            size_t printed = 0;
+            for (const auto& row : result.Rows)
+            {
+                if (row.Status == L"absent" && row.Baseline == L"match")
+                {
+                    continue;
+                }
+                if (printed++ >= 128)
+                {
+                    break;
+                }
+                std::wcout << L"[kmon.surface] " << row.Kind << L" index=" << row.Index
+                    << L" slot=" << HexText(row.Slot) << L" target=" << HexText(row.Target)
+                    << L" stable=" << row.Stable << L" executable=" << row.Executable << L" unowned=" << row.Unowned
+                    << L" baseline=" << row.Baseline << L" status=" << row.Status << L"\n";
+            }
+            std::wcout << L"[kmon.surfaces] rows=" << result.Rows.size() << L" next_module=" << result.NextModule
+                << L" next_handle=" << result.NextHandle << L" execution_observed=false; /json shows all rows\n";
+            break;
+        }
+
+        if (action == L"diff")
+        {
+            if (args.size() < 4 || args.size() > 5 || args[2].empty() || args[3].empty() ||
+                (args.size() == 5 && ToLower(args[4]) != L"/json"))
+            {
+                std::wcerr << L"!kmon diff: usage: !kmon diff <before.json> <after.json> [/json]\n";
+                break;
+            }
+            std::wstring before, after, error;
+            AnalystSnapshotDiff result;
+            if (!ReadAnalystSnapshot(args[2], &before, &error) || !ReadAnalystSnapshot(args[3], &after, &error) ||
+                !CompareAnalystSnapshots(before, after, &result, &error))
+            {
+                std::wcerr << L"!kmon diff: " << error << L"\n";
+                break;
+            }
+            if (args.size() == 5)
+            {
+                std::wcout << AnalystSnapshotDiffJson(result) << L"\n";
+                break;
+            }
+            for (size_t i = 0; i < result.Changes.size() && i < 64; ++i)
+            {
+                std::wcout << L"[kmon.diff] " << result.Changes[i].Kind << L" " << result.Changes[i].Identity << L"\n";
+            }
+            std::wcout << L"[kmon.diff.summary] new=" << result.Added << L" changed=" << result.Changed
+                << L" no_longer_observed=" << result.NoLongerObserved << L" unchanged=" << result.Unchanged
+                << L" boot=" << result.BootRelation << L" coverage_changed=" << result.CoverageChanged
+                << L" absence_is_resolution=false; /json shows all differences\n";
             break;
         }
 
@@ -25936,6 +24228,11 @@ static void HandleTimelineCommand(
         }
 
         std::wstring action = ToLower(args[1]);
+        if ((action == L"status" || action == L"clear" || action == L"reset") && args.size() != 2)
+        {
+            std::wcerr << L"!timeline: unexpected extra argument\n";
+            break;
+        }
         if (action == L"status")
         {
             TimelineStats stats = state.Timeline.GetStats();
@@ -27318,7 +25615,7 @@ static void PrintDumpLiveHelp()
     std::wcout << L"  /user <pid>        dump only that PID's visible resident pages (needs driver).\n";
     std::wcout << L"  /user <eprocess>   same, keyed by nt!_EPROCESS address.\n";
     std::wcout << L"  /compress          request compressed pages when the OS supports it.\n";
-    std::wcout << L"  /hv                include hypervisor pages when the OS supports it.\n";
+    std::wcout << L"  /hv                include hypervisor pages when the OS supports it (/hypervisor alias).\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  The unfiltered OS path needs elevation and SeDebugPrivilege. The file is\n";
@@ -27777,7 +26074,7 @@ static void PrintPoolHelp()
     std::wcout << L"  Requires SeDebugPrivilege; run elevated. The scanner attempts to enable it automatically.\n";
     std::wcout << L"  big/find list allocation VAs from PoolBigPageTable (page-sized+ only).\n";
     std::wcout << L"  tags uses SystemPoolTagInformation for small+big pool usage by tag (no VA).\n";
-    std::wcout << L"  /tags on big/find also attaches a top-tag summary without replacing the VA list.\n";
+    std::wcout << L"  /tags (or /with-tags) on big/find attaches a top-tag summary to the VA list.\n";
     std::wcout << L"  Use !pool find /tag <TAG> to scan\n";
     std::wcout << L"  for known suspicious tags; combine with /annotate to spot W+X allocations (executable NonPaged pool).\n";
     std::wcout << L"\n";
@@ -29309,6 +27606,7 @@ static void PrintVadHelp()
     std::wcout << L"  /wx        show writable executable VADs only\n";
     std::wcout << L"  /pe        probe private VAD first pages and show PE-like candidates only\n";
     std::wcout << L"  /hiddenpte walk process page tables and report present user PTE ranges not covered by any VAD\n";
+    std::wcout << L"             /hidden and /dkom are compatibility aliases.\n";
     std::wcout << L"  /limit n   cap printed/JSON records while still walking the tree\n";
     std::wcout << L"  /json path write stable JSON output\n";
     std::wcout << L"\n";
@@ -30161,6 +28459,12 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         {
             PrintAiHelpFromArgs(args, detailIndex);
         }
+        else if (command == L"??")
+        {
+            std::wcout << L"expression command:\n  ?? <expression>\n";
+            std::wcout << L"  Native mode accepts numbers, symbols, and + or - arithmetic.\n";
+            std::wcout << L"  A ready DbgEng backend can evaluate its supported expressions.\n";
+        }
         else if (command == L"backend")
         {
             PrintBackendHelp();
@@ -30385,7 +28689,12 @@ static bool PrintDetailedCommandHelp(const std::vector<std::wstring>& args, size
         }
         else if (command == L"!timeline")
         {
-            if (detailIndex < args.size() && ToLower(args[detailIndex]) == L"advanced")
+            if (detailIndex < args.size() &&
+                (ToLower(args[detailIndex]) == L"advanced" || ToLower(args[detailIndex]) == L"ingest" ||
+                    ToLower(args[detailIndex]) == L"update" || ToLower(args[detailIndex]) == L"live" ||
+                    ToLower(args[detailIndex]) == L"query" || ToLower(args[detailIndex]) == L"graph" ||
+                    ToLower(args[detailIndex]) == L"reconcile" || ToLower(args[detailIndex]) == L"export" ||
+                    ToLower(args[detailIndex]) == L"status" || ToLower(args[detailIndex]) == L"clear"))
             {
                 PrintTimelineAdvancedHelp();
             }
@@ -31225,7 +29534,7 @@ static int RunConsoleSurfaceSelfTest()
             L"help-timeline-root-completion");
         CheckCompletionCandidate(
             &context,
-            {L"!timeline", L"help", L""},
+            {L"!timeline", L"help"},
             L"advanced",
             L"timeline-help-advanced-completion");
 
@@ -31273,6 +29582,20 @@ static int RunConsoleSurfaceSelfTest()
             L"timeline-update-parser-rejects-unknown-option");
 
         uint64_t parsedNumber = 0;
+        for (const auto& invalid : std::vector<std::wstring>
+            {L" -1", L"0n-1", L"0n+1", L"`-1", L"1 ", std::wstring(L"10\0ff", 5)})
+        {
+            CheckConsoleSurfaceSelfTest(&context, !ParseUnsigned(invalid, 16, &parsedNumber),
+                L"unsigned-token-rejects-hidden-sign-space-or-nul");
+        }
+        for (const auto& info : CommandRegistry::Commands())
+        {
+            if (info.Support == CommandSupport::Native || info.Support == CommandSupport::Alias)
+            {
+                CheckConsoleSurfaceSelfTest(&context, IsNativeOwnedCommand(NormalizeInputCommand(info.Name)),
+                    std::wstring(L"registered-native-route-") + info.Name);
+            }
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             ParseUnsigned(L"010", 0, &parsedNumber) && parsedNumber == 10,
@@ -31459,18 +29782,18 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!minifilter"}, L"disable", L"minifilter-disable-completion");
         CheckCompletionCandidate(&context, {L"!minifilter"}, L"disable-all", L"minifilter-disable-all-completion");
         CheckCompletionCandidate(&context, {L"!minifilter"}, L"enable-all", L"minifilter-enable-all-completion");
-        CheckCompletionCandidate(&context, {L"!minifilter", L"disable"}, L"IRP_MJ_CREATE", L"minifilter-create-completion");
-        CheckCompletionCandidate(&context, {L"!minifilter", L"disable"}, L"all", L"minifilter-all-irp-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter", L"disable", L"fixture"}, L"IRP_MJ_CREATE", L"minifilter-create-completion");
+        CheckCompletionCandidate(&context, {L"!minifilter", L"disable", L"fixture"}, L"all", L"minifilter-all-irp-completion");
         CheckCompletionCandidate(&context, {L"!fltmgr"}, L"disable-all", L"fltmgr-disable-all-completion");
         CheckCompletionCandidate(&context, {L"help", L"!minifilter"}, L"disable-all", L"help-minifilter-disable-all-completion");
-        CheckCompletionCandidate(&context, {L"help", L"!minifilter", L"disable"}, L"all", L"help-minifilter-all-completion");
+        CheckCompletionCandidate(&context, {L"help", L"!minifilter", L"disable", L"fixture"}, L"all", L"help-minifilter-all-completion");
         CheckConsoleSurfaceSelfTest(
             &context,
             !CompletionCandidateExists({L"help", L"!minifilter"}, L"all") &&
                 !CompletionCandidateExists({L"help", L"!dml_proc"}, L"!pool") &&
                 CompletionCandidateExists({L"help", L"!dml_proc"}, L"help") &&
                 CompletionCandidateExists({L"help", L"!ti", L"by"}, L"pid") &&
-                CompletionCandidateExists({L"!ti", L"watch"}, L"/pid"),
+                !CompletionCandidateExists({L"!ti", L"watch"}, L"/pid"),
             L"help-prefix-reuses-native-completion-scopes");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -31524,7 +29847,7 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/suspicious", L"pool-pe-suspicious-completion");
         CheckCompletionCandidate(&context, {L"!pool", L"pe"}, L"/dump", L"pool-pe-dump-completion");
         CheckCompletionCandidate(&context, {}, L"!snapshot", L"snapshot-root-completion");
-        CheckCompletionCandidate(&context, {L"!snapshot"}, L"/memory", L"snapshot-memory-completion");
+        CheckCompletionCandidate(&context, {L"!snapshot", L"baseline"}, L"/memory", L"snapshot-memory-completion");
         CheckCompletionCandidate(&context, {L"!diff"}, L"/domain", L"diff-domain-option-completion");
         CheckCompletionCandidate(&context, {L"!diff", L"/domain"}, L"kpage", L"diff-domain-kpage-completion");
         CheckCompletionCandidate(&context, {L"!diff", L"/domain"}, L"pool", L"diff-domain-pool-completion");
@@ -31581,7 +29904,7 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(&context, {}, L"!kmon", L"kmon-root-completion");
         CheckCompletionCandidate(&context, {L"!kmon"}, L"start", L"kmon-start-completion");
         CheckCompletionCandidate(&context, {L"!kmon"}, L"iotrace", L"kmon-iotrace-completion");
-        CheckCompletionCandidate(&context, {L"!kmon", L"iotrace"}, L"on", L"kmon-iotrace-on-completion");
+        CheckCompletionCandidate(&context, {L"!kmon", L"iotrace", L"driver"}, L"on", L"kmon-iotrace-on-completion");
         CheckCompletionCandidate(&context, {L"!kmon", L"iotrace", L"drv"}, L"on", L"kmon-iotrace-driver-on-completion");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -32085,14 +30408,8 @@ static int RunConsoleSurfaceSelfTest()
             CompletionHint tiWatchPid = {};
             CheckConsoleSurfaceSelfTest(
                 &context,
-                FindCompletionTokenHint(
-                    L"!ti",
-                    {L"!ti", L"watch"},
-                    L"/pid",
-                    &tiWatchPid) &&
-                    tiWatchPid.Summary != nullptr &&
-                    std::wstring(tiWatchPid.Summary).find(L"PID") != std::wstring::npos,
-                L"completion-hints-ti-watch-pid-option");
+                !FindCompletionTokenHint(L"!ti", {L"!ti", L"watch"}, L"/pid", &tiWatchPid),
+                L"completion-hints-ti-watch-has-no-pid-option");
         }
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -32764,9 +31081,9 @@ static bool ParseDecimalIndex(const std::wstring& value, size_t* output)
             break;
         }
 
-        wchar_t* end = nullptr;
-        unsigned long parsed = wcstoul(value.c_str(), &end, 10);
-        if (end == nullptr || *end != L'\0' || parsed == 0)
+        uint64_t parsed = 0;
+        if (!commandinput::ParseDigits(value, 10, &parsed) || parsed == 0 ||
+            parsed > (std::numeric_limits<size_t>::max)())
         {
             break;
         }
@@ -33609,503 +31926,132 @@ static bool ExtractBalancedJsonObject(const std::wstring& text, std::wstring* js
 
 static bool ParseJsonStringAt(const std::wstring& text, size_t quote, std::wstring* value, size_t* next)
 {
-    bool ok = false;
-    std::wstring result;
-
-    do
+    size_t end = quote;
+    const bool ok = value != nullptr && mcpjson::ScanString(text, &end);
+    if (ok)
     {
-        if (value == nullptr || quote >= text.size() || text[quote] != L'\"')
+        *value = mcpjson::Unescape(text.substr(quote, end - quote));
+        if (next != nullptr)
         {
-            break;
+            *next = end;
         }
-
-        for (size_t index = quote + 1; index < text.size(); ++index)
-        {
-            wchar_t ch = text[index];
-            if (ch == L'\"')
-            {
-                *value = result;
-                if (next != nullptr)
-                {
-                    *next = index + 1;
-                }
-                ok = true;
-                break;
-            }
-
-            if (ch != L'\\' || index + 1 >= text.size())
-            {
-                result += ch;
-                continue;
-            }
-
-            wchar_t escaped = text[++index];
-            switch (escaped)
-            {
-            case L'\"':
-            case L'\\':
-            case L'/':
-                result += escaped;
-                break;
-            case L'b':
-                result += L'\b';
-                break;
-            case L'f':
-                result += L'\f';
-                break;
-            case L'n':
-                result += L'\n';
-                break;
-            case L'r':
-                result += L'\r';
-                break;
-            case L't':
-                result += L'\t';
-                break;
-            default:
-                result += escaped;
-                break;
-            }
-        }
-    } while (false);
-
+    }
     return ok;
 }
 
 static bool ExtractJsonStringValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = 0;
-
-    do
-    {
-        if (value == nullptr)
-        {
-            break;
-        }
-
-        while ((pos = json.find(pattern, pos)) != std::wstring::npos)
-        {
-            size_t colon = json.find(L':', pos + pattern.size());
-            if (colon == std::wstring::npos)
-            {
-                break;
-            }
-
-            size_t quote = colon + 1;
-            while (quote < json.size() && iswspace(json[quote]) != 0)
-            {
-                ++quote;
-            }
-
-            if (quote < json.size() && json[quote] == L'\"')
-            {
-                ok = ParseJsonStringAt(json, quote, value, nullptr);
-                break;
-            }
-
-            pos = colon + 1;
-        }
-    } while (false);
-
-    return ok;
+    return mcpjson::GetString(json, key, value);
 }
 
 static bool ExtractJsonBoolValue(const std::wstring& json, const std::wstring& key, bool* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) && (raw == L"true" || raw == L"false");
+    if (ok)
     {
-        if (value == nullptr || pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t item = colon + 1;
-        while (item < json.size() && iswspace(json[item]) != 0)
-        {
-            ++item;
-        }
-
-        if (json.compare(item, 4, L"true") == 0)
-        {
-            *value = true;
-            ok = true;
-        }
-        else if (json.compare(item, 5, L"false") == 0)
-        {
-            *value = false;
-            ok = true;
-        }
-    } while (false);
-
+        *value = raw == L"true";
+    }
     return ok;
 }
 
 static bool ExtractJsonScalarValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) &&
+        !raw.empty() && raw[0] != L'{' && raw[0] != L'[';
+    if (ok)
     {
-        if (value == nullptr)
-        {
-            break;
-        }
-
-        if (ExtractJsonStringValue(json, key, value))
-        {
-            ok = true;
-            break;
-        }
-
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t start = colon + 1;
-        while (start < json.size() && iswspace(json[start]) != 0)
-        {
-            ++start;
-        }
-
-        size_t end = start;
-        while (end < json.size() &&
-               json[end] != L',' &&
-               json[end] != L'}' &&
-               json[end] != L']' &&
-               iswspace(json[end]) == 0)
-        {
-            ++end;
-        }
-
-        if (end > start)
-        {
-            *value = TrimWhitespace(json.substr(start, end - start));
-            ok = !value->empty();
-        }
-    } while (false);
-
+        *value = raw[0] == L'"' ? mcpjson::Unescape(raw) : raw;
+    }
     return ok;
+}
+
+static std::vector<std::wstring> ExtractJsonArrayElements(
+    const std::wstring& json, const std::wstring& key, wchar_t expected)
+{
+    std::vector<std::wstring> values;
+    std::wstring raw;
+    if (mcpjson::FindRawValue(json, key, &raw) && !raw.empty() && raw[0] == L'[')
+    {
+        size_t pos = 1;
+        mcpjson::SkipWhitespace(raw, &pos);
+        while (pos < raw.size() && raw[pos] != L']')
+        {
+            size_t end = pos;
+            if (raw[pos] != expected || !mcpjson::ScanValue(raw, pos, &end))
+            {
+                values.clear();
+                break;
+            }
+            const std::wstring item = raw.substr(pos, end - pos);
+            values.push_back(expected == L'"' ? mcpjson::Unescape(item) : item);
+            pos = end;
+            mcpjson::SkipWhitespace(raw, &pos);
+            if (pos < raw.size() && raw[pos] == L',')
+            {
+                ++pos;
+                mcpjson::SkipWhitespace(raw, &pos);
+            }
+        }
+    }
+    return values;
 }
 
 static std::vector<std::wstring> ExtractJsonArrayObjects(const std::wstring& json, const std::wstring& key)
 {
-    std::vector<std::wstring> objects;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
-    {
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t bracket = json.find(L'[', pos + pattern.size());
-        if (bracket == std::wstring::npos)
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int objectDepth = 0;
-        size_t objectStart = std::wstring::npos;
-        for (size_t index = bracket + 1; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'\"')
-            {
-                inString = true;
-            }
-            else if (ch == L'{')
-            {
-                if (objectDepth == 0)
-                {
-                    objectStart = index;
-                }
-                ++objectDepth;
-            }
-            else if (ch == L'}')
-            {
-                --objectDepth;
-                if (objectDepth == 0 && objectStart != std::wstring::npos)
-                {
-                    objects.push_back(json.substr(objectStart, index - objectStart + 1));
-                    objectStart = std::wstring::npos;
-                }
-            }
-            else if (ch == L']' && objectDepth == 0)
-            {
-                break;
-            }
-        }
-    } while (false);
-
-    return objects;
+    return ExtractJsonArrayElements(json, key, L'{');
 }
 
 static bool ExtractJsonObjectValue(const std::wstring& json, const std::wstring& key, std::wstring* value)
 {
-    bool ok = false;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
+    std::wstring raw;
+    const bool ok = value != nullptr && mcpjson::FindRawValue(json, key, &raw) && !raw.empty() && raw[0] == L'{';
+    if (ok)
     {
-        if (value == nullptr || pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t colon = json.find(L':', pos + pattern.size());
-        if (colon == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t start = colon + 1;
-        while (start < json.size() && iswspace(json[start]) != 0)
-        {
-            ++start;
-        }
-
-        if (start >= json.size() || json[start] != L'{')
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int depth = 0;
-        for (size_t index = start; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'\"')
-            {
-                inString = true;
-            }
-            else if (ch == L'{')
-            {
-                ++depth;
-            }
-            else if (ch == L'}')
-            {
-                --depth;
-                if (depth == 0)
-                {
-                    *value = json.substr(start, index - start + 1);
-                    ok = true;
-                    break;
-                }
-            }
-        }
-    } while (false);
-
+        *value = raw;
+    }
     return ok;
 }
 
 static std::vector<std::wstring> ExtractJsonStringArrayValues(const std::wstring& json, const std::wstring& key)
 {
-    std::vector<std::wstring> values;
-    std::wstring pattern = L"\"" + key + L"\"";
-    size_t pos = json.find(pattern);
-
-    do
-    {
-        if (pos == std::wstring::npos)
-        {
-            break;
-        }
-
-        size_t bracket = json.find(L'[', pos + pattern.size());
-        if (bracket == std::wstring::npos)
-        {
-            break;
-        }
-
-        bool inString = false;
-        bool escaped = false;
-        int arrayDepth = 0;
-        for (size_t index = bracket; index < json.size(); ++index)
-        {
-            wchar_t ch = json[index];
-            if (inString)
-            {
-                if (escaped)
-                {
-                    escaped = false;
-                }
-                else if (ch == L'\\')
-                {
-                    escaped = true;
-                }
-                else if (ch == L'\"')
-                {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch == L'[')
-            {
-                ++arrayDepth;
-                continue;
-            }
-
-            if (ch == L']')
-            {
-                --arrayDepth;
-                if (arrayDepth == 0)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            if (arrayDepth == 1 && ch == L'\"')
-            {
-                std::wstring value;
-                size_t next = index + 1;
-                if (ParseJsonStringAt(json, index, &value, &next))
-                {
-                    values.push_back(value);
-                    index = next - 1;
-                }
-            }
-        }
-    } while (false);
-
-    return values;
+    return ExtractJsonArrayElements(json, key, L'"');
 }
 
 static std::vector<std::wstring> ExtractJsonObjectKeys(const std::wstring& json)
 {
     std::vector<std::wstring> keys;
-    int objectDepth = 0;
-    bool inString = false;
-    bool escaped = false;
-
-    for (size_t index = 0; index < json.size(); ++index)
+    size_t pos = 0;
+    mcpjson::SkipWhitespace(json, &pos);
+    if (pos < json.size() && json[pos] == L'{' && mcpjson::ValidateDocument(json))
     {
-        wchar_t ch = json[index];
-        if (inString)
+        ++pos;
+        mcpjson::SkipWhitespace(json, &pos);
+        while (pos < json.size() && json[pos] != L'}')
         {
-            if (escaped)
+            std::wstring key;
+            if (!ParseJsonStringAt(json, pos, &key, &pos))
             {
-                escaped = false;
-            }
-            else if (ch == L'\\')
-            {
-                escaped = true;
-            }
-            else if (ch == L'\"')
-            {
-                inString = false;
-            }
-            continue;
-        }
-
-        if (ch == L'\"')
-        {
-            if (objectDepth == 1)
-            {
-                std::wstring key;
-                size_t next = index + 1;
-                if (!ParseJsonStringAt(json, index, &key, &next))
-                {
-                    break;
-                }
-
-                size_t probe = next;
-                while (probe < json.size() && iswspace(json[probe]) != 0)
-                {
-                    ++probe;
-                }
-
-                if (probe < json.size() && json[probe] == L':')
-                {
-                    keys.push_back(ToLower(key));
-                }
-
-                index = next - 1;
-                continue;
-            }
-
-            inString = true;
-            continue;
-        }
-
-        if (ch == L'{')
-        {
-            ++objectDepth;
-            continue;
-        }
-        if (ch == L'}')
-        {
-            --objectDepth;
-            if (objectDepth < 0)
-            {
+                keys.clear();
                 break;
             }
-            continue;
+            keys.push_back(key);
+            mcpjson::SkipWhitespace(json, &pos);
+            ++pos;
+            if (!mcpjson::ScanValue(json, pos, &pos))
+            {
+                keys.clear();
+                break;
+            }
+            mcpjson::SkipWhitespace(json, &pos);
+            if (pos < json.size() && json[pos] == L',')
+            {
+                ++pos;
+                mcpjson::SkipWhitespace(json, &pos);
+            }
         }
     }
-
     return keys;
 }
 
@@ -34131,6 +32077,16 @@ static bool ValidateJsonObjectKeys(
     const std::wstring& context,
     std::wstring* error)
 {
+    size_t objectStart = 0;
+    mcpjson::SkipWhitespace(json, &objectStart);
+    if (objectStart >= json.size() || json[objectStart] != L'{' || !mcpjson::ValidateDocument(json))
+    {
+        if (error != nullptr)
+        {
+            *error = context + L" must be a complete JSON object with unique keys";
+        }
+        return false;
+    }
     bool ok = true;
     std::vector<std::wstring> keys = ExtractJsonObjectKeys(json);
 
@@ -34362,6 +32318,22 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
                 {
                     writeLike = true;
                     break;
+                }
+            }
+            break;
+        }
+
+        if (command == L"!kmon" && args.size() >= 2)
+        {
+            const auto action = ToLower(args[1]);
+            if (action == L"cases" || action == L"surfaces" || action == L"layouts")
+            {
+                for (size_t i = 2; i < args.size(); ++i)
+                {
+                    if (ToLower(args[i]) == L"/save")
+                    {
+                        writeLike = true;
+                    }
                 }
             }
             break;
@@ -37414,6 +35386,13 @@ static bool ResolveWriteTargetForRestore(
         *addressContext = ProcessAddressContext{};
         *hasAddressContext = false;
 
+        // Native restore reads cannot succeed without an open device.
+        // Reject before symbol resolution can contact a symbol server.
+        if (!device.IsOpen())
+        {
+            break;
+        }
+
         std::wstring command = NormalizeInputCommand(commandArgs[0]);
         std::wstring error;
         if (IsEnterCommand(command))
@@ -38700,6 +36679,14 @@ static void HandleAiPlannedWrite(
 {
     do
     {
+        if (args.size() > 4 ||
+            (args.size() >= 3 && ToLower(args[2]) == L"confirm" && args.size() != 3) ||
+            (args.size() == 4 && ToLower(args[3]) != L"confirm"))
+        {
+            std::wcerr << L"usage: ai write [index] [confirm]\n";
+            break;
+        }
+
         if (aiState.Commands.empty())
         {
             std::wcerr << L"no AI command plan is loaded. run ai plan <prompt> or a disable/enable goal first\n";
@@ -38816,6 +36803,13 @@ static void HandleAiPlannedWrite(
             symbols,
             ai,
             aiState);
+
+        if (!beforeResult.Error.empty())
+        {
+            std::wcerr << L"ai write aborted: prewrite backup failed\n";
+            WriteAiTranscriptEvent(aiState, L"ai_write_blocked", L"prewrite backup failed", item.Command);
+            break;
+        }
 
         std::vector<std::wstring> commandArgs = Split(item.Command);
         ExecuteCommandWithTranscript(
@@ -45000,7 +42994,12 @@ static bool ExtractAiCapabilityBooleanArg(
         std::wstring scalar;
         if (!ExtractJsonScalarValue(argsJson, key, &scalar))
         {
-            ok = true;
+            std::wstring raw;
+            ok = !mcpjson::FindRawValue(argsJson, key, &raw);
+            if (!ok && error != nullptr)
+            {
+                *error = L"invalid boolean argument " + key;
+            }
             break;
         }
 
@@ -50785,6 +48784,56 @@ static bool HandleCommand(
         std::wstring command = NormalizeInputCommand(args[0]);
         std::wstring error;
 
+        bool complete = true;
+        Split(originalLine, &complete);
+        if (originalLine.find(L'\0') != std::wstring::npos ||
+            (IsNativeOwnedCommand(command) && command != L"kd" && !complete))
+        {
+            std::wcerr << L"invalid command: embedded NUL or unterminated quote\n";
+            break;
+        }
+
+        struct ArgumentRange
+        {
+            const wchar_t* Command;
+            size_t Minimum;
+            size_t Maximum;
+        };
+        static const ArgumentRange ranges[] =
+        {
+            { L"q", 1, 1 }, { L"qq", 1, 1 }, { L"qd", 1, 1 },
+            { L"quit", 1, 1 }, { L"exit", 1, 1 }, { L"unload", 1, 1 },
+            { L"kddetach", 1, 1 }, { L"cls", 1, 1 },
+            { L"backend", 1, 2 }, { L"procctx", 1, 2 },
+            { L"n", 1, 2 }, { L"sq", 1, 2 }, { L"write", 2, 2 },
+            { L"setfield", 5, 5 }, { L"c", 4, 4 },
+            { L"query", 2, 3 }, { L"ln", 2, 2 }, { L"addr", 2, 2 },
+            { L"x", 2, 2 }, { L"lm", 1, 2 }, { L"modules", 1, 2 }, { L"!ci", 1, 2 }
+        };
+        const CommandInfo* helpInfo = CommandRegistry::Find(args[0]);
+        const bool suffixHelp = args.size() >= 3 && IsHelpToken(args.back()) && helpInfo != nullptr &&
+            (command[0] == L'!' || command.rfind(L"dump-", 0) == 0 || command == L"probe" ||
+                command == L"mcp" || command == L"remote" || command == L"backend" || command == L"kdinit" ||
+                command == L"log" || command == L"write" || command == L"procctx" || command == L"set-ppl-antimalware");
+        const bool helpRequest = (args.size() >= 2 && IsHelpToken(args[1])) || suffixHelp;
+        bool validArity = true;
+        if (!helpRequest)
+        {
+            for (const auto& range : ranges)
+            {
+                if (command == range.Command && (args.size() < range.Minimum || args.size() > range.Maximum))
+                {
+                    std::wcerr << L"invalid argument count for " << command << L"; use help " << command << L"\n";
+                    validArity = false;
+                    break;
+                }
+            }
+        }
+        if (!validArity)
+        {
+            break;
+        }
+
         if (command == L"help")
         {
             if (args.size() >= 2 && ToLower(args[1]) == L"all")
@@ -50812,7 +48861,7 @@ static bool HandleCommand(
                 PrintHelp(false);
             }
         }
-        else if (args.size() >= 2 && IsHelpToken(args[1]))
+        else if (helpRequest)
         {
             if (!PrintDetailedCommandHelp(args, 0))
             {
@@ -50866,7 +48915,8 @@ static bool HandleCommand(
         }
         else if (command == L"kdinit")
         {
-            state.DbgEngRemoteKernel = false;
+            bool remoteKernel = false;
+            std::wstring connectOptions;
             if (args.size() >= 2 && ToLower(args[1]) == L"/remote")
             {
                 if (args.size() < 3)
@@ -50875,22 +48925,20 @@ static bool HandleCommand(
                     break;
                 }
 
-                state.DbgEngRemoteKernel = true;
-                state.DbgEngConnectOptions = JoinArgs(args, 2);
+                remoteKernel = true;
+                connectOptions = JoinArgs(args, 2);
             }
             else if (args.size() >= 2 && ToLower(args[1]) == L"/local")
             {
-                state.DbgEngConnectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
+                connectOptions = args.size() >= 3 ? JoinArgs(args, 2) : L"";
             }
             else if (args.size() >= 2)
             {
                 std::wcerr << L"usage: kdinit [/local [connect-options]|/remote <connect-options>]\n";
                 break;
             }
-            else
-            {
-                state.DbgEngConnectOptions.clear();
-            }
+            state.DbgEngRemoteKernel = remoteKernel;
+            state.DbgEngConnectOptions = connectOptions;
 
             if (dbgeng.IsReady())
             {
@@ -50930,7 +48978,7 @@ static bool HandleCommand(
                 break;
             }
 
-            ExecuteDbgEngCommand(dbgeng, symbols, state, JoinArgs(args, 1), true);
+            ExecuteDbgEngCommand(dbgeng, symbols, state, commandinput::RawCommandTail(originalLine), true);
         }
         else if (command == L"u" || command == L"uf")
         {
@@ -50967,7 +49015,7 @@ static bool HandleCommand(
         else if ((command == L"?" || command == L"??") && args.size() >= 2)
         {
             uint64_t value = 0;
-            if (ParseAddressOrSymbol(symbols, state, args[1], &value, &error))
+            if (ParseAddressOrSymbol(symbols, state, JoinArgs(args, 1), &value, &error))
             {
                 PrintColoredText(L"Evaluate expression", KNDBG_COLOR_TITLE);
                 std::wcout << L": " << HexText(value) << L" = " << std::dec << value << L"\n";
@@ -51617,10 +49665,14 @@ static bool HandleCommand(
         }
         else if (command == L"|")
         {
-            std::wcout << L"0 id: current process context is not pinned by native backend\n";
+            HandleProcessContextCommand({ L"procctx", L"status" }, state, device, symbols);
         }
         else if (command == L"unload")
         {
+            if (!StopCollectorsBeforeDriverRelease())
+            {
+                break;
+            }
             DriverUnloadResult unloadResult = {};
             PrintLifecycleHeader(L"Main driver unload", L"device: " KNDBG_USER_DEVICE_NAME);
             PrintLifecycleStep(L"close device handle", L"release controller session");
@@ -51638,7 +49690,7 @@ static bool HandleCommand(
         }
         else if (command == L"q" || command == L"qq" || command == L"qd" || command == L"quit" || command == L"exit")
         {
-            keepRunning = false;
+            keepRunning = !StopCollectorsBeforeDriverRelease();
         }
         else if (command.size() > 0 && command[0] == L'!')
         {
@@ -51858,37 +49910,37 @@ static bool McpValidateToken(const std::wstring& value, std::wstring* error)
     return ok;
 }
 
-// Validates a hex byte list ("90 90 90" or "0x90 0x90"). Spaces separate bytes.
-static bool McpValidateByteList(const std::wstring& value, std::wstring* error)
+// Canonicalize the protocol's hex values independently of the console radix.
+static bool McpNormalizeByteList(std::wstring* value, std::wstring* error)
 {
-    bool ok = false;
-    do
+    bool ok = value != nullptr;
+    std::wstring normalized;
+    bool complete = true;
+    const std::vector<std::wstring> tokens = value != nullptr ? Split(*value, &complete) : std::vector<std::wstring>{};
+    ok = ok && complete && !tokens.empty();
+    for (const auto& token : tokens)
     {
-        if (value.empty())
+        uint64_t parsed = 0;
+        const std::wstring digits = token.rfind(L"0x", 0) == 0 || token.rfind(L"0X", 0) == 0 ? token.substr(2) : token;
+        if (!commandinput::ParseDigits(digits, 16, &parsed))
         {
-            *error = L"empty bytes";
+            ok = false;
             break;
         }
-
-        bool valid = true;
-        for (wchar_t ch : value)
+        if (!normalized.empty())
         {
-            bool isHex = (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F');
-            if (!isHex && ch != L' ' && ch != L'x' && ch != L'X')
-            {
-                valid = false;
-                break;
-            }
+            normalized += L" ";
         }
-        if (!valid)
-        {
-            *error = L"bytes must be space-separated hex values";
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
+        normalized += HexText(parsed);
+    }
+    if (ok)
+    {
+        *value = normalized;
+    }
+    else if (error != nullptr)
+    {
+        *error = L"bytes must be a nonempty list of hexadecimal values";
+    }
     return ok;
 }
 
@@ -51945,6 +49997,15 @@ static McpEngineResult DispatchMcpWriteTool(
 
     do
     {
+        McpToolCatalogEntry catalogEntry;
+        if (!FindMcpToolCatalogEntry(tool, &catalogEntry) || catalogEntry.ReadOnly ||
+            !ValidateMcpToolArguments(tool, argsJson, &argError))
+        {
+            result.IsError = true;
+            result.Text = L"invalid write tool arguments: " + argError;
+            break;
+        }
+
         if (tool == L"memory.write_virtual")
         {
             std::wstring address;
@@ -51959,13 +50020,19 @@ static McpEngineResult DispatchMcpWriteTool(
             }
             McpGetArg(argsJson, L"width", &width);
             McpGetArg(argsJson, L"process", &process);
-            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            if (!McpValidateToken(address, &argError) || !McpNormalizeByteList(&bytes, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
                 break;
             }
 
+            if (!width.empty() && width != L"1" && width != L"2" && width != L"4" && width != L"8")
+            {
+                result.IsError = true;
+                result.Text = L"memory.write_virtual width must be 1, 2, 4, or 8";
+                break;
+            }
             std::wstring enter = L"eb";
             if (width == L"2")
             {
@@ -52003,7 +50070,7 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.Text = L"memory.write_physical requires 'physical_address' and 'bytes'";
                 break;
             }
-            if (!McpValidateToken(address, &argError) || !McpValidateByteList(bytes, &argError))
+            if (!McpValidateToken(address, &argError) || !McpNormalizeByteList(&bytes, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
@@ -52022,7 +50089,7 @@ static McpEngineResult DispatchMcpWriteTool(
                 result.Text = L"memory.fill requires 'address', 'length', 'pattern'";
                 break;
             }
-            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpValidateByteList(pattern, &argError))
+            if (!McpValidateToken(address, &argError) || !McpValidateToken(length, &argError) || !McpNormalizeByteList(&pattern, &argError))
             {
                 result.IsError = true;
                 result.Text = L"invalid argument: " + argError;
@@ -52393,6 +50460,12 @@ static McpEngineResult DispatchMcpWriteTool(
                 Split(safety.BackupCommand), safety.BackupCommand, L"mcp",
                 state, dbgeng, device, service, symbols, ai, aiState);
             text += L"[backup] " + safety.BackupCommand + L"\n" + before.Output;
+            if (!before.Error.empty())
+            {
+                result.IsError = true;
+                result.Text = text + before.Error + L"\nwrite cancelled because the backup failed";
+                break;
+            }
         }
 
         CommandExecutionResult wrote = ExecuteCommandWithTranscript(
@@ -52411,6 +50484,11 @@ static McpEngineResult DispatchMcpWriteTool(
                 Split(safety.VerifyCommand), safety.VerifyCommand, L"mcp",
                 state, dbgeng, device, service, symbols, ai, aiState);
             text += L"[verify] " + safety.VerifyCommand + L"\n" + after.Output;
+            if (!after.Error.empty())
+            {
+                text += after.Error;
+                result.IsError = true;
+            }
         }
 
         if (!safety.Warning.empty())
@@ -52645,6 +50723,13 @@ static McpEngineResult DispatchMcpRequest(
     // Tool call. Write-ness is decided by the kTools table (single source of
     // truth) via the server, not a parallel hardcoded list.
     const std::wstring& tool = request.Name;
+    std::wstring argumentError;
+    if (!ValidateMcpToolArguments(tool, request.ArgumentsJson.empty() ? L"{}" : request.ArgumentsJson, &argumentError))
+    {
+        result.IsError = true;
+        result.Text = argumentError;
+        return result;
+    }
     if (g_McpServer.IsWriteTool(tool))
     {
         if (!g_McpServer.AllowWrite())
@@ -52684,21 +50769,26 @@ static McpEngineResult DispatchMcpRequest(
             return result;
         }
 
-        std::wstring funcText;
         bool isFunction = false;
-        if (ExtractAiCapabilityScalarAlias(argsJson, {L"function"}, &funcText))
+        if (!ExtractAiCapabilityBooleanArg(argsJson, L"function", &isFunction, &argErr))
         {
-            std::wstring lowered = ToLower(funcText);
-            isFunction = (lowered == L"true" || lowered == L"1" || lowered == L"yes");
+            result.IsError = true;
+            result.Text = argErr;
+            return result;
         }
 
         std::vector<std::wstring> dargs;
         dargs.push_back(isFunction ? L"uf" : L"u");
         dargs.push_back(address);
         std::wstring countText;
-        if (ExtractAiCapabilityScalarAlias(argsJson, {L"count"}, &countText) &&
-            ValidateAiCapabilityScalarText(countText, L"count", &argErr))
+        if (ExtractAiCapabilityScalarAlias(argsJson, {L"count"}, &countText))
         {
+            if (!ValidateAiCapabilityScalarText(countText, L"count", &argErr))
+            {
+                result.IsError = true;
+                result.Text = argErr;
+                return result;
+            }
             dargs.push_back(countText);
         }
 
@@ -53731,6 +51821,14 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
 {
     std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
 
+    const bool setup = sub == L"client-setup" || sub == L"setup" || sub == L"connect";
+    if ((sub != L"help" && sub != L"?" && sub != L"client-setup" && sub != L"setup" && sub != L"connect" && sub != L"endpoint" && sub != L"on" && sub != L"start" && sub != L"off" && sub != L"stop" && sub != L"status") ||
+        (sub != L"on" && sub != L"start" && args.size() > (setup ? 3u : 2u)))
+    {
+        std::wcerr << L"invalid mcp subcommand or argument count\n";
+        return;
+    }
+
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
@@ -53819,45 +51917,22 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             return;
         }
 
-        McpServerConfig config;
-        for (size_t i = 2; i < args.size(); ++i)
+        if (g_RemoteServer.IsRunning())
         {
-            if (args[i] == L"--allow-write" || args[i] == L"allow-write")
-            {
-                config.AllowWrite = true;
-            }
-            else if (args[i] == L"--loopback")
-            {
-                config.BindAddress = L"loopback";
-            }
-            else if (args[i] == L"--bind")
-            {
-                if (i + 1 < args.size())
-                {
-                    config.BindAddress = args[i + 1];
-                    ++i;
-                }
-            }
-            else if (args[i].rfind(L"--bind=", 0) == 0)
-            {
-                config.BindAddress = args[i].substr(7);
-            }
-            else if (args[i] == L"--token" || args[i] == L"--new-token" ||
-                     args[i].rfind(L"--token=", 0) == 0)
-            {
-                std::wcerr << L"mcp on no longer uses persisted tokens. "
-                           << L"Set a session password at the prompt.\n";
-                return;
-            }
-            else
-            {
-                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
-                if (parsed > 0 && parsed < 65536)
-                {
-                    config.Port = static_cast<uint16_t>(parsed);
-                }
-            }
+            std::wcerr << L"mcp on failed: remote server is running (listen XOR)\n";
+            return;
         }
+        McpServerConfig config;
+        commandinput::ListenerOptions options;
+        std::wstring optionError;
+        if (!commandinput::ParseListenerOptions(args, 2, false, config.Port, &options, &optionError))
+        {
+            std::wcerr << L"mcp start failed: " << optionError << L"\n";
+            return;
+        }
+        config.Port = options.Port;
+        config.BindAddress = options.BindAddress;
+        config.AllowWrite = options.AllowWrite;
 
         config.BindAddress = NormalizeMcpBindAddress(config.BindAddress);
         if (!IsMcpWildcardBind(config.BindAddress) &&
@@ -54273,7 +52348,11 @@ static void RunRemoteEngineLoop(
                     dispatchResult.Stdout = executed.Output;
                     dispatchResult.Stderr = executed.Error;
                     dispatchResult.KeepRunning = executed.KeepRunning;
-                    dispatchResult.IsError = false;
+                    dispatchResult.IsError = !executed.Error.empty();
+                    if (dispatchResult.IsError)
+                    {
+                        dispatchResult.Code = L"command-failed";
+                    }
                 }
             }
 
@@ -54317,6 +52396,13 @@ static void HandleRemoteCommand(
 {
     std::wstring sub = args.size() >= 2 ? ToLower(args[1]) : L"status";
 
+    if ((sub != L"help" && sub != L"?" && sub != L"off" && sub != L"stop" && sub != L"disconnect" && sub != L"on" && sub != L"start" && sub != L"status") ||
+        (sub != L"on" && sub != L"start" && args.size() > 2))
+    {
+        std::wcerr << L"invalid remote subcommand or argument count\n";
+        return;
+    }
+
     if (sub == L"help" || sub == L"?")
     {
         PrintSessionHelp(L"remote");
@@ -54356,31 +52442,16 @@ static void HandleRemoteCommand(
         }
 
         RemoteServerConfig config;
-        config.Port = knremote::kDefaultPort;
-        config.BindAddress = L"0.0.0.0";
-        for (size_t i = 2; i < args.size(); ++i)
+        commandinput::ListenerOptions options;
+        std::wstring optionError;
+        if (!commandinput::ParseListenerOptions(args, 2, true, knremote::kDefaultPort, &options, &optionError))
         {
-            if (args[i] == L"--loopback")
-            {
-                config.BindAddress = L"127.0.0.1";
-            }
-            else if (args[i] == L"--bind" && i + 1 < args.size())
-            {
-                config.BindAddress = args[++i];
-            }
-            else if (args[i] == L"--peer" && i + 1 < args.size())
-            {
-                config.Peer = args[++i];
-            }
-            else
-            {
-                unsigned long parsed = wcstoul(args[i].c_str(), nullptr, 10);
-                if (parsed > 0 && parsed < 65536)
-                {
-                    config.Port = static_cast<uint16_t>(parsed);
-                }
-            }
+            std::wcerr << L"remote on failed: " << optionError << L"\n";
+            return;
         }
+        config.Port = options.Port;
+        config.BindAddress = options.BindAddress;
+        config.Peer = options.Peer;
 
         if (config.Port == knremote::kMcpPort)
         {
@@ -54389,6 +52460,15 @@ static void HandleRemoteCommand(
         }
 
         config.BindAddress = knremote::NormalizeBindAddress(config.BindAddress);
+        in_addr bindAddress = {};
+        in_addr peerAddress = {};
+        if (!knremote::ParseIpv4(config.BindAddress, &bindAddress) ||
+            (!config.Peer.empty() && !knremote::ParseIpv4(config.Peer, &peerAddress)))
+        {
+            std::wcerr << L"remote on failed: --bind and --peer require IPv4 addresses\n";
+            return;
+        }
+
         config.AuditPath = GetExecutableDirectory() + L"\\.kn-live-dbg\\remote-audit-" +
                            std::to_wstring(config.Port) + L".jsonl";
         config.AddFirewall = !knremote::IsLoopbackBind(config.BindAddress);
@@ -54469,6 +52549,8 @@ static void HandleRemoteCommand(
     }
 }
 
+#include "CommandAuditSelfTest.inl"
+
 int wmain(int argc, wchar_t** argv)
 {
     // Last-resort crash diagnostics for faults that escape every guard
@@ -54509,6 +52591,28 @@ int wmain(int argc, wchar_t** argv)
     knremote::EnableVirtualTerminalConsoles();
     CommandRegistry::SetColorPrinter(PrintCommandRegistryColoredText);
 
+    if (argc >= 2 && (ToLower(argv[1]) == L"--help" || ToLower(argv[1]) == L"-h" || IsHelpToken(argv[1])))
+    {
+        std::wcout << L"KnLiveDbg.exe command-line usage:\n";
+        std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
+        std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
+        std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
+        std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
+        std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";
+        std::wcout << L"  KnLiveDbg.exe --game-manifest verify <manifest> <image>\n";
+        std::wcout << L"  KnLiveDbg.exe --game-manifest self-test\n";
+        std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
+        std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
+        std::wcout << L"            connect-argv, all, cloudfiles-query <path>, minifilter-attachments-query\n";
+        std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
+        PrintHelp(argc >= 3 && ToLower(argv[2]) == L"all");
+        return 0;
+    }
+
+    if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
+    {
+        return RunGameManifestCommand(argc, argv);
+    }
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
     {
         if (argc >= 3 && ToLower(argv[2]) == L"timeline")
@@ -54518,6 +52622,10 @@ int wmain(int argc, wchar_t** argv)
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
         {
             return RunMcpToolCatalogSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
+        {
+            return RunMcpTransportSelfTest();
         }
         if (argc >= 3 && ToLower(argv[2]) == L"remote-protocol")
         {
@@ -54564,6 +52672,10 @@ int wmain(int argc, wchar_t** argv)
             std::wcout << L"],\"error\":\"" << mcpjson::Escape(error) << L"\"}\n";
             return collected ? 0 : 1;
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"commands")
+        {
+            return RunCommandAuditSelfTest();
+        }
         if (argc >= 4 &&
             ToLower(argv[2]) ==
                 L"cloudfiles-query")
@@ -54583,13 +52695,14 @@ int wmain(int argc, wchar_t** argv)
             int timelineExit = RunTimelineSelfTest();
             int mcpExit = RunMcpToolCatalogSelfTest();
             int consoleExit = RunConsoleSurfaceSelfTest();
+            int commandExit = RunCommandAuditSelfTest();
             int remoteExit = RunRemoteProtocolSelfTest();
             int connectExit = RunRemoteConnectArgvSelfTest();
-            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0 &&
+            return (timelineExit == 0 && mcpExit == 0 && consoleExit == 0 && commandExit == 0 &&
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|console|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
         return 2;
     }
 
@@ -54600,7 +52713,7 @@ int wmain(int argc, wchar_t** argv)
 
     if (HasUnknownControllerArgv(argc, argv))
     {
-        std::wcerr << L"unknown argument. controller accepts --cloak* only.\n";
+        std::wcerr << L"unknown argument. use KnLiveDbg.exe --help for supported modes.\n";
         return 2;
     }
 
@@ -54671,7 +52784,9 @@ int wmain(int argc, wchar_t** argv)
     DriverService service(
         state.CloakActive ? state.Cloak.ServiceName.c_str() : KNDBG_SERVICE_NAME,
         state.CloakActive ? state.Cloak.DisplayName.c_str() : KNDBG_DISPLAY_NAME);
-    DeviceClient device;
+    // Kmon may retain the device after a failed disarm and retry in its destructor.
+    // Construct the device first so it outlives that function-local singleton.
+    static DeviceClient device;
     SymbolEngine symbols;
     DbgEngBackend dbgeng;
     AiProviderRuntime ai;
@@ -54917,34 +53032,18 @@ int wmain(int argc, wchar_t** argv)
 
     StopMcpServer();
     g_RemoteServer.Stop();
-    StopTimelineAutoDrainWorker();
+    const bool collectorsStopped = StopCollectorsBeforeDriverRelease(true);
     dbgeng.Shutdown();
-    bool cleanupOk = true;
-    // Collectors borrow the device and must stop before its handle is closed.
-    {
-        std::wstring stopError;
-        if (!GetKmonInstance().Stop(&stopError, true))
-        {
-            std::wcerr << L"kmon shutdown cleanup failed: " << stopError << L"\n";
-            cleanupOk = false;
-        }
-        g_KmonForShutdown.store(nullptr);
-        if (!GetTiSubscriberInstance().Stop(&stopError))
-        {
-            std::wcerr << L"TI shutdown cleanup failed: " << stopError << L"\n";
-            cleanupOk = false;
-        }
-        g_TiSubscriberForShutdown.store(nullptr);
-    }
-    if (!CleanupByovdFixtureDriverOnExit(state))
+    bool cleanupOk = collectorsStopped;
+    if (collectorsStopped && !CleanupByovdFixtureDriverOnExit(state))
     {
         cleanupOk = false;
     }
-    if (!CleanupProbeDriverOnExit(state))
+    if (collectorsStopped && !CleanupProbeDriverOnExit(state))
     {
         cleanupOk = false;
     }
-    if (!CleanupMainDriverOnExit(state, device, service))
+    if (collectorsStopped && !CleanupMainDriverOnExit(state, device, service))
     {
         cleanupOk = false;
     }
@@ -54965,10 +53064,6 @@ int wmain(int argc, wchar_t** argv)
     // write), then print where this session's evidence landed before the
     // console goes away. Idempotent Stops cover the never-started case.
     {
-        std::wstring stopError;
-        GetKmonInstance().Stop(&stopError);
-        GetTiSubscriberInstance().Stop(&stopError);
-
         struct SessionArtifactGroup
         {
             const wchar_t* Label;

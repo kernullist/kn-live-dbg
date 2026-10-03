@@ -128,6 +128,19 @@
     <ClCompile Include="DmaPostureScanner.cpp" />
     <ClCompile Include="InputStackScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
+    <ClCompile Include="ExecutableImage.cpp" />
+    <ClCompile Include="ExecutableImageVerifier.cpp" />
+    <ClCompile Include="CodeTargetResolver.cpp" />
+    <ClCompile Include="KernelMonitorVerification.cpp" />
+    <ClCompile Include="KernelMonitorCatalog.cpp" />
+    <ClCompile Include="KernelMonitorHunting.cpp" />
+    <ClCompile Include="KernelMonitorPipeline.cpp" />
+    <ClCompile Include="KernelMonitorLayout.cpp" />
+    <ClCompile Include="ProcessLayoutMonitor.cpp" />
+    <ClCompile Include="ExecutionSurfaceScanner.cpp" />
+    <ClCompile Include="AnalystSnapshot.cpp" />
+    <ClCompile Include="GameBuildManifest.cpp" />
+    <ClCompile Include="GameBuildManifestGenerator.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
     <ClCompile Include="MapperRemnantScanner.cpp" />
     <ClCompile Include="NmiScanner.cpp" />
@@ -169,7 +182,9 @@
     <ClCompile Include="SnapshotJson.cpp" />
     <ClCompile Include="SnapshotModel.cpp" />
     <ClCompile Include="SnapshotPrinter.cpp" />
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="main.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
@@ -186,6 +201,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AddressInspector.h" />
+    <ClInclude Include="AnalystSnapshot.h" />
+    <ClInclude Include="ExecutionSurfaceCore.h" />
+    <ClInclude Include="ExecutionSurfaceScanner.h" />
     <ClInclude Include="AiCapabilityCatalog.h" />
     <ClInclude Include="AiModelCatalog.h" />
     <ClInclude Include="AiProvider.h" />
@@ -196,7 +214,10 @@
     <ClInclude Include="CloudFileScanner.h" />
     <ClInclude Include="CloakSession.h" />
     <ClInclude Include="CommandRegistry.h" />
+    <ClInclude Include="CommandInput.h" />
+    <ClInclude Include="CommandAuditSelfTest.inl" />
     <ClInclude Include="CompletionHints.h" />
+    <ClInclude Include="CompletionEngine.inl" />
     <ClInclude Include="DbgEngBackend.h" />
     <ClInclude Include="DeviceClient.h" />
     <ClInclude Include="DriverService.h" />
@@ -211,6 +232,22 @@
     <ClInclude Include="DmaPostureScanner.h" />
     <ClInclude Include="InputStackScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />
+    <ClInclude Include="ExecutableImage.h" />
+    <ClInclude Include="ExecutableImageVerifier.h" />
+    <ClInclude Include="CodeTargetResolver.h" />
+    <ClInclude Include="ExecutableRegionCatalog.h" />
+    <ClInclude Include="KmonHunting.h" />
+    <ClInclude Include="KmonExecutablePages.h" />
+    <ClInclude Include="UserExecutablePteWalker.h" />
+    <ClInclude Include="ExecutableImagePermissions.h" />
+    <ClInclude Include="KmonHuntingJson.h" />
+    <ClInclude Include="KmonWorkQueue.h" />
+    <ClInclude Include="ContentHash.h" />
+    <ClInclude Include="GameBuildManifest.h" />
+    <ClInclude Include="NativeHandleSnapshot.h" />
+    <ClInclude Include="KmonHandleTracking.h" />
+    <ClInclude Include="ObservationModel.h" />
+    <ClInclude Include="ObservationWindows.h" />
     <ClInclude Include="LayoutResolver.h" />
     <ClInclude Include="LeftoverCommon.h" />
     <ClInclude Include="MapperRemnantScanner.h" />
@@ -244,6 +281,10 @@
     <ClInclude Include="KmonTemporalEvidence.h" />
     <ClInclude Include="KmonPlatformEvidence.h" />
     <ClInclude Include="KernelMonitor.h" />
+    <ClInclude Include="KmonEvidencePolicy.h" />
+    <ClInclude Include="KmonImportResolver.h" />
+    <ClInclude Include="ProcessLayoutCore.h" />
+    <ClInclude Include="ProcessLayoutMonitor.h" />
     <ClInclude Include="TimelineDashboard.h" />
     <ClInclude Include="TimelineModel.h" />
     <ClInclude Include="TimelineSelfTest.h" />

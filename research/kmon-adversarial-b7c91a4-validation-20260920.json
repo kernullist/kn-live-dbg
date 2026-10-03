@@ -1,0 +1,302 @@
+{
+  "schema": "kmon.adversarial.validation.summary.v1",
+  "date_local": "2026-09-20",
+  "timezone": "Asia/Seoul",
+  "generated_utc": "2026-09-19T23:47:35.2183260Z",
+  "base_revision": "b7c91a409303f60e0773ecc791450f327eedc423",
+  "source_state": "Uncommitted changes identified by normalized source hashes below.",
+  "scope": "Adversarial follow-up of the false-positive evidence fixes.",
+  "live_validation_owner": "user",
+  "live_kernel_channels_tested": false,
+  "real_cheat_samples": 0,
+  "full_application_sanitized": false,
+  "independent_analyst_audit": false,
+  "universal_zero_false_positive_claim_supported": false,
+  "universal_no_miss_claim_supported": false,
+  "driver_abi_changed": false,
+  "local_acceptance": "Passed finite regression controls and final diff review; no further actionable defect established in reviewed scope.",
+  "runtime_defects_fixed": [
+    "Excluded loader/dynamic bytes invalidated stable modifications in comparable code.",
+    "Clean page results retained verified ownership after live PE identity changed.",
+    "Reference file identity was not rechecked after live reads.",
+    "An unreadable or unresolved new driver load retained the prior instance baseline.",
+    "Discardable sections bypassed VA overflow validation and emitted wrapped coverage ranges."
+  ],
+  "new_runtime_regression_cases": 7,
+  "validation_defect_fixed": "Debug and ASan core builds shared vc140.pdb; per-configuration /Fd paths now permit concurrent execution.",
+  "expected_failures_before_fix": [
+    {
+      "path": ".build/kmon-review-b7-core-before.log",
+      "sha256": "4195585e8b13836787dd8b35a8b008a0104da405dc23b0f9e3ea4d2635088522"
+    },
+    {
+      "path": ".build/kmon-review-b7-console-before.log",
+      "sha256": "266fcd27bb5d8f391ca5e763eef44591c26938347b7c436e18d10cbca2880af2"
+    },
+    {
+      "path": ".build/kmon-review-b7-overflow-before.log",
+      "sha256": "3cc57bcdbc86473d4b410f840bf298aa5de00c50ca89f4db03b9482f23f6888e"
+    },
+    {
+      "path": ".build/kmon-review-b7-pdb-before.log",
+      "sha256": "2ee556d6826b5a8efce811b0b5a63d75ab58ae5246df8fc9735e82c78bac2a98"
+    }
+  ],
+  "configurations": [
+    {
+      "configuration": "Release",
+      "full_build": "passed",
+      "self_test_all": "passed",
+      "assertions": {
+        "timeline": 28,
+        "mcp": 75,
+        "console": 524,
+        "commands": 2037,
+        "remote": 52
+      },
+      "registered_commands": 261,
+      "build_log": {
+        "path": ".build/kmon-review-b7-build-release.log",
+        "sha256": "26fc13561cf7d9c70c3a6dea3c1b1075baace943d0e469fb81d3878323d800f6"
+      },
+      "self_test_log": {
+        "path": ".build/kmon-review-b7-all-release.log",
+        "sha256": "3d318756585e01be24ab161f4da607b4d78823a44d64f3cdd7d463d4cfef5500"
+      },
+      "application": {
+        "path": "x64/Release/KnLiveDbg.exe",
+        "sha256": "a8c214740d9f73a151a541a9f4edd717605242e02d508afd9d51f40fb1ea8596"
+      },
+      "driver": {
+        "path": "x64/Release/KnLiveDbg.sys",
+        "sha256": "0f8a0f42ee43b0123787274038f2be46bd069a9075a35cdbc2139f1f26829fe9"
+      }
+    },
+    {
+      "configuration": "Debug",
+      "full_build": "passed",
+      "self_test_all": "passed",
+      "assertions": {
+        "timeline": 28,
+        "mcp": 75,
+        "console": 524,
+        "commands": 2037,
+        "remote": 52
+      },
+      "registered_commands": 261,
+      "build_log": {
+        "path": ".build/kmon-review-b7-build-debug.log",
+        "sha256": "3697808f87a912e86520dec0c3c53639cbdb3a7cdeaf6529dce95979b0d7bb70"
+      },
+      "self_test_log": {
+        "path": ".build/kmon-review-b7-all-debug.log",
+        "sha256": "3d318756585e01be24ab161f4da607b4d78823a44d64f3cdd7d463d4cfef5500"
+      },
+      "application": {
+        "path": "x64/Debug/KnLiveDbg.exe",
+        "sha256": "7a8a5e68adb89cff5fde310480559b0156cff16e4134305772179b66df52d260"
+      },
+      "driver": {
+        "path": "x64/Debug/KnLiveDbg.sys",
+        "sha256": "d9cc8cb2aec21d0b38eb873fc6103b4340a6f2a3b6890e300709740897d951d7"
+      }
+    }
+  ],
+  "core": {
+    "configurations": [
+      "Debug",
+      "Release-ASan"
+    ],
+    "configurations_executed_concurrently": true,
+    "groups_passed_per_run": 7,
+    "existing_policy_and_forwarder_assertions_per_run": 49,
+    "hunting_assertions_per_run": 11326,
+    "page_assertions_per_run": 54,
+    "failures": 0,
+    "logs": [
+      {
+        "path": ".build/kmon-review-b7-core-debug.log",
+        "sha256": "597096a1b141619d0ab77106bced20a35d084ddee89480af0f0194d9b83757d8"
+      },
+      {
+        "path": ".build/kmon-review-b7-core-asan.log",
+        "sha256": "597096a1b141619d0ab77106bced20a35d084ddee89480af0f0194d9b83757d8"
+      }
+    ]
+  },
+  "layout": {
+    "configuration": "Release-ASan",
+    "assertions": 105075,
+    "failures": 0,
+    "log": {
+      "path": ".build/kmon-review-b7-layout-asan.log",
+      "sha256": "e635b75f9faf85b987f8a1701296cb4fa8e416b9dbf4cd072e0c4eb0aeb4d969"
+    }
+  },
+  "manifest": {
+    "configuration": "Release",
+    "result": "passed",
+    "scope": "Owned native EXE/PDB, secondary vptr and expected mismatch rejections.",
+    "log": {
+      "path": ".build/kmon-review-b7-manifest.log",
+      "sha256": "01171f1caf57752c0782e446df8e0cd5bc78ee1efaf9b6c278ed1634edf554bc"
+    }
+  },
+  "hunting": {
+    "result": "passed",
+    "malformed_replay_inputs_rejected": 8,
+    "comparison_scope": "owned user fixture; Kmon main-image executable-page component versus PE-sieve full-process output; not a detection-rate comparison",
+    "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+    "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+    "fixture_sha256": "bdaf32d9a02062f3a470d5feb5e8f135084e4053902afdb45a5eb5d0064f08a1",
+    "replay_sha256": "0b545ba03e5e95ed7fde5165e8bd034915c297fe8d2c73025b91a3a4584bff6b",
+    "report": {
+      "path": ".build/kmon-hunting/Release/validation.json",
+      "sha256": "29a8e511cb45590b21e9b7873e6b5d94e7158f1cde93664b83ad3f310bb70691"
+    },
+    "log": {
+      "path": ".build/kmon-review-b7-hunting.log",
+      "sha256": "831f42ea7b4471e1b49cf58c97951741f0eecd8ed00b6649d69a2b43c8d50bbb"
+    },
+    "runs": [
+      {
+        "mode": "clean",
+        "ground_truth": "clean_image",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 0,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 3,
+            "patched": 0,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "modified",
+        "ground_truth": "one_byte_executable_data_section_change",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 1,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 3,
+            "patched": 0,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "text",
+        "ground_truth": "one_byte_text_function_change",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 1,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 4,
+            "patched": 1,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      },
+      {
+        "mode": "jit",
+        "ground_truth": "benign_private_rx",
+        "malicious_sample": false,
+        "kmon_component": {
+          "scope": "main_image_executable_pages",
+          "modified_pages": 0,
+          "complete": true
+        },
+        "baseline_exit": 2,
+        "baseline_full_process_scanned": {
+          "total": 8,
+          "skipped": 0,
+          "modified": {
+            "total": 3,
+            "patched": 0,
+            "iat_hooked": 3,
+            "replaced": 0,
+            "hdr_modified": 0,
+            "implanted_pe": 0,
+            "implanted_shc": 0,
+            "unreachable_file": 0,
+            "other": 0
+          },
+          "errors": 0
+        }
+      }
+    ]
+  },
+  "source_hashes": [
+    {
+      "path": "tools/validate-kmon-core.ps1",
+      "sha256_lf_utf8": "36b93798eae47c061eb88d5351094899344ed69136aeea1349e3793b8d720b51"
+    },
+    {
+      "path": "user/ExecutableImage.cpp",
+      "sha256_lf_utf8": "d0681fbb1b5fa8c71772622f5ae225e9e572bbb402d69215c8ea528f36936b4f"
+    },
+    {
+      "path": "user/ExecutableImage.h",
+      "sha256_lf_utf8": "45a0b67f8891fe259df03b1a77cbddad980166318cb43b9eac9791ed26ac97ec"
+    },
+    {
+      "path": "user/ExecutableImageVerifier.cpp",
+      "sha256_lf_utf8": "45497c752652ec7ceaab375d38efdfe831578bb6248ca5a56f97dab95a43d2ae"
+    },
+    {
+      "path": "user/KernelMonitor.cpp",
+      "sha256_lf_utf8": "6060955230bdb87e0f4bb8ca0831b3a605f743b85f53f503fed49c4601781764"
+    },
+    {
+      "path": "user/KernelMonitorPipeline.cpp",
+      "sha256_lf_utf8": "7196130248e7dec563a94db2895490bc816c77150d6ab70022d174fd14983b59"
+    },
+    {
+      "path": "user/KernelMonitorVerification.cpp",
+      "sha256_lf_utf8": "04b57db8fab1480368cd978b7bfe1c60e5d2151106f065bee2eeb49af2eaf7df"
+    }
+  ]
+}

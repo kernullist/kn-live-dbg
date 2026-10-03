@@ -774,6 +774,9 @@ bool EtwScanner::Scan(const Options& options, EtwScanResult* result, std::wstrin
         result->LoggerNameOffset = loggerNameOffset;
         result->GetCpuClockOffset = getCpuClockOffset;
         result->LayoutFromPdb = layoutFromPdb;
+        TypeFieldInfo clockPointerField = {};
+        const bool clockPointerFromPdb = symbols_.FindField(L"nt!_WMI_LOGGER_CONTEXT", L"GetCpuClock",
+            &clockPointerField, nullptr) && clockPointerField.Length == sizeof(uint64_t) && !clockPointerField.IsBitField;
 
         if (!layoutFromPdb)
         {
@@ -873,6 +876,7 @@ bool EtwScanner::Scan(const Options& options, EtwScanResult* result, std::wstrin
                     if (IsKernelAddress(pointer))
                     {
                         record.GetCpuClockCallback = pointer;
+                        record.GetCpuClockCallbackSlot = result->LayoutFromPdb && clockPointerFromPdb ? getCpuClockAddress : 0;
                         record.HasGetCpuClockCallback = true;
                         record.GetCpuClockCallbackSource = L"GetCpuClock";
                         AnnotateAddress(symbols_, pointer, &record.GetCpuClockModule, &record.GetCpuClockSymbol);
@@ -931,7 +935,8 @@ bool EtwScanner::Scan(const Options& options, EtwScanResult* result, std::wstrin
                 for (const wchar_t* fieldName : callbackFieldNames)
                 {
                     TypeFieldInfo callbackField = {};
-                    if (!symbols_.FindField(L"nt!_WMI_LOGGER_CONTEXT", fieldName, &callbackField, nullptr))
+                    if (!symbols_.FindField(L"nt!_WMI_LOGGER_CONTEXT", fieldName, &callbackField, nullptr) ||
+                        callbackField.Length != sizeof(uint64_t) || callbackField.IsBitField)
                     {
                         continue;
                     }
@@ -954,6 +959,7 @@ bool EtwScanner::Scan(const Options& options, EtwScanResult* result, std::wstrin
                     }
 
                     record.GetCpuClockCallback = pointer;
+                    record.GetCpuClockCallbackSlot = callbackAddress;
                     record.HasGetCpuClockCallback = true;
                     record.GetCpuClockCallbackSource = fieldName;
                     AnnotateAddress(symbols_, pointer, &record.GetCpuClockModule, &record.GetCpuClockSymbol);

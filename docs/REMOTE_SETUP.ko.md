@@ -64,12 +64,14 @@ B가 실제로 도달하는 IPv4를 고른다(물리 Ethernet/Wi-Fi. Hyper-V/VPN
 | 플래그 | 효과 |
 |--------|------|
 | (bare) `remote on` | `0.0.0.0:51767`. 방화벽 규칙 추가. |
-| `remote on 52000` | 같은 bind, 다른 포트. **51766은 거부**(MCP). |
+| `remote on 52000` | 같은 bind, 10진수 포트 `1..65535`. **51766은 거부**(MCP). |
 | `--loopback` | `127.0.0.1`만. 방화벽 규칙 없음. 같은 박스 / SSH `-L`. |
-| `--bind <ipv4>` | 그 주소만 listen. `127.0.0.1`이면 `--loopback`과 같음. |
+| `--bind <ipv4>` / `--bind=<ipv4>` | 그 주소만 listen. `127.0.0.1`이면 `--loopback`과 같음. |
 | `--peer <ipv4>` | 그 클라이언트 IPv4만 accept. 방화벽 `RemoteAddresses`도 핀. |
 
 `--lan` / `--allow-write`는 없다. 쓰기는 로컬 TUI와 같다(`WriteEnabled`를 건드리지 않음).
+
+알 수 없는 옵션, 중복 옵션·포트, 충돌하는 bind 옵션, 빠진 값, 잘못된 포트는 비밀번호를 묻기 전에 거부한다. `remote on`과 `--connect`의 포트는 부호·16진수 접두어·공백·뒤따르는 문자가 없는 10진수여야 한다. `backend dbgeng`에서도 `remote`는 native 명령으로 처리한다.
 
 ### A가 remote engine loop에 있을 때
 
@@ -101,7 +103,7 @@ password: *****
 인증 후:
 
 ```text
-connected HOST Windows abi=15 write=on cloak=no cleartext=true
+connected HOST Windows abi=17 write=on cloak=no cleartext=true
 warning: session is cleartext; lab LAN only
 knkd>
 ```
@@ -155,7 +157,11 @@ B는 raw `knkd>` 줄을 보낸다. 계약은 **deny-list**이지 MCP 툴 카탈�
 
 dump / snapshot은 **A 디스크**에, 로컬 TUI와 같은 경로로 쓴다. B로 multi-GB pull은 없다.
 
-주소만 있는 `eb ffff...`(바이트 없음)은 `supply values on the command line`으로 거절한다. 같은 줄에 바이트를 붙인다(`eb <addr> 90`). B 쪽 대화형 write-preview는 아직 없다.
+주소만 있는 가상·물리 메모리 편집(`e*` / `pe*`, 예: 바이트 없는 `eb ffff...`)은 `supply values on the command line`으로 거부한다. 같은 줄에 바이트를 넣어야 하며(`eb <addr> 90`), 원격 실행은 로컬 stdin 편집기를 열지 않는다. B 쪽 대화형 write-preview는 아직 없다.
+
+명령 실패는 `command-failed` 같은 코드를 가진 오류 프레임으로 전달한다. stderr에만 진단을 출력한 실패도 포함하므로, 통신이 끝났다는 사실만으로 명령 성공을 판단하지 않는다.
+
+서버는 엔진을 기다리는 동안에도 제어 프레임을 읽는다. 프로토콜 `cancel`은 큐의 요청을 제거하고 `cancelled`를 반환하며, 이미 디스패치됐으면 `not-cancelable`을 반환한다. 연결 종료와 리스너 중지도 큐의 요청을 제거하므로 버려진 명령이 나중에 실행되지 않는다. 실행 중인 명령은 끝까지 진행한다. 현재 클라이언트는 결과를 동기적으로 기다리며, 실행 중 Ctrl+C를 `cancel` 요청에 연결하지 않는다.
 
 B에서 `ai`는 허용이다. A에 프로바이더 키가 있으면 B가 그 키를 쓰지 않게 `KNLIVEDBG_AI_REMOTE_POLICY=local-only`를 권장한다.
 
@@ -180,7 +186,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 - loopback이 아닌 `remote on`은 inbound TCP 규칙 `knlivedbg-remote`(DOMAIN|PRIVATE|PUBLIC)를 추가한다. `remote off` / 프로세스 종료 때 삭제. 크래시 leftover는 다음 Start에서 같은 이름을 지우고 다시 넣는다.
 - COM 실패는 경고만 찍고 listen은 유지. B가 timeout이면 `remote on`이 찍은 IP를 확인하고 포트를 수동으로 연다.
 - IPv4 peer는 제한하지 않는다 (Tailscale `100.x`, Hamachi, 공인, RFC1918). 한 클라이언트만 받으려면 `--peer`.
-- Auth lockout은 프로세스 수명: peer IP당 5회, 전역 15회 실패면 `remote off`까지 신규 auth 거부.
+- Auth lockout은 리스너 세션 동안 유지한다. peer IP당 5회, 전역 15회 실패면 `remote off` 후 새로 `remote on` 할 때까지 신규 auth를 거부한다.
 - remote가 떠 있는 동안 `mcp on`(반대도)은 실패: `listen XOR`.
 - 격리 lab 세그먼트만. 공유 사무실 LAN / 인터넷에 `0.0.0.0`을 열지 않는다. 와이어 암호가 필요하면 `--loopback` + `ssh -L 51767:127.0.0.1:51767`. TLS는 설계 문서 Appendix A(v2)이고 이 빌드에는 없다.
 
@@ -199,7 +205,8 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 | B `error: denied` | 세션 수명 / `kd` / `probe load` / unknown. A에서 `off` 후 치거나 허용된 명령을 쓴다 |
 | `supply values on the command line` | 주소만 있는 `e*` / `pe*`. 같은 줄에 바이트를 붙인다 |
 | Tab이 빈약함 | 클라이언트는 로컬 테이블. B EXE가 A보다 오래됐으면 다시 복사 |
-| A가 긴 `!hunt`에 멈춘 것처럼 보임 | 컨트롤 플레인 `off`는 큐 밖이지만 in-flight는 끝까지 돈다 |
+| A가 긴 `!hunt`에 멈춘 것처럼 보임 | `off`는 리스너와 큐의 요청을 중지한다. 이미 실행 중인 스캔은 선점할 수 없으며 완료 후 엔진이 돌아온다. |
+| B `error: command-failed` | 명령의 진단 출력을 확인한다. 통신이 완료돼도 잘못된 입력, 드라이버 실패, write 검증 실패는 명령 오류다. |
 
 드라이버 없이 도는 검사:
 
@@ -207,7 +214,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-`KnLiveDbg.exe --self-test remote-protocol`과 `--self-test connect-argv`를 돌린다(비밀번호 최소 5, deny-list, `--connect` argv, Tab이 `remote`로 확장, loopback listen). `--self-test all`에는 들어 있지 않다.
+`KnLiveDbg.exe --self-test remote-protocol`(52개 검사)과 `--self-test connect-argv`(4개 검사)를 실행한다. framing/auth, deny-list, 엄격한 argv, 로컬 자동 완성, 큐 요청 취소, 작업 대기 중 리스너 중지를 검증한다. **두 묶음 모두 `--self-test all`에 포함된다.** fixture가 `127.0.0.1:51767`을 사용하므로 구성별 실행은 순차로 한다. 드라이버를 로드하거나 방화벽 규칙을 추가하지 않는다. 검증된 Release/Debug 결과와 라이브 테스트 한계는 [명령 감사 보고서](COMMAND_AUDIT_20260919.md)에 있다.
 
 같은 박스 스모크 (A elevated, 드라이버 로드됨):
 

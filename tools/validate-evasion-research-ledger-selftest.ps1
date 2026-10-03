@@ -400,6 +400,13 @@ try
         Get-Technique `
             -Document $case `
             -Id "poolparty-dormant-threadpool-objects"
+    # The fixture must remain missing even when the repository gains partial coverage.
+    $missingTechnique.status = "missing"
+    $missingTechnique.claim = "unsupported"
+    $missingTechnique.release_gate = "backlog"
+    $missingTechnique.positive_controls = @()
+    $missingTechnique.negative_controls = @()
+    $missingTechnique.validation_commands = @()
     $coveredTechnique =
         Get-Technique `
             -Document $case `

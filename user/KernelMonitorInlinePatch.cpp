@@ -10,35 +10,11 @@
 #include <string>
 #include <vector>
 
-// Stage 2: inline patches on hot ntoskrnl/win32k entry points.
-//
-// A mapper or BYOVD driver that hides a process, reads a game, or blinds a
-// syscall query usually rewrites the first bytes of a hot entry point with a
-// transfer or an int3 trap instead of only hooking a callback table. This layer
-// reads the entry prologue of a symbol-resolved target list and decides from
-// the entry shape plus the ownership of the transfer target.
-//
-// Boundaries, all fail-closed:
-//   * a transfer that stays inside the module owning the function is how
-//     Windows applies a kernel hotpatch, so it is not a verdict;
-//   * win32k.sys forwards NtUser* into win32kbase/win32kfull, so a head
-//     transfer into an inbox image is not a verdict either -- only a non-inbox
-//     destination is;
-//   * a transfer through a register (jmp rax) has no statically known
-//     destination, so it stays a deferral instead of a guess;
-//   * a patch inside the function body, a .data slot swap (hook.dataptr), and a
-//     callback/SSDT/IDT hook (hook.unbacked) are covered by other layers;
-//   * a head transfer whose decoded destination is below the canonical kernel
-//     floor is not a verdict, and not a deferral either: such a value is not
-//     kernel code at all (the 32-bit immediate of a push/ret head sign-extends
-//     into the user half, and a thunk slot or an r/m the decoder read can hold
-//     anything). KmonCountMapperStubs applies the same rule to its stub slots,
-//     so a value that is data there is not a hook destination here. The int3
-//     trap form is unaffected.
-//
-// The reads repeat the canonical-address guard the kernel helpers in
-// KernelMonitor.cpp apply: a bogus size or a user-mode address must never turn
-// into a speculative read.
+// Entry-shape alerts retain their historical location-based noise filters.
+// Every resolved entry is also queued into the common byte/branch verifier
+// before those filters: same-module and inbox destinations are inspected there.
+// A shape exclusion is not an integrity verdict. Unknown register targets,
+// cycles and failed reads remain explicit coverage states in that verifier.
 
 namespace
 {
@@ -215,7 +191,7 @@ namespace
         return KmonEnsureKernelModuleView(symbols);
     }
 
-    using PatchConfirmations = std::map<std::wstring, uint32_t>;
+    using PatchConfirmations = std::map<std::wstring, KmonRepeatObservation>;
 
     struct CallbackProbeBatch
     {
@@ -347,9 +323,9 @@ namespace
         if (current != nullptr)
         {
             const auto found = previous.find(key);
-            const uint32_t prior = found != previous.end() ? found->second : 0;
-            strikes = prior < kStrikeThreshold ? prior + 1 : kStrikeThreshold;
-            (*current)[key] = strikes;
+            KmonRepeatObservation observation = found != previous.end() ? found->second : KmonRepeatObservation{};
+            strikes = observation.Observe(key, GetTickCount64(), 60000);
+            (*current)[key] = std::move(observation);
         }
         return strikes;
     }
@@ -486,7 +462,8 @@ namespace
                 cursor = 0;
                 for (size_t index = 0; index < priorCount; ++index)
                 {
-                    confirmations[PatchHex(base - 0x1000000 + index * 0x100) + L":old"] = 2;
+                    const std::wstring key = PatchHex(base - 0x1000000 + index * 0x100) + L":old";
+                    confirmations[key] = {key, GetTickCount64(), 2};
                 }
                 for (size_t pass = 0; pass < 2 && valid; ++pass)
                 {
@@ -782,128 +759,6 @@ namespace
     }
 }
 
-KmonInlinePatchDecode KmonDecodeInlinePatchHead(
-    const uint8_t* bytes,
-    size_t size,
-    uint64_t address)
-{
-    KmonInlinePatchDecode decode = {};
-    if (bytes == nullptr || address == 0 || size == 0)
-    {
-        return decode;
-    }
-    // CET landing pads and bounded NOP padding do not change the branch
-    // target. Inspect the instruction following them, not arbitrary body bytes.
-    size_t prefixBytes = 0;
-    if (size >= 4 && bytes[0] == 0xF3 && bytes[1] == 0x0F &&
-        bytes[2] == 0x1E && bytes[3] == 0xFA)
-    {
-        prefixBytes = 4;
-    }
-    while (prefixBytes < size && prefixBytes < 8 && bytes[prefixBytes] == 0x90)
-    {
-        ++prefixBytes;
-    }
-    if (prefixBytes != 0)
-    {
-        if (prefixBytes == size || address > (~0ull - prefixBytes))
-        {
-            return decode;
-        }
-        bytes += prefixBytes;
-        size -= prefixBytes;
-        address += prefixBytes;
-    }
-    // Only the forms a hook can plant are decoded. The ordinary prologue bytes
-    // (push, sub rsp, mov, call __chkstk) stay Plain, so a normal entry cannot
-    // become a transfer verdict.
-    if (bytes[0] == 0xCC)
-    {
-        decode.Shape = KmonInlinePatchShape::Trap;
-        return decode;
-    }
-    if (size >= 5 && bytes[0] == 0xE9)
-    {
-        int32_t relative = 0;
-        std::memcpy(&relative, bytes + 1, sizeof(relative));
-        decode.Shape = KmonInlinePatchShape::NearJump;
-        decode.Target = address + 5 + static_cast<int64_t>(relative);
-        decode.TargetKnown = true;
-        return decode;
-    }
-    if (size >= 2 && bytes[0] == 0xEB)
-    {
-        const int8_t relative = static_cast<int8_t>(bytes[1]);
-        decode.Shape = KmonInlinePatchShape::NearJump;
-        decode.Target = address + 2 + static_cast<int64_t>(relative);
-        decode.TargetKnown = true;
-        return decode;
-    }
-    if (size >= 6 && bytes[0] == 0xFF && bytes[1] == 0x25)
-    {
-        int32_t relative = 0;
-        std::memcpy(&relative, bytes + 2, sizeof(relative));
-        decode.Shape = KmonInlinePatchShape::RipIndirect;
-        decode.SlotAddress = address + 6 + static_cast<int64_t>(relative);
-        return decode;
-    }
-    // mov reg,imm64 followed by jmp reg: the ModRM r/m field has to name the
-    // same register the mov loaded, because the immediate is only the target
-    // when that register is the one the jump consumes. A jump through any other
-    // register has no statically known destination, so it must not be reported
-    // with this immediate as its target.
-    if (size >= 12 && (bytes[0] == 0x48 || bytes[0] == 0x49) &&
-        bytes[1] >= 0xB8 && bytes[1] <= 0xBF)
-    {
-        const uint8_t loadedRegister = static_cast<uint8_t>(
-            (bytes[1] - 0xB8) + ((bytes[0] & 1) != 0 ? 8 : 0));
-        const bool jumpHasRex = bytes[10] >= 0x40 && bytes[10] <= 0x4F;
-        const size_t jumpOffset = jumpHasRex ? 11 : 10;
-        if (size >= jumpOffset + 2 && bytes[jumpOffset] == 0xFF &&
-            (bytes[jumpOffset + 1] & 0xF8) == 0xE0)
-        {
-            const uint8_t jumpRegister = static_cast<uint8_t>(
-                (bytes[jumpOffset + 1] & 7) +
-                (jumpHasRex && (bytes[10] & 1) != 0 ? 8 : 0));
-            if (loadedRegister == jumpRegister)
-            {
-                uint64_t immediate = 0;
-                std::memcpy(&immediate, bytes + 2, sizeof(immediate));
-                decode.Shape = KmonInlinePatchShape::RegisterImmediate;
-                decode.Target = immediate;
-                decode.TargetKnown = true;
-                return decode;
-            }
-        }
-    }
-    // push imm32; ret: the ret sign-extends the pushed value, so this form only
-    // reaches kernel code for the top window of the kernel half (0xFFFFFFFF8..
-    // upwards, the only canonical kernel range a 32-bit immediate can express).
-    // The decode reports the sign-extended value as-is, and the classifier is
-    // what refuses a value below the canonical kernel floor.
-    if (size >= 6 && bytes[0] == 0x68 && bytes[5] == 0xC3)
-    {
-        int32_t immediate = 0;
-        std::memcpy(&immediate, bytes + 1, sizeof(immediate));
-        decode.Shape = KmonInlinePatchShape::PushRet;
-        decode.Target = static_cast<uint64_t>(static_cast<int64_t>(immediate));
-        decode.TargetKnown = true;
-        return decode;
-    }
-    if (size >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xF8) == 0xE0)
-    {
-        decode.Shape = KmonInlinePatchShape::RegisterIndirect;
-        return decode;
-    }
-    if (size >= 3 && bytes[0] >= 0x40 && bytes[0] <= 0x4F &&
-        bytes[1] == 0xFF && (bytes[2] & 0xF8) == 0xE0)
-    {
-        decode.Shape = KmonInlinePatchShape::RegisterIndirect;
-        return decode;
-    }
-    return decode;
-}
-
 bool KmonDecodeInlinePatchStub(
     const uint8_t* bytes,
     size_t size,
@@ -1168,6 +1023,7 @@ void KernelMonitor::ScanKernelInlinePatches()
 
     for (const ResolvedTarget& target : resolved)
     {
+        QueueExecutionReference(target.Address, 0, L"entrypoint");
         if (StopRequested.load())
         {
             break;
@@ -1181,7 +1037,7 @@ void KernelMonitor::ScanKernelInlinePatches()
 
         std::vector<uint8_t> prologue;
         if (!ReadKernelBytes(device, target.Address, kPrologueBytes, &prologue) ||
-            prologue.size() < 6)
+            prologue.size() != kPrologueBytes)
         {
             // A prologue that cannot be read proves nothing: the entry is a
             // deferral for this pass and the scan continues with the rest.
@@ -1241,12 +1097,15 @@ void KernelMonitor::ScanKernelInlinePatches()
             if (destination == nullptr)
             {
                 std::vector<uint8_t> stub;
+                std::vector<uint8_t> confirmedStub;
                 if (ReadKernelBytes(
                         device,
                         input.TransferTarget,
                         kStubBytes,
                         &stub) &&
-                    stub.size() >= 6)
+                    stub.size() == kStubBytes &&
+                    ReadKernelBytes(device, input.TransferTarget, kStubBytes, &confirmedStub) &&
+                    stub == confirmedStub)
                 {
                     input.StubKnown = true;
                     uint64_t destinationAddress = 0;
@@ -1270,12 +1129,25 @@ void KernelMonitor::ScanKernelInlinePatches()
             continue;
         }
 
-        // Two-scan confirmation: a page-in or a hotpatch transition lands in
-        // the first pass only, and a single pass must not print a verdict.
-        const std::wstring strikeKey =
-            std::wstring(target.Symbol) + L":" + KmonInlinePatchKindName(kind) +
+        std::vector<uint8_t> confirmedPrologue;
+        uint64_t confirmedSlot = 0;
+        if (!ReadKernelBytes(device, target.Address, kPrologueBytes, &confirmedPrologue) ||
+            confirmedPrologue != prologue ||
+            (decode.Shape == KmonInlinePatchShape::RipIndirect &&
+                (!ReadKernelU64(device, decode.SlotAddress, &confirmedSlot) || confirmedSlot != input.TransferTarget)))
+        {
+            ++skipped;
+            continue;
+        }
+        // Different addresses, bytes or targets must not accumulate confirmation.
+        std::wstring strikeKey = std::wstring(target.Symbol) + L":" + KmonInlinePatchKindName(kind) +
             L":" + PatchHex(target.Address) + L":" + PatchHex(input.TransferTarget) +
-            L":" + PatchHex(input.StubDestination);
+            L":" + PatchHex(input.StubDestination) + L":" + PatchHex(target.Owner->Base) +
+            L":" + PatchHex(target.Owner->End);
+        for (uint8_t byte : prologue)
+        {
+            strikeKey += L":" + std::to_wstring(byte);
+        }
         candidates.insert(strikeKey);
         uint32_t strikes = 0;
         {
@@ -1302,7 +1174,8 @@ void KernelMonitor::ScanKernelInlinePatches()
         {
             notes += L" stub_destination=" + PatchHex(input.StubDestination);
         }
-        notes += L" strikes=" + std::to_wstring(kStrikeThreshold);
+        notes += L" strikes=" + std::to_wstring(kStrikeThreshold) +
+            L" evidence=entry_shape original_bytes=unknown execution=not_established";
         if (!target.Owner->Leaf.empty())
         {
             notes += L" owner=" + target.Owner->Leaf;
@@ -1315,13 +1188,13 @@ void KernelMonitor::ScanKernelInlinePatches()
             kindName = L"hook.breakpoint";
             summary = label + L" (" + function +
                 L") starts with an int3 trap at " + PatchHex(target.Address) +
-                L"; the real prologue is not reachable";
+                L"; breakpoint ownership and purpose are unknown";
         }
         else if (kind == KmonInlinePatchKind::TrampolineStub)
         {
             kindName = L"hook.inline";
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer into an unbacked trampoline stub at " +
+                L") has a head transfer into an unowned trampoline-shaped stub at " +
                 PatchHex(input.TransferTarget) + L" that continues to " +
                 PatchHex(input.StubDestination);
         }
@@ -1329,8 +1202,8 @@ void KernelMonitor::ScanKernelInlinePatches()
         {
             kindName = L"hook.inline";
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer at " + PatchHex(target.Address) +
-                L" into code no loaded module owns (" +
+                L") has a head transfer at " + PatchHex(target.Address) +
+                L" into an address no loaded module owns (" +
                 PatchHex(input.TransferTarget) + L")";
         }
         else
@@ -1342,7 +1215,7 @@ void KernelMonitor::ScanKernelInlinePatches()
                 ? destination->Leaf
                 : std::wstring(L"<unknown>");
             summary = label + L" (" + function +
-                L") was rewritten to a head transfer into non-inbox module " +
+                L") has a head transfer into non-inbox module " +
                 destinationLeaf + L" (" + PatchHex(input.TransferTarget) + L")";
         }
 
@@ -1381,7 +1254,7 @@ void KernelMonitor::ScanKernelInlinePatches()
             std::wstring(),
             kLayer,
             L"inline patch scan capped at " + std::to_wstring(kEmitCap) +
-                L" findings; more patched entries exist in this pass",
+                L" leads; more entry-shape candidates exist in this pass",
             L"reattach after the mapper watch window or raise the pass budget");
     }
     else
@@ -1666,9 +1539,9 @@ bool KernelMonitorInlinePatchSelfTest()
             const bool callback = scenario < 3;
             const uint32_t outcome = scenario % 3;
             attempts.CallbackRedirectStrikes.clear();
-            attempts.CallbackRedirectStrikes[L"pending"] = 1;
+            attempts.CallbackRedirectStrikes[L"pending"] = {L"pending", GetTickCount64(), 1};
             attempts.InlinePatchStrikes.clear();
-            attempts.InlinePatchStrikes[L"pending"] = 1;
+            attempts.InlinePatchStrikes[L"pending"] = {L"pending", GetTickCount64(), 1};
             attempts.CallbackRedirectBatch.clear();
             attempts.CallbackRedirectBatch.push_back(0xFFFF800010000000ull);
             attempts.CallbackRedirectCursor = 321;
@@ -1780,9 +1653,9 @@ bool KernelMonitorInlinePatchSelfTest()
             break;
         }
         PatchConfirmations emittedIdentity;
-        emittedIdentity[L"symbol:kind:entry:target-a"] = 2;
+        emittedIdentity[L"symbol:kind:entry:target-a"] = {L"symbol:kind:entry:target-a", GetTickCount64(), 2};
         PatchConfirmations changedIdentity;
-        changedIdentity[L"symbol:kind:entry:target-b"] = 2;
+        changedIdentity[L"symbol:kind:entry:target-b"] = {L"symbol:kind:entry:target-b", GetTickCount64(), 2};
         std::unordered_set<std::wstring> identityKeys;
         const std::wstring oldIdentityKey = PatchObservationEventKey(emittedIdentity.begin()->first);
         const std::wstring newIdentityKey = PatchObservationEventKey(changedIdentity.begin()->first);

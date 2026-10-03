@@ -9,7 +9,7 @@ Reference pages:
 
 ## Backend Rule
 
-KnLiveDbg currently has a native live-memory backend, not a KD transport backend. This means commands fall into three groups:
+KnLiveDbg has a native live-memory backend alongside DbgEng routing. Commands fall into four groups:
 
 1. Native
    - Can be implemented using the current driver, `DbgHelp`, and local system APIs.
@@ -50,9 +50,17 @@ Backend mode differences:
 | --- | --- | --- | --- |
 | `auto` | Enabled for implemented live-memory commands. | Enabled for DbgEng-routed commands, `!extension` commands, and unknown `.meta` commands. | Normal mixed operation. |
 | `native` | Enabled. | Disabled except for explicit raw escapes such as `kd`. | Verifying driver-backed behavior without accidental raw WinDbg execution. |
-| `dbgeng` | Only session/TUI exceptions run before the raw DbgEng catch-all. | Enabled for most commands through `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
+| `dbgeng` | All native-owned commands run before the raw DbgEng catch-all. | Other commands use `IDebugControl4::ExecuteWide`. | WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, and exception commands. |
 
-The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver path (`IsNativeOwnedCommand`) is never sent to DbgEng. That includes session control (`q`/`unload`/`write`/`probe`/`procctx`/`backend`/`kdinit`/`mcp`/`ai`), native memory (`d*`/`e*`/`phys`/`pe*`/`vtop`/`f`/`m`/`setfield`/`u`/`uf`/`dt`), dumps (`dump-raw`/`dump-pe`), leftover detectors (`!payload`/`!mapper`/`!kpage`/`!pool pe`), PPL (`set-ppl-antimalware`), symbols (`lm`/`x`/`ln`/`.sympath`/`.reload`), and all native bang scanners (`!hunt`/`!ti`/`!timeline`/`!ssdt`/...). Only commands outside that set are raw-executed through DbgEng. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver path (`IsNativeOwnedCommand`) is never sent to DbgEng. That includes session control (`q`/`unload`/`write`/`probe`/`procctx`/`backend`/`kdinit`/`mcp`/`remote`/`ai`), native memory (`d*`/`e*`/`phys`/`pe*`/`vtop`/`f`/`m`/`setfield`/`u`/`uf`/`dt`), dumps (`dump-raw`/`dump-pe`), leftover detectors (`!payload`/`!mapper`/`!kpage`/`!pool pe`), PPL (`set-ppl-antimalware`), symbols (`lm`/`x`/`ln`/`.sympath`/`.reload`), and all native bang scanners (`!hunt`/`!ti`/`!timeline`/`!ssdt`/...). Only commands outside that set are raw-executed through DbgEng. `kd <windbg-command>` always executes a raw DbgEng command regardless of the selected backend mode.
+
+## Input Validation and Audit
+
+The 2026-09-19 registry has **261 entries: 151 Native, 17 Alias, and 93 DbgEng**. The [command audit](COMMAND_AUDIT_20260919.md) records handler coverage and regression evidence. Registry coverage includes dispatch/help checks for DbgEng entries; it does not certify the external debugger engine or target behavior.
+
+Native parsing rejects embedded NULs, unterminated quotes, invalid numeric suffixes/signs, overflow, and extra arguments on fixed-arity commands before side effects. Numeric inputs retain their documented radix rules, including `0x`, `0n`, and debugger address separators where supported. Listener and `--connect` ports use decimal `1..65535`. Zero-length, overflowing, and over-limit memory transfers are rejected before allocation or IOCTL dispatch.
+
+`?` and `??` evaluate the complete spaced expression. `kd <windbg-command>` preserves the original command tail and quotes for DbgEng. `remote` remains native-owned in every backend mode. Bare `|` displays the pinned `procctx` context.
 
 ## Native Commands
 
@@ -250,3 +258,17 @@ z
 29. Human-readable console output colorizes high-signal tokens for scanning: callback kind tags, object type names, modules, symbols, translated physical addresses, type/field names, and dump line addresses. Local stdout capture, AI transcript JSONL, and write-audit JSONL stay plain. A remote operator session embeds VT SGR in the captured stream so `KnLiveDbg.exe --connect` can color the same tokens; the client strips CSI when stdout or stderr is a pipe or file.
 30. The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands/options, including callback scopes, AI subcommands (`use`/`models`/`save`/`test`/`chat` plus curated and live OpenRouter model ids), backend modes, probe/procctx/write actions, `remote on` flags (`--loopback`/`--bind`/`--peer`), snapshot/diff/timeline subcommands and options, `dt` options, `vtop` context options, and `/process` memory command options. The `--connect` client uses the same `CompletionHints` tables locally (`ApplyTabCompletion`); it does not round-trip Tab to the analysis PC. On a real console it renders the same VT colors as the local TUI; a pipe or file strips CSI. Timeline completion now leads with the simple surface (`dashboard`, `reset`, `help`); advanced completions remain reachable after typing advanced subcommands explicitly. `!timeline dashboard` is intentionally parameterless because filtering, including TI task selection and JSONL export, happens inside the generated HTML dashboard. Ambiguous prefixes print matching candidates and redraw the current line without dispatching a command. Up/Down recalls recent non-empty commands from the current session history.
 31. `tools\build.ps1` stamps `KnLiveDbg.exe`, `KnLiveDbg.sys`, `KnLiveDbgProbe.sys`, `KnLiveDbgMiniFilterFixture.sys`, and `KnLiveDbgBindFixture.exe` with the current PE version without incrementing it by default; the BYOVD metadata fixture retains its intentional fixed version. `-BumpVersion` increments the patch component, with `0.0.0` as the local baseline and `0.0.1` as the first bumped build. `tools\release.ps1` packages the built PE files, both positive-control fixture drivers, the constrained Bind controller, runtime DLLs, symbols/certs when present, the clean-hunt helper, QoS/Bind and minifilter runners/validators, and `kn-live-dbg-version.json` into `release\KnLiveDbg-<version>-<configuration>-x64.zip`, using a version-bumped build unless `-NoVersionBump` is supplied. `tools\validate-timeline-selftest.ps1`, `tools\validate-mcp-tool-catalog.ps1`, `tools\validate-console-surface.ps1`, `tools\validate-remote-protocol.ps1`, `tools\validate-minifilter-detach-e2e-selftest.ps1`, `KnLiveDbgBindFixture.exe --self-test`, and `tools\validate-qos-bind-e2e-selftest.ps1` run driver-free fixture gates after a build.
+
+## Help and completion audit (2026-09-20)
+
+All 261 registry entries are checked for help and local/remote completion agreement.
+The local TUI, remote client, and remote completion protocol now use one engine in
+`CompletionHints.cpp` / `CompletionEngine.inl`. Subcommand options come from the
+same descriptions used by annotated Tab listings. Quoted input is preserved;
+option values do not receive unrelated switches or command names.
+
+The audit corrected kmon analyst commands and start options, TI action scopes,
+snapshot/diff options, memory-command aliases, JSON output syntax, and nested help.
+`!kmon iotrace <driver> on` arms interposition; `!kmon iotrace off` and
+`!kmon iotrace status` take no driver argument. See
+[the audit report](HELP_COMPLETION_AUDIT_20260920.md) for validation and limits.

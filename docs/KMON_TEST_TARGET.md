@@ -26,12 +26,12 @@ will miss the console self-test lookup next to `KnLiveDbg.exe`.
 
 ## Scenarios
 
-Each parent mode copies the fixture to `%TEMP%\kn-live-dbg-kmon\notepad.exe` so
-`KmonIsWindowsBuiltinLeaf` is true (this selects the default builtin `.text` /
-CoW policy without adding a watch). Sequential runs retry `DeleteFile` + `CopyFile`
-when the previous copy is still in use. `/seconds N` holds the artifact
-(default 45). `/seconds 0` holds until the process is killed. Child processes
-use `CREATE_NO_WINDOW` so the parent stdout is a single `KMON_FIXTURE` line.
+Parent modes use `%TEMP%\kn-live-dbg-kmon\ordinary-kmon-target.exe`.
+Only `/masquerade` uses `notepad.exe`, because its purpose is to exercise a
+Windows-name/path mismatch. Watched main-image verification is independent of
+the filename. Sequential runs retry `DeleteFile` + `CopyFile` while a previous
+fixture copy is in use. `/seconds N` holds the artifact (default 45), and
+`/seconds 0` holds until termination. Children use `CREATE_NO_WINDOW`.
 
 `/replace-main` unmaps only at the original ImageBase, allocates the private
 replacement at that same base, and does not resume the process. If
@@ -41,12 +41,12 @@ instead of leaving PEB ImageBase unmapped.
 | Flag | Artifact | Expected `process.hollow` / related layer |
 |---|---|---|
 | `/masquerade` | temp `notepad.exe` copy, no memory patch | `process.masquerade` |
-| `/overwrite` | NOP patch on own `.text` (`0x90` sled over the section head, `kOverwritePatchBytes`), RX restored | `exe_cow`, `exe_text` |
+| `/overwrite` | NOP patch on own `.text` (`0x90` sled over the section head, `kOverwritePatchBytes`), RX restored | `finding.code_modified`; COW is `coverage.image_cow` |
 | `/stamp` | in-memory `TimeDateStamp` rewritten | `hollow` |
 | `/nomz` | ImageBase MZ wiped | `exe_no_mz` |
 | `/orphan-private` | `VirtualAlloc` RX page with MZ | `exe_orphan_private` |
 | `/orphan-image` | delete-pending `SEC_IMAGE` map, not in the loader | `exe_orphan_image` |
-| `/orphan-mapped-rx` | anonymous headerless `MEM_MAPPED` section with inert RX bytes, never executed | `mapped_exec` on the builtin-named copy |
+| `/orphan-mapped-rx` | anonymous headerless `MEM_MAPPED` section with inert RX bytes, never executed | `mapped_exec` on an explicitly watched copy; no execution is inferred |
 | `/mapped-readonly` | same section bytes with `PAGE_READONLY` | no executable-orphan finding (negative control) |
 | `/replace-main` | suspended self-copy, EXE unmapped, private MZ, **never resumed** | `exe_private` |
 | `/ghost` | running copy then delete the file | `ghost` |
@@ -69,13 +69,17 @@ KMON_FIXTURE pid=<pid> scenario=<name> image=<path>
 
 PID is also written to `%TEMP%\kn-live-dbg-kmon\artifact.pid`. Every mode prints that line and writes that pid file; `/overwrite` announces before its destructive step because the `0x90` sled lands on the code that emits them, so a `/child overwrite` run still leaves the documented readiness signal.
 
+`/seconds` accepts decimal values from 0 through 4,294,967. Zero explicitly
+requests an indefinite hold. Missing, malformed, negative, or larger values
+fail before copying or modifying the fixture; milliseconds cannot wrap.
+
 ## Live `!kmon` pass
 
 Elevated, driver loaded:
 
 ```text
 write on
-!kmon /background
+!kmon /name ordinary-kmon-target.exe /background
 ```
 
 Other console:
@@ -84,10 +88,9 @@ Other console:
 .\x64\Release\tools\KnLiveDbgKmonTarget.exe /overwrite /seconds 60
 ```
 
-Then `!kmon` to attach the tail. User-mode hostility scans every ~8s (first
-tick ~1.5s after start). Repeat with `/stamp`, `/nomz`, `/orphan-private`,
-`/orphan-image`, `/orphan-mapped-rx`, `/mapped-readonly`, `/replace-main`,
-`/ghost`, `/masquerade`.
+Then `!kmon` to attach the tail. Bounded user/image scans rotate through
+targets; use `!kmon status` to inspect progress and overdue work. Repeat with `/stamp`, `/nomz`, `/orphan-private`,
+`/orphan-image`, `/orphan-mapped-rx`, `/mapped-readonly`, `/replace-main`, `/ghost`, `/masquerade`.
 
 `/replace-main` leaves a suspended process; the fixture terminates it when the
 hold expires.
@@ -116,11 +119,12 @@ hold expires.
    `OpenProcess` refused, PEB ImageBase unreadable, contract sled never
    observed, child exited before the COW sample).
 
-That gate does not require `write on` or `!kmon`. It does **not** assert that
-an unmodified `KnLiveDbg.exe` `.text` matches disk: reloc-aware compare of the
-TUI image is not a stable negative control. Ordinary third-party hosts do not
-receive the broad main-image text policy unless watched or classified as a
-drop-path host.
+That gate does not require `write on` or `!kmon`. The standalone
+`tools/validate-kmon-core.ps1` also compares an executable page in its own
+ordinary-name EXE against the relocation-aware disk reference, changes a byte
+in the middle of its second executable probe page, verifies the mismatch,
+and restores it. See [verification and manifest usage](KMON_DETECTION_VERIFICATION.md)
+for queue, short-lived capture, native PDB and mapping-reuse controls.
 
 The independent `kmon-mapped-section-artifact` console gate creates a real
 anonymous section, verifies `MEM_MAPPED` plus executable protection and readable

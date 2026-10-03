@@ -41,6 +41,17 @@ std::wstring BuildCompletionListing(
 std::vector<std::wstring> CollectCompletionCandidates(
     const std::vector<std::wstring>& argsBefore);
 
+struct CompletionContext
+{
+    std::vector<std::wstring> ArgsBefore;
+    std::wstring Prefix;
+    size_t TokenStart = 0;
+    size_t TokenEnd = 0;
+    bool CanComplete = false;
+};
+
+CompletionContext BuildCompletionContext(const std::wstring& line, size_t cursor);
+
 // Applies Tab to *line at *cursor using CollectCompletionCandidates.
 // If several matches share no extra prefix, *listing receives the annotated
 // listing (including a leading newline) and *listed is true.

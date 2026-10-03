@@ -15,6 +15,7 @@
 #include "McpJson.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -153,7 +154,7 @@ namespace
     struct McpToolArg
     {
         const wchar_t* Name;
-        const wchar_t* Type; // "string" or "boolean"
+        const wchar_t* Type; // "string", "boolean", or an array of strings
         bool Required;
     };
 
@@ -1349,6 +1350,98 @@ bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entr
     return found;
 }
 
+bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error)
+{
+    auto reject = [&](const std::wstring& reason)
+    {
+        if (error != nullptr)
+        {
+            *error = reason;
+        }
+        return false;
+    };
+    const McpToolDef* tool = FindTool(name);
+    size_t pos = 0;
+    mcpjson::SkipWhitespace(json, &pos);
+    if (tool == nullptr || pos >= json.size() || json[pos] != L'{' || !mcpjson::ValidateDocument(json))
+    {
+        return reject(L"tool arguments must be a complete JSON object with unique keys");
+    }
+    ++pos;
+    mcpjson::SkipWhitespace(json, &pos);
+    while (pos < json.size() && json[pos] != L'}')
+    {
+        const size_t keyStart = pos;
+        if (!mcpjson::ScanString(json, &pos))
+        {
+            return reject(L"invalid argument key");
+        }
+        const std::wstring key = mcpjson::Unescape(json.substr(keyStart, pos - keyStart));
+        mcpjson::SkipWhitespace(json, &pos);
+        ++pos;
+        mcpjson::SkipWhitespace(json, &pos);
+        const size_t valueStart = pos;
+        if (!mcpjson::ScanValue(json, pos, &pos))
+        {
+            return reject(L"invalid argument value");
+        }
+        const McpToolArg* definition = nullptr;
+        for (size_t index = 0; index < tool->ArgCount; ++index)
+        {
+            if (key == tool->Args[index].Name)
+            {
+                definition = &tool->Args[index];
+                break;
+            }
+        }
+        if (definition == nullptr)
+        {
+            return reject(L"unsupported tool argument: " + key);
+        }
+        const std::wstring raw = json.substr(valueStart, pos - valueStart);
+        const std::wstring type = definition->Type;
+        if ((type == L"string" && raw.front() != L'"') ||
+            (type == L"boolean" && raw != L"true" && raw != L"false") ||
+            (type == L"array" && raw.front() != L'['))
+        {
+            return reject(L"invalid argument type for " + key + L": expected " + type);
+        }
+        if (type == L"array")
+        {
+            size_t element = 1;
+            mcpjson::SkipWhitespace(raw, &element);
+            while (element < raw.size() && raw[element] != L']')
+            {
+                if (!mcpjson::ScanString(raw, &element))
+                {
+                    return reject(L"array argument must contain strings: " + key);
+                }
+                mcpjson::SkipWhitespace(raw, &element);
+                if (element < raw.size() && raw[element] == L',')
+                {
+                    ++element;
+                    mcpjson::SkipWhitespace(raw, &element);
+                }
+            }
+        }
+        mcpjson::SkipWhitespace(json, &pos);
+        if (pos < json.size() && json[pos] == L',')
+        {
+            ++pos;
+            mcpjson::SkipWhitespace(json, &pos);
+        }
+    }
+    for (size_t index = 0; index < tool->ArgCount; ++index)
+    {
+        std::wstring raw;
+        if (tool->Args[index].Required && !mcpjson::FindRawValue(json, tool->Args[index].Name, &raw))
+        {
+            return reject(std::wstring(L"missing required tool argument: ") + tool->Args[index].Name);
+        }
+    }
+    return true;
+}
+
 McpServer::McpServer()
 {
 }
@@ -1518,7 +1611,7 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
     std::shared_ptr<McpJob> job;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        if (!queue_.empty())
+        if (!stopRequested_.load() && !queue_.empty())
         {
             job = queue_.front();
             queue_.pop_front();
@@ -1529,13 +1622,17 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
 
 bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result)
 {
+    if (result == nullptr)
+    {
+        return false;
+    }
     std::shared_ptr<McpJob> job = std::make_shared<McpJob>();
     job->Request = request;
     std::future<McpEngineResult> future = job->ResultPromise.get_future();
 
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        if (queue_.size() >= maxPending_)
+        if (stopRequested_.load() || queue_.size() >= maxPending_)
         {
             return false;
         }
@@ -1543,11 +1640,25 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
     }
     SetEvent(jobReadyEvent_);
 
-    if (future.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
     {
-        result->IsError = true;
-        result->Text = L"engine timeout";
-        return true;
+        if (stopRequested_.load() || std::chrono::steady_clock::now() >= deadline)
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            const auto pending = std::find(queue_.begin(), queue_.end(), job);
+            const bool cancelled = pending != queue_.end();
+            if (cancelled)
+            {
+                queue_.erase(pending);
+            }
+            result->IsError = true;
+            result->Text = cancelled
+                ? L"engine wait ended; request cancelled before execution"
+                : L"engine wait ended after dispatch; outcome unknown, inspect state before retrying";
+            return true;
+        }
+        future.wait_until((std::min)(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(50)));
     }
 
     *result = future.get();
@@ -2001,7 +2112,8 @@ void McpServer::ListenerThreadMain()
         if (bodyStatus != NO_ERROR)
         {
             const bool tooLarge = bodyStatus == ERROR_FILE_TOO_LARGE;
-            sendResponse(requestId, tooLarge ? 413 : 400, tooLarge ? "Content Too Large" : "Bad Request", L"");
+            sendResponse(requestId, tooLarge ? 413 : 400, tooLarge ? "Content Too Large" : "Bad Request",
+                RpcError(L"", -32700, tooLarge ? L"request body exceeds 1 MiB" : L"request body could not be read"));
             return;
         }
         std::wstring body = mcpjson::Utf8ToWide(bodyUtf8);
@@ -2012,17 +2124,18 @@ void McpServer::ListenerThreadMain()
         }
 
         std::wstring method;
+        std::wstring version;
         std::wstring idRaw;
         std::wstring params;
         mcpjson::GetString(body, L"method", &method);
+        mcpjson::GetString(body, L"jsonrpc", &version);
         mcpjson::FindRawValue(body, L"id", &idRaw);
         if (!mcpjson::FindRawValue(body, L"params", &params))
         {
             params = L"{}";
         }
 
-        std::wstring version;
-        if (!mcpjson::GetString(body, L"jsonrpc", &version) || version != L"2.0" ||
+        if (version != L"2.0" ||
             (!idRaw.empty() && idRaw != L"null" && idRaw.front() != L'\"' &&
                 idRaw.front() != L'-' && (idRaw.front() < L'0' || idRaw.front() > L'9')))
         {
@@ -2037,7 +2150,7 @@ void McpServer::ListenerThreadMain()
 
         if (method.empty())
         {
-            sendResponse(requestId, 200, "OK", RpcError(idRaw, -32600, L"invalid request: missing method"));
+            sendResponse(requestId, 200, "OK", RpcError(idRaw, -32600, L"invalid request: requires method and jsonrpc 2.0"));
             return;
         }
 

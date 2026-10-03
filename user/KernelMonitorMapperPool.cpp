@@ -542,7 +542,7 @@ bool KernelMonitor::EmitMapperPoolResidual(
         range.KernelImport = ResidualIsKernelImportLeaf(leaf);
         ranges.push_back(range);
     }
-    if (!moduleRangesComplete || ranges.empty())
+    if (!moduleRangesComplete || ranges.empty() || !KmonKernelModuleRangesKnown(modules))
     {
         EmitUnique(
             L"driver.mapped_residue",

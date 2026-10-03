@@ -1,7 +1,7 @@
 {
   "schema": "kn-live-dbg.evasion-research-ledger.v1",
   "title": "KNLiveDbg Windows defense-evasion research and claim ledger",
-  "reviewed_through": "2026-07-30",
+  "reviewed_through": "2026-09-20",
   "scope": {
     "platform": "Windows x64 kernel, process, file-system, telemetry, and security-product impairment",
     "start_date": "2023-01-01",
@@ -28,52 +28,76 @@
       {
         "id": "bitdefender-labs",
         "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "elastic-security-labs",
-        "url": "https://www.elastic.co/security-labs/category/internals",
-        "last_checked_on": "2026-07-30"
+        "url": "https://www.elastic.co/security-labs/threat-command/category/platform-internals",
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "eset-research",
         "url": "https://www.welivesecurity.com/en/eset-research/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "google-threat-intelligence",
         "url": "https://cloud.google.com/blog/topics/threat-intelligence",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "mitre-attack-updates",
         "url": "https://attack.mitre.org/resources/updates/",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "safebreach-research",
-        "url": "https://www.safebreach.com/resources/research/",
-        "last_checked_on": "2026-07-30"
+        "url": "https://www.safebreach.com/breach-and-attack-simulation-research-and-news/",
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "arxiv-security-recent",
         "url": "https://arxiv.org/list/cs.CR/recent",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       },
       {
         "id": "atomic-red-team-t1685",
         "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
-        "last_checked_on": "2026-07-30"
+        "last_checked_on": "2026-09-20"
       }
     ]
   },
   "sources": [
     {
+      "id": "hasherezade-hollowing-24h2-2025",
+      "title": "Process Hollowing on Windows 11 24H2",
+      "publisher": "hasherezade",
+      "published_on": "2025-01-27",
+      "verified_on": "2026-09-20",
+      "url": "https://hshrzd.wordpress.com/2025/01/27/process-hollowing-on-windows-11-24h2/",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Original research compares MEM_PRIVATE RunPE with MEM_IMAGE alternatives on Windows 11 24H2; not a current exploit recipe or detector recall result.",
+      "primitive": "Image-backed impersonation can preserve normal layout classifications and requires independent content and image identity evidence."
+    },
+    {
+      "id": "microsoft-virtualquery-layout",
+      "title": "VirtualQueryEx",
+      "publisher": "Microsoft",
+      "published_on": "2022-05-24",
+      "verified_on": "2026-09-20",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "Current API contract checked on the verification date; publication metadata is not a technique introduction date.",
+      "primitive": "Region attributes coalesce contiguous pages; copy-on-write image pages still report MEM_IMAGE."
+    },
+    {
       "id": "bitdefender-bind-link-2026",
       "title": "Bind Link Abuse: One Windows Feature, Many Ways to Blind Your EDR",
       "publisher": "Bitdefender Labs",
       "published_on": "2026-07-15",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.bitdefender.com/en-gb/blog/businessinsights/bind-link-abuses-windows-feature-edr-evasion-technique",
       "source_type": "vendor-research",
       "primary": true,
@@ -85,8 +109,8 @@
       "title": "The Immutable Illusion: Pwning Your Kernel with Cloud Files",
       "publisher": "Elastic Security Labs",
       "published_on": "2026-02-20",
-      "verified_on": "2026-07-30",
-      "url": "https://www.elastic.co/security-labs/immutable-illusion",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/immutable-illusion",
       "source_type": "vendor-research",
       "primary": true,
       "version_note": "Author research documents Cloud Filter-backed False File Immutability and Redux/GodFault-Redux.",
@@ -97,7 +121,7 @@
       "title": "EDR killers explained: Beyond the drivers",
       "publisher": "ESET Research",
       "published_on": "2026-03-19",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.welivesecurity.com/en/eset-research/edr-killers-explained-beyond-the-drivers/",
       "source_type": "vendor-research",
       "primary": true,
@@ -109,7 +133,7 @@
       "title": "T1685 Throttle Cybersecurity Agent Network Traffic via QoS Policy",
       "publisher": "Red Canary Atomic Red Team",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/T1685/T1685.yaml",
       "source_type": "open-test",
       "primary": true,
@@ -121,8 +145,8 @@
       "title": "Shedding light on the ABYSSWORKER driver",
       "publisher": "Elastic Security Labs",
       "published_on": "2025-03-20",
-      "verified_on": "2026-07-30",
-      "url": "https://www.elastic.co/security-labs/abyssworker",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/abyssworker",
       "source_type": "vendor-research",
       "primary": true,
       "version_note": "Reverse engineering enumerates callback removal, dispatch replacement, minifilter detach, and thread/process termination handlers.",
@@ -133,7 +157,7 @@
       "title": "Process Injection Using Windows Thread Pools",
       "publisher": "SafeBreach Labs",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.safebreach.com/blog/process-injection-using-windows-thread-pools/",
       "source_type": "vendor-research",
       "primary": true,
@@ -145,7 +169,7 @@
       "title": "Update on Windows Downdate",
       "publisher": "SafeBreach Labs",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.safebreach.com/blog/update-on-windows-downdate-downgrade-attacks/",
       "source_type": "vendor-research",
       "primary": true,
@@ -157,7 +181,7 @@
       "title": "Detection Strategy DET0577 for KernelCallbackTable hijacking",
       "publisher": "MITRE ATT&CK",
       "published_on": "2025-10-21",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://attack.mitre.org/detectionstrategies/DET0577/",
       "source_type": "detection-strategy",
       "primary": true,
@@ -169,7 +193,7 @@
       "title": "Detection Strategy DET0467 for TLS callback injection",
       "publisher": "MITRE ATT&CK",
       "published_on": "2025-10-21",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://attack.mitre.org/detectionstrategies/DET0467/",
       "source_type": "detection-strategy",
       "primary": true,
@@ -177,11 +201,59 @@
       "primitive": "PE TLS-directory modification and hollowing can redirect execution before the nominal entry point"
     },
     {
+      "id": "tlscheck2-2026",
+      "title": "TLSCheck 2.0: An Enhanced Memory Forensics Approach to Efficiently Detect TLS Callbacks",
+      "publisher": "Kartik N. Iyer and Parag H. Rughani",
+      "published_on": "2026-04-22",
+      "verified_on": "2026-09-20",
+      "url": "https://arxiv.org/abs/2604.20378",
+      "source_type": "academic-paper",
+      "primary": true,
+      "version_note": "arXiv v1; methodology and stated limitations read; experiments not reproduced.",
+      "primitive": "PE32/PE32+ TLS callback extraction and code inspection provide static memory-forensics leads"
+    },
+    {
+      "id": "microsoft-pe-tls-format",
+      "title": "PE Format: The TLS Section",
+      "publisher": "Microsoft",
+      "published_on": "2025-07-14",
+      "verified_on": "2026-09-20",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section",
+      "source_type": "official-doc",
+      "primary": true,
+      "version_note": "MicrosoftDocs win32 source ms.date is 07/14/2025; living format specification checked on 2026-09-20.",
+      "primitive": "TLS directory pointer fields are VAs; callback arrays use architecture-sized entries and a null terminator"
+    },
+    {
+      "id": "phnt-worker-factory-2026",
+      "title": "phnt worker factory native query declarations",
+      "publisher": "System Informer",
+      "published_on": "2026-03-26",
+      "verified_on": "2026-09-20",
+      "url": "https://github.com/winsiderss/phnt/blob/53fbbdc5b5d2b08761db1c7b26bfa8c820924356/ntexapi.h",
+      "source_type": "reference-source",
+      "primary": true,
+      "version_note": "Pinned repository revision dated 2026-03-26; query-only x64 ABI validated on the owned fixture.",
+      "primitive": "WorkerFactoryBasicInformation exposes a start routine, start parameter and process identity"
+    },
+    {
+      "id": "elastic-callstacks-2025",
+      "title": "Call Stacks: No More Free Passes For Malware",
+      "publisher": "Elastic Security Labs",
+      "published_on": "2025-06-12",
+      "verified_on": "2026-09-20",
+      "url": "https://www.elastic.co/security-labs/threat-command/call-stacks-no-more-free-passes-for-malware",
+      "source_type": "vendor-research",
+      "primary": true,
+      "version_note": "Primary research article; recovered stacks distinguished from hardware execution traces.",
+      "primitive": "Call-stack context and executable ownership support investigation but are subject to reconstruction and spoofing limits"
+    },
+    {
       "id": "springer-byovd-detector-2026",
       "title": "Finding vulnerable drivers with hooking and reading result verification",
       "publisher": "Springer Cybersecurity",
       "published_on": "2026-05-13",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://link.springer.com/article/10.1186/s42400-025-00434-w",
       "source_type": "academic-paper",
       "primary": true,
@@ -193,7 +265,7 @@
       "title": "Unveiling BYOVD Threats: Malware's Use and Abuse of Kernel Drivers",
       "publisher": "NDSS Symposium",
       "published_on": "2026-02-23",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.ndss-symposium.org/wp-content/uploads/2026-s1491-paper.pdf",
       "source_type": "academic-paper",
       "primary": true,
@@ -205,7 +277,7 @@
       "title": "PsLookupProcessByProcessId function",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupprocessbyprocessid",
       "source_type": "official-doc",
       "primary": true,
@@ -217,7 +289,7 @@
       "title": "PsLookupThreadByThreadId function",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupthreadbythreadid",
       "source_type": "official-doc",
       "primary": true,
@@ -229,7 +301,7 @@
       "title": "Volatility 3 Windows handle-table traversal",
       "publisher": "Volatility Foundation",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://github.com/volatilityfoundation/volatility3/blob/fffd844b8ed7df500e74115a0ee6f818e6afa59f/volatility3/framework/plugins/windows/handles.py",
       "source_type": "reference-source",
       "primary": true,
@@ -241,7 +313,7 @@
       "title": "ReactOS executive handle-table implementation",
       "publisher": "ReactOS",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://github.com/reactos/reactos/blob/c606fd79b1c879bad37e49a69e71986dfbc2052e/ntoskrnl/ex/handle.c",
       "source_type": "reference-source",
       "primary": true,
@@ -253,7 +325,7 @@
       "title": "RX-INT: A Kernel Engine for Real-Time Detection and Analysis of In-Memory Threats",
       "publisher": "arXiv",
       "published_on": "2025-08-05",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2508.03879",
       "source_type": "academic-paper",
       "primary": true,
@@ -265,7 +337,7 @@
       "title": "An In-kernel Forensics Engine for Investigating Evasive Attacks",
       "publisher": "arXiv",
       "published_on": "2025-05-10",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2505.06498",
       "source_type": "academic-paper",
       "primary": true,
@@ -277,7 +349,7 @@
       "title": "Trace of the Times: Rootkit Detection through Temporal Anomalies in Kernel Activity",
       "publisher": "arXiv",
       "published_on": "2025-03-04",
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://arxiv.org/abs/2503.02402",
       "source_type": "academic-paper",
       "primary": true,
@@ -289,7 +361,7 @@
       "title": "EvilEDR: Repurposing EDR as an Offensive Tool",
       "publisher": "USENIX Security 2025",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://www.usenix.org/conference/usenixsecurity25/presentation/alachkar",
       "source_type": "academic-paper",
       "primary": true,
@@ -301,7 +373,7 @@
       "title": "I Solemnly Swear My Driver Is Up to No Good: Hunting for Attestation Signed Malware",
       "publisher": "Mandiant",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://cloud.google.com/blog/topics/threat-intelligence/hunting-attestation-signed-malware",
       "source_type": "vendor-research",
       "primary": true,
@@ -313,7 +385,7 @@
       "title": "Bindlink overview",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows/win32/bindlink/",
       "source_type": "official-doc",
       "primary": true,
@@ -325,7 +397,7 @@
       "title": "FilterVolumeInstanceFindFirst",
       "publisher": "Microsoft Learn",
       "published_on": null,
-      "verified_on": "2026-07-30",
+      "verified_on": "2026-09-20",
       "url": "https://learn.microsoft.com/en-us/windows/win32/api/fltuser/nf-fltuser-filtervolumeinstancefindfirst",
       "source_type": "official-doc",
       "primary": true,
@@ -334,6 +406,39 @@
     }
   ],
   "techniques": [
+    {
+      "id": "user-process-layout-history",
+      "title": "Process-instance layout changes and image impersonation leads",
+      "family": "process-injection",
+      "status": "partial",
+      "claim": "bounded",
+      "priority": "P1",
+      "release_gate": "backlog",
+      "source_ids": ["hasherezade-hollowing-24h2-2025", "microsoft-virtualquery-layout", "elastic-cloudfiles-ffi-2026"],
+      "observable": "Initial and periodic complete VA traversals expose executable permission, allocation and image mapping changes; independently qualified memory/file metadata and code comparisons also inspect unchanged layouts.",
+      "detector_anchors": [
+        { "path": "user/ProcessLayoutCore.h", "contains": "inline Delta Compare" },
+        { "path": "user/ProcessLayoutMonitor.cpp", "contains": "ProcessLayoutMonitor::Discover" },
+        { "path": "user/KernelMonitorLayout.cpp", "contains": "finding.layout_image_identity" }
+      ],
+      "positive_controls": [
+        { "path": "tools/process-layout-selftest.cpp", "contains": "real split protection delta" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "unchanged layout image identity mismatch detected" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "newly started child discovered and snapshotted" }
+      ],
+      "negative_controls": [
+        { "path": "tools/process-layout-selftest.cpp", "contains": "partial removal rejected" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "equivalent split" },
+        { "path": "tools/process-layout-selftest.cpp", "contains": "read failure is not mismatch" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-process-layout.ps1 -Sanitize" ],
+      "limitations": [
+        "Polling and bounded non-atomic sweeps can miss transient changes. Partial snapshots never imply absence; denied or capped processes remain coverage gaps.",
+        "Doppelganging, Herpaderping and Ghosting attribution needs section/file-object or historical evidence. Current mapped-name file identity is not proof of the original backing file.",
+        "Owned-process and synthetic controls do not establish real-cheat recall, clean fleet false-positive rates or external kernel validation."
+      ],
+      "next_action": "Operator validation on supported Windows builds, WOW64/PPL and labeled impersonation/JIT corpora; inspect coverage ages and queue loss before assigning detection claims."
+    },
     {
       "id": "callback-registration-removal",
       "title": "Security callback removal with owner persistence",
@@ -742,10 +847,19 @@
       "release_gate": "backlog",
       "source_ids": [
         "arxiv-rx-int-2025",
-        "arxiv-lase-2025"
+        "arxiv-lase-2025",
+        "elastic-callstacks-2025"
       ],
       "observable": "Executable VAD/page state, loader and backing-file cross-views, thread/APC/stack provenance, and live-versus-disk bytes disagree.",
       "detector_anchors": [
+        {
+          "path": "user/KernelMonitorHunting.cpp",
+          "contains": "ScanExecutablePageCandidates"
+        },
+        {
+          "path": "user/KernelMonitorVerification.cpp",
+          "contains": "ScanExecutableImage"
+        },
         {
           "path": "user/UserModeHunter.cpp",
           "contains": "module_stomping_permission_evidence"
@@ -772,9 +886,9 @@
       ],
       "limitations": [
         "Periodic collection leaves a TOCTOU gap compared with event-driven stateful hashing.",
-        "Headerless kernel executable pages are not yet covered by a full ownership sweep."
+        "Resident headerless code can be observed through bounded executable-page and ownership inspection, but unobserved ranges, unreadable pages, and transient mappings remain coverage gaps."
       ],
-      "next_action": "Add event-driven or higher-frequency provenance capture and a header-independent executable-page ownership corpus."
+      "next_action": "Extend event-driven provenance and the header-independent ownership corpus; measure full-sweep latency and transient-map recall on labeled live fixtures."
     },
     {
       "id": "pspcidtable-full-cross-view",
@@ -869,22 +983,31 @@
       "id": "poolparty-dormant-threadpool-objects",
       "title": "Dormant Windows thread-pool object graph injection",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P1",
       "release_gate": "backlog",
       "source_ids": [
-        "safebreach-poolparty-2023"
+        "safebreach-poolparty-2023",
+        "phnt-worker-factory-2026"
       ],
       "observable": "Worker-factory start routines, TP task/timer queues, IOCP completion keys, and ALPC/job/wait callbacks point to unowned executable memory before execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Current VAD/thread/APC/stack evidence generally observes these variants only after execution."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceScanner.cpp", "contains": "NtQueryInformationWorkerFactory" },
+        { "path": "user/KernelMonitorHunting.cpp", "contains": "ScanUserCallbackSurfaces" }
       ],
-      "next_action": "Build a read-only worker-factory and thread-pool object graph collector with benign thread-pool negative controls."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "owned WorkerFactory start routine observed" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "BenignWork" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "Read-only WorkerFactory start-routine queries are implemented and linked to existing native code verification; access failures and handle/time budgets remain explicit.",
+        "Dormant TP_WORK, TP_IO, TP_TIMER, ALPC, job and wait object graphs are not enumerated. The owned benign fixture validates collection, not malicious PoolParty recall."
+      ],
+      "next_action": "Qualify build-specific dormant thread-pool layouts and independent graph controls before expanding the claim beyond start-routine metadata."
     },
     {
       "id": "unknown-byovd-semantic-reachability",
@@ -934,43 +1057,63 @@
       "id": "kernelcallbacktable-invariant",
       "title": "KernelCallbackTable ownership invariant",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P2",
       "release_gate": "backlog",
       "source_ids": [
         "mitre-kernelcallbacktable-det0577"
       ],
       "observable": "A GUI process PEB callback entry changes or points outside the expected executable module ownership and correlates with write or message execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Generic VAD and write provenance do not enumerate or baseline the KernelCallbackTable itself."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceCore.h", "contains": "KernelCallbacks" },
+        { "path": "user/KernelMonitorVerification.cpp", "contains": "ObservationAnchorsMatch(work.Anchors, reader)" }
       ],
-      "next_action": "Add a per-process PEB callback-table snapshot with module ownership and same-identity temporal controls."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "KCT replaced root invalidates old stable slots" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "KCT null root" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "Only a PDB-qualified native x64 PEB root and a bounded 64-entry candidate prefix are read; full table extent, WOW64 KCT and message execution are not established.",
+        "Root replacement and malformed reads are covered by synthetic readers; live PDB-qualified KCT/VM validation remains with the operator."
+      ],
+      "next_action": "Validate qualified GUI-process fixtures across supported Windows builds, then add independently established table extents and message provenance."
     },
     {
       "id": "tls-callback-invariant",
       "title": "TLS callback directory ownership invariant",
       "family": "process-injection",
-      "status": "missing",
-      "claim": "unsupported",
+      "status": "partial",
+      "claim": "bounded",
       "priority": "P2",
       "release_gate": "backlog",
       "source_ids": [
-        "mitre-tls-callback-det0467"
+        "mitre-tls-callback-det0467",
+        "tlscheck2-2026",
+        "microsoft-pe-tls-format"
       ],
       "observable": "A loaded image TLS directory or callback array changes after load, points outside expected executable ownership, or precedes anomalous thread execution.",
-      "detector_anchors": [],
-      "positive_controls": [],
-      "negative_controls": [],
-      "validation_commands": [],
-      "limitations": [
-        "Generic PE/VAD integrity does not retain a dedicated TLS callback baseline."
+      "detector_anchors": [
+        { "path": "user/ExecutionSurfaceCore.h", "contains": "CompareTls" },
+        { "path": "user/ExecutionSurfaceScanner.cpp", "contains": "ReadNormalizedImageRange" },
+        { "path": "user/KernelMonitorHunting.cpp", "contains": "finding.tls_metadata" }
       ],
-      "next_action": "Add bounded TLS-directory parsing and same-image baseline controls with ordinary static TLS as negatives."
+      "positive_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "TLS directory removal" },
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "TLS callback target change" }
+      ],
+      "negative_controls": [
+        { "path": "tools/analyst-features-selftest.cpp", "contains": "clean owned fixture has no TLS baseline mismatches" }
+      ],
+      "validation_commands": [ ".\\tools\\validate-analyst-features.ps1 -Sanitize" ],
+      "limitations": [
+        "PE32/PE32+ directory/array parsing and relocation-aware qualified file comparison are implemented, with root/PE anchors revalidated before native code-path evidence is retained.",
+        "The 64-callback budget, denied handles, vanished images, absent file references and transient changes limit coverage; no pre-entry execution or malware-recall claim is made."
+      ],
+      "next_action": "Run operator-owned cross-build/WOW64 and transient callback corpora; calibrate legitimate runtime mutation before assigning a malicious verdict."
     },
     {
       "id": "transient-kernel-hook-timing",
