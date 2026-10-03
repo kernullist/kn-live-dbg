@@ -174,6 +174,7 @@ public:
     std::vector<TiEventRecord> RecentAfterSequence(uint64_t minSequenceExclusive, size_t maxCount) const;
     // The records and sequence bounds are captured under the same ring lock.
     TiSequenceSnapshot RecentAfterSequenceWithStatus(uint64_t minSequenceExclusive, size_t maxCount) const;
+    uint64_t PeekNextSequence() const;
     std::vector<TiEventRecord> FilterByPid(uint32_t pid, size_t maxCount) const;
     std::vector<TiEventRecord> FilterByTask(const std::wstring& taskName, size_t maxCount) const;
     std::vector<TiEventRecord> Grep(const std::wstring& pattern, size_t maxCount) const;

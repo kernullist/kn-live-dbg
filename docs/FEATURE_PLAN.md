@@ -8,6 +8,13 @@ machines, and Windows builds.
 
 ## Current Roadmap
 
+The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) is complete for the
+261-entry registry: numeric/JSON validation, fixed-arity dispatch, write backup
+failures, MCP queue timeout handling, remote queued cancellation/stop, collector
+shutdown, and log-file naming were corrected. Release/Debug driver-free
+regression gates passed; live kernel writes, lifecycle races, and external
+DbgEng execution remain on the [manual checklist](MANUAL_TEST_CHECKLIST.md).
+
 Completed core slices:
 
 1. Native VAD and thread/APC triage.
@@ -73,7 +80,7 @@ Completed core slices:
     builtin/drop `inject.remote` (game overlay inject still needs `/name`).
     Lab positive control: `KnLiveDbgKmonTarget.exe`
     (`docs/KMON_TEST_TARGET.md`). A driver filename is not required. Inbox
-    `System32\drivers` stays off unless `/verbose`. Esc detaches;
+    lifecycle events, including `System32\drivers` loads, remain visible. Esc detaches;
     `/background` (alias `/nowatch`) arms without occupying the prompt.
     `add`/`remove` require an already-collecting session; `/verbose` and
     `/log` apply only on the first start. Empty `PsLoadedModuleList` is
@@ -81,10 +88,13 @@ Completed core slices:
     `IOCTL_KNDBG_SET_PROCESS_LOGGING` so watched `/name` targets emit
     TI ReadVM/WriteVM.
 
+12. Bounded execution-evidence hunting: executable-section comparison for selected processes regardless of name, whole-range page scheduling, resumable user PTE walks, PE/PTE permission checks, owned capture buffers, File-handle lifecycle tracking, qualified object manifests, passive callback channels and `!kmon cases [/json]`. The [2026-09-20 review](KMON_ADVERSARIAL_REVIEW_20260920.md) fixed admission starvation, PFN provenance, late reference invalidation, refreshed-case ordering and reserved paging bits. Local Release/Debug and ASan gates pass; OS-specific live trials and actual game-cheat samples remain operator validation. See the [v0.0.33 release notes](RELEASE_NOTES_0.0.33.md) and [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md).
+
 Remaining priority order:
 
 1. WNF stabilization.
 2. Positive-control probe expansion.
+3. Measured Kmon coverage and false-positive rates on labeled live samples and long-running normal hosts, including transient mappings and session-specific kernel pages.
 
 ## P0-P2 Investigation Surface (2026-08-20)
 

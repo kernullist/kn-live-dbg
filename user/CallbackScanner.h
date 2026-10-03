@@ -43,6 +43,8 @@ struct KernelCallbackRecord
     uint64_t PostFunction = 0;
     uint64_t FunctionSlot = 0;
     uint64_t PostFunctionSlot = 0;
+    bool FunctionSlotVerified = false;
+    bool PostFunctionSlotVerified = false;
     uint64_t Context = 0;
     uint64_t Cookie = 0;
     uint64_t RawValue = 0;

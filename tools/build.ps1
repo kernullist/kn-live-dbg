@@ -1,7 +1,11 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
-    [switch]$BumpVersion
+    [switch]$BumpVersion,
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+    [string]$WindowsTargetPlatformVersion,
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$TestCertificateThumbprint
 )
 
 $ErrorActionPreference = "Stop"
@@ -662,12 +666,24 @@ $msbuildArgs = @(
     "/m",
     "/p:Configuration=$Configuration",
     "/p:Platform=x64",
+    "/p:TargetVersion=Windows10",
     "/p:DiaSdkIncludeDir=$diaIncludeDir",
     "/p:DiaSdkLibDir=$diaLibDir",
     "/p:DebuggingToolsIncludeDir=$debuggersIncludeDir",
     "/p:DebuggingToolsLibDir=$debuggersLibDir",
     "/v:minimal"
 )
+
+if (-not [string]::IsNullOrWhiteSpace($WindowsTargetPlatformVersion))
+{
+    $msbuildArgs += "/p:WindowsTargetPlatformVersion=$WindowsTargetPlatformVersion"
+    Write-Host "Windows SDK/WDK target: $WindowsTargetPlatformVersion"
+}
+if (-not [string]::IsNullOrWhiteSpace($TestCertificateThumbprint))
+{
+    $msbuildArgs += "/p:TestCertificate=$TestCertificateThumbprint"
+    $msbuildArgs += "/p:CertificateStoreName=My"
+}
 
 & $msbuild @msbuildArgs
 

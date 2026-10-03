@@ -1808,6 +1808,40 @@ Invoke-Step -Name "constrained Bind Filter fixture controller" -Script {
     }
 }
 
+Invoke-Step -Name "KMON fixture hold-time bounds" -Script {
+    $kmonFixture = Join-Path $rootPath 'x64\Release\tools\KnLiveDbgKmonTarget.exe'
+    $checkHoldTime = {
+        param([string[]]$Arguments, [bool]$ExpectedSuccess)
+        $prefix = Join-Path $buildDir ('kmon-hold-time-' + [guid]::NewGuid().ToString('N'))
+        $fixtureProcess = Start-Process `
+            -FilePath $kmonFixture `
+            -ArgumentList (ConvertTo-ProcessArguments -Arguments $Arguments) `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput ($prefix + '.stdout.log') `
+            -RedirectStandardError ($prefix + '.stderr.log')
+        $output = (Get-Content -LiteralPath ($prefix + '.stdout.log'), ($prefix + '.stderr.log') -Raw) -join "`n"
+        $marker = 'invalid /seconds value'
+        if ($ExpectedSuccess)
+        {
+            $marker = 'KnLiveDbgKmonTarget lab fixture'
+        }
+        if (($fixtureProcess.ExitCode -eq 0) -ne $ExpectedSuccess -or $output -notmatch $marker)
+        {
+            throw "KMON fixture hold-time check failed: $($Arguments -join ' '); log=$prefix"
+        }
+    }
+    foreach ($value in @('0', '1', '0001', '4294967'))
+    {
+        & $checkHoldTime -Arguments @('/help', '/seconds', $value) -ExpectedSuccess $true
+    }
+    foreach ($value in @('', ' ', '4294968', '4294967295', '18446744073709551616', '-1', '+1', '1x', 'junk'))
+    {
+        & $checkHoldTime -Arguments @('/help', '/seconds', $value) -ExpectedSuccess $false
+    }
+    & $checkHoldTime -Arguments @('/help', '/seconds') -ExpectedSuccess $false
+    Write-Host '[hunt-readiness] KMON fixture hold-time checks=14 passed'
+}
+
 Invoke-Step -Name "QoS and Bind Filter E2E evidence controls" -Script {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass `
         -File (Join-Path $rootPath "tools\validate-qos-bind-e2e-selftest.ps1") `

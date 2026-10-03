@@ -1988,6 +1988,8 @@ static bool ScanExCallbackTableRoot(
             {
                 continue;
             }
+            record.FunctionSlotVerified = !layout.UsedSyntheticFields &&
+                layout.Function.Length == 8 && !layout.Function.IsBitField;
             record.Context = callbackContext;
             if (layout.UsedSyntheticFields)
             {
@@ -2229,10 +2231,14 @@ static bool ScanRegistryCallbackListRoot(
                 if (layout.PreCallback.Length != 0)
                 {
                     context.TryAdd(blockAddress, layout.PreCallback.Offset, &record.FunctionSlot);
+                    record.FunctionSlotVerified = !layout.UsedSyntheticFields &&
+                        layout.PreCallback.Length == 8 && !layout.PreCallback.IsBitField;
                 }
                 if (layout.PostCallback.Length != 0)
                 {
                     context.TryAdd(blockAddress, layout.PostCallback.Offset, &record.PostFunctionSlot);
+                    record.PostFunctionSlotVerified = !layout.UsedSyntheticFields &&
+                        layout.PostCallback.Length == 8 && !layout.PostCallback.IsBitField;
                 }
                 record.Context = callbackContext;
                 record.Cookie = cookie;
@@ -2853,6 +2859,8 @@ static bool ScanMinifilterOperationArray(
             record.PostFunction = postOperation;
             AddOffset(context, entryAddress, layout.OperationPre.Offset, &record.FunctionSlot, nullptr);
             AddOffset(context, entryAddress, layout.OperationPost.Offset, &record.PostFunctionSlot, nullptr);
+            record.FunctionSlotVerified = layout.OperationPre.Length == 8 && !layout.OperationPre.IsBitField;
+            record.PostFunctionSlotVerified = layout.OperationPost.Length == 8 && !layout.OperationPost.IsBitField;
             context.AnnotateAddress(record.Function, &record.FunctionModule, &record.FunctionSymbol);
             context.AnnotateAddress(record.PostFunction, &record.PostFunctionModule, &record.PostFunctionSymbol);
             result->Records.push_back(record);
@@ -3596,6 +3604,8 @@ std::wstring BuildCallbacksJson(const KernelCallbackScanResult& result)
             out += L",\"registrationEnabled\":";
             out += record.RegistrationEnabled ? L"true" : L"false";
         }
+        out += L",\"functionSlotVerified\":" + std::wstring(record.FunctionSlotVerified ? L"true" : L"false");
+        out += L",\"postFunctionSlotVerified\":" + std::wstring(record.PostFunctionSlotVerified ? L"true" : L"false");
         if (record.FunctionSlot != 0)
         {
             out += L",\"functionSlot\":" + mcpjson::Quote(CallbacksJsonHex(record.FunctionSlot));
@@ -4430,6 +4440,10 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
                 record.Altitude = altitude;
                 context.TryAdd(itemAddress, layout.PreOperation.Offset, &record.FunctionSlot);
                 context.TryAdd(itemAddress, layout.PostOperation.Offset, &record.PostFunctionSlot);
+                record.FunctionSlotVerified = fieldsValid && !layout.UsedSyntheticItemType && !layout.UsedSyntheticFields &&
+                    layout.PreOperation.Length == 8 && !layout.PreOperation.IsBitField;
+                record.PostFunctionSlotVerified = fieldsValid && !layout.UsedSyntheticItemType && !layout.UsedSyntheticFields &&
+                    layout.PostOperation.Length == 8 && !layout.PostOperation.IsBitField;
                 record.Poisoned = !fieldsValid;
                 if (layout.EnabledFromPdb)
                 {

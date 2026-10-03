@@ -1,4 +1,5 @@
 #include "HandleTableScanner.h"
+#include "NativeHandleSnapshot.h"
 
 #include "LayoutResolver.h"
 #include "McpJson.h"
@@ -33,25 +34,6 @@ namespace
         ULONG SystemInformationLength,
         PULONG ReturnLength);
 
-    struct SystemHandleTableEntryEx
-    {
-        PVOID Object;
-        ULONG_PTR UniqueProcessId;
-        ULONG_PTR HandleValue;
-        ULONG GrantedAccess;
-        USHORT CreatorBackTraceIndex;
-        USHORT ObjectTypeIndex;
-        ULONG HandleAttributes;
-        ULONG Reserved;
-    };
-
-    struct SystemHandleInformationEx
-    {
-        ULONG_PTR NumberOfHandles;
-        ULONG_PTR Reserved;
-        SystemHandleTableEntryEx Handles[1];
-    };
-
     struct HandleRecordBatch
     {
         std::vector<size_t> Indices;
@@ -59,7 +41,7 @@ namespace
         uint64_t InvalidEntries = 0;
     };
 
-    HandleRecordBatch SelectHandleRecordBatch(const SystemHandleTableEntryEx* entries, size_t count,
+    HandleRecordBatch SelectHandleRecordBatch(const NativeHandleEntry* entries, size_t count,
         const HandleTableScanOptions& options)
     {
         HandleRecordBatch batch;
@@ -69,7 +51,7 @@ namespace
             {
                 continue;
             }
-            if (entries[index].HandleValue > UINT32_MAX)
+            if (entries[index].HandleValue == UINT64_MAX)
             {
                 ++batch.InvalidEntries;
                 continue;
@@ -1273,33 +1255,22 @@ bool HandleTableScanner::Scan(
             break;
         }
 
-        const size_t returnedBytes = needed != 0 && needed <= buffer.size() ? needed : 0;
-        if (returnedBytes < sizeof(ULONG_PTR) * 2)
+        std::vector<NativeHandleEntry> entries;
+        if (!ParseNativeHandleSnapshot(buffer.data(), buffer.size(), needed, &entries))
         {
             if (error != nullptr)
             {
-                *error = L"handle snapshot is truncated";
+                *error = L"native handle snapshot is truncated or inconsistent";
             }
             break;
         }
-
-        const SystemHandleInformationEx* table =
-            reinterpret_cast<const SystemHandleInformationEx*>(buffer.data());
-        const size_t headerBytes = offsetof(SystemHandleInformationEx, Handles);
-        const uint64_t count = static_cast<uint64_t>(table->NumberOfHandles);
-        const uint64_t maxCount = (returnedBytes - headerBytes) / sizeof(SystemHandleTableEntryEx);
-        const uint64_t useCount = count < maxCount ? count : maxCount;
-        if (count > maxCount)
-        {
-            result->Warnings.push_back(L"handle snapshot was truncated by buffer size");
-        }
-
+        const size_t useCount = entries.size();
         result->HandlesEnumerated = useCount;
-        result->CoverageComplete = count <= maxCount && status >= 0;
+        result->CoverageComplete = true;
         HandleRecordBatch batch;
         if (options.ContinueHandles)
         {
-            batch = SelectHandleRecordBatch(table->Handles, static_cast<size_t>(useCount), options);
+            batch = SelectHandleRecordBatch(entries.data(), static_cast<size_t>(useCount), options);
             result->HandleCandidates = batch.Candidates;
             result->InvalidHandleEntries = batch.InvalidEntries;
             result->HandleCoveragePartial = batch.Indices.size() < batch.Candidates || batch.InvalidEntries != 0;
@@ -1395,7 +1366,7 @@ bool HandleTableScanner::Scan(
         for (size_t visit = 0; visit < visitCount; ++visit)
         {
             const size_t index = options.ContinueHandles ? batch.Indices[visit] : visit;
-            const SystemHandleTableEntryEx& entry = table->Handles[index];
+            const NativeHandleEntry& entry = entries[index];
             const uint64_t typeFailuresBefore = result->ObjectTypeReadFailures;
             const uint64_t relationshipFailuresBefore = result->RelationshipReadFailures;
             const uint64_t unsupportedBefore = result->RelationshipUnsupported;
@@ -1409,11 +1380,7 @@ bool HandleTableScanner::Scan(
             {
                 continue;
             }
-            if (static_cast<uint64_t>(entry.HandleValue) > 0xFFFFFFFFull)
-            {
-                continue;
-            }
-            record.HandleValue = static_cast<uint32_t>(entry.HandleValue);
+            record.HandleValue = static_cast<uint64_t>(entry.HandleValue);
             if (!options.ContinueHandles)
             {
                 ++result->HandleCandidates;
@@ -1697,7 +1664,7 @@ bool HandleTableAccessMaskSelfTest()
 
     do
     {
-        std::vector<SystemHandleTableEntryEx> inventory(4097);
+        std::vector<NativeHandleEntry> inventory(4097);
         for (size_t index = 0; index < inventory.size(); ++index)
         {
             inventory[index].UniqueProcessId = 100;
@@ -1715,7 +1682,7 @@ bool HandleTableAccessMaskSelfTest()
         }
         continued.HandleAfter = inventory[firstHandles.Indices.back()].HandleValue;
         inventory.erase(inventory.begin() + 4095);
-        SystemHandleTableEntryEx prefix = {};
+        NativeHandleEntry prefix = {};
         prefix.UniqueProcessId = 100;
         prefix.HandleValue = 1;
         inventory.insert(inventory.begin(), prefix);
@@ -1737,6 +1704,15 @@ bool HandleTableAccessMaskSelfTest()
         const auto ambiguous = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
         if (ambiguous.InvalidEntries != 3 || ambiguous.Indices.empty() ||
             inventory[ambiguous.Indices.front()].HandleValue == 1)
+        {
+            break;
+        }
+        prefix.HandleValue = 0x1234567887654321ull;
+        inventory.push_back(prefix);
+        continued.HandleAfter = UINT32_MAX;
+        const auto wideHandle = SelectHandleRecordBatch(inventory.data(), inventory.size(), continued);
+        if (wideHandle.Indices.size() != 1 || wideHandle.InvalidEntries != 3 ||
+            inventory[wideHandle.Indices.front()].HandleValue != prefix.HandleValue)
         {
             break;
         }

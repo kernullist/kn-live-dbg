@@ -16,6 +16,7 @@ struct EtwLoggerRecord
     uint32_t GetCpuClockMode = 0xffffffffu;
     std::wstring GetCpuClockModeText;
     uint64_t GetCpuClockCallback = 0;
+    uint64_t GetCpuClockCallbackSlot = 0;
     std::wstring GetCpuClockModule;
     std::wstring GetCpuClockSymbol;
     std::wstring GetCpuClockCallbackSource;

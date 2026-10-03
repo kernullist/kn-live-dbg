@@ -64,12 +64,14 @@ Pick the IPv4 that B can actually reach (physical Ethernet/Wi-Fi, not a Hyper-V/
 | Flag | Effect |
 |------|--------|
 | (bare) `remote on` | Bind `0.0.0.0:51767`. Firewall rule added. |
-| `remote on 52000` | Same bind, different port. Port **51766 is rejected** (MCP). |
+| `remote on 52000` | Same bind, decimal port `1..65535`. Port **51766 is rejected** (MCP). |
 | `--loopback` | Bind `127.0.0.1` only. No firewall rule. Same box or SSH `-L`. |
-| `--bind <ipv4>` | Listen on that address only. `127.0.0.1` behaves like `--loopback`. |
+| `--bind <ipv4>` / `--bind=<ipv4>` | Listen on that address only. `127.0.0.1` behaves like `--loopback`. |
 | `--peer <ipv4>` | Accept only that client IPv4. Firewall `RemoteAddresses` is pinned too. |
 
 `--lan` and `--allow-write` do not exist. Writes follow the local TUI (`WriteEnabled` stays as it is).
+
+Unknown options, duplicate options/ports, conflicting bind options, missing values, and malformed ports reject the command before the password prompt. Ports in `remote on` and `--connect` must be decimal without signs, hex prefixes, whitespace, or trailing characters. `remote` remains a native command even with `backend dbgeng`.
 
 ### While A is in the remote engine loop
 
@@ -101,7 +103,7 @@ Type the password **before** TCP connect (the server's auth deadline is 10s afte
 After auth:
 
 ```text
-connected HOST Windows abi=15 write=on cloak=no cleartext=true
+connected HOST Windows abi=17 write=on cloak=no cleartext=true
 warning: session is cleartext; lab LAN only
 knkd>
 ```
@@ -155,7 +157,11 @@ B submits raw `knkd>` lines. The contract is a **deny-list**, not the MCP tool c
 
 Dumps and snapshots land on **A's filesystem**, at the same paths the local TUI would use. B does not pull multi-GB files.
 
-Address-only `eb ffff...` (no bytes) is rejected with `supply values on the command line`. Put the bytes on the same line (`eb <addr> 90`). There is no interactive write-preview on B yet.
+Address-only virtual and physical edits (`e*` / `pe*`, for example `eb ffff...` without bytes) are rejected with `supply values on the command line`. Put the bytes on the same line (`eb <addr> 90`); remote execution never opens the local stdin editor. There is no interactive write-preview on B yet.
+
+Command failures propagate as error frames with a code such as `command-failed`, including stderr-only failures. A completed exchange does not by itself mean the command succeeded.
+
+While waiting for the engine, the server continues reading control frames. Protocol `cancel` removes a queued request and returns `cancelled`; if dispatch has started, it returns `not-cancelable`. Disconnect and listener stop also remove queued work, so abandoned commands cannot execute later. Running commands continue to completion. The shipped client waits synchronously for each result and does not bind Ctrl+C to an in-flight `cancel` request.
 
 `ai` from B is allowed. On a box with provider keys, prefer `KNLIVEDBG_AI_REMOTE_POLICY=local-only` if B should not spend those keys.
 
@@ -180,7 +186,7 @@ The protocol also defines `completion-request` for a server-side pass. The shipp
 - Non-loopback `remote on` adds inbound TCP `knlivedbg-remote` (DOMAIN|PRIVATE|PUBLIC). `remote off` / process exit deletes it. A leftover rule from a crash is deleted on the next successful Start.
 - COM failure prints a warning and still listens. If B times out, add the port by hand or check which IP `remote on` printed.
 - Any IPv4 peer is accepted (Tailscale `100.x`, Hamachi, public, RFC1918). Pin a single client with `--peer` if needed.
-- Auth lockout is process-lifetime: 5 failures per peer IP, 15 global, then new auth is refused until `remote off`.
+- Auth lockout lasts for the listener session: 5 failures per peer IP, 15 global, then new auth is refused until `remote off` and a new `remote on`.
 - `mcp on` while remote is up (or the reverse) fails: `listen XOR`.
 - Isolated lab segment only. Shared office LAN / internet: do not bind `0.0.0.0`. Use `--loopback` plus `ssh -L 51767:127.0.0.1:51767` if the wire must be encrypted. TLS is v2 (Appendix A of the design doc), not this build.
 
@@ -199,7 +205,8 @@ The protocol also defines `completion-request` for a server-side pass. The shipp
 | B `error: denied` | Session-lifetime / `kd` / `probe load` / unknown name. Run it on A after `off`, or pick an allowed command |
 | `supply values on the command line` | Address-only `e*` / `pe*`. Add the bytes on the same line |
 | Tab does nothing useful | Client uses local tables. Rebuild B's EXE if it is older than A's command surface |
-| A hung in a long `!hunt` | Control plane `off` is queued-outside, but in-flight work runs to completion |
+| A appears stuck in a long `!hunt` | `off` stops the listener and cancels queued requests. An already-running scan cannot be preempted; the engine returns after it finishes. |
+| B `error: command-failed` | Inspect the command's diagnostic output. Invalid input, driver failures, and failed write verification are errors even if the transport exchange completed. |
 
 Driver-free checks (no live kernel):
 
@@ -207,7 +214,7 @@ Driver-free checks (no live kernel):
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-That runs `KnLiveDbg.exe --self-test remote-protocol` and `--self-test connect-argv` (password min 5, deny-list, `--connect` argv, Tab expands `remote`, loopback listen). It is not part of `--self-test all`.
+That runs `KnLiveDbg.exe --self-test remote-protocol` (52 checks) and `--self-test connect-argv` (4 checks): framing/auth, deny-list, strict argv, local completion, queued cancellation, and listener stop while a job is pending. **Both suites are included in `--self-test all`.** Run configurations sequentially because the fixture uses `127.0.0.1:51767`. It does not load a driver or add firewall rules. See the [command audit](COMMAND_AUDIT_20260919.md) for the verified Release/Debug results and live-test limits.
 
 Same-box smoke (A elevated, driver loaded):
 

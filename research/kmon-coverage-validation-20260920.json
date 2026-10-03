@@ -1,0 +1,281 @@
+{
+  "schema": "kmon.coverage.validation.summary.v1",
+  "date_local": "2026-09-20",
+  "timezone": "Asia/Seoul",
+  "generated_utc": "2026-09-19T15:11:06.452772+00:00",
+  "research_cutoff": "2026-09-19",
+  "base_revision": "0905f56ec631930c06c671031e195583a7f5ba6a",
+  "source_state": "uncommitted coverage extension identified by normalized source hashes below",
+  "scope": "bounded executable-page and user-PTE coverage, image permissions, callback provenance and hunting evidence",
+  "live_validation_owner": "user",
+  "live_kernel_channels_tested": false,
+  "real_cheat_samples": 0,
+  "independent_analyst_audit": false,
+  "competitive_ranking_supported": false,
+  "universal_no_miss_claim_supported": false,
+  "adversarial_fixes": [
+    "Exact PDB-backed callback slots replace object addresses; inferred WFP pointers remain candidates.",
+    "Whole-range cursors survive rediscovery; image candidates cannot evict non-image page candidates.",
+    "Resumable user PTE walk preserves aliases, inherited NX/U/S and large-page PAT semantics.",
+    "Large-page VAD gaps are emitted in VA order; record-limit-one regression reaches all three disjoint spans.",
+    "Process creation identity, EPROCESS/DTB, page permissions, bytes and available PFNs are revalidated.",
+    "Unavailable image identity and module inventory retain uncertain executable evidence instead of a clean verdict.",
+    "Image permission cursor resets when a cached reference is invalidated."
+  ],
+  "driver_abi_changed": false,
+  "full_application_sanitized": false,
+  "configurations": [
+    {
+      "configuration": "Release",
+      "application_build": "passed",
+      "application_sha256": "85b6947a0b186639581559b4a407a259525f3deed904f14c0cfeb7cbf1fd88f2",
+      "all_suites": "passed",
+      "console_assertions": 524,
+      "command_assertions": 1992,
+      "registered_commands": 261,
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "remote_assertions": 52,
+      "core_asan": "passed",
+      "hunting_assertions": 11326,
+      "page_coverage_assertions": 24,
+      "parser_asan_assertions": 275002,
+      "all_test_log": {
+        "path": ".build/kmon-hunting/all-release-coverage-final.log",
+        "sha256": "51f15e0b5503f8345984921839b8eee6e4109a093ee493a4d5e2e4959a9016bc"
+      },
+      "core_test_log": {
+        "path": ".build/kmon-hunting/core-coverage-release-final.log",
+        "sha256": "dae95c59ff4cbfeb64ef4c52ceb9a3492feb6231fa4ee6c0b0c0ee3d0d1d556f"
+      },
+      "hunting_test_log": {
+        "path": ".build/kmon-hunting/hunting-coverage-release-final.log",
+        "sha256": "754d8400bea263d83a9d53de4d7672bba7bc59b88c9cc12e99767f9304b86b94"
+      },
+      "command_audit_log": {
+        "path": ".build/kmon-hunting/command-coverage-release-final.log",
+        "sha256": "21e78098b2930734a33ccb7cd552bfc03a8e48b82e9896855089e21cb23c25a7"
+      },
+      "fixture_report_sha256": "67df509e7029113fba358f9a0a777122c3cb82862b9db9d8f771ecc13d71a3e5",
+      "fixture_sha256": "32c3e4754f63cdc61767c3a720f7e65ad0ad8e23dacbba5df671514ca20743c0",
+      "replay_sha256": "2a37e83fda727b83d0479032fc3c31a14c9cfe01dc96deaf4445a29cf27393b9",
+      "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+      "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+      "baseline_arguments": "/pid <owned_fixture_pid> /quiet /json /ofilter 2 /shellc 3 /iat 3 /report 7",
+      "runs": [
+        {
+          "mode": "clean",
+          "ground_truth": "clean_image",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "modified",
+          "ground_truth": "one_byte_executable_data_section_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "text",
+          "ground_truth": "one_byte_text_function_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            1
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "jit",
+          "ground_truth": "benign_private_rx",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        }
+      ]
+    },
+    {
+      "configuration": "Debug",
+      "application_build": "passed",
+      "application_sha256": "3d767707eb951255c6166fc5d4670defed7d3ad55e27cc3f4528835554a732f2",
+      "all_suites": "passed",
+      "console_assertions": 524,
+      "command_assertions": 1992,
+      "registered_commands": 261,
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "remote_assertions": 52,
+      "core_asan": "passed",
+      "hunting_assertions": 11326,
+      "page_coverage_assertions": 24,
+      "parser_asan_assertions": 275002,
+      "all_test_log": {
+        "path": ".build/kmon-hunting/all-debug-coverage-final.log",
+        "sha256": "51f15e0b5503f8345984921839b8eee6e4109a093ee493a4d5e2e4959a9016bc"
+      },
+      "core_test_log": {
+        "path": ".build/kmon-hunting/core-coverage-debug-final.log",
+        "sha256": "dae95c59ff4cbfeb64ef4c52ceb9a3492feb6231fa4ee6c0b0c0ee3d0d1d556f"
+      },
+      "hunting_test_log": {
+        "path": ".build/kmon-hunting/hunting-coverage-debug-final.log",
+        "sha256": "d2d8b7781cb15136a45ca81e63347cef68a78bbcd51422dc07d3d46dd18e940c"
+      },
+      "command_audit_log": {
+        "path": ".build/kmon-hunting/command-coverage-debug-final.log",
+        "sha256": "21e78098b2930734a33ccb7cd552bfc03a8e48b82e9896855089e21cb23c25a7"
+      },
+      "fixture_report_sha256": "340f7f8f93aea551f7d53d8081194221a665e98f8c206f20eef22a9982e46f0b",
+      "fixture_sha256": "e7078e38ef9065c2da1957c078ac0d63e2e7c2aaf33258fba9ccb6debaf1eba8",
+      "replay_sha256": "67744dfbe2cbec1e844c4341c4b68b08e536e6406eaf04d194814d00f459a1fe",
+      "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+      "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+      "baseline_arguments": "/pid <owned_fixture_pid> /quiet /json /ofilter 2 /shellc 3 /iat 3 /report 7",
+      "runs": [
+        {
+          "mode": "clean",
+          "ground_truth": "clean_image",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "modified",
+          "ground_truth": "one_byte_executable_data_section_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "text",
+          "ground_truth": "one_byte_text_function_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            1
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        },
+        {
+          "mode": "jit",
+          "ground_truth": "benign_private_rx",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": [
+            0
+          ],
+          "baseline_scanned_sections": [
+            1
+          ],
+          "baseline_errors": 0
+        }
+      ]
+    }
+  ],
+  "additional_replay_controls": [
+    "legacy optional-field omission accepted",
+    "verified low-address unknown executable page retained",
+    "session identity serialized and parsed",
+    "malformed new boolean/session fields rejected"
+  ],
+  "claim_gate": {
+    "component_evidence": "validated",
+    "require_competitive_exit": 3,
+    "scope_note": "owned main-image comparison and synthetic tests do not establish full-tool detection rates"
+  },
+  "source_sha256_lf_utf8": {
+    "tools/kmon-hunting-replay.cpp": "cb1c0eba550940eea964e2a2b5bad906ec44cd1f024a615aeb289b8ea6006f87",
+    "tools/kmon-hunting-selftest.h": "c18e4ee128c96c1522bbea86e5c0a889407bcb359d461e21fee1e6a8dce4494a",
+    "tools/kmon-page-coverage-selftest.h": "2768775bfa55a09a80019da924a8ca1412567575c60336d114490b84e25b361d",
+    "tools/validate-kmon-hunting.ps1": "4386a4d08f16993202c0172a706a5ad5b51ed5d3fc79d251ee1c95d188ef0212",
+    "user/CallbackScanner.cpp": "71e246df68b0d1ce3c82c38999ee49b5f0a12ee406e8909e51b30c8e8b263735",
+    "user/CallbackScanner.h": "fc11b3ebec11923608ff9b24a9c691710b8d7bcae4904ec755b0f8f125db4947",
+    "user/CodeTargetResolver.cpp": "7aadcd94efb829cf3be022c0d657209073cf79d11cda13a6f04191a65e420ab0",
+    "user/CodeTargetResolver.h": "d275dd0c814e603f54d4c40edc2a888e9aa5a186aed1dcfceb7e460915fbfb0c",
+    "user/ExecutableImagePermissions.h": "5e64b525965df1126ca51795b8d2ae4da9b15f6023cc474d0aea893ad9145949",
+    "user/KernelMonitor.cpp": "b84b7be2c1588d3f0620f86e2935c3c4e08d52ca1c68751378ace8c0fdc6f583",
+    "user/KernelMonitor.h": "7eaeec7fd70ed4289e8a952e2165b3642b494b11c5965c328ae98192b3de3191",
+    "user/KernelMonitorCatalog.cpp": "becb78c625ad7f0b62af0b2557082f2a6709510ee7225c4df279676f7bf350bc",
+    "user/KernelMonitorHunting.cpp": "3266bdbd74a612c6aefb218f698c8420b4a5ad83a26426e051edd5b721607e28",
+    "user/KernelMonitorVerification.cpp": "7fecca40fc29ff1c449daa532acc1a2414dcfec8898c13dde61dbc8c88d7623a",
+    "user/KmonExecutablePages.h": "2cb9829d4aa33f56c5633ae9805ecba94fcdac95983a048e14c14436f61ba267",
+    "user/KmonHunting.h": "3a12e3c589ee20742a515d7f426202fe3b0bf2c6f058ff71d6d5a9a5f801cd90",
+    "user/KmonHuntingJson.h": "717555e20c82e4aac77fa59db1aa28576361df73dd2445528aec2d3a859221f8",
+    "user/KnLiveDbg.vcxproj": "9367664d972c7aeb5753f571a4e92517e3d0a1b3388584476364f2fe76a20ef8",
+    "user/KnLiveDbg.vcxproj.filters": "edd6a524659bc5d4e3576045d394dc3760f25dfb74b76c2d6406073b4f840eac",
+    "user/ObservationModel.h": "e33df5a99d07b649ab70e6421d32d2d1b7698065733cc268e6d6623df0b4ca39",
+    "user/ProcessTriageScanner.cpp": "7ec01a28c6da6cbfb43bddf4866373c46eb4a4b1bc60b241907f96704dc5b1ea",
+    "user/ProcessTriageScanner.h": "0ccb02be9d35a6261cfc7b840d499f5cd7b1da87bba343a72b007f01fe7cfaad",
+    "user/UserExecutablePteWalker.h": "b32cfbe7055340a7b3272280750427d4430cd6dc555489f21b2f79b91ae492d1"
+  }
+}

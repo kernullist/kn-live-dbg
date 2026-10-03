@@ -189,7 +189,7 @@ namespace mcpjson
     // Bound recursion before accepting network-controlled nesting.
     inline bool ScanValue(const std::wstring& text, size_t pos, size_t* endOut, unsigned depth = 0)
     {
-        if (endOut == nullptr || pos >= text.size() || depth > 128)
+        if (endOut == nullptr || pos >= text.size() || depth > 64)
         {
             return false;
         }
@@ -363,6 +363,21 @@ namespace mcpjson
         }
         SkipWhitespace(text, &pos);
         return pos == text.size();
+    }
+
+    inline bool ScanString(const std::wstring& text, size_t* pos)
+    {
+        return pos != nullptr && *pos < text.size() && text[*pos] == L'"' &&
+            ScanValue(text, *pos, pos);
+    }
+
+    inline bool ValidateDocument(const std::wstring& text)
+    {
+        size_t pos = 0;
+        SkipWhitespace(text, &pos);
+        const bool ok = ScanValue(text, pos, &pos);
+        SkipWhitespace(text, &pos);
+        return ok && pos == text.size();
     }
 
     // Finds a top-level member named key inside a JSON object and returns its

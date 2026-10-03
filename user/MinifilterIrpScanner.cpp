@@ -1,4 +1,5 @@
 #include "MinifilterIrpScanner.h"
+#include "CommandInput.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "LeftoverCommon.h"
@@ -3198,9 +3199,7 @@ bool ParseMinifilterIrpMajor(const std::wstring& text, uint32_t* majorFunction, 
             number = number.substr(2);
             base = 10;
         }
-        wchar_t* end = nullptr;
-        parsed = wcstoull(number.c_str(), &end, static_cast<int>(base));
-        if (end == nullptr || *end != L'\0' || parsed > 0xffull)
+        if (!commandinput::ParseDigits(number, base, &parsed) || parsed > 0xffull)
         {
             if (error != nullptr)
             {

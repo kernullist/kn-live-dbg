@@ -84,6 +84,46 @@ namespace
         return overlaps;
     }
 
+    uint64_t LeafPhysical(uint64_t entry, uint64_t size)
+    {
+        // Large-page PAT is bit 12; physical bases are aligned to leaf size.
+        return EntryPhysical(entry) & ~(size - 1);
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> UnownedLeafRanges(
+        const std::vector<LeftoverModuleRange>& modules, uint64_t start, uint64_t size, uint64_t resume)
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> uncovered;
+        uint64_t end = 0;
+        if (!LeftoverTryAdd(start, size, &end) || size == 0 || resume >= end)
+        {
+            return uncovered;
+        }
+        uint64_t cursor = (std::max)(start, resume);
+        std::vector<std::pair<uint64_t, uint64_t>> covered;
+        for (const auto& module : modules)
+        {
+            if (module.Base < module.End && module.Base < end && module.End > cursor)
+            {
+                covered.emplace_back((std::max)(cursor, module.Base), (std::min)(end, module.End));
+            }
+        }
+        std::sort(covered.begin(), covered.end());
+        for (const auto& range : covered)
+        {
+            if (cursor < range.first)
+            {
+                uncovered.emplace_back(cursor, range.first);
+            }
+            cursor = (std::max)(cursor, range.second);
+        }
+        if (cursor < end)
+        {
+            uncovered.emplace_back(cursor, end);
+        }
+        return uncovered;
+    }
+
     bool BuildUnownedLeafSpans(
         const std::vector<LeftoverModuleRange>& modules,
         uint64_t start,
@@ -764,11 +804,15 @@ static bool ArmOrphanDeepRoots(
     return reset;
 }
 
-static bool ReadOrphanRootIdentity(
+bool ReadOrphanRootIdentity(
     DeviceClient& device, SymbolEngine& symbols,
     const OrphanKernelPageRoot& expected, uint64_t* eprocess,
     std::wstring* error)
 {
+    if (eprocess == nullptr)
+    {
+        return false;
+    }
     TypeFieldInfo dtb = {};
     TypeFieldInfo created = {};
     if (!symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtb, nullptr) ||
@@ -1049,6 +1093,8 @@ bool OrphanKernelPageScanner::WalkKernelPageTables(
         }
 
         flushOpen();
+        result->TraversalFinished = !truncated;
+        result->ResumeAddress = result->NextPageAddress;
         result->PageWalkComplete = options.PageStartAddress == 0 &&
             !truncated && !invalidRange && result->TableReadFailures == 0;
         if (truncated)
@@ -1528,6 +1574,7 @@ void OrphanKernelPageScanner::FinalizeRegions(
             ? static_cast<size_t>(options.RegionOffset) : 0;
         const size_t count = (std::min)(static_cast<size_t>(limit), filtered.size() - offset);
         result->RegionsTruncated = count < filtered.size();
+        result->RegionsDropped = filtered.size() - count;
         result->NextRegionOffset = offset + count < filtered.size() ? offset + count : 0;
         if (result->RegionsTruncated)
         {
@@ -1594,6 +1641,10 @@ bool OrphanKernelPageScanner::Scan(
         }
 
         OrphanKernelPageOptions local = options;
+        if (options.Incremental && options.Continuation == nullptr)
+        {
+            local.PageStartAddress = options.ResumeAddress;
+        }
         ControlRegisters registers = {};
         if (!device_.ReadControlRegisters(0, &registers, error))
         {
@@ -1825,7 +1876,9 @@ std::wstring BuildOrphanKernelPageJson(const OrphanKernelPageResult& result)
     out += L",\"pfnWalkComplete\":";
     out += result.PfnWalkComplete ? L"true" : L"false";
     out += L",\"tablePagesWalked\":" + std::to_wstring(result.TablePagesWalked);
+    out += L",\"resumeAddress\":" + std::to_wstring(result.ResumeAddress);
     out += L",\"tableReadFailures\":" + std::to_wstring(result.TableReadFailures);
+    out += L",\"regionsDropped\":" + std::to_wstring(result.RegionsDropped);
     out += L",\"executableLeaves\":" + std::to_wstring(result.ExecutableLeaves);
     out += L",\"moduleLeavesSkipped\":" + std::to_wstring(result.ModuleLeavesSkipped);
     out += L",\"selfMapLeavesSkipped\":" + std::to_wstring(result.SelfMapLeavesSkipped);
@@ -2157,6 +2210,28 @@ bool OrphanKernelPageSelfTest()
         const auto overflowProbe = ProbeRegionPageHeaders(readSample, ~uint64_t(0) - 0xFFF, 0x1000);
         if (observed.Address != 0 || observed.ReadFailures != 0 ||
             overflowProbe.ReadFailures != 1 || reads != previousReads)
+        {
+            ok = false;
+            break;
+        }
+        const std::vector<LeftoverModuleRange> overlapping =
+        {
+            {0x404000, 0x406000, L"second"},
+            {0x401000, 0x402000, L"first"},
+            {0x405000, 0x407000, L"overlap"}
+        };
+        const auto gaps = UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0);
+        const auto resumed = UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0x403000);
+        if (gaps.size() != 3 || gaps[0] != std::make_pair(0x400000ull, 0x401000ull) ||
+            gaps[1] != std::make_pair(0x402000ull, 0x404000ull) ||
+            gaps[2] != std::make_pair(0x407000ull, 0x600000ull) ||
+            resumed.size() != 2 || resumed[0] != std::make_pair(0x403000ull, 0x404000ull) ||
+            resumed[1] != gaps[2] ||
+            LeafPhysical(0x80001083, 0x200000) != 0x80000000 ||
+            LeafPhysical(0x80001083, 0x40000000) != 0x80000000 ||
+            LeafPhysical(0x80001003, 0x1000) != 0x80001000 ||
+            !UnownedLeafRanges(overlapping, 0x400000, 0x200000, 0x600000).empty() ||
+            !UnownedLeafRanges({{0x400000, 0x600000, L"full"}}, 0x400000, 0x200000, 0).empty())
         {
             ok = false;
             break;

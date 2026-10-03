@@ -1,0 +1,321 @@
+{
+  "schema": "kmon.adversarial.review.summary.v1",
+  "date_local": "2026-09-20",
+  "timezone": "Asia/Seoul",
+  "generated_utc": "2026-09-19T15:53:07.159838+00:00",
+  "base_revision": "e1babba66b331d73b35b45e5c7cd4d6a591e45eb",
+  "source_state": "pre-commit fixes identified by normalized source hashes; unchanged files inherit base_revision",
+  "scope": "executable-page admission, read PFN provenance, final reference consistency, refreshed case order and reserved paging bits",
+  "review_conclusion": "no additional actionable defects found in the final reviewed scope after the recorded fixes and local checks",
+  "fixes": [
+    {
+      "id": "R1",
+      "priority": 1,
+      "problem": "Repeated over-capacity inventories evict partial ranges and starve tail pages.",
+      "change": "Protect partial work, rotate admission after completed ranges and preserve the next cursor across deletion.",
+      "evidence": "Pre-fix regression failures plus ordered and 16-seed shuffled static-inventory tests."
+    },
+    {
+      "id": "R2",
+      "priority": 1,
+      "problem": "Physical bytes can acquire a different PFN when only surrounding translations are compared.",
+      "change": "Preserve actual physical-read addresses and reject contradictory known PFNs across all samples.",
+      "evidence": "Data-flow review and A/B/A, same-page-offset and unavailable-sample predicate controls; no live kernel race trial."
+    },
+    {
+      "id": "R3",
+      "priority": 1,
+      "problem": "Late slot, process or DTB invalidation can leave a finding and earlier hop references.",
+      "change": "Stage path references and publish them after final slot, process-instance and resolved-address-space checks.",
+      "evidence": "Late-slot predicate regression, caller-path review, full application builds and self-tests; no mocked-device race integration test."
+    },
+    {
+      "id": "R4",
+      "priority": 2,
+      "problem": "Refreshing an existing reference leaves it behind older evidence at the output limit.",
+      "change": "Keep the reference ID and move the refreshed reference to the latest position.",
+      "evidence": "A/B/A observations with a one-case output limit fail before the fix and pass afterward."
+    },
+    {
+      "id": "R5",
+      "priority": 2,
+      "problem": "Software-translated entries with fixed reserved paging bits are accepted as executable.",
+      "change": "Reject upper-level PS and large-page reserved address bits while preserving legal PAT positions.",
+      "evidence": "Three pre-fix negative controls fail; all negatives and the PAT positive control pass after the fix."
+    }
+  ],
+  "reproduction_logs": [
+    {
+      "stage": "base code with initial regressions",
+      "passed": 24,
+      "failed": 2,
+      "path": ".build/kmon-review/repro-core-release.log",
+      "sha256": "7dd7f862e8e1eb817b5d096ee91da4deb4b0b66cf7443748a6732627f40950e4"
+    },
+    {
+      "stage": "first admission fix with expanded inventory-order control",
+      "passed": 33,
+      "failed": 1,
+      "path": ".build/kmon-review/repro-admission-order.log",
+      "sha256": "eac8a6db387e6c831a43b030964542a42befd09dcd3372be6d5510ec3d02df9c"
+    },
+    {
+      "stage": "before reserved-bit fix",
+      "passed": 51,
+      "failed": 3,
+      "path": ".build/kmon-review/repro-reserved-paging-bits.log",
+      "sha256": "c4e4fb532f7c00ab001d241941e7e6288efe7c768dc14c6d918df65aab9c6bbd"
+    }
+  ],
+  "standalone_page_asan": {
+    "passed": 54,
+    "failed": 0,
+    "log": {
+      "path": ".build/kmon-review/pages-final.log",
+      "sha256": "d2e19dfcf38669890742b0e431c7cb771f8e84b96238ce66684cbc204773dd2b"
+    },
+    "binary": {
+      "path": ".build/kmon-review/page-review.exe",
+      "sha256": "e591cba16c9bed75e79fd2fe9c3f948990d053cadbf079b088bde12d0d9b006d"
+    }
+  },
+  "configurations": [
+    {
+      "configuration": "Release",
+      "application_build": "passed",
+      "application": {
+        "path": "x64/Release/KnLiveDbg.exe",
+        "sha256": "51875e1ed0cc033f8ba93f4c8f13c31720cb7705cda2482e8103dfe5818e0fc3"
+      },
+      "application_self_test_all": "passed",
+      "console_assertions": 524,
+      "command_assertions": 1992,
+      "registered_commands": 261,
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "remote_assertions": 52,
+      "core_asan": "passed",
+      "core_groups": 7,
+      "hunting_asan": "passed",
+      "hunting_assertions_per_run": 11326,
+      "page_coverage_assertions_per_run": 54,
+      "logs": {
+        "build": {
+          "path": ".build/kmon-review/build-release-final.log",
+          "sha256": "8d0c29ea192c4fb2fec37eca4bff346c0a4fc06609344ed0b6ed38b4927583eb"
+        },
+        "all": {
+          "path": ".build/kmon-review/all-release-final.log",
+          "sha256": "51f15e0b5503f8345984921839b8eee6e4109a093ee493a4d5e2e4959a9016bc"
+        },
+        "core": {
+          "path": ".build/kmon-review/core-release-final.log",
+          "sha256": "a11e3c37ed095b0287b71f5513f2f2d5ff748d8536f808099547140be7047c8c"
+        },
+        "hunting": {
+          "path": ".build/kmon-review/hunting-release-final.log",
+          "sha256": "77a4ab9e26c9d42cf51288d6348d9192178f67b26cb63a79f4b2406eb5b13e8a"
+        }
+      },
+      "fixture_report": {
+        "path": ".build/kmon-hunting/Release-asan/validation.json",
+        "sha256": "84896597eb487e829d8acd7be0daf51cce823a08d7b740c0dd054fb27c6c40c3"
+      },
+      "fixture": {
+        "path": ".build/kmon-hunting/Release-asan/kmon-hunting-fixture.exe",
+        "sha256": "f3a2eb272d3101b5d4601e9a48cc46ec6c9a1ad59065936812afac3b81cbc3e1"
+      },
+      "replay": {
+        "path": ".build/kmon-hunting/Release-asan/kmon-hunting-replay.exe",
+        "sha256": "3804c6ee21fbdb00ef3d9f7418f71c8beb59e3ea22278248794ea2f01d0f1a1a"
+      },
+      "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+      "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+      "baseline_arguments": "/pid <owned_fixture_pid> /quiet /json /ofilter 2 /shellc 3 /iat 3 /report 7",
+      "component_evidence": "validated",
+      "runs": [
+        {
+          "mode": "clean",
+          "ground_truth": "clean_image",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "modified",
+          "ground_truth": "one_byte_executable_data_section_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "text",
+          "ground_truth": "one_byte_text_function_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 1,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "jit",
+          "ground_truth": "benign_private_rx",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        }
+      ]
+    },
+    {
+      "configuration": "Debug",
+      "application_build": "passed",
+      "application": {
+        "path": "x64/Debug/KnLiveDbg.exe",
+        "sha256": "88c3fe88b398bf2ee87bdf1db20b4da4134d39f4612aded77266e53034340d39"
+      },
+      "application_self_test_all": "passed",
+      "console_assertions": 524,
+      "command_assertions": 1992,
+      "registered_commands": 261,
+      "timeline_assertions": 28,
+      "mcp_assertions": 75,
+      "remote_assertions": 52,
+      "core_asan": "passed",
+      "core_groups": 7,
+      "hunting_asan": "passed",
+      "hunting_assertions_per_run": 11326,
+      "page_coverage_assertions_per_run": 54,
+      "logs": {
+        "build": {
+          "path": ".build/kmon-review/build-debug-final.log",
+          "sha256": "de6d8394ee9f83b848e21d5a1e50ba22e7da628074c0ad75e131d14cdffb55b2"
+        },
+        "all": {
+          "path": ".build/kmon-review/all-debug-final.log",
+          "sha256": "51f15e0b5503f8345984921839b8eee6e4109a093ee493a4d5e2e4959a9016bc"
+        },
+        "core": {
+          "path": ".build/kmon-review/core-debug-final.log",
+          "sha256": "a11e3c37ed095b0287b71f5513f2f2d5ff748d8536f808099547140be7047c8c"
+        },
+        "hunting": {
+          "path": ".build/kmon-review/hunting-debug-final.log",
+          "sha256": "67a039d788275ec2c3dfd8e90250bbbe2cfb4cfc6a97c635094ffc09addb5564"
+        }
+      },
+      "fixture_report": {
+        "path": ".build/kmon-hunting/Debug-asan/validation.json",
+        "sha256": "e40ca6384e3e6f35cdc38012c890d1f129f142580ced1bc257e22431697ea9c8"
+      },
+      "fixture": {
+        "path": ".build/kmon-hunting/Debug-asan/kmon-hunting-fixture.exe",
+        "sha256": "0dc28ae7d47ced28dffefe8524a2f69a27260f1bec9338b001a1807f1214884f"
+      },
+      "replay": {
+        "path": ".build/kmon-hunting/Debug-asan/kmon-hunting-replay.exe",
+        "sha256": "92e2f8c0651a1a5505de2562d3636130ca987c7dcda44c437ea961aea902fe63"
+      },
+      "baseline_version": "pe-sieve 0.4.1.1 x64 (2025-09-13)",
+      "baseline_sha256": "9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b",
+      "baseline_arguments": "/pid <owned_fixture_pid> /quiet /json /ofilter 2 /shellc 3 /iat 3 /report 7",
+      "component_evidence": "validated",
+      "runs": [
+        {
+          "mode": "clean",
+          "ground_truth": "clean_image",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "modified",
+          "ground_truth": "one_byte_executable_data_section_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "text",
+          "ground_truth": "one_byte_text_function_change",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 1,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 1,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        },
+        {
+          "mode": "jit",
+          "ground_truth": "benign_private_rx",
+          "malicious_sample": false,
+          "kmon_component": {
+            "scope": "main_image_executable_pages",
+            "modified_pages": 0,
+            "complete": true
+          },
+          "baseline_main_image_code_scan_status": 0,
+          "baseline_scanned_sections": 1,
+          "baseline_errors": 0
+        }
+      ]
+    }
+  ],
+  "driver_source_changed": false,
+  "driver_abi_changed": false,
+  "full_application_sanitized": false,
+  "dedicated_parser_asan_rerun": false,
+  "live_validation_owner": "user",
+  "live_kernel_channels_tested": false,
+  "real_cheat_samples": 0,
+  "independent_analyst_audit": false,
+  "competitive_ranking_supported": false,
+  "universal_no_miss_claim_supported": false,
+  "source_sha256_lf_utf8": {
+    "tools/kmon-hunting-selftest.h": "91c40a115889db03ee391ffca0207db6835319d6374298042b86a51a9e34e2db",
+    "tools/kmon-page-coverage-selftest.h": "df8b95bdb929042e52d15dc057c5ba7c930367d3fc194196fbfa4a9c217d473e",
+    "user/CodeTargetResolver.cpp": "18b9cd3fe4790a530a190020d2ada23f0cd4d272080de1d86de7c71b753704df",
+    "user/CodeTargetResolver.h": "a694696e525fbd1b3873f3c9e486fc0c64e6e324ee5ea6af2f7e9680d2638d89",
+    "user/KernelMonitorHunting.cpp": "aae304ec68c42bbb8b16a3702c993bbb6e7b74d4552f5668615d929e792c4a0e",
+    "user/KernelMonitorVerification.cpp": "a7455a18574cb56be0210b8f0d9e5c3ce9068c8162cf07cef509ac996e905b9b",
+    "user/KmonExecutablePages.h": "b1cad61815e50c665c42b2e786cdcd2a763fdf6f781d2385ecc56d44af1c2f51",
+    "user/KmonHunting.h": "101aed464f512accf5b75378d31cf273f28fe661883150626f7a0826cb5c949c"
+  },
+  "hardware_reference": "https://cdrdv2-public.intel.com/851064/325384-087-sdm-vol-3abcd.pdf"
+}

@@ -74,6 +74,8 @@ struct OrphanKernelPageContinuation
 struct OrphanKernelPageOptions
 {
     bool DeepPfn = false;
+    bool Incremental = false;
+    uint64_t ResumeAddress = 0;
     bool WxOnly = false;
     bool PeOnly = false;
     bool IncludeSession = true;
@@ -103,7 +105,10 @@ struct OrphanKernelPageResult
     uint64_t PfnDatabase = 0;
     uint32_t PagingLevels = 4;
     uint64_t TablePagesWalked = 0;
+    uint64_t ResumeAddress = 0;
     uint64_t TableReadFailures = 0;
+    uint64_t RegionsDropped = 0;
+    bool TraversalFinished = false;
     uint64_t ExecutableLeaves = 0;
     uint64_t ModuleLeavesSkipped = 0;
     uint64_t SelfMapLeavesSkipped = 0;
@@ -167,6 +172,11 @@ private:
 
 std::wstring BuildOrphanKernelPageJson(const OrphanKernelPageResult& result);
 bool OrphanKernelPageSelfTest();
+bool ReadOrphanRootIdentity(
+    DeviceClient& device, SymbolEngine& symbols,
+    const OrphanKernelPageRoot& expected, uint64_t* eprocess,
+    std::wstring* error);
+
 bool ReadOrphanRootMemory(
     DeviceClient& device, uint64_t cr3, uint64_t address, uint32_t length,
     std::vector<uint8_t>* bytes, std::wstring* error = nullptr,

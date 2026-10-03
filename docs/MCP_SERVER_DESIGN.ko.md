@@ -6,7 +6,7 @@
 
 핵심 원칙은 기존 `docs/AI_ASSISTED_WORKFLOWS.md`의 철학을 그대로 잇는다: AI는 기본적으로 advisory, 숨은 자동 write 금지, raw evidence 보존, 드라이버는 좁은 메모리 primitive로 유지, 민감한 커널 상태는 local-only 가능. MCP는 기존 `ai` 명령과 동일한 **capability 카탈로그 + 가드 레이어**를 재사용하는 **세 번째 프런트엔드**다(REPL, 내부 AiProvider에 이은).
 
-> 결론 요약(먼저): **인프로세스 loopback Streamable HTTP**, **읽기 전용 v1**, **단일 엔진 스레드 직렬화**, **기존 카탈로그/가드 100% 재사용**, **MCP 활성화 시 커널 write 플래그 비무장**.
+> 현재 구현 (2026-09-19): 인프로세스 HTTP.sys, 기본 `0.0.0.0:51766`, 선택적 `--loopback`, 기본 읽기 전용, `--allow-write`에서 쓰기 12종, 단일 엔진 FIFO. 운영 절차는 [MCP_SETUP.ko.md](MCP_SETUP.ko.md), 검증 결과는 [명령 감사](COMMAND_AUDIT_20260919.md)를 따른다. 단계별 계획과 초기 scaffold 기록은 구현 이력이며, 미구현 기능은 아래에 구분한다.
 
 ---
 
@@ -34,7 +34,7 @@
 |---|------|------------------|
 | C1 | **단일 컨트롤러**: 드라이버가 `KNDBG_VERSION_FLAG_SINGLE_CONTROLLER` 강제. user-mode는 `\\.\KnLiveDbg`를 `CreateFileW(... ShareMode=0 ...)` 배타적 개방, 전역 `DeviceClient` 1개. | `DeviceClient::Open` (`ShareMode=0`), `shared/KnLiveDbgIoctl.h` |
 | C2 | **배치/헤드리스 모드 없음**: `wmain`이 argc/argv 무시. 항상 대화형 REPL(`knkd>`) 진입. | `wmain` (`UNREFERENCED_PARAMETER(argc/argv)`), REPL 루프 `while(!g_StopRequested)` |
-| C3 | **단일 스레드 엔진**: 모든 `HandleCommand` 디스패치, 모든 `DeviceClient` IOCTL, 모든 `SymbolEngine`(DbgHelp/DIA) 호출이 메인 REPL 스레드에서만 실행. `DeviceClient`에 락 없음, DbgHelp/DIA 비스레드안전. | `DeviceClient` (락 부재), `SymbolEngine` |
+| C3 | **단일 명령 엔진 스레드**: 명령 디스패치와 심볼 작업은 메인 스레드에서 직렬 실행한다. timeline drain 등 collector worker의 IOCTL은 별도 동기화 경로이므로 모든 `DeviceClient` 호출이 메인 스레드에서 실행되는 것은 아니다. | `RunMcpEngineLoop`, `TimelineAutoDrainWorker`, `SymbolEngine` |
 | C4 | **출력 캡처 이미 존재**: `ScopedWideStreamCapture`가 `std::wcout`/`std::wcerr`의 **프로세스 전역 rdbuf**를 문자열 버퍼로 스왑. transcript/AI evidence가 이미 사용. | `ScopedWideStreamCapture` (`std::wcout.rdbuf(&outBuffer_)`) |
 | C5 | **드라이버 write 기본 ON**: `IRP_MJ_CREATE`에서 핸들 컨텍스트 `WriteEnabled = TRUE`. write-virtual/physical/SetProcessProtection 핸들러의 커널측 게이트는 이 플래그 + `KNDBG_WRITE_ACK_MAGIC`(공개 컴파일 상수)뿐. **write 안전 파이프라인 전체가 user-mode에만 존재.** | `Driver.cpp` (`WriteEnabled = TRUE`), `KnLiveDbgIoctl.h` (`KNDBG_WRITE_ACK_MAGIC`) |
 | C6 | **capability 카탈로그 + 가드 존재**: 20개 read-only 툴, per-tool 인자 화이트리스트, 값 검증(`;`/개행/제어문자/help token 거부), write-like/raw-kd/nested-ai/세션변경/unload 거부, 단일 실행 경로. | `IsSupportedAiCapabilityTool`, `ValidateAiCapabilityToolArgKeys`, `ValidateAiCapabilityScalarText`, `ContainsUnsafeAiCommandCharacters`, `ExecuteAiCapabilityPlan` |
@@ -47,7 +47,7 @@
 
 ## 3. 아키텍처 결정
 
-### 3.1 Transport: 인프로세스 loopback Streamable HTTP (stdio 아님)
+### 3.1 Transport: 인프로세스 Streamable HTTP (stdio 아님)
 
 **결정**: 이미 실행 중인 elevated 컨트롤러 프로세스 내부에 **Streamable HTTP** 엔드포인트(`http://127.0.0.1:<port>/mcp`)를 둔다. **stdio는 라이브 프로세스의 기본 transport로 쓰지 않는다.**
 
@@ -59,19 +59,19 @@
 4. **HTTP는 콘솔과 깔끔히 공존**: HTTP 리스너는 자체 소켓/스레드를 소유하고 콘솔을 건드리지 않는다. operator REPL이 살아있어 human-in-the-loop가 유지된다(보안상 필수).
 5. **Claude Code, Cursor, Codex, Grok Build는 Streamable HTTP를 네이티브 지원**한다(아래 §8). 따라서 전송 shim 없이 직접 연결한다. Claude Desktop도 원격 HTTP connector는 지원하지만 연결이 Anthropic 클라우드에서 시작되므로 로컬 loopback/사설망 엔드포인트에는 도달하지 못하고, 로컬 `claude_desktop_config.json` 경로는 stdio다. `tools/mcp-bridge.ps1`은 Claude Desktop 로컬 MCP와 구형 stdio 전용 클라이언트에만 사용한다. 이 무상태 브리지는 버전과 전송을 고정하며 디바이스를 건드리지 않는다.
 
-**구현 스택**: HTTP 서버는 신규 추가다(현재 프로젝트는 `winhttp.lib` *클라이언트*만 링크, 서버 소켓/파이프 없음).
-- 1순위: **HTTP Server API(http.sys, `httpapi.lib`)** — `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup`(`http://127.0.0.1:<port>/mcp`). 커널측 URL 예약과 ACL을 얻고 raw 소켓 파싱을 피한다. URL 예약(`netsh http add urlacl` 또는 SDDL)이 필요할 수 있음(미해결 §10).
+**구현 스택**: HTTP Server API(http.sys, `httpapi.lib`)를 사용한다. 기본 URL prefix는 `http://+:<port>/mcp/`이며 `--loopback`은 loopback prefix만 등록한다. URL 등록 권한이 필요하다. 아래 WinSock 항목은 채택하지 않은 대안이다.
+- 채택 API: `HttpInitialize` / `HttpCreateRequestQueue` / `HttpAddUrlToUrlGroup`. HTTP framing은 HTTP.sys가 처리한다.
 - 대안: `INADDR_LOOPBACK`에 명시 `bind()`하는 소형 WinSock 리스너 — 외부 의존성은 `ws2_32`뿐이나 HTTP/1.1 파싱을 직접 짜야 함.
 
-**POST 응답 모드**: 동기 read 툴은 `Content-Type: application/json`(단일 응답, 가장 단순)으로 답한다. elicitation/진행 알림이 필요한 툴(향후 write)은 **반드시 `text/event-stream`(SSE)** 로 답해야 한다 — 단일 JSON POST 응답에는 서버→클라이언트 요청을 끼워 넣을 수 없기 때문(§7.4).
+**POST 응답 모드**: 현재 read/write 툴은 `application/json` 응답을 사용한다. SSE 진행 알림과 per-write elicitation은 미구현이다.
 
 ### 3.2 Process Model: 인프로세스, 명령으로 ON/OFF, REPL 공존
 
-**결정**: 별도 브리지 프로세스가 아니라 `KnLiveDbg.exe` **내부 서브시스템**. 단일 디바이스 핸들/심볼 엔진/상태를 공유한다(C1). 기본 OFF, operator 콘솔 명령 `mcp on <port>`로 활성화하면 토큰과 즉시 붙여넣을 수 있는 클라이언트 설정을 출력한다. `mcp off`로 즉시 정지.
+**결정**: `KnLiveDbg.exe` 내부 서브시스템으로 단일 디바이스 핸들·심볼 엔진·상태를 공유한다(C1). 기본 OFF이며 `mcp on`은 세션 비밀번호를 입력받고 접속 정보를 출력한다. `mcp off`는 정지를 요청하지만 이미 실행 중인 명령을 선점하지 않는다.
 
-- `McpServer` 객체를 `wmain`에서 `service/device/symbols/ai/aiState`와 함께 생성하되, `mcp on` 전까지 dormant.
+- 전역 `g_McpServer`는 `mcp on` 전까지 리스닝하지 않는다.
 - 활성화되면 HTTP 리스너 스레드를 1개 spawn. 이 스레드는 **커널 작업을 절대 직접 하지 않는다** — HTTP 검증(auth/host/origin/size) → JSON-RPC 파싱 → job 생성 → 엔진 큐 push → per-job 완료 future 대기만 한다.
-- 종료 경로(`mcp off` / Ctrl-C / `wmain` 정리): 리스너 정지 → 큐 드레인 및 대기 job 취소 → `SetWriteMode(false)` → write 무장 해제 → worker join → 기존 드라이버 정리.
+- `RequestStop`은 리스너 대기를 깨우고, `Stop`은 큐의 요청을 실패 처리한 뒤 리스너를 join한다. 실행 중인 엔진 작업은 완료를 기다린다. REPL 복귀 시 write 모드 처리는 §5.7을 따른다.
 
 **operator REPL은 유지된다.** 단, MCP 활성화 모드에서는 콘솔 입력을 단순 라인 리더로 전환한다(§4.2의 전역 rdbuf 경쟁 회피).
 
@@ -94,67 +94,22 @@ C3(단일 스레드 엔진) + C4(전역 rdbuf 캡처)가 가장 미묘한 부분
 
 ### 4.1 단일 엔진 스레드 + 직렬 작업 큐
 
+현재 구현은 `McpServer::queue_` 하나를 사용한다. 별도 `EngineQueue`나 CONSOLE 우선순위 큐는 없다. HTTP 스레드가 요청을 넣고, 메인 스레드의 `RunMcpEngineLoop`가 `JobReadyEvent`를 기다린 뒤 `TryPopJob`과 `DispatchMcpRequest`를 호출한다.
+
 ```text
-[HTTP 리스너 스레드]                 [엔진 스레드 = 메인 스레드]
-  validate(auth/host/origin/size)     drain 루프:
-  parse JSON-RPC                        wait(QueueCv) until !Queue.empty()
-  build McpJob ----------- push ----->  pop (operator job 우선)
-  future.wait_for(timeout)              if CONSOLE: ExecuteCommandWithTranscript
-  serialize result <---- promise -----  if MCP: 가드 검증 + capability 디스패치 + 직렬화
-                                        set promise
+HTTP listener -> validate -> queue_ -> engine dispatch -> ResultPromise
+                      30s response wait     one job at a time
 ```
 
-데이터 구조(코드 스타일 준수):
-
 ```cpp
-// MCP job marshalled onto the single engine thread.
 struct McpJob
 {
-    McpJobKind Kind;                 // Console or Mcp
-    std::vector<std::wstring> Args;  // synthetic command/capability args
-    std::wstring OriginalLine;
-    std::promise<McpResult> Done;
-    std::atomic<bool> Cancelled;
-};
-
-class EngineQueue
-{
-public:
-    bool Push(std::shared_ptr<McpJob> job);   // bounded; false => engine busy
-
-    std::shared_ptr<McpJob> Pop();            // operator(Console) jobs first
-
-private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<std::shared_ptr<McpJob>> consoleJobs_;
-    std::deque<std::shared_ptr<McpJob>> mcpJobs_;
-    size_t maxMcpPending_ = 8;
+    McpEngineRequest Request;
+    std::promise<McpEngineResult> ResultPromise;
 };
 ```
 
-엔진 루프(기존 `while(!g_StopRequested) ReadInteractiveCommandLine` 대체):
-
-```cpp
-while (!g_StopRequested)
-{
-    std::shared_ptr<McpJob> job = queue.Pop(); // blocks on cv
-    if (job == nullptr)
-    {
-        continue;
-    }
-
-    if (job->Cancelled.load())
-    {
-        // queued-but-cancelled: drop without touching the engine
-        job->Done.set_value(McpResult::Cancelled());
-        continue;
-    }
-
-    McpResult result = DispatchOnEngineThread(job, state, device, symbols /* ... */);
-    job->Done.set_value(std::move(result));
-}
-```
+콘솔 reader는 `off`/`status` 제어 요청만 전달하며 엔진 명령을 실행하거나 capture 스트림에 쓰지 않는다. 전체 REPL은 MCP 종료 후 재개한다.
 
 ### 4.2 전역 rdbuf 위험과 완화 (필수)
 
@@ -164,16 +119,16 @@ while (!g_StopRequested)
 
 1. **`ScopedWideStreamCapture`는 엔진 스레드에서만 생성한다.** HTTP 리스너 스레드는 절대 캡처를 만들지 않는다.
 2. **동시에 최대 1개만** 살아있는다. 단일 스레드 내 중첩(nested)은 LIFO 복원이 성립하므로 허용(예: capability 경로가 내부적으로 한 번 더 캡처). **스레드 간 동시 캡처는 금지.**
-3. 디버그 빌드에서 시작 시 엔진 TID를 잡아두고, `DeviceClient`/`SymbolEngine`의 모든 진입점과 캡처 ctor/dtor에 `assert(GetCurrentThreadId() == g_EngineTid)` + `g_CaptureDepth` 단일성 assert를 둔다. 관례가 아니라 코드로 강제.
-4. **MCP 활성화 모드에서는 콘솔 입력을 단순 라인 리더로 전환**한다. 라이브 렌더링 인터랙티브 에디터(`ReadInteractiveCommandLine`)는 타이핑 중 콘솔/`wcout`에 직접 렌더링하므로, MCP job 캡처와 동시에 살아있으면 전역 rdbuf를 경쟁한다. 따라서 MCP 모드에서는 결과 출력은 엔진 스레드만 담당하고, 콘솔 리더 스레드는 완성된 라인을 CONSOLE job으로 push만 한다. (리치 에디팅/히스토리 인라인 렌더링은 순수 REPL 모드 전용.)
-5. **`ScopedCommandProgress`는 MCP-origin job에서 비활성화**한다(`enabled=false`). 이 worker는 `STD_OUTPUT_HANDLE`에 직접 write(C10)하여 캡처/리다이렉트를 우회한다. HTTP 모드에선 프레이밍 손상은 아니지만 operator 콘솔에 MCP 노이즈를 뿌리고, 향후 stdio 브리지에서는 손상 원인이 된다.
+3. 엔진 스레드 소유권을 유지한다. 모든 `DeviceClient`/`SymbolEngine` 호출에 thread-ID assert를 넣는 방안은 추가 검증 항목이며, 전체 호출 지점에 구현된 보장으로 취급하지 않는다.
+4. **MCP 활성화 중 콘솔은 control-only reader다.** `ReadConsoleW`로 읽고 정지·상태 플래그만 전달한다. CONSOLE job을 MCP 큐에 넣지 않으며, rich editor는 일반 REPL에서만 사용한다.
+5. **콘솔 progress는 stream capture를 우회한다.** `ScopedCommandProgress`는 콘솔 핸들에 직접 쓴다. remote dispatch는 이를 끄지만 MCP origin 전체를 대상으로 끄는 처리는 없다. MCP는 HTTP를 사용하므로 콘솔 출력이 JSON-RPC framing에 들어가지는 않으며, MCP progress notification도 아니다.
 
 ### 4.3 백프레셔 · 취소 · 수명
 
 - **인플라이트 1개**: 엔진은 한 번에 job 하나만 실행. 긴 스캔(UserModeHunter, !pool pe, full callbacks)은 그 시간 동안 다른 모든 MCP 요청과 operator를 막는다 — 이는 **의도된 백프레셔**이며, 잘못된 취소 약속으로 가리지 않는다.
-- **대기 큐 bounded(예: MCP 8)**: 가득 차면 `isError:true`("engine busy")로 응답(§7.3 — JSON-RPC -32xxx 아님).
-- **operator 우선순위**: 큐에서 CONSOLE job을 MCP job보다 먼저 꺼낸다. 단, 인플라이트 job은 선점 불가하므로 "operator가 항상 즉시 실행"을 보장하진 않는다(정직하게 명시).
-- **취소(정직한 모델)**: cancellation notification은 **큐에 남아있는 job만** 제거한다. 디스패치된 스캔은 끝까지 실행된다 — 스캐너에 stop token이 없고(C9) `DeviceIoControl`이 동기이기 때문. "중도 취소"를 약속하지 않는다. 스캔을 짧게 유지하려면 `limit`/`count` 인자를 강제한다.
+- **대기 큐 최대 8개**: `tools/call`은 큐 포화 시 `isError:true`와 `engine busy; retry shortly`를 반환한다. 요청은 큐에 들어가지 않는다.
+- **operator 제어**: 정지·상태 요청은 별도 reader가 전달한다. 실행 중인 엔진 명령을 선점하거나 CONSOLE 작업을 우선 실행하는 큐는 없다.
+- **응답 대기 종료**: 30초 초과 또는 stop 시 큐에 남은 요청을 mutex 아래에서 제거하고 `engine wait ended; request cancelled before execution`을 반환한다. 이미 디스패치됐으면 `engine wait ended after dispatch; outcome unknown, inspect state before retrying`이며 실행은 계속될 수 있다. 변경 작업은 상태 확인 후 재시도한다. MCP cancellation notification은 현재 작업을 취소하지 않는다.
 - **late-result 수명**: `McpJob`은 엔진이 `shared_ptr`로 소유. worker가 timeout으로 future를 포기해도, job/결과 저장소는 엔진이 promise를 set할 때까지 살아있다(해제된 메모리에 promise set 금지). 인플라이트 1개 규칙상 timeout-but-running job은 자연스럽게 큐를 막는다(= 정상 백프레셔, hang 아님).
 - **엔진 스레드 재진입 금지**: 엔진 스레드 코드는 절대 자기 큐에 enqueue-and-wait 하지 않는다(자기 데드락). transport 스레드만 future를 기다린다. nested-ai/`assistant.answer`는 기존대로 거부되므로 재진입 경로가 닫혀 있다.
 
@@ -206,7 +161,7 @@ elevated 커널 RW 도구를 잠재적으로 적대적/인젝션된 LLM에 노�
 
 ### 5.2 인증과 비밀번호 취급
 
-1. `mcp on`은 운영자에게 세션용 임시 비밀번호를 입력받는다(입력+확인). 4-128자 printable ASCII, 공백 없음. **디스크에 저장하지 않으며** `mcp off`/프로세스 종료 시 지운다. 클라이언트는 `Authorization: Bearer <password>`를 보낸다.
+1. `mcp on`은 임시 세션 비밀번호를 두 번 입력받는다. 4-128자 printable ASCII이며 공백은 금지한다. 같은 PC 브리지를 위해 보호된 endpoint 파일에 저장하지만 재시작 시 재사용하지 않고 정상 중지 시 파일의 비밀값을 지운다.
 2. 클라이언트는 `Authorization: Bearer <password>`를 보낸다(원문 비밀번호도 허용). 상수 시간 비교, 불일치 시 401.
 3. `mcp on`은 같은 PC Desktop/구형 stdio 브리지용으로 보호된 `mcp-endpoint.json`을 쓴다. 네이티브 클라이언트는 IP + port + 비밀번호를 직접 쓴다. 비밀번호를 git에 커밋하지 말 것. `mcp off`는 endpoint에서 비밀번호를 지운다.
 4. listen IP를 출력해 원격 클라이언트가 주소를 고르게 한다. 디스크 토큰을 발급하거나 재사용하지 않는다.
@@ -224,20 +179,22 @@ MCP는 **기동 시 명시 플래그로 두 모드 중 하나를 선택**한다.
 명시 플래그로만 활성화. 활성화되면:
 
 1. **전체 write 툴 표면 등록**(§6.1 write 네임스페이스). `WriteEnabled`는 세션 동안 TRUE 유지(매 write momentary 토글 불필요 — write가 1급 시민이므로). PPL은 `process.set_protection`으로 **임의 타깃 허용**(lab); self-PPL은 그 특수 케이스라 `IOCTL_KNDBG_SET_PROCESS_PROTECTION`/write-virtual가 동일 `WriteEnabled`를 공유하는 문제가 자연히 사라진다.
-2. **모든 write에 마찰 없는 자동 안전 레일 유지** — 기존 `ai write confirm` 머신러리를 재사용하되 인터랙티브 확인만 뺀다: ① preflight read(현재 바이트) → ② backup/restore 커맨드 산출 → ③ write → ④ post-write read-back **verify-diff** → ⑤ write-audit JSONL(`WriteCommandAuditEvent`). 이 레일은 **LLM이 분석 대상 라이브 상태를 조용히 깨먹어 분석 자체를 무효화하는 것**을 막고 모든 변형을 복구 가능·감사 가능하게 한다.
+2. **메모리 write 검증**: preflight → 지원되는 backup/restore → write → read-back → audit 순서다. 필요한 백업 생성 실패는 변경을 중단하며 실행·검증 오류는 `isError:true`로 전달한다. 파일·링 작업 등에는 메모리 백업이 적용되지 않는다. 백업과 read-back이 모든 부수효과의 자동 복구를 보장하지는 않는다.
 3. **타입 있는 write 툴만**(raw 명령 문자열 금지 유지). 모델은 `eb <addr> <bytes>` 같은 raw 문자열이 아니라 `memory.write_virtual {address, bytes}`처럼 검증된 타입 인자로 호출한다 — 인젝션/체이닝/파싱 표면을 닫고 모델이 더 정확히 호출.
-4. **elicitation 기본 OFF**(lab 무마찰). `mcp write-confirm on`으로 per-write 사람 확인(SSE elicitation, §7.4)을 켤 수 있음.
+4. **per-write elicitation은 미구현**이다. `mcp write-confirm on`은 지원하는 명령이 아니다. 개별 확인이 필요하면 MCP를 읽기 전용으로 두고 로컬 `ai write [index] confirm`을 사용한다.
 
 #### 5.3.3 Lab write 모드의 잔여 위험과 권고 (반드시 인지)
 
-- **confused-deputy(가장 현실적인 위협)**: 분석 중인 멀웨어/공격자 제어 커널 데이터(프로세스명·모듈 경로·메모리 내용)가 모델 컨텍스트로 흘러들어가 프롬프트 인젝션으로 **파괴적 write를 유도**할 수 있다. 타입 인자·값 검증·backup/verify·audit가 복구·추적은 가능하게 하지만 **완전히 막진 못한다**. 신뢰할 수 없는 메모리를 읽으면서 같은 세션에 write를 여는 것은 본질적 리스크.
-- **권고**: ① write 세션 전 **VM 체크포인트/스냅샷**(격리 VM이므로 즉시 롤백 — lab 최강 안전망). ② write 전 `!snapshot`으로 분석 baseline 캡처. ③ loopback+토큰+단일 세션 핀은 그대로 유지. ④ 무인 신뢰가 걱정되면 `mcp write-confirm on`.
+- **confused-deputy**: 분석 대상의 프로세스명·경로·메모리 내용이 모델에 들어가 잘못된 write를 유도할 수 있다. 타입 검증·백업·감사는 이를 완전히 차단하거나 복구를 보장하지 않는다.
+- **권고**: write 세션 전 VM 체크포인트와 분석 baseline을 만든다. 네트워크 노출 범위를 제한하고, 개별 작업 확인이 필요하면 MCP는 읽기 전용으로 유지한다.
 - **raw `kd`/DbgEng 패스스루는 여전히 별개로 닫아둔다**(§5.4-3). 타입 write 툴이 "write" 요구를 이미 충족하고, raw 명령은 hang/crash/임의 실행이라 훨씬 큰 문. 필요하면 별도 확정.
-- TI **구독 시작**(`!ti start`)은 ETW 세션/파일 생성 부수효과로 여전히 콘솔 전용; `ti.query`는 기존 링만 읽음. lab 무인 TI를 원하면 write 모드 아래 `ti.subscribe` 추가 가능.
+- `ti.subscribe`는 구현돼 있다. `action=status`는 읽기 전용이고 `start`/`stop`은 ETW 세션 부수효과 때문에 `--allow-write`가 필요하다. `ti.query`는 기존 링을 읽는다.
 
 > 권장 드라이버 하드닝(후속, ABI bump): 읽기 전용 모드의 정확성을 위해 `SetWriteMode(false)`가 PPL과 write를 함께 닫는 현 구조는 그대로 유효. 다만 향후 "읽기 전용 + self-PPL만"을 다시 원하면 `IOCTL_KNDBG_SET_PROCESS_PROTECTION`에 `WriteEnabled` 독립 게이트를 추가한다.
 
-### 5.4 입력 가드 (프롬프트 인젝션 봉쇄)
+### 5.4 입력 검증
+
+요청 본문은 1 MiB, JSON 중첩은 최대 64다. 완전한 JSON 문서, UTF-8, 디코딩 후 중복 키, JSON-RPC envelope, 툴별 필수 필드·알려진 키·정확한 타입을 검사한다. 문자열 배열에 다른 타입을 섞을 수 없다. 콘솔 radix와 무관한 16진수 바이트 목록, width, 범위도 검사한다. HTTP 상태·오류코드와 대기 종료 동작은 [운영 가이드 §5.2](MCP_SETUP.ko.md#52-요청-검증과-응답-대기)를 따른다.
 
 1. 모든 `tools/call`은 기존 가드를 **그대로** 통과한다: `IsSupportedAiCapabilityTool`(툴 allowlist) + `ValidateAiCapabilityToolArgKeys`(per-tool 인자키 화이트리스트) + per-value `ValidateAiCapabilityScalarText` + `ContainsUnsafeAiCommandCharacters`(`;`/CR/LF/제어문자 거부) + scope enum 정규화 + `IsHelpToken` 거부.
 2. **raw 명령 문자열을 MCP로 절대 받지 않는다(write 포함).** 오직 `tool` + 타입 있는 args만. 읽기 전용 모드에서 인젝션된 모델의 최악은 "in-range 인자로 다른 read 스캐너 선택". Lab write 모드에서는 write 툴이 도달 가능하지만 **타입 인자 + 값 검증 + backup/verify/audit**를 거치고, raw kd/세션변경/unload는 두 모드 모두에서 미노출.
@@ -246,19 +203,19 @@ MCP는 **기동 시 명시 플래그로 두 모드 중 하나를 선택**한다.
 
 ### 5.5 egress 레드액션
 
-`ScopedWideStreamCapture`로 캡처한 텍스트와 직렬화 JSON 모두 **프로세스를 떠나기 전(HTTP UTF-8 변환 전)** `MaybeRedactTranscriptText`로 레드액션한다. 외부 모델은 잠재적 적대 주체로 간주하며, 큐레이션되지 않은 raw 커널 주소/심볼/경로(KASLR·심볼 노출)를 넘기지 않는다.
+초기 설계는 전송 전 일괄 레드액션을 제안했다. 현재 MCP는 분석 충실도를 위해 결과와 감사 인자를 기본적으로 자동 레드액션하지 않는다. `ai transcript`의 레드액션 설정을 MCP 전체에 적용되는 보장으로 해석하지 않는다.
 
 ### 5.6 감사 (필수, 비옵션)
 
-MCP 요청마다 append-only JSONL 1레코드: timestamp, peer(loopback port/PID), session id, tool, **레드액션된 args**, decision(allow/deny + 어느 가드가 발동), result byte size, write-arm 상태. (결과 hash만으로는 불충분 — 무엇이 빠져나갔는지 size+레드액션 스니펫 필요.) `kn://audit/tail`을 읽기 전용 리소스로 노출해 모니터링 클라이언트가 모델 행위를 관찰.
+데이터 요청과 세션 시작을 append-only JSONL로 기록한다. 필드는 `ts`, `session`, `peerPort`, `method`, `tool`, 최대 512자로 자른 `args`, `decision`, `isError`, `resultBytes`, `writeArmed`다. 인자 레드액션이나 모든 전송 거부 기록은 보장하지 않는다. 최근 50줄은 `kn://audit/tail`로 읽는다.
 
 ### 5.7 kill switch
 
-`mcp off` / Ctrl-C(`ConsoleHandler`)는: 리스너 정지 → 큐 드레인 + 대기 job 취소 → `SetWriteMode(false)`(커널 플래그 비무장) → write 무장 해제 → worker join → 기존 드라이버 정리. 비정상 종료가 핸들을 write-enabled로 남기지 않게 한다.
+`off`/`mcp off`는 새 작업을 중지하고 큐의 작업을 취소한다. 이미 디스패치된 작업은 완료될 때까지 엔진을 점유할 수 있다. 현재 `RunMcpEngineLoop`는 정상 REPL 복귀 시 `SetWriteMode(true)`로 대화형 기본값을 복원한다. 따라서 `mcp off`는 로컬 write-off 명령이 아니며, 복귀 후 읽기 전용이 필요하면 `write off`를 실행한다. 프로세스 종료는 별도 collector/device 정리 경로를 따른다.
 
 ### 5.8 세션 핀
 
-`Mcp-Session-Id`를 `InitializeResult`에 발급, 이후 모든 요청에 요구(없으면 400). **두 번째 동시 `initialize`는 거부**(단일 엔진/단일 디바이스 → 단일 MCP 세션). write-arm/elicitation 상태와 감사 귀속을 모호하지 않게 유지하고, 두 LLM이 IOCTL을 인터리브하지 못하게 한다.
+`initialize`는 새 `Mcp-Session-Id`를 발급한다. 이후 세션 검사가 필요한 요청은 이 ID가 일치해야 하며, 누락·불일치는 HTTP 200의 JSON-RPC `-32600`이다. 현재 구현은 새 `initialize`가 기존 ID를 교체하므로 두 번째 초기화를 거부하는 소유권 보장은 없다. 인증은 세션 비밀번호에 의존한다.
 
 ---
 
@@ -351,6 +308,8 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 
 ## 7. 구조화 출력 전략
 
+현재 카탈로그에는 구조화된 결과와 텍스트 전용 툴이 함께 있다. 아래에는 출력 설계 목표도 남겨 두었으며, per-tool `outputSchema`, 통일된 페이지네이션, `resource_link`는 전체 툴에 적용되는 보장이 아니다. 현재 계약은 운영 가이드 §6과 `tools/list`를 따른다.
+
 ### 7.1 2-tier
 
 - **Tier A (즉시 출시, 전 18툴)**: 기존 text 실행기를 `ScopedWideStreamCapture`(C4)로 감싸 `CommandExecutionResult.Output` 캡처 → 레드액션 → `{content:[{type:"text", text:<captured>}]}`. 스캐너 변경 0으로 day-1에 전 툴 동작.
@@ -377,7 +336,9 @@ Claude Code에서 `/mcp__knlivedbg__<prompt>` 슬래시 명령으로 노출. 읽
 - **툴 인자검증/실행/`engine busy`/`device busy`/`writes disabled`/scope 오류 = `isError:true` CallToolResult content**(텍스트 설명 포함). 모델이 self-correct 하도록.
 - JSON-RPC 프로토콜 에러는 **unknown tool(-32601) / malformed params(-32602) / parse·invalid request / auth·session** 에만. (`-32000`/`-32001` 같은 비즈니스 에러 금지 — 모델 self-correction을 깨고 에러 오라클이 됨.)
 
-### 7.4 토큰 예산 · 페이지네이션 · 대용량
+### 7.4 토큰 예산 · 페이지네이션 · 대용량 (설계 목표)
+
+아래 항목은 통일된 출력 계약의 목표다. 현재 모든 툴에 페이지네이션·`resource_link`·64KB/200개 제한이 구현된 것은 아니다. 실제 지원 인자는 `tools/list`와 운영 가이드 §6을 따른다.
 
 - 모든 list 툴: `offset`+`limit` + `{total, returned, truncated, next_offset}` 봉투. 보수적 기본 캡(예: 200 레코드 / 64KB), 초과 시 `truncated:true` + 명시적 hint(절대 조용한 누락 금지). `UserModeHunter`/pool-scan은 특히 bounded 기본값.
 - 대용량 산출물(snapshot/dump/full pool listing)은 inline 대신 **`resource_link`로 `kn://` 리소스 참조**. (Claude Code는 ~10k 토큰 경고, ~25k(`MAX_MCP_OUTPUT_TOKENS`)에서 truncate/persist.)
@@ -433,7 +394,7 @@ claude mcp add --transport stdio knlivedbg-bridge -- \
 }
 ```
 
-유용한 노브: per-server `timeout`(ms, 느린 스캔용 상향 — 진행 알림으로 연장 안 됨), `headersHelper`(접속 시 회전 토큰), `alwaysLoad`.
+클라이언트 timeout을 늘려도 서버의 30초 응답 대기는 연장되지 않는다. 디스패치된 작업은 계속 실행될 수 있으므로 §4.3의 결과 구분을 따른다.
 
 ### 8.3 Claude Desktop
 
@@ -451,7 +412,7 @@ Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공�
 | **1. 읽기 카탈로그(Tier A)** | 엔진 큐 + 콘솔-라인-as-job 드레인 루프, 18개 read-only 툴을 `ExecuteAiCapabilityPlan` 재사용 + `ScopedWideStreamCapture` text. origin="mcp" 감사. 기본 읽기 전용 모드 = `SetWriteMode(false)` 비무장. | 외부 LLM이 전체 읽기 포렌식 표면을 가드/감사 하에 구동. **실질 가치 1차 출시.** |
 | **2. 구조화 JSON(Tier B)** | 스캐너별 `Build*Json` 작성/재사용 → `structuredContent`+outputSchema. offset/limit 페이지네이션. 통합 surrogate-safe escaper. | 계약 변경 없이 툴별 text→structured 승격. |
 | **3. 리소스+프롬프트** | `kn://modules`/`drivers`/`snapshot`/`ti/stats`/`audit/tail` + 7개 플레이북 프롬프트. 대용량은 `resource_link`. | 모델 자기 그라운딩 + 슬래시 명령 워크플로. |
-| **4. Lab write 모드** | `mcp on --allow-write`로 write 네임스페이스(§6.1.1) 등록. 세션 동안 `WriteEnabled=TRUE`. 모든 write에 자동 preflight/backup/verify-diff/audit(인터랙티브 확인 없음). `process.set_protection` 임의 타깃. `dump.*` 출력 루트 제한. `mcp write-confirm on`으로 per-write SSE elicitation 옵션. | 격리 lab/VM 전용(결정 §10-Q1/Q2). 기본 OFF, `--allow-write` 없이는 등록 안 됨. write 전 VM 스냅샷 권장. |
+| **4. Lab write 모드** | `--allow-write`로 write 툴 등록, 지원되는 백업·read-back·감사, 임의 PID의 `process.set_protection`은 구현됐다. per-write SSE elicitation은 후속이다. | 기본 OFF. 현재 계약은 운영 가이드 §3.4와 §6.2를 따른다. |
 
 각 단계는 독립 출시 가능하며, 후속 단계가 Phase-0 보안 자세를 약화시키지 않는다.
 
@@ -464,9 +425,9 @@ Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공�
 1. **서버 스택 → http.sys (`httpapi.lib`)**. elevated 프로세스에 hand-rolled HTTP 파서를 두는 것이 최우선 EoP 표면이므로 커널-감사된 http.sys로 오프로드. **관리자/SYSTEM은 `HttpAddUrlToUrlGroup`에 별도 `netsh urlacl` 예약 불필요** → URL ACL 우려 해소. loopback 한정 prefix `http://127.0.0.1:<port>/mcp` + `http://[::1]:<port>/mcp`. WinSock 기각.
 2. **포트 → 고정 기본값 + override**. loopback 포트 스캔은 즉시 가능 → 랜덤의 보안 이득 ≈ 0인데 매 세션 클라 설정 깨짐 비용이 큼(실제 인증은 토큰). private 범위 고정 기본값(예: `51766`) + `mcp on <port>` override.
 3. **write 노출 → Lab write 모드 전면 개방 (Q1, 2026-06-24 갱신)**. 격리 lab/VM(Q2)이므로 분석 충실도를 위해 `mcp on --allow-write`로 전체 타입 write 툴(§6.1.1)을 연다. 단 "개방 ≠ 안전 레일 제거" — 마찰 없는 자동 preflight/backup/verify-diff/audit를 유지(§5.3.2)하고 raw kd/임의 명령/숨은 write는 계속 금지. 비-lab 기본은 읽기 전용 + 커널 플래그 비무장(§5.3.1). write 전 VM 스냅샷 권장(§5.3.3). *(이전 "PPL 예외만" 결정을 대체.)*
-4. **클라이언트 인증 → `mcp on`에서 운영자가 입력하는 세션 비밀번호**. 디스크에 저장하지 않는다. 클라이언트는 `Authorization: Bearer <password>`. 같은 PC 스니펫은 `mcp-load-env.ps1`이 그 값을 `KNLIVEDBG_TOKEN`에 넣을 수 있다. project-scope 커밋 금지.
+4. **클라이언트 인증**: `mcp on`에서 입력한 세션 비밀번호를 사용한다. 같은 PC 브리지용 보호된 endpoint 파일에 저장하며 정상 중지 시 비밀값을 지운다. 재시작 시 재사용하지 않는다.
 5. **실행 환경 → 격리 분석 VM 중심 (Q2)**. 기본은 lab NIC용 전체 인터페이스 바인드. `--loopback`도 가능. (라이브 EDR/AC 박스에서 쓸 일이 생기면 named pipe 옵션을 백로그에서 검토.)
-6. **타임아웃/캡 → 시작 기본값 채택, 라이브 VM 실측 튜닝**. 엔진 대기 30s(넘는 스캔은 범위를 나누거나 제한하며 클라이언트 timeout만으로 연장 불가), MCP 대기 큐 8, per-result 64KB/200 레코드, raw read 1MB(드라이버 캡), hunt/pool-scan 강제 `limit`. 전부 config 노출.
+6. **현재 한도**: 응답 대기 30초, MCP 대기 큐 8개, 요청 본문 1 MiB. 응답 대기는 실행 제한 시간이 아니다. 통일된 결과 64KB/200개 제한과 전체 설정 노출은 초기 목표이며, 툴마다 구현된 제한을 확인해야 한다.
 
 남은 백로그(운영/구현 시 결정): http.sys SDDL로 포트 ACL을 elevated 계정에 한정할지; `SetProcessProtection`에 `WriteEnabled`와 독립된 게이트를 추가하는 드라이버 하드닝(§5.3.1)으로 momentary write window 제거.
 
@@ -494,7 +455,7 @@ Claude 원격 connector를 쓰려고 커널 엔드포인트를 인터넷에 공�
 
 ---
 
-## 11.1 구현 상태 (v0 스캐폴드, feature/mcp-server)
+## 11.1 초기 구현 기록 (v0 scaffold, historical)
 
 Phase 0~1 + write 네임스페이스(§6.1.1)를 한 번에 구현한 초기 스캐폴드가 들어가 있다.
 
@@ -598,16 +559,16 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 
 - 라이브 검증 항목: `mcp on` → `claude mcp add --transport http` 연결 → `tools/list`/`resources/list` + `callbacks.list`/`ssdt.scan`/`kn://modules/kernel` 등 왕복 → `--allow-write`로 `memory.write_virtual` backup/verify 경로(테스트 VM, 스냅샷 후).
 
-### 11.1.5 현재 카탈로그 (2026-08)
+### 11.1.5 현재 카탈로그와 검증 (2026-09-19)
 
-실제 소스는 `user/McpServer.cpp`의 `kTools` 테이블이다. 운영자용 표는 `MCP_SETUP.ko.md` §6. 작성 시점 기준 **읽기 툴 67종**, **쓰기 툴 11종**. Phase 2 quiet surface로 `etw.providers`, `etw.ti_cross`, `hal.scan`, `hive.list`, `token.inspect`, `dpc.list`, `timer.list`가 추가됐다. Lab write 모드의 `process.set_protection`은 임의 대상 PID를 받으며, 초기 v0의 self-only 매핑은 과거 기록이다.
+현재 `user/McpServer.cpp`의 `kTools`는 **읽기 67종 + 쓰기 12종 = 총 79종**이다. 운영자용 표는 [MCP_SETUP.ko.md §6](MCP_SETUP.ko.md#6-제공-기능-카탈로그)에 있다. `ti.subscribe` start/stop은 write 모드가 필요하고 `process.set_protection`은 임의 PID를 받는다. Release/Debug에서 MCP 툴 75개 검사와 별도 HTTP 9개 검사가 통과했다. [명령 감사](COMMAND_AUDIT_20260919.md)에 parser ASan·queue 검증과 라이브 커널 검증 한계를 기록했다.
 
-## 12. 설계 핵심 7줄 요약
+## 12. 현재 구현 요약
 
-1. **인프로세스 loopback Streamable HTTP**(stdio 아님), 기본 OFF, `mcp on`으로 활성화.
-2. **단일 엔진 스레드**에 모든 MCP 요청을 직렬 큐로 마샬; HTTP 스레드는 커널을 절대 안 건드림.
-3. `ScopedWideStreamCapture`는 **엔진 스레드 전용·동시 1개**(전역 rdbuf UAF 방지).
-4. **두 모드** — 기본 읽기 전용(`SetWriteMode(false)`로 커널 플래그 비무장) / **Lab write 모드**(`--allow-write`, 격리 VM)는 타입 write 툴 전면 개방하되 자동 backup/verify/audit 유지, raw kd·숨은 write 금지.
-5. 모든 `tools/call`은 **기존 카탈로그+가드** 통과, raw 명령/신규 primitive 불가, egress 레드액션.
-6. 결과는 `structuredContent`+동일 JSON 텍스트 미러, 에러는 `isError:true`, 대용량은 `resource_link`+페이지네이션.
-7. **취소는 큐 단계만**(인플라이트 스캔 선점 불가 — 정직), 단일 세션 핀, 필수 감사, kill switch가 커널까지 비무장.
+1. HTTP.sys 인프로세스 서버는 기본 OFF, 기본 bind는 `0.0.0.0:51766`이며 `--loopback`을 지원한다.
+2. 커널·심볼 작업은 단일 엔진 FIFO에서 실행하고 capture도 엔진 스레드가 소유한다.
+3. 기본 읽기 전용이며 `--allow-write`에서 쓰기 12종을 노출한다.
+4. 완전한 JSON과 공개 툴 스키마를 검사하고 raw 명령은 받지 않는다.
+5. 구조화된 JSON을 제공하는 툴과 텍스트만 반환하는 툴이 함께 있다. 통일된 페이지네이션과 elicitation은 후속이다.
+6. 대기 종료 시 큐의 요청만 취소한다. 디스패치 후 결과는 불명일 수 있으며 MCP 취소 알림은 작업을 제거하지 않는다.
+7. `mcp off` 후 REPL은 기본 write-on으로 복귀한다. 세션 파일·감사·인증은 위 구현 계약을 따른다.

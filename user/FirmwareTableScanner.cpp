@@ -1108,7 +1108,11 @@ namespace
             }
 
             uint32_t requiredSize = 0;
-            if (!GetFirmwareProviderRequiredSize(candidate, &requiredSize))
+            TypeFieldInfo handlerField = {};
+            const bool handlerResolved = symbols.FindField(typeName, L"FirmwareTableHandler", &handlerField, nullptr) ||
+                symbols.FindField(typeName, L"Handler", &handlerField, nullptr);
+            if (!handlerResolved || handlerField.Length != sizeof(uint64_t) || handlerField.IsBitField ||
+                !GetFirmwareProviderRequiredSize(candidate, &requiredSize))
             {
                 continue;
             }
@@ -1296,6 +1300,7 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
 
         result->UsedFallbackLayout = !providerLayout.FromPdb;
         result->LayoutName = providerLayout.TypeName;
+        bool walkLinksVerified = true;
 
         while (current != listHead)
         {
@@ -1332,6 +1337,10 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
             record.NodeAddress = node;
             record.ListEntry = current;
             DecodeFirmwareProviderRecordFields(providerLayout, bytes, &record);
+            if (providerLayout.FromPdb)
+            {
+                TryAdd(node, providerLayout.HandlerOffset, &record.HandlerSlot);
+            }
 
             record.ProviderText = ProviderSignatureText(record.ProviderSignature);
             record.StandardProvider = IsStandardProviderSignature(record.ProviderSignature);
@@ -1354,22 +1363,30 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
 
             uint64_t nextBlink = 0;
             uint64_t nextBlinkAddress = 0;
-            if (record.Flink != 0 && IsKernelAddress(record.Flink) &&
+            bool recordLinksVerified = record.Flink != 0 && IsKernelAddress(record.Flink) &&
                 TryAdd(record.Flink, sizeof(uint64_t), &nextBlinkAddress) &&
-                ReadU64(device_, nextBlinkAddress, &nextBlink, nullptr) &&
-                nextBlink != current)
+                ReadU64(device_, nextBlinkAddress, &nextBlink, nullptr);
+            if (recordLinksVerified && nextBlink != current)
             {
+                recordLinksVerified = false;
                 record.Suspicious = true;
                 AppendNote(&record.Notes, L"Flink/Blink backlink mismatch");
             }
 
             uint64_t previousFlink = 0;
-            if (record.Blink != 0 && IsKernelAddress(record.Blink) &&
-                ReadU64(device_, record.Blink, &previousFlink, nullptr) &&
-                previousFlink != current)
+            const bool previousRead = record.Blink != 0 && IsKernelAddress(record.Blink) &&
+                ReadU64(device_, record.Blink, &previousFlink, nullptr);
+            if (previousRead && previousFlink != current)
             {
                 record.Suspicious = true;
                 AppendNote(&record.Notes, L"Blink/Flink forward-link mismatch");
+            }
+            recordLinksVerified = recordLinksVerified && previousRead && previousFlink == current;
+            if (!recordLinksVerified)
+            {
+                walkLinksVerified = false;
+                record.HandlerSlot = 0;
+                AppendNote(&record.Notes, L"registration links unverified; handler slot withheld");
             }
 
             AnnotateAddress(
@@ -1411,6 +1428,12 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
             ++slot;
         }
 
+        uint64_t lastLink = 0;
+        uint64_t headTailAddress = 0;
+        const uint64_t expectedTail = result->Records.empty() ? listHead : result->Records.back().ListEntry;
+        walkLinksVerified = walkLinksVerified && TryAdd(listHead, sizeof(uint64_t), &headTailAddress) &&
+            ReadU64(device_, headTailAddress, &lastLink, nullptr) && lastLink == expectedTail;
+        result->CoverageComplete = providerLayout.FromPdb && current == listHead && walkLinksVerified && result->Warnings.empty();
         for (FirmwareTableProviderRecord& record : result->Records)
         {
             if (signatureCounts[record.ProviderSignature] > 1)
@@ -1451,6 +1474,8 @@ std::wstring BuildFirmwareTableJson(const FirmwareTableScanResult& result)
     }
     out += L",\"usedFallbackLayout\":";
     out += result.UsedFallbackLayout ? L"true" : L"false";
+    out += L",\"coverageComplete\":";
+    out += result.CoverageComplete ? L"true" : L"false";
     out += L",\"records\":[";
 
     for (size_t index = 0; index < result.Records.size(); ++index)
@@ -1470,6 +1495,7 @@ std::wstring BuildFirmwareTableJson(const FirmwareTableScanResult& result)
         out += L",\"registerFlag\":" + std::to_wstring(record.RegisterFlag);
         out += L",\"nodeAddress\":" + mcpjson::Quote(FwTableJsonHex(record.NodeAddress));
         out += L",\"firmwareTableHandler\":" + mcpjson::Quote(FwTableJsonHex(record.FirmwareTableHandler));
+        out += L",\"handlerSlot\":" + mcpjson::Quote(FwTableJsonHex(record.HandlerSlot));
         if (!record.HandlerModule.empty())
         {
             out += L",\"handlerModule\":" + mcpjson::Quote(record.HandlerModule);
