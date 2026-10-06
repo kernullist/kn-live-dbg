@@ -510,7 +510,7 @@ HTTP 요청 본문은 **1 MiB**로 제한한다. 본문 읽기 실패와 불완�
 
 리스너 중지도 대기를 끝내고 큐에 남은 작업을 취소한다. 이미 디스패치된 작업은 선점할 수 없다. MCP `notifications/cancelled`는 알림으로 수신하지만 현재 작업을 제거하지 않는다. 클라이언트에서 취소했다는 사실만으로 변경이 방지됐다고 판단하면 안 된다.
 
-[명령 감사 보고서](COMMAND_AUDIT_20260919.md)에 드라이버 없는 JSON·스키마·큐·HTTP 회귀 결과가 있다. `--self-test mcp-http`는 `--self-test all`과 별도로 실행하며 HTTP.sys loopback URL 등록 권한이 필요하다.
+[명령 감사 보고서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)에 드라이버 없는 JSON·스키마·큐·HTTP 회귀 결과가 있다. `--self-test mcp-http`는 `--self-test all`과 별도로 실행하며 HTTP.sys loopback URL 등록 권한이 필요하다.
 
 ---
 

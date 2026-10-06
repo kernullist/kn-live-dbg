@@ -214,7 +214,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-`KnLiveDbg.exe --self-test remote-protocol`(52개 검사)과 `--self-test connect-argv`(4개 검사)를 실행한다. framing/auth, deny-list, 엄격한 argv, 로컬 자동 완성, 큐 요청 취소, 작업 대기 중 리스너 중지를 검증한다. **두 묶음 모두 `--self-test all`에 포함된다.** fixture가 `127.0.0.1:51767`을 사용하므로 구성별 실행은 순차로 한다. 드라이버를 로드하거나 방화벽 규칙을 추가하지 않는다. 검증된 Release/Debug 결과와 라이브 테스트 한계는 [명령 감사 보고서](COMMAND_AUDIT_20260919.md)에 있다.
+`KnLiveDbg.exe --self-test remote-protocol`(52개 검사)과 `--self-test connect-argv`(4개 검사)를 실행한다. framing/auth, deny-list, 엄격한 argv, 로컬 자동 완성, 큐 요청 취소, 작업 대기 중 리스너 중지를 검증한다. **두 묶음 모두 `--self-test all`에 포함된다.** fixture가 `127.0.0.1:51767`을 사용하므로 구성별 실행은 순차로 한다. 드라이버를 로드하거나 방화벽 규칙을 추가하지 않는다. 검증된 Release/Debug 결과와 라이브 테스트 한계는 [명령 감사 보고서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)에 있다.
 
 같은 박스 스모크 (A elevated, 드라이버 로드됨):
 

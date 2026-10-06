@@ -80,10 +80,10 @@ write ACK magic):
 
 ## Acceptance criteria (Phase A)
 
-The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) records build and
+The [2026-09-19 command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records build and
 driver-free regression evidence for the shutdown changes. It does not prove
 live dispatch/unload race behavior; those checks remain on the
-[manual checklist](MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle).
+[manual checklist](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle).
 
 - With `!kmon start /name loader.exe` and a loader that opens a device
   handle, a `driver.handle` event appears after its rotating scan with

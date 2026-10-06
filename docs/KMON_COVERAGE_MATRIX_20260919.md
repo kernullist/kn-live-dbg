@@ -12,7 +12,7 @@
 - [Microsoft WFP callout 구조](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/ns-fwpsk-fwps_callout0_)는 classify/notify/flow-delete 경로를 정의한다. 공개 API 구조는 `netio.sys` 내부 테이블의 빌드별 레이아웃을 보증하지 않는다.
 - [Intel SDM](https://www.intel.com/content/www/us/en/support/articles/000006715/processors.html)의 페이징 규칙에 따라 상위 단계의 NX·U/S, 큰 페이지와 PAT를 구분한다. PTE 한 개의 NX만 보고 실행 권한을 정하지 않는다.
 
-기존 CI 정책·수동 매핑·펌웨어 인터페이스 조사와 날짜는 [연구 기록](KMON_HUNTING_RESEARCH_20260919.md)에 있다. 오래된 기초 기법을 최신 사건으로 표시하지 않으며, 일반 악성코드 연구를 게임핵 표본 검증으로 계산하지 않는다.
+기존 CI 정책·수동 매핑·펌웨어 인터페이스 조사와 날짜는 [연구 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_HUNTING_RESEARCH_20260919.md)에 있다. 오래된 기초 기법을 최신 사건으로 표시하지 않으며, 일반 악성코드 연구를 게임핵 표본 검증으로 계산하지 않는다.
 
 ## 기법과 수집 경로
 
@@ -51,7 +51,7 @@
 
 큰 페이지 안의 VAD 빈 구간과 권한 불일치 구간은 VA 오름차순으로 기록한다. 뒤쪽 불일치를 먼저 기록하면 결과 상한에서 재개 VA가 앞쪽으로 돌아가 같은 구간을 반복할 수 있다. 상한을 1개로 둔 통합 회귀에서 빈 구간·비실행 VAD·나머지 구간을 세 번의 패스로 중복 없이 열거하고 물리 offset을 유지하는지 검사한다.
 
-페이지 검증은 현재 실행 권한, 반복 읽기 바이트, 프로세스 인스턴스와 확보한 PFN을 다시 확인한다. 물리 읽기 경로는 PTE가 확인된 페이지에만 적용하며, 실제 읽기에 사용한 PFN도 전후 번역과 대조한다. 실행 권한 판정은 상위 PML5E/PML4E의 예약된 PS 비트와 1 GiB/2 MiB leaf의 예약 주소 비트를 거부하고 올바른 PAT 비트는 허용한다. PAGE_GUARD로 확인된 주소는 일반 유저 가상 읽기를 보류한다. 등록 목록 스냅샷과 실제 읽기는 원자적이지 않으므로 무관측 구간이나 주소 재사용 가능성은 남는다. 수정 근거와 시험 범위는 [적대적 리뷰 기록](KMON_ADVERSARIAL_REVIEW_20260920.md)에 있다.
+페이지 검증은 현재 실행 권한, 반복 읽기 바이트, 프로세스 인스턴스와 확보한 PFN을 다시 확인한다. 물리 읽기 경로는 PTE가 확인된 페이지에만 적용하며, 실제 읽기에 사용한 PFN도 전후 번역과 대조한다. 실행 권한 판정은 상위 PML5E/PML4E의 예약된 PS 비트와 1 GiB/2 MiB leaf의 예약 주소 비트를 거부하고 올바른 PAT 비트는 허용한다. PAGE_GUARD로 확인된 주소는 일반 유저 가상 읽기를 보류한다. 등록 목록 스냅샷과 실제 읽기는 원자적이지 않으므로 무관측 구간이나 주소 재사용 가능성은 남는다. 수정 근거와 시험 범위는 [적대적 리뷰 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md)에 있다.
 
 합성 검사는 cursor·예산·alias·큰 페이지·NX/U/S·읽기 실패·PID 재사용·우선순위·소유권 미확정을 다룬다. 실전 결과와 구분해 기록하며, 이 표는 무누락 보증이나 탐지율 수치가 아니다.
 

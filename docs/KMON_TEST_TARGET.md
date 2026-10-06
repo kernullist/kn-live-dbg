@@ -151,4 +151,4 @@ event; that requires the live pass above.
   `!kpage`, `!mapper`, `!callbacks`).
 
 The implemented observations, current research, and remaining gaps are listed
-in [KMON_DETECTION_COVERAGE.md](KMON_DETECTION_COVERAGE.md).
+in [KMON_DETECTION_COVERAGE.md](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_DETECTION_COVERAGE.md).

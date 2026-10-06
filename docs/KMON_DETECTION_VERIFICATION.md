@@ -20,7 +20,7 @@
 기존 이벤트 종류는 유지하지만 `finding.*` 접두사 자체는 악성 판정이 아니다.
 모든 게시 이벤트에 `maliciousness=not_established`를 기록한다. 정상 패치,
 JIT, 로더 동작도 메모리 차이를 만들 수 있다. 구체적인 수정과 대조군 결과는
-[오탐 검토 기록](KMON_FALSE_POSITIVE_AUDIT_20260920.md)에 정리했다.
+[오탐 검토 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_FALSE_POSITIVE_AUDIT_20260920.md)에 정리했다.
 
 | 기록 | 의미 |
 |---|---|
@@ -84,7 +84,7 @@ captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
 `MEM_PRIVATE`·`MEM_MAPPED` PE, 불완전한 로더 목록에는 이 제외를 적용하지 않는다.
 이 제외는 정상 이미지의 PE 헤더를 중복 단서로 만들지 않도록 하는 검사이며,
 별도 이미지 바이트·실행 참조 검증을 대체하지 않는다. 실제 정상 DLL 음성 대조와
-fixture 결과는 [2026-10-06 호스트 기록](LIVE_HOST_VALIDATION_20261006.md)에 있다.
+fixture 결과는 [2026-10-06 호스트 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md)에 있다.
 
 `!kmon stop`은 수집을 멈추고 분석을 합류시킨 뒤 캡처·저장을 정리한다. 이후 iotrace를 drain/disarm하고 장치 참조를 해제한다. disarm 실패 시 장치 참조와 활성 상태를 남겨 재시도를 허용한다.
 
@@ -151,7 +151,7 @@ vptr player 20 24040 2
 
 추가로 감시 대상 변경과 종료의 로깅 제어를 직렬화하고, 객체 보고 캐시를 규칙·슬롯 수로 제한했다. 초기 수집 순번부터 링 손실을 계산하며, 명세 생성 중에는 이미지와 PDB가 교체되지 않도록 읽기 핸들을 유지한다.
 
-2026-09-19 초기 실행 코드 검증 단계의 결과(이후 확장 결과는 [별도 기록](../research/kmon-coverage-validation-20260920.json)):
+2026-09-19 초기 실행 코드 검증 단계의 결과(이후 확장 결과는 [별도 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-coverage-validation-20260920.json)):
 
 | 항목 | 결과 |
 |---|---|
@@ -164,4 +164,4 @@ vptr player 20 24040 2
 | AddressSanitizer 핵심 엔진 검증 | x64 Release 7개 검증 묶음 통과 |
 | 실제 EXE/PDB 명세 생성 및 음성 대조군 | Release / Debug 모두 통과 |
 
-전체 페이지 순회 확장은 꼬리 페이지, 범위 갱신 시 커서 유지, PID 재사용, 큐 퇴출 우선순위, NX/U/S 상속, 큰 페이지 PAT/예약 비트, VA alias, PTE 읽기 실패, PE 권한 불일치와 소유권 미확정을 검사한다. 2026-09-20 재검토의 재현 조건과 최종 시험 결과는 [적대적 리뷰 기록](KMON_ADVERSARIAL_REVIEW_20260920.md)에 정리했다. 실제 게임, DKOM, 커널 드라이버 장치 수명주기, 세션별 win32k 매핑 및 장시간 오탐률은 사용자가 별도 시험 호스트에서 검증한다. 합성 시험과 자체 프로세스 시험 결과를 실제 게임핵 재현율로 해석하면 안 된다.
+전체 페이지 순회 확장은 꼬리 페이지, 범위 갱신 시 커서 유지, PID 재사용, 큐 퇴출 우선순위, NX/U/S 상속, 큰 페이지 PAT/예약 비트, VA alias, PTE 읽기 실패, PE 권한 불일치와 소유권 미확정을 검사한다. 2026-09-20 재검토의 재현 조건과 최종 시험 결과는 [적대적 리뷰 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md)에 정리했다. 실제 게임, DKOM, 커널 드라이버 장치 수명주기, 세션별 win32k 매핑 및 장시간 오탐률은 사용자가 별도 시험 호스트에서 검증한다. 합성 시험과 자체 프로세스 시험 결과를 실제 게임핵 재현율로 해석하면 안 된다.

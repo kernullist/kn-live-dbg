@@ -1,6 +1,6 @@
 # 커널·유저 코드 연관 헌팅
 
-`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_COVERAGE_MATRIX_20260919.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
+`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_COVERAGE_MATRIX_20260919.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
 
 v0.0.33 이후에는 TLS 기준 비교, PDB로 확인한 KCT 후보, WorkerFactory 시작 루틴이 추가됐다. `!kmon surfaces`, 사건 필터·JSON 저장, `!kmon diff` 사용법과 제한은 [분석가용 가이드](KMON_ANALYST_SURFACES.md)를 참고한다. 메타데이터 차이와 실제 실행은 별도 증거다.
 
@@ -100,7 +100,7 @@ PE-sieve 옵션은 `/shellc 3 /iat 3 /report 7 /ofilter 2 /quiet /json`이다. �
 
 ASan 합성 검사는 boot/PID/생성 시각, stale/future 관측, hash/슬롯/세대 변경, padding, capacity와 불완전 근거를 확인한다. 변형과 stress 반복을 독립적인 게임핵 표본으로 세지 않는다.
 
-초기 연관 헌팅 릴리스 `0905f56`의 바이너리·보고서 hash는 [초기 검증 기록](../research/kmon-hunting-validation-20260919.json)에 보존했다. 이후 전체 페이지·PTE 확장의 검증은 [확장 검증 기록](../research/kmon-coverage-validation-20260920.json)에 분리한다. `e1babba` 이후의 용량 초과 순회·PFN·경로 재검증·사건 정렬·페이징 예약 비트 수정은 [적대적 리뷰 기록](KMON_ADVERSARIAL_REVIEW_20260920.md)과 [검증 자료](../research/kmon-adversarial-review-20260920.json)에 정리했다. source hash는 UTF-8/LF로 정규화했다. 합성 assertion과 반복 스트레스 횟수는 독립적인 악성 표본 수가 아니다.
+초기 연관 헌팅 릴리스 `0905f56`의 바이너리·보고서 hash는 [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-hunting-validation-20260919.json)에 보존했다. 이후 전체 페이지·PTE 확장의 검증은 [확장 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-coverage-validation-20260920.json)에 분리한다. `e1babba` 이후의 용량 초과 순회·PFN·경로 재검증·사건 정렬·페이징 예약 비트 수정은 [적대적 리뷰 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md)과 [검증 자료](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-adversarial-review-20260920.json)에 정리했다. source hash는 UTF-8/LF로 정규화했다. 합성 assertion과 반복 스트레스 횟수는 독립적인 악성 표본 수가 아니다.
 
 적대적 리뷰에서는 슬롯 대상 변경 후 이전 사건 잔존, 제한 query 핸들에서의 검사 누락, 포인터 field 폭/overflow, 읽기 실패 시 coverage, firmware 목록 링크 검증, replay·증거 파일 증가 중 입력 상한, 과도한 JSON 중첩, 스택 페이지의 과도한 hex 로그와 cases 자동완성을 수정했다. 수정한 범위의 재검토에서 추가 조치가 필요한 문제는 발견하지 못했으며, 실전 kernel lifetime/OS 호환성은 아래 VM 검증 범위에 남는다.
 

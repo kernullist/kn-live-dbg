@@ -56,12 +56,12 @@ The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver 
 
 ## Input Validation and Audit
 
-The [help and completion audit](HELP_COMPLETION_AUDIT_20260920.md) includes the
+The [help and completion audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/HELP_COMPLETION_AUDIT_20260920.md) includes the
 2026-10-06 refresh. The local console, `--connect` client, and remote completion
 requests use the same candidate and annotation tables. Type flags can be combined
 before the type; integrity options are offered after their required action.
 
-The 2026-09-19 registry has **261 entries: 151 Native, 17 Alias, and 93 DbgEng**. The [command audit](COMMAND_AUDIT_20260919.md) records handler coverage and regression evidence. Registry coverage includes dispatch/help checks for DbgEng entries; it does not certify the external debugger engine or target behavior.
+The 2026-09-19 registry has **261 entries: 151 Native, 17 Alias, and 93 DbgEng**. The [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records handler coverage and regression evidence. Registry coverage includes dispatch/help checks for DbgEng entries; it does not certify the external debugger engine or target behavior.
 
 Native parsing rejects embedded NULs, unterminated quotes, invalid numeric suffixes/signs, overflow, and extra arguments on fixed-arity commands before side effects. Numeric inputs retain their documented radix rules, including `0x`, `0n`, and debugger address separators where supported. Listener and `--connect` ports use decimal `1..65535`. Zero-length, overflowing, and over-limit memory transfers are rejected before allocation or IOCTL dispatch.
 
@@ -220,7 +220,7 @@ As of 2026-10-06:
 - `!hunt /deep` reuses existing TI evidence and does not start the subscriber.
   Check hunt `summary.coverage_complete`, `threat_intel_active`, and
   `threat_intel_available` independently of zero finding counts. See the
-  [live-host record](LIVE_HOST_VALIDATION_20261006.md) for actual results and
+  [live-host record](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md) for actual results and
   compatibility limits.
 - KMON user inspection rotates up to four explicit watches inside its six
   priority slots and two background slots per sweep. Each group has its own
@@ -308,4 +308,4 @@ The audit corrected kmon analyst commands and start options, TI action scopes,
 snapshot/diff options, memory-command aliases, JSON output syntax, and nested help.
 `!kmon iotrace <driver> on` arms interposition; `!kmon iotrace off` and
 `!kmon iotrace status` take no driver argument. See
-[the audit report](HELP_COMPLETION_AUDIT_20260920.md) for validation and limits.
+[the audit report](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/HELP_COMPLETION_AUDIT_20260920.md) for validation and limits.

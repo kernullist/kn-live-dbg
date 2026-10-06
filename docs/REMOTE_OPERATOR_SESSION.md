@@ -5,7 +5,7 @@
 | Title | Dedicated Remote Operator Session (thin TUI on PC B, engine+driver on PC A) |
 | Author | Kn-Live-Dbg / 꿀보 |
 | Date | 2026-08-27 |
-| Status | Implemented; command/transport audit updated 2026-09-19. [Operator guide](REMOTE_SETUP.ko.md), [audit evidence](COMMAND_AUDIT_20260919.md) |
+| Status | Implemented; command/transport audit updated 2026-09-19. [Operator guide](REMOTE_SETUP.ko.md), [audit evidence](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) |
 | Audience | Kn-Live-Dbg maintainers (driver ABI, user-mode engine, MCP) |
 | Related | `docs/REMOTE_SETUP.md`, `docs/ARCHITECTURE.md`, `docs/MCP_SERVER_DESIGN.md`, `docs/MCP_SETUP.md`, `docs/FEATURE_PLAN.md`. Canonical copy: `docs/REMOTE_OPERATOR_SESSION.md` |
 
@@ -689,7 +689,7 @@ Atom 카운터: sessions, commands ok/denied/busy, bytes in/out, last duration. 
 
 ## Testing
 
-2026-09-19 감사는 드라이버 없는 Release/Debug corpus와 loopback transport를 검증했다. 두 PC 라이브 세션, 커널 write, load/unload 경합은 아래 별도 수동 항목이다. 상세 결과는 [명령 감사](COMMAND_AUDIT_20260919.md)를 따른다.
+2026-09-19 감사는 드라이버 없는 Release/Debug corpus와 loopback transport를 검증했다. 두 PC 라이브 세션, 커널 write, load/unload 경합은 아래 별도 수동 항목이다. 상세 결과는 [명령 감사](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)를 따른다.
 
 1. **`KnLiveDbg.exe --self-test remote-protocol`**  
    52개 검사: loopback plain TCP framing, password/auth, deny-list, 엄격한 옵션, 대기 요청 cancel, 엔진이 큐를 처리하지 않는 동안 stop. 기본 bind는 `0.0.0.0`, fixture는 `127.0.0.1:51767`만 사용한다.

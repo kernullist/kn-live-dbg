@@ -6,7 +6,7 @@
 
 핵심 원칙은 기존 `docs/AI_ASSISTED_WORKFLOWS.md`의 철학을 그대로 잇는다: AI는 기본적으로 advisory, 숨은 자동 write 금지, raw evidence 보존, 드라이버는 좁은 메모리 primitive로 유지, 민감한 커널 상태는 local-only 가능. MCP는 기존 `ai` 명령과 동일한 **capability 카탈로그 + 가드 레이어**를 재사용하는 **세 번째 프런트엔드**다(REPL, 내부 AiProvider에 이은).
 
-> 현재 구현 (2026-09-19): 인프로세스 HTTP.sys, 기본 `0.0.0.0:51766`, 선택적 `--loopback`, 기본 읽기 전용, `--allow-write`에서 쓰기 12종, 단일 엔진 FIFO. 운영 절차는 [MCP_SETUP.ko.md](MCP_SETUP.ko.md), 검증 결과는 [명령 감사](COMMAND_AUDIT_20260919.md)를 따른다. 단계별 계획과 초기 scaffold 기록은 구현 이력이며, 미구현 기능은 아래에 구분한다.
+> 현재 구현 (2026-09-19): 인프로세스 HTTP.sys, 기본 `0.0.0.0:51766`, 선택적 `--loopback`, 기본 읽기 전용, `--allow-write`에서 쓰기 12종, 단일 엔진 FIFO. 운영 절차는 [MCP_SETUP.ko.md](MCP_SETUP.ko.md), 검증 결과는 [명령 감사](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)를 따른다. 단계별 계획과 초기 scaffold 기록은 구현 이력이며, 미구현 기능은 아래에 구분한다.
 
 ---
 
@@ -561,7 +561,7 @@ vcxproj: `McpServer.cpp` + 헤더 추가, `Httpapi.lib` 링크.
 
 ### 11.1.5 현재 카탈로그와 검증 (2026-09-19)
 
-현재 `user/McpServer.cpp`의 `kTools`는 **읽기 67종 + 쓰기 12종 = 총 79종**이다. 운영자용 표는 [MCP_SETUP.ko.md §6](MCP_SETUP.ko.md#6-제공-기능-카탈로그)에 있다. `ti.subscribe` start/stop은 write 모드가 필요하고 `process.set_protection`은 임의 PID를 받는다. Release/Debug에서 MCP 툴 75개 검사와 별도 HTTP 9개 검사가 통과했다. [명령 감사](COMMAND_AUDIT_20260919.md)에 parser ASan·queue 검증과 라이브 커널 검증 한계를 기록했다.
+현재 `user/McpServer.cpp`의 `kTools`는 **읽기 67종 + 쓰기 12종 = 총 79종**이다. 운영자용 표는 [MCP_SETUP.ko.md §6](MCP_SETUP.ko.md#6-제공-기능-카탈로그)에 있다. `ti.subscribe` start/stop은 write 모드가 필요하고 `process.set_protection`은 임의 PID를 받는다. Release/Debug에서 MCP 툴 75개 검사와 별도 HTTP 9개 검사가 통과했다. [명령 감사](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)에 parser ASan·queue 검증과 라이브 커널 검증 한계를 기록했다.
 
 ## 12. 현재 구현 요약
 
