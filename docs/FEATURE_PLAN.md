@@ -8,12 +8,12 @@ machines, and Windows builds.
 
 ## Current Roadmap
 
-The [2026-09-19 command audit](COMMAND_AUDIT_20260919.md) is complete for the
+The [2026-09-19 command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) is complete for the
 261-entry registry: numeric/JSON validation, fixed-arity dispatch, write backup
 failures, MCP queue timeout handling, remote queued cancellation/stop, collector
 shutdown, and log-file naming were corrected. Release/Debug driver-free
 regression gates passed; live kernel writes, lifecycle races, and external
-DbgEng execution remain on the [manual checklist](MANUAL_TEST_CHECKLIST.md).
+DbgEng execution remain on the [manual checklist](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/MANUAL_TEST_CHECKLIST.md).
 
 Completed core slices:
 
@@ -88,7 +88,7 @@ Completed core slices:
     `IOCTL_KNDBG_SET_PROCESS_LOGGING` so watched `/name` targets emit
     TI ReadVM/WriteVM.
 
-12. Bounded execution-evidence hunting: executable-section comparison for selected processes regardless of name, whole-range page scheduling, resumable user PTE walks, PE/PTE permission checks, owned capture buffers, File-handle lifecycle tracking, qualified object manifests, passive callback channels and `!kmon cases [/json]`. The [2026-09-20 review](KMON_ADVERSARIAL_REVIEW_20260920.md) fixed admission starvation, PFN provenance, late reference invalidation, refreshed-case ordering and reserved paging bits. Local Release/Debug and ASan gates pass; OS-specific live trials and actual game-cheat samples remain operator validation. See the [v0.0.33 release notes](RELEASE_NOTES_0.0.33.md) and [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md).
+12. Bounded execution-evidence hunting: executable-section comparison for selected processes regardless of name, whole-range page scheduling, resumable user PTE walks, PE/PTE permission checks, owned capture buffers, File-handle lifecycle tracking, qualified object manifests, passive callback channels and `!kmon cases [/json]`. The [2026-09-20 review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md) fixed admission starvation, PFN provenance, late reference invalidation, refreshed-case ordering and reserved paging bits. Local Release/Debug and ASan gates pass; OS-specific live trials and actual game-cheat samples remain operator validation. See the [v0.0.33 release notes](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/RELEASE_NOTES_0.0.33.md) and [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md).
 
 Remaining priority order:
 

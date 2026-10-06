@@ -214,7 +214,7 @@ Driver-free checks (no live kernel):
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-That runs `KnLiveDbg.exe --self-test remote-protocol` (52 checks) and `--self-test connect-argv` (4 checks): framing/auth, deny-list, strict argv, local completion, queued cancellation, and listener stop while a job is pending. **Both suites are included in `--self-test all`.** Run configurations sequentially because the fixture uses `127.0.0.1:51767`. It does not load a driver or add firewall rules. See the [command audit](COMMAND_AUDIT_20260919.md) for the verified Release/Debug results and live-test limits.
+That runs `KnLiveDbg.exe --self-test remote-protocol` (52 checks) and `--self-test connect-argv` (4 checks): framing/auth, deny-list, strict argv, local completion, queued cancellation, and listener stop while a job is pending. **Both suites are included in `--self-test all`.** Run configurations sequentially because the fixture uses `127.0.0.1:51767`. It does not load a driver or add firewall rules. See the [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) for the verified Release/Debug results and live-test limits.
 
 Same-box smoke (A elevated, driver loaded):
 

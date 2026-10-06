@@ -741,6 +741,8 @@ if (Test-Path $zipPath)
 $requiredFiles = @(
     "KnLiveDbg.exe",
     "KnLiveDbg.sys",
+    "KnLiveDbg.pdb",
+    "KnLiveDbgDriver.pdb",
     "KnLiveDbgProbe.sys",
     "amdryzenmasterdriver.sys",
     "KnLiveDbgMiniFilterFixture.sys",
@@ -825,6 +827,7 @@ $toolScripts = @(
     "mcp-bridge.ps1",
     "update-byovd-intel.ps1",
     "run-hunt-clean-host.ps1",
+    "owned-process-wait.ps1",
     "validate-hunt-clean-host.ps1",
     "validate-hunt-clean-host-selftest.ps1",
     "analyze-hunt-clean-host.ps1",
@@ -856,8 +859,11 @@ foreach ($toolScriptName in $toolScripts)
 
 $fixturePaths = @(
     "tools\KnLiveDbgHuntTarget.exe",
+    "tools\KnLiveDbgHuntTarget.pdb",
     "tools\KnLiveDbgHuntTargetDll.dll",
-    "tools\KnLiveDbgKmonTarget.exe"
+    "tools\KnLiveDbgHuntTargetDll.pdb",
+    "tools\KnLiveDbgKmonTarget.exe",
+    "tools\KnLiveDbgKmonTarget.pdb"
 )
 foreach ($fixturePath in $fixturePaths)
 {
@@ -874,43 +880,26 @@ $documentationPaths = @(
     "third_party\zydis\amalgamated\LICENSE-Zydis.txt",
     "docs\AI_ASSISTED_WORKFLOWS.md",
     "docs\ARCHITECTURE.md",
-    "docs\COMMAND_AUDIT_20260919.md",
     "docs\DRIVER_INTERACTION_TRACKING_DESIGN.md",
     "docs\FEATURE_PLAN.md",
-    "docs\HELP_COMPLETION_AUDIT_20260920.md",
     "docs\HUNT_TEST_TARGET.md",
-    "docs\KMON_ADVERSARIAL_REVIEW_20260920.md",
-    "docs\KMON_ANALYST_REVIEW_20260920.md",
     "docs\KMON_ANALYST_SURFACES.md",
-    "docs\KMON_ANALYST_VALIDATION_20260920.md",
     "docs\KMON_PROCESS_LAYOUTS.md",
-    "docs\KMON_PROCESS_LAYOUT_VALIDATION_20260920.md",
     "docs\KMON_COVERAGE_MATRIX_20260919.md",
     "docs\KMON_CROSS_DOMAIN_HUNTING.md",
     "docs\KMON_DETECTION_VERIFICATION.md",
-    "docs\KMON_FALSE_POSITIVE_AUDIT_20260920.md",
-    "docs\KMON_HUNTING_RESEARCH_20260919.md",
     "docs\KMON_TEST_TARGET.md",
-    "docs\MANUAL_TEST_CHECKLIST.md",
     "docs\MCP_SERVER_DESIGN.ko.md",
     "docs\MCP_SERVER_DESIGN.md",
     "docs\MCP_SETUP.ko.md",
     "docs\MCP_SETUP.md",
-    "docs\RELEASE_NOTES_0.0.33.md",
-    "docs\RELEASE_NOTES_0.0.34.md",
-    "docs\RESEARCH_REFRESH_20260920.md",
+    "docs\RELEASE_NOTES_0.0.35.md",
     "docs\REMOTE_OPERATOR_SESSION.md",
     "docs\REMOTE_SETUP.ko.md",
     "docs\REMOTE_SETUP.md",
     "docs\TIMELINE_COMMAND_USAGE.ko.md",
     "docs\TIMELINE_COMMAND_USAGE.md",
-    "docs\WINDBG_COMMAND_COVERAGE.md",
-    "research\help-completion-validation-20260920.json",
-    "research\kmon-adversarial-b7c91a4-validation-20260920.json",
-    "research\kmon-adversarial-review-20260920.json",
-    "research\kmon-coverage-validation-20260920.json",
-    "research\kmon-false-positive-validation-20260920.json",
-    "research\kmon-hunting-validation-20260919.json"
+    "docs\WINDBG_COMMAND_COVERAGE.md"
 )
 foreach ($documentationPath in $documentationPaths)
 {

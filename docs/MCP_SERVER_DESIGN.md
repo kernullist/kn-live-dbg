@@ -6,7 +6,7 @@ This document defines a design for adding an **MCP (Model Context Protocol) serv
 
 The core principles carry over directly from the philosophy of the existing `docs/AI_ASSISTED_WORKFLOWS.md`: the AI is advisory by default, no hidden automatic writes, raw evidence is preserved, the driver stays a narrow memory primitive, and sensitive kernel state can be kept local-only. MCP is a **third frontend** that reuses the **same capability catalog + guard layer** as the existing `ai` command (following the REPL and the internal AiProvider).
 
-> Current implementation (2026-09-19): in-process HTTP.sys, default `0.0.0.0:51766`, optional `--loopback`, read-only by default, 12 write tools under `--allow-write`, and a single engine FIFO. Use [MCP_SETUP.md](MCP_SETUP.md) for operation and the [command audit](COMMAND_AUDIT_20260919.md) for evidence. Phased plans and initial scaffold notes below are implementation history; unimplemented features are identified separately.
+> Current implementation (2026-09-19): in-process HTTP.sys, default `0.0.0.0:51766`, optional `--loopback`, read-only by default, 12 write tools under `--allow-write`, and a single engine FIFO. Use [MCP_SETUP.md](MCP_SETUP.md) for operation and the [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) for evidence. Phased plans and initial scaffold notes below are implementation history; unimplemented features are identified separately.
 
 ---
 
@@ -574,7 +574,7 @@ Side fix: found a bug where the `resources/read` listener handled only `session/
 
 ### 11.1.5 Current catalog and validation (2026-09-19)
 
-The current `kTools` table in `user/McpServer.cpp` contains **67 read tools + 12 write tools = 79 total**. Operator tables are in [MCP_SETUP.md §6](MCP_SETUP.md#6-capability-catalog). `ti.subscribe` start/stop require write mode, and `process.set_protection` accepts an arbitrary PID. Release/Debug passed 75 MCP-tool checks and nine separate HTTP checks per configuration. The [command audit](COMMAND_AUDIT_20260919.md) records parser ASan/queue evidence and live-kernel validation limits.
+The current `kTools` table in `user/McpServer.cpp` contains **67 read tools + 12 write tools = 79 total**. Operator tables are in [MCP_SETUP.md §6](MCP_SETUP.md#6-capability-catalog). `ti.subscribe` start/stop require write mode, and `process.set_protection` accepts an arbitrary PID. Release/Debug passed 75 MCP-tool checks and nine separate HTTP checks per configuration. The [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records parser ASan/queue evidence and live-kernel validation limits.
 
 ## 12. Current Implementation Summary
 

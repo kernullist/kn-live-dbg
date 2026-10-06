@@ -89,4 +89,4 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 | [Herpaderping 원저자 분석, 2020](https://github.com/jxy-s/herpaderping) | section 생성 시점과 디스크 내용·프로세스 알림 시점이 어긋날 수 있다. 최초 layout을 정상으로 간주하지 않고 이미지 검증을 수행한다. |
 | [Elastic Process Ghosting, 2021](https://www.elastic.co/blog/process-ghosting-a-new-executable-image-tampering-attack), [Microsoft PS_CREATE_NOTIFY_INFO](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_ps_create_notify_info) | 파일 객체와 생성 시점 근거가 있어야 정확한 기법 해석이 가능하다. 이번 주기적 사용자 모드 관측의 경계를 명시한다. |
 
-검증 명령은 `tools/validate-process-layout.ps1 -Sanitize`와 `-Configuration Debug`다. 합성 구간 오라클과 소유한 메모리·자식 프로세스·비실행 이미지 매핑을 사용한다. 실게임핵·VM·커널 동작 검증은 사용자가 수행한다. 상세 결과는 [검증 기록](KMON_PROCESS_LAYOUT_VALIDATION_20260920.md)에 남긴다.
+검증 명령은 `tools/validate-process-layout.ps1 -Sanitize`와 `-Configuration Debug`다. 합성 구간 오라클과 소유한 메모리·자식 프로세스·비실행 이미지 매핑을 사용한다. 실게임핵·VM·커널 동작 검증은 사용자가 수행한다. 상세 결과는 [검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_PROCESS_LAYOUT_VALIDATION_20260920.md)에 남긴다.

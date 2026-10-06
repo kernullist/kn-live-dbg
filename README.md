@@ -2,9 +2,9 @@
 
 Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the useful part of LiveKD: the kernel driver exposes narrow memory primitives, while the user-mode console owns service lifecycle, symbol loading, type interpretation, and operator UX.
 
-Changes since v0.0.33 are collected in the [v0.0.34 release notes](docs/RELEASE_NOTES_0.0.34.md): callback inspection, process memory layout history, stricter evidence validation, and shared local/remote help and completion. The [GitHub release](https://github.com/kernullist/kn-live-dbg/releases/tag/v0.0.34) provides the x64 package and its checksums.
+Changes since v0.0.34 are collected in the [v0.0.35 release notes](docs/RELEASE_NOTES_0.0.35.md): continued KMON collection and generation checks, transport and cleanup repairs, live-host integrity fixes, and refreshed help and completion. The [GitHub release](https://github.com/kernullist/kn-live-dbg/releases/tag/v0.0.35) provides the x64 package and its checksums.
 
-The current source also includes the [2026-10-06 live-host fixes and validation](docs/LIVE_HOST_VALIDATION_20261006.md). That host produced zero hunt findings with incomplete coverage; this is recorded as partial evidence.
+The release includes the [2026-10-06 live-host fixes and validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md). That host produced zero hunt findings with incomplete coverage; this is recorded as partial evidence.
 
 ## Demo
 
@@ -121,10 +121,10 @@ identification (code stomping detection). TI requests ETW stack capture with EVE
 - `docs/REMOTE_SETUP.md` is the operator guide for the LAN `knkd>` session (`remote on` / `KnLiveDbg.exe --connect`). `docs/REMOTE_OPERATOR_SESSION.md` is the design. This is not `kdinit /remote`. `mcp on` and `remote on` cannot run at the same time.
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
 - `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
-- [Command audit](docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
-- [Help and completion](docs/HELP_COMPLETION_AUDIT_20260920.md) records the original audit and the 2026-10-06 update of type flags, logging aliases, integrity scopes, and current coverage explanations. [Live-host validation](docs/LIVE_HOST_VALIDATION_20261006.md) records the current host's results and unresolved compatibility limits.
-- [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe collection and evidence semantics. The [2026-09-20 review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) preserves that review's fixes and regression evidence.
-- [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [initial validation](docs/KMON_ANALYST_VALIDATION_20260920.md) and the [follow-up adversarial review](docs/KMON_ANALYST_REVIEW_20260920.md).
+- [Command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
+- [Help and completion](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/HELP_COMPLETION_AUDIT_20260920.md) records the original audit and the 2026-10-06 update of type flags, logging aliases, integrity scopes, and current coverage explanations. [Live-host validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md) records the current host's results and unresolved compatibility limits.
+- [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe collection and evidence semantics. The [2026-09-20 review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md) preserves that review's fixes and regression evidence.
+- [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [initial validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md) and the [follow-up adversarial review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md).
 
 ## Build
 
@@ -163,7 +163,7 @@ Build:
 .\tools\build.ps1 -Configuration Release
 ```
 
-The projects default to SDK/WDK 10.0.26100.0. If a different complete SDK/WDK is installed, both build and release helpers accept `-WindowsTargetPlatformVersion`, for example `-WindowsTargetPlatformVersion 10.0.22621.0`. The override is passed to MSBuild; it does not install a kit or change the project's default. The v0.0.33 package uses the installed 10.0.22621.0 kit.
+The projects default to SDK/WDK 10.0.26100.0, which is used for the v0.0.35 package. If a different complete SDK/WDK is installed, both build and release helpers accept `-WindowsTargetPlatformVersion`, for example `-WindowsTargetPlatformVersion 10.0.22621.0`. The override is passed to MSBuild; it does not install a kit or change the project's default. The v0.0.33 and v0.0.34 packages used 10.0.22621.0.
 
 Driver-free regression checks after a build:
 
@@ -213,13 +213,15 @@ Create a release zip:
 .\tools\release.ps1 -Configuration Release
 ```
 
-The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\` so direct build outputs can refresh the BYOVD catalog. The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD and minifilter positive-control fixture drivers, the constrained Bind fixture controller, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, the public `docs/` guides and release notes, Kmon validation summaries, the MCP bridge and hunt/Kmon fixture executables under `tools/`, the vendored runtime manifest when present, the BYOVD updater, the clean-hunt runner/validator/analyzer, the CloudFiles, QoS/Bind, and minifilter fixture runners and validators, the aggregate elevated external gate and validator, and `kn-live-dbg-version.json`. YARA binaries are intentionally not packaged.
+The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\` so direct build outputs can refresh the BYOVD catalog. The release helper runs a version-bumped build unless `-SkipBuild` or `-NoVersionBump` is supplied, then creates `release\KnLiveDbg-<version>-Release-x64.zip` containing the built EXE/SYS files, the BYOVD and minifilter positive-control fixture drivers, the constrained Bind fixture controller, staged Debugging Tools runtime, PDB/CER/CAT files when present, `README.md`, operator guides and the current release notes, the MCP bridge and hunt/Kmon fixture executables under `tools/`, the vendored runtime manifest when present, the BYOVD updater, the clean-hunt runner/validator/analyzer with its owned-process wait helper, the CloudFiles, QoS/Bind, and minifilter fixture runners and validators, the aggregate elevated external gate and validator, and `kn-live-dbg-version.json`. Validation reports and review records remain in the source repository and are not packaged. YARA binaries are intentionally not packaged.
 
 Expected outputs:
 
 ```text
 x64\Release\KnLiveDbg.exe
 x64\Release\KnLiveDbg.sys
+x64\Release\KnLiveDbg.pdb
+x64\Release\KnLiveDbgDriver.pdb
 x64\Release\KnLiveDbgProbe.sys
 x64\Release\amdryzenmasterdriver.sys
 x64\Release\KnLiveDbgMiniFilterFixture.sys
@@ -246,7 +248,7 @@ Run these after building the corresponding configuration:
 
 `all` includes `timeline`, `mcp-tools`, `console`, `commands`, `remote-protocol`, and `connect-argv`; it runs before driver loading and symbol initialization. `mcp-http` is separate because its HTTP.sys loopback listener needs URL registration rights. Run network fixtures sequentially: remote uses `127.0.0.1:51767`, and HTTP uses `127.0.0.1:51768`. Neither fixture adds firewall rules or listens externally.
 
-`validate-command-audit.ps1 -Sanitize` builds the standalone numeric/JSON parser corpus with AddressSanitizer and runs the already-built executable's command corpus. The integrated command suite has 2,336 checks across 261 registered entries; the parser corpus has 275,002 checks and the completion corpus has 25,954 checks. The initial [command audit](docs/COMMAND_AUDIT_20260919.md) and later [Kmon review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) preserve their own results. The Kmon core/hunting gates add 11,326 hunting checks and 54 page-coverage checks per run. Build-time validators require a source checkout and compiler; the release ZIP contains operator guides and runnable fixture tools. These checks do not execute live kernel writes, load/unload races, or commands against an external DbgEng target; use the [manual checklist](docs/MANUAL_TEST_CHECKLIST.md) for those paths.
+`validate-command-audit.ps1 -Sanitize` builds the standalone numeric/JSON parser corpus with AddressSanitizer and runs the already-built executable's command corpus. The integrated command suite has 2,342 checks across 261 registered entries; the parser corpus has 275,002 checks and the completion corpus has 25,954 checks. The initial [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) and later [Kmon review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md) preserve their own results. The Kmon core/hunting gates add 11,326 hunting checks and 54 page-coverage checks per run. Build-time validators require a source checkout and compiler; the release ZIP contains operator guides and runnable fixture tools. These checks do not execute live kernel writes, load/unload races, or commands against an external DbgEng target; use the [manual checklist](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/MANUAL_TEST_CHECKLIST.md) for those paths.
 
 ## Run
 
@@ -290,7 +292,7 @@ The EXE expects `KnLiveDbg.sys` beside it. Keep the staged Debugging Tools DLLs 
 
 Interactive command dispatch has a delayed progress watchdog. Silent commands that run longer than about one second print a colored `still running` status line with elapsed time, then a neutral `finished` line when control returns. Once a command starts producing stdout/stderr, the watchdog suppresses further progress rows so status text does not interleave with command output. Console color changes and direct progress writes are serialized so a progress row cannot leave the prompt/output color stuck.
 
-`KnLiveDbg.exe --help` lists startup modes and native commands without loading a driver. Add `all` to include DbgEng routes. The [help and completion audit](docs/HELP_COMPLETION_AUDIT_20260920.md) covers the shared local/remote engine, scoped help, and regression checks.
+`KnLiveDbg.exe --help` lists startup modes and native commands without loading a driver. Add `all` to include DbgEng routes. The [help and completion audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/HELP_COMPLETION_AUDIT_20260920.md) covers the shared local/remote engine, scoped help, and regression checks.
 
 The `knkd>` prompt supports Tab completion for registered commands and context-aware subcommands, plus Up/Down history recall for recent commands. The `--connect` client uses the same `CompletionHints` tables locally (`ApplyTabCompletion`), including `remote on --loopback` / `--bind` / `--peer`. When more than one match remains, the prompt prints an annotated list instead of a bare name grid: the parent command's description and full usage line, then each remaining token with its own syntax and summary. Root listings with many matches stay one line per command (`name` + summary). Examples include `!callbacks <Tab>` for callback scopes plus `disable`/`enable`/`disable-all`/`enable-all`, `!callbacks disable <Tab>` for per-type scopes, `!callbacks object /module<Tab>` for the module option, `!pool <Tab>` for `big`/`find`/`tags`/`pe`, `!pool pe <Tab>` for the staged-PE hunt options, `!diff baseline /domain <Tab>` for the snapshot domains, `!kmon iotrace <Tab>` for `off`/`status`, `!kmon iotrace <driver> <Tab>` for `on`, `!byovd <Tab>` for scan/update/fixture, `!dml_proc <Tab>` for help, `!timeline <Tab>` for the simple timeline surface, `!timeline help <Tab>` for advanced help discovery, `!minifilter <Tab>` for `list`/`show`/`irp`/`disable`/`enable`/`disable-all`/`enable-all`, `!minifilter disable <filter> <Tab>` for `all` and common `IRP_MJ_*` names, `ai <Tab>` for primary AI actions including `use`/`models`/`save`/`test`, `ai use <Tab>` for presets and frontier OpenRouter model IDs, `ai models <Tab>` for `refresh` plus curated IDs, `ai explain !callbacks <Tab>` for callback scopes, `ai config <Tab>` for provider setup, `ai config model <Tab>` for the same model catalog, `backend <Tab>`, `probe <Tab>`, `procctx <Tab>`, `write <Tab>`, `u <Tab>` for `/process`, and option completion such as `dt -<Tab>`, `vtop /<Tab>`, and `db /<Tab>`. Callback completion and parsing use only canonical scope names (`object`, `registry`, `process`, `thread`, `imageload`, `minifilter`) plus `all`, `disable`, `enable`, `disable-all`, `enable-all`, `/module`, and `help`; short aliases are intentionally not accepted. Help is available as both `help <command>` and `<command> help`; nested AI topics also support `ai <subcommand> help` or `ai help <subcommand>`. When a prefix is ambiguous, the prompt prints matching candidates and redraws the current input line without dispatching anything.
 
@@ -2288,21 +2290,21 @@ Cross-process events (`AllocVM`, `ProtectVM`, `WriteVM`, `ReadVM`, `MapView`, `Q
 
 ## Kernel-cheat monitor (`!kmon`)
 
-Console events display `kind [observation|lead|coverage|sensor]`; JSONL uses the same `evidence.event_category` policy. A code difference, private executable page, or layout transition does not establish maliciousness. Raw evidence and investigation leads are retained. See the [false-positive audit](docs/KMON_FALSE_POSITIVE_AUDIT_20260920.md) for read/identity guards, normal controls, and validation limits.
+Console events display `kind [observation|lead|coverage|sensor]`; JSONL uses the same `evidence.event_category` policy. A code difference, private executable page, or layout transition does not establish maliciousness. Raw evidence and investigation leads are retained. See the [false-positive audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_FALSE_POSITIVE_AUDIT_20260920.md) for read/identity guards, normal controls, and validation limits.
 
 Without `/pid` or `/name`, a dedicated reader inventories existing and new processes, retains first/latest complete virtual-memory layouts, and compares allocation, mapping and protection changes. Discovery targets one second; periodic layout sweeps default to five seconds (`/layout-ms 1000..60000` on first start). `!kmon layouts` exposes coverage and per-process JSON snapshots. Initial observations are not trusted clean baselines, and executable/image changes feed the existing verification pipeline. See the [layout guide](docs/KMON_PROCESS_LAYOUTS.md) for budgets, process identity, partial scans and detection limits.
 
-The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
+The [cross-domain hunting guide](docs/KMON_CROSS_DOMAIN_HUNTING.md) covers passive firmware/hive/ETW slot verification, all-process scheduling, thread/APC/instrumentation and historical stack references, and `!kmon cases [/json]`. Cases retain process identity and observed mapping generations. Matching page contents are investigation leads; they do not establish a communication protocol or a cheat verdict. See the [research matrix](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_HUNTING_RESEARCH_20260919.md) for sources and the [verification model](docs/KMON_DETECTION_VERIFICATION.md) for capture semantics.
 
 The [hidden-code coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) maps 23 technique families to observed evidence and remaining boundaries. Bounded whole-range page sweeps, resumable user PTE traversal, all-process image comparison, PE/PTE permission checks, exact callback slots and WFP code candidates extend coverage beyond first-page and thread-entry checks. Runtime permissions, page contents and process/address-space identities are revalidated before retaining page evidence. Live VM and game-cheat validation is performed separately by the operator.
 
 `!kmon` is a session on top of `!ti` and `!timeline live`. It does not open a second TI provider. The cheat `.sys` name is not an input. Bare `!kmon` (or `!kmon start`) arms collectors and stays on the live tail.
 
-The [current implementation and coverage contract](docs/KMON_IMPLEMENTATION_2026-09-16.md)
+The [current implementation and coverage contract](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_IMPLEMENTATION_2026-09-16.md)
 records the G01-G22/B01 improvements, scan budgets, validation and remaining
-requirements. The [earlier hardening](docs/KMON_DETECTION_COVERAGE.md) is retained
+requirements. The [earlier hardening](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_DETECTION_COVERAGE.md) is retained
 as baseline history. A quiet or partial scan is not proof of absence.
-The [follow-up adversarial review](docs/KMON_REVIEW_FOLLOWUP_2026-09-16.md)
+The [follow-up adversarial review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_REVIEW_FOLLOWUP_2026-09-16.md)
 records subsequent repairs and their separate validation evidence.
 
 ```text

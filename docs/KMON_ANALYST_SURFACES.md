@@ -99,4 +99,4 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 ```
 
-하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실환경 커널·VM·게임핵 검증은 사용자가 별도로 수행한다.
+하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실환경 커널·VM·게임핵 검증은 사용자가 별도로 수행한다.

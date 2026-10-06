@@ -70,6 +70,7 @@
       <ControlFlowGuard>Guard</ControlFlowGuard>
     </ClCompile>
     <Link>
+      <ProgramDatabaseFile>$(OutDir)KnLiveDbgDriver.pdb</ProgramDatabaseFile>
       <AdditionalDependencies>$(DDK_LIB_PATH)\ntoskrnl.lib;$(DDK_LIB_PATH)\wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK /guard:cf %(AdditionalOptions)</AdditionalOptions>
     </Link>
@@ -92,6 +93,7 @@
       <ControlFlowGuard>Guard</ControlFlowGuard>
     </ClCompile>
     <Link>
+      <ProgramDatabaseFile>$(OutDir)KnLiveDbgDriver.pdb</ProgramDatabaseFile>
       <AdditionalDependencies>$(DDK_LIB_PATH)\ntoskrnl.lib;$(DDK_LIB_PATH)\wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK /guard:cf %(AdditionalOptions)</AdditionalOptions>
     </Link>

@@ -510,7 +510,7 @@ The engine serializes work with at most eight pending jobs. The 30-second wait h
 
 Stopping the listener also ends waits and cancels queued work. Already-dispatched work cannot be preempted. MCP `notifications/cancelled` is accepted as a notification but does not currently remove a job; do not treat client cancellation as proof that a mutation was prevented.
 
-The [command audit](COMMAND_AUDIT_20260919.md) records driver-free JSON/schema, queue, and HTTP regression results. `--self-test mcp-http` runs separately from `--self-test all` and needs HTTP.sys loopback URL registration rights.
+The [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records driver-free JSON/schema, queue, and HTTP regression results. `--self-test mcp-http` runs separately from `--self-test all` and needs HTTP.sys loopback URL registration rights.
 
 ---
 
