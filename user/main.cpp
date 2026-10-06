@@ -1839,6 +1839,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  d*/e*/vtop support /process <process-id>; procctx pins a default process context.\n";
     std::wcout << L"  Virtual e* writes default to System(pid 4) context for kernel addresses.\n";
     std::wcout << L"  Sparse reads keep layout and render unreadable bytes as ??.\n";
+    std::wcout << L"  Zero findings require complete coverage before claiming a clean scan; inspect JSON and warnings.\n";
     std::wcout << L"  ";
     PrintColoredText(L"native", KNDBG_COLOR_OK);
     std::wcout << L" means KnLiveDbg implementation; ";
@@ -1863,6 +1864,8 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !hive           registry hive GetCellRoutine ownership\n";
     std::wcout << L"  help !token          process token privilege and object-field triage\n";
     std::wcout << L"  help !drvobj         DRIVER_OBJECT and device-stack inspection\n";
+    std::wcout << L"  help !driver         driver identity, dispatch, Fast I/O, and coverage\n";
+    std::wcout << L"  help !module         PE, IAT/prologue, and sampled disk comparisons\n";
     std::wcout << L"  help !handles        process handle table vs VM/DUP access\n";
     std::wcout << L"  help !hiddenproc     ActiveProcessLinks x SPI x Toolhelp x handle owners\n";
     std::wcout << L"  help !dpc            sampled DPC deferred routines\n";
@@ -17477,13 +17480,19 @@ static void PrintModuleIntegrityHelp()
     std::wcout << L"  /wx           report only modules with W+X section/page evidence.\n";
     std::wcout << L"  /mismatch     report only modules with header, size, or section anomalies.\n";
     std::wcout << L"  /disk         compare live executable pages against on-disk PE raw data (additive;\n";
-    std::wcout << L"                applies basereloc deltas to disk pages when the image is relocated).\n";
+    std::wcout << L"                applies relocations and excludes verified loader-mutable ranges).\n";
     std::wcout << L"  /iat          walk IMAGE_DIRECTORY_ENTRY_IMPORT and flag live IAT thunks whose\n";
     std::wcout << L"                targets sit outside loaded modules or unexpected owners.\n";
     std::wcout << L"  /prologue     disassemble AddressOfEntryPoint and flag JMP/INT3 trampoline heads\n";
     std::wcout << L"                whose targets leave the owning module.\n";
     std::wcout << L"  /limit <n>    cap reported records while still scanning matching modules.\n";
     std::wcout << L"  /json <path>  write structured kn-live-dbg.module-integrity.v1 JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Disk comparisons require matching PE layout and complete relocation metadata.\n";
+    std::wcout << L"  Discardable sections, unsupported dynamic relocations, and read failures leave comparison gaps.\n";
+    std::wcout << L"  Inspect section info_codes and disk_compare_* fields; unavailable evidence is not a byte mismatch.\n";
+    std::wcout << L"  A matching sampled page does not verify every executable byte in the module.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !module integrity\n";
@@ -17510,6 +17519,7 @@ static void PrintDriverIntegrityHelp()
     std::wcout << L"  modules. !drvobj / !driver object walks DEVICE_OBJECT.NextDevice and the\n";
     std::wcout << L"  AttachedDevice / AttachedTo stack. ntoskrnl stubs are treated as normal\n";
     std::wcout << L"  because unused dispatch slots commonly point to nt!IopInvalidDeviceRequest.\n";
+    std::wcout << L"  Integrity scans also inspect DriverUnload and known FastIoDispatch callbacks.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  [driver|all]  driver object name/path substring filter. Defaults to all.\n";
@@ -17517,6 +17527,12 @@ static void PrintDriverIntegrityHelp()
     std::wcout << L"  /devices      walk NextDevice and attached stacks (default for !drvobj).\n";
     std::wcout << L"  /limit <n>    stop after <n> matching drivers.\n";
     std::wcout << L"  /json <path>  write structured JSON.\n";
+    std::wcout << L"\n";
+    std::wcout << L"notes:\n";
+    std::wcout << L"  Integrity JSON summary.coverage_complete requires complete identity, dispatch, and Fast I/O reads.\n";
+    std::wcout << L"  Each driver reports dispatch_coverage_complete and fast_io_coverage_complete.\n";
+    std::wcout << L"  Read failures, unsupported Fast I/O tails, or /limit truncation leave coverage incomplete.\n";
+    std::wcout << L"  suspicious=0 with incomplete coverage is not a clean result; /deep hunt preserves this gap.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !driver list\n";
@@ -22926,6 +22942,10 @@ static void PrintKmonHelp()
     std::wcout << L"dwm.exe is watched by default (no /name needed): its Microsoft-signed main\n";
     std::wcout << L"image text, graphics vtables, and heap vtable clones use bounded rotating scans.\n";
     std::wcout << L"Watched EXEs and DLLs are inspected under bounded budgets and read coverage.\n";
+    std::wcout << L"Each user sweep rotates up to four explicit watches within six priority slots,\n";
+    std::wcout << L"plus two background slots. These budgets do not guarantee a rescan deadline.\n";
+    std::wcout << L"A normal DLL is excluded from orphan-PE leads only with current MEM_IMAGE,\n";
+    std::wcout << L"a complete loader inventory, and an exact allocation/path match.\n";
     std::wcout << L"Eligible mapper and user-mode implant leads auto-capture the region to\n";
     std::wcout << L"<log dir>\\captures (bounded queues, 256MB session budget). First bytes are read\n";
     std::wcout << L"before asynchronous chunk persistence. Read/queue failures remain visible. Layers:\n";
@@ -22944,6 +22964,7 @@ static void PrintKmonHelp()
     std::wcout << L"bare !kmon (or !kmon start) arms TI + kernel live callbacks and stays on the\n";
     std::wcout << L"live tail. Esc/q returns to knkd>; collection keeps running. !kmon again reattaches.\n";
     std::wcout << L"  /background     arm only, return to the prompt (JSONL still fills); /nowatch alias\n";
+    std::wcout << L"  /pid N          add this PID to the explicit user inspection watch set\n";
     std::wcout << L"  /name game.exe  add overlay inject.remote and in-process dxgi/d3d IAT/vtable scans;\n";
     std::wcout << L"                  /name * watches every new process (wildcard promotion)\n";
     std::wcout << L"  /driver name    highlight only; never hides unknown drop names\n";
@@ -27477,7 +27498,7 @@ static void PrintBackendHelp()
     std::wcout << L"subcommands:\n";
     std::wcout << L"  auto     prefer native implementations, route unsupported commands to DbgEng\n";
     std::wcout << L"  native   disable generic DbgEng fallback\n";
-    std::wcout << L"  dbgeng   force DbgEng routing for most non-session commands\n";
+    std::wcout << L"  dbgeng   keep native-owned commands local; route other commands through DbgEng\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
     std::wcout << L"  Session, service, callbacks, AI, native memory, dt, and u/uf commands stay intercepted by the TUI.\n";
@@ -27604,6 +27625,10 @@ static void PrintHuntHelp()
     std::wcout << L"  IAT/vtable call-table hooks (dxgi/d3d/overlay/main image), cloned graphics vtables, and kernel-driver evidence.\n";
     std::wcout << L"  The /deep BYOVD path never auto-updates the catalog or uses name/version hints.\n";
     std::wcout << L"  /deep reuses recent !ti events if the Threat-Intelligence subscriber has captured any.\n";
+    std::wcout << L"  /deep does not start TI. Use !ti start before scanning when TI evidence is required.\n";
+    std::wcout << L"  JSON summary.coverage_complete must be true before treating findings=0 as complete.\n";
+    std::wcout << L"  Incomplete process or deep driver scans keep coverage incomplete, including unsupported Fast I/O tails.\n";
+    std::wcout << L"  Check threat_intel_active and threat_intel_available separately from finding counts.\n";
     std::wcout << L"  Console output is concise by default: conclusion, subject/what/why/next assessment, summary, and suppressed detail notice.\n";
     std::wcout << L"  Default output is a short subject/what/why/next assessment; raw tables and per-finding detail are hidden unless /details or /limit is supplied.\n";
     std::wcout << L"  Evidence is a lead with risk and confidence; use printed !vad, !threads, and !address follow-ups for triage.\n";
@@ -27695,6 +27720,9 @@ static void PrintDtHelp(const std::wstring& command)
     std::wcout << L"  Exact type names can dump field layouts and read field values when an address is supplied.\n";
     std::wcout << L"  Address arguments accept + or - arithmetic such as nt!Symbol+20 or 0xffff`0000-10.\n";
     std::wcout << L"  nt! is treated as the loaded kernel image, including ntoskrnl/ntkrnlmp PDB names.\n";
+    std::wcout << L"  Put -rN, -v, and -b before the type; these flags can be combined.\n";
+    std::wcout << L"  Bare types search already loaded CodeView/PDB modules. Use module!type to load that module's symbols.\n";
+    std::wcout << L"  Missing private types stay unavailable; a bare lookup does not download every module's PDB.\n";
     std::wcout << L"  Field filters match field names or field type names case-insensitively.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
@@ -27887,6 +27915,7 @@ static void PrintLogHelp()
     std::wcout << L"notes:\n";
     std::wcout << L"  The live console keeps colors; the log file receives clean text without console attributes.\n";
     std::wcout << L"  The default subcommand is status.\n";
+    std::wcout << L"  A custom path argument is not accepted; enable/on/start choose a new file in the EXE directory.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  log enable\n";
@@ -29918,9 +29947,9 @@ static int RunConsoleSurfaceSelfTest()
             L"help-only-completion-stays-on-first-token");
         CheckCompletionCandidate(&context, {L"!hunt"}, L"/details", L"hunt-details-completion");
         CheckCompletionCandidate(&context, {L"!hunt"}, L"/pid", L"hunt-pid-completion");
-        CheckCompletionCandidate(&context, {L"!module"}, L"/disk", L"module-disk-completion");
-        CheckCompletionCandidate(&context, {L"!module"}, L"/iat", L"module-iat-completion");
-        CheckCompletionCandidate(&context, {L"!module"}, L"/prologue", L"module-prologue-completion");
+        CheckCompletionCandidate(&context, {L"!module", L"integrity"}, L"/disk", L"module-disk-completion");
+        CheckCompletionCandidate(&context, {L"!module", L"integrity"}, L"/iat", L"module-iat-completion");
+        CheckCompletionCandidate(&context, {L"!module", L"integrity"}, L"/prologue", L"module-prologue-completion");
         CheckCompletionCandidate(&context, {}, L"!drvobj", L"drvobj-root-completion");
         CheckCompletionCandidate(&context, {}, L"!devstack", L"devstack-root-completion");
         CheckCompletionCandidate(&context, {}, L"!handles", L"handles-root-completion");
@@ -52650,7 +52679,8 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --game-manifest self-test\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
         std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
-        std::wcout << L"            connect-argv, all, cloudfiles-query <path>, minifilter-attachments-query\n";
+        std::wcout << L"            connect-argv, all, platform-query, cloudfiles-query <path>,\n";
+        std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
         PrintHelp(argc >= 3 && ToLower(argv[2]) == L"all");
         return 0;

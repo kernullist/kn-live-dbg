@@ -147,6 +147,20 @@ process, thread, and VAD slices from repeatedly missing one another. These
 limits are reported as partial coverage, not absence of hidden memory. Threads
 beyond the global inventory cap are likewise not reached by the TID cursor.
 
+The separate bounded user-inspection sweep now rotates up to four explicit
+`/pid` or `/name` watches first within six priority slots, followed by two
+background slots. Explicit watches, other priority hosts, and background hosts
+have independent cursors. This 2026-10-06 change preserves the total eight-host
+budget; it does not guarantee a scan deadline.
+
+A PE allocation is excluded from orphan-image leads only when the current
+mapping is `MEM_IMAGE`, the loader inventory is complete, and both the
+allocation base and current backing path match the loader entry exactly.
+Same-basename paths on another volume, private/mapped PEs, and incomplete
+inventories retain their investigation path. Loaded-image byte and execution
+checks remain independent. The [live-host record](LIVE_HOST_VALIDATION_20261006.md)
+includes the ordinary-DLL negative control and the remaining fixture limits.
+
 `GetFileAttributes` only supports a ghost-file allegation for file/path-not-found
 errors. Access denied remains unknown. Failure to query a mapped filename is
 not evidence of absent file backing. CoW sampling deduplicates pages and checks

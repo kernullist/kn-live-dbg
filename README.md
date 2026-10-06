@@ -4,6 +4,8 @@ Kn-Live-Dbg is a Windows kernel live-debugging experiment shaped after the usefu
 
 Changes since v0.0.33 are collected in the [v0.0.34 release notes](docs/RELEASE_NOTES_0.0.34.md): callback inspection, process memory layout history, stricter evidence validation, and shared local/remote help and completion. The [GitHub release](https://github.com/kernullist/kn-live-dbg/releases/tag/v0.0.34) provides the x64 package and its checksums.
 
+The current source also includes the [2026-10-06 live-host fixes and validation](docs/LIVE_HOST_VALIDATION_20261006.md). That host produced zero hunt findings with incomplete coverage; this is recorded as partial evidence.
+
 ## Demo
 
 https://github.com/user-attachments/assets/f3542a85-c960-46f2-a151-fdd23a8294a6
@@ -120,7 +122,8 @@ identification (code stomping detection). TI requests ETW stack capture with EVE
 - `docs/TIMELINE_COMMAND_USAGE.md` documents scenario-based `!timeline` usage for TI, snapshot reconciliation, kernel live callback collection, graphing, JSONL export, and reset workflows. The Korean mirror is `docs/TIMELINE_COMMAND_USAGE.ko.md`.
 - `docs/KMON_TEST_TARGET.md` documents `KnLiveDbgKmonTarget.exe`, the lab-only `!kmon` user-mode hostility fixture. `docs/HUNT_TEST_TARGET.md` is the separate `!hunt` fixture.
 - [Command audit](docs/COMMAND_AUDIT_20260919.md) records the 2026-09-19 review of all 261 registry entries, fixes, regression results, and live-test limits. The [manual test checklist](docs/MANUAL_TEST_CHECKLIST.md) separates driver-free gates from VM validation.
-- [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe current collection and evidence semantics. The [2026-09-20 review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) records the latest fixes and regression evidence.
+- [Help and completion](docs/HELP_COMPLETION_AUDIT_20260920.md) records the original audit and the 2026-10-06 update of type flags, logging aliases, integrity scopes, and current coverage explanations. [Live-host validation](docs/LIVE_HOST_VALIDATION_20261006.md) records the current host's results and unresolved compatibility limits.
+- [Kmon execution verification](docs/KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](docs/KMON_CROSS_DOMAIN_HUNTING.md), and the [coverage matrix](docs/KMON_COVERAGE_MATRIX_20260919.md) describe collection and evidence semantics. The [2026-09-20 review](docs/KMON_ADVERSARIAL_REVIEW_20260920.md) preserves that review's fixes and regression evidence.
 - [Analyst callback surfaces](docs/KMON_ANALYST_SURFACES.md) documents the post-v0.0.33 TLS baseline, qualified KCT prefix, query-only WorkerFactory collector, case filters and saved-snapshot comparisons, with [initial validation](docs/KMON_ANALYST_VALIDATION_20260920.md) and the [follow-up adversarial review](docs/KMON_ANALYST_REVIEW_20260920.md).
 
 ## Build
@@ -318,6 +321,7 @@ drvstatus
 mcp [on [port] [--allow-write] [--loopback] [--bind <addr>]|off|status|client-setup|endpoint]
 remote [on [port] [--loopback] [--bind <ipv4>] [--peer <ipv4>]|off|status|disconnect]
 log [enable|disable|status]
+log [on|off|start|stop]                 # aliases; log paths are chosen automatically
 probe [status|load [sys-path]|info|reset|unload]
 .sympath [path]
 .sympath+ <path>
@@ -337,8 +341,8 @@ dds, dps, dqs
 phys, pdb, pdw, pdd, pdq
 !db, !dw, !dd, !dq
 procctx [status|clear|<process-id>]
-u <address|symbol> [instruction-count]
-uf <address|symbol> [max-instructions]
+u [/process <pid>] [address|symbol] [instruction-count]
+uf [/process <pid>] <address|symbol> [max-instructions]
 dt [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]
@@ -348,12 +352,12 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !callbacks disable-all <module>
 !callbacks enable-all <module>
 !dml_proc [pid|name]
-!hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
+!hunt [/quick] [/deep] [/summary] [/details] [/pid <PID>]... [/limit <n>] [/json <path>]
 !vad <pid|image|eprocess> [/summary] [/exec] [/private] [/wx] [/pe] [/hiddenpte] [/limit <n>] [/json <path>]
 !vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
-!threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
+!threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|filters|layers]
 !wfp kernelcallouts
 !wfp callouts /module <name|GUID>
@@ -379,9 +383,11 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/iat] [/prologue] [/limit <n>] [/json <path>]
-!driver [list|object|integrity] [driver|all] [/dispatch] [/devices] [/limit <n>] [/json <path>]
+!driver list [driver|all] [/limit <n>] [/json <path>]
+!driver integrity [driver|all] [/limit <n>] [/json <path>]
+!driver object <name|address> [/dispatch] [/devices] [/json <path>]
 !drvobj <name|address> [/dispatch] [/devices] [/json <path>]
-!devstack <device-object-address> [/json <path>]
+!devstack <device-object-address|driver-name> [/json <path>]
 !handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]
 !hiddenproc [/json <path>]
 !wdfilter [/json <path>]
@@ -392,11 +398,11 @@ dtx [-rN] [-v] [-b] <type|type-pattern> [address|symbol] [field-filter...]
 !byovd fixture [status|load [sys-path]|unload|path]
 !pool [big|find|tags|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx] [/tags]
 !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
-!snapshot baseline [/all] [/name <label>]
+!snapshot baseline [/all] [/memory] [/name <label>]
 !snapshot save <path> [/all] [/name <label>]
-!snapshot show [baseline|<path>] [/domains] [/warnings]
-!diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
-!diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!snapshot show [baseline|<path>] [/domains|/no-domains] [/warnings]
+!diff baseline [/memory] [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!diff <old.json> <new.json> [/memory] [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
 dump-raw <address> <length> <path> [/zerofill] [/pid N | /name <image>]
 dump-pe <address> <path> [/pid N | /name <image>]
 dump-kernel <path> [/max <bytes>] [/strict]
@@ -412,11 +418,11 @@ dump-live <path> [/user [pid|eprocess]] [/compress] [/hv]
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
 !ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
-!kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background|/nowatch] [/log <dir>]
+!kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose|/all-drivers] [/background|/nowatch] [/log <dir>] [/manifest <path>] [/throttle <N>] [/layout-ms <1000..60000>]
 !kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
 !kmon iotrace <driver-name> on | !kmon iotrace off|status   # lab-only IOCTL interposition (ABI 17)
 !kmon cases [/pid N] [/role name] [/json] [/save path]  # recent investigation leads
-!kmon surfaces <pid> [/json] [/save path]   # TLS, qualified KCT, WorkerFactory metadata
+!kmon surfaces <pid> [/json] [/save path] [/module-start <N>] [/handle-start <N>]   # resumable static references
 !kmon layouts [/pid N [/initial]] [/json] [/save path]  # process memory layout history
 !kmon diff <before.json> <after.json> [/json]  # saved observations; no remediation claim
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
@@ -438,8 +444,9 @@ ai write [index] [confirm]
 ai report <path>
 c <address1> <address2> <length>
 s [-b|-w|-d|-q] <address> <length> <value...>
-f <address> <length> <byte-pattern...>
-m <source> <destination> <length>
+f [/process <pid>] <address> <length> <byte-pattern...>
+fp [/process <pid>] <address> <length> <pointer-pattern...>
+m [/process <pid>] <source> <destination> <length>
 write on|off
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 e* <address|symbol> [value...]          # defaults to System(pid 4) context
@@ -458,9 +465,26 @@ Help syntax notes:
 - `help <command>` and `<command> help` print detailed command-family syntax.
 - Count arguments are element counts for typed dumps, bytes for range lengths, and instruction counts for `u`/`uf`.
 - `nt!` is treated as the loaded kernel image for symbols and PDB type names.
+- `dt`/`dtx` flags precede the type and can be combined, for example `dt -r2 -v nt!_EPROCESS`. `-b` selects bare names. Bare type lookups search already loaded CodeView/PDB modules; qualify `module!type` to load that module's symbols. Missing private types remain unavailable.
+- Tab offers `integrity` before module options and `list`/`object`/`integrity` before driver options. It keeps path/value slots and quoted text intact. Logging completion includes `on`/`off`/`start`/`stop`; a custom log path is not accepted.
 - `d*`, `e*`, and `vtop` support `/process <process-id>` for one command; `procctx <pid>` pins a default context.
 - Virtual `e*` writes default to System(pid 4) context for kernel addresses and temporarily restore read-only leaf PTE write bits after patching. Each write is verified by reading the bytes back before the PTE is restored, and writes through a read-only large-page (2 MB/1 GB) mapping are refused rather than flipping a shared parent entry's write bit.
 - API-key AI providers load `.env` only from the EXE directory. Prefer `ai use cloud` / `ai models` / `ai test`; `ai run` remains read-only and `ai write confirm` (or `ai write <index> confirm`) is required for write-like plans.
+
+Interpret finding counts together with coverage. `!driver integrity` JSON exposes
+`summary.coverage_complete` and each driver's `dispatch_coverage_complete` and
+`fast_io_coverage_complete`. Failed reads, unsupported Fast I/O tails, and
+truncation leave the scan incomplete even when `suspicious=0`. `!hunt /deep`
+preserves incomplete driver coverage in its own `summary.coverage_complete`.
+It reuses an existing TI subscriber; start `!ti` first when TI evidence is required,
+then check `threat_intel_active` and `threat_intel_available` in the hunt summary.
+The clean-host analyzer accepts complete zero-finding evidence only when its
+coverage and requested TI checks also pass.
+
+For `!module integrity /disk`, inspect section `info_codes` and `disk_compare_*`
+fields. Loader-mutable ranges, unsupported relocation metadata, and discardable
+sections can leave comparison gaps. These gaps do not become byte-mismatch
+findings. A successful sampled-page comparison covers only the compared bytes.
 
 Example:
 
@@ -710,7 +734,7 @@ Backend mode behavior:
 | --- | --- | --- | --- |
 | `auto` | Native commands use the driver/`DbgHelp` path; DbgEng-only, extension, and unknown meta commands are lazily routed to DbgEng. | Default interactive use. | Keeps live-memory features native while preserving access to WinDbg parser and stop-state commands. |
 | `native` | Uses the native command handlers and blocks generic DbgEng fallback. | Driver-backed memory, symbol, type, callback, disassembly, and physical-memory work. | `!extension`, stack/register/breakpoint/execution/source/exception commands are reported as DbgEng-only instead of being executed. Explicit `u` and `uf` stay driver-backed when the device is open. |
-| `dbgeng` | Sends most non-session commands directly to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session commands, `!callbacks`, `!dml_proc`, `!vad`, `!threads`, `!wfp`, `!alpc`, `!vbs`, `!ci`, `!securekernel`, `!etw`, `!nmi`, `!payload`, `!mapper`, `!kpage`, `!minifilter`, `!fwtable`, `!module`, `!driver`, `!pool`, `!snapshot`, `!diff`, `!wnf`, `!address`, `dump-raw`, `dump-pe`, native physical bang commands, and explicit `u`/`uf` are still handled by the TUI before the raw DbgEng catch-all. |
+| `dbgeng` | Executes native-owned commands first; sends other commands to DbgEng raw execution. | WinDbg-compatible parser behavior. | Session control, native memory, symbols, types, disassembly, dumps, and native scanners stay in the TUI. Other commands use `IDebugControl4::ExecuteWide`. |
 
 `kd <command>` is an explicit raw DbgEng escape hatch and does not depend on the current backend mode.
 

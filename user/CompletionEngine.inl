@@ -313,19 +313,27 @@ std::vector<std::wstring> CollectCompletionCandidates(const std::vector<std::wst
         }
         else if (command == L"!driver")
         {
-            out.erase(std::remove(out.begin(), out.end(), L"/dispatch"), out.end());
-            out.erase(std::remove(out.begin(), out.end(), L"/devices"), out.end());
-            if (first == L"object")
+            if (args.size() == 1)
+            {
+                KeepCompletionTokens(&out, {L"list", L"object", L"integrity", L"help"});
+            }
+            else if (first == L"object")
             {
                 AddHintTableTokens(&out, kDrvobjTokens, std::size(kDrvobjTokens));
             }
-            else if (!first.empty())
+            else if (first == L"list" || first == L"integrity")
             {
+                out.erase(std::remove(out.begin(), out.end(), L"/dispatch"), out.end());
+                out.erase(std::remove(out.begin(), out.end(), L"/devices"), out.end());
                 KeepCompletionOptions(&out);
-                if (args.size() == 2 && (first == L"list" || first == L"integrity"))
+                if (args.size() == 2)
                 {
                     AddUniqueToken(&out, L"all");
                 }
+            }
+            else
+            {
+                out.clear();
             }
         }
         else if (command == L"!minifilter")
@@ -373,13 +381,32 @@ std::vector<std::wstring> CollectCompletionCandidates(const std::vector<std::wst
         }
         else if (command == L"!vad" || command == L"!mapper" || command == L"!payload" || command == L"!module")
         {
-            if (args.size() > 1)
+            if (command == L"!module" && args.size() == 1)
+            {
+                KeepCompletionTokens(&out, {L"integrity", L"help"});
+            }
+            else if (command == L"!module" && first != L"integrity")
+            {
+                out.clear();
+            }
+            else if (args.size() > 1)
             {
                 KeepCompletionOptions(&out);
                 if (command == L"!module" && first == L"integrity" && args.size() == 2)
                 {
                     AddUniqueToken(&out, L"all");
                 }
+            }
+        }
+        else if (command == L"dt" || command == L"dtx")
+        {
+            // Type flags have no separate value and precede the positional type.
+            if (std::any_of(args.begin() + 1, args.end(), [](const std::wstring& token)
+            {
+                return token.empty() || token[0] != L'-';
+            }))
+            {
+                out.clear();
             }
         }
         else if (command == L"ai")

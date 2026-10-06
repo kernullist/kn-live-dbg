@@ -43,6 +43,32 @@ int main()
         has({L"!kmon", L"cases", L"/role", L"/json"}, L"/json"), "consumed option versus identical value");
     check(CollectCompletionCandidates({L"!kmon", L"unknown"}).empty() &&
         CollectCompletionCandidates({L"ai", L"investigate"}).empty(), "unknown action does not restart root completion");
+    check(has({L"!driver"}, L"integrity") && !has({L"!driver"}, L"all") &&
+        !has({L"!driver"}, L"/json"), "driver action precedes targets and options");
+    check(has({L"!module"}, L"integrity") && !has({L"!module"}, L"all") &&
+        !has({L"!module"}, L"/disk"), "module integrity action precedes targets and options");
+    check(has({L"!module", L"integrity"}, L"/disk") && has({L"!driver", L"integrity"}, L"/json") &&
+        CollectCompletionCandidates({L"!module", L"unknown"}).empty() &&
+        CollectCompletionCandidates({L"!driver", L"unknown"}).empty(), "integrity scope and unknown action boundaries");
+    for (const auto* command : {L"dt", L"dtx"})
+    {
+        check(has({command, L"-v"}, L"-r2") && has({command, L"-r2", L"-v"}, L"-b"),
+            "type flags do not consume a positional type as an option value");
+        check(CollectCompletionCandidates({command, L"-v", L"nt!_EPROCESS"}).empty(),
+            "type flags are offered only before the type");
+    }
+    check(has({L"help", L"dt", L"-v"}, L"-r2") && has({L"ai", L"explain", L"dtx", L"-r2"}, L"-v"),
+        "nested type completion uses the same flag grammar");
+    check(has({L"log"}, L"on") && has({L"log"}, L"off") &&
+        has({L"log"}, L"start") && has({L"log"}, L"stop"), "supported logging aliases");
+    CompletionHint logEnable = {};
+    check(FindCompletionTokenHint(L"log", {L"log"}, L"enable", &logEnable) &&
+        logEnable.Syntax != nullptr && std::wstring(logEnable.Syntax) == L"log enable",
+        "logging does not advertise an unsupported path argument");
+    CompletionHint bareType = {};
+    check(FindCompletionTokenHint(L"dt", {L"dt"}, L"-b", &bareType) &&
+        std::wstring(bareType.Summary).find(L"bare") != std::wstring::npos,
+        "type bare-output flag describes the actual output");
 
     for (const auto& info : CommandRegistry::Commands())
     {

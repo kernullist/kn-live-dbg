@@ -47,3 +47,59 @@
 
 명령 검사와 생성 입력 검사를 수정 후 반복했고, 마지막 변경 검토에서 추가 수정 사항을 발견하지 못했다.
 실제 드라이버를 로드한 대상 분석과 실제 원격 GUI 입력 검증은 포함하지 않는다.
+
+## 2026-10-06 후속 동기화
+
+아래 내용은 위의 9월 점검 이력 이후 현재 소스에 적용한 갱신이다. 등록 명령은
+계속 261개이며, 새로운 명령이나 드라이버 ABI를 추가하지 않았다.
+
+- `dt`·`dtx`의 `-rN`, `-v`, `-b`는 별도 값 없이 타입 앞에서 조합하는 플래그다.
+  기존 완성기는 첫 플래그 뒤에서 타입 값을 기다려 다른 플래그를 숨겼다.
+  플래그를 연속 완성하고, 타입 뒤에는 플래그를 제시하지 않도록 수정했다.
+  `-b` 설명도 실제 bare 이름 출력에 맞췄다.
+- `log enable [path]`는 실제로 지원하지 않는 구문이었다. 자동 파일 이름을 쓰는
+  `log enable`로 고치고, 실제 파서가 받는 `on`·`off`·`start`·`stop` 별칭을 완성에
+  추가했다.
+- `!module`은 `integrity`, `!driver`는 `list`·`object`·`integrity`를 먼저 요구한다.
+  루트에서 잘못 제시하던 `all`과 검사 옵션을 해당 하위 명령 뒤로 옮겼다.
+  객체 검사의 `/dispatch`·`/devices`와 목록·무결성 검사의 옵션 경계도 유지한다.
+- `backend dbgeng`에서도 네이티브 소유 명령이 먼저 처리되는 동작을 설명한다.
+  bare 타입 조회는 이미 로드한 CodeView/PDB 모듈을 검색하고, `module!type`은
+  지정 모듈의 심벌 로드를 요청한다. private 타입이 없으면 미지원 상태로 남는다.
+- `!driver` 도움말에 `summary.coverage_complete`, `dispatch_coverage_complete`,
+  `fast_io_coverage_complete`를 추가했다. `!hunt /deep`의 기존 TI 재사용과
+  불완전 드라이버 검사 전파, `!module integrity /disk`의 제외·비교 실패 근거도 설명한다.
+- KMON 도움말·완성 설명에 명시적 감시 우선 배정과 순환 예산을 반영했다.
+  README·명령 목록에 `/pid`, `/memory`, `/layout-ms`, `/manifest`, 분석 재개 옵션
+  및 실제 하위 명령별 구문을 보완했다.
+
+수정 전 독립 완성 검사에서 타입·로그 동작의 새 회귀 조건 8개가 실패했다.
+하위 명령보다 먼저 옵션을 제시하는 문제는 실제 핸들러의 필수 동작 검사와
+대조해 확인했다. 회귀 검사는 실제 `ParseDtRequest`의 플래그 조합, 로컬·원격
+공통 완성, 상세 도움말의 검사 범위 설명도 검사한다.
+
+재실행 명령:
+
+```powershell
+.\tools\build.ps1 -Configuration Release
+.\tools\build.ps1 -Configuration Debug
+.\x64\Release\KnLiveDbg.exe --self-test all
+.\x64\Debug\KnLiveDbg.exe --self-test all
+.\tools\validate-command-audit.ps1 -Configuration Release -Sanitize
+.\tools\validate-command-audit.ps1 -Configuration Debug -Sanitize
+```
+
+최종 검증 결과(각 Release·Debug 구성):
+
+| 검사 | 결과 |
+| --- | --- |
+| 최종 빌드 | 성공, 컴파일러 경고·오류 0개 |
+| 전체 자체 검사 | timeline 28, MCP 도구 89, console 555, commands 2,342, remote protocol 66, connect argv 4 통과 |
+| 독립 파서 /W4 /WX + ASan | 275,002개 조건 통과 |
+| 독립 완성 엔진 /W4 /WX + ASan | 25,954개 조건 통과 |
+| HTTP 검사 | 별도 실행 9개 조건 통과 |
+| 시작 도움말 | `--help`, `--help all`, `-h`, `/?` 종료 코드 0, 드라이버 서비스 변화 없음 |
+| 문서 링크 | 변경한 문서의 로컬 링크 64개 확인, 누락 0개 |
+
+이 점검은 도움말·완성과 파서를 검증한다. 실제 드라이버 기능의 별도 근거와
+미완료 범위는 [2026-10-06 호스트 검증](LIVE_HOST_VALIDATION_20261006.md)에 기록했다.
