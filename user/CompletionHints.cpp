@@ -55,7 +55,7 @@ namespace
     {
         { L"auto", L"backend auto", L"native first; fall back to DbgEng for parser/stop-state" },
         { L"native", L"backend native", L"disable generic DbgEng fallback" },
-        { L"dbgeng", L"backend dbgeng", L"send most non-session commands to IDebugControl" },
+        { L"dbgeng", L"backend dbgeng", L"keep native-owned commands local; route other commands to DbgEng" },
         { L"help", nullptr, L"show backend usage" },
     };
 
@@ -132,9 +132,13 @@ namespace
 
     const CompletionHint kLogTokens[] =
     {
-        { L"enable", L"log enable [path]", L"mirror console output to a log file" },
+        { L"enable", L"log enable", L"mirror console output to a new file in the EXE directory" },
         { L"disable", L"log disable", L"stop file mirroring" },
         { L"status", L"log status", L"show whether logging is on and the path" },
+        { L"on", L"log on", L"alias for log enable" },
+        { L"off", L"log off", L"alias for log disable" },
+        { L"start", L"log start", L"alias for log enable" },
+        { L"stop", L"log stop", L"alias for log disable" },
         { L"help", nullptr, L"show log usage" },
     };
 
@@ -189,12 +193,12 @@ namespace
 
     const CompletionHint kDtTokens[] =
     {
-        { L"-r", L"dt -r <type> [addr]", L"recurse one level of nested fields" },
-        { L"-r1", L"dt -r1 <type> [addr]", L"recurse one level" },
-        { L"-r2", L"dt -r2 <type> [addr]", L"recurse two levels" },
-        { L"-r3", L"dt -r3 <type> [addr]", L"recurse three levels" },
-        { L"-v", L"dt -v <type> [addr]", L"verbose field display" },
-        { L"-b", L"dt -b <type> [addr]", L"show fields as bytes" },
+        { L"-r", nullptr, L"recurse one level of nested fields; place before the type" },
+        { L"-r1", nullptr, L"recurse one level; place before the type" },
+        { L"-r2", nullptr, L"recurse two levels; place before the type" },
+        { L"-r3", nullptr, L"recurse three levels; place before the type" },
+        { L"-v", nullptr, L"verbose type metadata; place before the type" },
+        { L"-b", nullptr, L"bare field/type names; place before the type" },
         { L"help", nullptr, L"show dt/dtx usage" },
     };
 
@@ -277,12 +281,12 @@ namespace
     const CompletionHint kHuntTokens[] =
     {
         { L"/quick", L"!hunt /quick", L"skip hidden-PTE and disk-vs-live page comparison" },
-        { L"/deep", L"!hunt /deep", L"add hidden-PTE, stomping, BYOVD hash, driver integrity, TI ring" },
+        { L"/deep", L"!hunt /deep", L"add hidden-PTE, stomping, BYOVD hash, driver integrity, and existing TI evidence" },
         { L"/summary", L"!hunt /summary", L"conclusion and assessment only" },
         { L"/details", L"!hunt /details", L"render raw triage tables after the assessment" },
         { L"/pid", L"!hunt /pid <n>", L"deep-triage this PID first; skip VAD/hook work on other processes" },
         { L"/limit", L"!hunt /limit <n>", L"cap per-finding detail (JSON stays full)" },
-        { L"/json", L"!hunt /json <path>", L"write kn-live-dbg.hunt.v1 JSON" },
+        { L"/json", L"!hunt /json <path>", L"write findings, coverage_complete, and TI state in kn-live-dbg.hunt.v1 JSON" },
         { L"help", nullptr, L"show !hunt usage" },
     };
 
@@ -504,7 +508,7 @@ namespace
         { L"/sections", nullptr, L"print the section table" },
         { L"/wx", nullptr, L"keep W+X section or page evidence" },
         { L"/mismatch", nullptr, L"keep header/size/section anomalies" },
-        { L"/disk", nullptr, L"compare live executable pages to the on-disk PE" },
+        { L"/disk", nullptr, L"compare immutable executable bytes after relocation; unavailable ranges leave gaps" },
         { L"/iat", nullptr, L"walk the live IAT and flag thunks outside expected modules" },
         { L"/prologue", nullptr, L"disassemble AddressOfEntryPoint for trampoline / trap heads" },
         { L"/limit", L"/limit <n>", L"cap printed modules" },
@@ -516,12 +520,12 @@ namespace
     {
         { L"list", L"!driver list [driver|all]", L"enumerate \\Driver objects" },
         { L"object", L"!driver object <name|address>", L"inspect one DRIVER_OBJECT and its devices" },
-        { L"integrity", L"!driver integrity [driver|all]", L"walk \\Driver and annotate MajorFunction[]" },
+        { L"integrity", L"!driver integrity [driver|all]", L"inspect identity, MajorFunction[], DriverUnload, and known Fast I/O callbacks" },
         { L"all", L"!driver integrity all", L"scan every driver object" },
         { L"/dispatch", nullptr, L"print MajorFunction[] with !drvobj" },
         { L"/devices", nullptr, L"walk DEVICE_OBJECT.NextDevice and attached stacks" },
         { L"/limit", L"/limit <n>", L"cap printed drivers" },
-        { L"/json", L"/json <path>", L"write kn-live-dbg.driver-integrity.v1" },
+        { L"/json", L"/json <path>", L"write kn-live-dbg.driver-integrity.v1 with aggregate and per-driver coverage" },
         { L"help", nullptr, L"show !driver usage" },
     };
 
@@ -751,8 +755,8 @@ namespace
 
     const CompletionHint kKmonOptTokens[] =
     {
-        { L"/pid", L"/pid <PID>", L"optional; add inject.remote for this PID" },
-        { L"/name", L"/name <image>", L"optional; inject.remote plus dxgi/d3d IAT/vtable scans" },
+        { L"/pid", L"/pid <PID>", L"add an explicit user inspection watch; prioritized within rotating scan budgets" },
+        { L"/name", L"/name <image>", L"watch matching processes; add inject.remote and dxgi/d3d IAT/vtable scans" },
         { L"/driver", L"/driver <sys>", L"highlight only; does not hide unknown drop names" },
         { L"/verbose", L"/verbose", L"kept for compatibility; all driver events already print" },
         { L"/all-drivers", L"/all-drivers", L"alias for /verbose" },
@@ -761,7 +765,7 @@ namespace
         { L"/throttle", L"/throttle <N>", L"max TUI events per second" },
         { L"/log", L"/log <dir>", L"derived JSONL directory" },
         { L"/manifest", L"/manifest <path>", L"optional exact-build game verification rules" },
-        { L"/layout-ms", L"/layout-ms <1000..60000>", L"layout rescan target interval; first start only" },
+        { L"/layout-ms", L"/layout-ms <1000..60000>", L"layout rescan target interval, default 5000 ms; first start only" },
         { L"help", nullptr, L"show !kmon option usage" },
     };
 
@@ -1253,7 +1257,7 @@ namespace
 
     const CompletionScopeTable kLogScopes[] =
     {
-        SCOPE(L"", L"log [enable|disable|status]", L"mirror console output to a file", kLogTokens),
+        SCOPE(L"", L"log [enable|disable|status|on|off|start|stop]", L"mirror console output to an automatically named file", kLogTokens),
     };
 
     const CompletionScopeTable kWriteScopes[] =
@@ -1313,7 +1317,7 @@ namespace
 
     const CompletionScopeTable kDtScopes[] =
     {
-        SCOPE(L"", L"dt|dtx [-rN] [-v] [-b] <type> [addr] [fields]", L"PDB type layout and live field values", kDtTokens),
+        SCOPE(L"", L"dt|dtx [-rN] [-v] [-b] <module!type|type|pattern> [addr] [fields]", L"PDB type layout; qualify a module to load its symbols", kDtTokens),
     };
 
     const CompletionScopeTable kSearchScopes[] =
@@ -1514,10 +1518,10 @@ namespace
 
     const CompletionScopeTable kDriverScopes[] =
     {
-        SCOPE(L"", L"!driver [list|object|integrity] [options]", L"DRIVER_OBJECT list, object, and dispatch integrity", kDriverTokens),
+        SCOPE(L"", L"!driver list|object|integrity [options]", L"DRIVER_OBJECT list, object, and dispatch integrity", kDriverTokens),
         SCOPE(L"list", L"!driver list [driver|all] [options]", L"enumerate \\Driver objects", kDriverTokens),
         SCOPE(L"object", L"!driver object <name|address> [options]", L"inspect one DRIVER_OBJECT", kDrvobjTokens),
-        SCOPE(L"integrity", L"!driver integrity [driver|all] [options]", L"DRIVER_OBJECT dispatch integrity", kDriverTokens),
+        SCOPE(L"integrity", L"!driver integrity [driver|all] [/limit <n>] [/json <path>]", L"identity, dispatch, and Fast I/O integrity with explicit coverage", kDriverTokens),
     };
 
     const CompletionScopeTable kDrvobjScopes[] =

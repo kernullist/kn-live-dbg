@@ -84,6 +84,14 @@ static int RunCommandAuditSelfTest()
         check(has({L"!vad"}, L"/hidden") && has({L"dump-live"}, L"/hypervisor"), L"documented option aliases");
         check(!has({L"!driver", L"list"}, L"/dispatch") &&
             !has({L"!callbacks", L"object"}, L"disable"), L"scope-specific options");
+        check(!has({L"!driver"}, L"/json") && !has({L"!module"}, L"/disk") &&
+            has({L"!module", L"integrity"}, L"/disk"), L"integrity options require their action");
+        DtRequest dtRequest = {};
+        std::wstring dtError;
+        check(ParseDtRequest({L"dt", L"-r2", L"-v", L"-b", L"nt!_EPROCESS"},
+            state, symbols, &dtRequest, &dtError) && dtRequest.RecursionDepth == 2 &&
+            dtRequest.Verbose && dtRequest.Bare && has({L"dt", L"-r2", L"-v"}, L"-b") &&
+            !has({L"dt", L"-v", L"nt!_EPROCESS"}, L"-b"), L"type completion follows the actual flag parser");
         check(!has({L"!unloaded"}, L"piddb"), L"mapper alias keeps its fixed scope");
         check(!has({L"!kmon", L"start", L"/log"}, L"/pid") &&
             has({L"!kmon", L"start", L"/log", L"my logs"}, L"/pid"), L"option values are not options");
@@ -122,6 +130,22 @@ static int RunCommandAuditSelfTest()
             run(L"help dump-pe").Output.find(L"/name") != std::wstring::npos, L"user process dump help");
         check(run(L"help !diff").Output.find(L"/memory") != std::wstring::npos &&
             run(L"help !snapshot").Output.find(L"/memory") != std::wstring::npos, L"memory-only snapshot help");
+        const auto driverHelp = run(L"help !driver integrity");
+        check(driverHelp.Output.find(L"dispatch_coverage_complete") != std::wstring::npos &&
+            driverHelp.Output.find(L"fast_io_coverage_complete") != std::wstring::npos &&
+            driverHelp.Output.find(L"summary.coverage_complete") != std::wstring::npos,
+            L"driver help explains aggregate and per-driver coverage");
+        const auto huntHelp = run(L"help !hunt");
+        check(huntHelp.Output.find(L"summary.coverage_complete") != std::wstring::npos &&
+            huntHelp.Output.find(L"does not start TI") != std::wstring::npos,
+            L"hunt help distinguishes findings, coverage, and TI state");
+        const auto kmonHelp = run(L"help !kmon start");
+        check(kmonHelp.Output.find(L"four explicit watches") != std::wstring::npos &&
+            kmonHelp.Output.find(L"two background slots") != std::wstring::npos,
+            L"kmon help describes bounded watch scheduling");
+        check(run(L"help dt").Output.find(L"already loaded CodeView/PDB") != std::wstring::npos &&
+            run(L"help backend").Output.find(L"native-owned commands local") != std::wstring::npos,
+            L"symbol lookup and backend help describe current routing");
     }
     const auto remoteStatus = run(L"remote status");
     check(remoteStatus.Error.empty() && remoteStatus.Output.find(L"remote server:") != std::wstring::npos &&

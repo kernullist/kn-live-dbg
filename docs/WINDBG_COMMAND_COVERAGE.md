@@ -56,6 +56,11 @@ The `dbgeng` catch-all is **native-first**: any command owned by the TUI/driver 
 
 ## Input Validation and Audit
 
+The [help and completion audit](HELP_COMPLETION_AUDIT_20260920.md) includes the
+2026-10-06 refresh. The local console, `--connect` client, and remote completion
+requests use the same candidate and annotation tables. Type flags can be combined
+before the type; integrity options are offered after their required action.
+
 The 2026-09-19 registry has **261 entries: 151 Native, 17 Alias, and 93 DbgEng**. The [command audit](COMMAND_AUDIT_20260919.md) records handler coverage and regression evidence. Registry coverage includes dispatch/help checks for DbgEng entries; it does not certify the external debugger engine or target behavior.
 
 Native parsing rejects embedded NULs, unterminated quotes, invalid numeric suffixes/signs, overflow, and extra arguments on fixed-arity commands before side effects. Numeric inputs retain their documented radix rules, including `0x`, `0n`, and debugger address separators where supported. Listener and `--connect` ports use decimal `1..65535`. Zero-length, overflowing, and over-limit memory transfers are rejected before allocation or IOCTL dispatch.
@@ -65,7 +70,7 @@ Native parsing rejects embedded NULs, unterminated quotes, invalid numeric suffi
 ## Native Commands
 
 ```text
-?, ||, ||s, |, .sympath, .sympath+, .reload
+?, ??, ||, ||s, |, .sympath, .sympath+, .reload
 lm, ld, ln, x
 d, da, db, dc, dd, dD, df, dp, dq, du, dw, dW, dyb, dyd
 dda, ddp, ddu, dpa, dpp, dpu, dqa, dqp, dqu
@@ -80,7 +85,7 @@ dt, dtx
 !vad scan <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !vad modules <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
 !vad mappedpe <pid|eprocess> [/summary] [/limit <n>] [/json <path>]
-!threads <pid|image|eprocess> [/apc] [/stacks] [/limit <n>] [/json <path>]
+!threads <pid|image|eprocess> [/summary] [/apc] [/stacks] [/limit <n>] [/json <path>]
 !wfp [providers|sublayers|callouts|kernelcallouts|filters|layers] [/module|/layer|/provider <value>]
 !alpc [ports|port|connections|queues] [/name <pattern>] [/pid <pid>]
 !vbs
@@ -94,32 +99,34 @@ dt, dtx
 !idt
 !hal [dispatch|private]
 !hive [list|cells]
-!token <pid|image|eprocess> | !token /all [/limit <n>]  (privileges plus TokenType/SessionId/integrity SID)
+!token <pid|image|eprocess> | !token /all [/limit <n>] [/system]  (privileges plus TokenType/SessionId/integrity SID)
 !dpc [/verbose] [/limit <n>]
 !timer [/verbose] [/limit <n>]
 !workitem [/verbose] [/limit <n>]
 !fwtable [providers|provider <signature>]
 !fwtable providers /module <name>
 !module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/disk] [/iat] [/prologue] [/limit <n>] [/json <path>]
-!driver [list|object|integrity] [driver|all] [/dispatch] [/devices] [/limit <n>] [/json <path>]
+!driver list [driver|all] [/limit <n>] [/json <path>]
+!driver integrity [driver|all] [/limit <n>] [/json <path>]
+!driver object <name|address> [/dispatch] [/devices] [/json <path>]
 !drvobj <name|address> [/dispatch] [/devices] [/json <path>]
-!devstack <device-object-address> [/json <path>]
+!devstack <device-object-address|driver-name> [/json <path>]
 !handles [pid] [/target <pid>] [/process|/all] [/suspicious] [/limit <n>] [/json <path>]
 !hiddenproc [/json <path>]
 !wdfilter [/json <path>]
 !inputstack [/json <path>]
 !dma [/json <path>]
 !hv [/json <path>]
-!hunt [/quick] [/deep] [/summary] [/details] [/limit <n>] [/json <path>]
+!hunt [/quick] [/deep] [/summary] [/details] [/pid <PID>]... [/limit <n>] [/json <path>]
 !byovd [scan|update|status] [/no-update] [/force-update] [/exact] [/sign|/no-sign] [/yara] [/yara-path <exe>] [/yara-timeout <seconds>] [/verbose] [/summary] [/limit <n>] [/json <path>]
 !byovd fixture [status|load [sys-path]|unload|path]
 !pool [big|find|tags|summary|pe] [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/addr <va>] [/limit <n>] [/nonpaged|/paged|/any] [/annotate] [/wx] [/tags]
 !pool pe [/tag <ABCD>] [/min <bytes>] [/max <bytes>] [/limit <n>] [/nonpaged|/paged|/any] [/suspicious] [/dump <directory>]
-!snapshot baseline [/all] [/name <label>]
+!snapshot baseline [/all] [/memory] [/name <label>]
 !snapshot save <path> [/all] [/name <label>]
-!snapshot show [baseline|<path>] [/domains] [/warnings]
-!diff baseline [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
-!diff <old.json> <new.json> [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!snapshot show [baseline|<path>] [/domains|/no-domains] [/warnings]
+!diff baseline [/memory] [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
+!diff <old.json> <new.json> [/memory] [/summary] [/details] [/domain <name>] [/risk high|all] [/limit <n>]
 !timeline
 !timeline dashboard
 !timeline reset
@@ -148,8 +155,13 @@ dump-analyze <path> [/json <path>]
 set-ppl-antimalware [on|off|status]
 !ti start [/pid <PID>]... [/name <imageName>]... [/throttle <N>] [/ring <N>] [/log <dir>]
 !ti stop | status | watch | recent [N] | stats | by pid <PID> | by task <name> | grep <pattern> | save <path> | clear | add /pid|/name <v> | remove /pid|/name <v>
-!kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose] [/background|/nowatch] [/log <dir>]
+!kmon [start] [/name <image>] [/pid <PID>] [/driver <sys>] [/verbose|/all-drivers] [/background|/nowatch] [/log <dir>] [/manifest <path>] [/throttle <N>] [/layout-ms <1000..60000>]
 !kmon stop | status | watch | recent [N] | save <path> | clear | add /pid|/name|/driver <v> | remove /pid|/name|/driver <v>
+!kmon iotrace <driver> on | !kmon iotrace off|status
+!kmon cases [/pid N] [/role name] [/json] [/save path]
+!kmon surfaces <pid> [/json] [/save path] [/module-start <N>] [/handle-start <N>]
+!kmon layouts [/pid N [/initial]] [/json] [/save path]
+!kmon diff <before.json> <after.json> [/json]
 !wnf [decode <hash>|instances|instance <hash|entry-address>|data <hash|entry-address>|candidates|lists]
 help <command>, <command> help
 !callbacks <scope> help
@@ -160,6 +172,7 @@ ai
 e, ea, eb, ed, eD, ef, ep, eq, eu, ew, eza, ezu
 c, f, fp, m, s
 n, sq
+log [enable|disable|status|on|off|start|stop]
 version, vertarget, vercommand, drvstatus, home, dashboard, cls, probe
 q, qq, qd
 ```
@@ -170,7 +183,7 @@ For scenario-based `!timeline` workflows, including TI, snapshot reconciliation,
 
 ```text
 $<, $><, $$<, $$><, $$>a<
-??, #, |s, ~, ~e, ~f, ~u, ~n, ~m, ~s
+#, |s, ~, ~e, ~f, ~u, ~n, ~m, ~s
 a, ad, ah, al, as
 ba, bc, bd, be, bl, bp, bu, bm, br, bs, bsc
 dg, dl, dv, dx
@@ -188,6 +201,30 @@ z
 ```
 
 ## Implementation Notes
+
+As of 2026-10-06:
+
+- Bare `dt`/`dtx` type searches inspect already loaded CodeView/PDB modules.
+  A qualified `module!type` lookup can load that module's symbols. Missing
+  private types remain unavailable. `-rN`, `-v`, and `-b` go before the type;
+  `-b` selects bare names.
+- Driver integrity includes identity, all 28 major dispatch indices,
+  `DriverUnload`, and known Fast I/O callbacks. JSON reports
+  `summary.coverage_complete`, `dispatch_coverage_complete`, and
+  `fast_io_coverage_complete`. A capped scan, failed read, or unsupported
+  Fast I/O tail remains incomplete. Deep hunt propagates this driver gap.
+- Module disk comparison checks matching PE layout, normalizes relocations,
+  and excludes verified mutable ranges. Discardable sections and unavailable
+  dynamic relocations appear in section `info_codes` and `disk_compare_*`;
+  an unavailable comparison is not a byte-mismatch finding.
+- `!hunt /deep` reuses existing TI evidence and does not start the subscriber.
+  Check hunt `summary.coverage_complete`, `threat_intel_active`, and
+  `threat_intel_available` independently of zero finding counts. See the
+  [live-host record](LIVE_HOST_VALIDATION_20261006.md) for actual results and
+  compatibility limits.
+- KMON user inspection rotates up to four explicit watches inside its six
+  priority slots and two background slots per sweep. Each group has its own
+  cursor. These are work budgets, not rescan deadlines.
 
 1. `x nt!*Mask*` is handled by splitting `module!symbol-mask` and enumerating the matching loaded kernel module. The `nt` module alias maps to `ntoskrnl.exe`/`ntkrnl*` and is loaded into DbgHelp under the `nt` name.
 2. `ln` resolves the input as either a number or symbol, then asks `DbgHelp` for the nearest symbol.

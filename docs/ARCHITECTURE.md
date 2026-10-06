@@ -416,7 +416,7 @@ Backend routing is mode-dependent:
 
 1. `auto` is the default. Implemented native commands stay on the driver/`DbgHelp` path, while registered DbgEng commands, `!extension` commands, and unknown dot meta-commands initialize or reuse DbgEng.
 2. `native` disables generic DbgEng fallback. Commands that require WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, or exception semantics are reported as DbgEng-only instead of being executed.
-3. `dbgeng` routes most non-session commands through `IDebugControl4::ExecuteWide`. The TUI still intercepts shutdown/service commands, backend management, native callback scanning, and explicit `u`/`uf`.
+3. `dbgeng` runs every native-owned command through the TUI before its raw catch-all. This includes session control, native memory, symbols, types, disassembly, dumps, and native scanners. Other commands use `IDebugControl4::ExecuteWide`.
 4. `kd <command>` is a raw DbgEng escape hatch independent of the selected backend mode.
 
 Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second without producing stdout/stderr, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns. After command output starts, progress rows are suppressed for that command so watchdog text does not split normal output lines. Console color scopes, captured stdout/stderr forwarding, and watchdog writes share a console-output lock so attribute restore cannot race with progress rendering.

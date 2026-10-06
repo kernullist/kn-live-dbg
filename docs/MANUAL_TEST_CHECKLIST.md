@@ -12,7 +12,7 @@ Check an item off only after it passes on a clean machine. A failure on a clean
 machine means a false positive (or a layout/assumption bug) and must be fixed
 before the feature is trusted.
 
-## Driver-free regression gate (2026-09-20)
+## Driver-free regression gate (2026-10-06)
 
 ```powershell
 .\x64\Release\KnLiveDbg.exe --self-test all
@@ -28,27 +28,30 @@ before the feature is trusted.
 .\tools\run-hunt-clean-host-selftest.ps1
 ```
 
-The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the [Kmon review](KMON_ADVERSARIAL_REVIEW_20260920.md) records the later command/page extensions. Build-time validators require the source tree and compiler. Release artifact checks are listed in the [v0.0.33 release notes](RELEASE_NOTES_0.0.33.md).
+The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the [help and completion audit](HELP_COMPLETION_AUDIT_20260920.md) includes the current refresh. The [Kmon review](KMON_ADVERSARIAL_REVIEW_20260920.md) records its historical command/page extensions. Build-time validators require the source tree and compiler. Published package checks remain in the versioned release notes.
 
 | Suite | Checks per Release/Debug configuration |
 | --- | ---: |
-| `commands` | 1,993 |
-| `console` | 524 |
+| `commands` | 2,342 |
+| `console` | 555 |
 | `timeline` | 28 |
-| `mcp-tools` | 75 |
-| `remote-protocol` | 52 |
+| `mcp-tools` | 89 |
+| `remote-protocol` | 66 |
 | `connect-argv` | 4 |
 | `mcp-http` (separate) | 9 |
 | Standalone parser with AddressSanitizer | 275,002 |
-| Kmon hunting / page coverage with AddressSanitizer | 11,326 / 54 |
-| Kmon core groups with AddressSanitizer | 7 |
+| Standalone completion with AddressSanitizer | 25,954 |
+
+The table records the current help/completion checks and the separate HTTP
+transport gate. For Kmon hunting/page/core checks and actual-host results, use
+the dated [live-host evidence](LIVE_HOST_VALIDATION_20261006.md).
 
 `--self-test all` runs the first six suites before elevation, driver loading,
 and symbol initialization. `mcp-http` requires HTTP.sys URL registration
 rights and runs separately. Run network fixtures sequentially: remote binds
 `127.0.0.1:51767`, HTTP binds `127.0.0.1:51768`. Neither opens an external
 listener or adds firewall rules. The sanitizer script instruments the
-standalone parser; its executable command checks use the normal build.
+standalone parser and completion engine; its executable command checks use the normal build.
 Sanitizer scripts select a Visual Studio installation with an x64 ASan runtime
 matching its default MSVC version and fail if no matching installation exists.
 The clean-host runner self-test verifies retained process handles and exit codes
@@ -57,6 +60,25 @@ The clean-host runner self-test verifies retained process handles and exit codes
 These results do not check off any live-kernel item below. Live writes,
 collector/load/unload races, and an external DbgEng target remain separate
 VM or hardware tests.
+
+Help/completion checks after an option or command change:
+
+1. Run `KnLiveDbg.exe --help` and `--help all`; startup help must return before
+   driver loading and listener creation. `-h` and `/?` use the same path.
+2. Complete `dt -v -<Tab>` and `dtx -r2 -<Tab>`. Flags stay available before the
+   type and stop after it. Confirm `dt -r2 -v -b nt!_EPROCESS` follows the actual
+   parser, and `-b` describes bare names.
+3. Complete `!module <Tab>` and `!driver <Tab>` before and after choosing an
+   action. Options belong to `integrity`, `list`, or `object`; an unknown action
+   has no candidates. `!driver object` retains `/dispatch` and `/devices`.
+4. Check `log <Tab>` for `enable`/`disable`/`status` and their supported aliases.
+   Do not add a path argument; the console chooses the output file name.
+5. Compare local and remote candidates and verify quoted paths, option value
+   slots, and nested `help`/`ai explain` contexts. Scoped help must leave the
+   execution backend uninitialized.
+6. Check `help !driver`, `help !hunt`, `help !module`, and `help !kmon` for current
+   coverage fields, TI prerequisites, comparison gaps, and rotating watch
+   budgets. A zero-finding result with incomplete coverage stays incomplete.
 
 ## Prerequisites
 
