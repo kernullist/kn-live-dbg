@@ -10,6 +10,8 @@
 // Shared PE/reference parsing extracted from the hunt deep-image engine.
 namespace executable_image
 {
+    std::wstring NormalizeReferencePath(const std::wstring& path);
+
     struct DiskPeSection
     {
         std::wstring Name;

@@ -6,17 +6,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-$install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if (-not $install)
-{
-    $fallback = Get-Item "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\vcvars64.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $fallback)
-    {
-        throw 'Visual C++ build tools were not found'
-    }
-    $install = Split-Path (Split-Path (Split-Path (Split-Path $fallback.FullName)))
-}
+. (Join-Path $PSScriptRoot 'msvc-validation-environment.ps1')
+$validationEnvironment = Get-MsvcValidationEnvironment -Sanitize:$Sanitize
 $variant = $Configuration
 if ($Sanitize)
 {
@@ -24,7 +15,7 @@ if ($Sanitize)
 }
 $output = Join-Path $repo ('.build\command-audit\' + $variant)
 New-Item -ItemType Directory -Force -Path $output | Out-Null
-$vcvars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+$vcvars = $validationEnvironment.VcVarsPath
 $source = Join-Path $PSScriptRoot 'command-parser-selftest.cpp'
 $parser = Join-Path $output 'command-parser-selftest.exe'
 $flags = '/O2 /MD'
@@ -35,13 +26,7 @@ if ($Configuration -eq 'Debug')
 if ($Sanitize)
 {
     $flags += ' /fsanitize=address /Zi'
-    $runtime = Get-Item (Join-Path $install 'VC\Tools\MSVC\*\bin\Hostx64\x64\clang_rt.asan_dynamic-x86_64.dll') |
-        Sort-Object FullName -Descending | Select-Object -First 1
-    if ($null -eq $runtime)
-    {
-        throw 'The x64 AddressSanitizer runtime was not found'
-    }
-    Copy-Item -LiteralPath $runtime.FullName -Destination $output -Force
+    Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} "{2}" /Fe:"{3}" /Fo:"{4}" /Fd:"{4}parser.pdb" /link /INCREMENTAL:NO' -f $vcvars, $flags, $source, $parser, ($output.Replace('\', '/') + '/')
 $batch = Join-Path $output 'compile.cmd'

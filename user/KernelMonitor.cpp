@@ -5379,6 +5379,51 @@ namespace
         } while (false);
     }
 
+    bool KmonLoaderImageAllocation(
+        uint64_t allocationBase,
+        uint32_t mappingType,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges)
+    {
+        return allocationBase != 0 && mappingType == MEM_IMAGE &&
+            std::any_of(moduleRanges.begin(), moduleRanges.end(),
+                [allocationBase](const std::pair<uint64_t, uint32_t>& module)
+                {
+                    return module.first == allocationBase && module.second != 0;
+                });
+    }
+
+    bool KmonLoaderImageFileMatches(
+        uint64_t allocationBase,
+        uint32_t mappingType,
+        const std::wstring& mappedFile,
+        const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
+        const std::vector<std::wstring>& modulePaths)
+    {
+        if (!KmonLoaderImageAllocation(allocationBase, mappingType, moduleRanges))
+        {
+            return false;
+        }
+        const std::wstring mappedPath = Win32PathFromKernelImagePath(mappedFile);
+        if (!PathLooksLikeWin32File(mappedPath))
+        {
+            return false;
+        }
+        for (size_t index = 0; index < moduleRanges.size() && index < modulePaths.size(); ++index)
+        {
+            if (moduleRanges[index].first != allocationBase || moduleRanges[index].second == 0)
+            {
+                continue;
+            }
+            const std::wstring loaderPath = Win32PathFromKernelImagePath(modulePaths[index]);
+            if (PathLooksLikeWin32File(loaderPath) &&
+                KmonNormalizeDriverPath(mappedPath) == KmonNormalizeDriverPath(loaderPath))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool KmonOrphanRegionInteresting(
         const MEMORY_BASIC_INFORMATION& region,
         uint64_t exeRegion,
@@ -5396,12 +5441,7 @@ namespace
             region.Type == MEM_MAPPED;
         // LDR entries are writable user data. A claimed range cannot turn a
         // private/section allocation into an image or own another allocation.
-        const bool loaderImage = region.Type == MEM_IMAGE &&
-            std::any_of(moduleRanges.begin(), moduleRanges.end(),
-                [alloc](const std::pair<uint64_t, uint32_t>& module)
-                {
-                    return module.first == alloc && module.second != 0;
-                });
+        const bool loaderImage = KmonLoaderImageAllocation(alloc, region.Type, moduleRanges);
         return
             region.State == MEM_COMMIT &&
             region.RegionSize >= 0x1000 &&
@@ -8376,6 +8416,7 @@ bool KernelMonitor::Start(
             NextMapperScanTickMs = 0;
             NextKpageScanTickMs = 0;
             NextUserScanTickMs = 0;
+            WatchedUserPidCursor = 0;
             NextImageScanTickMs = 0;
             NextChannelScanTickMs = 0;
             ChannelScanCursor = 0;
@@ -17099,6 +17140,7 @@ void KernelMonitor::ScanUserModeHostility()
             }
         }
     }
+    std::vector<uint32_t> watchedUserPids;
     std::vector<uint32_t> priorityPids;
     std::vector<uint32_t> backgroundPids;
     const uint64_t schedulingNow = GetTickCount64();
@@ -17107,32 +17149,38 @@ void KernelMonitor::ScanUserModeHostility()
     {
         if (target.Interesting)
         {
-            (target.HighPriority ? priorityPids : backgroundPids).push_back(target.Pid);
+            if (watchPids.count(target.Pid) != 0 || NameEqualsWatch(target.Leaf, watchNames))
+            {
+                watchedUserPids.push_back(target.Pid);
+            }
+            else
+            {
+                (target.HighPriority ? priorityPids : backgroundPids).push_back(target.Pid);
+            }
             const auto seen = UserLastScanMs.find(target.Pid);
             const uint64_t last = seen == UserLastScanMs.end() ? StartTickMs.load() : seen->second;
             oldest = (std::max)(oldest, schedulingNow - (std::min)(schedulingNow, last));
         }
     }
     UserOldestScanMs.store(oldest);
-    const auto priority = KmonNextPids(priorityPids, 6, &HighPriorityPidCursor);
-    const auto background = KmonNextPids(backgroundPids, 2, &BackgroundPidCursor);
-    if (!priority.empty())
+    const auto schedule = KmonSelectUserPids(watchedUserPids, priorityPids, backgroundPids,
+        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor);
+    std::map<uint32_t, size_t> selected;
+    for (size_t index = 0; index < schedule.size(); ++index)
     {
-        HighPriorityPidCursor = priority.back();
+        selected.emplace(schedule[index], index);
     }
-    if (!background.empty())
-    {
-        BackgroundPidCursor = background.back();
-    }
-    std::set<uint32_t> selected(priority.begin(), priority.end());
-    selected.insert(background.begin(), background.end());
     targets.erase(std::remove_if(targets.begin(), targets.end(), [&](const KmonUserTarget& target)
     {
         return selected.count(target.Pid) == 0;
     }), targets.end());
+    std::sort(targets.begin(), targets.end(), [&](const KmonUserTarget& left, const KmonUserTarget& right)
+    {
+        return selected.at(left.Pid) < selected.at(right.Pid);
+    });
     constexpr uint32_t kMaxDeepScans = 8;
     KmonUserThreadInventory userThreadInventory;
-    const bool scheduledCap = priorityPids.size() + backgroundPids.size() > targets.size();
+    const bool scheduledCap = watchedUserPids.size() + priorityPids.size() + backgroundPids.size() > targets.size();
     KmonAssignUserThreadQueryQuotas(&targets, 1024);
     uint32_t scanned = 0;
     bool deepCapped = scheduledCap;
@@ -18661,6 +18709,25 @@ void KernelMonitor::ScanUserModeHostility()
                     }
                     const bool privateMem =
                         record.HasPrivateMemory && record.PrivateMemory;
+                    MEMORY_BASIC_INFORMATION currentMapping = {};
+                    std::wstring currentMappedFile;
+                    if (hasVmRead && moduleInventoryComplete &&
+                        VirtualQueryEx(processHandle,
+                            reinterpret_cast<LPCVOID>(record.StartAddress),
+                            &currentMapping, sizeof(currentMapping)) == sizeof(currentMapping) &&
+                        currentMapping.State == MEM_COMMIT &&
+                        reinterpret_cast<uint64_t>(currentMapping.AllocationBase) == record.StartAddress &&
+                        KmonLoaderImageAllocation(record.StartAddress, currentMapping.Type, moduleRanges) &&
+                        QueryMappedImagePath(processHandle, record.StartAddress, &currentMappedFile) &&
+                        KmonLoaderImageFileMatches(record.StartAddress, currentMapping.Type,
+                            currentMappedFile, moduleRanges, modulePaths))
+                    {
+                        // Section PE probes include ordinary loaded DLLs. An
+                        // actual MEM_IMAGE allocation with a matching loader
+                        // base and backing file is not a private implant;
+                        // executable-page and hook checks still run.
+                        continue;
+                    }
                     if (!privateMem && !record.PeHeaderFound && !record.PeHeaderSuspicious)
                     {
                         continue;
@@ -24417,6 +24484,29 @@ bool KernelMonitorSelfTest()
         orphanRegion.Protect = PAGE_READONLY;
         const std::vector<std::pair<uint64_t, uint32_t>> emptyRanges;
         const uint64_t otherImage = 0x7ff000000000ull;
+        const uint64_t listedImage = reinterpret_cast<uint64_t>(orphanRegion.AllocationBase);
+        const std::vector<std::pair<uint64_t, uint32_t>> loaderRanges = { { listedImage, 0x2000 } };
+        if (!KmonLoaderImageAllocation(listedImage, MEM_IMAGE, loaderRanges) ||
+            KmonLoaderImageAllocation(listedImage, MEM_PRIVATE, loaderRanges) ||
+            KmonLoaderImageAllocation(listedImage, MEM_MAPPED, loaderRanges) ||
+            KmonLoaderImageAllocation(listedImage + 0x1000, MEM_IMAGE, loaderRanges) ||
+            KmonLoaderImageAllocation(listedImage, MEM_IMAGE, emptyRanges))
+        {
+            break;
+        }
+        const std::vector<std::wstring> loaderPaths = { L"C:\\Windows\\System32\\fixture.dll" };
+        if (!KmonLoaderImageFileMatches(listedImage, MEM_IMAGE,
+                L"\\??\\c:\\windows\\system32\\fixture.dll", loaderRanges, loaderPaths) ||
+            KmonLoaderImageFileMatches(listedImage, MEM_PRIVATE, loaderPaths[0], loaderRanges, loaderPaths) ||
+            KmonLoaderImageFileMatches(listedImage, MEM_MAPPED, loaderPaths[0], loaderRanges, loaderPaths) ||
+            KmonLoaderImageFileMatches(listedImage, MEM_IMAGE,
+                L"D:\\Windows\\System32\\fixture.dll", loaderRanges, loaderPaths) ||
+            KmonLoaderImageFileMatches(listedImage, MEM_IMAGE,
+                L"C:\\Temp\\fixture.dll", loaderRanges, loaderPaths) ||
+            KmonLoaderImageFileMatches(listedImage, MEM_IMAGE, L"", loaderRanges, loaderPaths))
+        {
+            break;
+        }
         // LOAD_LIBRARY_AS_IMAGE_RESOURCE views are read-only orphan MEM_IMAGE
         // regions and must not reach the orphan MZ probe any more.
         if (KmonOrphanRegionInteresting(

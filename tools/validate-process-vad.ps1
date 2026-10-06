@@ -11,6 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$script:ownedSessions = [Collections.Generic.List[Diagnostics.Process]]::new()
 
 function Test-IsAdministrator
 {
@@ -116,7 +117,7 @@ function Invoke-KnLiveDbgSession
     {
         throw "failed to start KnLiveDbg"
     }
-
+    $script:ownedSessions.Add($process)
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     foreach ($command in $Commands)
@@ -656,17 +657,24 @@ finally
             }
         }
     }
-    foreach ($leftover in @(Get-Process -Name "KnLiveDbg" -ErrorAction SilentlyContinue))
+    foreach ($leftover in $script:ownedSessions)
     {
         try
         {
-            Stop-Process -Id $leftover.Id -Force -ErrorAction Stop
-            $leftover.WaitForExit(5000) | Out-Null
+            if (-not $leftover.HasExited)
+            {
+                $leftover.Kill()
+                $leftover.WaitForExit(5000) | Out-Null
+            }
         }
         catch
         {
             $cleanupFailures.Add(
                 "could not stop leftover KnLiveDbg pid=$($leftover.Id): $($_.Exception.Message)")
+        }
+        finally
+        {
+            $leftover.Dispose()
         }
     }
 

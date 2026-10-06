@@ -100,6 +100,7 @@ private:
     std::wstring ResolveModuleImagePath(const KernelModuleInfo& module) const;
     bool EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error);
     bool EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error);
+    bool ShouldSearchTypeModule(const KernelModuleInfo& module, const std::wstring& moduleFilter) const;
     bool ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error);
     bool LoadDiaDataForModule(const KernelModuleInfo& module, IDiaDataSource* source, std::wstring* error);
     bool EnumerateTypesWithDia(

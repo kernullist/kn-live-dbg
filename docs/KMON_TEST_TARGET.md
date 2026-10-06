@@ -60,6 +60,10 @@ that case.
 layer requires an executable region at the allocation base, so read-only
 `LoadLibraryEx(LOAD_LIBRARY_AS_IMAGE_RESOURCE)` views left by icon/version
 readers (single orphan `MEM_IMAGE` + `PAGE_READONLY` region) stay silent.
+The fixture opens its own backing file with execute access before creating
+`SEC_IMAGE`; omitting that access produces `STATUS_ACCESS_DENIED`. It also
+requires a complete write and successful delete-pending disposition before
+mapping. Its minimal PE has a valid `.text` entry RVA and is never executed.
 
 Stdout line:
 

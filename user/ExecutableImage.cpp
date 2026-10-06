@@ -12,13 +12,14 @@ namespace executable_image
     constexpr size_t kMaxDynamicRelocationRanges = 65536;
     constexpr uint32_t kComImageFlagsIlOnly = 1;
 
-    static std::wstring NormalizeReferencePath(const std::wstring& path)
+    std::wstring NormalizeReferencePath(const std::wstring& path)
     {
         std::wstring result = path;
         if (_wcsnicmp(result.c_str(), L"\\SystemRoot\\", 12) == 0)
         {
             wchar_t windows[MAX_PATH] = {};
-            if (GetWindowsDirectoryW(windows, MAX_PATH) != 0)
+            const UINT length = GetWindowsDirectoryW(windows, MAX_PATH);
+            if (length != 0 && length < MAX_PATH)
             {
                 result = std::wstring(windows) + result.substr(11);
             }

@@ -18344,6 +18344,18 @@ static void PrintModuleIntegrityRecord(
             std::wcout << L" pageError=" << section.PageAttributeError;
         }
         PrintReasonCodes(section.ReasonCodes);
+        if (!section.InfoCodes.empty())
+        {
+            std::wcout << L" info=";
+            for (size_t index = 0; index < section.InfoCodes.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    std::wcout << L",";
+                }
+                std::wcout << section.InfoCodes[index];
+            }
+        }
         if (!section.Notes.empty())
         {
             std::wcout << L" notes=" << section.Notes;
@@ -29266,6 +29278,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             SnapshotJsonStrictParsingSelfTest(),
             L"snapshot-json-strict-numeric-and-boolean-fields");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            SnapshotMapperHashIdentitySelfTest(),
+            L"snapshot-cihash-distinct-cache-entry-identities");
 
         CheckCompletionCandidate(
             &context,
@@ -29727,6 +29743,22 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             IntegrityIatOwnerSelfTest(),
             L"module-iat-owner-classification");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            IntegrityFastIoSelfTest(),
+            L"driver-fast-io-pool-callback-validation");
+        DriverIntegrityResult driverJsonFixture = {};
+        DriverIntegrityRecord driverJsonRecord = {};
+        driverJsonRecord.Name = L"fixture\\driver\"name";
+        DriverDispatchRecord localDispatch = {};
+        DriverDispatchRecord delegatedDispatch = {};
+        delegatedDispatch.DelegatedToLoadedModule = true;
+        driverJsonRecord.Dispatch = { localDispatch, delegatedDispatch };
+        driverJsonFixture.Records.push_back(driverJsonRecord);
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            mcpjson::ValidateDocument(BuildDriverIntegrityJson(driverJsonFixture)),
+            L"driver-integrity-json-grammar");
         CheckConsoleSurfaceSelfTest(
             &context,
             IntegrityDiscardedSectionSelfTest(),

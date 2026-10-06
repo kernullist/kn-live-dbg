@@ -1799,7 +1799,7 @@ static NTSTATUS KnDbgHandleTimelineDrain(PIRP Irp, PIO_STACK_LOCATION Stack, PVO
 // objects so __try is legal here.
 // Declared in some WDK wdm.h variants only; always exported by ntoskrnl
 // as a C symbol.
-extern "C" extern POBJECT_TYPE IoDriverObjectType;
+extern "C" extern POBJECT_TYPE* IoDriverObjectType;
 
 static BOOLEAN KnDbgIotraceValidateDriverObject(PVOID Address)
 {
@@ -2041,7 +2041,7 @@ static NTSTATUS KnDbgHandleIotraceControl(PIRP Irp, PIO_STACK_LOCATION Stack, PV
             NTSTATUS refStatus = ObReferenceObjectByPointer(
                 target,
                 0,
-                IoDriverObjectType,
+                *IoDriverObjectType,
                 KernelMode);
             if (!NT_SUCCESS(refStatus))
             {

@@ -15,6 +15,52 @@ $preflightLog = Join-Path $outputPath "deep-ti-preflight.log"
 $contentionOutputPath = Join-Path $rootPath ".build\hunt-clean-host-runner-contention-selftest"
 $contentionLog = Join-Path $contentionOutputPath "contention.log"
 $machineMutexName = "Global\KnLiveDbg-Hunt-Runner-v1"
+. (Join-Path $PSScriptRoot "owned-process-wait.ps1")
+
+foreach ($expectedCode in @(0, 7, 259, -1))
+{
+    $ownedProcess = [Diagnostics.Process]::new()
+    $ownedProcess.StartInfo.FileName = $env:ComSpec
+    $ownedProcess.StartInfo.Arguments = "/d /c exit $expectedCode"
+    $ownedProcess.StartInfo.UseShellExecute = $false
+    $ownedProcess.StartInfo.CreateNoWindow = $true
+    $ownedHandle = $null
+    try
+    {
+        if (-not $ownedProcess.Start())
+        {
+            throw "could not start owned exit-code fixture"
+        }
+        $ownedHandle = $ownedProcess.SafeHandle
+        if (-not (Wait-KnOwnedProcessExit $ownedHandle 10000))
+        {
+            throw "owned exit-code fixture timed out"
+        }
+        $actualCode = Get-KnOwnedProcessExitCode $ownedHandle
+        if ($actualCode -ne $expectedCode)
+        {
+            throw "owned process exit code mismatch: expected=$expectedCode actual=$actualCode"
+        }
+    }
+    finally
+    {
+        try
+        {
+            if ($null -ne $ownedHandle -and -not (Wait-KnOwnedProcessExit $ownedHandle 0))
+            {
+                Stop-KnOwnedProcess $ownedHandle
+                if (-not (Wait-KnOwnedProcessExit $ownedHandle 10000))
+                {
+                    throw "owned exit-code fixture did not exit after termination"
+                }
+            }
+        }
+        finally
+        {
+            $ownedProcess.Dispose()
+        }
+    }
+}
 
 if ($null -ne (Get-Service -Name "KnLiveDbg" -ErrorAction SilentlyContinue))
 {
@@ -162,6 +208,7 @@ if ($contentionExitCode -eq 0 -or
 Write-Host "[hunt-clean-runner.selftest] PASS stale JSON was deleted and missing output failed closed"
 Write-Host "[hunt-clean-runner.selftest] PASS deep clean validation requires active TI before launch"
 Write-Host "[hunt-clean-runner.selftest] PASS clean/ESET runners share a machine-wide contention gate"
+Write-Host "[hunt-clean-runner.selftest] PASS retained handles preserve exit codes 0, 7, 259, and -1"
 Write-Host "[hunt-clean-runner.selftest] log=$logPath"
 Write-Host "[hunt-clean-runner.selftest] runner_output=$outerLog"
 exit 0

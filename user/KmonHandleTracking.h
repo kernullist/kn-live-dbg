@@ -171,6 +171,24 @@ inline std::vector<uint32_t> KmonNextPids(
 
 using KmonHandleKey = std::pair<uint64_t, uint64_t>;
 
+inline std::vector<uint32_t> KmonSelectUserPids(
+    const std::vector<uint32_t>& watched,
+    const std::vector<uint32_t>& priority,
+    const std::vector<uint32_t>& background,
+    uint32_t* watchedCursor,
+    uint32_t* priorityCursor,
+    uint32_t* backgroundCursor)
+{
+    // Explicit watches lead each bounded sweep. Other priority and background
+    // processes retain independent rotation and the existing total budget.
+    std::vector<uint32_t> selected = KmonNextPids(watched, 4, watchedCursor);
+    const auto otherPriority = KmonNextPids(priority, 6 - selected.size(), priorityCursor);
+    const auto otherBackground = KmonNextPids(background, 2, backgroundCursor);
+    selected.insert(selected.end(), otherPriority.begin(), otherPriority.end());
+    selected.insert(selected.end(), otherBackground.begin(), otherBackground.end());
+    return selected;
+}
+
 struct KmonHandleChange
 {
     NativeHandleEntry Entry = {};
@@ -258,6 +276,26 @@ inline bool KmonHandleTrackingSelfTest()
         }
     }
     ok = ok && visited.size() == pids.size();
+    uint32_t watchedCursor = 0, priorityCursor = 0, backgroundCursor = 0;
+    std::set<uint32_t> scheduled;
+    for (size_t sweep = 0; sweep < 8; ++sweep)
+    {
+        const auto selected = KmonSelectUserPids({1000}, pids, {2000, 2001, 2002},
+            &watchedCursor, &priorityCursor, &backgroundCursor);
+        ok = ok && selected.size() == 8 && selected.front() == 1000 &&
+            std::set<uint32_t>(selected.begin(), selected.end()).size() == selected.size();
+        scheduled.insert(selected.begin(), selected.end());
+    }
+    ok = ok && scheduled.size() == pids.size() + 4;
+    scheduled.clear();
+    for (size_t sweep = 0; sweep < 8; ++sweep)
+    {
+        const auto selected = KmonSelectUserPids(pids, {1000, 1001}, {2000, 2001},
+            &watchedCursor, &priorityCursor, &backgroundCursor);
+        ok = ok && selected.size() == 8 && selected.front() < 35;
+        scheduled.insert(selected.begin(), selected.end());
+    }
+    ok = ok && scheduled.size() == pids.size() + 4;
     NativeHandleEntry entry = {};
     entry.HandleValue = 0x100000004ull;
     entry.Object = reinterpret_cast<void*>(0xFFFF900000001000ull);

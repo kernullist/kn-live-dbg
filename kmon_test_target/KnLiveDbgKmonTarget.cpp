@@ -98,6 +98,16 @@ namespace
         return FixtureDir() + (masquerade ? L"\\notepad.exe" : L"\\ordinary-kmon-target.exe");
     }
 
+    bool FixturePathIsGone(const std::wstring& path)
+    {
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            return false;
+        }
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+
     bool UnlinkPathNow(const std::wstring& path)
     {
         HANDLE file = CreateFileW(
@@ -120,13 +130,13 @@ namespace
                 &disp,
                 sizeof(disp));
             CloseHandle(file);
-            if (posix && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+            if (posix && FixturePathIsGone(path))
             {
                 return true;
             }
         }
         DeleteFileW(path.c_str());
-        return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+        return FixturePathIsGone(path);
     }
 
     bool WritePidFile(uint32_t pid)
@@ -410,7 +420,7 @@ namespace
         std::memcpy(pe.data() + 0x84, &fh, sizeof(fh));
         IMAGE_OPTIONAL_HEADER64 opt = {};
         opt.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-        opt.AddressOfEntryPoint = 0x200;
+        opt.AddressOfEntryPoint = 0x1000;
         opt.ImageBase = 0x180000000ull;
         opt.SectionAlignment = 0x1000;
         opt.FileAlignment = 0x200;
@@ -432,6 +442,7 @@ namespace
         {
             std::memcpy(pe.data() + sectionOff, &section, sizeof(section));
         }
+        pe[section.PointerToRawData] = 0xC3;
         return pe;
     }
 
@@ -445,7 +456,7 @@ namespace
             std::wstring path = FixtureDir() + L"\\orphan.bin";
             file = CreateFileW(
                 path.c_str(),
-                GENERIC_READ | GENERIC_WRITE | DELETE,
+                GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE,
                 0,
                 nullptr,
                 CREATE_ALWAYS,
@@ -457,13 +468,17 @@ namespace
             }
             std::vector<uint8_t> pe = MinimalPeImage();
             DWORD written = 0;
-            if (!WriteFile(file, pe.data(), static_cast<DWORD>(pe.size()), &written, nullptr))
+            if (!WriteFile(file, pe.data(), static_cast<DWORD>(pe.size()), &written, nullptr) ||
+                written != pe.size())
             {
                 break;
             }
             FILE_DISPOSITION_INFO disp = {};
             disp.DeleteFile = TRUE;
-            SetFileInformationByHandle(file, FileDispositionInfo, &disp, sizeof(disp));
+            if (!SetFileInformationByHandle(file, FileDispositionInfo, &disp, sizeof(disp)))
+            {
+                break;
+            }
 
             auto createSection = NtdllProc<NtCreateSectionFn>("NtCreateSection");
             auto mapView = NtdllProc<NtMapViewOfSectionFn>("NtMapViewOfSection");

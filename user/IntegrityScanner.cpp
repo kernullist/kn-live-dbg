@@ -1,4 +1,5 @@
 #include "IntegrityScanner.h"
+#include "ExecutableImage.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 
@@ -257,9 +258,12 @@ namespace
         return true;
     }
 
-    bool IntegrityDiskPlansMatch(const IntegrityDiskLayout& observed, const IntegrityDiskLayout& disk)
+    bool IntegrityDiskPlansMatch(const IntegrityDiskLayout& observed, const IntegrityDiskLayout& disk,
+        uint64_t loadedBase = 0)
     {
-        return observed.Machine == disk.Machine && observed.PreferredBase == disk.PreferredBase &&
+        const bool baseMatches = observed.PreferredBase == disk.PreferredBase ||
+            (loadedBase != 0 && observed.PreferredBase == loadedBase);
+        return observed.Machine == disk.Machine && baseMatches &&
             observed.ImageSize == disk.ImageSize && observed.HeaderSize == disk.HeaderSize &&
             observed.RelocRva == disk.RelocRva && observed.RelocSize == disk.RelocSize &&
             !observed.Sections.empty() && observed.Sections.size() == disk.Sections.size() &&
@@ -667,6 +671,15 @@ namespace
             AddUnique(&section->ReasonCodes, code);
             AppendNote(&section->Notes, note);
         } while (false);
+    }
+
+    void AddSectionInfo(ModuleIntegritySectionRecord* section, const std::wstring& code, const std::wstring& note)
+    {
+        if (section != nullptr)
+        {
+            AddUnique(&section->InfoCodes, code);
+            AppendNote(&section->Notes, note);
+        }
     }
 
     std::wstring SectionName(const IMAGE_SECTION_HEADER& section)
@@ -1717,6 +1730,88 @@ namespace
         return ok;
     }
 
+    bool AppendFastIoDispatchRecords(
+        const std::vector<uint8_t>& table,
+        const std::vector<KernelModuleInfo>& modules,
+        SymbolEngine* symbols,
+        DriverIntegrityRecord* record)
+    {
+        if (record == nullptr || table.size() < 8)
+        {
+            return false;
+        }
+        uint32_t tableSize = 0;
+        std::memcpy(&tableSize, table.data(), sizeof(tableSize));
+        if (tableSize < 8 || tableSize > 0x200 || tableSize > table.size() || (tableSize - 8) % 8 != 0)
+        {
+            return false;
+        }
+        static const wchar_t* fastIoNames[] =
+        {
+            L"FastIoCheckIfPossible", L"FastIoRead", L"FastIoWrite",
+            L"FastIoQueryBasicInfo", L"FastIoQueryStandardInfo", L"FastIoLock",
+            L"FastIoUnlockSingle", L"FastIoUnlockAll", L"FastIoUnlockAllByKey",
+            L"FastIoDeviceControl", L"AcquireFileForNtCreateSection", L"ReleaseFileForNtCreateSection",
+            L"FastIoDetachDevice", L"FastIoQueryNetworkOpenInfo", L"AcquireForModWrite",
+            L"MdlRead", L"MdlReadComplete", L"PrepareMdlWrite", L"MdlWriteComplete",
+            L"FastIoReadCompressed", L"FastIoWriteCompressed", L"MdlReadCompleteCompressed",
+            L"MdlWriteCompleteCompressed", L"FastIoQueryOpen", L"ReleaseForModWrite",
+            L"AcquireForCcFlush", L"ReleaseForCcFlush"
+        };
+        uint64_t ownerStart = record->DriverStart;
+        uint64_t ownerSize = record->DriverSize;
+        const KernelModuleInfo* owner = FindModuleForAddress(modules, ownerStart);
+        if ((ownerStart == 0 || ownerSize == 0) && owner != nullptr)
+        {
+            ownerStart = owner->Base;
+            ownerSize = owner->Size;
+        }
+        uint64_t ownerEnd = 0;
+        const bool haveOwnerEnd = ownerStart != 0 && ownerSize != 0 && TryAdd(ownerStart, ownerSize, &ownerEnd);
+        const uint32_t declaredCount = (tableSize - 8u) / 8u;
+        const uint32_t ptrCount = (std::min)(declaredCount, static_cast<uint32_t>(_countof(fastIoNames)));
+        for (uint32_t index = 0; index < ptrCount; ++index)
+        {
+            uint64_t function = 0;
+            std::memcpy(&function, table.data() + 8u + index * 8u, sizeof(function));
+            if (function == 0)
+            {
+                continue;
+            }
+            DriverDispatchRecord dispatch = {};
+            dispatch.Index = 100 + index;
+            dispatch.Name = fastIoNames[index];
+            dispatch.Function = function;
+            const KernelModuleInfo* target = FindModuleForAddress(modules, function);
+            if (target != nullptr)
+            {
+                dispatch.ModuleName = target->ImageName;
+            }
+            if (symbols != nullptr)
+            {
+                AnnotatePointer(*symbols, function, &dispatch.ModuleName, &dispatch.SymbolName);
+            }
+            dispatch.InLoadedModule = target != nullptr;
+            dispatch.InOwningImage = haveOwnerEnd && function >= ownerStart && function < ownerEnd;
+            if (!dispatch.InLoadedModule)
+            {
+                dispatch.Suspicious = true;
+                dispatch.Notes = L"FastIo pointer is outside loaded kernel modules";
+                ++record->SuspiciousDispatchCount;
+                record->Suspicious = true;
+            }
+            else if (!dispatch.InOwningImage && !dispatch.ModuleName.empty() && !IsKernelModuleName(dispatch.ModuleName))
+            {
+                dispatch.DelegatedToLoadedModule = true;
+                dispatch.Notes = L"FastIo pointer delegates to another loaded kernel module";
+            }
+            record->Dispatch.push_back(std::move(dispatch));
+        }
+        // Retain known callback evidence when a future layout has extra fields,
+        // but leave its uninterpreted tail explicitly incomplete.
+        return declaredCount == ptrCount;
+    }
+
     bool ReadDriverRecord(
         DeviceClient& device,
         SymbolEngine& symbols,
@@ -1759,9 +1854,18 @@ namespace
             const bool sectionKnown = ReadFieldInteger(device, object.Body, driverSectionField,
                 sizeof(uint64_t), &record->DriverSection, nullptr);
             record->IdentityFieldsKnown = startKnown && sizeKnown && sectionKnown;
-            ReadFieldInteger(device, object.Body, deviceObjectField, sizeof(uint64_t), &record->DeviceObject, nullptr);
-            ReadFieldInteger(device, object.Body, fastIoField, sizeof(uint64_t), &record->FastIoDispatch, nullptr);
-            ReadFieldInteger(device, object.Body, unloadField, sizeof(uint64_t), &record->DriverUnload, nullptr);
+            const bool deviceObjectKnown = ReadFieldInteger(device, object.Body, deviceObjectField,
+                sizeof(uint64_t), &record->DeviceObject, nullptr);
+            const bool fastIoKnown = ReadFieldInteger(device, object.Body, fastIoField,
+                sizeof(uint64_t), &record->FastIoDispatch, nullptr);
+            record->FastIoCoverageComplete = fastIoKnown;
+            if (!fastIoKnown)
+            {
+                AppendNote(&record->Notes, L"FastIoDispatch pointer could not be read");
+            }
+            const bool unloadKnown = ReadFieldInteger(device, object.Body, unloadField,
+                sizeof(uint64_t), &record->DriverUnload, nullptr);
+            record->DispatchCoverageComplete = deviceObjectKnown && unloadKnown;
 
             const std::vector<KernelModuleInfo> modules = symbols.CopyModules();
             const KernelModuleInfo* owner = nullptr;
@@ -1785,6 +1889,7 @@ namespace
             {
                 record->Suspicious = true;
                 record->Notes = L"MajorFunction field address overflow";
+                record->DispatchCoverageComplete = false;
                 ok = true;
                 break;
             }
@@ -1796,12 +1901,14 @@ namespace
                 {
                     record->Suspicious = true;
                     record->Notes = L"MajorFunction entry address overflow";
+                    record->DispatchCoverageComplete = false;
                     break;
                 }
 
                 uint64_t function = 0;
                 if (!ReadKernelInteger(device, dispatchAddress, sizeof(uint64_t), &function, nullptr))
                 {
+                    record->DispatchCoverageComplete = false;
                     continue;
                 }
 
@@ -1857,151 +1964,31 @@ namespace
                 record->Dispatch.push_back(dispatch);
             }
 
-            if (record->FastIoDispatch != 0 && IsKernelAddress(record->FastIoDispatch))
+            if (!record->DispatchCoverageComplete)
             {
-                const KernelModuleInfo* fastIoOwner =
-                    FindModuleForAddress(modules, record->FastIoDispatch);
-                if (fastIoOwner == nullptr)
+                AppendNote(&record->Notes, L"Driver object callback fields could not be read completely");
+            }
+            if (fastIoKnown && record->FastIoDispatch != 0)
+            {
+                uint64_t tableSize = 0;
+                std::vector<uint8_t> table;
+                std::wstring ignored;
+                record->FastIoCoverageComplete =
+                    IsKernelAddress(record->FastIoDispatch) &&
+                    ReadKernelInteger(device, record->FastIoDispatch, sizeof(uint32_t), &tableSize, nullptr) &&
+                    tableSize >= 8 && tableSize <= 0x200 && (tableSize - 8) % 8 == 0 &&
+                    ReadKernelBytes(device, record->FastIoDispatch, static_cast<uint32_t>(tableSize), &table, &ignored) &&
+                    AppendFastIoDispatchRecords(table, modules, &symbols, record);
+                if (!record->FastIoCoverageComplete)
                 {
-                    DriverDispatchRecord table = {};
-                    table.Index = 99;
-                    table.Name = L"FastIoDispatch";
-                    table.Function = record->FastIoDispatch;
-                    table.Suspicious = true;
-                    table.Notes =
-                        L"FastIoDispatch table is outside loaded kernel modules";
-                    ++record->SuspiciousDispatchCount;
-                    record->Suspicious = true;
-                    record->Dispatch.push_back(table);
+                    AppendNote(&record->Notes, L"FastIoDispatch callback coverage is incomplete");
                 }
-                else
+                else if (FindModuleForAddress(modules, record->FastIoDispatch) == nullptr)
                 {
-                    uint64_t sizeValue = 0;
-                    uint32_t tableSize = 0xE0;
-                    if (ReadKernelInteger(
-                            device,
-                            record->FastIoDispatch,
-                            sizeof(uint32_t),
-                            &sizeValue,
-                            nullptr) &&
-                        sizeValue >= 16 &&
-                        sizeValue <= 0x200)
-                    {
-                        tableSize = static_cast<uint32_t>(sizeValue);
-                    }
-                    std::vector<uint8_t> table;
-                            std::wstring ignored;
-                            if (ReadKernelBytes(
-                                    device,
-                                    record->FastIoDispatch,
-                                    tableSize,
-                                    &table,
-                                    &ignored) &&
-                                table.size() >= 16)
-                            {
-                                static const wchar_t* fastIoNames[] =
-                                {
-                                    L"FastIoCheckIfPossible",
-                                    L"FastIoRead",
-                                    L"FastIoWrite",
-                                    L"FastIoQueryBasicInfo",
-                                    L"FastIoQueryStandardInfo",
-                                    L"FastIoLock",
-                                    L"FastIoUnlockSingle",
-                                    L"FastIoUnlockAll",
-                                    L"FastIoUnlockAllByKey",
-                                    L"FastIoDeviceControl",
-                                    L"AcquireFileForNtCreateSection",
-                                    L"ReleaseFileForNtCreateSection",
-                                    L"FastIoDetachDevice",
-                                    L"FastIoQueryNetworkOpenInfo",
-                                    L"AcquireForModWrite",
-                                    L"MdlRead",
-                                    L"MdlReadComplete",
-                                    L"PrepareMdlWrite",
-                                    L"MdlWriteComplete",
-                                    L"FastIoReadCompressed",
-                                    L"FastIoWriteCompressed",
-                                    L"MdlReadCompleteCompressed",
-                                    L"MdlWriteCompleteCompressed",
-                                    L"FastIoQueryOpen",
-                                    L"ReleaseForModWrite",
-                                    L"AcquireForCcFlush",
-                                    L"ReleaseForCcFlush"
-                                };
-                                uint32_t ptrCount =
-                                    (tableSize - 8u) / static_cast<uint32_t>(sizeof(uint64_t));
-                                if (ptrCount > _countof(fastIoNames))
-                                {
-                                    ptrCount = static_cast<uint32_t>(_countof(fastIoNames));
-                                }
-                                uint64_t ownerStart = record->DriverStart;
-                                uint64_t ownerSize = record->DriverSize;
-                                if ((ownerStart == 0 || ownerSize == 0) && owner != nullptr)
-                                {
-                                    ownerStart = owner->Base;
-                                    ownerSize = owner->Size;
-                                }
-                                uint64_t ownerEnd = 0;
-                                const bool haveOwnerEnd =
-                                    ownerStart != 0 &&
-                                    ownerSize != 0 &&
-                                    TryAdd(ownerStart, ownerSize, &ownerEnd);
-                                for (uint32_t index = 0; index < ptrCount; ++index)
-                                {
-                                    const size_t off =
-                                        8u + static_cast<size_t>(index) * sizeof(uint64_t);
-                                    if (off + sizeof(uint64_t) > table.size())
-                                    {
-                                        break;
-                                    }
-                                    uint64_t function = 0;
-                                    std::memcpy(&function, table.data() + off, sizeof(function));
-                                    if (function == 0)
-                                    {
-                                        continue;
-                                    }
-                                    DriverDispatchRecord dispatch = {};
-                                    dispatch.Index = 100 + index;
-                                    dispatch.Name = fastIoNames[index];
-                                    dispatch.Function = function;
-                                    AnnotatePointer(
-                                        symbols,
-                                        function,
-                                        &dispatch.ModuleName,
-                                        &dispatch.SymbolName);
-                                    dispatch.InLoadedModule =
-                                        FindModuleForAddress(modules, function) != nullptr;
-                                    dispatch.InOwningImage =
-                                        haveOwnerEnd &&
-                                        function >= ownerStart &&
-                                        function < ownerEnd;
-                                    if (!dispatch.InLoadedModule)
-                                    {
-                                        dispatch.Suspicious = true;
-                                        dispatch.Notes =
-                                            L"FastIo pointer is outside loaded kernel modules";
-                                    }
-                                    else if (
-                                        !dispatch.InOwningImage &&
-                                        !dispatch.ModuleName.empty() &&
-                                        !IsKernelModuleName(dispatch.ModuleName))
-                                    {
-                                        dispatch.DelegatedToLoadedModule = true;
-                                        dispatch.Notes =
-                                            L"FastIo pointer delegates to another loaded kernel module";
-                                    }
-                                    if (dispatch.Suspicious)
-                                    {
-                                        ++record->SuspiciousDispatchCount;
-                                        record->Suspicious = true;
-                                    }
-                                    record->Dispatch.push_back(dispatch);
-                                }
-                            }
+                    // FAST_IO_DISPATCH is data and may be allocated from pool.
+                    AppendNote(&record->Notes, L"FastIoDispatch table is allocated outside module images");
                 }
             }
-
             if (record->HasDriverStart && owner == nullptr)
             {
                 record->Suspicious = true;
@@ -2053,6 +2040,35 @@ namespace
             if (!importStem.empty() && importStem == targetStem)
             {
                 expected = true;
+                break;
+            }
+
+            // Kernel API-set contracts are routed to these exact schema hosts.
+            // A contract name alone does not make an arbitrary target trusted.
+            static const std::pair<const wchar_t*, const wchar_t*> kKernelApiSetHosts[] =
+            {
+                { L"ext-ms-win-accel-api-km-l1-1-0", L"winaccel" },
+                { L"ext-ms-win-fs-clfs-l1-1-0", L"clfs" },
+                { L"ext-ms-win-kmpdc-l1-1-0", L"pdc" },
+                { L"ext-ms-win-kmpdc-l1-1-1", L"pdc" },
+                { L"ext-ms-win-ntos-clipsp-l1-1-0", L"clipsp" },
+                { L"ext-ms-win-ntos-globmerger-l1-1-0", L"globmerger" },
+                { L"ext-ms-win-ntos-kcminitcfg-l1-1-0", L"cmimcext" },
+                { L"ext-ms-win-ntos-tm-l1-1-0", L"tm" },
+                { L"ext-ms-win-ntos-ucode-l1-1-0", L"ntosext" },
+                { L"ext-ms-win-ntos-werkernel-l1-1-1", L"werkernel" },
+                { L"ext-ms-win-ntos-win32k-l1-1-0", L"win32k" }
+            };
+            for (const auto& entry : kKernelApiSetHosts)
+            {
+                if (importStem == entry.first && targetStem == entry.second)
+                {
+                    expected = true;
+                    break;
+                }
+            }
+            if (expected)
+            {
                 break;
             }
 
@@ -3293,14 +3309,19 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                 // page can be normalized or reported as matching.
                                 HANDLE diskCompareFile = INVALID_HANDLE_VALUE;
                                 std::vector<IntegrityRelocation> relocations;
-                                const bool diskImageBaseMismatch = module.Base != record.PreferredImageBase;
-                                bool relocationsReady = !diskImageBaseMismatch;
+                                uint64_t diskPreferredBase = 0;
+                                bool diskImageBaseMismatch = false;
+                                bool relocationsReady = false;
                                 bool diskCompareFileReady = false;
                                 bool diskLayoutReady = false;
+                                executable_image::DiskPeMetadata diskMutationMetadata;
+                                bool diskMutationMetadataReady = false;
                                 if (options.CompareDiskPages && !record.ImagePath.empty())
                                 {
+                                    const std::wstring diskPath =
+                                        executable_image::NormalizeReferencePath(record.ImagePath);
                                     diskCompareFile = CreateFileW(
-                                        record.ImagePath.c_str(),
+                                        diskPath.c_str(),
                                         GENERIC_READ,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         nullptr,
@@ -3320,7 +3341,27 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                         observedLayout.Sections.assign(sections, sections + record.NumberOfSections);
                                         IntegrityDiskLayout diskLayout;
                                         diskLayoutReady = ReadIntegrityDiskLayout(diskCompareFile, &diskLayout) &&
-                                            IntegrityDiskPlansMatch(observedLayout, diskLayout);
+                                            IntegrityDiskPlansMatch(observedLayout, diskLayout, module.Base);
+                                        if (diskLayoutReady)
+                                        {
+                                            // The boot loader can rewrite the live PE ImageBase.
+                                            // Normalize from the independent disk preferred base.
+                                            diskPreferredBase = diskLayout.PreferredBase;
+                                            diskImageBaseMismatch = module.Base != diskPreferredBase;
+                                            relocationsReady = !diskImageBaseMismatch;
+                                            std::wstring metadataError;
+                                            diskMutationMetadataReady =
+                                                executable_image::ReadDiskPeMetadata(diskPath, &diskMutationMetadata, &metadataError) &&
+                                                executable_image::DiskFileIdentityMatches(diskCompareFile, diskMutationMetadata) &&
+                                                diskMutationMetadata.ImageBase == diskPreferredBase &&
+                                                diskMutationMetadata.SizeOfImage == diskLayout.ImageSize &&
+                                                diskMutationMetadata.DynamicRelocationTableComplete;
+                                            if (!diskMutationMetadataReady)
+                                            {
+                                                result->Warnings.push_back(record.ImageName +
+                                                    L": disk compare unavailable: independent dynamic relocation metadata is incomplete or unsupported");
+                                            }
+                                        }
                                         if (!diskLayoutReady)
                                         {
                                             result->Warnings.push_back(record.ImageName +
@@ -3577,7 +3618,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                         if (!diskCompareFileReady || diskCompareFile == INVALID_HANDLE_VALUE)
                                         {
                                             section.DiskCompareFailed = true;
-                                            AddSectionReason(
+                                            AddSectionInfo(
                                                 &section,
                                                 L"disk_open_failed",
                                                 L"could not open module image on disk for page compare");
@@ -3585,13 +3626,25 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                         else if (!diskLayoutReady)
                                         {
                                             section.DiskCompareFailed = true;
-                                            AddSectionReason(&section, L"disk_layout_unavailable_or_changed",
+                                            AddSectionInfo(&section, L"disk_layout_unavailable_or_changed",
                                                 L"live comparison plan does not match a complete independent disk PE layout");
+                                        }
+                                        else if ((section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0)
+                                        {
+                                            section.DiskCompareFailed = true;
+                                            AddSectionInfo(&section, L"disk_discardable_section_unavailable",
+                                                L"discardable section can be released or reused after image initialization");
+                                        }
+                                        else if (!diskMutationMetadataReady)
+                                        {
+                                            section.DiskCompareFailed = true;
+                                            AddSectionInfo(&section, L"disk_dynamic_relocations_unavailable",
+                                                L"independent dynamic relocation metadata is incomplete or unsupported");
                                         }
                                         else if (!relocationsReady)
                                         {
                                             section.DiskCompareFailed = true;
-                                            AddSectionReason(&section, L"disk_relocations_unavailable",
+                                            AddSectionInfo(&section, L"disk_relocations_unavailable",
                                                 L"complete bounded disk relocation metadata could not be validated");
                                         }
                                         else
@@ -3646,7 +3699,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                         record.SizeOfHeaders, pageRva, readLen, &diskPage))
                                                 {
                                                     section.DiskCompareFailed = true;
-                                                    AddSectionReason(
+                                                    AddSectionInfo(
                                                         &section,
                                                         L"disk_read_failed",
                                                         L"disk page read failed");
@@ -3656,7 +3709,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 if (diskImageBaseMismatch)
                                                 {
                                                     const uint64_t imageDelta =
-                                                        module.Base - record.PreferredImageBase;
+                                                        module.Base - diskPreferredBase;
                                                     uint32_t applied = 0;
                                                     if (!ApplyIntegrityRelocationsToPage(
                                                             relocations, pageRva, imageDelta, &diskPage,
@@ -3668,7 +3721,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                             }, &applied))
                                                     {
                                                         ++relocApplyFailures;
-                                                        AddSectionReason(&section, L"disk_compare_reloc_apply_failed",
+                                                        AddSectionInfo(&section, L"disk_compare_reloc_apply_failed",
                                                             L"complete relocation fixup bytes could not be normalized");
                                                         continue;
                                                     }
@@ -3692,7 +3745,7 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                     livePage.size() != readLen)
                                                 {
                                                     section.DiskCompareFailed = true;
-                                                    AddSectionReason(
+                                                    AddSectionInfo(
                                                         &section,
                                                         L"live_read_failed",
                                                         L"live page read failed during disk compare");
@@ -3700,6 +3753,33 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 }
 
                                                 ++comparedPages;
+                                                size_t maskedBytes = 0;
+                                                for (const executable_image::DiskPeMutableRange& range : diskMutationMetadata.DynamicRelocationRanges)
+                                                {
+                                                    const uint64_t first = (std::max<uint64_t>)(range.Rva, pageRva);
+                                                    const uint64_t last = (std::min<uint64_t>)(
+                                                        static_cast<uint64_t>(range.Rva) + range.Size,
+                                                        static_cast<uint64_t>(pageRva) + readLen);
+                                                    if (first < last)
+                                                    {
+                                                        const size_t offset = static_cast<size_t>(first - pageRva);
+                                                        const size_t length = static_cast<size_t>(last - first);
+                                                        std::memcpy(diskPage.data() + offset, livePage.data() + offset, length);
+                                                        maskedBytes += length;
+                                                    }
+                                                }
+                                                if (maskedBytes >= readLen)
+                                                {
+                                                    section.DiskCompareFailed = true;
+                                                    AddSectionInfo(&section, L"disk_compare_no_immutable_bytes",
+                                                        L"sample is entirely covered by validated dynamic relocation ranges");
+                                                    continue;
+                                                }
+                                                if (maskedBytes != 0)
+                                                {
+                                                    AddSectionInfo(&section, L"disk_compare_dynamic_ranges_skipped",
+                                                        L"validated loader dynamic relocation ranges were excluded from byte comparison");
+                                                }
                                                 if (memcmp(livePage.data(), diskPage.data(), readLen) != 0)
                                                 {
                                                     section.DiskCompareMismatch = true;
@@ -3727,19 +3807,24 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                      !section.DiskCompareFailed)
                                             {
                                                 section.DiskCompareFailed = true;
-                                                AddSectionReason(
+                                                AddSectionInfo(
                                                     &section,
                                                     L"disk_compare_no_pages",
                                                     L"no executable pages were compared");
                                             }
                                             else if (relocNormalizedPages != 0)
                                             {
-                                                AddSectionReason(
+                                                AddSectionInfo(
                                                     &section,
                                                     L"disk_compare_reloc_normalized",
                                                     L"compared pages after applying base relocation deltas to disk bytes");
                                             }
                                             FinalizeIntegrityDiskComparison(&section, comparedPages, relocApplyFailures);
+                                        }
+                                        if (section.DiskCompareFailed)
+                                        {
+                                            result->Warnings.push_back(record.ImageName + L":" + section.Name +
+                                                L": disk compare coverage incomplete: " + section.Notes);
                                         }
                                     }
 
@@ -4101,6 +4186,14 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
                 if (record.Suspicious)
                 {
                     ++result->SuspiciousDrivers;
+                }
+                if (!record.FastIoCoverageComplete)
+                {
+                    result->Warnings.push_back(L"FastIoDispatch callback coverage is incomplete for " + record.Name);
+                }
+                if (!record.DispatchCoverageComplete)
+                {
+                    result->Warnings.push_back(L"Driver object callback coverage is incomplete for " + record.Name);
                 }
                 result->Records.push_back(record);
             }
@@ -5218,6 +5311,10 @@ bool IntegrityScanner::InspectDriverObject(
                     majorFunction,
                     &record))
             {
+                if (!record.FastIoCoverageComplete)
+                {
+                    result->Warnings.push_back(L"FastIoDispatch callback coverage is incomplete for " + record.Name);
+                }
                 result->Drivers.push_back(record);
             }
         }
@@ -5406,9 +5503,15 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
                  << L",\"suspicious\":" << (section.Suspicious ? L"true" : L"false")
                  << L",\"wx_evidence\":" << (section.WxEvidence ? L"true" : L"false")
                  << L",\"mismatch_evidence\":" << (section.MismatchEvidence ? L"true" : L"false")
+                 << L",\"disk_compare_attempted\":" << (section.DiskCompareAttempted ? L"true" : L"false")
+                 << L",\"disk_compare_matched\":" << (section.DiskCompareMatched ? L"true" : L"false")
+                 << L",\"disk_compare_mismatch\":" << (section.DiskCompareMismatch ? L"true" : L"false")
+                 << L",\"disk_compare_failed\":" << (section.DiskCompareFailed ? L"true" : L"false")
                  << L",\"page_attribute_error\":\"" << JsonEscape(section.PageAttributeError)
                  << L"\",\"reason_codes\":";
             writeStringArray(section.ReasonCodes);
+            json << L",\"info_codes\":";
+            writeStringArray(section.InfoCodes);
             json << L",\"notes\":\"" << JsonEscape(section.Notes) << L"\"}";
         }
         json << L"],\"iat\":[";
@@ -5459,6 +5562,34 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
     return json.str();
 }
 
+bool DriverIntegrityCoverageComplete(const DriverIntegrityResult& result)
+{
+    if (result.Truncated || result.Records.size() != result.MatchingDrivers)
+    {
+        return false;
+    }
+    for (const DriverIntegrityRecord& record : result.Records)
+    {
+        if (!record.IdentityFieldsKnown || !record.FastIoCoverageComplete || !record.DispatchCoverageComplete)
+        {
+            return false;
+        }
+        uint32_t majorMask = 0;
+        for (const DriverDispatchRecord& dispatch : record.Dispatch)
+        {
+            if (dispatch.Index < 28)
+            {
+                majorMask |= uint32_t{1} << dispatch.Index;
+            }
+        }
+        if (majorMask != 0x0fffffffu)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
 {
     std::wstringstream json;
@@ -5467,7 +5598,8 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
     json << L"  \"summary\":{\"drivers_scanned\":" << result.DriversScanned
          << L",\"matching_drivers\":" << result.MatchingDrivers
          << L",\"suspicious_drivers\":" << result.SuspiciousDrivers
-         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
+         << L",\"truncated\":" << (result.Truncated ? L"true" : L"false")
+         << L",\"coverage_complete\":" << (DriverIntegrityCoverageComplete(result) ? L"true" : L"false") << L"},\n";
     json << L"  \"records\":[\n";
     for (size_t i = 0; i < result.Records.size(); ++i)
     {
@@ -5479,6 +5611,8 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
              << L",\"owning_module\":\"" << JsonEscape(record.OwningModule)
              << L"\",\"suspicious\":" << (record.Suspicious ? L"true" : L"false")
              << L",\"suspicious_dispatch_count\":" << record.SuspiciousDispatchCount
+             << L",\"fast_io_coverage_complete\":" << (record.FastIoCoverageComplete ? L"true" : L"false")
+             << L",\"dispatch_coverage_complete\":" << (record.DispatchCoverageComplete ? L"true" : L"false")
              << L",\"dispatch\":[";
         for (size_t d = 0; d < record.Dispatch.size(); ++d)
         {
@@ -5494,7 +5628,7 @@ std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result)
                  << L"\",\"symbol\":\"" << JsonEscape(dispatch.SymbolName)
                  << L"\",\"delegated_to_loaded_module\":"
                  << (dispatch.DelegatedToLoadedModule ? L"true" : L"false")
-                 << L"\",\"suspicious\":" << (dispatch.Suspicious ? L"true" : L"false")
+                 << L",\"suspicious\":" << (dispatch.Suspicious ? L"true" : L"false")
                  << L"}";
         }
         json << L"]}";
@@ -5649,6 +5783,11 @@ bool IntegrityRelocationSelfTest()
     changed = diskLayout;
     changed.PreferredBase += 0x10000;
     if (IntegrityDiskPlansMatch(changed, diskLayout))
+    {
+        return false;
+    }
+    if (!IntegrityDiskPlansMatch(changed, diskLayout, changed.PreferredBase) ||
+        IntegrityDiskPlansMatch(changed, diskLayout, changed.PreferredBase + 0x1000))
     {
         return false;
     }
@@ -5807,7 +5946,34 @@ bool IntegrityRelocationSelfTest()
     section = {};
     section.DiskCompareMatched = true;
     FinalizeIntegrityDiskComparison(&section, 2, 0);
-    return !section.DiskCompareFailed && section.DiskCompareMatched;
+    AddSectionInfo(&section, L"disk_compare_reloc_normalized", L"relocations applied");
+    if (section.DiskCompareFailed || !section.DiskCompareMatched || section.Suspicious ||
+        !section.ReasonCodes.empty() || section.InfoCodes.size() != 1)
+    {
+        return false;
+    }
+    section = {};
+    section.DiskCompareAttempted = true;
+    section.DiskCompareFailed = true;
+    AddSectionInfo(&section, L"disk_open_failed", L"disk unavailable");
+    FinalizeIntegrityDiskComparison(&section, 0, 0);
+    if (section.Suspicious || section.DiskCompareMatched || !section.DiskCompareFailed)
+    {
+        return false;
+    }
+    section.DiskCompareMismatch = true;
+    section.MismatchEvidence = true;
+    AddSectionReason(&section, L"disk_live_page_mismatch", L"executable bytes changed");
+    FinalizeIntegrityDiskComparison(&section, 1, 0);
+    ModuleIntegrityResult result;
+    ModuleIntegrityRecord record;
+    record.Sections.push_back(section);
+    result.Records.push_back(record);
+    const std::wstring json = BuildModuleIntegrityJson(result);
+    return section.Suspicious && section.MismatchEvidence && !section.DiskCompareMatched &&
+        json.find(L"\"disk_compare_failed\":true") != std::wstring::npos &&
+        json.find(L"\"disk_compare_mismatch\":true") != std::wstring::npos &&
+        json.find(L"\"info_codes\":[\"disk_open_failed\"]") != std::wstring::npos;
 }
 
 bool IntegrityDiscardedSectionSelfTest()
@@ -5841,10 +6007,143 @@ bool IntegrityIatOwnerSelfTest()
         {
             break;
         }
+        if (!IsExpectedImportOwner(L"ext-ms-win-ntos-tm-l1-1-0.dll", L"tm.sys") ||
+            IsExpectedImportOwner(L"ext-ms-win-ntos-tm-l1-1-0.dll", L"cheat.sys") ||
+            IsExpectedImportOwner(L"ext-ms-win-ntos-unknown-l1-1-0.dll", L"tm.sys") ||
+            IsExpectedImportOwner(L"ext-ms-win-ntos-tm-l1-1-0.dll", L"tm-lookalike.sys"))
+        {
+            break;
+        }
+        static const std::pair<const wchar_t*, const wchar_t*> kApiSetCases[] =
+        {
+            { L"ext-ms-win-accel-api-km-l1-1-0.dll", L"winaccel.sys" },
+            { L"ext-ms-win-fs-clfs-l1-1-0.dll", L"CLFS.SYS" },
+            { L"ext-ms-win-kmpdc-l1-1-0.dll", L"pdc.sys" },
+            { L"ext-ms-win-kmpdc-l1-1-1.dll", L"pdc.sys" },
+            { L"ext-ms-win-ntos-clipsp-l1-1-0.dll", L"clipsp.sys" },
+            { L"ext-ms-win-ntos-globmerger-l1-1-0.dll", L"globmerger.sys" },
+            { L"ext-ms-win-ntos-kcminitcfg-l1-1-0.dll", L"cmimcext.sys" },
+            { L"ext-ms-win-ntos-ucode-l1-1-0.dll", L"ntosext.sys" },
+            { L"ext-ms-win-ntos-werkernel-l1-1-1.dll", L"werkernel.sys" },
+            { L"ext-ms-win-ntos-win32k-l1-1-0.dll", L"win32k.sys" }
+        };
+        for (const auto& entry : kApiSetCases)
+        {
+            if (!IsExpectedImportOwner(entry.first, entry.second) ||
+                IsExpectedImportOwner(entry.first, L"cheat.sys") ||
+                IsExpectedImportOwner(L"ext-ms-win-unknown-l1-1-0.dll", entry.second) ||
+                IsExpectedImportOwner(entry.first, std::wstring(entry.second) + L".lookalike"))
+            {
+                return false;
+            }
+        }
         ok = true;
     } while (false);
 
     return ok;
+}
+
+bool IntegrityFastIoSelfTest()
+{
+    constexpr uint64_t driverBase = 0xfffff80000100000ull;
+    KernelModuleInfo driver = {};
+    driver.Base = driverBase;
+    driver.Size = 0x10000;
+    driver.ImageName = L"fixture.sys";
+    std::vector<KernelModuleInfo> modules = { driver };
+    std::vector<uint8_t> table(32, 0);
+    uint32_t tableSize = static_cast<uint32_t>(table.size());
+    std::memcpy(table.data(), &tableSize, sizeof(tableSize));
+    const uint64_t inside = driverBase + 0x100;
+    const uint64_t outside = 0xffff900000123000ull;
+    std::memcpy(table.data() + 8, &inside, sizeof(inside));
+    std::memcpy(table.data() + 24, &outside, sizeof(outside));
+    DriverIntegrityRecord record = {};
+    record.DriverStart = driverBase;
+    record.DriverSize = driver.Size;
+    record.FastIoDispatch = 0xffff900001000000ull;
+    if (!AppendFastIoDispatchRecords(table, modules, nullptr, &record) ||
+        record.Dispatch.size() != 2 || !record.Dispatch[0].InOwningImage ||
+        record.Dispatch[0].Suspicious || !record.Dispatch[1].Suspicious ||
+        !record.Suspicious || record.SuspiciousDispatchCount != 1)
+    {
+        return false;
+    }
+    // A larger future layout must retain known callbacks without claiming
+    // that its uninterpreted tail was inspected.
+    std::vector<uint8_t> extendedTable(0xe8, 0);
+    uint32_t extendedSize = static_cast<uint32_t>(extendedTable.size());
+    std::memcpy(extendedTable.data(), &extendedSize, sizeof(extendedSize));
+    std::memcpy(extendedTable.data() + 8, &outside, sizeof(outside));
+    std::memcpy(extendedTable.data() + 0xe0, &outside, sizeof(outside));
+    DriverIntegrityRecord extendedRecord = {};
+    if (AppendFastIoDispatchRecords(extendedTable, modules, nullptr, &extendedRecord) ||
+        extendedRecord.Dispatch.size() != 1 || !extendedRecord.Suspicious ||
+        extendedRecord.SuspiciousDispatchCount != 1)
+    {
+        return false;
+    }
+    DriverIntegrityResult coverage = {};
+    DriverIntegrityRecord completeRecord = {};
+    completeRecord.IdentityFieldsKnown = true;
+    for (uint32_t index = 0; index < 28; ++index)
+    {
+        DriverDispatchRecord dispatch = {};
+        dispatch.Index = index;
+        completeRecord.Dispatch.push_back(dispatch);
+    }
+    coverage.MatchingDrivers = 1;
+    coverage.Records.push_back(completeRecord);
+    if (!DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    coverage.Records[0].FastIoCoverageComplete = false;
+    if (DriverIntegrityCoverageComplete(coverage) ||
+        BuildDriverIntegrityJson(coverage).find(L"\"coverage_complete\":false") == std::wstring::npos)
+    {
+        return false;
+    }
+    coverage.Records[0] = completeRecord;
+    coverage.Records[0].DispatchCoverageComplete = false;
+    if (DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    coverage.Records[0] = completeRecord;
+    coverage.Records[0].IdentityFieldsKnown = false;
+    if (DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    coverage.Records[0] = completeRecord;
+    coverage.Records[0].Dispatch.pop_back();
+    coverage.Records[0].Dispatch.push_back(coverage.Records[0].Dispatch.front());
+    if (DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    coverage.Records[0] = completeRecord;
+    coverage.Truncated = true;
+    if (DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    coverage.Truncated = false;
+    coverage.MatchingDrivers = 2;
+    if (DriverIntegrityCoverageComplete(coverage))
+    {
+        return false;
+    }
+    table.resize(16);
+    record = DriverIntegrityRecord{};
+    if (AppendFastIoDispatchRecords(table, modules, nullptr, &record) || !record.Dispatch.empty())
+    {
+        return false;
+    }
+    tableSize = 15;
+    std::memcpy(table.data(), &tableSize, sizeof(tableSize));
+    return !AppendFastIoDispatchRecords(table, modules, nullptr, &record) && !record.Suspicious;
 }
 
 bool IntegrityProloguePatternSelfTest()

@@ -583,6 +583,7 @@ private:
     std::atomic<uint64_t> ImageLastCompleteMs{0};
     uint64_t NextPipelineStatusMs = 0;
     uint32_t HighPriorityPidCursor = 0;
+    uint32_t WatchedUserPidCursor = 0;
     uint32_t BackgroundPidCursor = 0;
     std::map<uint32_t, uint64_t> UserLastScanMs;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> HeapPageCursors;

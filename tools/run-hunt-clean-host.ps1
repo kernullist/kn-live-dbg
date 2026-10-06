@@ -25,6 +25,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "owned-process-wait.ps1")
+
 trap
 {
     if ($NoElevation -and
@@ -326,6 +328,7 @@ for ($run = 1; $run -le $Count; ++$run)
     Write-Host "[hunt-clean] start run=$run mode=$Mode ti=$([bool]$EnableThreatIntel)"
 
     $process = $null
+    $ownedProcessHandle = $null
     $stdoutTask = $null
     $stderrTask = $null
     $stdout = ""
@@ -351,6 +354,8 @@ for ($run = 1; $run -le $Count; ++$run)
         {
             throw "failed to start KnLiveDbg"
         }
+        # Retain the original owned process handle before PPL can restrict reopening.
+        $ownedProcessHandle = $process.SafeHandle
 
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -361,21 +366,21 @@ for ($run = 1; $run -le $Count; ++$run)
         $process.StandardInput.Close()
 
         $waitCompleted =
-            $process.WaitForExit($TimeoutSeconds * 1000)
+            Wait-KnOwnedProcessExit $ownedProcessHandle ($TimeoutSeconds * 1000)
         $timedOut = -not $waitCompleted
         if ($timedOut)
         {
             try
             {
-                if (-not $process.HasExited)
+                if (-not (Wait-KnOwnedProcessExit $ownedProcessHandle 0))
                 {
-                    $process.Kill()
+                    Stop-KnOwnedProcess $ownedProcessHandle
                 }
             }
             catch [System.InvalidOperationException]
             {
             }
-            $waitCompleted = $process.WaitForExit(10000)
+            $waitCompleted = Wait-KnOwnedProcessExit $ownedProcessHandle 10000
             if (-not $waitCompleted)
             {
                 throw "KnLiveDbg remained alive for 10 seconds after exact-PID termination; run=$run log=$logPath"
@@ -385,7 +390,7 @@ for ($run = 1; $run -le $Count; ++$run)
 
         try
         {
-            $exitCode = [int]$process.ExitCode
+            $exitCode = Get-KnOwnedProcessExitCode $ownedProcessHandle
         }
         catch
         {
@@ -395,7 +400,7 @@ for ($run = 1; $run -le $Count; ++$run)
             }
             # set-ppl-antimalware can make the unprotected runner lose
             # PROCESS_QUERY_INFORMATION on the already-started child.  In
-            # that case WaitForExit, fresh JSON validation, and exact service
+            # that case the retained-handle wait, fresh JSON, and exact service
             # cleanup remain the completion gates.
             $exitCodeUnavailable = $true
             Write-Warning "[hunt-clean] exit code unavailable after PPL transition; using artifact and cleanup gates"
@@ -459,12 +464,12 @@ for ($run = 1; $run -le $Count; ++$run)
             try
             {
                 if (-not $waitCompleted -and
-                    -not $process.HasExited)
+                    -not (Wait-KnOwnedProcessExit $ownedProcessHandle 0))
                 {
                     Write-Warning "[hunt-clean] stopping exact KnLiveDbg process pid=$($process.Id)"
-                    $process.Kill()
+                    Stop-KnOwnedProcess $ownedProcessHandle
                     $waitCompleted =
-                        $process.WaitForExit(10000)
+                        Wait-KnOwnedProcessExit $ownedProcessHandle 10000
                     if (-not $waitCompleted)
                     {
                         throw "process did not exit within 10 seconds"
@@ -472,15 +477,18 @@ for ($run = 1; $run -le $Count; ++$run)
                 }
                 if (-not $waitCompleted)
                 {
-                    $process.WaitForExit()
-                    $waitCompleted = $true
+                    $waitCompleted = Wait-KnOwnedProcessExit $ownedProcessHandle 10000
+                    if (-not $waitCompleted)
+                    {
+                        throw "owned process did not exit within 10 seconds"
+                    }
                 }
                 if ($null -eq $exitCode -and
                     -not $exitCodeUnavailable)
                 {
                     try
                     {
-                        $exitCode = [int]$process.ExitCode
+                        $exitCode = Get-KnOwnedProcessExitCode $ownedProcessHandle
                     }
                     catch
                     {
@@ -498,7 +506,8 @@ for ($run = 1; $run -le $Count; ++$run)
                 $cleanupFailures.Add("KnLiveDbg process cleanup failed: $($_.Exception.Message)")
                 try
                 {
-                    $canCaptureOutput = $process.HasExited
+                    $canCaptureOutput = $null -ne $ownedProcessHandle -and
+                        (Wait-KnOwnedProcessExit $ownedProcessHandle 0)
                 }
                 catch
                 {

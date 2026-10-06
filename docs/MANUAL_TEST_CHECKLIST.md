@@ -1,5 +1,8 @@
 # Manual Test Checklist
 
+The [2026-10-06 live-host validation report](LIVE_HOST_VALIDATION_20261006.md)
+records actual test-signed-host evidence, fixes, incomplete coverage, and cleanup.
+
 This document separates driver-free regression gates from live-kernel
 validation on a test-signing VM. Parser, dispatch, and transport checks run
 without loading the driver. Kernel behavior and false positives still need
@@ -22,6 +25,7 @@ before the feature is trusted.
 .\tools\validate-kmon-core.ps1 -Configuration Debug -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize -PeSieve C:\tools\pe-sieve64.exe
 .\tools\validate-kmon-hunting.ps1 -Configuration Debug -Sanitize -PeSieve C:\tools\pe-sieve64.exe
+.\tools\run-hunt-clean-host-selftest.ps1
 ```
 
 The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the [Kmon review](KMON_ADVERSARIAL_REVIEW_20260920.md) records the later command/page extensions. Build-time validators require the source tree and compiler. Release artifact checks are listed in the [v0.0.33 release notes](RELEASE_NOTES_0.0.33.md).
@@ -45,6 +49,10 @@ rights and runs separately. Run network fixtures sequentially: remote binds
 `127.0.0.1:51767`, HTTP binds `127.0.0.1:51768`. Neither opens an external
 listener or adds firewall rules. The sanitizer script instruments the
 standalone parser; its executable command checks use the normal build.
+Sanitizer scripts select a Visual Studio installation with an x64 ASan runtime
+matching its default MSVC version and fail if no matching installation exists.
+The clean-host runner self-test verifies retained process handles and exit codes
+`0`, `7`, `259`, and `-1`; run it with no existing KnLiveDbg service or process.
 
 These results do not check off any live-kernel item below. Live writes,
 collector/load/unload races, and an external DbgEng target remain separate

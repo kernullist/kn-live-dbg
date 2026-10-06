@@ -118,6 +118,8 @@ struct HuntProcessRecord
     std::wstring SystemProcessImageName;
     std::wstring ToolhelpImageName;
     std::wstring ApiImagePath;
+    std::wstring ApiPackageFullName;
+    std::wstring ApiPackagePath;
     uint64_t PebImageBase = 0;
     bool HasPebImageBase = false;
     uint64_t MainImageBase = 0;
