@@ -3812,6 +3812,21 @@ namespace
             record.HasSubsection;
     }
 
+    bool VadPeProbeRequired(const ProcessVadRecord& record, const ProcessVadScanOptions& options)
+    {
+        if (record.StartAddress == 0 || record.Size < kPageSize || !VadBasePageCommitted(record))
+        {
+            return false;
+        }
+        // Reservations cannot contain a PE at the VAD base. Apply the same
+        // commitment check to legacy private probes and full mapped PE scans.
+        const bool privateCandidate = record.HasPrivateMemory && record.PrivateMemory;
+        const bool sectionCandidate = !privateCandidate &&
+            (record.Executable || record.WritableExecutable || record.HasSubsection);
+        return options.ProbeAllPe ||
+            ((options.ProbePe || options.PeOnly) && (privateCandidate || sectionCandidate));
+    }
+
     bool PathLooksLikePeImage(const std::wstring& path)
     {
         const std::wstring lowered = ToLowerLocal(path);
@@ -4649,6 +4664,31 @@ bool ProcessTriageMappedPeSelfTest()
     {
         return false;
     }
+    ProcessVadScanOptions probeOptions = {};
+    probeOptions.ProbePe = true;
+    if (!VadPeProbeRequired(vad, probeOptions) || VadPeProbeRequired(reservedBase, probeOptions))
+    {
+        return false;
+    }
+    probeOptions.ProbeAllPe = true;
+    if (!VadPeProbeRequired(vad, probeOptions) || VadPeProbeRequired(reservedBase, probeOptions))
+    {
+        return false;
+    }
+    ProcessVadRecord inaccessible = vad;
+    inaccessible.EffectiveProtectionComplete = false;
+    if (!VadPeProbeRequired(inaccessible, probeOptions))
+    {
+        return false;
+    }
+    ProcessVadScanResult reservedCoverage;
+    reservedBase.PeProbeAttempted = false;
+    reservedBase.PeProbeReadSucceeded = false;
+    AccumulateVadReadCoverage(reservedBase, VadPeProbeRequired(reservedBase, probeOptions), &reservedCoverage);
+    if (!reservedCoverage.CoverageComplete || reservedCoverage.PeProbeReadFailures != 0)
+    {
+        return false;
+    }
 
     ProcessMappedPeRecord memoryOnly = {};
     memoryOnly.Base = vad.StartAddress;
@@ -5006,32 +5046,7 @@ bool ProcessTriageScanner::ScanVad(
                     ++result->WxCount;
                 }
 
-                const bool legacyPrivatePeProbe =
-                    (options.ProbePe || options.PeOnly) &&
-                    record.HasPrivateMemory &&
-                    record.PrivateMemory;
-                // NtMapViewOfSection / SEC_IMAGE implants are not
-                // PrivateMemory. Probe executable or subsection VADs when
-                // kmon already asked for PE probes, without walking every
-                // committed mapping (ProbeAllPe).
-                const bool sectionPeProbe =
-                    (options.ProbePe || options.PeOnly) &&
-                    (!record.HasPrivateMemory || !record.PrivateMemory) &&
-                    (record.Executable ||
-                        record.WritableExecutable ||
-                        record.HasSubsection) &&
-                    VadBasePageCommitted(record);
-                // A manual mapper may initially leave an image RW or even R;
-                // include committed VADs as well as executable and subsection-
-                // backed mappings. Pure reservations cannot contain a mapped
-                // image and are excluded to avoid meaningless read failures.
-                const bool mappedPeProbe =
-                    options.ProbeAllPe &&
-                    VadBasePageCommitted(record);
-                const bool peProbeRequired =
-                    (legacyPrivatePeProbe || sectionPeProbe || mappedPeProbe) &&
-                    record.StartAddress != 0 &&
-                    record.Size >= kPageSize;
+                const bool peProbeRequired = VadPeProbeRequired(record, options);
                 if (peProbeRequired &&
                     (dtb != 0 ||
                      HasExactProcessIdentity(options.Target)))

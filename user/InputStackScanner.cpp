@@ -60,6 +60,7 @@ namespace
             stem == L"ntkrnlmp" ||
             stem == L"dmvsc" ||
             stem == L"vmmouse" ||
+            stem == L"vmusbmouse" ||
             stem == L"vmhid" ||
             stem == L"spldr" ||
             stem == L"acpi" ||
@@ -230,6 +231,8 @@ bool InputStackKnownDriverSelfTest()
     {
         if (!IsKnownInputDriver(L"kbdclass.sys") ||
             !IsKnownInputDriver(L"\\Driver\\mouclass") ||
+            !IsKnownInputDriver(L"vmusbmouse.sys") ||
+            IsKnownInputDriver(L"vmusbmouse-lookalike.sys") ||
             IsKnownInputDriver(L"") ||
             IsKnownInputDriver(L"keylogger.sys"))
         {

@@ -55,6 +55,7 @@ struct ModuleIntegritySectionRecord
     std::wstring PageAttributeError;
     std::wstring Notes;
     std::vector<std::wstring> ReasonCodes;
+    std::vector<std::wstring> InfoCodes;
 };
 
 struct ModuleIatRecord
@@ -184,6 +185,8 @@ struct DriverIntegrityRecord
     bool HasDriverStart = false;
     // Known zero values are distinct from unreadable identity fields.
     bool IdentityFieldsKnown = false;
+    bool FastIoCoverageComplete = true;
+    bool DispatchCoverageComplete = true;
     bool Suspicious = false;
     uint32_t SuspiciousDispatchCount = 0;
     std::vector<DriverDispatchRecord> Dispatch;
@@ -363,9 +366,11 @@ private:
 
 std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result);
 std::wstring BuildDriverIntegrityJson(const DriverIntegrityResult& result);
+bool DriverIntegrityCoverageComplete(const DriverIntegrityResult& result);
 std::wstring BuildDriverObjectJson(const DriverObjectInspectResult& result);
 std::wstring BuildDeviceStackJson(const DeviceStackResult& result);
 bool IntegrityIatOwnerSelfTest();
+bool IntegrityFastIoSelfTest();
 bool IntegrityDiscardedSectionSelfTest();
 bool IntegrityProloguePatternSelfTest();
 bool IntegrityRelocationSelfTest();

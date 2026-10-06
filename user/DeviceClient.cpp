@@ -1326,14 +1326,17 @@ bool DeviceClient::ControlIotrace(
         if (!Ioctl(
                 IOCTL_KNDBG_IOTRACE_CONTROL,
                 &buffer,
-                sizeof(buffer),
+                sizeof(buffer.Request),
                 sizeof(buffer.Response),
                 &returned,
                 error,
-                deviceError) ||
-            returned < sizeof(buffer.Response))
+                deviceError))
         {
-            if (error != nullptr && returned < sizeof(buffer.Response))
+            break;
+        }
+        if (returned < sizeof(buffer.Response) || buffer.Response.Size != sizeof(buffer.Response))
+        {
+            if (error != nullptr)
             {
                 *error = L"Short iotrace control response";
             }
@@ -1348,8 +1351,10 @@ bool DeviceClient::ControlIotrace(
             }
             if (error != nullptr)
             {
-                *error = L"iotrace control failed: ntstatus=0x" +
-                    std::to_wstring(buffer.Response.NtStatus);
+                std::wstringstream stream;
+                stream << L"iotrace control failed: ntstatus=0x" << std::hex <<
+                    buffer.Response.NtStatus;
+                *error = stream.str();
             }
             break;
         }

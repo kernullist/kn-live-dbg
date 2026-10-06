@@ -11,6 +11,7 @@
 #include "Zydis.h"
 
 #include <Windows.h>
+#include <appmodel.h>
 #include <TlHelp32.h>
 #include <ShlObj.h>
 #include <WinTrust.h>
@@ -24,6 +25,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <unordered_set>
@@ -278,6 +280,8 @@ namespace
         std::wstring ProductName;
         std::wstring OriginalFilename;
         std::wstring FileDescription;
+        std::wstring SignerName;
+        std::wstring SignerOrganization;
         std::wstring ExecutableSectionNames;
         std::wstring PackerSectionHint;
         std::wstring PackerSectionNames;
@@ -4958,12 +4962,7 @@ namespace
                 break;
             }
 
-            backed =
-                CanonicalPathUnderDirectory(path, WindowsDirectory()) ||
-                CanonicalPathUnderDirectory(
-                    path,
-                    EnsureTrailingSlash(ProgramDataDirectory()) +
-                        L"Microsoft\\Windows Defender\\Platform");
+            backed = CanonicalPathUnderDirectory(path, WindowsDirectory());
         } while (false);
 
         return backed;
@@ -5050,6 +5049,100 @@ namespace
             metadata.SignatureValid;
     }
 
+    bool IsMicrosoftSharedModulePathShape(
+        const std::wstring& programData,
+        const std::wstring& programFilesX86,
+        const std::wstring& path,
+        bool webViewRuntimeImage = false)
+    {
+        const std::wstring canonical = CanonicalPathForCompare(path);
+        const auto relativeTo = [&](const std::wstring& root)
+        {
+            const std::wstring prefix = EnsureTrailingSlash(CanonicalPathForCompare(root));
+            return !prefix.empty() && canonical.rfind(prefix, 0) == 0
+                ? canonical.substr(prefix.size()) : std::wstring();
+        };
+        const auto versionDirectory = [](const std::wstring& value)
+        {
+            if (value.empty() || value.front() < L'0' || value.front() > L'9' ||
+                value.back() < L'0' || value.back() > L'9')
+            {
+                return false;
+            }
+            for (wchar_t ch : value)
+            {
+                if ((ch < L'0' || ch > L'9') && ch != L'.' && ch != L'-')
+                {
+                    return false;
+                }
+            }
+            return value.find(L'.') != std::wstring::npos && value.find(L"..") == std::wstring::npos;
+        };
+        const auto underVersion = [&](const std::wstring& relative, const std::wstring& suffix)
+        {
+            const size_t slash = relative.find(L'\\');
+            return slash != std::wstring::npos && versionDirectory(relative.substr(0, slash)) &&
+                relative.substr(slash + 1) == suffix;
+        };
+        const std::wstring webView = relativeTo(EnsureTrailingSlash(programFilesX86) +
+            L"Microsoft\\EdgeWebView\\Application");
+        if (webViewRuntimeImage)
+        {
+            return underVersion(webView, L"msedgewebview2.exe");
+        }
+        if (underVersion(relativeTo(EnsureTrailingSlash(programData) +
+                L"Microsoft\\Windows Defender\\Platform"), L"mpoav.dll") ||
+            underVersion(webView, L"ebwebview\\x64\\embeddedbrowserwebview.dll"))
+        {
+            return true;
+        }
+        const std::wstring definition = relativeTo(EnsureTrailingSlash(programData) +
+            L"Microsoft\\Windows Defender\\Definition Updates");
+        const size_t slash = definition.find(L'\\');
+        if (slash != 38 || definition.substr(slash + 1) != L"mpengine.dll" ||
+            definition[0] != L'{' || definition[37] != L'}')
+        {
+            return false;
+        }
+        for (size_t index = 1; index < 37; ++index)
+        {
+            const wchar_t ch = definition[index];
+            if (index == 9 || index == 14 || index == 19 || index == 24)
+            {
+                if (ch != L'-')
+                {
+                    return false;
+                }
+            }
+            else if ((ch < L'0' || ch > L'9') && (ch < L'a' || ch > L'f'))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool HasVerifiedMicrosoftSigner(const ImageMetadataRecord& metadata)
+    {
+        return metadata.SignatureChecked && metadata.SignatureValid &&
+            metadata.SignerOrganization == L"Microsoft Corporation" &&
+            (metadata.SignerName == L"Microsoft Windows" ||
+             metadata.SignerName == L"Microsoft Corporation" ||
+             metadata.SignerName == L"Microsoft Windows Publisher");
+    }
+
+    bool IsTrustedMicrosoftSharedModule(const std::wstring& path)
+    {
+        if (!IsMicrosoftSharedModulePathShape(ProgramDataDirectory(), ProgramFilesX86Directory(), path))
+        {
+            return false;
+        }
+        ImageMetadataRecord metadata = {};
+        return VerifyImageAuthenticodeSignature(
+            DosPathFromDevicePath(Win32FilePathFromMaybeNtPath(path)), &metadata) &&
+            HasVerifiedMicrosoftSigner(metadata);
+    }
+
     bool ShouldAuditBuiltinModuleProvenance(const HuntProcessRecord& process)
     {
         bool audit = false;
@@ -5112,6 +5205,43 @@ namespace
                 covered = true;
                 break;
             }
+            if (!(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) || module.Path.empty() ||
+                module.Size == 0 || address < module.Base || address - module.Base < module.Size ||
+                address - module.Base - module.Size >= 0x1000)
+            {
+                continue;
+            }
+            // Windows can append CFG dispatch code to a SEC_IMAGE
+            // allocation beyond the loader's SizeOfImage. Require matching
+            // kernel file identity, allocation base, and the exact MEM_IMAGE
+            // executable range rather than extending every loader interval.
+            for (const ProcessVadRecord& vad : process.VadRecords)
+            {
+                if (vad.StartAddress != module.Base || address > vad.EndAddress ||
+                    address < vad.StartAddress || !vad.HasPrivateMemory || vad.PrivateMemory ||
+                    !vad.EffectiveProtectionComplete || vad.SectionFileName.empty() ||
+                    !SameCanonicalPath(vad.SectionFileName, module.Path))
+                {
+                    continue;
+                }
+                for (const ProcessVadProtectionRange& range : vad.EffectiveProtectionRanges)
+                {
+                    if (address >= range.StartAddress && address <= range.EndAddress &&
+                        range.Committed && range.Executable && !range.Writable && range.Type == MEM_IMAGE)
+                    {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered)
+                {
+                    break;
+                }
+            }
+            if (covered)
+            {
+                break;
+            }
         }
 
         return covered;
@@ -5151,6 +5281,16 @@ namespace
         return found;
     }
 
+    const ProcessVadProtectionRange* FindVadEffectiveProtection(const ProcessVadRecord& vad, uint64_t address);
+
+    bool VadAddressHasObservedExecutablePage(const ProcessVadRecord& vad, uint64_t address)
+    {
+        // A default executable VAD can contain reserved or non-executable pages.
+        // Missing current page coverage cannot prove a hook destination is code.
+        const ProcessVadProtectionRange* range = FindVadEffectiveProtection(vad, address);
+        return range != nullptr && range->Committed && range->Executable;
+    }
+
     bool AddressInPrivateExecutableVad(const HuntProcessRecord& process, uint64_t address)
     {
         bool matched = false;
@@ -5163,7 +5303,7 @@ namespace
                 break;
             }
 
-            matched = vad->Executable &&
+            matched = VadAddressHasObservedExecutablePage(*vad, address) &&
                 vad->HasPrivateMemory &&
                 vad->PrivateMemory;
         } while (false);
@@ -5219,7 +5359,7 @@ namespace
                 break;
             }
             const ProcessVadRecord* vad = FindVadContaining(process, address);
-            if (vad == nullptr || !vad->Executable)
+            if (vad == nullptr || !VadAddressHasObservedExecutablePage(*vad, address))
             {
                 break;
             }
@@ -5475,6 +5615,32 @@ namespace
         } while (false);
 
         return jit;
+    }
+
+    bool VadLooksLikeMappedJitCode(const HuntProcessRecord& process, const ProcessVadRecord& vad)
+    {
+        if (!ProcessLooksLikeJitHost(process) || !vad.EffectiveProtectionComplete ||
+            !vad.HasPrivateMemory || vad.PrivateMemory || !vad.SectionFileName.empty() ||
+            vad.PeHeaderFound || vad.PeHeaderSuspicious || vad.EffectiveExecutableBytes == 0 ||
+            vad.EffectiveExecutableBytes >= kLargePrivateExecThreshold)
+        {
+            return false;
+        }
+        // The CLR uses anonymous mapped RX/RW views for dynamic code. A complete
+        // page view must prove that its executable pages are mapped and not writable.
+        bool mappedCode = false;
+        for (const ProcessVadProtectionRange& range : vad.EffectiveProtectionRanges)
+        {
+            if (range.Committed && range.Executable)
+            {
+                if (range.Type != MEM_MAPPED || range.Writable || range.WritableExecutable)
+                {
+                    return false;
+                }
+                mappedCode = true;
+            }
+        }
+        return mappedCode;
     }
 
     bool DecodeUserTrampolineTarget(
@@ -6403,6 +6569,63 @@ namespace
         {
             CloseHandle(handle);
         }
+    }
+
+    void CollectProcessPackageIdentity(HuntProcessRecord* process)
+    {
+        std::unique_ptr<void, decltype(&CloseHandle)> ownedHandle(nullptr, CloseHandle);
+        do
+        {
+            if (process == nullptr)
+            {
+                break;
+            }
+            process->ApiPackageFullName.clear();
+            process->ApiPackagePath.clear();
+            if (!process->Kernel.HasCreateTime || process->Kernel.CreateTime == 0)
+            {
+                break;
+            }
+            ownedHandle.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, process->ProcessId));
+            const HANDLE handle = ownedHandle.get();
+            FILETIME created = {}, exited = {}, kernel = {}, user = {};
+            if (handle == nullptr || !GetProcessTimes(handle, &created, &exited, &kernel, &user) ||
+                ((static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime) !=
+                    process->Kernel.CreateTime || WaitForSingleObject(handle, 0) != WAIT_TIMEOUT)
+            {
+                break;
+            }
+            UINT32 nameLength = 0;
+            if (GetPackageFullName(handle, &nameLength, nullptr) != ERROR_INSUFFICIENT_BUFFER ||
+                nameLength == 0 || nameLength > 32768)
+            {
+                break;
+            }
+            std::vector<wchar_t> name(nameLength, L'\0');
+            if (GetPackageFullName(handle, &nameLength, name.data()) != ERROR_SUCCESS ||
+                nameLength == 0 || nameLength > name.size() || name[nameLength - 1] != L'\0')
+            {
+                break;
+            }
+            UINT32 pathLength = 0;
+            if (GetPackagePathByFullName(name.data(), &pathLength, nullptr) != ERROR_INSUFFICIENT_BUFFER ||
+                pathLength == 0 || pathLength > 32768)
+            {
+                break;
+            }
+            std::vector<wchar_t> path(pathLength, L'\0');
+            if (GetPackagePathByFullName(name.data(), &pathLength, path.data()) != ERROR_SUCCESS ||
+                pathLength == 0 || pathLength > path.size() || path[pathLength - 1] != L'\0')
+            {
+                break;
+            }
+            if (WaitForSingleObject(handle, 0) != WAIT_TIMEOUT)
+            {
+                break;
+            }
+            process->ApiPackageFullName.assign(name.data(), nameLength - 1);
+            process->ApiPackagePath.assign(path.data(), pathLength - 1);
+        } while (false);
     }
 
     bool CollectToolhelpModules(HuntProcessRecord* process, std::wstring* warning)
@@ -7789,6 +8012,10 @@ namespace
         HMODULE wintrust = nullptr;
 
         typedef LONG (WINAPI* WinVerifyTrustFn)(HWND, GUID*, LPVOID);
+        typedef CRYPT_PROVIDER_DATA* (WINAPI* ProviderDataFn)(HANDLE);
+        typedef CRYPT_PROVIDER_SGNR* (WINAPI* ProviderSignerFn)(CRYPT_PROVIDER_DATA*, DWORD, BOOL, DWORD);
+        wchar_t signerName[512] = {};
+        wchar_t signerOrganization[256] = {};
 
         do
         {
@@ -7821,6 +8048,7 @@ namespace
             data.dwUnionChoice = WTD_CHOICE_FILE;
             data.pFile = &fileInfo;
             data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+            data.dwStateAction = WTD_STATEACTION_VERIFY;
 
             GUID action =
             {
@@ -7835,12 +8063,49 @@ namespace
             metadata->SignatureChecked = true;
             metadata->SignatureValid = status == ERROR_SUCCESS;
             metadata->SignaturePresent = metadata->SignatureValid || !IsNoAuthenticodeSignatureStatus(status);
+            if (metadata->SignatureValid && data.hWVTStateData != nullptr)
+            {
+                const auto providerData = reinterpret_cast<ProviderDataFn>(
+                    GetProcAddress(wintrust, "WTHelperProvDataFromStateData"));
+                const auto providerSigner = reinterpret_cast<ProviderSignerFn>(
+                    GetProcAddress(wintrust, "WTHelperGetProvSignerFromChain"));
+                CRYPT_PROVIDER_DATA* provider = providerData == nullptr
+                    ? nullptr : providerData(data.hWVTStateData);
+                CRYPT_PROVIDER_SGNR* signer = provider == nullptr || providerSigner == nullptr
+                    ? nullptr : providerSigner(provider, 0, FALSE, 0);
+                if (signer != nullptr && signer->csCertChain != 0 &&
+                    signer->pasCertChain != nullptr && signer->pasCertChain[0].pCert != nullptr)
+                {
+                    const PCCERT_CONTEXT certificate = signer->pasCertChain[0].pCert;
+                    DWORD length = CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0,
+                        nullptr, signerName, _countof(signerName));
+                    if (length <= 1 || length >= _countof(signerName))
+                    {
+                        signerName[0] = L'\0';
+                    }
+                    length = CertGetNameStringW(certificate, CERT_NAME_ATTR_TYPE, 0,
+                        const_cast<char*>(szOID_ORGANIZATION_NAME), signerOrganization,
+                        _countof(signerOrganization));
+                    if (length <= 1 || length >= _countof(signerOrganization))
+                    {
+                        signerOrganization[0] = L'\0';
+                    }
+                }
+            }
+            // Close provider state before assigning strings or unloading wintrust.
+            data.dwStateAction = WTD_STATEACTION_CLOSE;
+            verify(nullptr, &action, &data);
             checked = true;
         } while (false);
 
         if (wintrust != nullptr)
         {
             FreeLibrary(wintrust);
+        }
+        if (checked)
+        {
+            metadata->SignerName = signerName;
+            metadata->SignerOrganization = signerOrganization;
         }
 
         return checked;
@@ -17891,6 +18156,8 @@ namespace
                     !privateMemory &&
                     !loaderCovered &&
                     ProcessHasCompleteUserModuleInventory(*process);
+                const bool weakMappedRuntimeCode = unbackedMappedExecutable &&
+                    imageSectionReasons.empty() && VadLooksLikeMappedJitCode(*process, vad);
                 bool imageSectionPermissionSuspicious = !imageSectionReasons.empty();
                 bool imageExecutePermissionDrift =
                     std::find(
@@ -17920,7 +18187,7 @@ namespace
                     imageWritePermissionDrift ||
                     moduleStompingPermissionEvidence ||
                     defaultImageRwxSection ||
-                    unbackedMappedExecutable;
+                    (unbackedMappedExecutable && !weakMappedRuntimeCode);
                 // Raw stack slots routinely contain legitimate JIT and
                 // emulator return addresses.  Treat them as execution
                 // corroboration only after the VAD already has PE/header,
@@ -17966,7 +18233,7 @@ namespace
                 // on stronger code provenance, PE/header evidence, large
                 // size, image permission drift, or a violated built-in
                 // identity profile still promotes the region below.
-                if ((genericWxOnly || weakPrivateExecutableOnly) &&
+                if ((genericWxOnly || weakPrivateExecutableOnly || weakMappedRuntimeCode) &&
                     !relevantExecutionObserved &&
                     !identityCorroborated)
                 {
@@ -19102,6 +19369,23 @@ namespace
         return scan;
     }
 
+    bool ModuleShouldScanRawCallTables(
+        const HuntProcessRecord& process,
+        const HuntModuleRecord& module,
+        const DiskPeMetadata* diskMetadata)
+    {
+        const bool mainImage = IsMainImageModule(process, module);
+        if (mainImage && diskMetadata != nullptr && diskMetadata->ManagedImage &&
+            diskMetadata->SizeOfImage == module.Size && ProcessHasManagedRuntimeModule(process))
+        {
+            // CLR and mixed-mode image data includes runtime method/precode slots.
+            // Raw pointer words are not native vtables. Keep IAT and code checks.
+            return false;
+        }
+        const std::wstring leaf = LeafName(module.Name.empty() ? module.Path : module.Name);
+        return mainImage || ModuleLooksLikeGraphicsApiDll(leaf) || ModuleLooksLikeKnownUserOverlay(leaf);
+    }
+
     bool ModuleLooksLikeProcessMainImage(
         const HuntProcessRecord& process,
         const HuntModuleRecord& module)
@@ -19162,7 +19446,8 @@ namespace
                     !(module.ToolhelpSeen || ModuleHasCoreLdrView(module)) ||
                     IsWindowsBackedModulePath(module.Path) ||
                     IsTrustedMicrosoftWindowsAppRuntimeModule(
-                        module.Path))
+                        module.Path) ||
+                    IsTrustedMicrosoftSharedModule(module.Path))
                 {
                     continue;
                 }
@@ -19274,6 +19559,13 @@ namespace
             }
 
             belongs = CanonicalPathUnderDirectory(modulePath, imageDirectory);
+            if (!belongs && !process.ApiPackageFullName.empty() && !process.ApiPackagePath.empty())
+            {
+                // Package-hosted tasks can execute outside the package while
+                // loading its DLLs. Membership is ownership evidence only;
+                // executable-page and hook inspection still run independently.
+                belongs = CanonicalPathUnderDirectory(modulePath, process.ApiPackagePath);
+            }
         } while (false);
 
         return belongs;
@@ -19330,7 +19622,8 @@ namespace
             {
                 break;
             }
-            if (IsTrustedMicrosoftWindowsAppRuntimeModule(module.Path))
+            if (IsTrustedMicrosoftWindowsAppRuntimeModule(module.Path) ||
+                IsTrustedMicrosoftSharedModule(module.Path))
             {
                 break;
             }
@@ -20266,6 +20559,51 @@ namespace
         } while (false);
     }
 
+    bool DiskSlotIsUnchangedScalar(
+        const DiskPeMetadata& metadata,
+        uint32_t slotRva,
+        size_t width,
+        uint64_t target,
+        const std::vector<uint8_t>& diskPage)
+    {
+        const size_t offset = slotRva & 0xfffu;
+        if (!metadata.BaseRelocationTableComplete || !metadata.DynamicRelocationTableComplete ||
+            width == 0 || width > sizeof(target) ||
+            offset > diskPage.size() || width > diskPage.size() - offset)
+        {
+            return false;
+        }
+        const auto overlaps = [&](uint32_t rva, uint32_t size)
+        {
+            return static_cast<uint64_t>(rva) < static_cast<uint64_t>(slotRva) + width &&
+                static_cast<uint64_t>(slotRva) < static_cast<uint64_t>(rva) + size;
+        };
+        for (const DiskPeBaseRelocation& relocation : metadata.BaseRelocations)
+        {
+            if (overlaps(relocation.Rva, relocation.Width))
+            {
+                return false;
+            }
+        }
+        for (const DiskPeMutableRange& range : metadata.LoaderMutableRanges)
+        {
+            if (overlaps(range.Rva, range.Size))
+            {
+                return false;
+            }
+        }
+        for (const DiskPeMutableRange& range : metadata.DynamicRelocationRanges)
+        {
+            if (overlaps(range.Rva, range.Size))
+            {
+                return false;
+            }
+        }
+        uint64_t original = 0;
+        std::memcpy(&original, diskPage.data() + offset, width);
+        return original == target;
+    }
+
     void AddCallTableHookFindings(
         DeviceClient& device,
         HuntResult* result,
@@ -20388,17 +20726,22 @@ namespace
                 const std::wstring leaf =
                     LeafName(module.Name.empty() ? module.Path : module.Name);
                 const bool overlayLeaf = ModuleLooksLikeKnownUserOverlay(leaf);
-                const bool scanRdata =
-                    ModuleLooksLikeGraphicsApiDll(leaf) ||
-                    overlayLeaf ||
-                    IsMainImageModule(process, module);
+                DiskPeMetadata callTableMetadata = {};
+                const bool haveCallTableMetadata = ReadDiskPeMetadata(module.Path, &callTableMetadata, &ignored) &&
+                    callTableMetadata.SizeOfImage == module.Size &&
+                    callTableMetadata.TimeDateStamp == fileHeader.TimeDateStamp;
+                const bool scanRdata = ModuleShouldScanRawCallTables(process, module,
+                    haveCallTableMetadata ? &callTableMetadata : nullptr);
+                bool webViewSignerChecked = false;
+                bool trustedWebViewImage = false;
 
                 auto emitHook =
                     [&](uint64_t target,
                         const std::wstring& reason,
                         const std::wstring& title,
                         const std::wstring& slotName,
-                        uint32_t slotIndex)
+                        uint32_t slotIndex,
+                        uint32_t slotRva)
                     {
                         if (findings >= kMaxFindings ||
                             target == 0 ||
@@ -20409,6 +20752,51 @@ namespace
                         {
                             return;
                         }
+                        if (slotName == L"table_index" && haveCallTableMetadata)
+                        {
+                            std::vector<uint8_t> diskPage;
+                            if (ReadDiskPageForRva(module.Path, callTableMetadata, slotRva & ~0xfffu,
+                                    &diskPage, &ignored) &&
+                                DiskSlotIsUnchangedScalar(callTableMetadata, slotRva, thunkSize, target, diskPage))
+                            {
+                                // Image data constants can coincide with a private code allocation.
+                                // An unchanged non-relocated word does not prove a call-table hook.
+                                return;
+                            }
+                        }
+                        const ProcessVadRecord* targetVad = FindVadContaining(process, target);
+                        const ProcessVadProtectionRange* targetRange = targetVad == nullptr
+                            ? nullptr : FindVadEffectiveProtection(*targetVad, target);
+                        if (slotName == L"iat_index" && thunkSize == sizeof(uint64_t) &&
+                            IsMainImageModule(process, module) && targetRange != nullptr &&
+                            targetRange->Type == MEM_PRIVATE && !targetRange->Writable)
+                        {
+                            if (!webViewSignerChecked)
+                            {
+                                webViewSignerChecked = true;
+                                ImageMetadataRecord metadata = {};
+                                trustedWebViewImage =
+                                    SameCanonicalPath(module.Path, BestProcessImagePath(process)) &&
+                                    IsMicrosoftSharedModulePathShape(ProgramDataDirectory(),
+                                        ProgramFilesX86Directory(), module.Path, true) &&
+                                    VerifyImageAuthenticodeSignature(module.Path, &metadata) &&
+                                    HasVerifiedMicrosoftSigner(metadata);
+                            }
+                            std::vector<uint8_t> trampolineBytes;
+                            uint64_t destination = 0;
+                            uint64_t indirectSlot = 0;
+                            if (trustedWebViewImage && ReadHuntProcessMemory(device, process.Kernel,
+                                    target, 16, &trampolineBytes, &ignored) &&
+                                DecodeUserTrampolineTarget(trampolineBytes.data(), trampolineBytes.size(),
+                                    target, &destination, &indirectSlot) && indirectSlot == 0 &&
+                                AddressInsideModule(module, destination))
+                            {
+                                AddUnique(&result->Warnings,
+                                    L"verified Microsoft WebView IAT trampoline returns into its process image: " +
+                                    HuntHex(target, 16) + L" -> " + HuntHex(destination, 16));
+                                return;
+                            }
+                        }
                         seenTargets.insert(target);
                         std::map<std::wstring, std::wstring> evidence;
                         evidence[slotName] = std::to_wstring(slotIndex);
@@ -20416,6 +20804,7 @@ namespace
                         evidence[L"thunk_width"] =
                             std::to_wstring(static_cast<uint32_t>(thunkSize));
                         evidence[L"module_base"] = HuntHex(module.Base, 16);
+                        evidence[L"slot_rva"] = HuntHex(slotRva, 8);
                         AddFinding(
                             result,
                             process,
@@ -20464,7 +20853,8 @@ namespace
                                     ? L"overlay IAT thunk points at unbacked executable memory"
                                     : L"module IAT thunk points at unbacked executable memory",
                                 L"iat_index",
-                                static_cast<uint32_t>(index));
+                                static_cast<uint32_t>(index),
+                                iat.VirtualAddress + static_cast<uint32_t>(index * thunkSize));
                         }
                     }
                 }
@@ -20558,7 +20948,8 @@ namespace
                                     ? L"overlay call-table slot points at unbacked executable memory"
                                     : L"module call-table slot points at unbacked executable memory",
                                 L"table_index",
-                                static_cast<uint32_t>(slot));
+                                static_cast<uint32_t>(slot),
+                                slotRva);
                         }
                     }
                 }
@@ -23115,6 +23506,11 @@ namespace
             {
                 result->DriverObjectCount = driverIntegrity.DriversScanned;
                 result->SuspiciousDriverObjectCount = driverIntegrity.SuspiciousDrivers;
+                if (!DriverIntegrityCoverageComplete(driverIntegrity))
+                {
+                    result->CoverageComplete = false;
+                    AddUnique(&result->Warnings, L"deep driver integrity coverage is incomplete");
+                }
                 for (const std::wstring& warning : driverIntegrity.Warnings)
                 {
                     AddUnique(&result->Warnings, L"driver integrity warning: " + warning);
@@ -23124,6 +23520,7 @@ namespace
             else
             {
                 AddUnique(&result->Warnings, L"deep driver integrity scan failed: " + error);
+                result->CoverageComplete = false;
             }
         } while (false);
     }
@@ -23651,6 +24048,31 @@ bool HuntInjectedModuleSelfTest()
         }
 
         uint8_t relJmp[] = { 0xE9, 0x00, 0x10, 0x00, 0x00 };
+        HuntProcessRecord packagedHost = svchost;
+        packagedHost.ApiPackageFullName = L"Microsoft.StorePurchaseApp_test_x64__8wekyb3d8bbwe";
+        packagedHost.ApiPackagePath = L"C:\\Program Files\\WindowsApps\\Microsoft.StorePurchaseApp_test_x64__8wekyb3d8bbwe";
+        HuntModuleRecord packageModule = cheat;
+        packageModule.Path = packagedHost.ApiPackagePath + L"\\StoreExperienceHost.dll";
+        HuntModuleRecord packageLookalike = packageModule;
+        packageLookalike.Path = packagedHost.ApiPackagePath + L"-lookalike\\StoreExperienceHost.dll";
+        if (ModuleLooksLikeInjectedImage(packagedHost, packageModule, false) ||
+            !ModuleLooksLikeInjectedImage(packagedHost, packageLookalike, false) ||
+            !ModuleLooksLikeInjectedImage(packagedHost, cheat, false))
+        {
+            break;
+        }
+        packagedHost.ApiPackageFullName.clear();
+        if (!ModuleLooksLikeInjectedImage(packagedHost, packageModule, false))
+        {
+            break;
+        }
+        packagedHost.ApiPackageFullName = L"stale-package";
+        packagedHost.Kernel.HasCreateTime = false;
+        CollectProcessPackageIdentity(&packagedHost);
+        if (!packagedHost.ApiPackageFullName.empty() || !packagedHost.ApiPackagePath.empty())
+        {
+            break;
+        }
         uint64_t trampoline = 0;
         uint64_t slot = 0;
         uint8_t absJmp[12] = {
@@ -23872,6 +24294,52 @@ bool HuntInProcessHookSelfTest()
 
     do
     {
+        DiskPeMetadata scalarMetadata = {};
+        std::vector<uint8_t> scalarPage(0x1000, 0);
+        constexpr uint64_t scalar = 0x0000008000000000ull;
+        std::memcpy(scalarPage.data() + 0x18, &scalar, sizeof(scalar));
+        if (!DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage) ||
+            DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar + 1, scalarPage) ||
+            DiskSlotIsUnchangedScalar(scalarMetadata, 0x1fff, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.BaseRelocations.push_back({ 0x1018, 8 });
+        if (DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.BaseRelocations.clear();
+        scalarMetadata.BaseRelocationTableComplete = false;
+        if (DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.BaseRelocationTableComplete = true;
+        scalarMetadata.LoaderMutableRanges.push_back({ 0x101c, 4 });
+        if (DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.LoaderMutableRanges.clear();
+        scalarMetadata.DynamicRelocationTablePresent = true;
+        scalarMetadata.DynamicRelocationTableComplete = false;
+        if (DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.DynamicRelocationTableComplete = true;
+        scalarMetadata.DynamicRelocationRanges.push_back({ 0x101c, 4 });
+        if (DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+        scalarMetadata.DynamicRelocationRanges.clear();
+        if (!DiskSlotIsUnchangedScalar(scalarMetadata, 0x1018, 8, scalar, scalarPage))
+        {
+            break;
+        }
+
         if (!ModuleLooksLikeGraphicsApiDll(L"dxgi.dll") ||
             !ModuleLooksLikeGraphicsApiDll(L"d3d11.dll") ||
             !ModuleLooksLikeGraphicsApiDll(L"vulkan-1.dll") ||
@@ -23946,12 +24414,39 @@ bool HuntInProcessHookSelfTest()
         game.Modules.push_back(overlay);
         game.Modules.push_back(obsHook);
 
+        HuntProcessRecord managedTables = game;
+        HuntModuleRecord clr = {};
+        clr.Name = L"coreclr.dll";
+        clr.LdrLoadSeen = true;
+        managedTables.Modules.push_back(clr);
+        DiskPeMetadata managedMetadata = {};
+        managedMetadata.ManagedImage = true;
+        managedMetadata.SizeOfImage = static_cast<uint32_t>(main.Size);
+        if (ModuleShouldScanRawCallTables(managedTables, main, &managedMetadata) ||
+            !ModuleShouldScanRawCallTables(game, main, &managedMetadata) ||
+            !ModuleShouldScanRawCallTables(managedTables, main, nullptr) ||
+            !ModuleShouldScanRawCallTables(managedTables, dxgi, &managedMetadata))
+        {
+            break;
+        }
+        managedMetadata.SizeOfImage = 0;
+        if (!ModuleShouldScanRawCallTables(managedTables, main, &managedMetadata))
+        {
+            break;
+        }
+
         ProcessVadRecord privateRx = {};
         privateRx.StartAddress = 0x200000;
         privateRx.EndAddress = 0x201fff;
         privateRx.Executable = true;
         privateRx.HasPrivateMemory = true;
         privateRx.PrivateMemory = true;
+        ProcessVadProtectionRange privateRange = {};
+        privateRange.StartAddress = privateRx.StartAddress;
+        privateRange.EndAddress = privateRx.EndAddress;
+        privateRange.Committed = true;
+        privateRange.Executable = true;
+        privateRx.EffectiveProtectionRanges.push_back(privateRange);
         game.VadRecords.push_back(privateRx);
 
         HuntProcessRecord noGraphics = game;
@@ -25478,6 +25973,67 @@ bool HuntDynamicRelocationMaskSelfTest()
 
 bool HuntEffectiveVadProtectionSelfTest()
 {
+    HuntProcessRecord cfgProcess = {};
+    cfgProcess.PebLdrLoadEnumerated = true;
+    cfgProcess.ToolhelpModuleEnumerated = true;
+    HuntModuleRecord ntdll = {};
+    ntdll.Base = 0x7ff700000000ull;
+    ntdll.Size = 0x265000;
+    ntdll.Path = ExpectedSystem32Path(L"ntdll.dll");
+    ntdll.ToolhelpSeen = true;
+    cfgProcess.Modules.push_back(ntdll);
+    ProcessVadRecord cfgVad = {};
+    cfgVad.StartAddress = ntdll.Base;
+    cfgVad.EndAddress = ntdll.Base + ntdll.Size + 0xfff;
+    cfgVad.HasPrivateMemory = true;
+    cfgVad.SectionFileName = ntdll.Path;
+    cfgVad.EffectiveProtectionComplete = true;
+    ProcessVadProtectionRange cfgRange = {};
+    cfgRange.StartAddress = ntdll.Base + ntdll.Size;
+    cfgRange.EndAddress = cfgVad.EndAddress;
+    cfgRange.Committed = true;
+    cfgRange.Executable = true;
+    cfgRange.Type = MEM_IMAGE;
+    cfgVad.EffectiveProtectionRanges.push_back(cfgRange);
+    cfgProcess.VadRecords.push_back(cfgVad);
+    const uint64_t cfgTarget = cfgRange.StartAddress + 0x40;
+    if (!LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr) ||
+        LoaderModuleCoversAddress(cfgProcess, cfgVad.EndAddress + 1, nullptr) ||
+        LoaderModuleCoversAddress(cfgProcess, cfgTarget, &cfgProcess.Modules[0]) ||
+        AddressInUnbackedExecutableVad(cfgProcess, cfgTarget))
+    {
+        return false;
+    }
+    cfgProcess.VadRecords[0].EffectiveProtectionRanges[0].Type = MEM_PRIVATE;
+    if (LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr))
+    {
+        return false;
+    }
+    cfgProcess.VadRecords[0] = cfgVad;
+    cfgProcess.VadRecords[0].SectionFileName = L"C:\\Temp\\ntdll.dll";
+    if (LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr))
+    {
+        return false;
+    }
+    cfgProcess.VadRecords[0] = cfgVad;
+    cfgProcess.VadRecords[0].EffectiveProtectionComplete = false;
+    if (LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr))
+    {
+        return false;
+    }
+    cfgProcess.VadRecords[0] = cfgVad;
+    cfgProcess.Modules[0].Path = ExpectedSystem32Path(L"dxgi.dll");
+    cfgProcess.VadRecords[0].SectionFileName = cfgProcess.Modules[0].Path;
+    if (!LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr))
+    {
+        return false;
+    }
+    cfgProcess.VadRecords[0].EffectiveProtectionRanges[0].Writable = true;
+    if (LoaderModuleCoversAddress(cfgProcess, cfgTarget, nullptr))
+    {
+        return false;
+    }
+
     ProcessVadRecord vad = {};
     vad.StartAddress = 0x1000;
     vad.EndAddress = 0x2fff;
@@ -25510,6 +26066,56 @@ bool HuntEffectiveVadProtectionSelfTest()
     if (!VadAddressIsExecutable(vad, 0x1100) ||
         VadAddressIsWritableExecutable(vad, 0x1100) ||
         VadHasExecutionEvidence(process, vad, false, true))
+    {
+        return false;
+    }
+
+    ProcessVadRecord splitVad = vad;
+    splitVad.HasPrivateMemory = true;
+    splitVad.PrivateMemory = true;
+    splitVad.EffectiveProtectionRanges[1].Executable = false;
+    splitVad.EffectiveProtectionRanges[1].WritableExecutable = false;
+    HuntProcessRecord splitProcess = {};
+    splitProcess.VadRecords.push_back(splitVad);
+    if (!AddressInPrivateExecutableVad(splitProcess, 0x1100) ||
+        AddressInPrivateExecutableVad(splitProcess, 0x2100) ||
+        AddressInUnbackedExecutableVad(splitProcess, 0x2100))
+    {
+        return false;
+    }
+    splitProcess.VadRecords[0].EffectiveProtectionComplete = false;
+    splitProcess.VadRecords[0].EffectiveProtectionRanges.clear();
+    if (AddressInPrivateExecutableVad(splitProcess, 0x1100) ||
+        AddressInUnbackedExecutableVad(splitProcess, 0x1100))
+    {
+        return false;
+    }
+
+    HuntProcessRecord managed = {};
+    managed.ApiImagePath = L"C:\\Tools\\pwsh.exe";
+    ProcessVadRecord mapped = splitVad;
+    mapped.PrivateMemory = false;
+    mapped.EffectiveExecutableBytes = 0x1000;
+    mapped.EffectiveProtectionRanges[0].Type = MEM_MAPPED;
+    mapped.EffectiveProtectionRanges[1].Type = MEM_MAPPED;
+    if (!VadLooksLikeMappedJitCode(managed, mapped) || VadLooksLikeMappedJitCode(process, mapped))
+    {
+        return false;
+    }
+    mapped.PeHeaderFound = true;
+    if (VadLooksLikeMappedJitCode(managed, mapped))
+    {
+        return false;
+    }
+    mapped.PeHeaderFound = false;
+    mapped.EffectiveProtectionRanges[0].Writable = true;
+    if (VadLooksLikeMappedJitCode(managed, mapped))
+    {
+        return false;
+    }
+    mapped.EffectiveProtectionRanges[0].Writable = false;
+    mapped.EffectiveProtectionComplete = false;
+    if (VadLooksLikeMappedJitCode(managed, mapped))
     {
         return false;
     }
@@ -25599,6 +26205,49 @@ bool HuntEffectiveVadProtectionSelfTest()
 
 bool HuntEdrKillerProfileSelfTest()
 {
+    const std::wstring programData = L"C:\\ProgramData";
+    const std::wstring programFilesX86 = L"C:\\Program Files (x86)";
+    if (!IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.26080.4-0\\MpOav.dll") ||
+        !IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\{c6b3bcf0-ab8d-4cb6-99be-6576b10073ec}\\mpengine.dll") ||
+        !IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.53\\EBWebView\\x64\\EmbeddedBrowserWebView.dll") ||
+        !IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.53\\msedgewebview2.exe", true) ||
+        IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\Program Files (x86)\\Microsoft\\EdgeWebViewBackup\\Application\\154.0.4258.53\\msedgewebview2.exe", true) ||
+        IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramDataBackup\\Microsoft\\Windows Defender\\Platform\\4.18.26080.4-0\\MpOav.dll") ||
+        IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\..\\MpOav.dll") ||
+        IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.26080.4-0\\evil.dll") ||
+        IsMicrosoftSharedModulePathShape(programData, programFilesX86,
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\{not-a-guid}\\mpengine.dll"))
+    {
+        return false;
+    }
+    ImageMetadataRecord microsoft = {};
+    microsoft.SignatureChecked = true;
+    microsoft.SignatureValid = true;
+    microsoft.SignerName = L"Microsoft Windows";
+    microsoft.SignerOrganization = L"Microsoft Corporation";
+    if (!HasVerifiedMicrosoftSigner(microsoft))
+    {
+        return false;
+    }
+    microsoft.SignatureValid = false;
+    if (HasVerifiedMicrosoftSigner(microsoft))
+    {
+        return false;
+    }
+    microsoft.SignatureValid = true;
+    microsoft.SignerOrganization = L"Fixture Publisher";
+    if (HasVerifiedMicrosoftSigner(microsoft))
+    {
+        return false;
+    }
     const std::wstring windowsApps =
         L"C:\\Program Files\\WindowsApps";
     if (!IsMicrosoftWindowsAppRuntimeModulePathShape(
@@ -27540,6 +28189,7 @@ bool UserModeHunter::Scan(const HuntOptions& options, HuntResult* result, std::w
                 HasExactProcessIdentity(process.Kernel))
             {
                 CollectPebIdentity(device_, &process);
+                CollectProcessPackageIdentity(&process);
                 ApplyBuiltinProfile(&process);
                 CollectPebLdrModules(device_, &process);
 
@@ -28369,6 +29019,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"system_process_image\":\"" << HuntJsonEscape(process.SystemProcessImageName) << L"\"";
         json << L",\"toolhelp_image\":\"" << HuntJsonEscape(process.ToolhelpImageName) << L"\"";
         json << L",\"api_image_path\":\"" << HuntJsonEscape(process.ApiImagePath) << L"\"";
+        json << L",\"api_package_full_name\":\"" << HuntJsonEscape(process.ApiPackageFullName) << L"\"";
+        json << L",\"api_package_path\":\"" << HuntJsonEscape(process.ApiPackagePath) << L"\"";
         json << L",\"peb_image_base\":";
         if (process.HasPebImageBase)
         {

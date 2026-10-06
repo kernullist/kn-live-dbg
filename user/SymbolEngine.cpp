@@ -971,7 +971,11 @@ bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* erro
         Shutdown();
 
         symbolPath_ = symbolPath;
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_EXACT_SYMBOLS);
+        // Optional dt field filters are probed as symbols. A missing bare name
+        // must not download PDBs for every deferred module before it can fail.
+        // Qualified module!symbol requests still load their module on demand.
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES |
+            SYMOPT_EXACT_SYMBOLS | SYMOPT_NO_UNQUALIFIED_LOADS);
 
         if (!SymInitializeW(process_, symbolPath_.c_str(), FALSE))
         {
@@ -1300,6 +1304,21 @@ bool SymbolEngine::EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std
     } while (false);
 
     return ok;
+}
+
+bool SymbolEngine::ShouldSearchTypeModule(const KernelModuleInfo& module, const std::wstring& moduleFilter) const
+{
+    if (!moduleFilter.empty())
+    {
+        return ModuleNameMatches(module.ImageName, moduleFilter);
+    }
+    // Scanner fallbacks commonly retry an absent nt!type as a bare type.
+    // Do not turn that fallback into downloads for every deferred driver.
+    // Explicit module!type requests still load their requested module.
+    IMAGEHLP_MODULEW64 info = {};
+    info.SizeOfStruct = sizeof(info);
+    return SymGetModuleInfoW64(process_, module.Base, &info) &&
+        IsLoadedCodeViewSymbolType(info.SymType);
 }
 
 bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error)
@@ -2106,7 +2125,7 @@ bool SymbolEngine::EnumerateTypes(const std::wstring& mask, size_t limit, std::v
 
         for (const KernelModuleInfo& module : modules_)
         {
-            if (!ModuleNameMatches(module.ImageName, moduleFilter))
+            if (!ShouldSearchTypeModule(module, moduleFilter))
             {
                 continue;
             }
@@ -2258,7 +2277,7 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+            if (!ShouldSearchTypeModule(module, moduleFilter))
             {
                 continue;
             }
@@ -2864,7 +2883,7 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
             bool found = false;
             for (const KernelModuleInfo& module : modules_)
             {
-                if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+                if (!ShouldSearchTypeModule(module, moduleFilter))
                 {
                     continue;
                 }
@@ -2914,7 +2933,7 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
         {
             for (const KernelModuleInfo& module : modules_)
             {
-                if (!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter))
+                if (!ShouldSearchTypeModule(module, moduleFilter))
                 {
                     continue;
                 }

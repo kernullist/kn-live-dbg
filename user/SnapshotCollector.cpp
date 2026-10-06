@@ -1,4 +1,5 @@
 #include "SnapshotCollector.h"
+#include "SnapshotDiff.h"
 
 #include "AlpcScanner.h"
 #include "ByovdScanner.h"
@@ -71,6 +72,23 @@ namespace
             record.Risk = SnapshotRiskNormalize(record.Risk);
             document->Records.push_back(std::move(record));
         }
+    }
+
+    SnapshotRecord BuildMapperHashSnapshotRecord(const MapperHashRecord& item)
+    {
+        SnapshotRecord record;
+        record.Domain = L"leftover-mapper";
+        // CI can retain several entries for one path. The cache address identifies
+        // each entry within the same boot, as required by snapshot comparison.
+        record.Identity = L"cihash:" + SnapshotToLower(item.DriverName) + L":" +
+            SnapshotHex(item.EntryAddress, 16);
+        record.Display = item.DriverName;
+        record.Risk = item.Suspicious ? L"high" : L"medium";
+        record.Tags = {L"cihash"};
+        record.Tags.push_back(item.Suspicious ? L"suspicious" : L"stale");
+        record.Evidence[L"entry_address"] = SnapshotHex(item.EntryAddress, 16);
+        record.Evidence[L"notes"] = item.Notes;
+        return record;
     }
 
     std::wstring ModuleIdentityForAddress(SymbolEngine& symbols, uint64_t address)
@@ -1280,15 +1298,7 @@ namespace
             {
                 continue;
             }
-            SnapshotRecord record;
-            record.Domain = L"leftover-mapper";
-            record.Identity = L"cihash:" + SnapshotToLower(item.DriverName);
-            record.Display = item.DriverName;
-            record.Risk = item.Suspicious ? L"high" : L"medium";
-            record.Tags = {L"cihash"};
-            record.Tags.push_back(item.Suspicious ? L"suspicious" : L"stale");
-            record.Evidence[L"notes"] = item.Notes;
-            AddRecord(document, std::move(record));
+            AddRecord(document, BuildMapperHashSnapshotRecord(item));
         }
     }
 
@@ -2169,4 +2179,43 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
     } while (false);
 
     return ok;
+}
+
+bool SnapshotMapperHashIdentitySelfTest()
+{
+    SnapshotDocument document = {};
+    document.BootId = L"test-boot";
+    MapperHashRecord item = {};
+    item.DriverName = L"\\SystemRoot\\System32\\drivers\\same.sys";
+    for (uint64_t index = 0; index < 3; ++index)
+    {
+        item.EntryAddress = 0xffffa00000001000ull + index * 0x100;
+        AddRecord(&document, BuildMapperHashSnapshotRecord(item));
+    }
+    std::set<std::wstring> identities;
+    for (const SnapshotRecord& record : document.Records)
+    {
+        identities.insert(record.Identity);
+        if (record.Evidence.find(L"entry_address") == record.Evidence.end())
+        {
+            return false;
+        }
+    }
+    if (identities.size() != 3)
+    {
+        return false;
+    }
+    SnapshotDiffOptions options = {};
+    SnapshotDiffResult diff = {};
+    std::wstring error;
+    if (!BuildSnapshotDiff(document, document, options, &diff, &error) ||
+        !diff.Findings.empty())
+    {
+        return false;
+    }
+    SnapshotDocument extended = document;
+    item.EntryAddress = 0xffffa00000001300ull;
+    AddRecord(&extended, BuildMapperHashSnapshotRecord(item));
+    return BuildSnapshotDiff(document, extended, options, &diff, &error) &&
+        diff.Findings.size() == 1 && diff.Findings.front().Kind == L"added";
 }

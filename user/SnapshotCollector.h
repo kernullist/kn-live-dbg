@@ -29,3 +29,5 @@ private:
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };
+
+bool SnapshotMapperHashIdentitySelfTest();
