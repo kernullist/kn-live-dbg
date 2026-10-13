@@ -897,6 +897,7 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
                     ? options.DpcCursor.QueueIndex % queueCount : 0;
                 const uint32_t queueBudget = (std::min)(queueCount, 32u);
                 size_t nodesRemaining = (std::min)(dpcLimit, 4096u);
+                std::set<uint32_t> sampledProcessors;
                 coverageComplete = coverageComplete && options.DpcCursor.List.Entry == 0 && queueBudget == queueCount;
                 auto read = [&](uint64_t address, uint64_t* value)
                 {
@@ -915,7 +916,8 @@ bool DpcTimerScanner::Scan(const Options& options, DpcTimerScanResult* result, s
                         coverageComplete = false;
                         continue;
                     }
-                    ++result->ProcessorsSampled;
+                    sampledProcessors.insert(cpu);
+                    result->ProcessorsSampled = static_cast<uint32_t>(sampledProcessors.size());
                     const uint64_t dataAddress = prcbPtr + dpcDataField.Offset +
                         static_cast<uint64_t>(dataIndex) * dpcDataLayout.Size;
                     const uint64_t listHead = dataAddress + (modernDpcList ? dpcListField.Offset : 0) + dpcListHeadField.Offset;

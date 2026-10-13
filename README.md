@@ -6,6 +6,8 @@ Changes since v0.0.34 are collected in the [v0.0.35 release notes](docs/RELEASE_
 
 The release includes the [2026-10-06 live-host fixes and validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md). That host produced zero hunt findings with incomplete coverage; this is recorded as partial evidence.
 
+The current checkout's [2026-10-13 validation report](docs/LIVE_HOST_VALIDATION_20261013.md) records further write-plan and integrity fixes, actual execution results, and remaining host compatibility limits.
+
 ## Demo
 
 https://github.com/user-attachments/assets/f3542a85-c960-46f2-a151-fdd23a8294a6

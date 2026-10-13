@@ -1,6 +1,6 @@
 # Manual Test Checklist
 
-The [2026-10-06 live-host validation report](LIVE_HOST_VALIDATION_20261006.md)
+The [2026-10-13 live-host validation report](LIVE_HOST_VALIDATION_20261013.md)
 records actual test-signed-host evidence, fixes, incomplete coverage, and cleanup.
 
 This document separates driver-free regression gates from live-kernel
@@ -12,7 +12,7 @@ Check an item off only after it passes on a clean machine. A failure on a clean
 machine means a false positive (or a layout/assumption bug) and must be fixed
 before the feature is trusted.
 
-## Driver-free regression gate (2026-10-06)
+## Driver-free regression gate (2026-10-13)
 
 ```powershell
 .\x64\Release\KnLiveDbg.exe --self-test all
@@ -33,7 +33,7 @@ The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the 
 | Suite | Checks per Release/Debug configuration |
 | --- | ---: |
 | `commands` | 2,342 |
-| `console` | 555 |
+| `console` | 557 |
 | `timeline` | 28 |
 | `mcp-tools` | 89 |
 | `remote-protocol` | 66 |
@@ -44,7 +44,18 @@ The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the 
 
 The table records the current help/completion checks and the separate HTTP
 transport gate. For Kmon hunting/page/core checks and actual-host results, use
-the dated [live-host evidence](LIVE_HOST_VALIDATION_20261006.md).
+the dated [live-host evidence](LIVE_HOST_VALIDATION_20261013.md).
+
+The console gate includes write-plan range/context checks for decimal and
+hexadecimal input, restore-byte radix round trips, and preservation of confirmed
+W+X/mismatch evidence when another section page query is unavailable. Live module
+integrity reports `page_attribute_queries_complete=false` when required sample
+queries fail. This field describes the scheduled samples, not every image page.
+
+Restore preflight preserves the selected process context for `e*`, fill, move,
+and `setfield`. Unsupported or bitfield `setfield` targets do not produce a
+restore command. A successful IOCTL with fewer bytes than requested is still an
+incomplete restore read and must not produce a partial restore command.
 
 `--self-test all` runs the first six suites before elevation, driver loading,
 and symbol initialization. `mcp-http` requires HTTP.sys URL registration

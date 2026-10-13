@@ -75,41 +75,6 @@ namespace
         return _wcsicmp(a.c_str(), b.c_str()) == 0;
     }
 
-    bool ImageAllowsDiscardedInit(const std::wstring& imageName)
-    {
-        std::wstring image = ToLowerCopy(imageName);
-        const size_t slash = image.find_last_of(L"\\/");
-        if (slash != std::wstring::npos && slash + 1 < image.size())
-        {
-            image = image.substr(slash + 1);
-        }
-        return image == L"ntoskrnl.exe" ||
-            image == L"ntkrnlmp.exe" ||
-            image == L"ntkrnlpa.exe" ||
-            image == L"ntkrnlup.exe" ||
-            image == L"hal.dll" ||
-            image == L"halaacpi.dll" ||
-            image == L"halacpi.dll" ||
-            image == L"halmacpi.dll";
-    }
-
-    bool SectionLooksDiscarded(
-        const std::wstring& name,
-        uint32_t characteristics,
-        const std::wstring& imageName)
-    {
-        (void)characteristics;
-        // Live Characteristics and section names are attacker-controlled on a
-        // mapped third-party image. Only inbox NT/HAL INIT* names skip
-        // query-failed evidence.
-        if (!EqualsNoCaseLocal(name, L"INIT") &&
-            !EqualsNoCaseLocal(name, L"INITKDBG"))
-        {
-            return false;
-        }
-        return ImageAllowsDiscardedInit(imageName);
-    }
-
     bool IsKernelAddress(uint64_t value)
     {
         return value >= kKernelSpaceMin;
@@ -679,6 +644,18 @@ namespace
         {
             AddUnique(&section->InfoCodes, code);
             AppendNote(&section->Notes, note);
+        }
+    }
+
+    void MarkSectionPageQueryUnavailable(
+        ModuleIntegritySectionRecord* section,
+        const std::wstring& code,
+        const std::wstring& note)
+    {
+        if (section != nullptr)
+        {
+            section->PageAttributeQueryFailed = true;
+            AddSectionInfo(section, code, note);
         }
     }
 
@@ -3003,12 +2980,9 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
         }
 
         *result = ModuleIntegrityResult{};
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         for (const KernelModuleInfo& module : symbols_.Modules())
@@ -3455,15 +3429,9 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                 section.FirstPageQueryFailed = true;
                                                 section.PageAttributeQueryFailed = true;
                                                 section.PageAttributeError = firstProbe.Error;
-                                                if (section.Executable &&
-                                                    !SectionLooksDiscarded(
-                                                        section.Name,
-                                                        section.Characteristics,
-                                                        record.ImageName))
-                                                {
-                                                    section.MismatchEvidence = true;
-                                                    AddSectionReason(&section, L"exec_first_page_query_failed", L"first executable page translation failed");
-                                                }
+                                                MarkSectionPageQueryUnavailable(&section,
+                                                    L"exec_first_page_query_unavailable",
+                                                    L"first executable page translation unavailable; coverage incomplete");
                                             }
 
                                             if (span > 0x1000)
@@ -3503,15 +3471,9 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                         {
                                                             section.PageAttributeError = lastProbe.Error;
                                                         }
-                                                        if (section.Executable &&
-                                                            !SectionLooksDiscarded(
-                                                                section.Name,
-                                                                section.Characteristics,
-                                                                record.ImageName))
-                                                        {
-                                                            section.MismatchEvidence = true;
-                                                            AddSectionReason(&section, L"exec_last_page_query_failed", L"last executable page translation failed");
-                                                        }
+                                                        MarkSectionPageQueryUnavailable(&section,
+                                                            L"exec_last_page_query_unavailable",
+                                                            L"last executable page translation unavailable; coverage incomplete");
                                                     }
                                                 }
                                             }
@@ -3585,18 +3547,9 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                                                             {
                                                                 section.PageAttributeError = midProbe.Error;
                                                             }
-                                                            if (section.Executable &&
-                                                                !SectionLooksDiscarded(
-                                                                    section.Name,
-                                                                    section.Characteristics,
-                                                                    record.ImageName))
-                                                            {
-                                                                section.MismatchEvidence = true;
-                                                                AddSectionReason(
-                                                                    &section,
-                                                                    L"exec_mid_page_query_failed",
-                                                                    L"interior executable page translation failed");
-                                                            }
+                                                            MarkSectionPageQueryUnavailable(&section,
+                                                                L"exec_mid_page_query_unavailable",
+                                                                L"interior executable page translation unavailable; coverage incomplete");
                                                         }
                                                     }
                                                 }
@@ -3902,6 +3855,22 @@ bool IntegrityScanner::ScanModules(const ModuleIntegrityOptions& options, Module
                 }
             }
 
+            bool pageAttributeCoverage = record.HeaderRead && record.SectionTableOk;
+            for (const ModuleIntegritySectionRecord& section : record.Sections)
+            {
+                if ((section.Executable || EqualsNoCaseLocal(section.Name, L".text")) &&
+                    (!section.RangeValid || !section.PageAttributesQueried || section.PageAttributeQueryFailed))
+                {
+                    pageAttributeCoverage = false;
+                }
+                if (section.PageAttributeQueryFailed)
+                {
+                    result->Warnings.push_back(record.ImageName + L":" + section.Name +
+                        L": page attribute coverage incomplete; unavailable translation is not mismatch evidence");
+                }
+            }
+            result->PageAttributeQueriesComplete = result->PageAttributeQueriesComplete && pageAttributeCoverage;
+
             if (options.ScanIat)
             {
                 ScanModuleIat(
@@ -3998,12 +3967,9 @@ bool IntegrityScanner::ScanDrivers(const DriverIntegrityOptions& options, Driver
         }
 
         *result = DriverIntegrityResult{};
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         ObjectWalkContext ctx(device_, symbols_);
@@ -4224,12 +4190,9 @@ bool IntegrityScanner::InspectDeviceStack(
         }
 
         *result = DeviceStackResult{};
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         DeviceObjectLayout layout = {};
@@ -4285,12 +4248,9 @@ bool IntegrityScanner::ScanDeviceDriverBackrefs(
         *result = DeviceBackrefResult{};
         result->DriverObjectsKnown = knownDriverObjects.size();
 
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         ObjectWalkContext ctx(device_, symbols_);
@@ -4710,12 +4670,9 @@ bool IntegrityScanner::ScanTypeListDriverObjects(
         result->DriverObjectsKnown = knownDriverObjects.size();
         result->DeviceObjectsKnown = deviceDriverObjects.size();
 
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         ObjectWalkContext ctx(device_, symbols_);
@@ -5244,12 +5201,9 @@ bool IntegrityScanner::InspectDriverObject(
         }
 
         *result = DriverObjectInspectResult{};
-        if (symbols_.Modules().empty())
+        if (!symbols_.LoadKernelModules(error))
         {
-            if (!symbols_.LoadKernelModules(error))
-            {
-                break;
-            }
+            break;
         }
 
         uint64_t address = 0;
@@ -5423,6 +5377,7 @@ std::wstring BuildModuleIntegrityJson(const ModuleIntegrityResult& result)
          << L",\"mismatch_modules\":" << result.MismatchModules
          << L",\"iat_modules\":" << result.IatModules
          << L",\"prologue_modules\":" << result.PrologueModules
+         << L",\"page_attribute_queries_complete\":" << (result.PageAttributeQueriesComplete ? L"true" : L"false")
          << L",\"truncated\":" << (result.Truncated ? L"true" : L"false") << L"},\n";
     json << L"  \"warnings\":";
     writeStringArray(result.Warnings);
@@ -5978,11 +5933,32 @@ bool IntegrityRelocationSelfTest()
 
 bool IntegrityDiscardedSectionSelfTest()
 {
-    return SectionLooksDiscarded(L"INIT", 0, L"ntoskrnl.exe") &&
-        SectionLooksDiscarded(L"INITKDBG", IMAGE_SCN_MEM_EXECUTE, L"ntkrnlmp.exe") &&
-        !SectionLooksDiscarded(L"INIT", 0, L"cheat.sys") &&
-        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_DISCARDABLE, L"ntoskrnl.exe") &&
-        !SectionLooksDiscarded(L".text", IMAGE_SCN_MEM_EXECUTE, L"ntoskrnl.exe");
+    for (const wchar_t* name : {L"INIT", L"PAGE", L".text"})
+    {
+        ModuleIntegritySectionRecord missing = {};
+        missing.Name = name;
+        missing.Executable = true;
+        MarkSectionPageQueryUnavailable(&missing, L"query_unavailable", L"coverage incomplete");
+        if (!missing.PageAttributeQueryFailed || missing.Suspicious || missing.MismatchEvidence ||
+            missing.WxEvidence || !missing.ReasonCodes.empty() || missing.InfoCodes.size() != 1)
+        {
+            return false;
+        }
+        ModuleIntegritySectionRecord positive = {};
+        positive.WxEvidence = true;
+        positive.MismatchEvidence = true;
+        AddSectionReason(&positive, L"effective_wx_page", L"confirmed page evidence");
+        MarkSectionPageQueryUnavailable(&positive, L"query_unavailable", L"coverage incomplete");
+        if (!positive.PageAttributeQueryFailed || !positive.Suspicious || !positive.WxEvidence ||
+            !positive.MismatchEvidence || positive.ReasonCodes.size() != 1 || positive.InfoCodes.size() != 1)
+        {
+            return false;
+        }
+    }
+    ModuleIntegrityResult result = {};
+    result.PageAttributeQueriesComplete = false;
+    const std::wstring json = BuildModuleIntegrityJson(result);
+    return json.find(L"\"page_attribute_queries_complete\":false") != std::wstring::npos;
 }
 
 bool IntegrityIatOwnerSelfTest()
