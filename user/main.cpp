@@ -757,6 +757,9 @@ struct AiWriteSafetyPlan
     std::wstring Warning;
 };
 
+static bool WriteSafetyPlanRangesSelfTest();
+static bool ByteRestoreCommandSelfTest();
+
 static void PreserveAiSessionSettings(AiPlanState& target, const AiPlanState& source)
 {
     target.TranscriptPath = source.TranscriptPath;
@@ -18635,6 +18638,7 @@ static void HandleModuleIntegrityCommand(
                    << L" mismatch=" << result.MismatchModules
                    << L" iat=" << result.IatModules
                    << L" prologue=" << result.PrologueModules
+                   << L" page_queries_complete=" << (result.PageAttributeQueriesComplete ? L"yes" : L"no")
                    << L" truncated=" << (result.Truncated ? L"yes" : L"no") << L"\n";
     } while (false);
 }
@@ -29791,7 +29795,7 @@ static int RunConsoleSurfaceSelfTest()
         CheckConsoleSurfaceSelfTest(
             &context,
             IntegrityDiscardedSectionSelfTest(),
-            L"module-discardable-init-section");
+            L"module-page-query-coverage");
         CheckConsoleSurfaceSelfTest(
             &context,
             IntegrityProloguePatternSelfTest(),
@@ -30112,6 +30116,14 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             DpcTimerScannerSelfTest(),
             L"kmon-dpc-list-regression");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            WriteSafetyPlanRangesSelfTest(),
+            L"write-safety-range-and-context");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            ByteRestoreCommandSelfTest(),
+            L"write-restore-radix-roundtrip");
         CheckConsoleSurfaceSelfTest(
             &context,
             IsNativeOwnedCommand(L"!kmon"),
@@ -35117,14 +35129,19 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             EstimateEnterWriteSize(commandArgs, &byteCount);
 
             bool hasExplicitContext = addressIndex >= 3 && IsProcessContextOption(commandArgs[1]);
-            std::wstring contextPrefix = hasExplicitContext ? L"/process " + commandArgs[2] + L" " : L"/process 4 ";
-            plan.TargetKind = hasExplicitContext ? L"virtual-process" : L"virtual-kernel-system";
+            const bool hasActiveContext = !hasExplicitContext && resolved &&
+                state.HasProcessContext && IsLikelyUserVirtualAddress(address);
+            const std::wstring processText = hasExplicitContext ? commandArgs[2]
+                : (hasActiveContext ? std::to_wstring(state.ProcessContext.ProcessId) : L"4");
+            // Implicit procctx keeps the captured process generation for user reads.
+            std::wstring contextPrefix = hasActiveContext ? L"" : L"/process " + processText + L" ";
+            plan.TargetKind = hasExplicitContext || hasActiveContext ? L"virtual-process" : L"virtual-kernel-system";
             plan.Target = resolved ? HexText(address) : commandArgs[addressIndex];
-            plan.Target += hasExplicitContext ? L" pid=" + commandArgs[2] : L" pid=4(default)";
+            plan.Target += hasExplicitContext || hasActiveContext ? L" pid=" + processText : L" pid=4(default)";
             plan.ByteCountText = ByteCountText(byteCount);
-            plan.BackupCommand = L"db " + contextPrefix + commandArgs[addressIndex] + L" " + std::to_wstring(byteCount == 0 ? 16 : byteCount);
+            plan.BackupCommand = L"db " + contextPrefix + commandArgs[addressIndex] + L" 0n" + std::to_wstring(byteCount == 0 ? 16 : byteCount);
             plan.VerifyCommand = plan.BackupCommand;
-            plan.TranslationCommand = L"vtop " + contextPrefix + commandArgs[addressIndex] + L" " + std::to_wstring(byteCount == 0 ? 1 : byteCount);
+            plan.TranslationCommand = L"vtop " + contextPrefix + commandArgs[addressIndex] + L" 0n" + std::to_wstring(byteCount == 0 ? 1 : byteCount);
             plan.Warning = L"virtual write: e* user VAs use procctx or /process, kernel VAs use System(pid 4); verify page ownership, target module, and whether the range touches code, callbacks, list links, or reference counts";
         }
         else if (IsPhysicalEnterCommand(command))
@@ -35143,7 +35160,7 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             plan.TargetKind = L"physical";
             plan.Target = HexText(physicalAddress);
             plan.ByteCountText = ByteCountText(byteCount);
-            plan.BackupCommand = L"pdb " + commandArgs[1] + L" " + std::to_wstring(byteCount == 0 ? 16 : byteCount);
+            plan.BackupCommand = L"pdb " + commandArgs[1] + L" 0n" + std::to_wstring(byteCount == 0 ? 16 : byteCount);
             plan.VerifyCommand = plan.BackupCommand;
             plan.Warning = L"physical write: confirm this is not page table, MMIO, firmware-owned, or device memory before confirming";
         }
@@ -35179,43 +35196,53 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             plan.ByteCountText = ByteCountText(byteCount);
             plan.BackupCommand = L"dt " + commandArgs[1] + L" " + commandArgs[2] + L" " + commandArgs[3];
             plan.VerifyCommand = plan.BackupCommand;
-            plan.TranslationCommand = L"vtop " + commandArgs[2] + L" " + std::to_wstring(byteCount == 0 ? 1 : byteCount);
+            plan.TranslationCommand = L"vtop " + commandArgs[2] + L" 0n" + std::to_wstring(byteCount == 0 ? 1 : byteCount);
             plan.Warning = L"type field write: check field drift, bitfield width, pointer ownership, and list/refcount semantics";
         }
         else if (command == L"f" || command == L"fp")
         {
-            if (commandArgs.size() < 4)
+            size_t addressIndex = 0;
+            size_t lengthIndex = 0;
+            if (!TryGetEnterCommandArgumentIndexes(commandArgs, &addressIndex, &lengthIndex) ||
+                commandArgs.size() < lengthIndex + 2)
             {
                 plan.Warning = L"cannot build write safety plan: fill command has too few arguments";
                 break;
             }
 
             uint64_t length = 0;
-            ParseUnsigned(commandArgs[2], state.NumberBase, &length);
+            ParseUnsigned(commandArgs[lengthIndex], state.NumberBase, &length);
+            const std::wstring contextPrefix = addressIndex >= 3
+                ? L"/process " + commandArgs[2] + L" " : L"";
             plan.TargetKind = L"virtual-fill";
-            plan.Target = commandArgs[1];
+            plan.Target = contextPrefix + commandArgs[addressIndex];
             plan.ByteCountText = ByteCountText(length);
-            plan.BackupCommand = L"db " + commandArgs[1] + L" " + std::to_wstring(length == 0 ? 16 : length);
+            plan.BackupCommand = L"db " + contextPrefix + commandArgs[addressIndex] + L" 0n" + std::to_wstring(length == 0 ? 16 : length);
             plan.VerifyCommand = plan.BackupCommand;
-            plan.TranslationCommand = L"vtop " + commandArgs[1] + L" " + std::to_wstring(length == 0 ? 1 : length);
+            plan.TranslationCommand = L"vtop " + contextPrefix + commandArgs[addressIndex] + L" 0n" + std::to_wstring(length == 0 ? 1 : length);
             plan.Warning = L"fill write: confirm the whole target range is intended and does not cross into adjacent structure fields";
         }
         else if (command == L"m")
         {
-            if (commandArgs.size() < 4)
+            size_t sourceIndex = 0;
+            size_t destinationIndex = 0;
+            if (!TryGetEnterCommandArgumentIndexes(commandArgs, &sourceIndex, &destinationIndex) ||
+                commandArgs.size() != destinationIndex + 2)
             {
                 plan.Warning = L"cannot build write safety plan: move command has too few arguments";
                 break;
             }
 
             uint64_t length = 0;
-            ParseUnsigned(commandArgs[3], state.NumberBase, &length);
+            ParseUnsigned(commandArgs[destinationIndex + 1], state.NumberBase, &length);
+            const std::wstring contextPrefix = sourceIndex >= 3
+                ? L"/process " + commandArgs[2] + L" " : L"";
             plan.TargetKind = L"virtual-move";
-            plan.Target = L"destination " + commandArgs[2] + L" from source " + commandArgs[1];
+            plan.Target = L"destination " + contextPrefix + commandArgs[destinationIndex] + L" from source " + commandArgs[sourceIndex];
             plan.ByteCountText = ByteCountText(length);
-            plan.BackupCommand = L"db " + commandArgs[2] + L" " + std::to_wstring(length == 0 ? 16 : length);
+            plan.BackupCommand = L"db " + contextPrefix + commandArgs[destinationIndex] + L" 0n" + std::to_wstring(length == 0 ? 16 : length);
             plan.VerifyCommand = plan.BackupCommand;
-            plan.TranslationCommand = L"vtop " + commandArgs[2] + L" " + std::to_wstring(length == 0 ? 1 : length);
+            plan.TranslationCommand = L"vtop " + contextPrefix + commandArgs[destinationIndex] + L" 0n" + std::to_wstring(length == 0 ? 1 : length);
             plan.Warning = L"move write: confirm source and destination do not overlap unexpectedly";
         }
         else if (command == L"!ti" && commandArgs.size() >= 2)
@@ -35434,6 +35461,44 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
     return plan;
 }
 
+static bool CaptureWriteRestoreContext(
+    const DebuggerState& state,
+    const ProcessAddressContext* explicitContext,
+    uint64_t address,
+    ProcessAddressContext* addressContext,
+    bool* hasAddressContext)
+{
+    bool ok = false;
+
+    do
+    {
+        if (addressContext == nullptr || hasAddressContext == nullptr)
+        {
+            break;
+        }
+        const ProcessAddressContext* context = SelectMemoryAccessContext(state, explicitContext, address);
+        if (context == nullptr)
+        {
+            break;
+        }
+        *addressContext = *context;
+        *hasAddressContext = true;
+        ok = true;
+    } while (false);
+
+    return ok;
+}
+
+static bool IsSupportedSetfieldRestoreField(const TypeFieldInfo& field)
+{
+    return !field.IsBitField && field.Length != 0 && field.Length <= sizeof(uint64_t);
+}
+
+static bool IsCompleteRestoreRead(bool readOk, uint64_t requested, const std::vector<uint8_t>& bytes)
+{
+    return readOk && requested != 0 && bytes.size() == requested;
+}
+
 static bool ResolveWriteTargetForRestore(
     const std::wstring& commandLine,
     DebuggerState& state,
@@ -35495,9 +35560,17 @@ static bool ResolveWriteTargetForRestore(
                     break;
                 }
             }
-            else if (!EnsureKernelProcessAddressContext(state, device, symbols, addressContext, &error))
+            else
             {
-                break;
+                const ProcessAddressContext* context = nullptr;
+                if (!ResolveNativeWriteContext(state, device, symbols, *address, addressContext, &context, &error))
+                {
+                    break;
+                }
+                if (!CaptureWriteRestoreContext(state, context, *address, addressContext, hasAddressContext))
+                {
+                    break;
+                }
             }
 
             *hasAddressContext = true;
@@ -35523,6 +35596,7 @@ static bool ResolveWriteTargetForRestore(
 
             TypeFieldInfo field = {};
             if (!symbols.FindField(commandArgs[1], commandArgs[3], &field, &error) ||
+                !IsSupportedSetfieldRestoreField(field) ||
                 !ParseAddressOrSymbol(symbols, state, commandArgs[2], address, &error) ||
                 !TryAddOffset(*address, field.Offset, address))
             {
@@ -35530,27 +35604,46 @@ static bool ResolveWriteTargetForRestore(
             }
 
             *byteCount = static_cast<uint64_t>(field.Length);
-            if (*byteCount == 0 || *byteCount > sizeof(uint64_t))
-            {
-                *byteCount = sizeof(uint64_t);
-            }
-            ok = true;
-        }
-        else if (command == L"f" || command == L"fp")
-        {
-            if (commandArgs.size() < 4 ||
-                !ParseAddressOrSymbol(symbols, state, commandArgs[1], address, &error) ||
-                !ParseUnsigned(commandArgs[2], state.NumberBase, byteCount))
+            const ProcessAddressContext* context = nullptr;
+            if (!ResolveNativeWriteContext(state, device, symbols, *address, addressContext, &context, &error) ||
+                !CaptureWriteRestoreContext(state, context, *address, addressContext, hasAddressContext))
             {
                 break;
             }
             ok = true;
         }
-        else if (command == L"m")
+        else if (command == L"f" || command == L"fp" || command == L"m")
         {
-            if (commandArgs.size() < 4 ||
-                !ParseAddressOrSymbol(symbols, state, commandArgs[2], address, &error) ||
-                !ParseUnsigned(commandArgs[3], state.NumberBase, byteCount))
+            size_t firstAddressIndex = 0;
+            size_t nextIndex = 0;
+            if (!TryGetEnterCommandArgumentIndexes(commandArgs, &firstAddressIndex, &nextIndex) ||
+                commandArgs.size() < nextIndex + 2)
+            {
+                break;
+            }
+            const size_t targetIndex = command == L"m" ? nextIndex : firstAddressIndex;
+            const size_t lengthIndex = command == L"m" ? nextIndex + 1 : nextIndex;
+            if (!ParseAddressOrSymbol(symbols, state, commandArgs[targetIndex], address, &error) ||
+                !ParseUnsigned(commandArgs[lengthIndex], state.NumberBase, byteCount))
+            {
+                break;
+            }
+            const ProcessAddressContext* context = nullptr;
+            if (firstAddressIndex >= 3)
+            {
+                uint64_t pid = 0;
+                if (!ParseUnsigned(commandArgs[2], 10, &pid) || pid == 0 || pid > 0xffffffffull ||
+                    !ResolveProcessAddressContext(device, symbols, static_cast<uint32_t>(pid), addressContext, &error))
+                {
+                    break;
+                }
+                context = addressContext;
+            }
+            else if (!ResolveNativeWriteContext(state, device, symbols, *address, addressContext, &context, &error))
+            {
+                break;
+            }
+            if (!CaptureWriteRestoreContext(state, context, *address, addressContext, hasAddressContext))
             {
                 break;
             }
@@ -35573,11 +35666,149 @@ static std::wstring BuildByteRestoreCommand(const std::wstring& prefix, uint64_t
     stream << prefix << L" " << HexText(address);
     for (uint8_t value : bytes)
     {
-        stream << L" " << std::hex << std::setw(2) << std::setfill(L'0')
+        stream << L" 0x" << std::hex << std::setw(2) << std::setfill(L'0')
                << static_cast<unsigned>(value) << std::setfill(L' ') << std::dec;
     }
 
     return stream.str();
+}
+
+static bool WriteSafetyPlanRangesSelfTest()
+{
+    struct Case
+    {
+        const wchar_t* Command;
+        uint64_t Address;
+        uint64_t Length;
+        bool ProcessContext;
+        bool ActiveProcess = false;
+        uint64_t ProcessId = 4;
+    };
+    const Case cases[] =
+    {
+        {L"eq 0x1000 1 2", 0x1000, 16, true},
+        {L"eq /process 0n4 0x1000 1 2", 0x1000, 16, true},
+        {L"peq 0x1000 1 2", 0x1000, 16, false},
+        {L"f 0x1000 0x20 1", 0x1000, 32, false},
+        {L"fp 0x1000 0x20 1", 0x1000, 32, false},
+        {L"m 0x1000 0x2000 0x20", 0x2000, 32, false},
+        {L"f /process 0n4 0x1000 0x20 1", 0x1000, 32, true},
+        {L"fp /process 0n4 0x1000 0x20 1", 0x1000, 32, true},
+        {L"m /process 0n4 0x1000 0x2000 0x20", 0x2000, 32, true},
+        {L"eq 0x1000 1 2", 0x1000, 16, false, true, 42},
+        {L"eq /process 0n4 0x1000 1 2", 0x1000, 16, true, true, 4},
+        {L"eq 0xffff800000001000 1 2", 0xffff800000001000ull, 16, true, true, 4}
+    };
+    SymbolEngine symbols;
+    for (unsigned base : {10u, 16u})
+    {
+        DebuggerState state = {};
+        state.NumberBase = base;
+        for (const Case& test : cases)
+        {
+            state.HasProcessContext = test.ActiveProcess;
+            state.ProcessContext.ProcessId = 42;
+            const AiWriteSafetyPlan plan = BuildWriteSafetyPlan(test.Command, state, symbols);
+            if (plan.BackupCommand.empty() || plan.VerifyCommand.empty())
+            {
+                return false;
+            }
+            const std::wstring commands[] = {plan.BackupCommand, plan.VerifyCommand, plan.TranslationCommand};
+            for (const std::wstring& command : commands)
+            {
+                if (command.empty())
+                {
+                    continue;
+                }
+                const std::vector<std::wstring> args = Split(command);
+                const bool hasProcess = args.size() >= 3 && IsProcessContextOption(args[1]);
+                const size_t addressIndex = hasProcess ? 3 : 1;
+                uint64_t pid = 0;
+                uint64_t address = 0;
+                uint64_t length = 0;
+                if (hasProcess != test.ProcessContext || args.size() != addressIndex + 2 ||
+                    (hasProcess && (!ParseUnsigned(args[2], 10, &pid) || pid != test.ProcessId)) ||
+                    !ParseUnsigned(args[addressIndex], base, &address) || address != test.Address ||
+                    !ParseUnsigned(args[addressIndex + 1], base, &length) || length != test.Length)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    DebuggerState state = {};
+    state.HasProcessContext = true;
+    state.ProcessContext = {1, 42, 0xffff800000002000ull, 0x3000, 0x4000};
+    ProcessAddressContext captured = {};
+    bool hasContext = false;
+    if (!CaptureWriteRestoreContext(state, nullptr, 0x1000, &captured, &hasContext) ||
+        !hasContext || captured.Flags != state.ProcessContext.Flags ||
+        captured.ProcessId != 42 || captured.Eprocess != state.ProcessContext.Eprocess ||
+        captured.DirectoryTableBase != 0x3000 || captured.UserDirectoryTableBase != 0x4000)
+    {
+        return false;
+    }
+    hasContext = false;
+    if (CaptureWriteRestoreContext(state, nullptr, 0xffff800000001000ull, &captured, &hasContext) || hasContext)
+    {
+        return false;
+    }
+    const ProcessAddressContext system = {1, 4, 0xffff800000003000ull, 0x5000, 0};
+    if (!CaptureWriteRestoreContext(state, &system, 0xffff800000001000ull, &captured, &hasContext) ||
+        !hasContext || captured.ProcessId != 4 || captured.Eprocess != system.Eprocess)
+    {
+        return false;
+    }
+    state.HasProcessContext = false;
+    hasContext = false;
+    if (CaptureWriteRestoreContext(state, nullptr, 0x1000, &captured, &hasContext) || hasContext)
+    {
+        return false;
+    }
+    for (uint64_t length : {0ull, 1ull, 8ull, 9ull})
+    {
+        TypeFieldInfo field = {};
+        field.Length = length;
+        if (IsSupportedSetfieldRestoreField(field) != (length == 1 || length == 8))
+        {
+            return false;
+        }
+        field.IsBitField = true;
+        if (IsSupportedSetfieldRestoreField(field))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ByteRestoreCommandSelfTest()
+{
+    const std::vector<uint8_t> expected = {0x10, 0x2a, 0xab, 0xff};
+    if (!IsCompleteRestoreRead(true, expected.size(), expected) ||
+        IsCompleteRestoreRead(false, expected.size(), expected) ||
+        IsCompleteRestoreRead(true, expected.size() + 1, expected) ||
+        IsCompleteRestoreRead(true, 0, {}))
+    {
+        return false;
+    }
+    const std::vector<std::wstring> args = Split(BuildByteRestoreCommand(L"eb", 0x1000, expected));
+    if (args.size() != expected.size() + 2)
+    {
+        return false;
+    }
+    for (unsigned base : {10u, 16u})
+    {
+        for (size_t index = 0; index < expected.size(); ++index)
+        {
+            uint64_t value = 0;
+            if (!ParseUnsigned(args[index + 2], base, &value) || value != expected[index])
+            {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static void PopulateWriteRestoreCommand(
@@ -35636,9 +35867,11 @@ static void PopulateWriteRestoreCommand(
             readOk = device.ReadMemory(address, static_cast<uint32_t>(byteCount), &bytes, &error);
         }
 
-        if (!readOk)
+        if (!IsCompleteRestoreRead(readOk, byteCount, bytes))
         {
-            std::wstring note = L"restore read failed: " + error;
+            const std::wstring note = !readOk ? L"restore read failed: " + error
+                : L"restore read incomplete; expected " + std::to_wstring(byteCount) +
+                    L" bytes, got " + std::to_wstring(bytes.size()) + L"; restore command omitted";
             plan->Warning = plan->Warning.empty() ? note : plan->Warning + L"; " + note;
             break;
         }

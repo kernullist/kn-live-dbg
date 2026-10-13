@@ -153,6 +153,7 @@ struct ModuleIntegrityResult
     uint64_t IatModules = 0;
     uint64_t PrologueModules = 0;
     bool Truncated = false;
+    bool PageAttributeQueriesComplete = true;
 };
 
 struct DriverDispatchRecord
