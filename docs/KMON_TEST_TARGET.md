@@ -277,6 +277,60 @@ or the exact fixture path; it does not exempt code-change findings. Thus a
 clean secondary control is negative for byte modification, not for the
 presence of an unlisted image mapping.
 
+The harness also accepts a metadata-only `finding.executable_memory` for an
+inventoried secondary fixture page only when its process generation, address,
+capture hash, full 4 KiB contents, relocated pointers, and any intentional
+one-byte change match an independent fixture oracle. It requires
+`no_execution_reference` and `maliciousness=not_established`. The count is
+reported as `expected_secondary_page_observations`; no code-change finding is
+exempted by this rule.
+
+## Observing an actual vctip secondary view
+
+`-ObservedProcessId <PID>` adds an existing process to the watches after KMON
+starts, retains its process handle and creation time, and requires it to survive
+through the final drain. The harness exports that process's cases and full layout.
+It closes its handle without terminating the external process. In
+`-AllProcessLayouts` mode this does not narrow the host layout scope.
+
+On the validation PC, a minimal compile with the installed **Hostx86** MSVC
+compiler creates the real 32-bit `vctip.exe` and both PE32 `System.Data.dll`
+views. A Hostx64 invocation produced only a single GAC_64 view. Identify the
+actual executable, PID, creation time, and mappings instead of assuming that any
+process named vctip exercises the case. Do not terminate an existing process
+owned by another workload to force the reproduction.
+
+Take read-only snapshots before and after the all-process harness run. To
+isolate the actual process's image coverage while still collecting layouts
+across the host, use `-SkipFixtures`:
+
+```powershell
+python tools/validate-kmon-vctip.py snapshot --pid <PID> --out .build/vctip-before
+tools/validate-kmon-live.ps1 -AllProcessLayouts -ObservedProcessId <PID> -SkipFixtures -ObserveSeconds 300 -ProbeDriver -RequireQueueHealth -RequireCompletedWork -RequireLayoutNameAccounting -RequireFreshLayouts -OutputDirectory .build/vctip-live
+python tools/validate-kmon-vctip.py snapshot --pid <PID> --out .build/vctip-after
+python tools/validate-kmon-vctip.py audit --run .build/vctip-live --before .build/vctip-before/snapshot.json --after .build/vctip-after/snapshot.json
+python tools/test-kmon-vctip-audit.py
+```
+
+`-SkipFixtures` requires `-AllProcessLayouts` and at least one observed PID,
+and cannot be combined with fixture selectors. Its live-harness result verifies
+liveness and pipeline health; it must be followed by the separate image gate.
+For concurrent positive/negative controls, replace `-SkipFixtures` with
+`-ImageSweepFixtures -SecondaryViewFixtures -RequireImageCompletion` and allow
+at least 600 seconds. This adds load and does not guarantee that the actual
+vctip image will finish; preserve a failed additional gate as a coverage gap.
+
+Snapshot requires 64-bit Python and read access to the target; the live harness
+requires elevation. Use fresh output directories. The snapshot locks the reference
+against writes/replacement, parses PE32 HIGHLOW relocations independently, reads
+each page twice, and saves expected/observed executable bytes. It neither executes
+nor modifies the observed image. The offline gate checks process generation,
+exact mapped path/base, relocation basis, both complete image traversals, zero
+skipped/failed bytes, and absence of System.Data byte/identity findings. Passing
+the synthetic controls alone cannot pass this additional gate. These non-atomic
+observations do not attest unrelated runtime changes. See the
+[actual reproduction report](KMON_VCTIP_VALIDATION_20261024.md).
+
 ## Not covered here
 
 - Live DKOM `ActiveProcessLinks` unlink (needs a kernel fixture).

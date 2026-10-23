@@ -43,3 +43,6 @@ vendor/*
 knlivedbg-logs/
 dump-bin/
 .zcode/
+
+# Python validation helpers
+tools/__pycache__/

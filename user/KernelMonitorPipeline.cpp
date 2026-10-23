@@ -102,6 +102,11 @@ void KernelMonitor::ResetPipeline()
     ImageSweepProcessCursors[1] = {};
     NextImageSweepMs = 0;
     ImageSweepTurns = 0;
+    ImageAdmissionDeferred = 0;
+    ImageWatchAdmissionDeferred = 0;
+    NextImageAdmissionReportMs = 0;
+    ImageRescanDelays.clear();
+    ImageRescanDelayHits = 0;
     UserLastScanMs.clear();
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
@@ -873,6 +878,12 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"shutdown_events_processed"] = std::to_wstring(ShutdownEventsProcessed);
         event.Evidence[L"shutdown_events_unanalyzed"] = std::to_wstring(ShutdownEventsUnanalyzed);
         event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
+        event.Evidence[L"image_work_capacity"] = std::to_wstring(ImageWorkCapacity);
+        event.Evidence[L"image_watch_reserved_slots"] = std::to_wstring(ImageWatchReserve);
+        event.Evidence[L"image_admission_deferred_attempts"] = std::to_wstring(ImageAdmissionDeferred);
+        event.Evidence[L"image_watch_admission_deferred_attempts"] = std::to_wstring(ImageWatchAdmissionDeferred);
+        event.Evidence[L"image_rescan_delay_entries"] = std::to_wstring(ImageRescanDelays.size());
+        event.Evidence[L"image_rescan_delay_hits"] = std::to_wstring(ImageRescanDelayHits);
         uint64_t imageScheduled = 0, imageTraversed = 0, imageRemaining = 0;
         for (const auto& item : ImageWork)
         {
@@ -975,6 +986,95 @@ bool KmonPipelineSelfTest()
             if (monitor.FindImageWork(differentReference, selfBase, identity) == imageWork ||
                 monitor.ImageWork.size() != 3) { break; }
             monitor.ImageWork.clear();
+            // Eviction must retain the normal 30-second rescan deadline, not
+            // turn a completed image into permanently competing "initial" work.
+            auto completed = monitor.FindImageWork(selfPath, selfBase, identity);
+            if (completed == nullptr) { break; }
+            completed->Sweep.Coverage.TraversalComplete = true;
+            completed->NextSweepDueMs = GetTickCount64() + 30000;
+            monitor.RememberImageRescanDelay(*completed, GetTickCount64());
+            if (monitor.ImageRescanDelays.size() != 1) { break; }
+            monitor.ImageWork.clear();
+            if (monitor.FindImageWork(aliasPath, selfBase, identity) != nullptr ||
+                !monitor.ImageWork.empty() || monitor.ImageRescanDelayHits != 1) { break; }
+            // Process reuse, allocation reuse with a different file, and a
+            // changed full file ID must not inherit the previous deadline.
+            if (monitor.ImageRescanDelayed(selfPath, selfBase, reusedIdentity, GetTickCount64()) ||
+                monitor.ImageRescanDelayed(selfPath, selfBase + 4096, identity, GetTickCount64()) ||
+                monitor.ImageRescanDelayed(differentReference, selfBase, identity, GetTickCount64()) ||
+                !monitor.ImageRescanDelays.empty()) { break; }
+            completed = monitor.FindImageWork(selfPath, selfBase, identity);
+            if (completed == nullptr) { break; }
+            completed->Sweep.Coverage.TraversalComplete = true;
+            completed->NextSweepDueMs = GetTickCount64() + 30000;
+            monitor.RememberImageRescanDelay(*completed, GetTickCount64());
+            monitor.ImageRescanDelays.begin()->second.FileId.FileId.Identifier[15] ^= 1;
+            if (monitor.ImageRescanDelayed(selfPath, selfBase, identity, GetTickCount64()) ||
+                !monitor.ImageRescanDelays.empty()) { break; }
+            monitor.RememberImageRescanDelay(*completed, GetTickCount64());
+            monitor.ImageRescanDelays.begin()->second.DueMs = GetTickCount64() - 1;
+            if (monitor.ImageRescanDelayed(selfPath, selfBase, identity, GetTickCount64()) ||
+                !monitor.ImageRescanDelays.empty()) { break; }
+            for (size_t i = 0; i < 4096; ++i)
+            {
+                KernelMonitor::ImageRescanDelay delay;
+                delay.DueMs = GetTickCount64() + 30000;
+                monitor.ImageRescanDelays.emplace(std::to_wstring(i), delay);
+            }
+            monitor.RememberImageRescanDelay(*completed, GetTickCount64());
+            if (monitor.ImageRescanDelays.size() != 4096) { break; }
+            monitor.ImageRescanDelays.clear();
+            monitor.ImageWork.clear();
+            // A late discovered watched mapping must still enter a cache
+            // filled with unfinished background traversals. No tail is evicted.
+            bool admissionWatched = false;
+            if (monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != KernelMonitor::ImageWorkCapacity ||
+                admissionWatched) { break; }
+            monitor.WatchNamesLower.push_back(L"pending-watch.exe");
+            if (monitor.ImageWorkAdmissionLimit(0, &admissionWatched) !=
+                KernelMonitor::ImageWorkCapacity - KernelMonitor::ImageWatchReserve) { break; }
+            monitor.WatchNamesLower.clear();
+            monitor.WatchPids.insert(identity.ProcessId);
+            for (size_t i = 0; i < KernelMonitor::ImageWorkCapacity - KernelMonitor::ImageWatchReserve; ++i)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.LastUsedMs = GetTickCount64();
+                work.Sweep.Ranges.resize(2);
+                work.Sweep.NextRange = 1;
+                monitor.ImageWork.emplace(L"background-" + std::to_wstring(i), std::move(work));
+            }
+            ObservationIdentity backgroundIdentity = identity;
+            backgroundIdentity.ProcessId = 0;
+            const auto backgroundSize = monitor.ImageWork.size();
+            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity) != nullptr ||
+                monitor.ImageWork.size() != backgroundSize || monitor.ImageAdmissionDeferred != 1 ||
+                monitor.ImageWatchAdmissionDeferred != 0) { break; }
+            auto admitted = monitor.FindImageWork(selfPath, selfBase, identity);
+            if (admitted == nullptr || monitor.ImageWork.size() != backgroundSize + 1 ||
+                monitor.ImageWork.at(L"background-0").Sweep.NextRange != 1 ||
+                monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != backgroundSize + 1 || admissionWatched) { break; }
+            for (size_t i = 1; i < KernelMonitor::ImageWatchReserve; ++i)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.Identity = identity;
+                work.LastUsedMs = GetTickCount64();
+                monitor.ImageWork.emplace(L"watched-" + std::to_wstring(i), std::move(work));
+            }
+            if (monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity ||
+                monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != KernelMonitor::ImageWorkCapacity ||
+                monitor.FindImageWork(selfPath, selfBase + 4096, identity) != nullptr ||
+                monitor.ImageAdmissionDeferred != 2 || monitor.ImageWatchAdmissionDeferred != 1 ||
+                monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity) { break; }
+            // Reclaiming completed work still permits new background admission;
+            // removing the watch restores the ordinary capacity immediately.
+            monitor.ImageWork.at(L"background-0").Sweep.Coverage.TraversalComplete = true;
+            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity) == nullptr ||
+                monitor.ImageWork.count(L"background-0") != 0 ||
+                monitor.ImageWork.at(L"background-1").Sweep.NextRange != 1 ||
+                monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity) { break; }
+            monitor.ImageWork.clear();
+            monitor.WatchPids.clear();
+            if (monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != KernelMonitor::ImageWorkCapacity) { break; }
             // A DLL-rich process must not consume every watched image turn.
             for (uint32_t index = 0; index < 20; ++index)
             {

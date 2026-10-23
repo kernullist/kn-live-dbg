@@ -647,6 +647,24 @@ private:
     GameBuildManifest GameManifest;
     bool GameManifestActive = false;
     std::map<std::wstring, ImageVerificationWork> ImageWork;
+    static constexpr size_t ImageWorkCapacity = 2048;
+    static constexpr size_t ImageWatchReserve = 256;
+    size_t ImageWorkAdmissionLimit(uint32_t pid, bool* watched);
+    uint64_t ImageAdmissionDeferred = 0;
+    uint64_t ImageWatchAdmissionDeferred = 0;
+    uint64_t NextImageAdmissionReportMs = 0;
+    struct ImageRescanDelay
+    {
+        BY_HANDLE_FILE_INFORMATION FileIdentity{};
+        FILE_BASIC_INFO FileBasicIdentity{};
+        FILE_ID_INFO FileId{};
+        uint64_t DueMs = 0;
+    };
+    std::map<std::wstring, ImageRescanDelay> ImageRescanDelays;
+    uint64_t ImageRescanDelayHits = 0;
+    void RememberImageRescanDelay(const ImageVerificationWork& work, uint64_t now);
+    bool ImageRescanDelayed(const std::wstring& path, uint64_t base,
+        const ObservationIdentity& identity, uint64_t now);
     std::pair<uint32_t, uint64_t> ImageSweepProcessCursors[2];
     uint64_t NextImageSweepMs = 0;
     uint64_t ImageSweepTurns = 0;

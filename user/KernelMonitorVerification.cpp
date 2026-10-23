@@ -115,6 +115,83 @@ bool KernelMonitor::ResolveObservationProcess(DeviceClient& device, SymbolEngine
     return ResolveHuntAddressSpace(device, symbols, identity, context);
 }
 
+void KernelMonitor::RememberImageRescanDelay(const ImageVerificationWork& work, uint64_t now)
+{
+    if (!work.Loaded || !work.Sweep.Coverage.TraversalComplete || now >= work.NextSweepDueMs ||
+        !work.Reference.HasFileIdentity || !work.Reference.HasFileBasicIdentity) { return; }
+    for (auto it = ImageRescanDelays.begin(); it != ImageRescanDelays.end();)
+    {
+        if (now >= it->second.DueMs) { it = ImageRescanDelays.erase(it); }
+        else { ++it; }
+    }
+    // These records hold only file identities/deadlines, never PE ranges or
+    // verification results. Losing a delay at this bound merely permits an
+    // earlier rescan; it cannot authorize target bytes.
+    if (ImageRescanDelays.size() >= 4096) { return; }
+    HANDLE file = CreateFileW(work.Path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) { return; }
+    const std::unique_ptr<void, decltype(&CloseHandle)> owner(file, &CloseHandle);
+    ImageRescanDelay delay;
+    if (!executable_image::DiskFileIdentityMatches(file, work.Reference) ||
+        !GetFileInformationByHandleEx(file, FileIdInfo, &delay.FileId, sizeof(delay.FileId))) { return; }
+    delay.FileIdentity = work.Reference.FileIdentity;
+    delay.FileBasicIdentity = work.Reference.FileBasicIdentity;
+    delay.DueMs = work.NextSweepDueMs;
+    ImageRescanDelays[ImageKey(L"", work.Base, work.Identity)] = delay;
+}
+
+bool KernelMonitor::ImageRescanDelayed(const std::wstring& path, uint64_t base,
+    const ObservationIdentity& identity, uint64_t now)
+{
+    const auto it = ImageRescanDelays.find(ImageKey(L"", base, identity));
+    if (it == ImageRescanDelays.end()) { return false; }
+    if (now < it->second.DueMs)
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            const std::unique_ptr<void, decltype(&CloseHandle)> owner(file, &CloseHandle);
+            executable_image::DiskPeMetadata reference;
+            reference.HasFileIdentity = reference.HasFileBasicIdentity = true;
+            reference.FileIdentity = it->second.FileIdentity;
+            reference.FileBasicIdentity = it->second.FileBasicIdentity;
+            FILE_ID_INFO id{};
+            if (executable_image::DiskFileIdentityMatches(file, reference) &&
+                GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) &&
+                id.VolumeSerialNumber == it->second.FileId.VolumeSerialNumber &&
+                std::memcmp(id.FileId.Identifier, it->second.FileId.FileId.Identifier, sizeof(id.FileId.Identifier)) == 0)
+            {
+                ++ImageRescanDelayHits;
+                return true;
+            }
+        }
+    }
+    // File replacement, unavailable identity, expiry, or a new process/base
+    // must be able to start fresh. A path alias alone never justifies delay.
+    ImageRescanDelays.erase(it);
+    return false;
+}
+
+size_t KernelMonitor::ImageWorkAdmissionLimit(uint32_t pid, bool* watched)
+{
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    *watched = pid != 0 && WatchPids.count(pid) != 0;
+    if (*watched || (WatchPids.empty() && WatchNamesLower.empty())) { return ImageWorkCapacity; }
+    size_t occupied = 0;
+    for (const auto& item : ImageWork)
+    {
+        if (item.second.Identity.ProcessId != 0 && WatchPids.count(item.second.Identity.ProcessId) != 0)
+        {
+            if (++occupied == ImageWatchReserve) { break; }
+        }
+    }
+    // Scheduling already favors watched processes. Reserve admission space as
+    // well, otherwise unfinished background images can prevent a late-discovered
+    // watched view from ever reaching that scheduler. Keep the same total cap
+    // and retain every in-progress cursor; unused space returns as watches fill it.
+    return ImageWorkCapacity - (ImageWatchReserve - occupied);
+}
+
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
     uint64_t base, const ObservationIdentity& identity)
 {
@@ -150,12 +227,16 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
     }
     if (it == ImageWork.end())
     {
-        if (ImageWork.size() >= 2048)
+        if (ImageRescanDelayed(path, base, identity, now)) { return nullptr; }
+        bool watched = false;
+        auto limit = ImageWorkAdmissionLimit(identity.ProcessId, &watched);
+        if (ImageWork.size() >= limit)
         {
             for (auto old = ImageWork.begin(); old != ImageWork.end();)
             {
                 if (now - old->second.LastUsedMs > 300000 || old->second.Sweep.Coverage.TraversalComplete)
                 {
+                    RememberImageRescanDelay(old->second, now);
                     old = ImageWork.erase(old);
                 }
                 else
@@ -164,10 +245,33 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
                 }
             }
         }
-        if (ImageWork.size() >= 2048)
+        limit = ImageWorkAdmissionLimit(identity.ProcessId, &watched);
+        if (ImageWork.size() >= limit)
         {
-            EmitUnique(L"coverage.image", L"scan_failed:image:cache_cap", path, L"image",
-                L"image verification cache is full", L"new references deferred; existing cursors retained");
+            ++ImageAdmissionDeferred;
+            if (watched) { ++ImageWatchAdmissionDeferred; }
+            // These are retry attempts, not a count of distinct missing views.
+            // Sample with the actual process/mapping identity instead of one
+            // global PID-zero diagnostic that hides which image was deferred.
+            if (now >= NextImageAdmissionReportMs)
+            {
+                KmonEvent deferred;
+                deferred.Kind = L"coverage.image";
+                deferred.ProcessId = identity.ProcessId;
+                deferred.Image = path;
+                deferred.Summary = L"image_reference_admission_deferred";
+                deferred.Observation.Identity = identity;
+                deferred.Observation.Source = L"executable_page_sweep";
+                deferred.Observation.Coverage.Attempted = true;
+                deferred.Observation.Coverage.Reason = L"image_reference_admission_deferred";
+                deferred.Evidence[L"image_base"] = std::to_wstring(base);
+                deferred.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
+                deferred.Evidence[L"admission_limit"] = std::to_wstring(limit);
+                deferred.Evidence[L"watched"] = watched ? L"true" : L"false";
+                deferred.Evidence[L"policy"] = L"bounded_cache; preserve_incomplete_cursors; retry_on_rediscovery";
+                RecordEvent(std::move(deferred));
+                NextImageAdmissionReportMs = now + 5000;
+            }
             return nullptr;
         }
         it = ImageWork.emplace(key, ImageVerificationWork{}).first;

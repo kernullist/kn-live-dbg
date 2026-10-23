@@ -13,11 +13,16 @@ param(
     [switch]$AllProcessLayouts,
     [switch]$RequireLayoutNameAccounting,
     [switch]$RequireFreshLayouts,
+    [uint32[]]$ObservedProcessId = @(),
+    [switch]$SkipFixtures,
     [string]$MonitorExecutablePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($SkipFixtures -and (-not $AllProcessLayouts -or $ObservedProcessId.Count -eq 0 -or $ImageSweepFixtures -or $ImageStressFixtures -or $SecondaryViewFixtures)) {
+    throw '-SkipFixtures requires -AllProcessLayouts and an observed process, without fixture selectors.'
+}
 if ($SecondaryViewFixtures -and $ImageStressFixtures) {
     throw 'Run secondary-view and large-image stress fixtures separately.'
 }
@@ -28,6 +33,7 @@ if ($RequireFreshLayouts -and -not $AllProcessLayouts) {
     throw 'Layout freshness validation requires -AllProcessLayouts.'
 }
 . (Join-Path $PSScriptRoot 'owned-process-wait.ps1')
+. (Join-Path $PSScriptRoot 'kmon-secondary-observation.ps1')
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -39,7 +45,9 @@ if (Get-Service KnLiveDbg,KnLiveDbgProbe -ErrorAction SilentlyContinue) {
 $exe = Join-Path $repo "x64\$Configuration\KnLiveDbg.exe"
 if ($MonitorExecutablePath) { $exe = (Resolve-Path -LiteralPath $MonitorExecutablePath).Path }
 $fixture = Join-Path $repo "x64\$Configuration\tools\KnLiveDbgKmonTarget.exe"
-foreach ($path in @($exe, $fixture)) {
+$requiredBinaries = @($exe)
+if (-not $SkipFixtures) { $requiredBinaries += $fixture }
+foreach ($path in $requiredBinaries) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Build the solution first: $path" }
 }
 if (-not $OutputDirectory) {
@@ -50,6 +58,8 @@ $output = [IO.Path]::GetFullPath($OutputDirectory)
 if (Test-Path -LiteralPath $output) { throw "Use a new evidence directory: $output" }
 New-Item -ItemType Directory -Path $output | Out-Null
 $children = [Collections.Generic.List[Diagnostics.Process]]::new()
+$observedProcesses = [Collections.Generic.List[Diagnostics.Process]]::new()
+$observedIdentities = @()
 $monitor = $null
 $handle = $null
 $outFile = $null
@@ -70,6 +80,20 @@ function Get-KmonEventLayer($Event)
     return [string]$layer.Value
 }
 try {
+    foreach ($targetId in ($ObservedProcessId | Select-Object -Unique)) {
+        $target = Get-Process -Id $targetId -ErrorAction Stop
+        $observedProcesses.Add($target)
+        # Retain this instance's handle; PID reuse must not satisfy observation.
+        $null = $target.SafeHandle
+        $observedIdentities += [ordered]@{
+            pid=$target.Id; image=$target.Path
+            creation_filetime=$target.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+            started_utc=$target.StartTime.ToUniversalTime().ToString('o')
+        }
+        if ($target.HasExited) { throw "Observed process exited before startup: $targetId" }
+    }
+    ConvertTo-Json -InputObject @($observedIdentities) -Depth 4 |
+        Set-Content -LiteralPath "$output\observed-processes.json" -Encoding UTF8
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $exe
     $info.WorkingDirectory = Split-Path $exe
@@ -106,13 +130,18 @@ try {
     if ($text -notmatch '\[kmon\] started\.') { throw 'KMON startup timeout' }
     # Starting without a filter latches all-process layout collection. Adding
     # the controls afterwards selects hostility checks without narrowing it.
-    if ($AllProcessLayouts) { $monitor.StandardInput.WriteLine('!kmon add /name KnLiveDbgKmonTarget.exe') }
+    if ($AllProcessLayouts -and -not $SkipFixtures) { $monitor.StandardInput.WriteLine('!kmon add /name KnLiveDbgKmonTarget.exe') }
+    foreach ($target in $observedProcesses) { $monitor.StandardInput.WriteLine("!kmon add /pid $($target.Id)") }
     if ($ProbeDriver) { $monitor.StandardInput.WriteLine('probe load') }
 
     $modes = @('hold', 'mapped-readonly', 'overwrite', 'orphan-mapped-rx', 'orphan-private', 'orphan-image')
     if ($ImageSweepFixtures) { $modes += 'overwrite-tail' }
     if ($ImageStressFixtures) { $modes = @('large-clean', 'large-tail', 'rel32-clean', 'rel32-invalid') }
     if ($SecondaryViewFixtures) { $modes += @('alias32-clean', 'alias32-code', 'alias32-reloc', 'alias64-clean', 'alias64-code', 'alias64-reloc') }
+    if ($SkipFixtures) {
+        $modes = @()
+        '[]' | Set-Content -LiteralPath "$output\fixtures.json" -Encoding UTF8
+    }
     foreach ($mode in $modes) {
         $child = Start-Process -FilePath $fixture -ArgumentList @('/child', $mode, '/seconds', ($ObserveSeconds + 240)) `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput "$output\fixture-$mode.stdout.log" `
@@ -136,6 +165,7 @@ try {
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Wait-KnOwnedProcessExit $handle 0) { throw 'Console exited during observation' }
         foreach ($child in $children) { if ($child.HasExited) { throw "Fixture exited early: $($child.Id)" } }
+        foreach ($target in $observedProcesses) { if ($target.HasExited) { throw "Observed process exited early: $($target.Id)" } }
         $monitor.StandardInput.WriteLine('!kmon status')
         Start-Sleep -Seconds 5
     }
@@ -143,6 +173,10 @@ try {
     foreach ($run in $runs) {
         $monitor.StandardInput.WriteLine("!kmon cases /pid $($run.pid) /save `"$output\cases-$($run.scenario).json`"")
         $monitor.StandardInput.WriteLine("!kmon layouts /pid $($run.pid) /save `"$output\layouts-$($run.scenario).json`"")
+    }
+    foreach ($target in $observedProcesses) {
+        $monitor.StandardInput.WriteLine("!kmon cases /pid $($target.Id) /save `"$output\cases-observed-$($target.Id).json`"")
+        $monitor.StandardInput.WriteLine("!kmon layouts /pid $($target.Id) /json /save `"$output\layouts-observed-$($target.Id).json`"")
     }
     if ($ProbeDriver) {
         $monitor.StandardInput.WriteLine('!driver integrity KnLiveDbgProbe')
@@ -162,9 +196,12 @@ try {
     $code = Get-KnOwnedProcessExitCode $handle
     $code | Set-Content -LiteralPath "$output\exit.txt"
     if ($code -ne 0) { throw "Console exit code: $code" }
+    foreach ($target in $observedProcesses) { if ($target.HasExited) { throw "Observed process exited before final drain: $($target.Id)" } }
 } catch {
     $failure = $_ | Out-String
 } finally {
+    # External observation never transfers ownership of the target process.
+    foreach ($target in $observedProcesses) { $target.Dispose() }
     foreach ($child in $children) {
         try {
             if (-not $child.HasExited) {
@@ -336,6 +373,10 @@ try {
             }
             $matchesFixture
         })
+        $expectedSecondaryPages = @($own | Where-Object {
+            $secondary -and (Test-KmonSecondaryPageObservation $_ $secondaryMappings $secondaryBase `
+                $secondaryRelocationBase $run.scenario $run.started_utc $output)
+        })
         $unexpected = @($own | Where-Object {
             ($run.scenario -in @('hold', 'mapped-readonly', 'large-clean', 'rel32-clean') -and $_.kind -match '^finding\.|^process\.(hollow|implant)$' -and
                 -not ($_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation') -and
@@ -343,7 +384,8 @@ try {
             ($run.scenario -eq 'orphan-image' -and (Get-KmonEventLayer $_) -in @('private_exec_pe', 'private_exec_wiped')) -or
             ($secondary -and $_.kind -match '^finding\.|^process\.(hollow|implant)$' -and
                 -not ($_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation') -and
-                $_ -notin $expected -and $_ -notin $expectedLoadLeads -and $_ -notin $expectedStructuralLeads)
+                $_ -notin $expected -and $_ -notin $expectedLoadLeads -and $_ -notin $expectedStructuralLeads -and
+                $_ -notin $expectedSecondaryPages)
         })
         $negative = $run.scenario -in @('hold', 'mapped-readonly', 'large-clean', 'rel32-clean', 'alias32-clean', 'alias64-clean')
         # Assess the known fixture and its three imported images, not merely
@@ -383,6 +425,7 @@ try {
             unexpected_events=$unexpected.Count
             expected_drop_path_leads=$expectedLoadLeads.Count
             expected_secondary_structure_leads=$expectedStructuralLeads.Count
+            expected_secondary_page_observations=$expectedSecondaryPages.Count
             layout_change_observations=@($own | Where-Object { $_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation' }).Count
             image_completions=$imageCompletions; image_sweeps_completed=$imagesComplete
             secondary_image_base=$secondaryBase; secondary_relocation_base=$secondaryRelocationBase
@@ -540,8 +583,10 @@ try {
         schema='kn-live-dbg.kmon-live-validation.v1'; passed=$passed
         started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
         binary_sha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
-        fixture_sha256=(Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
+        fixture_sha256=$(if ($SkipFixtures) { '' } else { (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash })
         observe_seconds=$ObserveSeconds; scenarios=$results; event_count=$eventCount
+        observed_processes=@($observedIdentities)
+        skip_fixtures=[bool]$SkipFixtures
         probe_requested=[bool]$ProbeDriver; probe_lifecycle_events=$driverEvents
         capture_chunks_verified=$captures.Count; capture_bytes_verified=$captureBytes
         case_exports_verified=$runs.Count; layout_exports_verified=$runs.Count
@@ -561,7 +606,8 @@ try {
         fresh_layouts_required=[bool]$RequireFreshLayouts; fresh_layouts_passed=($allProcessScope -and $layoutLedger -and $layoutExpiredRecords -eq 0)
         capture_results_verified=$captureResults.Count
         shutdown_events_unanalyzed=$shutdownUnanalyzed
-        coverage_claim='bounded fixture observations only; inspect sensor and coverage records for gaps'
+        coverage_claim=$(if ($SkipFixtures) { 'observed process liveness only; a separate per-image coverage gate is required' }
+            else { 'bounded fixture observations only; inspect sensor and coverage records for gaps' })
         same_boot=$sameBoot; remaining_services=$services.Count; error=$failure
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$output\validation.json" -Encoding UTF8
     $(if ($passed) { 'complete' } else { 'failed' }) | Set-Content -LiteralPath "$output\status.txt"
