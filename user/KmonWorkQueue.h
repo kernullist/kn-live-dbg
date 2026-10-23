@@ -86,6 +86,14 @@ public:
         return Items.size();
     }
 
+    // A sole producer can use this as a source read budget. Concurrent
+    // consumers only increase the available room; zero must not mean unlimited.
+    size_t Available() const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        return Capacity - Items.size();
+    }
+
     uint64_t Loss() const
     {
         std::lock_guard<std::mutex> lock(Mutex);

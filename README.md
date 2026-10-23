@@ -12,6 +12,7 @@ The [2026-10-23 KMON live matrix](docs/KMON_LIVE_VALIDATION_20261023.md) exercis
 The [queue follow-up](docs/KMON_QUEUE_VALIDATION_20261023.md) records bounded analysis scheduling, loss accounting, and repeated live validation with `-RequireQueueHealth`.
 The [coverage follow-up](docs/KMON_COVERAGE_VALIDATION_20261023.md) records identity-checked read fallback, page-level capture gaps, completion of admitted work at shutdown, and repeated validation with `-RequireCompletedWork`.
 The [full image sweep follow-up](docs/KMON_IMAGE_SWEEP_VALIDATION_20261023.md) covers file-identity cursor sharing, bounded continuation, and live tail-page controls with `-RequireImageCompletion`.
+The [large-image and dynamic-relocation follow-up](docs/KMON_LARGE_IMAGE_VALIDATION_20261023.md) records bounded bulk scheduling, REL32 target validation, and the expanded live controls.
 
 ## Demo
 

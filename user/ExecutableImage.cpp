@@ -589,7 +589,8 @@ namespace executable_image
         const uint8_t* bytes,
         size_t size,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges)
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<uint32_t>* rel32Rvas)
     {
         if (bytes == nullptr ||
             ranges == nullptr ||
@@ -648,12 +649,16 @@ namespace executable_image
                 const uint64_t fixupRva = static_cast<uint64_t>(block.VirtualAddress) + offset;
                 if (fixupRva >= sizeOfImage ||
                     width > sizeOfImage - fixupRva ||
-                    !AddDynamicRelocationRange(
-                        ranges,
-                        static_cast<uint32_t>(fixupRva),
-                        width))
+                    ranges->size() >= kMaxDynamicRelocationRanges)
                 {
                     return false;
+                }
+                // Validate overlaps once after sorting the complete table;
+                // quadratic checks per fixup make large hostile tables costly.
+                ranges->push_back({static_cast<uint32_t>(fixupRva), width});
+                if (rel32Rvas != nullptr && type == IMAGE_FUNCTION_OVERRIDE_X64_REL32)
+                {
+                    rel32Rvas->push_back(static_cast<uint32_t>(fixupRva));
                 }
             }
 
@@ -667,7 +672,8 @@ namespace executable_image
         const uint8_t* bytes,
         size_t size,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges)
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<DiskPeRel32Override>* overrides)
     {
         if (bytes == nullptr ||
             ranges == nullptr ||
@@ -688,6 +694,8 @@ namespace executable_image
         const size_t recordsEnd = recordsStart + header.FuncOverrideSize;
         size_t cursor = recordsStart;
         std::vector<uint32_t> bddOffsets;
+        struct Candidate { uint32_t Bdd; std::vector<uint32_t> Rvas; std::vector<uint32_t> Fixups; uint32_t Original; };
+        std::vector<Candidate> candidates;
         while (cursor < recordsEnd)
         {
             if (recordsEnd - cursor < sizeof(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION))
@@ -717,6 +725,7 @@ namespace executable_image
                 cursor + sizeof(record);
             const size_t rvaCount =
                 record.RvaSize / sizeof(uint32_t);
+            Candidate candidate{record.BDDOffset, {}, {}, record.OriginalRva};
             for (size_t index = 0;
                  index < rvaCount;
                  ++index)
@@ -732,6 +741,7 @@ namespace executable_image
                 {
                     return false;
                 }
+                if (rvaCount <= 256) { candidate.Rvas.push_back(overrideRva); }
             }
 
             const size_t relocOffset =
@@ -740,10 +750,11 @@ namespace executable_image
                     bytes + relocOffset,
                     record.BaseRelocSize,
                     sizeOfImage,
-                    ranges))
+                    ranges, &candidate.Fixups))
             {
                 return false;
             }
+            candidates.push_back(std::move(candidate));
 
             cursor += static_cast<size_t>(recordSize);
         }
@@ -800,14 +811,71 @@ namespace executable_image
                 bdd.BDDSize;
         }
 
-        return expectedOffset == bddRegionSize;
+        if (expectedOffset != bddRegionSize) { return false; }
+        if (overrides != nullptr)
+        {
+            size_t targetBudget = kMaxDynamicRelocationRanges;
+            size_t nodeBudget = kMaxDynamicRelocationRanges;
+            for (const auto& existing : *overrides)
+            {
+                targetBudget -= (std::min)(targetBudget, existing.Targets.size());
+            }
+            for (auto& candidate : candidates)
+            {
+                // Repeated originals can describe externally supplied thunks;
+                // the PE does not provide their complete target set.
+                if (candidate.Fixups.empty() || candidate.Rvas.empty() ||
+                    std::find(candidate.Rvas.begin(), candidate.Rvas.end(), candidate.Original) != candidate.Rvas.end()) { continue; }
+                IMAGE_BDD_INFO bdd{};
+                std::memcpy(&bdd, bytes + recordsEnd + candidate.Bdd, sizeof(bdd));
+                const size_t count = bdd.BDDSize / sizeof(IMAGE_BDD_DYNAMIC_RELOCATION);
+                // Many records can share a BDD. Bound semantic work as well
+                // as table bytes so repeated references cannot amplify CPU.
+                if (count > nodeBudget) { continue; }
+                nodeBudget -= count;
+                bool supported = count != 0;
+                std::vector<bool> reachable(count, false), used(candidate.Rvas.size(), false);
+                if (supported) { reachable[0] = true; }
+                for (size_t i = 0; supported && i < count; ++i)
+                {
+                    IMAGE_BDD_DYNAMIC_RELOCATION node{};
+                    std::memcpy(&node, bytes + recordsEnd + candidate.Bdd + sizeof(bdd) + i * sizeof(node), sizeof(node));
+                    // V1 terminals are original (0,0,0) or self edges with
+                    // an RVA index. Internal edges must advance: no cycles.
+                    supported = node.Left == node.Right ?
+                        ((node.Left == 0 && node.Value == 0) ||
+                            (node.Left == i && node.Value < candidate.Rvas.size())) :
+                        (node.Left > i && node.Right > i && node.Left < count && node.Right < count);
+                    if (supported && reachable[i])
+                    {
+                        if (node.Left != node.Right) { reachable[node.Left] = reachable[node.Right] = true; }
+                        else if (node.Left != 0) { used[node.Value] = true; }
+                    }
+                }
+                if (!supported) { continue; }
+                std::vector<uint32_t> reachableTargets;
+                for (size_t i = 0; i < used.size(); ++i) { if (used[i]) { reachableTargets.push_back(candidate.Rvas[i]); } }
+                candidate.Rvas = std::move(reachableTargets);
+                candidate.Rvas.push_back(candidate.Original);
+                std::sort(candidate.Rvas.begin(), candidate.Rvas.end());
+                candidate.Rvas.erase(std::unique(candidate.Rvas.begin(), candidate.Rvas.end()), candidate.Rvas.end());
+                for (uint32_t fixup : candidate.Fixups)
+                {
+                    if (candidate.Rvas.size() > targetBudget) { break; }
+                    targetBudget -= candidate.Rvas.size();
+                    overrides->push_back({fixup, candidate.Original, candidate.Rvas});
+                }
+            }
+        }
+        return true;
     }
 
     bool ParseDynamicRelocationTable(
         const std::vector<uint8_t>& bytes,
         bool pe64,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges)
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<DiskPeRel32Override>* overrides)
     {
         if (ranges == nullptr ||
             sizeOfImage == 0 ||
@@ -817,6 +885,7 @@ namespace executable_image
         }
 
         std::vector<DiskPeMutableRange> parsedRanges;
+        std::vector<DiskPeRel32Override> parsedOverrides;
         IMAGE_DYNAMIC_RELOCATION_TABLE table = {};
         std::memcpy(&table, bytes.data(), sizeof(table));
         if (table.Version != 1 ||
@@ -864,7 +933,7 @@ namespace executable_image
                     payload,
                     payloadSize,
                     sizeOfImage,
-                    &parsedRanges))
+                    &parsedRanges, overrides != nullptr ? &parsedOverrides : nullptr))
             {
                 // Other DVRT symbol formats use different record layouts.
                 // Unknown records make the deep comparison incomplete; they
@@ -905,6 +974,7 @@ namespace executable_image
             DiskPeMutableRange& previous = normalized.back();
             const uint64_t previousEnd =
                 static_cast<uint64_t>(previous.Rva) + previous.Size;
+            if (range.Rva < previousEnd) { return false; } // ambiguous fixups
             if (range.Rva <= previousEnd)
             {
                 const uint64_t mergedEnd = std::max(previousEnd, rangeEnd);
@@ -921,6 +991,7 @@ namespace executable_image
             }
         }
         *ranges = std::move(normalized);
+        if (overrides != nullptr) { *overrides = std::move(parsedOverrides); }
         return true;
     }
 
@@ -1083,10 +1154,11 @@ namespace executable_image
                 tableBytes,
                 pe64,
                 metadata->SizeOfImage,
-                &metadata->DynamicRelocationRanges))
+                &metadata->DynamicRelocationRanges, &metadata->Rel32Overrides))
         {
             metadata->DynamicRelocationTableComplete = false;
             metadata->DynamicRelocationRanges.clear();
+            metadata->Rel32Overrides.clear();
             return;
         }
 
@@ -1097,6 +1169,7 @@ namespace executable_image
             {
                 metadata->DynamicRelocationTableComplete = false;
                 metadata->DynamicRelocationRanges.clear();
+                metadata->Rel32Overrides.clear();
                 return;
             }
         }
@@ -1858,10 +1931,11 @@ namespace executable_image
         const DiskPeMetadata& metadata,
         uint32_t rva,
         std::vector<uint8_t>* page,
-        std::wstring* error)
+        std::wstring* error,
+        HANDLE verifiedFile)
     {
         bool ok = false;
-        HANDLE file = INVALID_HANDLE_VALUE;
+        HANDLE file = verifiedFile;
 
         do
         {
@@ -1881,16 +1955,13 @@ namespace executable_image
             bool copied = true;
             page->assign(static_cast<size_t>(kPageSize), 0);
 
-            std::wstring path = NormalizeReferencePath(rawPath);
-            file = CreateFileW(
-                path.c_str(),
-                GENERIC_READ,
-                FILE_SHARE_READ,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL |
-                    FILE_FLAG_RANDOM_ACCESS,
-                nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                const std::wstring path = NormalizeReferencePath(rawPath);
+                file = CreateFileW(path.c_str(),
+                    GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+            }
             if (file == INVALID_HANDLE_VALUE)
             {
                 if (error != nullptr)
@@ -1899,7 +1970,7 @@ namespace executable_image
                 }
                 break;
             }
-            if (!DiskFileIdentityMatches(
+            if (verifiedFile == INVALID_HANDLE_VALUE && !DiskFileIdentityMatches(
                     file,
                     metadata))
             {
@@ -1994,7 +2065,7 @@ namespace executable_image
             ok = true;
         } while (false);
 
-        if (file != INVALID_HANDLE_VALUE)
+        if (verifiedFile == INVALID_HANDLE_VALUE && file != INVALID_HANDLE_VALUE)
         {
             CloseHandle(file);
         }

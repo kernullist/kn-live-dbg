@@ -176,46 +176,7 @@ void KernelMonitor::CollectorLoop()
             }
             if (timeline != nullptr)
             {
-                if (LiveCursorEventId != 0 && timeline->PeekNextEventId() <= LiveCursorEventId)
-                {
-                    LiveCursorEventId = 0;
-                    CollectionLost.fetch_add(1);
-                }
-                auto events = timeline->RecentAfterEventId(LiveCursorEventId, 512);
-                for (auto& event : events)
-                {
-                    if (event.EventId > LiveCursorEventId && event.EventId - LiveCursorEventId > 1)
-                    {
-                        CollectionLost.fetch_add(event.EventId - LiveCursorEventId - 1);
-                    }
-                    LiveCursorEventId = event.EventId;
-                    if (Lower(event.Source) == L"kernel-live")
-                    {
-                        KmonEvent classified;
-                        const bool known = KmonClassifyLiveEvent(event, &classified);
-                        if (known &&
-                            (classified.Kind == L"process.create" || classified.Kind == L"process.masquerade"))
-                        {
-                            LayoutMonitor.RequestDiscovery();
-                        }
-                        if (known &&
-                            (classified.Kind == L"driver.drop_load" || classified.Kind == L"driver.official_load" ||
-                                classified.Kind == L"driver.image_only"))
-                        {
-                            const auto base = event.Evidence.find(L"image_base");
-                            if (base != event.Evidence.end())
-                            {
-                                wchar_t* end = nullptr;
-                                const uint64_t address = wcstoull(base->second.c_str(), &end, 0);
-                                if (end != base->second.c_str() && *end == L'\0' && address >= 0xFFFF800000000000ull)
-                                {
-                                    QueueCapture(L"driver_load_source", address, 4096, ObserveProcessIdentity(0), event.TimestampFileTime, nullptr);
-                                }
-                            }
-                        }
-                        CollectedLive.Push(std::move(event));
-                    }
-                }
+                CollectLivePage(timeline);
             }
         }
         catch (...)
@@ -223,6 +184,55 @@ void KernelMonitor::CollectorLoop()
             CollectionLost.fetch_add(1);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+void KernelMonitor::CollectLivePage(TimelineStore* timeline, uint64_t throughEventId)
+{
+    if (timeline == nullptr) { return; }
+    if (LiveCursorEventId != 0 && timeline->PeekNextEventId() <= LiveCursorEventId)
+    {
+        LiveCursorEventId = 0;
+        CollectionLost.fetch_add(1);
+    }
+    const size_t room = (std::min<size_t>)(512, CollectedLive.Available());
+    if (room == 0 || LiveCursorEventId >= throughEventId) { return; }
+    // The collector is the sole producer (Stop takes over only after joining
+    // it). Leave excess events in the timeline instead of consuming/dropping
+    // them. RecentAfterEventId treats a zero limit as unlimited.
+    auto events = timeline->RecentAfterEventId(LiveCursorEventId, room);
+    for (auto& event : events)
+    {
+        const uint64_t next = (std::min)(event.EventId, throughEventId);
+        if (next > LiveCursorEventId)
+        {
+            const uint64_t missing = next - LiveCursorEventId - (event.EventId <= throughEventId ? 1 : 0);
+            if (missing != 0) { CollectionLost.fetch_add(missing); }
+        }
+        LiveCursorEventId = next;
+        if (event.EventId > throughEventId) { break; }
+        if (Lower(event.Source) != L"kernel-live") { continue; }
+        KmonEvent classified;
+        const bool known = KmonClassifyLiveEvent(event, &classified);
+        if (known && (classified.Kind == L"process.create" || classified.Kind == L"process.masquerade"))
+        {
+            LayoutMonitor.RequestDiscovery();
+        }
+        if (known && (classified.Kind == L"driver.drop_load" || classified.Kind == L"driver.official_load" ||
+            classified.Kind == L"driver.image_only"))
+        {
+            const auto base = event.Evidence.find(L"image_base");
+            if (base != event.Evidence.end())
+            {
+                wchar_t* end = nullptr;
+                const uint64_t address = wcstoull(base->second.c_str(), &end, 0);
+                if (end != base->second.c_str() && *end == L'\0' && address >= 0xFFFF800000000000ull)
+                {
+                    QueueCapture(L"driver_load_source", address, 4096, ObserveProcessIdentity(0), event.TimestampFileTime, nullptr);
+                }
+            }
+        }
+        CollectedLive.Push(std::move(event));
     }
 }
 
@@ -871,6 +881,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
                 progress.Evidence[L"last_cycle_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.ComparedBytes);
                 progress.Evidence[L"last_cycle_failed_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.FailedBytes);
                 progress.Evidence[L"last_cycle_skipped_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.SkippedBytes);
+                progress.Evidence[L"function_override_compared_bytes"] = std::to_wstring(work.Sweep.Rel32ValidatedBytes);
+                progress.Evidence[L"last_cycle_function_override_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteRel32ValidatedBytes);
                 RecordEvent(std::move(progress));
             }
         }
@@ -986,6 +998,36 @@ bool KmonPipelineSelfTest()
             monitor.ImageSweepTurns = 0;
             if (!fair) { break; }
             std::vector<KernelModuleInfo> owner{{selfBase, 1, selfPath, L"self"}};
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.Loaded = true; work.Identity.ProcessId = 100 + i; work.Identity.CreateTime = 1;
+                work.Base = 0x10000 + i * 4096;
+                work.Sweep.Ranges.resize(i >= 2 ? 4096 : 4);
+                monitor.ImageWork.emplace(std::to_wstring(i), std::move(work));
+            }
+            monitor.WatchPids.insert(100);
+            size_t watchedTurns = 0, bulkTurns = 0, ordinaryTurns = 0;
+            for (size_t turn = 1; turn <= 32; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                if (selected == nullptr) { fair = false; break; }
+                if (turn % 8 == 0)
+                {
+                    fair &= selected->Identity.ProcessId >= 102;
+                    ++bulkTurns;
+                    // A completed large traversal must leave the bulk queue.
+                    selected->Sweep.LastCompleteMs = turn;
+                    if (turn == 16) { monitor.ImageWork.at(L"2").Sweep.LastCompleteMs = 0; monitor.ImageWork.at(L"3").Sweep.LastCompleteMs = 0; }
+                }
+                else if (turn % 4 != 0) { fair &= selected->Identity.ProcessId == 100; ++watchedTurns; }
+                else { fair &= selected->Identity.ProcessId != 100; ++ordinaryTurns; }
+                selected->LastSweepMs = turn;
+            }
+            fair &= watchedTurns == 24 && bulkTurns == 4 && ordinaryTurns == 4;
+            monitor.ImageWork.clear(); monitor.WatchPids.clear();
+            monitor.ImageSweepProcessCursors[0] = {}; monitor.ImageSweepProcessCursors[1] = {}; monitor.ImageSweepTurns = 0;
+            if (!fair) { break; }
             const uint64_t code = reinterpret_cast<uint64_t>(&KmonPipelineSelfTest);
             // Allocation membership can extend beyond the reported module size;
             // it establishes neither matching code bytes nor a trusted image.
@@ -1163,6 +1205,56 @@ bool KmonPipelineSelfTest()
                 }
                 else { ok = false; }
                 VirtualFree(memory, 0, MEM_RELEASE);
+            }
+            // Backpressure must preserve unread source events, including when
+            // shutdown starts with a full analysis queue. Real source eviction
+            // must still be reported instead of disguised as successful drain.
+            for (const size_t sourceCapacity : {4096u, 1024u})
+            {
+                TimelineStore upstream(sourceCapacity);
+                std::vector<TimelineEvent> rawEvents(3000);
+                for (size_t index = 0; index < rawEvents.size(); ++index)
+                {
+                    auto& raw = rawEvents[index];
+                    raw.Source = L"kernel-live";
+                    raw.Action = L"selftest-unclassified";
+                    raw.Entity = L"backpressure-" + std::to_wstring(index);
+                    raw.TimestampFileTime = ObservationFileTime() + index;
+                }
+                const auto added = upstream.IngestEvents(rawEvents);
+                KernelMonitor pressure;
+                pressure.Options.LogDirectory = unique;
+                pressure.Timeline = &upstream;
+                bool preserved = added.Added == 3000;
+                if (sourceCapacity == 4096)
+                {
+                    for (size_t page = 0; page < 4; ++page) { pressure.CollectLivePage(&upstream); }
+                    preserved = preserved && pressure.CollectedLive.Available() == 0 &&
+                        pressure.LiveCursorEventId == 2048;
+                    pressure.CollectLivePage(&upstream);
+                    preserved = preserved && pressure.LiveCursorEventId == 2048 &&
+                        pressure.CollectedLive.Loss() == 0 && pressure.CollectionLost.load() == 0;
+                }
+                else
+                {
+                    // The first retained event lies one past the shutdown
+                    // fence: the single evicted event must count as lost.
+                    pressure.LiveCursorEventId = 1975;
+                    pressure.CollectLivePage(&upstream, 1976);
+                    preserved = preserved && pressure.LiveCursorEventId == 1976 &&
+                        pressure.CollectionLost.load() == 1 && pressure.CollectedLive.Size() == 0;
+                    pressure.LiveCursorEventId = 0;
+                    pressure.CollectionLost.store(0);
+                }
+                pressure.Stop(nullptr);
+                const uint64_t retained = sourceCapacity == 4096 ? 3000 : 1024;
+                preserved = preserved && pressure.LiveCursorEventId == 3000 &&
+                    pressure.LiveIngested.load() == retained && pressure.ShutdownEventsProcessed == retained &&
+                    pressure.CollectedLive.Size() == 0 && pressure.CollectedLive.Loss() == 0 &&
+                    pressure.CollectionLost.load() == 3000 - retained && pressure.ShutdownEventsUnanalyzed == 0;
+                if (!preserved) { std::fprintf(stderr, "FAIL live source backpressure/shutdown capacity=%zu\n", sourceCapacity); }
+                ok = preserved && ok;
+                for (const auto& path : pressure.SessionLogPaths()) { DeleteFileW(path.c_str()); }
             }
             // More than one normal analysis batch must survive final shutdown.
             monitor.WatchPids.insert(GetCurrentProcessId());

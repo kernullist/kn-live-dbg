@@ -8739,12 +8739,14 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     std::thread worker;
     DeviceClient* device = nullptr;
+    TimelineStore* timeline = nullptr;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         StopRequested.store(true);
         Active.store(false);
         LiveOutput.store(false);
         device = Device;
+        timeline = Timeline;
         if (Worker.joinable())
         {
             worker = std::move(Worker);
@@ -8763,14 +8765,19 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         worker.join();
     }
 
-    // No producer can append now. Classify the admitted events through the
-    // normal identity-fenced paths before draining the work they generated.
+    // Freeze the upstream tail now; backpressure can leave events there.
+    // Do not chase events emitted by shutdown itself beyond this boundary.
+    const uint64_t nextLive = timeline == nullptr ? 0 : timeline->PeekNextEventId();
+    const uint64_t liveFence = nextLive == 0 ? 0 : nextLive - 1;
+    // No queue producer can append now. Classify the admitted/deferred events
+    // through the normal identity-fenced paths before draining their work.
     const uint64_t layoutBefore = LayoutChecked.load() + LayoutRejected.load();
     const uint64_t referencesBefore = ExecutionReferenceProcessed;
     const uint64_t eventDrainStarted = GetTickCount64();
-    while ((CollectedTi.Size() != 0 || CollectedLive.Size() != 0) &&
+    while ((CollectedTi.Size() != 0 || CollectedLive.Size() != 0 || LiveCursorEventId < liveFence) &&
         GetTickCount64() - eventDrainStarted < 5000)
     {
+        CollectLivePage(timeline, liveFence);
         const auto pending = CollectedTi.Size() + CollectedLive.Size();
         IngestLiveTimeline();
         IngestThreatIntel();
@@ -8781,6 +8788,18 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     }
     ShutdownDrainMs += GetTickCount64() - eventDrainStarted;
     ShutdownEventsUnanalyzed += CollectedTi.Size() + CollectedLive.Size();
+    if (LiveCursorEventId < liveFence)
+    {
+        const uint64_t deferred = liveFence - LiveCursorEventId;
+        ShutdownEventsUnanalyzed += deferred;
+        KmonEvent backlog;
+        backlog.Kind = L"coverage.shutdown_event";
+        backlog.Summary = L"upstream live events remained unanalyzed at shutdown deadline";
+        backlog.Evidence[L"source_event_after"] = std::to_wstring(LiveCursorEventId);
+        backlog.Evidence[L"source_event_through"] = std::to_wstring(liveFence);
+        backlog.Evidence[L"deferred_source_events"] = std::to_wstring(deferred);
+        RecordEvent(std::move(backlog));
+    }
     // If the budget expires, retain the raw evidence and report the gap.
     for (const auto& raw : CollectedTi.Drain(2048))
     {

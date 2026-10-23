@@ -239,8 +239,9 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         work->ReportedHashes.clear();
     }
     CodeOwnership state = CodeOwnership::OwnedUnverified;
-    for (const auto& page : pages)
+    for (size_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex)
     {
+        const auto& page = pages[pageIndex];
         ExecutableRegionObservation observation;
         observation.Context.Identity = identity;
         observation.Context.Source = L"executable_page_compare";
@@ -251,6 +252,30 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         observation.Range = {base + page.Rva, page.Coverage.RequestedBytes};
         observation.Executable = true;
         observation.ImageMapping = true;
+        // Keep altered/partial pages individual. Consecutive fully compared
+        // pages can publish one coverage range; every byte was still read and
+        // compared. A fixed 64 KiB boundary bounds catalog granularity/cost.
+        if (page.Ownership == CodeOwnership::OwnedVerified && page.Rel32ValidatedBytes == 0)
+        {
+            work->ReportedHashes.erase(page.Rva);
+            while (pageIndex + 1 < pages.size())
+            {
+                const auto& next = pages[pageIndex + 1];
+                if (next.Ownership != CodeOwnership::OwnedVerified || next.Rel32ValidatedBytes != 0 ||
+                    (page.Rva >> 16) != (next.Rva >> 16) ||
+                    base + next.Rva != observation.Range.Address + observation.Range.Size) { break; }
+                observation.Range.Size += next.Coverage.RequestedBytes;
+                observation.Context.Coverage.RequestedBytes += next.Coverage.RequestedBytes;
+                observation.Context.Coverage.ComparedBytes += next.Coverage.ComparedBytes;
+                for (const auto& range : next.Coverage.Compared)
+                {
+                    AddObservationRange(&observation.Context.Coverage.Compared, range,
+                        &observation.Context.Coverage.RangesTruncated);
+                }
+                work->ReportedHashes.erase(next.Rva);
+                ++pageIndex;
+            }
+        }
         const uint64_t generation = ObserveExecutableRegion(observation);
         if (page.Ownership != CodeOwnership::OwnedModified)
         {
@@ -283,6 +308,11 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         event.Evidence[L"image_base"] = std::to_wstring(base);
         event.Evidence[L"rva"] = std::to_wstring(page.Rva);
         event.Evidence[L"cycle"] = std::to_wstring(work->Sweep.Cycle);
+        event.Evidence[L"function_override_compared_bytes"] = std::to_wstring(page.Rel32ValidatedBytes);
+        if (page.Rel32ValidatedBytes != 0)
+        {
+            event.Evidence[L"function_override_policy"] = L"file_declared_rel32_targets; feature_selection_not_attested";
+        }
         event.Evidence[L"code_hash"] = std::to_wstring(hash);
         event.Evidence[L"observed_capture_id"] = std::to_wstring(QueueCapturedBytes(L"modified_code",
             base + page.Rva, event.Observation, page.Observed));
@@ -313,6 +343,7 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         coverage.Evidence[L"remaining_pages"] = std::to_wstring(work->Sweep.Ranges.size() - work->Sweep.NextRange);
         coverage.Evidence[L"last_completion_ms"] = std::to_wstring(work->Sweep.LastCompleteMs);
         coverage.Evidence[L"image_base"] = std::to_wstring(base);
+        coverage.Evidence[L"function_override_compared_bytes"] = std::to_wstring(work->Sweep.Rel32ValidatedBytes);
         RecordEvent(std::move(coverage));
     }
     if (state != CodeOwnership::OwnedModified && work->Sweep.Coverage.Complete())
@@ -352,6 +383,23 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     for (size_t pass = 0; pass < 2; ++pass)
     {
         const size_t group = (preferred + pass) % 2;
+        // Reserve half of the background turns (one eighth overall while
+        // watches are busy) for large first traversals. Rotating every DLL of
+        // every background process equally left these tails almost untouched.
+        // Other background turns retain process fairness and periodic rescans.
+        if (group == 1 && ImageSweepTurns % 8 == 0)
+        {
+            ImageVerificationWork* bulk = nullptr;
+            for (auto& item : ImageWork)
+            {
+                auto& work = item.second;
+                if (!work.Loaded || now < work.NextSweepDueMs || work.Sweep.LastCompleteMs != 0 ||
+                    work.Sweep.Ranges.size() < 4096 || watched.count(work.Identity.ProcessId) != 0) { continue; }
+                if (bulk == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
+                    std::make_pair(bulk->LastSweepMs, bulk->Base)) { bulk = &work; }
+            }
+            if (bulk != nullptr) { ++bulk->SweepSchedulingTurns; return bulk; }
+        }
         struct Ready
         {
             ImageVerificationWork* Initial = nullptr;
@@ -401,7 +449,8 @@ void KernelMonitor::ContinueImageSweeps()
 {
     const uint64_t now = GetTickCount64();
     if (StopRequested.load() || now < NextImageSweepMs || ImageWork.empty() ||
-        LayoutCandidates.Size() >= 256 || ExecutionReferences.size() >= 256) { return; }
+        LayoutCandidates.Size() >= 256 || ExecutionReferences.size() >= 256 ||
+        CollectedLive.Size() >= 1024 || CollectedTi.Size() >= 1024) { return; }
     NextImageSweepMs = now + 50;
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
@@ -468,10 +517,10 @@ void KernelMonitor::ContinueImageSweeps()
                 before.RegionSize == after.RegionSize && before.State == after.State &&
                 before.Protect == after.Protect && before.Type == after.Type));
     };
-    // Include publication cost in the batch bound: a 25ms comparison can
-    // otherwise return hundreds of pages whose events starve other scanners.
+    // The verifier retains the 25ms bound. Coalesced publication permits a
+    // larger page ceiling without one catalog insertion/event per clean page.
     const auto lastDiscovered = selected->LastUsedMs;
-    ScanExecutableImage(path, base, identity, reader, 64);
+    ScanExecutableImage(path, base, identity, reader, 1024);
     // Continuation is not a new discovery. In particular, polling an exited
     // process must not keep its failed cache entries young indefinitely.
     selected->LastUsedMs = lastDiscovered;

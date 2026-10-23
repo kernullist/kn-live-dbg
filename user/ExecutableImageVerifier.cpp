@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <set>
 
 using namespace executable_image;
@@ -17,7 +18,8 @@ namespace
     }
 
     bool NormalizeRange(const std::wstring& path, const DiskPeMetadata& metadata,
-        uint64_t imageBase, uint32_t rva, uint32_t size, std::vector<uint8_t>* bytes)
+        uint64_t imageBase, uint32_t rva, uint32_t size, std::vector<uint8_t>* bytes,
+        HANDLE reference = INVALID_HANDLE_VALUE)
     {
         bool ok = false;
         do
@@ -30,20 +32,23 @@ namespace
             std::map<uint32_t, std::vector<uint8_t>> pages;
             const auto get = [&](uint32_t address, uint32_t length, uint8_t* out)
             {
-                for (uint32_t n = 0; n < length; ++n)
+                for (uint32_t n = 0; n < length;)
                 {
                     const uint32_t pageRva = (address + n) & ~0xFFFu;
                     auto it = pages.find(pageRva);
                     if (it == pages.end())
                     {
                         std::vector<uint8_t> page;
-                        if (!ReadDiskPageForRva(path, metadata, pageRva, &page, nullptr) || page.size() != 4096)
+                        if (!ReadDiskPageForRva(path, metadata, pageRva, &page, nullptr, reference) || page.size() != 4096)
                         {
                             return false;
                         }
                         it = pages.emplace(pageRva, std::move(page)).first;
                     }
-                    out[n] = it->second[(address + n) & 0xFFF];
+                    const auto offset = (address + n) & 0xFFF;
+                    const auto count = (std::min)(length - n, 4096 - offset);
+                    std::memcpy(out + n, it->second.data() + offset, count);
+                    n += count;
                 }
                 return true;
             };
@@ -209,8 +214,8 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
     return ok;
 }
 
-ExecutablePageResult CompareExecutableRange(const std::wstring& path, const DiskPeMetadata& metadata,
-    uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader)
+static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& path, const DiskPeMetadata& metadata,
+    uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader, HANDLE reference)
 {
     ExecutablePageResult result;
     result.Rva = rva;
@@ -244,7 +249,7 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
             result.Coverage.Reason = L"discardable_section";
             break;
         }
-        if (!NormalizeRange(path, metadata, imageBase, rva, size, &result.Expected) ||
+        if (!NormalizeRange(path, metadata, imageBase, rva, size, &result.Expected, reference) ||
             !ReadExact(reader, imageBase, rva, size, &result.Observed))
         {
             break;
@@ -265,6 +270,43 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
         };
         mask(metadata.LoaderMutableRanges);
         mask(metadata.DynamicRelocationRanges);
+        for (const auto& fixup : metadata.Rel32Overrides)
+        {
+            if (metadata.Machine != IMAGE_FILE_MACHINE_AMD64 || fixup.Rva < rva ||
+                uint64_t(fixup.Rva) + 4 > uint64_t(rva) + size || fixup.Targets.empty()) { continue; }
+            const auto overlaps = [&](uint32_t start, uint32_t length)
+            {
+                return uint64_t(start) < uint64_t(fixup.Rva) + 4 && fixup.Rva < uint64_t(start) + length;
+            };
+            bool supported = true;
+            for (const auto& range : metadata.LoaderMutableRanges) { supported &= !overlaps(range.Rva, range.Size); }
+            for (const auto& relocation : metadata.BaseRelocations) { supported &= !overlaps(relocation.Rva, relocation.Width); }
+            for (uint32_t target : fixup.Targets)
+            {
+                const auto destination = FindDiskSectionForRva(metadata, target);
+                const int64_t displacement = int64_t(target) - fixup.Rva - 4;
+                supported &= destination != nullptr && destination->Executable &&
+                    (destination->Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0 &&
+                    displacement >= INT32_MIN && displacement <= INT32_MAX;
+            }
+            int32_t diskDisplacement = 0;
+            const auto offset = fixup.Rva - rva;
+            std::memcpy(&diskDisplacement, result.Expected.data() + offset, 4);
+            supported &= int64_t(fixup.Rva) + 4 + diskDisplacement == fixup.OriginalRva;
+            if (!supported) { continue; }
+            int32_t observedDisplacement = 0;
+            std::memcpy(&observedDisplacement, result.Observed.data() + offset, 4);
+            const int64_t target = int64_t(fixup.Rva) + 4 + observedDisplacement;
+            // Accept only a complete, file-declared destination. Never mix
+            // bytes from multiple alternatives or accept a generic in-image jump.
+            if (target >= 0 && target <= UINT32_MAX &&
+                std::find(fixup.Targets.begin(), fixup.Targets.end(), uint32_t(target)) != fixup.Targets.end())
+            {
+                std::memcpy(result.Expected.data() + offset, &observedDisplacement, 4);
+            }
+            for (uint32_t i = 0; i < 4; ++i) { mutableBytes[offset + i] = false; }
+            result.Rel32ValidatedBytes += 4;
+        }
         bool differs = false;
         for (uint32_t i = 0; i < size; ++i)
         {
@@ -284,40 +326,44 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
                 break;
             }
         }
-        if (!DiskReferenceIdentityMatches(path, metadata))
+        if (reference == INVALID_HANDLE_VALUE && !DiskReferenceIdentityMatches(path, metadata))
         {
             result.Coverage.Reason = L"reference_changed_during_compare";
             break;
         }
-        for (uint32_t i = 0; i < size; ++i)
+        for (uint32_t i = 0; i < size;)
         {
-            if (mutableBytes[i])
+            const uint32_t start = i++;
+            const bool skipped = mutableBytes[start];
+            const bool changed = !skipped && result.Expected[start] != result.Observed[start];
+            while (i < size && mutableBytes[i] == skipped &&
+                (skipped || (result.Expected[i] != result.Observed[i]) == changed)) { ++i; }
+            const auto count = i - start;
+            if (skipped)
             {
-                ++result.Coverage.SkippedBytes;
-                AddObservationRange(&result.Coverage.Skipped, {imageBase + rva + i, 1}, &result.Coverage.RangesTruncated);
+                result.Coverage.SkippedBytes += count;
+                AddObservationRange(&result.Coverage.Skipped, {imageBase + rva + start, count}, &result.Coverage.RangesTruncated);
                 continue;
             }
-            ++result.Coverage.ComparedBytes;
-            AddObservationRange(&result.Coverage.Compared, {imageBase + rva + i, 1}, &result.Coverage.RangesTruncated);
-            if (result.Expected[i] != result.Observed[i])
+            result.Coverage.ComparedBytes += count;
+            AddObservationRange(&result.Coverage.Compared, {imageBase + rva + start, count}, &result.Coverage.RangesTruncated);
+            if (changed)
             {
-                if (!result.Changes.empty() && result.Changes.back().Address + result.Changes.back().Size == rva + i)
-                {
-                    ++result.Changes.back().Size;
-                }
-                else
-                {
-                    result.Changes.push_back({static_cast<uint64_t>(rva) + i, 1});
-                }
+                result.Changes.push_back({static_cast<uint64_t>(rva) + start, count});
             }
         }
         result.Coverage.TraversalComplete = true;
         result.Coverage.Reason = result.Coverage.SkippedBytes != 0 ? L"loader_mutable_ranges_excluded" : L"compared";
+        if (result.Rel32ValidatedBytes != 0 && result.Coverage.SkippedBytes == 0)
+        {
+            result.Coverage.Reason = L"compared_function_override_target_set";
+        }
         result.Ownership = !result.Changes.empty() ? CodeOwnership::OwnedModified :
             (result.Coverage.Complete() ? CodeOwnership::OwnedVerified : CodeOwnership::OwnedUnverified);
     } while (false);
     if (!result.Coverage.TraversalComplete)
     {
+        result.Rel32ValidatedBytes = 0;
         result.Coverage.FailedBytes = size;
         if (addressValid)
         {
@@ -325,6 +371,12 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
         }
     }
     return result;
+}
+
+ExecutablePageResult CompareExecutableRange(const std::wstring& path, const DiskPeMetadata& metadata,
+    uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader)
+{
+    return CompareExecutableRangeWithFile(path, metadata, imageBase, rva, size, reader, INVALID_HANDLE_VALUE);
 }
 
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
@@ -343,6 +395,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Coverage = {};
         sweep->Coverage.RequestedBytes = requested;
         sweep->NextRange = 0;
+        sweep->Rel32ValidatedBytes = 0;
         ++sweep->Cycle;
     }
     std::wstring reason;
@@ -353,6 +406,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Coverage.RequestedBytes = requested;
         sweep->NextRange = 0;
         sweep->Pages.clear();
+        sweep->Rel32ValidatedBytes = 0;
         ++sweep->Cycle;
         sweep->Coverage.Attempted = true;
         sweep->Coverage.InventoryAvailable = false;
@@ -361,20 +415,42 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     }
     sweep->Coverage.Attempted = true;
     sweep->Coverage.InventoryAvailable = true;
+    const auto reference = CreateFileW(NormalizeReferencePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    const std::unique_ptr<void, decltype(&CloseHandle)> referenceOwner(
+        reference == INVALID_HANDLE_VALUE ? nullptr : reference, &CloseHandle);
+    if (reference == INVALID_HANDLE_VALUE || !DiskFileIdentityMatches(reference, metadata))
+    {
+        sweep->Coverage.Reason = L"reference_unavailable_or_changed";
+        return results;
+    }
     const size_t end = sweep->NextRange + (std::min)(pageBudget, sweep->Ranges.size() - sweep->NextRange);
+    size_t publications = 0;
+    bool publicationLimited = false;
     for (; sweep->NextRange < end; ++sweep->NextRange)
     {
+        if (publications >= 64)
+        {
+            publicationLimited = true;
+            break;
+        }
         if (!results.empty() && budgetMs != 0 && GetTickCount64() - started >= budgetMs)
         {
             break;
         }
         const auto& range = sweep->Ranges[sweep->NextRange];
-        auto page = CompareExecutableRange(path, metadata, imageBase,
-            static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader);
+        auto page = CompareExecutableRangeWithFile(path, metadata, imageBase,
+            static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader, reference);
+        const bool coalesces = !results.empty() && page.Ownership == CodeOwnership::OwnedVerified &&
+            page.Rel32ValidatedBytes == 0 && results.back().Ownership == CodeOwnership::OwnedVerified &&
+            results.back().Rel32ValidatedBytes == 0 && (page.Rva >> 16) == (results.back().Rva >> 16) &&
+            page.Rva == uint64_t(results.back().Rva) + results.back().Coverage.RequestedBytes;
+        if (!coalesces) { ++publications; }
         sweep->Pages[page.Rva] = page.Ownership;
         sweep->Coverage.ComparedBytes += page.Coverage.ComparedBytes;
         sweep->Coverage.FailedBytes += page.Coverage.FailedBytes;
         sweep->Coverage.SkippedBytes += page.Coverage.SkippedBytes;
+        sweep->Rel32ValidatedBytes += page.Rel32ValidatedBytes;
         for (const auto& compared : page.Coverage.Compared)
         {
             AddObservationRange(&sweep->Coverage.Compared, compared, &sweep->Coverage.RangesTruncated);
@@ -394,7 +470,8 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     {
         return page.Coverage.ComparedBytes != 0;
     });
-    if (hasComparedBytes && !QualifyExecutableReference(metadata, imageBase, reader, &reason))
+    const bool sameReference = DiskFileIdentityMatches(reference, metadata) && DiskReferenceIdentityMatches(path, metadata);
+    if (!sameReference || (hasComparedBytes && !QualifyExecutableReference(metadata, imageBase, reader, &reason)))
     {
         // The mapping may have changed after the initial identity read.
         for (auto& page : results)
@@ -402,21 +479,23 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
             const uint64_t requested = page.Coverage.RequestedBytes;
             page.Ownership = CodeOwnership::OwnedUnverified;
             page.Changes.clear();
+            page.Rel32ValidatedBytes = 0;
             page.Coverage = {};
             page.Coverage.Attempted = true;
             page.Coverage.RequestedBytes = requested;
             page.Coverage.FailedBytes = requested;
             page.Coverage.Failed.push_back({imageBase + page.Rva, requested});
-            page.Coverage.Reason = L"image_identity_changed_during_compare";
+            page.Coverage.Reason = sameReference ? L"image_identity_changed_during_compare" : L"reference_changed_during_compare";
         }
         const uint64_t requested = sweep->Coverage.RequestedBytes;
         sweep->Coverage = {};
         sweep->Coverage.Attempted = true;
         sweep->Coverage.RequestedBytes = requested;
         sweep->Coverage.FailedBytes = requested;
-        sweep->Coverage.Reason = L"image_identity_changed_during_compare";
+        sweep->Coverage.Reason = sameReference ? L"image_identity_changed_during_compare" : L"reference_changed_during_compare";
         sweep->Pages.clear();
         sweep->NextRange = 0;
+        sweep->Rel32ValidatedBytes = 0;
         ++sweep->Cycle;
         return results;
     }
@@ -424,11 +503,12 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     sweep->Coverage.ResumeAddress = sweep->Coverage.TraversalComplete ? 0 : imageBase + sweep->Ranges[sweep->NextRange].Address;
     sweep->Coverage.Reason = sweep->Coverage.Complete() ? L"cycle_complete" :
         (sweep->Coverage.TraversalComplete ? L"cycle_complete_with_gaps" :
-            (sweep->NextRange < end ? L"time_budget" : L"page_budget"));
+            (publicationLimited ? L"publication_budget" : (sweep->NextRange < end ? L"time_budget" : L"page_budget")));
     if (sweep->Coverage.TraversalComplete)
     {
         sweep->LastCompleteMs = nowMs;
         ++sweep->CompletedCycles;
+        sweep->LastCompleteRel32ValidatedBytes = sweep->Rel32ValidatedBytes;
         sweep->LastCompleteCoverage = sweep->Coverage;
     }
     return results;
@@ -485,6 +565,8 @@ bool ExecutableImageVerifierSelfTest()
         sections[2].Characteristics = IMAGE_SCN_MEM_READ;
         std::memcpy(disk.data() + 0x80 + sizeof(nt), sections, sizeof(sections));
         std::fill(disk.begin() + 0x400, disk.begin() + 0x4400, static_cast<uint8_t>(0x90));
+        const int32_t originalRel32 = 0x1300 - 0x1151 - 4;
+        std::memcpy(disk.data() + 0x551, &originalRel32, 4);
         const uint64_t preferredPointer = nt.OptionalHeader.ImageBase + 0x1111;
         std::memcpy(disk.data() + 0x400 + 0xFFC, &preferredPointer, sizeof(preferredPointer));
         const IMAGE_BASE_RELOCATION reloc = {0x1000, 12};
@@ -612,6 +694,108 @@ bool ExecutableImageVerifierSelfTest()
                 dynamic ? "dynamic mutation preserves stable code change" : "loader mutation preserves stable code change");
         }
         ExecutableSweep cleanReuse;
+        {
+            auto dynamic = metadata;
+            dynamic.DynamicRelocationRanges.push_back({0x1151, 4});
+            dynamic.Rel32Overrides.push_back({0x1151, 0x1300, {0x1300, 0x1400}});
+            const auto compareTarget = [&](int32_t target)
+            {
+                const int32_t displacement = target - 0x1151 - 4;
+                std::memcpy(live.data() + 0x1151, &displacement, 4);
+                return CompareExecutableRange(path, dynamic, loadedBase, 0x1000, 4096, reader);
+            };
+            for (int32_t target : {0x1300, 0x1400})
+            {
+                const auto allowed = compareTarget(target);
+                reviewCheck(allowed.Ownership == CodeOwnership::OwnedVerified && allowed.Rel32ValidatedBytes == 4 &&
+                    allowed.Coverage.ComparedBytes == 4096 && allowed.Coverage.SkippedBytes == 0,
+                    "REL32 original and declared alternate both compared");
+            }
+            for (int32_t target : {0x1401, 0x1700, -1, 0x7000})
+            {
+                const auto denied = compareTarget(target);
+                reviewCheck(denied.Ownership == CodeOwnership::OwnedModified && denied.Rel32ValidatedBytes == 4 &&
+                    !denied.Changes.empty(), "REL32 undeclared and out-of-image destinations detected");
+            }
+            size_t reads = 0;
+            const ObservationReader changing = [&](uint64_t address, size_t length, std::vector<uint8_t>* bytes)
+            {
+                if (!reader(address, length, bytes)) { return false; }
+                if (address == loadedBase + 0x1000 && ++reads == 2) { (*bytes)[0x151] ^= 1; }
+                return true;
+            };
+            const auto unstable = CompareExecutableRange(path, dynamic, loadedBase, 0x1000, 4096, changing);
+            reviewCheck(unstable.Ownership == CodeOwnership::OwnedUnverified && unstable.Changes.empty() &&
+                unstable.Rel32ValidatedBytes == 0, "REL32 mismatch must survive a stable second read");
+            dynamic.Rel32Overrides[0].Targets.push_back(0x6000); // non-executable target
+            const auto unsupported = compareTarget(0x1400);
+            reviewCheck(unsupported.Coverage.SkippedBytes == 4 && unsupported.Rel32ValidatedBytes == 0,
+                "REL32 unsupported target set remains excluded");
+            std::memcpy(live.data() + 0x1151, &originalRel32, 4);
+
+            std::vector<uint8_t> dvrt;
+            const auto append = [&](const auto& value)
+            {
+                const auto bytes = reinterpret_cast<const uint8_t*>(&value);
+                dvrt.insert(dvrt.end(), bytes, bytes + sizeof(value));
+            };
+            append(IMAGE_DYNAMIC_RELOCATION_TABLE{1, 80});
+            append(IMAGE_DYNAMIC_RELOCATION64{IMAGE_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE, 68});
+            append(IMAGE_FUNCTION_OVERRIDE_HEADER{32});
+            append(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION{0x1300, 0, 4, 12});
+            append(uint32_t(0x1400)); append(IMAGE_BASE_RELOCATION{0x1000, 12});
+            append(uint16_t(0x1151)); append(uint16_t(0));
+            append(IMAGE_BDD_INFO{1, 24});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{2, 1, 0});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{1, 1, 0});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{0, 0, 0});
+            std::vector<DiskPeMutableRange> ranges;
+            std::vector<DiskPeRel32Override> overrides;
+            reviewCheck(ParseDynamicRelocationTable(dvrt, true, 0x7000, &ranges, &overrides) &&
+                overrides.size() == 1 && overrides[0].Rva == 0x1151 && overrides[0].Targets == std::vector<uint32_t>({0x1300, 0x1400}),
+                "DVRT retains qualified target alternatives");
+            auto overlapping = dvrt;
+            std::memcpy(overlapping.data() + 54, overlapping.data() + 52, 2);
+            reviewCheck(!ParseDynamicRelocationTable(overlapping, true, 0x7000, &ranges, &overrides),
+                "overlapping DVRT fixups rejected");
+            {
+                std::vector<uint8_t> repeated;
+                const auto put = [&](const auto& value)
+                {
+                    const auto first = reinterpret_cast<const uint8_t*>(&value);
+                    repeated.insert(repeated.end(), first, first + sizeof(value));
+                };
+                constexpr uint32_t records = 65, nodes = 1024;
+                constexpr uint32_t payloadBytes = 4 + records * 32 + 8 + nodes * 8;
+                put(IMAGE_DYNAMIC_RELOCATION_TABLE{1, 12 + payloadBytes});
+                put(IMAGE_DYNAMIC_RELOCATION64{IMAGE_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE, payloadBytes});
+                put(IMAGE_FUNCTION_OVERRIDE_HEADER{records * 32});
+                for (uint32_t i = 0; i < records; ++i)
+                {
+                    put(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION{0x1300, 0, 4, 12}); put(uint32_t(0x1400));
+                    put(IMAGE_BASE_RELOCATION{0x1000, 12}); put(uint16_t(0x1000 + i * 4)); put(uint16_t(0));
+                }
+                put(IMAGE_BDD_INFO{1, nodes * 8});
+                for (uint32_t i = 0; i < nodes; ++i) { put(IMAGE_BDD_DYNAMIC_RELOCATION{0, 0, 0}); }
+                std::vector<DiskPeMutableRange> boundedRanges;
+                std::vector<DiskPeRel32Override> boundedOverrides;
+                reviewCheck(ParseDynamicRelocationTable(repeated, true, 0x7000, &boundedRanges, &boundedOverrides) &&
+                    boundedOverrides.size() == 64 && boundedOverrides[0].Targets == std::vector<uint32_t>({0x1300}) &&
+                    boundedRanges.size() == 1 && boundedRanges[0].Size == records * 4,
+                    "shared BDD work is bounded; remaining operands stay excluded");
+            }
+            auto malformed = dvrt;
+            malformed[64] = 0xFF; // first BDD edge beyond the node array
+            overrides.clear();
+            reviewCheck(ParseDynamicRelocationTable(malformed, true, 0x7000, &ranges, &overrides) && overrides.empty(),
+                "malformed BDD cannot authorize excluded bytes");
+            const uint32_t original = 0x1300;
+            std::memcpy(dvrt.data() + 40, &original, 4);
+            reviewCheck(ParseDynamicRelocationTable(dvrt, true, 0x7000, &ranges, &overrides) && overrides.empty(),
+                "external-thunk sentinel remains excluded");
+            dvrt.pop_back();
+            reviewCheck(!ParseDynamicRelocationTable(dvrt, true, 0x7000, &ranges, &overrides), "truncated DVRT rejected");
+        }
         cleanReuse.Initialize(metadata);
         const ObservationReader cleanReuseReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
         {
@@ -798,6 +982,54 @@ bool ExecutableImageVerifierSelfTest()
         {
             break;
         }
+        // A large all-modified image must not turn a throughput increase into
+        // an unbounded finding/capture burst. Also verify cursor resumption.
+        constexpr uint32_t manyPages = 96;
+        auto largeNt = nt;
+        largeNt.FileHeader.NumberOfSections = 1;
+        largeNt.OptionalHeader.ImageBase = loadedBase;
+        largeNt.OptionalHeader.SizeOfImage = (manyPages + 1) * 4096;
+        largeNt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {};
+        auto largeSection = sections[0];
+        largeSection.Misc.VirtualSize = largeSection.SizeOfRawData = manyPages * 4096;
+        std::vector<uint8_t> largeDisk(0x400 + manyPages * 4096, 0x90);
+        std::fill(largeDisk.begin(), largeDisk.begin() + 0x400, uint8_t(0));
+        std::memcpy(largeDisk.data(), &dos, sizeof(dos));
+        std::memcpy(largeDisk.data() + 0x80, &largeNt, sizeof(largeNt));
+        std::memcpy(largeDisk.data() + 0x80 + sizeof(largeNt), &largeSection, sizeof(largeSection));
+        if (!rewriteReference(largeDisk)) { break; }
+        DiskPeMetadata largeMetadata;
+        if (!ReadDiskPeMetadata(path, &largeMetadata, nullptr)) { break; }
+        std::vector<uint8_t> largeLive(largeNt.OptionalHeader.SizeOfImage, 0x90);
+        std::copy(largeDisk.begin(), largeDisk.begin() + 0x400, largeLive.begin());
+        for (size_t i = 0; i < manyPages; ++i) { largeLive[(i + 1) * 4096] ^= 1; }
+        bool writeBlocked = false;
+        const ObservationReader largeReader = [&](uint64_t address, size_t length, std::vector<uint8_t>* bytes)
+        {
+            if (address < loadedBase || address - loadedBase >= largeLive.size() ||
+                length > largeLive.size() - (address - loadedBase)) { return false; }
+            if (length == 4096)
+            {
+                HANDLE writer = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                writeBlocked = writer == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION;
+                if (writer != INVALID_HANDLE_VALUE) { CloseHandle(writer); }
+            }
+            bytes->assign(largeLive.begin() + size_t(address - loadedBase), largeLive.begin() + size_t(address - loadedBase) + length);
+            return true;
+        };
+        ExecutableSweep largeSweep;
+        if (!largeSweep.Initialize(largeMetadata)) { break; }
+        const auto burst = AdvanceExecutableSweep(path, largeMetadata, loadedBase, largeReader, 1024, 11, &largeSweep);
+        if (burst.size() != 64 || largeSweep.NextRange != 64 || largeSweep.Coverage.Reason != L"publication_budget" ||
+            !writeBlocked || !std::all_of(burst.begin(), burst.end(), [](const ExecutablePageResult& page)
+            { return page.Ownership == CodeOwnership::OwnedModified; })) { break; }
+        const auto rest = AdvanceExecutableSweep(path, largeMetadata, loadedBase, largeReader, 1024, 12, &largeSweep);
+        if (rest.size() != 32 || !largeSweep.Coverage.Complete()) { break; }
+        for (size_t i = 0; i < manyPages; ++i) { largeLive[(i + 1) * 4096] ^= 1; }
+        const auto normal = AdvanceExecutableSweep(path, largeMetadata, loadedBase, largeReader, 1024, 13, &largeSweep);
+        if (normal.size() != manyPages || !largeSweep.Coverage.Complete() ||
+            !std::all_of(normal.begin(), normal.end(), [](const ExecutablePageResult& page)
+                { return page.Ownership == CodeOwnership::OwnedVerified; })) { break; }
         ok = true;
     } while (false);
     if (file != INVALID_HANDLE_VALUE)

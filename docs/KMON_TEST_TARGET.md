@@ -195,6 +195,27 @@ bounded process scheduling, and live thread-start query primitives. Neither
 this gate nor launching a fixture proves that a running `!kmon` emitted an
 event; that requires the live pass above.
 
+## Large-image and dynamic-relocation controls
+
+`/child large-clean` and `/child large-tail` create and load an owned DLL with
+a 16 MiB executable section. The tail control changes 16 bytes in its last page.
+`/child rel32-clean` and `/child rel32-invalid` load a small owned DLL with a
+version 1 function-override DVRT. The former selects a declared alternative;
+the latter selects an undeclared destination one byte beyond that alternative.
+All four use `LoadLibraryExW(DONT_RESOLVE_DLL_REFERENCES)` and never call the
+generated code. These controls do not patch Windows DLLs or other processes.
+Their exact generated Temp paths may produce a `drop_module` metadata lead
+with `maliciousness=not_established`. The harness reports those separately;
+it never exempts a code-modification or orphan-mapping finding.
+
+Run the four controls as a separate cohort with
+`tools/validate-kmon-live.ps1 -ImageStressFixtures -ObserveSeconds 300 -ProbeDriver -RequireQueueHealth -RequireCompletedWork -RequireImageCompletion`.
+The same watched-process layout scope as the ordinary fixture suite is retained.
+Large host background DLLs are assessed separately from the watched controls
+using final `coverage.image_progress` records and their actual compared bytes.
+`-MonitorExecutablePath` permits comparison with a saved monitor binary; keep
+that binary beside its compatible driver and runtime dependencies.
+
 ## Not covered here
 
 - Live DKOM `ActiveProcessLinks` unlink (needs a kernel fixture).

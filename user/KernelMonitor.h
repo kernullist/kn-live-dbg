@@ -353,6 +353,7 @@ private:
     friend bool KmonPipelineSelfTest();
     void WorkerLoop();
     void CollectorLoop();
+    void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
     void LayoutLoop();
     void DrainLayoutCandidates(bool finalDrain = false);

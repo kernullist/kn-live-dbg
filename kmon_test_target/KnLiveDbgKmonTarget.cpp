@@ -1,5 +1,5 @@
 // Lab-only positive-control process for !kmon user-mode hostility.
-// Operates on copies of this binary only. It does not resume a replaced
+// Operates on owned copies and inert generated images only. It does not resume a replaced
 // image and does not target a third-party or inbox Windows process.
 
 #include <Windows.h>
@@ -9,6 +9,7 @@
 #endif
 
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -345,6 +346,107 @@ namespace
             return false;
         }
         std::wprintf(L"KMON_TAIL rva=%u bytes=%zu\n", static_cast<uint32_t>(address - ImageBase()), sizeof(patch));
+        std::fflush(stdout);
+        return true;
+    }
+
+    // A real loader-listed DLL with inert code, never invoked. Large controls
+    // exercise long continuations; REL32 controls exercise the formerly
+    // excluded four-byte operand using a disk-declared DVRT target set.
+    HMODULE ControlledImage = nullptr;
+    std::wstring ControlledImagePath;
+    bool ControlledFileCreated = false;
+    bool ApplyControlledImage(const std::wstring& scenario)
+    {
+        const bool large = scenario == L"large-clean" || scenario == L"large-tail";
+        const bool modify = scenario == L"large-tail" || scenario == L"rel32-invalid";
+        const uint32_t codeSize = large ? 16 * 1024 * 1024 : 0x4000;
+        const uint32_t dataRva = 0x1000 + codeSize, relocRva = dataRva + 0x1000;
+        const uint32_t operandRva = 0x1000 + codeSize - 63;
+        std::vector<uint8_t> disk(0x400 + codeSize + 0x2000, 0);
+        IMAGE_DOS_HEADER dos{};
+        dos.e_magic = IMAGE_DOS_SIGNATURE; dos.e_lfanew = 0x80;
+        std::memcpy(disk.data(), &dos, sizeof(dos));
+        IMAGE_NT_HEADERS64 nt{};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt.FileHeader.NumberOfSections = 3;
+        nt.FileHeader.SizeOfOptionalHeader = sizeof(nt.OptionalHeader);
+        nt.FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL;
+        nt.FileHeader.TimeDateStamp = 0x4b4d4f4e;
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.ImageBase = 0x180000000ull;
+        nt.OptionalHeader.SectionAlignment = 0x1000;
+        nt.OptionalHeader.FileAlignment = 0x200;
+        nt.OptionalHeader.MajorOperatingSystemVersion = 6;
+        nt.OptionalHeader.MajorSubsystemVersion = 6;
+        nt.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+        nt.OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE | IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+        nt.OptionalHeader.SizeOfHeaders = 0x400;
+        nt.OptionalHeader.SizeOfImage = relocRva + 0x1000;
+        nt.OptionalHeader.SizeOfCode = codeSize;
+        nt.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {relocRva, 12};
+        if (!large) { nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] = {dataRva, sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)}; }
+        std::memcpy(disk.data() + 0x80, &nt, sizeof(nt));
+        IMAGE_SECTION_HEADER sections[3]{};
+        for (size_t i = 0; i < 3; ++i)
+        {
+            const char* name = i == 0 ? ".text" : (i == 1 ? ".rdata" : ".reloc");
+            std::memcpy(sections[i].Name, name, std::strlen(name));
+            sections[i].VirtualAddress = i == 0 ? 0x1000 : (i == 1 ? dataRva : relocRva);
+            sections[i].Misc.VirtualSize = sections[i].SizeOfRawData = i == 0 ? codeSize : 0x1000;
+            sections[i].PointerToRawData = i == 0 ? 0x400 : 0x400 + codeSize + uint32_t(i - 1) * 0x1000;
+            sections[i].Characteristics = IMAGE_SCN_MEM_READ | (i == 0 ? IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE : IMAGE_SCN_CNT_INITIALIZED_DATA);
+        }
+        std::memcpy(disk.data() + 0x80 + sizeof(nt), sections, sizeof(sections));
+        std::fill(disk.begin() + 0x400, disk.begin() + 0x400 + codeSize, uint8_t(0x90));
+        const IMAGE_BASE_RELOCATION baseReloc{0x1000, 12};
+        std::memcpy(disk.data() + sections[2].PointerToRawData, &baseReloc, sizeof(baseReloc));
+        if (!large)
+        {
+            IMAGE_LOAD_CONFIG_DIRECTORY64 config{};
+            config.Size = sizeof(config);
+            config.DynamicValueRelocTableOffset = 16;
+            config.DynamicValueRelocTableSection = 3;
+            std::memcpy(disk.data() + sections[1].PointerToRawData, &config, sizeof(config));
+            size_t cursor = sections[2].PointerToRawData + 16;
+            const auto append = [&](const auto& value)
+            {
+                std::memcpy(disk.data() + cursor, &value, sizeof(value)); cursor += sizeof(value);
+            };
+            append(IMAGE_DYNAMIC_RELOCATION_TABLE{1, 80});
+            append(IMAGE_DYNAMIC_RELOCATION64{IMAGE_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE, 68});
+            append(IMAGE_FUNCTION_OVERRIDE_HEADER{32});
+            append(IMAGE_FUNCTION_OVERRIDE_DYNAMIC_RELOCATION{0x1100, 0, 4, 12});
+            append(uint32_t(0x1200));
+            append(IMAGE_BASE_RELOCATION{operandRva & ~0xFFFu, 12});
+            append(uint16_t(0x1000 | (operandRva & 0xFFF))); append(uint16_t(0));
+            append(IMAGE_BDD_INFO{1, 24});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{2, 1, 0});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{1, 1, 0});
+            append(IMAGE_BDD_DYNAMIC_RELOCATION{0, 0, 0});
+            disk[0x400 + operandRva - 0x1000 - 1] = 0xE9;
+            const int32_t original = 0x1100 - int32_t(operandRva) - 4;
+            std::memcpy(disk.data() + 0x400 + operandRva - 0x1000, &original, sizeof(original));
+        }
+        ControlledImagePath = FixtureDir() + L"\\kmon-" + scenario + L"-" + std::to_wstring(GetCurrentProcessId()) +
+            L"-" + std::to_wstring(GetTickCount64()) + L".dll";
+        HANDLE file = CreateFileW(ControlledImagePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) { return false; }
+        ControlledFileCreated = true;
+        DWORD written = 0;
+        const bool saved = WriteFile(file, disk.data(), DWORD(disk.size()), &written, nullptr) && written == disk.size();
+        CloseHandle(file);
+        if (!saved) { return false; }
+        ControlledImage = LoadLibraryExW(ControlledImagePath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (ControlledImage == nullptr) { std::wprintf(L"controlled load error=%lu\n", GetLastError()); return false; }
+        auto address = reinterpret_cast<uint8_t*>(ControlledImage) + operandRva;
+        const int32_t displacement = (modify ? 0x1201 : 0x1200) - int32_t(operandRva) - 4;
+        const uint8_t marker[16] = {0x53, 0x57, 0x45, 0x45, 0x50, 0x5F, 0x54, 0x41, 0x49, 0x4C};
+        if ((!large && !PatchCurrentProcessBytes(address, &displacement, sizeof(displacement))) ||
+            (large && modify && !PatchCurrentProcessBytes(address, marker, sizeof(marker)))) { return false; }
+        std::wprintf(L"KMON_IMAGE path=%s rva=%u size=%u dynamic=%d\n", ControlledImagePath.c_str(), operandRva, codeSize, !large);
         std::fflush(stdout);
         return true;
     }
@@ -762,6 +864,11 @@ namespace
         {
             ok = ApplyTailOverwrite();
         }
+        else if (scenario == L"large-clean" || scenario == L"large-tail" ||
+            scenario == L"rel32-clean" || scenario == L"rel32-invalid")
+        {
+            ok = ApplyControlledImage(scenario);
+        }
         else if (scenario == L"stamp")
         {
             ok = ApplyStamp();
@@ -794,6 +901,8 @@ namespace
         {
             HoldSeconds(seconds);
         }
+        if (ControlledImage != nullptr) { FreeLibrary(ControlledImage); }
+        if (ControlledFileCreated) { DeleteFileW(ControlledImagePath.c_str()); }
         return ok;
     }
 }

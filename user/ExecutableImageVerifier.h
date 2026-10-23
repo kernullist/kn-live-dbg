@@ -34,6 +34,7 @@ struct ExecutablePageResult
     std::vector<uint8_t> Expected;
     std::vector<uint8_t> Observed;
     std::vector<ObservationRange> Changes;
+    uint32_t Rel32ValidatedBytes = 0;
 };
 
 struct ExecutableSweep
@@ -42,6 +43,8 @@ struct ExecutableSweep
     uint64_t Cycle = 1;
     uint64_t LastCompleteMs = 0;
     uint64_t CompletedCycles = 0;
+    uint64_t Rel32ValidatedBytes = 0;
+    uint64_t LastCompleteRel32ValidatedBytes = 0;
     ObservationCoverage LastCompleteCoverage;
     ObservationCoverage Coverage;
     std::vector<ObservationRange> Ranges;

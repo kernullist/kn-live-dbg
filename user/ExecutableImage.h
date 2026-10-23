@@ -36,6 +36,16 @@ namespace executable_image
         uint32_t Width = 0;
     };
 
+    // A finite set of in-image REL32 destinations, not an assertion about
+    // which CPU feature branch the loader selected. External thunk targets
+    // and unsupported record forms remain excluded.
+    struct DiskPeRel32Override
+    {
+        uint32_t Rva = 0;
+        uint32_t OriginalRva = 0;
+        std::vector<uint32_t> Targets;
+    };
+
     struct DiskPeMetadata
     {
         BY_HANDLE_FILE_INFORMATION FileIdentity = {};
@@ -65,6 +75,7 @@ namespace executable_image
         std::vector<DiskPeMutableRange> CrossPageRelocationRanges;
         std::vector<DiskPeMutableRange> LoaderMutableRanges;
         std::vector<DiskPeMutableRange> DynamicRelocationRanges;
+        std::vector<DiskPeRel32Override> Rel32Overrides;
         uint32_t BaserelocRva = 0;
         uint32_t BaserelocSize = 0;
         bool BaseRelocationTablePresent = false;
@@ -105,17 +116,20 @@ namespace executable_image
         const uint8_t* bytes,
         size_t size,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges);
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<uint32_t>* rel32Rvas = nullptr);
     bool ParseFunctionOverrideDynamicRelocations(
         const uint8_t* bytes,
         size_t size,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges);
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<DiskPeRel32Override>* overrides = nullptr);
     bool ParseDynamicRelocationTable(
         const std::vector<uint8_t>& bytes,
         bool pe64,
         uint32_t sizeOfImage,
-        std::vector<DiskPeMutableRange>* ranges);
+        std::vector<DiskPeMutableRange>* ranges,
+        std::vector<DiskPeRel32Override>* overrides = nullptr);
     void PopulateDynamicRelocationRanges(
         HANDLE file,
         DiskPeMetadata* metadata,
@@ -144,5 +158,8 @@ namespace executable_image
         const DiskPeMetadata& metadata,
         uint32_t rva,
         std::vector<uint8_t>* page,
-        std::wstring* error);
+        std::wstring* error,
+        // Optional read-only batch handle. The caller must qualify its file
+        // identity before and after the batch and keep writes/deletes denied.
+        HANDLE verifiedFile = INVALID_HANDLE_VALUE);
 }
