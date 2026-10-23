@@ -4,6 +4,7 @@
 #include "SymbolEngine.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -123,7 +124,8 @@ class KernelCallbackScanner
 public:
     KernelCallbackScanner(DeviceClient& device, SymbolEngine& symbols);
 
-    bool Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error);
+    bool Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error,
+        const std::function<void(const wchar_t*)>& checkpoint = {});
     bool SetModuleCallbacks(
         const std::wstring& scope,
         const std::wstring& moduleFilter,
@@ -139,14 +141,6 @@ private:
     bool ScanObjectCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanMinifilterCallbacks(KernelCallbackScanResult* result, std::wstring* error);
     bool ScanExecutiveCallbacks(KernelCallbackScanResult* result, std::wstring* error);
-    bool ScanObjectTypeCallbacks(
-        const std::wstring& target,
-        uint64_t objectTypeAddress,
-        uint32_t objectTypeIndex,
-        const std::wstring& objectTypeSource,
-        KernelCallbackScanResult* result,
-        std::wstring* error);
-
     DeviceClient& device_;
     SymbolEngine& symbols_;
 };

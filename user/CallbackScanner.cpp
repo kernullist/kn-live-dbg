@@ -3380,7 +3380,8 @@ bool KernelCallbackScanner::ScanExecutiveCallbacks(KernelCallbackScanResult* res
     return ok;
 }
 
-bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error)
+bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanResult* result, std::wstring* error,
+    const std::function<void(const wchar_t*)>& checkpoint)
 {
     bool ok = false;
 
@@ -3451,6 +3452,10 @@ bool KernelCallbackScanner::Scan(const std::wstring& scope, KernelCallbackScanRe
                 result->Incomplete = true;
                 result->Warnings.push_back(std::wstring(name) + L": " + localError);
             }
+            // Each surface has finished its own reads and consistency checks.
+            // Let a monitor service unrelated work without exposing a partial
+            // surface or holding a scanner/device/symbol lock across the call.
+            if (checkpoint) { checkpoint(name); }
         };
 
         if (scanOb)
@@ -4114,6 +4119,10 @@ bool KernelCallbackScanner::ScanMinifilterCallbacks(KernelCallbackScanResult* re
     return ok;
 }
 
+static bool ScanObjectTypeCallbacks(DeviceClient& device, SymbolEngine& symbols, const ObjectCallbackLayout& layout,
+    const std::wstring& target, uint64_t objectTypeAddress, uint32_t objectTypeIndex,
+    const std::wstring& objectTypeSource, KernelCallbackScanResult* result, std::wstring* error);
+
 bool KernelCallbackScanner::ScanObjectCallbacks(KernelCallbackScanResult* result, std::wstring* error)
 {
     bool ok = false;
@@ -4217,6 +4226,7 @@ bool KernelCallbackScanner::ScanObjectCallbacks(KernelCallbackScanResult* result
         {
             std::wstring localError;
             if (ScanObjectTypeCallbacks(
+                    device_, symbols_, objectLayout,
                     target.Name,
                     target.Address,
                     target.TypeIndex,
@@ -4253,7 +4263,10 @@ bool KernelCallbackScanner::ScanObjectCallbacks(KernelCallbackScanResult* result
     return ok;
 }
 
-bool KernelCallbackScanner::ScanObjectTypeCallbacks(
+static bool ScanObjectTypeCallbacks(
+    DeviceClient& device,
+    SymbolEngine& symbols,
+    const ObjectCallbackLayout& layout,
     const std::wstring& target,
     uint64_t objectTypeAddress,
     uint32_t objectTypeIndex,
@@ -4274,7 +4287,7 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             break;
         }
 
-        CallbackScanContext context(device_, symbols_);
+        CallbackScanContext context(device, symbols);
         if (!context.IsKernelPointer(objectTypeAddress))
         {
             if (error != nullptr)
@@ -4284,12 +4297,9 @@ bool KernelCallbackScanner::ScanObjectTypeCallbacks(
             break;
         }
 
-        ObjectCallbackLayout layout = {};
-        if (!BuildObjectCallbackLayout(context, &layout, error))
-        {
-            break;
-        }
-
+        // The immutable nt PDB layout was validated once by the enclosing
+        // surface scan. Resolving it again for every object type stalled KMON
+        // candidate servicing; list heads, links and records stay live reads.
         uint64_t headAddress = 0;
         if (!context.TryAdd(objectTypeAddress, layout.ObjectCallbackList.Offset, &headAddress))
         {

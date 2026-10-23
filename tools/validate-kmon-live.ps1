@@ -10,11 +10,19 @@ param(
     [switch]$RequireImageCompletion,
     [switch]$ImageStressFixtures,
     [switch]$AllProcessLayouts,
+    [switch]$RequireLayoutNameAccounting,
+    [switch]$RequireFreshLayouts,
     [string]$MonitorExecutablePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($RequireLayoutNameAccounting -and -not $AllProcessLayouts) {
+    throw 'Layout name accounting requires -AllProcessLayouts.'
+}
+if ($RequireFreshLayouts -and -not $AllProcessLayouts) {
+    throw 'Layout freshness validation requires -AllProcessLayouts.'
+}
 . (Join-Path $PSScriptRoot 'owned-process-wait.ps1')
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -201,12 +209,16 @@ try {
     foreach ($run in $runs) { $comparedPagesByPid[[long]$run.pid] = [Collections.Generic.HashSet[string]]::new() }
     $eventCount = 0
     [long]$layoutVerificationRecords = 0
+    [long]$layoutExpiredRecords = 0
     [long]$layoutCompletionRecords = 0
     foreach ($file in @(Get-ChildItem -LiteralPath $output -Filter 'kmon-events.*.jsonl' | Sort-Object Name)) {
         foreach ($line in [IO.File]::ReadLines($file.FullName)) {
             ++$eventCount
             $event = $line | ConvertFrom-Json
-            if ($event.kind -eq 'coverage.layout_verification') { ++$layoutVerificationRecords }
+            if ($event.kind -eq 'coverage.layout_verification') {
+                ++$layoutVerificationRecords
+                if ($event.evidence.coverage_reason -eq 'candidate_expired') { ++$layoutExpiredRecords }
+            }
             if ($event.kind -eq 'coverage.layout' -and $event.task -in @('initial_observation', 'complete')) { ++$layoutCompletionRecords }
             if ($event.kind -eq 'coverage.region') {
                 if ($comparedPagesByPid.ContainsKey([long]$event.pid) -and $event.evidence.source -eq 'executable_page_compare' -and
@@ -340,6 +352,12 @@ try {
     $finalPipeline = if ($pipeline.Count) { $pipeline[0].evidence } else { $null }
     $allProcessScope = $false
     $layoutProcessCount = 0
+    $layoutNameAccounting = $false
+    $layoutNames = [ordered]@{
+        snapshots=0; snapshots_with_gaps=0; image_allocations=[long]0; image_names_known=[long]0
+        image_name_failures=[long]0; image_name_capacity_failures=[long]0
+        image_name_query_failures=[long]0; image_name_truncated=[long]0; image_name_unqueryable=[long]0
+    }
     if ($AllProcessLayouts) {
         $inventory = Get-Content -LiteralPath "$output\layouts-inventory.json" -Raw | ConvertFrom-Json
         $layoutProcessCount = @($inventory.processes).Count
@@ -351,6 +369,37 @@ try {
         if ($finalLayout.scope -ne 'all_processes' -or $finalLayout.collection_active -or
             $finalLayout.notices_pending -ne 0 -or $finalLayout.verification_changes_pending -ne 0 -or
             $finalLayout.verification_pending -ne 0) { throw 'Layout shutdown left retained work' }
+        if ($RequireLayoutNameAccounting) {
+            if ([long]$finalPipeline.layout_expired -ne $layoutExpiredRecords) {
+                throw 'Layout expiration accounting mismatch'
+            }
+            # Strict mode rejects an old/missing schema instead of treating an
+            # unreported gap as zero. Account current snapshots, not region rows.
+            if ($finalLayout.stored_names -gt $finalLayout.stored_name_limit -or
+                $finalLayout.stored_name_characters -gt $finalLayout.stored_name_character_limit) {
+                throw 'Layout name storage exceeded its bounded budget'
+            }
+            foreach ($process in $finalLayout.processes) {
+                if (-not $process.snapshot_available) { continue }
+                if ([long]$process.image_names_known + [long]$process.image_name_failures -ne [long]$process.image_allocations -or
+                    [long]$process.image_name_capacity_failures + [long]$process.image_name_query_failures +
+                    [long]$process.image_name_truncated + [long]$process.image_name_unqueryable -ne [long]$process.image_name_failures) {
+                    throw "Layout name accounting mismatch: pid=$($process.pid)"
+                }
+                [long]$nameErrors = 0
+                foreach ($errorEntry in $process.image_name_errors.PSObject.Properties) { $nameErrors += [long]$errorEntry.Value }
+                if ($nameErrors -ne ([long]$process.image_name_query_failures + [long]$process.image_name_truncated)) {
+                    throw "Layout name error accounting mismatch: pid=$($process.pid)"
+                }
+                ++$layoutNames.snapshots
+                if ($process.image_name_failures -ne 0) { ++$layoutNames.snapshots_with_gaps }
+                foreach ($field in @('image_allocations', 'image_names_known', 'image_name_failures',
+                    'image_name_capacity_failures', 'image_name_query_failures', 'image_name_truncated', 'image_name_unqueryable')) {
+                    $layoutNames[$field] += [long]$process.$field
+                }
+            }
+            $layoutNameAccounting = $layoutNames.snapshots -gt 0 -and $layoutNames.image_names_known -gt 0
+        }
     }
     $queueHealth = $null -ne $finalPipeline
     $queueHealthFields = @('lost_events', 'layout_dropped', 'execution_references_dropped',
@@ -409,7 +458,9 @@ try {
     $passed = -not $failure -and $results.Count -eq $modes.Count -and @($results | Where-Object { -not $_.passed }).Count -eq 0 -and
         (-not $ProbeDriver -or $driverEvents -gt 0) -and $services.Count -eq 0 -and $sameBoot -and
         $captures.Count -gt 0 -and $null -ne $finalPipeline -and $finalPipeline.final_drain -eq 'true' -and
-        (-not $RequireQueueHealth -or $queueHealth) -and (-not $RequireCompletedWork -or $completedWork)
+        (-not $RequireQueueHealth -or $queueHealth) -and (-not $RequireCompletedWork -or $completedWork) -and
+        (-not $RequireLayoutNameAccounting -or $layoutNameAccounting) -and
+        (-not $RequireFreshLayouts -or ($allProcessScope -and $layoutLedger -and $layoutExpiredRecords -eq 0))
     [ordered]@{
         schema='kn-live-dbg.kmon-live-validation.v1'; passed=$passed
         started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
@@ -426,8 +477,12 @@ try {
         image_stress_fixtures=[bool]$ImageStressFixtures
         all_process_layouts=[bool]$AllProcessLayouts; all_process_scope_verified=$allProcessScope
         layout_process_count=$layoutProcessCount
+        layout_name_accounting_required=[bool]$RequireLayoutNameAccounting; layout_name_accounting_passed=$layoutNameAccounting
+        layout_names=$layoutNames
         layout_admission_ledger_passed=$layoutLedger; layout_verification_records=$layoutVerificationRecords
         layout_completion_records=$layoutCompletionRecords
+        layout_candidate_expirations=$layoutExpiredRecords
+        fresh_layouts_required=[bool]$RequireFreshLayouts; fresh_layouts_passed=($allProcessScope -and $layoutLedger -and $layoutExpiredRecords -eq 0)
         capture_results_verified=$captureResults.Count
         shutdown_events_unanalyzed=$shutdownUnanalyzed
         coverage_claim='bounded fixture observations only; inspect sensor and coverage records for gaps'

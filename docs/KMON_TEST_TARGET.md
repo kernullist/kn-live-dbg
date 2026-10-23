@@ -221,7 +221,7 @@ that binary beside its compatible driver and runtime dependencies.
 Add `-AllProcessLayouts` to the ordinary fixture suite:
 
 ```powershell
-tools/validate-kmon-live.ps1 -AllProcessLayouts -ImageSweepFixtures -ObserveSeconds 300 -ProbeDriver -RequireQueueHealth -RequireCompletedWork -RequireImageCompletion
+tools/validate-kmon-live.ps1 -AllProcessLayouts -ImageSweepFixtures -ObserveSeconds 300 -ProbeDriver -RequireQueueHealth -RequireCompletedWork -RequireImageCompletion -RequireLayoutNameAccounting -RequireFreshLayouts
 ```
 
 The harness starts KMON without a PID/name filter, then adds the owned control
@@ -236,6 +236,18 @@ the admitted layout queue, analysis queue, and capture work to be drained.
 The same five positive and two negative controls and all 28 fixed image
 traversals remain required. A zero-loss result is not a claim that every byte
 of every host process was verified. See the [full-process validation report](KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md).
+
+`-RequireLayoutNameAccounting` additionally reconciles successful and failed
+name collection against unique image allocations in every available final
+snapshot, checks the failure categories and API error totals, and enforces the
+entry and character storage budgets. It requires `-AllProcessLayouts`; omit it
+when comparing older binaries without these fields. See the
+[candidate freshness and name collection report](KMON_LAYOUT_FRESHNESS_VALIDATION_20261023.md)
+for the remaining gaps and repeated live results.
+
+`-RequireFreshLayouts` additionally requires zero `candidate_expired` rejection
+records in the full-process run. Mapping changes, process exits, and access
+failures remain explicit rejection records; they do not count as verified work.
 
 ## Not covered here
 

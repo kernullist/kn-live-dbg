@@ -224,7 +224,26 @@ namespace
                 SIZE_T count = 0;
                 return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes->data(), size, &count) && count == size;
             };
-            Check(QualifyExecutableReference(metadata, base, reader, &reason), "unmodified mapped image identity");
+            const auto loadedBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+            Check(QualifyExecutableReference(metadata, loadedBase, reader, &reason), "loaded image reference qualifies");
+            const auto mappedDos = static_cast<const IMAGE_DOS_HEADER*>(view);
+            const auto mappedNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(static_cast<const char*>(view) + mappedDos->e_lfanew);
+            const bool secondaryRelocationBase = mappedNt->OptionalHeader.ImageBase != metadata.ImageBase &&
+                mappedNt->OptionalHeader.ImageBase != base;
+            if (secondaryRelocationBase)
+            {
+                Check(!QualifyExecutableReference(metadata, base, reader, &reason) &&
+                    reason == L"live_image_relocation_base_ambiguous", "secondary image relocation basis remains unverified");
+                ExecutableSweep sweep;
+                sweep.Initialize(metadata);
+                const auto pages = AdvanceExecutableSweep(path, metadata, base, reader, 1, GetTickCount64(), &sweep);
+                Check(pages.empty() && sweep.Coverage.ComparedBytes == 0 && !sweep.Coverage.Complete() &&
+                    sweep.Coverage.Reason == reason, "secondary image view is not reported as code modification or clean");
+            }
+            else
+            {
+                Check(QualifyExecutableReference(metadata, base, reader, &reason), "unmodified mapped image reference qualifies");
+            }
             MEMORY_BASIC_INFORMATION before{}, after{};
             VirtualQuery(view, &before, sizeof(before));
             ProcessLayoutCandidate candidate;

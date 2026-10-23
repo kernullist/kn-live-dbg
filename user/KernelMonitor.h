@@ -356,10 +356,10 @@ private:
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
     void LayoutLoop();
-    void DrainLayoutCandidates(bool finalDrain = false);
+    void DrainLayoutCandidates(bool finalDrain = false, const wchar_t* before = L"layout_drain");
     bool QueueLayoutCandidate(ProcessLayoutCandidate candidate);
     bool QueueLayoutNotice(const ProcessLayoutNotice& notice);
-    void ServicePendingAnalysis();
+    void ServicePendingAnalysis(const wchar_t* before = L"scanner_boundary");
     void CaptureLoop();
     void CaptureWriterLoop();
     void DrainPipelineEvents(bool finalDrain = false);
@@ -530,6 +530,12 @@ private:
     KmonWorkQueue<ProcessLayoutCandidate> LayoutCandidates{2048};
     std::atomic<uint64_t> LayoutChecked{0};
     std::atomic<uint64_t> LayoutRejected{0};
+    std::atomic<uint64_t> LayoutExpired{0};
+    std::atomic<uint64_t> LayoutMaxQueueWaitMs{0};
+    std::atomic<uint64_t> LayoutMaxSourceWaitMs{0};
+    std::atomic<uint64_t> LayoutMaxServiceGapMs{0};
+    uint64_t LayoutLastServiceMs = 0;
+    std::wstring LayoutMaxServiceGapBefore;
     std::thread CaptureWorker;
     std::thread CaptureWriter;
     std::atomic<bool> CaptureStopping{false};

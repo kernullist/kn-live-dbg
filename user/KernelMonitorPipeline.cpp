@@ -105,22 +105,29 @@ void KernelMonitor::ResetPipeline()
     UserLastScanMs.clear();
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
+    LayoutExpired.store(0);
+    LayoutMaxQueueWaitMs.store(0);
+    LayoutMaxSourceWaitMs.store(0);
+    LayoutMaxServiceGapMs.store(0);
+    LayoutLastServiceMs = 0;
+    LayoutMaxServiceGapBefore.clear();
     BackgroundPidCursor = 0;
     NextPipelineStatusMs = 0;
 }
 
-void KernelMonitor::ServicePendingAnalysis()
+void KernelMonitor::ServicePendingAnalysis(const wchar_t* before)
 {
     if (ServicingAnalysis || StopRequested.load()) { return; }
     ServicingAnalysis = true;
     struct Reset { bool& Flag; ~Reset() { Flag = false; } } reset{ServicingAnalysis};
     // All verifier/catalog state stays on the analysis thread. Yield at safe
     // scan boundaries instead of waiting for an entire multi-scanner pass.
+    DrainLayoutCandidates(false, before);
     IngestLiveTimeline();
     IngestThreatIntel();
     DrainIotraceEvents();
     DrainPipelineEvents();
-    DrainLayoutCandidates();
+    DrainLayoutCandidates(false, L"after_event_ingestion");
     ScanExecutionReferences(128, 75);
     ContinueImageSweeps();
 }
@@ -815,6 +822,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"layout_completed"] = std::to_wstring(layout.Completed);
         event.Evidence[L"layout_failed"] = std::to_wstring(layout.Failed);
         event.Evidence[L"layout_stored_rows"] = std::to_wstring(layout.StoredRows);
+        event.Evidence[L"layout_stored_names"] = std::to_wstring(layout.StoredNames);
+        event.Evidence[L"layout_stored_name_characters"] = std::to_wstring(layout.StoredNameCharacters);
         event.Evidence[L"layout_notices_pending"] = std::to_wstring(layout.NoticesPending);
         event.Evidence[L"layout_notices_deferred"] = std::to_wstring(layout.NoticesDeferred);
         event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
@@ -827,6 +836,11 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"layout_changes_abandoned"] = std::to_wstring(layout.VerificationChangesAbandoned);
         event.Evidence[L"layout_checked"] = std::to_wstring(LayoutChecked.load());
         event.Evidence[L"layout_rejected"] = std::to_wstring(LayoutRejected.load());
+        event.Evidence[L"layout_expired"] = std::to_wstring(LayoutExpired.load());
+        event.Evidence[L"layout_max_queue_wait_ms"] = std::to_wstring(LayoutMaxQueueWaitMs.load());
+        event.Evidence[L"layout_max_source_wait_ms"] = std::to_wstring(LayoutMaxSourceWaitMs.load());
+        event.Evidence[L"layout_max_service_gap_ms"] = std::to_wstring(LayoutMaxServiceGapMs.load());
+        event.Evidence[L"layout_max_service_gap_before"] = LayoutMaxServiceGapBefore;
         event.Evidence[L"layout_oldest_ms"] = std::to_wstring(layout.OldestAgeMs);
         event.Evidence[L"catalog_stale_observations"] = std::to_wstring(RegionCatalog.StaleObservations);
         event.Evidence[L"catalog_rejected"] = std::to_wstring(RegionCatalog.Rejected);

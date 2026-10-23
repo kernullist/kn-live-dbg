@@ -1448,6 +1448,7 @@ bool KernelMonitor::ScanCallbackInlineTargets(const std::vector<KernelCallbackRe
     };
     for (size_t index = 0; index < count; ++index)
     {
+        if (index != 0 && index % 8 == 0) { ServicePendingAnalysis(L"callback_inline_targets"); }
         if (StopRequested.load())
         {
             return false;

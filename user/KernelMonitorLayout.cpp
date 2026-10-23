@@ -75,6 +75,12 @@ bool KernelMonitor::QueueLayoutNotice(const ProcessLayoutNotice& item)
     event.Evidence[L"finished_ms"] = std::to_wstring(item.FinishedMs);
     event.Evidence[L"regions"] = std::to_wstring(item.Rows);
     event.Evidence[L"image_name_failures"] = std::to_wstring(item.ImageNameFailures);
+    event.Evidence[L"image_allocations"] = std::to_wstring(item.ImageAllocations);
+    event.Evidence[L"image_names_known"] = std::to_wstring(item.ImageNamesKnown);
+    event.Evidence[L"image_name_capacity_failures"] = std::to_wstring(item.ImageNameCapacityFailures);
+    event.Evidence[L"image_name_query_failures"] = std::to_wstring(item.ImageNameQueryFailures);
+    event.Evidence[L"image_name_truncated"] = std::to_wstring(item.ImageNameTruncated);
+    event.Evidence[L"image_name_unqueryable"] = std::to_wstring(item.ImageNameUnqueryable);
     event.Evidence[L"changed_ranges"] = std::to_wstring(item.ChangedRanges);
     event.Evidence[L"candidate_ranges"] = std::to_wstring(item.CandidateRanges);
     event.Evidence[L"lead_event_limit"] = L"16";
@@ -118,6 +124,7 @@ bool KernelMonitor::QueueLayoutNotice(const ProcessLayoutNotice& item)
 
 bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
 {
+    candidate.QueuedMs = GetTickCount64();
     // Keep admitted work near the consumer instead of filling a 30-second
     // stale backlog. The source retains a refused change or periodic cursor.
     return LayoutCandidates.TryPushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
@@ -132,13 +139,34 @@ bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
     }, 128);
 }
 
-void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
+void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before)
 {
     const auto begin = GetTickCount64();
+    if (LayoutLastServiceMs != 0 && begin >= LayoutLastServiceMs)
+    {
+        const uint64_t gap = begin - LayoutLastServiceMs;
+        if (gap > LayoutMaxServiceGapMs.load())
+        {
+            LayoutMaxServiceGapMs.store(gap);
+            LayoutMaxServiceGapBefore = before;
+        }
+    }
+    LayoutLastServiceMs = begin;
+    // A full-host burst must not wait through many scanner passes. Spend a
+    // larger but still bounded slice while at least half the admission queue
+    // is occupied. Never extend the candidate's original validity window.
+    const bool pressure = LayoutCandidates.Size() >= 64;
+    const size_t candidateBudget = pressure ? 64 : 16;
+    const uint64_t timeBudgetMs = pressure ? 100 : 25;
     ProcessLayoutCandidate item;
-    for (size_t count = 0; count < 16 && (finalDrain || !StopRequested.load()) && GetTickCount64() - begin < 25 &&
+    for (size_t count = 0; count < candidateBudget && (finalDrain || !StopRequested.load()) && GetTickCount64() - begin < timeBudgetMs &&
         LayoutCandidates.Pop(&item); ++count)
     {
+        const uint64_t selectedMs = GetTickCount64();
+        const uint64_t queueWait = item.QueuedMs != 0 && selectedMs >= item.QueuedMs ? selectedMs - item.QueuedMs : 0;
+        const uint64_t sourceWait = item.QueuedMs >= item.ObservedMs ? item.QueuedMs - item.ObservedMs : 0;
+        LayoutMaxQueueWaitMs.store((std::max)(LayoutMaxQueueWaitMs.load(), queueWait));
+        LayoutMaxSourceWaitMs.store((std::max)(LayoutMaxSourceWaitMs.load(), sourceWait));
         const auto pid = item.Identity.ProcessId;
         HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         const std::unique_ptr<void, decltype(&CloseHandle)> handle(process, &CloseHandle);
@@ -161,11 +189,14 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
             rejected.Observation.Coverage.Attempted = true;
             const uint64_t now = GetTickCount64();
             const bool expired = now < item.ObservedMs || now - item.ObservedMs > process_layout::MaxSweepMs;
+            if (expired) { LayoutExpired.fetch_add(1); }
             rejected.Observation.Coverage.Reason = expired ? L"candidate_expired" : L"process_or_mapping_changed_or_unavailable";
             rejected.Evidence[L"base"] = std::to_wstring(item.Region.Base);
             rejected.Evidence[L"size"] = std::to_wstring(item.Region.Size);
             rejected.Evidence[L"candidate_role"] = item.Role;
             rejected.Evidence[L"candidate_age_ms"] = std::to_wstring(now >= item.ObservedMs ? now - item.ObservedMs : 0);
+            rejected.Evidence[L"queue_wait_ms"] = std::to_wstring(queueWait);
+            rejected.Evidence[L"source_wait_ms"] = std::to_wstring(sourceWait);
             RecordEvent(std::move(rejected));
             continue;
         }

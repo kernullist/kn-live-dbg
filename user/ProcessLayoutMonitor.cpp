@@ -14,7 +14,38 @@ namespace
     // Initial, current and in-progress snapshots coexist. The old budget
     // exhausted on ordinary full-host inventories before a new sweep fit.
     constexpr size_t MaxStoredRows = 524288;
-    constexpr size_t MaxStoredNames = 16384;
+    constexpr size_t MaxStoredNames = 65536;
+    // Preserve the old worst-case 32 MiB string payload while allowing the
+    // many short, repeated mapping names in first/current/pending snapshots.
+    constexpr size_t MaxStoredNameCharacters = 16 * 1024 * 1024;
+
+    template<typename Query>
+    bool ReadImageNameQuery(Query query, std::wstring& name, DWORD& error)
+    {
+        name.clear();
+        for (const DWORD capacity : {1024u, 32768u})
+        {
+            std::vector<wchar_t> path(capacity);
+            const DWORD length = query(path.data(), capacity);
+            error = length == 0 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER;
+            if (length != 0 && length < capacity)
+            {
+                name.assign(path.data(), length);
+                error = ERROR_SUCCESS;
+                return true;
+            }
+            if (length == 0 && error != ERROR_INSUFFICIENT_BUFFER) { return false; }
+        }
+        return false;
+    }
+
+    bool ReadImageName(HANDLE process, uint64_t address, std::wstring& name, DWORD& error)
+    {
+        return ReadImageNameQuery([&](wchar_t* path, DWORD capacity)
+        {
+            return GetMappedFileNameW(process, reinterpret_cast<void*>(address), path, capacity);
+        }, name, error);
+    }
 
     struct Handle
     {
@@ -98,10 +129,10 @@ bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate&
         if (!candidate.ImageName.empty())
         {
             // Equal MBI attributes do not identify the section at a reused VA.
-            wchar_t name[1024]{};
-            const DWORD length = GetMappedFileNameW(process, reinterpret_cast<void*>(candidate.Region.Base), name, 1024);
-            if (candidate.Region.Type != MEM_IMAGE || length == 0 || length >= 1024 ||
-                candidate.ImageName != std::wstring(name, length))
+            std::wstring name;
+            DWORD error = 0;
+            if (candidate.Region.Type != MEM_IMAGE || !ReadImageName(process, candidate.Region.Base, name, error) ||
+                candidate.ImageName != name)
             {
                 break;
             }
@@ -237,6 +268,56 @@ size_t ProcessLayoutMonitor::StoredNames() const
     return count;
 }
 
+size_t ProcessLayoutMonitor::StoredNameCharacters() const
+{
+    size_t count = 0;
+    for (const auto& item : Entries)
+    {
+        const auto& entry = item.second;
+        count += entry.History.Initial ? entry.History.Initial->ImageNameCharacters : 0;
+        count += entry.History.Current && entry.History.Current != entry.History.Initial ? entry.History.Current->ImageNameCharacters : 0;
+        count += entry.Pending ? entry.Pending->ImageNameCharacters : 0;
+    }
+    return count;
+}
+
+void ProcessLayoutMonitor::CollectImageName(process_layout::Snapshot& snapshot, const process_layout::Region& row,
+    HANDLE process, size_t& remainingNames, size_t& remainingCharacters)
+{
+    if (row.State == process_layout::Free || row.Type != process_layout::Image) { return; }
+    snapshot.ImageAllocations.insert(row.AllocationBase);
+    // Reserved image tails are not a reason to cache a failed name before a
+    // committed region of that allocation becomes available in this sweep.
+    if (row.State != process_layout::Commit || !snapshot.ImageNameAttempts.insert(row.AllocationBase).second) { return; }
+    if (remainingNames == 0 || remainingCharacters == 0 || snapshot.ImageNames.size() >= 512)
+    {
+        ++snapshot.ImageNameCapacityFailures;
+        ++snapshot.ImageNameFailures;
+        return;
+    }
+    std::wstring name;
+    DWORD error = 0;
+    if (!ReadImageName(process, row.Base, name, error))
+    {
+        if (error == ERROR_INSUFFICIENT_BUFFER) { ++snapshot.ImageNameTruncated; }
+        else { ++snapshot.ImageNameQueryFailures; }
+        ++snapshot.ImageNameErrors[error];
+        ++snapshot.ImageNameFailures;
+        return;
+    }
+    const size_t characters = name.size() + 1;
+    if (characters > remainingCharacters)
+    {
+        ++snapshot.ImageNameCapacityFailures;
+        ++snapshot.ImageNameFailures;
+        return;
+    }
+    snapshot.ImageNames.emplace(row.AllocationBase, std::move(name));
+    snapshot.ImageNameCharacters += characters;
+    remainingCharacters -= characters;
+    --remainingNames;
+}
+
 void ProcessLayoutMonitor::Fail(Entry& entry, const wchar_t* reason, uint32_t error, const NoticeSink& notice)
 {
     ++Counters.Failed;
@@ -330,6 +411,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     }
     size_t remainingRows = MaxStoredRows - (std::min)(MaxStoredRows, StoredRows());
     size_t remainingNames = MaxStoredNames - (std::min)(MaxStoredNames, StoredNames());
+    size_t remainingNameCharacters = MaxStoredNameCharacters - (std::min)(MaxStoredNameCharacters, StoredNameCharacters());
     for (size_t queries = 0; queries < 256 && sweep.Cursor < AddressLimit &&
         !stop.load() && GetTickCount64() - begin < 10; ++queries)
     {
@@ -347,25 +429,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
             return;
         }
         remainingRows -= sweep.Regions.size() - prior;
-        if (row.State != Free && row.Type == Image && sweep.ImageNames.count(row.AllocationBase) == 0)
-        {
-            if (remainingNames == 0 || sweep.ImageNames.size() >= 512)
-            {
-                ++sweep.ImageNameFailures;
-            }
-            else
-            {
-                wchar_t path[1024]{};
-                const DWORD length = GetMappedFileNameW(process.Value, reinterpret_cast<void*>(row.Base), path, 1024);
-                const bool known = length != 0 && length < 1024;
-                sweep.ImageNames.emplace(row.AllocationBase, known ? std::wstring(path, length) : L"");
-                --remainingNames;
-                if (!known)
-                {
-                    ++sweep.ImageNameFailures;
-                }
-            }
-        }
+        CollectImageName(sweep, row, process.Value, remainingNames, remainingNameCharacters);
     }
     if (!entry.Identity.SameInstance(ObserveProcessIdentity(entry.Pid, process.Value)) || !Alive(process.Value))
     {
@@ -379,6 +443,8 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
         return;
     }
     sweep.Complete = true;
+    sweep.ImageNameUnqueryable = sweep.ImageAllocations.size() - sweep.ImageNameAttempts.size();
+    sweep.ImageNameFailures += sweep.ImageNameUnqueryable;
     sweep.FinishedMs = GetTickCount64();
     sweep.ObservedAt = ObservationFileTime();
     if (sweep.FinishedMs - sweep.StartedMs > MaxSweepMs)
@@ -410,6 +476,12 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     event.ObservedAt = snapshot->ObservedAt;
     event.Rows = snapshot->Regions.size();
     event.ImageNameFailures = snapshot->ImageNameFailures;
+    event.ImageAllocations = snapshot->ImageAllocations.size();
+    event.ImageNamesKnown = snapshot->ImageNames.size();
+    event.ImageNameCapacityFailures = snapshot->ImageNameCapacityFailures;
+    event.ImageNameQueryFailures = snapshot->ImageNameQueryFailures;
+    event.ImageNameTruncated = snapshot->ImageNameTruncated;
+    event.ImageNameUnqueryable = snapshot->ImageNameUnqueryable;
     event.ChangedRanges = delta.ChangedRanges;
     event.CandidateRanges = delta.CandidateRanges;
     event.Changes = delta.Changes;
@@ -589,6 +661,8 @@ ProcessLayoutStats ProcessLayoutMonitor::Stats() const
     auto stats = Counters;
     stats.Tracked = Entries.size();
     stats.StoredRows = StoredRows();
+    stats.StoredNames = StoredNames();
+    stats.StoredNameCharacters = StoredNameCharacters();
     const auto now = GetTickCount64();
     for (const auto& item : Entries)
     {
@@ -610,6 +684,8 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
     {
         std::lock_guard<std::mutex> lock(Mutex);
         stats = Counters;
+        stats.StoredNames = StoredNames();
+        stats.StoredNameCharacters = StoredNameCharacters();
         if (pid == 0)
         {
             entries = Entries;
@@ -639,6 +715,9 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
     out += L",\"interval_ms\":" + std::to_wstring(stats.IntervalMs);
     out += L",\"stored_row_limit\":" + std::to_wstring(MaxStoredRows);
     out += L",\"stored_name_limit\":" + std::to_wstring(MaxStoredNames);
+    out += L",\"stored_name_character_limit\":" + std::to_wstring(MaxStoredNameCharacters);
+    out += L",\"stored_names\":" + std::to_wstring(stats.StoredNames);
+    out += L",\"stored_name_characters\":" + std::to_wstring(stats.StoredNameCharacters);
     out += L",\"verification_deferred\":" + std::to_wstring(stats.VerificationDeferred);
     out += L",\"verification_submitted\":" + std::to_wstring(stats.VerificationSubmitted);
     out += L",\"verification_changes_pending\":" + std::to_wstring(stats.VerificationChangesPending);
@@ -677,6 +756,21 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
             out += L",\"address_limit\":" + mcpjson::Quote(std::to_wstring(snapshot->Limit));
             out += L",\"region_count\":" + std::to_wstring(snapshot->Regions.size());
             out += L",\"image_name_failures\":" + std::to_wstring(snapshot->ImageNameFailures);
+            out += L",\"image_allocations\":" + std::to_wstring(snapshot->ImageAllocations.size());
+            out += L",\"image_names_known\":" + std::to_wstring(snapshot->ImageNames.size());
+            out += L",\"image_name_capacity_failures\":" + std::to_wstring(snapshot->ImageNameCapacityFailures);
+            out += L",\"image_name_query_failures\":" + std::to_wstring(snapshot->ImageNameQueryFailures);
+            out += L",\"image_name_truncated\":" + std::to_wstring(snapshot->ImageNameTruncated);
+            out += L",\"image_name_unqueryable\":" + std::to_wstring(snapshot->ImageNameUnqueryable);
+            out += L",\"image_name_errors\":{";
+            bool firstError = true;
+            for (const auto& error : snapshot->ImageNameErrors)
+            {
+                if (!firstError) { out += L","; }
+                firstError = false;
+                out += mcpjson::Quote(std::to_wstring(error.first)) + L":" + std::to_wstring(error.second);
+            }
+            out += L"}";
             if (pid != 0)
             {
                 out += L",\"regions\":[";
@@ -908,6 +1002,44 @@ bool ProcessLayoutMonitorSelfTest()
         monitor.Discover(emptyScope, GetTickCount64());
         if (monitor.Entries.count(UINT32_MAX) != 0 || monitor.Counters.VerificationChangesAbandoned != 0) { return false; }
         monitor.Reset();
+    }
+    {
+        MEMORY_BASIC_INFORMATION mapping{};
+        const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        if (VirtualQuery(reinterpret_cast<void*>(base), &mapping, sizeof(mapping)) != sizeof(mapping)) { return false; }
+        const auto row = Convert(mapping);
+        process_layout::Snapshot capped;
+        size_t slots = 0, characters = 10000;
+        for (size_t i = 0; i < 100; ++i) { monitor.CollectImageName(capped, row, GetCurrentProcess(), slots, characters); }
+        if (capped.ImageNameFailures != 1 || capped.ImageNameCapacityFailures != 1 || capped.ImageNameAttempts.size() != 1) { return false; }
+        process_layout::Snapshot reserved;
+        auto reserve = row;
+        reserve.State = process_layout::Reserve;
+        slots = 10;
+        monitor.CollectImageName(reserved, reserve, GetCurrentProcess(), slots, characters);
+        if (reserved.ImageAllocations.size() != 1 || !reserved.ImageNameAttempts.empty() || reserved.ImageNameFailures != 0) { return false; }
+        monitor.CollectImageName(reserved, row, GetCurrentProcess(), slots, characters);
+        if (reserved.ImageNames.size() != 1 || reserved.ImageNameFailures != 0 || slots != 9 || reserved.ImageNameCharacters == 0) { return false; }
+        process_layout::Snapshot characterCap;
+        characters = 1;
+        monitor.CollectImageName(characterCap, row, GetCurrentProcess(), slots, characters);
+        if (characterCap.ImageNameCapacityFailures != 1 || !characterCap.ImageNames.empty() || slots != 9 || characters != 1) { return false; }
+        process_layout::Snapshot unavailable;
+        characters = 10000;
+        monitor.CollectImageName(unavailable, row, nullptr, slots, characters);
+        if (unavailable.ImageNameQueryFailures != 1 || unavailable.ImageNameErrors.empty() || !unavailable.ImageNames.empty()) { return false; }
+        std::wstring longName(1500, L'x'), readName;
+        DWORD error = 0;
+        size_t queries = 0;
+        if (!ReadImageNameQuery([&](wchar_t* output, DWORD capacity)
+            {
+                ++queries;
+                if (capacity <= longName.size()) { return capacity; }
+                std::copy(longName.begin(), longName.end(), output);
+                return static_cast<DWORD>(longName.size());
+            }, readName, error) || queries != 2 || readName != longName || error != 0) { return false; }
+        if (ReadImageNameQuery([](wchar_t*, DWORD capacity) { return capacity; }, readName, error) ||
+            !readName.empty() || error != ERROR_INSUFFICIENT_BUFFER) { return false; }
     }
     monitor.Advance(entry, scope, stop, notice, candidate);
     const bool rejected = entry.Status == L"process_outside_scope" && !entry.Pending && !entry.History.Current;

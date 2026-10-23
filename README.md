@@ -13,6 +13,7 @@ The [queue follow-up](docs/KMON_QUEUE_VALIDATION_20261023.md) records bounded an
 The [coverage follow-up](docs/KMON_COVERAGE_VALIDATION_20261023.md) records identity-checked read fallback, page-level capture gaps, completion of admitted work at shutdown, and repeated validation with `-RequireCompletedWork`.
 The [full image sweep follow-up](docs/KMON_IMAGE_SWEEP_VALIDATION_20261023.md) covers file-identity cursor sharing, bounded continuation, and live tail-page controls with `-RequireImageCompletion`.
 The [large-image and dynamic-relocation follow-up](docs/KMON_LARGE_IMAGE_VALIDATION_20261023.md) records bounded bulk scheduling, REL32 target validation, and the expanded live controls.
+The [full-process layout follow-up](docs/KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md) records queue backpressure and retained work. The [candidate freshness and image-name follow-up](docs/KMON_LAYOUT_FRESHNESS_VALIDATION_20261023.md) records scheduling repairs, bounded name storage, and repeated full-process validation.
 
 ## Demo
 

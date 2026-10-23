@@ -32,6 +32,8 @@ struct ProcessLayoutStats
     uint64_t Pending = 0;
     uint64_t Unavailable = 0;
     uint64_t StoredRows = 0;
+    uint64_t StoredNames = 0;
+    uint64_t StoredNameCharacters = 0;
     uint64_t OldestAgeMs = 0;
     uint64_t LastInventoryMs = 0;
     uint64_t VerificationDeferred = 0;
@@ -58,6 +60,12 @@ struct ProcessLayoutNotice
     uint64_t CandidateRanges = 0;
     uint64_t Rows = 0;
     uint64_t ImageNameFailures = 0;
+    uint64_t ImageAllocations = 0;
+    uint64_t ImageNamesKnown = 0;
+    uint64_t ImageNameCapacityFailures = 0;
+    uint64_t ImageNameQueryFailures = 0;
+    uint64_t ImageNameTruncated = 0;
+    uint64_t ImageNameUnqueryable = 0;
     std::vector<process_layout::Change> Changes;
 };
 
@@ -67,6 +75,7 @@ struct ProcessLayoutCandidate
     process_layout::Region Region;
     uint64_t ObservedAt = 0;
     uint64_t ObservedMs = 0;
+    uint64_t QueuedMs = 0;
     std::wstring Role;
     std::wstring ImageName;
 };
@@ -122,6 +131,9 @@ private:
     void PublishCandidates(Entry& entry, const CandidateSink& candidate, bool periodic);
     size_t StoredRows() const;
     size_t StoredNames() const;
+    size_t StoredNameCharacters() const;
+    void CollectImageName(process_layout::Snapshot& snapshot, const process_layout::Region& row,
+        HANDLE process, size_t& remainingNames, size_t& remainingCharacters);
     mutable std::mutex Mutex;
     std::map<uint32_t, Entry> Entries;
     ProcessLayoutStats Counters;

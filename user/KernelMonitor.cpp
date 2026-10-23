@@ -8989,7 +8989,7 @@ void KernelMonitor::WorkerLoop()
         else if (nowMs >= NextHiddenScanTickMs)
         {
             ScanHiddenProcesses();
-            ServicePendingAnalysis();
+            ServicePendingAnalysis(L"after_hidden_processes");
             NextHiddenScanTickMs = GetTickCount64() + hiddenInterval;
         }
 
@@ -9004,7 +9004,7 @@ void KernelMonitor::WorkerLoop()
                 MapperWatchScans.fetch_add(1);
             }
             ScanMapperRemnants();
-            ServicePendingAnalysis();
+            ServicePendingAnalysis(L"after_mapper_remnants");
             if (!StopRequested.load())
             {
                 ScanPoolMappedImages();
@@ -9029,13 +9029,16 @@ void KernelMonitor::WorkerLoop()
                 // so a self-patching driver is reported while it is resident.
                 // Bounded to a few drivers per pass with a 60s recheck floor.
                 ScanKernelImageIntegrity();
+                ServicePendingAnalysis(L"after_kernel_image_integrity");
                 ScanDriverTamper();
             }
             ServicePendingAnalysis();
             if (!StopRequested.load())
             {
                 ScanHookCallbacks();
+                ServicePendingAnalysis(L"after_hook_callbacks");
                 ScanCallbackLifecycleSurfaces();
+                ServicePendingAnalysis(L"after_callback_lifecycle");
                 ScanPlatformEvidence();
             }
             ServicePendingAnalysis();
@@ -9050,8 +9053,10 @@ void KernelMonitor::WorkerLoop()
                 // cadence; the DDI hooks the Berkan renderer placed were
                 // invisible to every other callback scan.
                 ScanGraphicsDispatchTables();
+                ServicePendingAnalysis(L"after_graphics_dispatch");
                 ScanGraphicsReferences();
             }
+            ServicePendingAnalysis(L"after_graphics_references");
             NextMapperScanTickMs = GetTickCount64() +
                 (IsMapperWatchActive() ? kMapperWatchIntervalMs : idleMapperInterval);
         }
@@ -9068,6 +9073,7 @@ void KernelMonitor::WorkerLoop()
             {
                 ScanOrphanMappedPages();
             }
+            ServicePendingAnalysis(L"after_orphan_mapped_pages");
             NextKpageScanTickMs = GetTickCount64() +
                 (IsMapperWatchActive()
                     ? kMapperWatchKpageIntervalMs
@@ -9085,9 +9091,11 @@ void KernelMonitor::WorkerLoop()
             PruneStalePromotedWatches();
             EnableLoggingForWatchTargets();
             ScanUserModeHostility();
+            ServicePendingAnalysis(L"after_user_hostility");
             if (!StopRequested.load())
             {
                 ScanWatchedHandleTables();
+                ServicePendingAnalysis(L"after_watched_handle_tables");
                 ScanWatchedHandleCapabilities();
             }
             ServicePendingAnalysis();
@@ -9131,9 +9139,11 @@ void KernelMonitor::WorkerLoop()
         if (nowMs >= NextImageScanTickMs)
         {
             ScanKernelExecutableImages();
+            ServicePendingAnalysis(L"after_kernel_executable_images");
             NextImageScanTickMs = GetTickCount64() + 500;
         }
         ScanExecutablePageCandidates();
+        ServicePendingAnalysis(L"after_executable_page_candidates");
         ScanExecutionReferences();
 
         AnalysisLastCompleteMs.store(GetTickCount64());
@@ -14221,7 +14231,11 @@ void KernelMonitor::ScanHookCallbacks()
     KernelCallbackScanner scanner(*device, *symbols);
     KernelCallbackScanResult result = {};
     std::wstring error;
-    if (!scanner.Scan(L"all", &result, &error))
+    if (!scanner.Scan(L"all", &result, &error, [&](const wchar_t* surface)
+        {
+            const auto boundary = L"after_callback_surface:" + std::wstring(surface);
+            ServicePendingAnalysis(boundary.c_str());
+        }))
     {
         EmitUnique(
             L"hook.unbacked",
@@ -14251,8 +14265,10 @@ void KernelMonitor::ScanHookCallbacks()
         ClearEmittedKey(L"scan_failed:callbacks:coverage");
     }
 
+    size_t callbacksProcessed = 0;
     for (const KernelCallbackRecord& record : result.Records)
     {
+        if (++callbacksProcessed % 32 == 0) { ServicePendingAnalysis(L"callback_records"); }
         bool emittedUnbacked = false;
         auto emitCallbackIfUnbacked = [&](
             uint64_t fn,
@@ -17356,7 +17372,9 @@ void KernelMonitor::ScanUserModeHostility()
             break;
         }
         ++scanned;
-        if ((scanned % 16) == 0)
+        // Only eight targets can be selected. A sixteen-target interval never
+        // yielded, leaving admitted layout candidates to age through the pass.
+        if (scanned > 1)
         {
             ServicePendingAnalysis();
             if (StopRequested.load())

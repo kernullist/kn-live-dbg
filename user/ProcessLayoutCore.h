@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <set>
 
 namespace process_layout
 {
@@ -51,7 +52,15 @@ namespace process_layout
         std::vector<Region> Regions;
         // Names identify observations, not the file object that created a section.
         std::map<uint64_t, std::wstring> ImageNames;
+        std::set<uint64_t> ImageAllocations;
+        std::set<uint64_t> ImageNameAttempts;
+        uint64_t ImageNameCharacters = 0;
         uint64_t ImageNameFailures = 0;
+        uint64_t ImageNameCapacityFailures = 0;
+        uint64_t ImageNameQueryFailures = 0;
+        uint64_t ImageNameTruncated = 0;
+        uint64_t ImageNameUnqueryable = 0;
+        std::map<uint32_t, uint64_t> ImageNameErrors;
 
         bool Valid() const
         {

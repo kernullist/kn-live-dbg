@@ -1,6 +1,7 @@
 #include "ExecutableImageVerifier.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -156,6 +157,7 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
 {
     bool ok = false;
     bool mismatch = false;
+    bool relocationBaseAmbiguous = false;
     do
     {
         std::vector<uint8_t> bytes;
@@ -190,6 +192,13 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
             mismatch = true;
             break;
         }
+        uint64_t livePreferredBase = nt.OptionalHeader.ImageBase;
+        if (nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        {
+            uint32_t base32 = 0;
+            std::memcpy(&base32, bytes.data() + offsetof(IMAGE_NT_HEADERS32, OptionalHeader.ImageBase), sizeof(base32));
+            livePreferredBase = base32;
+        }
         if (metadata.HasPdbIdentity)
         {
             if (!ReadExact(reader, imageBase, metadata.PdbRva, 24, &bytes))
@@ -204,12 +213,24 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
                 break;
             }
         }
+        // Windows can expose a secondary SEC_IMAGE view whose header and
+        // relocation slots still refer to another load address. Normalizing
+        // it against this view's base invents code changes. A header naming
+        // neither the file preference nor this mapping does not establish a
+        // usable relocation basis; do not trust that third address or label
+        // the bytes clean/modified. Keep the ambiguity as explicit coverage.
+        if (livePreferredBase != metadata.ImageBase && livePreferredBase != imageBase)
+        {
+            relocationBaseAmbiguous = true;
+            break;
+        }
         ok = true;
     } while (false);
     if (reason != nullptr)
     {
         *reason = ok ? (metadata.HasPdbIdentity ? L"pe_and_pdb_identity_match" : L"pe_identity_match_no_pdb") :
-            (mismatch ? L"live_image_identity_mismatch" : L"live_image_identity_unreadable");
+            (mismatch ? L"live_image_identity_mismatch" :
+                (relocationBaseAmbiguous ? L"live_image_relocation_base_ambiguous" : L"live_image_identity_unreadable"));
     }
     return ok;
 }
@@ -903,6 +924,49 @@ bool ExecutableImageVerifierSelfTest()
         }
         metadata.TimeDateStamp ^= 1;
         unreadable = 0;
+        {
+            // Both a file-preferred header and a loader-updated header are
+            // normal. A third base is an unverified secondary view, not a
+            // positive code patch. Exercise both optional-header layouts.
+            const auto savedLive = live;
+            bool baseControls = true;
+            for (bool pe32 : {false, true})
+            {
+                auto reference = metadata;
+                auto header = nt;
+                if (pe32)
+                {
+                    reference.OptionalMagic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+                    reference.ImageBase = 0x10000000;
+                    header.OptionalHeader.Magic = reference.OptionalMagic;
+                }
+                std::memcpy(live.data() + dos.e_lfanew, &header, sizeof(header));
+                const auto setBase = [&](uint64_t value)
+                {
+                    const size_t offset = pe32 ? offsetof(IMAGE_NT_HEADERS32, OptionalHeader.ImageBase) :
+                        offsetof(IMAGE_NT_HEADERS64, OptionalHeader.ImageBase);
+                    std::memcpy(live.data() + dos.e_lfanew + offset, &value, pe32 ? 4 : 8);
+                };
+                setBase(reference.ImageBase);
+                baseControls = QualifyExecutableReference(reference, loadedBase, reader, nullptr) && baseControls;
+                if (!pe32)
+                {
+                    setBase(loadedBase);
+                    baseControls = QualifyExecutableReference(reference, loadedBase, reader, nullptr) && baseControls;
+                }
+                setBase(0x6e3e0000);
+                std::wstring reason;
+                ExecutableSweep secondary;
+                secondary.Initialize(reference);
+                const auto pages = AdvanceExecutableSweep(path, reference, loadedBase, reader, 1, 7, &secondary);
+                if (QualifyExecutableReference(reference, loadedBase, reader, &reason) ||
+                    reason != L"live_image_relocation_base_ambiguous" || !pages.empty() ||
+                    secondary.Coverage.ComparedBytes != 0 || secondary.Coverage.Complete() ||
+                    secondary.Coverage.Reason != reason) { baseControls = false; }
+            }
+            live = savedLive;
+            if (!baseControls) { break; }
+        }
         sweep.Initialize(metadata);
         AdvanceExecutableSweep(path, metadata, loadedBase, reader, 1, 7, &sweep);
         metadata.TimeDateStamp ^= 1;
