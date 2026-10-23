@@ -35,6 +35,8 @@ struct ExecutablePageResult
     std::vector<uint8_t> Observed;
     std::vector<ObservationRange> Changes;
     uint32_t Rel32ValidatedBytes = 0;
+    uint64_t RelocationBase = 0;
+    bool SecondaryImageView = false;
 };
 
 struct ExecutableSweep
@@ -49,6 +51,8 @@ struct ExecutableSweep
     ObservationCoverage Coverage;
     std::vector<ObservationRange> Ranges;
     std::map<uint32_t, CodeOwnership> Pages;
+    uint64_t RelocationBase = 0;
+    bool SecondaryImageView = false;
 
     bool Initialize(const executable_image::DiskPeMetadata& metadata);
 };

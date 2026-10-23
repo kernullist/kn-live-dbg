@@ -309,6 +309,8 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         event.Evidence[L"rva"] = std::to_wstring(page.Rva);
         event.Evidence[L"cycle"] = std::to_wstring(work->Sweep.Cycle);
         event.Evidence[L"function_override_compared_bytes"] = std::to_wstring(page.Rel32ValidatedBytes);
+        event.Evidence[L"relocation_base"] = std::to_wstring(page.RelocationBase);
+        event.Evidence[L"relocation_basis"] = page.SecondaryImageView ? L"independent_sec_image_no_execute" : L"mapping_base";
         if (page.Rel32ValidatedBytes != 0)
         {
             event.Evidence[L"function_override_policy"] = L"file_declared_rel32_targets; feature_selection_not_attested";
@@ -344,6 +346,9 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         coverage.Evidence[L"last_completion_ms"] = std::to_wstring(work->Sweep.LastCompleteMs);
         coverage.Evidence[L"image_base"] = std::to_wstring(base);
         coverage.Evidence[L"function_override_compared_bytes"] = std::to_wstring(work->Sweep.Rel32ValidatedBytes);
+        coverage.Evidence[L"relocation_base"] = std::to_wstring(work->Sweep.RelocationBase);
+        coverage.Evidence[L"relocation_basis"] = work->Sweep.RelocationBase == 0 ? L"unverified" :
+            (work->Sweep.SecondaryImageView ? L"independent_sec_image_no_execute" : L"mapping_base");
         RecordEvent(std::move(coverage));
     }
     if (state != CodeOwnership::OwnedModified && work->Sweep.Coverage.Complete())

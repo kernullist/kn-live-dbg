@@ -3,6 +3,7 @@
 #include "../user/AnalystSnapshot.h"
 #include "../user/ExecutableImageVerifier.h"
 #include "../user/McpJson.h"
+#include "secondary-image-fixture.h"
 
 #include <iostream>
 #include <random>
@@ -14,6 +15,7 @@ namespace
 {
     bool WindowsFixture();
     void ImageIdentityFixture();
+    void SecondaryImageFixture();
 }
 
 namespace
@@ -197,6 +199,7 @@ int wmain(int argc, wchar_t** argv)
     Check(WindowsFixture(), "Windows layout fixture");
     Check(ProcessLayoutMonitorSelfTest(), "reused PID rechecks name scope");
     ImageIdentityFixture();
+    SecondaryImageFixture();
     std::cout << "[layout.core] checks=" << Checks << " failures=" << Failures << '\n';
     return Failures == 0 ? 0 : 1;
 }
@@ -237,8 +240,10 @@ namespace
                 ExecutableSweep sweep;
                 sweep.Initialize(metadata);
                 const auto pages = AdvanceExecutableSweep(path, metadata, base, reader, 1, GetTickCount64(), &sweep);
-                Check(pages.empty() && sweep.Coverage.ComparedBytes == 0 && !sweep.Coverage.Complete() &&
-                    sweep.Coverage.Reason == reason, "secondary image view is not reported as code modification or clean");
+                Check(!pages.empty() && sweep.Coverage.ComparedBytes != 0 && sweep.SecondaryImageView &&
+                    sweep.RelocationBase == mappedNt->OptionalHeader.ImageBase &&
+                    pages[0].Ownership == CodeOwnership::OwnedVerified,
+                    "secondary image independently corroborated without a false code modification");
             }
             else
             {
@@ -293,6 +298,116 @@ namespace
         if (file != INVALID_HANDLE_VALUE)
         {
             CloseHandle(file);
+        }
+    }
+
+    void SecondaryImageFixture()
+    {
+        for (bool pe32 : {true, false})
+        {
+            secondary_image_fixture::Image image;
+            const auto path = EvidenceDirectory + L"\\secondary-" + (pe32 ? L"32" : L"64") + L".dll";
+            Check(image.Open(path, pe32), "real secondary image relocation fixture");
+            if (!image.Secondary) { continue; }
+            executable_image::DiskPeMetadata metadata;
+            Check(executable_image::ReadDiskPeMetadata(path, &metadata, nullptr), "secondary file metadata");
+            const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+            {
+                if (address < image.Base() || address - image.Base() >= 0x4000 || size > 0x4000 - (address - image.Base())) { return false; }
+                bytes->resize(size);
+                SIZE_T got = 0;
+                return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes->data(), size, &got) && got == size;
+            };
+            ExecutableSweep clean;
+            clean.Initialize(metadata);
+            const auto pages = AdvanceExecutableSweep(path, metadata, image.Base(), reader, 8, 1, &clean);
+            Check(pages.size() == 2 && clean.Coverage.Complete() && clean.Coverage.ComparedBytes == 8192 &&
+                clean.SecondaryImageView && clean.RelocationBase == image.Relocated &&
+                std::all_of(pages.begin(), pages.end(), [](const auto& page) { return page.Ownership == CodeOwnership::OwnedVerified; }),
+                "secondary PE32/PE32+ full coverage including cross-page relocations");
+            if (!pe32)
+            {
+                // Occupy the OS-preferred address with the unlisted first
+                // view. The real loader must relocate a third view; it also
+                // updates that view's header, so normal loaded-image checks
+                // must not apply the independent raw-view basis to it.
+                const auto loaded = LoadLibraryExW(path.c_str(), nullptr, 0);
+                Check(loaded != nullptr, "loader relocation under an occupied preferred address");
+                if (loaded)
+                {
+                    const uint64_t base = reinterpret_cast<uint64_t>(loaded);
+                    const ObservationReader loadedReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+                    {
+                        if (address < base || address - base >= 0x4000 || size > 0x4000 - (address - base)) { return false; }
+                        bytes->resize(size);
+                        SIZE_T got = 0;
+                        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes->data(), size, &got) && got == size;
+                    };
+                    ExecutableSweep loadedSweep;
+                    loadedSweep.Initialize(metadata);
+                    const auto loadedPages = AdvanceExecutableSweep(path, metadata, base, loadedReader, 8, 1, &loadedSweep);
+                    Check(base != image.Relocated && loadedPages.size() == 2 && loadedSweep.Coverage.Complete() &&
+                        !loadedSweep.SecondaryImageView && loadedSweep.RelocationBase == base &&
+                        std::all_of(loadedPages.begin(), loadedPages.end(), [](const auto& page) { return page.Ownership == CodeOwnership::OwnedVerified; }),
+                        "loader-adjusted image remains verified against its actual base");
+                    FreeLibrary(loaded);
+                }
+            }
+            for (uint32_t rva : {image.CodeRva, image.SlotRva, image.CrossRva + image.Width - 1})
+            {
+                const auto original = *(static_cast<const uint8_t*>(image.Secondary) + rva);
+                const uint8_t changed = original ^ 1;
+                Check(image.Write(rva, &changed, 1), "secondary private patch");
+                ExecutableSweep altered;
+                altered.Initialize(metadata);
+                const auto changes = AdvanceExecutableSweep(path, metadata, image.Base(), reader, 8, 2, &altered);
+                bool detected = false;
+                for (const auto& page : changes)
+                {
+                    for (const auto& change : page.Changes)
+                    {
+                        detected |= page.Ownership == CodeOwnership::OwnedModified && change.Address <= rva && rva - change.Address < change.Size;
+                    }
+                }
+                Check(detected && altered.Coverage.Complete(), "ordinary, relocation-only and split-slot patch detected");
+                Check(image.Write(rva, &original, 1), "secondary byte restored");
+            }
+            uint64_t fakeBase = image.Relocated ^ 0x01000000;
+            while (fakeBase == 0 || fakeBase == image.Preferred || fakeBase == image.Base()) { fakeBase += 0x10000; }
+            Check(image.Write(image.HeaderBaseOffset, &fakeBase, image.Width), "forged relocation header");
+            ExecutableSweep forged;
+            forged.Initialize(metadata);
+            Check(AdvanceExecutableSweep(path, metadata, image.Base(), reader, 8, 3, &forged).empty() &&
+                forged.Coverage.ComparedBytes == 0 && forged.Coverage.Reason == L"live_image_relocation_base_ambiguous",
+                "target header alone cannot qualify a secondary relocation base");
+            Check(image.Write(image.HeaderBaseOffset, &image.Relocated, image.Width), "restore relocation header");
+            bool replaced = false;
+            const ObservationReader changing = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+            {
+                const bool read = reader(address, size, bytes);
+                if (read && !replaced && address >= image.Base() + 0x1000)
+                {
+                    replaced = image.Write(image.HeaderBaseOffset, &fakeBase, image.Width);
+                }
+                return read;
+            };
+            ExecutableSweep raced;
+            raced.Initialize(metadata);
+            const auto racedPages = AdvanceExecutableSweep(path, metadata, image.Base(), changing, 8, 4, &raced);
+            Check(replaced && !racedPages.empty() && raced.Coverage.ComparedBytes == 0 && raced.Pages.empty() &&
+                raced.Coverage.Reason == L"image_identity_changed_during_compare" &&
+                std::all_of(racedPages.begin(), racedPages.end(), [](const auto& page)
+                    { return page.Changes.empty() && page.Ownership == CodeOwnership::OwnedUnverified; }),
+                "secondary header race invalidates all batch comparisons");
+            Check(image.Write(image.HeaderBaseOffset, &image.Relocated, image.Width), "restore raced header");
+            ExecutableSweep mixed;
+            mixed.Initialize(metadata);
+            AdvanceExecutableSweep(path, metadata, image.Base(), reader, 1, 5, &mixed);
+            const auto direct = image.Base();
+            Check(image.Write(image.HeaderBaseOffset, &direct, image.Width), "change basis between slices");
+            Check(AdvanceExecutableSweep(path, metadata, image.Base(), reader, 1, 6, &mixed).empty() &&
+                mixed.Coverage.ComparedBytes == 0 && mixed.Pages.empty() && mixed.Coverage.Reason == L"image_relocation_basis_changed",
+                "mixed relocation bases cannot complete one cycle");
         }
     }
 

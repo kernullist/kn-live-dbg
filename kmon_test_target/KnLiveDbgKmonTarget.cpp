@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "KmonTestTargetContract.h"
+#include "../tools/secondary-image-fixture.h"
 
 // Inert executable bytes, never called. The tail control requires a full
 // sweep beyond the first 256 executable pages; normal controls keep it intact.
@@ -841,6 +842,7 @@ namespace
 
     bool RunChild(const std::wstring& scenario, uint32_t seconds)
     {
+        secondary_image_fixture::Image secondary;
         // /overwrite replaces the first kOverwritePatchBytes bytes of this
         // image's exec section with a 0x90 sled -- the length is the shared
         // contract in KmonTestTargetContract.h -- and that sled lands on the
@@ -868,6 +870,26 @@ namespace
             scenario == L"rel32-clean" || scenario == L"rel32-invalid")
         {
             ok = ApplyControlledImage(scenario);
+        }
+        else if (scenario.rfind(L"alias32-", 0) == 0 || scenario.rfind(L"alias64-", 0) == 0)
+        {
+            const bool pe32 = scenario.rfind(L"alias32-", 0) == 0;
+            const auto mode = scenario.substr(8);
+            const auto path = FixtureDir() + L"\\kmon-" + scenario + L"-" + std::to_wstring(GetCurrentProcessId()) +
+                L"-" + std::to_wstring(GetTickCount64()) + L".dll";
+            ok = (mode == L"clean" || mode == L"code" || mode == L"reloc") && secondary.Open(path, pe32);
+            const uint32_t rva = mode == L"reloc" ? secondary.SlotRva : secondary.CodeRva;
+            if (ok && mode != L"clean")
+            {
+                uint8_t value = *(static_cast<const uint8_t*>(secondary.Secondary) + rva) ^ 0x01;
+                ok = secondary.Write(rva, &value, 1);
+            }
+            if (ok)
+            {
+                std::wprintf(L"KMON_SECONDARY path=%s base=%llu relocation_base=%llu preferred_base=%llu rva=%u size=8192 bits=%u\n",
+                    path.c_str(), secondary.Base(), secondary.Relocated, secondary.Preferred, rva, pe32 ? 32 : 64);
+                std::fflush(stdout);
+            }
         }
         else if (scenario == L"stamp")
         {

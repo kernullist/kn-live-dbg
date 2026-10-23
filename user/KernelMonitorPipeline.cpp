@@ -904,6 +904,9 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
                 progress.Evidence[L"last_cycle_failed_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.FailedBytes);
                 progress.Evidence[L"last_cycle_skipped_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.SkippedBytes);
                 progress.Evidence[L"function_override_compared_bytes"] = std::to_wstring(work.Sweep.Rel32ValidatedBytes);
+                progress.Evidence[L"relocation_base"] = std::to_wstring(work.Sweep.RelocationBase);
+                progress.Evidence[L"relocation_basis"] = work.Sweep.RelocationBase == 0 ? L"unverified" :
+                    (work.Sweep.SecondaryImageView ? L"independent_sec_image_no_execute" : L"mapping_base");
                 progress.Evidence[L"last_cycle_function_override_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteRel32ValidatedBytes);
                 RecordEvent(std::move(progress));
             }

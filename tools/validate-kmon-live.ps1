@@ -9,6 +9,7 @@ param(
     [switch]$ImageSweepFixtures,
     [switch]$RequireImageCompletion,
     [switch]$ImageStressFixtures,
+    [switch]$SecondaryViewFixtures,
     [switch]$AllProcessLayouts,
     [switch]$RequireLayoutNameAccounting,
     [switch]$RequireFreshLayouts,
@@ -17,6 +18,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($SecondaryViewFixtures -and $ImageStressFixtures) {
+    throw 'Run secondary-view and large-image stress fixtures separately.'
+}
 if ($RequireLayoutNameAccounting -and -not $AllProcessLayouts) {
     throw 'Layout name accounting requires -AllProcessLayouts.'
 }
@@ -108,6 +112,7 @@ try {
     $modes = @('hold', 'mapped-readonly', 'overwrite', 'orphan-mapped-rx', 'orphan-private', 'orphan-image')
     if ($ImageSweepFixtures) { $modes += 'overwrite-tail' }
     if ($ImageStressFixtures) { $modes = @('large-clean', 'large-tail', 'rel32-clean', 'rel32-invalid') }
+    if ($SecondaryViewFixtures) { $modes += @('alias32-clean', 'alias32-code', 'alias32-reloc', 'alias64-clean', 'alias64-code', 'alias64-reloc') }
     foreach ($mode in $modes) {
         $child = Start-Process -FilePath $fixture -ArgumentList @('/child', $mode, '/seconds', ($ObserveSeconds + 240)) `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput "$output\fixture-$mode.stdout.log" `
@@ -244,10 +249,33 @@ try {
         $referenceObservations = @($own | Where-Object { $_.kind -eq 'coverage.user_references' }).Count
         $comparedPages = $comparedPagesByPid[[long]$run.pid].Count
         $controlledName = ''; $controlledPath = ''; $controlledRva = 0
+        $secondary = $run.scenario -match '^alias(32|64)-(clean|code|reloc)$'
+        [uint64]$secondaryBase = 0; [uint64]$secondaryRelocationBase = 0
+        $secondaryMappings = @{}
         if ($ImageStressFixtures) {
             $marker = Get-Content -LiteralPath "$output\fixture-$($run.scenario).stdout.log" -Raw
             if ($marker -notmatch 'KMON_IMAGE path=(.+) rva=(\d+) size=(\d+) dynamic=([01])') { throw 'Missing controlled image identity' }
             $controlledPath = $Matches[1]; $controlledName = [IO.Path]::GetFileName($controlledPath); $controlledRva = [long]$Matches[2]
+        }
+        if ($secondary) {
+            $marker = Get-Content -LiteralPath "$output\fixture-$($run.scenario).stdout.log" -Raw
+            if ($marker -notmatch 'KMON_SECONDARY path=(.+) base=(\d+) relocation_base=(\d+) preferred_base=(\d+) rva=(\d+) size=8192 bits=(32|64)') {
+                throw 'Missing secondary image identity'
+            }
+            $controlledPath = $Matches[1]; $controlledName = [IO.Path]::GetFileName($controlledPath)
+            $secondaryBase = [uint64]$Matches[2]; $secondaryRelocationBase = [uint64]$Matches[3]
+            $preferredBase = [uint64]$Matches[4]; $controlledRva = [long]$Matches[5]
+            if ($secondaryBase -eq $secondaryRelocationBase -or $secondaryBase -eq $preferredBase -or
+                $secondaryRelocationBase -eq $preferredBase) { throw 'Fixture did not exercise a third relocation base' }
+            $secondaryLayout = Get-Content -LiteralPath "$output\layouts-$($run.scenario).json" -Raw | ConvertFrom-Json
+            foreach ($mapping in $secondaryLayout.processes[0].image_names) {
+                if ($mapping.name.EndsWith($controlledPath.Substring(2), [StringComparison]::OrdinalIgnoreCase)) {
+                    $secondaryMappings[[uint64]$mapping.allocation_base] = [string]$mapping.name
+                }
+            }
+            if ($secondaryMappings.Count -ne 2 -or -not $secondaryMappings.ContainsKey($secondaryBase)) {
+                throw 'Both owned fixture mappings must appear in the layout inventory'
+            }
         }
         $expected = @(switch ($run.scenario) {
             'overwrite' { $own | Where-Object { $_.kind -eq 'finding.code_modified' -and $_.image -match 'KnLiveDbgKmonTarget\.exe$' } }
@@ -267,29 +295,70 @@ try {
                     [IO.Path]::GetFileName($_.image) -eq $controlledName -and
                     [long]$_.evidence.rva -eq ($controlledRva -band -4096) }
             }
+            { $_ -match '^alias(32|64)-(code|reloc)$' } {
+                $own | Where-Object { $_.kind -eq 'finding.code_modified' -and
+                    [IO.Path]::GetFileName($_.image) -eq $controlledName -and
+                    [uint64]$_.evidence.image_base -eq $secondaryBase -and
+                    [long]$_.evidence.rva -eq ($controlledRva -band -4096) -and
+                    @($_.evidence.PSObject.Properties | Where-Object {
+                        $_.Name -match '^change_\d+$' -and $_.Value -eq "${controlledRva}:1"
+                    }).Count -gt 0 }
+            }
         })
         # Loading this exact generated DLL from Temp intentionally satisfies
         # the separate drop-path lead rule. Require its explicit non-verdict
         # classification; no byte-comparison finding is exempted.
-        $expectedLoadLeads = @($own | Where-Object { $ImageStressFixtures -and $_.kind -eq 'process.implant' -and
-            (Get-KmonEventLayer $_) -eq 'drop_module' -and $_.evidence.notes -eq $controlledPath -and
+        $expectedLoadLeads = @($own | Where-Object { ($ImageStressFixtures -or $secondary) -and $_.kind -eq 'process.implant' -and
+            (Get-KmonEventLayer $_) -eq 'drop_module' -and
+            ($_.evidence.notes -eq $controlledPath -or ($secondary -and $_.evidence.notes -eq $controlledPath.Substring(2))) -and
             $_.evidence.event_category -eq 'lead' -and $_.evidence.maliciousness -eq 'not_established' -and
             [long]$_.evidence.compared_bytes -eq 0 })
+        # These inert SEC_IMAGE fixtures intentionally bypass the loader list.
+        # Accept only the corresponding non-verdict structural leads at the
+        # two independently inventoried fixture bases, never byte findings.
+        $expectedStructuralLeads = @($own | Where-Object {
+            $matchesFixture = $false
+            if ($secondary -and $_.kind -in @('process.hollow', 'process.implant') -and
+                $_.evidence.event_category -eq 'lead' -and $_.evidence.maliciousness -eq 'not_established' -and
+                [long]$_.evidence.compared_bytes -eq 0) {
+                $layer = Get-KmonEventLayer $_
+                if ($_.kind -eq 'process.hollow' -and $layer -eq 'exe_orphan_image' -and
+                    $_.evidence.notes -match '^base=0x([0-9a-f]+) type=16777216 mapped=(.+)$') {
+                    $leadBase = [Convert]::ToUInt64($Matches[1], 16)
+                    $matchesFixture = $secondaryMappings.ContainsKey($leadBase) -and $secondaryMappings[$leadBase] -eq $Matches[2]
+                } elseif ($_.kind -eq 'process.implant' -and $layer -eq 'image_pe' -and
+                    $_.evidence.notes -match '^base=0x([0-9a-f]+) size=16384 rwx=0 pe=1 wiped=0 vad_private=0 vm_type=16777216 capture_queued=\d+ requested_bytes=16384$') {
+                    $matchesFixture = $secondaryMappings.ContainsKey([Convert]::ToUInt64($Matches[1], 16))
+                } elseif ($_.kind -eq 'process.implant' -and $layer -eq 'resource_only_pe' -and
+                    $run.scenario -like 'alias32-*' -and $_.evidence.notes -match '^base=0x([0-9a-f]+) size=16384$') {
+                    $matchesFixture = $secondaryMappings.ContainsKey([Convert]::ToUInt64($Matches[1], 16))
+                }
+            }
+            $matchesFixture
+        })
         $unexpected = @($own | Where-Object {
             ($run.scenario -in @('hold', 'mapped-readonly', 'large-clean', 'rel32-clean') -and $_.kind -match '^finding\.|^process\.(hollow|implant)$' -and
                 -not ($_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation') -and
                 $_ -notin $expectedLoadLeads) -or
-            ($run.scenario -eq 'orphan-image' -and (Get-KmonEventLayer $_) -in @('private_exec_pe', 'private_exec_wiped'))
+            ($run.scenario -eq 'orphan-image' -and (Get-KmonEventLayer $_) -in @('private_exec_pe', 'private_exec_wiped')) -or
+            ($secondary -and $_.kind -match '^finding\.|^process\.(hollow|implant)$' -and
+                -not ($_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation') -and
+                $_ -notin $expected -and $_ -notin $expectedLoadLeads -and $_ -notin $expectedStructuralLeads)
         })
-        $negative = $run.scenario -in @('hold', 'mapped-readonly', 'large-clean', 'rel32-clean')
+        $negative = $run.scenario -in @('hold', 'mapped-readonly', 'large-clean', 'rel32-clean', 'alias32-clean', 'alias64-clean')
         # Assess the known fixture and its three imported images, not merely
         # whichever subset the monitor happened to discover. Deleted SEC_IMAGE
         # controls have no readable file reference and are reported separately.
         $imageNames = @('KnLiveDbgKmonTarget.exe', 'KERNEL32.DLL', 'KERNELBASE.dll', 'ntdll.dll')
-        if ($ImageStressFixtures) { $imageNames += $controlledName }
+        if ($ImageStressFixtures -or $secondary) { $imageNames += $controlledName }
         $imageCompletions = @(foreach ($name in $imageNames) {
             $completed = @($own | Where-Object { $_.kind -eq 'coverage.image' -and
-                [IO.Path]::GetFileName($_.image) -ieq $name -and $_.summary -in @('cycle_complete', 'cycle_complete_with_gaps') })
+                [IO.Path]::GetFileName($_.image) -ieq $name -and $_.summary -in @('cycle_complete', 'cycle_complete_with_gaps') -and
+                (-not ($secondary -and $name -eq $controlledName) -or
+                    ([uint64]$_.evidence.image_base -eq $secondaryBase -and
+                        $_.evidence.PSObject.Properties['relocation_basis'] -and
+                        $_.evidence.relocation_basis -eq 'independent_sec_image_no_execute' -and
+                        [uint64]$_.evidence.relocation_base -eq $secondaryRelocationBase)) })
             $best = @($completed | Sort-Object { [long]$_.evidence.compared_bytes } -Descending | Select-Object -First 1)
             $completeBytes = $best.Count -eq 1 -and $best[0].evidence.coverage_status -eq 'complete'
             $traversedWithoutErrors = $best.Count -eq 1 -and [long]$best[0].evidence.failed_bytes -eq 0 -and
@@ -303,14 +372,20 @@ try {
         })
         $imagesComplete = @($imageCompletions | Where-Object { -not $_.traversed_without_errors }).Count -eq 0 -and
             $imageCompletions[0].bytes_complete
-        if ($ImageStressFixtures) { $imagesComplete = $imagesComplete -and $imageCompletions[-1].bytes_complete }
+        if ($ImageStressFixtures -or $secondary) { $imagesComplete = $imagesComplete -and $imageCompletions[-1].bytes_complete }
+        if ($secondary) {
+            $imagesComplete = $imagesComplete -and $imageCompletions[-1].compared_bytes -eq 8192 -and
+                $imageCompletions[-1].failed_bytes -eq 0 -and $imageCompletions[-1].skipped_bytes -eq 0
+        }
         [ordered]@{
             scenario=$run.scenario; pid=$run.pid; user_reference_observations=$referenceObservations; expected_events=$expected.Count
             unique_image_pages_compared=$comparedPages
             unexpected_events=$unexpected.Count
             expected_drop_path_leads=$expectedLoadLeads.Count
+            expected_secondary_structure_leads=$expectedStructuralLeads.Count
             layout_change_observations=@($own | Where-Object { $_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation' }).Count
             image_completions=$imageCompletions; image_sweeps_completed=$imagesComplete
+            secondary_image_base=$secondaryBase; secondary_relocation_base=$secondaryRelocationBase
             passed=($referenceObservations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0 -and
                 (-not $RequireImageCompletion -or $imagesComplete))
             first_detection_seconds=$(if ($expected.Count) { ([DateTime]$expected[0].ts - [DateTime]$run.started_utc).TotalSeconds } else { $null })
@@ -475,6 +550,7 @@ try {
         completed_work_required=[bool]$RequireCompletedWork; completed_work_passed=$completedWork
         image_completion_required=[bool]$RequireImageCompletion; image_sweep_fixtures=[bool]$ImageSweepFixtures
         image_stress_fixtures=[bool]$ImageStressFixtures
+        secondary_view_fixtures=[bool]$SecondaryViewFixtures
         all_process_layouts=[bool]$AllProcessLayouts; all_process_scope_verified=$allProcessScope
         layout_process_count=$layoutProcessCount
         layout_name_accounting_required=[bool]$RequireLayoutNameAccounting; layout_name_accounting_passed=$layoutNameAccounting

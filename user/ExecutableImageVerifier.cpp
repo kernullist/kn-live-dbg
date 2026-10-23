@@ -152,12 +152,11 @@ bool ReadNormalizedImageRange(const std::wstring& path, const DiskPeMetadata& me
     return NormalizeRange(path, metadata, imageBase, rva, size, bytes);
 }
 
-bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBase,
-    const ObservationReader& reader, std::wstring* reason)
+static bool ReadExecutableIdentity(const DiskPeMetadata& metadata, uint64_t imageBase,
+    const ObservationReader& reader, std::wstring* reason, uint64_t* headerBase)
 {
     bool ok = false;
     bool mismatch = false;
-    bool relocationBaseAmbiguous = false;
     do
     {
         std::vector<uint8_t> bytes;
@@ -213,33 +212,71 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
                 break;
             }
         }
-        // Windows can expose a secondary SEC_IMAGE view whose header and
-        // relocation slots still refer to another load address. Normalizing
-        // it against this view's base invents code changes. A header naming
-        // neither the file preference nor this mapping does not establish a
-        // usable relocation basis; do not trust that third address or label
-        // the bytes clean/modified. Keep the ambiguity as explicit coverage.
-        if (livePreferredBase != metadata.ImageBase && livePreferredBase != imageBase)
-        {
-            relocationBaseAmbiguous = true;
-            break;
-        }
+        *headerBase = livePreferredBase;
         ok = true;
     } while (false);
     if (reason != nullptr)
     {
         *reason = ok ? (metadata.HasPdbIdentity ? L"pe_and_pdb_identity_match" : L"pe_identity_match_no_pdb") :
-            (mismatch ? L"live_image_identity_mismatch" :
-                (relocationBaseAmbiguous ? L"live_image_relocation_base_ambiguous" : L"live_image_identity_unreadable"));
+            (mismatch ? L"live_image_identity_mismatch" : L"live_image_identity_unreadable");
     }
     return ok;
 }
 
+bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBase,
+    const ObservationReader& reader, std::wstring* reason)
+{
+    uint64_t headerBase = 0;
+    if (!ReadExecutableIdentity(metadata, imageBase, reader, reason, &headerBase)) { return false; }
+    // A live header alone cannot establish a third relocation base. The full
+    // sweep can corroborate it with an independent, file-bound image view.
+    if (headerBase != metadata.ImageBase && headerBase != imageBase)
+    {
+        if (reason) { *reason = L"live_image_relocation_base_ambiguous"; }
+        return false;
+    }
+    return true;
+}
+
+namespace
+{
+    struct ReferenceImageView
+    {
+        HANDLE Section = nullptr;
+        void* View = nullptr;
+        uint32_t Size = 0;
+        ~ReferenceImageView()
+        {
+            if (View) { UnmapViewOfFile(View); }
+            if (Section) { CloseHandle(Section); }
+        }
+        bool Open(HANDLE file, uint32_t size)
+        {
+            Section = CreateFileMappingW(file, nullptr, PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr);
+            if (!Section) { return false; }
+            View = MapViewOfFile(Section, FILE_MAP_READ, 0, 0, 0);
+            Size = size;
+            return View != nullptr;
+        }
+        uint64_t Base() const { return reinterpret_cast<uint64_t>(View); }
+        bool Read(uint64_t address, size_t size, std::vector<uint8_t>* bytes) const
+        {
+            if (!View || address < Base() || address - Base() >= Size || size > Size - (address - Base())) { return false; }
+            bytes->resize(size);
+            SIZE_T count = 0;
+            return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes->data(), size, &count) && count == size;
+        }
+    };
+}
+
 static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& path, const DiskPeMetadata& metadata,
-    uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader, HANDLE reference)
+    uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader, HANDLE reference,
+    uint64_t relocationBase, const ReferenceImageView* referenceImage = nullptr)
 {
     ExecutablePageResult result;
     result.Rva = rva;
+    result.RelocationBase = relocationBase;
+    result.SecondaryImageView = referenceImage != nullptr;
     result.Coverage.Attempted = true;
     result.Coverage.RequestedBytes = size;
     result.Coverage.Reason = L"reference_or_live_read_failed";
@@ -270,10 +307,43 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
             result.Coverage.Reason = L"discardable_section";
             break;
         }
-        if (!NormalizeRange(path, metadata, imageBase, rva, size, &result.Expected, reference) ||
+        if (!NormalizeRange(path, metadata, relocationBase, rva, size, &result.Expected, reference) ||
             !ReadExact(reader, imageBase, rva, size, &result.Observed))
         {
             break;
+        }
+        if (referenceImage)
+        {
+            // The local view comes from the already identity-checked handle,
+            // with writes/deletes denied and no DLL initialization. Validate
+            // every overlapping relocation byte against the disk calculation;
+            // never infer a delta from the target bytes or mask a bad slot.
+            std::vector<uint8_t> local;
+            auto it = std::lower_bound(metadata.BaseRelocations.begin(), metadata.BaseRelocations.end(), rva,
+                [](const DiskPeBaseRelocation& relocation, uint32_t address)
+                {
+                    return uint64_t(relocation.Rva) + relocation.Width <= address;
+                });
+            bool matched = true;
+            for (; matched && it != metadata.BaseRelocations.end() && it->Rva < uint64_t(rva) + size; ++it)
+            {
+                if (local.empty() && !referenceImage->Read(referenceImage->Base() + rva, size, &local))
+                {
+                    matched = false;
+                    break;
+                }
+                const uint32_t start = (std::max)(rva, it->Rva);
+                const auto end = (std::min)(uint64_t(rva) + size, uint64_t(it->Rva) + it->Width);
+                for (uint64_t address = start; address < end; ++address)
+                {
+                    matched &= local[static_cast<size_t>(address - rva)] == result.Expected[static_cast<size_t>(address - rva)];
+                }
+            }
+            if (!matched)
+            {
+                result.Coverage.Reason = L"reference_image_relocation_unverified";
+                break;
+            }
         }
         std::vector<bool> mutableBytes(size, false);
         const auto mask = [&](const std::vector<DiskPeMutableRange>& ranges)
@@ -397,7 +467,7 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
 ExecutablePageResult CompareExecutableRange(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader)
 {
-    return CompareExecutableRangeWithFile(path, metadata, imageBase, rva, size, reader, INVALID_HANDLE_VALUE);
+    return CompareExecutableRangeWithFile(path, metadata, imageBase, rva, size, reader, INVALID_HANDLE_VALUE, imageBase);
 }
 
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
@@ -419,8 +489,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Rel32ValidatedBytes = 0;
         ++sweep->Cycle;
     }
-    std::wstring reason;
-    if (!QualifyExecutableReference(metadata, imageBase, reader, &reason))
+    const auto reject = [&](const std::wstring& reason)
     {
         const uint64_t requested = sweep->Coverage.RequestedBytes;
         sweep->Coverage = {};
@@ -428,10 +497,18 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->NextRange = 0;
         sweep->Pages.clear();
         sweep->Rel32ValidatedBytes = 0;
+        sweep->RelocationBase = 0;
+        sweep->SecondaryImageView = false;
         ++sweep->Cycle;
         sweep->Coverage.Attempted = true;
         sweep->Coverage.InventoryAvailable = false;
         sweep->Coverage.Reason = reason;
+    };
+    std::wstring reason;
+    uint64_t headerBase = 0;
+    if (!ReadExecutableIdentity(metadata, imageBase, reader, &reason, &headerBase))
+    {
+        reject(reason);
         return results;
     }
     sweep->Coverage.Attempted = true;
@@ -445,6 +522,33 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Coverage.Reason = L"reference_unavailable_or_changed";
         return results;
     }
+    ReferenceImageView localImage;
+    const bool secondary = headerBase != metadata.ImageBase && headerBase != imageBase;
+    uint64_t relocationBase = imageBase;
+    const ObservationReader localReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+    {
+        return localImage.Read(address, size, bytes);
+    };
+    if (secondary)
+    {
+        uint64_t localBase = 0;
+        if (!localImage.Open(reference, metadata.SizeOfImage) ||
+            !ReadExecutableIdentity(metadata, localImage.Base(), localReader, nullptr, &localBase) ||
+            localBase != headerBase || localBase == 0 || (localBase & 0xFFFF) != 0 ||
+            localBase > UINT64_MAX - metadata.SizeOfImage)
+        {
+            reject(L"live_image_relocation_base_ambiguous");
+            return results;
+        }
+        relocationBase = localBase;
+    }
+    if (sweep->NextRange != 0 && (sweep->RelocationBase != relocationBase || sweep->SecondaryImageView != secondary))
+    {
+        reject(L"image_relocation_basis_changed");
+        return results;
+    }
+    sweep->RelocationBase = relocationBase;
+    sweep->SecondaryImageView = secondary;
     const size_t end = sweep->NextRange + (std::min)(pageBudget, sweep->Ranges.size() - sweep->NextRange);
     size_t publications = 0;
     bool publicationLimited = false;
@@ -461,7 +565,8 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         }
         const auto& range = sweep->Ranges[sweep->NextRange];
         auto page = CompareExecutableRangeWithFile(path, metadata, imageBase,
-            static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader, reference);
+            static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader, reference,
+            relocationBase, secondary ? &localImage : nullptr);
         const bool coalesces = !results.empty() && page.Ownership == CodeOwnership::OwnedVerified &&
             page.Rel32ValidatedBytes == 0 && results.back().Ownership == CodeOwnership::OwnedVerified &&
             results.back().Rel32ValidatedBytes == 0 && (page.Rva >> 16) == (results.back().Rva >> 16) &&
@@ -492,7 +597,12 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         return page.Coverage.ComparedBytes != 0;
     });
     const bool sameReference = DiskFileIdentityMatches(reference, metadata) && DiskReferenceIdentityMatches(path, metadata);
-    if (!sameReference || (hasComparedBytes && !QualifyExecutableReference(metadata, imageBase, reader, &reason)))
+    uint64_t finalHeaderBase = 0, finalLocalBase = 0;
+    const bool sameImage = !hasComparedBytes ||
+        (ReadExecutableIdentity(metadata, imageBase, reader, &reason, &finalHeaderBase) && finalHeaderBase == headerBase &&
+            (!secondary || (ReadExecutableIdentity(metadata, localImage.Base(), localReader, nullptr, &finalLocalBase) &&
+                finalLocalBase == relocationBase)));
+    if (!sameReference || !sameImage)
     {
         // The mapping may have changed after the initial identity read.
         for (auto& page : results)
@@ -501,6 +611,8 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
             page.Ownership = CodeOwnership::OwnedUnverified;
             page.Changes.clear();
             page.Rel32ValidatedBytes = 0;
+            page.RelocationBase = 0;
+            page.SecondaryImageView = false;
             page.Coverage = {};
             page.Coverage.Attempted = true;
             page.Coverage.RequestedBytes = requested;
@@ -517,6 +629,8 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Pages.clear();
         sweep->NextRange = 0;
         sweep->Rel32ValidatedBytes = 0;
+        sweep->RelocationBase = 0;
+        sweep->SecondaryImageView = false;
         ++sweep->Cycle;
         return results;
     }
