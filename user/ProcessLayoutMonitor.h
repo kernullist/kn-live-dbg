@@ -4,8 +4,10 @@
 #include "ObservationWindows.h"
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 
 struct ProcessLayoutScope
@@ -32,6 +34,12 @@ struct ProcessLayoutStats
     uint64_t StoredRows = 0;
     uint64_t OldestAgeMs = 0;
     uint64_t LastInventoryMs = 0;
+    uint64_t VerificationDeferred = 0;
+    uint64_t VerificationSubmitted = 0;
+    uint64_t VerificationChangesPending = 0;
+    uint64_t VerificationChangesAbandoned = 0;
+    uint64_t NoticesDeferred = 0;
+    uint64_t NoticesPending = 0;
     bool InventoryComplete = false;
     bool AllProcesses = true;
     uint32_t IntervalMs = 5000;
@@ -68,8 +76,8 @@ struct ProcessLayoutCandidate
 class ProcessLayoutMonitor
 {
 public:
-    using NoticeSink = std::function<void(ProcessLayoutNotice)>;
-    using CandidateSink = std::function<void(ProcessLayoutCandidate)>;
+    using NoticeSink = std::function<bool(const ProcessLayoutNotice&)>;
+    using CandidateSink = std::function<bool(ProcessLayoutCandidate)>;
 
     void Reset(uint32_t intervalMs = 5000);
     void Tick(const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
@@ -79,6 +87,9 @@ public:
     std::wstring Text(uint32_t pid = 0, bool initial = false) const;
     void NoteException();
     void RequestDiscovery();
+    // Finish finite changed-range work without creating new periodic scans.
+    void FlushCandidates(const CandidateSink& candidate);
+    void FlushNotices(const NoticeSink& notice);
 
 private:
     friend bool ProcessLayoutMonitorSelfTest();
@@ -94,6 +105,12 @@ private:
         uint64_t LastAttemptMs = 0;
         uint64_t VerificationCursor = 0;
         uint64_t ExportCursor = 0;
+        size_t VerificationBudget = 0;
+        size_t VerificationRowsRemaining = 0;
+        std::set<uint64_t> VerificationEmitted;
+        std::deque<ProcessLayoutCandidate> PendingChanges;
+        std::optional<ProcessLayoutNotice> PendingNotice;
+        bool PeriodicDeferred = false;
         std::wstring Status = L"pending";
         uint32_t Error = 0;
     };
@@ -102,6 +119,7 @@ private:
     void Advance(Entry& entry, const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
         const NoticeSink& notice, const CandidateSink& candidate);
     void Fail(Entry& entry, const wchar_t* reason, uint32_t error, const NoticeSink& notice);
+    void PublishCandidates(Entry& entry, const CandidateSink& candidate, bool periodic);
     size_t StoredRows() const;
     size_t StoredNames() const;
     mutable std::mutex Mutex;

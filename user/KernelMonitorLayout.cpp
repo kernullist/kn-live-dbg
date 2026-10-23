@@ -34,77 +34,12 @@ void KernelMonitor::LayoutLoop()
                 scope.Pids.insert(WatchPids.begin(), WatchPids.end());
                 scope.Names = WatchNamesLower;
             }
-            LayoutMonitor.Tick(scope, StopRequested, [this](ProcessLayoutNotice item)
+            LayoutMonitor.Tick(scope, StopRequested, [this](const ProcessLayoutNotice& item)
             {
-                KmonEvent event;
-                event.Kind = L"coverage.layout";
-                event.Task = item.Status;
-                event.ProcessId = item.Identity.ProcessId;
-                event.Image = item.Name;
-                event.Summary = L"process memory layout: " + item.Status;
-                event.Observation.Identity = item.Identity;
-                event.Observation.Timestamp = item.ObservedAt;
-                event.Observation.MonotonicMs = item.FinishedMs;
-                event.Observation.Source = L"virtual_query_layout";
-                event.Observation.DependencyGroup = L"virtual_query";
-                event.Observation.Coverage.Attempted = true;
-                event.Observation.Coverage.TraversalComplete = item.Cycle != 0;
-                event.Observation.Coverage.InventoryAvailable = item.Cycle != 0;
-                event.Observation.Coverage.Reason = item.Status;
-                event.Evidence[L"cycle"] = std::to_wstring(item.Cycle);
-                event.Evidence[L"started_ms"] = std::to_wstring(item.StartedMs);
-                event.Evidence[L"finished_ms"] = std::to_wstring(item.FinishedMs);
-                event.Evidence[L"regions"] = std::to_wstring(item.Rows);
-                event.Evidence[L"image_name_failures"] = std::to_wstring(item.ImageNameFailures);
-                event.Evidence[L"changed_ranges"] = std::to_wstring(item.ChangedRanges);
-                event.Evidence[L"candidate_ranges"] = std::to_wstring(item.CandidateRanges);
-                event.Evidence[L"lead_event_limit"] = L"16";
-                event.Evidence[L"verification_candidate_limit"] = L"8";
-                event.Evidence[L"delta_truncated"] = item.ChangedRanges > item.Changes.size() ? L"true" : L"false";
-                event.Evidence[L"snapshot_semantics"] = L"non_atomic; initial_is_not_clean; unseen_reuse_unknown";
-                event.Evidence[L"execution_proven"] = L"false";
-                PipelineEvents.Push(std::move(event));
-                size_t budget = 16;
-                for (const auto& change : item.Changes)
-                {
-                    if (budget == 0 || !change.Candidate())
-                    {
-                        continue;
-                    }
-                    --budget;
-                    KmonEvent lead;
-                    lead.Kind = L"finding.layout_change";
-                    lead.ProcessId = item.Identity.ProcessId;
-                    lead.Image = item.Name;
-                    lead.Observation.Identity = item.Identity;
-                    lead.Observation.Timestamp = item.ObservedAt;
-                    lead.Observation.MonotonicMs = item.FinishedMs;
-                    lead.Observation.Source = L"virtual_query_layout";
-                    lead.Observation.DependencyGroup = L"virtual_query";
-                    lead.Summary = L"memory layout changed; executable or image investigation lead";
-                    lead.Evidence[L"base"] = std::to_wstring(change.Base);
-                    lead.Evidence[L"size"] = std::to_wstring(change.Size);
-                    lead.Evidence[L"flags"] = std::to_wstring(change.Flags);
-                    lead.Evidence[L"before_type"] = std::to_wstring(change.Before.Type);
-                    lead.Evidence[L"after_type"] = std::to_wstring(change.After.Type);
-                    lead.Evidence[L"before_protect"] = std::to_wstring(change.Before.Protect);
-                    lead.Evidence[L"after_protect"] = std::to_wstring(change.After.Protect);
-                    lead.Evidence[L"cycle"] = std::to_wstring(item.Cycle);
-                    lead.Evidence[L"claim"] = L"layout_delta; JIT_and_loader_changes_possible; technique_not_proven";
-                    lead.Evidence[L"execution_proven"] = L"false";
-                    PipelineEvents.Push(std::move(lead));
-                }
+                return QueueLayoutNotice(item);
             }, [this](ProcessLayoutCandidate candidate)
             {
-                LayoutCandidates.PushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
-                {
-                    const auto& a = old.Region;
-                    const auto& b = fresh.Region;
-                    return old.Identity.SameInstance(fresh.Identity) && old.ImageName == fresh.ImageName &&
-                        a.Base == b.Base && a.Size == b.Size && a.AllocationBase == b.AllocationBase &&
-                        a.State == b.State && a.Protect == b.Protect &&
-                        a.AllocationProtect == b.AllocationProtect && a.Type == b.Type;
-                });
+                return QueueLayoutCandidate(std::move(candidate));
             });
         }
         catch (...)
@@ -113,6 +48,88 @@ void KernelMonitor::LayoutLoop()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+}
+
+bool KernelMonitor::QueueLayoutNotice(const ProcessLayoutNotice& item)
+{
+    // Leave room for capture/results producers; retry the entire source notice.
+    if (PipelineEvents.Size() > 367) { return false; }
+    std::vector<KmonEvent> batch;
+    KmonEvent event;
+    event.Kind = L"coverage.layout";
+    event.Task = item.Status;
+    event.ProcessId = item.Identity.ProcessId;
+    event.Image = item.Name;
+    event.Summary = L"process memory layout: " + item.Status;
+    event.Observation.Identity = item.Identity;
+    event.Observation.Timestamp = item.ObservedAt;
+    event.Observation.MonotonicMs = item.FinishedMs;
+    event.Observation.Source = L"virtual_query_layout";
+    event.Observation.DependencyGroup = L"virtual_query";
+    event.Observation.Coverage.Attempted = true;
+    event.Observation.Coverage.TraversalComplete = item.Cycle != 0;
+    event.Observation.Coverage.InventoryAvailable = item.Cycle != 0;
+    event.Observation.Coverage.Reason = item.Status;
+    event.Evidence[L"cycle"] = std::to_wstring(item.Cycle);
+    event.Evidence[L"started_ms"] = std::to_wstring(item.StartedMs);
+    event.Evidence[L"finished_ms"] = std::to_wstring(item.FinishedMs);
+    event.Evidence[L"regions"] = std::to_wstring(item.Rows);
+    event.Evidence[L"image_name_failures"] = std::to_wstring(item.ImageNameFailures);
+    event.Evidence[L"changed_ranges"] = std::to_wstring(item.ChangedRanges);
+    event.Evidence[L"candidate_ranges"] = std::to_wstring(item.CandidateRanges);
+    event.Evidence[L"lead_event_limit"] = L"16";
+    event.Evidence[L"verification_candidate_limit"] = L"8";
+    event.Evidence[L"delta_truncated"] = item.ChangedRanges > item.Changes.size() ? L"true" : L"false";
+    event.Evidence[L"snapshot_semantics"] = L"non_atomic; initial_is_not_clean; unseen_reuse_unknown";
+    event.Evidence[L"execution_proven"] = L"false";
+    batch.push_back(std::move(event));
+    size_t budget = 16;
+    for (const auto& change : item.Changes)
+    {
+        if (budget == 0 || !change.Candidate())
+        {
+            continue;
+        }
+        --budget;
+        KmonEvent lead;
+        lead.Kind = L"finding.layout_change";
+        lead.ProcessId = item.Identity.ProcessId;
+        lead.Image = item.Name;
+        lead.Observation.Identity = item.Identity;
+        lead.Observation.Timestamp = item.ObservedAt;
+        lead.Observation.MonotonicMs = item.FinishedMs;
+        lead.Observation.Source = L"virtual_query_layout";
+        lead.Observation.DependencyGroup = L"virtual_query";
+        lead.Summary = L"memory layout changed; executable or image investigation lead";
+        lead.Evidence[L"base"] = std::to_wstring(change.Base);
+        lead.Evidence[L"size"] = std::to_wstring(change.Size);
+        lead.Evidence[L"flags"] = std::to_wstring(change.Flags);
+        lead.Evidence[L"before_type"] = std::to_wstring(change.Before.Type);
+        lead.Evidence[L"after_type"] = std::to_wstring(change.After.Type);
+        lead.Evidence[L"before_protect"] = std::to_wstring(change.Before.Protect);
+        lead.Evidence[L"after_protect"] = std::to_wstring(change.After.Protect);
+        lead.Evidence[L"cycle"] = std::to_wstring(item.Cycle);
+        lead.Evidence[L"claim"] = L"layout_delta; JIT_and_loader_changes_possible; technique_not_proven";
+        lead.Evidence[L"execution_proven"] = L"false";
+        batch.push_back(std::move(lead));
+    }
+    return PipelineEvents.TryPushBatch(std::move(batch), 384);
+}
+
+bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
+{
+    // Keep admitted work near the consumer instead of filling a 30-second
+    // stale backlog. The source retains a refused change or periodic cursor.
+    return LayoutCandidates.TryPushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
+    {
+        const auto& a = old.Region;
+        const auto& b = fresh.Region;
+        return old.Identity.SameInstance(fresh.Identity) && old.ImageName == fresh.ImageName &&
+            (old.Role == L"layout_change") == (fresh.Role == L"layout_change") &&
+            a.Base == b.Base && a.Size == b.Size && a.AllocationBase == b.AllocationBase &&
+            a.State == b.State && a.Protect == b.Protect &&
+            a.AllocationProtect == b.AllocationProtect && a.Type == b.Type;
+    }, 128);
 }
 
 void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
@@ -132,6 +149,24 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
         if (!current())
         {
             LayoutRejected.fetch_add(1);
+            KmonEvent rejected;
+            rejected.Kind = L"coverage.layout_verification";
+            rejected.ProcessId = pid;
+            rejected.Image = item.ImageName;
+            rejected.Summary = L"layout candidate could not be revalidated; memory was not verified";
+            rejected.Observation.Identity = item.Identity;
+            rejected.Observation.Timestamp = item.ObservedAt;
+            rejected.Observation.MonotonicMs = item.ObservedMs;
+            rejected.Observation.Source = item.Role;
+            rejected.Observation.Coverage.Attempted = true;
+            const uint64_t now = GetTickCount64();
+            const bool expired = now < item.ObservedMs || now - item.ObservedMs > process_layout::MaxSweepMs;
+            rejected.Observation.Coverage.Reason = expired ? L"candidate_expired" : L"process_or_mapping_changed_or_unavailable";
+            rejected.Evidence[L"base"] = std::to_wstring(item.Region.Base);
+            rejected.Evidence[L"size"] = std::to_wstring(item.Region.Size);
+            rejected.Evidence[L"candidate_role"] = item.Role;
+            rejected.Evidence[L"candidate_age_ms"] = std::to_wstring(now >= item.ObservedMs ? now - item.ObservedMs : 0);
+            RecordEvent(std::move(rejected));
             continue;
         }
         LayoutChecked.fetch_add(1);
@@ -171,7 +206,8 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
         observation.Context.Ownership = CodeOwnership::Unknown;
         observation.Range = {item.Region.Base, item.Region.Size};
         observation.Executable = item.Region.Executable();
-        observation.Writable = (item.Region.Protect & (PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        observation.Writable = (item.Region.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         observation.CopyOnWrite = (item.Region.Protect & (PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY)) != 0;
         observation.ImageMapping = item.Region.Type == MEM_IMAGE;
         ObserveExecutableRegion(observation);
@@ -228,7 +264,10 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
                     work->LayoutIdentityReported = false;
                 }
             }
-            ScanExecutableImage(path, item.Region.AllocationBase, item.Identity, reader, 8);
+            if (observation.Executable)
+            {
+                ScanExecutableImage(path, item.Region.AllocationBase, item.Identity, reader, 8);
+            }
         }
     }
 }

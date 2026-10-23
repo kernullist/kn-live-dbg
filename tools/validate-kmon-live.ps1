@@ -9,6 +9,7 @@ param(
     [switch]$ImageSweepFixtures,
     [switch]$RequireImageCompletion,
     [switch]$ImageStressFixtures,
+    [switch]$AllProcessLayouts,
     [string]$MonitorExecutablePath = ''
 )
 
@@ -78,7 +79,8 @@ try {
     $outTask = $monitor.StandardOutput.BaseStream.CopyToAsync($outFile)
     $errTask = $monitor.StandardError.BaseStream.CopyToAsync($errFile)
     $monitor.StandardInput.WriteLine('write on')
-    $monitor.StandardInput.WriteLine("!kmon start /name KnLiveDbgKmonTarget.exe /background /log `"$output`"")
+    $startScope = if ($AllProcessLayouts) { '' } else { '/name KnLiveDbgKmonTarget.exe ' }
+    $monitor.StandardInput.WriteLine("!kmon start ${startScope}/background /log `"$output`"")
     $monitor.StandardInput.WriteLine('!kmon status')
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
     do {
@@ -90,6 +92,9 @@ try {
         }
     } while ($text -notmatch '\[kmon\] started\.' -and [DateTime]::UtcNow -lt $deadline)
     if ($text -notmatch '\[kmon\] started\.') { throw 'KMON startup timeout' }
+    # Starting without a filter latches all-process layout collection. Adding
+    # the controls afterwards selects hostility checks without narrowing it.
+    if ($AllProcessLayouts) { $monitor.StandardInput.WriteLine('!kmon add /name KnLiveDbgKmonTarget.exe') }
     if ($ProbeDriver) { $monitor.StandardInput.WriteLine('probe load') }
 
     $modes = @('hold', 'mapped-readonly', 'overwrite', 'orphan-mapped-rx', 'orphan-private', 'orphan-image')
@@ -121,6 +126,7 @@ try {
         $monitor.StandardInput.WriteLine('!kmon status')
         Start-Sleep -Seconds 5
     }
+    if ($AllProcessLayouts) { $monitor.StandardInput.WriteLine("!kmon layouts /json /save `"$output\layouts-inventory.json`"") }
     foreach ($run in $runs) {
         $monitor.StandardInput.WriteLine("!kmon cases /pid $($run.pid) /save `"$output\cases-$($run.scenario).json`"")
         $monitor.StandardInput.WriteLine("!kmon layouts /pid $($run.pid) /save `"$output\layouts-$($run.scenario).json`"")
@@ -130,7 +136,10 @@ try {
         $monitor.StandardInput.WriteLine('!module integrity KnLiveDbgProbe.sys /summary')
         $monitor.StandardInput.WriteLine('probe unload')
     }
-    foreach ($command in @('!kmon stop', '!ti stop', 'set-ppl-antimalware off', 'write off', 'exit')) {
+    $stopCommands = @('!kmon stop')
+    if ($AllProcessLayouts) { $stopCommands += "!kmon layouts /json /save `"$output\layouts-final.json`"" }
+    $stopCommands += @('!ti stop', 'set-ppl-antimalware off', 'write off', 'exit')
+    foreach ($command in $stopCommands) {
         $monitor.StandardInput.WriteLine($command)
     }
     $monitor.StandardInput.Close()
@@ -191,10 +200,14 @@ try {
     $comparedPagesByPid = @{}
     foreach ($run in $runs) { $comparedPagesByPid[[long]$run.pid] = [Collections.Generic.HashSet[string]]::new() }
     $eventCount = 0
+    [long]$layoutVerificationRecords = 0
+    [long]$layoutCompletionRecords = 0
     foreach ($file in @(Get-ChildItem -LiteralPath $output -Filter 'kmon-events.*.jsonl' | Sort-Object Name)) {
         foreach ($line in [IO.File]::ReadLines($file.FullName)) {
             ++$eventCount
             $event = $line | ConvertFrom-Json
+            if ($event.kind -eq 'coverage.layout_verification') { ++$layoutVerificationRecords }
+            if ($event.kind -eq 'coverage.layout' -and $event.task -in @('initial_observation', 'complete')) { ++$layoutCompletionRecords }
             if ($event.kind -eq 'coverage.region') {
                 if ($comparedPagesByPid.ContainsKey([long]$event.pid) -and $event.evidence.source -eq 'executable_page_compare' -and
                     [long]$event.evidence.compared_bytes -gt 0) {
@@ -325,6 +338,20 @@ try {
     }
     $pipeline = @($events | Where-Object { $_.kind -eq 'coverage.pipeline' } | Select-Object -Last 1)
     $finalPipeline = if ($pipeline.Count) { $pipeline[0].evidence } else { $null }
+    $allProcessScope = $false
+    $layoutProcessCount = 0
+    if ($AllProcessLayouts) {
+        $inventory = Get-Content -LiteralPath "$output\layouts-inventory.json" -Raw | ConvertFrom-Json
+        $layoutProcessCount = @($inventory.processes).Count
+        $allProcessScope = $inventory.schema -eq 'kmon.layouts.v1' -and $inventory.scope -eq 'all_processes' -and
+            $inventory.filter_pid -eq 0 -and $inventory.inventory_complete -and
+            $inventory.processes_over_cap -eq 0 -and $layoutProcessCount -gt $runs.Count
+        if (-not $allProcessScope) { throw 'Full-process layout scope was not verified' }
+        $finalLayout = Get-Content -LiteralPath "$output\layouts-final.json" -Raw | ConvertFrom-Json
+        if ($finalLayout.scope -ne 'all_processes' -or $finalLayout.collection_active -or
+            $finalLayout.notices_pending -ne 0 -or $finalLayout.verification_changes_pending -ne 0 -or
+            $finalLayout.verification_pending -ne 0) { throw 'Layout shutdown left retained work' }
+    }
     $queueHealth = $null -ne $finalPipeline
     $queueHealthFields = @('lost_events', 'layout_dropped', 'execution_references_dropped',
         'capture_queue_dropped', 'persistence_queue_dropped', 'diagnostic_queue_dropped',
@@ -333,6 +360,23 @@ try {
         if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties[$field] -or
             [long]$finalPipeline.$field -ne 0) { $queueHealth = $false }
     }
+    if ($AllProcessLayouts -and ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties['layout_changes_abandoned'] -or
+        [long]$finalPipeline.layout_changes_abandoned -ne 0)) { $queueHealth = $false }
+    $layoutLedger = -not $AllProcessLayouts
+    if ($AllProcessLayouts -and $null -ne $finalPipeline) {
+        $layoutLedger = $true
+        foreach ($field in @('layout_submitted', 'layout_checked', 'layout_rejected', 'layout_coalesced', 'layout_pending', 'layout_completed')) {
+            if ($null -eq $finalPipeline.PSObject.Properties[$field]) { $layoutLedger = $false }
+        }
+        if ($layoutLedger) {
+            $layoutLedger = [long]$finalPipeline.layout_submitted -eq (
+                [long]$finalPipeline.layout_checked + [long]$finalPipeline.layout_rejected +
+                [long]$finalPipeline.layout_coalesced + [long]$finalPipeline.layout_pending) -and
+                [long]$finalPipeline.layout_rejected -eq $layoutVerificationRecords -and
+                [long]$finalPipeline.layout_completed -eq $layoutCompletionRecords
+        }
+    }
+    if (-not $layoutLedger) { $queueHealth = $false }
     $captureResults = @($events | Where-Object { $_.kind -eq 'coverage.capture_result' })
     $captureLedger = @{}
     foreach ($event in $captures) {
@@ -352,6 +396,10 @@ try {
         if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties[$field] -or
             [long]$finalPipeline.$field -ne 0) { $completedWork = $false }
     }
+    if ($AllProcessLayouts -and ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties['layout_source_pending'] -or
+        [long]$finalPipeline.layout_source_pending -ne 0)) { $completedWork = $false }
+    if ($AllProcessLayouts -and ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties['layout_notices_pending'] -or
+        [long]$finalPipeline.layout_notices_pending -ne 0)) { $completedWork = $false }
     if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties['capture_requests_queued'] -or
         [long]$finalPipeline.capture_requests_queued -ne $captureResults.Count) { $completedWork = $false }
     $shutdownUnanalyzed = @($events | Where-Object { $_.kind -eq 'coverage.shutdown_event' }).Count
@@ -376,6 +424,10 @@ try {
         completed_work_required=[bool]$RequireCompletedWork; completed_work_passed=$completedWork
         image_completion_required=[bool]$RequireImageCompletion; image_sweep_fixtures=[bool]$ImageSweepFixtures
         image_stress_fixtures=[bool]$ImageStressFixtures
+        all_process_layouts=[bool]$AllProcessLayouts; all_process_scope_verified=$allProcessScope
+        layout_process_count=$layoutProcessCount
+        layout_admission_ledger_passed=$layoutLedger; layout_verification_records=$layoutVerificationRecords
+        layout_completion_records=$layoutCompletionRecords
         capture_results_verified=$captureResults.Count
         shutdown_events_unanalyzed=$shutdownUnanalyzed
         coverage_claim='bounded fixture observations only; inspect sensor and coverage records for gaps'

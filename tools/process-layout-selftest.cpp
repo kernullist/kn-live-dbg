@@ -301,10 +301,12 @@ namespace
         const auto notice = [&](ProcessLayoutNotice item)
         {
             notices.push_back(std::move(item));
+            return true;
         };
         const auto candidate = [&](ProcessLayoutCandidate item)
         {
             candidates.push_back(std::move(item));
+            return true;
         };
         const auto waitCycle = [&](uint64_t cycle)
         {
@@ -375,8 +377,16 @@ namespace
         Check(ProcessLayoutRegionMatches(expected, mbi), "mapping revalidation");
         expected.Protect = PAGE_EXECUTE_READ;
         Check(!ProcessLayoutRegionMatches(expected, mbi), "stale mapping rejected");
+        Check(VirtualProtect(static_cast<char*>(memory) + 4096, 4096, PAGE_READWRITE, &old) != FALSE,
+            "owned executable permission removed");
+        Check(waitCycle(3), "nonexecutable changed range traversal");
+        Check(std::any_of(candidates.begin(), candidates.end(), [&](const ProcessLayoutCandidate& item)
+        {
+            return item.Role == L"layout_change" && !item.Region.Executable() &&
+                item.Region.Base <= address + 4096 && address + 4096 < item.Region.Base + item.Region.Size;
+        }), "lost executable permission remains a verification candidate");
         VirtualFree(memory, 0, MEM_RELEASE);
-        Check(waitCycle(3), "freed allocation traversal");
+        Check(waitCycle(4), "freed allocation traversal");
         changed = false;
         for (const auto& item : notices)
         {

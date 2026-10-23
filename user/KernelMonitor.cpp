@@ -8830,14 +8830,30 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     // Producers and the analysis worker have joined. Finish already admitted
     // work with its normal identity/mapping checks, without restarting scans.
     const uint64_t drainStarted = GetTickCount64();
-    while ((LayoutCandidates.Size() != 0 || !ExecutionReferences.empty()) &&
+    while ((LayoutCandidates.Size() != 0 || !ExecutionReferences.empty() ||
+        LayoutMonitor.Stats().VerificationChangesPending != 0 || LayoutMonitor.Stats().NoticesPending != 0) &&
         GetTickCount64() - drainStarted < 10000)
     {
-        const auto pending = LayoutCandidates.Size() + ExecutionReferences.size();
+        const auto processed = LayoutChecked.load() + LayoutRejected.load() + ExecutionReferenceProcessed;
+        const auto notices = LayoutMonitor.Stats().NoticesPending;
+        LayoutMonitor.FlushNotices([this](const ProcessLayoutNotice& notice)
+        {
+            return QueueLayoutNotice(notice);
+        });
+        LayoutMonitor.FlushCandidates([this](ProcessLayoutCandidate candidate)
+        {
+            return QueueLayoutCandidate(std::move(candidate));
+        });
         DrainLayoutCandidates(true);
         ScanExecutionReferences(128, 75, true);
         DrainPipelineEvents();
-        if (LayoutCandidates.Size() + ExecutionReferences.size() >= pending) { break; }
+        if (LayoutChecked.load() + LayoutRejected.load() + ExecutionReferenceProcessed == processed &&
+            LayoutMonitor.Stats().NoticesPending >= notices)
+        {
+            // Draining diagnostics may have just made room for a retained
+            // notice. Retry admission instead of treating this as exhaustion.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     ShutdownLayoutProcessed += LayoutChecked.load() + LayoutRejected.load() - layoutBefore;
     ShutdownReferencesProcessed += ExecutionReferenceProcessed - referencesBefore;

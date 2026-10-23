@@ -216,6 +216,27 @@ using final `coverage.image_progress` records and their actual compared bytes.
 `-MonitorExecutablePath` permits comparison with a saved monitor binary; keep
 that binary beside its compatible driver and runtime dependencies.
 
+## Full-process layout queue controls
+
+Add `-AllProcessLayouts` to the ordinary fixture suite:
+
+```powershell
+tools/validate-kmon-live.ps1 -AllProcessLayouts -ImageSweepFixtures -ObserveSeconds 300 -ProbeDriver -RequireQueueHealth -RequireCompletedWork -RequireImageCompletion
+```
+
+The harness starts KMON without a PID/name filter, then adds the owned control
+processes to the watch list. This preserves the latched full-process layout
+scope. It saves the pre-stop inventory and post-stop layout export and checks
+`scope=all_processes`, a complete inventory, no process-cap omissions, and more
+processes than the control cohort. Queue health also requires zero abandoned
+source changes and reconciles every admitted candidate and completed layout
+against its processing counters and persisted coverage records. Completion
+requires the retained source changes and notices,
+the admitted layout queue, analysis queue, and capture work to be drained.
+The same five positive and two negative controls and all 28 fixed image
+traversals remain required. A zero-loss result is not a claim that every byte
+of every host process was verified. See the [full-process validation report](KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md).
+
 ## Not covered here
 
 - Live DKOM `ActiveProcessLinks` unlink (needs a kernel fixture).

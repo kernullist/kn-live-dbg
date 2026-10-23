@@ -808,15 +808,23 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
         event.Evidence[L"persistence_queue_dropped"] = std::to_wstring(CapturedPages.Loss());
         event.Evidence[L"diagnostic_queue_dropped"] = std::to_wstring(PipelineEvents.Loss());
+        event.Evidence[L"diagnostic_queue_peak"] = std::to_wstring(PipelineEvents.Peak());
         event.Evidence[L"catalog_queue_dropped"] = std::to_wstring(CapturedRegions.Loss());
         const auto layout = LayoutMonitor.Stats();
         event.Evidence[L"layout_tracked"] = std::to_wstring(layout.Tracked);
         event.Evidence[L"layout_completed"] = std::to_wstring(layout.Completed);
         event.Evidence[L"layout_failed"] = std::to_wstring(layout.Failed);
+        event.Evidence[L"layout_stored_rows"] = std::to_wstring(layout.StoredRows);
+        event.Evidence[L"layout_notices_pending"] = std::to_wstring(layout.NoticesPending);
+        event.Evidence[L"layout_notices_deferred"] = std::to_wstring(layout.NoticesDeferred);
         event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
         event.Evidence[L"layout_dropped"] = std::to_wstring(LayoutCandidates.Loss());
         event.Evidence[L"layout_peak"] = std::to_wstring(LayoutCandidates.Peak());
         event.Evidence[L"layout_coalesced"] = std::to_wstring(LayoutCandidates.Replacements());
+        event.Evidence[L"layout_source_pending"] = std::to_wstring(layout.VerificationChangesPending);
+        event.Evidence[L"layout_deferred"] = std::to_wstring(layout.VerificationDeferred);
+        event.Evidence[L"layout_submitted"] = std::to_wstring(layout.VerificationSubmitted);
+        event.Evidence[L"layout_changes_abandoned"] = std::to_wstring(layout.VerificationChangesAbandoned);
         event.Evidence[L"layout_checked"] = std::to_wstring(LayoutChecked.load());
         event.Evidence[L"layout_rejected"] = std::to_wstring(LayoutRejected.load());
         event.Evidence[L"layout_oldest_ms"] = std::to_wstring(layout.OldestAgeMs);
@@ -1209,6 +1217,48 @@ bool KmonPipelineSelfTest()
             // Backpressure must preserve unread source events, including when
             // shutdown starts with a full analysis queue. Real source eviction
             // must still be reported instead of disguised as successful drain.
+            {
+                KernelMonitor bounded;
+                for (size_t i = 0; i < 368; ++i) { bounded.PipelineEvents.Push(KmonEvent{}); }
+                ProcessLayoutNotice notice;
+                notice.Identity = identity;
+                notice.Status = L"complete";
+                notice.Cycle = 1;
+                notice.ChangedRanges = notice.CandidateRanges = 17;
+                notice.Changes.resize(17);
+                for (auto& change : notice.Changes) { change.Flags = process_layout::BecameExecutable; }
+                bool atomic = !bounded.QueueLayoutNotice(notice) && bounded.PipelineEvents.Size() == 368 &&
+                    bounded.PipelineEvents.Loss() == 0;
+                bounded.PipelineEvents.Drain(512);
+                atomic = bounded.QueueLayoutNotice(notice) && bounded.PipelineEvents.Size() == 17 && atomic;
+                const auto records = bounded.PipelineEvents.Drain(512);
+                atomic = records.size() == 17 && records.front().Kind == L"coverage.layout" && atomic;
+                for (size_t i = 1; i < records.size(); ++i) { atomic = records[i].Kind == L"finding.layout_change" && atomic; }
+                if (!atomic) { std::fprintf(stderr, "FAIL atomic layout diagnostic admission\n"); }
+                ok = atomic && ok;
+                // With no admitted candidates, stop must retry the source
+                // notice after its first iteration frees the diagnostic queue.
+                for (size_t i = 0; i < 368; ++i) { bounded.PipelineEvents.Push(KmonEvent{}); }
+                bounded.Options.LogDirectory = unique;
+                bounded.LayoutMonitor.Reset();
+                ProcessLayoutScope scope;
+                scope.All = false;
+                scope.Pids.insert(GetCurrentProcessId());
+                std::atomic<bool> stop{false};
+                const auto noticeDeadline = GetTickCount64() + 5000;
+                while (bounded.LayoutMonitor.Stats().NoticesPending == 0 && GetTickCount64() < noticeDeadline)
+                {
+                    bounded.LayoutMonitor.Tick(scope, stop,
+                        [&](const ProcessLayoutNotice& item) { return bounded.QueueLayoutNotice(item); },
+                        [](ProcessLayoutCandidate) { return true; });
+                }
+                const bool retained = bounded.LayoutMonitor.Stats().NoticesPending == 1;
+                bounded.Stop(nullptr);
+                const bool drained = retained && bounded.LayoutMonitor.Stats().NoticesPending == 0 &&
+                    bounded.PipelineEvents.Loss() == 0 && bounded.PipelineEvents.Size() == 0;
+                if (!drained) { std::fprintf(stderr, "FAIL retained layout notice shutdown\n"); }
+                ok = drained && ok;
+            }
             for (const size_t sourceCapacity : {4096u, 1024u})
             {
                 TimelineStore upstream(sourceCapacity);

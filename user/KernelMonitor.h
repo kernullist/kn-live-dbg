@@ -357,6 +357,8 @@ private:
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
     void LayoutLoop();
     void DrainLayoutCandidates(bool finalDrain = false);
+    bool QueueLayoutCandidate(ProcessLayoutCandidate candidate);
+    bool QueueLayoutNotice(const ProcessLayoutNotice& notice);
     void ServicePendingAnalysis();
     void CaptureLoop();
     void CaptureWriterLoop();

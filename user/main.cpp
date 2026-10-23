@@ -23670,6 +23670,11 @@ static void HandleKmonCommand(
                        << L" rows=" << stats.Layout.StoredRows << L" failed=" << stats.Layout.Failed
                        << L" verification_pending=" << stats.LayoutPending << L" dropped=" << stats.LayoutDropped
                        << L" checked=" << stats.LayoutChecked << L" rejected=" << stats.LayoutRejected << L"\n";
+            std::wcout << L"  layout_deferred=" << stats.Layout.VerificationDeferred
+                       << L" source_changes_pending=" << stats.Layout.VerificationChangesPending
+                       << L" source_changes_abandoned=" << stats.Layout.VerificationChangesAbandoned
+                       << L" notices_pending=" << stats.Layout.NoticesPending
+                       << L" submitted=" << stats.Layout.VerificationSubmitted << L"\n";
             std::wcout << L"  mapper_watch=";
             if (stats.MapperWatchRemainMs > 0)
             {

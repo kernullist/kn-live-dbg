@@ -39,8 +39,34 @@ public:
         return true;
     }
 
+    // All-or-none admission for a retained source record and its related leads.
+    bool TryPushBatch(std::vector<T> items, size_t admissionLimit)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        const size_t limit = (std::min)(Capacity, admissionLimit);
+        if (Items.size() > limit || items.size() > limit - Items.size()) { return false; }
+        for (auto& item : items) { Items.push_back(std::move(item)); }
+        HighWater = (std::max)(HighWater, Items.size());
+        return true;
+    }
+
     template<typename SameWork>
     bool PushLatest(T item, SameWork sameWork)
+    {
+        return InsertLatest(std::move(item), sameWork, Capacity, true);
+    }
+
+    // Admission refusal is not loss when the producer retains its work.
+    // Existing entries can still refresh at the admission limit.
+    template<typename SameWork>
+    bool TryPushLatest(T item, SameWork sameWork, size_t admissionLimit)
+    {
+        return InsertLatest(std::move(item), sameWork, admissionLimit, false);
+    }
+
+private:
+    template<typename SameWork>
+    bool InsertLatest(T item, SameWork sameWork, size_t admissionLimit, bool countLoss)
     {
         std::lock_guard<std::mutex> lock(Mutex);
         for (auto& pending : Items)
@@ -52,9 +78,9 @@ public:
                 return true;
             }
         }
-        if (Items.size() >= Capacity)
+        if (Items.size() >= (std::min)(Capacity, admissionLimit))
         {
-            ++Dropped;
+            if (countLoss) { ++Dropped; }
             return false;
         }
         Items.push_back(std::move(item));
@@ -62,6 +88,7 @@ public:
         return true;
     }
 
+public:
     uint64_t Replacements() const
     {
         std::lock_guard<std::mutex> lock(Mutex);
@@ -170,6 +197,9 @@ inline bool KmonWorkQueueSelfTest()
     ok = ok && batch.size() == 2 && batch[0] == 12 && batch[1] == 14 && !queue.Pop(&value);
     queue.Reset();
     ok = ok && queue.Loss() == 0 && queue.Size() == 0 && queue.Peak() == 0;
+    ok = ok && !queue.TryPushBatch({1, 2, 3}, 2) && queue.Size() == 0 && queue.Loss() == 0 &&
+        queue.TryPushBatch({1, 2}, 2) && !queue.TryPushBatch({3}, 2) && queue.Size() == 2 && queue.Loss() == 0;
+    queue.Reset();
     KmonWorkQueue<std::pair<int, int>> latest(2);
     const auto same = [](const auto& a, const auto& b) { return a.first == b.first; };
     ok = ok && latest.PushLatest({1, 10}, same) && latest.PushLatest({2, 20}, same) &&
@@ -177,6 +207,12 @@ inline bool KmonWorkQueueSelfTest()
         latest.Peak() == 2 && !latest.PushLatest({3, 40}, same) && latest.Loss() == 1;
     const auto refreshed = latest.Drain(2);
     ok = ok && refreshed.size() == 2 && refreshed[0] == std::make_pair(1, 30) && refreshed[1].first == 2;
+    latest.Reset();
+    ok = ok && latest.TryPushLatest({1, 1}, same, 1) &&
+        !latest.TryPushLatest({2, 2}, same, 1) && latest.Loss() == 0 && latest.Size() == 1 &&
+        latest.TryPushLatest({1, 3}, same, 0) && latest.Replacements() == 1;
+    const auto limited = latest.Drain(2);
+    ok = ok && limited.size() == 1 && limited[0] == std::make_pair(1, 3);
     latest.Reset();
     for (int n = 0; n < 1000; ++n) { ok = ok && latest.PushLatest({n % 2, n}, same); }
     ok = ok && latest.Size() == 2 && latest.Loss() == 0 && latest.Replacements() == 998;

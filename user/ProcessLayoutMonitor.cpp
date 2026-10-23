@@ -11,8 +11,10 @@
 namespace
 {
     constexpr size_t MaxProcesses = 4096;
-    constexpr size_t MaxStoredRows = 262144;
-    constexpr size_t MaxStoredNames = 8192;
+    // Initial, current and in-progress snapshots coexist. The old budget
+    // exhausted on ordinary full-host inventories before a new sweep fit.
+    constexpr size_t MaxStoredRows = 524288;
+    constexpr size_t MaxStoredNames = 16384;
 
     struct Handle
     {
@@ -177,6 +179,10 @@ void ProcessLayoutMonitor::Discover(const ProcessLayoutScope& scope, uint64_t no
         {
             if (found.count(it->first) == 0)
             {
+                // Keep retained evidence until admitted even after exit. The
+                // consumer will explicitly reject the old process identity.
+                if (it->second.PendingNotice || !it->second.PendingChanges.empty()) { ++it; continue; }
+                Counters.VerificationChangesAbandoned += it->second.PendingChanges.size();
                 ++Counters.Retired;
                 it = Entries.erase(it);
             }
@@ -244,7 +250,11 @@ void ProcessLayoutMonitor::Fail(Entry& entry, const wchar_t* reason, uint32_t er
         event.Name = entry.Name;
         event.Status = reason;
         event.FinishedMs = GetTickCount64();
-        notice(std::move(event));
+        if (!notice(event))
+        {
+            entry.PendingNotice = std::move(event);
+            ++Counters.NoticesDeferred;
+        }
     }
     entry.Status = reason;
     entry.Error = error;
@@ -275,6 +285,9 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     const bool newInstance = entry.Identity.CreateTime == 0 || !entry.Identity.SameInstance(identity);
     if (entry.Identity.CreateTime != 0 && newInstance)
     {
+        Counters.VerificationChangesAbandoned += entry.PendingChanges.size();
+        entry.PendingChanges.clear();
+        entry.PeriodicDeferred = false;
         entry.History = {};
         entry.Pending.reset();
         entry.FirstSeenMs = begin;
@@ -380,6 +393,9 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     }
     const auto snapshot = entry.Pending;
     entry.Pending.reset();
+    entry.VerificationBudget = 8;
+    entry.VerificationRowsRemaining = snapshot->Regions.size();
+    entry.VerificationEmitted.clear();
     entry.NextScanMs = snapshot->FinishedMs + Counters.IntervalMs;
     entry.Status = L"complete";
     ++Counters.Completed;
@@ -397,53 +413,119 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     event.ChangedRanges = delta.ChangedRanges;
     event.CandidateRanges = delta.CandidateRanges;
     event.Changes = delta.Changes;
-    notice(std::move(event));
+    if (!notice(event))
+    {
+        entry.PendingNotice = std::move(event);
+        ++Counters.NoticesDeferred;
+    }
 
-    // Changes go first, then rotate unchanged executable regions every cycle.
-    // Disk/code sweeps remain necessary when bytes change without a layout delta.
-    size_t budget = 4;
+    // Retain changed ranges until admitted; a new snapshot must not overwrite
+    // them under backpressure. Periodic work remains a cursor into the latest
+    // complete snapshot, not thousands of redundant queued copies.
     std::set<uint64_t> emitted;
-    const auto emit = [&](const Region& row, const wchar_t* role)
+    for (bool executable : {true, false})
     {
-        if (!row.Executable() || budget == 0 || !emitted.insert(row.Base).second)
+        // Preserve the original priority for executable transitions. New NX
+        // follow-ups use the remaining budget, never displace executable work.
+        for (const auto& change : delta.Changes)
         {
-            return;
-        }
-        ProcessLayoutCandidate work;
-        work.Identity = identity;
-        work.Region = row;
-        work.ObservedMs = snapshot->FinishedMs;
-        work.ObservedAt = snapshot->ObservedAt;
-        work.Role = role;
-        const auto path = snapshot->ImageNames.find(row.AllocationBase);
-        if (path != snapshot->ImageNames.end())
-        {
-            work.ImageName = path->second;
-        }
-        candidate(std::move(work));
-        --budget;
-    };
-    for (const auto& change : delta.Changes)
-    {
-        if (change.Candidate())
-        {
-            emit(change.After, L"layout_change");
+            const auto& row = change.After;
+            if (!change.Candidate() || row.State == Free || row.Executable() != executable ||
+                entry.PendingChanges.size() >= 4 || !emitted.insert(row.Base).second) { continue; }
+            ProcessLayoutCandidate work;
+            work.Identity = identity;
+            work.Region = row;
+            work.ObservedMs = snapshot->FinishedMs;
+            work.ObservedAt = snapshot->ObservedAt;
+            work.Role = L"layout_change";
+            const auto path = snapshot->ImageNames.find(row.AllocationBase);
+            if (path != snapshot->ImageNames.end()) { work.ImageName = path->second; }
+            entry.PendingChanges.push_back(std::move(work));
         }
     }
-    budget += 4;
+    PublishCandidates(entry, candidate, true);
+}
+
+void ProcessLayoutMonitor::PublishCandidates(Entry& entry, const CandidateSink& candidate, bool periodic)
+{
+    // A retry continues the same cycle's quota; it must not create eight new
+    // admissions every time the queue briefly has room.
+    auto& budget = entry.VerificationBudget;
+    if (budget == 0) { entry.PeriodicDeferred = false; return; }
+    auto& emitted = entry.VerificationEmitted;
+    while (!entry.PendingChanges.empty() && budget != 0)
+    {
+        if (!candidate(entry.PendingChanges.front()))
+        {
+            ++Counters.VerificationDeferred;
+            return;
+        }
+        emitted.insert(entry.PendingChanges.front().Region.Base);
+        entry.PendingChanges.pop_front();
+        ++Counters.VerificationSubmitted;
+        --budget;
+    }
+    if (!periodic || !entry.History.Current) { return; }
+    const auto& snapshot = entry.History.Current;
+    const uint64_t now = GetTickCount64();
+    if (now < snapshot->FinishedMs || now - snapshot->FinishedMs > process_layout::MaxSweepMs)
+    {
+        // Recollect instead of refreshing the timestamp of an old observation.
+        entry.PeriodicDeferred = false;
+        entry.NextScanMs = 0;
+        return;
+    }
+    entry.PeriodicDeferred = false;
     const auto& regions = snapshot->Regions;
     auto position = std::lower_bound(regions.begin(), regions.end(), entry.VerificationCursor,
-        [](const Region& row, uint64_t address)
+        [](const process_layout::Region& row, uint64_t address)
         {
             return row.Base < address;
         });
     size_t index = position == regions.end() ? 0 : static_cast<size_t>(position - regions.begin());
-    for (size_t visited = 0; visited < regions.size() && budget != 0; ++visited)
+    while (entry.VerificationRowsRemaining != 0 && !regions.empty() && budget != 0)
     {
-        emit(regions[index], entry.History.Completed == 1 ? L"layout_initial" : L"layout_periodic");
+        const auto& row = regions[index];
+        if (row.Executable() && emitted.count(row.Base) == 0)
+        {
+            ProcessLayoutCandidate work;
+            work.Identity = snapshot->Identity;
+            work.Region = row;
+            work.ObservedMs = snapshot->FinishedMs;
+            work.ObservedAt = snapshot->ObservedAt;
+            work.Role = entry.History.Completed == 1 ? L"layout_initial" : L"layout_periodic";
+            const auto path = snapshot->ImageNames.find(row.AllocationBase);
+            if (path != snapshot->ImageNames.end()) { work.ImageName = path->second; }
+            if (!candidate(std::move(work)))
+            {
+                ++Counters.VerificationDeferred;
+                entry.VerificationCursor = row.Base;
+                entry.PeriodicDeferred = true;
+                return;
+            }
+            emitted.insert(row.Base);
+            ++Counters.VerificationSubmitted;
+            --budget;
+        }
+        --entry.VerificationRowsRemaining;
         index = (index + 1) % regions.size();
     }
     entry.VerificationCursor = regions.empty() ? 0 : regions[index].Base;
+}
+
+void ProcessLayoutMonitor::FlushCandidates(const CandidateSink& candidate)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    for (auto& item : Entries) { PublishCandidates(item.second, candidate, false); }
+}
+
+void ProcessLayoutMonitor::FlushNotices(const NoticeSink& notice)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    for (auto& item : Entries)
+    {
+        if (item.second.PendingNotice && notice(*item.second.PendingNotice)) { item.second.PendingNotice.reset(); }
+    }
 }
 
 void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
@@ -469,9 +551,23 @@ void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atom
         CursorPid = next->first;
         ++next;
         ++visited;
+        if (entry.PendingNotice)
+        {
+            if (!notice(*entry.PendingNotice)) { ++Counters.NoticesDeferred; continue; }
+            entry.PendingNotice.reset();
+        }
+        if (!entry.PendingChanges.empty())
+        {
+            PublishCandidates(entry, candidate, false);
+            if (!entry.PendingChanges.empty()) { continue; }
+        }
         if (GetTickCount64() >= entry.NextScanMs)
         {
             Advance(entry, scope, stop, notice, candidate);
+        }
+        else if (entry.PeriodicDeferred)
+        {
+            PublishCandidates(entry, candidate, true);
         }
     }
 }
@@ -497,6 +593,8 @@ ProcessLayoutStats ProcessLayoutMonitor::Stats() const
     for (const auto& item : Entries)
     {
         const auto& entry = item.second;
+        stats.VerificationChangesPending += entry.PendingChanges.size();
+        stats.NoticesPending += entry.PendingNotice ? 1 : 0;
         stats.Pending += entry.Pending != nullptr || !entry.History.Current ? 1 : 0;
         stats.Unavailable += entry.Status != L"complete" && entry.Status != L"collecting" && entry.Status != L"pending" ? 1 : 0;
         const uint64_t last = entry.History.Current ? entry.History.Current->FinishedMs : entry.FirstSeenMs;
@@ -526,6 +624,8 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
         }
         for (auto& item : entries)
         {
+            stats.VerificationChangesPending += item.second.PendingChanges.size();
+            stats.NoticesPending += item.second.PendingNotice ? 1 : 0;
             item.second.ExportCursor = item.second.Pending ? item.second.Pending->Cursor : 0;
             item.second.Pending.reset();
         }
@@ -537,6 +637,14 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
     out += L",\"inventory_ms\":" + std::to_wstring(stats.LastInventoryMs);
     out += L",\"processes_over_cap\":" + std::to_wstring(stats.ProcessCap);
     out += L",\"interval_ms\":" + std::to_wstring(stats.IntervalMs);
+    out += L",\"stored_row_limit\":" + std::to_wstring(MaxStoredRows);
+    out += L",\"stored_name_limit\":" + std::to_wstring(MaxStoredNames);
+    out += L",\"verification_deferred\":" + std::to_wstring(stats.VerificationDeferred);
+    out += L",\"verification_submitted\":" + std::to_wstring(stats.VerificationSubmitted);
+    out += L",\"verification_changes_pending\":" + std::to_wstring(stats.VerificationChangesPending);
+    out += L",\"verification_changes_abandoned\":" + std::to_wstring(stats.VerificationChangesAbandoned);
+    out += L",\"notices_deferred\":" + std::to_wstring(stats.NoticesDeferred);
+    out += L",\"notices_pending\":" + std::to_wstring(stats.NoticesPending);
     out += L",\"view\":" + mcpjson::Quote(initial ? L"initial" : L"current");
     out += L",\"filter_pid\":" + std::to_wstring(pid) + L",\"processes\":[";
     bool first = true;
@@ -555,6 +663,8 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
         out += L",\"status\":" + mcpjson::Quote(entry.Status) + L",\"error\":" + std::to_wstring(entry.Error);
         out += L",\"cycles\":" + std::to_wstring(entry.History.Completed);
         out += L",\"verification_cursor\":" + mcpjson::Quote(std::to_wstring(entry.VerificationCursor));
+        out += L",\"verification_budget_remaining\":" + std::to_wstring(entry.VerificationBudget);
+        out += L",\"verification_periodic_deferred\":" + std::wstring(entry.PeriodicDeferred ? L"true" : L"false");
         out += L",\"verification_coverage\":\"bounded_rotating_candidates; not_full_code_coverage\"";
         out += L",\"last_attempt_ms\":" + std::to_wstring(entry.LastAttemptMs);
         out += L",\"pending_cursor\":" + mcpjson::Quote(std::to_wstring(entry.ExportCursor));
@@ -700,10 +810,105 @@ bool ProcessLayoutMonitorSelfTest()
     std::atomic<bool> stop{false};
     const auto notice = [](ProcessLayoutNotice)
     {
+        return true;
     };
     const auto candidate = [](ProcessLayoutCandidate)
     {
+        return true;
     };
+    {
+        ProcessLayoutMonitor::Entry bounded;
+        auto snapshot = std::make_shared<process_layout::Snapshot>();
+        snapshot->Identity = ObserveProcessIdentity(entry.Pid);
+        snapshot->FinishedMs = GetTickCount64();
+        snapshot->ObservedAt = ObservationFileTime();
+        for (size_t i = 0; i < 6; ++i)
+        {
+            const uint64_t base = 0x10000 + i * 0x1000;
+            snapshot->Regions.push_back({base, 4096, base, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_READWRITE, MEM_PRIVATE});
+        }
+        bounded.History.Current = snapshot;
+        bounded.History.Completed = 1;
+        bounded.VerificationBudget = 8;
+        bounded.VerificationRowsRemaining = snapshot->Regions.size();
+        std::vector<uint64_t> admitted;
+        size_t room = 0;
+        const auto limited = [&](ProcessLayoutCandidate item)
+        {
+            if (room == 0) { return false; }
+            --room;
+            admitted.push_back(item.Region.Base);
+            return true;
+        };
+        for (size_t retry = 0; retry < 100; ++retry) { monitor.PublishCandidates(bounded, limited, true); }
+        if (bounded.VerificationCursor != 0x10000 || !bounded.PeriodicDeferred || !admitted.empty()) { return false; }
+        for (size_t pass = 0; pass < 3; ++pass)
+        {
+            room = 2;
+            monitor.PublishCandidates(bounded, limited, true);
+        }
+        if (admitted.size() != 6) { return false; }
+        for (size_t i = 0; i < admitted.size(); ++i)
+        {
+            if (admitted[i] != snapshot->Regions[i].Base) { return false; }
+        }
+        room = 100;
+        monitor.PublishCandidates(bounded, limited, true);
+        monitor.PublishCandidates(bounded, limited, true);
+        if (admitted.size() != 6 || bounded.VerificationBudget != 2 || bounded.VerificationRowsRemaining != 0) { return false; }
+        for (size_t i = 6; i < 10; ++i)
+        {
+            const uint64_t base = 0x10000 + i * 0x1000;
+            snapshot->Regions.push_back({base, 4096, base, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_READWRITE, MEM_PRIVATE});
+        }
+        bounded.VerificationBudget = 8;
+        bounded.VerificationRowsRemaining = snapshot->Regions.size();
+        bounded.VerificationEmitted.clear();
+        admitted.clear();
+        monitor.PublishCandidates(bounded, limited, true);
+        monitor.PublishCandidates(bounded, limited, true);
+        if (admitted.size() != 8 || bounded.VerificationBudget != 0) { return false; }
+        bounded.VerificationBudget = 1; // A separate retained changed-range batch.
+        ProcessLayoutCandidate change;
+        change.Identity = snapshot->Identity;
+        change.Region = snapshot->Regions[2];
+        change.Region.Protect = PAGE_READWRITE;
+        change.Role = L"layout_change";
+        bounded.PendingChanges.push_back(change);
+        const auto cursor = bounded.VerificationCursor;
+        room = 0;
+        monitor.Entries.emplace(entry.Pid, std::move(bounded));
+        monitor.FlushCandidates(limited);
+        if (monitor.Stats().VerificationChangesPending != 1 ||
+            monitor.Entries.at(entry.Pid).VerificationCursor != cursor) { return false; }
+        room = 1;
+        monitor.FlushCandidates(limited);
+        if (monitor.Stats().VerificationChangesPending != 0 || admitted.back() != change.Region.Base ||
+            monitor.Entries.at(entry.Pid).VerificationCursor != cursor) { return false; }
+        auto& held = monitor.Entries.at(entry.Pid);
+        held.PendingNotice = ProcessLayoutNotice{};
+        held.PendingNotice->Cycle = 123;
+        monitor.FlushNotices([](const ProcessLayoutNotice&) { return false; });
+        if (monitor.Stats().NoticesPending != 1 || held.PendingNotice->Cycle != 123) { return false; }
+        size_t notices = 0;
+        monitor.FlushNotices([&](const ProcessLayoutNotice& item) { if (item.Cycle == 123) { ++notices; } return true; });
+        if (notices != 1 || monitor.Stats().NoticesPending != 0) { return false; }
+        monitor.Reset();
+        ProcessLayoutMonitor::Entry retired;
+        retired.Pid = UINT32_MAX;
+        retired.VerificationBudget = 1;
+        retired.PendingChanges.push_back(change);
+        monitor.Entries.emplace(retired.Pid, std::move(retired));
+        ProcessLayoutScope emptyScope;
+        emptyScope.All = false;
+        monitor.Discover(emptyScope, GetTickCount64());
+        if (monitor.Entries.count(UINT32_MAX) != 1 || monitor.Counters.VerificationChangesAbandoned != 0) { return false; }
+        room = 1;
+        monitor.FlushCandidates(limited);
+        monitor.Discover(emptyScope, GetTickCount64());
+        if (monitor.Entries.count(UINT32_MAX) != 0 || monitor.Counters.VerificationChangesAbandoned != 0) { return false; }
+        monitor.Reset();
+    }
     monitor.Advance(entry, scope, stop, notice, candidate);
     const bool rejected = entry.Status == L"process_outside_scope" && !entry.Pending && !entry.History.Current;
     scope.Pids.insert(entry.Pid);
