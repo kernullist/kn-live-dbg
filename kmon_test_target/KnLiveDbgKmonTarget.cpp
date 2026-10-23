@@ -17,6 +17,11 @@
 
 #include "KmonTestTargetContract.h"
 
+// Inert executable bytes, never called. The tail control requires a full
+// sweep beyond the first 256 executable pages; normal controls keep it intact.
+#pragma section(".kntail", read, execute)
+__declspec(allocate(".kntail")) const volatile uint8_t KmonImageTail[1024 * 1024] = {0xA5};
+
 namespace
 {
     constexpr uint32_t kHoldSecondsDefault = 45;
@@ -329,6 +334,19 @@ namespace
         }
         uint32_t stamp = 0x44664466;
         return PatchCurrentProcessBytes(ImageBase() + stampRva, &stamp, sizeof(stamp));
+    }
+
+    bool ApplyTailOverwrite()
+    {
+        auto address = const_cast<uint8_t*>(KmonImageTail) + sizeof(KmonImageTail) - 64;
+        const uint8_t patch[16] = {0x53, 0x57, 0x45, 0x45, 0x50, 0x5F, 0x54, 0x41, 0x49, 0x4C};
+        if (!PatchCurrentProcessBytes(address, patch, sizeof(patch)) || std::memcmp(address, patch, sizeof(patch)) != 0)
+        {
+            return false;
+        }
+        std::wprintf(L"KMON_TAIL rva=%u bytes=%zu\n", static_cast<uint32_t>(address - ImageBase()), sizeof(patch));
+        std::fflush(stdout);
+        return true;
     }
 
     bool ApplyNoMz()
@@ -740,6 +758,10 @@ namespace
         {
             ok = ApplyOverwrite();
         }
+        else if (scenario == L"overwrite-tail")
+        {
+            ok = ApplyTailOverwrite();
+        }
         else if (scenario == L"stamp")
         {
             ok = ApplyStamp();
@@ -815,6 +837,7 @@ int wmain(int argc, wchar_t** argv)
         std::wprintf(L"  /orphan-private   private RX page with MZ (exe_orphan_private)\n");
         std::wprintf(L"  /orphan-image     delete-pending SEC_IMAGE map (exe_orphan_image)\n");
         std::wprintf(L"  /orphan-mapped-rx headerless executable section, never executed\n");
+        std::wprintf(L"  /overwrite-tail patch the last page of the inert 1 MiB executable section\n");
         std::wprintf(L"  /mapped-readonly same bytes without execute permission (negative control)\n");
         std::wprintf(L"  /replace-main     suspended self-copy, unmap EXE, private MZ (exe_private)\n");
         std::wprintf(L"  /ghost            running image then delete the file (ghost)\n");

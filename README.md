@@ -11,6 +11,7 @@ The current checkout's [2026-10-23 validation report](docs/LIVE_HOST_VALIDATION_
 The [2026-10-23 KMON live matrix](docs/KMON_LIVE_VALIDATION_20261023.md) exercises emitted detections with owned memory fixtures and records repairs to loader ownership and VAD PE classification. Repeat it with `tools/validate-kmon-live.ps1` from an elevated PowerShell.
 The [queue follow-up](docs/KMON_QUEUE_VALIDATION_20261023.md) records bounded analysis scheduling, loss accounting, and repeated live validation with `-RequireQueueHealth`.
 The [coverage follow-up](docs/KMON_COVERAGE_VALIDATION_20261023.md) records identity-checked read fallback, page-level capture gaps, completion of admitted work at shutdown, and repeated validation with `-RequireCompletedWork`.
+The [full image sweep follow-up](docs/KMON_IMAGE_SWEEP_VALIDATION_20261023.md) covers file-identity cursor sharing, bounded continuation, and live tail-page controls with `-RequireImageCompletion`.
 
 ## Demo
 

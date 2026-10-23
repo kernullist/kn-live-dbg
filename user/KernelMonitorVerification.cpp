@@ -39,6 +39,24 @@ namespace
         return ImageKey(role, target, identity) + L":" + std::to_wstring(slot);
     }
 
+    bool SameReferenceFile(HANDLE alias, const std::wstring& path,
+        const executable_image::DiskPeMetadata& reference)
+    {
+        // Use the full volume/file ID for aliasing (also on file systems with
+        // 128-bit IDs), and the metadata stamp to reject a replaced reference.
+        HANDLE original = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (original == INVALID_HANDLE_VALUE) { return false; }
+        const std::unique_ptr<void, decltype(&CloseHandle)> owner(original, &CloseHandle);
+        FILE_ID_INFO a{}, b{};
+        return executable_image::DiskFileIdentityMatches(alias, reference) &&
+            executable_image::DiskFileIdentityMatches(original, reference) &&
+            GetFileInformationByHandleEx(alias, FileIdInfo, &a, sizeof(a)) &&
+            GetFileInformationByHandleEx(original, FileIdInfo, &b, sizeof(b)) &&
+            a.VolumeSerialNumber == b.VolumeSerialNumber &&
+            std::memcmp(a.FileId.Identifier, b.FileId.Identifier, sizeof(a.FileId.Identifier)) == 0;
+    }
+
     std::vector<KernelModuleInfo> UserModules(uint32_t pid)
     {
         std::vector<KernelModuleInfo> modules;
@@ -109,6 +127,29 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
     auto it = ImageWork.find(key);
     if (it == ImageWork.end())
     {
+        // A mapped device path and a loader DOS path can name the same file.
+        // Share a cursor only after checking the backing identity and process
+        // generation; basename/path normalization alone is not evidence.
+        HANDLE alias = INVALID_HANDLE_VALUE;
+        for (auto candidate = ImageWork.begin(); candidate != ImageWork.end(); ++candidate)
+        {
+            if (candidate->second.Base != base || !candidate->second.Loaded ||
+                !candidate->second.Identity.SameInstance(identity)) { continue; }
+            if (alias == INVALID_HANDLE_VALUE)
+            {
+                alias = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (alias == INVALID_HANDLE_VALUE) { break; }
+            }
+            if (SameReferenceFile(alias, candidate->second.Path, candidate->second.Reference))
+            {
+                it = candidate;
+                break;
+            }
+        }
+        if (alias != INVALID_HANDLE_VALUE) { CloseHandle(alias); }
+    }
+    if (it == ImageWork.end())
+    {
         if (ImageWork.size() >= 2048)
         {
             for (auto old = ImageWork.begin(); old != ImageWork.end();)
@@ -159,6 +200,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.ObjectReports.clear();
             work.ReportedHashes.clear();
             work.Sweep = {};
+            work.NextSweepDueMs = 0;
         }
     }
     if (!work.Loaded && (work.LastAttemptMs == 0 || now - work.LastAttemptMs >= 30000))
@@ -185,7 +227,13 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         return CodeOwnership::OwnedUnverified;
     }
     const uint64_t now = GetTickCount64();
-    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, reader, pageBudget, now, &work->Sweep);
+    if (now < work->NextSweepDueMs) { return CodeOwnership::OwnedUnverified; }
+    work->LastSweepMs = now;
+    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, reader, pageBudget, now, &work->Sweep, 25);
+    // Completed small images must not continually restart while larger images
+    // still have an unvisited tail. Failed identities are retried, not trusted.
+    work->NextSweepDueMs = work->Sweep.Coverage.TraversalComplete ? now + 30000 :
+        (pages.empty() ? now + 5000 : 0);
     if (pages.empty() && !work->Sweep.Coverage.InventoryAvailable)
     {
         work->ReportedHashes.clear();
@@ -289,6 +337,144 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     ImageRemainingPages.store(remaining);
     ImageLastCompleteMs.store(lastComplete);
     return state;
+}
+
+KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64_t now)
+{
+    std::set<uint32_t> watched;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        watched.insert(WatchPids.begin(), WatchPids.end());
+    }
+    // Rotate process generations first, then the least recently scanned image.
+    // A process with many DLLs must not starve a small process's image tail.
+    const size_t preferred = (++ImageSweepTurns % 4) == 0 ? 1 : 0;
+    for (size_t pass = 0; pass < 2; ++pass)
+    {
+        const size_t group = (preferred + pass) % 2;
+        struct Ready
+        {
+            ImageVerificationWork* Initial = nullptr;
+            ImageVerificationWork* Repeat = nullptr;
+            uint64_t Turns = 0;
+        };
+        std::map<std::pair<uint32_t, uint64_t>, Ready> eligible;
+        for (auto& item : ImageWork)
+        {
+            auto& work = item.second;
+            const bool priority = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0;
+            if (work.Loaded && priority == (group == 0))
+            {
+                const auto key = std::make_pair(work.Identity.ProcessId, work.Identity.CreateTime);
+                auto& ready = eligible[key];
+                ready.Turns += work.SweepSchedulingTurns;
+                if (now < work.NextSweepDueMs) { continue; }
+                auto& candidate = work.Sweep.LastCompleteMs == 0 ? ready.Initial : ready.Repeat;
+                if (candidate == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
+                    std::make_pair(candidate->LastSweepMs, candidate->Base))
+                {
+                    candidate = &work;
+                }
+            }
+        }
+        for (auto it = eligible.begin(); it != eligible.end();)
+        {
+            if (it->second.Initial == nullptr && it->second.Repeat == nullptr) { it = eligible.erase(it); }
+            else { ++it; }
+        }
+        if (eligible.empty()) { continue; }
+        auto selected = eligible.upper_bound(ImageSweepProcessCursors[group]);
+        if (selected == eligible.end()) { selected = eligible.begin(); }
+        ImageSweepProcessCursors[group] = selected->first;
+        auto& ready = selected->second;
+        // Finish previously unseen tails first, while reserving one in four
+        // process turns for rescans so a very large image cannot freeze them.
+        auto work = ready.Initial != nullptr && (ready.Repeat == nullptr || ready.Turns % 4 != 3)
+            ? ready.Initial : ready.Repeat;
+        ++work->SweepSchedulingTurns;
+        return work;
+    }
+    return nullptr;
+}
+
+void KernelMonitor::ContinueImageSweeps()
+{
+    const uint64_t now = GetTickCount64();
+    if (StopRequested.load() || now < NextImageSweepMs || ImageWork.empty() ||
+        LayoutCandidates.Size() >= 256 || ExecutionReferences.size() >= 256) { return; }
+    NextImageSweepMs = now + 50;
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    if (!GetLiveTargets(&device, &symbols)) { return; }
+    auto selected = SelectImageSweepWork(now);
+    if (selected == nullptr) { return; }
+    // Copy these before calling the verifier (which rechecks the disk cache).
+    const auto identity = selected->Identity;
+    const auto path = selected->Path;
+    const auto base = selected->Base;
+    const uint32_t pid = identity.ProcessId;
+    HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (pid != 0 && process == nullptr)
+    {
+        process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    }
+    const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
+    ProcessAddressContext context{};
+    bool resolved = false, tried = false;
+    const auto sameProcess = [&]()
+    {
+        if (pid == 0) { return true; }
+        if (process != nullptr)
+        {
+            DWORD exitCode = 0;
+            return GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE &&
+                identity.SameInstance(ObserveProcessIdentity(pid, process));
+        }
+        ProcessAddressContext current{};
+        return ResolveObservationProcess(*device, *symbols, identity, &current);
+    };
+    const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+    {
+        if (size == 0 || size > 4096 || address > UINT64_MAX - size || !sameProcess()) { return false; }
+        if (pid == 0)
+        {
+            return address >= 0xFFFF800000000000ull && device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+        }
+        MEMORY_BASIC_INFORMATION before{}, after{};
+        const bool known = process != nullptr && VirtualQueryEx(process, reinterpret_cast<void*>(address),
+            &before, sizeof(before)) == sizeof(before);
+        if (known && (before.State != MEM_COMMIT || before.Type != MEM_IMAGE ||
+            reinterpret_cast<uint64_t>(before.AllocationBase) != base ||
+            (before.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+            address < reinterpret_cast<uint64_t>(before.BaseAddress) || size > before.RegionSize ||
+            address - reinterpret_cast<uint64_t>(before.BaseAddress) > before.RegionSize - size)) { return false; }
+        bytes->resize(size);
+        SIZE_T read = 0;
+        bool ok = process != nullptr && ReadProcessMemory(process, reinterpret_cast<void*>(address),
+            bytes->data(), size, &read) && read == size;
+        if (!ok)
+        {
+            if (!tried)
+            {
+                tried = true;
+                resolved = ResolveObservationProcess(*device, *symbols, identity, &context);
+            }
+            ok = resolved && device->ReadProcessVirtual(pid, context.Eprocess, identity.CreateTime,
+                address, static_cast<uint32_t>(size), bytes, nullptr);
+        }
+        return ok && sameProcess() && (!known ||
+            (VirtualQueryEx(process, reinterpret_cast<void*>(address), &after, sizeof(after)) == sizeof(after) &&
+                before.BaseAddress == after.BaseAddress && before.AllocationBase == after.AllocationBase &&
+                before.RegionSize == after.RegionSize && before.State == after.State &&
+                before.Protect == after.Protect && before.Type == after.Type));
+    };
+    // Include publication cost in the batch bound: a 25ms comparison can
+    // otherwise return hundreds of pages whose events starve other scanners.
+    const auto lastDiscovered = selected->LastUsedMs;
+    ScanExecutableImage(path, base, identity, reader, 64);
+    // Continuation is not a new discovery. In particular, polling an exited
+    // process must not keep its failed cache entries young indefinitely.
+    selected->LastUsedMs = lastDiscovered;
 }
 
 void KernelMonitor::ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,

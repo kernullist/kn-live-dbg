@@ -328,8 +328,10 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
 }
 
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
-    uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep)
+    uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
+    uint64_t budgetMs)
 {
+    const uint64_t started = GetTickCount64();
     std::vector<ExecutablePageResult> results;
     if (sweep == nullptr || sweep->Ranges.empty() || pageBudget == 0)
     {
@@ -362,6 +364,10 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     const size_t end = sweep->NextRange + (std::min)(pageBudget, sweep->Ranges.size() - sweep->NextRange);
     for (; sweep->NextRange < end; ++sweep->NextRange)
     {
+        if (!results.empty() && budgetMs != 0 && GetTickCount64() - started >= budgetMs)
+        {
+            break;
+        }
         const auto& range = sweep->Ranges[sweep->NextRange];
         auto page = CompareExecutableRange(path, metadata, imageBase,
             static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader);
@@ -417,10 +423,13 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     sweep->Coverage.TraversalComplete = sweep->NextRange == sweep->Ranges.size();
     sweep->Coverage.ResumeAddress = sweep->Coverage.TraversalComplete ? 0 : imageBase + sweep->Ranges[sweep->NextRange].Address;
     sweep->Coverage.Reason = sweep->Coverage.Complete() ? L"cycle_complete" :
-        (sweep->Coverage.TraversalComplete ? L"cycle_complete_with_gaps" : L"page_budget");
+        (sweep->Coverage.TraversalComplete ? L"cycle_complete_with_gaps" :
+            (sweep->NextRange < end ? L"time_budget" : L"page_budget"));
     if (sweep->Coverage.TraversalComplete)
     {
         sweep->LastCompleteMs = nowMs;
+        ++sweep->CompletedCycles;
+        sweep->LastCompleteCoverage = sweep->Coverage;
     }
     return results;
 }
@@ -552,6 +561,23 @@ bool ExecutableImageVerifierSelfTest()
         {
             break;
         }
+        ExecutableSweep timed;
+        timed.Initialize(metadata);
+        const ObservationReader slowReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        {
+            if (size == 4096) { Sleep(20); }
+            return reader(address, size, bytes);
+        };
+        const auto firstTimed = AdvanceExecutableSweep(path, metadata, loadedBase, slowReader, 4, 10, &timed, 1);
+        const bool paused = firstTimed.size() == 1 && timed.NextRange == 1 && timed.CompletedCycles == 0 &&
+            timed.Coverage.Reason == L"time_budget" && !timed.Coverage.TraversalComplete;
+        const auto tailTimed = AdvanceExecutableSweep(path, metadata, loadedBase, reader, 4, 11, &timed);
+        if (!paused || tailTimed.size() != 3 || tailTimed.back().Rva != 0x5000 ||
+            tailTimed.back().Ownership != CodeOwnership::OwnedModified || timed.CompletedCycles != 1 ||
+            !timed.LastCompleteCoverage.Complete()) { break; }
+        AdvanceExecutableSweep(path, metadata, loadedBase, reader, 1, 12, &timed);
+        if (timed.Coverage.TraversalComplete || timed.NextRange != 1 || timed.CompletedCycles != 1 ||
+            !timed.LastCompleteCoverage.Complete() || timed.LastCompleteMs != 11) { break; }
         bool reviewControls = true;
         const auto reviewCheck = [&](bool condition, const char* name)
         {

@@ -8812,7 +8812,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     // work with its normal identity/mapping checks, without restarting scans.
     const uint64_t drainStarted = GetTickCount64();
     while ((LayoutCandidates.Size() != 0 || !ExecutionReferences.empty()) &&
-        GetTickCount64() - drainStarted < 5000)
+        GetTickCount64() - drainStarted < 10000)
     {
         const auto pending = LayoutCandidates.Size() + ExecutionReferences.size();
         DrainLayoutCandidates(true);

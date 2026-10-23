@@ -98,6 +98,10 @@ void KernelMonitor::ResetPipeline()
     AnalysisLastCompleteMs.store(0);
     ImageRemainingPages.store(0);
     ImageLastCompleteMs.store(0);
+    ImageSweepProcessCursors[0] = {};
+    ImageSweepProcessCursors[1] = {};
+    NextImageSweepMs = 0;
+    ImageSweepTurns = 0;
     UserLastScanMs.clear();
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
@@ -118,6 +122,7 @@ void KernelMonitor::ServicePendingAnalysis()
     DrainPipelineEvents();
     DrainLayoutCandidates();
     ScanExecutionReferences(128, 75);
+    ContinueImageSweeps();
 }
 
 void KernelMonitor::CollectorLoop()
@@ -836,6 +841,42 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"shutdown_events_processed"] = std::to_wstring(ShutdownEventsProcessed);
         event.Evidence[L"shutdown_events_unanalyzed"] = std::to_wstring(ShutdownEventsUnanalyzed);
         event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
+        uint64_t imageScheduled = 0, imageTraversed = 0, imageRemaining = 0;
+        for (const auto& item : ImageWork)
+        {
+            const auto& work = item.second;
+            imageScheduled += work.Sweep.Coverage.Attempted ? 1 : 0;
+            imageTraversed += work.Sweep.LastCompleteMs != 0 ? 1 : 0;
+            imageRemaining += work.Sweep.Ranges.size() - work.Sweep.NextRange;
+            if (finalDrain)
+            {
+                KmonEvent progress;
+                progress.Kind = L"coverage.image_progress";
+                progress.ProcessId = work.Identity.ProcessId;
+                progress.Image = work.Path;
+                progress.Summary = L"final image sweep cursor; traversal does not imply all bytes verified";
+                progress.Observation.Identity = work.Identity;
+                progress.Observation.Source = L"executable_page_sweep";
+                progress.Observation.Coverage = work.Sweep.Coverage;
+                progress.Evidence[L"image_base"] = std::to_wstring(work.Base);
+                progress.Evidence[L"reference_loaded"] = work.Loaded ? L"true" : L"false";
+                progress.Evidence[L"total_pages"] = std::to_wstring(work.Sweep.Ranges.size());
+                progress.Evidence[L"cursor"] = std::to_wstring(work.Sweep.NextRange);
+                progress.Evidence[L"cycle"] = std::to_wstring(work.Sweep.Cycle);
+                progress.Evidence[L"remaining_pages"] = std::to_wstring(work.Sweep.Ranges.size() - work.Sweep.NextRange);
+                progress.Evidence[L"last_completion_ms"] = std::to_wstring(work.Sweep.LastCompleteMs);
+                progress.Evidence[L"last_sweep_ms"] = std::to_wstring(work.LastSweepMs);
+                progress.Evidence[L"completed_cycles"] = std::to_wstring(work.Sweep.CompletedCycles);
+                progress.Evidence[L"last_cycle_requested_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.RequestedBytes);
+                progress.Evidence[L"last_cycle_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.ComparedBytes);
+                progress.Evidence[L"last_cycle_failed_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.FailedBytes);
+                progress.Evidence[L"last_cycle_skipped_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.SkippedBytes);
+                RecordEvent(std::move(progress));
+            }
+        }
+        ImageRemainingPages.store(imageRemaining);
+        event.Evidence[L"image_scheduled_items"] = std::to_wstring(imageScheduled);
+        event.Evidence[L"image_traversed_items"] = std::to_wstring(imageTraversed);
         event.Evidence[L"image_remaining_pages"] = std::to_wstring(ImageRemainingPages.load());
         event.Evidence[L"image_last_complete_ms"] = std::to_wstring(ImageLastCompleteMs.load());
         event.Evidence[L"analysis_budget_exceeded"] = std::to_wstring(AnalysisBudgetExceeded.load());
@@ -883,6 +924,67 @@ bool KmonPipelineSelfTest()
             const uint64_t selfBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
             wchar_t selfPath[32768]{};
             GetModuleFileNameW(nullptr, selfPath, 32768);
+            auto imageWork = monitor.FindImageWork(selfPath, selfBase, identity);
+            if (imageWork == nullptr || imageWork->Sweep.Ranges.size() < 2) { break; }
+            imageWork->Sweep.NextRange = 1;
+            const std::wstring aliasPath = L"\\\\?\\" + std::wstring(selfPath);
+            if (monitor.FindImageWork(aliasPath, selfBase, identity) != imageWork ||
+                imageWork->Sweep.NextRange != 1 || monitor.ImageWork.size() != 1) { break; }
+            auto reusedIdentity = identity;
+            ++reusedIdentity.CreateTime;
+            if (monitor.FindImageWork(aliasPath, selfBase, reusedIdentity) == imageWork) { break; }
+            wchar_t differentReference[32768]{};
+            GetModuleFileNameW(GetModuleHandleW(L"ntdll.dll"), differentReference, 32768);
+            if (monitor.FindImageWork(differentReference, selfBase, identity) == imageWork ||
+                monitor.ImageWork.size() != 3) { break; }
+            monitor.ImageWork.clear();
+            // A DLL-rich process must not consume every watched image turn.
+            for (uint32_t index = 0; index < 20; ++index)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.Loaded = true;
+                work.Identity.ProcessId = index == 19 ? 200 : 100;
+                work.Identity.CreateTime = 1;
+                work.Base = 0x10000 + index * 4096;
+                monitor.ImageWork.emplace(std::to_wstring(index), std::move(work));
+            }
+            monitor.WatchPids.insert(100);
+            monitor.WatchPids.insert(200);
+            bool fair = true;
+            for (uint32_t turn = 0; turn < 8; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                fair = fair && selected != nullptr && selected->Identity.ProcessId == (turn % 2 == 0 ? 100u : 200u);
+                if (selected) { selected->LastSweepMs = turn + 1; }
+            }
+            monitor.ImageWork.clear();
+            monitor.WatchPids.clear();
+            monitor.ImageSweepProcessCursors[0] = {};
+            monitor.ImageSweepProcessCursors[1] = {};
+            monitor.ImageSweepTurns = 0;
+            if (!fair) { break; }
+            KernelMonitor::ImageVerificationWork initial, repeat;
+            initial.Loaded = repeat.Loaded = true;
+            initial.Identity.ProcessId = repeat.Identity.ProcessId = 100;
+            initial.Identity.CreateTime = repeat.Identity.CreateTime = 1;
+            initial.Base = 0x10000;
+            initial.LastSweepMs = 900;
+            repeat.Base = 0x20000;
+            repeat.Sweep.LastCompleteMs = 1;
+            monitor.ImageWork.emplace(L"initial", std::move(initial));
+            monitor.ImageWork.emplace(L"repeat", std::move(repeat));
+            monitor.WatchPids.insert(100);
+            for (size_t turn = 0; turn < 8; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                fair = fair && selected == &monitor.ImageWork.at(turn % 4 == 3 ? L"repeat" : L"initial");
+            }
+            monitor.ImageWork.clear();
+            monitor.WatchPids.clear();
+            monitor.ImageSweepProcessCursors[0] = {};
+            monitor.ImageSweepProcessCursors[1] = {};
+            monitor.ImageSweepTurns = 0;
+            if (!fair) { break; }
             std::vector<KernelModuleInfo> owner{{selfBase, 1, selfPath, L"self"}};
             const uint64_t code = reinterpret_cast<uint64_t>(&KmonPipelineSelfTest);
             // Allocation membership can extend beyond the reported module size;

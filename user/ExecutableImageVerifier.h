@@ -41,6 +41,8 @@ struct ExecutableSweep
     size_t NextRange = 0;
     uint64_t Cycle = 1;
     uint64_t LastCompleteMs = 0;
+    uint64_t CompletedCycles = 0;
+    ObservationCoverage LastCompleteCoverage;
     ObservationCoverage Coverage;
     std::vector<ObservationRange> Ranges;
     std::map<uint32_t, CodeOwnership> Pages;
@@ -74,6 +76,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(
     const ObservationReader& reader,
     size_t pageBudget,
     uint64_t nowMs,
-    ExecutableSweep* sweep);
+    ExecutableSweep* sweep,
+    uint64_t budgetMs = 0);
 
 bool ExecutableImageVerifierSelfTest();

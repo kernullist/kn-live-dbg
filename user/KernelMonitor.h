@@ -426,6 +426,7 @@ private:
     CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget);
     void ScanKernelExecutableImages();
+    void ContinueImageSweeps();
     void ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader);
     void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
@@ -620,6 +621,9 @@ private:
         uint64_t LastAttemptMs = 0;
         uint64_t LastUsedMs = 0;
         uint64_t LastReferenceCheckMs = 0;
+        uint64_t LastSweepMs = 0;
+        uint64_t NextSweepDueMs = 0;
+        uint64_t SweepSchedulingTurns = 0;
         bool Loaded = false;
         bool LayoutIdentityReported = false;
         bool ManifestChecked = false;
@@ -634,6 +638,10 @@ private:
     GameBuildManifest GameManifest;
     bool GameManifestActive = false;
     std::map<std::wstring, ImageVerificationWork> ImageWork;
+    std::pair<uint32_t, uint64_t> ImageSweepProcessCursors[2];
+    uint64_t NextImageSweepMs = 0;
+    uint64_t ImageSweepTurns = 0;
+    ImageVerificationWork* SelectImageSweepWork(uint64_t now);
     std::map<std::pair<uint32_t, uint64_t>, size_t> UserImageCursors;
     ExecutableRegionCatalog RegionCatalog;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserRegionCursors;

@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct ExecutableRegionObservation
@@ -71,9 +72,9 @@ public:
             return 0;
         }
         ExecutableRegionRecord* previous = nullptr;
-        for (auto& pair : Records)
+        for (const auto generation : InstanceRecords(observation.Context.Identity))
         {
-            auto& record = pair.second;
+            auto& record = Records.at(generation);
             const auto& old = record.Latest;
             if (old.Context.Identity.SameInstance(observation.Context.Identity) &&
                 old.Range.Overlaps(observation.Range) &&
@@ -118,10 +119,12 @@ public:
         {
             if (Records.size() >= Capacity)
             {
-                auto oldest = std::min_element(Records.begin(), Records.end(), [](const auto& a, const auto& b)
-                {
-                    return a.second.LastSeenMs < b.second.LastSeenMs;
-                });
+                auto oldest = Records.find(LastSeenOrder.begin()->second);
+                const auto key = InstanceKey(oldest->second.Latest.Context.Identity);
+                auto bucket = ByInstance.find(key);
+                bucket->second.erase(oldest->first);
+                if (bucket->second.empty()) { ByInstance.erase(bucket); }
+                LastSeenOrder.erase(LastSeenOrder.begin());
                 Records.erase(oldest);
                 ++Evicted;
             }
@@ -137,12 +140,15 @@ public:
                 previous->Latest.Context.Ownership != observation.Context.Ownership ||
                 previous->Sources.count(observation.Context.Source) == 0;
         }
+        LastSeenOrder.erase({previous->LastSeenMs, previous->Generation});
         previous->LastSeenMs = observation.Context.MonotonicMs;
         previous->Latest = observation;
         previous->Latest.Context.MappingGeneration = previous->Generation;
-        for (auto& pair : Records)
+        ByInstance[InstanceKey(observation.Context.Identity)].insert(previous->Generation);
+        LastSeenOrder.insert({previous->LastSeenMs, previous->Generation});
+        for (const auto generation : InstanceRecords(observation.Context.Identity))
         {
-            auto& containing = pair.second;
+            auto& containing = Records.at(generation);
             if (containing.Generation == previous->Generation || !containing.Active ||
                 !containing.Latest.Context.Identity.SameInstance(observation.Context.Identity) ||
                 containing.LastSeenMs > previous->LastSeenMs || previous->LastSeenMs - containing.LastSeenMs > 1000)
@@ -171,9 +177,9 @@ public:
     const ExecutableRegionRecord* Find(const ObservationIdentity& identity, uint64_t address, uint64_t nowMs) const
     {
         const ExecutableRegionRecord* result = nullptr;
-        for (const auto& pair : Records)
+        for (const auto generation : InstanceRecords(identity))
         {
-            const auto& record = pair.second;
+            const auto& record = Records.at(generation);
             if (record.Active && record.Latest.Context.Identity.SameInstance(identity) &&
                 record.Latest.Range.Contains(address) && nowMs >= record.LastSeenMs &&
                 nowMs - record.LastSeenMs <= 30000 &&
@@ -192,9 +198,9 @@ public:
         {
             return;
         }
-        for (auto& pair : Records)
+        for (const auto generation : InstanceRecords(identity))
         {
-            auto& record = pair.second;
+            auto& record = Records.at(generation);
             const auto& old = record.Latest.Range;
             if (record.Latest.Context.Identity.SameInstance(identity) && old.Overlaps(range))
             {
@@ -265,9 +271,25 @@ public:
     uint64_t LinksEvicted = 0;
 
 private:
+    using ProcessKey = std::tuple<std::wstring, uint32_t, uint64_t>;
+    static ProcessKey InstanceKey(const ObservationIdentity& identity)
+    {
+        // Match SameInstance's kernel special case. EPROCESS and session are
+        // optional qualifiers and must still be checked inside the bucket.
+        return {identity.BootId, identity.ProcessId, identity.ProcessId == 0 ? 0 : identity.CreateTime};
+    }
+    const std::set<uint64_t>& InstanceRecords(const ObservationIdentity& identity) const
+    {
+        static const std::set<uint64_t> empty;
+        const auto found = ByInstance.find(InstanceKey(identity));
+        return found == ByInstance.end() ? empty : found->second;
+    }
     size_t Capacity;
     uint64_t NextGeneration = 0;
     std::map<uint64_t, ExecutableRegionRecord> Records;
+    std::map<ProcessKey, std::set<uint64_t>> ByInstance;
+    // Same timestamp ties keep the original lowest-generation eviction order.
+    std::set<std::pair<uint64_t, uint64_t>> LastSeenOrder;
     std::vector<ExecutableRegionLink> Links;
 };
 
@@ -347,5 +369,31 @@ inline bool ExecutableRegionCatalogSelfTest()
     region.Range.Size = 4096;
     region.Context.MonotonicMs = 1500;
     ok = ok && nested.Observe(region) == 0;
+    ExecutableRegionCatalog indexed(3);
+    region.Context.MonotonicMs = 3000;
+    region.Context.Identity = identity;
+    const auto firstIndexed = indexed.Observe(region);
+    region.Context.Identity.ProcessId += 1;
+    const auto otherIndexed = indexed.Observe(region);
+    region.Context.Identity.CreateTime += 1;
+    indexed.Observe(region);
+    // Refresh the oldest record, then force an eviction at the same timestamp.
+    region.Context.Identity = identity;
+    region.Context.MonotonicMs = 3001;
+    ok = ok && indexed.Observe(region) == firstIndexed;
+    region.Context.Identity.BootId = L"next_boot";
+    indexed.Observe(region);
+    ok = ok && indexed.Snapshot().count(otherIndexed) == 0 && indexed.Snapshot().count(firstIndexed) == 1;
+    indexed.RetireRange(identity, region.Range, 3002);
+    ok = ok && indexed.Find(identity, region.Range.Address, 3002) == nullptr;
+    region.Context.Identity = identity;
+    region.Context.Identity.ProcessId = 0;
+    region.Context.MonotonicMs = 3003;
+    const auto kernelIndexed = indexed.Observe(region);
+    region.Context.Identity.CreateTime += 99;
+    ok = ok && indexed.Observe(region) == kernelIndexed;
+    auto qualifier = region.Context.Identity;
+    qualifier.Eprocess = 0xFFFF800000001000ull;
+    ok = ok && indexed.Find(qualifier, region.Range.Address, 3003) != nullptr;
     return ok;
 }

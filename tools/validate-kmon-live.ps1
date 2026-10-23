@@ -5,7 +5,9 @@ param(
     [ValidateRange(60, 600)][int]$ObserveSeconds = 150,
     [switch]$ProbeDriver,
     [switch]$RequireQueueHealth,
-    [switch]$RequireCompletedWork
+    [switch]$RequireCompletedWork,
+    [switch]$ImageSweepFixtures,
+    [switch]$RequireImageCompletion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,7 +89,9 @@ try {
     if ($text -notmatch '\[kmon\] started\.') { throw 'KMON startup timeout' }
     if ($ProbeDriver) { $monitor.StandardInput.WriteLine('probe load') }
 
-    foreach ($mode in @('hold', 'mapped-readonly', 'overwrite', 'orphan-mapped-rx', 'orphan-private', 'orphan-image')) {
+    $modes = @('hold', 'mapped-readonly', 'overwrite', 'orphan-mapped-rx', 'orphan-private', 'orphan-image')
+    if ($ImageSweepFixtures) { $modes += 'overwrite-tail' }
+    foreach ($mode in $modes) {
         $child = Start-Process -FilePath $fixture -ArgumentList @('/child', $mode, '/seconds', ($ObserveSeconds + 240)) `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput "$output\fixture-$mode.stdout.log" `
             -RedirectStandardError "$output\fixture-$mode.stderr.log"
@@ -177,31 +181,79 @@ try {
 }
 
 try {
-    $events = @(Get-ChildItem -LiteralPath $output -Filter 'kmon-events.*.jsonl' | Sort-Object Name |
-        ForEach-Object { Get-Content -LiteralPath $_.FullName | ForEach-Object { $_ | ConvertFrom-Json } })
+    # Full sweeps can emit tens of thousands of page observations. Stream
+    # their unique addresses instead of retaining every PSObject in memory.
+    $events = [Collections.Generic.List[object]]::new()
+    $comparedPagesByPid = @{}
+    foreach ($run in $runs) { $comparedPagesByPid[[long]$run.pid] = [Collections.Generic.HashSet[string]]::new() }
+    $eventCount = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $output -Filter 'kmon-events.*.jsonl' | Sort-Object Name)) {
+        foreach ($line in [IO.File]::ReadLines($file.FullName)) {
+            ++$eventCount
+            $event = $line | ConvertFrom-Json
+            if ($event.kind -eq 'coverage.region') {
+                if ($comparedPagesByPid.ContainsKey([long]$event.pid) -and $event.evidence.source -eq 'executable_page_compare' -and
+                    [long]$event.evidence.compared_bytes -gt 0) {
+                    [void]$comparedPagesByPid[[long]$event.pid].Add([string]$event.evidence.base)
+                }
+            } elseif ($event.kind -match '^finding\.|^process\.(hollow|implant)$|^driver\.(drop_load|official_load|image_only)$' -or
+                $event.kind -in @('coverage.user_references', 'coverage.image', 'coverage.capture',
+                    'coverage.capture_result', 'coverage.pipeline', 'coverage.shutdown_event')) {
+                $events.Add($event)
+            }
+        }
+    }
     $results = @(foreach ($run in $runs) {
         $own = @($events | Where-Object { $_.pid -eq $run.pid })
         $referenceObservations = @($own | Where-Object { $_.kind -eq 'coverage.user_references' }).Count
-        $comparedPages = @($own | Where-Object {
-            $_.kind -eq 'coverage.region' -and $_.evidence.source -eq 'executable_page_compare' -and
-            [long]$_.evidence.compared_bytes -gt 0
-        } | ForEach-Object { $_.evidence.base } | Sort-Object -Unique).Count
+        $comparedPages = $comparedPagesByPid[[long]$run.pid].Count
         $expected = @(switch ($run.scenario) {
             'overwrite' { $own | Where-Object { $_.kind -eq 'finding.code_modified' -and $_.image -match 'KnLiveDbgKmonTarget\.exe$' } }
+            'overwrite-tail' {
+                $marker = Get-Content -LiteralPath "$output\fixture-overwrite-tail.stdout.log" -Raw
+                if ($marker -notmatch 'KMON_TAIL rva=(\d+) bytes=16') { throw 'Missing tail patch identity' }
+                $tailRva = [long]$Matches[1]
+                $own | Where-Object { $_.kind -eq 'finding.code_modified' -and
+                    $_.image -match 'KnLiveDbgKmonTarget\.exe$' -and
+                    [long]$_.evidence.rva -eq ($tailRva -band -4096) }
+            }
             'orphan-mapped-rx' { $own | Where-Object { $_.kind -eq 'process.implant' -and (Get-KmonEventLayer $_) -eq 'mapped_exec' } }
             'orphan-private' { $own | Where-Object { $_.kind -eq 'process.hollow' -and (Get-KmonEventLayer $_) -eq 'exe_orphan_private' } }
             'orphan-image' { $own | Where-Object { $_.kind -eq 'process.hollow' -and (Get-KmonEventLayer $_) -eq 'exe_orphan_image' } }
         })
         $unexpected = @($own | Where-Object {
-            ($run.scenario -in @('hold', 'mapped-readonly') -and $_.kind -match '^finding\.|^process\.(hollow|implant)$') -or
+            ($run.scenario -in @('hold', 'mapped-readonly') -and $_.kind -match '^finding\.|^process\.(hollow|implant)$' -and
+                -not ($_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation')) -or
             ($run.scenario -eq 'orphan-image' -and (Get-KmonEventLayer $_) -in @('private_exec_pe', 'private_exec_wiped'))
         })
         $negative = $run.scenario -in @('hold', 'mapped-readonly')
+        # Assess the known fixture and its three imported images, not merely
+        # whichever subset the monitor happened to discover. Deleted SEC_IMAGE
+        # controls have no readable file reference and are reported separately.
+        $imageNames = @('KnLiveDbgKmonTarget.exe', 'KERNEL32.DLL', 'KERNELBASE.dll', 'ntdll.dll')
+        $imageCompletions = @(foreach ($name in $imageNames) {
+            $completed = @($own | Where-Object { $_.kind -eq 'coverage.image' -and
+                [IO.Path]::GetFileName($_.image) -ieq $name -and $_.summary -in @('cycle_complete', 'cycle_complete_with_gaps') })
+            $best = @($completed | Sort-Object { [long]$_.evidence.compared_bytes } -Descending | Select-Object -First 1)
+            $completeBytes = $best.Count -eq 1 -and $best[0].evidence.coverage_status -eq 'complete'
+            $traversedWithoutErrors = $best.Count -eq 1 -and [long]$best[0].evidence.failed_bytes -eq 0 -and
+                [long]$best[0].evidence.requested_bytes -eq ([long]$best[0].evidence.compared_bytes + [long]$best[0].evidence.skipped_bytes)
+            [ordered]@{image=$name; traversed=$completed.Count -gt 0; bytes_complete=$completeBytes
+                traversed_without_errors=$traversedWithoutErrors
+                compared_bytes=$(if ($best.Count) { [long]$best[0].evidence.compared_bytes } else { 0 })
+                failed_bytes=$(if ($best.Count) { [long]$best[0].evidence.failed_bytes } else { 0 })
+                skipped_bytes=$(if ($best.Count) { [long]$best[0].evidence.skipped_bytes } else { 0 })}
+        })
+        $imagesComplete = @($imageCompletions | Where-Object { -not $_.traversed_without_errors }).Count -eq 0 -and
+            $imageCompletions[0].bytes_complete
         [ordered]@{
             scenario=$run.scenario; pid=$run.pid; user_reference_observations=$referenceObservations; expected_events=$expected.Count
             unique_image_pages_compared=$comparedPages
             unexpected_events=$unexpected.Count
-            passed=($referenceObservations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0)
+            layout_change_observations=@($own | Where-Object { $_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation' }).Count
+            image_completions=$imageCompletions; image_sweeps_completed=$imagesComplete
+            passed=($referenceObservations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0 -and
+                (-not $RequireImageCompletion -or $imagesComplete))
             first_detection_seconds=$(if ($expected.Count) { ([DateTime]$expected[0].ts - [DateTime]$run.started_utc).TotalSeconds } else { $null })
         }
     })
@@ -272,7 +324,7 @@ try {
     if ($shutdownUnanalyzed -ne 0) { $completedWork = $false }
     $services = @(Get-Service KnLiveDbg,KnLiveDbgProbe -ErrorAction SilentlyContinue)
     $sameBoot = $boot -eq (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
-    $passed = -not $failure -and $results.Count -eq 6 -and @($results | Where-Object { -not $_.passed }).Count -eq 0 -and
+    $passed = -not $failure -and $results.Count -eq $(if ($ImageSweepFixtures) { 7 } else { 6 }) -and @($results | Where-Object { -not $_.passed }).Count -eq 0 -and
         (-not $ProbeDriver -or $driverEvents -gt 0) -and $services.Count -eq 0 -and $sameBoot -and
         $captures.Count -gt 0 -and $null -ne $finalPipeline -and $finalPipeline.final_drain -eq 'true' -and
         (-not $RequireQueueHealth -or $queueHealth) -and (-not $RequireCompletedWork -or $completedWork)
@@ -281,13 +333,14 @@ try {
         started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
         binary_sha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
         fixture_sha256=(Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
-        observe_seconds=$ObserveSeconds; scenarios=$results; event_count=$events.Count
+        observe_seconds=$ObserveSeconds; scenarios=$results; event_count=$eventCount
         probe_requested=[bool]$ProbeDriver; probe_lifecycle_events=$driverEvents
         capture_chunks_verified=$captures.Count; capture_bytes_verified=$captureBytes
         case_exports_verified=$runs.Count; layout_exports_verified=$runs.Count
         final_pipeline=$finalPipeline
         queue_health_required=[bool]$RequireQueueHealth; queue_health_passed=$queueHealth
         completed_work_required=[bool]$RequireCompletedWork; completed_work_passed=$completedWork
+        image_completion_required=[bool]$RequireImageCompletion; image_sweep_fixtures=[bool]$ImageSweepFixtures
         capture_results_verified=$captureResults.Count
         shutdown_events_unanalyzed=$shutdownUnanalyzed
         coverage_claim='bounded fixture observations only; inspect sensor and coverage records for gaps'

@@ -42,6 +42,7 @@ instead of leaving PEB ImageBase unmapped.
 |---|---|---|
 | `/masquerade` | temp `notepad.exe` copy, no memory patch | `process.masquerade` |
 | `/overwrite` | NOP patch on own `.text` (`0x90` sled over the section head, `kOverwritePatchBytes`), RX restored | `finding.code_modified`; COW is `coverage.image_cow` |
+| `/overwrite-tail` | 16-byte change in the last page of the inert 1 MiB `.kntail` executable section, never called | `finding.code_modified` at the page containing the printed `KMON_TAIL rva` |
 | `/stamp` | in-memory `TimeDateStamp` rewritten | `hollow` |
 | `/nomz` | ImageBase MZ wiped | `exe_no_mz` |
 | `/orphan-private` | `VirtualAlloc` RX page with MZ | `exe_orphan_private` |
@@ -72,6 +73,17 @@ KMON_FIXTURE pid=<pid> scenario=<name> image=<path>
 ```
 
 PID is also written to `%TEMP%\kn-live-dbg-kmon\artifact.pid`. Every mode prints that line and writes that pid file; `/overwrite` announces before its destructive step because the `0x90` sled lands on the code that emits them, so a `/child overwrite` run still leaves the documented readiness signal.
+
+All modes contain the same `.kntail` section. `hold` and `mapped-readonly` keep
+it intact, providing normal tail bytes as well as the modified tail control.
+`validate-kmon-live.ps1 -ImageSweepFixtures -RequireImageCompletion` adds the
+tail scenario and requires full traversal without read failures of the fixture,
+KERNEL32, KERNELBASE and ntdll in every scenario, plus complete byte comparison
+of the fixture itself. Loader-mutable exclusions remain partial and are counted
+separately. It uses completed sweep events,
+not a zero queue depth or a sum of repeated page reads. Loader layout changes
+already classified as observations are counted separately from findings; their
+raw events remain in the evidence.
 
 `/seconds` accepts decimal values from 0 through 4,294,967. Zero explicitly
 requests an indefinite hold. Missing, malformed, negative, or larger values
