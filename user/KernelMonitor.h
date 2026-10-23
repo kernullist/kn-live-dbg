@@ -192,6 +192,7 @@ enum KmonTamperMask : uint32_t
 
 uint64_t KmonHashBytes64(const uint8_t* data, size_t size);
 bool KmonKernelModuleRangesKnown(const std::vector<KernelModuleInfo>& modules);
+bool KmonLoadedImageAllocation(HANDLE process, uint64_t address, const std::vector<KernelModuleInfo>& modules);
 
 // Returns the subset of KmonTamperMask that the live snapshot contradicts.
 // Pure so the self-test can drive it with synthetic snapshots.
@@ -355,6 +356,7 @@ private:
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
     void LayoutLoop();
     void DrainLayoutCandidates();
+    void ServicePendingAnalysis();
     void CaptureLoop();
     void CaptureWriterLoop();
     void DrainPipelineEvents(bool finalDrain = false);
@@ -431,7 +433,7 @@ private:
     void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
         const ObservationIdentity& identity = {}, uint64_t observedAt = 0,
         const std::vector<ObservationAnchor>& anchors = {}, uint64_t expectedPeb = 0);
-    void ScanExecutionReferences();
+    void ScanExecutionReferences(size_t maxCount = 32, uint64_t budgetMs = 100);
     void ScanExecutablePageCandidates();
     void QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role);
     void ScanCommunicationSurfaces();
@@ -647,6 +649,13 @@ private:
     std::set<std::wstring> ExecutionReferenceKeys;
     std::map<std::wstring, uint64_t> ExecutionReferenceLastChecked;
     uint64_t ExecutionReferenceDropped = 0;
+    uint64_t ExecutionReferenceQueued = 0;
+    uint64_t ExecutionReferenceProcessed = 0;
+    uint64_t ExecutionReferenceExpired = 0;
+    std::map<std::wstring, uint64_t> ExecutionReferenceQueueDropsByRole;
+    std::map<std::wstring, size_t> ReferenceScanCursors;
+    uint64_t ReferenceCursorEvicted = 0;
+    bool ServicingAnalysis = false;
 
     TiSubscriber* Ti = nullptr;
     TimelineStore* Timeline = nullptr;

@@ -5,6 +5,7 @@
 #include "ExecutionSurfaceScanner.h"
 
 #include <TlHelp32.h>
+#include <Psapi.h>
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -387,6 +388,40 @@ void KernelMonitor::ScanKernelExecutableImages()
     }
 }
 
+bool KmonLoadedImageAllocation(HANDLE process, uint64_t address, const std::vector<KernelModuleInfo>& modules)
+{
+    MEMORY_BASIC_INFORMATION mapping{};
+    if (process == nullptr || VirtualQueryEx(process, reinterpret_cast<void*>(address), &mapping,
+        sizeof(mapping)) != sizeof(mapping) || mapping.State != MEM_COMMIT || mapping.Type != MEM_IMAGE)
+    {
+        return false;
+    }
+    const auto base = reinterpret_cast<uint64_t>(mapping.AllocationBase);
+    const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto& module) { return module.Base == base; });
+    if (owner == modules.end() || owner->ImagePath.empty()) { return false; }
+    wchar_t name[32768]{};
+    const DWORD length = GetMappedFileNameW(process, reinterpret_cast<void*>(address), name, 32768);
+    if (length == 0 || length >= 32768) { return false; }
+    const auto mappedPath = ProcessLayoutReferencePath(std::wstring(name, length));
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE mapped = CreateFileW(mappedPath.c_str(), FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE listed = CreateFileW(owner->ImagePath.c_str(), FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING, 0, nullptr);
+    const std::unique_ptr<void, decltype(&CloseHandle)> mappedOwner(mapped == INVALID_HANDLE_VALUE ? nullptr : mapped, &CloseHandle);
+    const std::unique_ptr<void, decltype(&CloseHandle)> listedOwner(listed == INVALID_HANDLE_VALUE ? nullptr : listed, &CloseHandle);
+    FILE_ID_INFO mappedId{}, listedId{};
+    MEMORY_BASIC_INFORMATION after{};
+    const bool sameFile = mapped != INVALID_HANDLE_VALUE && listed != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(mapped, FileIdInfo, &mappedId, sizeof(mappedId)) &&
+        GetFileInformationByHandleEx(listed, FileIdInfo, &listedId, sizeof(listedId)) &&
+        mappedId.VolumeSerialNumber == listedId.VolumeSerialNumber &&
+        std::memcmp(mappedId.FileId.Identifier, listedId.FileId.Identifier, sizeof(mappedId.FileId.Identifier)) == 0 &&
+        VirtualQueryEx(process, reinterpret_cast<void*>(address), &after, sizeof(after)) == sizeof(after) &&
+        after.State == MEM_COMMIT && after.Type == MEM_IMAGE && after.AllocationBase == mapping.AllocationBase;
+    wchar_t confirmedName[32768]{};
+    return sameFile && GetMappedFileNameW(process, reinterpret_cast<void*>(address), confirmedName, 32768) == length &&
+        std::wstring(name, length) == std::wstring(confirmedName, length);
+}
+
 void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     const std::wstring& role, const ObservationIdentity& identity, uint64_t observedAt,
     const std::vector<ObservationAnchor>& anchors, uint64_t expectedPeb)
@@ -413,16 +448,18 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     if (ExecutionReferences.size() >= 1024)
     {
         ++ExecutionReferenceDropped;
+        ++ExecutionReferenceQueueDropsByRole[role];
         EmitUnique(L"coverage.references", L"scan_failed:references:queue_cap", L"", L"references",
             L"execution reference queue is full", L"reference dropped; a later source sweep may rediscover it");
         return;
     }
     ExecutionReferenceKeys.insert(key);
+    ++ExecutionReferenceQueued;
     ExecutionReferences.push_back({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
         GetTickCount64(), actual, role, anchors, expectedPeb});
 }
 
-void KernelMonitor::ScanExecutionReferences()
+void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs)
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
@@ -430,10 +467,13 @@ void KernelMonitor::ScanExecutionReferences()
     {
         return;
     }
-    for (size_t n = 0; n < 32 && !ExecutionReferences.empty() && !StopRequested.load(); ++n)
+    const auto begin = GetTickCount64();
+    for (size_t n = 0; n < maxCount && !ExecutionReferences.empty() && !StopRequested.load() &&
+        GetTickCount64() - begin < budgetMs; ++n)
     {
         auto work = std::move(ExecutionReferences.front());
         ExecutionReferences.pop_front();
+        ++ExecutionReferenceProcessed;
         const auto referenceKey = ReferenceKey(work.Target, work.Slot, work.Role, work.Identity);
         ExecutionReferenceKeys.erase(referenceKey);
         {
@@ -443,6 +483,7 @@ void KernelMonitor::ScanExecutionReferences()
         if (GetTickCount64() - work.ObservedMs > 30000)
         {
             ++ExecutionReferenceDropped;
+            ++ExecutionReferenceExpired;
             EmitUnique(L"coverage.references", L"scan_failed:references:expired", L"", L"references",
                 L"queued reference expired", L"reference older than 30 seconds was discarded", work.Identity.ProcessId);
             continue;
@@ -585,6 +626,7 @@ void KernelMonitor::ScanExecutionReferences()
                 L"reference root or PE metadata changed before decoding", L"queued reference withheld", pid);
             continue;
         }
+        bool imageAllocationExtension = false;
         const CodeTargetInspector inspect = [&](uint64_t address, const std::vector<uint8_t>& bytes)
         {
             for (const auto& module : modules)
@@ -623,6 +665,11 @@ void KernelMonitor::ScanExecutionReferences()
             if (!KmonKernelModuleRangesKnown(modules))
             {
                 return CodeOwnership::Unknown;
+            }
+            if (pid != 0 && KmonLoadedImageAllocation(process, address, modules))
+            {
+                imageAllocationExtension = true;
+                return CodeOwnership::OwnedUnverified;
             }
             PhysicalTranslationInfo page = {};
             return executableMapping(address, &page) ? CodeOwnership::UnownedExecutable : CodeOwnership::Unknown;
@@ -672,6 +719,10 @@ void KernelMonitor::ScanExecutionReferences()
         event.Observation.MonotonicMs = work.ObservedMs;
         event.Observation.DependencyGroup = L"static_code_reference";
         event.Evidence[L"module_inventory"] = modules.empty() ? L"unavailable" : L"snapshot";
+        if (imageAllocationExtension)
+        {
+            event.Evidence[L"image_allocation_extension"] = L"same_allocation_and_backing_file; outside_reported_module_size; bytes_unverified";
+        }
         event.Evidence[L"relationship"] = L"address";
         event.Evidence[L"reference_role"] = work.Role;
         event.Evidence[L"slot"] = std::to_wstring(work.Slot);

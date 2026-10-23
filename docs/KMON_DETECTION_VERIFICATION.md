@@ -76,6 +76,23 @@ captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
 
 기본 상한은 TI/라이브 분석 큐 각각 2,048건, 우선 캡처와 후속 캡처 각각 256건, 저장 대기 512청크, 실행 참조 1,024건, 영역 카탈로그 16,384건이다. 카탈로그 퇴출과 큐 손실도 상태에 포함된다. 참조 캐시는 최대 2,048개이며, 용량 부족은 coverage 이벤트로 남는다.
 
+2026-10-23 큐 개선에서는 같은 프로세스 세대·주소·크기·매핑 속성·이미지 경로의
+미처리 layout 후보를 FIFO 위치를 유지한 채 최신 관측으로 합친다. 속성이 바뀐
+관측과 layout change 기록은 별도로 남긴다. 긴 스캔 사이와 모듈 경계에서도
+이벤트·layout·실행 참조를 처리한다. layout 25ms, 참조 75ms 예산은 항목 사이에서
+확인하는 작업 예산이며, 느린 단일 읽기를 중단하는 실시간 기한은 아니다.
+
+대량 정적 참조는 IAT/모듈 테이블당 16개, 드라이버 디스패치·콜백·SSDT·IDT·HAL
+테이블당 64개씩 코드 경로 검증 위치를 순환한다. 대기 참조가 256개 이상이면
+미접수 위치를 보존해 다음 순회에서 재개한다. 기존 표면 검사와 직접 이상 판정은
+계속하며, 별도 이벤트 참조에는 1,024개 큐의 나머지 공간을 남긴다. 커서는 유저
+프로세스 세대와 모듈별로 분리하며 용량 퇴출도 기록한다. 이는 전체 경로 검사 완료나
+짧은 수명의 모든 참조를 관측했다는 뜻이 아니다.
+
+`coverage.pipeline`은 원본 연속성 손실, TI/라이브 분석 큐 손실·최대 점유,
+layout 병합 및 참조 접수·처리·만료를 구분한다. 콘솔 `lost`도 내부 분석 큐
+손실을 합산한다. [반복 실행 및 개선 기록](KMON_QUEUE_VALIDATION_20261023.md)을 참고한다.
+
 핸들은 한 번에 8개 PID를 순환하며, 프로세스별로 128개 변경 기록의 연결을 해석한다. 사용자 정밀 검사는 우선 대상 6개와 배경 대상 2개씩 진행한다. 2026-10-06 수정부터 우선 대상 6자리 중 최대 4자리는 명시적 `/pid`·`/name` 감시에 먼저 배정하며, 남은 자리를 다른 우선 대상에 배정한다. 명시적 감시·다른 우선 대상·배경 대상은 각각 독립 커서로 순환한다. 이미지당 16페이지, 프로세스당 8개 이미지, private heap 64페이지의 커서를 유지한다. 커널 페이지 테이블도 VA 커서로 재개한다. 그래픽스 드라이버의 writable data는 한 번에 최대 4 KiB 또는 후보 포인터 32개까지 살펴보고, 모듈 내부 목적지도 공통 검증기에 전달한다. 데이터 포인터의 존재만으로 실제 실행이나 훅을 단정하지 않는다. 이 수치는 작업량 예산이며 실시간 주기 보장은 아니다. `!kmon status`의 가장 오래 검사하지 못한 대상, 미완료 페이지, 마지막 완료 시각과 지연을 확인해야 한다.
 
 정상 DLL의 PE 헤더를 orphan-PE 단서에서 제외하려면 현재 `MEM_IMAGE` 매핑,
@@ -85,6 +102,14 @@ captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
 이 제외는 정상 이미지의 PE 헤더를 중복 단서로 만들지 않도록 하는 검사이며,
 별도 이미지 바이트·실행 참조 검증을 대체하지 않는다. 실제 정상 DLL 음성 대조와
 fixture 결과는 [2026-10-06 호스트 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md)에 있다.
+
+로더 목록과 이미지 바이트 비교 후보는 별도로 유지한다. VAD에서 발견한 파일 기반
+PE를 비교 후보에 추가해도 로더 소유권을 부여하지 않는다. 비등록 `SEC_IMAGE`는
+`exe_orphan_image` 검사에 계속 남는다. VAD PE 단서의 backing 종류는 현재
+`VirtualQueryEx` 결과와 VAD private 속성으로 구분하며, `image_pe`, `mapped_pe`,
+`section_pe` 또는 `vad_pe`를 사용한다. 정보가 모순되거나 부족하면 private로
+추정하지 않는다. `*_wiped`는 헤더 이상 단서이며, PE의 존재만으로 실제 실행을
+판정하지 않는다. 재현과 수정 후 결과는 [2026-10-23 KMON 실검증](KMON_LIVE_VALIDATION_20261023.md)에 있다.
 
 `!kmon stop`은 수집을 멈추고 분석을 합류시킨 뒤 캡처·저장을 정리한다. 이후 iotrace를 drain/disarm하고 장치 참조를 해제한다. disarm 실패 시 장치 참조와 활성 상태를 남겨 재시도를 허용한다.
 
@@ -126,6 +151,9 @@ vptr player 20 24040 2
 .\tools\validate-kmon-manifest.ps1
 .\x64\Release\KnLiveDbg.exe --self-test console
 .\x64\Release\KnLiveDbg.exe --self-test timeline
+# 관리자 PowerShell: 실제 드라이버와 6개 자체 프로세스 대조군
+.\tools\validate-kmon-live.ps1 -ObserveSeconds 180 -ProbeDriver
+.\tools\validate-kmon-live.ps1 -ObserveSeconds 180 -ProbeDriver -RequireQueueHealth
 ```
 
 핵심 테스트는 네이티브 File 핸들 스냅샷, 25개 PID 순환, 닫힘·재등장·PID 재사용, 장치 스택 대조군, 다중 실행 섹션과 페이지 경계 재배치, 분기 순환/읽기 실패, COW와 매핑 재사용을 검사한다. 자체 EXE의 두 번째 실행 페이지 중간 바이트를 변경했다 복구하는 시험도 포함한다.
@@ -148,6 +176,7 @@ vptr player 20 24040 2
 - 한 번만 바뀐 이미지 바이트, 두 번째 읽기의 실패, 폐기된 INIT와 검사 중 바뀐 PE 식별.
 - 루트 슬롯은 같지만 중간 분기 코드 또는 RIP 상대 간접 슬롯이 바뀐 경로.
 - 정상 export 전달과 다른 함수/ordinal, 순환·잘린 전달 문자열, 파일 조회 오류 및 반복 증거의 수명 경계.
+- VAD 전용 PE 후보가 로더 목록을 오염시키는 누락과 private/image/mapped/미확정 backing 분류.
 
 추가로 감시 대상 변경과 종료의 로깅 제어를 직렬화하고, 객체 보고 캐시를 규칙·슬롯 수로 제한했다. 초기 수집 순번부터 링 손실을 계산하며, 명세 생성 중에는 이미지와 PDB가 교체되지 않도록 읽기 핸들을 유지한다.
 

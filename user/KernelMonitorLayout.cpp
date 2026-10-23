@@ -96,7 +96,15 @@ void KernelMonitor::LayoutLoop()
                 }
             }, [this](ProcessLayoutCandidate candidate)
             {
-                LayoutCandidates.Push(std::move(candidate));
+                LayoutCandidates.PushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
+                {
+                    const auto& a = old.Region;
+                    const auto& b = fresh.Region;
+                    return old.Identity.SameInstance(fresh.Identity) && old.ImageName == fresh.ImageName &&
+                        a.Base == b.Base && a.Size == b.Size && a.AllocationBase == b.AllocationBase &&
+                        a.State == b.State && a.Protect == b.Protect &&
+                        a.AllocationProtect == b.AllocationProtect && a.Type == b.Type;
+                });
             });
         }
         catch (...)
@@ -111,7 +119,7 @@ void KernelMonitor::DrainLayoutCandidates()
 {
     const auto begin = GetTickCount64();
     ProcessLayoutCandidate item;
-    for (size_t count = 0; count < 16 && !StopRequested.load() && GetTickCount64() - begin < 100 &&
+    for (size_t count = 0; count < 16 && !StopRequested.load() && GetTickCount64() - begin < 25 &&
         LayoutCandidates.Pop(&item); ++count)
     {
         const auto pid = item.Identity.ProcessId;

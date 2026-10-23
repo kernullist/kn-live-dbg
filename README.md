@@ -8,6 +8,9 @@ The release includes the [2026-10-06 live-host fixes and validation](https://git
 
 The current checkout's [2026-10-23 validation report](docs/LIVE_HOST_VALIDATION_20261023.md) records CI/HVCI decoding repairs, hypervisor interface qualification, and live driver/memory-fixture checks. The [2026-10-13 report](docs/LIVE_HOST_VALIDATION_20261013.md) preserves earlier write-plan and integrity fixes and their host compatibility limits.
 
+The [2026-10-23 KMON live matrix](docs/KMON_LIVE_VALIDATION_20261023.md) exercises emitted detections with owned memory fixtures and records repairs to loader ownership and VAD PE classification. Repeat it with `tools/validate-kmon-live.ps1` from an elevated PowerShell.
+The [queue follow-up](docs/KMON_QUEUE_VALIDATION_20261023.md) records bounded analysis scheduling, loss accounting, and repeated live validation with `-RequireQueueHealth`.
+
 ## Demo
 
 https://github.com/user-attachments/assets/f3542a85-c960-46f2-a151-fdd23a8294a6

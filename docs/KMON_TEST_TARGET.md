@@ -102,6 +102,47 @@ hold expires.
 `add` / `remove` only work after collection is already running. `/verbose` and
 `/log` apply only on the first start.
 
+### Automated live matrix
+
+From an elevated PowerShell, after building the solution:
+
+```powershell
+.\tools\validate-kmon-live.ps1 -ObserveSeconds 180 -ProbeDriver
+# Also fail on collector/analysis/capture/persistence queue losses:
+.\tools\validate-kmon-live.ps1 -ObserveSeconds 180 -ProbeDriver -RequireQueueHealth
+```
+
+The runner starts an actual `!kmon` session and six owned children: `hold`,
+`mapped-readonly`, `overwrite`, `orphan-mapped-rx`, `orphan-private`, and
+`orphan-image`. It checks emitted JSONL events, requires a user reference
+observation for every child, and rejects findings on the two negative
+controls. The image case must produce `exe_orphan_image` and must not be
+mislabelled `private_exec_pe` or `private_exec_wiped`. `-ProbeDriver` additionally
+loads the bundled probe and requires an observed driver lifecycle event.
+It does not enable raw I/O interposition.
+
+`-RequireQueueHealth` requires zero reported event loss, layout/reference drops,
+capture/persistence/diagnostic/catalog queue drops, and reference cursor eviction.
+Reference expiration is included in reference drops. Pending work and ordinary
+read failures remain visible and are not claims of complete host coverage.
+
+Evidence defaults to a fresh `.build\kmon-live\<timestamp>` directory. Use
+`-OutputDirectory <new-directory>` to choose a location. The runner saves
+console output, fixture PIDs, case/layout exports and `validation.json`,
+including first detection times, executable hashes, final pipeline coverage
+counters and cleanup results. Case/layout identities and every completed
+capture's file length and SHA-256 are checked against their event records.
+It refuses an existing KnLiveDbg service and keeps its creation-time process
+handle across the console's PPL transition. A timeout, missing expected event,
+early child exit or fallback service cleanup fails the run.
+
+This is a bounded observation test. `-ObserveSeconds` controls the observation
+window, not a detection deadline guarantee. Coverage, capture failures and
+queue loss must still be examined in the logs; a passing fixture matrix is
+not proof that the whole machine was scanned. Direct `/child` launches avoid
+the parent modes' shared temporary executable, and readiness uses each
+child's stdout rather than the shared `artifact.pid` file.
+
 ## Automated primitives
 
 `KnLiveDbg.exe --self-test console` includes `kmon-artifact-primitives`:

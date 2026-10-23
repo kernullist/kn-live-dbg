@@ -91,6 +91,21 @@ void KernelMonitor::ResetPipeline()
     NextPipelineStatusMs = 0;
 }
 
+void KernelMonitor::ServicePendingAnalysis()
+{
+    if (ServicingAnalysis || StopRequested.load()) { return; }
+    ServicingAnalysis = true;
+    struct Reset { bool& Flag; ~Reset() { Flag = false; } } reset{ServicingAnalysis};
+    // All verifier/catalog state stays on the analysis thread. Yield at safe
+    // scan boundaries instead of waiting for an entire multi-scanner pass.
+    IngestLiveTimeline();
+    IngestThreatIntel();
+    DrainIotraceEvents();
+    DrainPipelineEvents();
+    DrainLayoutCandidates();
+    ScanExecutionReferences(128, 75);
+}
+
 void KernelMonitor::CollectorLoop()
 {
     while (!StopRequested.load())
@@ -615,6 +630,11 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"collector_last_ms"] = std::to_wstring(CollectorLastMs.load());
         event.Evidence[L"collector_max_gap_ms"] = std::to_wstring(CollectorMaxGapMs.load());
         event.Evidence[L"ti_session_lost"] = std::to_wstring(TiSessionLost.load());
+        event.Evidence[L"source_continuity_lost"] = std::to_wstring(CollectionLost.load());
+        event.Evidence[L"ti_analysis_dropped"] = std::to_wstring(CollectedTi.Loss());
+        event.Evidence[L"live_analysis_dropped"] = std::to_wstring(CollectedLive.Loss());
+        event.Evidence[L"ti_analysis_peak"] = std::to_wstring(CollectedTi.Peak());
+        event.Evidence[L"live_analysis_peak"] = std::to_wstring(CollectedLive.Peak());
         event.Evidence[L"analysis_pending"] = std::to_wstring(CollectedTi.Size() + CollectedLive.Size());
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
@@ -627,6 +647,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"layout_failed"] = std::to_wstring(layout.Failed);
         event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
         event.Evidence[L"layout_dropped"] = std::to_wstring(LayoutCandidates.Loss());
+        event.Evidence[L"layout_peak"] = std::to_wstring(LayoutCandidates.Peak());
+        event.Evidence[L"layout_coalesced"] = std::to_wstring(LayoutCandidates.Replacements());
         event.Evidence[L"layout_checked"] = std::to_wstring(LayoutChecked.load());
         event.Evidence[L"layout_rejected"] = std::to_wstring(LayoutRejected.load());
         event.Evidence[L"layout_oldest_ms"] = std::to_wstring(layout.OldestAgeMs);
@@ -634,6 +656,17 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"catalog_rejected"] = std::to_wstring(RegionCatalog.Rejected);
         event.Evidence[L"catalog_links_evicted"] = std::to_wstring(RegionCatalog.LinksEvicted);
         event.Evidence[L"execution_references_dropped"] = std::to_wstring(ExecutionReferenceDropped);
+        event.Evidence[L"execution_references_pending"] = std::to_wstring(ExecutionReferences.size());
+        event.Evidence[L"execution_references_queued"] = std::to_wstring(ExecutionReferenceQueued);
+        event.Evidence[L"execution_references_processed"] = std::to_wstring(ExecutionReferenceProcessed);
+        event.Evidence[L"execution_references_expired"] = std::to_wstring(ExecutionReferenceExpired);
+        event.Evidence[L"reference_scan_cursors"] = std::to_wstring(ReferenceScanCursors.size());
+        event.Evidence[L"reference_cursor_evicted"] = std::to_wstring(ReferenceCursorEvicted);
+        event.Evidence[L"reference_scan_policy"] = L"rotating static sources: IAT/table 16, kernel tables 64; not complete path coverage";
+        for (const auto& dropped : ExecutionReferenceQueueDropsByRole)
+        {
+            event.Evidence[L"reference_queue_dropped_" + dropped.first] = std::to_wstring(dropped.second);
+        }
         event.Evidence[L"final_drain"] = finalDrain ? L"true" : L"false";
         event.Evidence[L"first_capture_max_ms"] = std::to_wstring(CaptureFirstMaxMs.load());
         event.Evidence[L"capture_failures"] = std::to_wstring(CaptureFailed.load());
@@ -679,6 +712,22 @@ bool KmonPipelineSelfTest()
             }
             monitor.CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, &monitor);
             const auto identity = ObserveProcessIdentity(GetCurrentProcessId());
+            const uint64_t selfBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+            wchar_t selfPath[32768]{};
+            GetModuleFileNameW(nullptr, selfPath, 32768);
+            std::vector<KernelModuleInfo> owner{{selfBase, 1, selfPath, L"self"}};
+            const uint64_t code = reinterpret_cast<uint64_t>(&KmonPipelineSelfTest);
+            // Allocation membership can extend beyond the reported module size;
+            // it establishes neither matching code bytes nor a trusted image.
+            if (!KmonLoadedImageAllocation(GetCurrentProcess(), code, owner) ||
+                KmonLoadedImageAllocation(GetCurrentProcess(), reinterpret_cast<uint64_t>(allocation), owner) ||
+                KmonLoadedImageAllocation(GetCurrentProcess(), code, {})) { break; }
+            owner[0].ImagePath = L"C:\\nonexistent-kmon-image-reference.dll";
+            if (KmonLoadedImageAllocation(GetCurrentProcess(), code, owner)) { break; }
+            wchar_t otherPath[32768]{};
+            GetModuleFileNameW(GetModuleHandleW(L"ntdll.dll"), otherPath, 32768);
+            owner[0].ImagePath = otherPath;
+            if (KmonLoadedImageAllocation(GetCurrentProcess(), code, owner)) { break; }
             if (monitor.CaptureRegion(L"selftest_stale_ti", 0x10000, 4096,
                     identity.ProcessId, true, nullptr, nullptr, nullptr, 4096, nullptr, 0,
                     identity.CreateTime + 1) || monitor.PriorityCaptures.Size() != 0)
