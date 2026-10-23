@@ -355,7 +355,7 @@ private:
     void CollectorLoop();
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
     void LayoutLoop();
-    void DrainLayoutCandidates();
+    void DrainLayoutCandidates(bool finalDrain = false);
     void ServicePendingAnalysis();
     void CaptureLoop();
     void CaptureWriterLoop();
@@ -433,7 +433,9 @@ private:
     void QueueExecutionReference(uint64_t target, uint64_t slot, const std::wstring& role,
         const ObservationIdentity& identity = {}, uint64_t observedAt = 0,
         const std::vector<ObservationAnchor>& anchors = {}, uint64_t expectedPeb = 0);
-    void ScanExecutionReferences(size_t maxCount = 32, uint64_t budgetMs = 100);
+    void ScanExecutionReferences(size_t maxCount = 32, uint64_t budgetMs = 100, bool finalDrain = false);
+    static bool ResolveObservationProcess(DeviceClient& device, SymbolEngine& symbols,
+        const ObservationIdentity& identity, ProcessAddressContext* context);
     void ScanExecutablePageCandidates();
     void QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role);
     void ScanCommunicationSurfaces();
@@ -527,7 +529,10 @@ private:
     std::thread CaptureWorker;
     std::thread CaptureWriter;
     std::atomic<bool> CaptureStopping{false};
+    std::atomic<uint64_t> CaptureStopDeadlineMs{0};
     std::atomic<bool> WriterStopping{false};
+    std::atomic<bool> CaptureWorkerDone{false};
+    std::atomic<bool> CaptureWriterDone{false};
     struct CaptureRequest
     {
         uint64_t Id = 0;
@@ -538,6 +543,9 @@ private:
         uint64_t EventTimestamp = 0;
         uint64_t MappingGeneration = 0;
         uint64_t RootCr3 = 0;
+        uint64_t ReadBytes = 0;
+        uint64_t FailedBytes = 0;
+        uint64_t SkippedBytes = 0;
         ObservationIdentity Identity;
         std::wstring Role;
         std::wstring Key;
@@ -576,6 +584,17 @@ private:
     std::atomic<bool> TiAvailable{false};
     std::atomic<uint64_t> CaptureQueued{0};
     std::atomic<uint64_t> CaptureFailed{0};
+    std::atomic<uint64_t> CaptureReadBytes{0};
+    std::atomic<uint64_t> CaptureReadFailedBytes{0};
+    std::atomic<uint64_t> CaptureUnreadableBytes{0};
+    std::atomic<uint64_t> CaptureReadFailedRequests{0};
+    std::atomic<uint64_t> CaptureFallbackPages{0};
+    std::atomic<uint64_t> CaptureTraversed{0};
+    uint64_t ShutdownLayoutProcessed = 0;
+    uint64_t ShutdownReferencesProcessed = 0;
+    uint64_t ShutdownDrainMs = 0;
+    uint64_t ShutdownEventsProcessed = 0;
+    uint64_t ShutdownEventsUnanalyzed = 0;
     std::atomic<uint64_t> CaptureFirstMaxMs{0};
     std::atomic<uint64_t> UserScanCursor{0};
     std::atomic<uint64_t> UserOldestScanMs{0};

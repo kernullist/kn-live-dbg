@@ -8763,7 +8763,25 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         worker.join();
     }
 
-    // Preserve collected raw events without initiating stale live analysis.
+    // No producer can append now. Classify the admitted events through the
+    // normal identity-fenced paths before draining the work they generated.
+    const uint64_t layoutBefore = LayoutChecked.load() + LayoutRejected.load();
+    const uint64_t referencesBefore = ExecutionReferenceProcessed;
+    const uint64_t eventDrainStarted = GetTickCount64();
+    while ((CollectedTi.Size() != 0 || CollectedLive.Size() != 0) &&
+        GetTickCount64() - eventDrainStarted < 5000)
+    {
+        const auto pending = CollectedTi.Size() + CollectedLive.Size();
+        IngestLiveTimeline();
+        IngestThreatIntel();
+        ShutdownEventsProcessed += pending - CollectedTi.Size() - CollectedLive.Size();
+        DrainLayoutCandidates(true);
+        ScanExecutionReferences(128, 75, true);
+        DrainPipelineEvents();
+    }
+    ShutdownDrainMs += GetTickCount64() - eventDrainStarted;
+    ShutdownEventsUnanalyzed += CollectedTi.Size() + CollectedLive.Size();
+    // If the budget expires, retain the raw evidence and report the gap.
     for (const auto& raw : CollectedTi.Drain(2048))
     {
         KmonEvent event;
@@ -8790,14 +8808,40 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         event.Evidence[L"source_event_id"] = std::to_wstring(raw.EventId);
         RecordEvent(std::move(event));
     }
+    // Producers and the analysis worker have joined. Finish already admitted
+    // work with its normal identity/mapping checks, without restarting scans.
+    const uint64_t drainStarted = GetTickCount64();
+    while ((LayoutCandidates.Size() != 0 || !ExecutionReferences.empty()) &&
+        GetTickCount64() - drainStarted < 5000)
+    {
+        const auto pending = LayoutCandidates.Size() + ExecutionReferences.size();
+        DrainLayoutCandidates(true);
+        ScanExecutionReferences(128, 75, true);
+        DrainPipelineEvents();
+        if (LayoutCandidates.Size() + ExecutionReferences.size() >= pending) { break; }
+    }
+    ShutdownLayoutProcessed += LayoutChecked.load() + LayoutRejected.load() - layoutBefore;
+    ShutdownReferencesProcessed += ExecutionReferenceProcessed - referencesBefore;
+    ShutdownDrainMs += GetTickCount64() - drainStarted;
+    CaptureStopDeadlineMs.store(GetTickCount64() + 5000);
     CaptureStopping.store(true);
     if (CaptureWorker.joinable())
     {
+        while (!CaptureWorkerDone.load())
+        {
+            DrainPipelineEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         CaptureWorker.join();
     }
     WriterStopping.store(true);
     if (CaptureWriter.joinable())
     {
+        while (!CaptureWriterDone.load())
+        {
+            DrainPipelineEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         CaptureWriter.join();
     }
     DrainPipelineEvents(true);
@@ -19048,7 +19092,10 @@ void KernelMonitor::ScanUserModeHostility()
             const size_t imageStart = imagePaths.empty() ? 0 : imageCursor % imagePaths.size();
             const size_t imageBudget = (std::min<size_t>)(imagePaths.size(), 8);
             imageCursor = imageStart + imageBudget;
-            const ObservationReader imageReader = [device, processHandle, codeIdentity](
+            ProcessAddressContext imageReadContext{};
+            bool imageReadContextTried = false;
+            bool imageReadContextValid = false;
+            const ObservationReader imageReader = [&](
                 uint64_t address, size_t size, std::vector<uint8_t>* bytes)
             {
                 if (size > 4096 || address > UINT64_MAX - size || codeIdentity.CreateTime == 0)
@@ -19062,7 +19109,12 @@ void KernelMonitor::ScanUserModeHostility()
                 {
                     return true;
                 }
-                return device->ReadProcessVirtual(codeIdentity.ProcessId, codeIdentity.Eprocess,
+                if (!imageReadContextTried)
+                {
+                    imageReadContextTried = true;
+                    imageReadContextValid = ResolveObservationProcess(*device, *symbols, codeIdentity, &imageReadContext);
+                }
+                return imageReadContextValid && device->ReadProcessVirtual(codeIdentity.ProcessId, imageReadContext.Eprocess,
                     codeIdentity.CreateTime, address, static_cast<uint32_t>(size), bytes, nullptr);
             };
             const std::wstring referencePrefix = std::to_wstring(pid) + L":" +

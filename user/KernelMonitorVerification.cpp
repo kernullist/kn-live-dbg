@@ -91,6 +91,12 @@ namespace
     }
 }
 
+bool KernelMonitor::ResolveObservationProcess(DeviceClient& device, SymbolEngine& symbols,
+    const ObservationIdentity& identity, ProcessAddressContext* context)
+{
+    return ResolveHuntAddressSpace(device, symbols, identity, context);
+}
+
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
     uint64_t base, const ObservationIdentity& identity)
 {
@@ -459,7 +465,7 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
         GetTickCount64(), actual, role, anchors, expectedPeb});
 }
 
-void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs)
+void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, bool finalDrain)
 {
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
@@ -468,7 +474,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs)
         return;
     }
     const auto begin = GetTickCount64();
-    for (size_t n = 0; n < maxCount && !ExecutionReferences.empty() && !StopRequested.load() &&
+    for (size_t n = 0; n < maxCount && !ExecutionReferences.empty() && (finalDrain || !StopRequested.load()) &&
         GetTickCount64() - begin < budgetMs; ++n)
     {
         auto work = std::move(ExecutionReferences.front());
@@ -576,7 +582,8 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs)
         bool physicalPageRead = false;
         uint64_t lastReadPhysical = 0;
         uint64_t pageHeadPhysical = 0;
-        const ObservationReader reader = [device, process, &work, &executableMapping, &physicalPageRead, &lastReadPhysical]
+        const ObservationReader reader = [device, symbols, process, &work, &executableMapping,
+            &physicalPageRead, &lastReadPhysical, &addressSpaceTried, &addressSpaceValid, &addressSpace]
             (uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
             lastReadPhysical = 0;
@@ -617,7 +624,12 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs)
             {
                 return true;
             }
-            return device->ReadProcessVirtual(work.Identity.ProcessId, work.Identity.Eprocess,
+            if (!addressSpaceTried)
+            {
+                addressSpaceTried = true;
+                addressSpaceValid = ResolveObservationProcess(*device, *symbols, work.Identity, &addressSpace);
+            }
+            return addressSpaceValid && device->ReadProcessVirtual(work.Identity.ProcessId, addressSpace.Eprocess,
                 work.Identity.CreateTime, address, static_cast<uint32_t>(size), bytes, nullptr);
         };
         if (!ObservationAnchorsMatch(work.Anchors, reader))

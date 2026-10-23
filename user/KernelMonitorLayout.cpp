@@ -115,11 +115,11 @@ void KernelMonitor::LayoutLoop()
     }
 }
 
-void KernelMonitor::DrainLayoutCandidates()
+void KernelMonitor::DrainLayoutCandidates(bool finalDrain)
 {
     const auto begin = GetTickCount64();
     ProcessLayoutCandidate item;
-    for (size_t count = 0; count < 16 && !StopRequested.load() && GetTickCount64() - begin < 25 &&
+    for (size_t count = 0; count < 16 && (finalDrain || !StopRequested.load()) && GetTickCount64() - begin < 25 &&
         LayoutCandidates.Pop(&item); ++count)
     {
         const auto pid = item.Identity.ProcessId;
@@ -228,7 +228,7 @@ void KernelMonitor::DrainLayoutCandidates()
                     work->LayoutIdentityReported = false;
                 }
             }
-            ScanExecutableImage(path, item.Region.AllocationBase, item.Identity, reader, 4);
+            ScanExecutableImage(path, item.Region.AllocationBase, item.Identity, reader, 8);
         }
     }
 }

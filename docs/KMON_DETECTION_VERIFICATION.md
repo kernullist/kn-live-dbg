@@ -62,9 +62,9 @@ IAT, vtable, CFG 및 그래픽스 데이터의 포인터 슬롯은 경로 검사
 
 ## 수집, 캡처와 검사 예산
 
-이벤트 수집, 메모리 캡처, 파일 저장, 분석은 별도 스레드에서 실행된다. 심벌 분석은 분석 경로에 남는다. TI와 라이브 타임라인의 도착 순번을 사용하며, 원본 링에서 놓친 구간과 내부 큐의 초과를 기록한다.
+이벤트 수집, 메모리 캡처, 파일 저장, 분석은 별도 스레드에서 실행된다. 이미지 비교와 카탈로그 갱신은 분석 경로에 남는다. TI와 라이브 타임라인의 도착 순번을 사용하며, 원본 링에서 놓친 구간과 내부 큐의 초과를 기록한다.
 
-캡처는 첫 페이지를 우선 읽고 나머지를 작은 청크로 순환 처리한다. 일반 요청은 기본 256 KiB, 드라이버 이미지 요청은 최대 16 MiB이며, 세션 저장 예산은 256 MiB이다. 저장 파일은 다음 형식이다.
+캡처는 첫 페이지를 우선 읽고 이후에도 페이지 경계를 넘지 않는 최대 4 KiB 청크로 순환 처리한다. 접근 불가 페이지 뒤의 읽기 가능한 영역도 계속 수집한다. guard/noaccess 및 미커밋 영역은 읽지 않고 skipped로 남기며, 정체성이 바뀌면 요청을 중단한다. 드라이버 대체 읽기는 EPROCESS를 확인하고 생성 시각이 일치할 때만 사용한다. 일반 요청은 기본 256 KiB, 드라이버 이미지 요청은 최대 16 MiB이며, 세션 저장 예산은 256 MiB이다. 저장 파일은 다음 형식이다.
 
 ```text
 captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
@@ -72,7 +72,13 @@ captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
 
 `coverage.capture`의 `capture_id`, `chunk_offset`, `address`, `requested_bytes`, `capture_bytes`, `capture_sha256`, `persistence`로 청크를 연결한다. 원본 비교 바이트와 변경된 메모리 바이트는 서로 다른 캡처 ID로 저장한다. 예약 성공은 저장 성공이 아니다. 실패한 읽기, 큐 초과, 종료로 중단된 후속 청크는 부분 캡처로 취급해야 한다.
 
+`coverage.capture_result`는 요청별 읽기 순회 결과이다. requested = compared + failed + skipped이며, `unvisited_bytes`는 순회하지 못한 부분, `known_unreadable_bytes`는 확인된 접근 불가 부분이다. `read_completion=true`도 skipped/failed가 있으면 partial이다. 영속화 성공은 각 `coverage.capture`와 파일 해시로 별도 확인한다. `capture_failures`는 접근 불가 영역을 포함한 기존 공백 집계이며, `capture_read_failed_requests/bytes`와 `capture_known_unreadable_bytes`가 실제 읽기 오류와 제외 영역을 구분한다.
+
 실행 영역 후보의 첫 캡처가 실패하면 이후 영역 검사에서 최소 5초 간격으로 재시도한다. 같은 세대의 첫 청크가 저장되면 재시도를 멈춘다. 재시도 상태는 최대 16,384개이며, 퇴출된 상태는 다시 캡처될 수 있다. 저장 실패로 예약한 바이트는 세션 예산에 반환한다. 종료 시 영역 메타데이터 큐를 모두 비우고 마지막 손실·검사 지표를 기록한다.
+
+종료 시 생산자와 분석 스레드를 합류한 뒤, 접수된 원본 이벤트, layout/실행 참조, 후속 캡처를 각 단계 최대 5초 작업 예산으로 마무리한다. 정체성·매핑·관측 나이 검증은 그대로 적용한다. 캡처/저장 스레드를 기다리는 동안 결과 큐도 처리한다. 예산 초과로 분석하지 못한 이벤트는 원문과 `shutdown_events_unanalyzed`로 남긴다. 이 예산은 항목 사이에서 확인하므로 느린 단일 I/O를 강제로 중단하는 기한이 아니다.
+
+`validate-kmon-live.ps1 -RequireQueueHealth -RequireCompletedWork`는 접수된 원본·layout·참조·캡처의 남은 대기, 원문만 보관한 종료 이벤트 및 미순회 캡처 바이트가 0인지 확인한다. 알려진 접근 불가 영역이나 미접수된 이미지 전체 스캔까지 완료했다는 뜻은 아니다. 이미지 캐시의 `image_remaining_pages`와 개별 coverage의 공백은 계속 공개한다.
 
 기본 상한은 TI/라이브 분석 큐 각각 2,048건, 우선 캡처와 후속 캡처 각각 256건, 저장 대기 512청크, 실행 참조 1,024건, 영역 카탈로그 16,384건이다. 카탈로그 퇴출과 큐 손실도 상태에 포함된다. 참조 캐시는 최대 2,048개이며, 용량 부족은 coverage 이벤트로 남는다.
 
@@ -81,6 +87,7 @@ captures\capture-<collector-pid>-<session-tick>-<capture-id>-<offset>.bin
 관측과 layout change 기록은 별도로 남긴다. 긴 스캔 사이와 모듈 경계에서도
 이벤트·layout·실행 참조를 처리한다. layout 25ms, 참조 75ms 예산은 항목 사이에서
 확인하는 작업 예산이며, 느린 단일 읽기를 중단하는 실시간 기한은 아니다.
+layout 후보의 이미지 비교는 방문당 최대 8페이지로 순회한다. 전체 이미지의 미검사 페이지는 다음 방문에서 계속한다.
 
 대량 정적 참조는 IAT/모듈 테이블당 16개, 드라이버 디스패치·콜백·SSDT·IDT·HAL
 테이블당 64개씩 코드 경로 검증 위치를 순환한다. 대기 참조가 256개 이상이면

@@ -69,7 +69,10 @@ void KernelMonitor::ResetPipeline()
     PipelineEvents.Reset();
     CapturedRegions.Reset();
     CaptureStopping.store(false);
+    CaptureStopDeadlineMs.store(0);
     WriterStopping.store(false);
+    CaptureWorkerDone.store(false);
+    CaptureWriterDone.store(false);
     CollectorLastMs.store(0);
     CollectorMaxGapMs.store(0);
     CollectionLost.store(0);
@@ -77,6 +80,17 @@ void KernelMonitor::ResetPipeline()
     TiAvailable.store(false);
     CaptureQueued.store(0);
     CaptureFailed.store(0);
+    CaptureReadBytes.store(0);
+    CaptureReadFailedBytes.store(0);
+    CaptureUnreadableBytes.store(0);
+    CaptureReadFailedRequests.store(0);
+    CaptureFallbackPages.store(0);
+    CaptureTraversed.store(0);
+    ShutdownLayoutProcessed = 0;
+    ShutdownReferencesProcessed = 0;
+    ShutdownDrainMs = 0;
+    ShutdownEventsProcessed = 0;
+    ShutdownEventsUnanalyzed = 0;
     CaptureFirstMaxMs.store(0);
     UserScanCursor.store(0);
     UserOldestScanMs.store(0);
@@ -301,9 +315,53 @@ uint64_t KernelMonitor::QueueCapturedBytes(const std::wstring& role, uint64_t ad
 
 void KernelMonitor::CaptureLoop()
 {
+    CaptureWorkerDone.store(false);
     size_t priorityBurst = 0;
+    const auto finished = [this](const CaptureRequest& work, const std::wstring& reason)
+    {
+        const bool traversed = work.Offset == work.Size;
+        if (traversed) { CaptureTraversed.fetch_add(1); }
+        const bool gaps = !traversed || work.FailedBytes != 0 || work.SkippedBytes != 0;
+        if (gaps) { CaptureFailed.fetch_add(1); }
+        if (work.FailedBytes != 0) { CaptureReadFailedRequests.fetch_add(1); }
+        KmonEvent event;
+        event.Kind = L"coverage.capture_result";
+        event.ProcessId = work.Identity.ProcessId;
+        event.Observation.Identity = work.Identity;
+        event.Observation.Source = L"priority_capture";
+        auto& coverage = event.Observation.Coverage;
+        coverage.Attempted = true;
+        coverage.InventoryAvailable = true;
+        coverage.TraversalComplete = traversed;
+        coverage.RequestedBytes = work.Size;
+        coverage.ComparedBytes = work.ReadBytes;
+        coverage.FailedBytes = work.FailedBytes;
+        coverage.SkippedBytes = work.SkippedBytes + work.Size - work.Offset;
+        coverage.ResumeAddress = traversed ? 0 : work.Address + work.Offset;
+        coverage.Reason = traversed ? (gaps ? L"capture_read_complete_with_gaps" : L"capture_read_complete") : reason;
+        event.Summary = coverage.Reason;
+        event.Evidence[L"capture_id"] = std::to_wstring(work.Id);
+        event.Evidence[L"capture_role"] = work.Role;
+        event.Evidence[L"address"] = std::to_wstring(work.Address);
+        event.Evidence[L"read_completion"] = traversed ? L"true" : L"false";
+        event.Evidence[L"unvisited_bytes"] = std::to_wstring(work.Size - work.Offset);
+        event.Evidence[L"known_unreadable_bytes"] = std::to_wstring(work.SkippedBytes);
+        event.Evidence[L"persistence_scope"] = L"per_chunk; consult coverage.capture";
+        PipelineEvents.Push(std::move(event));
+        std::lock_guard<std::mutex> lock(CapturesMutex);
+        CapturedKeys.erase(work.Key);
+    };
     while (!CaptureStopping.load() || PriorityCaptures.Size() != 0 || ContinuedCaptures.Size() != 0)
     {
+        const bool shutdownExpired = CaptureStopping.load() && CaptureStopDeadlineMs.load() != 0 &&
+            GetTickCount64() >= CaptureStopDeadlineMs.load();
+        // A readable image may contain thousands of pages. Let persistence
+        // catch up instead of turning successful reads into queue losses.
+        if (!shutdownExpired && CapturedPages.Size() >= 384)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
         CaptureRequest work;
         bool present = false;
         if (priorityBurst >= 8)
@@ -326,6 +384,12 @@ void KernelMonitor::CaptureLoop()
             continue;
         }
         bool success = false;
+        bool fatal = false;
+        bool unreadable = false;
+        std::wstring reason = L"memory_read_failed";
+        std::wstring detail;
+        const uint32_t count = static_cast<uint32_t>((std::min<uint64_t>)(work.Size - work.Offset,
+            4096 - ((work.Address + work.Offset) & 4095)));
         try
         {
             DeviceClient* device = nullptr;
@@ -340,18 +404,9 @@ void KernelMonitor::CaptureLoop()
                 std::lock_guard<std::mutex> lock(CapturesMutex);
                 byteBudget = CapturedBytes < 256ull * 1024 * 1024;
             }
-            if (!byteBudget || (CaptureStopping.load() && work.Offset != 0))
+            if (!byteBudget || shutdownExpired)
             {
-                KmonEvent event;
-                event.Kind = L"coverage.capture";
-                event.Observation.Identity = work.Identity;
-                event.Summary = byteBudget ? L"capture continuation cancelled during shutdown" : L"capture byte budget exhausted";
-                event.Evidence[L"capture_id"] = std::to_wstring(work.Id);
-                event.Evidence[L"resume_offset"] = std::to_wstring(work.Offset);
-                PipelineEvents.Push(std::move(event));
-                CaptureFailed.fetch_add(1);
-                std::lock_guard<std::mutex> lock(CapturesMutex);
-                CapturedKeys.erase(work.Key);
+                finished(work, byteBudget ? L"shutdown_capture_budget" : L"session_capture_byte_budget");
                 continue;
             }
             CapturedPage page;
@@ -367,8 +422,6 @@ void KernelMonitor::CaptureLoop()
             page.Context.Timestamp = ObservationFileTime();
             page.Context.MonotonicMs = GetTickCount64();
             page.Context.Coverage.Attempted = true;
-            const uint32_t count = static_cast<uint32_t>((std::min<uint64_t>)(work.Size - work.Offset,
-                (work.Offset == 0 || work.RootCr3 != 0) ? 4096 - (page.Address & 4095) : 16384));
             if (work.RootCr3 != 0)
             {
                 const OrphanKernelPageRoot root = {work.RootCr3, work.Identity.ProcessId, work.Identity.CreateTime};
@@ -390,6 +443,11 @@ void KernelMonitor::CaptureLoop()
                     page.Context.PfnKnown = true;
                     page.Context.Pfn = before.PhysicalAddress >> 12;
                 }
+                else if (!known)
+                {
+                    reason = L"address_space_identity_unavailable";
+                    fatal = true;
+                }
             }
             else if (work.Identity.ProcessId == 0)
             {
@@ -397,26 +455,55 @@ void KernelMonitor::CaptureLoop()
                 PhysicalTranslationInfo after = {};
                 const bool translated = device != nullptr && device->TranslateVirtual(0, page.Address, 1, &before, nullptr);
                 success = device != nullptr && page.Address >= 0xFFFF800000000000ull &&
-                    device->ReadMemory(page.Address, count, &page.Bytes, nullptr) && page.Bytes.size() == count;
-                if (success && translated && device->TranslateVirtual(0, page.Address, 1, &after, nullptr) &&
-                    before.PhysicalAddress == after.PhysicalAddress)
+                    device->ReadMemory(page.Address, count, &page.Bytes, &detail) && page.Bytes.size() == count;
+                if (success && translated)
                 {
-                    page.Context.PfnKnown = true;
-                    page.Context.Pfn = before.PhysicalAddress >> 12;
-                    if (((before.Pml5e | before.Pml4e | before.Pdpte | before.Pde | before.Pte) >> 63) == 0)
+                    success = device->TranslateVirtual(0, page.Address, 1, &after, nullptr) &&
+                        before.PhysicalAddress == after.PhysicalAddress;
+                    if (!success)
                     {
-                        page.Context.Coverage.InventoryAvailable = true;
+                        reason = L"mapping_changed_during_capture";
+                        fatal = true;
+                    }
+                    else
+                    {
+                        page.Context.PfnKnown = true;
+                        page.Context.Pfn = before.PhysicalAddress >> 12;
+                        page.Context.Coverage.InventoryAvailable =
+                            ((before.Pml5e | before.Pml4e | before.Pdpte | before.Pde | before.Pte) >> 63) == 0;
                     }
                 }
             }
             else
             {
                 HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, work.Identity.ProcessId);
-                const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
-                if (process != nullptr && work.Identity.SameInstance(ObserveProcessIdentity(work.Identity.ProcessId, process)))
+                if (process == nullptr)
                 {
-                    MEMORY_BASIC_INFORMATION region = {};
-                    if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(page.Address), &region, sizeof(region)) == sizeof(region))
+                    detail = L"OpenProcess=" + std::to_wstring(GetLastError());
+                    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, work.Identity.ProcessId);
+                }
+                const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
+                MEMORY_BASIC_INFORMATION region{};
+                const bool regionKnown = process != nullptr &&
+                    VirtualQueryEx(process, reinterpret_cast<LPCVOID>(page.Address), &region, sizeof(region)) == sizeof(region);
+                const bool inaccessible = regionKnown && (region.State != MEM_COMMIT ||
+                    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0);
+                if (process != nullptr && !work.Identity.SameInstance(ObserveProcessIdentity(work.Identity.ProcessId, process)))
+                {
+                    reason = L"process_identity_changed";
+                    fatal = true;
+                }
+                else if (inaccessible)
+                {
+                    // Reading guard pages changes target state. Never fall
+                    // back through the driver to bypass a known protection.
+                    unreadable = true;
+                    reason = region.State != MEM_COMMIT ? L"page_not_committed" : L"page_protection_excluded";
+                    detail = L"state=" + std::to_wstring(region.State) + L" protect=" + std::to_wstring(region.Protect);
+                }
+                else if (process != nullptr)
+                {
+                    if (regionKnown)
                     {
                         page.Context.AllocationBase = reinterpret_cast<uint64_t>(region.AllocationBase);
                         page.Context.Coverage.InventoryAvailable = region.State == MEM_COMMIT &&
@@ -425,11 +512,38 @@ void KernelMonitor::CaptureLoop()
                     page.Bytes.resize(count);
                     SIZE_T read = 0;
                     success = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(page.Address), page.Bytes.data(), count, &read) && read == count;
+                    if (!success) { detail += L" ReadProcessMemory=" + std::to_wstring(GetLastError()); }
                 }
-                if (!success && device != nullptr)
+                if (!success && !fatal && !inaccessible && device != nullptr && symbols != nullptr)
                 {
-                    success = device->ReadProcessVirtual(work.Identity.ProcessId, work.Identity.Eprocess,
-                        work.Identity.CreateTime, page.Address, count, &page.Bytes, nullptr) && page.Bytes.size() == count;
+                    ProcessAddressContext context{};
+                    if (work.Identity.Eprocess == 0 &&
+                        !ResolveObservationProcess(*device, *symbols, work.Identity, &context))
+                    {
+                        reason = L"process_identity_unavailable";
+                        fatal = true;
+                    }
+                    else
+                    {
+                        if (work.Identity.Eprocess == 0) { work.Identity.Eprocess = context.Eprocess; }
+                        std::wstring driverError;
+                        success = device->ReadProcessVirtual(work.Identity.ProcessId, work.Identity.Eprocess,
+                            work.Identity.CreateTime, page.Address, count, &page.Bytes, &driverError) && page.Bytes.size() == count;
+                        detail += L" driver=" + driverError;
+                        if (success) { CaptureFallbackPages.fetch_add(1); }
+                    }
+                }
+                if (success && process != nullptr)
+                {
+                    DWORD exitCode = 0;
+                    MEMORY_BASIC_INFORMATION after{};
+                    success = work.Identity.SameInstance(ObserveProcessIdentity(work.Identity.ProcessId, process)) &&
+                        GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE &&
+                        (!regionKnown || (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(page.Address), &after, sizeof(after)) == sizeof(after) &&
+                            after.AllocationBase == region.AllocationBase && after.BaseAddress == region.BaseAddress &&
+                            after.RegionSize == region.RegionSize && after.State == region.State &&
+                            after.Type == region.Type && after.Protect == region.Protect));
+                    if (!success) { reason = L"mapping_or_process_changed_during_capture"; fatal = true; }
                 }
             }
             const uint64_t now = GetTickCount64();
@@ -447,11 +561,15 @@ void KernelMonitor::CaptureLoop()
                 page.Context.Coverage.RequestedBytes = count;
                 page.Context.Coverage.ComparedBytes = count;
                 page.Context.Coverage.Reason = L"bytes_captured_not_integrity_verified";
+                page.Context.Identity = work.Identity;
                 success = CapturedPages.Push(std::move(page));
                 if (success)
                 {
+                    CaptureReadBytes.fetch_add(count);
+                    work.ReadBytes += count;
                     work.Offset += count;
                 }
+                else { reason = L"persistence_queue_full"; fatal = true; }
             }
             if (!success)
             {
@@ -460,8 +578,25 @@ void KernelMonitor::CaptureLoop()
                 event.ProcessId = work.Identity.ProcessId;
                 event.Observation.Identity = work.Identity;
                 event.Observation.Source = L"priority_capture";
-                event.Summary = L"capture read, identity, or persistence queue failed";
+                event.Summary = reason;
+                event.Observation.Coverage.Attempted = true;
+                event.Observation.Coverage.RequestedBytes = count;
+                if (unreadable)
+                {
+                    event.Observation.Coverage.SkippedBytes = count;
+                    event.Observation.Coverage.Skipped.push_back({page.Address, count});
+                }
+                else
+                {
+                    event.Observation.Coverage.FailedBytes = count;
+                    event.Observation.Coverage.Failed.push_back({page.Address, count});
+                }
+                event.Observation.Coverage.Reason = reason;
                 event.Evidence[L"capture_id"] = std::to_wstring(work.Id);
+                event.Evidence[L"capture_role"] = work.Role;
+                event.Evidence[L"address"] = std::to_wstring(page.Address);
+                event.Evidence[L"read_error"] = detail;
+                event.Evidence[L"continuing"] = fatal ? L"false" : L"true";
                 event.Evidence[L"failed_offset"] = std::to_wstring(work.Offset);
                 event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(now - work.SubmittedMs);
                 PipelineEvents.Push(std::move(event));
@@ -470,26 +605,39 @@ void KernelMonitor::CaptureLoop()
         catch (...)
         {
             success = false;
+            fatal = true;
+            reason = L"capture_exception";
         }
-        if (success && work.Offset < work.Size)
+        if (!success)
+        {
+            if (unreadable)
+            {
+                work.SkippedBytes += count;
+                CaptureUnreadableBytes.fetch_add(count);
+            }
+            else
+            {
+                work.FailedBytes += count;
+                CaptureReadFailedBytes.fetch_add(count);
+            }
+            work.Offset += count;
+        }
+        if (!fatal && work.Offset < work.Size)
         {
             if (ContinuedCaptures.Push(work))
             {
                 continue;
             }
-            success = false;
+            reason = L"continuation_queue_full";
         }
-        if (!success)
-        {
-            CaptureFailed.fetch_add(1);
-        }
-        std::lock_guard<std::mutex> lock(CapturesMutex);
-        CapturedKeys.erase(work.Key);
+        finished(work, reason);
     }
+    CaptureWorkerDone.store(true);
 }
 
 void KernelMonitor::CaptureWriterLoop()
 {
+    CaptureWriterDone.store(false);
     while (!WriterStopping.load() || CapturedPages.Size() != 0)
     {
         CapturedPage page;
@@ -580,6 +728,10 @@ void KernelMonitor::CaptureWriterLoop()
             event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(page.FirstDelayMs);
             event.Evidence[L"mapping_consistency"] = page.Context.PfnKnown ? L"pfn_checked_before_and_after" : L"unverified";
             event.Evidence[L"persistence"] = written ? L"complete" : L"failed";
+            while (!StopRequested.load() && PipelineEvents.Size() >= 384)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             PipelineEvents.Push(std::move(event));
             if (written)
             {
@@ -604,6 +756,7 @@ void KernelMonitor::CaptureWriterLoop()
             CaptureFailed.fetch_add(1);
         }
     }
+    CaptureWriterDone.store(true);
 }
 
 void KernelMonitor::DrainPipelineEvents(bool finalDrain)
@@ -670,6 +823,21 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"final_drain"] = finalDrain ? L"true" : L"false";
         event.Evidence[L"first_capture_max_ms"] = std::to_wstring(CaptureFirstMaxMs.load());
         event.Evidence[L"capture_failures"] = std::to_wstring(CaptureFailed.load());
+        event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
+        event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
+        event.Evidence[L"capture_known_unreadable_bytes"] = std::to_wstring(CaptureUnreadableBytes.load());
+        event.Evidence[L"capture_read_failed_requests"] = std::to_wstring(CaptureReadFailedRequests.load());
+        event.Evidence[L"capture_fallback_pages"] = std::to_wstring(CaptureFallbackPages.load());
+        event.Evidence[L"capture_requests_traversed"] = std::to_wstring(CaptureTraversed.load());
+        event.Evidence[L"capture_requests_queued"] = std::to_wstring(CaptureQueued.load());
+        event.Evidence[L"shutdown_layout_processed"] = std::to_wstring(ShutdownLayoutProcessed);
+        event.Evidence[L"shutdown_references_processed"] = std::to_wstring(ShutdownReferencesProcessed);
+        event.Evidence[L"shutdown_drain_ms"] = std::to_wstring(ShutdownDrainMs);
+        event.Evidence[L"shutdown_events_processed"] = std::to_wstring(ShutdownEventsProcessed);
+        event.Evidence[L"shutdown_events_unanalyzed"] = std::to_wstring(ShutdownEventsUnanalyzed);
+        event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
+        event.Evidence[L"image_remaining_pages"] = std::to_wstring(ImageRemainingPages.load());
+        event.Evidence[L"image_last_complete_ms"] = std::to_wstring(ImageLastCompleteMs.load());
         event.Evidence[L"analysis_budget_exceeded"] = std::to_wstring(AnalysisBudgetExceeded.load());
         RecordEvent(std::move(event));
         NextPipelineStatusMs = now + 5000;
@@ -838,7 +1006,75 @@ bool KmonPipelineSelfTest()
             monitor.Options.LogDirectory = unique;
             DeleteFileW(blockedPath.c_str());
             ok = ok && queued != 0 && monitor.CapturedBytes == savedBudget && monitor.CaptureFailed.load() == 2;
+            // A failed middle page must not hide the readable tail, including
+            // when stop is requested after admission. Guard protection must
+            // survive; no kernel fallback is allowed for a known guard page.
+            for (const DWORD protection : {PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD})
+            {
+                auto memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 3 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (memory == nullptr) { ok = false; break; }
+                std::memset(memory, 0x53, 4096);
+                std::memset(memory + 8192, 0x74, 4096);
+                DWORD old = 0;
+                const bool protectedPage = VirtualProtect(memory + 4096, 4096, protection, &old) != FALSE;
+                KernelMonitor holes;
+                const uint64_t start = reinterpret_cast<uint64_t>(memory) + 17;
+                ok = protectedPage && holes.QueueCapture(L"selftest_hole", start, 12288 - 17,
+                    identity, ObservationFileTime(), nullptr) && ok;
+                holes.CaptureStopping.store(true);
+                holes.CaptureLoop();
+                const auto pages = holes.CapturedPages.Drain(8);
+                MEMORY_BASIC_INFORMATION middle{};
+                ok = ok && VirtualQuery(memory + 4096, &middle, sizeof(middle)) == sizeof(middle) &&
+                    middle.Protect == protection && pages.size() == 2 &&
+                    pages[0].Offset == 0 && pages[0].Bytes == std::vector<uint8_t>(4096 - 17, 0x53) &&
+                    pages[1].Offset == 8192 - 17 && pages[1].Bytes == std::vector<uint8_t>(4096, 0x74) &&
+                    holes.CaptureFailed.load() == 1 && holes.CaptureTraversed.load() == 1 &&
+                    holes.CaptureReadBytes.load() == 8192 - 17 && holes.CaptureReadFailedBytes.load() == 0 &&
+                    holes.CaptureUnreadableBytes.load() == 4096;
+                bool honestResult = false;
+                for (const auto& event : holes.PipelineEvents.Drain(16))
+                {
+                    const auto& coverage = event.Observation.Coverage;
+                    honestResult = honestResult || (event.Kind == L"coverage.capture_result" &&
+                        coverage.TraversalComplete && !coverage.Complete() && coverage.FailedBytes == 0 &&
+                        coverage.ComparedBytes == 8192 - 17 && coverage.SkippedBytes == 4096);
+                }
+                ok = ok && honestResult;
+                MEMORY_BASIC_INFORMATION head{};
+                if (VirtualQuery(memory, &head, sizeof(head)) == sizeof(head))
+                {
+                    ProcessLayoutCandidate candidate;
+                    candidate.Identity = identity;
+                    candidate.Region = {reinterpret_cast<uint64_t>(head.BaseAddress), head.RegionSize,
+                        reinterpret_cast<uint64_t>(head.AllocationBase), head.State, head.Protect, head.AllocationProtect, head.Type};
+                    candidate.ObservedAt = ObservationFileTime();
+                    candidate.ObservedMs = GetTickCount64();
+                    candidate.Role = L"selftest_shutdown";
+                    holes.LayoutCandidates.Push(candidate);
+                    ++candidate.Identity.CreateTime;
+                    holes.LayoutCandidates.Push(candidate);
+                    holes.Options.LogDirectory = unique;
+                    holes.Stop(nullptr);
+                    ok = ok && holes.LayoutCandidates.Size() == 0 && holes.LayoutChecked.load() == 1 &&
+                        holes.LayoutRejected.load() == 1 && holes.ShutdownLayoutProcessed == 2;
+                }
+                else { ok = false; }
+                VirtualFree(memory, 0, MEM_RELEASE);
+            }
             // More than one normal analysis batch must survive final shutdown.
+            monitor.WatchPids.insert(GetCurrentProcessId());
+            for (uint64_t i = 0; i < 513; ++i)
+            {
+                TimelineEvent raw;
+                raw.Source = L"kernel-live";
+                raw.Action = L"process-create";
+                raw.Entity = L"kn-shutdown-fixture.exe";
+                raw.ProcessId = GetCurrentProcessId();
+                raw.TimestampFileTime = ObservationFileTime();
+                raw.EventId = i + 1;
+                ok = monitor.CollectedLive.Push(std::move(raw)) && ok;
+            }
             for (uint64_t i = 0; i < 600; ++i)
             {
                 ExecutableRegionObservation region;
@@ -851,15 +1087,25 @@ bool KmonPipelineSelfTest()
             }
             monitor.NextPipelineStatusMs = UINT64_MAX;
             monitor.Stop(nullptr);
-            ok = ok && monitor.CapturedRegions.Size() == 0 && monitor.CatalogRecords.load() == 600;
+            ok = ok && monitor.CapturedRegions.Size() == 0 && monitor.CatalogRecords.load() == 600 &&
+                monitor.LiveIngested.load() == 513 && monitor.ShutdownEventsProcessed == 513 &&
+                monitor.ShutdownEventsUnanalyzed == 0;
             bool finalStats = false;
+            size_t classifiedShutdown = 0;
             for (const auto& event : monitor.Ring)
             {
+                if (event.Kind == L"process.create" && event.Image == L"kn-shutdown-fixture.exe") { ++classifiedShutdown; }
+                ok = ok && event.Kind != L"coverage.shutdown_event";
                 const auto marker = event.Evidence.find(L"final_drain");
                 finalStats = finalStats || (event.Kind == L"coverage.pipeline" &&
                     marker != event.Evidence.end() && marker->second == L"true");
             }
-            ok = ok && finalStats;
+            if (!finalStats || classifiedShutdown != 513 || monitor.ShutdownEventsUnanalyzed != 0)
+            {
+                std::fprintf(stderr, "FAIL shutdown event analysis: classified=%zu unprocessed=%llu\n",
+                    classifiedShutdown, static_cast<unsigned long long>(monitor.ShutdownEventsUnanalyzed));
+            }
+            ok = ok && finalStats && classifiedShutdown == 513;
             wchar_t executable[32768] = {};
             GetModuleFileNameW(nullptr, executable, 32768);
             if (!CopyFileW(executable, referencePath.c_str(), TRUE))

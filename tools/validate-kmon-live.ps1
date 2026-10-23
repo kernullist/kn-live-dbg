@@ -4,7 +4,8 @@ param(
     [string]$OutputDirectory = '',
     [ValidateRange(60, 600)][int]$ObserveSeconds = 150,
     [switch]$ProbeDriver,
-    [switch]$RequireQueueHealth
+    [switch]$RequireQueueHealth,
+    [switch]$RequireCompletedWork
 )
 
 $ErrorActionPreference = 'Stop'
@@ -181,8 +182,12 @@ try {
     $results = @(foreach ($run in $runs) {
         $own = @($events | Where-Object { $_.pid -eq $run.pid })
         $referenceObservations = @($own | Where-Object { $_.kind -eq 'coverage.user_references' }).Count
+        $comparedPages = @($own | Where-Object {
+            $_.kind -eq 'coverage.region' -and $_.evidence.source -eq 'executable_page_compare' -and
+            [long]$_.evidence.compared_bytes -gt 0
+        } | ForEach-Object { $_.evidence.base } | Sort-Object -Unique).Count
         $expected = @(switch ($run.scenario) {
-            'overwrite' { $own | Where-Object { $_.kind -eq 'finding.code_modified' } }
+            'overwrite' { $own | Where-Object { $_.kind -eq 'finding.code_modified' -and $_.image -match 'KnLiveDbgKmonTarget\.exe$' } }
             'orphan-mapped-rx' { $own | Where-Object { $_.kind -eq 'process.implant' -and (Get-KmonEventLayer $_) -eq 'mapped_exec' } }
             'orphan-private' { $own | Where-Object { $_.kind -eq 'process.hollow' -and (Get-KmonEventLayer $_) -eq 'exe_orphan_private' } }
             'orphan-image' { $own | Where-Object { $_.kind -eq 'process.hollow' -and (Get-KmonEventLayer $_) -eq 'exe_orphan_image' } }
@@ -194,6 +199,7 @@ try {
         $negative = $run.scenario -in @('hold', 'mapped-readonly')
         [ordered]@{
             scenario=$run.scenario; pid=$run.pid; user_reference_observations=$referenceObservations; expected_events=$expected.Count
+            unique_image_pages_compared=$comparedPages
             unexpected_events=$unexpected.Count
             passed=($referenceObservations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0)
             first_detection_seconds=$(if ($expected.Count) { ([DateTime]$expected[0].ts - [DateTime]$run.started_utc).TotalSeconds } else { $null })
@@ -241,12 +247,35 @@ try {
         if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties[$field] -or
             [long]$finalPipeline.$field -ne 0) { $queueHealth = $false }
     }
+    $captureResults = @($events | Where-Object { $_.kind -eq 'coverage.capture_result' })
+    $captureLedger = @{}
+    foreach ($event in $captures) {
+        $id = [string]$event.evidence.capture_id
+        if (-not $captureLedger.ContainsKey($id)) { $captureLedger[$id] = [long]0 }
+        $captureLedger[$id] += [long]$event.evidence.capture_bytes
+    }
+    $completedWork = $null -ne $finalPipeline -and $captureResults.Count -gt 0
+    foreach ($event in $captureResults) {
+        $e = $event.evidence
+        $persisted = if ($captureLedger.ContainsKey([string]$e.capture_id)) { $captureLedger[[string]$e.capture_id] } else { 0 }
+        if ([long]$e.requested_bytes -ne ([long]$e.compared_bytes + [long]$e.failed_bytes + [long]$e.skipped_bytes) -or
+            $persisted -ne [long]$e.compared_bytes) { throw "Capture accounting mismatch: $($e.capture_id)" }
+        if ($e.read_completion -ne 'true' -or [long]$e.unvisited_bytes -ne 0) { $completedWork = $false }
+    }
+    foreach ($field in @('analysis_pending', 'layout_pending', 'execution_references_pending', 'capture_pending', 'shutdown_events_unanalyzed')) {
+        if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties[$field] -or
+            [long]$finalPipeline.$field -ne 0) { $completedWork = $false }
+    }
+    if ($null -eq $finalPipeline -or $null -eq $finalPipeline.PSObject.Properties['capture_requests_queued'] -or
+        [long]$finalPipeline.capture_requests_queued -ne $captureResults.Count) { $completedWork = $false }
+    $shutdownUnanalyzed = @($events | Where-Object { $_.kind -eq 'coverage.shutdown_event' }).Count
+    if ($shutdownUnanalyzed -ne 0) { $completedWork = $false }
     $services = @(Get-Service KnLiveDbg,KnLiveDbgProbe -ErrorAction SilentlyContinue)
     $sameBoot = $boot -eq (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
     $passed = -not $failure -and $results.Count -eq 6 -and @($results | Where-Object { -not $_.passed }).Count -eq 0 -and
         (-not $ProbeDriver -or $driverEvents -gt 0) -and $services.Count -eq 0 -and $sameBoot -and
         $captures.Count -gt 0 -and $null -ne $finalPipeline -and $finalPipeline.final_drain -eq 'true' -and
-        (-not $RequireQueueHealth -or $queueHealth)
+        (-not $RequireQueueHealth -or $queueHealth) -and (-not $RequireCompletedWork -or $completedWork)
     [ordered]@{
         schema='kn-live-dbg.kmon-live-validation.v1'; passed=$passed
         started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
@@ -258,6 +287,9 @@ try {
         case_exports_verified=$runs.Count; layout_exports_verified=$runs.Count
         final_pipeline=$finalPipeline
         queue_health_required=[bool]$RequireQueueHealth; queue_health_passed=$queueHealth
+        completed_work_required=[bool]$RequireCompletedWork; completed_work_passed=$completedWork
+        capture_results_verified=$captureResults.Count
+        shutdown_events_unanalyzed=$shutdownUnanalyzed
         coverage_claim='bounded fixture observations only; inspect sensor and coverage records for gaps'
         same_boot=$sameBoot; remaining_services=$services.Count; error=$failure
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$output\validation.json" -Encoding UTF8
