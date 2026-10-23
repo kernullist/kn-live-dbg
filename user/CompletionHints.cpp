@@ -429,7 +429,7 @@ namespace
 
     const CompletionHint kCiTokens[] =
     {
-        { L"options", L"!ci options", L"decode nt!g_CiOptions bits" },
+        { L"options", L"!ci options", L"query public CI/HVCI options" },
         { L"policy", L"!ci policy", L"Code Integrity policy / HVCI related state" },
         { L"help", nullptr, L"show !ci usage" },
     };

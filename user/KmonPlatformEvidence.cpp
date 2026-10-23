@@ -1,4 +1,5 @@
 #include "KmonPlatformEvidence.h"
+#include "CodeIntegrityState.h"
 
 #include <Windows.h>
 #include <winternl.h>
@@ -949,39 +950,31 @@ namespace
 
     bool CollectCodeIntegrity(KmonPlatformEvidenceResult* result)
     {
-        using QueryFunction = NTSTATUS(NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-        const auto query = reinterpret_cast<QueryFunction>(GetProcAddress(
-            GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
-        result->Fields[L"ci.source"] = L"NtQuerySystemInformation(SystemCodeIntegrityInformation=103)";
+        const auto state = codeintegrity::Query();
+        result->Fields[L"ci.source"] = codeintegrity::kSource;
         result->Fields[L"ci.state"] = L"unknown";
-        if (query == nullptr)
+        if (!state.QueryAvailable)
         {
             result->Warnings.push_back(L"Code integrity query is unavailable");
             return false;
         }
-        SYSTEM_CODEINTEGRITY_INFORMATION information = {};
-        information.Length = sizeof(information);
-        ULONG returned = 0;
-        const NTSTATUS status = query(static_cast<SYSTEM_INFORMATION_CLASS>(103), &information,
-            sizeof(information), &returned);
-        result->Fields[L"ci.ntstatus"] = HexNumber(static_cast<uint32_t>(status));
-        if (status < 0 || returned != sizeof(information) || information.Length != sizeof(information))
+        result->Fields[L"ci.ntstatus"] = HexNumber(state.NtStatus);
+        if (!state.Resolved)
         {
             result->Warnings.push_back(L"Code integrity query did not return a complete known structure");
             return false;
         }
-        const ULONG flags = information.CodeIntegrityOptions;
         result->Fields[L"ci.state"] = L"observed";
-        result->Fields[L"ci.raw_mask"] = HexNumber(flags);
-        result->Fields[L"ci.kmci_enabled_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_ENABLED) != 0);
-        result->Fields[L"ci.testsign_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_TESTSIGN) != 0);
-        result->Fields[L"ci.umci_enabled_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_UMCI_ENABLED) != 0);
-        result->Fields[L"ci.umci_audit_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_UMCI_AUDITMODE_ENABLED) != 0);
-        result->Fields[L"ci.hvci_kmci_enabled_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0);
-        result->Fields[L"ci.hvci_kmci_audit_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_HVCI_KMCI_AUDITMODE_ENABLED) != 0);
-        result->Fields[L"ci.hvci_strict_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_HVCI_KMCI_STRICTMODE_ENABLED) != 0);
-        result->Fields[L"ci.hvci_ium_observed"] = Boolean((flags & CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED) != 0);
-        result->Fields[L"ci.unknown_option_mask"] = HexNumber(flags & ~ULONG(0x3fff));
+        result->Fields[L"ci.raw_mask"] = HexNumber(state.Raw);
+        result->Fields[L"ci.kmci_enabled_observed"] = Boolean(state.CodeIntegrityEnabled);
+        result->Fields[L"ci.testsign_observed"] = Boolean(state.TestSign);
+        result->Fields[L"ci.umci_enabled_observed"] = Boolean(state.UmciEnabled);
+        result->Fields[L"ci.umci_audit_observed"] = Boolean(state.UmciAuditMode);
+        result->Fields[L"ci.hvci_kmci_enabled_observed"] = Boolean(state.HvciEnabled);
+        result->Fields[L"ci.hvci_kmci_audit_observed"] = Boolean(state.HvciAuditMode);
+        result->Fields[L"ci.hvci_strict_observed"] = Boolean(state.HvciStrictMode);
+        result->Fields[L"ci.hvci_ium_observed"] = Boolean(state.HvciIumEnabled);
+        result->Fields[L"ci.unknown_option_mask"] = HexNumber(state.UnknownOptions);
         return true;
     }
 

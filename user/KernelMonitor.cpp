@@ -16241,7 +16241,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"ci",
                     L"kernel code integrity is disabled (DSE off)",
-                    result.CiOptions.SymbolSource);
+                    codeintegrity::kSource);
             }
             else
             {
@@ -16255,7 +16255,7 @@ void KernelMonitor::ScanCpuIntegrityHooks()
                     std::wstring(),
                     L"ci",
                     L"kernel test-signing is enabled (DSE test mode)",
-                    result.CiOptions.SymbolSource);
+                    codeintegrity::kSource);
             }
             else
             {

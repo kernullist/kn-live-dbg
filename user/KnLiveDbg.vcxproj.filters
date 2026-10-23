@@ -477,6 +477,9 @@
     <ClInclude Include="VbsScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="CodeIntegrityState.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="WfpScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>

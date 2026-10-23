@@ -188,89 +188,16 @@ namespace
         return symbols.FindField(typeName, fieldName, field, &ignored);
     }
 
-    void DecodeCiOptionsBits(uint32_t raw, VbsCiOptionsInfo* info)
+    void ReadCiOptions(VbsScanResult* result)
     {
-        info->CodeIntegrityEnabled = (raw & 0x00000001u) != 0;
-        info->TestSign             = (raw & 0x00000002u) != 0;
-        info->UmciEnabled          = (raw & 0x00000004u) != 0;
-        info->UmciAuditMode        = (raw & 0x00000008u) != 0;
-        info->HvciEnforced         = (raw & 0x00000020u) != 0;
-        info->UmciExclusionPaths   = (raw & 0x00000040u) != 0;
-        info->TestBuild            = (raw & 0x00000080u) != 0;
-        info->PreproductionBuild   = (raw & 0x00000100u) != 0;
-        info->FlightBuild          = (raw & 0x00000200u) != 0;
-        info->HvciStrictMode       = (raw & 0x00000400u) != 0;
-        info->HvciDebugMode        = (raw & 0x00000800u) != 0;
-    }
-
-    void ReadCiOptions(DeviceClient& device, SymbolEngine& symbols, VbsScanResult* result)
-    {
-        const std::vector<std::wstring> candidates =
+        result->CiOptions = codeintegrity::Query();
+        if (!result->CiOptions.Resolved)
         {
-            L"nt!g_CiOptions",
-            L"ci!g_CiOptions",
-            L"nt!CiOptions"
-        };
-
-        uint64_t address = 0;
-        std::wstring matched;
-        if (!ResolveFirst(symbols, candidates, &address, &matched))
-        {
-            result->Warnings.push_back(L"CiOptions symbol not resolved; HVCI/CI state will be reported as unknown");
-            return;
+            result->Warnings.push_back(L"SystemCodeIntegrityInformation unavailable or incomplete; CI/HVCI state is unknown");
         }
-
-        uint32_t raw = 0;
-        std::wstring readError;
-        if (!ReadU32(device, address, &raw, &readError))
+        else if (result->CiOptions.UnknownOptions != 0)
         {
-            result->Warnings.push_back(L"failed to read " + matched + L": " + readError);
-            return;
-        }
-
-        result->CiOptions.Raw = raw;
-        result->CiOptions.Resolved = true;
-        result->CiOptions.SymbolSource = matched;
-        DecodeCiOptionsBits(raw, &result->CiOptions);
-    }
-
-    void DetectHypervisor(VbsScanResult* result)
-    {
-        int regs[4] = {0, 0, 0, 0};
-        __cpuid(regs, 1);
-        if ((static_cast<uint32_t>(regs[2]) & 0x80000000u) == 0)
-        {
-            return;
-        }
-
-        result->Hypervisor.HypervisorPresent = true;
-
-        __cpuid(regs, 0x40000000);
-        uint32_t leafBase = static_cast<uint32_t>(regs[0]);
-        result->Hypervisor.HvLeafBase = leafBase;
-
-        char vendor[13] = {0};
-        memcpy(vendor + 0, &regs[1], sizeof(int));
-        memcpy(vendor + 4, &regs[2], sizeof(int));
-        memcpy(vendor + 8, &regs[3], sizeof(int));
-        vendor[12] = 0;
-        std::wstring vendorWide;
-        for (size_t i = 0; i < 12 && vendor[i] != 0; ++i)
-        {
-            unsigned char ch = static_cast<unsigned char>(vendor[i]);
-            if (ch >= 0x20 && ch < 0x7f)
-            {
-                vendorWide.push_back(static_cast<wchar_t>(ch));
-            }
-        }
-        result->Hypervisor.VendorSignature = vendorWide;
-
-        if (leafBase >= 0x40000006u)
-        {
-            __cpuid(regs, 0x40000006);
-            uint32_t features = static_cast<uint32_t>(regs[0]);
-            result->Hypervisor.HvHardwareFeatures = features;
-            result->Hypervisor.HvFeaturesValid = true;
+            result->Warnings.push_back(L"SystemCodeIntegrityInformation contains additional option bits; retained in unknownOptions without interpretation");
         }
     }
 
@@ -295,6 +222,10 @@ namespace
                 result->HvlpVsmVtlCallVaSymbol = matched;
                 result->HvlpVsmVtlCallVaResolved = true;
                 result->VbsActive = (pointer != 0 && IsKernelAddress(pointer));
+                if (!result->IsVbsActivityKnown())
+                {
+                    result->Warnings.push_back(matched + L" has an unrecognized nonzero pointer; VBS activity is unknown");
+                }
             }
             else
             {
@@ -623,6 +554,54 @@ namespace
     }
 }
 
+bool VbsScanResult::IsVbsActivityKnown() const
+{
+    // A null pointer is the inactive marker; an unrecognized nonzero pointer
+    // could be layout drift/corruption (or an unsupported address range).
+    return HvlpVsmVtlCallVaResolved &&
+        (HvlpVsmVtlCallVa == 0 || IsKernelAddress(HvlpVsmVtlCallVa));
+}
+
+VbsHypervisorInfo QueryVbsHypervisorInfo(VbsCpuidQuery query)
+{
+    VbsHypervisorInfo result;
+    int regs[4] = {};
+    query(regs, 1);
+    if ((static_cast<uint32_t>(regs[2]) & 0x80000000u) == 0)
+    {
+        return result;
+    }
+    result.HypervisorPresent = true;
+
+    query(regs, 0x40000000);
+    result.HvMaxLeaf = static_cast<uint32_t>(regs[0]);
+    char vendor[13] = {};
+    memcpy(vendor + 0, &regs[1], sizeof(int));
+    memcpy(vendor + 4, &regs[2], sizeof(int));
+    memcpy(vendor + 8, &regs[3], sizeof(int));
+    for (size_t i = 0; i < 12 && vendor[i] != 0; ++i)
+    {
+        const unsigned char ch = static_cast<unsigned char>(vendor[i]);
+        if (ch >= 0x20 && ch < 0x7f)
+        {
+            result.VendorSignature.push_back(static_cast<wchar_t>(ch));
+        }
+    }
+    if (result.HvMaxLeaf >= 0x40000001u)
+    {
+        query(regs, 0x40000001);
+        result.HvInterfaceSignature = static_cast<uint32_t>(regs[0]);
+        result.HvInterfaceQueried = true;
+    }
+    if (HasMicrosoftHypervisorHardwareLeaf(result.HvMaxLeaf, result.HvInterfaceSignature))
+    {
+        query(regs, 0x40000006);
+        result.HvHardwareFeatures = static_cast<uint32_t>(regs[0]);
+        result.HvFeaturesValid = true;
+    }
+    return result;
+}
+
 VbsScanner::VbsScanner(DeviceClient& device, SymbolEngine& symbols) :
     device_(device),
     symbols_(symbols)
@@ -646,8 +625,11 @@ bool VbsScanner::Scan(const Options& options, VbsScanResult* result, std::wstrin
 
         *result = VbsScanResult{};
 
-        ReadCiOptions(device_, symbols_, result);
-        DetectHypervisor(result);
+        ReadCiOptions(result);
+        result->Hypervisor = QueryVbsHypervisorInfo([](int* registers, int leaf)
+        {
+            __cpuidex(registers, leaf, 0);
+        });
 
         if (options.Target == Scope::Vbs || options.Target == Scope::SecureKernel)
         {
@@ -678,32 +660,55 @@ namespace
 
 std::wstring BuildVbsJson(const VbsScanResult& result)
 {
-    std::wstring out = L"{\"schema\":\"kn-live-dbg.vbs.v1\",\"vbsActive\":";
-    out += result.VbsActive ? L"true" : L"false";
+    std::wstring out = L"{\"schema\":\"kn-live-dbg.vbs.v2\",\"vbsActive\":";
+    out += !result.IsVbsActivityKnown() ? L"null" : (result.VbsActive ? L"true" : L"false");
+    out += L",\"vbsActiveKnown\":";
+    out += result.IsVbsActivityKnown() ? L"true" : L"false";
 
-    // CodeIntegrity options block. Raw is emitted as a quoted hex string so the
-    // model sees the actual nt!g_CiOptions bitmask alongside the decoded bools.
-    out += L",\"ciOptions\":{\"raw\":" + mcpjson::Quote(VbsJsonHex(result.CiOptions.Raw));
-    out += L",\"resolved\":";
-    out += result.CiOptions.Resolved ? L"true" : L"false";
-    if (!result.CiOptions.SymbolSource.empty())
+    // Query failure is unknown, not disabled. Preserve unrecognized option bits
+    // without guessing their meaning on newer Windows builds.
+    const auto& ci = result.CiOptions;
+    const auto flag = [&](bool value) -> const wchar_t*
     {
-        out += L",\"symbolSource\":" + mcpjson::Quote(result.CiOptions.SymbolSource);
-    }
+        return !ci.Resolved ? L"null" : (value ? L"true" : L"false");
+    };
+    out += L",\"ciOptions\":{\"source\":" + mcpjson::Quote(codeintegrity::kSource);
+    out += L",\"raw\":";
+    out += ci.Resolved ? mcpjson::Quote(VbsJsonHex(ci.Raw)) : L"null";
+    out += L",\"unknownOptions\":";
+    out += ci.Resolved ? mcpjson::Quote(VbsJsonHex(ci.UnknownOptions)) : L"null";
+    out += L",\"ntstatus\":" + mcpjson::Quote(VbsJsonHex(ci.NtStatus));
+    out += L",\"returnedLength\":" + std::to_wstring(ci.ReturnedLength);
+    out += L",\"resolved\":";
+    out += ci.Resolved ? L"true" : L"false";
     out += L",\"codeIntegrityEnabled\":";
-    out += result.CiOptions.CodeIntegrityEnabled ? L"true" : L"false";
+    out += flag(ci.CodeIntegrityEnabled);
     out += L",\"testSign\":";
-    out += result.CiOptions.TestSign ? L"true" : L"false";
+    out += flag(ci.TestSign);
     out += L",\"umciEnabled\":";
-    out += result.CiOptions.UmciEnabled ? L"true" : L"false";
+    out += flag(ci.UmciEnabled);
     out += L",\"umciAuditMode\":";
-    out += result.CiOptions.UmciAuditMode ? L"true" : L"false";
-    out += L",\"hvciEnforced\":";
-    out += result.CiOptions.HvciEnforced ? L"true" : L"false";
+    out += flag(ci.UmciAuditMode);
+    out += L",\"umciExclusionPaths\":";
+    out += flag(ci.UmciExclusionPaths);
+    out += L",\"testBuild\":";
+    out += flag(ci.TestBuild);
+    out += L",\"preproductionBuild\":";
+    out += flag(ci.PreproductionBuild);
+    out += L",\"debugMode\":";
+    out += flag(ci.DebugMode);
+    out += L",\"flightBuild\":";
+    out += flag(ci.FlightBuild);
+    out += L",\"flightingEnabled\":";
+    out += flag(ci.FlightingEnabled);
+    out += L",\"hvciEnabled\":";
+    out += flag(ci.HvciEnabled);
+    out += L",\"hvciAuditMode\":";
+    out += flag(ci.HvciAuditMode);
     out += L",\"hvciStrictMode\":";
-    out += result.CiOptions.HvciStrictMode ? L"true" : L"false";
-    out += L",\"hvciDebugMode\":";
-    out += result.CiOptions.HvciDebugMode ? L"true" : L"false";
+    out += flag(ci.HvciStrictMode);
+    out += L",\"hvciIumEnabled\":";
+    out += flag(ci.HvciIumEnabled);
     out += L"}";
 
     // Hypervisor presence and CPUID-derived vendor signature.
@@ -715,6 +720,13 @@ std::wstring BuildVbsJson(const VbsScanResult& result)
     }
     out += L",\"featuresValid\":";
     out += result.Hypervisor.HvFeaturesValid ? L"true" : L"false";
+    out += L",\"maximumLeaf\":" + mcpjson::Quote(VbsJsonHex(result.Hypervisor.HvMaxLeaf));
+    out += L",\"interfaceSignature\":";
+    out += result.Hypervisor.HvInterfaceQueried ?
+        mcpjson::Quote(VbsJsonHex(result.Hypervisor.HvInterfaceSignature)) : L"null";
+    out += L",\"hardwareFeatures\":";
+    out += result.Hypervisor.HvFeaturesValid ?
+        mcpjson::Quote(VbsJsonHex(result.Hypervisor.HvHardwareFeatures)) : L"null";
     out += L"}";
 
     out += L",\"secureKernelLoaded\":";

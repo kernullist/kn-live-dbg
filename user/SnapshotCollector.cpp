@@ -1922,7 +1922,7 @@ namespace
         vbs.Display = L"VBS state";
         vbs.Risk = L"info";
         vbs.Tags = {L"vbs"};
-        vbs.Evidence[L"vbs_active"] = BoolText(result.VbsActive);
+        vbs.Evidence[L"vbs_active"] = result.IsVbsActivityKnown() ? BoolText(result.VbsActive) : L"unknown";
         vbs.Evidence[L"secure_kernel_loaded"] = BoolText(result.SecureKernelLoaded);
         vbs.Evidence[L"skci_loaded"] = BoolText(result.SkciLoaded);
         vbs.Evidence[L"hypervisor_present"] = BoolText(result.Hypervisor.HypervisorPresent);
@@ -1935,13 +1935,21 @@ namespace
         ci.Display = L"Code Integrity options";
         ci.Risk = L"info";
         ci.Tags = {L"ci"};
+        const auto ciFlag = [&](bool value) { return result.CiOptions.Resolved ? BoolText(value) : L"unknown"; };
+        ci.Evidence[L"source"] = codeintegrity::kSource;
         ci.Evidence[L"resolved"] = BoolText(result.CiOptions.Resolved);
-        ci.Evidence[L"raw"] = SnapshotHex(result.CiOptions.Raw, 8);
-        ci.Evidence[L"ci_enabled"] = BoolText(result.CiOptions.CodeIntegrityEnabled);
-        ci.Evidence[L"testsign"] = BoolText(result.CiOptions.TestSign);
-        ci.Evidence[L"umci"] = BoolText(result.CiOptions.UmciEnabled);
-        ci.Evidence[L"hvci"] = BoolText(result.CiOptions.HvciEnforced);
-        ci.Evidence[L"hvci_debug"] = BoolText(result.CiOptions.HvciDebugMode);
+        ci.Evidence[L"ntstatus"] = SnapshotHex(result.CiOptions.NtStatus, 8);
+        ci.Evidence[L"raw"] = result.CiOptions.Resolved ? SnapshotHex(result.CiOptions.Raw, 8) : L"unknown";
+        ci.Evidence[L"unknown_options"] = result.CiOptions.Resolved ? SnapshotHex(result.CiOptions.UnknownOptions, 8) : L"unknown";
+        ci.Evidence[L"ci_enabled"] = ciFlag(result.CiOptions.CodeIntegrityEnabled);
+        ci.Evidence[L"testsign"] = ciFlag(result.CiOptions.TestSign);
+        ci.Evidence[L"umci"] = ciFlag(result.CiOptions.UmciEnabled);
+        ci.Evidence[L"hvci"] = ciFlag(result.CiOptions.HvciEnabled);
+        ci.Evidence[L"hvci_audit"] = ciFlag(result.CiOptions.HvciAuditMode);
+        ci.Evidence[L"hvci_strict"] = ciFlag(result.CiOptions.HvciStrictMode);
+        ci.Evidence[L"hvci_ium"] = ciFlag(result.CiOptions.HvciIumEnabled);
+        ci.Evidence[L"debug_mode"] = ciFlag(result.CiOptions.DebugMode);
+        ci.Evidence[L"hvci_debug"] = L"unknown"; // Retired field; no such public CI flag.
         AddRecord(document, std::move(ci));
     }
 

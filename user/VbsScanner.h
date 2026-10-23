@@ -2,37 +2,34 @@
 
 #include "DeviceClient.h"
 #include "SymbolEngine.h"
+#include "CodeIntegrityState.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-struct VbsCiOptionsInfo
-{
-    uint32_t Raw = 0;
-    bool Resolved = false;
-    std::wstring SymbolSource;
-    bool CodeIntegrityEnabled = false;
-    bool TestSign = false;
-    bool UmciEnabled = false;
-    bool UmciAuditMode = false;
-    bool HvciEnforced = false;
-    bool UmciExclusionPaths = false;
-    bool TestBuild = false;
-    bool PreproductionBuild = false;
-    bool FlightBuild = false;
-    bool HvciStrictMode = false;
-    bool HvciDebugMode = false;
-};
+using VbsCiOptionsInfo = codeintegrity::State;
 
 struct VbsHypervisorInfo
 {
     bool HypervisorPresent = false;
     std::wstring VendorSignature;
     uint32_t HvHardwareFeatures = 0;
-    uint32_t HvLeafBase = 0;
+    uint32_t HvMaxLeaf = 0;
+    uint32_t HvInterfaceSignature = 0;
+    bool HvInterfaceQueried = false;
     bool HvFeaturesValid = false;
 };
+
+inline bool HasMicrosoftHypervisorHardwareLeaf(uint32_t maximumLeaf, uint32_t interfaceSignature)
+{
+    // TLFS compatibility is defined by the vendor-neutral "Hv#1" interface,
+    // not the vendor name or the presence of numerically higher CPUID leaves.
+    return maximumLeaf >= 0x40000006u && interfaceSignature == 0x31237648u;
+}
+
+using VbsCpuidQuery = void (*)(int* registers, int leaf);
+VbsHypervisorInfo QueryVbsHypervisorInfo(VbsCpuidQuery query);
 
 struct VbsModuleHit
 {
@@ -61,6 +58,8 @@ struct VbsScanResult
     std::wstring HvlpVsmVtlCallVaSymbol;
     bool HvlpVsmVtlCallVaResolved = false;
     bool VbsActive = false;
+    // Reading a private symbol successfully does not validate its pointer value.
+    bool IsVbsActivityKnown() const;
 
     uint64_t HvcallStubAddress = 0;
     std::wstring HvcallStubSymbol;

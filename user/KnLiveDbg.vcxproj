@@ -297,6 +297,7 @@
     <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="VbsScanner.h" />
+    <ClInclude Include="CodeIntegrityState.h" />
     <ClInclude Include="WdFilterRuntimeScanner.h" />
     <ClInclude Include="WfpScanner.h" />
     <ClInclude Include="WfpCalloutScanner.h" />

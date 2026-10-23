@@ -12822,12 +12822,12 @@ static void PrintVbsHelp()
     std::wcout << L"  !vbs\n";
     std::wcout << L"\n";
     std::wcout << L"output:\n";
-    std::wcout << L"  Comprehensive VBS/HVCI/MBEC/Secure Kernel/trustlet status report.\n";
-    std::wcout << L"  Sources: nt!g_CiOptions, nt!HvlpVsmVtlCallVa, CPUID(0x40000000/0x40000006),\n";
+    std::wcout << L"  VBS/HVCI, hypervisor, Secure Kernel and trustlet observations.\n";
+    std::wcout << L"  Sources: SystemCodeIntegrityInformation, nt!HvlpVsmVtlCallVa, CPUID(0x40000000/1/6),\n";
     std::wcout << L"  PsLoadedModuleList (securekernel.exe/skci.dll), and PsActiveProcessHead walk.\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
-    std::wcout << L"  CiOptions resolves through nt!g_CiOptions, ci!g_CiOptions, or nt!CiOptions in that order.\n";
+    std::wcout << L"  CI/HVCI uses the public system-information flags; private CiOptions symbols are not interchangeable.\n";
     std::wcout << L"  Trustlet detection requires _EPROCESS/_KPROCESS.SecureState exposure in the loaded kernel PDB.\n";
     std::wcout << L"  When SecureState is unavailable, well-known trustlet image names (lsaiso.exe, bioiso.exe, securesystem.exe, kdcustomization.exe) are still listed as candidates.\n";
 }
@@ -12840,10 +12840,11 @@ static void PrintCiHelp()
     std::wcout << L"  !ci policy\n";
     std::wcout << L"\n";
     std::wcout << L"scopes:\n";
-    std::wcout << L"  options   decode CiOptions bits (CODEINTEGRITY_OPTION_ENABLED, TESTSIGN, UMCI_ENABLED, HVCI_ENFORCED, etc.)\n";
+    std::wcout << L"  options   decode SystemCodeIntegrityInformation (CI, TESTSIGN, UMCI, HVCI enabled/audit/strict/IUM)\n";
     std::wcout << L"  policy    summarize Code Integrity policy state (CiOptions plus best-effort policy hints)\n";
     std::wcout << L"\n";
     std::wcout << L"notes:\n";
+    std::wcout << L"  HVCI audit mode is separate from kernel-debugger mode; failed queries remain unknown.\n";
     std::wcout << L"  WDAC policy hash extraction depends on private CI internals and is reported as a follow-up source for now.\n";
 }
 
@@ -12886,13 +12887,16 @@ static std::wstring FormatCiOptionsFlagText(const VbsCiOptionsInfo& info)
     if (info.TestSign)             append(L"TESTSIGN");
     if (info.UmciEnabled)          append(L"UMCI_ENABLED");
     if (info.UmciAuditMode)        append(L"UMCI_AUDITMODE_ENABLED");
-    if (info.HvciEnforced)         append(L"HVCI_ENFORCED");
+    if (info.HvciEnabled)          append(L"HVCI_KMCI_ENABLED");
     if (info.UmciExclusionPaths)   append(L"UMCI_EXCLUSIONPATHS_ENABLED");
     if (info.TestBuild)            append(L"TEST_BUILD");
     if (info.PreproductionBuild)   append(L"PREPRODUCTION_BUILD");
+    if (info.DebugMode)            append(L"DEBUGMODE_ENABLED");
     if (info.FlightBuild)          append(L"FLIGHT_BUILD");
+    if (info.FlightingEnabled)     append(L"FLIGHTING_ENABLED");
+    if (info.HvciAuditMode)         append(L"HVCI_AUDIT_MODE");
     if (info.HvciStrictMode)       append(L"HVCI_STRICT_MODE");
-    if (info.HvciDebugMode)        append(L"HVCI_DEBUG_MODE");
+    if (info.HvciIumEnabled)        append(L"HVCI_IUM_ENABLED");
 
     return acc;
 }
@@ -12902,12 +12906,18 @@ static void PrintCiOptionsBlock(const VbsCiOptionsInfo& info)
     PrintColoredText(L"[ci.options]", KNDBG_COLOR_TITLE);
     if (!info.Resolved)
     {
-        std::wcout << L" status=unresolved\n";
+        std::wcout << L" status=unknown source=" << codeintegrity::kSource
+                   << L" ntstatus=0x" << std::hex << info.NtStatus << std::dec
+                   << L" returned_length=" << info.ReturnedLength << L"\n";
         return;
     }
 
-    std::wcout << L" source=" << info.SymbolSource;
+    std::wcout << L" source=" << codeintegrity::kSource;
     std::wcout << L" raw=0x" << std::hex << info.Raw << std::dec << L"\n";
+    if (info.UnknownOptions != 0)
+    {
+        std::wcout << L"  unknown_options=0x" << std::hex << info.UnknownOptions << std::dec << L"\n";
+    }
 
     std::wstring flagsText = FormatCiOptionsFlagText(info);
     std::wcout << L"  flags=";
@@ -12924,9 +12934,11 @@ static void PrintCiOptionsBlock(const VbsCiOptionsInfo& info)
     std::wcout << L"  ci=" << FormatBoolText(info.CodeIntegrityEnabled)
                << L" testsign=" << FormatBoolText(info.TestSign)
                << L" umci=" << FormatBoolText(info.UmciEnabled)
-               << L" hvci=" << FormatBoolText(info.HvciEnforced)
+               << L" hvci=" << FormatBoolText(info.HvciEnabled)
+               << L" hvci_audit=" << FormatBoolText(info.HvciAuditMode)
                << L" hvci_strict=" << FormatBoolText(info.HvciStrictMode)
-               << L" hvci_debug=" << FormatBoolText(info.HvciDebugMode) << L"\n";
+               << L" hvci_ium=" << FormatBoolText(info.HvciIumEnabled)
+               << L" debug_mode=" << FormatBoolText(info.DebugMode) << L"\n";
 }
 
 static void PrintHypervisorBlock(const VbsHypervisorInfo& info)
@@ -12938,25 +12950,35 @@ static void PrintHypervisorBlock(const VbsHypervisorInfo& info)
     {
         std::wcout << L" vendor=\"" << info.VendorSignature << L"\"";
     }
-    if (info.HvLeafBase != 0)
+    if (info.HvMaxLeaf != 0)
     {
-        std::wcout << L" leaf_base=0x" << std::hex << info.HvLeafBase << std::dec;
+        std::wcout << L" max_leaf=0x" << std::hex << info.HvMaxLeaf << std::dec;
+    }
+    if (info.HvInterfaceQueried)
+    {
+        std::wcout << L" interface=0x" << std::hex << info.HvInterfaceSignature << std::dec;
     }
     if (info.HvFeaturesValid)
     {
         std::wcout << L" hv_hw_features=0x" << std::hex << info.HvHardwareFeatures << std::dec;
     }
+    else
+    {
+        std::wcout << L" hv_hw_features=unavailable";
+    }
     std::wcout << L"\n";
-    std::wcout << L"  note: MBEC enablement requires IA32_VMX_PROCBASED_CTLS2 bit 22 (MSR read, kernel-only); inferred from HVCI enforcement instead.\n";
+    std::wcout << L"  note: HVCI state does not establish hardware MBEC support or enablement.\n";
 }
 
 static void PrintVbsCoreBlock(const VbsScanResult& result)
 {
     PrintColoredText(L"[vbs.core]", KNDBG_COLOR_TITLE);
     std::wcout << L" vbs_active=";
-    PrintColoredText(FormatBoolText(result.VbsActive), FormatBoolColor(result.VbsActive));
-    std::wcout << L" hvci_enforced=";
-    PrintColoredText(FormatBoolText(result.CiOptions.HvciEnforced), FormatBoolColor(result.CiOptions.HvciEnforced));
+    PrintColoredText(result.IsVbsActivityKnown() ? FormatBoolText(result.VbsActive) : L"unknown",
+        result.IsVbsActivityKnown() ? FormatBoolColor(result.VbsActive) : KNDBG_COLOR_WARN);
+    std::wcout << L" hvci_enabled=";
+    PrintColoredText(result.CiOptions.Resolved ? FormatBoolText(result.CiOptions.HvciEnabled) : L"unknown",
+        result.CiOptions.Resolved ? FormatBoolColor(result.CiOptions.HvciEnabled) : KNDBG_COLOR_WARN);
     std::wcout << L" sk_loaded=";
     PrintColoredText(FormatBoolText(result.SecureKernelLoaded), FormatBoolColor(result.SecureKernelLoaded));
     std::wcout << L" skci=";
@@ -13041,7 +13063,7 @@ static bool PrepareVbsScan(
 
     do
     {
-        if (!device.IsOpen())
+        if (options.Target != VbsScanner::Scope::Ci && !device.IsOpen())
         {
             if (error != nullptr)
             {
@@ -13050,7 +13072,7 @@ static bool PrepareVbsScan(
             break;
         }
 
-        if (symbols.Modules().empty())
+        if (options.Target != VbsScanner::Scope::Ci && symbols.Modules().empty())
         {
             if (!symbols.LoadKernelModules(error))
             {
@@ -13122,7 +13144,11 @@ static void PrintCiPolicyBlock(const VbsScanResult& result)
 {
     PrintColoredText(L"[ci.policy]", KNDBG_COLOR_TITLE);
     std::wcout << L" status=";
-    if (result.CiOptions.Resolved && result.CiOptions.UmciEnabled)
+    if (result.CiOptions.Resolved && result.CiOptions.UmciAuditMode)
+    {
+        PrintColoredText(L"UMCI-audit", KNDBG_COLOR_WARN);
+    }
+    else if (result.CiOptions.Resolved && result.CiOptions.UmciEnabled)
     {
         PrintColoredText(L"UMCI-enforced", KNDBG_COLOR_OK);
     }
@@ -13139,7 +13165,8 @@ static void PrintCiPolicyBlock(const VbsScanResult& result)
         std::wcout << L" testsign=" << FormatBoolText(result.CiOptions.TestSign)
                    << L" audit=" << FormatBoolText(result.CiOptions.UmciAuditMode)
                    << L" exclusion_paths=" << FormatBoolText(result.CiOptions.UmciExclusionPaths)
-                   << L" hvci=" << FormatBoolText(result.CiOptions.HvciEnforced)
+                   << L" hvci=" << FormatBoolText(result.CiOptions.HvciEnabled)
+                   << L" hvci_audit=" << FormatBoolText(result.CiOptions.HvciAuditMode)
                    << L" hvci_strict=" << FormatBoolText(result.CiOptions.HvciStrictMode);
     }
     std::wcout << L"\n";

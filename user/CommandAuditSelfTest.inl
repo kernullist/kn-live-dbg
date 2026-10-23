@@ -36,6 +36,281 @@ static int RunCommandAuditSelfTest()
         return result;
     };
 
+    // Exercise the API boundary as well as the documented bit meanings. A
+    // failed/short query may leave plausible bytes behind; they are not evidence.
+    {
+        static ULONG mask = 0;
+        static ULONG replyLength = sizeof(SYSTEM_CODEINTEGRITY_INFORMATION);
+        static ULONG structureLength = sizeof(SYSTEM_CODEINTEGRITY_INFORMATION);
+        static NTSTATUS replyStatus = 0;
+        static bool contractOk = false;
+        const codeintegrity::QueryFunction query = [](SYSTEM_INFORMATION_CLASS kind,
+            PVOID buffer, ULONG size, PULONG returned) -> NTSTATUS
+        {
+            auto* information = static_cast<SYSTEM_CODEINTEGRITY_INFORMATION*>(buffer);
+            contractOk = static_cast<int>(kind) == 103 && size == sizeof(*information) &&
+                information->Length == sizeof(*information) && information->CodeIntegrityOptions == 0;
+            information->Length = structureLength;
+            information->CodeIntegrityOptions = mask;
+            *returned = replyLength;
+            return replyStatus;
+        };
+        // Order follows Microsoft's SYSTEM_CODEINTEGRITY_INFORMATION table.
+        bool codeintegrity::State::* const flags[] = {
+            &codeintegrity::State::CodeIntegrityEnabled, &codeintegrity::State::TestSign,
+            &codeintegrity::State::UmciEnabled, &codeintegrity::State::UmciAuditMode,
+            &codeintegrity::State::UmciExclusionPaths, &codeintegrity::State::TestBuild,
+            &codeintegrity::State::PreproductionBuild, &codeintegrity::State::DebugMode,
+            &codeintegrity::State::FlightBuild, &codeintegrity::State::FlightingEnabled,
+            &codeintegrity::State::HvciEnabled, &codeintegrity::State::HvciAuditMode,
+            &codeintegrity::State::HvciStrictMode, &codeintegrity::State::HvciIumEnabled
+        };
+        for (unsigned bit = 0; bit != 32; ++bit)
+        {
+            mask = ULONG(1) << bit;
+            const auto observed = codeintegrity::Query(query);
+            check(contractOk && observed.Resolved && observed.Raw == mask,
+                L"CI query contract and raw bit " + std::to_wstring(bit));
+            for (unsigned field = 0; field != _countof(flags); ++field)
+            {
+                check(observed.*flags[field] == (bit == field),
+                    L"CI flag isolation " + std::to_wstring(bit) + L"/" + std::to_wstring(field));
+            }
+            check(observed.UnknownOptions == (bit >= 14 ? mask : 0), L"CI unknown bits retained");
+        }
+        mask = 0;
+        const auto disabled = codeintegrity::Query(query);
+        check(disabled.Resolved && !disabled.HvciEnabled && disabled.Raw == 0, L"CI known disabled state");
+        mask = 0xffffffffu;
+        const auto combined = codeintegrity::Query(query);
+        for (const auto field : flags)
+        {
+            check(combined.*field, L"CI combined independent flags");
+        }
+        check(combined.UnknownOptions == 0xffffc000u, L"CI combined unknown options");
+        const auto rejects = [&](const codeintegrity::State& observed, const wchar_t* name)
+        {
+            check(!observed.Resolved && observed.Raw == 0 && observed.UnknownOptions == 0 &&
+                !observed.CodeIntegrityEnabled && !observed.HvciEnabled, name);
+        };
+        rejects(codeintegrity::Query(nullptr), L"CI missing API");
+        replyStatus = static_cast<NTSTATUS>(0xc0000022u);
+        const auto denied = codeintegrity::Query(query);
+        rejects(denied, L"CI access denied with populated output");
+        check(denied.NtStatus == 0xc0000022u && denied.QueryAvailable, L"CI failure diagnostics");
+        replyStatus = 0;
+        for (const ULONG length : {0ul, 4ul, 7ul, 9ul, 16ul})
+        {
+            replyLength = length;
+            rejects(codeintegrity::Query(query), L"CI unexpected returned length");
+        }
+        replyLength = sizeof(SYSTEM_CODEINTEGRITY_INFORMATION);
+        structureLength = 0;
+        rejects(codeintegrity::Query(query), L"CI unexpected structure length");
+        structureLength = sizeof(SYSTEM_CODEINTEGRITY_INFORMATION);
+
+        VbsScanResult evidence;
+        evidence.CiOptions = denied;
+        const auto unknownJson = BuildVbsJson(evidence);
+        check(unknownJson.find(L"\"hvciEnabled\":null") != std::wstring::npos &&
+            unknownJson.find(L"\"codeIntegrityEnabled\":null") != std::wstring::npos &&
+            unknownJson.find(L"\"raw\":null") != std::wstring::npos &&
+            unknownJson.find(L"\"vbsActive\":null") != std::wstring::npos,
+            L"CI/VBS JSON unknown is not disabled");
+        evidence.CiOptions = disabled;
+        const auto disabledJson = BuildVbsJson(evidence);
+        check(disabledJson.find(L"\"hvciEnabled\":false") != std::wstring::npos &&
+            disabledJson.find(L"\"raw\":\"0x0\"") != std::wstring::npos,
+            L"CI JSON known disabled");
+        mask = 0x800; // Audit can be reported without the enabled bit.
+        evidence.CiOptions = codeintegrity::Query(query);
+        const auto auditJson = BuildVbsJson(evidence);
+        check(auditJson.find(L"\"hvciAuditMode\":true") != std::wstring::npos &&
+            auditJson.find(L"\"debugMode\":false") != std::wstring::npos,
+            L"CI JSON audit/debug separation");
+        check(FormatCiOptionsFlagText(evidence.CiOptions) == L"HVCI_AUDIT_MODE",
+            L"CI console audit/debug separation");
+        std::wostringstream ciOutput;
+        auto* savedOut = std::wcout.rdbuf(ciOutput.rdbuf());
+        PrintCiOptionsBlock(denied);
+        PrintVbsCoreBlock(VbsScanResult{});
+        evidence.CiOptions.UmciEnabled = true;
+        evidence.CiOptions.UmciAuditMode = true;
+        PrintCiPolicyBlock(evidence);
+        std::wcout.rdbuf(savedOut);
+        check(ciOutput.str().find(L"status=unknown") != std::wstring::npos &&
+            ciOutput.str().find(L"hvci_enabled=unknown") != std::wstring::npos &&
+            ciOutput.str().find(L"UMCI-audit") != std::wstring::npos,
+            L"CI console unknown and audit posture");
+        const auto liveCi = run(L"!ci options");
+        check(liveCi.KeepRunning && liveCi.Output.find(codeintegrity::kSource) != std::wstring::npos &&
+            liveCi.Error.find(L"requires the KnLiveDbg.sys") == std::wstring::npos,
+            L"CI command does not require a driver or private symbols");
+        check(!HasMicrosoftHypervisorHardwareLeaf(0x40000010, 0), L"large leaf range alone is not a Hyper-V interface");
+        check(!HasMicrosoftHypervisorHardwareLeaf(0x40000006, 0x12345678), L"unknown hypervisor interface rejected");
+        check(!HasMicrosoftHypervisorHardwareLeaf(0x40000005, 0x31237648), L"Hyper-V hardware leaf must exist");
+        check(HasMicrosoftHypervisorHardwareLeaf(0x40000006, 0x31237648), L"Hv#1 interface hardware leaf");
+        check(HasMicrosoftHypervisorHardwareLeaf(0x40000010, 0x31237648), L"vendor-neutral Hv#1 compatibility");
+        check(unknownJson.find(L"\"hardwareFeatures\":null") != std::wstring::npos,
+            L"unavailable hypervisor features are not a zero capability mask");
+
+        // A changed type/meaning must not silently reuse the v1 wire contract.
+        std::wstring schema;
+        check(mcpjson::GetString(unknownJson, L"schema", &schema) && schema == L"kn-live-dbg.vbs.v2",
+            L"VBS nullable API evidence has a new schema version");
+        std::wstring ciJson;
+        std::wstring legacy;
+        check(mcpjson::FindRawValue(auditJson, L"ciOptions", &ciJson) &&
+            !mcpjson::FindRawValue(ciJson, L"hvciEnforced", &legacy) &&
+            !mcpjson::FindRawValue(ciJson, L"hvciDebugMode", &legacy),
+            L"VBS v2 removes misleading legacy CI fields");
+        evidence.HvlpVsmVtlCallVaResolved = true;
+        evidence.HvlpVsmVtlCallVa = 0x1234; // Read succeeded, but this is not a VTL kernel pointer.
+        const auto invalidPointerJson = BuildVbsJson(evidence);
+        std::wstring active;
+        std::wstring known;
+        check(mcpjson::FindRawValue(invalidPointerJson, L"vbsActive", &active) && active == L"null" &&
+            mcpjson::FindRawValue(invalidPointerJson, L"vbsActiveKnown", &known) && known == L"false",
+            L"invalid nonzero VTL pointer is unknown, not disabled");
+        ciOutput.str(L"");
+        savedOut = std::wcout.rdbuf(ciOutput.rdbuf());
+        PrintVbsCoreBlock(evidence);
+        std::wcout.rdbuf(savedOut);
+        check(ciOutput.str().find(L"vbs_active=unknown") != std::wstring::npos,
+            L"invalid VTL pointer is also unknown in console");
+        for (const uint64_t pointer : {0ull, 0x0000800000000000ull, 0xffff7fffffffffffull,
+            0xffff800000001000ull})
+        {
+            evidence.HvlpVsmVtlCallVa = pointer;
+            evidence.VbsActive = pointer == 0xffff800000001000ull;
+            const auto json = BuildVbsJson(evidence);
+            const wchar_t* expectedActive = pointer == 0 ? L"false" : (evidence.VbsActive ? L"true" : L"null");
+            const wchar_t* expectedKnown = pointer == 0 || evidence.VbsActive ? L"true" : L"false";
+            check(mcpjson::ValidateDocument(json) &&
+                mcpjson::FindRawValue(json, L"vbsActive", &active) && active == expectedActive &&
+                mcpjson::FindRawValue(json, L"vbsActiveKnown", &known) && known == expectedKnown,
+                L"VBS pointer validity boundary " + std::to_wstring(pointer));
+        }
+
+        // Parse the full document and exact member types; substring matches can
+        // accidentally succeed on nested or malformed output.
+        const wchar_t* const jsonFlags[] = {L"codeIntegrityEnabled", L"testSign", L"umciEnabled",
+            L"umciAuditMode", L"umciExclusionPaths", L"testBuild", L"preproductionBuild", L"debugMode",
+            L"flightBuild", L"flightingEnabled", L"hvciEnabled", L"hvciAuditMode", L"hvciStrictMode",
+            L"hvciIumEnabled"};
+        for (const auto& ci : {denied, disabled, combined})
+        {
+            evidence = {};
+            evidence.CiOptions = ci;
+            const auto json = BuildVbsJson(evidence);
+            check(mcpjson::ValidateDocument(json) && mcpjson::FindRawValue(json, L"ciOptions", &ciJson),
+                L"CI JSON is structurally valid");
+            for (const auto name : jsonFlags)
+            {
+                std::wstring value;
+                const wchar_t* expected = !ci.Resolved ? L"null" : (ci.Raw == 0 ? L"false" : L"true");
+                check(mcpjson::FindRawValue(ciJson, name, &value) && value == expected,
+                    std::wstring(L"CI exact JSON member type ") + name);
+            }
+        }
+        for (const ULONG auditMask : {0x400ul, 0x800ul, 0xc00ul})
+        {
+            mask = auditMask;
+            evidence.CiOptions = codeintegrity::Query(query);
+            const auto json = BuildVbsJson(evidence);
+            std::wstring enabled;
+            std::wstring audit;
+            check(mcpjson::FindRawValue(json, L"ciOptions", &ciJson) &&
+                mcpjson::FindRawValue(ciJson, L"hvciEnabled", &enabled) &&
+                mcpjson::FindRawValue(ciJson, L"hvciAuditMode", &audit) &&
+                enabled == (auditMask == 0x800 ? L"false" : L"true") &&
+                audit == (auditMask == 0x400 ? L"false" : L"true"),
+                L"HVCI enabled and audit are independent JSON observations");
+        }
+    }
+
+    {
+        static bool present = false;
+        static uint32_t maximumLeaf = 0;
+        static uint32_t signature = 0;
+        static uint32_t features = 0;
+        static const char* vendor = "Microsoft Hv";
+        static std::vector<int> calls;
+        const VbsCpuidQuery query = [](int* registers, int leaf)
+        {
+            calls.push_back(leaf);
+            std::fill(registers, registers + 4, 0);
+            if (leaf == 1)
+            {
+                registers[2] = present ? static_cast<int>(0x80000000u) : 0;
+            }
+            else if (leaf == 0x40000000)
+            {
+                registers[0] = static_cast<int>(maximumLeaf);
+                memcpy(registers + 1, vendor, 12);
+            }
+            else if (leaf == 0x40000001)
+            {
+                registers[0] = static_cast<int>(signature);
+            }
+            else if (leaf == 0x40000006)
+            {
+                registers[0] = static_cast<int>(features);
+            }
+        };
+        const auto observe = [&]() { calls.clear(); return QueryVbsHypervisorInfo(query); };
+        auto observed = observe();
+        check(!observed.HypervisorPresent && !observed.HvFeaturesValid && calls == std::vector<int>{1},
+            L"CPUID stops before hypervisor leaves when presence bit is clear");
+        present = true;
+        for (const uint32_t limit : {0u, 0x40000000u})
+        {
+            maximumLeaf = limit;
+            observed = observe();
+            check(observed.HypervisorPresent && !observed.HvInterfaceQueried && !observed.HvFeaturesValid &&
+                calls == std::vector<int>({1, 0x40000000}), L"CPUID does not query an absent interface leaf");
+        }
+        maximumLeaf = 0x40000010;
+        signature = 0x12345678;
+        observed = observe();
+        check(observed.VendorSignature == L"Microsoft Hv" && observed.HvInterfaceQueried &&
+            !observed.HvFeaturesValid && calls == std::vector<int>({1, 0x40000000, 0x40000001}),
+            L"CPUID rejects non-Hv#1 even with a Microsoft vendor string and large range");
+        signature = 0x31237648;
+        maximumLeaf = 0x40000005;
+        observed = observe();
+        check(!observed.HvFeaturesValid && calls == std::vector<int>({1, 0x40000000, 0x40000001}),
+            L"CPUID does not query hardware features outside the supported range");
+        vendor = "VMwareVMware";
+        for (const uint32_t limit : {0x40000006u, 0x40000010u})
+        {
+            maximumLeaf = limit;
+            for (const uint32_t mask : {0u, 0x80000001u})
+            {
+                features = mask;
+                observed = observe();
+                check(observed.VendorSignature == L"VMwareVMware" && observed.HvFeaturesValid &&
+                    observed.HvHardwareFeatures == mask &&
+                    calls == std::vector<int>({1, 0x40000000, 0x40000001, 0x40000006}),
+                    L"CPUID accepts vendor-neutral Hv#1 and preserves zero/high feature bits");
+                VbsScanResult evidence;
+                evidence.Hypervisor = observed;
+                const auto json = BuildVbsJson(evidence);
+                std::wstring hv;
+                std::wstring raw;
+                check(mcpjson::ValidateDocument(json) && mcpjson::FindRawValue(json, L"hypervisor", &hv) &&
+                    mcpjson::FindRawValue(hv, L"hardwareFeatures", &raw) &&
+                    raw == (mask == 0 ? L"\"0x0\"" : L"\"0x80000001\""),
+                    L"CPUID supported feature mask is a JSON hex string, including zero");
+            }
+        }
+        present = false;
+        observed = observe();
+        check(!observed.HypervisorPresent && !observed.HvInterfaceQueried && !observed.HvFeaturesValid &&
+            observed.HvMaxLeaf == 0 && observed.HvHardwareFeatures == 0 && observed.VendorSignature.empty(),
+            L"CPUID new observation does not retain previous capabilities");
+    }
+
     for (const auto& info : CommandRegistry::Commands())
     {
         const std::wstring name = info.Name;
