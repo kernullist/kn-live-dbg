@@ -82,6 +82,10 @@ bool KernelMonitor::QueueLayoutNotice(const ProcessLayoutNotice& item)
     event.Evidence[L"image_name_query_failures"] = std::to_wstring(item.ImageNameQueryFailures);
     event.Evidence[L"image_name_truncated"] = std::to_wstring(item.ImageNameTruncated);
     event.Evidence[L"image_name_unqueryable"] = std::to_wstring(item.ImageNameUnqueryable);
+    event.Evidence[L"image_name_retry_attempts"] = std::to_wstring(item.ImageNameRetryAttempts);
+    event.Evidence[L"image_name_recovered"] = std::to_wstring(item.ImageNameRecovered);
+    event.Evidence[L"image_name_diagnostics_omitted"] = std::to_wstring(item.ImageNameDiagnosticsOmitted);
+    event.Evidence[L"image_name_diagnostics"] = item.ImageNameDiagnostics;
     event.Evidence[L"changed_ranges"] = std::to_wstring(item.ChangedRanges);
     event.Evidence[L"candidate_ranges"] = std::to_wstring(item.CandidateRanges);
     event.Evidence[L"lead_event_limit"] = L"16";

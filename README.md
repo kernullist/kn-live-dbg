@@ -18,6 +18,7 @@ The [secondary image-view follow-up](docs/KMON_SECONDARY_IMAGE_VALIDATION_202610
 The [actual vctip reproduction](docs/KMON_VCTIP_VALIDATION_20261024.md) covers its real System.Data.dll secondary view, image-cache admission pressure, and explicit per-view completion gates.
 The [concurrent image scheduling follow-up](docs/KMON_IMAGE_SCHEDULING_VALIDATION_20261024.md) records first-traversal scheduling across processes, bounded rescan history, and repeated actual-vctip validation alongside all 13 controls.
 The [kernel capture and detection latency follow-up](docs/KMON_CAPTURE_LATENCY_VALIDATION_20261024.md) separates unreadable discardable sections from other capture failures and connects initial/changed layout leads to bounded deep-scan priority.
+The [background completion and image-name follow-up](docs/KMON_BACKGROUND_COMPLETION_VALIDATION_20261024.md) covers prioritizing short remaining image ranges, checking mappings before retrying names, and repeated full-process validation.
 
 ## Demo
 

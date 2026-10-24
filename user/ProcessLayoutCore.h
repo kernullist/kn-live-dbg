@@ -39,6 +39,20 @@ namespace process_layout
         }
     };
 
+    struct ImageNameDiagnostic
+    {
+        uint64_t Address = 0;
+        uint64_t AllocationBase = 0;
+        uint32_t InitialError = 0;
+        uint32_t RetryError = 0;
+        bool Retried = false;
+        bool Recovered = false;
+        std::wstring Stage;
+        uint64_t CurrentAllocationBase = 0;
+        uint32_t CurrentState = 0;
+        uint32_t CurrentType = 0;
+    };
+
     struct Snapshot
     {
         ObservationIdentity Identity;
@@ -61,6 +75,10 @@ namespace process_layout
         uint64_t ImageNameTruncated = 0;
         uint64_t ImageNameUnqueryable = 0;
         std::map<uint32_t, uint64_t> ImageNameErrors;
+        uint64_t ImageNameRetryAttempts = 0;
+        uint64_t ImageNameRecovered = 0;
+        uint64_t ImageNameDiagnosticsOmitted = 0;
+        std::vector<ImageNameDiagnostic> ImageNameDiagnostics;
 
         bool Valid() const
         {

@@ -111,6 +111,69 @@ bool ProcessLayoutRegionMatches(const process_layout::Region& expected, const ME
         expected.Base + expected.Size <= row.Base + row.Size && expected.SameAttributes(row);
 }
 
+namespace
+{
+    template<typename QueryMapping, typename QueryName>
+    bool RetryImageName(const process_layout::Region& expected, QueryMapping queryMapping,
+        QueryName queryName, std::wstring& name, process_layout::ImageNameDiagnostic& diagnostic)
+    {
+        name.clear();
+        diagnostic.Stage = L"not_retryable";
+        if (diagnostic.InitialError == ERROR_ACCESS_DENIED || diagnostic.InitialError == ERROR_INVALID_HANDLE ||
+            diagnostic.InitialError == ERROR_INVALID_PARAMETER || diagnostic.InitialError == ERROR_INSUFFICIENT_BUFFER)
+        { return false; }
+        const auto current = [&](MEMORY_BASIC_INFORMATION& mapping)
+        {
+            const bool queried = queryMapping(&mapping);
+            diagnostic.CurrentAllocationBase = reinterpret_cast<uint64_t>(mapping.AllocationBase);
+            diagnostic.CurrentState = mapping.State;
+            diagnostic.CurrentType = mapping.Type;
+            return queried && ProcessLayoutRegionMatches(expected, mapping);
+        };
+        MEMORY_BASIC_INFORMATION before{}, after{};
+        diagnostic.Stage = L"mapping_unavailable_or_changed_before_retry";
+        if (!current(before)) { return false; }
+        diagnostic.Retried = true;
+        diagnostic.Stage = L"retry_failed";
+        std::wstring recovered;
+        DWORD retryError = 0;
+        if (!queryName(recovered, retryError))
+        {
+            diagnostic.RetryError = retryError;
+            return false;
+        }
+        diagnostic.Stage = L"mapping_unavailable_or_changed_after_retry";
+        if (!current(after) || before.BaseAddress != after.BaseAddress || before.RegionSize != after.RegionSize ||
+            !Convert(before).SameAttributes(Convert(after))) { return false; }
+        diagnostic.Recovered = true;
+        diagnostic.Stage = L"recovered";
+        name = std::move(recovered);
+        return true;
+    }
+
+    std::wstring ImageNameDiagnosticsJson(const process_layout::Snapshot& snapshot)
+    {
+        std::wstring out = L"[";
+        bool first = true;
+        for (const auto& item : snapshot.ImageNameDiagnostics)
+        {
+            if (!first) { out += L","; }
+            first = false;
+            out += L"{\"address\":" + mcpjson::Quote(std::to_wstring(item.Address)) +
+                L",\"allocation_base\":" + mcpjson::Quote(std::to_wstring(item.AllocationBase)) +
+                L",\"initial_error\":" + std::to_wstring(item.InitialError) +
+                L",\"retry_error\":" + std::to_wstring(item.RetryError) +
+                L",\"retried\":" + (item.Retried ? std::wstring(L"true") : std::wstring(L"false")) +
+                L",\"recovered\":" + (item.Recovered ? std::wstring(L"true") : std::wstring(L"false")) +
+                L",\"stage\":" + mcpjson::Quote(item.Stage) +
+                L",\"current_allocation_base\":" + mcpjson::Quote(std::to_wstring(item.CurrentAllocationBase)) +
+                L",\"current_state\":" + std::to_wstring(item.CurrentState) +
+                L",\"current_type\":" + std::to_wstring(item.CurrentType) + L"}";
+        }
+        return out + L"]";
+    }
+}
+
 bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate& candidate)
 {
     bool current = false;
@@ -299,11 +362,31 @@ void ProcessLayoutMonitor::CollectImageName(process_layout::Snapshot& snapshot, 
     DWORD error = 0;
     if (!ReadImageName(process, row.Base, name, error))
     {
-        if (error == ERROR_INSUFFICIENT_BUFFER) { ++snapshot.ImageNameTruncated; }
-        else { ++snapshot.ImageNameQueryFailures; }
-        ++snapshot.ImageNameErrors[error];
-        ++snapshot.ImageNameFailures;
-        return;
+        // One transient failure used to poison this allocation for the whole
+        // sweep. Retry once, only while the observed mapping still matches.
+        // This is fresh name evidence, never a name copied from an old sweep.
+        process_layout::ImageNameDiagnostic diagnostic;
+        diagnostic.Address = row.Base;
+        diagnostic.AllocationBase = row.AllocationBase;
+        diagnostic.InitialError = error;
+        const bool recovered = RetryImageName(row,
+            [&](MEMORY_BASIC_INFORMATION* mapping)
+            {
+                return VirtualQueryEx(process, reinterpret_cast<void*>(row.Base), mapping, sizeof(*mapping)) == sizeof(*mapping);
+            },
+            [&](std::wstring& value, DWORD& code) { return ReadImageName(process, row.Base, value, code); }, name, diagnostic);
+        snapshot.ImageNameRetryAttempts += diagnostic.Retried ? 1 : 0;
+        snapshot.ImageNameRecovered += recovered ? 1 : 0;
+        if (snapshot.ImageNameDiagnostics.size() < 32) { snapshot.ImageNameDiagnostics.push_back(std::move(diagnostic)); }
+        else { ++snapshot.ImageNameDiagnosticsOmitted; }
+        if (!recovered)
+        {
+            if (error == ERROR_INSUFFICIENT_BUFFER) { ++snapshot.ImageNameTruncated; }
+            else { ++snapshot.ImageNameQueryFailures; }
+            ++snapshot.ImageNameErrors[error];
+            ++snapshot.ImageNameFailures;
+            return;
+        }
     }
     const size_t characters = name.size() + 1;
     if (characters > remainingCharacters)
@@ -482,6 +565,10 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     event.ImageNameQueryFailures = snapshot->ImageNameQueryFailures;
     event.ImageNameTruncated = snapshot->ImageNameTruncated;
     event.ImageNameUnqueryable = snapshot->ImageNameUnqueryable;
+    event.ImageNameRetryAttempts = snapshot->ImageNameRetryAttempts;
+    event.ImageNameRecovered = snapshot->ImageNameRecovered;
+    event.ImageNameDiagnosticsOmitted = snapshot->ImageNameDiagnosticsOmitted;
+    event.ImageNameDiagnostics = ImageNameDiagnosticsJson(*snapshot);
     event.ChangedRanges = delta.ChangedRanges;
     event.CandidateRanges = delta.CandidateRanges;
     event.Changes = delta.Changes;
@@ -762,6 +849,10 @@ std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
             out += L",\"image_name_query_failures\":" + std::to_wstring(snapshot->ImageNameQueryFailures);
             out += L",\"image_name_truncated\":" + std::to_wstring(snapshot->ImageNameTruncated);
             out += L",\"image_name_unqueryable\":" + std::to_wstring(snapshot->ImageNameUnqueryable);
+            out += L",\"image_name_retry_attempts\":" + std::to_wstring(snapshot->ImageNameRetryAttempts);
+            out += L",\"image_name_recovered\":" + std::to_wstring(snapshot->ImageNameRecovered);
+            out += L",\"image_name_diagnostics_omitted\":" + std::to_wstring(snapshot->ImageNameDiagnosticsOmitted);
+            out += L",\"image_name_diagnostics\":" + ImageNameDiagnosticsJson(*snapshot);
             out += L",\"image_name_errors\":{";
             bool firstError = true;
             for (const auto& error : snapshot->ImageNameErrors)
@@ -1040,6 +1131,46 @@ bool ProcessLayoutMonitorSelfTest()
             }, readName, error) || queries != 2 || readName != longName || error != 0) { return false; }
         if (ReadImageNameQuery([](wchar_t*, DWORD capacity) { return capacity; }, readName, error) ||
             !readName.empty() || error != ERROR_INSUFFICIENT_BUFFER) { return false; }
+        // Reproduce error 59 deterministically at the API boundary. Recovery
+        // needs the same mapping on both sides; persistent errors and races
+        // must remain gaps. This does not pretend to reproduce the OS cause.
+        for (size_t scenario = 0; scenario < 6; ++scenario)
+        {
+            process_layout::ImageNameDiagnostic diagnostic;
+            diagnostic.InitialError = scenario == 5 ? ERROR_ACCESS_DENIED : ERROR_UNEXP_NET_ERR;
+            size_t mappingQueries = 0, nameQueries = 0;
+            std::wstring recovered = L"stale";
+            const bool success = RetryImageName(row, [&](MEMORY_BASIC_INFORMATION* current)
+            {
+                ++mappingQueries;
+                *current = mapping;
+                if (scenario == 1 || (scenario == 2 && mappingQueries == 2)) { current->State = MEM_FREE; }
+                if (scenario == 4) { current->AllocationBase = reinterpret_cast<void*>(base + 4096); }
+                return true;
+            }, [&](std::wstring& value, DWORD& code)
+            {
+                ++nameQueries;
+                if (scenario == 3) { code = ERROR_UNEXP_NET_ERR; return false; }
+                value = L"fresh-name"; code = 0; return true;
+            }, recovered, diagnostic);
+            if (success != (scenario == 0) || diagnostic.Recovered != success ||
+                recovered != (success ? L"fresh-name" : L"") || nameQueries > 1) { return false; }
+            if (scenario == 0 && (mappingQueries != 2 || nameQueries != 1)) { return false; }
+            if ((scenario == 1 || scenario == 4 || scenario == 5) && diagnostic.Retried) { return false; }
+            if (scenario == 2 && (!diagnostic.Retried || mappingQueries != 2)) { return false; }
+            if (scenario == 3 && diagnostic.RetryError != ERROR_UNEXP_NET_ERR) { return false; }
+            if (scenario == 5 && mappingQueries != 0) { return false; }
+        }
+        process_layout::Snapshot boundedDiagnostics;
+        for (size_t i = 0; i < 40; ++i)
+        {
+            auto unique = row;
+            unique.AllocationBase = i * 4096;
+            monitor.CollectImageName(boundedDiagnostics, unique, nullptr, slots, characters);
+        }
+        if (boundedDiagnostics.ImageNameQueryFailures != 40 || boundedDiagnostics.ImageNameDiagnostics.size() != 32 ||
+            boundedDiagnostics.ImageNameDiagnosticsOmitted != 8 || boundedDiagnostics.ImageNameRetryAttempts != 0 ||
+            boundedDiagnostics.ImageNameRecovered != 0) { return false; }
     }
     monitor.Advance(entry, scope, stop, notice, candidate);
     const bool rejected = entry.Status == L"process_outside_scope" && !entry.Pending && !entry.History.Current;

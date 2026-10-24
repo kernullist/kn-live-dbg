@@ -66,6 +66,10 @@ struct ProcessLayoutNotice
     uint64_t ImageNameQueryFailures = 0;
     uint64_t ImageNameTruncated = 0;
     uint64_t ImageNameUnqueryable = 0;
+    uint64_t ImageNameRetryAttempts = 0;
+    uint64_t ImageNameRecovered = 0;
+    uint64_t ImageNameDiagnosticsOmitted = 0;
+    std::wstring ImageNameDiagnostics = L"[]";
     std::vector<process_layout::Change> Changes;
 };
 

@@ -514,6 +514,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     // of a DLL-rich process that still had unseen tails.
     std::map<std::pair<uint32_t, uint64_t>, ImageVerificationWork*> eligible[2][2];
     ImageVerificationWork* bulk = nullptr;
+    ImageVerificationWork* finishing = nullptr;
     for (auto& item : ImageWork)
     {
         auto& work = item.second;
@@ -526,6 +527,11 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         if (group == 1 && phase == 0 && work.Sweep.Ranges.size() >= 4096 &&
             (bulk == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
                 std::make_pair(bulk->LastSweepMs, bulk->Base))) { bulk = &work; }
+        const auto remaining = work.Sweep.Ranges.size() - work.Sweep.NextRange;
+        if (group == 1 && phase == 0 && remaining > 0 && remaining <= 1024 &&
+            (finishing == nullptr || std::make_pair(remaining, work.LastSweepMs) <
+                std::make_pair(finishing->Sweep.Ranges.size() - finishing->Sweep.NextRange, finishing->LastSweepMs)))
+        { finishing = &work; }
     }
     const auto ready = [&](size_t group) { return !eligible[group][0].empty() || !eligible[group][1].empty(); };
     if (!ready(0) && !ready(1)) { return nullptr; }
@@ -550,9 +556,17 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         auto& candidates = eligible[group][phase];
         if (candidates.empty()) { continue; }
         ImageVerificationWork* selected = nullptr;
-        // Two in three background initial turns serve large tails, including
-        // borrowed turns. Ordinary first work and periodic rescans keep slots.
-        if (group == 1 && phase == 0 && ImageSweepClassTurns[1][0] % 3 != 0 && bulk != nullptr)
+        // Preserve ordinary rotation and a dedicated large-image turn. Spend
+        // the second bulk turn on a bounded tail when one is ready; spreading
+        // every turn across large images left many small tails unfinished.
+        // Only a third of initial background turns may prefer short work.
+        if (group == 1 && phase == 0 && ImageSweepClassTurns[1][0] % 3 == 2 && finishing != nullptr)
+        {
+            selected = finishing;
+            ++ImageCompletionPriorityTurns;
+            ++selected->CompletionPriorityTurns;
+        }
+        else if (group == 1 && phase == 0 && ImageSweepClassTurns[1][0] % 3 != 0 && bulk != nullptr)
         {
             selected = bulk;
         }
