@@ -17332,14 +17332,31 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 (target.HighPriority ? priorityPids : backgroundPids).push_back(target.Pid);
             }
-            const auto seen = UserLastScanMs.find(target.Pid);
+            const auto seen = UserLastScanMs.find({target.Pid, target.CreateTime});
             const uint64_t last = seen == UserLastScanMs.end() ? StartTickMs.load() : seen->second;
             oldest = (std::max)(oldest, schedulingNow - (std::min)(schedulingNow, last));
         }
     }
     UserOldestScanMs.store(oldest);
+    std::vector<uint32_t> urgentPids;
+    for (auto it = UserLayoutLeads.begin(); it != UserLayoutLeads.end();)
+    {
+        const auto generation = userGenerations.find(it->first.first);
+        if (generation == userGenerations.end() || generation->second != it->first.second)
+        {
+            it = UserLayoutLeads.erase(it);
+        }
+        else
+        {
+            if (KmonUserLayoutLeadReady(it->first.first, it->first.second, schedulingNow, UserLastScanMs))
+            {
+                urgentPids.push_back(it->first.first);
+            }
+            ++it;
+        }
+    }
     const auto schedule = KmonSelectUserPids(watchedUserPids, priorityPids, backgroundPids,
-        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor);
+        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor, urgentPids, &UrgentUserPidCursor);
     std::map<uint32_t, size_t> selected;
     for (size_t index = 0; index < schedule.size(); ++index)
     {
@@ -17385,7 +17402,39 @@ void KernelMonitor::ScanUserModeHostility()
 
         const uint32_t pid = target.Pid;
         UserScanCursor.store(pid);
-        UserLastScanMs[pid] = GetTickCount64();
+        uint64_t nextMemoryAnalysisMs = GetTickCount64() + 50;
+        const auto serviceMemoryAnalysis = [&]()
+        {
+            if (StopRequested.load()) { return false; }
+            if (GetTickCount64() >= nextMemoryAnalysisMs)
+            {
+                // Private/mapped-memory inspections may have few modules and
+                // therefore miss the module loop's normal analysis yields.
+                // Service retained work between records, never under a watch
+                // lock or while an image-cache entry is borrowed.
+                ServicePendingAnalysis(L"user_memory_walk");
+                UserMemoryAnalysisYields.fetch_add(1);
+                nextMemoryAnalysisMs = GetTickCount64() + 50;
+            }
+            return !StopRequested.load();
+        };
+        const auto scanKey = std::make_pair(pid, target.CreateTime);
+        const auto lead = UserLayoutLeads.find(scanKey);
+        if (lead != UserLayoutLeads.end())
+        {
+            KmonEvent scheduled;
+            scheduled.Kind = L"coverage.user_scheduling";
+            scheduled.ProcessId = pid;
+            scheduled.Observation.Identity.ProcessId = pid;
+            scheduled.Observation.Identity.CreateTime = target.CreateTime;
+            scheduled.Summary = L"layout execution lead selected for deep process inspection";
+            scheduled.Evidence[L"layout_lead_wait_ms"] = std::to_wstring(GetTickCount64() - lead->second);
+            scheduled.Evidence[L"layout_priority_slot"] = selected.at(pid) < 2 &&
+                std::find(urgentPids.begin(), urgentPids.end(), pid) != urgentPids.end() ? L"true" : L"false";
+            RecordEvent(std::move(scheduled));
+            UserLayoutLeads.erase(lead);
+        }
+        UserLastScanMs[scanKey] = GetTickCount64();
         if (UserLastScanMs.size() > 4096)
         {
             UserLastScanMs.erase(UserLastScanMs.begin());
@@ -17678,6 +17727,7 @@ void KernelMonitor::ScanUserModeHostility()
             {
                 UserPteCursors[pteKey] = kernelVad.HiddenPteResumeAddress;
             }
+            if (!serviceMemoryAnalysis()) { break; }
             const std::wstring vadFailKey =
                 L"scan_failed:userhostility:vad:" + std::to_wstring(pid);
             if (wantKernelVad && !kernelVadScanned)
@@ -18546,7 +18596,7 @@ void KernelMonitor::ScanUserModeHostility()
                         &candidates, &threadRegionQueryFailures, &codeProbeFailures);
                     for (const KmonUserThreadCodeCandidate& candidate : candidates)
                     {
-                        if (StopRequested.load())
+                        if (!serviceMemoryAnalysis())
                         {
                             break;
                         }
@@ -18590,6 +18640,7 @@ void KernelMonitor::ScanUserModeHostility()
                 int step = 0;
                 for (; step < 4096 && orphans < 4; ++step)
                 {
+                    if (!serviceMemoryAnalysis()) { break; }
                     if (StopRequested.load())
                     {
                         break;
@@ -18834,6 +18885,7 @@ void KernelMonitor::ScanUserModeHostility()
                     &vadHostIsWow64);
                 for (const ProcessVadRecord& record : kernelVad.Records)
                 {
+                    if (!serviceMemoryAnalysis()) { break; }
                     if (!emitPrivateVadImplants)
                     {
                         break;
@@ -18980,6 +19032,7 @@ void KernelMonitor::ScanUserModeHostility()
                 uint32_t vadRwPtes = 0;
                 for (const ProcessHiddenVadPteRecord& pte : kernelVad.HiddenPteRecords)
                 {
+                    if (!serviceMemoryAnalysis()) { break; }
                     if (!pte.Executable || pte.Size < 0x1000)
                     {
                         continue;
@@ -19582,6 +19635,7 @@ void KernelMonitor::ScanUserModeHostility()
                     module.ImageName = KmonBasenameLower(modulePaths[index]);
                     evidenceModules.push_back(std::move(module));
                 }
+                if (!serviceMemoryAnalysis()) { break; }
                 ScanUserExecutionEvidence(kernelVad.Target, evidenceModules, moduleInventoryComplete,
                     &kernelVad, imagePath, true);
             }

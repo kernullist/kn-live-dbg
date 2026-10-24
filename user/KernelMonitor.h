@@ -559,6 +559,8 @@ private:
         uint64_t ReadBytes = 0;
         uint64_t FailedBytes = 0;
         uint64_t SkippedBytes = 0;
+        uint64_t DiscardableUnreadableBytes = 0;
+        std::vector<uint8_t> KernelImageHeader;
         ObservationIdentity Identity;
         std::wstring Role;
         std::wstring Key;
@@ -570,6 +572,8 @@ private:
         uint64_t Offset = 0;
         uint64_t RequestedBytes = 0;
         uint64_t FirstDelayMs = 0;
+        uint64_t RequestAgeAtReadStartMs = 0;
+        uint64_t ReadDurationMs = 0;
         uint64_t RootCr3 = 0;
         ObservationContext Context;
         std::wstring Role;
@@ -600,6 +604,10 @@ private:
     std::atomic<uint64_t> CaptureReadBytes{0};
     std::atomic<uint64_t> CaptureReadFailedBytes{0};
     std::atomic<uint64_t> CaptureUnreadableBytes{0};
+    std::atomic<uint64_t> CaptureDiscardableUnreadableBytes{0};
+    std::atomic<uint64_t> CaptureKernelContinuations{0};
+    std::atomic<uint64_t> CaptureRootLayoutResolutions{0};
+    std::atomic<uint64_t> CaptureRootIdentityChecks{0};
     std::atomic<uint64_t> CaptureReadFailedRequests{0};
     std::atomic<uint64_t> CaptureFallbackPages{0};
     std::atomic<uint64_t> CaptureTraversed{0};
@@ -619,7 +627,10 @@ private:
     uint32_t HighPriorityPidCursor = 0;
     uint32_t WatchedUserPidCursor = 0;
     uint32_t BackgroundPidCursor = 0;
-    std::map<uint32_t, uint64_t> UserLastScanMs;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserLastScanMs;
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserLayoutLeads;
+    uint32_t UrgentUserPidCursor = 0;
+    std::atomic<uint64_t> UserMemoryAnalysisYields{0};
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> HeapPageCursors;
 
 
@@ -648,7 +659,7 @@ private:
         uint64_t PermissionCursor = 0;
     };
     ImageVerificationWork* FindImageWork(const std::wstring& path, uint64_t base,
-        const ObservationIdentity& identity);
+        const ObservationIdentity& identity, bool* referenceUnavailable = nullptr);
     GameBuildManifest GameManifest;
     bool GameManifestActive = false;
     std::map<std::wstring, ImageVerificationWork> ImageWork;

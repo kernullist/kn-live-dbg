@@ -17,6 +17,7 @@ The [full-process layout follow-up](docs/KMON_ALL_PROCESS_LAYOUT_VALIDATION_2026
 The [secondary image-view follow-up](docs/KMON_SECONDARY_IMAGE_VALIDATION_20261023.md) records independent relocation-basis checks and live PE32/PE32+ clean, code-change, and relocation-only controls.
 The [actual vctip reproduction](docs/KMON_VCTIP_VALIDATION_20261024.md) covers its real System.Data.dll secondary view, image-cache admission pressure, and explicit per-view completion gates.
 The [concurrent image scheduling follow-up](docs/KMON_IMAGE_SCHEDULING_VALIDATION_20261024.md) records first-traversal scheduling across processes, bounded rescan history, and repeated actual-vctip validation alongside all 13 controls.
+The [kernel capture and detection latency follow-up](docs/KMON_CAPTURE_LATENCY_VALIDATION_20261024.md) separates unreadable discardable sections from other capture failures and connects initial/changed layout leads to bounded deep-scan priority.
 
 ## Demo
 

@@ -12,6 +12,51 @@
 
 namespace
 {
+    // Only describe an unreadable whole-page range covered exclusively by a
+    // discardable section in the header actually captured from this image.
+    // Invalid/overlapping/truncated metadata never grants an exclusion.
+    bool DiscardableCapturePage(const std::vector<uint8_t>& header, uint64_t imageSize,
+        uint64_t offset, uint32_t count, std::wstring* sectionName)
+    {
+        if (header.size() < sizeof(IMAGE_DOS_HEADER) || count == 0 || offset >= imageSize || count > imageSize - offset)
+        { return false; }
+        IMAGE_DOS_HEADER dos{};
+        std::memcpy(&dos, header.data(), sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
+            static_cast<size_t>(dos.e_lfanew) > header.size() - sizeof(IMAGE_DOS_HEADER)) { return false; }
+        const size_t ntOffset = static_cast<size_t>(dos.e_lfanew);
+        if (header.size() - ntOffset < sizeof(IMAGE_NT_HEADERS64)) { return false; }
+        IMAGE_NT_HEADERS64 nt{};
+        std::memcpy(&nt, header.data() + ntOffset, sizeof(nt));
+        if (nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            nt.FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+            nt.FileHeader.NumberOfSections == 0 || nt.FileHeader.NumberOfSections > 96 ||
+            nt.OptionalHeader.SizeOfImage != imageSize || nt.OptionalHeader.SectionAlignment != 4096 ||
+            offset < nt.OptionalHeader.SizeOfHeaders) { return false; }
+        const size_t table = ntOffset + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+        if (table > header.size() || nt.FileHeader.NumberOfSections > (header.size() - table) / sizeof(IMAGE_SECTION_HEADER))
+        { return false; }
+        bool found = false;
+        for (size_t i = 0; i < nt.FileHeader.NumberOfSections; ++i)
+        {
+            IMAGE_SECTION_HEADER section{};
+            std::memcpy(&section, header.data() + table + i * sizeof(section), sizeof(section));
+            const uint64_t start = section.VirtualAddress;
+            const uint64_t length = (std::max<uint64_t>)(section.Misc.VirtualSize, section.SizeOfRawData);
+            const uint64_t end = start + ((length + 4095) & ~4095ull);
+            if (start % 4096 != 0 || end > imageSize) { return false; }
+            if (start < offset + count && end > offset)
+            {
+                if (found || start > offset || end < offset + count ||
+                    (section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0) { return false; }
+                found = true;
+                sectionName->clear();
+                for (const auto ch : section.Name) { if (ch == 0) { break; } sectionName->push_back(ch); }
+            }
+        }
+        return found;
+    }
+
     void UpdateMaximum(std::atomic<uint64_t>& value, uint64_t candidate)
     {
         uint64_t previous = value.load();
@@ -83,6 +128,10 @@ void KernelMonitor::ResetPipeline()
     CaptureReadBytes.store(0);
     CaptureReadFailedBytes.store(0);
     CaptureUnreadableBytes.store(0);
+    CaptureDiscardableUnreadableBytes.store(0);
+    CaptureKernelContinuations.store(0);
+    CaptureRootLayoutResolutions.store(0);
+    CaptureRootIdentityChecks.store(0);
     CaptureReadFailedRequests.store(0);
     CaptureFallbackPages.store(0);
     CaptureTraversed.store(0);
@@ -112,6 +161,9 @@ void KernelMonitor::ResetPipeline()
     ImageRescanDelayHits = 0;
     ImageRescanHistoryHits = 0;
     UserLastScanMs.clear();
+    UserLayoutLeads.clear();
+    UrgentUserPidCursor = 0;
+    UserMemoryAnalysisYields.store(0);
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
     LayoutExpired.store(0);
@@ -348,6 +400,12 @@ void KernelMonitor::CaptureLoop()
 {
     CaptureWorkerDone.store(false);
     size_t priorityBurst = 0;
+    CaptureRequest immediate;
+    bool haveImmediate = false;
+    size_t quantumPages = 0;
+    OrphanRootIdentityLayout rootLayout;
+    SymbolEngine* rootLayoutSymbols = nullptr;
+    bool rootLayoutKnown = false;
     const auto finished = [this](const CaptureRequest& work, const std::wstring& reason)
     {
         const bool traversed = work.Offset == work.Size;
@@ -375,27 +433,40 @@ void KernelMonitor::CaptureLoop()
         event.Evidence[L"capture_role"] = work.Role;
         event.Evidence[L"address"] = std::to_wstring(work.Address);
         event.Evidence[L"read_completion"] = traversed ? L"true" : L"false";
+        event.Evidence[L"read_completion_delay_ms"] = std::to_wstring(GetTickCount64() - work.SubmittedMs);
         event.Evidence[L"unvisited_bytes"] = std::to_wstring(work.Size - work.Offset);
         event.Evidence[L"known_unreadable_bytes"] = std::to_wstring(work.SkippedBytes);
+        event.Evidence[L"discardable_unreadable_bytes"] = std::to_wstring(work.DiscardableUnreadableBytes);
         event.Evidence[L"persistence_scope"] = L"per_chunk; consult coverage.capture";
         PipelineEvents.Push(std::move(event));
         std::lock_guard<std::mutex> lock(CapturesMutex);
         CapturedKeys.erase(work.Key);
     };
-    while (!CaptureStopping.load() || PriorityCaptures.Size() != 0 || ContinuedCaptures.Size() != 0)
+    while (!CaptureStopping.load() || haveImmediate || PriorityCaptures.Size() != 0 || ContinuedCaptures.Size() != 0)
     {
         const bool shutdownExpired = CaptureStopping.load() && CaptureStopDeadlineMs.load() != 0 &&
             GetTickCount64() >= CaptureStopDeadlineMs.load();
         // A readable image may contain thousands of pages. Let persistence
         // catch up instead of turning successful reads into queue losses.
-        if (!shutdownExpired && CapturedPages.Size() >= 384)
+        if (!shutdownExpired && CapturedPages.Size() >= (haveImmediate ? 388 : 384))
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
         CaptureRequest work;
         bool present = false;
-        if (priorityBurst >= 8)
+        if (haveImmediate)
+        {
+            work = std::move(immediate);
+            haveImmediate = false;
+            present = true;
+            ++quantumPages;
+        }
+        else
+        {
+            quantumPages = 1;
+        }
+        if (!present && priorityBurst >= 8)
         {
             present = ContinuedCaptures.Pop(&work);
             priorityBurst = 0;
@@ -417,6 +488,8 @@ void KernelMonitor::CaptureLoop()
         bool success = false;
         bool fatal = false;
         bool unreadable = false;
+        bool discardableUnreadable = false;
+        std::wstring discardableSection;
         std::wstring reason = L"memory_read_failed";
         std::wstring detail;
         const uint32_t count = static_cast<uint32_t>((std::min<uint64_t>)(work.Size - work.Offset,
@@ -452,27 +525,44 @@ void KernelMonitor::CaptureLoop()
             page.Context.Source = L"priority_capture";
             page.Context.Timestamp = ObservationFileTime();
             page.Context.MonotonicMs = GetTickCount64();
+            page.RequestAgeAtReadStartMs = page.Context.MonotonicMs - work.SubmittedMs;
             page.Context.Coverage.Attempted = true;
             if (work.RootCr3 != 0)
             {
                 const OrphanKernelPageRoot root = {work.RootCr3, work.Identity.ProcessId, work.Identity.CreateTime};
                 uint64_t beforeProcess = 0;
                 uint64_t afterProcess = 0;
+                if (rootLayoutSymbols != symbols)
+                {
+                    rootLayoutSymbols = symbols;
+                    rootLayoutKnown = false;
+                }
+                if (root.ProcessId != 0 && symbols != nullptr && !rootLayoutKnown)
+                {
+                    CaptureRootLayoutResolutions.fetch_add(1);
+                    rootLayoutKnown = ResolveOrphanRootIdentityLayout(*symbols, &rootLayout, &detail);
+                }
+                const auto readIdentity = [&](uint64_t* process)
+                {
+                    if (!rootLayoutKnown) { return false; }
+                    CaptureRootIdentityChecks.fetch_add(1);
+                    return ReadOrphanRootIdentity(*device, rootLayout, root, process, &detail);
+                };
                 const bool known = device != nullptr && (root.ProcessId == 0 ||
-                    (symbols != nullptr && ReadOrphanRootIdentity(*device, *symbols, root, &beforeProcess, nullptr)));
-                PhysicalTranslationInfo before = {};
-                PhysicalTranslationInfo after = {};
-                const bool translated = known && device->TranslateVirtual(work.RootCr3, page.Address, 1, &before, nullptr);
-                success = translated && ReadOrphanRootMemory(*device, work.RootCr3, page.Address, count, &page.Bytes, nullptr) &&
-                    page.Bytes.size() == count && device->TranslateVirtual(work.RootCr3, page.Address, 1, &after, nullptr) &&
-                    before.PhysicalAddress == after.PhysicalAddress &&
-                    (root.ProcessId == 0 || (ReadOrphanRootIdentity(*device, *symbols, root, &afterProcess, nullptr) &&
+                    readIdentity(&beforeProcess));
+                PhysicalTranslationInfo capturedMapping = {};
+                // The reader already brackets its physical read with the full
+                // page-table identity check. Return that evidence instead of
+                // issuing two redundant translations around the same read.
+                success = known && ReadOrphanRootMemory(*device, work.RootCr3, page.Address, count,
+                    &page.Bytes, &detail, false, &capturedMapping) && page.Bytes.size() == count &&
+                    (root.ProcessId == 0 || (readIdentity(&afterProcess) &&
                         beforeProcess == afterProcess));
                 if (success)
                 {
                     page.Context.Source = L"address_space_root_capture";
                     page.Context.PfnKnown = true;
-                    page.Context.Pfn = before.PhysicalAddress >> 12;
+                    page.Context.Pfn = capturedMapping.PhysicalAddress >> 12;
                 }
                 else if (!known)
                 {
@@ -487,6 +577,22 @@ void KernelMonitor::CaptureLoop()
                 const bool translated = device != nullptr && device->TranslateVirtual(0, page.Address, 1, &before, nullptr);
                 success = device != nullptr && page.Address >= 0xFFFF800000000000ull &&
                     device->ReadMemory(page.Address, count, &page.Bytes, &detail) && page.Bytes.size() == count;
+                if (success && work.Offset == 0 && work.Role == L"driver_image")
+                {
+                    work.KernelImageHeader = page.Bytes;
+                }
+                if (!success && !translated && device != nullptr &&
+                    DiscardableCapturePage(work.KernelImageHeader, work.Size, work.Offset, count, &discardableSection))
+                {
+                    std::vector<uint8_t> currentHeader;
+                    if (device->ReadMemory(work.Address, static_cast<uint32_t>(work.KernelImageHeader.size()), &currentHeader, nullptr) &&
+                        currentHeader == work.KernelImageHeader && !device->TranslateVirtual(0, page.Address, 1, &after, nullptr))
+                    {
+                        unreadable = true;
+                        discardableUnreadable = true;
+                        reason = L"unreadable_discardable_section";
+                    }
+                }
                 if (success && translated)
                 {
                     success = device->TranslateVirtual(0, page.Address, 1, &after, nullptr) &&
@@ -578,6 +684,7 @@ void KernelMonitor::CaptureLoop()
                 }
             }
             const uint64_t now = GetTickCount64();
+            page.ReadDurationMs = now - page.Context.MonotonicMs;
             page.FirstDelayMs = now - work.SubmittedMs;
             if (work.EventTimestamp != 0 && ObservationFileTime() >= work.EventTimestamp)
             {
@@ -627,9 +734,12 @@ void KernelMonitor::CaptureLoop()
                 event.Evidence[L"capture_role"] = work.Role;
                 event.Evidence[L"address"] = std::to_wstring(page.Address);
                 event.Evidence[L"read_error"] = detail;
+                event.Evidence[L"discardable_section"] = discardableSection;
                 event.Evidence[L"continuing"] = fatal ? L"false" : L"true";
                 event.Evidence[L"failed_offset"] = std::to_wstring(work.Offset);
                 event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(now - work.SubmittedMs);
+                event.Evidence[L"request_age_at_read_start_ms"] = std::to_wstring(page.RequestAgeAtReadStartMs);
+                event.Evidence[L"page_read_duration_ms"] = std::to_wstring(page.ReadDurationMs);
                 PipelineEvents.Push(std::move(event));
             }
         }
@@ -645,6 +755,11 @@ void KernelMonitor::CaptureLoop()
             {
                 work.SkippedBytes += count;
                 CaptureUnreadableBytes.fetch_add(count);
+                if (discardableUnreadable)
+                {
+                    work.DiscardableUnreadableBytes += count;
+                    CaptureDiscardableUnreadableBytes.fetch_add(count);
+                }
             }
             else
             {
@@ -655,6 +770,19 @@ void KernelMonitor::CaptureLoop()
         }
         if (!fatal && work.Offset < work.Size)
         {
+            // Kernel windows are often only 16 KiB and can disappear while
+            // waiting behind every other request between individual pages.
+            // Keep a four-page quantum; elapsed wall time can include VM
+            // preemption and must not split a 16 KiB window back into the queue.
+            // Retain per-page identity, mapping and failure accounting, and
+            // check shutdown before every page. Larger requests rotate again.
+            if (work.Address >= 0xFFFF800000000000ull && quantumPages < 4 && !shutdownExpired)
+            {
+                immediate = std::move(work);
+                haveImmediate = true;
+                CaptureKernelContinuations.fetch_add(1);
+                continue;
+            }
             if (ContinuedCaptures.Push(work))
             {
                 continue;
@@ -757,6 +885,8 @@ void KernelMonitor::CaptureWriterLoop()
             event.Evidence[L"chunk_offset"] = std::to_wstring(page.Offset);
             event.Evidence[L"root_cr3"] = std::to_wstring(page.RootCr3);
             event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(page.FirstDelayMs);
+            event.Evidence[L"request_age_at_read_start_ms"] = std::to_wstring(page.RequestAgeAtReadStartMs);
+            event.Evidence[L"page_read_duration_ms"] = std::to_wstring(page.ReadDurationMs);
             event.Evidence[L"mapping_consistency"] = page.Context.PfnKnown ? L"pfn_checked_before_and_after" : L"unverified";
             event.Evidence[L"persistence"] = written ? L"complete" : L"failed";
             while (!StopRequested.load() && PipelineEvents.Size() >= 384)
@@ -873,6 +1003,11 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"capture_failures"] = std::to_wstring(CaptureFailed.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
+        event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());
+        event.Evidence[L"capture_kernel_contiguous_pages"] = std::to_wstring(CaptureKernelContinuations.load());
+        event.Evidence[L"capture_root_layout_resolutions"] = std::to_wstring(CaptureRootLayoutResolutions.load());
+        event.Evidence[L"capture_root_identity_checks"] = std::to_wstring(CaptureRootIdentityChecks.load());
+        event.Evidence[L"user_memory_analysis_yields"] = std::to_wstring(UserMemoryAnalysisYields.load());
         event.Evidence[L"capture_known_unreadable_bytes"] = std::to_wstring(CaptureUnreadableBytes.load());
         event.Evidence[L"capture_read_failed_requests"] = std::to_wstring(CaptureReadFailedRequests.load());
         event.Evidence[L"capture_fallback_pages"] = std::to_wstring(CaptureFallbackPages.load());
@@ -949,6 +1084,49 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
 
 bool KmonPipelineSelfTest()
 {
+    {
+        std::vector<uint8_t> header(4096);
+        IMAGE_DOS_HEADER dos{}; dos.e_magic = IMAGE_DOS_SIGNATURE; dos.e_lfanew = 128;
+        IMAGE_NT_HEADERS64 nt{};
+        nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.NumberOfSections = 2;
+        nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt.OptionalHeader.SizeOfImage = 16384;
+        nt.OptionalHeader.SizeOfHeaders = 4096;
+        nt.OptionalHeader.SectionAlignment = 4096;
+        IMAGE_SECTION_HEADER sections[2]{};
+        sections[0].VirtualAddress = 4096; sections[0].Misc.VirtualSize = 4096;
+        sections[0].Characteristics = IMAGE_SCN_MEM_EXECUTE;
+        sections[1].VirtualAddress = 8192; sections[1].Misc.VirtualSize = 4097;
+        sections[1].Characteristics = IMAGE_SCN_MEM_DISCARDABLE;
+        std::memcpy(sections[1].Name, "INIT", 4);
+        const auto write = [&]()
+        {
+            std::memcpy(header.data(), &dos, sizeof(dos));
+            std::memcpy(header.data() + 128, &nt, sizeof(nt));
+            std::memcpy(header.data() + 128 + sizeof(nt), sections, sizeof(sections));
+        };
+        write();
+        std::wstring name;
+        if (!DiscardableCapturePage(header, 16384, 8192, 4096, &name) || name != L"INIT" ||
+            !DiscardableCapturePage(header, 16384, 12288, 4096, &name) ||
+            DiscardableCapturePage(header, 16384, 4096, 4096, &name) ||
+            DiscardableCapturePage(header, 16384, 0, 4096, &name) ||
+            DiscardableCapturePage(header, 16384, 8191, 4096, &name) ||
+            DiscardableCapturePage(header, 16384, 16384, 1, &name) ||
+            DiscardableCapturePage(header, 12288, 8192, 4096, &name) ||
+            DiscardableCapturePage(std::vector<uint8_t>(header.begin(), header.begin() + 256), 16384, 8192, 4096, &name))
+        { return false; }
+        sections[0].Misc.VirtualSize = 8192; write();
+        if (DiscardableCapturePage(header, 16384, 8192, 4096, &name)) { return false; }
+        sections[0].Misc.VirtualSize = 4096;
+        sections[1].Characteristics = 0; write();
+        if (DiscardableCapturePage(header, 16384, 8192, 4096, &name)) { return false; }
+        sections[1].Characteristics = IMAGE_SCN_MEM_DISCARDABLE;
+        sections[1].Misc.VirtualSize = UINT32_MAX; write();
+        if (DiscardableCapturePage(header, 16384, 8192, 4096, &name)) { return false; }
+    }
     bool ok = false;
     wchar_t temporary[MAX_PATH] = {};
     wchar_t unique[MAX_PATH] = {};
@@ -1025,8 +1203,9 @@ bool KmonPipelineSelfTest()
             const uint64_t selfBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
             wchar_t selfPath[32768]{};
             GetModuleFileNameW(nullptr, selfPath, 32768);
-            auto imageWork = monitor.FindImageWork(selfPath, selfBase, identity);
-            if (imageWork == nullptr || imageWork->Sweep.Ranges.size() < 2) { break; }
+            bool referenceUnavailable = true;
+            auto imageWork = monitor.FindImageWork(selfPath, selfBase, identity, &referenceUnavailable);
+            if (imageWork == nullptr || referenceUnavailable || imageWork->Sweep.Ranges.size() < 2) { break; }
             imageWork->Sweep.NextRange = 1;
             const std::wstring aliasPath = L"\\\\?\\" + std::wstring(selfPath);
             if (monitor.FindImageWork(aliasPath, selfBase, identity) != imageWork ||
@@ -1039,6 +1218,15 @@ bool KmonPipelineSelfTest()
             if (monitor.FindImageWork(differentReference, selfBase, identity) == imageWork ||
                 monitor.ImageWork.size() != 3) { break; }
             monitor.ImageWork.clear();
+            const auto missingReference = std::wstring(unique) + L"\\missing-reference.exe";
+            if (monitor.FindImageWork(missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
+                !referenceUnavailable || monitor.ImageWork.size() != 1) { break; }
+            referenceUnavailable = false;
+            if (monitor.FindImageWork(missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
+                !referenceUnavailable) { break; }
+            if (monitor.FindImageWork(missingReference, 0, identity, &referenceUnavailable) != nullptr ||
+                referenceUnavailable) { break; }
+            monitor.ImageWork.clear();
             // Eviction must retain the normal 30-second rescan deadline, not
             // turn a completed image into permanently competing "initial" work.
             auto completed = monitor.FindImageWork(selfPath, selfBase, identity);
@@ -1049,7 +1237,8 @@ bool KmonPipelineSelfTest()
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
             if (monitor.ImageRescanDelays.size() != 1) { break; }
             monitor.ImageWork.clear();
-            if (monitor.FindImageWork(aliasPath, selfBase, identity) != nullptr ||
+            referenceUnavailable = true;
+            if (monitor.FindImageWork(aliasPath, selfBase, identity, &referenceUnavailable) != nullptr || referenceUnavailable ||
                 !monitor.ImageWork.empty() || monitor.ImageRescanDelayHits != 1) { break; }
             // Process reuse, allocation reuse with a different file, and a
             // changed full file ID must not inherit the previous deadline.
@@ -1131,7 +1320,8 @@ bool KmonPipelineSelfTest()
             ObservationIdentity backgroundIdentity = identity;
             backgroundIdentity.ProcessId = 0;
             const auto backgroundSize = monitor.ImageWork.size();
-            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity) != nullptr ||
+            referenceUnavailable = true;
+            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity, &referenceUnavailable) != nullptr || referenceUnavailable ||
                 monitor.ImageWork.size() != backgroundSize || monitor.ImageAdmissionDeferred != 1 ||
                 monitor.ImageWatchAdmissionDeferred != 0) { break; }
             auto admitted = monitor.FindImageWork(selfPath, selfBase, identity);
@@ -1452,6 +1642,29 @@ bool KmonPipelineSelfTest()
             // A failed middle page must not hide the readable tail, including
             // when stop is requested after admission. Guard protection must
             // survive; no kernel fallback is allowed for a known guard page.
+            {
+                KernelMonitor unavailable;
+                const auto kernel = ObserveProcessIdentity(0);
+                ok = unavailable.QueueCapture(L"selftest_kernel_unavailable", 0xFFFF900000001000ull,
+                    9 * 4096, kernel, ObservationFileTime(), nullptr) && ok;
+                ok = unavailable.QueueCapture(L"selftest_kernel_fairness", 0xFFFF900000020000ull,
+                    4096, kernel, ObservationFileTime(), nullptr) && ok;
+                unavailable.CaptureStopping.store(true);
+                unavailable.CaptureLoop();
+                ok = ok && unavailable.CaptureTraversed.load() == 2 && unavailable.CaptureKernelContinuations.load() == 6 &&
+                    unavailable.CaptureReadFailedBytes.load() == 10 * 4096 &&
+                    unavailable.CaptureReadBytes.load() == 0 && unavailable.CapturedPages.Size() == 0 &&
+                    unavailable.PriorityCaptures.Loss() == 0 && unavailable.ContinuedCaptures.Loss() == 0;
+                std::vector<std::wstring> order;
+                for (const auto& event : unavailable.PipelineEvents.Drain(32))
+                {
+                    if (event.Kind == L"coverage.capture" && event.Observation.Coverage.FailedBytes == 4096)
+                    { order.push_back(event.Evidence.at(L"capture_id")); }
+                }
+                const auto other = std::find_if(order.begin(), order.end(), [&](const auto& id) { return id != order.front(); });
+                ok = ok && order.size() == 10 && other != order.end() &&
+                    other - order.begin() == 4 && order.front() == order.back();
+            }
             for (const DWORD protection : {PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD})
             {
                 auto memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 3 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));

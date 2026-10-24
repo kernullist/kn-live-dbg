@@ -45,6 +45,14 @@ struct OrphanKernelPageRoot
     uint64_t CreateTime = 0;
 };
 
+// Immutable kernel type offsets, scoped to the current symbol/session binding.
+// This never caches a process identity, CR3, or page-table observation.
+struct OrphanRootIdentityLayout
+{
+    uint32_t DirectoryTableBaseOffset = 0;
+    uint32_t CreateTimeOffset = 0;
+};
+
 struct OrphanKernelPageBodyCursor
 {
     uint64_t PageAddress = 0;
@@ -172,6 +180,12 @@ private:
 
 std::wstring BuildOrphanKernelPageJson(const OrphanKernelPageResult& result);
 bool OrphanKernelPageSelfTest();
+bool ResolveOrphanRootIdentityLayout(SymbolEngine& symbols,
+    OrphanRootIdentityLayout* layout, std::wstring* error);
+bool ReadOrphanRootIdentity(
+    DeviceClient& device, const OrphanRootIdentityLayout& layout,
+    const OrphanKernelPageRoot& expected, uint64_t* eprocess,
+    std::wstring* error);
 bool ReadOrphanRootIdentity(
     DeviceClient& device, SymbolEngine& symbols,
     const OrphanKernelPageRoot& expected, uint64_t* eprocess,
@@ -180,6 +194,6 @@ bool ReadOrphanRootIdentity(
 bool ReadOrphanRootMemory(
     DeviceClient& device, uint64_t cr3, uint64_t address, uint32_t length,
     std::vector<uint8_t>* bytes, std::wstring* error = nullptr,
-    bool requireExecutable = false);
+    bool requireExecutable = false, PhysicalTranslationInfo* capturedMapping = nullptr);
 bool ProbeOrphanRootExecutable(
     DeviceClient& device, uint64_t cr3, uint64_t address, bool* executable);

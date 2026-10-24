@@ -804,21 +804,17 @@ static bool ArmOrphanDeepRoots(
     return reset;
 }
 
-bool ReadOrphanRootIdentity(
-    DeviceClient& device, SymbolEngine& symbols,
-    const OrphanKernelPageRoot& expected, uint64_t* eprocess,
-    std::wstring* error)
+bool ResolveOrphanRootIdentityLayout(SymbolEngine& symbols,
+    OrphanRootIdentityLayout* layout, std::wstring* error)
 {
-    if (eprocess == nullptr)
-    {
-        return false;
-    }
+    if (layout == nullptr) { return false; }
+    *layout = {};
     TypeFieldInfo dtb = {};
     TypeFieldInfo created = {};
     if (!symbols.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtb, nullptr) ||
         !symbols.FindField(L"nt!_EPROCESS", L"CreateTime", &created, nullptr) ||
         dtb.Length != sizeof(uint64_t) || created.Length != sizeof(uint64_t) ||
-        dtb.Offset == 0 || dtb.Offset > 0x10000 || created.Offset > 0x10000)
+        dtb.Offset == 0 || dtb.Offset > 0x10000 || created.Offset == 0 || created.Offset > 0x10000)
     {
         if (error != nullptr)
         {
@@ -826,14 +822,43 @@ bool ReadOrphanRootIdentity(
         }
         return false;
     }
+    layout->DirectoryTableBaseOffset = dtb.Offset;
+    layout->CreateTimeOffset = created.Offset;
+    return true;
+}
+
+bool ReadOrphanRootIdentity(
+    DeviceClient& device, SymbolEngine& symbols,
+    const OrphanKernelPageRoot& expected, uint64_t* eprocess,
+    std::wstring* error)
+{
+    if (eprocess != nullptr) { *eprocess = 0; }
+    OrphanRootIdentityLayout layout;
+    return ResolveOrphanRootIdentityLayout(symbols, &layout, error) &&
+        ReadOrphanRootIdentity(device, layout, expected, eprocess, error);
+}
+
+bool ReadOrphanRootIdentity(
+    DeviceClient& device, const OrphanRootIdentityLayout& layout,
+    const OrphanKernelPageRoot& expected, uint64_t* eprocess,
+    std::wstring* error)
+{
+    if (eprocess == nullptr) { return false; }
+    *eprocess = 0;
+    if (layout.DirectoryTableBaseOffset == 0 || layout.DirectoryTableBaseOffset > 0x10000 ||
+        layout.CreateTimeOffset == 0 || layout.CreateTimeOffset > 0x10000)
+    {
+        if (error != nullptr) { *error = L"process root identity fields are unavailable"; }
+        return false;
+    }
     ProcessAddressContext context = {};
     ProcessAddressContext after = {};
     uint64_t creation = 0;
     uint64_t creationAddress = 0;
-    if (!device.ResolveProcess(expected.ProcessId, dtb.Offset, 0, &context, error) ||
-        context.Eprocess == 0 || !LeftoverTryAdd(context.Eprocess, created.Offset, &creationAddress) ||
+    if (!device.ResolveProcess(expected.ProcessId, layout.DirectoryTableBaseOffset, 0, &context, error) ||
+        context.Eprocess == 0 || !LeftoverTryAdd(context.Eprocess, layout.CreateTimeOffset, &creationAddress) ||
         !LeftoverReadU64(device, creationAddress, &creation, error) ||
-        !device.ResolveProcess(expected.ProcessId, dtb.Offset, 0, &after, error))
+        !device.ResolveProcess(expected.ProcessId, layout.DirectoryTableBaseOffset, 0, &after, error))
     {
         return false;
     }
@@ -870,8 +895,10 @@ static bool SameOrphanRootMapping(const PhysicalTranslationInfo& before, const P
 
 bool ReadOrphanRootMemory(
     DeviceClient& device, uint64_t cr3, uint64_t address, uint32_t length,
-    std::vector<uint8_t>* bytes, std::wstring* error, bool requireExecutable)
+    std::vector<uint8_t>* bytes, std::wstring* error, bool requireExecutable, PhysicalTranslationInfo* capturedMapping)
 {
+    if (capturedMapping != nullptr) { *capturedMapping = {}; }
+    if (error != nullptr) { error->clear(); }
     if (bytes == nullptr || cr3 == 0 || length == 0 || length > 0x10000 ||
         address > (std::numeric_limits<uint64_t>::max)() - length)
     {
@@ -879,6 +906,7 @@ bool ReadOrphanRootMemory(
     }
     bytes->clear();
     bytes->reserve(length);
+    PhysicalTranslationInfo firstMapping = {};
     while (bytes->size() < length)
     {
         const uint64_t current = address + bytes->size();
@@ -888,19 +916,29 @@ bool ReadOrphanRootMemory(
         PhysicalTranslationInfo after = {};
         bool writable = false;
         std::vector<uint8_t> part;
-        if (!device.TranslateVirtual(cr3, current, 1, &before, error) || before.PageSize == 0 ||
-            (requireExecutable && !ValidatePfnTranslation(before, before.PhysicalAddress & ~0xFFFull, &writable)) ||
-            !device.ReadPhysical(before.PhysicalAddress, count, &part, error) || part.size() != count ||
-            !device.TranslateVirtual(cr3, current, 1, &after, error) || !SameOrphanRootMapping(before, after))
+        const wchar_t* phase = nullptr;
+        if (!device.TranslateVirtual(cr3, current, 1, &before, error) || before.PageSize == 0)
+        { phase = L"translation_before"; }
+        else if (requireExecutable && !ValidatePfnTranslation(before, before.PhysicalAddress & ~0xFFFull, &writable))
+        { phase = L"not_executable"; }
+        else if (!device.ReadPhysical(before.PhysicalAddress, count, &part, error) || part.size() != count)
+        { phase = L"physical_read"; }
+        else if (!device.TranslateVirtual(cr3, current, 1, &after, error))
+        { phase = L"translation_after"; }
+        else if (!SameOrphanRootMapping(before, after))
+        { phase = L"mapping_changed"; }
+        if (phase != nullptr)
         {
-            if (error != nullptr && error->empty())
+            if (error != nullptr)
             {
-                *error = L"root mapping changed or bytes were unreadable";
+                *error = std::wstring(phase) + L": " + *error;
             }
             return false;
         }
+        if (bytes->empty()) { firstMapping = before; }
         bytes->insert(bytes->end(), part.begin(), part.end());
     }
+    if (capturedMapping != nullptr) { *capturedMapping = firstMapping; }
     return true;
 }
 
@@ -1965,6 +2003,17 @@ std::wstring BuildOrphanKernelPageJson(const OrphanKernelPageResult& result)
 bool OrphanKernelPageSelfTest()
 {
     bool ok = true;
+    {
+        DeviceClient unopened;
+        for (const auto layout : {OrphanRootIdentityLayout{}, OrphanRootIdentityLayout{0x10008, 0x468},
+            OrphanRootIdentityLayout{0x28, 0x10008}, OrphanRootIdentityLayout{0x28, 0}})
+        {
+            uint64_t process = 123;
+            std::wstring error;
+            ok = ok && !ReadOrphanRootIdentity(unopened, layout, {}, &process, &error) && process == 0 &&
+                error == L"process root identity fields are unavailable";
+        }
+    }
 
     {
         PhysicalTranslationInfo before = {};

@@ -210,8 +210,9 @@ size_t KernelMonitor::ImageWorkAdmissionLimit(uint32_t pid, bool* watched)
 }
 
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
-    uint64_t base, const ObservationIdentity& identity)
+    uint64_t base, const ObservationIdentity& identity, bool* referenceUnavailable)
 {
+    if (referenceUnavailable != nullptr) { *referenceUnavailable = false; }
     if (base == 0 || path.empty() || (identity.ProcessId != 0 && identity.CreateTime == 0))
     {
         return nullptr;
@@ -339,6 +340,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
                 L"executable image reference unavailable", error, identity.ProcessId);
         }
     }
+    if (referenceUnavailable != nullptr) { *referenceUnavailable = !work.Loaded; }
     return work.Loaded ? &work : nullptr;
 }
 

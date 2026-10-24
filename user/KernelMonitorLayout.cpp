@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "KmonHandleTracking.h"
 
 #include <chrono>
 #include <memory>
@@ -162,6 +163,7 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
     const bool pressure = LayoutCandidates.Size() >= (LayoutAdmissionLimit - LayoutChangeReserve) / 2;
     const size_t candidateBudget = pressure ? 64 : 16;
     const uint64_t timeBudgetMs = pressure ? 100 : 25;
+    const auto watches = SnapshotWatchPids();
     ProcessLayoutCandidate item;
     for (size_t count = 0; count < candidateBudget && (finalDrain || !StopRequested.load()) && GetTickCount64() - begin < timeBudgetMs &&
         LayoutCandidates.Pop(&item); ++count)
@@ -247,12 +249,19 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
         observation.ImageMapping = item.Region.Type == MEM_IMAGE;
         ObserveExecutableRegion(observation);
         QueueExecutableRegionPages(observation, observation.ImageMapping ? L"image_page_candidate" : L"user_page_candidate");
+        const bool watched = std::find(watches.begin(), watches.end(), pid) != watches.end();
+        bool layoutLead = watched && observation.Executable && !observation.ImageMapping;
         if (observation.ImageMapping && !item.ImageName.empty())
         {
             // Preserve the device volume; path classification normalization is
             // intentionally lossy and must never select an on-disk reference.
             const auto path = ProcessLayoutReferencePath(item.ImageName);
-            const auto work = FindImageWork(path, item.Region.AllocationBase, item.Identity);
+            bool referenceUnavailable = false;
+            const auto work = FindImageWork(path, item.Region.AllocationBase, item.Identity, &referenceUnavailable);
+            // An admitted reference that could not be read/parsed warrants a
+            // deep ownership check, including deleted files that return access
+            // denied. Cache admission pressure alone is not such a lead.
+            layoutLead = watched && observation.Executable && referenceUnavailable;
             if (work != nullptr)
             {
                 HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -303,6 +312,11 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
             {
                 ScanExecutableImage(path, item.Region.AllocationBase, item.Identity, reader, 8);
             }
+        }
+        if (layoutLead && item.Identity.CreateTime != 0)
+        {
+            KmonRequestUserLayoutLead(pid, item.Identity.CreateTime, GetTickCount64(),
+                watched, UserLastScanMs, &UserLayoutLeads, item.Role == L"layout_change");
         }
     }
 }

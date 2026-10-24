@@ -2,6 +2,7 @@
 
 #include "NativeHandleSnapshot.h"
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <set>
@@ -171,21 +172,58 @@ inline std::vector<uint32_t> KmonNextPids(
 
 using KmonHandleKey = std::pair<uint64_t, uint64_t>;
 
+inline void KmonRequestUserLayoutLead(uint32_t pid, uint64_t created, uint64_t now, bool watched,
+    const std::map<std::pair<uint32_t, uint64_t>, uint64_t>& lastScan,
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t>* leads, bool changed = false)
+{
+    if (!watched || pid <= 4 || created == 0 || leads == nullptr) { return; }
+    const auto key = std::make_pair(pid, created);
+    const auto last = lastScan.find(key);
+    // Periodic rediscovery must not make unchanged JIT/private mappings take
+    // urgent slots forever. New processes and actual layout changes qualify.
+    // Retain changes during cooldown; selection waits until they are due.
+    if (last != lastScan.end() && !changed) { return; }
+    if (leads->count(key) != 0 || leads->size() < 4096) { leads->emplace(key, now); }
+}
+
+inline bool KmonUserLayoutLeadReady(uint32_t pid, uint64_t created, uint64_t now,
+    const std::map<std::pair<uint32_t, uint64_t>, uint64_t>& lastScan)
+{
+    const auto last = lastScan.find({pid, created});
+    return last == lastScan.end() || (now >= last->second && now - last->second >= 30000);
+}
+
 inline std::vector<uint32_t> KmonSelectUserPids(
     const std::vector<uint32_t>& watched,
     const std::vector<uint32_t>& priority,
     const std::vector<uint32_t>& background,
     uint32_t* watchedCursor,
     uint32_t* priorityCursor,
-    uint32_t* backgroundCursor)
+    uint32_t* backgroundCursor,
+    const std::vector<uint32_t>& urgent = {},
+    uint32_t* urgentCursor = nullptr)
 {
-    // Explicit watches lead each bounded sweep. Other priority and background
-    // processes retain independent rotation and the existing total budget.
-    std::vector<uint32_t> selected = KmonNextPids(watched, 4, watchedCursor);
+    // Layout leads use at most half the watched quota. The remaining watches
+    // and both other tiers keep independent rotation within eight targets.
+    std::vector<uint32_t> eligible;
+    for (const auto pid : urgent)
+    {
+        if (std::find(watched.begin(), watched.end(), pid) != watched.end()) { eligible.push_back(pid); }
+    }
+    std::vector<uint32_t> selected = KmonNextPids(eligible, 2, urgentCursor);
+    std::vector<uint32_t> ordinary;
+    for (const auto pid : watched)
+    {
+        if (std::find(selected.begin(), selected.end(), pid) == selected.end()) { ordinary.push_back(pid); }
+    }
+    const auto watches = KmonNextPids(ordinary, 4 - selected.size(), watchedCursor);
+    selected.insert(selected.end(), watches.begin(), watches.end());
     const auto otherPriority = KmonNextPids(priority, 6 - selected.size(), priorityCursor);
     const auto otherBackground = KmonNextPids(background, 2, backgroundCursor);
     selected.insert(selected.end(), otherPriority.begin(), otherPriority.end());
     selected.insert(selected.end(), otherBackground.begin(), otherBackground.end());
+    // Preserve the previous per-tier workload even when a tier is empty.
+    // Extra deep scans lengthen the pass and delay background image sweeps.
     return selected;
 }
 
@@ -261,6 +299,20 @@ struct KmonHandleHistory
 inline bool KmonHandleTrackingSelfTest()
 {
     bool ok = NativeHandleSnapshotSelfTest();
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> scanTimes{{{10, 1}, 10000}}, leads;
+    KmonRequestUserLayoutLead(10, 1, 39999, true, scanTimes, &leads);
+    KmonRequestUserLayoutLead(10, 0, 40000, true, scanTimes, &leads);
+    KmonRequestUserLayoutLead(11, 1, 40000, false, scanTimes, &leads);
+    ok = ok && leads.empty();
+    KmonRequestUserLayoutLead(10, 1, 10001, true, scanTimes, &leads, true);
+    KmonRequestUserLayoutLead(10, 1, 50000, true, scanTimes, &leads, true);
+    KmonRequestUserLayoutLead(10, 2, 10001, true, scanTimes, &leads);
+    ok = ok && leads.size() == 2 && leads.at({10, 1}) == 10001 && leads.at({10, 2}) == 10001 &&
+        !KmonUserLayoutLeadReady(10, 1, 39999, scanTimes) && KmonUserLayoutLeadReady(10, 1, 40000, scanTimes) &&
+        KmonUserLayoutLeadReady(10, 2, 10001, scanTimes);
+    leads.clear();
+    KmonRequestUserLayoutLead(10, 1, 100000, true, scanTimes, &leads);
+    ok = ok && leads.empty();
     uint32_t last = 0;
     std::vector<uint32_t> pids;
     std::set<uint32_t> visited;
@@ -287,6 +339,34 @@ inline bool KmonHandleTrackingSelfTest()
         scheduled.insert(selected.begin(), selected.end());
     }
     ok = ok && scheduled.size() == pids.size() + 4;
+    // A sustained lead flood cannot consume the ordinary watched/priority/
+    // background rotations. Empty priority slots do not add deep scans.
+    uint32_t urgentCursor = 0;
+    watchedCursor = priorityCursor = backgroundCursor = 0;
+    scheduled.clear();
+    std::set<uint32_t> urgentVisited;
+    for (size_t sweep = 0; sweep < 20; ++sweep)
+    {
+        const auto selected = KmonSelectUserPids(pids, {1000, 1001}, {2000, 2001},
+            &watchedCursor, &priorityCursor, &backgroundCursor, {30, 31, 32, 33, 34, 9999}, &urgentCursor);
+        ok = ok && selected.size() == 8 && selected[0] >= 30 && selected[0] <= 34 &&
+            selected[1] >= 30 && selected[1] <= 34 &&
+            std::set<uint32_t>(selected.begin(), selected.end()).size() == 8 &&
+            std::find(selected.begin(), selected.end(), 9999u) == selected.end();
+        urgentVisited.insert(selected[0]); urgentVisited.insert(selected[1]);
+        scheduled.insert(selected.begin(), selected.end());
+    }
+    ok = ok && scheduled.size() == pids.size() + 4 && urgentVisited.size() == 5;
+    watchedCursor = priorityCursor = backgroundCursor = urgentCursor = 0;
+    scheduled.clear();
+    for (size_t sweep = 0; sweep < 7; ++sweep)
+    {
+        const auto selected = KmonSelectUserPids(pids, {}, {2000, 2001},
+            &watchedCursor, &priorityCursor, &backgroundCursor, {}, &urgentCursor);
+        ok = ok && selected.size() == 6 && std::set<uint32_t>(selected.begin(), selected.end()).size() == 6;
+        scheduled.insert(selected.begin(), selected.end());
+    }
+    ok = ok && scheduled.size() == pids.size() + 2;
     scheduled.clear();
     for (size_t sweep = 0; sweep < 8; ++sweep)
     {
