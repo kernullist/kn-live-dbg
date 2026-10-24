@@ -356,6 +356,18 @@ try
 "@
         }
 
+    Invoke-Case -Name "scoped-callback-coverage" -ExpectedExit 0 -Mutation {
+        param($b, $d, $r, $p, $n)
+        foreach ($document in @($b, $d, $r)) {
+            $document.Value.metadata.callbacks_coverage_complete = "false"
+            $document.Value.metadata["callbacks_minifilter_coverage_complete"] = "true"
+        }
+    }
+    Invoke-Case -Name "scoped-callback-incomplete" -ExpectedExit 1 -Mutation {
+        param($b, $d, $r, $p, $n)
+        $d.Value.metadata["callbacks_minifilter_coverage_complete"] = "false"
+    }
+
     $malformedRoot = Join-Path $testRoot "malformed"
     New-Item `
         -ItemType Directory `

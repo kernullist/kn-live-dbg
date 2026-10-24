@@ -4,6 +4,8 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <cwctype>
 #include <memory>
 #include <new>
@@ -74,6 +76,42 @@ static std::wstring DbgHelpErrorText(const wchar_t* prefix, DWORD error)
     std::wstringstream stream;
     stream << prefix << L": " << error << L" " << buffer;
     return stream.str();
+}
+
+static DWORD EnableModuleQueryPrivilege()
+{
+    // Recent Windows builds can return a successful module query with every
+    // ImageBase redacted unless SeDebugPrivilege is enabled. An elevated
+    // token may contain the privilege without having it enabled.
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    {
+        return GetLastError();
+    }
+    LUID luid = {};
+    DWORD status = ERROR_SUCCESS;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid))
+    {
+        status = GetLastError();
+    }
+    else
+    {
+        TOKEN_PRIVILEGES privileges = {};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
+        if (!AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr))
+        {
+            status = GetLastError();
+        }
+        else
+        {
+            status = GetLastError(); // ERROR_NOT_ALL_ASSIGNED is not success.
+        }
+    }
+    CloseHandle(token);
+    return status;
 }
 
 static std::wstring LoadedModulePathText(const wchar_t* moduleName)
@@ -996,6 +1034,7 @@ bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* erro
 void SymbolEngine::Shutdown()
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
+    typeLayouts_.clear();
     if (ready_)
     {
         SymCleanup(process_);
@@ -1019,6 +1058,7 @@ const std::wstring& SymbolEngine::SymbolPath() const
 void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
+    typeLayouts_.clear();
     symbolPath_ = symbolPath;
 
     if (ready_)
@@ -1052,6 +1092,9 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
             }
             break;
         }
+
+        modules->clear();
+        const DWORD privilegeStatus = EnableModuleQueryPrivilege();
 
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll == nullptr)
@@ -1127,20 +1170,56 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
             break;
         }
 
+        const size_t headerSize = offsetof(KNDBG_RTL_PROCESS_MODULES, Modules);
+        const size_t available = std::min<size_t>(required, buffer.size());
+        if (available < headerSize)
+        {
+            if (error != nullptr) { *error = L"module query returned a truncated header"; }
+            break;
+        }
         auto rawModules = reinterpret_cast<PKNDBG_RTL_PROCESS_MODULES>(buffer.data());
-        modules->clear();
-        modules->reserve(rawModules->NumberOfModules);
+        if (rawModules->NumberOfModules == 0 ||
+            rawModules->NumberOfModules > (available - headerSize) / sizeof(KNDBG_RTL_PROCESS_MODULE_INFORMATION))
+        {
+            if (error != nullptr) { *error = L"module query returned an empty or truncated inventory"; }
+            break;
+        }
+        std::vector<KernelModuleInfo> collected;
+        collected.reserve(rawModules->NumberOfModules);
 
         for (ULONG index = 0; index < rawModules->NumberOfModules; ++index)
         {
             const KNDBG_RTL_PROCESS_MODULE_INFORMATION& raw = rawModules->Modules[index];
+            if (raw.ImageBase == nullptr || raw.ImageSize == 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"kernel module addresses are redacted or invalid; SeDebugPrivilege must be assigned and enabled "
+                             L"(privilege status=" + std::to_wstring(privilegeStatus) + L"); inventory is unavailable";
+                }
+                break;
+            }
+            const auto pathEnd = static_cast<const UCHAR*>(
+                memchr(raw.FullPathName, '\0', sizeof(raw.FullPathName)));
+            if (pathEnd == nullptr ||
+                raw.OffsetToFileName > static_cast<size_t>(pathEnd - raw.FullPathName))
+            {
+                if (error != nullptr) { *error = L"module query returned an invalid image path"; }
+                break;
+            }
             KernelModuleInfo module = {};
             module.Base = reinterpret_cast<uint64_t>(raw.ImageBase);
             module.Size = raw.ImageSize;
             module.ImagePath = AsWide(reinterpret_cast<const char*>(raw.FullPathName));
             module.ImageName = AsWide(reinterpret_cast<const char*>(raw.FullPathName + raw.OffsetToFileName));
-            modules->push_back(module);
+            collected.push_back(module);
         }
+
+        if (collected.size() != rawModules->NumberOfModules)
+        {
+            break;
+        }
+        *modules = std::move(collected);
 
         ok = true;
     } while (false);
@@ -1193,12 +1272,14 @@ bool SymbolEngine::EnsureModuleLoaded(const KernelModuleInfo& module, std::wstri
                 break;
             }
 
+            typeLayouts_.clear();
             SymUnloadModule64(process_, module.Base);
         }
 
         std::wstring imagePath = ResolveModuleImagePath(module);
         std::wstring moduleName = GetDbgHelpModuleName(module);
 
+        typeLayouts_.clear();
         SetLastError(ERROR_SUCCESS);
         DWORD64 loaded = SymLoadModuleExW(
             process_,
@@ -1343,6 +1424,7 @@ bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& modu
         SymSetOptions(immediateOptions);
         restoreOptions = true;
 
+        typeLayouts_.clear();
         SymUnloadModule64(process_, module.Base);
 
         std::wstring moduleName = GetDbgHelpModuleName(module);
@@ -1410,6 +1492,7 @@ bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& modu
 bool SymbolEngine::LoadKernelModules(std::wstring* error)
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
+    typeLayouts_.clear();
     bool ok = false;
 
     do
@@ -2798,6 +2881,15 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
 bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
+    if (layout != nullptr && ready_)
+    {
+        const auto cached = typeLayouts_.find(typeName);
+        if (cached != typeLayouts_.end())
+        {
+            *layout = cached->second;
+            return true;
+        }
+    }
     bool ok = false;
 
     do
@@ -2978,6 +3070,16 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
         ok = true;
     } while (false);
 
+    if (ok && layout != nullptr && layout->ModuleBase != 0 &&
+        typeName.find(L'!') != std::wstring::npos)
+    {
+        // Bound retained metadata even for sessions inspecting many types.
+        if (typeLayouts_.size() >= 256)
+        {
+            typeLayouts_.clear();
+        }
+        typeLayouts_[typeName] = *layout;
+    }
     return ok;
 }
 

@@ -16,6 +16,7 @@
 #include <chrono>
 #include <ctime>
 #include <exception>
+#include <filesystem>
 
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -621,6 +622,8 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     Stats.EventsSelfExcluded.store(0);
     Stats.EventsWatchMatched.store(0);
     Stats.EventsLogged.store(0);
+    Stats.LogWriteFailures.store(0);
+    Stats.LastLogError.store(0);
     Stats.LogBytesWritten.store(0);
     Stats.LogRotations.store(0);
     Stats.EventsLost.store(0);
@@ -735,6 +738,36 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         if (error != nullptr)
         {
             *error = L"OpenTraceW failed (gle=" + std::to_wstring(gle) + L")";
+        }
+        return false;
+    }
+
+    // Logging is part of the subscription contract. Create the requested
+    // directory and prove the file is writable before reporting success.
+    DWORD logError = ERROR_SUCCESS;
+    {
+        std::lock_guard<std::mutex> logLock(LogMutex);
+        CloseLogLocked();
+        std::error_code directoryError;
+        std::filesystem::create_directories(Options.LogDirectory, directoryError);
+        if (directoryError)
+        {
+            logError = static_cast<DWORD>(directoryError.value());
+        }
+        else if (!EnsureLogOpenLocked())
+        {
+            logError = Stats.LastLogError.load();
+        }
+    }
+    if (logError != ERROR_SUCCESS)
+    {
+        Stats.LastLogError.store(logError);
+        setStartStatus(logError);
+        StopLocked(nullptr);
+        if (error != nullptr)
+        {
+            *error = L"TI log initialization failed (gle=" + std::to_wstring(logError) +
+                L"): " + Options.LogDirectory;
         }
         return false;
     }
@@ -1357,7 +1390,10 @@ void TiSubscriber::RecordKeep(TiEventRecord&& record)
     }
 
     // Always log to JSONL.
-    WriteLogLine(record);
+    if (!WriteLogLine(record))
+    {
+        Stats.LogWriteFailures.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Push to ring (newest at back). Assign a monotonic Sequence under the
     // ring lock so timeline recent cursors can track arrival order instead of
@@ -1830,6 +1866,8 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
     s.EventsSelfExcluded = Stats.EventsSelfExcluded.load(std::memory_order_relaxed);
     s.EventsWatchMatched = Stats.EventsWatchMatched.load(std::memory_order_relaxed);
     s.EventsLogged = Stats.EventsLogged.load(std::memory_order_relaxed);
+    s.LogWriteFailures = Stats.LogWriteFailures.load(std::memory_order_relaxed);
+    s.LastLogError = Stats.LastLogError.load(std::memory_order_relaxed);
     s.LogBytesWritten = Stats.LogBytesWritten.load(std::memory_order_relaxed);
     s.LogRotations = Stats.LogRotations.load(std::memory_order_relaxed);
     s.EventsLost = Stats.EventsLost.load(std::memory_order_relaxed);
@@ -2205,6 +2243,7 @@ bool TiSubscriber::EnsureLogOpenLocked()
                              nullptr);
     if (LogHandle == INVALID_HANDLE_VALUE)
     {
+        Stats.LastLogError.store(GetLastError(), std::memory_order_relaxed);
         return false;
     }
     LogCurrentBytes = 0;
@@ -2253,6 +2292,7 @@ void TiSubscriber::RotateLogLocked()
                              nullptr);
     if (LogHandle == INVALID_HANDLE_VALUE)
     {
+        Stats.LastLogError.store(GetLastError(), std::memory_order_relaxed);
         return;
     }
     LogCurrentBytes = 0;
@@ -2312,8 +2352,10 @@ bool TiSubscriber::WriteLogLine(const TiEventRecord& record)
     {
         DWORD chunk = (remaining > 0x100000) ? 0x100000u : static_cast<DWORD>(remaining);
         DWORD written = 0;
-        if (!WriteFile(LogHandle, cursor, chunk, &written, nullptr) || written == 0)
+        const BOOL wrote = WriteFile(LogHandle, cursor, chunk, &written, nullptr);
+        if (!wrote || written == 0)
         {
+            Stats.LastLogError.store(wrote ? ERROR_WRITE_FAULT : GetLastError(), std::memory_order_relaxed);
             return false;
         }
         cursor += written;

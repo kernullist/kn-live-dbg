@@ -92,6 +92,8 @@ struct TiSubscriberStats
     uint64_t EventsSelfExcluded = 0;
     uint64_t EventsWatchMatched = 0;
     uint64_t EventsLogged = 0;
+    uint64_t LogWriteFailures = 0;
+    uint32_t LastLogError = 0;
     uint64_t LogBytesWritten = 0;
     uint32_t LogRotations = 0;
     uint64_t EventsLost = 0;          // ETW session lost-event counter
@@ -114,6 +116,8 @@ struct TiSubscriberStatsAtomic
     std::atomic<uint64_t> EventsSelfExcluded{0};
     std::atomic<uint64_t> EventsWatchMatched{0};
     std::atomic<uint64_t> EventsLogged{0};
+    std::atomic<uint64_t> LogWriteFailures{0};
+    std::atomic<uint32_t> LastLogError{0};
     std::atomic<uint64_t> LogBytesWritten{0};
     std::atomic<uint32_t> LogRotations{0};
     std::atomic<uint64_t> EventsLost{0};

@@ -727,6 +727,7 @@ namespace
 
         document->Metadata[L"callbacks_coverage_complete"] =
             L"false";
+        document->Metadata[L"callbacks_minifilter_coverage_complete"] = L"false";
         document->Metadata[L"callbacks_record_count"] =
             L"0";
         if (!scanner.Scan(L"all", &result, &error))
@@ -738,6 +739,14 @@ namespace
 
         document->Metadata[L"callbacks_coverage_complete"] =
             BoolText(!result.Incomplete);
+        for (const auto& surface : result.Surfaces)
+        {
+            if (surface.Name == L"minifilter")
+            {
+                document->Metadata[L"callbacks_minifilter_coverage_complete"] =
+                    BoolText(surface.CoverageComplete);
+            }
+        }
         document->Metadata[L"callbacks_record_count"] =
             DecText(result.Records.size());
         AddWarnings(document, L"callbacks", result.Warnings);
@@ -1232,6 +1241,30 @@ namespace
         }
     }
 
+    SnapshotRecord BuildMapperUnloadedSnapshotRecord(const MapperUnloadedRecord& item)
+    {
+        SnapshotRecord record;
+        record.Domain = L"leftover-mapper";
+        // The same image can be unloaded repeatedly at a reused base. The
+        // unload time identifies the event; the ring slot can move when full.
+        record.Identity = L"unloaded:" + SnapshotToLower(item.Name) + L":" +
+            SnapshotHex(item.StartAddress, 16) + L":" +
+            SnapshotHex(item.EndAddress, 16) + L":" + DecText(item.TimeStamp);
+        record.Display = item.Name.empty() ? L"<unnamed unloaded>" : item.Name;
+        record.Risk = item.Suspicious ? L"high" : L"medium";
+        record.Tags = {L"unloaded"};
+        if (item.Suspicious)
+        {
+            record.Tags.push_back(L"suspicious");
+        }
+        record.Evidence[L"start"] = SnapshotHex(item.StartAddress, 16);
+        record.Evidence[L"end"] = SnapshotHex(item.EndAddress, 16);
+        record.Evidence[L"unload_time"] = DecText(item.TimeStamp);
+        record.Evidence[L"still_executable"] = BoolText(item.StillExecutable);
+        record.Evidence[L"notes"] = item.Notes;
+        return record;
+    }
+
     void CaptureMapperRemnants(DeviceClient& device, SymbolEngine& symbols, SnapshotDocument* document)
     {
         MapperRemnantScanner scanner(device, symbols);
@@ -1255,22 +1288,7 @@ namespace
 
         for (const MapperUnloadedRecord& item : result.Unloaded)
         {
-            SnapshotRecord record;
-            record.Domain = L"leftover-mapper";
-            record.Identity = L"unloaded:" + SnapshotToLower(item.Name) + L":" +
-                SnapshotHex(item.StartAddress, 16);
-            record.Display = item.Name.empty() ? L"<unnamed unloaded>" : item.Name;
-            record.Risk = item.Suspicious ? L"high" : L"medium";
-            record.Tags = {L"unloaded"};
-            if (item.Suspicious)
-            {
-                record.Tags.push_back(L"suspicious");
-            }
-            record.Evidence[L"start"] = SnapshotHex(item.StartAddress, 16);
-            record.Evidence[L"end"] = SnapshotHex(item.EndAddress, 16);
-            record.Evidence[L"still_executable"] = BoolText(item.StillExecutable);
-            record.Evidence[L"notes"] = item.Notes;
-            AddRecord(document, std::move(record));
+            AddRecord(document, BuildMapperUnloadedSnapshotRecord(item));
         }
 
         for (const MapperPiddbRecord& item : result.Piddb)
@@ -2226,4 +2244,36 @@ bool SnapshotMapperHashIdentitySelfTest()
     AddRecord(&extended, BuildMapperHashSnapshotRecord(item));
     return BuildSnapshotDiff(document, extended, options, &diff, &error) &&
         diff.Findings.size() == 1 && diff.Findings.front().Kind == L"added";
+}
+
+bool SnapshotMapperUnloadedIdentitySelfTest()
+{
+    MapperUnloadedRecord item = {};
+    item.Name = L"Probe.sys";
+    item.StartAddress = 0xfffff80001000000ull;
+    item.EndAddress = item.StartAddress + 0x10000;
+    item.TimeStamp = 123456789;
+    SnapshotDocument document = {};
+    document.BootId = L"test-boot";
+    AddRecord(&document, BuildMapperUnloadedSnapshotRecord(item));
+    ++item.TimeStamp;
+    AddRecord(&document, BuildMapperUnloadedSnapshotRecord(item));
+    if (document.Records[0].Identity == document.Records[1].Identity ||
+        document.Records[1].Evidence[L"unload_time"] != L"123456790")
+    {
+        return false;
+    }
+    // Ring compaction and case changes must not invent a new unload event.
+    item.Index = 17;
+    item.EntryAddress = 0xffff800000003000ull;
+    item.Name = L"probe.SYS";
+    if (BuildMapperUnloadedSnapshotRecord(item).Identity != document.Records[1].Identity)
+    {
+        return false;
+    }
+    SnapshotDiffOptions options = {};
+    SnapshotDiffResult diff = {};
+    std::wstring error;
+    return BuildSnapshotDiff(document, document, options, &diff, &error) &&
+        diff.Findings.empty();
 }

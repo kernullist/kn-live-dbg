@@ -825,7 +825,7 @@
         },
         {
           "path": "user/SnapshotDiff.cpp",
-          "contains": "minifilter attachment removal comparison skipped because current attachment or callback coverage is incomplete"
+          "contains": "minifilter attachment removal comparison skipped because current attachment or minifilter callback coverage is incomplete"
         }
       ],
       "validation_commands": [

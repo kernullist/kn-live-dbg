@@ -1235,6 +1235,13 @@ bool FirmwareTableScanner::Scan(FirmwareTableScanResult* result, std::wstring* e
 
         *result = FirmwareTableScanResult{};
 
+        // Providers can be registered by drivers loaded after console startup.
+        // A stale module list falsely labels their handlers as non-image code.
+        if (!symbols_.LoadKernelModules(error))
+        {
+            break;
+        }
+
         uint64_t listHead = 0;
         if (!symbols_.ResolveSymbol(L"nt!ExpFirmwareTableProviderListHead", &listHead, error))
         {

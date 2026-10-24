@@ -31,3 +31,4 @@ private:
 };
 
 bool SnapshotMapperHashIdentitySelfTest();
+bool SnapshotMapperUnloadedIdentitySelfTest();

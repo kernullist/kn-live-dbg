@@ -143,6 +143,9 @@ std::wstring BuildMinifilterIrpJson(const MinifilterIrpScanResult& result);
 std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change);
 std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch);
 bool MinifilterIrpScannerSelfTest();
+// Raw callback replacement has no kernel-owned lifetime/rundown contract.
+// Keep every public mutation entry point fail-closed until one exists.
+bool RequireManagedCallbackLifetime(std::wstring* error);
 uint32_t MinifilterCallbackIndexFromMajor(uint32_t majorFunction);
 bool ResolveMinifilterNopThunks(
     DeviceClient& device,

@@ -350,9 +350,20 @@ function Assert-SnapshotContract
         throw "$Context does not declare same-boot-only evidence"
     }
 
+    $callbackCoverageName = "callbacks_coverage_complete"
+    $metadata = Get-RequiredProperty -Object $Document -Name "metadata" -Context $Context
+    $hasScopedCoverage = if ($metadata -is [System.Collections.IDictionary]) {
+        @($metadata.Keys) -ccontains "callbacks_minifilter_coverage_complete"
+    } else {
+        $null -ne $metadata.PSObject.Properties["callbacks_minifilter_coverage_complete"]
+    }
+    if ($hasScopedCoverage)
+    {
+        $callbackCoverageName = "callbacks_minifilter_coverage_complete"
+    }
     foreach ($coverageName in @(
             "minifilter_attachments_coverage_complete",
-            "callbacks_coverage_complete"))
+            $callbackCoverageName))
     {
         if ((Get-MetadataString `
                 -Document $Document `

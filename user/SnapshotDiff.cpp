@@ -878,6 +878,10 @@ bool BuildSnapshotDiff(
             SnapshotMetadataTrue(
                 newSnapshot,
                 L"callbacks_coverage_complete");
+        const bool minifilterCallbackCoverageComplete =
+            newSnapshot.Metadata.count(L"callbacks_minifilter_coverage_complete") != 0
+                ? SnapshotMetadataTrue(newSnapshot, L"callbacks_minifilter_coverage_complete")
+                : callbackCoverageComplete;
         const bool moduleCoverageComplete =
             SnapshotMetadataTrue(
                 newSnapshot,
@@ -1309,10 +1313,10 @@ bool BuildSnapshotDiff(
                     L"minifilter-attachments");
         if (minifilterRemovalRequested &&
             (!minifilterAttachmentCoverageComplete ||
-             !callbackCoverageComplete))
+             !minifilterCallbackCoverageComplete))
         {
             result->Warnings.push_back(
-                L"minifilter attachment removal comparison skipped because current attachment or callback coverage is incomplete");
+                L"minifilter attachment removal comparison skipped because current attachment or minifilter callback coverage is incomplete");
         }
         else if (minifilterRemovalRequested)
         {
@@ -2222,6 +2226,25 @@ bool SnapshotMinifilterAttachmentDiffSelfTest()
             &error) ||
         !incompleteRemovalResult.Findings.empty() ||
         incompleteRemovalResult.Warnings.empty())
+    {
+        return false;
+    }
+
+    // A missing executive callback layout must not disable an independently
+    // complete minifilter cross-view. An explicit failed scoped scan still wins.
+    SnapshotDocument scopedRemoval = removalNew;
+    scopedRemoval.Metadata[L"callbacks_coverage_complete"] = L"false";
+    scopedRemoval.Metadata[L"callbacks_minifilter_coverage_complete"] = L"true";
+    SnapshotDiffResult scopedResult = {};
+    if (!BuildSnapshotDiff(removalOld, scopedRemoval, options, &scopedResult, &error) ||
+        scopedResult.Removed != 1)
+    {
+        return false;
+    }
+    scopedRemoval.Metadata[L"callbacks_coverage_complete"] = L"true";
+    scopedRemoval.Metadata[L"callbacks_minifilter_coverage_complete"] = L"false";
+    if (!BuildSnapshotDiff(removalOld, scopedRemoval, options, &scopedResult, &error) ||
+        scopedResult.Removed != 0 || scopedResult.Warnings.empty())
     {
         return false;
     }

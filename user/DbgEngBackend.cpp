@@ -3,8 +3,13 @@
 #include <DbgEng.h>
 #include <Objbase.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <cwctype>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "Dbgeng.lib")
@@ -37,6 +42,42 @@ static std::wstring FormatDbgEngHex64(uint64_t value)
 
     stream << L"0x" << std::hex << value << std::dec;
     return stream.str();
+}
+
+static bool CheckLocalKernelPipe(const std::wstring& options, std::wstring* error)
+{
+    if (options.size() < 4 || _wcsnicmp(options.c_str(), L"com:", 4) != 0)
+    {
+        return true;
+    }
+    bool pipeTransport = false;
+    std::wstring port;
+    std::wistringstream parts(options.substr(4));
+    std::wstring part;
+    while (std::getline(parts, part, L','))
+    {
+        const auto first = part.find_first_not_of(L" \t");
+        if (first == std::wstring::npos) continue;
+        part = part.substr(first, part.find_last_not_of(L" \t") - first + 1);
+        if (_wcsicmp(part.c_str(), L"pipe") == 0) pipeTransport = true;
+        if (_wcsnicmp(part.c_str(), L"port=", 5) == 0) port = part.substr(5);
+    }
+    if (pipeTransport && _wcsnicmp(port.c_str(), L"\\\\.\\pipe\\", 9) == 0 &&
+        !WaitNamedPipeW(port.c_str(), 1))
+    {
+        const DWORD status = GetLastError();
+        if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+        {
+            // Some DbgEng transports retry a missing pipe indefinitely even
+            // after an exit interrupt. Do not enter that loop without a server.
+            if (error != nullptr)
+            {
+                *error = L"local KD pipe is unavailable; start the target pipe server first: " + port;
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 class CapturingOutputCallbacks : public IDebugOutputCallbacksWide
@@ -119,6 +160,7 @@ struct DbgEngBackend::Impl
         Symbols(nullptr),
         Callbacks(nullptr),
         CoInitialized(false),
+        Attached(false),
         Ready(false)
     {
     }
@@ -128,6 +170,7 @@ struct DbgEngBackend::Impl
     IDebugSymbols3* Symbols;
     CapturingOutputCallbacks* Callbacks;
     bool CoInitialized;
+    bool Attached;
     bool Ready;
 };
 
@@ -156,6 +199,11 @@ bool DbgEngBackend::Initialize(
         if (impl_->Ready)
         {
             ok = true;
+            break;
+        }
+
+        if (remoteKernel && !CheckLocalKernelPipe(connectOptions, error))
+        {
             break;
         }
 
@@ -243,15 +291,80 @@ bool DbgEngBackend::Initialize(
             break;
         }
 
+        if (!remoteKernel)
+        {
+            result = impl_->Client->IsKernelDebuggerEnabled();
+            if (result != S_OK)
+            {
+                if (error != nullptr)
+                {
+                    *error = result == S_FALSE
+                        ? L"local kernel debugging is not enabled for this boot"
+                        : HResultText(L"local kernel debugger availability check failed", result);
+                }
+                break;
+            }
+        }
+
         const wchar_t* options = connectOptions.empty() ? nullptr : connectOptions.c_str();
         result = impl_->Client->AttachKernelWide(
             remoteKernel ? DEBUG_ATTACH_KERNEL_CONNECTION : DEBUG_ATTACH_LOCAL_KERNEL,
             options);
-        if (FAILED(result))
+        if (result != S_OK)
         {
             if (error != nullptr)
             {
                 *error = HResultText(remoteKernel ? L"AttachKernelWide remote kernel failed" : L"AttachKernelWide local kernel failed", result);
+            }
+            break;
+        }
+        impl_->Attached = true;
+
+        // AttachKernel only requests a connection. DbgEng requires the initial
+        // WaitForEvent before commands can use a target. Live kernel waits must
+        // use INFINITE; SetInterrupt(EXIT) is the documented cross-thread cancel.
+        std::mutex waitMutex;
+        std::condition_variable waitCondition;
+        bool finished = false;
+        bool timedOut = false;
+        std::thread cancelWait([&]()
+        {
+            std::unique_lock<std::mutex> lock(waitMutex);
+            if (!waitCondition.wait_for(lock, std::chrono::seconds(30), [&]() { return finished; }))
+            {
+                timedOut = true;
+                lock.unlock();
+                impl_->Control->SetInterrupt(DEBUG_INTERRUPT_EXIT);
+            }
+        });
+        result = impl_->Control->WaitForEvent(0, INFINITE);
+        {
+            std::lock_guard<std::mutex> lock(waitMutex);
+            finished = true;
+        }
+        waitCondition.notify_one();
+        cancelWait.join();
+        if (result != S_OK || timedOut)
+        {
+            if (error != nullptr)
+            {
+                *error = timedOut ? L"kernel attach did not complete within 30 seconds"
+                    : HResultText(L"initial kernel debug event failed", result);
+            }
+            break;
+        }
+
+        ULONG debugClass = DEBUG_CLASS_UNINITIALIZED;
+        ULONG qualifier = 0;
+        ULONG processor = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (impl_->Control->GetDebuggeeType(&debugClass, &qualifier) != S_OK ||
+            debugClass != DEBUG_CLASS_KERNEL ||
+            impl_->Control->GetActualProcessorType(&processor) != S_OK ||
+            processor == IMAGE_FILE_MACHINE_UNKNOWN)
+        {
+            if (error != nullptr)
+            {
+                *error = L"kernel attach completed without a usable kernel target";
             }
             break;
         }
@@ -277,9 +390,10 @@ void DbgEngBackend::Shutdown()
 
     if (impl_->Client != nullptr)
     {
-        if (impl_->Ready)
+        if (impl_->Attached)
         {
             impl_->Client->EndSession(DEBUG_END_PASSIVE);
+            impl_->Attached = false;
         }
 
         impl_->Client->SetOutputCallbacksWide(nullptr);

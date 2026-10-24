@@ -14,6 +14,8 @@ param(
 
     [switch]$NoElevation,
 
+    [switch]$CheckMutationGuard,
+
     [string]$ElevationStatusPath = ""
 )
 
@@ -693,6 +695,10 @@ if (-not (Test-IsAdministrator))
         "-ElevationStatusPath",
         (ConvertTo-ProcessArgument $statusPath)
     )
+    if ($CheckMutationGuard)
+    {
+        $arguments += "-CheckMutationGuard"
+    }
     Write-Host (
         "[minifilter-detach-e2e] requesting UAC elevation")
     $child =
@@ -967,6 +973,61 @@ try
             "live attachment query did not observe the clean fixture instance; exit={0} log={1}" -f
                 $query.ExitCode,
                 $queryAttachedLog)
+    }
+
+    if ($CheckMutationGuard)
+    {
+        # Prove the executable advertises the guard before sending legacy
+        # mutation syntax. Never run this probe against an older unsafe build.
+        $guardHelp = Join-Path $outputPath "mutation-guard-help.stdout.log"
+        Invoke-KnLiveDbgScript -Executable $executable `
+            -Commands @("help !minifilter", "exit") `
+            -OutputPath $guardHelp `
+            -ErrorPath (Join-Path $outputPath "mutation-guard-help.stderr.log") `
+            -Context "mutation guard capability check"
+        if ((Get-Content -LiteralPath $guardHelp -Raw) -notmatch
+            'disable/enable/disable-all/enable-all are unavailable')
+        {
+            throw "executable does not advertise the callback lifetime guard; refusing legacy mutation probe"
+        }
+
+        $guardBefore = Join-Path $outputPath "mutation-guard-before.json"
+        $guardAfter = Join-Path $outputPath "mutation-guard-after.json"
+        $guardOut = Join-Path $outputPath "mutation-guard.stdout.log"
+        $guardErr = Join-Path $outputPath "mutation-guard.stderr.log"
+        $guardCommands = @(
+            "!minifilter disable $filterName CREATE /pre",
+            "!minifilter enable $filterName CREATE /pre",
+            "!fltmgr disable $filterName all /both",
+            "!fltmgr enable $filterName all /both",
+            "!minifilter disable-all $filterName /post",
+            "!minifilter enable-all $filterName /post",
+            "!callbacks disable minifilter $filterName",
+            "!callbacks enable minifilter $filterName",
+            "!callbacks disable-all $filterName",
+            "!callbacks enable-all $filterName"
+        )
+        Invoke-KnLiveDbgScript -Executable $executable `
+            -Commands (@("write on", "!minifilter show $filterName /json `"$guardBefore`"") +
+                $guardCommands + @("!minifilter show $filterName /json `"$guardAfter`"", "write off", "exit")) `
+            -OutputPath $guardOut -ErrorPath $guardErr -Context "callback mutation guard"
+        $guardText = (Get-Content -LiteralPath $guardOut -Raw) + (Get-Content -LiteralPath $guardErr -Raw)
+        if ([regex]::Matches($guardText, 'callback mutation is unavailable').Count -ne $guardCommands.Count)
+        {
+            throw "not every legacy mutation command reported the lifetime guard"
+        }
+        $beforeFilter = @((Get-Content -LiteralPath $guardBefore -Raw | ConvertFrom-Json).filters |
+            Where-Object { $_.name -eq $filterName })
+        $afterFilter = @((Get-Content -LiteralPath $guardAfter -Raw | ConvertFrom-Json).filters |
+            Where-Object { $_.name -eq $filterName })
+        if ($beforeFilter.Count -ne 1 -or $afterFilter.Count -ne 1 -or
+            $beforeFilter[0].instanceCount -lt 1 -or $beforeFilter[0].liveCallbackCount -lt 1 -or
+            (ConvertTo-Json -InputObject $beforeFilter[0] -Depth 20 -Compress) -ne
+            (ConvertTo-Json -InputObject $afterFilter[0] -Depth 20 -Compress))
+        {
+            throw "callback mutation guard changed fixture registration or live callback coverage"
+        }
+        Write-Host "[minifilter-detach-e2e] mutation guard passed commands=$($guardCommands.Count) registration=unchanged"
     }
 
     Invoke-KnLiveDbgScript `

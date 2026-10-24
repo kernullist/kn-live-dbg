@@ -197,8 +197,16 @@ namespace
             return false;
         }
 
+        // Match Path.GetTempPath used by the PowerShell runner. New Windows
+        // versions give SYSTEM a private SystemTemp root through GetTempPath2.
+        // Resolve dynamically so older supported hosts keep the original API.
+        using GetTempPathFn = DWORD(WINAPI*)(DWORD, LPWSTR);
+        const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        const auto getTempPath2 = kernel32 == nullptr ? nullptr :
+            reinterpret_cast<GetTempPathFn>(GetProcAddress(kernel32, "GetTempPath2W"));
+        const GetTempPathFn getTempPath = getTempPath2 != nullptr ? getTempPath2 : GetTempPathW;
         const DWORD required =
-            GetTempPathW(
+            getTempPath(
                 0,
                 nullptr);
         if (required == 0 ||
@@ -216,7 +224,7 @@ namespace
             static_cast<size_t>(required) + 1,
             L'\0');
         const DWORD written =
-            GetTempPathW(
+            getTempPath(
                 static_cast<DWORD>(buffer.size()),
                 buffer.data());
         if (written == 0 ||

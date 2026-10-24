@@ -1854,7 +1854,7 @@ static void PrintHelp(bool includeDbgEng)
 
     PrintColoredText(L"high-value topics", KNDBG_COLOR_ACCENT);
     std::wcout << L"\n";
-    std::wcout << L"  help !callbacks      list callbacks; disable/enable one module per type\n";
+    std::wcout << L"  help !callbacks      inspect callbacks; pointer mutation is unavailable\n";
     std::wcout << L"  help !hunt           whole-system user-mode anomaly hunt\n";
     std::wcout << L"  help !vad            VAD triage, injection scan, hidden PTEs, mapped-PE inventory\n";
     std::wcout << L"  help !threads        thread list, suspicious starts, APC evidence\n";
@@ -1888,7 +1888,7 @@ static void PrintHelp(bool includeDbgEng)
     std::wcout << L"  help !payload        hook-to-body layer (unbacked pointer trace)\n";
     std::wcout << L"  help !mapper         bookkeeping-remnant layer (unload / PiDDB / ci hash)\n";
     std::wcout << L"  help !kpage          orphan-page layer (executable VA outside modules)\n";
-    std::wcout << L"  help !minifilter     list minifilters and enable/disable IRP handlers\n";
+    std::wcout << L"  help !minifilter     inspect minifilters; pointer mutation is unavailable\n";
     std::wcout << L"  --cloak              relaunch from a random EXE/service/device session\n";
     std::wcout << L"  ai help              AI goals, local tools, playbooks, go/no, explain, run, and write\n";
     std::wcout << L"\n";
@@ -1958,13 +1958,9 @@ static void PrintCallbacksHelp()
     std::wcout << L"  The scanner locates callback roots from symbols or self-discovered kernel lists.\n";
     std::wcout << L"  Module filters match callback function owners case-insensitively by image name or stem.\n";
     std::wcout << L"  Some private callback item layouts are absent from public PDBs; fallback notes are printed per record.\n";
-    std::wcout << L"  disable/enable patch only that module's function pointers. They never write NULL and never unlink lists.\n";
-    std::wcout << L"  Ob/Cm/Ps use a CFG-valid return-0 thunk (OB_PREOP_SUCCESS / STATUS_SUCCESS / VOID).\n";
-    std::wcout << L"  minifilter disable/enable reuses !minifilter SetAllIrps: Pre returns 1, Post returns 0, live CallbackNodes included.\n";
-    std::wcout << L"  Original pointers are saved in this session so enable can restore them. Requires 'write on'.\n";
-    std::wcout << L"  disable-all/enable-all apply every scope to that module. A module name is required; fail-closed otherwise.\n";
-    std::wcout << L"  After disable, list rows for that module print DISABLED and keep the original owner in notes.\n";
-    std::wcout << L"  help !callbacks disable and !callbacks disable help show the write syntax.\n";
+    std::wcout << L"  disable/enable/disable-all/enable-all are unavailable, including with 'write on'.\n";
+    std::wcout << L"  Raw replacement lacks kernel-owned callback lifetime and rundown; driver unload can cause 0xCE.\n";
+    std::wcout << L"  These legacy commands fail before changing pointers. Inspection remains available.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !callbacks all\n";
@@ -1976,12 +1972,6 @@ static void PrintCallbacksHelp()
     std::wcout << L"  !callbacks minifilter\n";
     std::wcout << L"  !callbacks object WdFilter.sys\n";
     std::wcout << L"  !callbacks minifilter UnionFS\n";
-    std::wcout << L"  write on\n";
-    std::wcout << L"  !callbacks disable object WdFilter\n";
-    std::wcout << L"  !callbacks disable process WdFilter.sys\n";
-    std::wcout << L"  !callbacks disable minifilter WdFilter\n";
-    std::wcout << L"  !callbacks disable-all WdFilter\n";
-    std::wcout << L"  !callbacks enable-all WdFilter\n";
 }
 
 static std::wstring NormalizeCallbackHelpScope(const std::wstring& value)
@@ -2099,7 +2089,7 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"important output:\n";
         std::wcout << L"  altitude, filter, frame, driverObject, major, function, and post identify filter ownership.\n";
         std::wcout << L"  module filters match operation callback function owners case-insensitively.\n";
-        std::wcout << L"  disable/enable reuse !minifilter SetAllIrps on matching FilterName: Pre returns 1, Post returns 0.\n";
+        std::wcout << L"  disable/enable are unavailable: callback lifetime and rundown are not implemented.\n";
     }
     else if (scope == L"disable" || scope == L"enable")
     {
@@ -2107,9 +2097,8 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  !callbacks " << scope << L" <all|object|registry|process|thread|imageload|minifilter> <module>\n";
         std::wcout << L"  !callbacks " << scope << L" <scope> /module <module>\n";
         std::wcout << L"\n";
-        std::wcout << L"  Needs write on. Patches only that module. Never writes NULL and never unlinks lists.\n";
-        std::wcout << L"  Ob/Cm/Ps use a CFG return-0 thunk. minifilter reuses !minifilter SetAllIrps (Pre=1, Post=0).\n";
-        std::wcout << L"  enable restores same-session backups only.\n";
+        std::wcout << L"  Unavailable even with write on: no kernel-owned callback lifetime and rundown.\n";
+        std::wcout << L"  Fails before changing pointers. Use read-only inspection or supported lifecycle APIs.\n";
     }
     else if (scope == L"disable-all" || scope == L"enable-all")
     {
@@ -2117,8 +2106,7 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  !callbacks " << scope << L" <module>\n";
         std::wcout << L"  !callbacks " << scope << L" /module <module>\n";
         std::wcout << L"\n";
-        std::wcout << L"  Same as disable/enable with scope=all. A module name is required.\n";
-        std::wcout << L"  Needs write on. enable-all skips types this session never disabled.\n";
+        std::wcout << L"  Unavailable even with write on: no kernel-owned callback lifetime and rundown.\n";
     }
     else
     {
@@ -14846,34 +14834,23 @@ static void PrintMinifilterHelp()
     std::wcout << L"\n";
     std::wcout << L"  Walks fltmgr!FltGlobals frames, FLT_FILTER.Operations, and the live\n";
     std::wcout << L"  FLT_INSTANCE.CallbackNodes that FltMgr actually dispatches (PDB layout).\n";
-    std::wcout << L"  list/show/irp are read-only. disable/enable write FLT_FILTER.Operations and\n";
-    std::wcout << L"  replace live FLT_INSTANCE.CallbackNode Pre/Post with distinct CFG-valid\n";
-    std::wcout << L"  thunks: Pre returns FLT_PREOP_SUCCESS_NO_CALLBACK (1), Post returns\n";
-    std::wcout << L"  FLT_POSTOP_FINISHED_PROCESSING (0). A shared return-0 Pre is\n";
-    std::wcout << L"  FLT_PREOP_SUCCESS_WITH_CALLBACK and drains FastIO to IRP. Do not write NULL\n";
-    std::wcout << L"  (kCFG 0x139/0xa) and do not unlink CallbackLinks (corrupt list 0x139/0x3).\n";
-    std::wcout << L"  disable saves the original pointers in this session so enable can restore them.\n";
-    std::wcout << L"  disable <name> all and disable-all walk every registered slot and sweep any\n";
-    std::wcout << L"  leftover original callbacks. enable-all restores every same-session backup.\n";
+    std::wcout << L"  list/show/irp are read-only. disable/enable/disable-all/enable-all are unavailable.\n";
+    std::wcout << L"  Raw replacement lacks kernel-owned callback lifetime and rundown; driver unload can cause 0xCE.\n";
+    std::wcout << L"  Legacy mutation commands fail before changing pointers, including with 'write on'.\n";
+    std::wcout << L"  Use the filter's supported lifecycle API for attachment changes.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
-    std::wcout << L"  /pre /post /both  which callback to change (default both).\n";
+    std::wcout << L"  /pre /post /both  legacy mutation selectors (mutation unavailable).\n";
     std::wcout << L"  /json <path>      write kn-live-dbg.minifilter.v1, minifilter-irp.v1, or minifilter-irp-batch.v1.\n";
     std::wcout << L"\n";
     std::wcout << L"  IRP majors accept IRP_MJ_CREATE, CREATE, directory_control, ioctl, 0x00, 0n12.\n";
-    std::wcout << L"  all / * / every / IRP_MJ_ALL / disable-all / enable-all apply to every slot.\n";
-    std::wcout << L"  Ambiguous filter names fail closed. Inbox names (WdFilter, FileInfo, ...) warn\n";
-    std::wcout << L"  but are not blocked. disable/enable/disable-all/enable-all require 'write on'.\n";
+    std::wcout << L"  all / * / every / IRP_MJ_ALL remain recognized in the unavailable legacy syntax.\n";
+    std::wcout << L"  Ambiguous filter names fail closed.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !minifilter\n";
     std::wcout << L"  !minifilter show UnionFS\n";
     std::wcout << L"  !minifilter irp UnionFS IRP_MJ_CREATE\n";
-    std::wcout << L"  write on\n";
-    std::wcout << L"  !minifilter disable UnionFS CREATE\n";
-    std::wcout << L"  !minifilter disable UnionFS all\n";
-    std::wcout << L"  !minifilter disable-all UnionFS\n";
-    std::wcout << L"  !minifilter enable-all UnionFS\n";
 }
 
 static void PrintMinifilterSlot(const MinifilterIrpSlot& slot)
@@ -20977,6 +20954,8 @@ static void HandleTiCommand(
                        << L" self_excluded=" << s.EventsSelfExcluded
                        << L" watch_matched=" << s.EventsWatchMatched << L"\n";
             std::wcout << L"  logged=" << s.EventsLogged
+                       << L" log_failed=" << s.LogWriteFailures
+                       << L" last_log_error=" << s.LastLogError
                        << L" log_bytes=" << s.LogBytesWritten
                        << L" rotations=" << s.LogRotations
                        << L" etw_lost=" << s.EventsLost << L"\n";
@@ -29347,6 +29326,10 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             SnapshotMapperHashIdentitySelfTest(),
             L"snapshot-cihash-distinct-cache-entry-identities");
+        CheckConsoleSurfaceSelfTest(
+            &context,
+            SnapshotMapperUnloadedIdentitySelfTest(),
+            L"snapshot-unloaded-driver-reused-base-identities");
 
         CheckCompletionCandidate(
             &context,
@@ -30832,14 +30815,13 @@ static int RunConsoleSurfaceSelfTest()
                     minifilterHelp.find(L"disable-all") != std::wstring::npos &&
                     minifilterHelp.find(L"enable-all") != std::wstring::npos &&
                     minifilterHelp.find(L"IRP_MJ_CREATE") != std::wstring::npos &&
-                    minifilterHelp.find(L"disable UnionFS all") != std::wstring::npos &&
-                    minifilterHelp.find(L"disable-all UnionFS") != std::wstring::npos &&
+                    minifilterHelp.find(L"are unavailable") != std::wstring::npos &&
+                    minifilterHelp.find(L"fail before changing pointers") != std::wstring::npos &&
                     minifilterHelp.find(L"CallbackNodes") != std::wstring::npos &&
-                    minifilterHelp.find(L"FLT_PREOP_SUCCESS_NO_CALLBACK") != std::wstring::npos &&
-                    minifilterHelp.find(L"FLT_POSTOP_FINISHED_PROCESSING") != std::wstring::npos &&
+                    callbacksHelp.find(L"are unavailable") != std::wstring::npos &&
+                    callbacksDisableHelp.find(L"Unavailable even with write on") != std::wstring::npos &&
                     minifilterHelp.find(L"minifilter-irp-batch.v1") != std::wstring::npos &&
-                    rootHelp.find(L"help !minifilter") != std::wstring::npos &&
-                    rootHelp.find(L"disable <name> all") != std::wstring::npos,
+                    rootHelp.find(L"help !minifilter") != std::wstring::npos,
                 L"minifilter-help-routes");
         }
 
@@ -35410,14 +35392,11 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
 
             if (action == L"disable" || action == L"disable-all")
             {
-                plan.Warning = L"replaces that module's Ob/Cm/Ps function pointers with a CFG return-0 thunk "
-                               L"and disables matching minifilter IRPs via live CallbackNodes; originals stay "
-                               L"in this session for enable. Never writes NULL and never unlinks lists.";
+                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
             }
             else if (action == L"enable" || action == L"enable-all")
             {
-                plan.Warning = L"restores same-session callback backups for that module; slots never disabled "
-                               L"in this session are skipped";
+                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
             }
             else
             {
@@ -35463,21 +35442,13 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
                 plan.BackupCommand = L"!minifilter show " + specifier;
                 plan.VerifyCommand = plan.BackupCommand;
             }
-            const bool allSlots =
-                action == L"disable-all" ||
-                action == L"enable-all" ||
-                (commandArgs.size() >= 4 && IsMinifilterIrpAllToken(commandArgs[3]));
             if (action == L"disable" || action == L"disable-all")
             {
-                plan.Warning = allSlots
-                    ? L"nulls every registered Pre/Post on the filter; originals stay in this session for enable-all"
-                    : L"nulls the selected FLT_OPERATION_REGISTRATION Pre/Post; enable restores the same-session backup";
+                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
             }
             else if (action == L"enable" || action == L"enable-all")
             {
-                plan.Warning = allSlots
-                    ? L"restores every same-session backup for that filter; slots never disabled in this session are skipped"
-                    : L"restores the same-session Pre/Post backup; fails if this session never disabled that IRP";
+                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
             }
             else
             {
@@ -45499,6 +45470,8 @@ static std::wstring BuildMcpTiStatsJson(const TiSubscriberStats& stats, bool act
     out += L",\"eventsSelfExcluded\":" + std::to_wstring(stats.EventsSelfExcluded);
     out += L",\"eventsWatchMatched\":" + std::to_wstring(stats.EventsWatchMatched);
     out += L",\"eventsLogged\":" + std::to_wstring(stats.EventsLogged);
+    out += L",\"logWriteFailures\":" + std::to_wstring(stats.LogWriteFailures);
+    out += L",\"lastLogError\":" + std::to_wstring(stats.LastLogError);
     out += L",\"logBytesWritten\":" + std::to_wstring(stats.LogBytesWritten);
     out += L",\"logRotations\":" + std::to_wstring(stats.LogRotations);
     out += L",\"keywordMode\":\"all\"";
@@ -49417,6 +49390,13 @@ static bool HandleCommand(
         }
         else if (command == L"lm" || command == L"modules")
         {
+            // A native session can load/unload drivers after startup (including
+            // the probe). Enumerate the live module list for each request.
+            if (!symbols.LoadKernelModules(&error))
+            {
+                std::wcerr << L"module enumeration failed: " << error << L"\n";
+                return true;
+            }
             std::wstring filter;
             if (args.size() >= 2)
             {
@@ -50786,6 +50766,15 @@ static McpEngineResult DispatchMcpWriteTool(
         {
             result.IsError = true;
             result.Text = L"unknown write tool: " + tool;
+            break;
+        }
+
+        // Unavailable callback writes must report the lifetime failure even
+        // when the target is absent; a backup query must not mask the guard.
+        if ((tool == L"minifilter.set_irp" || tool == L"callbacks.set") &&
+            !RequireManagedCallbackLifetime(&result.Text))
+        {
+            result.IsError = true;
             break;
         }
 

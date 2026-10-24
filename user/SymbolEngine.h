@@ -4,6 +4,7 @@
 #include <DbgHelp.h>
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -122,4 +123,7 @@ private:
     // order is always dbghelpMutex_ -> modulesMutex_.
     mutable std::recursive_mutex dbghelpMutex_;
     std::vector<KernelModuleInfo> modules_;
+    // Successful qualified PDB layouts only. Protected by dbghelpMutex_ and
+    // invalidated whenever symbol/module state can change. Failures are retried.
+    std::map<std::wstring, TypeLayoutInfo> typeLayouts_;
 };

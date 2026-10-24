@@ -3384,6 +3384,11 @@ bool MinifilterIrpScanner::SetIrp(
             break;
         }
         *change = MinifilterIrpChange{};
+        if (action != MinifilterIrpAction::Status &&
+            !RequireManagedCallbackLifetime(error))
+        {
+            break;
+        }
         if (majorFunction == kIrpMjOperationEnd)
         {
             if (error != nullptr)
@@ -3682,6 +3687,10 @@ bool MinifilterIrpScanner::SetAllIrps(
             break;
         }
         *batch = MinifilterIrpBatchResult{};
+        if (!RequireManagedCallbackLifetime(error))
+        {
+            break;
+        }
         if (action != MinifilterIrpAction::Disable && action != MinifilterIrpAction::Enable)
         {
             if (error != nullptr)
@@ -3970,6 +3979,23 @@ std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch)
     return out;
 }
 
+bool RequireManagedCallbackLifetime(std::wstring* error)
+{
+    // A live FltMgr callback reached an unloaded KnLiveDbg.sys thunk (0xCE).
+    // User-mode backups cannot own callback registration lifetime, drain
+    // in-flight calls, cover newly attached instances, or survive controller
+    // termination. Restoring a pointer before SCM unload is not sufficient.
+    // Do not re-enable raw replacements without a kernel-owned lifetime and
+    // rundown protocol, including failure/termination paths.
+    if (error != nullptr)
+    {
+        *error = L"callback mutation is unavailable: kernel-owned callback lifetime "
+                 L"and rundown are not implemented; no pointers were changed. "
+                 L"Use read-only callback inspection or the filter's supported lifecycle API.";
+    }
+    return false;
+}
+
 bool ResolveMinifilterNopThunks(
     DeviceClient& device,
     SymbolEngine& symbols,
@@ -3977,6 +4003,12 @@ bool ResolveMinifilterNopThunks(
     uint64_t* postThunk,
     std::wstring* error)
 {
+    if (preThunk != nullptr) { *preThunk = 0; }
+    if (postThunk != nullptr) { *postThunk = 0; }
+    if (!RequireManagedCallbackLifetime(error))
+    {
+        return false;
+    }
     return EnsureFltNopThunks(device, symbols, preThunk, postThunk, error);
 }
 
@@ -3990,6 +4022,38 @@ bool MinifilterIrpScannerSelfTest()
     bool ok = true;
     do
     {
+        // Exercise public entry points without a driver: the lifetime guard
+        // must run before device queries, layout discovery, or pointer writes.
+        DeviceClient closedDevice;
+        SymbolEngine symbols;
+        MinifilterIrpScanner scanner(closedDevice, symbols);
+        for (MinifilterIrpAction action : {MinifilterIrpAction::Disable, MinifilterIrpAction::Enable})
+        {
+            for (MinifilterIrpWhich which : {MinifilterIrpWhich::Pre, MinifilterIrpWhich::Post, MinifilterIrpWhich::Both})
+            {
+                MinifilterIrpChange change = {};
+                MinifilterIrpBatchResult batch = {};
+                std::wstring error;
+                if (scanner.SetIrp(L"fixture", 0, action, which, &change, nullptr, &error) ||
+                    error.find(L"callback mutation is unavailable") == std::wstring::npos ||
+                    change.PreChanged || change.PostChanged || change.LiveNodesChanged != 0)
+                {
+                    return false;
+                }
+                error.clear();
+                if (scanner.SetAllIrps(L"fixture", action, which, &batch, nullptr, &error) ||
+                    error.find(L"callback mutation is unavailable") == std::wstring::npos ||
+                    batch.Changed != 0 || batch.LiveNodesChanged != 0)
+                {
+                    return false;
+                }
+            }
+        }
+        uint64_t pre = 1, post = 1;
+        if (ResolveMinifilterNopThunks(closedDevice, symbols, &pre, &post, nullptr) || pre != 0 || post != 0)
+        {
+            return false;
+        }
         uint32_t major = 0;
         if (!ParseMinifilterIrpMajor(L"IRP_MJ_CREATE", &major, nullptr) || major != 0)
         {

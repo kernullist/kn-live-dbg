@@ -5382,6 +5382,10 @@ bool KernelCallbackScanner::SetModuleCallbacks(
         }
 
         *result = KernelCallbackSetResult{};
+        if (!RequireManagedCallbackLifetime(error))
+        {
+            break;
+        }
         result->Action = (action == KernelCallbackSetAction::Disable) ? L"disable" : L"enable";
         result->Scope = scope.empty() ? L"all" : ToLowerLocal(scope);
         result->Module = CallbackTrimCopy(moduleFilter);
@@ -5690,6 +5694,23 @@ bool KernelCallbackScannerSelfTest()
     bool ok = true;
     do
     {
+        DeviceClient closedDevice;
+        SymbolEngine symbols;
+        KernelCallbackScanner scanner(closedDevice, symbols);
+        for (const wchar_t* scope : {L"all", L"object", L"registry", L"process", L"thread", L"imageload", L"minifilter"})
+        {
+            for (KernelCallbackSetAction action : {KernelCallbackSetAction::Disable, KernelCallbackSetAction::Enable})
+            {
+                KernelCallbackSetResult result = {};
+                std::wstring error;
+                if (scanner.SetModuleCallbacks(scope, L"fixture", action, &result, &error) ||
+                    error.find(L"callback mutation is unavailable") == std::wstring::npos ||
+                    result.Changed != 0)
+                {
+                    return false;
+                }
+            }
+        }
         constexpr uint64_t slotAddress = 0xFFFFF80000001000ull;
         constexpr uint64_t blockAddress = 0xFFFF900000001000ull;
         uint64_t observedSlot = blockAddress | 5;

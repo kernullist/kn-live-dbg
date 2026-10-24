@@ -11,7 +11,9 @@
 namespace
 {
     constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
-    constexpr uint32_t kMaxDispatchSlots = 128;
+    // Current PDBs expose more than 128 private dispatch pointer fields.
+    // Retain a bounded walk while allowing a page of independently typed slots.
+    constexpr uint32_t kMaxDispatchSlots = 512;
 
     bool IsKernelAddress(uint64_t value)
     {
@@ -398,7 +400,7 @@ bool HalDispatchScanner::Scan(const Options& options, HalDispatchScanResult* res
             Target target = {};
             target.Symbol = L"nt!HalDispatchTable";
             target.Name = L"HalDispatchTable";
-            target.TypeNames = {L"nt!_HAL_DISPATCH"};
+            target.TypeNames = {L"nt!_HAL_DISPATCH", L"nt!HAL_DISPATCH"};
             target.Optional = false;
             targets.push_back(target);
         }

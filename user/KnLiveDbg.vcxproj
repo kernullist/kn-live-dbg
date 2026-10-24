@@ -102,6 +102,9 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <Manifest Include="KnLiveDbg.manifest" />
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="AddressInspector.cpp" />
     <ClCompile Include="AiCapabilityCatalog.cpp" />
     <ClCompile Include="AiModelCatalog.cpp" />
