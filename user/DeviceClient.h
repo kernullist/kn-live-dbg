@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <mutex>
+#include "../shared/KnLiveDbgManagedCallbacks.h"
 
 struct PhysicalTranslationInfo
 {
@@ -125,6 +127,12 @@ public:
     bool Open(const std::wstring& userDeviceName, std::wstring* error);
     void Close();
     bool IsOpen() const;
+
+    // The provider owns callbacks and rundown. Closing this client releases
+    // its control lease; no provider code ever points into KnLiveDbg.sys.
+    bool ControlManagedCallbacks(uint32_t action, uint32_t mask, uint64_t expectedFilter,
+        KNDBG_MANAGED_CALLBACK_STATUS* status, std::wstring* error);
+    void CloseManagedCallbacks();
 
     // Boot-stable type index of "File" objects, learned by matching this
     // client's own device handle in a SystemExtendedHandleInformation walk
@@ -276,4 +284,6 @@ private:
         DWORD* deviceError = nullptr);
 
     HANDLE device_;
+    HANDLE managedCallbackPort_ = INVALID_HANDLE_VALUE;
+    std::mutex managedCallbackMutex_;
 };

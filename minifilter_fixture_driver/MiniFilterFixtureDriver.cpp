@@ -1,23 +1,9 @@
 #include <fltKernel.h>
+#include "ManagedCallbacks.h"
 
 namespace
 {
     PFLT_FILTER g_Filter = nullptr;
-
-    FLT_PREOP_CALLBACK_STATUS FLTAPI PassThroughCreate(
-        _Inout_ PFLT_CALLBACK_DATA data,
-        _In_ PCFLT_RELATED_OBJECTS objects,
-        _Outptr_result_maybenull_ PVOID* completionContext)
-    {
-        UNREFERENCED_PARAMETER(data);
-        UNREFERENCED_PARAMETER(objects);
-
-        if (completionContext != nullptr)
-        {
-            *completionContext = nullptr;
-        }
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
 
     NTSTATUS FLTAPI InstanceSetup(
         _In_ PCFLT_RELATED_OBJECTS objects,
@@ -71,7 +57,9 @@ namespace
 
         if (g_Filter != nullptr)
         {
+            ManagedCallbacksStop();
             FltUnregisterFilter(g_Filter);
+            ManagedCallbacksUnregistered();
             g_Filter = nullptr;
         }
         return STATUS_SUCCESS;
@@ -83,8 +71,8 @@ namespace
             {
                 IRP_MJ_CREATE,
                 0,
-                PassThroughCreate,
-                nullptr
+                ManagedPreCreate,
+                ManagedPostCreate
             },
             {
                 IRP_MJ_OPERATION_END,
@@ -112,6 +100,7 @@ NTSTATUS DriverEntry(
         return STATUS_INVALID_PARAMETER;
     }
 
+    ManagedCallbacksInitialize();
     g_Registration =
         FLT_REGISTRATION{};
     g_Registration.Size =
@@ -142,11 +131,13 @@ NTSTATUS DriverEntry(
         return status;
     }
 
-    status =
-        FltStartFiltering(g_Filter);
+    status = ManagedCallbacksStart(g_Filter);
+    if (NT_SUCCESS(status)) status = FltStartFiltering(g_Filter);
     if (!NT_SUCCESS(status))
     {
+        ManagedCallbacksStop();
         FltUnregisterFilter(g_Filter);
+        ManagedCallbacksUnregistered();
         g_Filter = nullptr;
     }
     return status;

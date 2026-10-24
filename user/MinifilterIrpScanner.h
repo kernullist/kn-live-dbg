@@ -58,6 +58,8 @@ struct MinifilterFilterRecord
     std::wstring Notes;
     bool WellKnownInbox = false;
     bool LiveLayoutAvailable = false;
+    bool Managed = false;
+    KNDBG_MANAGED_CALLBACK_STATUS ManagedState = {};
     std::vector<MinifilterIrpSlot> OperationsTable;
     std::vector<MinifilterIrpSlot> LiveCallbackTable;
 };
@@ -74,6 +76,8 @@ struct MinifilterIrpChange
     bool WellKnownInbox = false;
     uint32_t LiveNodesChanged = 0;
     uint32_t LiveNodesFailed = 0;
+    bool Managed = false;
+    KNDBG_MANAGED_CALLBACK_STATUS ManagedState = {};
 };
 
 struct MinifilterIrpBatchResult
@@ -144,8 +148,10 @@ std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change);
 std::wstring BuildMinifilterIrpBatchJson(const MinifilterIrpBatchResult& batch);
 bool MinifilterIrpScannerSelfTest();
 // Raw callback replacement has no kernel-owned lifetime/rundown contract.
-// Keep every public mutation entry point fail-closed until one exists.
+// External raw mutation remains fail-closed; the cooperative provider is separate.
 bool RequireManagedCallbackLifetime(std::wstring* error);
+bool IsManagedCallbackTarget(const std::wstring& name);
+std::wstring BuildManagedCallbackStatusJson(const KNDBG_MANAGED_CALLBACK_STATUS& status);
 uint32_t MinifilterCallbackIndexFromMajor(uint32_t majorFunction);
 bool ResolveMinifilterNopThunks(
     DeviceClient& device,

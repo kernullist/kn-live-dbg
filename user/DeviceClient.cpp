@@ -6,6 +6,7 @@
 
 #include <limits>
 #include <sstream>
+#include <fltUser.h>
 
 static std::wstring DeviceErrorText(const wchar_t* prefix, DWORD error)
 {
@@ -82,6 +83,15 @@ bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
 
 void DeviceClient::Close()
 {
+    // Keep the port and device close in the same critical section as control
+    // requests. A concurrent status query must not reopen a lease between the
+    // port close and the device becoming unavailable.
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    if (managedCallbackPort_ != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(managedCallbackPort_);
+        managedCallbackPort_ = INVALID_HANDLE_VALUE;
+    }
     if (device_ != INVALID_HANDLE_VALUE)
     {
         CloseHandle(device_);
@@ -92,6 +102,66 @@ void DeviceClient::Close()
 bool DeviceClient::IsOpen() const
 {
     return device_ != INVALID_HANDLE_VALUE;
+}
+
+void DeviceClient::CloseManagedCallbacks()
+{
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    if (managedCallbackPort_ != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(managedCallbackPort_);
+        managedCallbackPort_ = INVALID_HANDLE_VALUE;
+    }
+}
+
+bool DeviceClient::ControlManagedCallbacks(uint32_t action, uint32_t mask,
+    uint64_t expectedFilter, KNDBG_MANAGED_CALLBACK_STATUS* status, std::wstring* error)
+{
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    if (status == nullptr || !IsOpen())
+    {
+        if (error != nullptr) *error = L"managed callback control requires an open driver session and output";
+        return false;
+    }
+    *status = {};
+    HRESULT hr = S_OK;
+    if (managedCallbackPort_ == INVALID_HANDLE_VALUE)
+    {
+        hr = FilterConnectCommunicationPort(KNDBG_MANAGED_CALLBACK_PORT, 0,
+            nullptr, 0, nullptr, &managedCallbackPort_);
+    }
+    KNDBG_MANAGED_CALLBACK_REQUEST request = {};
+    request.Magic = KNDBG_MANAGED_CALLBACK_MAGIC;
+    request.Version = KNDBG_MANAGED_CALLBACK_VERSION;
+    request.Size = sizeof(request);
+    request.Action = action;
+    request.Mask = mask;
+    request.ExpectedFilter = expectedFilter;
+    DWORD returned = 0;
+    if (SUCCEEDED(hr))
+        hr = FilterSendMessage(managedCallbackPort_, &request, sizeof(request),
+            status, sizeof(*status), &returned);
+    if (FAILED(hr) || returned != sizeof(*status) ||
+        status->Magic != KNDBG_MANAGED_CALLBACK_MAGIC ||
+        status->Version != KNDBG_MANAGED_CALLBACK_VERSION || status->Size != sizeof(*status) ||
+        status->SupportedMask != KNDBG_MANAGED_BOTH || status->Filter == 0 ||
+        (action != KNDBG_MANAGED_QUERY && status->Filter != expectedFilter))
+    {
+        // Do not retry a mutation after an uncertain reply. Closing the lease
+        // restores defaults in the provider, including on transport failure.
+        if (managedCallbackPort_ != INVALID_HANDLE_VALUE) CloseHandle(managedCallbackPort_);
+        managedCallbackPort_ = INVALID_HANDLE_VALUE;
+        if (error != nullptr)
+        {
+            std::wstringstream message;
+            message << L"managed callback provider unavailable, disconnected, busy, or protocol mismatch (hr=0x"
+                    << std::hex << static_cast<unsigned long>(hr) << L"); control lease closed";
+            *error = message.str();
+        }
+        *status = {};
+        return false;
+    }
+    return true;
 }
 
 bool DeviceClient::QueryFileObjectTypeIndex(uint32_t* objectTypeIndex, std::wstring* error)

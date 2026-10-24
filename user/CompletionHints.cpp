@@ -251,10 +251,10 @@ namespace
         { L"thread", L"!callbacks thread [module]", L"PspCreateThreadNotifyRoutine blocks" },
         { L"imageload", L"!callbacks imageload [module]", L"PspLoadImageNotifyRoutine blocks" },
         { L"minifilter", L"!callbacks minifilter [module]", L"minifilter operations from fltmgr!FltGlobals" },
-        { L"disable", L"!callbacks disable <scope> <module>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"enable", L"!callbacks enable <scope> <module>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"disable-all", L"!callbacks disable-all <module>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"enable-all", L"!callbacks enable-all <module>", L"unavailable: callback lifetime/rundown is not implemented" },
+        { L"disable", L"!callbacks disable <scope> <module>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"enable", L"!callbacks enable <scope> <module>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"disable-all", L"!callbacks disable-all <module>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"enable-all", L"!callbacks enable-all <module>", L"cooperative fixture only; external raw writes unavailable" },
         { L"/module", L"!callbacks [scope] [module|/module <module>]", L"keep records owned by that module name or stem" },
         { L"help", nullptr, L"show !callbacks usage" },
     };
@@ -678,10 +678,10 @@ namespace
         { L"show", L"!minifilter show <name|addr>", L"one filter and its IRP slots" },
         { L"status", L"!minifilter status <name|address> <IRP_MJ_*|all>", L"alias for !minifilter irp" },
         { L"irp", L"!minifilter irp <name|addr> <mj>", L"print one IRP pre/post slot" },
-        { L"disable", L"!minifilter disable <name|addr> <mj|all>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"enable", L"!minifilter enable <name|addr> <mj|all>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"disable-all", L"!minifilter disable-all <name|addr>", L"unavailable: callback lifetime/rundown is not implemented" },
-        { L"enable-all", L"!minifilter enable-all <name|addr>", L"unavailable: callback lifetime/rundown is not implemented" },
+        { L"disable", L"!minifilter disable <name|addr> <mj|all>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"enable", L"!minifilter enable <name|addr> <mj|all>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"disable-all", L"!minifilter disable-all <name|addr>", L"cooperative fixture only; external raw writes unavailable" },
+        { L"enable-all", L"!minifilter enable-all <name|addr>", L"cooperative fixture only; external raw writes unavailable" },
         { L"/json", L"/json <path>", L"write structured JSON" },
         { L"help", nullptr, L"show !minifilter usage" },
     };
@@ -1357,11 +1357,11 @@ namespace
 
     const CompletionScopeTable kCallbackScopes[] =
     {
-        SCOPE(L"write-module", L"!callbacks disable|enable <scope> <module|/module <module>>", L"legacy callback mutation is unavailable", kCallbackWriteAllTokens),
-        SCOPE(L"", L"!callbacks [all|object|registry|process|thread|imageload|minifilter] [module] | disable|enable <scope> <module>", L"inspect callbacks; mutation is unavailable", kCallbackTokens),
+        SCOPE(L"write-module", L"!callbacks disable|enable <scope> <module|/module <module>>", L"cooperative fixture only; provider-owned rundown", kCallbackWriteAllTokens),
+        SCOPE(L"", L"!callbacks [all|object|registry|process|thread|imageload|minifilter] [module] | disable|enable <scope> <module>", L"inspect callbacks; cooperative fixture control", kCallbackTokens),
         SCOPE(L"filter", L"!callbacks [scope] [module|/module <module>]", L"module-filtered callback listing", kCallbackWriteAllTokens),
-        SCOPE(L"write", L"!callbacks disable|enable <scope> <module>", L"legacy callback mutation is unavailable", kCallbackWriteTokens),
-        SCOPE(L"write-all", L"!callbacks disable-all|enable-all <module>", L"legacy callback mutation is unavailable", kCallbackWriteAllTokens),
+        SCOPE(L"write", L"!callbacks disable|enable <scope> <module>", L"cooperative fixture only; provider-owned rundown", kCallbackWriteTokens),
+        SCOPE(L"write-all", L"!callbacks disable-all|enable-all <module>", L"cooperative fixture only; provider-owned rundown", kCallbackWriteAllTokens),
     };
 
     const CompletionScopeTable kDmlProcScopes[] =
@@ -1599,14 +1599,14 @@ namespace
 
     const CompletionScopeTable kMinifilterScopes[] =
     {
-        SCOPE(L"", L"!minifilter [list|show|irp|disable|enable|disable-all|enable-all]", L"inspect filters; mutation is unavailable", kMinifilterRootTokens),
+        SCOPE(L"", L"!minifilter [list|show|irp|disable|enable|disable-all|enable-all]", L"inspect filters; cooperative fixture control", kMinifilterRootTokens),
         SCOPE(L"show", L"!minifilter show <name|address> [/json <path>]", L"show filter IRP callbacks", kMinifilterActionTokens),
         SCOPE(L"irp", L"!minifilter irp <name|address> <IRP_MJ_*|all> [/json <path>]", L"irp filter IRP callbacks", kMinifilterActionTokens),
         SCOPE(L"status", L"!minifilter status <name|address> <IRP_MJ_*|all> [/json <path>]", L"status filter IRP callbacks", kMinifilterActionTokens),
-        SCOPE(L"disable", L"!minifilter disable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"legacy callback mutation is unavailable", kMinifilterActionTokens),
-        SCOPE(L"enable", L"!minifilter enable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"legacy callback mutation is unavailable", kMinifilterActionTokens),
-        SCOPE(L"disable-all", L"!minifilter disable-all <name|address> [/pre|/post|/both] [/json <path>]", L"legacy callback mutation is unavailable", kMinifilterActionTokens),
-        SCOPE(L"enable-all", L"!minifilter enable-all <name|address> [/pre|/post|/both] [/json <path>]", L"legacy callback mutation is unavailable", kMinifilterActionTokens),
+        SCOPE(L"disable", L"!minifilter disable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"cooperative fixture only; provider-owned rundown", kMinifilterActionTokens),
+        SCOPE(L"enable", L"!minifilter enable <name|address> <IRP_MJ_*|all> [/pre|/post|/both] [/json <path>]", L"cooperative fixture only; provider-owned rundown", kMinifilterActionTokens),
+        SCOPE(L"disable-all", L"!minifilter disable-all <name|address> [/pre|/post|/both] [/json <path>]", L"cooperative fixture only; provider-owned rundown", kMinifilterActionTokens),
+        SCOPE(L"enable-all", L"!minifilter enable-all <name|address> [/pre|/post|/both] [/json <path>]", L"cooperative fixture only; provider-owned rundown", kMinifilterActionTokens),
     };
 
     const CompletionScopeTable kWnfScopes[] =

@@ -4113,6 +4113,23 @@ bool KernelCallbackScanner::ScanMinifilterCallbacks(KernelCallbackScanResult* re
             break;
         }
 
+        KNDBG_MANAGED_CALLBACK_STATUS managed = {};
+        bool queriedManaged = false;
+        bool managedKnown = false;
+        for (auto& record : result->Records)
+        {
+            if (!IsManagedCallbackTarget(record.FilterName) || record.MajorFunction != 0) continue;
+            if (!queriedManaged)
+            {
+                managedKnown = device_.ControlManagedCallbacks(KNDBG_MANAGED_QUERY, 0, 0, &managed, nullptr);
+                queriedManaged = true;
+            }
+            if (managedKnown && managed.Filter == record.Filter)
+            {
+                record.Notes += L"; provider-owned CREATE body enabled_mask=" + std::to_wstring(managed.EnabledMask) +
+                    L" owner_pid=" + std::to_wstring(managed.OwnerPid) + L"; registered wrappers unchanged";
+            }
+        }
         ok = true;
     } while (false);
 
@@ -5309,6 +5326,8 @@ std::wstring BuildCallbackSetJson(const KernelCallbackSetResult& result)
     out += L",\"failed\":" + std::to_wstring(result.Failed);
     out += L",\"minifilterLiveNodesChanged\":" + std::to_wstring(result.MinifilterLiveNodesChanged);
     out += L",\"minifilterLiveNodesFailed\":" + std::to_wstring(result.MinifilterLiveNodesFailed);
+    out += L",\"managed\":";
+    out += result.Managed ? BuildManagedCallbackStatusJson(result.ManagedState) : L"null";
     out += L",\"changes\":[";
     for (size_t index = 0; index < result.Changes.size(); ++index)
     {
@@ -5382,6 +5401,31 @@ bool KernelCallbackScanner::SetModuleCallbacks(
         }
 
         *result = KernelCallbackSetResult{};
+        const std::wstring managedScope = scope.empty() ? L"all" : ToLowerLocal(scope);
+        if (IsManagedCallbackTarget(moduleFilter) &&
+            (managedScope == L"all" || managedScope == L"minifilter"))
+        {
+            if (action != KernelCallbackSetAction::Disable && action != KernelCallbackSetAction::Enable)
+            {
+                if (error != nullptr) *error = L"invalid cooperative callback action";
+                break;
+            }
+            MinifilterIrpScanner scanner(device_, symbols_);
+            MinifilterIrpBatchResult batch;
+            if (!scanner.SetAllIrps(KNDBG_MANAGED_CALLBACK_FILTER,
+                    action == KernelCallbackSetAction::Disable ? MinifilterIrpAction::Disable : MinifilterIrpAction::Enable,
+                    MinifilterIrpWhich::Both, &batch, nullptr, error)) break;
+            result->Action = action == KernelCallbackSetAction::Disable ? L"disable" : L"enable";
+            result->Scope = managedScope;
+            result->Module = moduleFilter;
+            result->Attempted = batch.Attempted;
+            result->Changed = batch.Changed;
+            result->Skipped = batch.Skipped;
+            result->Managed = true;
+            result->ManagedState = batch.Changes.front().ManagedState;
+            ok = true;
+            break;
+        }
         if (!RequireManagedCallbackLifetime(error))
         {
             break;

@@ -3327,6 +3327,14 @@ bool MinifilterIrpScanner::Scan(MinifilterIrpScanResult* result, std::wstring* e
         {
             break;
         }
+        for (auto& filter : result->Filters)
+        {
+            if (!IsManagedCallbackTarget(filter.Name)) continue;
+            std::wstring managedError;
+            filter.Managed = device_.ControlManagedCallbacks(KNDBG_MANAGED_QUERY, 0, 0,
+                &filter.ManagedState, &managedError) && filter.ManagedState.Filter == filter.Filter;
+            if (!filter.Managed) filter.Notes += L"; cooperative callback state unavailable";
+        }
         ok = true;
     } while (false);
     return ok;
@@ -3384,7 +3392,7 @@ bool MinifilterIrpScanner::SetIrp(
             break;
         }
         *change = MinifilterIrpChange{};
-        if (action != MinifilterIrpAction::Status &&
+        if (action != MinifilterIrpAction::Status && !IsManagedCallbackTarget(specifier) &&
             !RequireManagedCallbackLifetime(error))
         {
             break;
@@ -3403,7 +3411,8 @@ bool MinifilterIrpScanner::SetIrp(
         }
 
         MinifilterFilterRecord filter = {};
-        if (!Show(specifier, &filter, result, error))
+        if (!Show(IsManagedCallbackTarget(specifier) ? KNDBG_MANAGED_CALLBACK_FILTER : specifier,
+                &filter, result, error))
         {
             break;
         }
@@ -3435,6 +3444,30 @@ bool MinifilterIrpScanner::SetIrp(
 
         if (action == MinifilterIrpAction::Status)
         {
+            change->Managed = filter.Managed;
+            change->ManagedState = filter.ManagedState;
+            ok = true;
+            break;
+        }
+
+        if (IsManagedCallbackTarget(specifier))
+        {
+            if (!filter.Managed || majorFunction != 0 ||
+                (action != MinifilterIrpAction::Disable && action != MinifilterIrpAction::Enable) ||
+                (which != MinifilterIrpWhich::Both && which != MinifilterIrpWhich::Pre &&
+                 which != MinifilterIrpWhich::Post))
+            {
+                if (error != nullptr) *error = L"cooperative provider must be loaded and support this CREATE action";
+                break;
+            }
+            const uint32_t mask = which == MinifilterIrpWhich::Pre ? KNDBG_MANAGED_PRE :
+                which == MinifilterIrpWhich::Post ? KNDBG_MANAGED_POST : KNDBG_MANAGED_BOTH;
+            if (!device_.ControlManagedCallbacks(action == MinifilterIrpAction::Disable
+                    ? KNDBG_MANAGED_DISABLE : KNDBG_MANAGED_ENABLE,
+                    mask, filter.Filter, &change->ManagedState, error)) break;
+            change->Managed = true;
+            // PreChanged/PostChanged describe registered pointers. Only the
+            // provider's body state changed; report that separately in JSON.
             ok = true;
             break;
         }
@@ -3687,8 +3720,26 @@ bool MinifilterIrpScanner::SetAllIrps(
             break;
         }
         *batch = MinifilterIrpBatchResult{};
-        if (!RequireManagedCallbackLifetime(error))
+        if (!IsManagedCallbackTarget(specifier) && !RequireManagedCallbackLifetime(error))
         {
+            break;
+        }
+        if (IsManagedCallbackTarget(specifier))
+        {
+            MinifilterIrpChange change = {};
+            if (action != MinifilterIrpAction::Disable && action != MinifilterIrpAction::Enable)
+            {
+                if (error != nullptr) *error = L"SetAllIrps requires disable or enable";
+                break;
+            }
+            if (!SetIrp(KNDBG_MANAGED_CALLBACK_FILTER, 0, action, which, &change, result, error)) break;
+            batch->Filter = change.Filter;
+            batch->FilterName = change.FilterName;
+            batch->Attempted = 1;
+            batch->Changed = change.ManagedState.PreviousEnabledMask != change.ManagedState.EnabledMask ? 1u : 0u;
+            batch->Skipped = 1 - batch->Changed;
+            batch->Changes.push_back(change);
+            ok = true;
             break;
         }
         if (action != MinifilterIrpAction::Disable && action != MinifilterIrpAction::Enable)
@@ -3881,6 +3932,8 @@ std::wstring BuildMinifilterIrpJson(const MinifilterIrpScanResult& result)
         out += L",\"activeOperationCount\":" + std::to_wstring(filter.ActiveOperationCount);
         out += L",\"instanceCount\":" + std::to_wstring(filter.InstanceCount);
         out += L",\"liveCallbackCount\":" + std::to_wstring(filter.LiveCallbackCount);
+        out += L",\"managed\":";
+        out += filter.Managed ? BuildManagedCallbackStatusJson(filter.ManagedState) : L"null";
         out += L",\"liveLayoutAvailable\":";
         out += filter.LiveLayoutAvailable ? L"true" : L"false";
         out += L",\"wellKnownInbox\":";
@@ -3940,6 +3993,8 @@ std::wstring BuildMinifilterIrpChangeJson(const MinifilterIrpChange& change)
     out += change.WellKnownInbox ? L"true" : L"false";
     out += L",\"liveNodesChanged\":" + std::to_wstring(change.LiveNodesChanged);
     out += L",\"liveNodesFailed\":" + std::to_wstring(change.LiveNodesFailed);
+    out += L",\"managed\":";
+    out += change.Managed ? BuildManagedCallbackStatusJson(change.ManagedState) : L"null";
     out += L"}";
     return out;
 }
@@ -3989,11 +4044,40 @@ bool RequireManagedCallbackLifetime(std::wstring* error)
     // rundown protocol, including failure/termination paths.
     if (error != nullptr)
     {
-        *error = L"callback mutation is unavailable: kernel-owned callback lifetime "
-                 L"and rundown are not implemented; no pointers were changed. "
-                 L"Use read-only callback inspection or the filter's supported lifecycle API.";
+        *error = L"callback mutation is unavailable for this target: raw pointer replacement "
+                 L"has no provider-owned lifetime/rundown; no pointers were changed. "
+                 L"Only KnLiveDbgMiniFilterFixture supports cooperative CREATE control. "
+                 L"Use read-only inspection or the target's supported lifecycle API.";
     }
     return false;
+}
+
+bool IsManagedCallbackTarget(const std::wstring& name)
+{
+    return _wcsicmp(name.c_str(), KNDBG_MANAGED_CALLBACK_FILTER) == 0 ||
+        _wcsicmp(name.c_str(), L"KnLiveDbgMiniFilterFixture.sys") == 0;
+}
+
+std::wstring BuildManagedCallbackStatusJson(const KNDBG_MANAGED_CALLBACK_STATUS& status)
+{
+    std::wstring out = L"{\"mode\":\"provider-owned-rundown\",\"enabledMask\":" + std::to_wstring(status.EnabledMask);
+    out += L",\"previousEnabledMask\":" + std::to_wstring(status.PreviousEnabledMask);
+    out += L",\"preBodyChanged\":";
+    out += ((status.PreviousEnabledMask ^ status.EnabledMask) & KNDBG_MANAGED_PRE) != 0 ? L"true" : L"false";
+    out += L",\"postBodyChanged\":";
+    out += ((status.PreviousEnabledMask ^ status.EnabledMask) & KNDBG_MANAGED_POST) != 0 ? L"true" : L"false";
+    out += L",\"drainingMask\":" + std::to_wstring(status.DrainingMask);
+    out += L",\"ownerPid\":" + std::to_wstring(status.OwnerPid);
+    out += L",\"generation\":" + std::to_wstring(status.Generation);
+    out += L",\"automaticRestores\":" + std::to_wstring(status.AutomaticRestores);
+    out += L",\"activePre\":" + std::to_wstring(status.ActivePre);
+    out += L",\"activePost\":" + std::to_wstring(status.ActivePost);
+    out += L",\"preEntered\":" + std::to_wstring(status.PreEntered);
+    out += L",\"postEntered\":" + std::to_wstring(status.PostEntered);
+    out += L",\"preSkipped\":" + std::to_wstring(status.PreSkipped);
+    out += L",\"postSkipped\":" + std::to_wstring(status.PostSkipped);
+    out += L",\"pointersChanged\":false}";
+    return out;
 }
 
 bool ResolveMinifilterNopThunks(
@@ -4022,6 +4106,14 @@ bool MinifilterIrpScannerSelfTest()
     bool ok = true;
     do
     {
+        if (!IsManagedCallbackTarget(L"KnLiveDbgMiniFilterFixture") ||
+            !IsManagedCallbackTarget(L"knlivedbgminifilterfixture.SYS") ||
+            IsManagedCallbackTarget(L"KnLiveDbgMiniFilterFixtureOther") ||
+            IsManagedCallbackTarget(L"C:\\KnLiveDbgMiniFilterFixture.sys") ||
+            IsManagedCallbackTarget(L"WdFilter") || IsManagedCallbackTarget(L""))
+        {
+            return false;
+        }
         // Exercise public entry points without a driver: the lifetime guard
         // must run before device queries, layout discovery, or pointer writes.
         DeviceClient closedDevice;

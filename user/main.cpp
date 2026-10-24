@@ -1958,9 +1958,10 @@ static void PrintCallbacksHelp()
     std::wcout << L"  The scanner locates callback roots from symbols or self-discovered kernel lists.\n";
     std::wcout << L"  Module filters match callback function owners case-insensitively by image name or stem.\n";
     std::wcout << L"  Some private callback item layouts are absent from public PDBs; fallback notes are printed per record.\n";
-    std::wcout << L"  disable/enable/disable-all/enable-all are unavailable, including with 'write on'.\n";
-    std::wcout << L"  Raw replacement lacks kernel-owned callback lifetime and rundown; driver unload can cause 0xCE.\n";
-    std::wcout << L"  These legacy commands fail before changing pointers. Inspection remains available.\n";
+    std::wcout << L"  Raw callback writes are unavailable, including with 'write on'.\n";
+    std::wcout << L"  KnLiveDbgMiniFilterFixture alone supports cooperative CREATE pre/post control (scope minifilter/all).\n";
+    std::wcout << L"  Its kernel owns rundown and restores defaults on disconnect/process exit; no registered pointers change.\n";
+    std::wcout << L"  Unsupported targets fail before changing pointers. Inspection remains available.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !callbacks all\n";
@@ -2089,7 +2090,7 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"important output:\n";
         std::wcout << L"  altitude, filter, frame, driverObject, major, function, and post identify filter ownership.\n";
         std::wcout << L"  module filters match operation callback function owners case-insensitively.\n";
-        std::wcout << L"  disable/enable are unavailable: callback lifetime and rundown are not implemented.\n";
+        std::wcout << L"  disable/enable support only the cooperative KnLiveDbgMiniFilterFixture provider.\n";
     }
     else if (scope == L"disable" || scope == L"enable")
     {
@@ -2097,7 +2098,8 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  !callbacks " << scope << L" <all|object|registry|process|thread|imageload|minifilter> <module>\n";
         std::wcout << L"  !callbacks " << scope << L" <scope> /module <module>\n";
         std::wcout << L"\n";
-        std::wcout << L"  Unavailable even with write on: no kernel-owned callback lifetime and rundown.\n";
+        std::wcout << L"  Unavailable even with write on for external providers; raw pointers are never replaced.\n";
+        std::wcout << L"  KnLiveDbgMiniFilterFixture supports minifilter/all with provider-owned rundown. Requires write on.\n";
         std::wcout << L"  Fails before changing pointers. Use read-only inspection or supported lifecycle APIs.\n";
     }
     else if (scope == L"disable-all" || scope == L"enable-all")
@@ -2106,7 +2108,7 @@ static bool PrintCallbackScopeHelp(const std::wstring& requestedScope)
         std::wcout << L"  !callbacks " << scope << L" <module>\n";
         std::wcout << L"  !callbacks " << scope << L" /module <module>\n";
         std::wcout << L"\n";
-        std::wcout << L"  Unavailable even with write on: no kernel-owned callback lifetime and rundown.\n";
+        std::wcout << L"  Unavailable even with write on for external providers. KnLiveDbgMiniFilterFixture supports cooperative control.\n";
     }
     else
     {
@@ -11402,6 +11404,12 @@ static void PrintCallbackSetResult(const KernelCallbackSetResult& result)
     }
     std::wcout << L"\n";
 
+    if (result.Managed)
+    {
+        std::wcout << L"  provider-owned-rundown enabled_mask=" << result.ManagedState.EnabledMask
+                   << L" previous_mask=" << result.ManagedState.PreviousEnabledMask
+                   << L" owner_pid=" << result.ManagedState.OwnerPid << L" pointers_changed=0\n";
+    }
     for (const KernelCallbackPointerChange& change : result.Changes)
     {
         if (!change.Changed && change.Skipped)
@@ -14834,23 +14842,28 @@ static void PrintMinifilterHelp()
     std::wcout << L"\n";
     std::wcout << L"  Walks fltmgr!FltGlobals frames, FLT_FILTER.Operations, and the live\n";
     std::wcout << L"  FLT_INSTANCE.CallbackNodes that FltMgr actually dispatches (PDB layout).\n";
-    std::wcout << L"  list/show/irp are read-only. disable/enable/disable-all/enable-all are unavailable.\n";
-    std::wcout << L"  Raw replacement lacks kernel-owned callback lifetime and rundown; driver unload can cause 0xCE.\n";
-    std::wcout << L"  Legacy mutation commands fail before changing pointers, including with 'write on'.\n";
+    std::wcout << L"  list/show/irp are read-only. External callback writes are unavailable.\n";
+    std::wcout << L"  Raw callback pointer replacement remains unavailable. Unsupported targets fail before changing pointers.\n";
+    std::wcout << L"  KnLiveDbgMiniFilterFixture supports disable/enable/disable-all/enable-all for CREATE with write on.\n";
+    std::wcout << L"  Its kernel owns pre/post rundown and restores defaults on disconnect or owner process exit.\n";
+    std::wcout << L"  Registered wrappers stay in the provider image; pointers_changed=0. enabled_mask: pre=1, post=2.\n";
     std::wcout << L"  Use the filter's supported lifecycle API for attachment changes.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
-    std::wcout << L"  /pre /post /both  legacy mutation selectors (mutation unavailable).\n";
+    std::wcout << L"  /pre /post /both  select the cooperative provider body (default both).\n";
     std::wcout << L"  /json <path>      write kn-live-dbg.minifilter.v1, minifilter-irp.v1, or minifilter-irp-batch.v1.\n";
     std::wcout << L"\n";
     std::wcout << L"  IRP majors accept IRP_MJ_CREATE, CREATE, directory_control, ioctl, 0x00, 0n12.\n";
-    std::wcout << L"  all / * / every / IRP_MJ_ALL remain recognized in the unavailable legacy syntax.\n";
+    std::wcout << L"  all / * / every / IRP_MJ_ALL select all supported cooperative registrations.\n";
     std::wcout << L"  Ambiguous filter names fail closed.\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
     std::wcout << L"  !minifilter\n";
     std::wcout << L"  !minifilter show UnionFS\n";
     std::wcout << L"  !minifilter irp UnionFS IRP_MJ_CREATE\n";
+    std::wcout << L"  write on\n";
+    std::wcout << L"  !minifilter disable KnLiveDbgMiniFilterFixture CREATE /pre\n";
+    std::wcout << L"  !minifilter enable-all KnLiveDbgMiniFilterFixture\n";
 }
 
 static void PrintMinifilterSlot(const MinifilterIrpSlot& slot)
@@ -14929,6 +14942,15 @@ static void PrintMinifilterFilter(const MinifilterFilterRecord& filter, bool ver
     if (!filter.Notes.empty())
     {
         std::wcout << L"  notes=" << filter.Notes << L"\n";
+    }
+    if (filter.Managed)
+    {
+        std::wcout << L"  provider-owned-rundown enabled_mask=" << filter.ManagedState.EnabledMask
+                   << L" owner_pid=" << filter.ManagedState.OwnerPid
+                   << L" generation=" << filter.ManagedState.Generation
+                   << L" automatic_restores=" << filter.ManagedState.AutomaticRestores
+                   << L" active_pre=" << filter.ManagedState.ActivePre
+                   << L" active_post=" << filter.ManagedState.ActivePost << L"\n";
     }
     if (verboseSlots)
     {
@@ -15210,6 +15232,13 @@ static void HandleMinifilterCommand(
             std::wcout << L"\n";
             for (const MinifilterIrpChange& change : batch.Changes)
             {
+                if (change.Managed)
+                {
+                    std::wcout << L"  provider-owned-rundown enabled_mask=" << change.ManagedState.EnabledMask
+                               << L" previous_mask=" << change.ManagedState.PreviousEnabledMask
+                               << L" owner_pid=" << change.ManagedState.OwnerPid << L" pointers_changed=0\n";
+                    continue;
+                }
                 if (!change.PreChanged && !change.PostChanged)
                 {
                     continue;
@@ -15264,6 +15293,13 @@ static void HandleMinifilterCommand(
         std::wcout << L" " << (change.FilterName.empty() ? L"<unnamed>" : change.FilterName)
                    << L" " << change.Before.MajorName
                    << L" action=" << action << L"\n";
+        if (change.Managed)
+        {
+            std::wcout << L"  provider-owned-rundown enabled_mask=" << change.ManagedState.EnabledMask
+                       << L" previous_mask=" << change.ManagedState.PreviousEnabledMask
+                       << L" owner_pid=" << change.ManagedState.OwnerPid << L" pointers_changed=0\n";
+            break;
+        }
         std::wcout << L"  before pre=" << HexTextWidth(change.Before.Pre, 16, true)
                    << L" post=" << HexTextWidth(change.Before.Post, 16, true) << L"\n";
         std::wcout << L"  after  pre=" << HexTextWidth(change.After.Pre, 16, true)
@@ -35386,17 +35422,29 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
 
             if (!setModule.empty())
             {
-                plan.BackupCommand = L"!callbacks " + setScope + L" " + setModule;
+                if (IsManagedCallbackTarget(setModule) &&
+                    (ToLower(setScope) == L"all" || ToLower(setScope) == L"minifilter"))
+                {
+                    // The provider controls only CREATE bodies. Unrelated
+                    // executive PDB gaps must not invalidate its state query.
+                    plan.TargetKind = L"managed-callback";
+                    plan.ByteCountText = L"0 (registered pointers unchanged)";
+                    plan.BackupCommand = L"!minifilter show " KNDBG_MANAGED_CALLBACK_FILTER;
+                }
+                else
+                {
+                    plan.BackupCommand = L"!callbacks " + setScope + L" " + setModule;
+                }
                 plan.VerifyCommand = plan.BackupCommand;
             }
 
             if (action == L"disable" || action == L"disable-all")
             {
-                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
+                plan.Warning = L"cooperative CREATE control is supported only by KnLiveDbgMiniFilterFixture; external raw callback writes are rejected";
             }
             else if (action == L"enable" || action == L"enable-all")
             {
-                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
+                plan.Warning = L"cooperative CREATE control is supported only by KnLiveDbgMiniFilterFixture; external raw callback writes are rejected";
             }
             else
             {
@@ -35444,11 +35492,11 @@ static AiWriteSafetyPlan BuildWriteSafetyPlan(
             }
             if (action == L"disable" || action == L"disable-all")
             {
-                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
+                plan.Warning = L"cooperative CREATE control is supported only by KnLiveDbgMiniFilterFixture; external raw callback writes are rejected";
             }
             else if (action == L"enable" || action == L"enable-all")
             {
-                plan.Warning = L"unavailable: raw callback replacement has no kernel-owned lifetime/rundown; execution will fail before writes";
+                plan.Warning = L"cooperative CREATE control is supported only by KnLiveDbgMiniFilterFixture; external raw callback writes are rejected";
             }
             else
             {
@@ -50771,11 +50819,19 @@ static McpEngineResult DispatchMcpWriteTool(
 
         // Unavailable callback writes must report the lifetime failure even
         // when the target is absent; a backup query must not mask the guard.
-        if ((tool == L"minifilter.set_irp" || tool == L"callbacks.set") &&
-            !RequireManagedCallbackLifetime(&result.Text))
+        if (tool == L"minifilter.set_irp" || tool == L"callbacks.set")
         {
-            result.IsError = true;
-            break;
+            std::wstring target, scope;
+            McpGetArg(argsJson, tool == L"minifilter.set_irp" ? L"filter" : L"module", &target);
+            McpGetArg(argsJson, L"scope", &scope);
+            const bool supportedScope = tool == L"minifilter.set_irp" || scope.empty() ||
+                ToLower(scope) == L"all" || ToLower(scope) == L"minifilter";
+            if ((!IsManagedCallbackTarget(target) || !supportedScope) &&
+                !RequireManagedCallbackLifetime(&result.Text))
+            {
+                result.IsError = true;
+                break;
+            }
         }
 
         // Build the deterministic safety plan, then run backup -> write ->

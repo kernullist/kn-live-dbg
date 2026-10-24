@@ -986,7 +986,7 @@ try
             -ErrorPath (Join-Path $outputPath "mutation-guard-help.stderr.log") `
             -Context "mutation guard capability check"
         if ((Get-Content -LiteralPath $guardHelp -Raw) -notmatch
-            'disable/enable/disable-all/enable-all are unavailable')
+            'Raw callback pointer replacement remains unavailable')
         {
             throw "executable does not advertise the callback lifetime guard; refusing legacy mutation probe"
         }
@@ -995,17 +995,18 @@ try
         $guardAfter = Join-Path $outputPath "mutation-guard-after.json"
         $guardOut = Join-Path $outputPath "mutation-guard.stdout.log"
         $guardErr = Join-Path $outputPath "mutation-guard.stderr.log"
+        $unsupportedTarget = "KnLiveDbgUnsupportedCallbackProvider"
         $guardCommands = @(
-            "!minifilter disable $filterName CREATE /pre",
-            "!minifilter enable $filterName CREATE /pre",
-            "!fltmgr disable $filterName all /both",
-            "!fltmgr enable $filterName all /both",
-            "!minifilter disable-all $filterName /post",
-            "!minifilter enable-all $filterName /post",
-            "!callbacks disable minifilter $filterName",
-            "!callbacks enable minifilter $filterName",
-            "!callbacks disable-all $filterName",
-            "!callbacks enable-all $filterName"
+            "!minifilter disable $unsupportedTarget CREATE /pre",
+            "!minifilter enable $unsupportedTarget CREATE /pre",
+            "!fltmgr disable $unsupportedTarget all /both",
+            "!fltmgr enable $unsupportedTarget all /both",
+            "!minifilter disable-all $unsupportedTarget /post",
+            "!minifilter enable-all $unsupportedTarget /post",
+            "!callbacks disable minifilter $unsupportedTarget",
+            "!callbacks enable minifilter $unsupportedTarget",
+            "!callbacks disable-all $unsupportedTarget",
+            "!callbacks enable-all $unsupportedTarget"
         )
         Invoke-KnLiveDbgScript -Executable $executable `
             -Commands (@("write on", "!minifilter show $filterName /json `"$guardBefore`"") +
@@ -1020,6 +1021,11 @@ try
             Where-Object { $_.name -eq $filterName })
         $afterFilter = @((Get-Content -LiteralPath $guardAfter -Raw | ConvertFrom-Json).filters |
             Where-Object { $_.name -eq $filterName })
+        # Provider counters are live telemetry, not registration pointers.
+        foreach ($entry in @($beforeFilter) + @($afterFilter))
+        {
+            $entry.PSObject.Properties.Remove("managed")
+        }
         if ($beforeFilter.Count -ne 1 -or $afterFilter.Count -ne 1 -or
             $beforeFilter[0].instanceCount -lt 1 -or $beforeFilter[0].liveCallbackCount -lt 1 -or
             (ConvertTo-Json -InputObject $beforeFilter[0] -Depth 20 -Compress) -ne

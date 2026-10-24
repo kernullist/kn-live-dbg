@@ -98,7 +98,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="MiniFilterFixtureDriver.cpp" />
+    <ClCompile Include="ManagedCallbacks.cpp" />
+    <ClInclude Include="ManagedCallbacks.h" />
+    <ClInclude Include="..\shared\KnLiveDbgManagedCallbacks.h" />
   </ItemGroup>
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ResourceCompile Include="KnLiveDbgMiniFilterFixture.rc" />
   </ItemGroup>

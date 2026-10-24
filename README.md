@@ -21,6 +21,7 @@ The [kernel capture and detection latency follow-up](docs/KMON_CAPTURE_LATENCY_V
 The [background completion and image-name follow-up](docs/KMON_BACKGROUND_COMPLETION_VALIDATION_20261024.md) covers prioritizing short remaining image ranges, checking mappings before retrying names, and repeated full-process validation.
 The [large background image follow-up](docs/KMON_LARGE_BACKGROUND_VALIDATION_20261024.md) covers progress-based scheduling, exact byte comparison, and repeatability of observed address coverage under the same controls.
 The [native feature validation](docs/NATIVE_FEATURE_VALIDATION_20261024.md) records direct execution of the other feature families, snapshot and module-inventory fixes, BYOVD version accuracy, TI log persistence, and controlled detection results.
+The [managed callback validation](docs/MANAGED_CALLBACK_VALIDATION_20261025.md) describes the cooperative test provider, kernel-owned rundown, automatic restoration, and termination/unload tests. External callback pointer replacement remains unavailable.
 
 ## Demo
 
@@ -94,7 +95,7 @@ kn-live-dbg/
 30. Captures same-boot session baselines with `!snapshot` and compares them with `!diff` -- keeping the baseline in memory, auto-writing JSON plus Markdown under `.kn-live-dbg`, reporting added/escalated records plus coverage-gated callback removal and `_EPROCESS.Protection` changes, scanning VAD DKOM hidden-PTE evidence for every newly observed live process, and ordering pool findings so pool-PE suspects, pool-PE hits, W+X NonPaged allocations, and large NonPaged allocations surface first. A `kpage` domain records every executable kernel region outside loaded modules (PTE walk, pool-type and tag agnostic), so a before/after `!diff baseline /domain kpage /risk high` surfaces mapper code hidden in pool even without a PE header.
 31. Dumps kernel memory to file with `dump-raw <address> <length> <path> [/zerofill]` -- chunked 256 KB reads through the driver IOCTL with optional zero-fill on per-chunk failure -- reconstructs on-disk PE images from running drivers/`ntoskrnl` with `dump-pe <address> <path>`, writes a WinDbg-openable complete dump with `dump-kernel <path>` (8 KB `DUMP_HEADER64` plus streamed physical RAM runs from `MmGetPhysicalMemoryRanges`), and asks Windows for an OS live kernel dump with `dump-live <path>` via `NtSystemDebugControl(SysDbgGetLiveKernelDump)`, or writes a WinDbg kernel complete dump of one process with `dump-live <path> /user <pid|eprocess>`. `dump-analyze <path>` is offline: it parses that `DUMP_HEADER64`, lists physical runs, and walks `PsLoadedModuleList` through 4-level or LA57 5-level paging. `dump-pe` parses the in-memory `IMAGE_DOS_HEADER`/`IMAGE_NT_HEADERS` (PE32 and PE32+), copies each section's `SizeOfRawData` bytes from `address + VirtualAddress` to file offset `PointerToRawData`, and zero-fills sections whose reads fail (discarded INIT, paged-out sections) so the dump remains valid for IDA/Ghidra inspection of relocations-applied, IAT-resolved, in-place-patched live images. Both `dump-raw` and `dump-pe` also target another process's user-mode address space with `[/pid N | /name <image>]`: `dump-raw` reads any user VA range (loader modules, manual maps, heap stubs; `PROCESS_VM_READ` handle first so it works without the driver, kernel `ReadProcessVirtual` fallback for restricted/protected targets), and `dump-pe` rebuilds a user-mode mapped image -- loader module, manual map, or MUI data-file view -- with the same on-disk reconstruction, so a `kmon`-flagged `private_exec_pe`/`cloned_vtable` region can be pulled straight from the live box.
 32. Hunts PE images stashed in big pool with `!pool pe` -- enumerates big pool entries via `NtQuerySystemInformation(SystemBigPoolInformation)` and runs the same plausibility-gated NT header detector used by `dump-pe` on each entry's first 4 KB, surfacing reflective-loaded modules, unpacker stages, and stomped driver replacements even when the operator has stripped `MZ` / `PE\0\0` / `e_lfanew` to evade signature scanners. Hits are tagged with `WIPED=[MZ,e_lfanew,PE]` markers and can be dumped to disk in one shot via `/dump <directory>` (reusing the dump-pe section walker + signature recovery).
-33. Inspects filesystem minifilters and IRP pre/post handlers with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB layouts. Legacy `disable`/`enable`/`disable-all`/`enable-all` commands in both `!minifilter` and `!callbacks` are unavailable: raw pointer replacement lacks kernel-owned callback lifetime and rundown, and caused a confirmed `0xCE` crash after driver unload. These commands now fail before writes. The supported attach/detach/reattach fixture remains available; `tools\run-minifilter-detach-e2e.ps1 -CheckMutationGuard` also verifies refusal and unchanged registration.
+33. Inspects filesystem minifilters and IRP pre/post handlers with `!minifilter`. The walk uses `fltmgr!FltGlobals` and PDB layouts. `KnLiveDbgMiniFilterFixture` supports cooperative CREATE pre/post disable/enable through its own kernel control port and rundown; its registered pointers remain unchanged. The provider restores defaults on control-port disconnect or owner process exit, including when a duplicated port handle survives. External raw pointer replacement remains unavailable after a confirmed `0xCE` unload crash. The attach/detach/reattach fixture and rejection regression remain available.
 34. Traces leftover mapper payloads after the original driver image is gone, as separate layers. `!byovd` is loaded BYOVD. `!mapper` is bookkeeping remnants (`MmUnloadedDrivers` / PiDDB / ci hash); `leftover=0` is ledger-clean, not payload-absent. `!kpage` is orphan executable pages; `!kpage /deep` adds a capped PFN-database pass. `!payload` / `!payload scan` is hook-to-body. `!pool pe` is staged pool PE. None of these add driver IOCTLs.
 35. Introspects a single virtual address with `!address <va>` -- reports canonicality, kernel vs user half, the live page-table walk (PML5/PML4/PDPTE/PDE/PTE values and addresses), effective R/W/X/U permissions ANDed across every traversed level, large-page detection, the resulting physical address and page offset, and the owning kernel module + nearest symbol. Auto-detects LA57 paging from the driver TranslateVirtual response and adjusts the kernel/user half-space split accordingly.
 36. Elevates KnLiveDbg.exe to PPL Antimalware with `set-ppl-antimalware [on|off|status]` -- the driver writes `0x31` (PS_PROTECTION: PPL/Antimalware) into the calling process's `_EPROCESS.Protection` byte. Required prerequisite for subscribing to the Microsoft-Windows-Threat-Intelligence ETW provider, which gates events on the consumer being PPL Antimalware.
@@ -1363,12 +1364,9 @@ The elevated positive-control gate exercises every VAD filter plus both new mode
 !callbacks object WdFilter.sys
 !callbacks minifilter UnionFS
 write on
-!callbacks disable object WdFilter
-!callbacks disable process WdFilter.sys
-!callbacks disable minifilter WdFilter
-!callbacks disable-all WdFilter
-!callbacks enable object WdFilter
-!callbacks enable-all WdFilter
+!callbacks disable minifilter KnLiveDbgMiniFilterFixture
+!callbacks disable-all KnLiveDbgMiniFilterFixture
+!callbacks enable-all KnLiveDbgMiniFilterFixture
 ```
 
 The scanner currently covers:
@@ -1380,7 +1378,7 @@ The scanner currently covers:
 5. Image load callbacks by enumerating and validating load-image notify routine table candidates such as `PspLoadImageNotifyRoutine`, then decoding callback routine blocks with the same stable x64 fallback.
 6. Minifilter callbacks by discovering `fltmgr!FltGlobals`, validating the frame-list root, walking `FrameList`, each `_FLTP_FRAME.RegisteredFilters`, and each `_FLT_FILTER.Operations` registration array.
 
-Legacy `disable`/`enable`/`disable-all`/`enable-all` syntax is recognized but unavailable, including through MCP `callbacks.set` and with `write on`. A confirmed `0xCE` crash showed FltMgr calling a replacement in `KnLiveDbg.sys` after it unloaded. User-mode backups cannot guarantee callback lifetime or drain in-flight calls. All mutation entry points now reject before device queries or writes; use the read-only inspection commands or the target driver's supported lifecycle API.
+`disable`/`enable`/`disable-all`/`enable-all` support only `KnLiveDbgMiniFilterFixture`, with scope `minifilter` or `all`, including MCP `callbacks.set`. The test provider owns its CREATE bodies and rundown; registered wrappers stay in its image. A confirmed `0xCE` crash showed why replacing an external filter's pointers with `KnLiveDbg.sys` addresses is unsafe. External targets and object/registry/process/thread/image-load mutation still reject before pointer writes. Use read-only inspection or the target driver's supported lifecycle API for those targets.
 
 Each record prints the discovered root address and source, callback function address, nearest symbol, owning module, object type name/index/address and discovery source for object callbacks, minifilter name/altitude/frame/driver object when present, callback/list block addresses, altitude when present, and registration/callback context pointer. Object callback rows use `object=<name>` in both the header and detail line so Process, Thread, Desktop, and other object-manager surfaces are visible without interpreting the raw `_OBJECT_TYPE` address. Image-load output uses `function` for the `PLOAD_IMAGE_NOTIFY_ROUTINE` owner and reports the decoded notify block plus raw encoded slot value. Minifilter output includes operation callbacks, filter unload, instance setup/teardown, name provider, KTM, section, and volume-mount routines when the target build exposes those fields. Add a module name after the callback scope, for example `!callbacks object WdFilter.sys` or `!callbacks minifilter UnionFS`, to print only records whose pre/function or post callback is owned by that module; the match is case-insensitive and treats `WdFilter` and `WdFilter.sys` as the same module stem. Registry callback routines are validated against loaded kernel image ranges before being emitted. Registration and callback context pointers are annotated with a module and nearest symbol only when they point into a loaded kernel image; process creation notify block context values are printed as `notifyType=<decoded-api> metadata=<hex>` because they are internal notify metadata, not callback module pointers. The implementation is PDB-driven where public or private type metadata exists; the expected public-PDB object-callback item fallback is validated against live pointers before records are emitted, while warnings are reserved for partial PDB layouts, structure drift, or failed validation.
 
@@ -1924,17 +1922,42 @@ owners, and observed coverage. `!fltmgr` is an alias.
 !minifilter irp <name|address> <IRP_MJ_*> [/json <path>]
 ```
 
-`disable`/`enable`/`disable-all`/`enable-all` and MCP `minifilter.set_irp`
-are unavailable. Raw replacement has no kernel-owned callback lifetime or
-rundown protocol and can leave calls into an unloaded driver. The commands
-fail before writes; `write on` does not bypass this guard. Supported filter
-attachment changes are covered by `tools/run-minifilter-detach-e2e.ps1`;
-add `-CheckMutationGuard` to verify rejection and unchanged fixture pointers.
+`disable`/`enable`/`disable-all`/`enable-all` and MCP `minifilter.set_irp` support
+only the cooperative `KnLiveDbgMiniFilterFixture` CREATE registration, selected
+by its exact name (or `.sys` name). `/pre`, `/post`, and `/both` select its harmless
+counting bodies; `all` selects the provider's supported registration. `write on`
+is required. The provider's kernel waits for active bodies before acknowledging
+disable. Closing the controller's device session or terminating its process
+restores both bodies. A pause survives supported instance detach/reattach while
+that control lease remains active. No registered pointer or external code changes.
+`all` covers these CREATE bodies; lifecycle and process-exit notifications remain registered.
+
+`show` and mutation JSON expose `managed.enabledMask` (`pre=1`, `post=2`),
+active/entered/skipped counters, owner PID, and automatic restoration count.
+Pointer fields still describe the registered wrappers; they stay nonzero when
+a body is paused. General callback inspection annotates the cooperative body
+state in notes. Unsupported targets remain unavailable, even with `write on`.
+
+Run `python tools/run-managed-callback-e2e.py --output .build/managed-callback/run1`
+from an elevated shell after a Release build. It refuses existing fixture or
+controller services, creates its own demand-start fixture, and removes it on
+completion. It exercises only this harmless provider, including process death,
+duplicated handles, reply failure, real rundown waits, and unload under I/O.
+To include the controller's concurrent port/device-close test, first build
+`tools/validate-managed-callback-close.ps1 -BuildOnly`, then pass
+`--close-race-executable .build/managed-close-selftest/managed-callback-close-selftest.exe`
+to the Python harness. This adds 100 close cycles with four concurrent readers.
+Supported attachment changes are also covered by
+`tools/run-minifilter-detach-e2e.ps1 -CheckMutationGuard`; the guard probe now
+targets an unsupported name and verifies that the fixture's registration stays intact.
 
 ```text
 knkd> !minifilter
 knkd> !minifilter show UnionFS
 knkd> !minifilter irp UnionFS CREATE
+knkd> write on
+knkd> !minifilter disable KnLiveDbgMiniFilterFixture CREATE /pre
+knkd> !minifilter enable-all KnLiveDbgMiniFilterFixture
 ```
 
 ## Threat-Intelligence ETW (`!ti`)

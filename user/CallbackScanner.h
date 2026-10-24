@@ -87,6 +87,8 @@ struct KernelCallbackSetResult
     uint32_t Failed = 0;
     uint32_t MinifilterLiveNodesChanged = 0;
     uint32_t MinifilterLiveNodesFailed = 0;
+    bool Managed = false;
+    KNDBG_MANAGED_CALLBACK_STATUS ManagedState = {};
     std::vector<KernelCallbackPointerChange> Changes;
     std::vector<std::wstring> Failures;
     std::vector<std::wstring> Warnings;
