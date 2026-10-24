@@ -22,6 +22,7 @@ The [background completion and image-name follow-up](docs/KMON_BACKGROUND_COMPLE
 The [large background image follow-up](docs/KMON_LARGE_BACKGROUND_VALIDATION_20261024.md) covers progress-based scheduling, exact byte comparison, and repeatability of observed address coverage under the same controls.
 The [native feature validation](docs/NATIVE_FEATURE_VALIDATION_20261024.md) records direct execution of the other feature families, snapshot and module-inventory fixes, BYOVD version accuracy, TI log persistence, and controlled detection results.
 The [managed callback validation](docs/MANAGED_CALLBACK_VALIDATION_20261025.md) describes the cooperative test provider, kernel-owned rundown, automatic restoration, and termination/unload tests. External callback pointer replacement remains unavailable.
+The [external callback lifetime review](docs/EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) explains the dispatch-before-entry and pending-completion gaps, and tests registered wrapper lifetime separately from body rundown.
 
 ## Demo
 
@@ -1937,6 +1938,9 @@ active/entered/skipped counters, owner PID, and automatic restoration count.
 Pointer fields still describe the registered wrappers; they stay nonzero when
 a body is paused. General callback inspection annotates the cooperative body
 state in notes. Unsupported targets remain unavailable, even with `write on`.
+Local thunk rundown and filter references do not establish an external callback
+dispatch/completion contract. The lifetime review above records why the raw
+replacement guard remains in place.
 
 Run `python tools/run-managed-callback-e2e.py --output .build/managed-callback/run1`
 from an elevated shell after a Release build. It refuses existing fixture or

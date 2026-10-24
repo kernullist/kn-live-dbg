@@ -15,6 +15,9 @@
 #define KNDBG_MANAGED_RELEASE 3u
 // A bounded, one-shot delay in our harmless CREATE body, for rundown testing.
 #define KNDBG_MANAGED_TEST_HOLD 4u
+// Test the gap before the body acquires its own rundown. The registered wrapper
+// is still protected by FltMgr; this must never be used to justify raw hooks.
+#define KNDBG_MANAGED_TEST_HOLD_BEFORE_BODY 5u
 
 struct KNDBG_MANAGED_CALLBACK_REQUEST
 {

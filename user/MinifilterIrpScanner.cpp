@@ -4040,12 +4040,16 @@ bool RequireManagedCallbackLifetime(std::wstring* error)
     // User-mode backups cannot own callback registration lifetime, drain
     // in-flight calls, cover newly attached instances, or survive controller
     // termination. Restoring a pointer before SCM unload is not sufficient.
-    // Do not re-enable raw replacements without a kernel-owned lifetime and
-    // rundown protocol, including failure/termination paths.
+    // A rundown acquired inside a replacement still misses callers that have
+    // fetched its address but have not entered it. Pinning a filter only delays
+    // destruction; it neither serializes dispatch nor drains pre/post pairs.
+    // External providers must participate before pointer publication and own
+    // completion/teardown. Local thunk rundown alone cannot lift this guard.
     if (error != nullptr)
     {
         *error = L"callback mutation is unavailable for this target: raw pointer replacement "
                  L"has no provider-owned lifetime/rundown; no pointers were changed. "
+                 L"Local rundown cannot drain dispatch before entry or pending pre/post completions. "
                  L"Only KnLiveDbgMiniFilterFixture supports cooperative CREATE control. "
                  L"Use read-only inspection or the target's supported lifecycle API.";
     }
@@ -4054,8 +4058,12 @@ bool RequireManagedCallbackLifetime(std::wstring* error)
 
 bool IsManagedCallbackTarget(const std::wstring& name)
 {
-    return _wcsicmp(name.c_str(), KNDBG_MANAGED_CALLBACK_FILTER) == 0 ||
-        _wcsicmp(name.c_str(), L"KnLiveDbgMiniFilterFixture.sys") == 0;
+    // JSON strings can contain embedded NULs. Compare the complete name, not
+    // just the prefix seen by _wcsicmp, before granting the provider capability.
+    constexpr wchar_t imageName[] = L"KnLiveDbgMiniFilterFixture.sys";
+    return (name.size() == _countof(KNDBG_MANAGED_CALLBACK_FILTER) - 1 &&
+            _wcsicmp(name.c_str(), KNDBG_MANAGED_CALLBACK_FILTER) == 0) ||
+        (name.size() == _countof(imageName) - 1 && _wcsicmp(name.c_str(), imageName) == 0);
 }
 
 std::wstring BuildManagedCallbackStatusJson(const KNDBG_MANAGED_CALLBACK_STATUS& status)
@@ -4114,6 +4122,10 @@ bool MinifilterIrpScannerSelfTest()
         {
             return false;
         }
+        std::wstring embeddedNul = KNDBG_MANAGED_CALLBACK_FILTER;
+        embeddedNul += L'\0';
+        embeddedNul += L".sys";
+        if (IsManagedCallbackTarget(embeddedNul)) return false;
         // Exercise public entry points without a driver: the lifetime guard
         // must run before device queries, layout discovery, or pointer writes.
         DeviceClient closedDevice;

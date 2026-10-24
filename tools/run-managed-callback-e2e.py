@@ -5,6 +5,7 @@ Requires a built/test-signed Release tree. Refuses pre-existing fixture services
 Never loads or modifies another filter, security policy, or callback pointer.
 """
 import argparse
+import contextlib
 import ctypes as c
 from ctypes import wintypes as w
 import json
@@ -29,12 +30,63 @@ flt.FilterConnectCommunicationPort.argtypes = [w.LPCWSTR, w.DWORD, c.c_void_p, w
 flt.FilterConnectCommunicationPort.restype = c.c_long
 flt.FilterSendMessage.argtypes = [w.HANDLE, c.c_void_p, w.DWORD, c.c_void_p, w.DWORD, c.POINTER(w.DWORD)]
 flt.FilterSendMessage.restype = c.c_long
+flt.FilterUnload.argtypes = [w.LPCWSTR]
+flt.FilterUnload.restype = c.c_long
 kernel.CloseHandle.argtypes = [w.HANDLE]
 kernel.DuplicateHandle.argtypes = [w.HANDLE, w.HANDLE, w.HANDLE, c.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD]
 kernel.VirtualAlloc.argtypes = [c.c_void_p, c.c_size_t, w.DWORD, w.DWORD]
 kernel.VirtualAlloc.restype = c.c_void_p
 kernel.VirtualProtect.argtypes = [c.c_void_p, c.c_size_t, w.DWORD, c.POINTER(w.DWORD)]
 kernel.VirtualFree.argtypes = [c.c_void_p, c.c_size_t, w.DWORD]
+
+
+@contextlib.contextmanager
+def driver_load_privilege():
+    """FilterUnload needs SeLoadDriverPrivilege enabled, not merely elevation.
+
+    fltmc enables its own token privilege. Direct FltLib calls must do the same;
+    restore the caller's previous token state even when the call fails.
+    """
+    class Luid(c.Structure):
+        _fields_ = [('LowPart', w.DWORD), ('HighPart', w.LONG)]
+    class LuidAttributes(c.Structure):
+        _fields_ = [('Luid', Luid), ('Attributes', w.DWORD)]
+    class Privileges(c.Structure):
+        _fields_ = [('Count', w.DWORD), ('Entries', LuidAttributes * 1)]
+    advapi = c.WinDLL('advapi32.dll', use_last_error=True)
+    advapi.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, c.POINTER(w.HANDLE)]
+    advapi.OpenProcessToken.restype = w.BOOL
+    advapi.LookupPrivilegeValueW.argtypes = [w.LPCWSTR, w.LPCWSTR, c.POINTER(Luid)]
+    advapi.LookupPrivilegeValueW.restype = w.BOOL
+    advapi.AdjustTokenPrivileges.argtypes = [w.HANDLE, w.BOOL, c.POINTER(Privileges),
+        w.DWORD, c.POINTER(Privileges), c.POINTER(w.DWORD)]
+    advapi.AdjustTokenPrivileges.restype = w.BOOL
+    token = w.HANDLE()
+    if not advapi.OpenProcessToken(w.HANDLE(-1), 0x20 | 0x8, c.byref(token)):
+        raise c.WinError(c.get_last_error())
+    previous, desired, returned = Privileges(), Privileges(), w.DWORD()
+    changed = False
+    try:
+        desired.Count = 1
+        desired.Entries[0].Attributes = 2
+        if not advapi.LookupPrivilegeValueW(None, 'SeLoadDriverPrivilege', c.byref(desired.Entries[0].Luid)):
+            raise c.WinError(c.get_last_error())
+        c.set_last_error(0)
+        if not advapi.AdjustTokenPrivileges(token, False, c.byref(desired), c.sizeof(previous),
+                c.byref(previous), c.byref(returned)):
+            raise c.WinError(c.get_last_error())
+        changed = True
+        if c.get_last_error() != 0:
+            raise c.WinError(c.get_last_error())
+        yield
+    finally:
+        try:
+            if changed:
+                c.set_last_error(0)
+                if not advapi.AdjustTokenPrivileges(token, False, c.byref(previous), 0, None, None) or c.get_last_error() != 0:
+                    raise c.WinError(c.get_last_error())
+        finally:
+            kernel.CloseHandle(token)
 
 
 class Request(c.Structure):
@@ -191,17 +243,27 @@ def main():
             time.sleep(.01)
         raise TimeoutError('kernel did not release control lease')
 
-    def hold_body(owner, observer, bit, milliseconds=500):
+    def hold_body(owner, observer, bit, milliseconds=500, before_entry=False):
         before = observer.send()
-        owner.send(4, bit, milliseconds, os.getpid())
+        owner.send(5 if before_entry else 4, bit, milliseconds, os.getpid())
         until = time.monotonic() + 5
         while time.monotonic() < until:
             state = observer.send()
             if state.HoldEntered == before.HoldEntered + 1 and state.HoldCompleted == before.HoldCompleted:
-                assert getattr(state, 'ActivePre' if bit == 1 else 'ActivePost') > 0
+                if not before_entry:
+                    assert getattr(state, 'ActivePre' if bit == 1 else 'ActivePost') > 0
                 return state
             time.sleep(.001)
         raise TimeoutError('real callback hold was not observed')
+
+    def wait_hold_complete(observer, held):
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            state = observer.send()
+            if state.HoldCompleted == held.HoldEntered:
+                return state
+            time.sleep(.001)
+        raise TimeoutError('registered wrapper did not finish its bounded delay')
 
     def cleanup_main():
         path = r'SYSTEM\CurrentControlSet\Services\KnLiveDbg'
@@ -248,7 +310,11 @@ def main():
                 check('paused-bodies-no-new-entry', after.EnabledMask == 0 and after.ActivePre == after.ActivePost == 0 and
                       after.PreEntered == before.PreEntered and after.PostEntered == before.PostEntered and
                       after.PreSkipped > before.PreSkipped and after.PostSkipped > before.PostSkipped)
-                for changes in (dict(Version=2), dict(Mask=4), dict(Reserved=1), dict(ExpectedFilter=1)):
+                for changes in (dict(Version=2), dict(Mask=4), dict(Reserved=1), dict(ExpectedFilter=1),
+                                dict(Action=6),
+                                dict(Action=5, Mask=1, HoldMilliseconds=501, HoldProcessId=os.getpid()),
+                                dict(Action=5, Mask=3, HoldMilliseconds=100, HoldProcessId=os.getpid()),
+                                dict(Action=5, Mask=1, HoldMilliseconds=100, HoldProcessId=4)):
                     try:
                         owner.send(1, 3, **changes) if 'Mask' not in changes else owner.send(1, **changes)
                         raise AssertionError('malformed request accepted')
@@ -296,6 +362,20 @@ def main():
                       query_results['count'] > 0 and not query_results['errors'], **query_results)
                 check('repeated-transitions', True, cycles=args.cycles, transitions=args.cycles * 6)
                 owner.send(2, 3)
+                # Demonstrate the exact boundary of local body rundown: an
+                # already-dispatched wrapper can still be before its acquire.
+                # Its code stays safe because FltMgr owns this registered wrapper.
+                for iteration in range(3):
+                    for bit, active, entered in ((1, 'ActivePre', 'PreEntered'), (2, 'ActivePost', 'PostEntered')):
+                        held = hold_body(owner, observer, bit, before_entry=True)
+                        state = owner.send(1, bit)
+                        pending = state.HoldCompleted < held.HoldEntered
+                        finished = wait_hold_complete(observer, held)
+                        check(f'before-entry-rundown-gap-{iteration}-{bit}', pending and
+                              getattr(state, active) == 0 and
+                              getattr(finished, entered) == getattr(state, entered),
+                              body_active=getattr(state, active), wrapper_still_pending=pending)
+                        owner.send(2, 3)
                 for bit, active in ((1, 'ActivePre'), (2, 'ActivePost')):
                     held = hold_body(owner, observer, bit, 400)
                     check('inflight-observed-' + str(bit), getattr(held, active) > 0)
@@ -385,6 +465,40 @@ def main():
                     child.terminate()
                     child.wait(10)
 
+            # Normal and forced owner exit while a registered wrapper is before
+            # its body rundown acquire. Existing native-controller cases below
+            # separately exercise the public console and KnLiveDbg.sys teardown.
+            for force in (False, True):
+                for bit in (1, 2):
+                    child = subprocess.Popen([sys.executable, __file__, '--lease-child'],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    try:
+                        json.loads(child.stdout.readline())
+                        class ChildOwner:
+                            def send(self, action, mask, hold_ms=0, hold_pid=0):
+                                child.stdin.write(json.dumps(dict(action=action, mask=mask,
+                                    hold_ms=hold_ms, hold_pid=hold_pid)) + '\n')
+                                child.stdin.flush()
+                                return json.loads(child.stdout.readline())
+                        child_owner = ChildOwner()
+                        child_owner.send(2, 3)
+                        held = hold_body(child_owner, observer, bit, before_entry=True)
+                        if force:
+                            child.terminate()
+                        else:
+                            child.stdin.close()
+                        child.wait(10)
+                        restored = wait_default(observer)
+                        finished = wait_hold_complete(observer, held)
+                        check(f'before-entry-owner-exit-{force}-{bit}',
+                              (force or child.returncode == 0) and restored.OwnerPid == 0 and
+                              finished.EnabledMask == 3 and finished.DrainingMask == 0)
+                    finally:
+                        if child.poll() is None:
+                            child.terminate()
+                            child.wait(10)
+
             for force in (False, True):
                 for iteration in range(3):
                     tag = ('forced' if force else 'normal') + '-' + str(iteration)
@@ -402,6 +516,24 @@ def main():
                         native.command('!minifilter enable-all ' + NAME)
                     baseline = native.json_command('!minifilter show ' + NAME, 'before')['filters']
                     baseline = next(x for x in baseline if x['name'] == NAME)
+                    if not force and iteration == 0:
+                        # A real loaded target, selected by raw address rather
+                        # than the provider name, must not enter the legacy path.
+                        address = baseline['filter']
+                        probes = [f'!minifilter disable {address} CREATE /both',
+                                  f'!minifilter enable {address} CREATE /both',
+                                  f'!fltmgr disable-all {address}',
+                                  f'!callbacks disable minifilter {address}',
+                                  f'!callbacks enable-all {address}']
+                        for index, command in enumerate(probes):
+                            refusal = native.command(command)
+                            check(f'loaded-address-mutation-refused-{index}',
+                                  'callback mutation is unavailable' in refusal and
+                                  observer.send().EnabledMask == 3 and observer.send().OwnerPid == native.proc.pid)
+                        unchanged = native.json_command('!minifilter show ' + NAME, 'after-raw-refusals')['filters']
+                        unchanged = next(x for x in unchanged if x['name'] == NAME)
+                        check('loaded-address-registration-unchanged', baseline['slots'] == unchanged['slots'] and
+                              baseline['liveCallbackCount'] == unchanged['liveCallbackCount'])
                     state = native.json_command('!minifilter disable ' + NAME + ' CREATE /both', 'disable')
                     check(tag + '-disabled', state['managed']['enabledMask'] == 0 and state['managed']['ownerPid'] == native.proc.pid)
                     after = native.json_command('!minifilter show ' + NAME, 'after')['filters']
@@ -463,6 +595,31 @@ def main():
                 load()
                 with Port() as observer:
                     check(f'{mode}-reload-{iteration}', observer.send().EnabledMask == 3 and observer.send().OwnerPid == 0)
+
+        # Direct FilterUnload avoids spending the hold interval launching a
+        # command process. The only pending callback here is before body rundown;
+        # FltUnregisterFilter must still wait for the FltMgr-owned wrapper.
+        for bit in (1, 2):
+            with Port() as owner, Port() as observer:
+                held = hold_body(owner, observer, bit, before_entry=True)
+                state = owner.send(1, bit)
+                check(f'unload-before-entry-observed-{bit}', state.HoldCompleted < held.HoldEntered and
+                      getattr(state, 'ActivePre' if bit == 1 else 'ActivePost') == 0)
+                with driver_load_privilege():
+                    start = time.monotonic()
+                    hr = flt.FilterUnload(NAME)
+                    duration = time.monotonic() - start
+                check(f'unload-before-entry-waits-{bit}', hr >= 0 and duration > .1,
+                      seconds=round(duration, 3), hresult=f'0x{hr & 0xffffffff:08x}')
+                try:
+                    owner.send()
+                    raise AssertionError('unloaded wrapper provider still responds')
+                except OSError:
+                    pass
+            load()
+            with Port() as observer:
+                check(f'unload-before-entry-reload-{bit}', observer.send().EnabledMask == 3 and
+                      observer.send().OwnerPid == 0)
         io_stop.set()
         for worker in workers:
             worker.join(10)
@@ -483,7 +640,8 @@ def main():
             check('fixture-cleanup', run('sc.exe', 'query', NAME, expected=None).returncode == 1060 and
                   NAME.encode() not in run('fltmc.exe', 'filters').stdout)
         (output / 'result.json').write_text(json.dumps(dict(passed=completed and all(x['passed'] for x in checks),
-            checks=len(checks), exe_sha256=__import__('hashlib').sha256(EXE.read_bytes()).hexdigest()), indent=2))
+            checks=len(checks), exe_sha256=__import__('hashlib').sha256(EXE.read_bytes()).hexdigest(),
+            fixture_sha256=__import__('hashlib').sha256((EXE.parent / (NAME + '.sys')).read_bytes()).hexdigest()), indent=2))
 
 
 if __name__ == '__main__':

@@ -24,6 +24,7 @@ namespace
     ULONG g_HoldMask;
     ULONG g_HoldMilliseconds;
     ULONG g_HoldPid;
+    bool g_HoldBeforeBody;
 
     void LockControl()
     {
@@ -72,7 +73,8 @@ namespace
     void ReleaseOwner(bool automatic)
     {
         if (g_OwnerId == 0) return;
-        // Complete any one-shot test body before ending the owner's lease.
+        // Disarm future test delays and drain bodies. FltMgr owns wrapper
+        // lifetime, including a wrapper that has not acquired body rundown.
         KIRQL irql;
         KeAcquireSpinLock(&g_State, &irql);
         g_HoldMask = 0;
@@ -171,11 +173,12 @@ namespace
         if (request.Magic != KNDBG_MANAGED_CALLBACK_MAGIC ||
             request.Version != KNDBG_MANAGED_CALLBACK_VERSION ||
             request.Size != sizeof(request) || request.Reserved != 0 ||
-            request.Action > KNDBG_MANAGED_TEST_HOLD)
+            request.Action > KNDBG_MANAGED_TEST_HOLD_BEFORE_BODY)
             return STATUS_INVALID_PARAMETER;
         const bool query = request.Action == KNDBG_MANAGED_QUERY;
         const bool release = request.Action == KNDBG_MANAGED_RELEASE;
-        const bool hold = request.Action == KNDBG_MANAGED_TEST_HOLD;
+        const bool hold = request.Action == KNDBG_MANAGED_TEST_HOLD ||
+            request.Action == KNDBG_MANAGED_TEST_HOLD_BEFORE_BODY;
         if ((query || release) ? request.Mask != 0 :
             (request.Mask == 0 || (request.Mask & ~KNDBG_MANAGED_BOTH) != 0))
             return STATUS_INVALID_PARAMETER;
@@ -225,6 +228,7 @@ namespace
                     g_HoldMask = request.Mask;
                     g_HoldMilliseconds = request.HoldMilliseconds;
                     g_HoldPid = request.HoldProcessId;
+                    g_HoldBeforeBody = request.Action == KNDBG_MANAGED_TEST_HOLD_BEFORE_BODY;
                     KeReleaseSpinLock(&g_State, irql);
                 }
                 else
@@ -259,6 +263,35 @@ namespace
         return status;
     }
 
+    void TestHoldBeforeBody(ULONG index, PFLT_CALLBACK_DATA data)
+    {
+        // Deliberately outside g_Bodies: a local rundown cannot count a caller
+        // that has not acquired it yet. Only our registered, FltMgr-owned
+        // wrapper may run this bounded test; no external pointer is replaced.
+        KeEnterCriticalRegion();
+        KIRQL irql;
+        KeAcquireSpinLock(&g_State, &irql);
+        ULONG delay = 0;
+        if (!g_Status.Stopping && g_HoldBeforeBody && g_HoldMask == (1u << index) &&
+            FltGetRequestorProcessId(data) == g_HoldPid)
+        {
+            delay = g_HoldMilliseconds;
+            g_HoldMask = 0;
+            ++g_Status.HoldEntered;
+        }
+        KeReleaseSpinLock(&g_State, irql);
+        if (delay != 0)
+        {
+            LARGE_INTEGER interval;
+            interval.QuadPart = -static_cast<LONGLONG>(delay) * 10000;
+            KeDelayExecutionThread(KernelMode, FALSE, &interval);
+            KeAcquireSpinLock(&g_State, &irql);
+            ++g_Status.HoldCompleted;
+            KeReleaseSpinLock(&g_State, irql);
+        }
+        KeLeaveCriticalRegion();
+    }
+
     void RunBody(ULONG index, PFLT_CALLBACK_DATA data)
     {
         // CREATE pre/post callbacks run at <= APC_LEVEL. Keep normal APCs
@@ -274,7 +307,7 @@ namespace
         {
             if (index == 0) { ++g_Status.ActivePre; ++g_Status.PreEntered; }
             else { ++g_Status.ActivePost; ++g_Status.PostEntered; }
-            if (g_HoldMask == bit && FltGetRequestorProcessId(data) == g_HoldPid)
+            if (!g_HoldBeforeBody && g_HoldMask == bit && FltGetRequestorProcessId(data) == g_HoldPid)
             {
                 delay = g_HoldMilliseconds;
                 g_HoldMask = 0;
@@ -371,6 +404,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI ManagedPreCreate(
 {
     UNREFERENCED_PARAMETER(objects);
     if (completionContext != nullptr) *completionContext = nullptr;
+    TestHoldBeforeBody(0, data);
     RunBody(0, data);
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -381,6 +415,10 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI ManagedPostCreate(
 {
     UNREFERENCED_PARAMETER(objects);
     UNREFERENCED_PARAMETER(completionContext);
-    if ((flags & FLTFL_POST_OPERATION_DRAINING) == 0) RunBody(1, data);
+    if ((flags & FLTFL_POST_OPERATION_DRAINING) == 0)
+    {
+        TestHoldBeforeBody(1, data);
+        RunBody(1, data);
+    }
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
