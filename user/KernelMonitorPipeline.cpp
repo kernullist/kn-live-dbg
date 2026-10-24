@@ -100,6 +100,9 @@ void KernelMonitor::ResetPipeline()
     ImageLastCompleteMs.store(0);
     ImageSweepProcessCursors[0] = {};
     ImageSweepProcessCursors[1] = {};
+    ImageSweepGroupTurns = {};
+    ImageSweepClassTurns = {};
+    ImageBorrowedBackgroundTurns = 0;
     NextImageSweepMs = 0;
     ImageSweepTurns = 0;
     ImageAdmissionDeferred = 0;
@@ -107,6 +110,7 @@ void KernelMonitor::ResetPipeline()
     NextImageAdmissionReportMs = 0;
     ImageRescanDelays.clear();
     ImageRescanDelayHits = 0;
+    ImageRescanHistoryHits = 0;
     UserLastScanMs.clear();
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
@@ -834,6 +838,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
         event.Evidence[L"layout_dropped"] = std::to_wstring(LayoutCandidates.Loss());
         event.Evidence[L"layout_peak"] = std::to_wstring(LayoutCandidates.Peak());
+        event.Evidence[L"layout_admission_limit"] = std::to_wstring(LayoutAdmissionLimit);
+        event.Evidence[L"layout_change_reserved_slots"] = std::to_wstring(LayoutChangeReserve);
         event.Evidence[L"layout_coalesced"] = std::to_wstring(LayoutCandidates.Replacements());
         event.Evidence[L"layout_source_pending"] = std::to_wstring(layout.VerificationChangesPending);
         event.Evidence[L"layout_deferred"] = std::to_wstring(layout.VerificationDeferred);
@@ -884,6 +890,12 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_watch_admission_deferred_attempts"] = std::to_wstring(ImageWatchAdmissionDeferred);
         event.Evidence[L"image_rescan_delay_entries"] = std::to_wstring(ImageRescanDelays.size());
         event.Evidence[L"image_rescan_delay_hits"] = std::to_wstring(ImageRescanDelayHits);
+        event.Evidence[L"image_rescan_history_hits"] = std::to_wstring(ImageRescanHistoryHits);
+        event.Evidence[L"image_first_watched_turns"] = std::to_wstring(ImageSweepClassTurns[0][0]);
+        event.Evidence[L"image_repeat_watched_turns"] = std::to_wstring(ImageSweepClassTurns[0][1]);
+        event.Evidence[L"image_first_background_turns"] = std::to_wstring(ImageSweepClassTurns[1][0]);
+        event.Evidence[L"image_repeat_background_turns"] = std::to_wstring(ImageSweepClassTurns[1][1]);
+        event.Evidence[L"image_borrowed_background_turns"] = std::to_wstring(ImageBorrowedBackgroundTurns);
         uint64_t imageScheduled = 0, imageTraversed = 0, imageRemaining = 0;
         for (const auto& item : ImageWork)
         {
@@ -909,6 +921,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
                 progress.Evidence[L"remaining_pages"] = std::to_wstring(work.Sweep.Ranges.size() - work.Sweep.NextRange);
                 progress.Evidence[L"last_completion_ms"] = std::to_wstring(work.Sweep.LastCompleteMs);
                 progress.Evidence[L"last_sweep_ms"] = std::to_wstring(work.LastSweepMs);
+                progress.Evidence[L"prior_traversal_ms"] = std::to_wstring(work.PriorTraversalMs);
+                progress.Evidence[L"scheduling_turns"] = std::to_wstring(work.SweepSchedulingTurns);
                 progress.Evidence[L"completed_cycles"] = std::to_wstring(work.Sweep.CompletedCycles);
                 progress.Evidence[L"last_cycle_requested_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.RequestedBytes);
                 progress.Evidence[L"last_cycle_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.ComparedBytes);
@@ -969,6 +983,45 @@ bool KmonPipelineSelfTest()
             }
             monitor.CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, &monitor);
             const auto identity = ObserveProcessIdentity(GetCurrentProcessId());
+            {
+                // A periodic burst cannot consume the changed-range reserve.
+                // Refusal retains source work; neither admission class may drop
+                // entries or renew a retained observation's original timestamp.
+                bool admission = true;
+                ProcessLayoutCandidate queued;
+                queued.Identity = identity;
+                queued.Role = L"layout_periodic";
+                queued.ObservedMs = 1;
+                for (size_t index = 0; index < 128; ++index)
+                {
+                    queued.Region.Base = 0x10000 + index * 4096;
+                    admission &= monitor.QueueLayoutCandidate(queued);
+                }
+                queued.Region.Base = 0x100000;
+                admission &= !monitor.QueueLayoutCandidate(queued);
+                queued.Role = L"layout_change";
+                for (size_t index = 0; index < 32; ++index)
+                {
+                    queued.Region.Base = 0x100000 + index * 4096;
+                    admission &= monitor.QueueLayoutCandidate(queued);
+                }
+                queued.Region.Base = 0x200000;
+                admission &= !monitor.QueueLayoutCandidate(queued);
+                queued.Role = L"layout_periodic";
+                queued.Region.Base = 0x10000;
+                queued.ObservedMs = 2; // A genuinely newer producer observation.
+                admission &= monitor.QueueLayoutCandidate(queued);
+                auto retainedCandidates = monitor.LayoutCandidates.Drain(160);
+                admission &= retainedCandidates.size() == 160 && monitor.LayoutCandidates.Loss() == 0 &&
+                    monitor.LayoutCandidates.Replacements() == 1 && retainedCandidates.front().ObservedMs == 2;
+                for (size_t index = 1; index < retainedCandidates.size(); ++index)
+                {
+                    admission &= retainedCandidates[index].ObservedMs == 1 &&
+                        retainedCandidates[index].Role == (index < 128 ? L"layout_periodic" : L"layout_change");
+                }
+                monitor.LayoutCandidates.Reset();
+                if (!admission) { break; }
+            }
             const uint64_t selfBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
             wchar_t selfPath[32768]{};
             GetModuleFileNameW(nullptr, selfPath, 32768);
@@ -991,6 +1044,7 @@ bool KmonPipelineSelfTest()
             auto completed = monitor.FindImageWork(selfPath, selfBase, identity);
             if (completed == nullptr) { break; }
             completed->Sweep.Coverage.TraversalComplete = true;
+            completed->Sweep.LastCompleteMs = GetTickCount64();
             completed->NextSweepDueMs = GetTickCount64() + 30000;
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
             if (monitor.ImageRescanDelays.size() != 1) { break; }
@@ -1006,6 +1060,7 @@ bool KmonPipelineSelfTest()
             completed = monitor.FindImageWork(selfPath, selfBase, identity);
             if (completed == nullptr) { break; }
             completed->Sweep.Coverage.TraversalComplete = true;
+            completed->Sweep.LastCompleteMs = GetTickCount64();
             completed->NextSweepDueMs = GetTickCount64() + 30000;
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
             monitor.ImageRescanDelays.begin()->second.FileId.FileId.Identifier[15] ^= 1;
@@ -1013,12 +1068,42 @@ bool KmonPipelineSelfTest()
                 !monitor.ImageRescanDelays.empty()) { break; }
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
             monitor.ImageRescanDelays.begin()->second.DueMs = GetTickCount64() - 1;
-            if (monitor.ImageRescanDelayed(selfPath, selfBase, identity, GetTickCount64()) ||
+            monitor.ImageWork.clear();
+            completed = monitor.FindImageWork(aliasPath, selfBase, identity);
+            // An evicted repeat keeps only its scheduling class. It still has
+            // to read every byte again, and cannot claim a completed cycle.
+            if (completed == nullptr || completed->PriorTraversalMs == 0 ||
+                completed->Sweep.LastCompleteMs != 0 || completed->Sweep.Coverage.TraversalComplete ||
+                completed->Sweep.Coverage.ComparedBytes != 0 || monitor.ImageRescanHistoryHits != 1) { break; }
+            const uint64_t historyNow = GetTickCount64();
+            auto& history = monitor.ImageRescanDelays.begin()->second;
+            const auto due = history.DueMs, traversed = history.TraversedMs;
+            history.ExpiresMs = historyNow + 1;
+            uint64_t rememberedTraversal = 0;
+            if (monitor.ImageRescanDelayed(aliasPath, selfBase, identity, historyNow, &rememberedTraversal) ||
+                rememberedTraversal != traversed || history.ExpiresMs != historyNow + 300000 ||
+                history.DueMs != due || history.TraversedMs != traversed) { break; }
+            // Activity can outlive the original expiry without postponing a
+            // rescan or turning historical traversal into current verification.
+            if (monitor.ImageRescanDelayed(aliasPath, selfBase, identity, historyNow + 2, &rememberedTraversal) ||
+                rememberedTraversal != traversed || history.DueMs != due ||
+                completed->Sweep.Coverage.ComparedBytes != 0 || completed->Sweep.CompletedCycles != 0) { break; }
+            const ObservationReader unreadableRepeat = [](uint64_t, size_t, std::vector<uint8_t>*) { return false; };
+            if (monitor.ScanExecutableImage(aliasPath, selfBase, identity, unreadableRepeat, 1) != CodeOwnership::OwnedUnverified ||
+                completed->Sweep.Coverage.ComparedBytes != 0 || completed->Sweep.CompletedCycles != 0) { break; }
+            monitor.ImageRescanDelays.begin()->second.ExpiresMs = GetTickCount64() - 1;
+            uint64_t expiredTraversal = 1;
+            if (monitor.ImageRescanDelayed(selfPath, selfBase, identity, GetTickCount64(), &expiredTraversal) ||
+                expiredTraversal != 0 ||
                 !monitor.ImageRescanDelays.empty()) { break; }
+            completed->Sweep.Coverage.TraversalComplete = true;
+            completed->Sweep.LastCompleteMs = GetTickCount64();
+            completed->NextSweepDueMs = GetTickCount64() + 30000;
             for (size_t i = 0; i < 4096; ++i)
             {
                 KernelMonitor::ImageRescanDelay delay;
                 delay.DueMs = GetTickCount64() + 30000;
+                delay.ExpiresMs = GetTickCount64() + 300000;
                 monitor.ImageRescanDelays.emplace(std::to_wstring(i), delay);
             }
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
@@ -1099,6 +1184,8 @@ bool KmonPipelineSelfTest()
             monitor.ImageSweepProcessCursors[0] = {};
             monitor.ImageSweepProcessCursors[1] = {};
             monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {};
+            monitor.ImageSweepClassTurns = {};
             if (!fair) { break; }
             KernelMonitor::ImageVerificationWork initial, repeat;
             initial.Loaded = repeat.Loaded = true;
@@ -1121,14 +1208,93 @@ bool KmonPipelineSelfTest()
             monitor.ImageSweepProcessCursors[0] = {};
             monitor.ImageSweepProcessCursors[1] = {};
             monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {};
+            monitor.ImageSweepClassTurns = {};
+            if (!fair) { break; }
+            // Many repeat-only processes must not dilute first traversal
+            // service. Each repeat process still gets a turn, including an
+            // evicted/recreated entry whose sweep itself has never completed.
+            for (uint32_t index = 0; index < 14; ++index)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.Loaded = true;
+                work.Identity.ProcessId = 100 + index;
+                work.Identity.CreateTime = 1;
+                work.Base = 0x10000;
+                if (index != 0) { work.PriorTraversalMs = 1; }
+                monitor.ImageWork.emplace(std::to_wstring(index), std::move(work));
+                monitor.WatchPids.insert(100 + index);
+            }
+            std::set<uint32_t> repeatedPids;
+            size_t firstService = 0;
+            for (size_t turn = 0; turn < 104; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                if (selected == nullptr) { fair = false; break; }
+                if (turn % 4 == 3)
+                {
+                    fair &= selected->PriorTraversalMs != 0;
+                    repeatedPids.insert(selected->Identity.ProcessId);
+                }
+                else { fair &= selected->Identity.ProcessId == 100; ++firstService; }
+                // Completion/eviction of an individual image cannot reset the
+                // group-level reservation for periodic rescans.
+                selected->SweepSchedulingTurns = 0;
+                selected->LastSweepMs = turn + 1;
+            }
+            fair &= firstService == 78 && repeatedPids.size() == 13;
+            for (auto& item : monitor.ImageWork) { item.second.NextSweepDueMs = 2000; }
+            const auto served = monitor.ImageSweepGroupTurns;
+            fair &= monitor.SelectImageSweepWork(1000) == nullptr && monitor.ImageSweepGroupTurns == served;
+            monitor.ImageWork.at(L"1").NextSweepDueMs = 0;
+            fair &= monitor.SelectImageSweepWork(1000) == &monitor.ImageWork.at(L"1");
+            monitor.ImageWork.clear(); monitor.WatchPids.clear();
+            monitor.ImageSweepProcessCursors = {}; monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {}; monitor.ImageSweepClassTurns = {};
+            if (!fair) { break; }
+            // Lend unused watched initial slots to background first work,
+            // while the planned watched counter still reaches its rescan slot.
+            for (uint32_t index = 0; index < 3; ++index)
+            {
+                KernelMonitor::ImageVerificationWork work;
+                work.Loaded = true; work.Identity.ProcessId = 100 + index;
+                work.Identity.CreateTime = 1; work.Base = 0x10000;
+                if (index == 0) { work.PriorTraversalMs = 1; }
+                monitor.ImageWork.emplace(std::to_wstring(index), std::move(work));
+            }
+            monitor.WatchPids.insert(100);
+            for (size_t turn = 0; turn < 64; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                if (selected == nullptr) { fair = false; break; }
+                selected->LastSweepMs = turn + 1;
+            }
+            fair &= monitor.ImageSweepClassTurns[0][1] == 12 && monitor.ImageSweepClassTurns[1][0] == 52 &&
+                monitor.ImageBorrowedBackgroundTurns == 36;
+            // With only background work, it receives the whole schedule and
+            // keeps one in four turns for rescans, not just the native share.
+            monitor.WatchPids.clear(); monitor.ImageSweepProcessCursors = {}; monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {}; monitor.ImageSweepClassTurns = {};
+            monitor.ImageBorrowedBackgroundTurns = 0;
+            for (size_t turn = 0; turn < 32; ++turn)
+            {
+                auto selected = monitor.SelectImageSweepWork(1000);
+                if (selected == nullptr) { fair = false; break; }
+                selected->LastSweepMs = turn + 1;
+            }
+            fair &= monitor.ImageSweepClassTurns[1][0] == 24 && monitor.ImageSweepClassTurns[1][1] == 8 &&
+                monitor.ImageBorrowedBackgroundTurns == 0;
+            monitor.ImageWork.clear(); monitor.ImageSweepProcessCursors = {}; monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {}; monitor.ImageSweepClassTurns = {};
             if (!fair) { break; }
             std::vector<KernelModuleInfo> owner{{selfBase, 1, selfPath, L"self"}};
-            for (uint32_t i = 0; i < 4; ++i)
+            for (uint32_t i = 0; i < 5; ++i)
             {
                 KernelMonitor::ImageVerificationWork work;
                 work.Loaded = true; work.Identity.ProcessId = 100 + i; work.Identity.CreateTime = 1;
                 work.Base = 0x10000 + i * 4096;
-                work.Sweep.Ranges.resize(i >= 2 ? 4096 : 4);
+                work.Sweep.Ranges.resize(i == 2 || i == 3 ? 4096 : 4);
+                if (i == 4) { work.PriorTraversalMs = 1; }
                 monitor.ImageWork.emplace(std::to_wstring(i), std::move(work));
             }
             monitor.WatchPids.insert(100);
@@ -1137,21 +1303,29 @@ bool KmonPipelineSelfTest()
             {
                 auto selected = monitor.SelectImageSweepWork(1000);
                 if (selected == nullptr) { fair = false; break; }
-                if (turn % 8 == 0)
+                const size_t backgroundPhase = ((turn - 1) / 4) % 4;
+                if (turn % 4 == 0 && (backgroundPhase == 1 || backgroundPhase == 2))
                 {
                     fair &= selected->Identity.ProcessId >= 102;
                     ++bulkTurns;
                     // A completed large traversal must leave the bulk queue.
                     selected->Sweep.LastCompleteMs = turn;
-                    if (turn == 16) { monitor.ImageWork.at(L"2").Sweep.LastCompleteMs = 0; monitor.ImageWork.at(L"3").Sweep.LastCompleteMs = 0; }
+                    if (backgroundPhase == 2) { monitor.ImageWork.at(L"2").Sweep.LastCompleteMs = 0; monitor.ImageWork.at(L"3").Sweep.LastCompleteMs = 0; }
                 }
                 else if (turn % 4 != 0) { fair &= selected->Identity.ProcessId == 100; ++watchedTurns; }
-                else { fair &= selected->Identity.ProcessId != 100; ++ordinaryTurns; }
+                else
+                {
+                    fair &= selected->Identity.ProcessId != 100;
+                    if (backgroundPhase == 3) { fair &= selected->Identity.ProcessId == 104; }
+                    ++ordinaryTurns;
+                }
                 selected->LastSweepMs = turn;
             }
             fair &= watchedTurns == 24 && bulkTurns == 4 && ordinaryTurns == 4;
+            fair &= monitor.ImageSweepClassTurns[1][0] == 6 && monitor.ImageSweepClassTurns[1][1] == 2;
             monitor.ImageWork.clear(); monitor.WatchPids.clear();
             monitor.ImageSweepProcessCursors[0] = {}; monitor.ImageSweepProcessCursors[1] = {}; monitor.ImageSweepTurns = 0;
+            monitor.ImageSweepGroupTurns = {}; monitor.ImageSweepClassTurns = {};
             if (!fair) { break; }
             const uint64_t code = reinterpret_cast<uint64_t>(&KmonPipelineSelfTest);
             // Allocation membership can extend beyond the reported module size;

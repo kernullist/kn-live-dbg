@@ -25,6 +25,7 @@
 #include "KmonExecutablePages.h"
 #include "ProcessLayoutMonitor.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -527,6 +528,8 @@ private:
     std::thread LayoutWorker;
     ProcessLayoutMonitor LayoutMonitor;
     bool LayoutAllProcesses = true;
+    static constexpr size_t LayoutAdmissionLimit = 160;
+    static constexpr size_t LayoutChangeReserve = 32;
     KmonWorkQueue<ProcessLayoutCandidate> LayoutCandidates{2048};
     std::atomic<uint64_t> LayoutChecked{0};
     std::atomic<uint64_t> LayoutRejected{0};
@@ -633,6 +636,8 @@ private:
         uint64_t LastSweepMs = 0;
         uint64_t NextSweepDueMs = 0;
         uint64_t SweepSchedulingTurns = 0;
+        // Scheduling history only: never restores sweep bytes or a verdict.
+        uint64_t PriorTraversalMs = 0;
         bool Loaded = false;
         bool LayoutIdentityReported = false;
         bool ManifestChecked = false;
@@ -659,13 +664,19 @@ private:
         FILE_BASIC_INFO FileBasicIdentity{};
         FILE_ID_INFO FileId{};
         uint64_t DueMs = 0;
+        uint64_t TraversedMs = 0;
+        uint64_t ExpiresMs = 0;
     };
     std::map<std::wstring, ImageRescanDelay> ImageRescanDelays;
     uint64_t ImageRescanDelayHits = 0;
+    uint64_t ImageRescanHistoryHits = 0;
     void RememberImageRescanDelay(const ImageVerificationWork& work, uint64_t now);
     bool ImageRescanDelayed(const std::wstring& path, uint64_t base,
-        const ObservationIdentity& identity, uint64_t now);
-    std::pair<uint32_t, uint64_t> ImageSweepProcessCursors[2];
+        const ObservationIdentity& identity, uint64_t now, uint64_t* priorTraversal = nullptr);
+    std::array<std::array<std::pair<uint32_t, uint64_t>, 2>, 2> ImageSweepProcessCursors{};
+    std::array<uint64_t, 2> ImageSweepGroupTurns{};
+    std::array<std::array<uint64_t, 2>, 2> ImageSweepClassTurns{};
+    uint64_t ImageBorrowedBackgroundTurns = 0;
     uint64_t NextImageSweepMs = 0;
     uint64_t ImageSweepTurns = 0;
     ImageVerificationWork* SelectImageSweepWork(uint64_t now);

@@ -127,6 +127,10 @@ bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
     candidate.QueuedMs = GetTickCount64();
     // Keep admitted work near the consumer instead of filling a 30-second
     // stale backlog. The source retains a refused change or periodic cursor.
+    // Preserve the periodic admission window and add room for changed work, whose
+    // original observation deadline continues running while held at the source.
+    const size_t limit = candidate.Role == L"layout_change" ? LayoutAdmissionLimit :
+        LayoutAdmissionLimit - LayoutChangeReserve;
     return LayoutCandidates.TryPushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
     {
         const auto& a = old.Region;
@@ -136,7 +140,7 @@ bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
             a.Base == b.Base && a.Size == b.Size && a.AllocationBase == b.AllocationBase &&
             a.State == b.State && a.Protect == b.Protect &&
             a.AllocationProtect == b.AllocationProtect && a.Type == b.Type;
-    }, 128);
+    }, limit);
 }
 
 void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before)
@@ -153,9 +157,9 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
     }
     LayoutLastServiceMs = begin;
     // A full-host burst must not wait through many scanner passes. Spend a
-    // larger but still bounded slice while at least half the admission queue
+    // larger but still bounded slice once half the periodic admission window
     // is occupied. Never extend the candidate's original validity window.
-    const bool pressure = LayoutCandidates.Size() >= 64;
+    const bool pressure = LayoutCandidates.Size() >= (LayoutAdmissionLimit - LayoutChangeReserve) / 2;
     const size_t candidateBudget = pressure ? 64 : 16;
     const uint64_t timeBudgetMs = pressure ? 100 : 25;
     ProcessLayoutCandidate item;

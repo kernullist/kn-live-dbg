@@ -117,16 +117,17 @@ bool KernelMonitor::ResolveObservationProcess(DeviceClient& device, SymbolEngine
 
 void KernelMonitor::RememberImageRescanDelay(const ImageVerificationWork& work, uint64_t now)
 {
-    if (!work.Loaded || !work.Sweep.Coverage.TraversalComplete || now >= work.NextSweepDueMs ||
+    if (!work.Loaded || !work.Sweep.Coverage.TraversalComplete || work.Sweep.LastCompleteMs == 0 ||
         !work.Reference.HasFileIdentity || !work.Reference.HasFileBasicIdentity) { return; }
     for (auto it = ImageRescanDelays.begin(); it != ImageRescanDelays.end();)
     {
-        if (now >= it->second.DueMs) { it = ImageRescanDelays.erase(it); }
+        if (now >= it->second.ExpiresMs) { it = ImageRescanDelays.erase(it); }
         else { ++it; }
     }
     // These records hold only file identities/deadlines, never PE ranges or
-    // verification results. Losing a delay at this bound merely permits an
-    // earlier rescan; it cannot authorize target bytes.
+    // verification results. Retain prior traversal classification beyond the
+    // delay so cache churn cannot promote repeat work into the initial lane.
+    // Losing history at this bound merely gives work earlier service.
     if (ImageRescanDelays.size() >= 4096) { return; }
     HANDLE file = CreateFileW(work.Path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) { return; }
@@ -137,15 +138,18 @@ void KernelMonitor::RememberImageRescanDelay(const ImageVerificationWork& work, 
     delay.FileIdentity = work.Reference.FileIdentity;
     delay.FileBasicIdentity = work.Reference.FileBasicIdentity;
     delay.DueMs = work.NextSweepDueMs;
+    delay.TraversedMs = work.Sweep.LastCompleteMs;
+    delay.ExpiresMs = now + 300000;
     ImageRescanDelays[ImageKey(L"", work.Base, work.Identity)] = delay;
 }
 
 bool KernelMonitor::ImageRescanDelayed(const std::wstring& path, uint64_t base,
-    const ObservationIdentity& identity, uint64_t now)
+    const ObservationIdentity& identity, uint64_t now, uint64_t* priorTraversal)
 {
+    if (priorTraversal != nullptr) { *priorTraversal = 0; }
     const auto it = ImageRescanDelays.find(ImageKey(L"", base, identity));
     if (it == ImageRescanDelays.end()) { return false; }
-    if (now < it->second.DueMs)
+    if (now < it->second.ExpiresMs)
     {
         HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (file != INVALID_HANDLE_VALUE)
@@ -161,8 +165,21 @@ bool KernelMonitor::ImageRescanDelayed(const std::wstring& path, uint64_t base,
                 id.VolumeSerialNumber == it->second.FileId.VolumeSerialNumber &&
                 std::memcmp(id.FileId.Identifier, it->second.FileId.FileId.Identifier, sizeof(id.FileId.Identifier)) == 0)
             {
-                ++ImageRescanDelayHits;
-                return true;
+                // Keep actively rediscovered identities in the repeat lane.
+                // Only the idle eviction deadline moves: the original rescan
+                // due time, traversal timestamp and current coverage do not.
+                it->second.ExpiresMs = now + 300000;
+                if (now < it->second.DueMs)
+                {
+                    ++ImageRescanDelayHits;
+                    return true;
+                }
+                if (priorTraversal != nullptr)
+                {
+                    *priorTraversal = it->second.TraversedMs;
+                    ++ImageRescanHistoryHits;
+                }
+                return false;
             }
         }
     }
@@ -227,7 +244,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
     }
     if (it == ImageWork.end())
     {
-        if (ImageRescanDelayed(path, base, identity, now)) { return nullptr; }
+        uint64_t priorTraversal = 0;
+        if (ImageRescanDelayed(path, base, identity, now, &priorTraversal)) { return nullptr; }
         bool watched = false;
         auto limit = ImageWorkAdmissionLimit(identity.ProcessId, &watched);
         if (ImageWork.size() >= limit)
@@ -278,6 +296,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
         it->second.Identity = identity;
         it->second.Path = path;
         it->second.Base = base;
+        it->second.PriorTraversalMs = priorTraversal;
     }
     auto& work = it->second;
     work.LastUsedMs = now;
@@ -305,6 +324,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.ReportedHashes.clear();
             work.Sweep = {};
             work.NextSweepDueMs = 0;
+            work.PriorTraversalMs = 0;
         }
     }
     if (!work.Loaded && (work.LastAttemptMs == 0 || now - work.LastAttemptMs >= 30000))
@@ -486,70 +506,66 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         std::lock_guard<std::mutex> lock(WatchMutex);
         watched.insert(WatchPids.begin(), WatchPids.end());
     }
-    // Rotate process generations first, then the least recently scanned image.
-    // A process with many DLLs must not starve a small process's image tail.
-    const size_t preferred = (++ImageSweepTurns % 4) == 0 ? 1 : 0;
-    for (size_t pass = 0; pass < 2; ++pass)
+    // Select first traversal vs rescan across processes, then rotate process
+    // generations and their least recently scanned image within that class.
+    // Per-process classification let repeat-only processes dilute every turn
+    // of a DLL-rich process that still had unseen tails.
+    std::map<std::pair<uint32_t, uint64_t>, ImageVerificationWork*> eligible[2][2];
+    ImageVerificationWork* bulk = nullptr;
+    for (auto& item : ImageWork)
     {
-        const size_t group = (preferred + pass) % 2;
-        // Reserve half of the background turns (one eighth overall while
-        // watches are busy) for large first traversals. Rotating every DLL of
-        // every background process equally left these tails almost untouched.
-        // Other background turns retain process fairness and periodic rescans.
-        if (group == 1 && ImageSweepTurns % 8 == 0)
+        auto& work = item.second;
+        if (!work.Loaded || now < work.NextSweepDueMs) { continue; }
+        const size_t group = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0 ? 0 : 1;
+        const size_t phase = work.Sweep.LastCompleteMs == 0 && work.PriorTraversalMs == 0 ? 0 : 1;
+        auto& candidate = eligible[group][phase][{work.Identity.ProcessId, work.Identity.CreateTime}];
+        if (candidate == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
+            std::make_pair(candidate->LastSweepMs, candidate->Base)) { candidate = &work; }
+        if (group == 1 && phase == 0 && work.Sweep.Ranges.size() >= 4096 &&
+            (bulk == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
+                std::make_pair(bulk->LastSweepMs, bulk->Base))) { bulk = &work; }
+    }
+    const auto ready = [&](size_t group) { return !eligible[group][0].empty() || !eligible[group][1].empty(); };
+    if (!ready(0) && !ready(1)) { return nullptr; }
+    size_t scheduledGroup = (++ImageSweepTurns % 4) == 0 ? 1 : 0;
+    if (!ready(scheduledGroup)) { scheduledGroup = 1 - scheduledGroup; }
+    // Advance the planned slot even when it is lent out; otherwise an empty
+    // watched first-traversal lane would never reach its reserved rescan slot.
+    const size_t scheduledPhase = ImageSweepGroupTurns[scheduledGroup]++ % 4 == 3 ? 1 : 0;
+    std::array<std::pair<size_t, size_t>, 4> order{{
+        {scheduledGroup, scheduledPhase}, {scheduledGroup, 1 - scheduledPhase},
+        {1 - scheduledGroup, 0}, {1 - scheduledGroup, 1}}};
+    if (scheduledGroup == 0 && scheduledPhase == 0)
+    {
+        // Finished watched processes must not spend all their unused initial
+        // share on rescans while background images still have unseen bytes.
+        // Keep the watched rescan slots and the entire native background share.
+        std::swap(order[1], order[2]);
+    }
+    for (const auto& slot : order)
+    {
+        const auto group = slot.first, phase = slot.second;
+        auto& candidates = eligible[group][phase];
+        if (candidates.empty()) { continue; }
+        ImageVerificationWork* selected = nullptr;
+        // Two in three background initial turns serve large tails, including
+        // borrowed turns. Ordinary first work and periodic rescans keep slots.
+        if (group == 1 && phase == 0 && ImageSweepClassTurns[1][0] % 3 != 0 && bulk != nullptr)
         {
-            ImageVerificationWork* bulk = nullptr;
-            for (auto& item : ImageWork)
-            {
-                auto& work = item.second;
-                if (!work.Loaded || now < work.NextSweepDueMs || work.Sweep.LastCompleteMs != 0 ||
-                    work.Sweep.Ranges.size() < 4096 || watched.count(work.Identity.ProcessId) != 0) { continue; }
-                if (bulk == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
-                    std::make_pair(bulk->LastSweepMs, bulk->Base)) { bulk = &work; }
-            }
-            if (bulk != nullptr) { ++bulk->SweepSchedulingTurns; return bulk; }
+            selected = bulk;
         }
-        struct Ready
+        else
         {
-            ImageVerificationWork* Initial = nullptr;
-            ImageVerificationWork* Repeat = nullptr;
-            uint64_t Turns = 0;
-        };
-        std::map<std::pair<uint32_t, uint64_t>, Ready> eligible;
-        for (auto& item : ImageWork)
-        {
-            auto& work = item.second;
-            const bool priority = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0;
-            if (work.Loaded && priority == (group == 0))
-            {
-                const auto key = std::make_pair(work.Identity.ProcessId, work.Identity.CreateTime);
-                auto& ready = eligible[key];
-                ready.Turns += work.SweepSchedulingTurns;
-                if (now < work.NextSweepDueMs) { continue; }
-                auto& candidate = work.Sweep.LastCompleteMs == 0 ? ready.Initial : ready.Repeat;
-                if (candidate == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
-                    std::make_pair(candidate->LastSweepMs, candidate->Base))
-                {
-                    candidate = &work;
-                }
-            }
+            auto& cursor = ImageSweepProcessCursors[group][phase];
+            auto next = candidates.upper_bound(cursor);
+            if (next == candidates.end()) { next = candidates.begin(); }
+            cursor = next->first;
+            selected = next->second;
         }
-        for (auto it = eligible.begin(); it != eligible.end();)
-        {
-            if (it->second.Initial == nullptr && it->second.Repeat == nullptr) { it = eligible.erase(it); }
-            else { ++it; }
-        }
-        if (eligible.empty()) { continue; }
-        auto selected = eligible.upper_bound(ImageSweepProcessCursors[group]);
-        if (selected == eligible.end()) { selected = eligible.begin(); }
-        ImageSweepProcessCursors[group] = selected->first;
-        auto& ready = selected->second;
-        // Finish previously unseen tails first, while reserving one in four
-        // process turns for rescans so a very large image cannot freeze them.
-        auto work = ready.Initial != nullptr && (ready.Repeat == nullptr || ready.Turns % 4 != 3)
-            ? ready.Initial : ready.Repeat;
-        ++work->SweepSchedulingTurns;
-        return work;
+        if (scheduledGroup == 0 && scheduledPhase == 0 && group == 1 && phase == 0) { ++ImageBorrowedBackgroundTurns; }
+        ++ImageSweepClassTurns[group][phase];
+        ++selected->SweepSchedulingTurns;
+        return selected;
     }
     return nullptr;
 }
