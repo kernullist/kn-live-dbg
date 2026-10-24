@@ -648,6 +648,7 @@ private:
         uint64_t NextSweepDueMs = 0;
         uint64_t SweepSchedulingTurns = 0;
         uint64_t CompletionPriorityTurns = 0;
+        uint64_t BulkProgressTurns = 0;
         // Scheduling history only: never restores sweep bytes or a verdict.
         uint64_t PriorTraversalMs = 0;
         bool Loaded = false;
@@ -690,6 +691,7 @@ private:
     std::array<std::array<uint64_t, 2>, 2> ImageSweepClassTurns{};
     uint64_t ImageBorrowedBackgroundTurns = 0;
     uint64_t ImageCompletionPriorityTurns = 0;
+    uint64_t ImageBulkProgressTurns = 0;
     uint64_t NextImageSweepMs = 0;
     uint64_t ImageSweepTurns = 0;
     ImageVerificationWork* SelectImageSweepWork(uint64_t now);

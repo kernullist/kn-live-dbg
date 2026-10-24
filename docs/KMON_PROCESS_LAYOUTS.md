@@ -60,7 +60,11 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 전체 차례를 그 그룹에 배정한다. 배경 최초 순회의 세 차례는 일반 순환,
 4,096페이지 이상인 대형 이미지, 1,024페이지 이하가 남은 이미지에 각각 배정한다.
 마지막 차례는 남은 페이지가 적은 작업을 먼저 선택하며, 없으면 대형 이미지에
-돌려준다. 빌려준 차례에서도 원래 감시 배분 카운터를 전진시킨다.
+돌려준다. 대형 이미지 차례는 첫 순회 커서가 덜 진행된 작업을 먼저 고른다.
+짧은 부수 검사에 의해 검사 시각이 갱신되거나 시간 예산에 따른 진행량이 달라도
+우선순위가 실제 순회량을 따라가게 한다. 동일성 검사에 실패한 작업은 일반 순환에서
+재시도하며 대형 이미지 우선 차례를 독점하지 않는다.
+빌려준 차례에서도 원래 감시 배분 카운터를 전진시킨다.
 이 정책은 프로세스마다 DLL 수가 달라도 재검사만 남은 프로세스가 다른 프로세스의
 최초 순회를 계속 희석하지 않게 한다. 시간 단위 완료 기한을 보장하지는 않는다.
 `image_first_watched_turns`, `image_repeat_watched_turns`,
@@ -68,6 +72,8 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 `image_borrowed_background_turns`는 감시 최초 순회 몫에서 빌린 횟수다.
 `image_completion_priority_turns`는 짧은 잔여 구간을 우선한 횟수이며, 실제
 완료 수와는 다르다. [배경 완료·이름 조회 검증](KMON_BACKGROUND_COMPLETION_VALIDATION_20261024.md)을 참고한다.
+`image_bulk_progress_turns`와 이미지별 `bulk_progress_turns`는 진행량 기준으로
+대형 이미지를 선택한 횟수다. [대형 배경·범위 편차 검증](KMON_LARGE_BACKGROUND_VALIDATION_20261024.md)을 참고한다.
 최종 `coverage.image_progress`의 `prior_traversal_ms`는 스케줄링 이력이며 현재 순회의
 완료 증거는 아니다. [동시 부하 검증](KMON_IMAGE_SCHEDULING_VALIDATION_20261024.md)을 참고한다.
 

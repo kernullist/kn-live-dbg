@@ -153,6 +153,7 @@ void KernelMonitor::ResetPipeline()
     ImageSweepClassTurns = {};
     ImageBorrowedBackgroundTurns = 0;
     ImageCompletionPriorityTurns = 0;
+    ImageBulkProgressTurns = 0;
     NextImageSweepMs = 0;
     ImageSweepTurns = 0;
     ImageAdmissionDeferred = 0;
@@ -1033,6 +1034,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_repeat_background_turns"] = std::to_wstring(ImageSweepClassTurns[1][1]);
         event.Evidence[L"image_borrowed_background_turns"] = std::to_wstring(ImageBorrowedBackgroundTurns);
         event.Evidence[L"image_completion_priority_turns"] = std::to_wstring(ImageCompletionPriorityTurns);
+        event.Evidence[L"image_bulk_progress_turns"] = std::to_wstring(ImageBulkProgressTurns);
         uint64_t imageScheduled = 0, imageTraversed = 0, imageRemaining = 0;
         for (const auto& item : ImageWork)
         {
@@ -1061,6 +1063,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
                 progress.Evidence[L"prior_traversal_ms"] = std::to_wstring(work.PriorTraversalMs);
                 progress.Evidence[L"scheduling_turns"] = std::to_wstring(work.SweepSchedulingTurns);
                 progress.Evidence[L"completion_priority_turns"] = std::to_wstring(work.CompletionPriorityTurns);
+                progress.Evidence[L"bulk_progress_turns"] = std::to_wstring(work.BulkProgressTurns);
                 progress.Evidence[L"completed_cycles"] = std::to_wstring(work.Sweep.CompletedCycles);
                 progress.Evidence[L"last_cycle_requested_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.RequestedBytes);
                 progress.Evidence[L"last_cycle_compared_bytes"] = std::to_wstring(work.Sweep.LastCompleteCoverage.ComparedBytes);
@@ -1493,6 +1496,7 @@ bool KmonPipelineSelfTest()
             monitor.WatchPids.insert(100);
             size_t watchedTurns = 0, bulkTurns = 0, ordinaryTurns = 0, finishTurns = 0;
             monitor.ImageCompletionPriorityTurns = 0;
+            monitor.ImageBulkProgressTurns = 0;
             std::set<uint32_t> bulkServed, ordinaryServed;
             for (size_t turn = 1; turn <= 64; ++turn)
             {
@@ -1504,6 +1508,7 @@ bool KmonPipelineSelfTest()
                     fair &= selected->Identity.ProcessId == 102 || selected->Identity.ProcessId == 103;
                     ++bulkTurns;
                     bulkServed.insert(selected->Identity.ProcessId);
+                    selected->Sweep.NextRange += 16;
                 }
                 else if (turn % 4 == 0 && backgroundPhase == 2)
                 {
@@ -1522,6 +1527,7 @@ bool KmonPipelineSelfTest()
             }
             fair &= watchedTurns == 48 && bulkTurns == 4 && ordinaryTurns == 8 && finishTurns == 4 &&
                 monitor.ImageCompletionPriorityTurns == 4 && bulkServed.size() == 2 && ordinaryServed.size() == 3;
+            fair &= monitor.ImageBulkProgressTurns == 4;
             fair &= monitor.ImageSweepClassTurns[1][0] == 12 && monitor.ImageSweepClassTurns[1][1] == 4;
             // No short tail: the completion slot goes back to large work.
             monitor.ImageWork.at(L"1").NextSweepDueMs = 2000;
@@ -1531,6 +1537,38 @@ bool KmonPipelineSelfTest()
             const auto fallback = monitor.SelectImageSweepWork(1000);
             fair &= fallback != nullptr && (fallback->Identity.ProcessId == 102 || fallback->Identity.ProcessId == 103) &&
                 monitor.ImageCompletionPriorityTurns == 4;
+            // A recent incidental read must not put a barely scanned large
+            // image behind one that already advanced much farther.
+            auto& ahead = monitor.ImageWork.at(L"2");
+            auto& behind = monitor.ImageWork.at(L"3");
+            ahead.Sweep.NextRange = 2048; ahead.LastSweepMs = 1;
+            behind.Sweep.NextRange = 128; behind.LastSweepMs = 999;
+            const auto selectBulk = [&]()
+            {
+                monitor.ImageSweepTurns = 3;
+                monitor.ImageSweepGroupTurns[1] = 0;
+                monitor.ImageSweepClassTurns[1][0] = 1;
+                return monitor.SelectImageSweepWork(1000);
+            };
+            fair &= selectBulk() == &behind;
+            behind.Sweep.Coverage.Attempted = true;
+            behind.Sweep.Coverage.InventoryAvailable = false;
+            behind.Sweep.NextRange = 0;
+            fair &= selectBulk() == &ahead;
+            // Failed identities keep ordinary service, including when all
+            // large work is unavailable. They cannot monopolize the bulk lane.
+            ahead.Sweep.Coverage.Attempted = true;
+            ahead.Sweep.Coverage.InventoryAvailable = false;
+            monitor.ImageWork.at(L"0").NextSweepDueMs = 2000;
+            monitor.ImageWork.at(L"4").NextSweepDueMs = 2000;
+            std::set<uint32_t> unavailableServed;
+            for (size_t turn = 0; turn < 4; ++turn)
+            {
+                auto retry = selectBulk();
+                fair &= retry != nullptr;
+                if (retry) { unavailableServed.insert(retry->Identity.ProcessId); }
+            }
+            fair &= unavailableServed.size() == 2;
             monitor.ImageWork.clear(); monitor.WatchPids.clear();
             monitor.ImageSweepProcessCursors[0] = {}; monitor.ImageSweepProcessCursors[1] = {}; monitor.ImageSweepTurns = 0;
             monitor.ImageSweepGroupTurns = {}; monitor.ImageSweepClassTurns = {};

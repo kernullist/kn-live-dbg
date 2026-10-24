@@ -524,9 +524,14 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         auto& candidate = eligible[group][phase][{work.Identity.ProcessId, work.Identity.CreateTime}];
         if (candidate == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
             std::make_pair(candidate->LastSweepMs, candidate->Base)) { candidate = &work; }
-        if (group == 1 && phase == 0 && work.Sweep.Ranges.size() >= 4096 &&
-            (bulk == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
-                std::make_pair(bulk->LastSweepMs, bulk->Base))) { bulk = &work; }
+        // Incidental layout scans also update LastSweepMs. Equal turns did
+        // not mean equal progress under the time budget, and a small incidental
+        // read could postpone a large unvisited tail. Raise the lowest cursor
+        // first; ordinary rotation still retries unavailable identities.
+        const bool bulkReady = !work.Sweep.Coverage.Attempted || work.Sweep.Coverage.InventoryAvailable;
+        if (group == 1 && phase == 0 && work.Sweep.Ranges.size() >= 4096 && bulkReady &&
+            (bulk == nullptr || std::make_pair(work.Sweep.NextRange, work.LastSweepMs) <
+                std::make_pair(bulk->Sweep.NextRange, bulk->LastSweepMs))) { bulk = &work; }
         const auto remaining = work.Sweep.Ranges.size() - work.Sweep.NextRange;
         if (group == 1 && phase == 0 && remaining > 0 && remaining <= 1024 &&
             (finishing == nullptr || std::make_pair(remaining, work.LastSweepMs) <
@@ -569,6 +574,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         else if (group == 1 && phase == 0 && ImageSweepClassTurns[1][0] % 3 != 0 && bulk != nullptr)
         {
             selected = bulk;
+            ++ImageBulkProgressTurns;
+            ++selected->BulkProgressTurns;
         }
         else
         {

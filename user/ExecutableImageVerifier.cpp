@@ -345,6 +345,37 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
                 break;
             }
         }
+        // Most executable pages have neither loader-mutable bytes nor REL32
+        // alternatives. An exact comparison needs no per-byte mask/range walk.
+        // Keep normalization, live reads, and the final reference/image fences;
+        // even equal bytes in an excluded range must stay unverified.
+        const auto overlapsPage = [&](uint32_t start, uint32_t length)
+        {
+            return length != 0 && uint64_t(start) < uint64_t(rva) + size &&
+                rva < uint64_t(start) + length;
+        };
+        const auto hasMutable = [&](const std::vector<DiskPeMutableRange>& ranges)
+        {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const DiskPeMutableRange& range)
+            { return overlapsPage(range.Rva, range.Size); });
+        };
+        if (!hasMutable(metadata.LoaderMutableRanges) && !hasMutable(metadata.DynamicRelocationRanges) &&
+            std::none_of(metadata.Rel32Overrides.begin(), metadata.Rel32Overrides.end(),
+                [&](const DiskPeRel32Override& fixup) { return overlapsPage(fixup.Rva, 4); }) &&
+            result.Expected == result.Observed)
+        {
+            if (reference == INVALID_HANDLE_VALUE && !DiskReferenceIdentityMatches(path, metadata))
+            {
+                result.Coverage.Reason = L"reference_changed_during_compare";
+                break;
+            }
+            result.Coverage.ComparedBytes = size;
+            result.Coverage.Compared.push_back({imageBase + rva, size});
+            result.Coverage.TraversalComplete = true;
+            result.Coverage.Reason = L"compared";
+            result.Ownership = CodeOwnership::OwnedVerified;
+            break;
+        }
         std::vector<bool> mutableBytes(size, false);
         const auto mask = [&](const std::vector<DiskPeMutableRange>& ranges)
         {
@@ -808,6 +839,11 @@ bool ExecutableImageVerifierSelfTest()
         {
             auto mutableMetadata = metadata;
             auto& ranges = dynamic ? mutableMetadata.DynamicRelocationRanges : mutableMetadata.LoaderMutableRanges;
+            ranges.push_back({0x2004, 1});
+            const auto equalExcluded = CompareExecutableRange(path, mutableMetadata, loadedBase, 0x2000, 4096, reader);
+            reviewCheck(equalExcluded.Ownership == CodeOwnership::OwnedUnverified &&
+                equalExcluded.Coverage.ComparedBytes == 4095 && equalExcluded.Coverage.SkippedBytes == 1 &&
+                equalExcluded.Changes.empty(), "equal mutable bytes remain excluded from exact comparison");
             ranges.push_back({0x3004, 1});
             size_t mutableReads = 0;
             const ObservationReader mutableReader = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
@@ -866,6 +902,10 @@ bool ExecutableImageVerifierSelfTest()
             const auto unsupported = compareTarget(0x1400);
             reviewCheck(unsupported.Coverage.SkippedBytes == 4 && unsupported.Rel32ValidatedBytes == 0,
                 "REL32 unsupported target set remains excluded");
+            const auto equalUnsupported = compareTarget(0x1300);
+            reviewCheck(equalUnsupported.Ownership == CodeOwnership::OwnedUnverified &&
+                equalUnsupported.Coverage.SkippedBytes == 4 && equalUnsupported.Coverage.ComparedBytes == 4092,
+                "equal unsupported REL32 bytes remain excluded");
             std::memcpy(live.data() + 0x1151, &originalRel32, 4);
 
             std::vector<uint8_t> dvrt;
