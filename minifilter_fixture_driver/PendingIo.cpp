@@ -18,6 +18,7 @@ namespace
         PEPROCESS TargetProcess;
         PFLT_CALLBACK_DATA Data; // Owned until the matching FltComplete call.
         PFLT_CALLBACK_DATA PreIdentity; // Identity only, never dereferenced after pre.
+        ULONGLONG Generation;
         ULONG_PTR Owner;
         ULONG Mode, DelayMilliseconds, WakeReason;
         ULONG Gate, GateMilliseconds;
@@ -83,17 +84,34 @@ namespace
         KeSetEvent(&operation->Resume, IO_NO_INCREMENT, FALSE);
     }
 
+    // g_Lock held. Return the arm's process reference to release outside the
+    // spin lock. Publication, consumption and retirement use this same lock.
+    PEPROCESS Disarm()
+    {
+        PEPROCESS target = g_Target;
+        g_Target = nullptr;
+        g_Status.ArmedMode = 0;
+        g_Status.ArmedRemaining = 0;
+        g_Status.ArmedGeneration = 0;
+        g_Gate = 0;
+        return target;
+    }
+
+    PEPROCESS ChangeTopology()
+    {
+        ++g_Status.TopologyGeneration;
+        if (g_Target != nullptr) ++g_Status.TopologyDisarms;
+        return Disarm();
+    }
+
     // Caller owns g_Control. Do not wait for I/O while holding a control lock.
     void ReleaseOwner(bool automatic)
     {
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
-        PEPROCESS target = g_Target;
+        PEPROCESS target = Disarm();
         PEPROCESS owner = g_OwnerProcess;
-        g_Target = nullptr;
         g_OwnerProcess = nullptr;
-        g_Status.ArmedMode = 0;
-        g_Status.ArmedRemaining = 0;
         for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
         {
             auto operation = CONTAINING_RECORD(entry, Operation, AllLink);
@@ -375,6 +393,12 @@ namespace
         if (client == nullptr || client->Pid != PsGetCurrentProcessId()) status = STATUS_ACCESS_DENIED;
         else if (request.Action != KNDBG_PENDING_QUERY && g_Status.Stopping) status = STATUS_FLT_DELETING_OBJECT;
         else if (request.Action != KNDBG_PENDING_QUERY && g_Owner != 0 && g_Owner != id) status = STATUS_DEVICE_BUSY;
+        else if (arm && g_Status.InstanceStarts != g_Status.InstanceCompletes)
+        {
+            ++g_Status.ArmDuringTeardownRejected;
+            status = STATUS_DEVICE_BUSY;
+        }
+        else if (arm && g_Status.LiveInstances == 0) status = STATUS_DEVICE_NOT_READY;
         else if (arm && (g_Status.ArmedMode != 0 || g_Status.LiveContexts != 0 ||
                          g_Status.ActiveWorkers != 0 || g_Status.QueueDepth != 0)) status = STATUS_DEVICE_BUSY;
         else if (arm)
@@ -389,6 +413,7 @@ namespace
             g_Target = target; target = nullptr;
             g_Status.ArmedMode = request.Mode;
             g_Status.ArmedRemaining = batch ? request.Reserved : 1;
+            g_Status.ArmedGeneration = g_Status.TopologyGeneration;
             if (batch) ++g_Status.BatchArms;
             g_Delay = race ? 2000 : request.DelayMilliseconds;
             g_Gate = batch ? KNDBG_PENDING_GATE_PRE : (race ? request.Reserved : 0);
@@ -513,8 +538,7 @@ void PendingIoProcessExit(PEPROCESS process)
     PEPROCESS target = nullptr;
     if (g_Target == process)
     {
-        target = g_Target; g_Target = nullptr;
-        g_Status.ArmedMode = 0; g_Status.ArmedRemaining = 0;
+        target = Disarm();
     }
     for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
     {
@@ -557,6 +581,19 @@ NTSTATUS PendingIoInstanceSetup(PCFLT_RELATED_OBJECTS objects)
         }
     }
     if (NT_SUCCESS(status)) status = FltSetInstanceContext(objects->Instance, FLT_SET_CONTEXT_KEEP_IF_EXISTS, state, nullptr);
+    PEPROCESS retired = nullptr;
+    if (NT_SUCCESS(status))
+    {
+        KeAcquireSpinLock(&g_Lock, &irql);
+        if (g_Status.Stopping)
+        {
+            ++g_Status.SetupDuringStopRejected;
+            status = STATUS_FLT_DELETING_OBJECT;
+        }
+        else retired = ChangeTopology();
+        KeReleaseSpinLock(&g_Lock, irql);
+    }
+    if (retired != nullptr) ObDereferenceObject(retired);
     FltReleaseContext(state);
     return status;
 }
@@ -568,6 +605,7 @@ void PendingIoInstanceTeardownStart(PCFLT_RELATED_OBJECTS objects, FLT_INSTANCE_
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     state->Stopping = true;
+    PEPROCESS retired = ChangeTopology();
     ++g_Status.InstanceStarts;
     if (reason & FLTFL_INSTANCE_TEARDOWN_MANUAL) ++g_Status.ManualTeardowns;
     if (reason & (FLTFL_INSTANCE_TEARDOWN_FILTER_UNLOAD | FLTFL_INSTANCE_TEARDOWN_MANDATORY_FILTER_UNLOAD))
@@ -578,6 +616,7 @@ void PendingIoInstanceTeardownStart(PCFLT_RELATED_OBJECTS objects, FLT_INSTANCE_
         if (operation->InstanceState == state) Wake(operation, 3);
     }
     KeReleaseSpinLock(&g_Lock, irql);
+    if (retired != nullptr) ObDereferenceObject(retired);
     FltReleaseContext(state);
 }
 
@@ -601,6 +640,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     PEPROCESS requestor = FltGetRequestorProcess(data), target = nullptr;
     ULONG mode = 0, delay = 0, gate = 0, gateMilliseconds = 0;
     ULONG_PTR owner = 0;
+    ULONGLONG generation = 0;
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     if (!g_Status.Stopping && !state->Stopping)
@@ -612,9 +652,13 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
         {
             mode = g_Status.ArmedMode;
             target = g_Target;
+            generation = g_Status.ArmedGeneration;
             // The arm owns one process reference until its final admission.
             // Earlier members of a bounded batch each acquire their own.
-            if (--g_Status.ArmedRemaining == 0) { g_Status.ArmedMode = 0; g_Target = nullptr; }
+            if (--g_Status.ArmedRemaining == 0)
+            {
+                g_Status.ArmedMode = 0; g_Target = nullptr; g_Status.ArmedGeneration = 0;
+            }
             else ObReferenceObject(target);
             delay = g_Delay; owner = g_Owner;
             gate = g_Gate; gateMilliseconds = g_GateMilliseconds;
@@ -639,6 +683,14 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
                         ++g_Status.OtherReadSkipped;
                         continue;
                     }
+                    // A live owner and the same I/O are insufficient after a
+                    // lower instance was detached/replaced. An old upper pre
+                    // must not start new pending work in the new topology.
+                    if (upper->Generation != g_Status.TopologyGeneration)
+                    {
+                        ++g_Status.GenerationLowerRejected;
+                        continue;
+                    }
                     // Release/exit may have woken the upper context before this
                     // callback reached the lower instance. Do not publish a new
                     // unsignalled context after that owner's cancellation sweep.
@@ -653,6 +705,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
                         KNDBG_PENDING_FAIL_READ_LOCK : KNDBG_PENDING_PRE;
                     target = requestor; ObReferenceObject(target);
                     delay = upper->DelayMilliseconds; owner = upper->Owner;
+                    generation = upper->Generation;
                     gate = upper->Gate; gateMilliseconds = upper->GateMilliseconds;
                     break;
                 }
@@ -681,6 +734,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     operation->InstanceState = state;
     operation->FileObject = objects->FileObject;
     operation->PreIdentity = data;
+    operation->Generation = generation;
     operation->TargetProcess = target;
     operation->Mode = mode;
     operation->Owner = owner;

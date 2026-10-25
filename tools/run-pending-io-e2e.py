@@ -29,7 +29,7 @@ NAME, INSTANCE = managed.NAME, managed.INSTANCE
 LOWER = NAME + '.Lower'
 PORT = '\\' + NAME + 'PendingIo'
 MAGIC = 0x4B50494F
-VERSION = 3
+VERSION = 4
 SERVICE = 'SYSTEM\\CurrentControlSet\\Services\\' + NAME
 flt, kernel = managed.flt, managed.kernel
 flt.FilterDetach.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
@@ -59,10 +59,11 @@ class Status(c.Structure):
         'RaceCancelSeen', 'RaceStopSeen', 'BeforeLowerEntered', 'BeforeLowerCompleted',
         'StaleLowerRejected', 'OtherReadSkipped', 'ArmedRemaining', 'BatchArms',
         'ManualTeardowns', 'UnloadTeardowns', 'RaceTeardownSeen', 'BeforeLowerCancelSeen',
-        'BeforeLowerStopSeen', 'BeforeLowerTeardownSeen')]
+        'BeforeLowerStopSeen', 'BeforeLowerTeardownSeen', 'TopologyGeneration', 'ArmedGeneration',
+        'TopologyDisarms', 'GenerationLowerRejected', 'ArmDuringTeardownRejected', 'SetupDuringStopRejected')]
 
 
-assert c.sizeof(Request) == 32 and c.sizeof(Status) == 320
+assert c.sizeof(Request) == 32 and c.sizeof(Status) == 368
 
 
 def fields(state):
@@ -219,7 +220,14 @@ def child_owner():
             command = json.loads(line)
             if command.pop('exit', False):
                 return
-            print(json.dumps(fields(owner.send(**command))), flush=True)
+            expect_error = command.pop('expect_error', False)
+            try:
+                response = fields(owner.send(**command))
+            except OSError as error:
+                if not expect_error:
+                    raise
+                response = dict(error=str(error))
+            print(json.dumps(response), flush=True)
 
 
 def main():
@@ -291,7 +299,7 @@ def main():
         (output / 'unload-audits.json').write_text(json.dumps(audits, indent=2), encoding='utf-8')
         check(name + '-final-ledger', state.Magic == MAGIC and state.Version == VERSION and
             state.Size == c.sizeof(Status) and balanced(state) and state.Stopping == 1 and
-            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == 0
+            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == state.ArmedGeneration == 0
             and state.InstanceStarts == state.InstanceCompletes, state=fields(state))
 
     def new_child(role):

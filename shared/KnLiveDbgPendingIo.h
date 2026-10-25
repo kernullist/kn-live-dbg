@@ -3,7 +3,7 @@
 // Test-provider protocol only. No external callbacks, pointers or paths accepted.
 #define KNDBG_PENDING_PORT L"\\KnLiveDbgMiniFilterFixturePendingIo"
 #define KNDBG_PENDING_MAGIC 0x4B50494Fu
-#define KNDBG_PENDING_VERSION 3u
+#define KNDBG_PENDING_VERSION 4u
 #define KNDBG_PENDING_QUERY 0u
 #define KNDBG_PENDING_ARM 1u
 #define KNDBG_PENDING_RESUME 2u
@@ -42,7 +42,9 @@ struct KNDBG_PENDING_STATUS
     unsigned __int64 BeforeLowerEntered, BeforeLowerCompleted, StaleLowerRejected, OtherReadSkipped;
     unsigned __int64 ArmedRemaining, BatchArms, ManualTeardowns, UnloadTeardowns;
     unsigned __int64 RaceTeardownSeen, BeforeLowerCancelSeen, BeforeLowerStopSeen, BeforeLowerTeardownSeen;
+    unsigned __int64 TopologyGeneration, ArmedGeneration, TopologyDisarms, GenerationLowerRejected;
+    unsigned __int64 ArmDuringTeardownRejected, SetupDuringStopRejected;
 };
 
 static_assert(sizeof(KNDBG_PENDING_REQUEST) == 32, "pending request ABI");
-static_assert(sizeof(KNDBG_PENDING_STATUS) == 320, "pending status ABI");
+static_assert(sizeof(KNDBG_PENDING_STATUS) == 368, "pending status ABI");
