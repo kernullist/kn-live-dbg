@@ -4,6 +4,8 @@
 강제 종료, 새 ARM, 인스턴스 분리·재연결, 언로드 및 시험 실행기 실패를 함께 검토했다.
 원시 증거는 `C:\git\kn-live-dbg\.build\pending-query-fault-20261025`에 보존한다.
 이번 변경은 시험 실행기와 정리 경로다. 커널 소스와 v7 ABI는 변경하지 않았다.
+수정과 실행기는 `d38a5b4`에 반영됐다. 현재 재현 절차와 결과 판정 기준은
+[수동 검증 체크리스트](MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation)에서 확인할 수 있다.
 
 ## 발견과 수정
 

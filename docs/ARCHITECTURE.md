@@ -173,7 +173,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 14. If exact `SymGetTypeFromNameW` lookup fails, the symbol engine reuses `SymEnumTypesW` exact matching to recover module base plus type id before falling back to DIA; the match accepts module-qualified names, leaf type names, and leading-underscore variants.
 15. Wildcard `dt` patterns such as `dt nt!*` use `SymEnumTypesW` against matching loaded kernel modules, apply the `*`/`?` filter in user mode, fall back to DIA UDT enumeration when DbgHelp cannot enumerate the type stream, and print list-only type matches.
 16. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
-17. `!callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread/image-load callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership. `disable`/`enable` (and `disable-all`/`enable-all`) patch only a named module's callbacks through `IOCTL_KNDBG_WRITE_VIRTUAL`: Ob/Cm/Ps slots get a CFG-valid return-0 thunk; minifilter slots reuse the live CallbackNodes path. Original pointers are session-backed. NULL writes and list unlinks are refused.
+17. `!callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread/image-load callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership. `disable`/`enable` and their `-all` forms support only the cooperative `KnLiveDbgMiniFilterFixture` with `minifilter` or `all` scope. They pause/resume the provider's CREATE counting bodies through its control port; registered callback pointers remain unchanged. External callback mutation is rejected before pointer writes.
 18. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
 19. `uf` resolves an address or symbol, reads a bounded code window through the driver, and uses the same Zydis decoder as `u` while stopping at common function terminal instructions. If the driver device is not open, it falls back to the DbgEng command path.
 20. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
@@ -186,7 +186,7 @@ All requests include an explicit `Size` field. Variable read/write payloads use 
 4. Thread callbacks: enumerate `PspCreateThreadNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
 5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
 6. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
-7. Per-module disable/enable: after a successful scan, `SetModuleCallbacks` keeps only records owned by the requested module (minifilter write matching uses FilterName, not fltmgr helper Pre/Post). Ob/Cm/Ps function pointers are replaced with `KnDbgMinifilterPostCallbackNop` (return 0). Minifilter control calls `MinifilterIrpScanner::SetAllIrps` on each unique filter object. Session backups are keyed by slot address plus the original module so `enable` still finds thunked slots whose live FunctionModule is KnLiveDbg. List overlay marks those rows `DISABLED`.
+7. Cooperative disable/enable: `SetModuleCallbacks` accepts the exact fixture name or its `.sys` name with `minifilter`/`all` scope and delegates to `MinifilterIrpScanner::SetAllIrps`. The provider reports enabled/active counters and owner PID independently of the registered wrapper addresses. Unsupported scopes, other filters, addresses, and path-shaped targets fail the lifetime guard. The [external callback lifetime review](EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) records why a local thunk rundown cannot protect dispatch before entry or pending pre/post completion contexts.
 
 ## ETW Logger / NMI Callback Flow
 
@@ -329,9 +329,43 @@ Detection layers (run in this order when the goal is mapper-family coverage):
 ## Minifilter IRP Control Flow
 
 1. `!minifilter` (`MinifilterIrpScanner`) resolves `fltmgr!FltGlobals` and PDB layouts for `_GLOBALS`, `_FLTP_FRAME`, `_FLT_FILTER`, `_FLT_OBJECT`, `_FLT_RESOURCE_LIST_HEAD`, and `_FLT_OPERATION_REGISTRATION`. Missing symbols or an implausible operation-entry size fail closed.
-2. Frame and filter lists are walked with cycle guards. Each filter records name, altitude, driver, and every `Operations` slot until `IRP_MJ_OPERATION_END`, including already-null pre/post slots so a disabled handler remains visible.
-3. `disable`/`enable` write only the selected `PreOperation`/`PostOperation` pointer through `IOCTL_KNDBG_WRITE_VIRTUAL`. The driver write gate must be on. Original pointers are saved in-process so `enable` can restore them in the same session. The slot is read back after each write. `disable-all` / `disable <name> all` walk every registered slot, skip already-null handlers, and keep going if a later slot fails; the batch fails closed only when nothing changed and at least one write failed. `enable-all` fails closed when this session has no backup for that filter.
-4. `minifilter.list` is the read-only MCP/AI tool. `minifilter.set_irp` is write-gated and is not on the AI planner catalog. `irp=all` uses the same batch path.
+2. Frame and filter lists are walked with cycle guards. Each filter records name, altitude, driver, and every `Operations` slot until `IRP_MJ_OPERATION_END`, including null pre/post registrations. A paused cooperative body still has a nonzero registered wrapper; its state is reported separately under `managed`.
+3. `disable`/`enable` require write mode and the exact cooperative fixture target. `/pre`, `/post`, and `/both` select the CREATE counting bodies (`enabledMask`: pre=1, post=2). Kernel-owned rundown waits for active bodies before acknowledging disable. `all` selects these supported bodies, while mandatory lifecycle, process-exit, and I/O-context handling stays active. The registered pointers are never replaced. Closing the controlling device session or owner process termination restores the bodies; a supported detach/reattach preserves a live control lease.
+4. `minifilter.list` is the read-only MCP/AI tool. `minifilter.set_irp` is write-gated and is not on the AI planner catalog. It uses the same fixture identity and supported-IRP checks; `irp=all` selects the provider's supported CREATE registration.
+
+### Pending I/O fixture and failure recovery
+
+`minifilter_fixture_driver/PendingIo.cpp` has a separate administrator/SYSTEM test
+port, defined in `shared/KnLiveDbgPendingIo.h`. Protocol v7 has a 32-byte request
+and a 528-byte status. It is independent of the main driver's ABI 17.
+
+- A live owner arms one target with one request or 2–8 READs. READ buffers are
+  locked before asynchronous use. Upper/lower contexts pair by callback-data
+  identity and instance generation; teardown retires unused reservations.
+- A process exit status of 259 alone does not prove liveness. Target admission
+  and watching also check the process signal. Watch results are applied only to
+  the reservation they observed, so a stale result cannot retire a new ARM.
+- QUERY validates the client and copies a local snapshot under the state lock.
+  Reply copying uses exception handling outside that lock. QUERY_RACE adds a
+  bounded 50–500ms hold after capture. A snapshot includes its own active query;
+  `QueryStarted = QueryCompleted + QueryActive` holds in live responses.
+- Stop closes the server and joins the pending worker; managed shutdown drains
+  bodies and removes its process notification. `FltUnregisterFilter` drains
+  registrations and instances before the final `PendingIoFinalAudit` is stored.
+  Only that final ledger requires zero active queries, connections, instances,
+  contexts, workers, owner, and reservation, with all lifetime counts balanced.
+- Runner cleanup releases independent resources even when a test or evidence
+  write fails. Native filter absence is checked before deleting its own service.
+  The failure supervisor assigns the runner to a Windows job before allowing
+  setup, reaps its helpers, and verifies the fixture service image before recovery.
+  Expected child failures remain failed records; the supervisor separately
+  verifies their expected exit codes, final ledgers, and resource cleanup.
+
+See the [pending lifetime report](PENDING_IO_LIFETIME_VALIDATION_20261025.md),
+[query review](PENDING_QUERY_REVIEW_20261025.md), and
+[response-buffer/failure review](PENDING_QUERY_FAULT_REVIEW_20261025.md).
+The [manual checklist](MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation)
+contains current reproduction commands and result criteria.
 
 ## Module And Driver Integrity Flow
 
@@ -487,7 +521,7 @@ Completed hardening items:
 1. JSONL write-command audit logging is implemented with `ai audit <path>`.
 2. Transcript rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
 3. Transcript command records now include command-class labels such as `memory-read`, `physical-write`, `type`, `callbacks`, `disassembly`, `symbols`, `dbgeng`, and `session`.
-4. Callback module filtering is implemented with `!callbacks [scope] [module]`. Per-type disable/enable for one module is implemented with `!callbacks disable|enable <scope> <module>` and `disable-all`/`enable-all`.
+4. Callback module filtering is implemented with `!callbacks [scope] [module]`. Disable/enable and their `-all` forms operate only on the cooperative fixture's CREATE bodies with `minifilter`/`all` scope; external callback mutation remains unavailable.
 5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
 6. AI plan command schema validation is implemented before plan storage.
 7. Local-only AI provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`. It blocks HTTP complete/refresh without clearing the selected provider.

@@ -6,6 +6,8 @@ Changes since v0.0.34 are collected in the [v0.0.35 release notes](docs/RELEASE_
 
 The release includes the [2026-10-06 live-host fixes and validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/LIVE_HOST_VALIDATION_20261006.md). That host produced zero hunt findings with incomplete coverage; this is recorded as partial evidence.
 
+Source changes after v0.0.35 include the [2026-10-25 response-buffer and runner-failure review](docs/PENDING_QUERY_FAULT_REVIEW_20261025.md), implemented in `d38a5b4`. Its live matrix records 1,034 ordinary checks, 50 verified injected runner failures, and 344 final unload ledgers, with no new reboot, dump, or remaining fixture service in that test interval. The [current manual checklist](docs/MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation) describes how to repeat and interpret these tests.
+
 The current checkout's [2026-10-23 validation report](docs/LIVE_HOST_VALIDATION_20261023.md) records CI/HVCI decoding repairs, hypervisor interface qualification, and live driver/memory-fixture checks. The [2026-10-13 report](docs/LIVE_HOST_VALIDATION_20261013.md) preserves earlier write-plan and integrity fixes and their host compatibility limits.
 
 The [2026-10-23 KMON live matrix](docs/KMON_LIVE_VALIDATION_20261023.md) exercises emitted detections with owned memory fixtures and records repairs to loader ownership and VAD PE classification. Repeat it with `tools/validate-kmon-live.ps1` from an elevated PowerShell.
@@ -55,7 +57,7 @@ kn-live-dbg/
   shared/KnLiveDbgProbeIoctl.h  positive-control probe ABI
   driver/Driver.cpp             WDM driver with virtual/physical memory IOCTLs
   probe_driver/ProbeDriver.cpp  WDM positive-control test buffer driver
-  minifilter_fixture_driver/    no-op minifilter detach/reattach positive control
+  minifilter_fixture_driver/    cooperative callback and pending-I/O test provider
   bind_fixture_controller/      temp-only QoS/Bind positive-control controller
   hunt_test_target/             lab-only !hunt positive-control process
   kmon_test_target/             lab-only !kmon user-mode hostility fixture
@@ -1960,7 +1962,9 @@ To include the controller's concurrent port/device-close test, first build
 to the Python harness. This adds 100 close cycles with four concurrent readers.
 `tools/run-pending-io-e2e.py --output .build/pending-io/run1` exercises actual
 pending CREATE pre/post and paired asynchronous READ contexts in the fixture.
-Its separate admin test port arms one target process request at a time. Mandatory
+Its separate admin test port arms one target process, with a single request or a
+bounded batch of 2–8 READs. The fixture protocol is v7 (32-byte request, 528-byte
+status), separate from the main driver ABI. Mandatory
 context cleanup and READ buffer lifetime remain active when CREATE counting bodies
 are paused. Use `--read-only --cycles 10` for the READ buffer/draining regression.
 It records the final context/worker ledger after each unload and removes its own

@@ -8,6 +8,13 @@ machines, and Windows builds.
 
 ## Current Roadmap
 
+Source validation through 2026-10-25 includes [KMON background image coverage](KMON_LARGE_BACKGROUND_VALIDATION_20261024.md),
+[native feature checks](NATIVE_FEATURE_VALIDATION_20261024.md), and
+[pending query/runner-failure races](PENDING_QUERY_FAULT_REVIEW_20261025.md).
+These are dated host observations for changes after v0.0.35. Use the current
+[manual checklist](MANUAL_TEST_CHECKLIST.md) for reproduction; the versioned
+release links below preserve the earlier release evidence.
+
 The [2026-09-19 command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) is complete for the
 261-entry registry: numeric/JSON validation, fixed-arity dispatch, write backup
 failures, MCP queue timeout handling, remote queued cancellation/stop, collector
@@ -27,9 +34,12 @@ Completed core slices:
    `!kpage` (orphan executable pages; optional `/deep` PFN walk),
    `!payload` (hook-to-body), and `!pool pe` (staged pool PE). A clean
    `!mapper` is ledger-clean, not payload-absent.
-7. Minifilter IRP control: `!minifilter` list/show plus session-backed
-   enable/disable of one filter IRP, or every registered slot
-   (`disable-all` / `irp=all`).
+7. Minifilter inspection plus cooperative CREATE-body control for
+   `KnLiveDbgMiniFilterFixture`: kernel-owned rundown, owner restoration, and
+   pending pre/post lifetime validation. `disable-all` / `irp=all` select that
+   provider's supported bodies; registered pointers stay unchanged. External
+   callback mutation remains unavailable. Query buffer faults and runner exit
+   recovery are covered by the latest supervised fixture tests.
 8. Evidence timeline (`!timeline`) with TI ingest, kernel live
    process/image/thread callbacks, dashboard, and MCP
    query/export/reconcile.

@@ -1,7 +1,13 @@
 # Manual Test Checklist
 
-The [2026-10-13 live-host validation report](LIVE_HOST_VALIDATION_20261013.md)
-records actual test-signed-host evidence, fixes, incomplete coverage, and cleanup.
+Latest source validation is recorded in the
+[2026-10-25 response-buffer and runner-failure review](PENDING_QUERY_FAULT_REVIEW_20261025.md).
+It contains the `d38a5b4` cleanup fixes, 1,034 ordinary checks, 50 verified injected
+failures, and 344 final unload ledgers. The
+[2026-10-24 native feature report](NATIVE_FEATURE_VALIDATION_20261024.md) and
+[2026-10-13 live-host report](LIVE_HOST_VALIDATION_20261013.md) preserve earlier
+feature checks, incomplete coverage, and cleanup evidence. Their dated results
+do not automatically check off a new host or build.
 
 This document separates driver-free regression gates from live-kernel
 validation on a test-signing VM. Parser, dispatch, and transport checks run
@@ -42,7 +48,7 @@ The [command audit](COMMAND_AUDIT_20260919.md) records the initial results; the 
 | Standalone parser with AddressSanitizer | 275,002 |
 | Standalone completion with AddressSanitizer | 25,954 |
 
-The table records the current help/completion checks and the separate HTTP
+The table records the 2026-10-13 help/completion checks and separate HTTP
 transport gate. For Kmon hunting/page/core checks and actual-host results, use
 the dated [live-host evidence](LIVE_HOST_VALIDATION_20261013.md).
 
@@ -278,19 +284,90 @@ clean bill on the others:
 ## Minifilter IRP control
 
 ### `!minifilter`
+
 - `help !minifilter` shows `list`, `show`, `disable`, `disable-all`, `enable-all`,
-  `IRP_MJ_CREATE`, `disable UnionFS all`, and `disable-all UnionFS`.
+  the cooperative CREATE scope, and the example
+  `disable KnLiveDbgMiniFilterFixture CREATE /pre`.
 - Tab after `!minifilter` offers `disable-all` / `enable-all`. Tab after
   `!minifilter disable` offers `all` and `IRP_MJ_CREATE`. Tab after
   `help !minifilter` offers `disable-all`.
 - `!minifilter` on a clean box lists inbox filters (FileInfo, WdFilter, ...) with
   no crash and `complete=yes` when fltmgr symbols loaded.
 - `!minifilter show FileInfo` prints IRP slots; CREATE/CLEANUP should be active.
-- `!minifilter disable <lab-filter> CREATE` without `write on` must fail.
-- `!minifilter disable-all <lab-filter>` without `write on` must fail the same way.
-- After `write on`, disable then enable of a lab/test filter must restore the
-  same pre/post pointers. `disable-all` then `enable-all` must restore every
-  slot this session disabled. Do not disable WdFilter on a production box.
+- After `write off`, both `disable KnLiveDbgMiniFilterFixture CREATE` and
+  `disable-all KnLiveDbgMiniFilterFixture` must be refused.
+- After `write on`, `/pre`, `/post`, and `/both` pause only the fixture's CREATE
+  counting bodies. `managed.enabledMask` is pre=1, post=2. Disable waits for active
+  bodies; enable restores counting. Registered pre/post pointers stay unchanged
+  throughout, including while a body is paused.
+- `all` selects the provider's supported CREATE bodies. Mandatory context cleanup,
+  process-exit handling, and filter lifecycle callbacks remain active. Unsupported
+  target names, pointer addresses, path-shaped names, and IRPs are refused without
+  pointer mutation. `!callbacks` control accepts this fixture only with
+  `minifilter`/`all` scope.
+- Verify restoration after controller close and owner termination, preservation
+  of a live lease across supported detach/reattach, and complete drain on unload.
+  The [managed callback report](MANAGED_CALLBACK_VALIDATION_20261025.md) and
+  [external lifetime review](EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) describe
+  the supported behavior and registration-lifetime checks.
+
+### Pending I/O and runner-failure validation
+
+Run from the repository root in an elevated shell with Python 3.11 or newer and
+the matching `x64/Release/KnLiveDbgMiniFilterFixture.sys`. Build before loading the
+fixture, keep its service absent at the start, and use a fresh output directory
+for each run. Build and run the fixture suites sequentially.
+
+Both query runners support `--help` without elevation or fixture setup. Help
+must exit 0 without a traceback; missing required arguments and invalid reader
+counts must exit 2 before loading a driver.
+
+```powershell
+python tools/run-managed-callback-e2e.py --output .build/managed-current --cycles 30
+python tools/run-pending-io-e2e.py --output .build/pending-current --cycles 4
+python tools/run-pending-query-e2e.py --output .build/query-current --case all --iterations 4 --readers 8 --last-close --reply-change mixed
+python tools/run-pending-query-failure-e2e.py --output .build/query-failures-current --iterations 3 --readers 8
+```
+
+Repeat the query and supervisor suites with `--readers 2` and `--readers 16`,
+changing output paths. Existing batch, partial submission, re-ARM, and target-watch
+regressions remain in `run-pending-multiread-e2e.py`, `run-pending-partial-e2e.py`,
+`run-pending-rearm-e2e.py`, and `run-pending-watch-e2e.py`; their dated reports record
+the exact invocation matrix.
+
+- Confirm the fixture protocol is v7, with a 32-byte request and 528-byte status.
+  This does not change the main driver's ABI 17.
+- The ordinary query suite must exit 0 and report `passed=true`. Mixed reply
+  changes cover PAGE_NOACCESS, PAGE_READONLY, decommit, release/reserve, and content
+  overwrite across a page boundary. Expected copy faults return 998 and 0 bytes;
+  successful replies preserve the captured snapshot, and readable boundary
+  canaries stay intact.
+- A live snapshot includes its own query. Require
+  `QueryStarted = QueryCompleted + QueryActive` while running. Only the final
+  unload ledger requires `QueryActive=0`, all query/gate/context/instance counts
+  balanced, `Violations=0`, and zero remaining contexts, workers, connections,
+  instances, owner, and reservation.
+- The failure supervisor tests ten stages, including partial reader startup,
+  exceptions during the race, audit/log errors, and abrupt runner exit. Its root
+  result must exit 0, report `passed=true`, and verify `10 * iterations` expected
+  failures when `--case all` is selected. Each `verified.json` must contain
+  `verified_expected_failure=true`, job active count 0, and no supervisor cleanup
+  errors.
+- Structured child failures must exit 1 with `passed=false` and the selected
+  failure marker. `runner-exit` exits 86 and leaves no child `result.json` because
+  it skips Python cleanup; the supervisor must recover the fixture service and
+  final audit. Use the supervisor for abrupt-exit testing. Its own termination
+  or an OS stop is outside the recorded service-recovery guarantee.
+- Check `failure.txt`, `cleanup_errors`, `journal.jsonl`, `unload-audits.json`, and
+  supervisor recovery evidence together. An expected test failure is not a
+  successful child test, and extra cleanup errors must fail validation. After
+  each run, require `sc.exe query KnLiveDbgMiniFilterFixture` to return 1060 and
+  the fixture to be absent from `fltmc.exe filters`.
+- Record the boot time before and after the test interval and inspect new
+  bugcheck/reboot events, dumps, and remaining owned processes/services. Keep
+  earlier crashes distinct from new test failures. The
+  [latest review](PENDING_QUERY_FAULT_REVIEW_20261025.md) preserves the observed
+  interval, binary hash, and complete matrix.
 
 ## WFP kernel callouts
 
