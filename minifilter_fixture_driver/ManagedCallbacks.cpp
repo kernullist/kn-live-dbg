@@ -1,4 +1,5 @@
 #include "ManagedCallbacks.h"
+#include "PendingIo.h"
 #include "../shared/KnLiveDbgManagedCallbacks.h"
 
 namespace
@@ -96,6 +97,7 @@ namespace
     {
         UNREFERENCED_PARAMETER(processId);
         if (createInfo != nullptr) return;
+        PendingIoProcessExit(process);
         LockControl();
         if (g_OwnerProcess == process) ReleaseOwner(true);
         UnlockControl();
@@ -402,23 +404,19 @@ void ManagedCallbacksUnregistered() { g_Filter = nullptr; }
 FLT_PREOP_CALLBACK_STATUS FLTAPI ManagedPreCreate(
     PFLT_CALLBACK_DATA data, PCFLT_RELATED_OBJECTS objects, PVOID* completionContext)
 {
-    UNREFERENCED_PARAMETER(objects);
-    if (completionContext != nullptr) *completionContext = nullptr;
     TestHoldBeforeBody(0, data);
     RunBody(0, data);
-    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    return PendingIoPreOperation(data, objects, completionContext);
 }
 
 FLT_POSTOP_CALLBACK_STATUS FLTAPI ManagedPostCreate(
     PFLT_CALLBACK_DATA data, PCFLT_RELATED_OBJECTS objects, PVOID completionContext,
     FLT_POST_OPERATION_FLAGS flags)
 {
-    UNREFERENCED_PARAMETER(objects);
-    UNREFERENCED_PARAMETER(completionContext);
     if ((flags & FLTFL_POST_OPERATION_DRAINING) == 0)
     {
         TestHoldBeforeBody(1, data);
         RunBody(1, data);
     }
-    return FLT_POSTOP_FINISHED_PROCESSING;
+    return PendingIoPostOperation(data, objects, completionContext, flags);
 }

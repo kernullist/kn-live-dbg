@@ -23,6 +23,7 @@ The [large background image follow-up](docs/KMON_LARGE_BACKGROUND_VALIDATION_202
 The [native feature validation](docs/NATIVE_FEATURE_VALIDATION_20261024.md) records direct execution of the other feature families, snapshot and module-inventory fixes, BYOVD version accuracy, TI log persistence, and controlled detection results.
 The [managed callback validation](docs/MANAGED_CALLBACK_VALIDATION_20261025.md) describes the cooperative test provider, kernel-owned rundown, automatic restoration, and termination/unload tests. External callback pointer replacement remains unavailable.
 The [external callback lifetime review](docs/EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) explains the dispatch-before-entry and pending-completion gaps, and tests registered wrapper lifetime separately from body rundown.
+The [pending I/O lifetime validation](docs/PENDING_IO_LIFETIME_VALIDATION_20261025.md) records a fixture READ buffer crash, its MDL lifetime fix, and real pending pre/post, draining, cancellation, termination, and unload tests.
 
 ## Demo
 
@@ -1951,6 +1952,13 @@ To include the controller's concurrent port/device-close test, first build
 `tools/validate-managed-callback-close.ps1 -BuildOnly`, then pass
 `--close-race-executable .build/managed-close-selftest/managed-callback-close-selftest.exe`
 to the Python harness. This adds 100 close cycles with four concurrent readers.
+`tools/run-pending-io-e2e.py --output .build/pending-io/run1` exercises actual
+pending CREATE pre/post and paired asynchronous READ contexts in the fixture.
+Its separate admin test port arms one target process request at a time. Mandatory
+context cleanup and READ buffer lifetime remain active when CREATE counting bodies
+are paused. Use `--read-only --cycles 10` for the READ buffer/draining regression.
+It records the final context/worker ledger after each unload and removes its own
+service on completion. Build and run these harnesses sequentially.
 Supported attachment changes are also covered by
 `tools/run-minifilter-detach-e2e.ps1 -CheckMutationGuard`; the guard probe now
 targets an unsupported name and verifies that the fixture's registration stays intact.

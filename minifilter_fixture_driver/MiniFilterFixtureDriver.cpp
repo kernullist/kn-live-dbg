@@ -1,5 +1,6 @@
 #include <fltKernel.h>
 #include "ManagedCallbacks.h"
+#include "PendingIo.h"
 
 namespace
 {
@@ -11,7 +12,6 @@ namespace
         _In_ DEVICE_TYPE volumeDeviceType,
         _In_ FLT_FILESYSTEM_TYPE volumeFilesystemType)
     {
-        UNREFERENCED_PARAMETER(objects);
         UNREFERENCED_PARAMETER(flags);
 
         if (volumeDeviceType !=
@@ -27,7 +27,7 @@ namespace
         {
             return STATUS_FLT_DO_NOT_ATTACH;
         }
-        return STATUS_SUCCESS;
+        return PendingIoInstanceSetup(objects);
     }
 
     NTSTATUS FLTAPI InstanceQueryTeardown(
@@ -42,12 +42,20 @@ namespace
         return STATUS_SUCCESS;
     }
 
-    VOID FLTAPI InstanceTeardown(
+    VOID FLTAPI InstanceTeardownStart(
         _In_ PCFLT_RELATED_OBJECTS objects,
         _In_ FLT_INSTANCE_TEARDOWN_FLAGS reason)
     {
-        UNREFERENCED_PARAMETER(objects);
         UNREFERENCED_PARAMETER(reason);
+        PendingIoInstanceTeardownStart(objects);
+    }
+
+    VOID FLTAPI InstanceTeardownComplete(
+        _In_ PCFLT_RELATED_OBJECTS objects,
+        _In_ FLT_INSTANCE_TEARDOWN_FLAGS reason)
+    {
+        UNREFERENCED_PARAMETER(reason);
+        PendingIoInstanceTeardownComplete(objects);
     }
 
     NTSTATUS FLTAPI FilterUnload(
@@ -57,8 +65,10 @@ namespace
 
         if (g_Filter != nullptr)
         {
+            PendingIoStop();
             ManagedCallbacksStop();
             FltUnregisterFilter(g_Filter);
+            PendingIoUnregistered();
             ManagedCallbacksUnregistered();
             g_Filter = nullptr;
         }
@@ -73,6 +83,12 @@ namespace
                 0,
                 ManagedPreCreate,
                 ManagedPostCreate
+            },
+            {
+                IRP_MJ_READ,
+                FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
+                PendingIoPreOperation,
+                PendingIoPostOperation
             },
             {
                 IRP_MJ_OPERATION_END,
@@ -101,6 +117,7 @@ NTSTATUS DriverEntry(
     }
 
     ManagedCallbacksInitialize();
+    PendingIoInitialize();
     g_Registration =
         FLT_REGISTRATION{};
     g_Registration.Size =
@@ -109,6 +126,7 @@ NTSTATUS DriverEntry(
         FLT_REGISTRATION_VERSION;
     g_Registration.OperationRegistration =
         kOperationCallbacks;
+    g_Registration.ContextRegistration = PendingIoContextRegistration();
     g_Registration.FilterUnloadCallback =
         FilterUnload;
     g_Registration.InstanceSetupCallback =
@@ -116,9 +134,9 @@ NTSTATUS DriverEntry(
     g_Registration.InstanceQueryTeardownCallback =
         InstanceQueryTeardown;
     g_Registration.InstanceTeardownStartCallback =
-        InstanceTeardown;
+        InstanceTeardownStart;
     g_Registration.InstanceTeardownCompleteCallback =
-        InstanceTeardown;
+        InstanceTeardownComplete;
 
     NTSTATUS status =
         FltRegisterFilter(
@@ -131,12 +149,15 @@ NTSTATUS DriverEntry(
         return status;
     }
 
-    status = ManagedCallbacksStart(g_Filter);
+    status = PendingIoStart(g_Filter, registryPath);
+    if (NT_SUCCESS(status)) status = ManagedCallbacksStart(g_Filter);
     if (NT_SUCCESS(status)) status = FltStartFiltering(g_Filter);
     if (!NT_SUCCESS(status))
     {
+        PendingIoStop();
         ManagedCallbacksStop();
         FltUnregisterFilter(g_Filter);
+        PendingIoUnregistered();
         ManagedCallbacksUnregistered();
         g_Filter = nullptr;
     }

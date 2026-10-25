@@ -99,8 +99,11 @@
   <ItemGroup>
     <ClCompile Include="MiniFilterFixtureDriver.cpp" />
     <ClCompile Include="ManagedCallbacks.cpp" />
+    <ClCompile Include="PendingIo.cpp" />
     <ClInclude Include="ManagedCallbacks.h" />
+    <ClInclude Include="PendingIo.h" />
     <ClInclude Include="..\shared\KnLiveDbgManagedCallbacks.h" />
+    <ClInclude Include="..\shared\KnLiveDbgPendingIo.h" />
   </ItemGroup>
   <ItemDefinitionGroup>
     <Link>
