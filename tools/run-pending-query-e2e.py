@@ -4,6 +4,7 @@ import ctypes as c
 from ctypes import wintypes as w
 import importlib.util
 import json
+import os
 import pathlib
 import random
 import sys
@@ -65,18 +66,33 @@ def coherent(state):
 
 
 class Readers:
-    def __init__(self, sources, count):
+    def __init__(self, sources, count, fail_start=False):
         self.stop, self.unloading = threading.Event(), threading.Event()
         self.errors, self.rows, self.threads = [], [], []
-        for index in range(count):
-            source, allowed = sources[index % len(sources)]
-            row = dict(index=index, allowed=allowed, successes=0, denied=0, closed=0, max_us=0,
-                owners=set(), generations=set())
-            self.rows.append(row)
-            port = borrowed(duplicate(source))
-            worker = threading.Thread(target=self.run, args=(port, row))
-            self.threads.append(worker)
-            worker.start()
+        try:
+            for index in range(count):
+                if fail_start and index == 1:
+                    raise RuntimeError('injected runner failure: reader-start')
+                source, allowed = sources[index % len(sources)]
+                row = dict(index=index, allowed=allowed, successes=0, denied=0, closed=0, max_us=0,
+                    owners=set(), generations=set())
+                port = borrowed(duplicate(source))
+                worker = threading.Thread(target=self.run, args=(port, row))
+                try:
+                    worker.start()
+                except BaseException:
+                    port.close()
+                    raise
+                self.rows.append(row)
+                self.threads.append(worker)
+        except BaseException as error:
+            # The caller never receives a partially constructed Readers object.
+            # Stop/join leases already started before propagating its failure.
+            try:
+                self.finish()
+            except BaseException:
+                error.add_note('partial reader cleanup:\n' + traceback.format_exc())
+            raise
 
     def run(self, port, row):
         previous = None
@@ -127,7 +143,82 @@ class Readers:
         return [dict(row, owners=sorted(row['owners']), generations=sorted(row['generations'])) for row in self.rows]
 
 
+class ReplyBuffer:
+    """Owned two-page reply crossing a page boundary; never read a dead page."""
+    MODES = ('noaccess', 'readonly', 'decommit', 'release', 'overwrite')
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.base = kernel.VirtualAlloc(None, 8192, 0x3000, 4)
+        assert self.base
+        self.output = self.base + 4096 - 256
+        self.changed = False
+        c.memset(self.base, 0xa5, 8192)
+
+    def change(self):
+        if self.mode in ('noaccess', 'readonly'):
+            old = w.DWORD()
+            assert kernel.VirtualProtect(self.base + 4096, 4096,
+                1 if self.mode == 'noaccess' else 2, c.byref(old))
+        elif self.mode == 'decommit':
+            assert kernel.VirtualFree(self.base + 4096, 4096, 0x4000)
+        elif self.mode == 'release':
+            address = self.base
+            assert kernel.VirtualFree(address, 0, 0x8000)
+            self.base = None
+            # Keep this VA inaccessible until the reply returns. Unrelated
+            # Python allocations must not reuse a deliberately released reply.
+            reserved = kernel.VirtualAlloc(address, 8192, 0x2000, 1)
+            if reserved != address:
+                if reserved:
+                    kernel.VirtualFree(reserved, 0, 0x8000)
+                raise RuntimeError('could not reserve released reply address')
+            self.base = reserved
+        else:
+            assert self.mode == 'overwrite'
+            c.memset(self.output, 0x5a, c.sizeof(p.Status))
+        self.changed = True
+
+    def verify(self, reply, held):
+        assert self.changed
+        if self.mode == 'overwrite':
+            assert reply['hr'] == 0 and reply['returned'] == c.sizeof(p.Status), reply
+            state = p.Status.from_buffer_copy(c.string_at(self.output, c.sizeof(p.Status)))
+            coherent(state)
+            assert state.OwnerPid == held.OwnerPid and state.ArmedRemaining == held.ArmedRemaining
+            assert state.ArmedGeneration == held.ArmedGeneration
+            reply['state'] = p.fields(state)
+        else:
+            assert reply['hr'] == 0x800703e6 and reply['returned'] == 0, reply
+        if self.mode in ('noaccess', 'readonly'):
+            old = w.DWORD()
+            assert kernel.VirtualProtect(self.base + 4096, 4096, 4, c.byref(old))
+        if self.mode != 'release':
+            assert c.string_at(self.output - 64, 64) == b'\xa5' * 64, 'reply prefix overwritten'
+        if self.mode not in ('release', 'decommit'):
+            assert c.string_at(self.output + c.sizeof(p.Status), 64) == b'\xa5' * 64, 'reply suffix overwritten'
+        return dict(mode=self.mode, **reply)
+
+    def close(self):
+        if self.base:
+            assert kernel.VirtualFree(self.base, 0, 0x8000)
+            self.base = None
+
+
 class Suite(watch.Suite):
+    def record(self, kind, **detail):
+        if self.cleanup_in_progress and getattr(self, 'inject_failure', None) == 'cleanup-log':
+            raise OSError('injected cleanup evidence failure')
+        return super().record(kind, **detail)
+
+    def inject(self, stage):
+        if getattr(self, 'inject_failure', None) == stage:
+            if stage == 'cleanup-command-log':
+                log = self.output / 'lifecycle.log'
+                log.rename(self.output / 'lifecycle-before-failure.log')
+                log.mkdir()  # Force real append failures during cleanup commands.
+            raise RuntimeError('injected runner failure: ' + stage)
+
     def query_hold(self, monitor, count):
         state = p.wait_state(monitor, lambda s: s.QueryGateEntered == count and s.QueryGateCompleted == 0)
         coherent(state)
@@ -340,16 +431,14 @@ class Suite(watch.Suite):
                 if churn is not None:
                     churn.join(15)
                 if clients is not None:
-                    clients.finish()
-                source.close()
-                monitor.close()
-                kernel.CloseHandle(root)
-                if foreign.value:
-                    kernel.CloseHandle(foreign)
-                for child in (owner, next_owner, target, replacement):
-                    child.close(force=True)
+                    self.cleanup_steps(('readers', clients.finish))
+                self.cleanup_steps(('source', source.close), ('monitor', monitor.close),
+                    ('root', lambda: kernel.CloseHandle(root)),
+                    ('foreign', lambda: kernel.CloseHandle(foreign) if foreign.value else None),
+                    *((f'child-{child.proc.pid}', lambda child=child: child.close(force=True))
+                      for child in (owner, next_owner, target, replacement)))
 
-    def races(self, iterations, readers, seed, last_close=False):
+    def races(self, iterations, readers, seed, last_close=False, reply_change='none'):
         rng = random.Random(seed)
         for iteration in range(iterations):
             for owner_query in (False, True):
@@ -359,10 +448,14 @@ class Suite(watch.Suite):
                 monitor, source = p.Port(), p.Port()
                 foreign = borrowed(duplicate(w.HANDLE(owner.ready['handle']), int(owner.proc._handle)))
                 duplication_root = borrowed(duplicate(source.handle))
-                clients, gates = None, []
-                order = rng.sample(['close', 'duplicate', 'kill', 'arm', 'topology', 'unload'], 6)
-                barrier, errors, calls = threading.Barrier(7), [], {}
+                clients, gates, buffers = None, [], []
+                actions = ['close', 'duplicate', 'kill', 'arm', 'topology', 'unload']
+                if reply_change != 'none':
+                    actions.append('buffer')
+                order = rng.sample(actions, len(actions))
+                barrier, errors, calls = threading.Barrier(len(actions) + 1), [], {}
                 original_closing, root_closing, duplicate_observed = threading.Event(), threading.Event(), threading.Event()
+                buffers_changed, unload_started = threading.Event(), threading.Event()
                 query_count = min(readers, 4)
                 unload_delay = rng.choice((.02, .04, .07))
 
@@ -371,7 +464,15 @@ class Suite(watch.Suite):
                         barrier.wait(5)
                         time.sleep(order.index(action) * .002 + (unload_delay if action == 'unload' else 0))
                         began, detail = time.perf_counter_ns(), {}
-                        if action == 'close':
+                        if action == 'buffer':
+                            before = monitor.send()
+                            assert before.QueryGateCompleted == 0
+                            for buffer in buffers:
+                                buffer.change()
+                            detail['modes'] = [buffer.mode for buffer in buffers]
+                            detail['before'] = p.fields(before)
+                            buffers_changed.set()
+                        elif action == 'close':
                             # Every send on this exact handle is already inside
                             # Message. No user-handle value is used after close.
                             if last_close:
@@ -441,6 +542,8 @@ class Suite(watch.Suite):
                             # Observe a real duplicate/query/close cycle before
                             # initiating unload instead of assuming it ran.
                             assert duplicate_observed.wait(5)
+                            if buffers:
+                                assert buffers_changed.wait(5)
                             if last_close:
                                 # Both remaining user handles begin closing while
                                 # the queries are held. Do not wait for CloseHandle
@@ -450,6 +553,7 @@ class Suite(watch.Suite):
                             assert before.QueryGateEntered - before.QueryGateCompleted >= query_count, p.fields(before)
                             detail['before'] = p.fields(before)
                             clients.unloading.set()
+                            unload_started.set()
                             hr = flt.FilterUnload(p.NAME)
                             assert hr >= 0, hr
                             self.loaded = False
@@ -461,27 +565,65 @@ class Suite(watch.Suite):
                 workers = [threading.Thread(target=actor, args=(action,)) for action in order]
                 try:
                     self.arm(owner, target)
-                    clients = Readers([(monitor.handle, True), (foreign.handle, False)], readers)
+                    clients = Readers([(monitor.handle, True), (foreign.handle, False)], readers,
+                        fail_start=getattr(self, 'inject_failure', None) == 'reader-start')
                     clients.warmed()
+                    if reply_change != 'none':
+                        for index in range(query_count):
+                            mode = (ReplyBuffer.MODES[(iteration * query_count + index) % len(ReplyBuffer.MODES)]
+                                if reply_change == 'mixed' else reply_change)
+                            buffers.append(ReplyBuffer(mode))
                     with p.managed.driver_load_privilege():
-                        for worker in workers:
-                            worker.start()
-                        handle = w.HANDLE(source.handle.value)
-                        gates = [self.background(lambda: raw_query(handle, delay=500)) for _ in range(query_count)]
-                        if owner_query:
-                            owner.send(action=6, delay=500)
-                        held = self.query_hold(monitor, query_count + int(owner_query))
-                        barrier.wait(5)
-                        for worker in workers:
-                            worker.join(15)
+                        actors_released = False
+                        try:
+                            for worker in workers:
+                                worker.start()
+                            handle = w.HANDLE(source.handle.value)
+                            gates = [self.background(lambda index=index: raw_query(handle, delay=500,
+                                output=buffers[index].output if buffers else None)) for index in range(query_count)]
+                            if owner_query:
+                                owner.send(action=6, delay=500)
+                            held = self.query_hold(monitor, query_count + int(owner_query))
+                            self.inject('after-gates')
+                            self.inject('cleanup-audit')
+                            self.inject('cleanup-log')
+                            self.inject('cleanup-command-log')
+                            barrier.wait(5)
+                            actors_released = True
+                            if getattr(self, 'inject_failure', None) in ('during-race', 'reader-error', 'runner-exit'):
+                                assert unload_started.wait(5)
+                                assert not all(gate[1].is_set() for gate in gates), 'failure missed the live queries'
+                                self.record('runner-failure-window', label=label, failure=self.inject_failure,
+                                    live_queries=sum(not gate[1].is_set() for gate in gates),
+                                    buffer_modes=[buffer.mode for buffer in buffers],
+                                    buffers_changed=buffers_changed.is_set(),
+                                    original_closing=original_closing.is_set(), root_closing=root_closing.is_set())
+                                if self.inject_failure == 'runner-exit':
+                                    os._exit(86)  # The supervising job owns crash cleanup.
+                                if self.inject_failure == 'reader-error':
+                                    clients.errors.append('injected reader assertion')
+                                self.inject(self.inject_failure)
+                        finally:
+                            # Keep SeLoadDriverPrivilege until every native actor
+                            # has returned, even when the test body raises early.
+                            if not actors_released:
+                                barrier.abort()
+                            for worker in workers:
+                                if worker.ident is not None:
+                                    worker.join(15)
                     self.record('query-race-calls', label=label, held=p.fields(held), calls=calls, errors=errors, order=order)
                     state = self.audit(label) if not self.loaded else None
+                    self.inject('after-unload')
                     if getattr(self, 'inject_post_unload_failure', False):
                         raise AssertionError('injected failure after observed unload')
                     assert not errors and all(not worker.is_alive() for worker in workers), errors
                     assert state is not None, 'unload did not complete'
                     replies = [self.joined(gate) for gate in gates]
-                    assert all(reply['hr'] == 0 for reply in replies), replies
+                    if buffers:
+                        replies = [buffer.verify(reply, held) for buffer, reply in zip(buffers, replies)]
+                        assert state.QueryReplyFailures == sum(buffer.mode != 'overwrite' for buffer in buffers)
+                    else:
+                        assert all(reply['hr'] == 0 for reply in replies), replies
                     rows = clients.finish()
                     result = None
                     if calls['arm'].get('read_sent'):
@@ -499,14 +641,34 @@ class Suite(watch.Suite):
                             worker.join(15)
                     for gate in gates:
                         gate[0].join(15)
+                    self.cleanup_steps(('race-evidence', lambda: self.record('query-race-finally',
+                        label=label, calls=calls, errors=errors, queries=[gate[2] for gate in gates],
+                        live_actors=[worker.name for worker in workers if worker.is_alive()],
+                        live_queries=sum(gate[0].is_alive() for gate in gates))))
+                    if not self.loaded and not any(audit['name'] == label for audit in self.audits):
+                        self.cleanup_steps(('race-final-audit', lambda: self.audit(label)))
+                    # Never unmap an output still in use by a live send.
+                    if all(not gate[0].is_alive() for gate in gates):
+                        self.cleanup_steps(*((f'reply-buffer-{index}', buffer.close) for index, buffer in enumerate(buffers)))
                     if clients is not None:
-                        clients.finish()
-                    source.close()
-                    foreign.close()
-                    duplication_root.close()
-                    monitor.close()
-                    for child in (owner, next_owner, target, replacement):
-                        child.close(force=True)
+                        self.cleanup_steps(('readers', clients.finish))
+                    self.cleanup_steps(('source', source.close), ('foreign', foreign.close),
+                        ('duplication-root', duplication_root.close), ('monitor', monitor.close),
+                        *((f'child-{child.proc.pid}', lambda child=child: child.close(force=True))
+                          for child in (owner, next_owner, target, replacement)))
+                    self.cleanup_steps(('race-resources', lambda: self.check(label + '-resources-closed',
+                        all(not worker.is_alive() for worker in workers) and
+                        all(not gate[0].is_alive() for gate in gates) and
+                        (clients is None or all(not worker.is_alive() for worker in clients.threads)) and
+                        all(not port.handle.value for port in (source, foreign, duplication_root, monitor)) and
+                        all(child.proc.poll() is not None for child in (owner, next_owner, target, replacement)))))
+
+    def audit(self, name):
+        state = super().audit(name)
+        self.inject('audit')
+        if name == 'cleanup' and getattr(self, 'inject_failure', None) == 'cleanup-audit':
+            raise RuntimeError('injected cleanup audit failure')
+        return state
 
 
 def main():
@@ -517,14 +679,31 @@ def main():
     parser.add_argument('--case', choices=('stress', 'controls', 'races', 'all'), default='all')
     parser.add_argument('--seed', type=int, default=251025)
     parser.add_argument('--last-close', action='store_true', help='close the duplication root during gated races')
+    parser.add_argument('--reply-change', choices=('none', 'mixed', *ReplyBuffer.MODES), default='none')
+    parser.add_argument('--inject-failure', choices=('reader-start', 'after-gates', 'during-race',
+        'reader-error', 'after-unload', 'audit', 'cleanup-audit', 'cleanup-log', 'cleanup-command-log', 'runner-exit'),
+        help='fail one race deliberately; exit 1 and recorded failure are expected')
+    parser.add_argument('--start-event', help=argparse.SUPPRESS)
     parser.add_argument('--inject-post-unload-failure', action='store_true',
         help='deliberately fail one race after unload to verify failure cleanup (exit 1 expected)')
     args = parser.parse_args()
     assert c.windll.shell32.IsUserAnAdmin(), 'run elevated'
     assert 1 <= args.iterations <= 100
     assert not args.inject_post_unload_failure or args.case == 'races' and args.iterations == 1
+    assert not args.inject_failure or args.case == 'races' and args.iterations == 1
+    assert args.inject_failure != 'runner-exit' or args.start_event, 'runner-exit needs the failure supervisor'
+    if args.start_event:
+        kernel.OpenEventW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+        kernel.OpenEventW.restype = w.HANDLE
+        event = kernel.OpenEventW(0x100000, False, args.start_event)
+        assert event
+        try:
+            assert kernel.WaitForSingleObject(event, 30000) == 0, 'supervisor did not assign the job'
+        finally:
+            kernel.CloseHandle(event)
     suite, completed, started = Suite(args.output, 8), False, time.monotonic()
     suite.inject_post_unload_failure = args.inject_post_unload_failure
+    suite.inject_failure = args.inject_failure
     try:
         suite.setup()
         if args.case in ('stress', 'all'):
@@ -532,19 +711,22 @@ def main():
         if args.case in ('controls', 'all'):
             suite.query_controls(args.iterations)
         if args.case in ('races', 'all'):
-            suite.races(args.iterations, args.readers, args.seed, args.last_close)
+            suite.races(args.iterations, args.readers, args.seed, args.last_close, args.reply_change)
         completed = True
     finally:
-        if sys.exc_info()[0] is not None:
-            (suite.output / 'failure.txt').write_text(traceback.format_exc(), encoding='utf-8')
+        original_failure = traceback.format_exc() if sys.exc_info()[0] is not None else None
+        if original_failure:
+            suite.cleanup_steps(('failure-report', lambda: (suite.output / 'failure.txt').write_text(
+                original_failure, encoding='utf-8')))
         errors = suite.cleanup()
         result = dict(passed=completed and not errors and all(row['passed'] for row in suite.checks),
             checks=len(suite.checks), iterations=args.iterations, readers=args.readers,
             case=args.case, seed=args.seed, last_close=args.last_close,
-            injected_failure=args.inject_post_unload_failure, seconds=time.monotonic() - started,
+            reply_change=args.reply_change, injected_failure=args.inject_failure or args.inject_post_unload_failure,
+            seconds=time.monotonic() - started,
             fixture_sha256=suite.hash, cleanup_errors=errors)
         (suite.output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
-        if errors:
+        if errors and not original_failure:
             raise RuntimeError(errors)
 
 

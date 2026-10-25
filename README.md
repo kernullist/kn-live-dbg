@@ -1974,6 +1974,15 @@ adds concurrent snapshot checks and bounded holds before copying a query reply.
 Use `--case races --last-close` to close the last duplication root during those
 holds. Live snapshots include their own active query; only the final unload ledger
 requires zero active queries and equal query-start/completion counts.
+Add `--reply-change mixed` to combine page protection/decommit/release and reply
+overwrites with the last-close races. Replies cross a page boundary and include
+boundary canaries; expected copy faults must return zero bytes and drain normally.
+`tools/run-pending-query-failure-e2e.py --output .build/pending-query-failure/run1 --iterations 3`
+supervises partial reader startup, live-race exceptions, reporting failures, and
+abrupt runner exit. A Windows job contains its helpers before test setup, and the
+supervisor recovers only the verified fixture service. Expected failures stay
+failed in the runner evidence; separate checks verify cleanup and final ledgers.
+See [the response-buffer and runner-failure review](docs/PENDING_QUERY_FAULT_REVIEW_20261025.md).
 Supported attachment changes are also covered by
 `tools/run-minifilter-detach-e2e.ps1 -CheckMutationGuard`; the guard probe now
 targets an unsupported name and verifies that the fixture's registration stays intact.

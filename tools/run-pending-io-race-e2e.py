@@ -132,6 +132,8 @@ class Suite:
         self.output = output.resolve()
         self.output.mkdir(parents=True, exist_ok=False)
         self.checks, self.audits, self.children = [], [], []
+        self.cleanup_errors = []
+        self.cleanup_in_progress = False
         self.owned, self.loaded = False, False
         self.path = self.output / 'target.tmp'
         self.path.write_bytes(b'P' * 4096)
@@ -155,8 +157,13 @@ class Suite:
     def run(self, *args, expected=0):
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
-        with open(self.output / 'lifecycle.log', 'ab') as log:
-            log.write((' '.join(args) + '\n').encode() + result.stdout)
+        try:
+            with open(self.output / 'lifecycle.log', 'ab') as log:
+                log.write((' '.join(args) + '\n').encode() + result.stdout)
+        except BaseException:
+            if not self.cleanup_in_progress:
+                raise
+            self.cleanup_errors.append('cleanup-command-log:\n' + traceback.format_exc())
         if expected is not None:
             assert result.returncode == expected, (args, result.returncode, result.stdout)
         return result
@@ -378,23 +385,38 @@ class Suite:
                     owner.close(force=True)
                     target.close(force=True)
 
+    def cleanup_steps(self, *steps):
+        # A reporting/join failure must neither mask the original exception nor
+        # skip independent releases. Keep every cleanup failure in the result.
+        for name, step in steps:
+            try:
+                step()
+            except BaseException:
+                self.cleanup_errors.append(name + ':\n' + traceback.format_exc())
+
     def cleanup(self):
-        errors = []
+        self.cleanup_in_progress = True
         for child in reversed(self.children):
-            try:
-                child.close(force=True)
-            except BaseException:
-                errors.append(traceback.format_exc())
+            self.cleanup_steps(('child-close', lambda child=child: child.close(force=True)))
         if self.owned:
+            if self.loaded:
+                self.cleanup_steps(('filter-unload', lambda: self.unload('cleanup')))
+            # Audit/reporting may fail *after* successful native unload. Check
+            # actual filter absence independently, then remove our own service.
+            # Never delete its service while the filter remains registered.
             try:
-                if self.loaded:
-                    self.unload('cleanup')
-                self.check('no-filter-residue', p.NAME.encode() not in self.run('fltmc.exe', 'filters').stdout)
+                absent = p.NAME.encode() not in self.run('fltmc.exe', 'filters').stdout
+                self.cleanup_steps(('filter-absence-report', lambda: self.check('no-filter-residue', absent)))
+                assert absent, 'refusing service deletion while filter remains registered'
                 self.run('sc.exe', 'delete', p.NAME)
-                self.check('no-service-residue', self.run('sc.exe', 'query', p.NAME, expected=None).returncode == 1060)
+                absent = self.run('sc.exe', 'query', p.NAME, expected=None).returncode == 1060
+                assert absent, 'service remains after deletion'
+                self.owned = False
+                self.cleanup_steps(('service-absence-report', lambda: self.check('no-service-residue', absent)))
             except BaseException:
-                errors.append(traceback.format_exc())
-        return errors
+                self.cleanup_errors.append('service-cleanup:\n' + traceback.format_exc())
+        self.cleanup_in_progress = False
+        return list(self.cleanup_errors)
 
 
 def main():
