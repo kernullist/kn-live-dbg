@@ -104,6 +104,53 @@ namespace
         return Disarm();
     }
 
+    // PASSIVE_LEVEL, no spin lock. An exit code of STATUS_PENDING (259) is
+    // legal, so the code alone is not a liveness test. Use a kernel handle
+    // and a zero-time wait; never wait for process exit while owning g_Control.
+    NTSTATUS ProbeTarget(PEPROCESS target)
+    {
+        if (PsGetProcessExitStatus(target) != STATUS_PENDING) return STATUS_PROCESS_IS_TERMINATING;
+        HANDLE handle = nullptr;
+        NTSTATUS status = ObOpenObjectByPointer(target, OBJ_KERNEL_HANDLE, nullptr,
+            SYNCHRONIZE, *PsProcessType, KernelMode, &handle);
+        if (!NT_SUCCESS(status)) return status;
+        LARGE_INTEGER immediate = {};
+        status = ZwWaitForSingleObject(handle, FALSE, &immediate);
+        ZwClose(handle);
+        if (status == STATUS_TIMEOUT) return STATUS_SUCCESS;
+        return status == STATUS_SUCCESS ? STATUS_PROCESS_IS_TERMINATING : STATUS_UNSUCCESSFUL;
+    }
+
+    void RetireExitedTarget()
+    {
+        LockControl();
+        KIRQL irql;
+        KeAcquireSpinLock(&g_Lock, &irql);
+        PEPROCESS target = g_Target;
+        if (target != nullptr) ObReferenceObject(target);
+        KeReleaseSpinLock(&g_Lock, irql);
+        PEPROCESS retired = nullptr;
+        if (target != nullptr && !NT_SUCCESS(ProbeTarget(target)))
+        {
+            KeAcquireSpinLock(&g_Lock, &irql);
+            // Topology teardown can retire the arm while the probe runs.
+            if (g_Target == target)
+            {
+                retired = Disarm();
+                ++g_Status.TargetWatchRetires;
+                for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
+                {
+                    auto operation = CONTAINING_RECORD(entry, Operation, AllLink);
+                    if (operation->TargetProcess == target) Wake(operation, 2);
+                }
+            }
+            KeReleaseSpinLock(&g_Lock, irql);
+        }
+        UnlockControl();
+        if (retired != nullptr) ObDereferenceObject(retired);
+        if (target != nullptr) ObDereferenceObject(target);
+    }
+
     // Caller owns g_Control. Do not wait for I/O while holding a control lock.
     void ReleaseOwner(bool automatic)
     {
@@ -220,7 +267,17 @@ namespace
         KeReleaseSpinLock(&g_Lock, irql);
         for (;;)
         {
-            KeWaitForSingleObject(&g_WorkAvailable, Executive, KernelMode, FALSE, nullptr);
+            // A new ARM can follow this target's exit notification but precede
+            // its final process signal (including exit code 259). Notification
+            // cleanup has already run in that case. Keep unused reservations
+            // watched until they are consumed or retired, without a new thread.
+            RetireExitedTarget();
+            KeAcquireSpinLock(&g_Lock, &irql);
+            const bool armed = g_Target != nullptr;
+            KeReleaseSpinLock(&g_Lock, irql);
+            LARGE_INTEGER probeInterval;
+            probeInterval.QuadPart = -1000000; // 100 ms, only while an arm exists.
+            KeWaitForSingleObject(&g_WorkAvailable, Executive, KernelMode, FALSE, armed ? &probeInterval : nullptr);
             for (;;)
             {
                 KeAcquireSpinLock(&g_Lock, &irql);
@@ -369,7 +426,8 @@ namespace
                 (request.Reserved == KNDBG_PENDING_GATE_PRE && request.Mode != KNDBG_PENDING_POST) ||
                 (request.Reserved == KNDBG_PENDING_GATE_POST &&
                     (request.Mode == KNDBG_PENDING_POST || request.Mode == KNDBG_PENDING_BOTH)) ||
-                (request.Reserved == KNDBG_PENDING_GATE_BEFORE_LOWER && request.Mode == KNDBG_PENDING_DRAIN_PAIR);
+                ((request.Reserved == KNDBG_PENDING_GATE_BEFORE_LOWER ||
+                  request.Reserved == KNDBG_PENDING_GATE_EXIT_TAIL) && request.Mode == KNDBG_PENDING_DRAIN_PAIR);
             if (!gateValid || request.Mode > KNDBG_PENDING_DRAIN_PAIR ||
                 request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) return STATUS_INVALID_PARAMETER;
         }
@@ -387,12 +445,18 @@ namespace
         LockControl();
         const ULONG_PTR id = reinterpret_cast<ULONG_PTR>(cookie);
         NTSTATUS status = STATUS_SUCCESS;
+        const NTSTATUS targetStatus = arm ? ProbeTarget(target) : STATUS_SUCCESS;
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
         auto client = FindClient(id);
         if (client == nullptr || client->Pid != PsGetCurrentProcessId()) status = STATUS_ACCESS_DENIED;
         else if (request.Action != KNDBG_PENDING_QUERY && g_Status.Stopping) status = STATUS_FLT_DELETING_OBJECT;
         else if (request.Action != KNDBG_PENDING_QUERY && g_Owner != 0 && g_Owner != id) status = STATUS_DEVICE_BUSY;
+        else if (arm && !NT_SUCCESS(targetStatus))
+        {
+            ++g_Status.TargetArmRejected;
+            status = targetStatus;
+        }
         else if (arm && g_Status.InstanceStarts != g_Status.InstanceCompletes)
         {
             ++g_Status.ArmDuringTeardownRejected;
@@ -418,6 +482,7 @@ namespace
             g_Delay = race ? 2000 : request.DelayMilliseconds;
             g_Gate = batch ? KNDBG_PENDING_GATE_PRE : (race ? request.Reserved : 0);
             g_GateMilliseconds = race ? request.DelayMilliseconds : 0;
+            KeSetEvent(&g_WorkAvailable, IO_NO_INCREMENT, FALSE);
         }
         else if (request.Action == KNDBG_PENDING_RESUME)
         {
@@ -536,8 +601,14 @@ void PendingIoProcessExit(PEPROCESS process)
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     PEPROCESS target = nullptr;
+    ULONG exitGateMilliseconds = 0;
     if (g_Target == process)
     {
+        if (g_Gate == KNDBG_PENDING_GATE_EXIT_TAIL)
+        {
+            exitGateMilliseconds = g_GateMilliseconds;
+            ++g_Status.TargetExitGateEntered;
+        }
         target = Disarm();
     }
     for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
@@ -548,6 +619,19 @@ void PendingIoProcessExit(PEPROCESS process)
     KeReleaseSpinLock(&g_Lock, irql);
     if (target != nullptr) ObDereferenceObject(target);
     UnlockControl();
+    if (exitGateMilliseconds != 0)
+    {
+        // Test-only 50..500 ms tail, with no control/spin lock held. The old
+        // cancellation sweep is finished but the process is not signaled yet.
+        // ManagedCallbacksStop removes/joins this notification before unload.
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -static_cast<LONGLONG>(exitGateMilliseconds) * 10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        KeAcquireSpinLock(&g_Lock, &irql);
+        ++g_Status.TargetExitGateCompleted;
+        if (g_Status.Stopping) ++g_Status.TargetExitGateStopSeen;
+        KeReleaseSpinLock(&g_Lock, irql);
+    }
 }
 
 NTSTATUS PendingIoInstanceSetup(PCFLT_RELATED_OBJECTS objects)

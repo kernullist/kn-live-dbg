@@ -193,7 +193,7 @@ class Suite(m.Suite):
                     target.close()
                 self.unload(label)
 
-    def partial_races(self, iterations, submitted, seed):
+    def partial_races(self, iterations, submitted, seed, rearm=False):
         rng = random.Random(seed)
         for iteration in range(iterations):
             for topology in ('reconnect-first', 'free-upper', 'free-lower'):
@@ -205,9 +205,11 @@ class Suite(m.Suite):
                     # A live duplicate must not suppress the owner's exit cleanup.
                     assert kernel.DuplicateHandle(w.HANDLE(int(owner.proc._handle)), w.HANDLE(owner.ready['handle']),
                         w.HANDLE(-1), c.byref(duplicate), 0, False, 2)
-                    order = rng.sample(['cancel', 'kill', 'topology', 'late', 'unload'], 5)
-                    barrier = threading.Barrier(6)
+                    actions = ['cancel', 'kill', 'topology', 'late', 'unload'] + (['arm'] if rearm else [])
+                    order = rng.sample(actions, len(actions))
+                    barrier = threading.Barrier(len(actions) + 1)
                     reconnected, late_sent = threading.Event(), threading.Event()
+                    arm_seen = threading.Event()
                     commands = threading.Lock()
                     outcomes, errors = {}, []
 
@@ -221,7 +223,19 @@ class Suite(m.Suite):
                                 if action == 'unload':
                                     assert late_sent.wait(2), 'remaining submission did not complete'
                             begin, detail = time.perf_counter_ns(), {}
-                            if action == 'cancel':
+                            if action == 'arm':
+                                try:
+                                    owner.send(action=5, mode=4, pid=target.proc.pid, delay=500,
+                                        Reserved=self.count, expect_error=True)
+                                    reply = owner.receive()
+                                    # The prior batch is still held. Only busy,
+                                    # deleting, or an unload-closed port is valid.
+                                    assert reply.get('error') in ('message: 0x800700aa',
+                                        'message: 0x801f000b', 'message: 0x80070006'), reply
+                                    detail['reply'] = reply
+                                finally:
+                                    arm_seen.set()
+                            elif action == 'cancel':
                                 try:
                                     with commands:
                                         target.send(cancel=True, slot=0)
@@ -230,6 +244,8 @@ class Suite(m.Suite):
                                     assert target.proc.poll() is not None or killed != 'owner'
                                     detail['sent'] = False
                             elif action == 'kill':
+                                if rearm:
+                                    assert arm_seen.wait(2), 'new ARM did not reach its response'
                                 if killed in ('owner', 'both'):
                                     owner.proc.terminate()
                                 if killed in ('target', 'both'):
@@ -313,9 +329,10 @@ class Suite(m.Suite):
                             state.InstanceStarts == state.InstanceCompletes == expected_instances and
                             state.ManualTeardowns + state.UnloadTeardowns == expected_instances and
                             submitted <= state.PreQueued <= self.count and
+                            (not rearm or state.BatchArms == 1) and
                             (killed == 'target' or outcomes['kill']['end'] < outcomes['unload']['end']),
                             state=p.fields(state), order=order, calls=outcomes, messages=messages,
-                            topology=topology, killed=killed, submitted=submitted)
+                            topology=topology, killed=killed, submitted=submitted, rearm=rearm)
                         try:
                             observer.send()
                             raise AssertionError('unloaded port still responds')
@@ -325,6 +342,7 @@ class Suite(m.Suite):
                         barrier.abort()
                         reconnected.set()
                         late_sent.set()
+                        arm_seen.set()
                         for thread in actors:
                             if thread.ident is not None:
                                 thread.join(15)

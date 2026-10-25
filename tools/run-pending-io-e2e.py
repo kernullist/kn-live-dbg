@@ -29,7 +29,7 @@ NAME, INSTANCE = managed.NAME, managed.INSTANCE
 LOWER = NAME + '.Lower'
 PORT = '\\' + NAME + 'PendingIo'
 MAGIC = 0x4B50494F
-VERSION = 4
+VERSION = 5
 SERVICE = 'SYSTEM\\CurrentControlSet\\Services\\' + NAME
 flt, kernel = managed.flt, managed.kernel
 flt.FilterDetach.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
@@ -60,10 +60,12 @@ class Status(c.Structure):
         'StaleLowerRejected', 'OtherReadSkipped', 'ArmedRemaining', 'BatchArms',
         'ManualTeardowns', 'UnloadTeardowns', 'RaceTeardownSeen', 'BeforeLowerCancelSeen',
         'BeforeLowerStopSeen', 'BeforeLowerTeardownSeen', 'TopologyGeneration', 'ArmedGeneration',
-        'TopologyDisarms', 'GenerationLowerRejected', 'ArmDuringTeardownRejected', 'SetupDuringStopRejected')]
+        'TopologyDisarms', 'GenerationLowerRejected', 'ArmDuringTeardownRejected', 'SetupDuringStopRejected',
+        'TargetArmRejected', 'TargetWatchRetires', 'TargetExitGateEntered', 'TargetExitGateCompleted',
+        'TargetExitGateStopSeen')]
 
 
-assert c.sizeof(Request) == 32 and c.sizeof(Status) == 368
+assert c.sizeof(Request) == 32 and c.sizeof(Status) == 408
 
 
 def fields(state):
@@ -74,7 +76,8 @@ def balanced(state):
     return (state.LiveContexts == state.ActiveWorkers == state.QueueDepth == state.Violations == 0
         and state.Created == state.Freed == state.LogicalCompleted
         and state.PreQueued == state.PreCompleted and state.PostQueued == state.PostCompleted
-        and state.RaceEntered == state.RaceCompleted and state.BeforeLowerEntered == state.BeforeLowerCompleted)
+        and state.RaceEntered == state.RaceCompleted and state.BeforeLowerEntered == state.BeforeLowerCompleted
+        and state.TargetExitGateEntered == state.TargetExitGateCompleted)
 
 
 class Port:
@@ -459,7 +462,8 @@ def main():
                 bad_commands += [dict(Action=4, Mode=mode, TargetPid=target.proc.pid,
                     DelayMilliseconds=delay, Reserved=gate) for mode, delay, gate in (
                         (1, 49, 1), (1, 501, 1), (1, 100, 0), (1, 100, 3),
-                        (2, 100, 1), (1, 100, 2), (1, 100, 4), (5, 100, 1))]
+                        (2, 100, 1), (1, 100, 2), (1, 100, 4), (5, 100, 1),
+                        (1, 100, 8), (4, 49, 8), (4, 501, 8), (4, 100, 16))]
                 bad_commands += [dict(Action=5, Mode=mode, TargetPid=target.proc.pid,
                     DelayMilliseconds=delay, Reserved=count) for mode, delay, count in (
                         (4, 100, 0), (4, 100, 1), (4, 100, 9), (1, 100, 8),

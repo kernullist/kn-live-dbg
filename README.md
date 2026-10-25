@@ -27,6 +27,7 @@ The [pending I/O lifetime validation](docs/PENDING_IO_LIFETIME_VALIDATION_202610
 The [pending I/O race review](docs/PENDING_IO_RACE_REVIEW_20261025.md) reproduces and fixes pending creation after owner exit and incorrect pairing of concurrent READs, with repeated cancellation, termination, and unload races.
 The [multiple-READ teardown review](docs/PENDING_MULTIREAD_REVIEW_20261025.md) extends the fixture to bounded READ batches and validates per-request cancellation, simultaneous instance detach/unload, and context draining under concurrent I/O.
 The [partial-batch and reconnection review](docs/PENDING_PARTIAL_REVIEW_20261025.md) fixes reservations surviving instance replacement and old upper contexts pairing with new lower instances, with partial submission, cancellation, process exit, reconnection, and unload tests.
+The [ARM admission and target-exit review](docs/PENDING_REARM_REVIEW_20261025.md) fixes reservations for exited requestors, including admission after their exit notification, and tests new ARM requests against reconnection, late READs, cancellation, termination, and unload.
 
 ## Demo
 
