@@ -442,8 +442,9 @@ namespace
         __try { RtlCopyMemory(&request, input, sizeof(request)); ProbeForWrite(output, sizeof(g_Status), 1); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
         if (request.Magic != KNDBG_PENDING_MAGIC || request.Version != KNDBG_PENDING_VERSION ||
-            request.Size != sizeof(request) || request.Action > KNDBG_PENDING_ARM_READ_BATCH)
+            request.Size != sizeof(request) || request.Action > KNDBG_PENDING_QUERY_RACE)
             return STATUS_INVALID_PARAMETER;
+        const bool queryRace = request.Action == KNDBG_PENDING_QUERY_RACE;
         const bool batch = request.Action == KNDBG_PENDING_ARM_READ_BATCH;
         const bool race = request.Action == KNDBG_PENDING_ARM_RACE || batch;
         const bool arm = request.Action == KNDBG_PENDING_ARM || race;
@@ -466,11 +467,13 @@ namespace
                 request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) return STATUS_INVALID_PARAMETER;
         }
         else if (request.Reserved != 0) return STATUS_INVALID_PARAMETER;
-        if (arm ? (request.Mode < KNDBG_PENDING_PRE || request.Mode > KNDBG_PENDING_FAIL_READ_LOCK ||
+        if (queryRace ? (request.Mode != 0 || request.TargetPid != 0 ||
+                        request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) :
+            arm ? (request.Mode < KNDBG_PENDING_PRE || request.Mode > KNDBG_PENDING_FAIL_READ_LOCK ||
                    request.TargetPid <= 4 || request.DelayMilliseconds == 0 || request.DelayMilliseconds > 2000) :
                   (request.Mode != 0 || request.TargetPid != 0 || request.DelayMilliseconds != 0))
             return STATUS_INVALID_PARAMETER;
-        if (request.Action == KNDBG_PENDING_QUERY)
+        if (request.Action == KNDBG_PENDING_QUERY || queryRace)
         {
             // A read-only snapshot must remain observable while the watcher or
             // a lifecycle transition owns g_Control. Client identity and status
@@ -480,12 +483,37 @@ namespace
             KeAcquireSpinLock(&g_Lock, &irql);
             auto client = FindClient(reinterpret_cast<ULONG_PTR>(cookie));
             const bool allowed = client != nullptr && client->Pid == PsGetCurrentProcessId();
-            if (allowed) snapshot = g_Status;
+            if (allowed)
+            {
+                ++g_Status.QueryStarted;
+                ++g_Status.QueryActive;
+                if (queryRace) ++g_Status.QueryGateEntered;
+                snapshot = g_Status;
+            }
+            else ++g_Status.QueryDenied;
             KeReleaseSpinLock(&g_Lock, irql);
             if (!allowed) return STATUS_ACCESS_DENIED;
+            if (queryRace)
+            {
+                // Hold only an authorized, registered Message callback. No
+                // client pointer survives the snapshot and no lock is held.
+                // FltMgr must drain this callback before unloading its code.
+                LARGE_INTEGER timeout;
+                timeout.QuadPart = -static_cast<LONGLONG>(request.DelayMilliseconds) * 10000;
+                KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+                KeAcquireSpinLock(&g_Lock, &irql);
+                ++g_Status.QueryGateCompleted;
+                KeReleaseSpinLock(&g_Lock, irql);
+            }
+            NTSTATUS status = STATUS_SUCCESS;
             __try { RtlCopyMemory(output, &snapshot, sizeof(snapshot)); *returned = sizeof(snapshot); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
-            return STATUS_SUCCESS;
+            __except (EXCEPTION_EXECUTE_HANDLER) { status = GetExceptionCode(); }
+            KeAcquireSpinLock(&g_Lock, &irql);
+            --g_Status.QueryActive;
+            ++g_Status.QueryCompleted;
+            if (!NT_SUCCESS(status)) ++g_Status.QueryReplyFailures;
+            KeReleaseSpinLock(&g_Lock, irql);
+            return status;
         }
         PEPROCESS target = nullptr;
         if (arm)

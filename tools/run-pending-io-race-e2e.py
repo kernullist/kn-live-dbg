@@ -196,7 +196,7 @@ class Suite:
         self.audits.append(dict(name=name, **p.fields(state)))
         (self.output / 'unload-audits.json').write_text(json.dumps(self.audits, indent=2), encoding='utf-8')
         self.check(name + '-ledger', state.Magic == p.MAGIC and state.Version == p.VERSION and
-            state.Size == c.sizeof(p.Status) and p.balanced(state) and state.Stopping == 1 and
+            state.Size == c.sizeof(p.Status) and p.final_balanced(state) and state.Stopping == 1 and
             state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == state.ArmedGeneration == 0
             and state.InstanceStarts == state.InstanceCompletes, state=p.fields(state))
         return state

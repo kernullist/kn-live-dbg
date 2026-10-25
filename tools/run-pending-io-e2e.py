@@ -29,7 +29,7 @@ NAME, INSTANCE = managed.NAME, managed.INSTANCE
 LOWER = NAME + '.Lower'
 PORT = '\\' + NAME + 'PendingIo'
 MAGIC = 0x4B50494F
-VERSION = 6
+VERSION = 7
 SERVICE = 'SYSTEM\\CurrentControlSet\\Services\\' + NAME
 flt, kernel = managed.flt, managed.kernel
 flt.FilterDetach.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
@@ -63,10 +63,12 @@ class Status(c.Structure):
         'TopologyDisarms', 'GenerationLowerRejected', 'ArmDuringTeardownRejected', 'SetupDuringStopRejected',
         'TargetArmRejected', 'TargetWatchRetires', 'TargetExitGateEntered', 'TargetExitGateCompleted',
         'TargetExitGateStopSeen', 'TargetWatchProbes', 'TargetWatchStaleResults', 'WatchGateEntered',
-        'WatchGateCompleted', 'WatchGateKind', 'WatchGateTargetPid', 'WatchGateGeneration', 'WatchGateStatus')]
+        'WatchGateCompleted', 'WatchGateKind', 'WatchGateTargetPid', 'WatchGateGeneration', 'WatchGateStatus',
+        'QueryStarted', 'QueryCompleted', 'QueryActive', 'QueryDenied', 'QueryGateEntered', 'QueryGateCompleted',
+        'QueryReplyFailures')]
 
 
-assert c.sizeof(Request) == 32 and c.sizeof(Status) == 472
+assert c.sizeof(Request) == 32 and c.sizeof(Status) == 528
 
 
 def fields(state):
@@ -79,7 +81,14 @@ def balanced(state):
         and state.PreQueued == state.PreCompleted and state.PostQueued == state.PostCompleted
         and state.RaceEntered == state.RaceCompleted and state.BeforeLowerEntered == state.BeforeLowerCompleted
         and state.TargetExitGateEntered == state.TargetExitGateCompleted
-        and state.WatchGateEntered == state.WatchGateCompleted)
+        and state.WatchGateEntered == state.WatchGateCompleted
+        and state.QueryGateEntered == state.QueryGateCompleted)
+
+
+def final_balanced(state):
+    # A live query snapshot includes itself. Only the post-unregister ledger
+    # can require that all registered query callbacks have returned.
+    return balanced(state) and state.QueryActive == 0 and state.QueryStarted == state.QueryCompleted
 
 
 class Port:
@@ -303,7 +312,7 @@ def main():
         audits.append(dict(name=name, **fields(state)))
         (output / 'unload-audits.json').write_text(json.dumps(audits, indent=2), encoding='utf-8')
         check(name + '-final-ledger', state.Magic == MAGIC and state.Version == VERSION and
-            state.Size == c.sizeof(Status) and balanced(state) and state.Stopping == 1 and
+            state.Size == c.sizeof(Status) and final_balanced(state) and state.Stopping == 1 and
             state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == state.ArmedGeneration == 0
             and state.InstanceStarts == state.InstanceCompletes, state=fields(state))
 
@@ -472,6 +481,10 @@ def main():
                     DelayMilliseconds=delay, Reserved=count) for mode, delay, count in (
                         (4, 100, 0), (4, 100, 1), (4, 100, 9), (1, 100, 8),
                         (4, 49, 8), (4, 501, 8))]
+                bad_commands += [dict(Action=6, Mode=mode, TargetPid=pid, DelayMilliseconds=delay,
+                    Reserved=reserved) for mode, pid, delay, reserved in (
+                        (0, 0, 0, 0), (0, 0, 49, 0), (0, 0, 501, 0), (1, 0, 100, 0),
+                        (0, target.proc.pid, 100, 0), (0, 0, 100, 1))]
                 for bad in bad_commands:
                     try:
                         owner.send(**bad)

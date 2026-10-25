@@ -29,6 +29,7 @@ The [multiple-READ teardown review](docs/PENDING_MULTIREAD_REVIEW_20261025.md) e
 The [partial-batch and reconnection review](docs/PENDING_PARTIAL_REVIEW_20261025.md) fixes reservations surviving instance replacement and old upper contexts pairing with new lower instances, with partial submission, cancellation, process exit, reconnection, and unload tests.
 The [ARM admission and target-exit review](docs/PENDING_REARM_REVIEW_20261025.md) fixes reservations for exited requestors, including admission after their exit notification, and tests new ARM requests against reconnection, late READs, cancellation, termination, and unload.
 The [target-watch race review](docs/PENDING_WATCH_REVIEW_20261025.md) tests exit code 259 and stale watch results against new ARM requests, requestor replacement, cancellation, reconnection, and unload, and keeps status queries observable during the watch.
+The [concurrent-query lifetime review](docs/PENDING_QUERY_REVIEW_20261025.md) validates snapshots across duplicated ports, last-handle close, owner exit, re-ARM, reconnection, reply-buffer faults, and unload, including the final query callback ledger.
 
 ## Demo
 
@@ -1968,6 +1969,11 @@ service on completion. Build and run these harnesses sequentially.
 adds bounded holds before the target probe and after an unsuccessful probe. It
 checks status-query authorization, code-259 exit signals, stale-result retirement,
 requestor replacement, and concurrent cancellation/termination/reconnection/unload.
+`tools/run-pending-query-e2e.py --output .build/pending-query/run1 --case all --readers 8 --iterations 4`
+adds concurrent snapshot checks and bounded holds before copying a query reply.
+Use `--case races --last-close` to close the last duplication root during those
+holds. Live snapshots include their own active query; only the final unload ledger
+requires zero active queries and equal query-start/completion counts.
 Supported attachment changes are also covered by
 `tools/run-minifilter-detach-e2e.ps1 -CheckMutationGuard`; the guard probe now
 targets an unsupported name and verifies that the fixture's registration stays intact.
