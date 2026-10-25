@@ -893,7 +893,7 @@ $documentationPaths = @(
     "docs\MCP_SERVER_DESIGN.md",
     "docs\MCP_SETUP.ko.md",
     "docs\MCP_SETUP.md",
-    "docs\RELEASE_NOTES_0.0.35.md",
+    "docs\RELEASE_NOTES_$version.md",
     "docs\REMOTE_OPERATOR_SESSION.md",
     "docs\REMOTE_SETUP.ko.md",
     "docs\REMOTE_SETUP.md",
