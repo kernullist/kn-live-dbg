@@ -17,8 +17,10 @@ namespace
         PFILE_OBJECT FileObject; // Identity only while this I/O owns a context.
         PEPROCESS TargetProcess;
         PFLT_CALLBACK_DATA Data; // Owned until the matching FltComplete call.
+        PFLT_CALLBACK_DATA PreIdentity; // Identity only, never dereferenced after pre.
         ULONG_PTR Owner;
         ULONG Mode, DelayMilliseconds, WakeReason;
+        ULONG Gate, GateMilliseconds;
         bool LowerClaimed, PostWork;
         KEVENT Resume;
     };
@@ -35,6 +37,7 @@ namespace
     ULONG_PTR g_NextClient, g_Owner;
     PEPROCESS g_OwnerProcess, g_Target;
     ULONG g_Delay;
+    ULONG g_Gate, g_GateMilliseconds;
     KNDBG_PENDING_STATUS g_Status;
     FLT_CONTEXT_REGISTRATION g_Contexts[2];
     WCHAR g_AuditPath[512];
@@ -156,6 +159,33 @@ namespace
         }
     }
 
+    void TestGate(Operation* operation, PFLT_CALLBACK_DATA data, ULONG gate)
+    {
+        if (operation->Gate != gate) return;
+        const bool early = gate == KNDBG_PENDING_GATE_BEFORE_LOWER;
+        KIRQL irql;
+        KeAcquireSpinLock(&g_Lock, &irql);
+        if (early) ++g_Status.BeforeLowerEntered;
+        else ++g_Status.RaceEntered;
+        KeReleaseSpinLock(&g_Lock, irql);
+        // Test-only, bounded and lock-free. Keep the callback/worker's existing
+        // ownership while cancellation, process exit and stop enter concurrently.
+        // Stop joins this thread (or FltMgr drains the early pre callback).
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -static_cast<LONGLONG>(operation->GateMilliseconds) * 10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        const bool cancelled = FltIsIoCanceled(data) != FALSE;
+        KeAcquireSpinLock(&g_Lock, &irql);
+        if (early) ++g_Status.BeforeLowerCompleted;
+        else
+        {
+            ++g_Status.RaceCompleted;
+            if (cancelled) ++g_Status.RaceCancelSeen;
+            if (g_Status.Stopping) ++g_Status.RaceStopSeen;
+        }
+        KeReleaseSpinLock(&g_Lock, irql);
+    }
+
     VOID Worker(PVOID)
     {
         KIRQL irql;
@@ -182,6 +212,7 @@ namespace
                 --g_Status.QueueDepth;
                 ++g_Status.ActiveWorkers;
                 KeReleaseSpinLock(&g_Lock, irql);
+                TestGate(operation, data, post ? KNDBG_PENDING_GATE_POST : KNDBG_PENDING_GATE_PRE);
                 LARGE_INTEGER timeout;
                 timeout.QuadPart = -static_cast<LONGLONG>(operation->DelayMilliseconds) * 10000;
                 // Pre I/O has not reached lower drivers and has no cancel routine
@@ -296,9 +327,21 @@ namespace
         __try { RtlCopyMemory(&request, input, sizeof(request)); ProbeForWrite(output, sizeof(g_Status), 1); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
         if (request.Magic != KNDBG_PENDING_MAGIC || request.Version != KNDBG_PENDING_VERSION ||
-            request.Size != sizeof(request) || request.Reserved != 0 || request.Action > KNDBG_PENDING_RELEASE)
+            request.Size != sizeof(request) || request.Action > KNDBG_PENDING_ARM_RACE)
             return STATUS_INVALID_PARAMETER;
-        const bool arm = request.Action == KNDBG_PENDING_ARM;
+        const bool race = request.Action == KNDBG_PENDING_ARM_RACE;
+        const bool arm = request.Action == KNDBG_PENDING_ARM || race;
+        if (race)
+        {
+            const bool gateValid =
+                (request.Reserved == KNDBG_PENDING_GATE_PRE && request.Mode != KNDBG_PENDING_POST) ||
+                (request.Reserved == KNDBG_PENDING_GATE_POST &&
+                    (request.Mode == KNDBG_PENDING_POST || request.Mode == KNDBG_PENDING_BOTH)) ||
+                (request.Reserved == KNDBG_PENDING_GATE_BEFORE_LOWER && request.Mode == KNDBG_PENDING_DRAIN_PAIR);
+            if (!gateValid || request.Mode > KNDBG_PENDING_DRAIN_PAIR ||
+                request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) return STATUS_INVALID_PARAMETER;
+        }
+        else if (request.Reserved != 0) return STATUS_INVALID_PARAMETER;
         if (arm ? (request.Mode < KNDBG_PENDING_PRE || request.Mode > KNDBG_PENDING_FAIL_READ_LOCK ||
                    request.TargetPid <= 4 || request.DelayMilliseconds == 0 || request.DelayMilliseconds > 2000) :
                   (request.Mode != 0 || request.TargetPid != 0 || request.DelayMilliseconds != 0))
@@ -331,7 +374,9 @@ namespace
             }
             g_Target = target; target = nullptr;
             g_Status.ArmedMode = request.Mode;
-            g_Delay = request.DelayMilliseconds;
+            g_Delay = race ? 2000 : request.DelayMilliseconds;
+            g_Gate = race ? request.Reserved : 0;
+            g_GateMilliseconds = race ? request.DelayMilliseconds : 0;
         }
         else if (request.Action == KNDBG_PENDING_RESUME)
         {
@@ -531,7 +576,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     if (!NT_SUCCESS(FltGetInstanceContext(objects->Instance, reinterpret_cast<PFLT_CONTEXT*>(&state))))
         return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     PEPROCESS requestor = FltGetRequestorProcess(data), target = nullptr;
-    ULONG mode = 0, delay = 0;
+    ULONG mode = 0, delay = 0, gate = 0, gateMilliseconds = 0;
     ULONG_PTR owner = 0;
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
@@ -545,6 +590,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
             mode = g_Status.ArmedMode; g_Status.ArmedMode = 0;
             target = g_Target; g_Target = nullptr;
             delay = g_Delay; owner = g_Owner;
+            gate = g_Gate; gateMilliseconds = g_GateMilliseconds;
         }
         else if (state->Lower && read)
         {
@@ -556,11 +602,28 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
                     upper->LogicalReleased == 0 &&
                     upper->FileObject == objects->FileObject && upper->TargetProcess == requestor)
                 {
+                    // Concurrent READs can share the file, process, offset and
+                    // length. Only this I/O's callback data may claim its pair.
+                    if (upper->PreIdentity != data)
+                    {
+                        ++g_Status.OtherReadSkipped;
+                        continue;
+                    }
+                    // Release/exit may have woken the upper context before this
+                    // callback reached the lower instance. Do not publish a new
+                    // unsignalled context after that owner's cancellation sweep.
+                    // Check and publish under the same lock used by ReleaseOwner.
+                    if (upper->Owner != g_Owner || upper->WakeReason >= 2)
+                    {
+                        ++g_Status.StaleLowerRejected;
+                        continue;
+                    }
                     upper->LowerClaimed = true;
                     mode = upper->Mode == KNDBG_PENDING_FAIL_READ_LOCK ?
                         KNDBG_PENDING_FAIL_READ_LOCK : KNDBG_PENDING_PRE;
                     target = requestor; ObReferenceObject(target);
                     delay = upper->DelayMilliseconds; owner = upper->Owner;
+                    gate = upper->Gate; gateMilliseconds = upper->GateMilliseconds;
                     break;
                 }
             }
@@ -587,14 +650,19 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     operation->References = 1;
     operation->InstanceState = state;
     operation->FileObject = objects->FileObject;
+    operation->PreIdentity = data;
     operation->TargetProcess = target;
     operation->Mode = mode;
     operation->Owner = owner;
     operation->DelayMilliseconds = delay;
+    operation->Gate = gate;
+    operation->GateMilliseconds = gateMilliseconds;
     KeInitializeEvent(&operation->Resume, NotificationEvent, FALSE);
     InsertTailList(&g_Operations, &operation->AllLink);
     ++g_Status.LiveContexts; ++g_Status.Created;
     KeReleaseSpinLock(&g_Lock, irql);
+    if (!state->Lower && mode == KNDBG_PENDING_DRAIN_PAIR)
+        TestGate(operation, data, KNDBG_PENDING_GATE_BEFORE_LOWER);
     const bool pend = mode == KNDBG_PENDING_PRE || mode == KNDBG_PENDING_BOTH ||
         mode == KNDBG_PENDING_FAIL_PRE_QUEUE || (state->Lower && mode == KNDBG_PENDING_FAIL_READ_LOCK);
     if (pend && data->Iopb->MajorFunction == IRP_MJ_READ)

@@ -24,6 +24,7 @@ The [native feature validation](docs/NATIVE_FEATURE_VALIDATION_20261024.md) reco
 The [managed callback validation](docs/MANAGED_CALLBACK_VALIDATION_20261025.md) describes the cooperative test provider, kernel-owned rundown, automatic restoration, and termination/unload tests. External callback pointer replacement remains unavailable.
 The [external callback lifetime review](docs/EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) explains the dispatch-before-entry and pending-completion gaps, and tests registered wrapper lifetime separately from body rundown.
 The [pending I/O lifetime validation](docs/PENDING_IO_LIFETIME_VALIDATION_20261025.md) records a fixture READ buffer crash, its MDL lifetime fix, and real pending pre/post, draining, cancellation, termination, and unload tests.
+The [pending I/O race review](docs/PENDING_IO_RACE_REVIEW_20261025.md) reproduces and fixes pending creation after owner exit and incorrect pairing of concurrent READs, with repeated cancellation, termination, and unload races.
 
 ## Demo
 

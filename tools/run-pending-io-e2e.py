@@ -7,6 +7,7 @@ filter, callback pointer, security policy, or reboot setting is modified.
 import argparse
 import ctypes as c
 from ctypes import wintypes as w
+import errno
 import hashlib
 import importlib.util
 import json
@@ -28,6 +29,7 @@ NAME, INSTANCE = managed.NAME, managed.INSTANCE
 LOWER = NAME + '.Lower'
 PORT = '\\' + NAME + 'PendingIo'
 MAGIC = 0x4B50494F
+VERSION = 2
 SERVICE = 'SYSTEM\\CurrentControlSet\\Services\\' + NAME
 flt, kernel = managed.flt, managed.kernel
 flt.FilterDetach.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
@@ -53,10 +55,12 @@ class Status(c.Structure):
         'Created', 'Freed', 'LogicalCompleted', 'PreQueued', 'PreCompleted', 'PostCalled',
         'PostQueued', 'PostCompleted', 'PostDrained', 'PreCancelled', 'AllocFailed',
         'QueueFailed', 'OwnerRestores', 'InstanceStarts', 'InstanceCompletes',
-        'BufferLocks', 'BufferLockFailures', 'Violations')]
+        'BufferLocks', 'BufferLockFailures', 'Violations', 'RaceEntered', 'RaceCompleted',
+        'RaceCancelSeen', 'RaceStopSeen', 'BeforeLowerEntered', 'BeforeLowerCompleted',
+        'StaleLowerRejected', 'OtherReadSkipped')]
 
 
-assert c.sizeof(Request) == 32 and c.sizeof(Status) == 192
+assert c.sizeof(Request) == 32 and c.sizeof(Status) == 256
 
 
 def fields(state):
@@ -66,7 +70,8 @@ def fields(state):
 def balanced(state):
     return (state.LiveContexts == state.ActiveWorkers == state.QueueDepth == state.Violations == 0
         and state.Created == state.Freed == state.LogicalCompleted
-        and state.PreQueued == state.PreCompleted and state.PostQueued == state.PostCompleted)
+        and state.PreQueued == state.PreCompleted and state.PostQueued == state.PostCompleted
+        and state.RaceEntered == state.RaceCompleted and state.BeforeLowerEntered == state.BeforeLowerCompleted)
 
 
 class Port:
@@ -77,7 +82,7 @@ class Port:
             raise OSError(f'connect: 0x{hr & 0xffffffff:08x}')
 
     def send(self, action=0, mode=0, pid=0, delay=0, **overrides):
-        request = Request(MAGIC, 1, c.sizeof(Request), action, mode, pid, delay, 0)
+        request = Request(MAGIC, VERSION, c.sizeof(Request), action, mode, pid, delay, 0)
         for key, value in overrides.items():
             setattr(request, key, value)
         state, returned = Status(), w.DWORD()
@@ -85,7 +90,7 @@ class Port:
             c.byref(state), c.sizeof(state), c.byref(returned))
         if hr < 0:
             raise OSError(f'message: 0x{hr & 0xffffffff:08x}')
-        assert returned.value == c.sizeof(state) and state.Magic == MAGIC and state.Version == 1
+        assert returned.value == c.sizeof(state) and state.Magic == MAGIC and state.Version == VERSION
         return state
 
     def close(self):
@@ -112,8 +117,8 @@ def wait_state(port, predicate, timeout=8):
 
 class Child:
     """Bounded protocol reads, so a stuck kernel I/O cannot hang the test runner."""
-    def __init__(self, role, *args):
-        self.proc = subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), role, *map(str, args)],
+    def __init__(self, role, *args, script=None):
+        self.proc = subprocess.Popen([sys.executable, str(pathlib.Path(script or __file__).resolve()), role, *map(str, args)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW)
         self.lines = queue.Queue()
@@ -147,10 +152,20 @@ class Child:
             else:
                 self.send(exit=True)
             self.proc.wait(10)
+            if not force:
+                assert self.proc.returncode == 0, self.proc.stderr.read()
         self.reader.join(2)
         assert not self.reader.is_alive()
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
-            stream.close()
+            try:
+                stream.close()
+            except OSError as error:
+                # Termination can race a command write. Windows may report EINVAL
+                # or EPIPE again while TextIOWrapper flushes that dead stdin on
+                # close. Suppress only this case, after confirming it did close.
+                if (stream is not self.proc.stdin or self.proc.poll() is None or
+                    error.errno not in (errno.EINVAL, errno.EPIPE) or not stream.closed):
+                    raise
 
 
 def child_io(path):
@@ -272,7 +287,7 @@ def main():
         state = Status.from_buffer_copy(raw)
         audits.append(dict(name=name, **fields(state)))
         (output / 'unload-audits.json').write_text(json.dumps(audits, indent=2), encoding='utf-8')
-        check(name + '-final-ledger', state.Magic == MAGIC and state.Version == 1 and
+        check(name + '-final-ledger', state.Magic == MAGIC and state.Version == VERSION and
             state.Size == c.sizeof(Status) and balanced(state) and state.Stopping == 1 and
             state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == 0
             and state.InstanceStarts == state.InstanceCompletes, state=fields(state))
@@ -425,9 +440,17 @@ def main():
                         _, state = finish(observer)
                         bodies.send(2, 3)
                         check('context-cleanup-while-bodies-paused-' + str(mode), balanced(state), held=fields(held))
-                for bad in (dict(Version=2), dict(Reserved=1), dict(Action=99), dict(Mode=1),
+                bad_commands = [dict(Version=VERSION + 1), dict(Version=VERSION - 1),
+                            dict(Reserved=1), dict(Action=99), dict(Mode=1),
                             dict(Action=1, Mode=1, TargetPid=4, DelayMilliseconds=100),
-                            dict(Action=1, Mode=1, TargetPid=target.proc.pid, DelayMilliseconds=2001)):
+                            dict(Action=1, Mode=1, TargetPid=target.proc.pid, DelayMilliseconds=2001)]
+                # Race holds are fixture-only, bounded and valid for exactly one
+                # callback phase. Reject obsolete ABI and unsafe/mismatched gates.
+                bad_commands += [dict(Action=4, Mode=mode, TargetPid=target.proc.pid,
+                    DelayMilliseconds=delay, Reserved=gate) for mode, delay, gate in (
+                        (1, 49, 1), (1, 501, 1), (1, 100, 0), (1, 100, 3),
+                        (2, 100, 1), (1, 100, 2), (1, 100, 4), (5, 100, 1))]
+                for bad in bad_commands:
                     try:
                         owner.send(**bad)
                         raise AssertionError('accepted malformed command')
