@@ -121,6 +121,33 @@ namespace
         return status == STATUS_SUCCESS ? STATUS_PROCESS_IS_TERMINATING : STATUS_UNSUCCESSFUL;
     }
 
+    void WatchGate(PEPROCESS target, ULONG phase, NTSTATUS status)
+    {
+        ULONG delay = 0;
+        KIRQL irql;
+        KeAcquireSpinLock(&g_Lock, &irql);
+        if (g_Target == target && g_Gate == phase)
+        {
+            delay = g_GateMilliseconds;
+            g_Gate = 0;
+            ++g_Status.WatchGateEntered;
+            g_Status.WatchGateKind = phase;
+            g_Status.WatchGateTargetPid = HandleToULong(PsGetProcessId(target));
+            g_Status.WatchGateGeneration = g_Status.ArmedGeneration;
+            g_Status.WatchGateStatus = static_cast<ULONG>(status);
+        }
+        KeReleaseSpinLock(&g_Lock, irql);
+        if (delay == 0) return;
+        // Test-only 50..500 ms hold at the existing control-lock boundary.
+        // The worker retains its snapshot reference, and Stop joins the worker.
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -static_cast<LONGLONG>(delay) * 10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        KeAcquireSpinLock(&g_Lock, &irql);
+        ++g_Status.WatchGateCompleted;
+        KeReleaseSpinLock(&g_Lock, irql);
+    }
+
     void RetireExitedTarget()
     {
         LockControl();
@@ -130,11 +157,16 @@ namespace
         if (target != nullptr) ObReferenceObject(target);
         KeReleaseSpinLock(&g_Lock, irql);
         PEPROCESS retired = nullptr;
-        if (target != nullptr && !NT_SUCCESS(ProbeTarget(target)))
+        if (target != nullptr)
         {
+            WatchGate(target, KNDBG_PENDING_GATE_WATCH_SNAPSHOT, STATUS_PENDING);
+            const NTSTATUS status = ProbeTarget(target);
+            if (!NT_SUCCESS(status)) WatchGate(target, KNDBG_PENDING_GATE_WATCH_RESULT, status);
             KeAcquireSpinLock(&g_Lock, &irql);
+            ++g_Status.TargetWatchProbes;
             // Topology teardown can retire the arm while the probe runs.
-            if (g_Target == target)
+            if (g_Target != target) ++g_Status.TargetWatchStaleResults;
+            else if (!NT_SUCCESS(status))
             {
                 retired = Disarm();
                 ++g_Status.TargetWatchRetires;
@@ -427,7 +459,9 @@ namespace
                 (request.Reserved == KNDBG_PENDING_GATE_POST &&
                     (request.Mode == KNDBG_PENDING_POST || request.Mode == KNDBG_PENDING_BOTH)) ||
                 ((request.Reserved == KNDBG_PENDING_GATE_BEFORE_LOWER ||
-                  request.Reserved == KNDBG_PENDING_GATE_EXIT_TAIL) && request.Mode == KNDBG_PENDING_DRAIN_PAIR);
+                  request.Reserved == KNDBG_PENDING_GATE_EXIT_TAIL ||
+                  request.Reserved == KNDBG_PENDING_GATE_WATCH_SNAPSHOT ||
+                  request.Reserved == KNDBG_PENDING_GATE_WATCH_RESULT) && request.Mode == KNDBG_PENDING_DRAIN_PAIR);
             if (!gateValid || request.Mode > KNDBG_PENDING_DRAIN_PAIR ||
                 request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) return STATUS_INVALID_PARAMETER;
         }
@@ -436,6 +470,23 @@ namespace
                    request.TargetPid <= 4 || request.DelayMilliseconds == 0 || request.DelayMilliseconds > 2000) :
                   (request.Mode != 0 || request.TargetPid != 0 || request.DelayMilliseconds != 0))
             return STATUS_INVALID_PARAMETER;
+        if (request.Action == KNDBG_PENDING_QUERY)
+        {
+            // A read-only snapshot must remain observable while the watcher or
+            // a lifecycle transition owns g_Control. Client identity and status
+            // already share g_Lock; do not hold it while touching user memory.
+            KNDBG_PENDING_STATUS snapshot = {};
+            KIRQL irql;
+            KeAcquireSpinLock(&g_Lock, &irql);
+            auto client = FindClient(reinterpret_cast<ULONG_PTR>(cookie));
+            const bool allowed = client != nullptr && client->Pid == PsGetCurrentProcessId();
+            if (allowed) snapshot = g_Status;
+            KeReleaseSpinLock(&g_Lock, irql);
+            if (!allowed) return STATUS_ACCESS_DENIED;
+            __try { RtlCopyMemory(output, &snapshot, sizeof(snapshot)); *returned = sizeof(snapshot); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
+            return STATUS_SUCCESS;
+        }
         PEPROCESS target = nullptr;
         if (arm)
         {
@@ -450,8 +501,8 @@ namespace
         KeAcquireSpinLock(&g_Lock, &irql);
         auto client = FindClient(id);
         if (client == nullptr || client->Pid != PsGetCurrentProcessId()) status = STATUS_ACCESS_DENIED;
-        else if (request.Action != KNDBG_PENDING_QUERY && g_Status.Stopping) status = STATUS_FLT_DELETING_OBJECT;
-        else if (request.Action != KNDBG_PENDING_QUERY && g_Owner != 0 && g_Owner != id) status = STATUS_DEVICE_BUSY;
+        else if (g_Status.Stopping) status = STATUS_FLT_DELETING_OBJECT;
+        else if (g_Owner != 0 && g_Owner != id) status = STATUS_DEVICE_BUSY;
         else if (arm && !NT_SUCCESS(targetStatus))
         {
             ++g_Status.TargetArmRejected;
@@ -502,7 +553,7 @@ namespace
             KeReleaseSpinLock(&g_Lock, irql);
             __try { RtlCopyMemory(output, &snapshot, sizeof(snapshot)); *returned = sizeof(snapshot); }
             __except (EXCEPTION_EXECUTE_HANDLER) { status = GetExceptionCode(); }
-            if (!NT_SUCCESS(status) && request.Action != KNDBG_PENDING_QUERY && g_Owner == id)
+            if (!NT_SUCCESS(status) && g_Owner == id)
                 ReleaseOwner(true);
         }
         UnlockControl();
