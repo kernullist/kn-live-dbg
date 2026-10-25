@@ -46,8 +46,7 @@ namespace
         _In_ PCFLT_RELATED_OBJECTS objects,
         _In_ FLT_INSTANCE_TEARDOWN_FLAGS reason)
     {
-        UNREFERENCED_PARAMETER(reason);
-        PendingIoInstanceTeardownStart(objects);
+        PendingIoInstanceTeardownStart(objects, reason);
     }
 
     VOID FLTAPI InstanceTeardownComplete(

@@ -28,8 +28,9 @@ spec.loader.exec_module(p)
 kernel, flt = p.kernel, p.flt
 
 
-def io_child(path):
-    """Two independent IRPs on one FileObject; cancellation runs in this process."""
+def io_child(path, slot_count=2):
+    """Independent IRPs on one FileObject; cancellation runs in this process."""
+    assert 2 <= slot_count <= 16
     class Overlapped(c.Structure):
         _fields_ = [('Internal', c.c_size_t), ('InternalHigh', c.c_size_t),
             ('Offset', w.DWORD), ('OffsetHigh', w.DWORD), ('Event', w.HANDLE)]
@@ -45,7 +46,7 @@ def io_child(path):
     output_lock = threading.Lock()
     slots = [dict(work=queue.Queue(), ready=threading.Event(), read=False,
         overlap=Overlapped(), event=kernel.CreateEventW(None, True, False, None),
-        buffer=kernel.VirtualAlloc(None, 4096, 0x3000, 4)) for _ in range(2)]
+        buffer=kernel.VirtualAlloc(None, 4096, 0x3000, 4)) for _ in range(slot_count)]
     assert all(s['buffer'] and s['event'] for s in slots)
 
     def emit(value):
@@ -67,6 +68,9 @@ def io_child(path):
             if slot['read']:
                 c.memset(c.byref(slot['overlap']), 0, c.sizeof(Overlapped))
                 slot['overlap'].Event = slot['event']
+                offset = int(command.get('offset', 0))
+                slot['overlap'].Offset = offset & 0xffffffff
+                slot['overlap'].OffsetHigh = offset >> 32
                 kernel.ResetEvent(slot['event'])
                 transferred = w.DWORD()
                 ok = kernel.ReadFile(handle, slot['buffer'], 4096, c.byref(transferred), c.byref(slot['overlap']))
@@ -76,7 +80,8 @@ def io_child(path):
                     error = 0 if ok else c.get_last_error()
                 result = dict(ok=bool(ok), error=error, bytes=transferred.value)
                 if ok:
-                    result['data_matches'] = c.string_at(slot['buffer'], transferred.value) == b'P' * 4096
+                    expected = bytes([command.get('value', 80)]) * 4096
+                    result['data_matches'] = c.string_at(slot['buffer'], transferred.value) == expected
             else:
                 opened = kernel.CreateFileW(path, 0x80000000, 7, None, 3, 0x80, None)
                 ok = opened != w.HANDLE(-1).value
@@ -85,7 +90,7 @@ def io_child(path):
                     kernel.CloseHandle(opened)
             emit(dict(kind='io', slot=index, started=started, finished=time.perf_counter_ns(), **result))
 
-    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(2)]
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(slot_count)]
     for thread in threads:
         thread.start()
     for slot in slots:
@@ -192,7 +197,7 @@ class Suite:
         (self.output / 'unload-audits.json').write_text(json.dumps(self.audits, indent=2), encoding='utf-8')
         self.check(name + '-ledger', state.Magic == p.MAGIC and state.Version == p.VERSION and
             state.Size == c.sizeof(p.Status) and p.balanced(state) and state.Stopping == 1 and
-            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == 0
+            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == 0
             and state.InstanceStarts == state.InstanceCompletes, state=p.fields(state))
         return state
 
@@ -424,7 +429,7 @@ def main():
 if __name__ == '__main__':
     try:
         if sys.argv[1:2] == ['--io-child']:
-            io_child(sys.argv[2])
+            io_child(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 2)
         else:
             main()
     except BaseException:

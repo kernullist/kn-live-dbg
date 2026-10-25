@@ -3,12 +3,13 @@
 // Test-provider protocol only. No external callbacks, pointers or paths accepted.
 #define KNDBG_PENDING_PORT L"\\KnLiveDbgMiniFilterFixturePendingIo"
 #define KNDBG_PENDING_MAGIC 0x4B50494Fu
-#define KNDBG_PENDING_VERSION 2u
+#define KNDBG_PENDING_VERSION 3u
 #define KNDBG_PENDING_QUERY 0u
 #define KNDBG_PENDING_ARM 1u
 #define KNDBG_PENDING_RESUME 2u
 #define KNDBG_PENDING_RELEASE 3u
 #define KNDBG_PENDING_ARM_RACE 4u // DelayMilliseconds=50..500, Reserved=one gate below.
+#define KNDBG_PENDING_ARM_READ_BATCH 5u // DRAIN_PAIR only, Reserved=2..8 READs, first worker gate=50..500ms.
 #define KNDBG_PENDING_GATE_PRE 1u
 #define KNDBG_PENDING_GATE_POST 2u
 #define KNDBG_PENDING_GATE_BEFORE_LOWER 4u
@@ -39,7 +40,9 @@ struct KNDBG_PENDING_STATUS
     unsigned __int64 BufferLocks, BufferLockFailures, Violations;
     unsigned __int64 RaceEntered, RaceCompleted, RaceCancelSeen, RaceStopSeen;
     unsigned __int64 BeforeLowerEntered, BeforeLowerCompleted, StaleLowerRejected, OtherReadSkipped;
+    unsigned __int64 ArmedRemaining, BatchArms, ManualTeardowns, UnloadTeardowns;
+    unsigned __int64 RaceTeardownSeen, BeforeLowerCancelSeen, BeforeLowerStopSeen, BeforeLowerTeardownSeen;
 };
 
 static_assert(sizeof(KNDBG_PENDING_REQUEST) == 32, "pending request ABI");
-static_assert(sizeof(KNDBG_PENDING_STATUS) == 256, "pending status ABI");
+static_assert(sizeof(KNDBG_PENDING_STATUS) == 320, "pending status ABI");

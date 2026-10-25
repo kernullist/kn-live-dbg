@@ -29,7 +29,7 @@ NAME, INSTANCE = managed.NAME, managed.INSTANCE
 LOWER = NAME + '.Lower'
 PORT = '\\' + NAME + 'PendingIo'
 MAGIC = 0x4B50494F
-VERSION = 2
+VERSION = 3
 SERVICE = 'SYSTEM\\CurrentControlSet\\Services\\' + NAME
 flt, kernel = managed.flt, managed.kernel
 flt.FilterDetach.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
@@ -57,10 +57,12 @@ class Status(c.Structure):
         'QueueFailed', 'OwnerRestores', 'InstanceStarts', 'InstanceCompletes',
         'BufferLocks', 'BufferLockFailures', 'Violations', 'RaceEntered', 'RaceCompleted',
         'RaceCancelSeen', 'RaceStopSeen', 'BeforeLowerEntered', 'BeforeLowerCompleted',
-        'StaleLowerRejected', 'OtherReadSkipped')]
+        'StaleLowerRejected', 'OtherReadSkipped', 'ArmedRemaining', 'BatchArms',
+        'ManualTeardowns', 'UnloadTeardowns', 'RaceTeardownSeen', 'BeforeLowerCancelSeen',
+        'BeforeLowerStopSeen', 'BeforeLowerTeardownSeen')]
 
 
-assert c.sizeof(Request) == 32 and c.sizeof(Status) == 256
+assert c.sizeof(Request) == 32 and c.sizeof(Status) == 320
 
 
 def fields(state):
@@ -289,7 +291,7 @@ def main():
         (output / 'unload-audits.json').write_text(json.dumps(audits, indent=2), encoding='utf-8')
         check(name + '-final-ledger', state.Magic == MAGIC and state.Version == VERSION and
             state.Size == c.sizeof(Status) and balanced(state) and state.Stopping == 1 and
-            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == 0
+            state.WorkerAlive == state.LiveInstances == state.Connections == state.OwnerPid == state.ArmedMode == state.ArmedRemaining == 0
             and state.InstanceStarts == state.InstanceCompletes, state=fields(state))
 
     def new_child(role):
@@ -450,6 +452,10 @@ def main():
                     DelayMilliseconds=delay, Reserved=gate) for mode, delay, gate in (
                         (1, 49, 1), (1, 501, 1), (1, 100, 0), (1, 100, 3),
                         (2, 100, 1), (1, 100, 2), (1, 100, 4), (5, 100, 1))]
+                bad_commands += [dict(Action=5, Mode=mode, TargetPid=target.proc.pid,
+                    DelayMilliseconds=delay, Reserved=count) for mode, delay, count in (
+                        (4, 100, 0), (4, 100, 1), (4, 100, 9), (1, 100, 8),
+                        (4, 49, 8), (4, 501, 8))]
                 for bad in bad_commands:
                     try:
                         owner.send(**bad)

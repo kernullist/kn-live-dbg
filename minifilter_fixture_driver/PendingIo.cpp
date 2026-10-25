@@ -93,6 +93,7 @@ namespace
         g_Target = nullptr;
         g_OwnerProcess = nullptr;
         g_Status.ArmedMode = 0;
+        g_Status.ArmedRemaining = 0;
         for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
         {
             auto operation = CONTAINING_RECORD(entry, Operation, AllLink);
@@ -146,7 +147,7 @@ namespace
         {
             // A synchronous request's cancellation need not wake the system
             // thread's cancellable wait. Check the held IRP itself as well.
-            // This fixture admits one targeted I/O, with a bounded 10 ms poll;
+            // This fixture admits a bounded target batch, with a 10 ms poll;
             // it does not install another cancel callback with a separate lifetime.
             if (FltIsIoCanceled(data)) return STATUS_CANCELLED;
             const ULONGLONG now = KeQueryInterruptTime();
@@ -168,7 +169,7 @@ namespace
         if (early) ++g_Status.BeforeLowerEntered;
         else ++g_Status.RaceEntered;
         KeReleaseSpinLock(&g_Lock, irql);
-        // Test-only, bounded and lock-free. Keep the callback/worker's existing
+        // Test-only, bounded wait with no lock held. Keep the existing
         // ownership while cancellation, process exit and stop enter concurrently.
         // Stop joins this thread (or FltMgr drains the early pre callback).
         LARGE_INTEGER timeout;
@@ -176,12 +177,19 @@ namespace
         KeDelayExecutionThread(KernelMode, FALSE, &timeout);
         const bool cancelled = FltIsIoCanceled(data) != FALSE;
         KeAcquireSpinLock(&g_Lock, &irql);
-        if (early) ++g_Status.BeforeLowerCompleted;
+        if (early)
+        {
+            ++g_Status.BeforeLowerCompleted;
+            if (cancelled) ++g_Status.BeforeLowerCancelSeen;
+            if (g_Status.Stopping) ++g_Status.BeforeLowerStopSeen;
+            if (operation->InstanceState->Stopping) ++g_Status.BeforeLowerTeardownSeen;
+        }
         else
         {
             ++g_Status.RaceCompleted;
             if (cancelled) ++g_Status.RaceCancelSeen;
             if (g_Status.Stopping) ++g_Status.RaceStopSeen;
+            if (operation->InstanceState->Stopping) ++g_Status.RaceTeardownSeen;
         }
         KeReleaseSpinLock(&g_Lock, irql);
     }
@@ -327,11 +335,17 @@ namespace
         __try { RtlCopyMemory(&request, input, sizeof(request)); ProbeForWrite(output, sizeof(g_Status), 1); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
         if (request.Magic != KNDBG_PENDING_MAGIC || request.Version != KNDBG_PENDING_VERSION ||
-            request.Size != sizeof(request) || request.Action > KNDBG_PENDING_ARM_RACE)
+            request.Size != sizeof(request) || request.Action > KNDBG_PENDING_ARM_READ_BATCH)
             return STATUS_INVALID_PARAMETER;
-        const bool race = request.Action == KNDBG_PENDING_ARM_RACE;
+        const bool batch = request.Action == KNDBG_PENDING_ARM_READ_BATCH;
+        const bool race = request.Action == KNDBG_PENDING_ARM_RACE || batch;
         const bool arm = request.Action == KNDBG_PENDING_ARM || race;
-        if (race)
+        if (batch)
+        {
+            if (request.Mode != KNDBG_PENDING_DRAIN_PAIR || request.Reserved < 2 || request.Reserved > 8 ||
+                request.DelayMilliseconds < 50 || request.DelayMilliseconds > 500) return STATUS_INVALID_PARAMETER;
+        }
+        else if (race)
         {
             const bool gateValid =
                 (request.Reserved == KNDBG_PENDING_GATE_PRE && request.Mode != KNDBG_PENDING_POST) ||
@@ -374,8 +388,10 @@ namespace
             }
             g_Target = target; target = nullptr;
             g_Status.ArmedMode = request.Mode;
+            g_Status.ArmedRemaining = batch ? request.Reserved : 1;
+            if (batch) ++g_Status.BatchArms;
             g_Delay = race ? 2000 : request.DelayMilliseconds;
-            g_Gate = race ? request.Reserved : 0;
+            g_Gate = batch ? KNDBG_PENDING_GATE_PRE : (race ? request.Reserved : 0);
             g_GateMilliseconds = race ? request.DelayMilliseconds : 0;
         }
         else if (request.Action == KNDBG_PENDING_RESUME)
@@ -495,7 +511,11 @@ void PendingIoProcessExit(PEPROCESS process)
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     PEPROCESS target = nullptr;
-    if (g_Target == process) { target = g_Target; g_Target = nullptr; g_Status.ArmedMode = 0; }
+    if (g_Target == process)
+    {
+        target = g_Target; g_Target = nullptr;
+        g_Status.ArmedMode = 0; g_Status.ArmedRemaining = 0;
+    }
     for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
     {
         auto operation = CONTAINING_RECORD(entry, Operation, AllLink);
@@ -541,7 +561,7 @@ NTSTATUS PendingIoInstanceSetup(PCFLT_RELATED_OBJECTS objects)
     return status;
 }
 
-void PendingIoInstanceTeardownStart(PCFLT_RELATED_OBJECTS objects)
+void PendingIoInstanceTeardownStart(PCFLT_RELATED_OBJECTS objects, FLT_INSTANCE_TEARDOWN_FLAGS reason)
 {
     Instance* state = nullptr;
     if (!NT_SUCCESS(FltGetInstanceContext(objects->Instance, reinterpret_cast<PFLT_CONTEXT*>(&state)))) return;
@@ -549,6 +569,9 @@ void PendingIoInstanceTeardownStart(PCFLT_RELATED_OBJECTS objects)
     KeAcquireSpinLock(&g_Lock, &irql);
     state->Stopping = true;
     ++g_Status.InstanceStarts;
+    if (reason & FLTFL_INSTANCE_TEARDOWN_MANUAL) ++g_Status.ManualTeardowns;
+    if (reason & (FLTFL_INSTANCE_TEARDOWN_FILTER_UNLOAD | FLTFL_INSTANCE_TEARDOWN_MANDATORY_FILTER_UNLOAD))
+        ++g_Status.UnloadTeardowns;
     for (auto entry = g_Operations.Flink; entry != &g_Operations; entry = entry->Flink)
     {
         auto operation = CONTAINING_RECORD(entry, Operation, AllLink);
@@ -587,10 +610,17 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
             read == (g_Status.ArmedMode == KNDBG_PENDING_DRAIN_PAIR ||
                      g_Status.ArmedMode == KNDBG_PENDING_FAIL_READ_LOCK))
         {
-            mode = g_Status.ArmedMode; g_Status.ArmedMode = 0;
-            target = g_Target; g_Target = nullptr;
+            mode = g_Status.ArmedMode;
+            target = g_Target;
+            // The arm owns one process reference until its final admission.
+            // Earlier members of a bounded batch each acquire their own.
+            if (--g_Status.ArmedRemaining == 0) { g_Status.ArmedMode = 0; g_Target = nullptr; }
+            else ObReferenceObject(target);
             delay = g_Delay; owner = g_Owner;
             gate = g_Gate; gateMilliseconds = g_GateMilliseconds;
+            // Hold only the first worker. The remaining READs can accumulate
+            // behind it, then drain without serial per-request test delays.
+            g_Gate = 0;
         }
         else if (state->Lower && read)
         {

@@ -25,6 +25,7 @@ The [managed callback validation](docs/MANAGED_CALLBACK_VALIDATION_20261025.md) 
 The [external callback lifetime review](docs/EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) explains the dispatch-before-entry and pending-completion gaps, and tests registered wrapper lifetime separately from body rundown.
 The [pending I/O lifetime validation](docs/PENDING_IO_LIFETIME_VALIDATION_20261025.md) records a fixture READ buffer crash, its MDL lifetime fix, and real pending pre/post, draining, cancellation, termination, and unload tests.
 The [pending I/O race review](docs/PENDING_IO_RACE_REVIEW_20261025.md) reproduces and fixes pending creation after owner exit and incorrect pairing of concurrent READs, with repeated cancellation, termination, and unload races.
+The [multiple-READ teardown review](docs/PENDING_MULTIREAD_REVIEW_20261025.md) extends the fixture to bounded READ batches and validates per-request cancellation, simultaneous instance detach/unload, and context draining under concurrent I/O.
 
 ## Demo
 
