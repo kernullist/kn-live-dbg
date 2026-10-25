@@ -217,6 +217,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except SystemExit:
+        raise
     except BaseException:
         traceback.print_exc()
         sys.exit(1)

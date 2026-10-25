@@ -682,7 +682,7 @@ def main():
     parser.add_argument('--reply-change', choices=('none', 'mixed', *ReplyBuffer.MODES), default='none')
     parser.add_argument('--inject-failure', choices=('reader-start', 'after-gates', 'during-race',
         'reader-error', 'after-unload', 'audit', 'cleanup-audit', 'cleanup-log', 'cleanup-command-log', 'runner-exit'),
-        help='fail one race deliberately; exit 1 and recorded failure are expected')
+        help='fail one race deliberately (exit 1; supervised runner-exit uses exit 86)')
     parser.add_argument('--start-event', help=argparse.SUPPRESS)
     parser.add_argument('--inject-post-unload-failure', action='store_true',
         help='deliberately fail one race after unload to verify failure cleanup (exit 1 expected)')
@@ -733,6 +733,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except SystemExit:
+        raise
     except BaseException:
         traceback.print_exc()
         sys.exit(1)
