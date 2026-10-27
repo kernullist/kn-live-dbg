@@ -1,8 +1,8 @@
 # 커널·유저 코드 연관 헌팅
 
-`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_COVERAGE_MATRIX_20260919.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
+`!kmon`은 수동 매핑된 커널 코드와 정상 프로세스 안에 숨은 유저 코드를 조사할 때 실행 바이트와 참조 경로를 함께 남긴다. CI 값, 파일 서명, 프로세스 이름만으로 정상 여부를 결정하지 않는다. 조사 근거는 [연구 문서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_HUNTING_RESEARCH_20260919.md), 기법별 관측 범위는 [은닉 코드 관측 범위](KMON_DETECTION_COVERAGE.md), 페이지 비교·캡처 방식은 [실행 코드 검증](KMON_DETECTION_VERIFICATION.md)에 정리했다.
 
-v0.0.33 이후에는 TLS 기준 비교, PDB로 확인한 KCT 후보, WorkerFactory 시작 루틴이 추가됐다. `!kmon surfaces`, 사건 필터·JSON 저장, `!kmon diff` 사용법과 제한은 [분석가용 가이드](KMON_ANALYST_SURFACES.md)를 참고한다. 메타데이터 차이와 실제 실행은 별도 증거다.
+현재 수집에는 TLS 기준 비교, PDB로 확인한 KCT 후보, WorkerFactory 시작 루틴이 포함된다. `!kmon surfaces`, 사건 필터·JSON 저장, `!kmon diff` 사용법과 제한은 [분석가용 가이드](KMON_ANALYST_SURFACES.md)를 참고한다. 메타데이터 차이와 실제 실행은 별도 증거다.
 
 ```text
 !kmon start /name game.exe /background
@@ -75,42 +75,24 @@ replay는 `hop_N_hunt_reference`를 파싱한 객체 하나를 한 줄에 둔다
 
 ## 재현 검증과 외부 비교
 
-공식 PE-sieve v0.4.1.1 x64의 확인된 SHA-256:
-
-```text
-9f3ff2884a2c61006cd0a92b7572a815b8dc17012be7747a6abd6ca07c503a3b
-```
-
 ```powershell
+.\tools\validate-kmon-hunting.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize -PeSieve C:\tools\pe-sieve64.exe
-.\tools\validate-kmon-hunting.ps1 -Configuration Debug -Sanitize -PeSieve C:\tools\pe-sieve64.exe
 python tools\validate-kmon-hunting-evidence.py .build\kmon-hunting\Release-asan\validation.json
 ```
 
-스크립트는 소유 fixture만 시작하고 정리한다. 드라이버 설치나 kernel callback 변경은 없다. 다음은 Kmon의 **메인 이미지 실행 페이지 비교 컴포넌트**와 PE-sieve main-image `code_scan`의 결과이며 전체 `!kmon` 탐지율 비교가 아니다.
+PE-sieve 경로를 생략하면 외부 비교를 실행한 것이 아니다. 비교할 때는 실제 도구
+버전·hash·옵션·원본 JSON과 같은 소유 fixture의 ground truth를 함께 보존한다.
+이 비교는 메인 이미지 실행 페이지 컴포넌트 검사이며 전체 KMON 탐지율 순위가 아니다.
+초기 비교 수치와 후속 실호스트 결과는 [검증 현황](VALIDATION.md)과 그 원문에 있다.
 
-| Ground truth | Kmon 수정 페이지 | PE-sieve code_scan |
-|---|---:|---|
-| 정상 이미지 | 0 | status 0 |
-| 별도 executable data section의 미실행 바이트 1개 변경 | 1 | status 0 |
-| 호출하지 않는 `.text` 함수의 바이트 1개 변경 | 1 | status 1 |
-| 정상 private RX return stub, 호출하지 않음 | 0 | status 0 |
+`validate-kmon-hunting-evidence.py --require-competitive`는 owned-fixture 형식에
+**종료 코드 3**을 반환한다. 이 형식만으로 독립 감사·실전 corpus·kernel trial을
+입증했다고 표시하면 거부한다. 변형·반복 assertion을 독립적인 악성 표본 수로 세지 않는다.
 
-PE-sieve 옵션은 `/shellc 3 /iat 3 /report 7 /ofilter 2 /quiet /json`이다. 전체 보고서의 다른 DLL IAT 기록을 치트 판정이나 fixture 오탐 수로 계산하지 않는다. 실행 섹션 검사 정책의 차이도 전체 도구의 우위를 뜻하지 않는다. [공식 릴리스](https://github.com/hasherezade/pe-sieve/releases/tag/v0.4.1.1)의 버전·hash와 원본 JSON을 `validation.json`에 보존한다.
-
-ASan 합성 검사는 boot/PID/생성 시각, stale/future 관측, hash/슬롯/세대 변경, padding, capacity와 불완전 근거를 확인한다. 변형과 stress 반복을 독립적인 게임핵 표본으로 세지 않는다.
-
-초기 연관 헌팅 릴리스 `0905f56`의 바이너리·보고서 hash는 [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-hunting-validation-20260919.json)에 보존했다. 이후 전체 페이지·PTE 확장의 검증은 [확장 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-coverage-validation-20260920.json)에 분리한다. `e1babba` 이후의 용량 초과 순회·PFN·경로 재검증·사건 정렬·페이징 예약 비트 수정은 [적대적 리뷰 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md)과 [검증 자료](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/research/kmon-adversarial-review-20260920.json)에 정리했다. source hash는 UTF-8/LF로 정규화했다. 합성 assertion과 반복 스트레스 횟수는 독립적인 악성 표본 수가 아니다.
-
-적대적 리뷰에서는 슬롯 대상 변경 후 이전 사건 잔존, 제한 query 핸들에서의 검사 누락, 포인터 field 폭/overflow, 읽기 실패 시 coverage, firmware 목록 링크 검증, replay·증거 파일 증가 중 입력 상한, 과도한 JSON 중첩, 스택 페이지의 과도한 hex 로그와 cases 자동완성을 수정했다. 수정한 범위의 재검토에서 추가 조치가 필요한 문제는 발견하지 못했으며, 실전 kernel lifetime/OS 호환성은 아래 VM 검증 범위에 남는다.
-
-`validate-kmon-hunting-evidence.py --require-competitive`는 현재 owned-fixture 형식에서 **종료 코드 3**을 반환한다. 이 형식으로 실전 표본 수·독립 감사·kernel trial을 입증했다고 쓰면 입력을 거부한다. 실전 corpus와 동일 조건의 전체 도구 비교가 확보되어야 경쟁력 판정을 확장할 수 있다.
-
-## 실전 검증에 남은 작업
-
-실제 VM·게임핵 표본 검증은 사용자 담당이다. 커널 채널 통합의 빌드·컴포넌트 검증과 OS 빌드별 실제 등록 목록 검증을 구분한다. [공개 memory sample 목록](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples)의 이전 Windows/범용 악성코드 자료는 현재 Windows 10/11 게임핵의 커널·유저 채널 ground truth를 대신하지 않는다.
-
-1. VM의 커널/PDB/CI/HVCI 상태와 바이너리 SHA-256을 기록하고 정상 시스템의 한 source 순회 이상을 관측한다. coverage와 reference drop도 확인한다.
-2. 기존 `KnLiveDbgProbe.sys`의 정상 KNFW provider를 등록/해제하며 `!fwtable`과 `coverage.channel`을 대조한다. 비표준 이름만으로 악성 사건을 만들면 실패다. PDB가 없으면 partial과 withheld slot을 기대한다.
-3. 소유 fixture 네 모드의 PID/생성 시각/캡처 hash를 대조하고 시작·종료·PID 재사용 중 stale 연결이 없는지 확인한다.
-4. 허가된 실제 게임핵 표본은 acquisition hash, 커널·유저 관계의 analyst label, 정상 대조군, 관측 가능 시간 구간을 갖춰 보관한다. 레이아웃·권한·손실로 관측하지 못한 항목을 정상 또는 탐지 성공으로 집계하지 않는다.
+실제 채널 검증은 OS/PDB/CI 상태·바이너리 hash·관측 시간을 기록하고, 정상
+등록/해제·PID 재사용·캡처 hash·슬롯 재검증과 coverage/loss를 확인한다.
+기존 probe의 정상 KNFW 등록도 비표준 이름만으로 악성 사건이 되면 안 된다.
+보호된 게임, 다른 Windows 빌드, 허가된 실제 표본 및 외부 비교에는 각각 별도
+ground truth가 필요하다. 이미 수행한 소유 fixture 실호스트 검증과 이 미검증
+범위를 혼동하지 않는다. [현재 체크리스트](MANUAL_TEST_CHECKLIST.md)를 참고한다.

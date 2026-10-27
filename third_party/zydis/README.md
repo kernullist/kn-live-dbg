@@ -7,6 +7,8 @@ Source:
 - https://github.com/zyantific/zydis
 - tag: `v4.1.1`
 - generated with `assets/amalgamate.py`
+- Generated `Source file:` comments use upstream-relative paths (`src/...`).
+  Remove build-machine home paths when regenerating; keep source and licenses unchanged.
 
 Files:
 

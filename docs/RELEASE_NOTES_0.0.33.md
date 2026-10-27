@@ -45,10 +45,10 @@ Final local results:
 
 Detailed evidence and limits:
 
-- [Command audit](COMMAND_AUDIT_20260919.md): shared parsing, dispatcher, transport and shutdown review.
-- [Research refresh](RESEARCH_REFRESH_20260920.md): 22 primary-source entries revisited, discovery endpoint results and current implementation limits; the 45-day freshness gate is unchanged.
-- [Latest Kmon review](KMON_ADVERSARIAL_REVIEW_20260920.md): repeated adversarial regressions, Release/Debug builds, 11,326 hunting checks and 54 page-coverage checks per ASan run.
-- [Execution verification](KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](KMON_CROSS_DOMAIN_HUNTING.md) and [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md): implemented behavior and observation limits.
+- [Command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.33/docs/COMMAND_AUDIT_20260919.md): shared parsing, dispatcher, transport and shutdown review.
+- [Research refresh](https://github.com/kernullist/kn-live-dbg/blob/v0.0.33/docs/RESEARCH_REFRESH_20260920.md): 22 primary-source entries revisited, discovery endpoint results and current implementation limits; the 45-day freshness gate is unchanged.
+- [Latest Kmon review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.33/docs/KMON_ADVERSARIAL_REVIEW_20260920.md): repeated adversarial regressions, Release/Debug builds, 11,326 hunting checks and 54 page-coverage checks per ASan run.
+- [Execution verification](KMON_DETECTION_VERIFICATION.md), [cross-domain hunting](KMON_CROSS_DOMAIN_HUNTING.md) and [coverage matrix](https://github.com/kernullist/kn-live-dbg/blob/v0.0.33/docs/KMON_COVERAGE_MATRIX_20260919.md): implemented behavior and observation limits.
 - The attached `release-validation.json` records the final packaged build, embedded test signer, command/transport checks and ZIP manifest verification. Prior development reports retain their historical binary hashes.
 
 Actual VM/game-cheat trials remain operator-owned, as requested. The local checks do not measure real-cheat recall, long-running normal-host false positives, every OS/PDB layout or live kernel races.

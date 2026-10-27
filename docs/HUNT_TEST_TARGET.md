@@ -471,3 +471,18 @@ than by making this target change host firewall state.
     Each child waits for the parent process or the configured `/seconds`
     timeout, and parent cleanup removes the temporary copies after the children
     exit.
+
+
+## Output interpretation
+
+`module_stomping_permission_evidence` records permission evidence separately
+from a byte comparison. `eset_exact_file_sha1_ioc` identifies an exact catalogued
+file hash. A `GentlemenCollection` path by itself is treated as supporting
+context, not a confirmed malicious executable.
+
+The recorded public Table 2 HTML snapshot contains 274 unique lower-case image
+names for GentleKiller security-product targets. This is the source review's
+snapshot, not a claim that the external article was refreshed by a docs edit.
+Use the article-currentness validator to compare new source material.
+Runner target-lifetime padding and `/stop-event` keep the fixture alive through
+its selected workload; early exit and incomplete manifests remain failures.

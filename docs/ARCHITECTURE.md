@@ -1,536 +1,161 @@
 # Architecture
 
-## Recommended Split
-
-Kn Live Dbg follows a LiveKD-style split:
-
-1. Kernel driver
-   - Owns only privileged memory operations.
-   - Optionally takes device/symbolic names from the service Parameters key so `--cloak` can avoid compiled `KnLiveDbg` object names.
-   - Creates the device with an Administrators/SYSTEM-only security descriptor.
-   - Validates IOCTL buffers and sizes.
-   - Uses `MmCopyMemory` for virtual reads. Opt-in MDL fallback copies from a read-only, non-executable system mapping of the locked pages; page locking alone does not stabilize the original virtual address.
-   - Walks x64 page tables for VA-to-PA translation.
-   - Detects active LA57 and includes PML5E in translation responses when five-level paging is enabled.
-   - Uses `MmCopyMemory` for physical reads.
-   - Uses page-sized `MmMapIoSpaceEx` mappings for physical writes, with `MmGetVirtualForPhysical` fallback when the kernel already has a direct mapping for the target PFN.
-   - Keeps write access controlled per open handle, with writes enabled by default.
-   - Enforces one active controller PID at a time. Secondary handles preserve tracing on close; the last handle stops IO tracing and unregisters live callbacks before a new owner can open the device.
-
-2. User-mode TUI
-   - Optional `remote on` listener lets another LAN PC attach with
-     `KnLiveDbg.exe --connect <ipv4>:51767`. The driver, exclusive
-     device handle, and symbols stay on the controller PC. Default
-     bind is `0.0.0.0:51767` with a session password (5-128 printable
-     ASCII) and a process-managed firewall rule. The client Tab prompt
-     uses the same `CompletionHints` tables as the local TUI. Command
-     output uses the same console colors; a pipe or file on the client
-     strips VT sequences. See `docs/REMOTE_SETUP.md` and
-     `docs/REMOTE_OPERATOR_SESSION.md`. This is not `kdinit /remote`.
-   - Owns driver install/load/unload through SCM.
-   - Acquires a process-wide named mutex before touching SCM so only one `KnLiveDbg.exe` instance can run at a time.
-   - Displays colored staged lifecycle output for elevation checks, single-instance acquisition, SCM query/install/start, device open, ABI verification, symbol initialization, probe load, and service unload paths.
-   - Automatically closes the device handle, stops the main driver, and deletes the service on normal process exit, EOF, Ctrl+C, `q`, `quit`, `exit`, and `unload`.
-   - Tracks `probe load` within the session and automatically stops/deletes the probe service during process cleanup when the session loaded it.
-   - Prints a colored startup welcome banner and dashboard with driver, write gate, backend, symbol, AI, probe, and quick-action status before the interactive prompt.
-   - Owns kernel module enumeration.
-   - Owns symbol path, PDB loading, type lookup, and field offset resolution.
-   - Uses DIA SDK as a fallback when `DbgHelp` cannot return complete UDT field metadata.
-   - Serializes every `DbgHelp`/DIA entry point behind an internal recursive mutex (`dbghelpMutex_`), because the `!kmon` worker thread resolves offsets while hunt/kmon commands run on the engine thread — DbgHelp is single-threaded and unsynchronized use crashed `!hunt /deep` sessions. Recursive field walks (`FindFieldRecursiveById`) additionally cap their total `GetTypeLayoutById` calls per top-level lookup so wide embedded-UDT graphs cannot explode combinatorially.
-   - Owns PDB-driven callback list decoding for object, registry, process, thread, image-load, and minifilter callbacks.
-   - Presents Windbg-like commands.
-   - Redraws the dashboard with `home` or `dashboard`.
-   - Optionally attaches a DbgEng local-kernel backend for commands that need debugger-engine semantics.
-
-This keeps the driver small and reduces the amount of complex parser/symbol code running in kernel mode.
-
-`--cloak` is an opt-in ephemeral identity: user mode generates a leaf name, copies the EXE/SYS/runtime DLLs, relaunches, and publishes `DeviceName`/`SymbolicLink` under the new service `Parameters` key. `DriverEntry` reads `RegistryPath\Parameters` and uses those UNICODE_STRING values for `IoCreateDeviceSecure` / `IoCreateSymbolicLink`; missing or invalid values keep the compiled `KnLiveDbg` names. Shutdown stops/deletes the random service and removes the copied SYS/sidecars. The running copy of the EXE is marked for reboot-delete.
-
-## Command, transport, and shutdown boundaries
-
-`CommandInput.h` provides bounded numeric parsing shared by console, MCP,
-and remote argument handling. Native command dispatch validates NULs, quotes,
-arity, and memory ranges before side effects; raw `kd` retains the original
-DbgEng command tail. `McpJson.h` validates complete JSON, UTF-8, duplicate
-decoded keys, and nesting depth. MCP also checks required fields, known keys,
-and exact argument types against the live tool catalog.
-
-MCP and remote listeners marshal work to the main engine thread and cannot
-listen simultaneously. MCP uses a FIFO with at most eight pending jobs and
-a 30-second response wait. Timeout/stop removes a job if it is still queued;
-once dispatched, its outcome is unknown to the timed-out caller and execution
-continues. The shared job keeps the promise alive. MCP cancellation
-notifications do not currently cancel jobs.
-
-Remote waits poll the socket and stop state while the engine runs, so protocol
-`cancel`, disconnect, and listener stop can remove queued work. A running
-command cannot be preempted. Command failures propagate to the remote error
-frame even when there is no standard output. The shipped client waits for
-each result synchronously and has no in-flight cancel key binding.
-
-Normal quit/unload cleanup stops kmon, TI, and timeline collectors before
-closing the device. Failed I/O-trace disarm retains the device for retry;
-the normal quit/unload path reports failure instead of abandoning cleanup.
-Driver unload waits for active traced dispatches before releasing their code.
-
-See the [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) for regression evidence and
-the live-kernel tests that remain outside the driver-free corpus.
-
-## IOCTL Contract
-
-The ABI lives in `shared/KnLiveDbgIoctl.h`.
-
-Current calls:
-
-1. `IOCTL_KNDBG_GET_VERSION`
-2. `IOCTL_KNDBG_READ_VIRTUAL`
-3. `IOCTL_KNDBG_WRITE_VIRTUAL`
-4. `IOCTL_KNDBG_SET_WRITE_MODE`
-5. `IOCTL_KNDBG_QUERY_ADDRESS`
-6. `IOCTL_KNDBG_TRANSLATE_VIRTUAL`
-7. `IOCTL_KNDBG_READ_PHYSICAL`
-8. `IOCTL_KNDBG_WRITE_PHYSICAL`
-9. `IOCTL_KNDBG_GET_SESSION_STATUS`
-10. `IOCTL_KNDBG_RESOLVE_PROCESS`
-11. `IOCTL_KNDBG_FLUSH_VIRTUAL`
-12. `IOCTL_KNDBG_SET_PROCESS_PROTECTION`
-13. `IOCTL_KNDBG_READ_MSR`
-14. `IOCTL_KNDBG_READ_CONTROL_REGISTERS`
-15. `IOCTL_KNDBG_READ_IDT`
-16. `IOCTL_KNDBG_TIMELINE_CONTROL`
-17. `IOCTL_KNDBG_TIMELINE_STATUS`
-18. `IOCTL_KNDBG_TIMELINE_DRAIN`
-19. `IOCTL_KNDBG_READ_PROCESS_VIRTUAL`
-20. `IOCTL_KNDBG_GET_PHYSICAL_RANGES`
-21. `IOCTL_KNDBG_SET_PROCESS_LOGGING`
-
-State-changing IOCTLs validate both input and output sizes before performing writes, flushes, or control changes. `IoStatus.Information` never advertises a response larger than the supplied output buffer.
-
-All requests include an explicit `Size` field. Variable read/write payloads use `FIELD_OFFSET(..., Data)` as the header size. Current `KNDBG_ABI_VERSION` is 17. ABI version 5 adds `IOCTL_KNDBG_FLUSH_VIRTUAL` plus explicit translation metadata for paging level and page-table entry physical addresses. ABI version 7 makes MDL-backed virtual reads opt-in through `KNDBG_READ_FLAG_ALLOW_MDL_FALLBACK`; the driver additionally requires canonical system range and resident-page preflight before `MmProbeAndLockPages`, so broad scanners keep failed pointer probes on the safer `MmCopyMemory` path. ABI version 8 adds the read-only `IOCTL_KNDBG_READ_MSR` primitive, which permits only a fixed architectural MSR whitelist (`IA32_EFER`/`STAR`/`LSTAR`/`CSTAR`/`FMASK`/`FS_BASE`/`GS_BASE`/`KERNEL_GS_BASE`) and pins thread affinity to a caller-selected processor so per-CPU MSR divergence is observable; no write-mode gate is required because the call is read-only. ABI version 9 adds the read-only `IOCTL_KNDBG_READ_CONTROL_REGISTERS` primitive, which returns CR0/CR2/CR3/CR4/CR8 read on a caller-selected processor under the same affinity-pinned pattern. ABI version 10 adds the read-only `IOCTL_KNDBG_READ_IDT` primitive, which returns the IDTR (base + limit) read via `__sidt` on a caller-selected processor. Later ABI versions add the bounded kernel live-callback ring (`IOCTL_KNDBG_TIMELINE_CONTROL` / `STATUS` / `DRAIN`) used by `!timeline live`, `IOCTL_KNDBG_READ_PROCESS_VIRTUAL` for DTB-qualified process virtual reads, and ABI version 15 `IOCTL_KNDBG_GET_PHYSICAL_RANGES`, which copies `MmGetPhysicalMemoryRanges()` into a bounded `{Base,Size}[]` so user mode can stream a complete dump without mapping MMIO holes. ABI version 16 adds `IOCTL_KNDBG_SET_PROCESS_LOGGING`, which calls `ZwSetInformationProcess(ProcessEnableLogging / ProcessEnableReadWriteVmLogging)` so ETW-TI `ReadVM`/`WriteVM`/`Suspend` events are actually generated on watched processes. ABI version 17 adds `IOCTL_KNDBG_IOTRACE_CONTROL` / `DRAIN` for the opt-in driver interaction trace described in [DRIVER_INTERACTION_TRACKING_DESIGN.md](DRIVER_INTERACTION_TRACKING_DESIGN.md).
-
-## Physical Memory Flow
-
-1. `vtop` sends a virtual address, optional directory-table base, and requested length to the driver.
-2. If the directory-table base is zero, the driver uses the current x64 CR3.
-3. `vtop /process` and `procctx <pid>` resolve process DTBs by asking the driver to read PDB-resolved EPROCESS offsets.
-4. The driver checks CR4.LA57, records whether the walk is PML4 or PML5, reads PML5E when LA57 is active, then reads PML4E, PDPTE, PDE, and PTE entries with `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL)`.
-5. The walk supports 4 KB pages plus 2 MB and 1 GB large pages.
-6. The response reports CR3, VA, PA, paging level, page size, page offset, contiguous translated bytes, the page-table entries that were used, the physical address of each entry, and the leaf PTE/PDE/PDPTE physical address plus writable state.
-7. `d*` can use `/process <pid>` or a stored `procctx` to translate user VAs page-by-page for physical reads. Native `e*` user VA writes use the captured `procctx` or an explicit `/process <pid>` context; kernel VA writes use the System process context (`pid 4`). Address-only `e*` first reads the current value through the selected context and opens a one-line replacement prompt before writing. If the translated leaf PTE/PDE/PDPTE is not writable, `e*` writes that leaf entry through physical memory with the write bit set, flushes the VA through `IOCTL_KNDBG_FLUSH_VIRTUAL`, performs kernel-VA edits through the original virtual address, uses physical writes for translated user VAs, restores the original write state, and flushes again before continuing.
-8. Virtual and physical display commands perform sparse reads for dump output. Readable bytes are printed normally, while unreadable bytes keep the requested layout and are shown as `??` or `0x????...` for wider units.
-9. `phys`, `pdb`, `pdw`, `pdd`, `pdq`, `!db`, `!dw`, `!dd`, and `!dq` read physical memory directly through `IOCTL_KNDBG_READ_PHYSICAL`.
-10. `peb`, `pew`, `ped`, `peq`, `!eb`, `!ew`, `!ed`, and `!eq` write physical memory through `IOCTL_KNDBG_WRITE_PHYSICAL`; address-only form prompts with the current physical value before writing, and write mode starts enabled and can be disabled with `write off`.
-11. `dump-kernel <path>` asks the driver for RAM runs, writes a WinDbg `DUMP_HEADER64`, then streams each run through `IOCTL_KNDBG_READ_PHYSICAL`. Failed pages are zero-filled unless `/strict` is set. `dump-live <path>` does not use the driver; it calls `NtSystemDebugControl(SysDbgGetLiveKernelDump)`. `dump-live /user <pid|eprocess>` walks that process DTB through the driver and writes a filtered complete dump, merging the KPTI user/kernel page-table root and retargeting CPU0 `CurrentThread` so WinDbg's default process is the target. `dump-analyze <path>` is offline: it parses the 8 KB header, lists physical runs, and walks `PsLoadedModuleList` through the dump DTB. Paging depth is CR4.LA57 from `ContextRecord` (when `KdSecondaryVersion=2` and `KSPECIAL_REGISTERS.Cr3` matches `DirectoryTableBase`) plus a 4-level/5-level probe of the module-list Flink/Blink, so LA57 dumps walk PML5. Non-AMD64 dumps skip VA translation. The offline walker validates fixed reserved paging bits and masks large-page physical bases to 52 bits; PAT, NX, and ignored software bits do not change the target address. No extra IOCTL.
-
-## P0-P2 Investigation Surface Flow
-
-1. `!drvobj` / `!driver object` and `!devstack` walk `_DRIVER_OBJECT` device lists and `DEVICE_OBJECT.AttachedDevice` / `AttachedTo` stacks in user mode. `!driver list|integrity` enumerates `\Driver`.
-2. `!module integrity /disk /iat /prologue` compares live executable pages to disk, walks the live IAT, and disassembles `AddressOfEntryPoint` for trampoline heads.
-3. `!handles` uses `SystemExtendedHandleInformation` and flags non-system VM/DUP access to another process. Owner/target PIDs are decimal-first.
-4. `!hiddenproc` cross-views `ActiveProcessLinks`, `SystemProcessInformation`, Toolhelp, and handle owners. Full `PspCidTable` remains on `!hunt /deep`.
-5. `!wdfilter` walks WdFilter RuntimeDriver leftovers. `!inputstack` walks kbd/mou class attached stacks.
-6. `!vad` resolves `_SUBSECTION.ControlArea` and backing `FILE_OBJECT` names into VAD notes when PDB fields are available.
-7. `!dma` reports ACPI DMAR/IVRS, Kernel DMA Protection, and removable PCI buses. `!hv` reports CPUID hypervisor presence, CR4.VMXE, and CPUID timing; it does not read `IA32_FEATURE_CONTROL`.
-8. `!byovd` Authenticode verification is on by default; `/no-sign` skips it.
-9. `dump-analyze` is the offline dump DTB walker described in Physical Memory Flow item 11.
-
-## Native Process Listing Flow
-
-1. `!dml_proc` stays on the native TUI path, accepts an optional decimal PID filter, and is not routed to DbgEng extension loading.
-2. The all-process form resolves PID 4 through `IOCTL_KNDBG_RESOLVE_PROCESS` using PDB-resolved `_KPROCESS.DirectoryTableBase` offsets.
-3. User mode resolves `_EPROCESS.ActiveProcessLinks`, `_EPROCESS.UniqueProcessId`, and optional display fields from the loaded kernel PDB.
-4. The walker prefers `nt!PsActiveProcessHead` as the list anchor. If that symbol is unavailable, it falls back to PID 4's `ActiveProcessLinks`, prints the System process first, then follows `Flink` with a guard for the hidden list head.
-5. Output includes EPROCESS, PID, parent PID when available, active thread count, directory-table base, image name, and a `dt nt!_EPROCESS <address>` follow-up.
-
-## Process Memory Triage Flow
-
-1. `!vad` and `!threads` stay entirely in user mode on top of `DeviceClient`, `SymbolEngine`, the native process-list walker, and page-table translation. The driver remains a narrow read/translate primitive provider.
-2. Target resolution accepts decimal PID, image name, or EPROCESS. Image names are matched with the same basename/stem logic used by AI process resolution; ambiguous image matches require PID or EPROCESS.
-3. `ProcessTriageScanner` resolves `_EPROCESS.VadRoot`, `_RTL_AVL_TREE.Root`, `_RTL_BALANCED_NODE.Left/Right`, `_MMVAD_SHORT.VadNode`, VPN, protection, private-memory, commit, no-change, large-page, and subsection fields from the loaded nt PDB/DIA metadata. Missing optional fields become warnings or reduced annotations, not hard-coded offsets.
-4. VAD traversal is iterative, bounded, and cycle guarded. Each node is validated as kernel-canonical before dereference, and its child pointers are queued before optional record metadata is decoded. An unreadable or filtered record therefore cannot suppress valid descendants. Full traversal produces total/matching counters; `/limit` caps only retained output records. `/pe` translates a committed private VAD base through the target DTB and reuses the pool-hunt PE probe to identify intact and signature-wiped PE candidates.
-5. `!vad scan` applies the injection-oriented predicate after full traversal and combines private executable, W+X, intact/wiped PE, large private executable, and hidden-PTE evidence. It requires honest VAD coverage before treating page-table-only ranges as actionable and records every probe/coverage boundary in `kn-live-dbg.vad.v1`.
-6. `!vad modules` builds a per-allocation-base union from Toolhelp loader modules and all VADs, then independently records `VirtualQueryEx` `MEM_IMAGE` identity, probes committed base pages for PE headers/entry points, and asks `K32GetMappedFileNameW` for each mapped VAD base. `!vad mappedpe` is the CLI compatibility alias for the same mode. This retains manual/private PEs and loader-invisible SEC_IMAGE mappings even when the header page is decommitted or the backing file has a nonstandard extension. Source, path, protection, reason, and coverage fields are emitted in `kn-live-dbg.process-pe.v1`; an unreadable path for a known `MEM_IMAGE` fails path coverage closed.
-7. `/hiddenpte` performs a second pass over the target process page tables using physical reads from the selected process DTB. It traverses present user-half PML5/PML4/PDPT/PD/PT entries, handles 1 GB and 2 MB large pages, subtracts normalized VAD intervals plus known VAD-less OS shared mappings, and reports present leaf ranges that no VAD covers as DKOM-style hidden memory evidence.
-8. `!threads` resolves `_EPROCESS.ThreadListHead` and `_ETHREAD.ThreadListEntry`, then optional thread ID, start, Win32StartAddress, TEB, and stack fields. User module ranges are collected with `CreateToolhelp32Snapshot` when possible and correlated with VAD classifications to flag starts outside modules, in private executable VADs, or in W+X VADs.
-9. `/apc` resolves `_ETHREAD.ApcState`, `_KAPC_STATE.ApcListHead`, and `_KAPC` routine fields when symbols expose them. The scanner reports queue/list evidence conservatively and emits layout warnings instead of claiming certainty when APC metadata is incomplete.
-10. Both commands print compact console rows plus stable JSON records and summary counters. The output is designed for diffing and for AI tool routing through `vad.list` and `threads.list`. The elevated `tools/validate-process-vad.ps1` positive-control gate asserts every VAD filter, output-only limits, PID/EPROCESS equivalence, mapped-PE cross-view coverage, and fixture cleanup.
-
-## Symbol Flow
-
-1. TUI calls `NtQuerySystemInformation(SystemModuleInformation)`.
-2. TUI translates `\SystemRoot\...` paths into local Windows paths.
-3. The build helper stages the pinned `vendor\debugging-tools\x64` Debugging Tools runtime DLLs beside the EXE so DbgHelp can load `symsrv.dll`, DbgEng can load `DbgModel.dll`, and both can use the Microsoft symbol server instead of the limited System32 runtime. If the vendor runtime is incomplete, it falls back to the locally installed Windows Kits Debugging Tools copy for missing debugger-runtime files. MSBuild receives DIA SDK and Debugging Tools include/lib directories from discovered Visual Studio and Windows Kits installations rather than fixed edition-specific paths.
-4. The sync script, build script, and EXE startup path create `symsrv.yes` when `symsrv.dll` is present but the consent marker is missing.
-5. Startup registers staged `msdia140.dll` with `DllRegisterServer` before symbol initialization so DIA fallback does not require a separate `regsvr32` step in normal elevated runs.
-6. Startup creates `<exe-dir>\symbols`, prepends the EXE directory and its non-cache subdirectories to the DbgHelp/DbgEng symbol path, then appends `SRV*<exe-dir>\symbols*https://msdl.microsoft.com/download/symbols` so downloaded PDBs are managed under the runnable EXE bundle.
-7. TUI calls `SymLoadModuleExW` for each loaded kernel image.
-8. Kernel images named `ntoskrnl.exe` or `ntkrnl*` are loaded into DbgHelp under the `nt` module alias.
-9. After driver load and ABI verification, startup forces the `nt` kernel image symbols to materialize, which downloads the PDB into the configured symbol cache when it is not already present.
-10. If forced symbol loading still leaves the module at `SymNone`, the warning includes the loaded `dbghelp.dll` path and `symsrv.dll` load state for runtime diagnosis.
-11. `addr` uses `SymFromNameW`.
-12. Native address parsing accepts numbers, loaded symbols, WinDbg backtick-separated addresses, and simple `+`/`-` arithmetic before command dispatch. Arithmetic expressions are evaluated in user mode so `dt`, `d*`, `e*`, `vtop`, `u`, `uf`, `setfield`, and AI preview helpers do not hand expression text to DbgHelp as a raw symbol.
-13. Exact `dt` layouts use `SymGetTypeFromNameW` and `SymGetTypeInfo`.
-14. If exact `SymGetTypeFromNameW` lookup fails, the symbol engine reuses `SymEnumTypesW` exact matching to recover module base plus type id before falling back to DIA; the match accepts module-qualified names, leaf type names, and leading-underscore variants.
-15. Wildcard `dt` patterns such as `dt nt!*` use `SymEnumTypesW` against matching loaded kernel modules, apply the `*`/`?` filter in user mode, fall back to DIA UDT enumeration when DbgHelp cannot enumerate the type stream, and print list-only type matches.
-16. If `DbgHelp` fails to return a usable UDT layout, the user-mode symbol engine opens the loaded PDB with DIA, or asks DIA to resolve the PDB from the module image plus symbol path, and recovers field names, offsets, lengths, bit positions, and type names. DIA activation first uses registered COM, then falls back to creating `IDiaDataSource` directly from the staged `msdia*.dll` through `DllGetClassObject` so COM registration failures are reported separately from PDB/type lookup failures.
-17. `!callbacks` resolves private callback structure fields from kernel PDBs, discovers object type objects from `ObTypeIndexTable`, discovers registry/process/thread/image-load callback roots by enumerating and validating candidate symbols, discovers minifilters from `fltmgr!FltGlobals.FrameList`, walks live list/table roots through the memory reader, and annotates callback routine addresses plus image-backed context addresses with loaded module ownership. `disable`/`enable` and their `-all` forms support only the cooperative `KnLiveDbgMiniFilterFixture` with `minifilter` or `all` scope. They pause/resume the provider's CREATE counting bodies through its control port; registered callback pointers remain unchanged. External callback mutation is rejected before pointer writes.
-18. `u` resolves an address or symbol with the native symbol engine, reads bounded code bytes through `IOCTL_KNDBG_READ_VIRTUAL`, and formats x64 instructions with the vendored Zydis decoder. This keeps local live-kernel disassembly independent from DbgEng memory callbacks, which can fail in local-kernel sessions. If the driver device is not open, `u` still falls back to the DbgEng disassembly path.
-19. `uf` resolves an address or symbol, reads a bounded code window through the driver, and uses the same Zydis decoder as `u` while stopping at common function terminal instructions. If the driver device is not open, it falls back to the DbgEng command path.
-20. `setfield` resolves a field offset in user mode, then sends a byte write to the driver.
-
-## Callback Scanner Flow
-
-1. Object callbacks: resolve `_OBJECT_TYPE.CallbackList`, discover object type objects from `ObTypeIndexTable`, read `_OBJECT_TYPE.Name` and table index, then walk each callback list. Human output carries the object type name/index alongside the `_OBJECT_TYPE` address. If the target nt PDB exposes `_OBJECT_TYPE` but omits the private callback item type, the scanner falls back to the guarded x64 object-callback item field layout, validates live list pointers, callback-entry pointers, operation masks, and callback routine pointers, and treats that as the normal public-symbol path unless validation fails.
-2. Registry callbacks: enumerate `CmpCallbackListHead` and nearby candidate symbols, validate the list-head shape, then walk callback context records. Public nt PDBs can omit `_CM_CALLBACK_CONTEXT_BLOCK`, so the scanner uses guarded x64 fallback layouts. Pre/post routine pointers that are kernel-canonical are kept even when they sit outside every loaded module -- that is the primary Cm hook signal for pool shellcode and manual-map leftovers -- and are tagged `function outside loaded modules`. Callback context values are module-annotated only when they also point into a loaded kernel image.
-3. Process callbacks: enumerate `PspCreateProcessNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks. Public nt PDBs can omit `_EX_CALLBACK_ROUTINE_BLOCK`, so the scanner uses the stable x64 function/context fallback layout for this block. The block context value is decoded as `notifyType` metadata and is not module-annotated.
-4. Thread callbacks: enumerate `PspCreateThreadNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
-5. Image-load callbacks: enumerate `PspLoadImageNotifyRoutine` and nearby candidate symbols, validate table slots, decode fast references, then read callback routine blocks with the same stable x64 layout.
-6. Minifilter callbacks: resolve `fltmgr!FltGlobals`, validate `FrameList`, walk `_FLTP_FRAME.RegisteredFilters`, decode `_FLT_FILTER` metadata, and enumerate `_FLT_OPERATION_REGISTRATION` entries plus filter-level routines.
-7. Cooperative disable/enable: `SetModuleCallbacks` accepts the exact fixture name or its `.sys` name with `minifilter`/`all` scope and delegates to `MinifilterIrpScanner::SetAllIrps`. The provider reports enabled/active counters and owner PID independently of the registered wrapper addresses. Unsupported scopes, other filters, addresses, and path-shaped targets fail the lifetime guard. The [external callback lifetime review](EXTERNAL_CALLBACK_LIFETIME_REVIEW_20261025.md) records why a local thunk rundown cannot protect dispatch before entry or pending pre/post completion contexts.
-
-## ETW Logger / NMI Callback Flow
-
-1. `!etw` and `!nmi` share the same KnLiveDbg.sys virtual-read primitive used by other native scanners and rely on the loaded kernel PDB for symbol and type information. `!etw integrity` additionally uses the vendored Zydis decoder to inspect function instruction bytes.
-2. `EtwScanner::Scan` resolves `nt!EtwpDebuggerData`, reads 64 `WMI_LOGGER_CONTEXT*` pointers from offset `0x10`, and for each non-null logger context reads `LoggerName` (UNICODE_STRING) and `GetCpuClock` (function pointer). PDB-resolved offsets are used when `nt!_WMI_LOGGER_CONTEXT.LoggerName` and `.GetCpuClock` are exposed; otherwise the fallback offsets `0x68` and `0x28` are used and a warning is emitted because those values drift across builds.
-3. Each `GetCpuClock` target is annotated with owning module (`KernelModuleInfo` lookup) and nearest symbol (`SymbolEngine::FindNearestSymbol`). Pointers that do not land inside any loaded kernel module are tagged `Suspicious=true` with a `Notes` string — the canonical InfinityHook indicator.
-4. `!etw logger <index|name>` reuses the same scan and applies a decimal index filter or a case-insensitive name substring filter in the user-mode pass.
-5. `NmiScanner::Scan` resolves `nt!KiNmiCallbackListHead` (or `nt!KiNmiCallbackList` as an alias), reads the head pointer, then walks the `KNMI_HANDLER_CALLBACK` singly-linked list. The node layout is fixed: `Next` at `0x00`, `Callback` at `0x08`, `Context` at `0x10`, `Handle` at `0x18`. Iteration is bounded to 256 nodes with a visited-node cycle guard.
-6. Each NMI callback is annotated with module + symbol and flagged suspicious if outside loaded kernel modules.
-7. Both scanners check kernel canonical form (`address >= 0xffff800000000000`) at every pointer dereference and tolerate `MmCopyMemory` short reads through the existing `device.ReadMemory` path.
-8. Signature-scan extraction of `KiNmiCallbackListHead` from a `KeRegisterNmiCallback` disassembly is documented as a follow-up milestone; this initial pass relies on PDB symbol resolution.
-9. `WnfScanner::Scan` exposes the documented WNF state-name encoding (XOR with `0x41C64E6DA3BC0074` and a `Version`/`Lifetime`/`DataScope`/`PermanentData`/`Sequence` + `OwnerTag` bit layout per Ionescu's "Out-of-Sight" reference) through `!wnf decode`, and attempts a live walk through `!wnf instances`/`instance`/`data`. Live walking first collects silo-state candidates, runs the modern LIST_ENTRY heuristic walker, and falls back to the legacy `_RTL_AVL_TABLE` path only when no candidate WNF list is identified. The AVL path uses PDB-resolved `StateName`/`ChangeStamp`/`DataSize`/`LastDataBlock` fields; the LIST_ENTRY path accepts either state-name hash or stable entry address filters, annotates subscriber/backing-object chains, and heuristically locates `_WNF_DATA_BLOCK` pointers for `!wnf data` by probing the matched entry. When walking cannot produce records the scanner emits precise diagnostics and the standalone decoder remains available.
-
-10. `EtwScanner::ScanIntegrity` resolves a fixed list of canonical kernel dispatch targets across five categories: core ETW dispatch (`EtwpReserveTraceBuffer`/`EtwpReserveTraceBufferAtomic`/`EtwpLogKernelEvent`/`EtwpReleaseTraceBuffer`/`EtwpFinalizeTraceBuffer`/`EtwpCommitTraceBuffer`/`EtwSendTraceBuffer`/`EtwpEventDispatcher`), classic cycle-count surface (`EtwpGetCycleCount`/`EtwpReceiveCycleCount`), PMC/HAL (`HalpCollectPmcCounters`/`HalCollectPmcCounters`/`HalpProcessorPerfCounter`/`HalpInterruptHandle`), timing sources (`KeQueryPerformanceCounter`/`KeQuerySystemTimePrecise`/`KeQueryInterruptTimePrecise`/`KeQueryUnbiasedInterruptTimePrecise`/`RtlGetSystemTimePrecise`/`HalpTimerQueryHostPerformanceCounter`), and syscall path (`KiSystemCall64`/`KiSystemCall64Shadow`/`KiSystemServiceUser`). For each resolved target the scanner reads 0x100 bytes through the driver, decodes up to 16 instructions with `ZydisDisassembleIntel`, and runs five structural checks against the prologue: first-instruction unconditional `jmp` (classic trampoline), first-instruction `int3`/`ud2` (debug-trap replacement), `mov reg,imm64;jmp reg` indirect trampoline, `push imm;ret` 32-bit-target trampoline, and any `call`/`jmp` in the first 16 instructions whose target lies in kernel canonical space but outside any loaded kernel module. Each finding records the instruction index/offset, mnemonic, target with module/symbol annotation, and a human-readable reason. The per-target status is `clean`, `SUSPICIOUS`, `unresolved`, `read-failed`, or `decode-failed`. Targets absent from the loaded PDB are reported `unresolved` and skipped without failing the scan, so a single command sweeps multiple Windows build variants.
-
-## CPU-State MSR Flow
-
-1. `!msrcheck` lives in `MsrScanner` (`user/MsrScanner.h/.cpp`) on top of the new read-only `DeviceClient::ReadMsr` wrapper over `IOCTL_KNDBG_READ_MSR`. The driver remains a narrow primitive: it reads one whitelisted architectural MSR via `__readmsr` on a caller-selected logical processor after pinning thread affinity with `KeSetSystemAffinityThreadEx`/`KeRevertToUserAffinityThreadEx`, and reverts before completing the IRP.
-2. `MsrScanner::Scan` samples `IA32_LSTAR`, `IA32_CSTAR`, `IA32_STAR`, `IA32_FMASK`, and `IA32_EFER` on every active processor in group 0 (`GetActiveProcessorCount(0)`), records the per-CPU values, and marks a reading divergent when the values are not identical across cores.
-3. The kernel programs these SYSCALL-configuration MSRs uniformly, so any per-CPU divergence is flagged as a single-core hook signal.
-4. For `LSTAR` the scanner resolves `nt!KiSystemCall64` and flags a mismatch as a possible SYSCALL hook; when that symbol is unavailable it falls back to loaded-module containment of the entry pointer. `CSTAR` is validated only when non-zero (it is unused on most Intel parts). `STAR` selectors and `EFER` bits are decoded for inspection but are not, by themselves, treated as suspicious.
-5. The driver only permits the fixed MSR whitelist, all of which are always present in x64 long mode, so `__readmsr` cannot `#GP` on a permitted index; unknown indices are rejected with `STATUS_INVALID_PARAMETER`. The IOCTL is read-only and does not consult the write-mode gate.
-6. This is the first slice of the broader CPU-state detection family; the same read-only IOCTL pattern is intended to back future GDT integrity checks. The MSR/CR/IDT IOCTLs pin per-processor affinity through `KeGetProcessorNumberFromIndex` + `KeSetSystemGroupAffinityThread`, so a caller-supplied processor index spans all processor groups and machines with more than 64 logical processors are fully covered.
-
-## Phase 2 Quiet Surface Flow
-
-1. `!hal` (`HalDispatchScanner`) resolves `nt!HalDispatchTable` and optional `nt!HalPrivateDispatchTable`, reads only pointer fields described by the matching PDB type, and flags targets outside loaded modules or owned by unexpected non-nt/hal modules. A missing type layout produces incomplete coverage; the scanner does not interpret the leading version field or adjacent qwords as callbacks.
-2. `!hive` (`HiveScanner`) walks `nt!CmpHiveListHead` only when `_CMHIVE.Hive`, `_CMHIVE.HiveList`, and `_HHIVE.GetCellRoutine` are PDB-resolved. It validates forward/back links and flags GetCell/ReleaseCell routines outside ntoskrnl. Layout, link, limit, and read failures remain coverage gaps rather than findings.
-3. `!token` (`TokenPrivilegeScanner`) resolves `_EPROCESS.Token` EX_FAST_REF, reads `_SEP_TOKEN_PRIVILEGES` Present/Enabled/EnabledByDefault, and surfaces high-risk enabled privileges on non-system-profile processes. `!hunt` (default/deep) emits `unexpected_enabled_privilege` findings; snapshots store a privilege fingerprint under `process-security`.
-4. `!etw providers` probes ETW provider anchors for GUID-and-pointer-shaped diagnostic candidates. Until a PDB-backed registration layout is available, those pointers are not classified as callbacks or tampering. `!etw ti-cross` treats inactive TI as skipped, high drops as operational, and silence alone as inconclusive without expected activity or an independent contradiction.
-5. `!dpc` / `!timer` (`DpcTimerScanner`) use PDB fields for `_KPRCB.DpcData`, modern `_KDPC_DATA.DpcList` / `_KDPC_LIST.ListHead` or legacy `_KDPC_DATA.DpcListHead`, `_KDPC`, and `_KTIMER`; timer buckets additionally require an exact PDB symbol extent. Modern DPC singly linked queues validate NULL termination and tail identity; legacy doubly linked lists validate backlinks. Every truncation/read failure clears coverage. High risk is reserved for non-image callback routines. Modern timer roots and `!workitem` remain incomplete.
-6. `!cr` lives in `CrScanner` (`user/CrScanner.h/.cpp`) on top of `DeviceClient::ReadControlRegisters` over `IOCTL_KNDBG_READ_CONTROL_REGISTERS`. It samples CR0/CR4/CR8 on every active processor in group 0 and flags `CR0.WP=0` (kernel write-protect disabled) and any per-CPU divergence of CR0/CR4 as suspicious. CR4 mitigation bits (SMEP/SMAP/UMIP/LA57/CET/PKE) are decoded; SMEP or SMAP being disabled is surfaced as a note rather than a hard suspicion because legacy CPUs may legitimately lack them. The scanner needs no symbol metadata, only the driver device.
-7. `!idt` lives in `IdtScanner` (`user/IdtScanner.h/.cpp`) on top of `DeviceClient::ReadIdt` over `IOCTL_KNDBG_READ_IDT`. It reads the boot processor IDTR, derives the gate count from the limit (bounded to 256), reads the gate descriptors with the existing memory-read primitive, rebuilds each handler from its split offset fields (`OffsetLow | OffsetMiddle << 16 | OffsetHigh << 32`), annotates the owning module/symbol, and flags any present gate whose handler lies outside every loaded kernel module as interrupt-hook evidence. Only flagged gates are listed; per-processor IDT comparison is a documented future enhancement.
-8. `!ssdt` lives in `SsdtScanner` (`user/SsdtScanner.h/.cpp`) and, unlike the MSR/CR slices, needs no new driver IOCTL: it reuses the existing `DeviceClient::ReadMemory` primitive plus the PDB-first `LayoutResolver` for the `_KSERVICE_TABLE_DESCRIPTOR` Base/Limit field offsets (stable x64 fallback `0x00`/`0x10`). It resolves `nt!KeServiceDescriptorTable` for the native table and, when a `win32k*` module is loaded, `nt!KeServiceDescriptorTableShadow[1]` for the win32k table. For each slot it decodes the x64 service routine as `KiServiceTable + (entry >> 4)` (arithmetic shift; the offset is usually negative into `.text`), annotates the owning module/symbol, and flags routines that fall outside the expected image (ntoskrnl for the native table, any `win32k*` module for the shadow table) or outside every loaded module. The walk bounds the service count to a sane cap and bails when the descriptor reads back implausible values. Only hooked entries are listed; a clean table prints a one-line summary.
-
-## VBS / HVCI / Secure Kernel Flow
-
-1. `!vbs`, `!ci`, and `!securekernel` share `VbsScanner`. The CI scope queries the OS API and CPUID without needing a device or symbols; the VBS/trustlet scopes also read live kernel memory through `KnLiveDbg.sys`.
-2. `CodeIntegrityState.h` queries `NtQuerySystemInformation(SystemCodeIntegrityInformation=103)` and validates NTSTATUS, returned length, and structure length before decoding SDK constants. Both VBS/CI and KMON platform evidence use it. HVCI enabled/audit/strict/IUM are `0x400/0x800/0x1000/0x2000`; CI debug mode is `0x80`. Private `g_CiOptions` values are not decoded using this contract. Unknown bits are retained. Failed queries become unknown in the console/snapshot and null in JSON, never a known disabled state.
-3. VBS activity is inferred from `nt!HvlpVsmVtlCallVa` (with `nt!HvlpVtlCallVa` and `nt!HvlVtlCallVa` fallbacks). A null pointer is the inactive marker and a pointer in the supported kernel address range is the active marker; missing/unreadable or unrecognized nonzero values remain unknown. This private-symbol heuristic does not verify page mappings. `nt!HvcallpVtlCallStub` is resolved as a secondary marker.
-4. The scanner scans `SymbolEngine::Modules()` for `securekernel.exe` and `skci.dll` to confirm Secure Kernel runtime presence.
-5. CPUID leaves `0x1` (hypervisor-present bit), `0x40000000` (vendor + maximum leaf), and `0x40000001` (interface signature) are queried in user mode. Leaf `0x40000006` is interpreted as Microsoft hardware features only when the maximum leaf includes it and the interface is `Hv#1`. Vendor identity alone does not establish compatibility. HVCI does not establish MBEC support or enablement.
-6. Trustlet enumeration walks `nt!PsActiveProcessHead` through `_EPROCESS.ActiveProcessLinks` with a bounded visited set, reads `_EPROCESS.UniqueProcessId`, `ImageFileName`, and `_EPROCESS.SecureState` (or `_KPROCESS.SecureState` through the embedded `Pcb`) per record. Bit 0 (`SecureKernelInProcess`) marks IUM trustlets; when the field is absent, the scanner falls back to case-insensitive prefix matches against well-known trustlet image names (`lsaiso`, `bioiso`, `securesystem`, `kdcustomization`) which tolerate the 15-byte `ImageFileName` truncation.
-7. `!vbs` prints all five blocks (`[vbs.core]`, `[ci.options]`, `[vbs.hypervisor]`, `[securekernel.modules]`, `[securekernel.trustlets]`). `!ci [options|policy]` prints the CI options + hypervisor blocks plus an optional `[ci.policy]` summary that explicitly notes WDAC policy blob discovery is reserved for a later milestone. `!securekernel` prints the secure kernel module list plus trustlet list.
-8. Structured VBS output uses `kn-live-dbg.vbs.v2`: unknown CI flags/raw masks and unknown VBS activity are null. The source is the public OS query, so v1 private-mask semantics and non-null types are not preserved. Consumers must handle the version change and use `hvciEnabled`/`hvciAuditMode`/`debugMode`; the misleading `hvciEnforced` and `hvciDebugMode` fields are removed.
-
-## ALPC Port Discovery Flow
-
-1. `!alpc` is implemented natively against live kernel memory through the existing `KnLiveDbg.sys` virtual-read path and PDB type metadata.
-2. `AlpcScanner::Scan` resolves `nt!ObTypeIndexTable`, enumerates `_OBJECT_TYPE` slots, and locates the `ALPC Port` and `Directory` type entries by reading each type's `_OBJECT_TYPE.Name` (or `TypeName`) `UNICODE_STRING`.
-3. `nt!ObHeaderCookie` is resolved when present; if it cannot be found, the scanner records a warning and falls back to raw `_OBJECT_HEADER.TypeIndex` comparisons for pre-cookie kernels.
-4. `nt!ObpRootDirectoryObject` is read to get the root `_OBJECT_DIRECTORY`. The scanner recurses through `_OBJECT_DIRECTORY.HashBuckets[]` (bucket count derived from the PDB-resolved array length) following each `_OBJECT_DIRECTORY_ENTRY.ChainLink` and descending into directory-typed children with bounded depth and a visited-directory cycle guard.
-5. Each candidate object body has its `_OBJECT_HEADER` computed by subtracting `_OBJECT_HEADER.Body` offset, its `TypeIndex` decoded with the per-object XOR (`raw ^ cookie ^ ((header_addr >> 8) & 0xff)`), and matched against the `ALPC Port` type index.
-6. For each port the scanner reads `_ALPC_PORT.OwnerProcess`, `ConnectionPort`, `CommunicationInfo`, and Flags. `_ALPC_COMMUNICATION_INFO.ConnectionPort`, `ServerCommunicationPort`, and `ClientCommunicationPort` are followed to surface paired server/client ports that are not themselves named in the directory tree.
-7. Queue depths are computed by bounded `_LIST_ENTRY` walks on `MainQueue`, `PendingQueue`, `LargeMessageQueue`, `CanceledQueue`, and `WaitQueue`. `_KQUEUE` fields (typically `WaitQueue`) are detected by PDB type name and the list head is adjusted past the dispatcher header before walking.
-8. Owner annotations resolve `_EPROCESS.UniqueProcessId` and `ImageFileName` for each port whose `OwnerProcess` lies in the kernel canonical range.
-9. `!alpc ports`, `!alpc connections`, `!alpc port <addr>`, and `!alpc queues <addr>` reuse the same scanner with different scope/filter combinations. `connections` groups records by `ConnectionPort` to render server/client family graphs; `queues` populates queue counts for a single explicit port address.
-10. The `alpc.list` AI capability tool routes back through `HandleAlpcCommand` with scope and optional name/pid arguments validated against the same shape rules used for plan commands.
-
-## Windows Filtering Platform Flow
-
-1. `!wfp` is implemented natively in user mode against the Base Filtering Engine (BFE) through `fwpuclnt.dll`; the kernel driver is not involved and the BFE service must be running.
-2. `WfpScanner::Scan` opens an engine handle with `FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, nullptr, &engine)`, then builds in-memory provider, layer, and sublayer indexes by enumerating `FWPM_PROVIDER0`, `FWPM_LAYER0`, and `FWPM_SUBLAYER0` through the standard `FwpmXxxCreateEnumHandle0` / `FwpmXxxEnum0` / `FwpmXxxDestroyEnumHandle0` cycle. Each page-sized batch is freed with `FwpmFreeMemory0` before the next page.
-3. The five subcommands `!wfp providers`, `!wfp sublayers`, `!wfp callouts`, `!wfp filters`, and `!wfp layers` reuse those indexes to resolve owning provider names, applicable layer names, and sublayer names, then format each record under `[wfp.provider]`, `[wfp.sublayer]`, `[wfp.callout]`, `[wfp.filter]`, and `[wfp.layer]` headings with key GUIDs, decoded flag mnemonics, and action/weight metadata.
-4. Module ownership for callouts comes from `FWPM_CALLOUT0.providerKey` resolved against the provider index and printed as the provider display name plus `serviceName`. Kernel-mode callout function pointers are not exposed by user-mode `FWPM_CALLOUT0`; `!wfp kernelcallouts` recovers them separately (see below).
-5. `!wfp kernelcallouts` lives in `WfpCalloutScanner` (`user/WfpCalloutScanner.h/.cpp`) and resolves the kernel callout function pointers that the BFE metadata omits. It anchors on the public symbol `netio!gWfpGlobal`, then locates the callout array by scoring documented candidate layouts (e.g. a Win11 variant with the engine struct behind the pointer at `gWfpGlobal`, count/array at `+0x198`/`+0x1a0` and `0x60`-byte slots; an older `+0x190`/`+0x198` with `0x50`-byte slots; or `+0x548`/`+0x550` with `0x40`-byte slots; classify at `+0x10`) against live pointers -- a candidate wins only when the sampled non-null classify pointers land in loaded kernel modules -- with a bounded offset-scan fallback for build drift. It then walks the array, recovers classify (`+ClassifyOffset`), notify (`+0x18`), and flowDelete (`+0x20`) pointers, joins each slot to the user-mode callout metadata (name/layer/provider) by callout id through `WfpScanner`, annotates module/symbol, and flags any classify target outside every loaded kernel module. The table location and slot layout are not in public PDBs and drift across builds, so the scanner reports cleanly (warnings, `Resolved=false`) instead of fabricating when no layout validates. It reuses the existing memory-read primitive; no new driver IOCTL is added.
-5. `!wfp callouts /module <name|GUID>` filters by provider service name (case-insensitive substring), provider display name, or `providerKey` GUID. `!wfp filters /layer <name|GUID>` filters by layer display-name substring or `layerKey` GUID, and `/provider` applies the same provider matching as `/module` for filters.
-6. The `wfp.list` AI capability tool routes back through `HandleWfpCommand` with scope and optional module/layer arguments validated against the same shape rules used for plan commands.
-
-## Windows Notification Facility (WNF) Flow
-
-1. `!wnf decode <hash>` is a pure standalone decoder. `DecodeWnfStateName` applies the documented Ionescu mask `0x41C64E6DA3BC0074` and extracts Version (bits 0-3), Lifetime (bits 4-5: WellKnown/Permanent/Persistent/Temporary), DataScope (bits 6-9: System/Session/User/Process/Machine/PhysicalMachine), PermanentData (bit 10), Sequence (bits 11-63), and OwnerTag (bits 32-63 for WellKnown names rendered as ASCII when printable).
-2. Live walking (`!wnf instances` / `!wnf instance` / `!wnf data`) shares a silo-candidate collector that tries `nt!ExpWnfSiloState`, `nt!ExpWnfState`, and `nt!ExpWnfProcess` first, then disassembles `nt!NtQueryWnfStateData` and `nt!NtPublishWnfStateData` with Zydis. Anchor disassembly follows indirect calls two levels deep and records each RIP-relative reference under both dereference and inline-struct interpretations, producing a union of plausible silo pointers.
-3. **LIST_ENTRY heuristic walker (modern Win11)** runs first. `CollectListHeadsFromSilo` scans the first 0x800 bytes of each silo candidate looking for `LIST_ENTRY`-shaped heads via `DetectListEntryHead` (Flink/Blink both kernel-canonical AND either self-sentinel for empty lists OR Flink->Blink->head round-trip for non-empty). Each non-empty chain is walked up to 0x80 entries with 0x80 bytes captured per entry. `ExtractStateNameFromEntry` then probes byte offsets `0x10..0x38` of each entry for a 64-bit value that (a) is non-zero, (b) is not a kernel-canonical pointer, and (c) passes `LooksLikeStateName` (Version <= 7, Lifetime <= 3, DataScope <= 5). Per-list scoring counts UNIQUE state-name values extracted; lists with fewer than 4 hits, less than 50% hit rate, or fewer than 4 unique values are dropped. The single highest-scoring list is treated as the authoritative `_WNF_NAME_INSTANCE` chain. Runner-up lists are surfaced as diagnostics.
-4. **Legacy `RTL_AVL_TABLE` walker** runs only when the LIST_ENTRY walker produces no records. The AVL table is located via PDB-resolved fields (`NameSet`/`NameSubscriptionTable`/`SubscriptionTable`/`NameInstanceTable`/`NameInstances`) on `nt!_WNF_SUBSCRIPTION_TABLE`, `nt!_WNF_SILODRIVERSTATE`, or `nt!_WNF_PROCESS_CONTEXT`, then validated with `LooksLikeAvlTable` (NumberOfElements <= 0x10000, AllocateRoutine/FreeRoutine kernel-canonical, root.Parent == tableAddr structural sentinel check). Iterative in-order traversal walks up to 16384 nodes at depth 64. Each node's `_WNF_NAME_INSTANCE` user data begins at `+0x20` (past the `_RTL_BALANCED_LINKS` sentinel) with PDB-resolved `StateName`/`ChangeStamp`/`DataSize`/`LastDataBlock` offsets.
-5. `instance <hash|entry-address>` filters by raw state-name match in either walker, and in LIST_ENTRY mode also accepts the stable entry address shown by `!wnf instances`. `data <hash|entry-address>` dumps up to 256 bytes of the last-published payload. The AVL path follows PDB-resolved `LastDataBlock`/`StateData` fields and then tries buffer offsets `0x10`/`0x18`/`0x20`/`0x00`; the LIST_ENTRY path probes the first 0x200 bytes of the matched entry for a kernel-canonical pointer whose dereferenced 16-byte header matches `_WNF_DATA_BLOCK` (`DataSize`, `AllocatedSize`, `ChangeStamp`). If the probe fails, diagnostics include a per-pointer header census to support build-specific layout inspection.
-6. Three diagnostic subcommands feed manual investigation: `!wnf candidates` dumps the first 0x100 bytes of every silo candidate with embedded state-name-shape and kernel-pointer counts; `!wnf lists` walks every detected LIST_ENTRY head and dumps each chain with per-entry hex/ASCII plus state-name probe annotations; `!wnf instances` itself prints runner-up list scores so operators can spot when the top-1 selection landed on a sentinel chain.
-
-## Big Pool Tracking Flow
-
-1. `!pool [big|find|summary]` is implemented entirely in user mode in `PoolScanner` -- no new IOCTL is added to `KnLiveDbg.sys`. The scanner enables `SeDebugPrivilege` via `OpenProcessToken`/`AdjustTokenPrivileges`, resolves `ntdll!NtQuerySystemInformation` once with `GetProcAddress`, and issues a `SystemBigPoolInformation` (class 0x42) query in a `for(;;)` retry loop that grows from `0x10000` to `0x4000000` bytes and bails after 16 length-mismatch retries.
-2. The returned `_SYSTEM_BIGPOOL_INFORMATION` blob is parsed defensively: `returnLength` must reach the entry-array offset and stay inside the allocated buffer before any dereference. A declared `Count` exceeding the returned entries is rejected before reserve/indexing. A malformed table cannot establish allocation absence. Each entry's `VirtualAddress | NonPaged:1` union is decoded by masking the low bit before reuse.
-3. Per-entry filters apply in `PoolScanner::Scan` in this order: paged class (`PagedFilter::NonPagedOnly` default), 4-byte ASCII tag comparison against `TagUlong`, `[MinSize, MaxSize]` size band, address containment against `[VirtualAddress, VirtualAddress+SizeInBytes)`, and a hard limit on printed entries. Tag parsing zero-pads the upper bytes to mirror the C multi-character literal encoding (`'SG' = 0x4753`).
-4. With `/annotate`, the scanner issues one `IOCTL_KNDBG_TRANSLATE_VIRTUAL` per kept entry via `DeviceClient::TranslateVirtual` with `DirectoryTableBase = 0` (the driver substitutes the live CR3). It then walks the populated PML5/PML4/PDPTE/PDE/PTE slots driven by the response's `PagingLevels` count, gated on `KNDBG_TRANSLATE_FLAG_LA57_ACTIVE` for whether `Pml5e` is part of the chain. Effective `Writable` ANDs the bit-1 mask across every traversed level; effective `Executable` ANDs `(NX == 0)` likewise; `Readable` reflects the leaf Present bit.
-5. The output format uses the project's `PrintColoredText` plus `KNDBG_COLOR_*` palette. `[W+X]` non-paged allocations are highlighted in red to flag BYOVD/payload-staging candidates; large-page (`PS=1`) leaves print a `LargePage` marker. `/wx` implies `/annotate`, keeps only entries whose effective page permissions are writable and executable, and applies `/limit` after that attribute filter. `!pool summary` and the trailing `[pool.summary]` line always print and surface the raw `TotalEntries`/`NonPagedCount`/`PagedCount`/`MatchingCount`, the buffer size that finally satisfied the kernel, the retry count, and an explicit `(no SeDebugPrivilege)` warning when elevation failed.
-
-## Memory Dump Flow
-
-1. `dump-raw <address> <length> <path> [/zerofill]` and `dump-pe <address> <path>` are implemented in `MemoryDumper` purely on top of `DeviceClient::ReadMemory` -- no new IOCTL is required. The shared helper `ReadKernelRange` chunks every kernel read into 256 KB IOCTL calls and either aborts at the first failure (raw default and PE header read) or zero-fills the failed chunk and continues (raw `/zerofill` and PE section reads, where discarded INIT or paged-out pages are the common failure mode).
-2. `DumpKernelRangeToFile` validates the requested length against a 1 GB sanity cap, allocates a single zero-initialised output buffer, drives the chunked read into it, and then writes the whole buffer with `std::ofstream` in binary mode. Per-chunk failure counts (`ChunksFailed`) and the matching warning list are reported back in `DumpRawResult` so the TUI can colour the zero-filled count in `KNDBG_COLOR_WARN`.
-3. `DumpKernelPeToFile` reads an initial 4 KB at `<address>` and routes the buffer through `LocateAndRestoreNtHeaders`, which combines NT-header location and signature recovery in one pass. Phase 1 trusts `e_lfanew` if it points within the buffer and the target passes `IsPlausibleNtHeader` (Machine != 0; NumberOfSections in `1..96`; SizeOfOptionalHeader == `0xF0` for PE32+ or `0xE0` for PE32; OptionalHeader.Magic matches the size; SizeOfHeaders in `(0, 0x10000]`; SizeOfImage > SizeOfHeaders -- and the Signature may be either `0x00004550` or zero so wiped-signature malware still validates). Phase 2 falls back to a 4-byte-aligned scan from `0x40` to `0x1000`, picking the first offset that passes the same check. Once located, wiped `MZ` / `PE\0\0` / corrupted `e_lfanew` are patched directly into the in-memory header buffer (so the eventual file output is repaired) and reported through `DumpPeResult.RestoredDosMagic` / `RestoredPeSignature` / `RestoredELfanew`. The optional header magic then dispatches to `IMAGE_NT_HEADERS64` (PE32+) or `IMAGE_NT_HEADERS32` (PE32) to extract `SizeOfHeaders`, `NumberOfSections`, `SizeOfImage`, `ImageBase`, and `Machine`. Headers larger than 4 KB trigger a re-read up to a 64 KB ceiling, after which the recovery helper runs a second time so that re-fetched kernel-side wipes get patched in the final buffer (the helper guards against duplicate warnings on the second pass).
-4. The output file size is computed as `max(SizeOfHeaders, max_over_sections(PointerToRawData + SizeOfRawData))` and clamped to a 512 MB ceiling. A single zero-filled `std::vector<uint8_t>` of that size is allocated; the in-memory headers are copied verbatim (preserving any loader patches), then for each `IMAGE_SECTION_HEADER` the scanner reads `SizeOfRawData` bytes from `<address> + VirtualAddress` and writes them at file offset `PointerToRawData`. Failed section reads leave the corresponding output range zero (already initialised) and are recorded as `[ZERO-FILLED]` per-section records plus a textual warning in `DumpPeResult.Warnings`.
-5. Section records (`DumpedSectionRecord`) carry the section name, RVA, virtual and raw sizes, file offset, characteristics flags, and the read outcome. The TUI prints each section under `[dump-pe.section]` with the colour palette used elsewhere; the trailing `[dump-pe]` summary line surfaces 32 vs 64-bit class, machine type, section count, header size, `ImageBase`, `SizeOfImage`, the actual output file size, and the resolved output path.
-
-## Big Pool PE Hunt Flow
-
-1. `!pool pe` lives in `PoolPeHunter` (`user/PoolPeHunter.h/.cpp`). It shares the `SystemBigPoolInformation`-based enumeration scaffolding with `PoolScanner` (separate copy to keep the two scanners decoupled) but replaces the per-entry payload analysis with a PE-header detector.
-2. For every kept big pool entry the hunter reads the first `0x1000` bytes through `DeviceClient::ReadMemory` on the default `MmCopyMemory` path and feeds the bytes into `ProbeForPeHeader` in `MemoryDumper.cpp`. That probe is a non-mutating wrapper around the same `IsPlausibleNtHeader` plausibility gates used by `dump-pe`'s header recovery: it trusts `e_lfanew` first, then sweeps `0x40..0x1000` on a 4-byte grid, and accepts hits with either an intact `0x00004550` signature or a zeroed signature paired with a plausible `IMAGE_FILE_HEADER` / `IMAGE_OPTIONAL_HEADER`.
-3. The probe returns a `PeHeaderProbe` with the NT offset, the wipe anomaly flags (`MzWiped`, `PeSignatureWiped`, `ELfanewMismatch`), and decoded fields (Machine, NumberOfSections, Characteristics, SizeOfHeaders, SizeOfImage, ImageBase, TimeDateStamp, 32/64-bit class). The hunter promotes these into `PoolPeHit` records; hits with any wipe flag set are counted against `SuspiciousWipes`.
-4. With `/dump <directory>`, each hit is then routed through `DumpKernelPeToFile` to produce a structurally-valid on-disk PE under `<directory>\poolpe_<tag>_<address>.bin`. The dump path applies the same signature recovery, so even a `[pool-pe.suspect]` hit with all three signatures wiped yields a file that IDA/Ghidra can open.
-5. The TUI handler `HandlePoolScanPeCommand` parses the options (`/tag`, `/min`, `/max`, `/limit`, `/nonpaged|/paged|/any`, `/suspicious`, `/dump`), invokes the hunter, and renders results with `[pool-pe.hit]` (intact header) or `[pool-pe.suspect]` (any wipe). The summary line surfaces `total` / `nonpaged` / `paged` / `scanned` / `readFail` / `hits` / `suspicious` counters and an `(no SeDebugPrivilege)` warning when elevation failed.
-6. `!kmon` samples headerless executable kernel regions outside loaded modules in interleaved `0x4000`-byte windows, resuming across passes (128 selected windows during a mapper watch, 64 while idle). `CountKernelImportStubs` shares the validated RIP-slot and matching `mov rax..r15, imm64; jmp/call` decoder with the mapper layer. During the post-driver-load mapper watch a headerless executable window qualifies with at least two imports, including session-space candidates; while idle, a nonpaged big-pool window requires at least three. Generic unowned RX observations and NX pool-interior PE probes provide additional evidence without satisfying this import-stub classifier. Hits emit `pool_code`/`kpage_code` and register a residue PFN for `!hunt` correlation; mapper-watch hits also set the watch-residue flag. Read failures, incomplete inventories, and enumeration/window caps retain explicit coverage limits. See [the current implementation and coverage contract](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_IMPLEMENTATION_2026-09-16.md).
-
-## Address Inspection Flow
-
-1. `!address <va>` lives in `AddressInspector` (`user/AddressInspector.h/.cpp`). The handler parses the argument through the shared `ParseAddressOrSymbol` path so `nt!Foo`, `module+0xN`, hex/decimal values and address expressions all work transparently.
-2. `InspectAddress` first classifies the address without touching the kernel: canonicality is tested for both LA48 (bit 47 must extend through bit 63) and LA57 (bit 56 must extend through bit 63), the zero-page bucket is split out for the first 4 KB, and the LA48 split is used as the working hypothesis for kernel vs user space. The hypothesis is corrected later if the driver response advertises LA57.
-3. Module containment is computed via a linear sweep over `SymbolEngine::Modules()`; ranges are half-open. The nearest symbol comes through `SymbolEngine::FindNearestSymbol` (DbgHelp/DIA), which works even for addresses outside any module-list span.
-4. When the address is canonical, `DeviceClient::TranslateVirtual` is called with `DirectoryTableBase = 0`; the driver substitutes the live CR3 and walks PML5/PML4/PDPTE/PDE/PTE (auto-detecting LA57 via CR4.LA57), returning per-level values and physical addresses plus the `KNDBG_TRANSLATE_FLAG_LARGE_PAGE` / `KNDBG_TRANSLATE_FLAG_LA57_ACTIVE` markers.
-5. Effective permissions are then re-computed by `WalkPtePermissions`: present = AND of bit 0 across every traversed level, writable = AND of bit 1, executable = AND of `(NX == 0)`, user-accessible = AND of bit 2. The starting index in the level array is 0 for LA57 and 1 for LA48, gated on the LA57 flag from the driver. The large-page short-circuit is implemented inside `WalkPtePermissions` itself by testing the PS bit (bit 7) at the PDPTE and PDE levels and breaking before walking the unused PTE level -- without this, the driver's zero-valued PTE for 1 GB / 2 MB mappings would erroneously clear Present and Writable on what is actually a valid large mapping.
-6. The TUI handler `HandleAddressCommand` renders the result in three coloured blocks: `[address]` summary, `[address.translation]` per-level PTE listing with the `(P W U PS NX)` annotation, and `[address.physical]` PA/offset. A `[W+X]` tag is highlighted in red when the page allows both writes and executes.
-
-## Leftover Payload Flow
-
-kdmapper-style attacks are two objects: a signed exploit driver that was
-really loaded (`NtLoadDriver` / `IopLoadDriver`), and a payload copied into
-independent kernel pages that was never a loaded module. No single command
-covers both. Operators must not treat `!mapper leftover=0` as "no mapper".
-
-Detection layers (run in this order when the goal is mapper-family coverage):
-
-| Layer | Command | What it can see | What a quiet result means |
-|---|---|---|---|
-| Loaded BYOVD | `!byovd` | The signed exploit driver while it is still in the module list | Image already unloaded, or never matched the catalog |
-| Bookkeeping remnants | `!mapper` | Incomplete cleanup of `MmUnloadedDrivers`, `PiDDBCacheTable`, `g_KernelHashBucketList` for a driver that was loaded for real | Ledgers look clean. Stock kdmapper wipe is expected to look like this |
-| Orphan executable pages | `!kpage` (`/pe`, `/wx`) | Executable leaves outside `SystemModuleInformation`, including independent-page payloads | No such leaves in the walked tables. PTE-remap into a live module still hides here |
-| Hook-to-body | `!payload` / `!payload scan` | Hook pointers (callbacks, SSDT, IDT, NMI, HAL, MSR, ETW, WFP, DPC, dispatch, firmware tables) that land outside every loaded module | No scanned hook surface pointed off-module. Does not prove orphan pages are unused |
-| Staged pool PE | `!pool pe` | Intact or signature-wiped PE headers in big pool | Payload was not pool-backed, or the header is gone |
-| Temporal bookkeeping | `!snapshot` domains `leftover-mapper` + `kpage` | Same-boot add/drop of `!mapper` records and of orphan executable regions (PTE walk, tag/pool-type agnostic) | Snapshot never runs `!payload scan`; the PFN `/deep` pass is also not part of `!snapshot` |
-
-1. These scanners stay in user mode and reuse `ReadMemory`, `TranslateVirtual`, `ReadPhysical`, `ReadControlRegisters`, and `GetPhysicalMemoryRanges`. The driver ABI does not change.
-2. `!payload <addr>` (`PayloadTracer`) inspects one kernel VA: module containment from `SystemModuleInformation`, `InspectAddress` page-walk permissions, one `SystemBigPoolInformation` snapshot, a PE-header probe at the pool base or page-aligned VA (intact or signature-wiped), and a bounded Zydis disassembly. Classification is evidence, not proof.
-3. `!payload scan` first collects function pointers that sit outside every loaded module from the existing hook scanners (callbacks, SSDT, IDT, NMI, HAL, SYSCALL MSRs, ETW, WFP callouts, DPC/timer, driver dispatch, firmware table handlers). A failed surface is a coverage warning. Unique addresses are then traced with the same path as `!payload <addr>`, capped by `/limit` (default 16, max 128).
-4. `!mapper` (`MapperRemnantScanner`) walks `nt!MmUnloadedDrivers` with the stable x64 `0x28` slot (public PDBs omit `_MM_UNLOADED_DRIVER`; a missing-type `GetTypeLayout` would load every kernel PDB). `nt!PiDDBCacheTable` is validated as an `RTL_AVL_TABLE` using x64 routine slots `0x48/0x50/0x58`; a failed header falls back to `nt!PiDDBCacheList`. `ci!g_KernelHashBucketList` (or nearby ci symbols) is either a `LIST_ENTRY` head or a singly-linked chain. Missing symbols fail closed. Overlap with a live image is `REUSED` or `RELOAD`, not `STILL-X`. Names explained by the unload log or `dump_*` are `EXPECTED` and omitted from default output. Wiped names with a non-zero range, a zero `TimeDateStamp`, or an unloaded range that is still present+executable and not reused are `SUSPICIOUS`. The mapped payload itself is not in these lists.
-5. `!kpage` (`OrphanKernelPageScanner`) walks the kernel half of the live LA48/LA57 CR3 page tables, subtracts loaded-module spans from executable leaves, coalesces compatible remainder spans without merging distinct big-pool allocations, and skips the mode-appropriate `MmPteBase` self-map window. Session-space hits stay low-risk unless they are W+X or PE-like. `/wx` and `/pe` filter after classification. Failed table reads or selected-region translation checks make coverage partial.
-6. `!kpage /deep` additionally walks `nt!MmPfnDatabase` using the PDB `_MMPFN` layout and `PteAddress`, derives the mode-appropriate canonical VA, and validates the actual translated PFN plus effective parent NX/RW permissions. It retains ActiveAndValid executable kernel pages the page-table walk did not emit. The PFN pass is capped, propagates read/validation failures, and is not part of `!snapshot`.
-7. Snapshots store `leftover-mapper` plus a `kpage` domain: `CaptureKpage` runs the same page-table walk (session space excluded, 512-region cap, full 65536-table-page budget) and records every executable region outside loaded modules with W+X/PE risk, big-pool tag, and PFN evidence, so a before/after diff surfaces mapper code hidden in pool even without a PE header (snapshot captures always include the full domain set; `/all` is a compatibility no-op). `!payload scan` stays an operator command; the PFN deep pass remains excluded because it is the expensive half.
-8. MCP/AI tools are `byovd.scan`, `mapper.list`, `kpage.list`, `payload.inspect`, `payload.scan`, and `pool.scan_pe`. `kpage.list` must not set `deep=true` unless the operator asks for a PFN walk. Planner text must not treat a clean `mapper.list` as payload absence.
-
-## Minifilter IRP Control Flow
-
-1. `!minifilter` (`MinifilterIrpScanner`) resolves `fltmgr!FltGlobals` and PDB layouts for `_GLOBALS`, `_FLTP_FRAME`, `_FLT_FILTER`, `_FLT_OBJECT`, `_FLT_RESOURCE_LIST_HEAD`, and `_FLT_OPERATION_REGISTRATION`. Missing symbols or an implausible operation-entry size fail closed.
-2. Frame and filter lists are walked with cycle guards. Each filter records name, altitude, driver, and every `Operations` slot until `IRP_MJ_OPERATION_END`, including null pre/post registrations. A paused cooperative body still has a nonzero registered wrapper; its state is reported separately under `managed`.
-3. `disable`/`enable` require write mode and the exact cooperative fixture target. `/pre`, `/post`, and `/both` select the CREATE counting bodies (`enabledMask`: pre=1, post=2). Kernel-owned rundown waits for active bodies before acknowledging disable. `all` selects these supported bodies, while mandatory lifecycle, process-exit, and I/O-context handling stays active. The registered pointers are never replaced. Closing the controlling device session or owner process termination restores the bodies; a supported detach/reattach preserves a live control lease.
-4. `minifilter.list` is the read-only MCP/AI tool. `minifilter.set_irp` is write-gated and is not on the AI planner catalog. It uses the same fixture identity and supported-IRP checks; `irp=all` selects the provider's supported CREATE registration.
-
-### Pending I/O fixture and failure recovery
-
-`minifilter_fixture_driver/PendingIo.cpp` has a separate administrator/SYSTEM test
-port, defined in `shared/KnLiveDbgPendingIo.h`. Protocol v7 has a 32-byte request
-and a 528-byte status. It is independent of the main driver's ABI 17.
-
-- A live owner arms one target with one request or 2–8 READs. READ buffers are
-  locked before asynchronous use. Upper/lower contexts pair by callback-data
-  identity and instance generation; teardown retires unused reservations.
-- A process exit status of 259 alone does not prove liveness. Target admission
-  and watching also check the process signal. Watch results are applied only to
-  the reservation they observed, so a stale result cannot retire a new ARM.
-- QUERY validates the client and copies a local snapshot under the state lock.
-  Reply copying uses exception handling outside that lock. QUERY_RACE adds a
-  bounded 50–500ms hold after capture. A snapshot includes its own active query;
-  `QueryStarted = QueryCompleted + QueryActive` holds in live responses.
-- Stop closes the server and joins the pending worker; managed shutdown drains
-  bodies and removes its process notification. `FltUnregisterFilter` drains
-  registrations and instances before the final `PendingIoFinalAudit` is stored.
-  Only that final ledger requires zero active queries, connections, instances,
-  contexts, workers, owner, and reservation, with all lifetime counts balanced.
-- Runner cleanup releases independent resources even when a test or evidence
-  write fails. Native filter absence is checked before deleting its own service.
-  The failure supervisor assigns the runner to a Windows job before allowing
-  setup, reaps its helpers, and verifies the fixture service image before recovery.
-  Expected child failures remain failed records; the supervisor separately
-  verifies their expected exit codes, final ledgers, and resource cleanup.
-
-See the [pending lifetime report](PENDING_IO_LIFETIME_VALIDATION_20261025.md),
-[query review](PENDING_QUERY_REVIEW_20261025.md), and
-[response-buffer/failure review](PENDING_QUERY_FAULT_REVIEW_20261025.md).
-The [manual checklist](MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation)
-contains current reproduction commands and result criteria.
-
-## Module And Driver Integrity Flow
-
-1. `IntegrityScanner` is a user-mode scanner layered on the existing `DeviceClient` and `SymbolEngine`; no new kernel IOCTLs or driver-side parsers are added.
-2. `!module integrity [module|all] [/summary] [/verbose] [/headers] [/sections] [/wx] [/mismatch] [/limit <n>] [/json <path>]` iterates the loaded kernel module list, reads each live PE header, validates MZ/PE signatures, optional-header bounds, image/header sizes, alignments, data directories, and the section table, compares the module-list size to `OptionalHeader.SizeOfImage`, and checks executable or `.text` section first/last pages for both static W+X section characteristics and effective W+X page-table permissions through `TranslateVirtual`.
-3. Module results keep a compact console path for suspicious evidence, operator filters for summary/verbose/header/section/W+X/mismatch views, and a stable `kn-live-dbg.module-integrity.v1` JSON path for baseline diffing. Header read failures, invalid PE shapes, bad section ranges, page-query failures, and malformed modules are marked with reason codes but do not abort the full scan.
-4. `!driver integrity [driver|all] [/limit <n>] [/json <path>]` walks `\Driver` through the Object Manager namespace. The walker resolves `ObTypeIndexTable`/`ObpTypeIndexTable`, `_OBJECT_HEADER` fields, `_OBJECT_DIRECTORY.HashBuckets`, and `_OBJECT_DIRECTORY_ENTRY` links from PDB/DIA metadata; when `nt!ObHeaderCookie` is present it decodes object type indices with the documented XOR formula.
-5. Driver records read `_DRIVER_OBJECT.DriverStart`, `DriverSize`, `DriverSection`, `DeviceObject`, `FastIoDispatch`, `DriverUnload`, and `MajorFunction[]` from PDB-resolved offsets. Dispatch pointers are annotated with owning module and nearest symbol, then flagged when they fall outside every loaded module or target another non-kernel module. ntoskrnl stubs are accepted because unused dispatch slots commonly point at `nt!IopInvalidDeviceRequest`.
-6. `module.integrity` and `driver.integrity` expose these same read-only paths to the AI capability router. `module.integrity` accepts only validated `target`/`module`/`name`, `limit`, `summary`, `verbose`, `headers`, `sections`, `wx`, and `mismatch` args; `driver.integrity` accepts target/limit args. Both reject unsafe text, require the driver device to be open, and never emit raw debugger commands.
-
-## BYOVD Intelligence Flow
-
-1. `ByovdScanner` is a user-mode scanner layered on `SymbolEngine`; no new kernel IOCTLs are required. It reuses the loaded kernel module list, resolves each module's disk path, hashes the file with MD5/SHA1/SHA256, reads the PE fixed file version, optionally runs LOLDrivers YARA rules through an external `yara64.exe`/`yara.exe`, and compares that evidence against a local catalog.
-2. `tools\update-byovd-intel.ps1` downloads `https://aka.ms/VulnerableDriverBlockList`, extracts `DriverPolicy_Enforced.xml`, normalizes `<Deny Hash=...>` entries into exact hash matches, normalizes `<FileAttrib ... FileName MinimumFileVersion MaximumFileVersion>` entries into Microsoft name/version hints, downloads LOLDrivers hash feeds, and stores LOLDrivers YARA files under `<exe-dir>\data\byovd\yara`.
-3. `!byovd scan` calls the updater automatically when `<exe-dir>\data\byovd\byovd_catalog.tsv` is missing or older than 24 hours. `/no-update` keeps a scan fully offline/reproducible, while `/force-update` refreshes before scanning. Update failures are non-fatal when an older local catalog exists; missing catalog plus update failure aborts the scan.
-4. Exact MD5/SHA1/SHA256 hits are emitted as `HIGH` confidence. `/yara` hits are also emitted as `HIGH` confidence with `source=loldrivers_yara`, `match_type=yara`, and the YARA rule name in `value`. Microsoft file-attribute hits are emitted as `MEDIUM` confidence because this slice checks file name and PE version range, reads PE version-info vendor metadata to suppress third-party rule collisions against Microsoft-owned OS binaries, but does not yet validate the full signer/certificate constraints embedded in the WDAC policy.
-   `summary.yara_scans` counts attempted external YARA process invocations; failures and timeouts are tracked separately.
-5. `!byovd fixture load` installs the benign no-op fixture driver `amdryzenmasterdriver.sys`, which has fixed PE version `1.0.0.0` and no device or IOCTL surface. It exists only to exercise the Microsoft file-name/version positive-control path and should produce a `MEDIUM` hit, not a `HIGH` exact-hash hit. If Windows blocks this fixture at service start, the scanner is not expected to report it because the module never enters the loaded module list; check HVCI, Secure Boot, test signing, and vulnerable-driver blocklist policy before treating that as a scanner failure.
-6. The build helper copies `tools\update-byovd-intel.ps1` into `x64\<Configuration>\tools\`, and the scanner also parent-probes development repo layouts. The release package includes the same updater script so a deployed EXE can refresh its own local catalog. The release package also includes the BYOVD fixture driver so `!byovd fixture load` works from the EXE directory. Release packages intentionally do not include `yara64.exe`, `yara.exe`, or `libyara.dll`; operators install YARA separately, place it on `PATH`, or pass `/yara-path`.
-7. Hunt treats exact BYOVD catalog matches as the high-signal driver path. Strong ESET Gentlemen driver names can still produce loaded-module IOC findings, but weak driver names are suppressed in the loaded-module name-only sweep and require a BYOVD hash/catalog match, driver-service correlation, or driver-integrity anomaly before they are reported.
-
-## Threat-Intelligence ETW Flow
-
-1. `!ti` and the PPL prerequisite live in `user/ThreatIntelSubscriber.h/.cpp` plus `HandleTiCommand` / `CheckSelfIsPplAntimalware` in `user/main.cpp`. The provider Microsoft-Windows-Threat-Intelligence (GUID `f4e1897c-bb5d-5668-f1d8-040f4d8dd344`) is enabled with `EnableTraceEx2(EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_LEVEL_VERBOSE, MatchAnyKeyword=0, MatchAllKeyword=0)`. The zero keyword mask is intentional: for ETW provider enable calls it means all keywords, including keyword-0 TI events that can carry memory-operation tasks such as `AllocVM`/`VAlloc` on some Windows builds. Using `~0` only matches events with at least one keyword bit set and can make the subscription look active while those tasks never arrive.
-2. Session lifecycle is StartTraceW (own session named `KnLiveDbg-Ti`, real-time mode, ClientContext=2 so `TimeStamp` is FILETIME-compatible) → `EnableTraceEx2` → `OpenTraceW` → worker thread runs `ProcessTrace`. Stop tears down in reverse: `EnableTraceEx2(DISABLE)` → `ControlTraceW(STOP)` → `CloseTrace` → thread join. A leftover session from a prior crash is best-effort stopped before the new StartTrace; on `ERROR_ALREADY_EXISTS` the props blob is rebuilt before the retry because StartTraceW mutates it on failure.
-3. `OnEventRecord` is the hot path. It self-excludes events for the calling PID (snapshot atomic) to prevent feedback, increments `std::atomic<uint64_t>` counters (received / kept / dropped / self-excluded / watch-matched / logged), then decodes via `TdhGetEventInformation` + per-property `TdhGetProperty` calls. Struct-typed properties are short-circuited (`PropertyStruct` flag); array properties iterate up to a 32-element cap. Properties TDH cannot decode are emitted as `<decode-error:STATUS>` strings, and the entire payload falls back to a raw hex prefix when TDH refuses the event outright.
-4. Per-event PID-to-image resolution uses a bounded cache (`std::unordered_map<uint32_t, std::wstring>`, 16K entries with whole-cache eviction on overflow) so a single `OpenProcess` + `QueryFullProcessImageNameW` per PID, not per event. Without the cache the consumer collapses under high TI rates.
-5. Records land in `std::deque<TiEventRecord> Ring` (1M-event default capacity, mutex-protected). When full, oldest-first eviction. Records are also serialized as a single JSON line and appended to the active log file via `WriteFile`; the writer loops on partial-write returns. When `LogCurrentBytes` reaches `LogRotateBytes`, the rotation closes the current file, advances an integer index modulo `LogRotateCount`, deletes the file at the next index (oldest by age), and opens it `CREATE_ALWAYS`. The first file uses a `<timestamp>-<ms>-<pid>` suffix; rotated files use `.1.jsonl`..`.N.jsonl` so a single subscriber session never collides with another.
-6. Watch matching combines an explicit PID set, an image-basename list (lowercase, case-insensitive), and a promoted-PID set. An empty watch set short-circuits to match-all so `!ti watch` without filters is not silent. Otherwise the hot path checks caller-side PID set → promoted-PID set → caller image basename. Then it consults the per-record `TargetProcessId` and `TargetImageBase` fields that `OnEventRecord` pre-extracted (first non-`CallingProcessId` `*processid` payload field, plus a cached basename resolution) and re-runs the PID / promoted / basename checks against the target side. A first match on either caller or target inserts the matching PID into the promoted-PID set so the next event referencing the same process hits the O(1) path without re-walking anything. The printer reads the same pre-extracted fields when rendering the `image=caller -> target=victim(pid=N)` header line, so payload-side work happens once per event regardless of how many consumers read it.
-7. Live output goes through a bounded `PrintQueue` drained by `!ti watch` polling. Throttle uses a 1-second window plus atomic counter; events over the cap are dropped from the live queue (but kept in ring + log) and counted into `ThrottleSuppressed` which the watch loop renders as a `[ti.throttle] suppressed N events` line.
-8. `CheckSelfIsPplAntimalware` in main.cpp implements the proactive prerequisite gate: it tries multiple PDB type/field combinations for `DirectoryTableBase` (`nt!_EPROCESS` and `nt!_KPROCESS` with both `DirectoryTableBase` and `Pcb.DirectoryTableBase` paths) so it survives the symbol-server drift where `SymbolEngine::FindField` cannot chase nested fields on some builds, then resolves `_EPROCESS.Protection` similarly. With the offsets in hand it calls `DeviceClient::ResolveProcess` for the EPROCESS pointer and `DeviceClient::ReadMemory` for one byte at `EPROCESS + Protection.Offset`. If the byte is not `0x31`, `!ti start` emits a clear remediation hint and refuses to call the subscriber. When the gate cannot run (symbols unavailable, IOCTL error), `!ti start` still proceeds and the underlying `EnableTraceEx2(ERROR_ACCESS_DENIED)` failure surfaces with the same hint.
-9. Hard-exit teardown is wired through a global `std::atomic<TiSubscriber*> g_TiSubscriberForShutdown` that `HandleTiCommand` populates **before** calling `sub.Start()` (so a `CTRL_CLOSE_EVENT` arriving during the start sequence still tears the session down) and clears AFTER `sub.Stop()` returns on the manual stop path. The console control handler synchronously invokes `sub->Stop()` on `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT`, and `CTRL_SHUTDOWN_EVENT` — Windows' handler budget (5 s for CLOSE, 20 s for LOGOFF/SHUTDOWN) is well above the IOCTL/join latencies in Stop. `Stop()` is itself idempotent (atomic exchange on `Active`), so the dtor path running again during static destruction is a no-op. The only path that still leaks the kernel ETW session is an external `TerminateProcess`; the session name is fixed (`KnLiveDbg-Ti`) so a stale instance can be removed with `logman stop KnLiveDbg-Ti -ets`.
-10. `!hunt /deep` reuses the existing ring through a small DTO (`HuntTelemetryEvent`) instead of linking `UserModeHunter` directly to `ThreatIntelSubscriber`. The TUI copies up to 4096 newest TI records into `HuntOptions`; the hunter emits telemetry findings when a strong Gentlemen EDR-killer process/staging signal correlates with driver I/O (`DeviceIoControl`/driver-object/device-object style events) or repeated process-impairment activity. The process-impairment path covers termination/open-process activity plus sensitive cross-process tasks such as `AllocVM`, `ProtectVM`, `ReadVM`, `WriteVM`, `MapView`, `QueueUserApc`, `SetThreadContext`, and `Suspend`/`Resume`. It also emits a behavior-only finding when one caller repeatedly targets known security-product process names from the GentleKiller target list, which covers renamed callers without relying on the EDR-killer filename. Those behavior-only raw JSON reasons (`known_security_product_process_target` / `gentlekiller_security_target_list`) are rendered as generalized high-signal console labels (`security_product_process_targeting` / `security_product_target_list`) so the operator does not have to expand generic detail output to see renamed GentleKiller-style impairment. The ESET prose says the private target list exceeds 400 processes; the source and validator intentionally pin the 274 unique lower-case image names exposed by public Table 2 HTML. These telemetry findings still require either EDR-killer profile/staging context or repeated GentleKiller security-product targets, so default hunt stays independent of TI, offline scans still work when the subscriber is not active, and weak vendor-name-only false positives are avoided.
-11. Gentlemen process-name matching handles the ESET suffix scheme as a known-base plus suffix-tail grammar (`1`, `2`, `Light`, and `Clear`) instead of blindly stripping trailing characters. This keeps digit-ending bases such as `G11<suffix>` intact, preserves suffix evidence even for exact already-suffixed IoCs such as `FaceIT1.exe`, and covers compact bases such as `MB<suffix>` only when a stronger context is present, such as the `GentlemenCollection` staging path or TI driver/process-impairment telemetry. Exact-only public filenames such as `HwAudKiller.exe` are not suffix-normalized. Credential-tool profiles are excluded from suffix-normalized matching, and weak vendor-impersonation names are not emitted as standalone process findings unless paired with stronger Gentlemen staging or telemetry evidence.
-12. The ESET fake-signature/version/icon/packer layer is recorded as supporting evidence on existing EDR-killer process-profile or TI-correlation findings, not as a standalone process-wide sweep. The helper normalizes the on-disk image path, reads version strings through `Version.dll`, checks Authenticode trust through dynamically loaded `WinTrust.dll`, records group-icon resource presence through `LOAD_LIBRARY_AS_DATAFILE`, parses PE section names for known Enigma/Themida hints, and attaches suffix-tail policy hints for `1`/`2`/`Light`/`Clear`, using `mixed` when a combined tail such as `1clear` crosses policy classes. `edr_killer_invalid_code_signature` is emitted only when a signature is present but trust fails; version, icon, and packer-section evidence are reason-promoted only when the process already has Gentlemen profile, suffix, staging, or telemetry context. A `GentlemenCollection` path alone is only supporting context; an unknown process name in that path still needs evasion metadata before a process-profile finding is emitted. OxideHarvest-related process-name hits are gated by Gentlemen staging context or the `-i`/`-u`/`-p`/`-t`/`-o` command-line shape with values, and record the matched option set as evidence.
-The current automatic memory, callback, process-execution, temporal and policy collectors are described in [the G01-G22/B01 implementation contract](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_IMPLEMENTATION_2026-09-16.md). The legacy classifier details below are supplemented by rotating image comparison, per-root continuation, PSS/runtime evidence and explicit coverage events.
-
-13. `!kmon` is the unknown-kernel-drop session on top of `!ti` and `!timeline live` (`user/KernelMonitor.cpp`, `user/HiddenProcessScanner.cpp`). Bare `!kmon` (or `!kmon start`) requires write mode, flips PPL Antimalware if needed, starts silent TI when idle, enables kernel live callbacks, and sets EPROCESS VM-logging flags on `/pid`/`/name` targets through `IOCTL_KNDBG_SET_PROCESS_LOGGING` (ABI 16), then stays on a live tail. A driver filename is not required; `/driver` is highlight-only and does not hide other names. Default matching prints `driver.drop_load` (non-inbox paths, including Program Files), `driver.short_lived` (load/unload within 30s), `driver.mapped_residue` (live pool PE, unbacked `DRIVER_OBJECT`, orphan kpage PE/W+X, headerless executable import-stub code in pool/kpage both during the mapper watch and idle, BYOVD, plus periodic `!mapper` leftovers), `hook.inline` / `hook.breakpoint` (the 16-byte prologue of a symbol-resolved hot entry list -- query/read/write entry points on ntoskrnl plus the win32k family -- decoded as `E9 rel32`, an `FF25` slot, `mov reg,imm64` + `jmp/call reg`, or `push+ret`, plus an `int3` trap; an in-module destination is a Windows kernel hotpatch, a win32k forwarder into an inbox image is normal, and a register-indirect head or a body/`.data` patch stays a deferral because `hook.dataptr` and `hook.unbacked` cover those; a non-inbox destination or a transfer onto a pool-resident secondary stub body is the verdict, two consecutive passes must agree, and the layer runs every 20s, 10s during the mapper watch), `thread.unbacked` / `thread.hidden` / `thread.dkom` (a bounded kernel-context walk of `_EPROCESS.ThreadListHead` through the driver -- the same kernel-memory view the module fingerprint uses -- compared against a host Toolhelp thread snapshot, plus `_EPROCESS.ActiveThreads` sampled before and after the walk: an unbacked start address is `thread.unbacked`, a thread the host view lacks is `thread.hidden`, and an accounting gap is `thread.dkom`; the `thread.hidden` and `thread.dkom` verdicts wait for two consecutive passes while `thread.unbacked` prints on its first confirming pass; 20s), `pool.hidden` / `mapper.stub` (stub thunks decoded from the region body the orphan-page walk already produced, split by whether `SystemBigPoolInformation` reports the range (a silent range is `pool.hidden`, and the table cannot tell a removed allocation from an executable mapping that never was a big-pool allocation); a PE-bearing region keeps the older `unbacked_pe` / `orphan_page` verdicts so one region is never reported twice), `hook.scan` / `thread.scan` and the `coverage:patch:*` markers (a prologue, thunk slot, thread list, or region body that could not be read: deferral, never a verdict; an unreadable region body in the stub layer withholds the verdict without a marker), `hook.unbacked` (notify/Ob/input/dispatch/SSDT/IDT/MSR/HAL/WFP/DPC/minifilter routines outside loaded modules; empty `PsLoadedModuleList` is fail-closed so those pointers are not treated as unbacked), `process.hidden` (~5s; ActiveProcessLinks vs SPI/Toolhelp vs handle owners vs CID -- DKOM unlink from ActiveProcessLinks needs CID or handle-owner confirmation because SPI/Toolhelp consume that list), `process.masquerade` (Windows-named image from a non-inbox path), `process.hollow` (PEB ImageBase EXE-region replace, WOW64 PEB32 ImageBase at +0x08 first: unmapped/private/unbacked MEM_IMAGE, mapped-path mismatch, stamp/section/arch, builtin W+X, process-overwriting COW and reloc-aware `.text`/EP vs disk for Windows builtins only, extra executable PE outside the module list (read-only image-resource views are skipped), ghosting), `process.implant` (drop-dir DLL or extra module in a builtin), `inject.remote` into/from Windows builtins or drop-path callers (game overlay inject still needs `/name` or `/pid`), `integrity.ci` (DSE off only), `integrity.cr`, `process.syscall_unnamed`, and a one-shot `gap.kernel_rw`. Post-load hiding layers a kernel-context view over the host-side baseline diff. A bounded walk of `nt!PsLoadedModuleList` through the driver kernel-VA path captures entries (Flink/Blink plus base/size/name) every 15s, or every 1.5s while the mapper watch is armed, and the host `NtQuerySystemInformation` view is compared against it: a disagreement is reported as `driver.inventory_divergence` (`user_view_missing` when the walk sees a module the query view dropped, `kernel_view_missing` for the mirror case, at most 16 per scan, each side confirmed by two consecutive scans). The same snapshot verifies that each entry Flink/Blink pair points back at its neighbour and reports `driver.module_chain_broken` when it does not. The baseline diff then reports `driver.vanished` (a resident module left the list with no unload event; two consecutive scans must agree within a 120s lifecycle window, or a single scan when the cross view or the chain break names the same module), `driver.unnotified_load` (a module appeared with no load event), `driver.remap` (same name on a new image base with no lifecycle event), `driver.tampered` (loaded image head/entry hash or `DRIVER_OBJECT` identity fields changed after the load), and `driver.evidence_asymmetry` (still listed, but its `HKLM\SYSTEM\CurrentControlSet\Services\<stem>` key and/or its on-disk image is gone; the `reason` field separates `no_service_key` / `no_image_file` / `no_service_key_no_image_file`; the noise-prone service-key-only form on a non-inbox loader is gated, because a legitimate uninstall leaves exactly that trace -- it is withheld unless the corroboration helper matches the same driver stem against an already-confirmed cross-view divergence, a chain break, or a tamper strike that passed its threshold, and the notes record `corroboration=<source|none>`), while `driver.mapped_residue layer=driver_object` covers a `DRIVER_OBJECT` whose loader-entry `DllBase` is outside the list, that has neither `DriverStart` nor `DriverSection`, that only the `\Device` back-reference view reaches, or that only the bounded `_OBJECT_TYPE.TypeList` sweep reaches (link offsets calibrated against the `\Driver` set with at least two independent matches, `type_list_only=true`, `scan=driver_object_type_list`; every 60s, or 5s during the mapper watch, capped at 16 reports). The inventory, symbol, service-key, kernel-context, and `\Driver` views are fail-closed: an unreadable or truncated view withholds the verdict and emits `scan_failed:modinv:*`, `scan_failed:modinv:kernelview`, or `scan_failed:drvobj:typelist` once, and an incomplete sweep marks itself (`:truncated` for a cut chain, `:reportcap` when anonymous reports were capped) so it is never read as a clean result. Remaining limits: the kernel-side module-list fingerprint push is not implemented (the cross view is polled from user mode), a driver that hides and unhides inside the 2-scan/120s window can still be missed, and a `DRIVER_OBJECT` that is absent from its own type list as well stays out of reach. The thread, inline-patch, and mapper-stub layers have their own blind spots: a thread whose start address sits inside a loaded image, a hotpatch that stays inside the owning module or forwards into an inbox win32k image (that is how Windows itself patches), a register-indirect entry transfer, a patch below the prologue (covered by `hook.dataptr` / `hook.unbacked`), and a stub body that cannot be read or is shorter than the sampled window. Every driver lifecycle event prints with no exception path — `driver.official_load` / `driver.official_unload` / `driver.device` (inbox, undecoded `DRIVER_OBJECT` paths, and bare object names included), `driver.drop_load`, and post-arm `driver.image_only` — because `!kmon` runs long after boot, right before the suspect activity, when driver events are rare and all of them are signal; `/verbose` (alias `/all-drivers`) is kept only for compatibility. Mapper-watch arming follows the same rule: any kernel driver load or unload arms the capped 30 s burst. `!kmon add`/`remove` require an already-collecting session; a later `!kmon start` with `/pid`/`/name`/`/driver` extends watches instead of replacing the collector; `/verbose` and `/log` apply only on the first start. Esc/q detaches to the prompt; collection continues; `!kmon` again reattaches. `/background` (alias `/nowatch`) arms without occupying the prompt. Scan cadence is hidden ~5s, mapper/hooks/pool ~8s, kpage/CPU ~20s, user-mode hostility ~8s (first ticks delayed so TI ingest is not stalled at start). Watched-name processes are promoted on the kernel process-create callback, and descendants of any watched pid are auto-promoted too (`watch_source=child_of:<pid>`, pruned on liveness with a create-time pin so differently-named 2nd stages stay watched after the loader exits); unclassified TI tasks from watched pids are kept as a first-seen-per-task `loader.activity` trail (64 tasks/pid, 128 events/pass), which also lets the WriteVM/ProtectVM exemption reach `inject.kernel_phys` for tasks classification rejects. TI tasks beyond the driver-object and inject-material families are classified too: `SetWindowsHook`/`UnhookWindowsHookEx` surface as `hook.window` (Steam/OBS/Discord/RTSS overlay callers suppressed first; drop-path callers, builtin targets, and watched caller/target show), `TerminateProcess`/`SuspendProcess`/`ResumeProcess` as `process.impair` (watched or builtin targets, or drop-path callers), and `CreateRemoteThread` joined the inject.remote material list; the hunt impairment terms and the timeline critical terms (setwindowshook, suspendthread) follow. Driver interaction visibility comes in two layers: a rotating batch of eight watched PIDs gets File-handle lifecycle observations resolved through FILE_OBJECT and the device stack, with a 128-record resolution cursor per PID, and `!kmon iotrace <driver> on|off|status` (ABI 17) opt-in interposes one named driver's `IRP_MJ_DEVICE_CONTROL` through the main KnLiveDbg.sys driver — SEH-validated, reference-pinned, lazily-allocated non-paged ring, disarm-on-stop/unload with in-flight drain — printing `driver.ioctl` first-seen per (pid, IOCTL code); it is lab-only by design (see docs/DRIVER_INTERACTION_TRACKING_DESIGN.md). When user-handle reads are denied, supported cross-process byte reads can fall back to the handle-less `IOCTL_KNDBG_READ_PROCESS_VIRTUAL` (KeStackAttachProcess + MmCopyMemory, ExpectedEprocess/ExpectedCreateTime pinned), the kernel VAD scan substitutes for VirtualQueryEx region state, and when Toolhelp module enumeration is denied the module inventory is rebuilt from kernel VAD image-backed records (section file names resolved kernel-side via ControlArea → FILE_OBJECT and mapped to drive letters) so IAT/export/vtable/text hook scans keep running; call-table slot targets are validated against kernel VAD records when VirtualQueryEx is unavailable, the EXE mapped-path mismatch check uses the kernel section file name, and a deduped `handle_denied:<pid>` `process.implant` note reports that a hostile/watched target refused or stripped the user handle (a coverage limitation, not proof that an Ob callback caused the denial).  Derived events go to a separate ring plus `kmon-events-*.jsonl`. Post-Berkan hardening: dwm.exe is default-watched for signed main-image text/graphics-vtable/cloned-vtable/private-exec scans; resource-only PEs (theme/MUI data views) downgrade to `resource_only_pe` and low-entropy RX data pages drop from orphans; System-origin APC/context writes always display; sustained drop/unknown lsass reads become `process.credscan` (per caller-target window, signed paths exempt); csrss/builtin WRITEVM stays unclassified (raw TI log keeps it) with a 30s image-resolution cache keeping driver-lifecycle ingest responsive; and mapper/user-mode detections auto-capture the region to `<log dir>\captures` (deduped, 256MB budget, chunked with partial-prefix preservation; layers include driver_image on any kernel driver load, 2MB orphan_wx samples, apc_routine from kernel-origin APCs, hidden_eprocess at DKOM detection, and graphics_dispatch scanning dxgkrnl/GPU `.data` sections for unbacked DDI function pointers; TI events carry ETW callstacks via EVENT_ENABLE_PROPERTY_STACK_TRACE). `dump-raw`/`dump-pe` accept `/pid N | /name <image>` to dump another process's user-mode range or mapped PE (handle-first, kernel `ReadProcessVirtual` fallback). Kernel `MmCopyVirtualMemory` remains `gap.kernel_rw`. Lab positive control is `KnLiveDbgKmonTarget.exe` (`docs/KMON_TEST_TARGET.md`).
-
-## Kmon execution evidence flow
-
-1. `KernelMonitorPipeline.cpp` separates ingestion, analysis, capture reads and storage. Bounded queues own captured bytes, and coverage/status records expose drops, work cursors and incomplete reads.
-2. File handles are parsed with the native pointer-width ABI and resolved through `FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT`. Creation identity and observation generations distinguish close/reopen and PID reuse. See [driver interaction tracking](DRIVER_INTERACTION_TRACKING_DESIGN.md).
-3. `ExecutableImageVerifier` compares declared executable sections against a qualified local PE/PDB reference with relocation handling. The same comparison engine supports Kmon and user-mode hunting. Selected processes are eligible independently of their names; bounded image/page cursors determine when each is visited.
-4. `KmonExecutablePages` keeps at most 512 ranges and schedules up to eight 4 KiB pages per analysis pass. Admission protects partial ranges at the same priority and rotates after completed work. `UserExecutablePteWalker` resumes a bounded user-page-table walk with inherited NX/U/S and large-page handling. PE-declared permissions are checked separately from observed bytes.
-5. Firmware, hive, ETW logger, standard kernel callback and user instrumentation slots feed `CodeTargetResolver`. Verified slots are distinguished from inferred WFP code candidates and historical ETW stack addresses. Optional build manifests constrain object/vtable rules to a qualified EXE/PDB identity.
-6. Before publishing references, the collector checks the pointer slot, process instance and available EPROCESS/DTB again. Physical-read PFNs are compared with surrounding translations. A late identity/slot failure withholds the path, while already captured historical bytes can remain.
-7. `KmonHuntIndex` derives `!kmon cases [/json]` from at most 512 recent references. Matching full-page hashes and tightly spaced PFN observations describe content/address relationships; they do not identify a communication protocol, current RIP or malicious actor.
-
-`ExecutionSurfaceScanner` adds read-only TLS, qualified native KCT-prefix and WorkerFactory metadata after v0.0.33. Its native references join the existing verification queue with PE/directory/root bytes that must still match before and after decoding. `AnalystSnapshot` preserves JSON evidence and compares it using boot/process-instance identity; missing rows never imply remediation. The direct command can collect TLS and WorkerFactory metadata without the driver. See the [analyst guide](KMON_ANALYST_SURFACES.md) for bounds, collection failures and file formats.
-
-The [verification guide](KMON_DETECTION_VERIFICATION.md), [hunting guide](KMON_CROSS_DOMAIN_HUNTING.md), [coverage matrix](KMON_COVERAGE_MATRIX_20260919.md) and [adversarial review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ADVERSARIAL_REVIEW_20260920.md) give limits and local test evidence. The [v0.0.33 notes](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/RELEASE_NOTES_0.0.33.md) remain the historical release comparison; subsequent analyst features have their own [validation record](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md).
-
-## Timeline Flow
-
-1. `TimelineStore` is a bounded user-mode evidence store. It normalizes TI, snapshot, live kernel, and snapshot-diff events into `TimelineEvent` records with schema-versioned JSON output, event ids, source/domain/action, process ids, risk, confidence, and key/value evidence. Before dedupe, the store enriches events with stable semantic keys such as `process_instance_id`, `analysis_family`, `cross_process_operation`, `network_endpoint`, `dns_query`, `file_path`, `registry_key`, `service_name`, `scheduled_task`, `wmi_entity`, `memory_address`, and `snapshot_diff_subject`. TI records use the provider task name as the timeline action and get a triage risk classification before storage.
-2. Plain `!timeline` is the compact operator path: it asks whether to enable TI ETW and kernel live process/image/thread callbacks, starts the requested collection paths when possible, then copies recent TI ring records, the in-memory snapshot baseline when present, and active live-callback evidence. Recent TI ingest uses a timestamp cursor so repeated updates focus on newly observed records; explicit advanced `all` mode bypasses the cursor and rescans the ring through the normal dedupe path.
-3. `!timeline ingest ti` copies records out of the TI ring without clearing the subscriber ring or log. `recent` uses the same cursor as update, while `all` is the deliberate bulk-rescan mode. `!timeline ingest snapshot` copies process and domain records from the in-memory baseline or a snapshot JSON file.
-4. The live channel keeps kernel work intentionally thin: process/image/thread callbacks only push minimal atoms into a bounded nonpaged ring. Thread-create atoms also carry the callback creator PID/TID so remote-thread creation can be distinguished from ordinary target-process thread activity after user-mode enrichment. The driver image is linked with `/INTEGRITYCHECK` because `PsSetCreateProcessNotifyRoutineEx` rejects process-create callbacks from images without `IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY`. User mode controls `live start|stop|status|clear|drain` for compatibility, starts an auto-drain worker when live collection is enabled, records collector health/drop counters, and performs enrichment after the event leaves the driver.
-5. `TimelineStore::BuildGraph` derives source/domain/process/image nodes plus host, DNS, file, registry, service, task, WMI, memory, and snapshot-diff nodes. Stable edge kinds include `parent-child`, `process-loads-image`, `ti-targets-process`, `cross-process-<operation>`, `process-connects-host`, `process-queries-dns`, `process-touches-file`, `process-modifies-registry`, `process-controls-service`, `process-controls-task`, `process-controls-wmi`, `process-changes-memory`, and `snapshot-diff-record`. Duplicate nodes/edges are suppressed by deterministic map keys.
-6. `TimelineStore::AnalyzeLiveSignals` promotes analyst-relevant semantic events into matched-rule findings: short-lived process/thread activity, TI-near-thread/image correlation, cross-process manipulation, risk-tagged network/DNS activity, executable file artifacts, registry persistence, service/task/WMI persistence, executable memory/VAD transitions, and high-risk snapshot-diff milestones.
-7. `!timeline dashboard` writes a fixed self-contained HTML artifact under `.kn-live-dbg\timeline-dashboard.html` and opens it in the default browser. The command takes no filters or path parameters. Before writing the HTML, it refreshes recent TI ring records and queued kernel-live events into `TimelineStore`; if no snapshot process events have been ingested yet and the driver/symbol context is available, it also captures a lightweight current process baseline and ingests it as snapshot/process evidence so already-running processes are visible beside later TI/live events. The dashboard warns when TI ETW is active but has received no events, because memory operations such as RWX VAlloc/AllocVM require TI delivery rather than process/image/thread live callbacks. Analysts use the in-page Analyst Focus panel plus source/domain/PID/image/TI-task/risk/search controls to inspect processes, threads, drivers, DLLs, hosts, files, registry keys, services, tasks, WMI entities, memory/VAD transitions, TI evidence, matched live-analysis rules, explained relationship rows, related target events, and export filtered JSONL without regenerating the dashboard. `!timeline help` shows only the simple operator surface; `!timeline help advanced` exposes legacy query/graph/reconcile/ingest/update commands and manual live callback controls for scripting and compatibility.
-8. `!diff baseline` and file-to-file `!diff` print the snapshot diff as before, then copy diff findings into the user-mode timeline as `snapshot-diff` milestone events. MCP `snapshot.diff` remains read-only and does not mutate the session timeline.
-9. `TimelineStore::ReconcileSnapshot` compares filtered timeline events with a snapshot baseline or JSON file. It reports event-without-snapshot process/image findings, high-signal snapshot-without-event findings, snapshot warnings, and live-drop confidence caveats rather than claiming complete observation when the ring reported loss.
-10. MCP exposes read-only `timeline.status`, `timeline.query`, `timeline.export`, `timeline.reconcile`, and `graph.query`. Session mutations (`update`, `clear`, `ingest`, `live start`, `live stop`, `live drain`, file-writing CLI export, dashboard HTML generation) remain TUI-controlled.
-11. `KnLiveDbg.exe --self-test timeline` runs before elevation, SCM, device open, and symbol initialization. The fixture validates ingest counts, TI cursor/classification, source/domain/PID query, P0/P1/P2 semantic normalization, graph nodes/edges, live-analysis findings, dashboard HTML generation, reconciliation miss types, live-drop confidence lowering, warning propagation, and reconcile/analysis JSON schema.
-
-## DbgEng Flow
-
-1. `kdinit` or `backend dbgeng` initializes `DbgEngBackend`.
-2. The backend calls `DebugCreate(__uuidof(IDebugClient5))`.
-3. It installs an `IDebugOutputCallbacksWide` capture sink.
-4. It queries `IDebugControl4` and `IDebugSymbols3`.
-5. It mirrors the current symbol path into DbgEng.
-6. It attaches with `AttachKernelWide(DEBUG_ATTACH_LOCAL_KERNEL, nullptr)` for local mode or `AttachKernelWide(DEBUG_ATTACH_KERNEL_CONNECTION, connectionOptions)` for remote mode.
-7. Raw commands are executed with `IDebugControl4::ExecuteWide`.
-
-The DbgEng backend is intentionally isolated from the native memory backend. Native read/write operations still go through `KnLiveDbg.sys`, while DbgEng commands execute through the debugger engine.
-
-`u` and `uf` are deliberately wired as explicit commands instead of falling through the generic command router. Both stay on the driver-backed memory path and use Zydis for instruction decoding when the device is open; DbgEng is only a fallback when the native device is unavailable.
-
-Backend routing is mode-dependent:
-
-1. `auto` is the default. Implemented native commands stay on the driver/`DbgHelp` path, while registered DbgEng commands, `!extension` commands, and unknown dot meta-commands initialize or reuse DbgEng.
-2. `native` disables generic DbgEng fallback. Commands that require WinDbg parser, stop-state, extension, breakpoint, register, stack, source, trace, or exception semantics are reported as DbgEng-only instead of being executed.
-3. `dbgeng` runs every native-owned command through the TUI before its raw catch-all. This includes session control, native memory, symbols, types, disassembly, dumps, and native scanners. Other commands use `IDebugControl4::ExecuteWide`.
-4. `kd <command>` is a raw DbgEng escape hatch independent of the selected backend mode.
-
-Interactive command execution is wrapped by a delayed progress watchdog. If a dispatched command runs longer than about one second without producing stdout/stderr, the watchdog writes elapsed-time status rows directly to the console with `WriteConsoleW`, outside stdout/stderr transcript capture, and stops once the command returns. After command output starts, progress rows are suppressed for that command so watchdog text does not split normal output lines. Console color scopes, captured stdout/stderr forwarding, and watchdog writes share a console-output lock so attribute restore cannot race with progress rendering.
-
-The interactive prompt uses a console key reader instead of plain line input. Tab completion is built from `CommandRegistry` plus context-specific subcommand tables for `!callbacks`, `!byovd`, `!pool` / `!pool pe`, `!ti`, `ai`, `backend`, `kdinit`, `probe`, `procctx`, `write`, `!timeline`, `dt`, `vtop`, `s`, `u`/`uf`, and native memory commands. Up/Down recalls recent non-empty commands with a bounded in-memory history; editing a recalled line turns it into the current draft, while blank Enter only advances to a fresh prompt and does not dispatch a command. Session commands include dashboard redraws and `cls` screen clearing, both handled by the TUI before backend routing. The same command-family tables feed detailed help routing: `help <command>`, `<command> help`, `!callbacks <scope> help`, `help !callbacks disable`, `!timeline help`, `ai <subcommand> help`, and `ai help <subcommand>` all stop before command execution and print operator-focused usage for that command family. The top-level help groups registered commands by feature area, color-codes headings and support tags (`native`, `alias`, `dbgeng`), and explains symbol/address conventions, `/process` versus `procctx`, count units, sparse-read `??` output, and write-context defaults so operators do not have to infer those rules from examples. The completer replaces the current token with a unique match or the longest common prefix; if the prefix is ambiguous, it prints candidates and redraws the current `knkd>` line.
-
-Human-readable native command output uses scoped console attributes for high-signal tokens such as callback kind tags, object types, modules, symbols, translated physical addresses, and type/field names. The color layer is applied only while writing to the console stream, so transcript capture and JSONL records remain plain text.
-
-## Build and Release Flow
-
-1. `tools\build.ps1` is the authoritative scripted build path for PE-stamped artifacts. The configured default is Visual Studio 2022 with SDK/WDK 10.0.26100.0 and the `WindowsKernelModeDriver10.0` toolset. Both build and release helpers accept `-WindowsTargetPlatformVersion` to select another installed complete SDK/WDK; the v0.0.33 release uses 10.0.22621.0. A user-mode SDK alone does not supply kernel headers or the driver toolset.
-2. It takes the highest current PE version from `.build\version-state.json`, the existing output PE, or an exact `vX.Y.Z` Git tag reachable from `HEAD`. With none of those, it starts from `0.0.0`.
-3. Normal builds do not increment the version; `-BumpVersion` increments the patch component by one and saves the new version state after a successful build.
-4. The first bumped build is therefore `0.0.1`.
-5. The script discovers MSBuild and the DIA SDK from installed Visual Studio instances, writes `.build\generated\KnLiveDbgVersion.h`, then MSBuild compiles VERSIONINFO resources into `KnLiveDbg.exe`, `KnLiveDbg.sys`, `KnLiveDbgProbe.sys`, `KnLiveDbgMiniFilterFixture.sys`, and `KnLiveDbgBindFixture.exe` before the WDK TestSign step. The BYOVD metadata fixture keeps its intentional fixed `1.0.0.0`.
-6. After a successful build, the script verifies the stamped PE versions, checks the embedded driver signers, and stages Debugging Tools runtime DLLs beside the EXE. `-TestCertificateThumbprint` selects a certificate in `CurrentUser\My` for WDK TestSign. Trust status is printed separately; a local test signer does not establish production signing or successful kernel loading.
-7. `tools\release.ps1` runs a version-bumped build by default and creates `release\KnLiveDbg-<version>-<configuration>-x64.zip` from the output directory. `-NoVersionBump` keeps the current version for ad hoc packages.
-8. The release zip includes the runnable EXE/SYS files, staged runtime dependencies, PDB/CER/CAT files when present, public operator/review docs, Kmon validation summaries, MCP bridge, hunt/Kmon fixtures, README/runtime manifest metadata, and `kn-live-dbg-version.json`. Documentation uses an explicit package allowlist; private planning files are excluded. Every staged file has a size and SHA-256 in the package manifest, apart from the manifest itself.
-9. `tools\validate-timeline-selftest.ps1`, `tools\validate-mcp-tool-catalog.ps1`, and `tools\validate-console-surface.ps1` are post-build driver-free regression gates for the timeline store, graph, reconciliation path, MCP tool catalog, and interactive help/completion surface. They call `KnLiveDbg.exe --self-test timeline`, `KnLiveDbg.exe --self-test mcp-tools`, and `KnLiveDbg.exe --self-test console`, which exit before any privileged driver lifecycle work.
-
-## AI Provider Flow
-
-1. `AiProviderRuntime` lives entirely in user mode. `AiModelCatalog` is the operator name table: presets (`cloud`, `cheap`, `deepseek`, `private`, `chatgpt`, `off`), aliases (`opus`, `grok`, `gpt`, `sol`, ...), curated OpenRouter ids (2026-08-24 snapshot, `cloud` default `anthropic/claude-opus-5`), and a process-lifetime live catalog from `GET /v1/models`.
-2. Daily setup is `ai use <preset|model> [model]`, `ai models [query|refresh]`, `ai test`, and `ai save`. `ai use` accepts one or two tokens; a second token must fit the preset's provider (OpenRouter keeps `vendor/model` ids; DeepSeek native names stay on DeepSeek). Extra tokens, leading `/`, and mixed-provider pairs are rejected. Resolve order is preset, alias, exact id, unique tail, unique substring. Re-selecting the same provider does not reset model or `base-url`. Advanced overrides remain `ai config provider`, `ai config policy`, `ai config model`, `ai config base-url`, and `ai config effort`.
-3. `openai-codex-cli` executes `codex exec` as an external process and captures stdout/stderr.
-4. `openai-codex-subscription` reads Codex OAuth credentials from environment variables or auth files and calls the Codex Responses endpoint. The `chatgpt` preset selects this path; the OpenRouter alias `gpt-5.5` does not.
-5. `deepseek` and `openrouter` use OpenAI-compatible chat-completions requests over WinHTTP.
-6. `.env` is loaded only from `<EXE dir>\.env`. Process environment variables override `.env`. `ai use`, `ai save`, and `ai config provider|model|policy` merge `KNLIVEDBG_AI_PROVIDER`, `KNLIVEDBG_AI_MODEL`, and `KNLIVEDBG_AI_REMOTE_POLICY` into that file through `.env.tmp` then `MoveFileEx`. Disabled is stored as `off`. Empty model is stored so `ai use off` cannot resurrect the previous model. API keys, `BASE_URL`, effort, and timeout are preserved and are not rewritten by `ai use`. `.env.local` is gitignored and is not loaded. Repo-root and cwd `.env` files are not searched.
-7. AI requests receive only curated session context and the operator prompt. The model cannot call memory IOCTLs or execute generated debugger commands directly.
-8. `ai <goal>` is an intent router. Exact read-only command lines such as `!callbacks ...`, `dt ...`, `uf ...`, `!ci options`, `!vbs`, or `!hiddenproc` are treated as evidence commands and routed through the AI evidence-analysis path. Requests that ask to list, show, recommend, or suggest commands are routed to the command planner instead of executing a local capability immediately. Known playbooks and local process-field queries run before any model call. Other requests use the strict `kn-live-dbg.ai-capability-plan.v1` tool-router JSON schema from the shared `AiCapabilityCatalog`; the provider chooses from local read-only tools such as `process.find`, `hiddenproc.list`, `handles.list`, `dump.analyze`, or `assistant.answer`; the C++ executor rejects unknown tools/fields, validates per-tool arguments, runs the selected tools locally, then asks the model to explain the captured output. Cheap tools run after a preview. `hunt.run`, `payload.scan`, `snapshot.capture`, and `kpage.list` with `deep=true` wait for `ai go`. `ai chat <goal>` skips playbooks, process-field shortcuts, conceptual short-circuits, and command-recommendation plans and sends the request to that catalog planner. Exact read-only command lines still run as evidence. Write-like and disable/enable goals still stage a write plan. `dump-kernel` / `dump-live` stay blocked from AI.
-9. `ai test` / `ai config test` performs a real provider/model round-trip with a small marker prompt and reports transport status, HTTP status when available, elapsed time, and marker match result. `ai status` is the health view; `ai config status` adds the verbose dump. Tab completion for `ai use` / `ai models` / `ai config model` comes from presets, aliases, the curated snapshot, and the live cache after `ai models refresh`.
-10. `KNLIVEDBG_AI_REMOTE_POLICY=local-only` or `ai config policy local-only` blocks HTTP-backed providers (`openai-codex-subscription`, `deepseek`, and `openrouter`) at request time, including `ai models refresh`. The selected provider is left in place; `ai use private` switches to the local Codex CLI. Policy changes persist to the EXE-dir `.env`.
-11. Default `ai <goal>` does not auto-build a `kn-live-dbg.ai-plan.v2` command plan. `ai plan` is the explicit command-proposal planner. Session context (last PID/image/address/dump) is rewritten into follow-ups such as "that process" / "그 프로세스". Process-field queries update last PID/image only; they do not treat the `_EPROCESS` address as "this address". Generic playbooks are skipped when the goal already names a `.sys`/`.exe`/`.dll`/`.drv` file so the planner can keep module filters.
-12. `ai plan` validates each proposed command before storing it: empty commands, nested `ai`, shutdown/unload commands, bare `kd`, overlong commands, and unknown non-DbgEng commands are rejected. Write-like proposals are forced to require explicit confirmation.
-13. `ai run` routes approved read-only plan commands back through the normal TUI command dispatcher, so backend mode, DbgEng routing, and native command handling stay consistent.
-14. Write-like commands, shutdown commands, unload commands, and nested `ai` commands are blocked from `ai run`.
-15. `ai analyze !callbacks`, `ai explain <read-only-command...>`, implicit `ai <read-only-command...>`, and `ai annotate u|uf` execute read-only evidence commands through the same dispatcher, then send bounded stdout/stderr evidence to the selected model. Empty stderr is omitted from the evidence prompt so the model does not echo a trailing `stderr` line; a trailing empty-stderr echo is also stripped from the printed report. Callback analysis uses `!callbacks <scope> [module]` output.
-16. `ai diagnose` uses current session context plus an operator note to explain symbol, type-layout, DbgEng, or setup failures.
-17. `ai playbook` creates deterministic read-only command plans for callback, minifilter, object-callback, hidden-process, handles, leftover, integrity, VBS, DMA, address, and suspect-driver investigations. `run` still goes through the guarded `ai run` path. Natural-language goals can also run the matching local-tool playbook without `ai playbook`. `ai chat` does not use those playbooks.
-17a. `ai <subcommand> help`, `ai help <subcommand>`, and Tab completion cover every AI subcommand, including `use`, `models`, `save`, `test`, and `chat`. After `ai explain|analyze|annotate`, Tab reuses the nested native command completer, and a trailing `help` prints that command's native help.
-18. `ai write [index] confirm` is the explicit operator confirmation path for planned write-like commands. If the plan has one write, the index may be omitted (`ai write` / `ai write confirm`). The preflight path builds backup/read-current, small-range restore, translation, and verification commands for recognized write forms, then prints a deterministic before/after diff of verification stdout/stderr after the write. Natural-language disable/enable goals and exact write-like lines after `ai` stage this plan instead of listing or mutating immediately.
-19. `ai transcript` captures AI events and command stdout/stderr as JSONL after it is enabled.
-20. `ai transcript max <bytes|off>` rotates long transcript files, and `ai transcript redact <on|off>` controls stdout/stderr redaction for long hex addresses and `sk-...` style tokens.
-21. `ai audit <path|off|status>` writes a separate JSONL record for every write-like command that executes through the normal dispatcher.
-20. Transcript command records include origin, backend mode, command class, write-like status, stdout/stderr character counts, deterministic output summaries, raw stdout/stderr, and keep-running state.
-21. `ai report` writes a Markdown report with session context, provider status, transcript settings, write-audit path, parsed plan, and raw AI plan response.
-22. `backend dbgeng` does not swallow `ai`; the TUI handles it before raw DbgEng command routing.
-
-## Process layout monitoring
-
-`ProcessLayoutMonitor` adds an independent read-only discovery/layout thread to
-Kmon. It collects complete non-free VA traversals under Boot/PID/create-time
-identity, retains immutable first/latest snapshots and compares intervals rather
-than MBI row indices. Failed or capped sweeps preserve prior observations. New
-process events request an early inventory with a 200ms floor; polling targets one
-second. Bounded candidates cross `KmonWorkQueue` to the analysis thread, which
-revalidates identity/mapping before page and image verification. JSON readers copy
-immutable histories and a value copy of the pending cursor. Stop joins this thread
-before draining pipeline events. Details: [process layout guide](KMON_PROCESS_LAYOUTS.md).
-
-## Hardening Backlog
-
-No large hardening backlog item is currently left open in this document. New work should be added here once it is scoped.
-
-Completed hardening items:
-
-1. JSONL write-command audit logging is implemented with `ai audit <path>`.
-2. Transcript rotation and redaction controls are implemented with `ai transcript max` and `ai transcript redact`.
-3. Transcript command records now include command-class labels such as `memory-read`, `physical-write`, `type`, `callbacks`, `disassembly`, `symbols`, `dbgeng`, and `session`.
-4. Callback module filtering is implemented with `!callbacks [scope] [module]`. Disable/enable and their `-all` forms operate only on the cooperative fixture's CREATE bodies with `minifilter`/`all` scope; external callback mutation remains unavailable.
-5. Write verification before/after diff rendering is implemented for confirmed AI write commands.
-6. AI plan command schema validation is implemented before plan storage.
-7. Local-only AI provider policy is implemented with `ai config policy local-only` and `KNLIVEDBG_AI_REMOTE_POLICY=local-only`. It blocks HTTP complete/refresh without clearing the selected provider.
-8. Single-controller ownership is implemented in the driver and reported by `drvstatus`.
-9. Process DTB resolution is implemented with PDB-resolved EPROCESS offsets and `procctx`/`vtop /process`; native `e*` user VA writes use captured `procctx` or explicit `/process`, while kernel VA writes use System (`pid 4`).
-10. LA57 detection and PML5E reporting are implemented in the page-table walker.
-11. DIA fallback is implemented for UDT field metadata when `DbgHelp` fails.
-12. `KnLiveDbgProbe.sys` provides a positive-control contiguous virtual and physical test buffer.
-13. Remote KD attach is available through `kdinit /remote <connection-options>`. That is DbgEng `DEBUG_ATTACH_KERNEL_CONNECTION`, not the LAN `knkd>` session.
-14. AI command proposal validation is versioned as `kn-live-dbg.ai-plan.v2` and rejects missing purpose metadata, command chaining, session mutation, raw `kd` blocked-command wrappers, and unsupported backend expectations.
-15. AI command evidence and transcripts include deterministic output summaries before raw stdout/stderr.
-16. LAN remote operator session (`remote on` / `KnLiveDbg.exe --connect`) is a sibling of MCP: plain TCP `KNR1`, session password, process-managed firewall rule `knlivedbg-remote`, listen XOR with `mcp on`. Operator guide: `docs/REMOTE_SETUP.md`.
+Implementation baseline: v0.0.36. For operator syntax use
+[the command guide](COMMAND_REFERENCE.md); for measured behavior use
+[validation status](VALIDATION.md).
+
+## Components
+
+| Component | Responsibility |
+| --- | --- |
+| `driver/Driver.cpp`, `shared/KnLiveDbgIoctl.h` | Administrators/SYSTEM device, exclusive controller, memory/page-table/CPU primitives, process operations, live callbacks and experimental I/O trace |
+| `user/DeviceClient.*`, `DriverService.*` | ABI-checked IOCTL client and owned SCM lifecycle |
+| `user/main.cpp`, `CommandRegistry.*`, `CommandInput.h`, `CompletionHints.h` | Local dispatch, syntax validation, help, completion, self-tests, execution-origin policy |
+| `user/SymbolEngine.*`, `NativeDisassembler.*`, `DbgEngBackend.*` | DbgHelp/DIA types and symbols, Zydis disassembly, optional DbgEng commands |
+| `user/*Scanner.*`, `UserModeHunter.*` | Bounded native collectors and cross-view interpretation |
+| `KernelMonitor.*`, `KernelMonitorHunting.cpp`, `ProcessLayoutMonitor.*` | Continuous discovery, queues, capture, image traversal and evidence |
+| `KmonHunting.h`, `ObservationModel.h`, `ExecutableRegionCatalog.h`, `ExecutableImageVerifier.h` | Observation contracts, bounded case/region indexes, reference-byte verification |
+| `ThreatIntelSubscriber.*`, `Timeline*`, `Snapshot*` | Events, persistence, baselines and comparison |
+| `McpServer.*`, `RemoteServer.*`, `RemoteClient.cpp` | Separate typed-tool and human-console transports |
+| `AiProvider.*`, `AiModelCatalog.*` | Provider execution, model resolution and advisory plans |
+| `probe_driver/`, `minifilter_fixture_driver/`, `hunt_test_target/`, `kmon_test_target/`, `bind_fixture_controller/`, `byovd_fixture_driver/` | Owned positive/negative controls with separate contracts |
+
+All `user/` filenames in the table are relative to that directory. Build and
+packaging behavior is documented in [BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md).
+
+## IOCTL and memory contracts
+
+The main ABI is **17**, defined in [KnLiveDbgIoctl.h](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/shared/KnLiveDbgIoctl.h).
+Requests carry sizes; variable payloads use their header offset rather than
+assuming a fixed trailing-array size. User-mode code validates responses and
+preserves short reads as incomplete data. Write-like calls require the
+per-handle write mode and their acknowledgment fields. The interactive default
+is write-on; MCP disarms it when entering read-only mode.
+
+Virtual and physical reads use `MmCopyMemory`. Page-table translation supports
+four/five-level walks and effective permissions across parent entries.
+Process-context operations resolve the DTB and identity rather than interpreting
+a user VA in the controller's address space. MDL fallback is opt-in and limited
+by system-address/residency checks; ordinary scanner read failures stay gaps.
+Translation metadata includes walked entry addresses and paging level.
+
+Native writes capture the intended process context for preflight, mutation, and
+verification. Small recognized ranges can produce exact-byte restore commands;
+short or failed backup reads must not produce a misleading partial restore.
+The complete mutation implementation remains in the dispatcher and driver, not
+in a documentation recipe.
+
+`dump-kernel` streams physical runs into a complete-dump layout; non-strict
+unreadable pages may be zero-filled and are reported. `dump-live` uses the OS
+live-dump path, while its selected-process form uses the process page tables.
+Neither represents an atomic, fully paused machine snapshot.
+
+## Engine, symbols, and transports
+
+The main engine owns DeviceClient and DbgHelp/DIA operations. Symbols are loaded
+from the EXE-local search path and cache. Missing fields or symbols must remain
+unsupported/partial; a guessed layout is not a stable Windows ABI.
+
+MCP and remote listeners own transport work and enqueue engine jobs. They have
+separate FIFOs and cannot listen simultaneously. Console output capture belongs
+to the engine thread. A wait ending before dispatch can remove a queued job;
+after dispatch it may leave an unknown outcome while execution continues.
+Neither timeout nor socket closure implies rollback.
+
+See [MCP design](MCP_SERVER_DESIGN.md) and [remote design](REMOTE_OPERATOR_SESSION.md)
+for bounds, authentication, stop behavior, and audit contracts. Normal shutdown
+stops collectors before closing their device and services. Failed I/O-trace
+disarm keeps the controller available for retry and can delay driver unload.
+
+## Scanner evidence
+
+Collectors cross-check modules, objects, callbacks, process/VAD/PTE views,
+CPU state, and user-mode observations. Read failure, missing layout, exhausted
+budget, or an incomplete inventory cannot prove absence. The snapshot/diff path
+requires comparable same-boot identities and preserves domain coverage.
+
+CI/HVCI state comes from validated `SystemCodeIntegrityInformation` responses.
+The `kn-live-dbg.vbs.v2` output uses null for unknown values, separates CI
+debugger mode from HVCI enabled/audit/strict/IUM flags, and qualifies Microsoft
+hypervisor feature leaves with `Hv#1` and the reported leaf range. It does not
+infer enforcement history from a current flag. Recapture older unloaded-driver
+snapshot baselines after the v0.0.36 identity-format change.
+
+`!hunt` combines memory, process, driver, policy and event evidence. Name/path
+matches remain distinct from exact hashes and observed effects.
+Exact-only public filenames such as `HwAudKiller.exe` are not suffix-normalized.
+A `GentlemenCollection` path alone is only supporting context. The source's
+GentleKiller target list is a recorded snapshot of
+274 unique lower-case image names exposed by public Table 2 HTML, not a newly refreshed threat feed.
+TI classification qualifies sensitive cross-process tasks before correlating
+them. [Hunt fixture documentation](HUNT_TEST_TARGET.md) describes the controls.
+
+## KMON collection and verification
+
+KMON joins TI and kernel live events with rotating native scans. In full-process
+layout mode, discovery is not limited to watch names; watched targets receive
+priority shares without eliminating background work. Capture and analysis have
+bounded queues, identity checks, explicit loss accounting, and shutdown drain.
+
+Image work keeps cursors by process creation, base and validated file identity.
+Dedicated continuation uses bounded page/time budgets, balances watched and
+background targets and first/repeated sweeps, and reserves background turns for
+general rotation, large-image progress and short remaining work. Completion
+means traversal; failed or excluded bytes still prevent full verification.
+
+Byte comparison validates the PE/reference identity and supported relocations.
+Secondary image views require an independently supported relocation basis.
+Excluded loader/dynamic ranges remain unverified even when their bytes happen
+to match. Stored captures and compared-address accounting are separate from
+the number of emitted findings.
+
+Typed callback slots and execution references are revalidated around reads.
+Candidate layouts, static branches, matching bytes, shared PFNs and temporal
+relationships do not establish current execution or the actor that wrote memory.
+Cases and executable-region catalogs are finite current-state indexes; JSONL
+and snapshots do not make every evicted relationship reconstructible.
+See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFICATION.md),
+[analyst surfaces](KMON_ANALYST_SURFACES.md), and
+[process layouts](KMON_PROCESS_LAYOUTS.md).
+
+## Cooperative callbacks and pending I/O
+
+`!callbacks` and `!minifilter` control only the exact cooperative
+`KnLiveDbgMiniFilterFixture` target's CREATE bodies, through its control port.
+The provider owns rundown, owner restoration and lifecycle callbacks. `all`
+selects supported bodies; it does not select arbitrary external registrations.
+Registered pre/post pointers remain unchanged. External pointer replacement is
+unavailable because entry-time rundown does not protect a pointer fetched before
+entry or arbitrary pending completion contexts.
+
+The managed protocol is version 1. The independent pending-I/O protocol is
+**7**, with **32-byte requests** and **528-byte status replies**, in
+[KnLiveDbgPendingIo.h](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/shared/KnLiveDbgPendingIo.h).
+
+- The fixture locks READ buffers before asynchronous completion and manages
+  logical/worker references independently.
+- Pairing requires the same callback data, a live owner, and the current
+  instance topology generation. Detach/reconnect retires stale reservations.
+- Target exit checks use a process reference and termination signaling; exit
+  code 259 alone does not establish that a target is still alive. A stale watch
+  result cannot retire a new ARM or replacement requestor.
+- QUERY authorizes the port cookie/current caller and captures a local status
+  snapshot under `g_Lock`. It releases the lock before delay/copy; it retains no
+  client/port pointer across that interval. Reply copying is exception-guarded.
+- `g_Control` serializes control/owner mutations. QUERY avoids that long path so
+  status remains observable during target-watch work. Query counters are
+  diagnostics, not a replacement for Filter Manager callback lifetime.
+- Stop disarms reservations, wakes/joins workers and releases ownership.
+  Unregister drains callbacks and instances before the final audit.
+  Only final ledgers require all active counts zero and started/completed pairs
+  balanced; a live query includes itself.
+
+Python runners keep independent cleanup steps so a report/log failure does not
+skip resource release. The failure supervisor starts a gated child in a
+kill-on-close Windows job and recovers only the verified owned fixture service.
+Injected child failures remain failures; the parent separately verifies cleanup.
+Supervisor termination and OS failure are outside that recovery guarantee.
+See the [lifecycle test checklist](MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation).
+
+Raw `!kmon iotrace` does not use this cooperative contract. Its separate
+[publication and unload limits](DRIVER_INTERACTION_TRACKING_DESIGN.md) remain open.

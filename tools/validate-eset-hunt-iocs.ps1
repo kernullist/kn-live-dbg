@@ -310,7 +310,6 @@ $mainPath = Join-Path $Root "user\main.cpp"
 $wfpScannerPath = Join-Path $Root "user\WfpScanner.cpp"
 $wfpScannerHeaderPath = Join-Path $Root "user\WfpScanner.h"
 $targetPath = Join-Path $Root "hunt_test_target\KnLiveDbgHuntTarget.cpp"
-$readmePath = Join-Path $Root "README.md"
 $testDocPath = Join-Path $Root "docs\HUNT_TEST_TARGET.md"
 $coveragePath = Join-Path $Root "docs\WINDBG_COMMAND_COVERAGE.md"
 $architecturePath = Join-Path $Root "docs\ARCHITECTURE.md"
@@ -346,7 +345,6 @@ $main = Read-TextFile -Path $mainPath
 $wfpScanner = Read-TextFile -Path $wfpScannerPath
 $wfpScannerHeader = Read-TextFile -Path $wfpScannerHeaderPath
 $targetSource = Read-TextFile -Path $targetPath
-$readme = Read-TextFile -Path $readmePath
 $testDoc = Read-TextFile -Path $testDocPath
 $coverage = Read-TextFile -Path $coveragePath
 $architecture = Read-TextFile -Path $architecturePath
@@ -1006,13 +1004,10 @@ Test-RequiredText -Text $main -Needle 'kind = L"module_stomping"' -Name "console
 Test-RequiredText -Text $main -Needle 'kind = L"mapped_code_or_loader_evasion"' -Name "console mapped-code assessment kind" -Failures $failures
 Test-RequiredText -Text $main -Needle "process main image or section backing was swapped" -Name "console process tampering assessment text" -Failures $failures
 Test-RequiredText -Text $main -Needle "loaded module code or section permissions indicate module stomping" -Name "console module-stomping assessment text" -Failures $failures
-Test-RequiredText -Text $readme -Needle "kernel_main_section_swap_evidence" -Name "README main section swap documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "process_tampering_primitive_evidence" -Name "README process tampering primitive documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "module_stomping_permission_evidence" -Name "README module stomping permission documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "security_tool_communication_blocking" -Name "README WFP communication-blocking documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "kernel_main_section_swap_evidence" -Name "hunt target main section swap documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "process_tampering_primitive_evidence" -Name "hunt target process tampering primitive documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "security_tool_communication_blocking" -Name "hunt target WFP communication-blocking documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "kernel_main_section_swap_evidence" -Name "hunt guide main section swap documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "process_tampering_primitive_evidence" -Name "hunt guide process tampering primitive documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "module_stomping_permission_evidence" -Name "hunt guide module stomping permission documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "security_tool_communication_blocking" -Name "hunt guide WFP communication-blocking documentation" -Failures $failures
 Test-RequiredText -Text $coverage -Needle "kernel_main_section_swap_evidence" -Name "command coverage main section swap documentation" -Failures $failures
 Test-RequiredText -Text $coverage -Needle "process_tampering_primitive_evidence" -Name "command coverage process tampering primitive documentation" -Failures $failures
 Test-RequiredText -Text $coverage -Needle "module_stomping_permission_evidence" -Name "command coverage module stomping permission documentation" -Failures $failures
@@ -1213,15 +1208,12 @@ Test-RequiredText -Text $readiness -Needle "edr-killer-gentlemen-staging-only-ne
 Test-RequiredText -Text $targetSource -Needle "StageOnlyBenign.exe" -Name "hunt target staging-only negative benign copy" -Failures $failures
 Test-RequiredText -Text $targetSource -Needle "GentlemenCollection staging alone does not create a process-profile finding" -Name "hunt target staging-only negative contract" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "StageOnlyBenign.exe" -Name "hunt target staging-only negative documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "make-eset-hunt-e2e-vm-bundle.ps1" -Name "README ESET VM bundle workflow" -Failures $failures
-Test-RequiredText -Text $readme -Needle "bundle_contract=eset-hunt-e2e-vm-bundle-v1" -Name "README ESET VM bundle contract" -Failures $failures
-Test-RequiredText -Text $readme -Needle 'A `GentlemenCollection` path by itself is treated as supporting' -Name "README GentlemenCollection supporting-only gate" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "make-eset-hunt-e2e-vm-bundle.ps1" -Name "hunt guide ESET VM bundle workflow" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "bundle_contract=eset-hunt-e2e-vm-bundle-v1" -Name "hunt guide ESET VM bundle contract" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle 'A `GentlemenCollection` path by itself is treated as supporting' -Name "hunt guide GentlemenCollection supporting-only gate" -Failures $failures
 Test-RequiredText -Text $architecture -Needle 'Exact-only public filenames such as `HwAudKiller.exe` are not suffix-normalized' -Name "architecture exact HwAudKiller gate" -Failures $failures
 Test-RequiredText -Text $architecture -Needle 'A `GentlemenCollection` path alone is only supporting context' -Name "architecture GentlemenCollection supporting-only gate" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "make-eset-hunt-e2e-vm-bundle.ps1" -Name "hunt target ESET VM bundle workflow" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "bundle_contract=eset-hunt-e2e-vm-bundle-v1" -Name "hunt target ESET VM bundle contract" -Failures $failures
-Test-RequiredText -Text $readme -Needle "Table 3/4 process and driver indicators" -Name "README ESET Table 3/4 currentness documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "Table 3/4 process and driver indicators" -Name "hunt target ESET Table 3/4 currentness documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "Table 3/4 process and driver indicators" -Name "hunt guide ESET Table 3/4 currentness documentation" -Failures $failures
 
 foreach ($staleScenarioName in @("edr-killer-suffix-name-kasp-light", "edr-killer-suffix-name-easolo-light", "edr-killer-suffix-name-easolo-clear"))
 {
@@ -1229,34 +1221,23 @@ foreach ($staleScenarioName in @("edr-killer-suffix-name-kasp-light", "edr-kille
     Test-ForbiddenText -Text $e2eArtifactValidator -Needle $staleScenarioName -Name "stale ESET artifact scenario name" -Failures $failures
 }
 
-Test-RequiredText -Text $readme -Needle "eset_exact_file_sha1_ioc" -Name "README exact hash documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "run-eset-hunt-e2e.ps1" -Name "README ESET E2E runner documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "-ArticleHtml <path>" -Name "README ESET article currentness validation documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "-ArticleUrl <url>" -Name "README ESET article URL validation documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "article-validator.log" -Name "README ESET E2E article validator log documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "known defense-evasion driver service" -Name "README ESET E2E system assessment documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "target-lifetime padding" -Name "README ESET E2E lifetime padding documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "/stop-event" -Name "README ESET E2E stop-event documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "validate-eset-hunt-e2e-artifacts.ps1" -Name "README ESET artifact validator documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "runner.log" -Name "README ESET runner log documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "-ReuseExistingTarget" -Name "README ESET reuse existing target documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "target exits before the 35-scenario manifest" -Name "README ESET early-exit runner diagnostic documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "prints the tails of the target" -Name "README ESET failure-tail runner diagnostic documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "GentleKiller security-product targets" -Name "README GentleKiller target-list documentation" -Failures $failures
-Test-RequiredText -Text $readme -Needle "public Table 2 HTML currently exposes 274 unique lower-case image names" -Name "README public Table 2 target-list caveat" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "eset_exact_file_sha1_ioc" -Name "hunt guide exact hash documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "run-eset-hunt-e2e.ps1" -Name "hunt guide ESET E2E runner documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "-ArticleHtml <path>" -Name "hunt guide ESET article currentness validation documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "-ArticleUrl <url>" -Name "hunt guide ESET article URL validation documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "article-validator.log" -Name "hunt guide ESET E2E article validator log documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "known defense-evasion driver service" -Name "hunt guide ESET E2E system assessment documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "target-lifetime padding" -Name "hunt guide ESET E2E lifetime padding documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "/stop-event" -Name "hunt guide ESET E2E stop-event documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "validate-eset-hunt-e2e-artifacts.ps1" -Name "hunt guide ESET artifact validator documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "runner.log" -Name "hunt guide ESET runner log documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "-ReuseExistingTarget" -Name "hunt guide ESET reuse existing target documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "target exits before the 35-scenario manifest" -Name "hunt guide ESET early-exit runner diagnostic documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "prints the tails of the target" -Name "hunt guide ESET failure-tail runner diagnostic documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "GentleKiller security-product targets" -Name "hunt guide GentleKiller target-list documentation" -Failures $failures
+Test-RequiredText -Text $testDoc -Needle "recorded public Table 2 HTML snapshot contains 274 unique lower-case image" -Name "hunt guide public Table 2 target-list caveat" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "exact ESET SHA-1 IoCs" -Name "hunt target exact hash test caveat" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "run-eset-hunt-e2e.ps1" -Name "hunt target ESET E2E runner documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "-ArticleHtml <path>" -Name "hunt target ESET article currentness validation documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "-ArticleUrl <url>" -Name "hunt target ESET article URL validation documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "article-validator.log" -Name "hunt target ESET article validator log documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "known defense-evasion driver service" -Name "hunt target ESET system assessment documentation" -Failures $failures
 Test-RequiredText -Text $testDoc -Needle "slow deep hunt cannot race the fixture lifetime" -Name "hunt target ESET E2E lifetime padding documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "/stop-event" -Name "hunt target ESET E2E stop-event documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "validate-eset-hunt-e2e-artifacts.ps1" -Name "hunt target ESET artifact validator documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "runner.log" -Name "hunt target ESET runner log documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "-ReuseExistingTarget" -Name "hunt target ESET reuse existing target documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "target exits before the 35-scenario manifest" -Name "hunt target ESET early-exit runner diagnostic documentation" -Failures $failures
-Test-RequiredText -Text $testDoc -Needle "prints the tails of the target" -Name "hunt target ESET failure-tail runner diagnostic documentation" -Failures $failures
 Test-RequiredText -Text $coverage -Needle "ESET-published Gentlemen/OxideHarvest SHA-1 IoCs" -Name "command coverage exact hash documentation" -Failures $failures
 Test-RequiredText -Text $architecture -Needle "sensitive cross-process tasks" -Name "architecture TI task documentation" -Failures $failures
 Test-RequiredText -Text $architecture -Needle "GentleKiller target list" -Name "architecture target-list documentation" -Failures $failures

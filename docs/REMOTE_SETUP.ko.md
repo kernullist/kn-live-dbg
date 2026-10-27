@@ -163,7 +163,7 @@ dump / snapshot은 **A 디스크**에, 로컬 TUI와 같은 경로로 쓴다. B�
 
 서버는 엔진을 기다리는 동안에도 제어 프레임을 읽는다. 프로토콜 `cancel`은 큐의 요청을 제거하고 `cancelled`를 반환하며, 이미 디스패치됐으면 `not-cancelable`을 반환한다. 연결 종료와 리스너 중지도 큐의 요청을 제거하므로 버려진 명령이 나중에 실행되지 않는다. 실행 중인 명령은 끝까지 진행한다. 현재 클라이언트는 결과를 동기적으로 기다리며, 실행 중 Ctrl+C를 `cancel` 요청에 연결하지 않는다.
 
-B에서 `ai`는 허용이다. A에 프로바이더 키가 있으면 B가 그 키를 쓰지 않게 `KNLIVEDBG_AI_REMOTE_POLICY=local-only`를 권장한다.
+B의 `ai`는 A의 provider 설정을 사용한다. `local-only`는 KnLiveDbg HTTP 호출을 차단하지만 외부 CLI는 네트워크를 사용할 수 있고, 허용된 운영자는 AI 설정을 변경할 수 있다. 별도의 자격 증명 접근 경계가 아니다.
 
 ---
 
@@ -188,7 +188,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 - IPv4 peer는 제한하지 않는다 (Tailscale `100.x`, Hamachi, 공인, RFC1918). 한 클라이언트만 받으려면 `--peer`.
 - Auth lockout은 리스너 세션 동안 유지한다. peer IP당 5회, 전역 15회 실패면 `remote off` 후 새로 `remote on` 할 때까지 신규 auth를 거부한다.
 - remote가 떠 있는 동안 `mcp on`(반대도)은 실패: `listen XOR`.
-- 격리 lab 세그먼트만. 공유 사무실 LAN / 인터넷에 `0.0.0.0`을 열지 않는다. 와이어 암호가 필요하면 `--loopback` + `ssh -L 51767:127.0.0.1:51767`. TLS는 설계 문서 Appendix A(v2)이고 이 빌드에는 없다.
+- 격리 lab 세그먼트만. 공유 사무실 LAN / 인터넷에 `0.0.0.0`을 열지 않는다. 와이어 암호가 필요하면 `--loopback` + `ssh -L 51767:127.0.0.1:51767`를 사용한다. 인증된 암호화 전송은 [남은 작업](FEATURE_PLAN.md)이다.
 
 ---
 
@@ -214,7 +214,7 @@ A에서 `remote <Tab>`은 `on` / `off` / `status` / `disconnect` / `help`. `remo
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-`KnLiveDbg.exe --self-test remote-protocol`(52개 검사)과 `--self-test connect-argv`(4개 검사)를 실행한다. framing/auth, deny-list, 엄격한 argv, 로컬 자동 완성, 큐 요청 취소, 작업 대기 중 리스너 중지를 검증한다. **두 묶음 모두 `--self-test all`에 포함된다.** fixture가 `127.0.0.1:51767`을 사용하므로 구성별 실행은 순차로 한다. 드라이버를 로드하거나 방화벽 규칙을 추가하지 않는다. 검증된 Release/Debug 결과와 라이브 테스트 한계는 [명령 감사 보고서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md)에 있다.
+`KnLiveDbg.exe --self-test remote-protocol`과 `--self-test connect-argv`를 실행한다. framing/auth, deny-list, 엄격한 argv, 로컬 자동 완성, 큐 요청 취소, 작업 대기 중 리스너 중지를 검증한다. **두 묶음 모두 `--self-test all`에 포함된다.** fixture가 `127.0.0.1:51767`을 사용하므로 구성별 실행은 순차로 한다. 드라이버를 로드하거나 방화벽 규칙을 추가하지 않는다. 날짜별 결과와 라이브 테스트 한계는 [검증 현황](VALIDATION.md)에 있다.
 
 같은 박스 스모크 (A elevated, 드라이버 로드됨):
 

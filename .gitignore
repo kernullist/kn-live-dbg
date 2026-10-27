@@ -1,7 +1,22 @@
 .vs/
 .build/
-.env
-.env.local
+.env*
+!.env.example
+# Credentials and local captures must not become publication inputs.
+*.pfx
+*.p12
+*.pem
+*.key
+*.dmp
+*.dump
+auth.json
+credentials.json
+id_rsa
+id_ed25519
+mcp-endpoint.json
+mcp-clients/
+.kn-live-dbg/
+.codex/
 *.user
 *.suo
 *.opensdf

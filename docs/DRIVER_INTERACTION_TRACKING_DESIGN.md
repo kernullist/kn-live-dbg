@@ -1,97 +1,65 @@
-# Driver Interaction Tracking — Design (Phase A/B implemented)
+# Driver interaction tracking
 
-Goal: when `!kmon` watches a game-cheat loader by name, show how that loader
-(and its auto-promoted children) interact with kernel drivers — which device
-handles it acquires, when, and what can be inferred about the communication
-channel — without destabilizing the host.
+KMON records device-handle relationships for watched processes and exposes a
+separate opt-in raw I/O-trace path. Both are implemented, but their lifetime and
+evidence guarantees differ. Main ABI **17**, I/O-trace control/drain function
+numbers **0x816/0x817**.
 
-Status: **Phase A and Phase B.1 are implemented** (ABI 17, IOCTL 0x816/0x817).
+## Watched handle observations
 
-## Why this is hard (hard constraints)
+Native-width File handles are followed through
+`FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT`. PDB fields, object types,
+address bounds, cycle checks and stack-depth budgets qualify each relationship.
+Filesystem and control-device observations remain separate; failed lookups stay
+unknown. Manually mapped code may lack a conventional driver object or loader
+entry, so this collector is not a complete payload inventory.
 
-1. **ETW-TI has no DeviceIoControl.** The Threat Intelligence provider
-   exposes process/thread/image/driver-object events and cross-process VM
-   operations, not IOCTL traffic. `!kmon` already prints this as
-   `gap.kernel_rw`.
-2. **ObRegisterCallbacks only supports Process/Thread (and Desktop)
-   object types.** A probe driver cannot strip or observe device-handle
-   creation through object callbacks; there is no supported notify on
-   `\Device\*` handle opens.
-3. **Manually mapped drivers have no DRIVER_OBJECT at all.** kdmapper-style
-   2nd stages never appear in the driver lists; the loader talks to the
-   mapped code through (a) the vulnerable driver's IOCTL channel it used
-   for mapping (BYOVD handle), (b) shared physical-memory windows, or
-   (c) hooks that fire on their own. "Track the driver" for this class
-   really means "track the channel and the effects".
+`DeviceClient::QueryFileObjectTypeIndex` identifies File handles from an owned
+handle. A shared handle snapshot rotates through eight watched PIDs, with a
+128-record per-PID resolution cursor. Records retain process creation identity,
+full-width handle/access values, object addresses and observation generation.
+Complete snapshots support present/opened/closed/reappeared transitions; closed
+objects are not dereferenced. Short opens entirely between snapshots can be missed.
 
-## Phase A — watched-PID handle-table diffing (implemented, no driver change)
+The ring/log retains ordinary filesystem observations even when the console
+suppresses their display. `!kmon status` exposes scan age and pending work.
+Missing snapshots/symbols produce coverage/sensor records. Handle presence is
+not proof of a specific IOCTL, memory write, actor or malicious intent. TI is
+not used as a universal DeviceIoControl trace; `gap.kernel_rw` preserves that gap.
 
-Watched File handles are parsed with the native pointer-width ABI and followed
-through `FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT`. PDB field offsets,
-object type tags, address bounds, cycle detection and a stack-depth budget
-qualify each connection. Filesystem and control-device channels remain
-separate; unreadable paths remain unknown.
+## Experimental raw I/O trace
 
-`DeviceClient::QueryFileObjectTypeIndex` learns the File type index from the
-client's own `CreateFile` handle. A shared system handle snapshot is consumed
-by a rotating batch of eight watched PIDs. Per-PID pending records retain a
-128-record resolution cursor. Evidence includes process creation identity,
-full-width handle/access values, File/device/driver addresses, and observation
-generation. Complete snapshots produce `present_at_attach`, `opened`, `closed`
-and `reappeared` transitions. Closed objects are never dereferenced.
+`!kmon iotrace <driver-name> on` resolves the driver object in user mode, then
+requests a write-gated dispatch interposition. `off` and `status` take no driver
+argument. The driver replaces the target's `IRP_MJ_DEVICE_CONTROL` dispatch
+entry with a trampoline, records PID/IOCTL/length metadata in a bounded ring,
+and forwards the IRP. The ring holds 1,024 records and the first-seen display
+tracks at most 256 PID/IOCTL pairs.
 
-Ordinary filesystem observations are retained in the ring/log while their
-console display is quiet. Snapshot or symbol failures are coverage/sensor
-records. An open and close wholly between snapshots can still be missed;
-`!kmon status` exposes the oldest PID scan age and pending work.
+The implementation references the target object and tracks entered trampolines.
+Disarm restores the entry and waits for active calls, returning
+`STATUS_DEVICE_BUSY` while keeping the reference when its bounded wait ends.
+Controller shutdown retains the device on failed disarm so cleanup can retry.
+Driver unload retries busy disarm without a fixed retry count; a stuck dispatch
+can delay unload indefinitely.
 
-## Phase B — kernel-side IOCTL observability (B.1 implemented as `!kmon iotrace`)
+**Unresolved lifetime boundary:** a caller can fetch a published function pointer
+before entering the trampoline. An object reference and an active-entry counter
+alone do not establish a drain contract for that interval. The current code has
+no cooperative external-provider publication contract. This is an experimental
+raw path with unload-safety limitations, not a generally safe monitoring feature.
 
-Opt-in, lab-only: `!kmon iotrace <driver-name> on | !kmon iotrace off|status` resolves the
-named driver's DRIVER_OBJECT via the `\Driver` object-directory walk
-(`IntegrityScanner`, user mode — the driver never does name lookups), then
-arms the main `KnLiveDbg.sys` driver (ABI 17, `IOCTL_KNDBG_IOTRACE_CONTROL` 0x816 with the
-write ACK magic):
+The cooperative minifilter CREATE controls and pending-I/O fixture do not use
+this raw replacement mechanism. Their passing tests do not validate it.
+See [architecture](ARCHITECTURE.md#cooperative-callbacks-and-pending-io) and
+[remaining work](FEATURE_PLAN.md).
 
-- The target's `MajorFunction[IRP_MJ_DEVICE_CONTROL]` is swapped to the
-  driver's trampoline after SEH-validating `Type == IO_TYPE_DRIVER` and
-  referencing the DRIVER_OBJECT with `ObReferenceObjectByPointer` so the
-  target cannot be freed while the hook is live. The trampoline records
-  caller pid, IOCTL code, and in/out lengths into a non-paged spinlocked
-  ring (1024 records, allocated lazily on first arm) and passes the IRP
-  through untouched.
-- The kmon worker drains the ring (`IOCTL_KNDBG_IOTRACE_DRAIN` 0x817) and
-  prints `driver.ioctl` events, first-seen per (pid, IOCTL code) with a
-  256-entry cap, decoded into function/device-type/method plus lengths.
-- DISARM restores the original entry and waits for active trampolines to
-  leave (4,000 waits of nominally 100 us each). If dispatch is still active,
-  it reports `STATUS_DEVICE_BUSY` and keeps the target reference. Scheduling
-  can make the elapsed wait longer than the nominal 400 ms.
-- Normal `q`/`unload` stops kmon, TI, and timeline before closing the device.
-  If I/O-trace disarm fails, the controller keeps the device available and
-  reports failure so cleanup can be retried. Driver unload retries disarm
-  while it is busy, with no fixed retry count; a stuck target dispatch can
-  therefore delay unload indefinitely. Active dispatch code must not be
-  released just because a timeout expired.
-- Risk statement: interposing a dispatch entry tampers with live kernel
-  state and can crash the host if the target driver misbehaves; it is
-  gated behind an explicit per-driver arm command and is intended for lab
-  analysis of a captured loader, not for always-on monitoring.
+## Validation
 
-## Acceptance criteria (Phase A)
-
-The [2026-09-19 command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) records build and
-driver-free regression evidence for the shutdown changes. It does not prove
-live dispatch/unload race behavior; those checks remain on the
-[manual checklist](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle).
-
-- With `!kmon start /name loader.exe` and a loader that opens a device
-  handle, a `driver.handle` event appears after its rotating scan with
-  access mask and a qualified connection or an explicit unknown status. Device
-  names and BYOVD matching are not required for retaining the observation.
-- No `driver.handle` events for non-watched processes (watch-gated like
-  `loader.activity`).
-- Handle-table walk failure surfaces as a coverage note
-  (`scan_failed:userhostity:handles:<pid>`), never as silence.
-- Self-test: watch-match gating for the new kind plus
-  handle-record dedup logic (pure functions).
+Owned handle controls should verify watch gating, exact process/device identity,
+open/close/reuse, scan failures and bounded work. Names and BYOVD catalog matches
+are not prerequisites for retaining an observation. Pure-function/command tests
+and ordinary handle observations do not prove raw dispatch/unload safety.
+Use [validation status](VALIDATION.md) and the
+[shutdown checklist](MANUAL_TEST_CHECKLIST.md#collector-and-shutdown-lifecycle)
+to keep these scopes separate.

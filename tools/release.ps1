@@ -3,6 +3,8 @@ param(
     [string]$Configuration = "Release",
     [switch]$SkipBuild,
     [switch]$NoVersionBump,
+    [switch]$IncludePrivateSymbols,
+    [string]$PythonExecutable = "python",
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$WindowsTargetPlatformVersion,
     [ValidatePattern('^[0-9a-fA-F]{40}$')]
@@ -306,6 +308,51 @@ function Get-ReleaseVersion
     return "dev"
 }
 
+function Assert-PackagePublicInput
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [bool]$AllowPrivateSymbols = $false
+    )
+
+    $segments = $RelativePath.Replace("\", "/").Split([char]"/")
+    $name = $segments[-1]
+    $extension = [IO.Path]::GetExtension($name)
+    foreach ($segment in $segments)
+    {
+        if ($segment -in @(
+                ".git", ".build", ".vs", ".codex", ".kn-live-dbg",
+                "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"))
+        {
+            throw "Local state or evidence directories cannot be packaged"
+        }
+    }
+    if (($name -like ".env*" -and $name -ine ".env.example") -or
+        $name -in @("auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519") -or
+        $extension -in @(".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log"))
+    {
+        throw "Credential containers or raw captures cannot be packaged"
+    }
+    if ($extension -ieq ".pdb" -and -not $AllowPrivateSymbols)
+    {
+        throw "Private symbols require -IncludePrivateSymbols"
+    }
+    if ($extension -ieq ".cer")
+    {
+        # Reject private-key containers even if renamed to .cer, without importing keys.
+        $certificateBytes = [IO.File]::ReadAllBytes($SourcePath)
+        if ([Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType(
+                $certificateBytes) -ne
+            [Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+        {
+            throw "Release certificates must contain only a public X.509 certificate"
+        }
+    }
+}
+
 function Copy-PackageFile
 {
     param(
@@ -336,6 +383,9 @@ function Copy-PackageFile
     {
         throw "Package source is a reparse point: $SourcePath"
     }
+
+    Assert-PackagePublicInput -RelativePath $sourceItem.Name `
+        -SourcePath $sourceItem.FullName -AllowPrivateSymbols:$IncludePrivateSymbols
 
     $destination =
         Join-Path $DestinationDir $sourceItem.Name
@@ -461,6 +511,8 @@ function Copy-PackageRelativeFile
         $normalized.Replace("\", "/")
     $sourceItem =
         Get-Item -LiteralPath $source
+    Assert-PackagePublicInput -RelativePath $normalized `
+        -SourcePath $source -AllowPrivateSymbols:$IncludePrivateSymbols
     $sourceHash =
         Get-FileSha256 `
             -Path $source
@@ -741,8 +793,6 @@ if (Test-Path $zipPath)
 $requiredFiles = @(
     "KnLiveDbg.exe",
     "KnLiveDbg.sys",
-    "KnLiveDbg.pdb",
-    "KnLiveDbgDriver.pdb",
     "KnLiveDbgProbe.sys",
     "amdryzenmasterdriver.sys",
     "KnLiveDbgMiniFilterFixture.sys",
@@ -771,13 +821,35 @@ foreach ($name in $requiredFiles)
     Copy-PackageFile -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
 }
 
-$optionalPatterns = @("*.pdb", "*.cer", "*.cat")
-foreach ($pattern in $optionalPatterns)
+# Never collect unrelated certificates, symbols, or catalogs from build output.
+$optionalFiles = @(
+    "KnLiveDbg.cer",
+    "KnLiveDbgProbe.cer",
+    "amdryzenmasterdriver.cer",
+    "KnLiveDbgMiniFilterFixture.cer",
+    "KnLiveDbg.cat",
+    "KnLiveDbgProbe.cat",
+    "amdryzenmasterdriver.cat",
+    "KnLiveDbgMiniFilterFixture.cat"
+)
+if ($IncludePrivateSymbols)
 {
-    $items = Get-ChildItem -LiteralPath $outputDir -Filter $pattern -File -ErrorAction SilentlyContinue | Sort-Object Name
-    foreach ($item in $items)
+    Write-Warning "Private PDBs can disclose source paths and build-account details. Review this package before sharing."
+    $optionalFiles += @(
+        "KnLiveDbg.pdb",
+        "KnLiveDbgDriver.pdb",
+        "KnLiveDbgProbe.pdb",
+        "amdryzenmasterdriver.pdb",
+        "KnLiveDbgMiniFilterFixture.pdb",
+        "KnLiveDbgBindFixture.pdb"
+    )
+}
+foreach ($name in $optionalFiles)
+{
+    $source = Join-Path $outputDir $name
+    if (Test-Path -LiteralPath $source -PathType Leaf)
     {
-        Copy-PackageFile -SourcePath $item.FullName -DestinationDir $stagingDir -Copied $copied -Entries $entries
+        Copy-PackageFile -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
     }
 }
 
@@ -824,6 +896,7 @@ if (Test-Path $vendorManifest)
 }
 
 $toolScripts = @(
+    "validate-public-content.py",
     "mcp-bridge.ps1",
     "update-byovd-intel.ps1",
     "run-hunt-clean-host.ps1",
@@ -859,12 +932,17 @@ foreach ($toolScriptName in $toolScripts)
 
 $fixturePaths = @(
     "tools\KnLiveDbgHuntTarget.exe",
-    "tools\KnLiveDbgHuntTarget.pdb",
     "tools\KnLiveDbgHuntTargetDll.dll",
-    "tools\KnLiveDbgHuntTargetDll.pdb",
-    "tools\KnLiveDbgKmonTarget.exe",
-    "tools\KnLiveDbgKmonTarget.pdb"
+    "tools\KnLiveDbgKmonTarget.exe"
 )
+if ($IncludePrivateSymbols)
+{
+    $fixturePaths += @(
+        "tools\KnLiveDbgHuntTarget.pdb",
+        "tools\KnLiveDbgHuntTargetDll.pdb",
+        "tools\KnLiveDbgKmonTarget.pdb"
+    )
+}
 foreach ($fixturePath in $fixturePaths)
 {
     Copy-PackageRelativeFile `
@@ -876,8 +954,14 @@ foreach ($fixturePath in $fixturePaths)
 
 $documentationPaths = @(
     "LICENSE",
+    ".env.example",
     "third_party\zydis\amalgamated\LICENSE-Zycore.txt",
     "third_party\zydis\amalgamated\LICENSE-Zydis.txt",
+    "docs\README.md",
+    "docs\BUILD_AND_RELEASE.md",
+    "docs\COMMAND_REFERENCE.md",
+    "docs\VALIDATION.md",
+    "docs\MANUAL_TEST_CHECKLIST.md",
     "docs\AI_ASSISTED_WORKFLOWS.md",
     "docs\ARCHITECTURE.md",
     "docs\DRIVER_INTERACTION_TRACKING_DESIGN.md",
@@ -885,7 +969,7 @@ $documentationPaths = @(
     "docs\HUNT_TEST_TARGET.md",
     "docs\KMON_ANALYST_SURFACES.md",
     "docs\KMON_PROCESS_LAYOUTS.md",
-    "docs\KMON_COVERAGE_MATRIX_20260919.md",
+    "docs\KMON_DETECTION_COVERAGE.md",
     "docs\KMON_CROSS_DOMAIN_HUNTING.md",
     "docs\KMON_DETECTION_VERIFICATION.md",
     "docs\KMON_TEST_TARGET.md",
@@ -893,6 +977,7 @@ $documentationPaths = @(
     "docs\MCP_SERVER_DESIGN.md",
     "docs\MCP_SETUP.ko.md",
     "docs\MCP_SETUP.md",
+    "docs\MCP_TOOL_REFERENCE.md",
     "docs\RELEASE_NOTES_$version.md",
     "docs\REMOTE_OPERATOR_SESSION.md",
     "docs\REMOTE_SETUP.ko.md",
@@ -977,6 +1062,21 @@ $versionManifest = [pscustomobject]@{
     files         = $entries
 }
 $versionManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $versionManifestPath -Encoding ascii
+
+$publicContentArguments = @(
+    (Join-Path $PSScriptRoot "validate-public-content.py"),
+    "--tree", "--root", $stagingDir,
+    "--report", (Join-Path $repo ".build\release-public-content-validation.json")
+)
+if ($IncludePrivateSymbols)
+{
+    $publicContentArguments += "--allow-private-symbols"
+}
+& $PythonExecutable @publicContentArguments
+if ($LASTEXITCODE -ne 0)
+{
+    throw "Public-content validation failed; no release ZIP was produced"
+}
 
 New-ZipFromDirectory -SourceDir $stagingDir -ZipPath $zipPath
 

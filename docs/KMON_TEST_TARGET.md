@@ -235,14 +235,14 @@ requires the retained source changes and notices,
 the admitted layout queue, analysis queue, and capture work to be drained.
 The same five positive and two negative controls and all 28 fixed image
 traversals remain required. A zero-loss result is not a claim that every byte
-of every host process was verified. See the [full-process validation report](KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md).
+of every host process was verified. See the [full-process validation report](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md).
 
 `-RequireLayoutNameAccounting` additionally reconciles successful and failed
 name collection against unique image allocations in every available final
 snapshot, checks the failure categories and API error totals, and enforces the
 entry and character storage budgets. It requires `-AllProcessLayouts`; omit it
 when comparing older binaries without these fields. See the
-[candidate freshness and name collection report](KMON_LAYOUT_FRESHNESS_VALIDATION_20261023.md)
+[candidate freshness and name collection report](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_LAYOUT_FRESHNESS_VALIDATION_20261023.md)
 for the remaining gaps and repeated live results.
 
 `-RequireFreshLayouts` additionally requires zero `candidate_expired` rejection
@@ -267,7 +267,7 @@ must remain free of unexpected findings. All six secondary images must compare
 basis and the fixture's relocation address. Completing the primary mapping
 does not satisfy this check. Together with `-ImageSweepFixtures`, the suite
 contains 13 controls and requires 58 image traversals. Run it separately from
-`-ImageStressFixtures`. See the [validation report](KMON_SECONDARY_IMAGE_VALIDATION_20261023.md).
+`-ImageStressFixtures`. See the [validation report](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_SECONDARY_IMAGE_VALIDATION_20261023.md).
 
 These views deliberately lack loader-list entries. Their orphan-image,
 image-PE, foreign-architecture, and temporary-path leads remain expected
@@ -329,7 +329,7 @@ exact mapped path/base, relocation basis, both complete image traversals, zero
 skipped/failed bytes, and absence of System.Data byte/identity findings. Passing
 the synthetic controls alone cannot pass this additional gate. These non-atomic
 observations do not attest unrelated runtime changes. See the
-[actual reproduction report](KMON_VCTIP_VALIDATION_20261024.md).
+[actual reproduction report](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_VCTIP_VALIDATION_20261024.md).
 
 ## Not covered here
 
@@ -339,5 +339,7 @@ observations do not attest unrelated runtime changes. See the
 - Kernel mapper / pool PE / unbacked hook positives (those stay on `!pool pe`,
   `!kpage`, `!mapper`, `!callbacks`).
 
-The implemented observations, current research, and remaining gaps are listed
-in [KMON_DETECTION_COVERAGE.md](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_DETECTION_COVERAGE.md).
+The implemented observations and remaining gaps are listed in
+[KMON_DETECTION_COVERAGE.md](KMON_DETECTION_COVERAGE.md).
+Use [validation status](VALIDATION.md) for the dated live-host evidence and
+[the manual checklist](MANUAL_TEST_CHECKLIST.md) for current all-process runs.

@@ -1,275 +1,72 @@
-# !kmon detection coverage and September 2026 hardening
+# KMON 탐지 관측 범위
 
-Historical baseline: the later [G01-G22/B01 implementation contract](KMON_IMPLEMENTATION_2026-09-16.md)
-supersedes this document for changed collectors and remaining-gap descriptions.
-The validation below belongs to the earlier source snapshot.
+기준 구현은 **v0.0.36**이다. 이 문서는 과거 구현 계획을 대신하는 현재 관측
+범위 안내다. 실측은 [검증 현황](VALIDATION.md), 실행 절차는
+[검증기 설명](KMON_DETECTION_VERIFICATION.md)과 [대조군 안내](KMON_TEST_TARGET.md)에 있다.
 
-Research cutoff: 2026-09-16. The monitor reports observed inconsistencies and
-execution candidates. A quiet pass only applies to the views that were actually
-read within that pass's budgets. It does not establish that a machine is clean.
+KMON은 메모리·등록 정보·이벤트의 관측과 조사 단서를 기록한다.
+`finding.*` 접두사도 악성 판정이 아니며 `maliciousness=not_established`를 유지한다.
+실제로 읽고 비교한 범위와 실패·제외·미방문 범위를 함께 해석해야 한다.
 
-Follow-up fixes and the explicit raw I/O hook unload exception are documented
-in [the adversarial review](KMON_ADVERSARIAL_REVIEW.md).
+## 기법과 수집 경로
 
-## What changed
+| 기법 계열 | 현재 관측 경로 | 해석과 제한 |
+|---|---|---|
+| BYOVD, CI 정책·콜백 변형 | 드라이버 수명주기·잔존물, CI 관측, 커널 이미지 비교 | 현재 CI 값과 서명만으로 과거 우회 여부를 결정하지 않음 |
+| 수동 매핑, PE 헤더·import 흔적 제거, RX pool 코드 | 커널 PTE/PFN·pool 교차 관측, 실행 영역 전체 페이지 순환 | PE 헤더·W+X·컴파일러 패턴은 필수 조건이 아님 |
+| 로더 목록·driver object·pool 흔적 은닉 | 모듈·오브젝트·pool·페이지 관측 대조 | 모든 목록이 동시에 변조되면 페이지 관측과 읽기 실패도 조사 근거 |
+| 커널 이미지 덮어쓰기, 코드 동굴, 인라인 분기 | 실행 섹션 전체 비교와 분기 목적지 검증 | 로컬 참조 파일이 신뢰 가능한 원본이라는 별도 운영 조건 |
+| 정상 이미지의 헤더·데이터·padding을 실행 가능하게 변경 | PE 실행 선언과 현재 PTE 권한 대조 | `owned_unexpected_executable`; 바이트 변경이나 악성 판정과 구분 |
+| Ps process/thread/image, registry, Ob, minifilter 콜백 | 실제 pre/post 함수 슬롯을 전후 재검증하고 코드 확인 | PDB 필드 폭을 확인한 슬롯만 검증된 채널로 연결; fallback은 별도 후보 |
+| DPC·timer·work item·NMI·시스템 스레드 | 기존 예약 실행·커널 스레드·CPU 무결성 수집과 코드 검사 | 등록·대기 상태의 참조이며 현재 RIP가 아님 |
+| firmware table, hive, ETW logger 통신 경로 | 등록된 함수 슬롯과 코드 경로 검사 | 요청의 발신자·프로토콜은 정적 포인터만으로 확정하지 않음 |
+| WFP 네트워크 경로 | classify/notify/flow-delete 후보를 순환 코드 검사 | 내부 레이아웃은 추정값. 검증된 콜백이나 통신 연결로 승격하지 않음 |
+| 유저 수동 매핑·raw shellcode·reflection | VAD·VirtualQuery·실제 PTE의 실행 영역 전체 페이지 순환 | 이미지 이름·헤더·신규 스레드·콜백 참조 없이도 수집 |
+| 정상 프로세스 위장·정상 DLL 내부 implant | 선택된 모든 프로세스의 EXE/DLL 실행 섹션 비교 | 감시 이름·Windows 기본 프로세스 여부로 비교를 제외하지 않음 |
+| hollowing·stomping·ghosted/replaced backing | 이미지 바이트 비교, 매핑 대조, 참조를 검증할 수 없는 실행 페이지 보존 | 정확한 기법명은 별도 분석. 참조 파일/헤더 확인 실패를 정상 일치로 취급하지 않음 |
+| 프로세스별 배치 변화·신규 인스턴스 | 이름 미지정 시 전체 프로세스 발견, 초기·최신 완전 VA 순회, 할당/권한/매핑 변화와 초기·주기적 이미지 검증 연결 | 초기 상태는 정상 기준이 아님. 부분 순회는 비교하지 않으며 도플갱잉의 TxF 이력은 증명하지 않음. [배치 가이드](KMON_PROCESS_LAYOUTS.md) 참고 |
+| VAD unlink·VAD 권한 위장·PTE 직접 매핑 | 모든 선택 프로세스의 재개 가능한 사용자 페이지 테이블 순회 | VAD가 불완전하면 DKOM 확정은 제한되지만 현재 실행 페이지 읽기는 별도 재검증 |
+| threadless·APC·thread-pool·TLS·VEH·WNF 기반 실행 | 전체 실행 메모리/이미지 검사, APC·instrumentation·ETW 스택 참조; TLS 배열·재배치 기준 비교와 WorkerFactory 시작 루틴 | 휴면 TP 객체 그래프, VEH/WNF 전용 실행 추적은 미지원; 메타데이터는 실행 증거가 아님 |
+| PEB KernelCallbackTable 변조 | PDB로 확인한 native x64 루트와 64개 후보, 루트 교체 재검증, 저장 스냅샷 비교 | 전체 테이블 길이·WOW64 KCT·GUI 메시지 실행은 미확정. [분석가용 가이드](KMON_ANALYST_SURFACES.md) 참고 |
+| sleep encryption·NX/RX 변동·짧은 실행 구간 | 기존 이벤트 캡처와 주기적 페이지 검사의 병행 | 스캔 사이에만 복호화되거나 이벤트가 손실된 구간은 미관측 가능 |
+| WOW64 payload | 아키텍처에 독립적인 페이지·이미지 검사 | x64 정적 분기 디코더를 x86 반환 주소에 적용하지 않음 |
+| PPL·프로세스 query 핸들 제한 | 생성 시각·EPROCESS를 확인한 드라이버 읽기와 물리 페이지 읽기 | 모듈 소유권을 확인하지 못하면 `unknown`을 보존; 일부 스레드 메타데이터 수집은 제한 |
+| 공유 section·물리 페이지 alias | 반복 관측한 PFN과 전체 페이지 SHA-256 | 동일 내용·동일 PFN은 통신 방향이나 쓰기 주체를 증명하지 않음 |
+| 스택 위조·ROP·정상 코드 재사용 | 원본 스택·참조 경로·이벤트 행위와 변경 코드 대조 | 코드 바이트가 변하지 않는 행위는 메모리 내용 비교만으로 식별할 수 없음 |
+| 세션별 win32k·GUI 경로 | 기존 그래픽스 포인터·사용자 이미지 검사, session coverage 기록 | 올바른 세션 주소 공간이 확인되지 않은 커널 페이지는 미검증 |
+| 대체 CR3·EPT shadow·악성 하이퍼바이저 | 읽은 주소 공간과 CPU/가상화 관련 관측 | 센서에 제공되는 매핑과 실제 instruction fetch가 다르면 외부 관측 필요 |
+| UEFI runtime·SMM·DMA 펌웨어 코드 | Windows에 남은 실행 매핑·후속 변형 및 관련 보안 상태 정보 | Windows firmware table handler 검사는 SPI flash/SMM/장치 펌웨어 검사와 다름 |
 
-### Kernel mappings, pool code, and mapper residue
+## 현재 검사 계약
 
-`OrphanKernelPageScanner` now handles the LA57 kernel floor correctly, retains
-supervisor leaves below user-accessible parent entries, and excludes the correct
-512 GB LA48 self-map window. Large executable leaves have loaded-module spans
-subtracted instead of discarding a whole 2 MB or 1 GB mapping after one overlap.
-Adjacent big-pool allocations keep their separate identities.
+- 이미지 커서는 프로세스 생성 시각·기준 주소·확인된 파일 정체성을 기준으로
+  이어간다. 최초 검사·재검사와 감시·배경 작업을 배분하며, 배경 최초 검사에는
+  일반 회전·대형 이미지 진행·짧은 잔여 작업 차례를 둔다.
+- 전용 이미지 순회는 최대 1,024페이지와 25ms 검사 경계를 사용한다. 실제
+  선택 횟수나 `image_traversed_items`는 바이트 검증 성공 수가 아니다.
+  한 API 호출의 지연까지 25ms로 제한한다는 뜻도 아니다.
+- 보조 이미지 뷰는 실제 재배치 기준을 독립 검증할 수 있을 때 비교한다.
+  지원하지 않는 동적 재배치, 폐기 가능한 섹션과 읽기 실패는 제외/미검증으로
+  남는다. 같은 바이트라는 이유만으로 제외 범위를 검증 완료로 바꾸지 않는다.
+- 큐 수용·지연·손실, 이름 조회, 페이지 캡처, 종료 시 대기 작업과 이미지 진행은
+  각 coverage 필드로 기록한다. 검사기가 의도적으로 보류한 범위를 없애서
+  무손실·완료율을 높이지 않는다.
+- 현재 사건 주소 모델은 user VA `< 0x0000800000000000`, kernel VA
+  `>= 0xFFFF800000000000`이다. 일부 페이지 순회의 LA57 지원이 전체 수집기와
+  사건 인덱스의 확장 주소 지원을 보장하지 않는다.
 
-This LA57 repair applies to the orphan-page/PFN scanner. Other pointer
-classifiers still use LA48 kernel floors; the full monitor has not been
-validated on a live LA57 host.
+## 남는 한계
 
-PFN candidates must translate back to the claimed physical page and have
-effective executable permissions through the complete parent chain. Failed
-table reads, PFN reads, translation checks, and selected-window revalidation
-clear the relevant completeness flag. Missing or malformed module ranges cannot
-prove that a target is outside all modules.
+스캔 사이의 짧은 실행, 암호화/NX 전이, 계속 바뀌는 대상 집합, 보호된 프로세스,
+불완전한 심벌·레이아웃과 신뢰할 수 없는 참조 파일은 관측 공백을 남긴다.
+센서와 같은 권한에서 여러 뷰를 함께 변조하거나 실제 instruction fetch와
+읽기 매핑이 다르면 독립된 외부 관측이 필요하다.
 
-`!kmon` requests 16 KB body windows, retaining at most 128 during a mapper watch
-or 64 while idle. Selection interleaves one window from each discovered region
-before revisiting larger regions, then resumes at the saved logical offset on
-later passes. This avoids repeatedly checking only allocation prefixes and
-avoids letting one huge mapping monopolize the selected windows. Enumeration
-still has table/PFN budgets and a 65,536 retained-region cap; window rotation
-does not repair an area never reached by enumeration. Standalone `!kpage`
-retains full-region output unless its caller opts into window mode.
-Every page start in a selected body window is checked for a PE header; the
-reported `peAddress` preserves its actual position inside the window. Custom
-body windows are clamped to 64 KB so page probing remains bounded.
+코드 바이트가 바뀌지 않는 정상 코드 재사용·데이터 조작의 의도, 전체 TP 객체
+그래프, WOW64 KCT, SPI/SMM/DMA 펌웨어와 모든 커널 빌드를 검증했다고 주장하지
+않는다. 실호스트의 양성·음성 대조군 통과는 다른 워크로드의 무누락·무오탐
+보증이나 제품 간 탐지율 비교가 아니다.
 
-The shared mapper decoder accepts validated RIP-relative import slots and
-matching `mov rax..r15, imm64; jmp/call` register pairs, with an optional single
-NOP. It rejects unrelated intervening bytes, mismatched REX registers, and
-overflowing relative targets. At most 32 distinct residual branch targets per
-body are checked for mapping and effective execution permission. All targets in
-the bounded body are collected, sorted and deduplicated; a per-region cursor
-resumes target validation on later visits. The cursor cache holds 4096 regions
-and reports eviction as lost continuation coverage. Exceeding the target budget
-is partial coverage. Unreadable bytes are not evidence. Short
-successful body/header reads retain partial-coverage markers while preserving
-verified positive evidence from the readable prefix. Pool PE read failures are
-now visible as coverage events and in JSON.
-
-Big-pool parsers validate returned bytes and declared counts before reserving
-or indexing memory. A partial table cannot be used to claim an allocation is
-absent. Mapper bookkeeping no longer interprets unreadable names, timestamps,
-or slots as successful reads of wiped values.
-
-These changes strengthen `pool.hidden`, `mapper.stub`, and
-`driver.mapped_residue`. They do not make import-free code, NX-at-rest payloads,
-or code that only executes between sampling passes universally detectable.
-
-### Callbacks and kernel execution
-
-The hot-entry inline scanner read bytes successfully but did not mark the
-production input `PrologueKnown`, suppressing its verdicts. Production and
-regression tests now share the byte-to-input construction. The decoder handles
-CET ENDBR64/NOP prefixes, short branches, and immediate branches using R8-R15.
-
-`ScanCallbackInlineTargets` supplements callback-pointer ownership checks.
-It samples up to 64 owned callback entry points per pass, revisits each batch
-before advancing its cursor, and follows
-up to four supported static branch hops, including an in-image code cave and
-RIP-relative pointer slot. A terminal target outside a complete loaded-module
-view produces `hook.inline layer=callback_redirect` only after two matching
-observations. A read failure, changed target, disappeared callback, cycle, or
-unresolved transfer cannot inherit a previous confirmation. A normal tail call
-into another loaded module is a negative control.
-Confirmation capacity is reserved for a whole batch before sampling, preventing
-stable populations larger than the cache from starving all second observations.
-Capacity resets are reported and retire the corresponding event identities.
-Surviving pending entries are revisited after registration changes, and the last
-batch address is retained until the next fresh inventory to preserve progress.
-Failed attempts, including caught C++ exceptions, clear pending confirmations.
-
-Notify slots, Ob lists, and registry lists distinguish malformed links from
-unreadable data. Cycles and broken backlinks no longer look like completed
-empty scans. Unreadable records generate coverage notes, not poisoned-pointer
-allegations. Notify record identity includes its slot address.
-
-Modern `_KDPC_DATA.DpcList` / `_KDPC_LIST.ListHead` singly linked DPC queues are
-resolved from PDB fields alongside the legacy doubly linked layout. The walker
-validates NULL termination, tail identity, read completion, cycles, and limits.
-Private symbol changes can still make a queue unavailable. Modern timer roots
-and work-item queues are not fully covered by this repair.
-
-Kernel thread starts use `_ETHREAD.StartAddress` and, when available,
-`_ETHREAD.Win32StartAddress`. Toolhelp completeness requires an actual
-`ERROR_NO_MORE_FILES` termination. Comparisons include owning PID, TID, and
-kernel object identity; stable `ActiveThreads` values bracket the list walk.
-An unavailable or malformed module inventory withholds unbacked-start conclusions while
-independent thread-list comparisons remain possible. Failed passes and monitor
-restart clear confirmation state, preventing unrelated generations from
-combining into two strikes.
-
-The thread report budget counts newly claimed events, so the same 16 deduplicated
-findings cannot permanently hide a seventeenth thread or later DKOM finding.
-Event keys include kernel object identity, with start address included for
-unbacked-start events.
-
-HAL, ETW, hive, and KDBG module lookups returned pointers into temporary vectors
-from `SymbolEngine::Modules()`. They now retain owned module values, with
-lifetime regression controls for the hive/KDBG helpers. Input-stack driver
-selection uses exact names, and incomplete stack/NMI views remain explicit.
-
-### User process identity and hidden executable memory
-
-PEB and loader agreement is compared independently with
-`EPROCESS.SectionBaseAddress`. A pair of matching forged user structures no
-longer determines the only main-image address inspected.
-
-Executable `MEM_MAPPED` sections are included alongside private code and orphan
-PEs. Across scanned hosts, the new `thread_private_exec` and
-`thread_mapped_exec` layers require a complete module inventory,
-a live thread start within the exact region, matching process creation time,
-and readable bytes at that start. Entropy remains a candidate heuristic;
-packed data, JIT engines, overlays, and instrumentation need operational
-negative controls before treating these events as malware.
-
-Process materialization is capped at 4,096 entries; entries beyond that snapshot
-cap are not covered by continuation. Deep process selection is capped at 1,024
-hosts. When saturated, 768 places are
-reserved for higher-priority hosts and 256 for other hosts; both groups rotate.
-Each process resumes its virtual-memory walk using `(PID, CreateTime)` after
-the 4,096-region or four-finding budget. Thread corroboration uses one lazy
-Toolhelp inventory per pass (65,536 entries), at most 64 thread-start queries
-per host, and at most 1,024 queries per pass. Quotas are assigned to selected
-hosts before queries begin, and per-generation TID continuation advances only
-when a query is attempted. Each sampled thread start is queried directly for
-its memory region, independently of the sequential VM cursor. This prevents
-process, thread, and VAD slices from repeatedly missing one another. These
-limits are reported as partial coverage, not absence of hidden memory. Threads
-beyond the global inventory cap are likewise not reached by the TID cursor.
-
-The separate bounded user-inspection sweep now rotates up to four explicit
-`/pid` or `/name` watches first within six priority slots, followed by two
-background slots. Explicit watches, other priority hosts, and background hosts
-have independent cursors. This 2026-10-06 change preserves the total eight-host
-budget; it does not guarantee a scan deadline.
-
-A PE allocation is excluded from orphan-image leads only when the current
-mapping is `MEM_IMAGE`, the loader inventory is complete, and both the
-allocation base and current backing path match the loader entry exactly.
-Same-basename paths on another volume, private/mapped PEs, and incomplete
-inventories retain their investigation path. Loaded-image byte and execution
-checks remain independent. The [live-host record](LIVE_HOST_VALIDATION_20261006.md)
-includes the ordinary-DLL negative control and the remaining fixture limits.
-
-`GetFileAttributes` only supports a ghost-file allegation for file/path-not-found
-errors. Access denied remains unknown. Failure to query a mapped filename is
-not evidence of absent file backing. CoW sampling deduplicates pages and checks
-that each page belongs to the same executable `MEM_IMAGE` allocation. A failed
-memory read no longer substitutes zero bytes or an entropy verdict. VAD VPN
-high-field read failures and invalid/overflowing address ranges are rejected.
-Hidden-process completeness includes both before/after SPI and Toolhelp calls.
-
-Inbox path checks are anchored at the path root; embedded `Windows\\System32`
-directories, traversal, alternate streams, and an `explorer.exe` directory do
-not qualify. A basename such as `csrss.exe` alone no longer suppresses WriteVM
-classification. Path classes are lexical policy, not signer or file identity:
-other volumes, hard links, and reparse points need separate provenance evidence.
-
-### Monitor lifecycle
-
-Timeline callback registration/removal ran while a fast mutex raised IRQL to
-APC_LEVEL even though these callback APIs require PASSIVE_LEVEL. The control
-path now uses a kernel mutex and enforces PASSIVE_LEVEL. Ring reset clears
-publication metadata under the spin lock; it no longer zeros the entire large
-buffer at DISPATCH_LEVEL. Every newly exposed event slot is fully overwritten
-before its count is published. The IOCTL ABI is unchanged.
-
-## Validation and how to reproduce it
-
-Build with `tools/build.ps1 -Configuration Release`, then run:
-
-```powershell
-.\x64\Release\KnLiveDbg.exe --self-test console
-.\x64\Release\KnLiveDbg.exe --self-test timeline
-.\x64\Release\KnLiveDbg.exe --self-test remote-protocol
-```
-
-The console suite contains independent gates for `kmon-inline-runtime-regression`,
-`kmon-lifecycle-regression`, `pool-pe-window-regression`,
-`kmon-mapper-stub-regression`, `kmon-thread-classification`,
-`kmon-user-memory-regression`, `kmon-dpc-list-regression`,
-`kmon-mapped-section-artifact`, mapper residue, orphan pages, VAD traversal,
-hidden-process views, callback parsing, hive ownership, and KDBG decoding.
-The mapped-section artifact creates an actual anonymous section, samples its
-inert RX bytes, then verifies that the same bytes under read-only protection
-do not qualify. It never executes the bytes.
-
-The final September 16 adversarial-review run passed the Release solution build, 357 console
-checks, 28 timeline checks, and 44 remote-protocol checks. WDK native code
-analysis completed with zero errors and 12 warnings: five intentional raw
-`DRIVER_OBJECT` inspection warnings, six dispatch/DriverEntry annotation
-warnings, and one potential-null warning in resident-range preflight. The last
-site is preceded by canonical-system-range validation; the analyzer does not
-infer that helper's range constraint. This is not a zero-warning analysis claim.
-
-No test driver or protected game was loaded for this run. Actual kernel callback
-redirection, mapper positives, Windows build compatibility, Driver Verifier,
-and game/anti-cheat/JIT false-positive soak remain unverified. Test signing
-produced a signer certificate, but host Authenticode checking returned
-`UnknownError`; build success does not establish driver-load trust.
-Use [the fixture guide](KMON_TEST_TARGET.md) and
-[the manual checklist](MANUAL_TEST_CHECKLIST.md) for the separate live gate.
-
-## Known detection gaps
-
-1. A kernel attacker can alter several in-OS views together. Module/list/PTE
-   agreement from this sensor is not an external ground truth. EPT deception,
-   VTL isolation, DMA/firmware mutation, and a compromised collector need a
-   separate trusted observation source.
-2. Polling can miss short-lived mappings, transient callback changes, NX/RX
-   toggling, and code erased between scans. Finite budgets can also delay
-   coverage while inventories continually change.
-3. Static branch following does not establish semantic integrity of an entire
-   function. Same-image patches, no-op callbacks, dynamic indirect dispatch,
-   obfuscated/import-free code, and register-only continuations may escape.
-   Import slots outside the selected body window may remain unresolved.
-4. Ex callback objects, notification-enable masks, all modern timer/work-item
-   roots, and removal of an already absent callback need additional exact-layout
-   collectors or a trustworthy baseline. This change does not claim them.
-5. User thread-start evidence misses hijacked existing threads, APC/thread-pool
-   execution that retains a normal start address, and fully spoofed stacks.
-   Protected processes and unreadable pages retain coverage gaps.
-6. Signed drivers and executable private/mapped regions can be legitimate.
-   Signatures, path names, entropy, pool tags, and import counts are evidence
-   features, not standalone malware labels. No precision/recall percentage or
-   universal detection claim is supported by the local test suite.
-
-## Research used
-
-- Samuel Tulach, 2024-07-12, [Detecting manually mapped drivers](https://tulach.cc/detecting-manually-mapped-drivers/).
-  Compiler-generated import wrappers motivate header-independent scanning;
-  compiler variation and non-image executable code limit signature-only claims.
-- Microsoft, [No-Execute Nonpaged Pool](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/no-execute-nonpaged-pool).
-  Nonpaged residency alone does not imply executable memory; effective page
-  permissions are checked separately.
-- Intel, [5-Level Paging and 5-Level EPT](https://cdrdv2-public.intel.com/671442/5-level-paging-white-paper.pdf).
-  Canonical address widths and hierarchy depth must match the actual paging mode.
-- Ori Damari, [Dumping DPC Queues](https://repnz.github.io/posts/practical-reverse-engineering/dumping-dpc-queues/).
-  The modern DPC queue representation differs from legacy LIST_ENTRY assumptions.
-- Elastic, 2025-06-12, [Call Stacks: No More Free Passes for Malware](https://www.elastic.co/security-labs/threat-command/call-stacks-no-more-free-passes-for-malware).
-  Callback/proxy execution and stack manipulation motivate corroboration beyond
-  process names and initial thread entry points.
-- Elastic, 2026-03-19, [SILENTCONNECT delivers ScreenConnect](https://www.elastic.co/security-labs/threat-command/silentconnect-delivers-screenconnect).
-  Observed PEB masquerading reinforces checking independent image identity.
-- ESET, 2026-03-19, [EDR killers explained: Beyond the drivers](https://www.welivesecurity.com/en/eset-research/edr-killers-explained-beyond-the-drivers/).
-  Disabling security components involves more than one signed-driver list.
-- Kaspersky, 2026-08-14, [CoolClient backdoor goes deeper: HoneyMyte adds Windows kernel rootkit](https://securelist.com/honeymyte-coolclient-driver-rootkit/121028/).
-  Recent rootkit activity combines process/module hiding with callback and
-  injection mechanisms, supporting multi-view detection rather than names.
-- Microsoft, [VirtualQueryEx](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex)
-  and [NtQueryInformationThread](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntqueryinformationthread).
-  CoW image pages retain their mapping type; working-set sharing and thread
-  start queries are separate observations.
-- Microsoft, [ExAcquireFastMutex](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exacquirefastmutex)
-  and [PsSetCreateProcessNotifyRoutineEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex).
-  These document the APC_LEVEL transition and PASSIVE_LEVEL callback contract.
+공개 연구의 날짜와 출처별 주장 범위는 [연구 ledger](../research/evasion-research-ledger.json)에
+보존한다. 문서 최신화만으로 해당 자료를 새로 조사하거나 외부 검증을 완료한
+것으로 표시하지 않는다.

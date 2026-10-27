@@ -81,17 +81,10 @@ TI ring 자체를 지우려면 `!ti clear`를 별도로 사용한다.
 command-line JSONL export도 주요 표면에서 숨긴다. 분석가 주도 export는 dashboard
 버튼을 사용하고, script에서는 advanced `!timeline export`를 사용한다.
 
-드라이버 파일명을 모르는 게임 핵 커널 드랍/맵/은닉은 `!timeline` 파이어호스 대신
-`!kmon`을 쓴다. `write on` 다음 `!kmon`이면 TI + live collector를 켜고 non-inbox
-드랍, 짧은 생존, 살아 있는 mapped payload(pool PE / unbacked DRIVER_OBJECT /
-kpage PE), unbacked 콜백/입력스택/SSDT 훅, mapper 잔여, 은닉 프로세스,
-Windows 이름 위장(`process.masquerade`), EXE 이미지 영역 바꿔치기
-(`process.hollow`: private/unbacked MEM_IMAGE, mapped-path, stamp/arch,
-builtin COW/.text vs disk, extra PE, ghosting), implant, builtin/drop
-`inject.remote`만 테일한다. `/name`은 게임 overlay inject를 추가한다.
-`/background`는 프롬프트를 점유하지 않고 수집만 켠다. `add`/`remove`는
-수집 중에만 된다. Esc는 프롬프트만 돌리고 수집은 유지한다. `!timeline`은
-증거 그래프/대시보드용으로 남는다. 랩 픽스처는 `docs/KMON_TEST_TARGET.md`.
+지속적인 코드·드라이버 관측은 [KMON](KMON_DETECTION_COVERAGE.md)을 사용한다.
+[대조군 안내](KMON_TEST_TARGET.md)에서 검증 범위와 제한을 확인한다.
+라이브 tail에서 빠져나와도 수집은 계속된다. Timeline은 증거 그래프/대시보드이며,
+수집 손실과 비교 공백은 결과 해석에 계속 반영해야 한다.
 
 ## Scenario: 빠른 triage
 

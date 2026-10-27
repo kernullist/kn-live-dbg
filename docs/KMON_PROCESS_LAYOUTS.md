@@ -1,6 +1,6 @@
 # Kmon 프로세스 메모리 배치 이력
 
-`!kmon`을 `/pid`·`/name` 없이 시작하면 기존 프로세스와 새 프로세스의 가상 메모리 배치를 수집한다. 첫 완전 순회 결과와 최신 결과를 보관하고, 이전 결과와 달라진 할당·상태·보호 속성·매핑 종류를 기록한다. 조사·구현 기준일은 2026-09-20이다.
+현재 v0.0.36의 `!kmon`을 `/pid`·`/name` 없이 시작하면 기존 프로세스와 새 프로세스의 가상 메모리 배치를 수집한다. 첫 완전 순회 결과와 최신 결과를 보관하고, 이전 결과와 달라진 할당·상태·보호 속성·매핑 종류를 기록한다. 아래 연구 자료의 확인일과 실제 실행 결과는 각각의 기록을 따른다.
 
 초기 스냅샷은 **처음 관측한 상태**다. 이미 은닉 코드가 들어간 프로세스를 정상 기준으로 승인하지 않는다. `MEM_IMAGE` 안의 코드가 바뀌면 배치가 그대로일 수 있으므로, 초기·주기적 실행 영역 후보를 기존 이미지·페이지 검증에도 전달한다.
 
@@ -40,7 +40,7 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 미검증 뷰의 수가 아니다. `coverage.image`의 `image_reference_admission_deferred`는
 최대 5초에 한 번 PID·프로세스 생성 시각·파일·이미지 주소와 함께 표본을 기록한다.
 후보 큐 손실 0이나 이름 수집 성공만으로 전체 이미지 검증을 완료했다고 판단하면
-안 된다. [실제 vctip 검증](KMON_VCTIP_VALIDATION_20261024.md)은 이 차이를 재현한다.
+안 된다. [실제 vctip 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_VCTIP_VALIDATION_20261024.md)은 이 차이를 재현한다.
 
 순회를 마친 이미지 작업을 캐시에서 제거해도 원래의 30초 재검사 대기는 최대 4,096개의
 작은 식별자 기록으로 유지한다. 순회 이력은 제거 후 또는 마지막 파일 식별자 확인 후
@@ -71,11 +71,11 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 `image_first_background_turns`, `image_repeat_background_turns`가 실제 선택 횟수다.
 `image_borrowed_background_turns`는 감시 최초 순회 몫에서 빌린 횟수다.
 `image_completion_priority_turns`는 짧은 잔여 구간을 우선한 횟수이며, 실제
-완료 수와는 다르다. [배경 완료·이름 조회 검증](KMON_BACKGROUND_COMPLETION_VALIDATION_20261024.md)을 참고한다.
+완료 수와는 다르다. [배경 완료·이름 조회 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_BACKGROUND_COMPLETION_VALIDATION_20261024.md)을 참고한다.
 `image_bulk_progress_turns`와 이미지별 `bulk_progress_turns`는 진행량 기준으로
-대형 이미지를 선택한 횟수다. [대형 배경·범위 편차 검증](KMON_LARGE_BACKGROUND_VALIDATION_20261024.md)을 참고한다.
+대형 이미지를 선택한 횟수다. [대형 배경·범위 편차 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_LARGE_BACKGROUND_VALIDATION_20261024.md)을 참고한다.
 최종 `coverage.image_progress`의 `prior_traversal_ms`는 스케줄링 이력이며 현재 순회의
-완료 증거는 아니다. [동시 부하 검증](KMON_IMAGE_SCHEDULING_VALIDATION_20261024.md)을 참고한다.
+완료 증거는 아니다. [동시 부하 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_IMAGE_SCHEDULING_VALIDATION_20261024.md)을 참고한다.
 
 감시 프로세스의 최초 레이아웃에서 실행 가능한 private/mapped 영역 또는 읽거나
 해석할 수 없는 이미지 참조를 발견하면 정밀 사용자 검사의 우선 요청을 만든다.
@@ -86,7 +86,7 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 우선 차례 사용 여부다. 우선순위는 탐지 판정이나 검증 완료를 뜻하지 않는다.
 긴 사용자 메모리 검사는 잠금 밖의 레코드 경계에서도 보류 분석에 차례를 준다.
 `user_memory_analysis_yields`는 이 처리 횟수이며, 검사 완료나 성공 바이트를 뜻하지 않는다.
-[커널 캡처·탐지 지연 검증](KMON_CAPTURE_LATENCY_VALIDATION_20261024.md)을 참고한다.
+[커널 캡처·탐지 지연 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_CAPTURE_LATENCY_VALIDATION_20261024.md)을 참고한다.
 
 ## 수집과 비교
 
@@ -152,7 +152,7 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 - 첫 관측과 현재 관측이 같아도 코드 바이트가 같다는 뜻은 아니다. 주기적 실행 영역 후보·이미지 비교를 병행하지만 예산과 대기열 한도 때문에 전체 코드의 즉시 검사로 표현하지 않는다.
 - PPL·종료 경쟁·권한 부족·지원하지 않는 주소 공간 질의는 coverage gap이다. layout 수집기는 이를 우회해 완전 결과를 만들지 않는다. WOW64에도 x64 질의를 사용하되 설정한 주소 상한까지 완료하지 못하면 부분 상태로 남긴다. 기존 드라이버 기반 VAD/PTE 검사는 독립적으로 유지한다.
 - JIT, hotpatch, 정상 모듈 교체·업데이트, 파일 이름 변경은 분석가가 구분해야 한다. 공유 비트나 디스크 파일 하나만으로 정상·악성을 판정하지 않는다.
-- 메모리 PE 헤더의 ImageBase가 디스크 선호 주소·현재 매핑 주소와 모두 다르면, 동일성이 확인된 파일 핸들로 독립 `SEC_IMAGE_NO_EXECUTE` 뷰를 만든다. 독립 뷰의 PE/PDB 식별자·기준 주소가 일치하고 해당 페이지의 모든 재배치 바이트가 디스크 재계산과 일치할 때 그 기준으로 비교한다. 대상 바이트에서 기준을 역산하거나 재배치 슬롯을 제외하지 않는다. 근거가 부족하면 `live_image_relocation_base_ambiguous` 또는 `reference_image_relocation_unverified`로 남긴다. 비교 전후 헤더·파일을 확인하고 순회 도중 기준이 바뀌면 이전 부분 결과를 폐기한다. `coverage.image`와 이미지 진행 기록의 `relocation_base`·`relocation_basis`에서 적용 기준을 확인할 수 있다. [보조 뷰 검증 보고서](KMON_SECONDARY_IMAGE_VALIDATION_20261023.md)를 참고한다.
+- 메모리 PE 헤더의 ImageBase가 디스크 선호 주소·현재 매핑 주소와 모두 다르면, 동일성이 확인된 파일 핸들로 독립 `SEC_IMAGE_NO_EXECUTE` 뷰를 만든다. 독립 뷰의 PE/PDB 식별자·기준 주소가 일치하고 해당 페이지의 모든 재배치 바이트가 디스크 재계산과 일치할 때 그 기준으로 비교한다. 대상 바이트에서 기준을 역산하거나 재배치 슬롯을 제외하지 않는다. 근거가 부족하면 `live_image_relocation_base_ambiguous` 또는 `reference_image_relocation_unverified`로 남긴다. 비교 전후 헤더·파일을 확인하고 순회 도중 기준이 바뀌면 이전 부분 결과를 폐기한다. `coverage.image`와 이미지 진행 기록의 `relocation_base`·`relocation_basis`에서 적용 기준을 확인할 수 있다. [보조 뷰 검증 보고서](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_SECONDARY_IMAGE_VALIDATION_20261023.md)를 참고한다.
 - `clear`는 기존 이벤트 ring을 비운다. layout 기준은 유지한다. `stop` 후 결과를 조회·저장할 수 있으며, 새 세션 시작 시 기준은 초기화된다. 종료된 프로세스의 전체 layout은 메모리에서 제거되므로 필요하면 종료 전에 `/save`한다. 이미 기록한 변화 이벤트는 기존 JSONL에 남는다.
 
 ## 조사 자료와 적용
@@ -165,8 +165,8 @@ PID는 십진수다. `/pid` 없는 `layouts` 출력은 프로세스별 수집 �
 | [Microsoft GetMappedFileNameW](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getmappedfilenamew) | 실제 매핑 이름을 수집한다. 읽지 못한 이름을 “파일 없음”으로 단정하지 않는다. |
 | [hasherezade, Windows 11 24H2 Hollowing, 2025-01-27](https://hshrzd.wordpress.com/2025/01/27/process-hollowing-on-windows-11-24h2/) | 원저자의 실험은 `MEM_PRIVATE`형 RunPE와 `MEM_IMAGE`형 변형의 차이를 보여 준다. PRIVATE 여부를 탐지의 필수 조건으로 두지 않는다. |
 | [Elastic, Call Stacks, 2025-06-12](https://www.elastic.co/security-labs/threat-command/call-stacks-no-more-free-passes-for-malware) | 배치 후보를 기존 실행 참조·메모리 소유권 관측에 연결한다. 스냅샷을 현재 실행 증거로 표시하지 않는다. |
-| [Elastic, Immutable Illusion, 2026-02-20](https://www.elastic.co/security-labs/threat-command/immutable-illusion) | 파일 불변성 가정의 실패를 다룬 최신 연구다. 현재 파일 식별자 일치를 서명 신뢰나 최초 section 출처의 증명으로 확장하지 않는다. 이 변경이 FFI 전용 검출기라는 주장은 하지 않는다. |
+| [Elastic, Immutable Illusion, 2026-02-20](https://www.elastic.co/security-labs/threat-command/immutable-illusion) | 파일 불변성 가정의 실패를 다룬다. 현재 파일 식별자 일치를 서명 신뢰나 최초 section 출처의 증명으로 확장하지 않는다. 이 변경이 FFI 전용 검출기라는 주장은 하지 않는다. |
 | [Herpaderping 원저자 분석, 2020](https://github.com/jxy-s/herpaderping) | section 생성 시점과 디스크 내용·프로세스 알림 시점이 어긋날 수 있다. 최초 layout을 정상으로 간주하지 않고 이미지 검증을 수행한다. |
 | [Elastic Process Ghosting, 2021](https://www.elastic.co/blog/process-ghosting-a-new-executable-image-tampering-attack), [Microsoft PS_CREATE_NOTIFY_INFO](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_ps_create_notify_info) | 파일 객체와 생성 시점 근거가 있어야 정확한 기법 해석이 가능하다. 이번 주기적 사용자 모드 관측의 경계를 명시한다. |
 
-검증 명령은 `tools/validate-process-layout.ps1 -Sanitize`와 `-Configuration Debug`다. 합성 구간 오라클과 소유한 메모리·자식 프로세스·비실행 이미지 매핑을 사용한다. 기존 [검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_PROCESS_LAYOUT_VALIDATION_20260920.md)과 실제 드라이버를 실행한 [전체 프로세스 큐 검증](KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md)을 구분한다. 후자는 이 테스트 PC에서의 결과이며 실게임핵·다른 PC의 동작 검증을 대신하지 않는다.
+검증 명령은 `tools/validate-process-layout.ps1 -Sanitize`와 `-Configuration Debug`다. 합성 구간 오라클과 소유한 메모리·자식 프로세스·비실행 이미지 매핑을 사용한다. 기존 [검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_PROCESS_LAYOUT_VALIDATION_20260920.md)과 실제 드라이버를 실행한 [전체 프로세스 큐 검증](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/docs/KMON_ALL_PROCESS_LAYOUT_VALIDATION_20261023.md)을 구분한다. 후자는 이 테스트 PC에서의 결과이며 실게임핵·다른 PC의 동작 검증을 대신하지 않는다.

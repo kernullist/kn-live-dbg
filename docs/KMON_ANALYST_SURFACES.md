@@ -1,6 +1,9 @@
 # Kmon callback 조사와 스냅샷 비교
 
-이 문서는 v0.0.33 이후 `main`에 추가한 기능을 설명한다. 조사 기준일은 2026-09-20이다. `!kmon surfaces`는 프로세스의 TLS 콜백, KernelCallbackTable 후보, WorkerFactory 시작 루틴을 읽는다. `!kmon cases`에는 기존 코드·페이지 검증을 거친 조사 단서가 들어간다. 두 결과 모두 JSON으로 보존하고 `!kmon diff`로 비교할 수 있다.
+현재 v0.0.36의 `!kmon surfaces`는 프로세스의 TLS 콜백, KernelCallbackTable 후보,
+WorkerFactory 시작 루틴을 읽는다. `!kmon cases`에는 코드·페이지 검증을 거친
+조사 단서가 들어간다. 두 결과 모두 JSON으로 보존하고 `!kmon diff`로 비교한다.
+아래 연구 자료의 확인 기준일은 2026-09-20이며 문서 정리가 이를 갱신하지 않는다.
 
 ## 조사 근거와 구현 선택
 
@@ -99,4 +102,4 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 ```
 
-하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실환경 커널·VM·게임핵 검증은 사용자가 별도로 수행한다.
+하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실호스트 대조군과 별도 미검증 범위는 [검증 현황](VALIDATION.md)에서 구분한다.

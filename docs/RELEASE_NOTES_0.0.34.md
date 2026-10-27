@@ -40,9 +40,9 @@ Actual kernel-driver loading, live remote GUI operation, real game-cheat trials 
 
 Detailed behavior and review evidence:
 
-- [Callback inspection and snapshots](KMON_ANALYST_SURFACES.md) and [analyst review](KMON_ANALYST_REVIEW_20260920.md).
-- [Process layout history](KMON_PROCESS_LAYOUTS.md) and [layout validation](KMON_PROCESS_LAYOUT_VALIDATION_20260920.md).
-- [False-positive causes and follow-up fixes](KMON_FALSE_POSITIVE_AUDIT_20260920.md).
-- [Help and completion audit](HELP_COMPLETION_AUDIT_20260920.md).
+- [Callback inspection and snapshots](KMON_ANALYST_SURFACES.md) and [analyst review](https://github.com/kernullist/kn-live-dbg/blob/v0.0.34/docs/KMON_ANALYST_REVIEW_20260920.md).
+- [Process layout history](KMON_PROCESS_LAYOUTS.md) and [layout validation](https://github.com/kernullist/kn-live-dbg/blob/v0.0.34/docs/KMON_PROCESS_LAYOUT_VALIDATION_20260920.md).
+- [False-positive causes and follow-up fixes](https://github.com/kernullist/kn-live-dbg/blob/v0.0.34/docs/KMON_FALSE_POSITIVE_AUDIT_20260920.md).
+- [Help and completion audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.34/docs/HELP_COMPLETION_AUDIT_20260920.md).
 
 [Full comparison: v0.0.33...v0.0.34](https://github.com/kernullist/kn-live-dbg/compare/v0.0.33...v0.0.34)

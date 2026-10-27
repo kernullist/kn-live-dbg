@@ -163,7 +163,7 @@ Command failures propagate as error frames with a code such as `command-failed`,
 
 While waiting for the engine, the server continues reading control frames. Protocol `cancel` removes a queued request and returns `cancelled`; if dispatch has started, it returns `not-cancelable`. Disconnect and listener stop also remove queued work, so abandoned commands cannot execute later. Running commands continue to completion. The shipped client waits synchronously for each result and does not bind Ctrl+C to an in-flight `cancel` request.
 
-`ai` from B is allowed. On a box with provider keys, prefer `KNLIVEDBG_AI_REMOTE_POLICY=local-only` if B should not spend those keys.
+`ai` from B uses A's provider configuration. `local-only` blocks KnLiveDbg HTTP calls, but an external CLI may still use the network, and an authorized operator can change AI settings. It is not a separate credential-access boundary.
 
 ---
 
@@ -188,7 +188,7 @@ The protocol also defines `completion-request` for a server-side pass. The shipp
 - Any IPv4 peer is accepted (Tailscale `100.x`, Hamachi, public, RFC1918). Pin a single client with `--peer` if needed.
 - Auth lockout lasts for the listener session: 5 failures per peer IP, 15 global, then new auth is refused until `remote off` and a new `remote on`.
 - `mcp on` while remote is up (or the reverse) fails: `listen XOR`.
-- Isolated lab segment only. Shared office LAN / internet: do not bind `0.0.0.0`. Use `--loopback` plus `ssh -L 51767:127.0.0.1:51767` if the wire must be encrypted. TLS is v2 (Appendix A of the design doc), not this build.
+- Isolated lab segment only. Shared office LAN / internet: do not bind `0.0.0.0`. Use `--loopback` plus `ssh -L 51767:127.0.0.1:51767` if the wire must be encrypted. Authenticated encrypted transport remains open work; see [the roadmap](FEATURE_PLAN.md).
 
 ---
 
@@ -214,7 +214,7 @@ Driver-free checks (no live kernel):
 .\tools\validate-remote-protocol.ps1 -Configuration Release
 ```
 
-That runs `KnLiveDbg.exe --self-test remote-protocol` (52 checks) and `--self-test connect-argv` (4 checks): framing/auth, deny-list, strict argv, local completion, queued cancellation, and listener stop while a job is pending. **Both suites are included in `--self-test all`.** Run configurations sequentially because the fixture uses `127.0.0.1:51767`. It does not load a driver or add firewall rules. See the [command audit](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/COMMAND_AUDIT_20260919.md) for the verified Release/Debug results and live-test limits.
+That runs `KnLiveDbg.exe --self-test remote-protocol` and `--self-test connect-argv`: framing/auth, deny-list, strict argv, local completion, queued cancellation, and listener stop while a job is pending. **Both suites are included in `--self-test all`.** Run configurations sequentially because the fixture uses `127.0.0.1:51767`. It does not load a driver or add firewall rules. See [validation status](VALIDATION.md) for dated results and live-test limits.
 
 Same-box smoke (A elevated, driver loaded):
 

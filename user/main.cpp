@@ -1700,8 +1700,8 @@ static std::vector<std::wstring> Split(const std::wstring& line, bool* complete 
 {
     // Whitespace-delimited tokenizer with double-quote support. We only
     // recognise '"' as a quote character, matching CMD/PowerShell convention
-    // -- this keeps unquoted paths containing apostrophes (e.g. C:\Users\O'
-    // Brien\foo.bin) intact rather than swallowing everything from the
+    // -- this keeps unquoted paths containing apostrophes intact
+    // rather than swallowing everything from the
     // apostrophe onward. Quotes can begin and end mid-token, so the input
     // --path="C:\Program Files\foo" yields a single token
     // --path=C:\Program Files\foo. A token may mix quoted and unquoted

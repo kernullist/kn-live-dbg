@@ -88,17 +88,10 @@ Command-line JSONL export is also kept out of the main surface. Use the
 dashboard export button for analyst-driven export, or advanced `!timeline export`
 for scripts.
 
-For unknown kernel cheat drops (no driver filename), use `!kmon` instead of
-staring at the TI firehose. Bare `!kmon` arms the same TI + live collectors and
-tails only non-inbox drops, short-lived loads, live mapped payloads (pool PE /
-unbacked DRIVER_OBJECT / kpage PE), unbacked callbacks/input/SSDT hooks,
-mapper leftovers, hidden processes, Windows-named masquerade, EXE-region
-replace (`process.hollow`: private/unbacked MEM_IMAGE, mapped-path, stamp/arch,
-builtin COW/.text vs disk, extra PE, ghosting), implants, and builtin/drop
-`inject.remote`. `/name` adds overlay-style inject. `/background` arms without
-occupying the prompt. `add`/`remove` only while collecting. Esc detaches the
-tail; collection keeps running. `!timeline` remains the evidence graph/dashboard.
-Lab fixture: `docs/KMON_TEST_TARGET.md`.
+For continuous code and driver observations use [KMON](KMON_DETECTION_COVERAGE.md).
+Its [fixture guide](KMON_TEST_TARGET.md) documents controls and remaining scope.
+Detaching a live tail does not stop collection. Timeline remains the evidence
+graph/dashboard; collection and comparison gaps remain visible.
 
 ## Scenario: Fast Triage
 
