@@ -1,6 +1,6 @@
 # Documentation
 
-Current implementation baseline: **v0.0.36 / af8f2d0**. Documentation reviewed
+Current implementation baseline: **v0.0.36 / 6646461**. Documentation reviewed
 against that source on **2026-10-27**. This review updates documentation; it is
 not a new live-host test or release.
 

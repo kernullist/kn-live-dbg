@@ -1,6 +1,6 @@
 # Validation status
 
-The released baseline is **v0.0.36 / af8f2d0**. The latest recorded runtime
+The released baseline is **v0.0.36 / 6646461**. The latest recorded runtime
 validation is **2026-10-25**; the **2026-10-27** documentation review does not
 renew those observations. Follow the [manual checklist](MANUAL_TEST_CHECKLIST.md)
 to validate another binary or host.
@@ -58,6 +58,18 @@ The released ZIP and manifest identify distributed files independently.
 - Earlier Fast I/O/process-read gaps and WinHTTP Event-handle retention are not
   closed by the release. Runner cleanup does not cover supervisor termination
   or an OS stop.
+
+## Git history maintenance
+
+On **2026-10-27**, repository branches and tags were rewritten to remove
+developer-local path strings. The v0.0.36 source tag now resolves to
+`6646461422125290ade00c74ce5e3e07d617e3a7`. Historical report titles and recorded
+`base_commit` / `base_revision` values retain their original identifiers from
+before the rewrite. Runtime results and binary hashes were not regenerated,
+and published release assets are unchanged.
+
+Use a fresh clone, or rebase local changes onto the rewritten history.
+Merging the old history back would restore the removed content.
 
 ## Historical reports
 
