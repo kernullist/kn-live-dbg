@@ -112,6 +112,7 @@ void KernelMonitor::ResetPipeline()
     CollectedLive.Reset();
     PriorityCaptures.Reset();
     ContinuedCaptures.Reset();
+    CaptureTimings.Reset();
     CapturedPages.Reset();
     CapturedEvidenceBundles.Reset();
     EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
@@ -343,6 +344,7 @@ bool KernelMonitor::QueueCapture(const std::wstring& role, uint64_t address, uin
     request.Address = address;
     request.Size = (std::min<uint64_t>)(size, 16 * 1024 * 1024);
     request.SubmittedMs = GetTickCount64();
+    request.QueuedMs = request.SubmittedMs;
     request.EventTimestamp = eventTimestamp;
     request.MappingGeneration = mappingGeneration;
     request.RootCr3 = rootCr3;
@@ -423,7 +425,11 @@ uint64_t KernelMonitor::QueueCapturedBytes(const std::wstring& role, uint64_t ad
 void KernelMonitor::CaptureLoop()
 {
     CaptureWorkerDone.store(false);
-    size_t priorityBurst = 0;
+    KmonCapturePicker picker;
+    const auto timestamps = [](const CaptureRequest& work)
+    {
+        return std::make_pair(work.QueuedMs, work.SubmittedMs);
+    };
     CaptureRequest immediate;
     bool haveImmediate = false;
     size_t quantumPages = 0;
@@ -490,19 +496,23 @@ void KernelMonitor::CaptureLoop()
         {
             quantumPages = 1;
         }
-        if (!present && priorityBurst >= 8)
-        {
-            present = ContinuedCaptures.Pop(&work);
-            priorityBurst = 0;
-        }
         if (!present)
         {
-            present = PriorityCaptures.Pop(&work);
-            ++priorityBurst;
-        }
-        if (!present)
-        {
-            present = ContinuedCaptures.Pop(&work);
+            const auto now = GetTickCount64();
+            const auto kind = picker.Pick(PriorityCaptures.Timing(now, timestamps), ContinuedCaptures.Timing(now, timestamps));
+            if (kind == KmonCaptureClass::Continued)
+            {
+                present = ContinuedCaptures.Pop(&work);
+            }
+            else if (kind == KmonCaptureClass::First)
+            {
+                present = PriorityCaptures.Pop(&work);
+            }
+            if (present)
+            {
+                picker.Dispatched(kind);
+                CaptureTimings.Dispatch(kind, work.QueuedMs, GetTickCount64(), CaptureStopping.load());
+            }
         }
         if (!present)
         {
@@ -510,6 +520,10 @@ void KernelMonitor::CaptureLoop()
             continue;
         }
         bool success = false;
+        const bool firstAttempt = work.Offset == 0;
+        bool attempted = false;
+        bool shutdownAttempt = false;
+        uint64_t attemptStarted = 0;
         bool fatal = false;
         bool unreadable = false;
         bool discardableUnreadable = false;
@@ -549,6 +563,9 @@ void KernelMonitor::CaptureLoop()
             page.Context.Source = L"priority_capture";
             page.Context.Timestamp = ObservationFileTime();
             page.Context.MonotonicMs = GetTickCount64();
+            attempted = true;
+            attemptStarted = page.Context.MonotonicMs;
+            shutdownAttempt = CaptureStopping.load();
             page.RequestAgeAtReadStartMs = page.Context.MonotonicMs - work.SubmittedMs;
             page.Context.Coverage.Attempted = true;
             if (work.RootCr3 != 0)
@@ -773,6 +790,10 @@ void KernelMonitor::CaptureLoop()
             fatal = true;
             reason = L"capture_exception";
         }
+        if (attempted)
+        {
+            CaptureTimings.Attempt(work.SubmittedMs, attemptStarted, GetTickCount64(), firstAttempt, success, shutdownAttempt);
+        }
         if (!success)
         {
             if (unreadable)
@@ -807,6 +828,7 @@ void KernelMonitor::CaptureLoop()
                 CaptureKernelContinuations.fetch_add(1);
                 continue;
             }
+            work.QueuedMs = GetTickCount64();
             if (ContinuedCaptures.Push(work))
             {
                 continue;
@@ -1049,6 +1071,13 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"analysis_pending"] = std::to_wstring(CollectedTi.Size() + CollectedLive.Size());
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
+        const auto captureNow = GetTickCount64();
+        const auto captureTimestamps = [](const CaptureRequest& work)
+        {
+            return std::make_pair(work.QueuedMs, work.SubmittedMs);
+        };
+        event.Evidence[L"capture_scheduling_json"] = KmonCaptureTimingJson(CaptureTimings.Snapshot(),
+            PriorityCaptures.Timing(captureNow, captureTimestamps), ContinuedCaptures.Timing(captureNow, captureTimestamps));
         event.Evidence[L"persistence_queue_dropped"] = std::to_wstring(CapturedPages.Loss());
         event.Evidence[L"diagnostic_queue_dropped"] = std::to_wstring(PipelineEvents.Loss());
         event.Evidence[L"diagnostic_queue_peak"] = std::to_wstring(PipelineEvents.Peak());
@@ -1190,6 +1219,98 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         RecordEvent(std::move(event));
         NextPipelineStatusMs = now + 5000;
     }
+}
+
+bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    auto memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    const auto release = [](void* address)
+    {
+        if (address != nullptr)
+        {
+            VirtualFree(address, 0, MEM_RELEASE);
+        }
+    };
+    const std::unique_ptr<void, decltype(release)> owner(memory, release);
+    bool ok = false;
+    KmonCaptureTimingStats normal, shutdown;
+    do
+    {
+        if (memory == nullptr)
+        {
+            break;
+        }
+        std::memset(memory, 0x31, 8 * 4096);
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(memory + 4096, 4096, PAGE_NOACCESS, &oldProtection) ||
+            !VirtualProtect(memory + 2 * 4096, 4096, PAGE_READWRITE | PAGE_GUARD, &oldProtection))
+        {
+            break;
+        }
+        const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+        KernelMonitor monitor;
+        if (!monitor.QueueCapture(L"owned_scheduler_large", reinterpret_cast<uint64_t>(memory), 6 * 4096,
+                identity, 0, nullptr) ||
+            !monitor.QueueCapture(L"owned_scheduler_small", reinterpret_cast<uint64_t>(memory + 7 * 4096), 4096,
+                identity, 0, nullptr))
+        {
+            break;
+        }
+        monitor.CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, &monitor);
+        const auto started = GetTickCount64();
+        while (monitor.CaptureTraversed.load() != 2 && GetTickCount64() - started < 3000)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        monitor.CaptureStopping.store(true);
+        monitor.CaptureWorker.join();
+        normal = monitor.CaptureTimings.Snapshot();
+        MEMORY_BASIC_INFORMATION guarded{};
+        ok = monitor.CaptureTraversed.load() == 2 && monitor.CaptureReadBytes.load() == 5 * 4096 &&
+            monitor.CaptureUnreadableBytes.load() == 2 * 4096 && monitor.CaptureReadFailedBytes.load() == 0 &&
+            monitor.CapturedPages.Size() == 5 && normal.FirstQueueWait.Samples == 2 &&
+            normal.ContinuedQueueWait.Samples == 5 && normal.FirstAttemptAge.Samples == 2 &&
+            normal.PageService.Samples == 7 && normal.FailedAttempts == 2 && normal.InvalidClocks == 0 &&
+            normal.ShutdownDispatches == 0 && normal.ShutdownAttempts == 0 &&
+            VirtualQuery(memory + 2 * 4096, &guarded, sizeof(guarded)) == sizeof(guarded) &&
+            (guarded.Protect & PAGE_GUARD) != 0;
+        KernelMonitor draining;
+        if (!draining.QueueCapture(L"owned_scheduler_shutdown", reinterpret_cast<uint64_t>(memory), 4096, identity, 0, nullptr))
+        {
+            ok = false;
+            break;
+        }
+        draining.CaptureStopping.store(true);
+        draining.CaptureLoop();
+        shutdown = draining.CaptureTimings.Snapshot();
+        ok = ok && shutdown.ShutdownDispatches == 1 && shutdown.ShutdownAttempts == 1 &&
+            shutdown.FirstQueueWait.Samples == 0 && shutdown.PageService.Samples == 0 && draining.CapturedPages.Size() == 1;
+        // Exercise kernel scheduling with an explicitly absent device. No kernel
+        // read can succeed, but the existing four-page quantum must survive.
+        KernelMonitor unavailable;
+        const auto kernelIdentity = ObserveProcessIdentity(0);
+        if (!unavailable.QueueCapture(L"owned_unavailable_kernel_large", 0xFFFF900000001000ull,
+                9 * 4096, kernelIdentity, 0, nullptr) ||
+            !unavailable.QueueCapture(L"owned_unavailable_kernel_small", 0xFFFF900000020000ull,
+                4096, kernelIdentity, 0, nullptr))
+        {
+            ok = false;
+            break;
+        }
+        unavailable.CaptureStopping.store(true);
+        unavailable.CaptureLoop();
+        const auto kernelStats = unavailable.CaptureTimings.Snapshot();
+        ok = ok && unavailable.CaptureTraversed.load() == 2 && unavailable.CaptureKernelContinuations.load() == 6 &&
+            unavailable.CaptureReadFailedBytes.load() == 10 * 4096 && unavailable.CapturedPages.Size() == 0 &&
+            kernelStats.ShutdownAttempts == 10 && kernelStats.ShutdownDispatches == 4 && kernelStats.PageService.Samples == 0;
+    } while (false);
+    if (diagnostics != nullptr)
+    {
+        *diagnostics = L"{\"schema\":\"kn.capture_scheduler_test.v1\",\"passed\":" + std::wstring(ok ? L"true" : L"false") +
+            L",\"corpus\":\"owned_process_and_absent_device\",\"driver_loaded\":false,\"normal\":" + KmonCaptureTimingJson(normal, {}, {}) +
+            L",\"shutdown\":" + KmonCaptureTimingJson(shutdown, {}, {}) + L"}";
+    }
+    return ok;
 }
 
 bool KmonPipelineSelfTest()

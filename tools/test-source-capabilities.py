@@ -44,6 +44,7 @@ def main():
     assert "exact_reference_blob" in by_key[("image", "replay_verification", "recipe")]["requirements"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     assert "claim_specific_requirements" in by_key[("proof", "image_range", "recipe")]["requirements"]
+    assert "no_hard_deadline_or_measured_slo" in by_key[("scheduler", "capture_timing", "native")]["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

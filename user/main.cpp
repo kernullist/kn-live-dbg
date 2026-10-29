@@ -53279,7 +53279,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
         std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
-        std::wcout << L"            connect-argv, all, platform-query, cloudfiles-query <path>,\n";
+        std::wcout << L"            connect-argv, capture-scheduler, all, platform-query, cloudfiles-query <path>,\n";
         std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
         PrintHelp(argc >= 3 && ToLower(argv[2]) == L"all");
@@ -53311,6 +53311,13 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
     {
+        if (argc == 3 && ToLower(argv[2]) == L"capture-scheduler")
+        {
+            std::wstring diagnostics;
+            const bool passed = KmonCaptureSchedulingIntegrationSelfTest(&diagnostics);
+            std::wcout << diagnostics << L"\n";
+            return passed ? 0 : 1;
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"timeline")
         {
             return RunTimelineSelfTest();
@@ -53398,7 +53405,7 @@ int wmain(int argc, wchar_t** argv)
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
         return 2;
     }
 

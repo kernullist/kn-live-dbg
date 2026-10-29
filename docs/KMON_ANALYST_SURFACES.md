@@ -162,6 +162,19 @@ KnLiveDbg.exe --offline !kmon replay-image <directory> /current /json
 
 발견·주소·시간·의미·보존·재생·신뢰 항목은 각각 별도로 출력한다. 같은 바이트를 두 번 읽어 주소 coverage를 늘리지 않으며, 덤프 읽기의 수집 시간으로 대상 실행 시간이나 연속 관측을 계산하지 않는다. 제외 범위는 남겨 두고, 확인된 차이도 악성·변경 주체·승인된 변경·전체 이미지 무결성을 자동 입증하지 않는다.
 
+## 캡처 큐의 대기와 처리 시간
+
+`coverage.pipeline`의 `capture_scheduling_json`은 별도로 파싱할 수 있는 JSON 문자열이다. 첫 캡처·이어 읽기 큐의 대기 시간, 원래 요청의 age, 첫 시도까지의 시간, 페이지 처리 시간을 구분한다. P50/P95/P99는 log2 구간의 상한값이고 `max_ms`는 실제 최댓값이며, `samples=0`은 측정값이 없다는 뜻이다. 실패한 시도는 처리 시간 표본에 포함하고 종료 중 시작한 작업은 별도 집계한다.
+
+기본 긴급도 기준은 첫 캡처 250ms, 이어 읽기 1,000ms다. 이는 측정된 SLO나 강제 중단 제한이 아니다. 오래 기다린 이어 읽기가 먼저 처리될 수 있지만, 두 큐에 작업이 있을 때 첫 캡처는 최대 8회, 이어 읽기는 최대 1회 연속 선택한다. 커널 캡처의 기존 4페이지 단위는 유지한다. `scope_saturated`는 이 두 요청 큐의 용량 포화만 나타내며 전체 원본 수집·쓰기 완료를 뜻하지 않는다.
+
+다음 명령은 자체 프로세스의 메모리와 장치가 없는 경로로 worker를 시험한다. 드라이버를 로드하지 않는다.
+
+```powershell
+.\x64\Release\KnLiveDbg.exe --self-test capture-scheduler
+python tools/test-capture-scheduling-cli.py --exe x64/Release/KnLiveDbg.exe
+```
+
 ## 검증
 
 ```powershell

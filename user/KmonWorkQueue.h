@@ -6,6 +6,15 @@
 #include <mutex>
 #include <vector>
 
+struct KmonQueueTiming
+{
+    size_t Pending = 0;
+    size_t Capacity = 0;
+    uint64_t OldestQueueWaitMs = 0;
+    uint64_t OldestRequestAgeMs = 0;
+    size_t InvalidClocks = 0;
+};
+
 template<typename T>
 class KmonWorkQueue
 {
@@ -111,6 +120,29 @@ public:
     {
         std::lock_guard<std::mutex> lock(Mutex);
         return Items.size();
+    }
+
+    // The projection returns queue-admission and original-request timestamps.
+    // It must be bounded, nonblocking, and must not call back into this queue.
+    template<typename Timestamps>
+    KmonQueueTiming Timing(uint64_t now, Timestamps timestamps) const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        KmonQueueTiming timing;
+        timing.Pending = Items.size();
+        timing.Capacity = Capacity;
+        for (const auto& item : Items)
+        {
+            const auto times = timestamps(item);
+            if (times.first > now || times.second > times.first)
+            {
+                ++timing.InvalidClocks;
+                continue;
+            }
+            timing.OldestQueueWaitMs = (std::max)(timing.OldestQueueWaitMs, now - times.first);
+            timing.OldestRequestAgeMs = (std::max)(timing.OldestRequestAgeMs, now - times.second);
+        }
+        return timing;
     }
 
     // A sole producer can use this as a source read budget. Concurrent

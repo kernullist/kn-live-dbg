@@ -45,6 +45,14 @@ claims, unmet requirements, evidence references and separate coverage ledgers.
 Failed replay returns `proof=null`. A supported comparison claim proves neither
 execution nor maliciousness; see [image proof](ARCHITECTURE.md#claim-specific-image-proof).
 
+`KnLiveDbg.exe --self-test capture-scheduler` runs the capture worker using owned
+process memory and an absent kernel device. It emits JSON and exits 0 on success
+or 1 on failure; extra arguments return 2. No driver is loaded. Runtime
+`coverage.pipeline` events expose queue/service distributions through the
+`capture_scheduling_json` evidence field. Quantiles are bucket upper bounds,
+and urgency thresholds are not latency guarantees. See
+[capture scheduling](ARCHITECTURE.md#capture-scheduling-and-latency).
+
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
 DIA provider. Names are case-sensitive. It opens no live device and downloads no

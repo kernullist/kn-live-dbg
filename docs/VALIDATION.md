@@ -7,6 +7,32 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Capture scheduling checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`b2dcf028b9024f3a9c7ed5fb8e85a6bcf9d9bf70d716f8a960721ca475df15da`.
+The core ASan harness passed 130 capture scheduling controls, including class
+fairness, urgency selection, exact percentile bucket boundaries, clock reversal,
+concurrent metrics, shutdown separation, completed fixed cohorts and incomplete
+churning cohorts. Existing verifier/core controls and hunting 11,345, pages 54
+and false-positive controls 49 also passed.
+
+The public capture scheduler CLI passed 23 checks. Its actual worker uses owned
+process memory with guard/no-access pages: two first dispatches, five continued
+dispatches, seven page attempts and two protected-page failures. The guard
+remained set. A separate shutdown attempt did not enter normal distributions.
+With an explicitly absent device, two kernel requests retained their four-page
+quantum: ten unavailable page attempts, four queue dispatches and six immediate
+continuations. No kernel read succeeded and no driver was loaded.
+
+Release build and driver-free checks passed: timeline 28, MCP 89, console 558,
+commands 2,998, remote 66 and connect arguments; capabilities 18 selected
+contracts/261 routes. Publication-scanner tests passed 10 tests. Logs are under
+`.build/architecture/w08-capture-*`; existing compiler/LTCG warnings remain.
+The 250/1,000 ms values are scheduling urgency thresholds, not measured SLOs.
+Real fixed/churning workloads, current six/thirteen-control runs and other
+image/reference/layout schedulers still need their own validation.
+
 ## Image proof checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

@@ -12,6 +12,7 @@
 #include "AnalystSnapshot.h"
 #include "EvidenceBundle.h"
 #include "KmonWorkQueue.h"
+#include "KmonCaptureScheduling.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -359,6 +360,7 @@ private:
     void InvalidateInlinePatchConfirmations() noexcept;
     bool ScanCallbackInlineTargets(const std::vector<KernelCallbackRecord>& records);
     friend bool KmonPipelineSelfTest();
+    friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     void WorkerLoop();
     void CollectorLoop();
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
@@ -563,6 +565,7 @@ private:
         uint64_t Size = 0;
         uint64_t Offset = 0;
         uint64_t SubmittedMs = 0;
+        uint64_t QueuedMs = 0;
         uint64_t EventTimestamp = 0;
         uint64_t MappingGeneration = 0;
         uint64_t RootCr3 = 0;
@@ -609,6 +612,7 @@ private:
     KmonWorkQueue<TimelineEvent> CollectedLive{2048};
     KmonWorkQueue<CaptureRequest> PriorityCaptures{256};
     KmonWorkQueue<CaptureRequest> ContinuedCaptures{256};
+    KmonCaptureTimings CaptureTimings;
     KmonWorkQueue<CapturedPage> CapturedPages{512};
     KmonWorkQueue<KmonEvent> PipelineEvents{512};
     KmonWorkQueue<ExecutableRegionObservation> CapturedRegions{2048};
@@ -1422,3 +1426,4 @@ const wchar_t* KmonResidualSignalKindName(KmonResidualSignalKind kind);
 bool KernelMonitorMapperPoolSelfTest();
 
 bool KmonPipelineSelfTest();
+bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

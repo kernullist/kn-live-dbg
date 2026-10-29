@@ -362,6 +362,46 @@ hashes to every typed observation, supported-build fixture attestations and
 broker isolation remain open. Files and renamed JSON packages are excluded from
 public source publication by the repository's sensitive-content gate.
 
+## Capture scheduling and latency
+
+The capture worker preserves its bounded first/continuation queues and the
+four-page kernel quantum. It now chooses between queue classes using oldest
+queue wait and urgency thresholds of 250 ms for first capture and 1,000 ms for
+continuations. A more overdue continuation can borrow an earlier turn. While
+both queues are pending, first captures get at most eight consecutive dispatches
+and continuations at most one. These are dispatch bounds; a kernel dispatch can
+retain its existing four-page quantum. FIFO order within each queue remains.
+The thresholds are initial scheduling policy, not measured SLOs or hard
+deadlines, and should be evaluated against the intended workload.
+
+Each continuation updates its queue-admission time while retaining the original
+request time. `coverage.pipeline` carries `capture_scheduling_json`, a JSON
+string with schema `kn.capture_scheduling.v1`. It reports pending counts,
+capacity saturation, oldest queue wait and oldest request age separately.
+Saturation refers only to the first/continuation request queues, not the writer
+queue or the coverage of the whole pipeline.
+Dispatched first/continuation queue waits, first-attempt age, and page-service
+duration have sample counts, exact maxima and log2-bucket P50/P95/P99 upper
+bounds. Service includes identity/protection checks and capture admission;
+it is not just the memory-copy API duration. Failed attempts remain in the
+normal service sample population. Acquisition uses `GetTickCount64` and does
+not subtract unrelated event wall-clock timestamps.
+
+Dispatches and attempts started during shutdown have separate counters and do
+not enter normal latency distributions. Invalid clock order is reported instead
+of underflowing an age. Immediate pages within the kernel quantum are service
+attempts but are not extra queue dispatches. The worker still cannot preempt a
+synchronous kernel/file call, and no real six/thirteen-control or environment
+latency target has been validated by the synthetic scheduler tests.
+
+`--self-test capture-scheduler` runs the actual capture worker against owned
+user memory, including guard/no-access pages, and an explicitly absent device.
+It verifies queue/service accounting, shutdown separation and preservation of
+the kernel quantum without loading a driver. The core ASan harness additionally
+checks percentile bounds, concurrency, fixed cohorts and sustained churn.
+Image/reference/layout scheduling and generic deadline/dependency propagation
+remain separate work.
+
 ## Exact image reference replay
 
 `--offline !kmon verify-image` now connects the dump observation source to the
