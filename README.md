@@ -9,6 +9,12 @@ Download the Release x64 ZIP and `SHA256SUMS.txt` together.
 The [release notes](docs/RELEASE_NOTES_0.0.36.md) describe the shipped changes,
 signer, validation, and limitations. The main user/kernel ABI is **17**.
 
+The `main` branch also includes retained KMON evidence with driver-free offline
+queries, replay and explanations, plus reference-scheduling and TI queue fixes.
+These changes are newer than v0.0.36. See the [current guides](docs/README.md) and
+[development validation](docs/VALIDATION.md#reference-watch-and-ti-queue-review-2026-10-29)
+for their scope and remaining gaps.
+
 ## Start here
 
 1. Extract the entire package on a Windows x64 lab machine configured to load

@@ -1,6 +1,8 @@
 # Kmon callback 조사와 스냅샷 비교
 
-현재 v0.0.36의 `!kmon surfaces`는 프로세스의 TLS 콜백, KernelCallbackTable 후보,
+이 가이드는 [문서 인덱스](README.md)의 main 구현을 기준으로 한다.
+출시본 v0.0.36 이후의 보존 증거·오프라인 조사 기능도 포함한다.
+`!kmon surfaces`는 프로세스의 TLS 콜백, KernelCallbackTable 후보,
 WorkerFactory 시작 루틴을 읽는다. `!kmon cases`에는 코드·페이지 검증을 거친
 조사 단서가 들어간다. 두 결과 모두 JSON으로 보존하고 `!kmon diff`로 비교한다.
 아래 연구 자료의 확인 기준일은 2026-09-20이며 문서 정리가 이를 갱신하지 않는다.

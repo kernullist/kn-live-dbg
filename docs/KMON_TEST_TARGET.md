@@ -159,8 +159,9 @@ examined visits from unexamined events and completed thread inventories; it
 reports first-visit delay and the largest gap, including both window edges.
 These visits do not establish complete APC/callback coverage or execution.
 The driver-free counterexamples run with
-`powershell -NoProfile -File tools/test-kmon-reference-coverage.ps1`.
-It refuses an existing KnLiveDbg service and keeps its creation-time process
+`powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-kmon-reference-coverage.ps1`.
+The execution-policy option applies only to that process running the repository test.
+The live runner refuses an existing KnLiveDbg service and keeps its creation-time process
 handle across the console's PPL transition. A timeout, missing expected event,
 early child exit or fallback service cleanup fails the run.
 

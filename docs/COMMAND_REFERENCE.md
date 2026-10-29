@@ -110,17 +110,21 @@ a highlight, not an exclusive collection filter. Starting KMON can configure
 TI, process logging and live callbacks, so it requires the applicable write
 and collection prerequisites.
 
-Name/PID watches prioritize activity. With no named layout restriction,
-full-process layout discovery rotates across the host. This is still bounded
-work; every image and page need not finish within a single run.
+Name/PID watches prioritize activity. Starting without either filter latches
+full-process layout discovery; adding watches afterwards does not narrow that
+scope. Watched reference metadata also rotates independently of deep image
+scans. This is still bounded work; every image, page and reference need not
+finish within a single run.
 
 - [Coverage](KMON_DETECTION_COVERAGE.md): supported paths and blind spots.
 - [Verification](KMON_DETECTION_VERIFICATION.md): image identity, relocations,
   captures, compared/failed/excluded bytes and traversal progress.
 - [Process layouts](KMON_PROCESS_LAYOUTS.md): initial/current maps and changes.
-- [Analyst surfaces](KMON_ANALYST_SURFACES.md): TLS, KCT, WorkerFactory and saved diffs.
+- [Analyst surfaces](KMON_ANALYST_SURFACES.md): TLS, KCT, WorkerFactory, scoped cases,
+  retained evidence, offline replay and saved diffs.
 - [Cross-domain hunting](KMON_CROSS_DOMAIN_HUNTING.md): relationships and replay.
-- [Fixture guide](KMON_TEST_TARGET.md): 13-control and real-vctip validation.
+- [Fixture guide](KMON_TEST_TARGET.md): six-control reference checks, 13-control
+  image load and real-vctip validation.
 
 `finding.*` describes evidence requiring interpretation. A code difference does
 not identify a malicious actor, and a temporal/PFN relationship does not prove

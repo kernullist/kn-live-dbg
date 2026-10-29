@@ -1,10 +1,11 @@
 # Validation status
 
 The released baseline is **v0.0.36 / 6646461**. Development verification of the
-retained investigation path was recorded on **2026-10-29**, separately from the
-**2026-10-25** release validation. The **2026-10-27** documentation review did not
-renew runtime observations. Follow the [manual checklist](MANUAL_TEST_CHECKLIST.md)
-to validate another binary or host.
+retained investigation path and subsequent reference/TI queue fixes was recorded
+on **2026-10-29**, through **e73932d**, separately from the **2026-10-25** release
+validation. Each section identifies its binary and test scope. Documentation
+updates do not renew these observations. Follow the
+[manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
 ## Release candidate
 

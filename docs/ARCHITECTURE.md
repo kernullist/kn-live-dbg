@@ -1,6 +1,7 @@
 # Architecture
 
-Implementation baseline: v0.0.36. For operator syntax use
+This describes main at the [documented source revision](README.md), including
+changes after v0.0.36. For operator syntax use
 [the command guide](COMMAND_REFERENCE.md); for measured behavior use
 [validation status](VALIDATION.md).
 
@@ -15,6 +16,7 @@ Implementation baseline: v0.0.36. For operator syntax use
 | `user/*Scanner.*`, `UserModeHunter.*` | Bounded native collectors and cross-view interpretation |
 | `KernelMonitor.*`, `KernelMonitorHunting.cpp`, `ProcessLayoutMonitor.*` | Continuous discovery, queues, capture, image traversal and evidence |
 | `KmonHunting.h`, `ObservationModel.h`, `ExecutableRegionCatalog.h`, `ExecutableImageVerifier.h` | Observation contracts, bounded case/region indexes, reference-byte verification |
+| `EvidenceBundle.*`, `EvidenceInvestigation.*`, `AnalystSnapshot.*` | Durable reference read sets, bounded offline queries/replay and saved analyst views |
 | `ThreatIntelSubscriber.*`, `Timeline*`, `Snapshot*` | Events, persistence, baselines and comparison |
 | `McpServer.*`, `RemoteServer.*`, `RemoteClient.cpp` | Separate typed-tool and human-console transports |
 | `AiProvider.*`, `AiModelCatalog.*` | Provider execution, model resolution and advisory plans |
@@ -96,6 +98,22 @@ KMON joins TI and kernel live events with rotating native scans. In full-process
 layout mode, discovery is not limited to watch names; watched targets receive
 priority shares without eliminating background work. Capture and analysis have
 bounded queues, identity checks, explicit loss accounting, and shutdown drain.
+
+Watched reference metadata has its own rotation between deep scans. Each visit
+qualifies the retained process handle against the current watch conditions;
+implicit child watches require the stored creation time. This avoids inheriting
+a stale watch when a PID is reused. Reference verification runs before and after
+event ingestion, with a larger bounded budget under queue pressure. IAT walks
+yield between descriptors/thunks so a long walk can service waiting work.
+
+TI and live-event collection limit each source read to available analysis queue
+space. Full queues retain the upstream cursor; actual source overwrite remains
+loss. Shutdown joins the collectors, freezes source tails, and drains through
+those boundaries within the event-processing budget. A TI generation change
+cannot satisfy the frozen tail. Unprocessed source spans remain visible in
+`shutdown_events_unanalyzed`. See the [verification contracts](KMON_DETECTION_VERIFICATION.md)
+for budgets, counters and limits; a drained queue does not mean complete image
+or callback coverage.
 
 Image work keeps cursors by process creation, base and validated file identity.
 Dedicated continuation uses bounded page/time budgets, balances watched and

@@ -7,7 +7,9 @@ Preserve failed runs, partial coverage and cleanup errors.
 
 ## Driver-free gates
 
-From the source root, after building the configuration under test:
+From the source root, after building the configuration under test, use a shell
+that permits the inspected repository scripts. The Windows PowerShell command
+below sets its execution policy for that process only.
 
 ```powershell
 .\x64\Release\KnLiveDbg.exe --help all
@@ -15,6 +17,9 @@ From the source root, after building the configuration under test:
 .\tools\validate-command-audit.ps1 -Sanitize
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize
+.\tools\validate-analyst-features.ps1 -Sanitize
+.\tools\validate-evidence-bundle.ps1 -Sanitize
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-kmon-reference-coverage.ps1
 .\tools\validate-minifilter-detach-e2e-selftest.ps1
 .\tools\validate-evasion-research-ledger-selftest.ps1
 python tools/test-kmon-capture-accounting.py
@@ -23,7 +28,9 @@ python tools/test-kmon-vctip-audit.py
 python tools/test-kmon-image-coverage.py
 ```
 
-Use `-Configuration Debug` and the Debug EXE when validating that build.
+Use the Debug EXE and `-Configuration Debug` on validators that support it when
+validating a Debug build. The evidence-bundle validator builds its own Release
+or Release-ASan harness.
 `--self-test all` runs timeline, MCP catalog, console, command, remote-protocol,
 and connect-argument checks before driver/elevation/symbol initialization.
 AddressSanitizer applies to the standalone harnesses, not every command run by
@@ -93,7 +100,32 @@ evidence runners; run only the applicable owned controls.
 ## KMON all-process validation
 
 Use [KMON_TEST_TARGET.md](KMON_TEST_TARGET.md) for fixture setup and actual-vctip
-observation. A representative 13-control load run is:
+observation. For the six-control reference regression, run both watch policies
+sequentially from an elevated shell with the same monitor and fixture binaries:
+
+```powershell
+.\tools\validate-kmon-live.ps1 -AllProcessLayouts -ObserveSeconds 180 `
+  -RequireQueueHealth -RequireCompletedWork -OutputDirectory .build/kmon-reference-pid-a
+.\tools\validate-kmon-live.ps1 -AllProcessLayouts -NameOnlyFixtures -ObserveSeconds 180 `
+  -RequireQueueHealth -RequireCompletedWork -OutputDirectory .build/kmon-reference-name-a
+```
+
+The first run registers the fixture name and explicit PIDs; the second registers
+only the name. Confirm `fixture_watch_policy` and `all_process_scope_verified`
+in `validation.json`. Each child needs an examined reference observation bound
+to its creation time and a boot identity inside the observation window.
+Compare `user_reference_coverage` visit counts, completed thread inventories,
+first-visit delay and maximum gaps, together with positive/negative outcomes.
+Unavailable, failed or empty-thread rows must not satisfy the gate. The latest
+[six-control results](VALIDATION.md#reference-watch-and-ti-queue-review-2026-10-29)
+are bounded observations, not a per-target completion deadline.
+
+The native suite separately checks stale/missing watch identities, name and
+extension matching, full TI queue/one-slot admission, source-generation changes,
+source-eviction accounting and shutdown across multiple batches. Live queue
+peaks must be recorded; a passing run need not have reached full capacity.
+
+For the broader 13-control load, including secondary image views:
 
 ```powershell
 .\tools\validate-kmon-live.ps1 -AllProcessLayouts `
@@ -188,6 +220,11 @@ the exact invocation matrix.
 
 - Stop/restart TI, timeline and KMON while the owned workload produces activity.
   Preserve ring/log/queue loss and coverage; detached display is not stopped collection.
+- Check `ti_analysis_dropped`, `source_continuity_lost`, reference expiry/drop
+  counters and `shutdown_events_unanalyzed` separately. Queue backpressure must
+  preserve the source cursor, and shutdown must either process the frozen source
+  tail or report the remaining span. Queue drain alone is not complete image
+  or callback coverage.
 - Exercise queued versus dispatched transport cancellation separately. A lost
   response or client timeout does not prove an in-flight operation was cancelled.
 - Confirm normal `q` stops collectors before closing the device/service. Check

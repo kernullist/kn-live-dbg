@@ -1,8 +1,10 @@
 # Documentation
 
-Current implementation baseline: **v0.0.36 / 6646461**. Documentation reviewed
-against that source on **2026-10-27**. This review updates documentation; it is
-not a new live-host test or release.
+These guides describe **main through e73932d**, reviewed on **2026-10-29**.
+The latest published release remains **v0.0.36 / 6646461**. Retained evidence,
+offline investigation and the subsequent reference/TI queue changes belong to
+main; consult the release notes for shipped behavior. This documentation update
+does not repeat or renew the binary-specific tests in [validation status](VALIDATION.md).
 
 ## Operation
 
@@ -26,7 +28,7 @@ not a new live-host test or release.
 | [KMON coverage](KMON_DETECTION_COVERAGE.md) | Supported observation paths and limitations |
 | [Code verification](KMON_DETECTION_VERIFICATION.md) | Identity, relocations, comparison and coverage fields |
 | [Cross-domain hunting](KMON_CROSS_DOMAIN_HUNTING.md) | Relationships, capture, replay, comparison limits |
-| [Analyst surfaces](KMON_ANALYST_SURFACES.md) | TLS, KCT, WorkerFactory and snapshot interpretation |
+| [Analyst surfaces](KMON_ANALYST_SURFACES.md) | TLS, KCT, WorkerFactory, scoped cases, durable evidence and offline replay |
 | [Process layouts](KMON_PROCESS_LAYOUTS.md) | Whole-process discovery, history, scheduling |
 | [Driver interaction](DRIVER_INTERACTION_TRACKING_DESIGN.md) | Handles, IOCTL observations and lifetime limits |
 | [MCP design](MCP_SERVER_DESIGN.md) / [한국어](MCP_SERVER_DESIGN.ko.md) | HTTP and engine contracts |
@@ -35,11 +37,13 @@ not a new live-host test or release.
 
 ## Validation and releases
 
-- [Validation status](VALIDATION.md): release evidence, known gaps, and links to
-  the original dated reports at v0.0.36. Those reports remain historical records
-  in Git; their results are not refreshed by this documentation review.
+- [Validation status](VALIDATION.md): separate release and development evidence,
+  including the six-control reference and TI queue results, known gaps, and links
+  to the original reports at v0.0.36. The dated observations are not refreshed by
+  this documentation update.
 - [Manual checklist](MANUAL_TEST_CHECKLIST.md): rerun instructions and acceptance
-  criteria, including pending-I/O and runner-failure tests.
+  criteria, including PID-and-name/name-only reference runs, pending-I/O and
+  runner-failure tests.
 - [KMON test target](KMON_TEST_TARGET.md) and [hunt test target](HUNT_TEST_TARGET.md).
 - [Research claim ledger](../research/evasion-research-ledger.json): source dates,
   evidence requirements, and limits. Documentation edits do not renew research

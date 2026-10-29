@@ -1,6 +1,7 @@
 # Remaining work
 
-Baseline: v0.0.36. Implemented features are described in the
+Scope: the main revision identified in the [documentation index](README.md);
+the latest published release is v0.0.36. Implemented features are described in the
 [command guide](COMMAND_REFERENCE.md), [architecture](ARCHITECTURE.md), and
 [KMON coverage](KMON_DETECTION_COVERAGE.md). Completed implementation plans and
 per-commit work logs have been removed from this roadmap.
@@ -36,7 +37,7 @@ capabilities or a comparative detection rate.
 
 | Area | Remaining work | Evidence required before claiming completion |
 | --- | --- | --- |
-| KMON coverage under churn | Improve large background image completion and run-to-run coverage without starving watched or transient targets | Fixed-cohort compared-address metrics, 13-control all-process runs, independent vctip audit, and retained partial/failure results |
+| KMON coverage under churn | Extend the six-control reference-scheduling and queue improvements to large background images, transient targets and longer workloads | Preserve the six-control PID-and-name/name-only regression; add fixed-cohort compared-address metrics, 13-control all-process runs and independent vctip audit on the new binary, retaining partial/failure results |
 | Image reference trust | Stronger provenance for the exact reference bytes and remaining relocation exclusions | Wrong/replaced-file, identity, relocation-only and ordinary-byte controls; no promotion of excluded bytes to verified |
 | Address model | Consistent extended virtual-address support across classifiers, catalog, scanners, and replay | Real LA57 coverage plus boundary/large-page/alias tests; a five-level walk alone is insufficient |
 | Execution surfaces | Broader typed layouts for thread-pool, WOW64 KCT and other callback roots | Exact layout/identity validation, unsupported-state reporting, owned positives and normal-workload negatives |
@@ -46,6 +47,11 @@ capabilities or a comparative detection rate.
 | Remote/MCP | Authenticated encrypted transport, clearer dispatched-operation outcomes, uniform output/pagination where useful | Compatibility and disconnect/timeout/retry tests; no silent downgrade or duplicate mutation |
 | Normal-workload validation | More Windows builds, protected-process/game compatibility, long-running and verifier stress | Independent ground truth with separate misses, false positives, inaccessible scope, and side effects |
 | Historical open findings | Fast I/O/process-read gaps and WinHTTP Event-handle retention | Reproduction and closure evidence for the specific observations in the native-feature report |
+
+The latest [reference and queue review](VALIDATION.md#reference-watch-and-ti-queue-review-2026-10-29)
+records bounded six-control passes, with background image work and layout/capture
+failures still present. Earlier 13-control and vctip observations identify their
+own binaries; they are not fresh validation of the newer implementation.
 
 The current `private` AI preset invokes an external CLI; it is not an offline
 inference guarantee. A genuinely local/offline provider contract remains
