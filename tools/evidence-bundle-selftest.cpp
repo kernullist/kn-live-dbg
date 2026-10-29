@@ -5,6 +5,7 @@
 #include "../user/McpJson.h"
 #include "observation-source-selftest.h"
 #include "evidence-inventory-selftest.h"
+#include "evidence-graph-selftest.h"
 
 #include <filesystem>
 #include <fstream>
@@ -70,6 +71,7 @@ namespace
         auto b = Fixture();
         observation_source_test::Run(Check, b);
         evidence_inventory_test::Run(Check, directory, b);
+        evidence_graph_test::Run(Check, directory, b);
         EvidenceBundle parsed;
         std::wstring error;
         const auto json = EvidenceBundleJson(b);

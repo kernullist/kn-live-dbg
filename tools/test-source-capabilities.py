@@ -36,6 +36,8 @@ def main():
     assert by_key[("security", "inspect_vtl1_memory", "native")]["implementation"] == "unsupported"
     assert by_key[("io", "interpose_dispatch", "native")]["implementation"] == "experimental"
     assert "image_verification_not_replayed" in by_key[("evidence", "replay", "bundle")]["limits"]
+    assert "single_bundle_fact_graph" in by_key[("evidence", "graph", "bundle")]["limits"]
+    assert "graph_and_query_bound_cursor" in by_key[("evidence", "graph", "bundle")]["requirements"]
     assert "qualified_paging_depth" in by_key[("memory", "read_virtual", "dump")]["requirements"]
     assert "not_captured_vs_not_present" in by_key[("memory", "read_virtual", "dump")]["limits"]
     schema = by_key[("schema", "export_type", "local_pdb")]

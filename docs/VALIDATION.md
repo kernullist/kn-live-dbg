@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retained fact graph checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`a6f36a083354fddedd3055e2d909317f861a476173aa5fc8e6b01205a8f939dd`.
+The evidence ASan harness passed 521 controls, including 72 graph controls for
+scope identity, changed input/query cursors, missing/conflicting reads, indirect
+and cyclic references, LA57 qualification, maximum admitted spans, cancellation
+and budgets. Eight interrupted publications left three valid final files and
+five absent files; fresh-process reads passed.
+
+The public graph CLI passed 164 checks, including cross-process pagination,
+resolved evidence references, original coverage, PID reuse, legacy address
+normalization, identical file aliases and failed input boundaries. Existing
+evidence CLI checks passed 99, with one symbolic-link check skipped because the
+environment could not create that link. No live evidence was replayed.
+
+Release build, timeline 28, MCP 89, console 558, commands 2,998, remote 66 and
+connect-argument checks passed. Capabilities expose 19 selected contracts/261
+routes; publication-scanner regressions passed 10 tests. Full diagnostics are
+under `.build/architecture/w09-graph-*`. The first harness compile exposed a
+missing serializer include, which was corrected before successful validation.
+Review also retained original comparison coverage/capture state in graph context
+and made unavailable input report a null context instead of a default receipt.
+Existing LTCG alignment warnings remain. No driver was loaded. These checks
+cover one retained-bundle adapter, not cross-source joins, generic kernel object
+graphs, execution attribution or live-target compatibility.
+
 ## Capture scheduling checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

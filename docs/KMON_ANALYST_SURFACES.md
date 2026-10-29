@@ -175,6 +175,18 @@ KnLiveDbg.exe --offline !kmon replay-image <directory> /current /json
 python tools/test-capture-scheduling-cli.py --exe x64/Release/KnLiveDbg.exe
 ```
 
+## 저장 증거의 관계 조회
+
+```powershell
+.\KnLiveDbg.exe --offline !kmon graph "D:\evidence\cases\selected.kncase" /depth 2 /limit 64 /json
+```
+
+`graph`는 한 `.kncase`의 프로세스·주소 공간, 메모리 구간, 정적 참조와 원본 증거 관계를 반환한다. 포인터나 정적 분기를 저장 바이트에서 재구성한 `references`와 원본을 가리키는 `derived_from`만 만든다. 실행·작성자·통신·소유권을 새로 확정하지 않는다. 누락·충돌 구간과 알 수 없는 layout은 그대로 남기고, 다른 파일의 동일 PID·주소·PFN과 자동으로 합치지 않는다.
+
+`/node`에 반환된 ID를 지정하면 그 노드를 시작점으로 양방향 탐색한다. 깊이는 0~8이며 0은 시작 노드만 반환한다. `/limit`은 노드와 연결선을 합한 수로 1~128이다. `next_cursor`가 있으면 같은 파일·노드·깊이·제한으로 이어 조회한다. 연결선의 양 끝 노드가 이전 페이지에 있을 수 있다. 원본이나 조회 조건이 바뀌면 커서는 거부한다.
+
+`/budget-ms`는 이미 만들어진 그래프를 탐색하는 시간 예산으로 기본 1,000ms, 범위 0~5,000ms다. 0은 조회를 보류한다. 파일 읽기와 재구성은 파일 2MiB·구간 128개 상한으로 먼저 수행하며 이 시간 예산에 포함되지 않는다. `status=ok`와 종료 코드 0은 해당 조회 성공만 뜻한다. `gaps`, 원래 coverage, 캡처 중단·읽기 집합 완전성은 별도로 확인해야 한다. 실제 대상이 종료되어도 파일로 다시 조회할 수 있으며 드라이버는 로드하지 않는다.
+
 ## 검증
 
 ```powershell
@@ -185,6 +197,7 @@ python tools/test-capture-scheduling-cli.py --exe x64/Release/KnLiveDbg.exe
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 .\tools\validate-evidence-bundle.ps1 -Sanitize
+python tools/test-evidence-graph-cli.py --exe x64/Release/KnLiveDbg.exe --fixtures <evidence-validation-run-directory>
 .\tools\validate-image-recipe.ps1 -Sanitize
 # 위 도구가 출력한 run 디렉터리를 지정한다.
 python tools\test-evidence-cli.py --executable x64\Release\KnLiveDbg.exe --fixtures <run-directory>

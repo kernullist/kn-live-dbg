@@ -495,6 +495,48 @@ reanalysis; rereading the saved source cannot create another target observation.
 This is a selected image proof path. Generic cross-view, object-lifetime,
 deadlock, writer-attribution and live temporal policies remain separate work.
 
+## Retained fact graph
+
+`EvidenceGraph` adapts one validated `.kncase` to evidence, recorded process or
+address-space, raw memory-range and address nodes. It preserves missing spans
+as missing states. `derived_from` edges identify provenance; `references` edges
+require retained bytes reconstructed by the existing slot/head decoder. An
+indirect transfer retains both its instruction and slot span references.
+Unsupported register targets, inconsistent references, identity conflicts and
+future receipts do not create asserted reference targets. Independently valid
+static bytes may still yield a reference when other capture spans are missing.
+
+Node/edge IDs bind the policy, original bundle digest and normalized content.
+PID, address and PFN alone are never join keys. This version does not join
+bundles. Every edge names its original digest, receipt, evidence spans and
+shared context: source, dependency group, historical state, collector capture
+interval, original comparison coverage and unknown layout/security domain.
+The original receipt remains recorded metadata. It is not a new ownership,
+execution, writer, whole-system completeness or authenticated collector claim.
+Image verification must use its separate recipe/proof path.
+
+Queries run over the materialized graph without acquiring more memory. One
+input is limited to 2 MiB/128 spans; materialization rejects more than 256 nodes
+or 512 edges. Breadth-first traversal visits both edge directions, with depth
+0..8, at most 128 records per page, a cooperative cancellation flag and a
+0..5,000 ms traversal budget. File I/O, canonical validation, static replay and
+materialization precede that time budget and are not interruptible deadlines.
+Original edge direction is retained in output. Records are ordered as visited
+nodes followed by selected edges; a page can contain only edges whose endpoints
+appeared earlier. Depth zero returns only the root. An edge between two boundary
+nodes is not expanded until another depth is allowed.
+
+`kg1` continuations bind graph digest, root, depth, record limit and record
+offset. They survive process restart; changed content or query scope rejects
+them. The budget can be increased without changing result identity. A cursor is
+consistency metadata, not authentication or permission. Failed, cancelled or
+deferred queries return no result records and no successful total. `status=ok`
+means the bounded query succeeded; gaps and incomplete capture stay explicit.
+The output schema is private investigation data and the publication scanner
+rejects standalone copies even when renamed. Generic object graphs, qualified
+cross-source joins, runtime type layouts and hypothesis/claim graph adapters
+remain separate work.
+
 ## Offline dump observation source
 
 `DumpObservationSource` and the existing dump analyzer share one qualified

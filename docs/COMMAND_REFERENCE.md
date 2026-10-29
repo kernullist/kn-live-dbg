@@ -14,6 +14,19 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
+`KnLiveDbg.exe --offline !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
+returns a private `kn.evidence_graph.v1` fact graph over one retained bundle.
+The default root is its evidence node, depth is 2, record limit is 64 and
+traversal budget is 1,000 ms. Edges retain their direction, while queries follow
+both directions. The record limit counts nodes and edges together; endpoints
+can be on another page. Continue with the same file, root, depth and limit.
+Changing those inputs invalidates the cursor. A zero budget defers the query.
+The time budget applies after bounded file loading and graph materialization.
+JSON is returned with or without `/json`. Exit 0 means this query succeeded,
+including when the retained evidence has gaps; 1 means unavailable input,
+invalid cursor/node or deferred/cancelled traversal, and 2 means invalid grammar.
+See [retained fact graph](ARCHITECTURE.md#retained-fact-graph).
+
 `KnLiveDbg.exe --offline !kmon dump-read <file.dmp> <hex-address> <length> /json`
 reads 1..4,096 bytes through the shared observation source. Supported inputs are
 AMD64 PAGE/DU64 full-dump physical runs with a qualified four/five-level root.

@@ -33,6 +33,7 @@
 #include "AnalystSnapshot.h"
 #include "EvidenceInvestigation.h"
 #include "EvidenceInventory.h"
+#include "EvidenceGraph.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -95,6 +96,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -23034,6 +23036,7 @@ static void PrintKmonHelp()
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
+    std::wcout << L"  !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory> [/current] [/json]\n";
@@ -23374,7 +23377,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23474,6 +23477,96 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         const auto result = source->Read(request);
         std::wcout << ObservationReadJson(source->Capabilities(), request, result) << L"\n";
         return result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1;
+    }
+    if (action == L"graph")
+    {
+        EvidenceGraphQuery query;
+        query.Cancellation = &g_StopRequested;
+        std::set<std::wstring> seen;
+        bool valid = args.size() >= 3 && !args[2].empty();
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            if (!seen.insert(option).second)
+            {
+                valid = false;
+            }
+            else if (option == L"/json")
+            {
+                continue;
+            }
+            else if (i + 1 < args.size() && (option == L"/node" || option == L"/cursor" ||
+                option == L"/depth" || option == L"/limit" || option == L"/budget-ms"))
+            {
+                const auto& value = args[++i];
+                uint64_t number = 0;
+                if (option == L"/node")
+                {
+                    query.Node = value;
+                    valid = !value.empty();
+                }
+                else if (option == L"/cursor")
+                {
+                    query.Cursor = value;
+                    valid = !value.empty();
+                }
+                else if (!ParseUnsigned(value, 10, &number))
+                {
+                    valid = false;
+                }
+                else if (option == L"/depth")
+                {
+                    valid = number <= 8;
+                    query.Depth = static_cast<size_t>(number);
+                }
+                else if (option == L"/limit")
+                {
+                    valid = number >= 1 && number <= 128;
+                    query.Limit = static_cast<size_t>(number);
+                }
+                else
+                {
+                    valid = number <= 5000;
+                    query.TimeBudgetMs = number;
+                }
+            }
+            else
+            {
+                valid = false;
+            }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
+            return 2;
+        }
+        EvidenceBundle bundle;
+        EvidenceGraph graph;
+        EvidenceGraphPage page;
+        std::wstring error, digest;
+        try
+        {
+            if (g_StopRequested.load())
+            {
+                page.Status = L"cancelled";
+            }
+            else if (LoadEvidenceBundle(args[2], &bundle, &error, &digest))
+            {
+                graph = BuildEvidenceGraph(bundle, digest);
+                page = graph.Status == L"materialized" ? QueryEvidenceGraph(graph, query) : EvidenceGraphPage{};
+                if (graph.Status != L"materialized")
+                {
+                    page.Status = graph.Status;
+                }
+            }
+        }
+        catch (const std::exception&)
+        {
+            page = EvidenceGraphPage{};
+            page.Status = L"materialization_failed";
+        }
+        std::wcout << EvidenceGraphJson(graph, query, page) << L"\n";
+        return page.Status == L"ok" ? 0 : 1;
     }
     if (action == L"inventory")
     {
@@ -24414,7 +24507,7 @@ static void HandleKmonCommand(
         }
 
         if (action == L"dump-read" || action == L"verify-image" || action == L"replay-image" ||
-            action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
+            action == L"inventory" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;
@@ -53267,7 +53360,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
