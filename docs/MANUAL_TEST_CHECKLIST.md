@@ -14,6 +14,7 @@ below sets its execution policy for that process only.
 ```powershell
 .\x64\Release\KnLiveDbg.exe --help all
 .\x64\Release\KnLiveDbg.exe --self-test all
+python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe
 .\tools\validate-command-audit.ps1 -Sanitize
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize

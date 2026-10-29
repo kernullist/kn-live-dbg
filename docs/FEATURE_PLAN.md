@@ -35,6 +35,56 @@ capabilities or a comparative detection rate.
 
 ## Open engineering work
 
+## Kernel investigation platform
+
+The 2026-10-29 full-kernel security architecture proposal is adopted as the
+following dependency-ordered work packages. Existing observation identity,
+catalogs, image verification and v1 evidence remain the migration base. A command
+route, successful fixture or supported page-table format alone is not a validated
+backend/build/security-state combination.
+
+| Package | Implementation and acceptance scope | Dependencies |
+| --- | --- | --- |
+| W01 Baseline/capability | Selected compiled source contracts and command routes via `--capabilities`; runtime capability probes and a measured build/security matrix remain open | None |
+| W02 Address/identity | Shared address-space descriptor, LA48/LA57 boundaries, source/epoch isolation, v1 adaptation through admission, storage and replay | W01 |
+| W03 Read-set source | Read-only source interface; sparse statuses, budgets, cancellation, identity and side effects; same parser on live and stored bytes | W02 |
+| W04 Schema broker | Exact image/PDB/type package, qualified partial states, artifact verification and isolated untrusted parsing | W02-W03 |
+| W05 Proof/coverage | Unique intervals, temporal/semantic/persistence/replay scope, deterministic claim requirements and counterexamples | W02-W04 |
+| W06 Evidence store v2 | Recoverable journal/index, inventory and result continuations, stable snapshots, v1 import, interruption/corruption/large inventory controls | W03,W05 |
+| W07 Exact reference replay | Exact reference artifact and normalization recipe, original-policy replay distinct from current reanalysis, preserved exclusions | W04-W06 |
+| W08 Scheduler SLO | Deadline/age/fairness and first capture metrics; fixed-cohort/churn and current six/thirteen-control validation | W03,W05 |
+| W09 Entity graph | Scoped process/thread/image/object/device/IRP entities and typed evidence edges, bounded explanation queries | W03-W06 |
+| W10 Kernel rules | Unowned code, image changes, cross-view absence, device channels and security-state transitions with negative controls | W07-W09 |
+| W11 User/runtime | Qualified callback/thread-pool/WOW64/JIT providers and game object lifetime; registrations separate from execution | W07-W09 |
+| W12 Wait/I/O diagnosis | Qualified wait/lock/IRP graphs, observed transitions and false-cycle controls | W04,W09 |
+| W13 Trace/VMI | Versioned import first; CPU/VM/VTL/code/loss scope; actual backend access and compatibility gates | W02-W09 |
+| W14 Security/AI | Offline/observe/collect/lab policy, kernel enforcement, protected transport and operation outcomes, evidence-checked AI plans | W01 onward |
+| W15 Independent validation | Versioned corpus and ground truth; family-separated comparisons, false positives, latency and safety by environment | Each package |
+
+Integration proceeds through source/address/proof and observe/collect boundaries,
+then durable replay and scheduling, then entity/rule/diagnostic queries, and
+finally optional execution adapters. Package completion requires usable public
+contracts, capability/error/coverage reporting, bounded lifetime and retention,
+negative controls, independent replay or an alternative oracle, and current
+help/API documentation. Unsupported external adapters remain explicit gaps.
+
+### Compiled capability inventory
+
+`KnLiveDbg.exe --capabilities` exits before driver, service, symbol or live-monitor
+initialization. Its `kn.capabilities.v1` JSON includes the binary version, main
+ABI, selected source contracts and command routes generated from the registry.
+`inventory_complete=false` means the selected operations are not the entire
+product inventory. `implementation` describes code, while `availability` remains
+`not_probed`; OS build, active address width and security state are not inferred.
+The output preserves unsupported VTL1 access and trace/VMI paths, experimental
+dispatch interposition, bounded inventory and incomplete image replay.
+
+Use `python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe`
+after building to check JSON, registry/ABI agreement, unsupported contracts,
+strict arguments and startup help. This gate does not establish live support.
+
+## Remaining domain work
+
 | Area | Remaining work | Evidence required before claiming completion |
 | --- | --- | --- |
 | KMON coverage under churn | Extend the six-control reference-scheduling and queue improvements to large background images, transient targets and longer workloads | Preserve the six-control PID-and-name/name-only regression; add fixed-cohort compared-address metrics, 13-control all-process runs and independent vctip audit on the new binary, retaining partial/failure results |

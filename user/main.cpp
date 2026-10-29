@@ -8,6 +8,7 @@
 #include "CallbackScanner.h"
 #include "CloudFileScanner.h"
 #include "CommandRegistry.h"
+#include "SourceCapabilities.h"
 #include "CommandInput.h"
 #include "CompletionHints.h"
 #include "DbgEngBackend.h"
@@ -53109,6 +53110,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"KnLiveDbg.exe command-line usage:\n";
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
+        std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon evidence|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
@@ -53125,6 +53127,16 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
+    if (argc >= 2 && ToLower(argv[1]) == L"--capabilities")
+    {
+        if (argc != 2)
+        {
+            std::wcerr << L"usage: KnLiveDbg.exe --capabilities\n";
+            return 1;
+        }
+        std::wcout << SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT)) << L"\n";
+        return 0;
+    }
     if (argc >= 2 && ToLower(argv[1]) == L"--offline")
     {
         // Return before any driver service, symbol engine, or live monitor is constructed.

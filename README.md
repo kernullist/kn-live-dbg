@@ -29,6 +29,7 @@ for their scope and remaining gaps.
 # Driver-free startup help and component checks
 .\x64\Release\KnLiveDbg.exe --help all
 .\x64\Release\KnLiveDbg.exe --self-test all
+.\x64\Release\KnLiveDbg.exe --capabilities
 
 # Build from source with the installed SDK/WDK and signing configuration
 .\tools\build.ps1 -Configuration Release
@@ -81,6 +82,10 @@ not change these transport or kernel permissions.
 
 The [documentation index](docs/README.md) links the current guides, source map,
 test procedures, remaining work, and fixed-version historical evidence.
+The [platform roadmap](docs/FEATURE_PLAN.md#kernel-investigation-platform) tracks
+the common source, address, proof, persistence and policy contracts. The
+driver-free `--capabilities` JSON reports selected compiled source contracts and
+every command route. It does not probe the host or certify OS/security support.
 
 | Guide | Purpose |
 | --- | --- |

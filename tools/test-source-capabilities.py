@@ -1,0 +1,50 @@
+"""Check compiled capability claims without starting a live controller."""
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exe", type=Path, required=True)
+    args = parser.parse_args()
+    exe = str(args.exe.resolve())
+    result = subprocess.run([exe, "--capabilities"], capture_output=True, text=True,
+                            check=True, timeout=30)
+    data = json.loads(result.stdout)
+    assert data["schema"] == "kn.capabilities.v1"
+    assert data["scope"] == "compiled_contract" and data["target_probed"] is False
+    assert data["inventory_complete"] is False
+    assert data["target"] == {"os_build": None, "security_state": "unknown",
+                              "virtual_address_bits": None, "validation": "not_performed"}
+    root = Path(__file__).resolve().parents[1]
+    abi = re.search(r"#define KNDBG_ABI_VERSION (\d+)u",
+                    (root / "shared/KnLiveDbgIoctl.h").read_text()).group(1)
+    assert data["driver_abi"] == int(abi)
+    keys = [(c["domain"], c["operation"], c["backend"]) for c in data["capabilities"]]
+    assert len(set(keys)) == len(keys)
+    for capability in data["capabilities"]:
+        assert capability["availability"] == "not_probed"
+        assert capability["requirements"] and capability["limits"]
+    by_key = dict(zip(keys, data["capabilities"]))
+    assert by_key[("security", "inspect_vtl1_memory", "native")]["implementation"] == "unsupported"
+    assert by_key[("io", "interpose_dispatch", "native")]["implementation"] == "experimental"
+    assert "image_verification_not_replayed" in by_key[("evidence", "replay", "bundle")]["limits"]
+    registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
+    expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
+    assert expected, "command registry was not parsed"
+    actual = [(c["name"], c["canonical"], c["route"]) for c in data["commands"]]
+    assert actual == [(name, canonical, route.lower()) for name, canonical, route in expected]
+    invalid = subprocess.run([exe, "--capabilities", "unexpected"], capture_output=True,
+                             text=True, timeout=30)
+    assert invalid.returncode != 0 and not invalid.stdout.strip()
+    help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
+                                 check=True, timeout=30)
+    assert "--capabilities" in help_result.stdout
+    print(f"source capabilities passed: {len(keys)} contracts, {len(actual)} command routes")
+
+
+if __name__ == "__main__":
+    main()

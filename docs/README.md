@@ -34,6 +34,7 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 | [MCP design](MCP_SERVER_DESIGN.md) / [한국어](MCP_SERVER_DESIGN.ko.md) | HTTP and engine contracts |
 | [Remote design](REMOTE_OPERATOR_SESSION.md) | Framing, queue, disconnect and shutdown |
 | [Remaining work](FEATURE_PLAN.md) | Open work, separated from implemented features |
+| [Platform packages](FEATURE_PLAN.md#kernel-investigation-platform) | Adopted full-kernel architecture, capability contract and dependency order |
 
 ## Validation and releases
 
