@@ -2,12 +2,7 @@
 
 #include "KmonHunting.h"
 
-struct AnalystCaseFilter
-{
-    bool HasPid = false;
-    uint32_t ProcessId = 0;
-    std::wstring Role;
-};
+using AnalystCaseFilter = KmonHuntFilter;
 
 std::vector<KmonHuntCase> FilterAnalystCases(const std::vector<KmonHuntCase>& cases, const AnalystCaseFilter& filter);
 bool SaveAnalystSnapshot(const std::wstring& path, const std::wstring& json, std::wstring* error);

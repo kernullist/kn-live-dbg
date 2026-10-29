@@ -4,6 +4,8 @@
 #include "KmonExecutablePages.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <random>
 
 struct KmonHuntReference
 {
@@ -28,6 +30,85 @@ struct KmonHuntCase
     KmonHuntReference Related;
     bool HasRelated = false;
 };
+
+struct KmonHuntFilter
+{
+    bool HasPid = false;
+    uint32_t ProcessId = 0;
+    std::wstring Role;
+
+    bool Matches(const KmonHuntReference& row) const
+    {
+        return (!HasPid || row.Context.Identity.ProcessId == ProcessId) &&
+            (Role.empty() || row.Role == Role);
+    }
+};
+
+struct KmonHuntQueryOptions
+{
+    size_t Limit = 256;
+    std::wstring Cursor;
+};
+
+struct KmonHuntQueryPage
+{
+    std::vector<KmonHuntCase> Cases;
+    std::wstring Status = L"ok";
+    std::wstring NextCursor;
+    uint64_t AsOfMs = 0;
+    uint64_t Epoch = 0;
+    uint64_t Revision = 0;
+    size_t Offset = 0;
+    size_t Limit = 256;
+    size_t Matched = 0;
+    size_t RetainedReferences = 0;
+    size_t ReferenceCapacity = 0;
+
+    size_t Omitted() const { return Status == L"ok" ? Matched - Offset - Cases.size() : 0; }
+    bool Complete() const { return Status == L"ok" && Offset == 0 && Omitted() == 0; }
+};
+
+// A cursor is a bounded continuation contract, not an authorization credential.
+// Include the exact filter and limit so changing scope cannot silently skip rows.
+inline std::wstring KmonHuntQueryScope(const KmonHuntFilter& filter, size_t limit)
+{
+    std::wstring out = std::to_wstring(limit) + L":" + (filter.HasPid ? L"1:" : L"0:") +
+        std::to_wstring(filter.HasPid ? filter.ProcessId : 0) + L":";
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    for (const wchar_t c : filter.Role)
+    {
+        const uint32_t unit = static_cast<uint32_t>(c);
+        for (int shift = 28; shift >= 0; shift -= 4)
+        {
+            out += hex[(unit >> shift) & 15];
+        }
+    }
+    return out;
+}
+
+inline bool KmonHuntCursorNumber(const std::wstring& cursor, size_t* at, uint64_t* value)
+{
+    *value = 0;
+    const size_t start = *at;
+    while (*at < cursor.size() && cursor[*at] != L':')
+    {
+        const auto c = cursor[(*at)++];
+        if (c < L'0' || c > L'9' || *at - start > 20 ||
+            *value > (UINT64_MAX - static_cast<uint64_t>(c - L'0')) / 10)
+        {
+            return false;
+        }
+        *value = *value * 10 + static_cast<uint64_t>(c - L'0');
+    }
+    return *at > start && *at < cursor.size() && cursor[(*at)++] == L':';
+}
+
+inline uint64_t KmonHuntQueryEpochSeed()
+{
+    // Avoid restarting the cursor namespace at 1 in each new analyst process.
+    std::random_device random;
+    return (((static_cast<uint64_t>(random()) << 32) | random()) & (UINT64_MAX >> 1)) | 1;
+}
 
 inline bool KmonHuntOwnership(CodeOwnership ownership)
 {
@@ -109,6 +190,7 @@ public:
 
     uint64_t Observe(KmonHuntReference reference)
     {
+        AdvanceRevision();
         const auto& context = reference.Context;
         const auto& identity = context.Identity;
         if (identity.BootId.empty() || identity.BootId.size() > 128 || reference.Role.empty() || reference.Role.size() > 64 ||
@@ -182,23 +264,72 @@ public:
         return NextId;
     }
 
-    std::vector<KmonHuntCase> Cases(uint64_t now, size_t limit = 128) const
+    KmonHuntQueryPage Query(uint64_t now, const KmonHuntFilter& filter = {},
+        const KmonHuntQueryOptions& options = {}) const
     {
-        std::vector<KmonHuntCase> result;
-        limit = (std::min<size_t>)(limit, 256);
-        const auto fresh = [now](const auto& row)
+        KmonHuntQueryPage page;
+        page.AsOfMs = now;
+        page.Epoch = QueryEpoch;
+        page.Revision = Revision;
+        page.Limit = options.Limit;
+        page.RetainedReferences = References.size();
+        page.ReferenceCapacity = Capacity;
+        if (options.Limit == 0 || options.Limit > 256 || filter.Role.size() > 128 ||
+            filter.Role.find(L'\0') != std::wstring::npos)
         {
-            return now >= row.Context.MonotonicMs && now - row.Context.MonotonicMs <= 30000;
+            page.Status = L"invalid_query";
+            return page;
+        }
+        const auto scope = KmonHuntQueryScope(filter, options.Limit);
+        if (!options.Cursor.empty())
+        {
+            size_t at = 0;
+            uint64_t epoch = 0, revision = 0, asOf = 0, offset = 0;
+            if (options.Cursor.size() > 1200 || options.Cursor.compare(0, 3, L"q1:") != 0 ||
+                (at = 3, !KmonHuntCursorNumber(options.Cursor, &at, &epoch)) ||
+                !KmonHuntCursorNumber(options.Cursor, &at, &revision) ||
+                !KmonHuntCursorNumber(options.Cursor, &at, &asOf) ||
+                !KmonHuntCursorNumber(options.Cursor, &at, &offset) ||
+                offset == 0 || offset > 66048 || options.Cursor.substr(at) != scope)
+            {
+                page.Status = L"invalid_cursor";
+                return page;
+            }
+            if (epoch != QueryEpoch || revision != Revision || Revision == UINT64_MAX ||
+                asOf > now || now - asOf > 30000)
+            {
+                page.Status = L"stale_cursor";
+                return page;
+            }
+            page.AsOfMs = asOf;
+            page.Offset = static_cast<size_t>(offset);
+        }
+        const auto fresh = [&page](const auto& row)
+        {
+            return page.AsOfMs >= row.Context.MonotonicMs && page.AsOfMs - row.Context.MonotonicMs <= 30000;
+        };
+        const auto append = [&](const std::wstring& kind, ObservationRelation relation,
+            const KmonHuntReference& primary, const KmonHuntReference* related)
+        {
+            if (!filter.Matches(primary) && (related == nullptr || !filter.Matches(*related)))
+            {
+                return;
+            }
+            if (page.Matched++ >= page.Offset && page.Cases.size() < page.Limit)
+            {
+                page.Cases.push_back({kind, relation, primary, related == nullptr ? KmonHuntReference{} : *related,
+                    related != nullptr});
+            }
         };
         // Exact content links come first. Time coincidence alone creates no edge.
-        for (auto kernel = References.rbegin(); kernel != References.rend() && result.size() < limit; ++kernel)
+        for (auto kernel = References.rbegin(); kernel != References.rend(); ++kernel)
         {
             if (kernel->Context.Identity.ProcessId != 0 || !KmonChannelRole(kernel->Role) ||
                 !kernel->SlotStable || !kernel->PageComparable || !fresh(*kernel))
             {
                 continue;
             }
-            for (auto user = References.rbegin(); user != References.rend() && result.size() < limit; ++user)
+            for (auto user = References.rbegin(); user != References.rend(); ++user)
             {
                 if (user->Context.Identity.ProcessId == 0 || !fresh(*user) || !user->PageComparable ||
                     user->Context.Identity.BootId != kernel->Context.Identity.BootId || user->PageSha256 != kernel->PageSha256)
@@ -209,13 +340,13 @@ public:
                     kernel->Context.MonotonicMs - user->Context.MonotonicMs : user->Context.MonotonicMs - kernel->Context.MonotonicMs;
                 const bool physical = delta <= 1000 && kernel->Context.PfnKnown && user->Context.PfnKnown &&
                     kernel->Context.Pfn == user->Context.Pfn;
-                result.push_back({L"cross_domain_content", physical ? ObservationRelation::PhysicalPage : ObservationRelation::Content,
-                    *kernel, *user, true});
+                append(L"cross_domain_content", physical ? ObservationRelation::PhysicalPage : ObservationRelation::Content,
+                    *kernel, &*user);
             }
         }
-        for (unsigned priority = 0; priority < 2 && result.size() < limit; ++priority)
+        for (unsigned priority = 0; priority < 2; ++priority)
         {
-            for (auto row = References.rbegin(); row != References.rend() && result.size() < limit; ++row)
+            for (auto row = References.rbegin(); row != References.rend(); ++row)
             {
                 if (!fresh(*row) || KmonPageRole(row->Role) != (priority == 1))
                 {
@@ -237,11 +368,25 @@ public:
                 {
                     kind = L"image_executable_permission";
                 }
-                result.push_back({kind,
-                    ObservationRelation::Address, *row, {}, false});
+                append(kind, ObservationRelation::Address, *row, nullptr);
             }
         }
-        return result;
+        if (page.Offset > page.Matched || (page.Offset != 0 && page.Offset == page.Matched))
+        {
+            page.Status = L"invalid_cursor";
+            page.Cases.clear();
+        }
+        else if (page.Omitted() != 0)
+        {
+            page.NextCursor = L"q1:" + std::to_wstring(QueryEpoch) + L":" + std::to_wstring(Revision) +
+                L":" + std::to_wstring(page.AsOfMs) + L":" + std::to_wstring(page.Offset + page.Cases.size()) + L":" + scope;
+        }
+        return page;
+    }
+
+    std::vector<KmonHuntCase> Cases(uint64_t now, size_t limit = 128) const
+    {
+        return limit == 0 ? std::vector<KmonHuntCase>{} : Query(now, {}, {(std::min<size_t>)(limit, 256), {}}).Cases;
     }
 
     size_t Size() const
@@ -251,6 +396,7 @@ public:
 
     void Retire(const ObservationIdentity& identity, uint64_t root, uint64_t slot, const std::wstring& role)
     {
+        AdvanceRevision();
         References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& row)
         {
             return row.Context.Identity.SameInstance(identity) && (slot != 0 || row.Root == root) &&
@@ -262,6 +408,10 @@ public:
     uint64_t Rejected = 0;
 
 private:
+    void AdvanceRevision() { if (Revision != UINT64_MAX) { ++Revision; } }
+    inline static std::atomic<uint64_t> NextQueryEpoch{KmonHuntQueryEpochSeed()};
+    uint64_t QueryEpoch = NextQueryEpoch.fetch_add(1);
+    uint64_t Revision = 0;
     size_t Capacity;
     uint64_t LastMs = 0;
     uint64_t NextId = 0;

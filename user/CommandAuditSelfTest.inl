@@ -340,6 +340,8 @@ static int RunCommandAuditSelfTest()
             CompletionCandidateExists({L"!kmon", L"start"}, L"/layout-ms"), L"kmon layout interval completion");
         check(CompletionCandidateExists({L"!kmon", L"start"}, L"/manifest"), L"kmon manifest completion");
         check(CompletionCandidateExists({L"!kmon", L"cases"}, L"/role") &&
+            CompletionCandidateExists({L"!kmon", L"cases"}, L"/limit") &&
+            CompletionCandidateExists({L"!kmon", L"cases"}, L"/cursor") &&
             CompletionCandidateExists({L"!kmon", L"layouts", L"/pid", L"55"}, L"/initial") &&
             CompletionCandidateExists({L"!kmon", L"surfaces", L"55"}, L"/handle-start"), L"kmon analyst completion");
         check(!has({L"!kmon", L"stop"}, L"/pid") && !has({L"!kmon"}, L"on"), L"kmon action boundaries");
@@ -463,13 +465,20 @@ static int RunCommandAuditSelfTest()
         check(invalidCases.Error.find(L"usage") != std::wstring::npos, L"kmon cases rejects invalid arguments");
     }
     for (const auto& line : {L"!kmon cases /pid 0 /json", L"!kmon cases /role tls_callback /json",
-        L"!kmon cases /pid 55 /role tls_callback /json"})
+        L"!kmon cases /pid 55 /role tls_callback /json", L"!kmon cases /limit 1 /json",
+        L"!kmon cases /limit 256 /json"})
     {
         const auto result = run(line);
         check(result.Error.empty() && result.Output.find(L"kmon.hunt.v1") != std::wstring::npos,
             L"case filters accept valid options");
     }
+    const auto invalidCursor = run(L"!kmon cases /cursor invalid /json");
+    check(invalidCursor.Error.empty() && invalidCursor.Output.find(L"\"query_status\":\"invalid_cursor\"") != std::wstring::npos &&
+        invalidCursor.Output.find(L"\"matched_case_count\":null") != std::wstring::npos,
+        L"invalid continuation reports query failure instead of empty successful scope");
     for (const auto& line : {L"!kmon cases /pid", L"!kmon cases /pid -1", L"!kmon cases /pid 4294967296",
+        L"!kmon cases /limit 0", L"!kmon cases /limit 257", L"!kmon cases /limit -1", L"!kmon cases /limit",
+        L"!kmon cases /cursor", L"!kmon cases /cursor /json", L"!kmon cases /limit 1 /limit 2",
         L"!kmon cases /pid 1 /pid 2", L"!kmon cases /json /json", L"!kmon cases /role /json",
         L"!kmon cases /save /json", L"!kmon surfaces", L"!kmon surfaces 0", L"!kmon surfaces 4",
         L"!kmon surfaces 4294967296", L"!kmon surfaces 55 /unknown", L"!kmon surfaces 55 /json /json",

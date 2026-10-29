@@ -23022,7 +23022,7 @@ static void PrintKmonHelp()
     std::wcout << L"  no /pid or /name: discover all processes every second, including new instances\n";
     std::wcout << L"  !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
     std::wcout << L"    per-PID export includes regions and recent deltas; first observed is not clean\n";
-    std::wcout << L"  !kmon cases [/pid N] [/role name] [/json] [/save path]  recent leads (30s expiry)\n";
+    std::wcout << L"  !kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]  recent leads (30s expiry)\n";
     std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
@@ -23961,6 +23961,7 @@ static void HandleKmonCommand(
         if (action == L"cases")
         {
             AnalystCaseFilter filter;
+            KmonHuntQueryOptions queryOptions;
             bool jsonOutput = false;
             bool valid = true;
             std::wstring savePath;
@@ -23977,7 +23978,8 @@ static void HandleKmonCommand(
                 {
                     jsonOutput = true;
                 }
-                else if ((option == L"/pid" || option == L"/role" || option == L"/save") &&
+                else if ((option == L"/pid" || option == L"/role" || option == L"/save" ||
+                    option == L"/limit" || option == L"/cursor") &&
                     i + 1 < args.size() && !args[i + 1].empty())
                 {
                     const auto value = args[++i];
@@ -23992,6 +23994,17 @@ static void HandleKmonCommand(
                     {
                         valid = value.size() <= 128 && value.front() != L'/';
                         filter.Role = value;
+                    }
+                    else if (option == L"/limit")
+                    {
+                        uint64_t limit = 0;
+                        valid = ParseUnsigned(value, 10, &limit) && limit >= 1 && limit <= 256;
+                        queryOptions.Limit = static_cast<size_t>(limit);
+                    }
+                    else if (option == L"/cursor")
+                    {
+                        valid = value.size() <= 1200 && value.front() != L'/';
+                        queryOptions.Cursor = value;
                     }
                     else
                     {
@@ -24010,11 +24023,18 @@ static void HandleKmonCommand(
             }
             if (!valid)
             {
-                std::wcerr << L"!kmon cases: usage: !kmon cases [/pid N] [/role name] [/json] [/save path]\n";
+                std::wcerr << L"!kmon cases: usage: !kmon cases [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json] [/save path]\n";
                 break;
             }
             std::vector<KmonHuntCase> cases;
-            const auto json = kmon.HuntCasesJson(filter, &cases);
+            KmonHuntQueryPage queryPage;
+            const auto json = kmon.HuntCasesJson(filter, &cases, queryOptions, &queryPage);
+            if (queryPage.Status != L"ok")
+            {
+                if (jsonOutput) { std::wcout << json << L"\n"; }
+                else { std::wcerr << L"!kmon cases: " << queryPage.Status << L"; restart without /cursor\n"; }
+                break;
+            }
             if (!savePath.empty())
             {
                 std::wstring error;
@@ -24045,7 +24065,14 @@ static void HandleKmonCommand(
                 }
                 std::wcout << L"\n";
             }
-            std::wcout << L"[kmon.cases] returned=" << cases.size() << L" claim=investigation_leads communication_proven=false\n";
+            std::wcout << L"[kmon.cases] matched=" << queryPage.Matched << L" returned=" << cases.size()
+                << L" offset=" << queryPage.Offset << L" omitted_by_budget=" << queryPage.Omitted()
+                << L" scope=retained_fresh_references claim=investigation_leads communication_proven=false\n";
+            if (!queryPage.NextCursor.empty())
+            {
+                std::wcout << L"[kmon.cases] next_cursor=" << queryPage.NextCursor
+                    << L" (repeat the same filters and /limit; restart if stale)\n";
+            }
             break;
         }
 

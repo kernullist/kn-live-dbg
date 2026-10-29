@@ -30,7 +30,7 @@ namespace
 std::vector<KmonHuntCase> KernelMonitor::HuntCases(const AnalystCaseFilter& filter) const
 {
     std::lock_guard<std::mutex> lock(HuntMutex);
-    return FilterAnalystCases(HuntIndex.Cases(GetTickCount64(), 256), filter);
+    return HuntIndex.Query(GetTickCount64(), filter).Cases;
 }
 
 void KernelMonitor::QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role)
@@ -74,20 +74,21 @@ void KernelMonitor::ScanExecutablePageCandidates()
     }
 }
 
-std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::vector<KmonHuntCase>* cases) const
+std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::vector<KmonHuntCase>* cases,
+    const KmonHuntQueryOptions& options, KmonHuntQueryPage* page) const
 {
     std::lock_guard<std::mutex> lock(HuntMutex);
     const uint64_t now = GetTickCount64();
-    auto filtered = FilterAnalystCases(HuntIndex.Cases(now, 256), filter);
-    auto json = KmonHuntCasesJson(filtered, now, HuntIndex.Evicted, HuntIndex.Rejected);
+    auto result = HuntIndex.Query(now, filter, options);
+    auto json = KmonHuntQueryJson(result, filter, HuntIndex.Evicted, HuntIndex.Rejected);
     if (cases != nullptr)
     {
-        *cases = std::move(filtered);
+        *cases = result.Cases;
     }
-    json.pop_back();
-    json += L",\"candidate_limit\":256,\"filter_pid\":" +
-        (filter.HasPid ? std::to_wstring(filter.ProcessId) : L"null");
-    json += L",\"filter_role\":" + mcpjson::Quote(filter.Role) + L"}";
+    if (page != nullptr)
+    {
+        *page = std::move(result);
+    }
     return json;
 }
 

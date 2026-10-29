@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <random>
+#include <set>
 
 static volatile LONG TlsNotifications = 0;
 
@@ -205,6 +206,72 @@ namespace
 
     void SnapshotTests(const std::wstring& directory)
     {
+        KmonHuntIndex crowded;
+        for (uint32_t i = 0; i < 300; ++i)
+        {
+            crowded.Observe(Reference(1000 + i));
+        }
+        const auto target = crowded.Query(100, {true, 1000, L"tls_callback"});
+        Check(target.Cases.size() == 1 && target.Matched == 1 && target.Complete() &&
+            target.Cases[0].Primary.Context.Identity.ProcessId == 1000,
+            "target beyond global cap remains queryable");
+        const auto initialPage = crowded.Query(100);
+        Check(initialPage.Matched == 300 && initialPage.Cases.size() == 256 && initialPage.Omitted() == 44 &&
+            !initialPage.Complete() && !initialPage.NextCursor.empty(), "query reports retained matches beyond output budget");
+        const auto last = crowded.Query(101, {}, {256, initialPage.NextCursor});
+        Check(last.Status == L"ok" && last.AsOfMs == 100 && last.Offset == 256 && last.Matched == 300 &&
+            last.Cases.size() == 44 && last.Omitted() == 0 && !last.Complete() && last.NextCursor.empty(),
+            "continuation uses fixed observation time and reports prior pages");
+        Check(crowded.Query(30101, {}, {256, initialPage.NextCursor}).Status == L"stale_cursor" &&
+            crowded.Query(99, {}, {256, initialPage.NextCursor}).Status == L"stale_cursor",
+            "expired and future query cursors are rejected");
+        Check(crowded.Query(100, {true, 1000, L""}, {256, initialPage.NextCursor}).Status == L"invalid_cursor" &&
+            crowded.Query(100, {}, {1, initialPage.NextCursor}).Status == L"invalid_cursor",
+            "cursor is bound to exact endpoint filters and page size");
+        for (const auto& cursor : {L"bad", L"q1:", L"q1:18446744073709551616:1:100:256:256:0:0:",
+            L"q1:1:1:100:0:256:0:0:", L"q1:-1:1:100:1:256:0:0:"})
+        {
+            Check(crowded.Query(100, {}, {256, cursor}).Status == L"invalid_cursor", "malformed cursor rejected");
+        }
+        Check(crowded.Query(100, {}, {0, {}}).Status == L"invalid_query" &&
+            crowded.Query(100, {}, {257, {}}).Status == L"invalid_query", "invalid query limits rejected");
+        crowded.Observe(Reference(0));
+        Check(crowded.Query(100, {}, {256, initialPage.NextCursor}).Status == L"stale_cursor",
+            "index mutation invalidates cursor instead of silently skipping rows");
+        const auto pair = crowded.Query(100, {true, 1000, L"tls_callback"}, {1, {}});
+        Check(pair.Matched == 2 && pair.Cases.size() == 1 && pair.Cases[0].HasRelated &&
+            pair.Cases[0].Primary.Context.Identity.ProcessId == 0 &&
+            pair.Cases[0].Related.Context.Identity.ProcessId == 1000, "paired target preserves both endpoints");
+        Check(crowded.Query(100, {true, 1000, L"firmware_table_handler"}).Matched == 0,
+            "PID and role cannot match different endpoints");
+        std::set<std::wstring> actualCases, expectedCases;
+        for (uint64_t i = 1; i <= 300; ++i)
+        {
+            expectedCases.insert(L"301:" + std::to_wstring(i));
+            expectedCases.insert(std::to_wstring(i) + L":0");
+        }
+        expectedCases.insert(L"301:0");
+        std::wstring cursor;
+        size_t returned = 0;
+        for (size_t pageNumber = 0; pageNumber < 32; ++pageNumber)
+        {
+            const auto page = crowded.Query(100 + pageNumber, {}, {37, cursor});
+            Check(page.Status == L"ok" && page.Matched == expectedCases.size(), "page exact count matches fixture oracle");
+            for (const auto& row : page.Cases)
+            {
+                actualCases.insert(std::to_wstring(row.Primary.Id) + L":" +
+                    std::to_wstring(row.HasRelated ? row.Related.Id : 0));
+            }
+            returned += page.Cases.size();
+            cursor = page.NextCursor;
+            if (cursor.empty()) { break; }
+        }
+        Check(cursor.empty() && returned == expectedCases.size() && actualCases == expectedCases,
+            "pagination has no duplicate or missing pair and single-reference cases");
+        const auto beforeReset = crowded.Query(100, {}, {1, {}});
+        crowded = KmonHuntIndex{};
+        Check(crowded.Query(100, {}, {1, beforeReset.NextCursor}).Status == L"stale_cursor",
+            "index reset cannot revive an old cursor");
         KmonHuntCase item{L"cross_domain_content", ObservationRelation::Content, Reference(0), Reference(55), true};
         auto a = KmonHuntCasesJson({item}, 100, 0, 0);
         item.Primary.Id = 500;
@@ -213,6 +280,33 @@ namespace
         auto b = KmonHuntCasesJson({item}, 1000, 0, 0);
         AnalystSnapshotDiff result;
         std::wstring error;
+        const auto queryJson = KmonHuntQueryJson(initialPage, {}, 0, 0);
+        Check(CompareAnalystSnapshots(queryJson, queryJson, &result, &error) && result.Unchanged == 256,
+            "paged query snapshot retains compatible hunt schema");
+        Check(CompareAnalystSnapshots(queryJson, KmonHuntQueryJson(last, {}, 0, 0), &result, &error) &&
+            result.CoverageChanged, "different query pages have different coverage");
+        for (const auto& change : std::vector<std::pair<std::wstring, std::wstring>>{
+            {L"\"matched_case_count\":300", L"\"matched_case_count\":0"},
+            {L"\"returned_case_count\":256", L"\"returned_case_count\":255"},
+            {L"\"omitted_by_budget\":44", L"\"omitted_by_budget\":43"},
+            {L"\"complete_within_query_scope\":false", L"\"complete_within_query_scope\":true"},
+            {L"\"query_status\":\"ok\"", L"\"query_status\":\"stale_cursor\""}})
+        {
+            auto invalid = queryJson;
+            invalid.replace(invalid.find(change.first), change.first.size(), change.second);
+            Check(!CompareAnalystSnapshots(invalid, queryJson, &result, &error),
+                "query snapshot rejects inconsistent or failed continuation claims");
+        }
+        const auto scopedQuery = KmonHuntQueryJson(target, {true, 1000, L"tls_callback"}, 0, 0);
+        for (const auto& change : std::vector<std::pair<std::wstring, std::wstring>>{
+            {L"\"filter_pid\":1000", L"\"filter_pid\":9999"},
+            {L"\"retained_references\":300", L"\"retained_references\":0"}})
+        {
+            auto invalid = scopedQuery;
+            invalid.replace(invalid.find(change.first), change.first.size(), change.second);
+            Check(!CompareAnalystSnapshots(invalid, scopedQuery, &result, &error),
+                "query metadata must agree with actual endpoints and retained capacity");
+        }
         Check(CompareAnalystSnapshots(a, b, &result, &error) && result.Unchanged == 1 && result.Changed == 0,
             "refresh times and IDs do not change a lead");
         auto equivalent = a;

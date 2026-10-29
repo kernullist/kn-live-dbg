@@ -63,3 +63,27 @@ inline std::wstring KmonHuntCasesJson(const std::vector<KmonHuntCase>& cases, ui
     out += L"]}";
     return out;
 }
+
+inline std::wstring KmonHuntQueryJson(const KmonHuntQueryPage& page, const KmonHuntFilter& filter,
+    uint64_t evicted, uint64_t rejected, const wchar_t* inputMode = L"live_observations")
+{
+    auto out = KmonHuntCasesJson(page.Cases, page.AsOfMs, evicted, rejected, inputMode);
+    out.pop_back();
+    out += L",\"query_schema\":\"kmon.case_query.v1\",\"query_scope\":\"retained_fresh_references\"";
+    out += L",\"query_status\":" + mcpjson::Quote(page.Status);
+    out += L",\"query_epoch\":" + mcpjson::Quote(std::to_wstring(page.Epoch));
+    out += L",\"query_revision\":" + mcpjson::Quote(std::to_wstring(page.Revision));
+    out += L",\"candidate_limit\":" + std::to_wstring(page.Limit);
+    out += L",\"filter_pid\":" + (filter.HasPid ? std::to_wstring(filter.ProcessId) : L"null");
+    out += L",\"filter_role\":" + mcpjson::Quote(filter.Role);
+    const bool ok = page.Status == L"ok";
+    out += L",\"matched_case_count\":" + (ok ? std::to_wstring(page.Matched) : L"null");
+    out += L",\"returned_case_count\":" + std::to_wstring(page.Cases.size());
+    out += L",\"page_offset\":" + std::to_wstring(page.Offset);
+    out += L",\"omitted_by_budget\":" + (ok ? std::to_wstring(page.Omitted()) : L"null");
+    out += L",\"complete_within_query_scope\":" + std::wstring(page.Complete() ? L"true" : L"false");
+    out += L",\"next_cursor\":" + (page.NextCursor.empty() ? L"null" : mcpjson::Quote(page.NextCursor));
+    out += L",\"underlying_index_retention\":{\"reference_capacity\":" + std::to_wstring(page.ReferenceCapacity);
+    out += L",\"retained_references\":" + std::to_wstring(page.RetainedReferences) + L",\"freshness_ms\":30000}}";
+    return out;
+}

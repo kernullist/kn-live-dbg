@@ -263,6 +263,8 @@ namespace
         Fields fields;
         bool value = false;
         uint64_t number = 0;
+        uint64_t queryReturned = UINT64_MAX;
+        AnalystCaseFilter queryFilter;
         std::wstring claim, array, processKey, boot;
         bool unknownIdentity = false;
         if (json.size() > MaxSnapshotBytes || !mcpjson::ValidateDocument(json) || !SnapshotStringsValid(json) || !Object(json, &fields) ||
@@ -348,6 +350,67 @@ namespace
                     coverage.emplace(name, fields.at(name));
                 }
             }
+            if (fields.count(L"query_schema") != 0)
+            {
+                std::wstring schema, status, scope, cursor;
+                uint64_t matched = 0, offset = 0, omitted = 0, limit = 0, epoch = 0, revision = 0, asOf = 0;
+                bool complete = false;
+                Fields retention;
+                uint64_t capacity = 0, retained = 0, freshness = 0;
+                if (!Text(fields, L"query_schema", &schema, 64) || schema != L"kmon.case_query.v1" ||
+                    !Text(fields, L"query_status", &status, 64) || status != L"ok" ||
+                    !Text(fields, L"query_scope", &scope, 64) || scope != L"retained_fresh_references" ||
+                    !Number(fields, L"query_epoch", &epoch) || epoch == 0 ||
+                    !Number(fields, L"query_revision", &revision) || !Number(fields, L"generated_ms", &asOf) ||
+                    fields.count(L"filter_pid") == 0 || fields.count(L"filter_role") == 0 ||
+                    !Number(fields, L"matched_case_count", &matched) || matched > 66048 ||
+                    !Number(fields, L"returned_case_count", &queryReturned) ||
+                    !Number(fields, L"page_offset", &offset) || offset > matched ||
+                    !Number(fields, L"candidate_limit", &limit) || limit == 0 || limit > 256 ||
+                    queryReturned != (std::min)(limit, matched - offset) || (offset != 0 && offset == matched) ||
+                    !Number(fields, L"omitted_by_budget", &omitted) || omitted != matched - offset - queryReturned ||
+                    !Boolean(fields, L"complete_within_query_scope", &complete) || complete != (offset == 0 && omitted == 0) ||
+                    fields.count(L"next_cursor") == 0 ||
+                    (omitted == 0 ? fields.at(L"next_cursor") != L"null" :
+                        (!Text(fields, L"next_cursor", &cursor, 1200) || cursor.empty())) ||
+                    fields.count(L"underlying_index_retention") == 0 ||
+                    !Object(fields.at(L"underlying_index_retention"), &retention) ||
+                    !Number(retention, L"reference_capacity", &capacity) || capacity == 0 || capacity > 512 ||
+                    !Number(retention, L"retained_references", &retained) || retained > capacity ||
+                    matched > retained * retained / 4 + retained ||
+                    !Number(retention, L"freshness_ms", &freshness) || freshness != 30000)
+                {
+                    return false;
+                }
+                queryFilter.HasPid = fields.at(L"filter_pid") != L"null";
+                uint64_t pid = 0;
+                if ((queryFilter.HasPid && !Number(fields, L"filter_pid", &pid)) ||
+                    !Text(fields, L"filter_role", &queryFilter.Role, 128))
+                {
+                    return false;
+                }
+                queryFilter.ProcessId = static_cast<uint32_t>(pid);
+                if (omitted != 0)
+                {
+                    const auto expected = L"q1:" + std::to_wstring(epoch) + L":" + std::to_wstring(revision) +
+                        L":" + std::to_wstring(asOf) + L":" + std::to_wstring(offset + queryReturned) + L":" +
+                        KmonHuntQueryScope(queryFilter, static_cast<size_t>(limit));
+                    if (cursor != expected) { return false; }
+                }
+                for (const auto name : {L"query_schema", L"query_scope", L"query_status", L"page_offset",
+                    L"matched_case_count", L"returned_case_count", L"omitted_by_budget", L"complete_within_query_scope"})
+                {
+                    coverage.emplace(name, fields.at(name));
+                }
+                coverage.emplace(L"underlying_index_retention", Canonical(retention));
+            }
+            else if (fields.count(L"query_status") != 0 || fields.count(L"page_offset") != 0 ||
+                fields.count(L"returned_case_count") != 0 || fields.count(L"next_cursor") != 0 ||
+                fields.count(L"matched_case_count") != 0 || fields.count(L"omitted_by_budget") != 0 ||
+                fields.count(L"complete_within_query_scope") != 0)
+            {
+                return false;
+            }
             snapshot->Coverage = Canonical(coverage);
         }
         const auto found = fields.find(surfaces ? L"rows" : L"cases");
@@ -367,7 +430,7 @@ namespace
             mcpjson::SkipWhitespace(array, &pos);
             if (pos < array.size() && array[pos] == L']')
             {
-                return true;
+                return queryReturned == UINT64_MAX || snapshot->Rows.size() == queryReturned;
             }
             size_t end = 0;
             Fields row;
@@ -425,6 +488,24 @@ namespace
                 {
                     return false;
                 }
+                if (queryReturned != UINT64_MAX)
+                {
+                    const auto matches = [&](const std::wstring& serialized)
+                    {
+                        Fields endpoint;
+                        uint64_t pid = 0;
+                        std::wstring role;
+                        return Object(serialized, &endpoint) && Number(endpoint, L"pid", &pid) &&
+                            Text(endpoint, L"role", &role, 128) &&
+                            (!queryFilter.HasPid || pid == queryFilter.ProcessId) &&
+                            (queryFilter.Role.empty() || role == queryFilter.Role);
+                    };
+                    if (!matches(row.at(L"primary")) &&
+                        (row.count(L"related") == 0 || !matches(row.at(L"related"))))
+                    {
+                        return false;
+                    }
+                }
                 key = mcpjson::Quote(kind) + L":" + primaryKey + L":" + relatedKey;
                 state = L"{\"kind\":" + mcpjson::Quote(kind) + L",\"relation\":" + mcpjson::Quote(relation) +
                     L",\"primary\":" + primaryState + (relatedState.empty() ? L"" : L",\"related\":" + relatedState) + L"}";
@@ -473,14 +554,9 @@ namespace
 std::vector<KmonHuntCase> FilterAnalystCases(const std::vector<KmonHuntCase>& cases, const AnalystCaseFilter& filter)
 {
     std::vector<KmonHuntCase> result;
-    const auto matches = [&](const KmonHuntReference& row)
-    {
-        return (!filter.HasPid || row.Context.Identity.ProcessId == filter.ProcessId) &&
-            (filter.Role.empty() || row.Role == filter.Role);
-    };
     for (const auto& item : cases)
     {
-        if (matches(item.Primary) || (item.HasRelated && matches(item.Related)))
+        if (filter.Matches(item.Primary) || (item.HasRelated && filter.Matches(item.Related)))
         {
             result.push_back(item);
         }

@@ -298,7 +298,8 @@ public:
     KmonStats SnapshotStats() const;
     KmonOptions CurrentOptions() const;
     std::vector<KmonHuntCase> HuntCases(const AnalystCaseFilter& filter = {}) const;
-    std::wstring HuntCasesJson(const AnalystCaseFilter& filter = {}, std::vector<KmonHuntCase>* cases = nullptr) const;
+    std::wstring HuntCasesJson(const AnalystCaseFilter& filter = {}, std::vector<KmonHuntCase>* cases = nullptr,
+        const KmonHuntQueryOptions& options = {}, KmonHuntQueryPage* page = nullptr) const;
     std::wstring LayoutsJson(uint32_t pid = 0, bool initial = false) const;
     std::wstring LayoutsText(uint32_t pid = 0, bool initial = false) const;
     bool IsMapperWatchActive() const;

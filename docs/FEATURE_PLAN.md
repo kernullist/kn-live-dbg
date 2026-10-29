@@ -5,6 +5,33 @@ Baseline: v0.0.36. Implemented features are described in the
 [KMON coverage](KMON_DETECTION_COVERAGE.md). Completed implementation plans and
 per-commit work logs have been removed from this roadmap.
 
+## Investigation milestone
+
+The adopted design connects existing observations to retained evidence and
+reproducible investigation. Implement one complete path before adding more
+scanner families: an owned reference is observed with its process identity,
+bytes, slot and coverage; it remains queryable after the recent index expires;
+an offline reader explains the supported facts and missing evidence.
+
+| Stage | Contract and acceptance evidence |
+| --- | --- |
+| Scoped queries | Filter each endpoint before the result limit, retain the other endpoint of a matching relation, expose exact retained-scope counts and bounded continuation; test targets beyond 256 global results, paging, and stale cursors |
+| Identity and time | Separate a canonical process key from optional identity assertions; keep delayed receipts without rolling the current view backward; test PID/address reuse and conflicting optional fields |
+| Durable evidence | Commit bounded, versioned bundles containing raw spans, validity and acquisition receipts; report missing/corrupt chunks and interrupted publication without claiming complete evidence |
+| Offline investigation | Query retained history and replay the available original evidence without opening a live device; explain each finding's evidence and unfulfilled requirements after expiry, eviction and restart |
+
+Keep the existing command and observation import contracts through adapters.
+Current-state freshness, historical retention, byte verification, execution
+observation and actor attribution are separate claims. Hash equality identifies
+stored bytes; it does not establish that the original collector was trustworthy.
+Raw captures, local paths and private symbols are local investigation artifacts,
+not inputs to source commits or automatic public exports.
+
+Trace/VMI adapters, broad thread-pool layouts, approved reference distribution,
+encrypted remote transport and independent corpus comparisons remain separate
+work packages below. A local fixture or replay pass does not establish those
+capabilities or a comparative detection rate.
+
 ## Open engineering work
 
 | Area | Remaining work | Evidence required before claiming completion |

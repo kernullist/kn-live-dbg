@@ -720,7 +720,7 @@ namespace
         { L"iotrace", L"!kmon iotrace <driver> on | !kmon iotrace off|status", L"lab-only: interpose a driver's IOCTL dispatch and print driver.ioctl" },
                 { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
-        { L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent kernel/user investigation leads" },
+        { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
         { L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"TLS, KCT and WorkerFactory references" },
         { L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"process memory layout history and changes" },
         { L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations" },
@@ -734,6 +734,8 @@ namespace
         { L"/json", L"!kmon cases /json", L"structured observations and claim boundaries" },
         { L"/pid", L"/pid <PID>", L"match either endpoint with this process ID" },
         { L"/role", L"/role <name>", L"exact reference role on the matching endpoint" },
+        { L"/limit", L"/limit <count>", L"1..256 matching cases per page (default 256)" },
+        { L"/cursor", L"/cursor <token>", L"next_cursor with unchanged filters and limit; restart if stale" },
         { L"/save", L"/save <path>", L"persist UTF-8 JSON to a new file" },
     };
 
@@ -1633,7 +1635,7 @@ namespace
         SCOPE(L"iotrace", L"!kmon iotrace <driver> on | !kmon iotrace off|status", L"lab-only IOCTL dispatch interposition", kKmonIoTokens),
         SCOPE(L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations", kKmonDiffTokens),
         SCOPE(L"", L"!kmon [start] [options] | stop | status | add | remove | iotrace | watch | recent | cases | surfaces | layouts | diff | save | clear", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
-        SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/json] [/save path]", L"recent investigation leads", kKmonCaseTokens),
+        SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent investigation leads", kKmonCaseTokens),
         SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"static callback references", kKmonSurfaceTokens),
         SCOPE(L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"memory layout observations", kKmonLayoutTokens),
         SCOPE(L"opts", L"!kmon [start] [/pid <PID>] [/name <image>] [/driver <sys>] [/verbose] [/background] [/throttle <N>] [/log <dir>] [/manifest <path>] [/layout-ms <1000..60000>]", L"kmon start options", kKmonOptTokens),

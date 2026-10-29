@@ -32,6 +32,7 @@ PID는 십진수다. 다음 명령은 대상 메모리나 콜백을 수정하지
 
 !kmon cases /pid 1234
 !kmon cases /pid 1234 /role tls_callback /json
+!kmon cases /pid 1234 /limit 64 /json
 !kmon cases /save "D:\evidence\cases-before.json"
 !kmon cases /save "D:\evidence\cases-after.json"
 !kmon diff "D:\evidence\cases-before.json" "D:\evidence\cases-after.json"
@@ -77,7 +78,11 @@ PID는 십진수다. 다음 명령은 대상 메모리나 콜백을 수정하지
 
 TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참조의 출처 바이트로 보관한다. 코드 경로 검사 전후에 이 바이트와 슬롯을 재확인한다. TLS 배열 앞쪽에 NULL 종료자가 생기면 뒤쪽 슬롯이 같아도 등록된 참조로 보존하지 않는다. KCT는 현재 PEB 주소 자체도 다시 질의하므로 옛 PEB에 같은 테이블 포인터가 남아 있는 경우를 걸러낸다. 여러 읽기의 시간차 자체를 제거하는 원자적 캡처는 아니다.
 
-`cases`는 최대 512개 최근 참조에서 최대 256개 후보 사건을 만든 뒤 필터링한다. `/pid`와 `/role`은 동일한 끝점에서 함께 일치해야 한다. 커널·사용자 간 관계는 한쪽이 필터에 맞으면 다른 끝점도 보존한다. 만료는 30초이며 필터나 상한으로 보이지 않는 항목이 있을 수 있다.
+`cases`는 최대 512개 최근 참조에서 `/pid`와 `/role`이 같은 끝점에 함께 일치하는 사건을 고른 뒤 결과 제한을 적용한다. 커널·사용자 간 관계는 한쪽이 필터에 맞으면 다른 끝점도 보존한다. `/limit 1..256`의 기본값은 256이다. `matched_case_count`는 유지된 신선한 참조에서 일치하는 전체 사건 수, `returned_case_count`는 이번 페이지 수, `omitted_by_budget`는 이번 페이지 뒤에 남은 수다. `page_offset`은 앞 페이지에서 건너온 수를 나타낸다.
+
+`next_cursor`가 있으면 동일한 필터와 `/limit`에 `/cursor <next_cursor>`를 추가한다. 조회 시각을 고정하되 인덱스가 변경·초기화되거나 커서가 30초를 넘으면 `query_status=stale_cursor`로 거부한다. 범위·페이지 크기가 달라지거나 토큰이 잘못되면 `invalid_cursor`다. 이때 일치 수는 `null`이며 빈 정상 조회로 취급하지 않는다. 커서를 빼고 다시 시작해야 한다. 변화가 빈번한 라이브 인덱스에서 모든 페이지를 계속 이어갈 수 있다고 보장하지 않는다.
+
+`complete_within_query_scope`는 유지된 신선한 참조의 일치 사건이 한 응답에 모두 들어왔는지만 나타낸다. 수집 완료나 시스템 전체의 부재 증거가 아니다. 참조의 30초 만료, 용량 제한, `evidence_evicted`·`evidence_rejected`는 그대로 적용되고 `underlying_index_retention`에 조회 기반을 표시한다.
 
 ## 저장 형식과 diff
 
@@ -89,7 +94,7 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 
 `coverage_changed`와 원본 스냅샷의 coverage를 함께 확인해야 한다. 스캔 시작 위치·예산과 다음 재개 위치도 비교 범위에 포함한다. `no_longer_observed`는 만료, 필터 차이, 예산 부족, 접근 실패 또는 실제 제거 모두에서 발생할 수 있다. `absence_is_resolution=false`를 유지한다. 가져온 파일은 신뢰·인증된 기준으로 취급하지 않으며 `input_trust=unverified_snapshots`로 표시한다. 잘못된 UTF-8, 중복 키·식별자, 다른 스키마, 범위를 넘는 정수와 과대한 파일은 거부한다. 파일당 상한은 32MiB다.
 
-사건 스냅샷의 관측 범위는 필드 이름과 정규화한 값을 함께 비교한다. `filter_pid`는 NULL 또는 32비트 부호 없는 정수, `filter_role`은 최대 128자의 문자열, `candidate_limit`은 1~256으로 제한한다. 이 선택 필드가 없는 이전 `kmon.hunt.v1` 스냅샷도 읽을 수 있다. 짝이 맞지 않는 UTF-16 surrogate escape와 파서가 해석하는 객체의 멤버 이름에 포함된 NUL은 거부하며, 잘못된 식별자를 대체 문자로 바꿔 다른 관측과 합치지 않는다.
+사건 스냅샷의 관측 범위는 필드 이름과 정규화한 값을 함께 비교한다. `filter_pid`는 NULL 또는 32비트 부호 없는 정수, `filter_role`은 최대 128자의 문자열, `candidate_limit`은 1~256으로 제한한다. 새 응답의 `query_schema=kmon.case_query.v1`은 페이지 위치·반환 수·남은 수·완료 여부도 검증한다. 실패한 조회를 정상 스냅샷으로 저장하지 않는다. 이 선택 필드가 없는 이전 `kmon.hunt.v1` 스냅샷도 읽을 수 있다. 짝이 맞지 않는 UTF-16 surrogate escape와 파서가 해석하는 객체의 멤버 이름에 포함된 NUL은 거부하며, 잘못된 식별자를 대체 문자로 바꿔 다른 관측과 합치지 않는다.
 
 ## 검증
 

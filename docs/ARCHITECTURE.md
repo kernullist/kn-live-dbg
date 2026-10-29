@@ -112,8 +112,16 @@ the number of emitted findings.
 Typed callback slots and execution references are revalidated around reads.
 Candidate layouts, static branches, matching bytes, shared PFNs and temporal
 relationships do not establish current execution or the actor that wrote memory.
-Cases and executable-region catalogs are finite current-state indexes; JSONL
-and snapshots do not make every evicted relationship reconstructible.
+Cases and executable-region catalogs are finite current-state indexes. Case
+queries apply PID and role predicates to the same endpoint before limiting
+output, preserve both endpoints of matching relations, and count all matching
+cases in the retained fresh scope. Continuations bind the index epoch/revision,
+query time, filter and page size; mutation or expiry rejects a stale cursor
+instead of silently changing page membership. This is a query-scope contract,
+not a claim that collection was complete. JSONL and snapshots do not yet make
+every evicted relationship reconstructible; the
+[investigation milestone](FEATURE_PLAN.md#investigation-milestone) separates
+immutable evidence from the recent view.
 See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFICATION.md),
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).
