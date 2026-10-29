@@ -251,6 +251,13 @@ std::wstring EvidenceReplayJson(const EvidenceBundle& b, const EvidenceReplayRes
     json += L",\"claim\":\"stored_static_facts_only\",\"execution_observed\":false,\"communication_proven\":false,\"actor_attributed\":false";
     json += L",\"image_verification_replayed\":false,\"collection_complete\":false,\"collector_authenticated\":false";
     json += L",\"status\":" + mcpjson::Quote(r.Gaps.empty() ? L"replayed_declared_scope" : L"partial");
+    const auto& coverage = b.Receipt.Reference.Context.Coverage;
+    uint64_t uniqueCompared = 0;
+    json += L",\"original_comparison_coverage\":{\"denominator\":\"declared_byte_count\",\"exact_requested_ranges_available\":false";
+    json += L",\"unique_compared_bytes\":" + (coverage.UniqueComparedBytes(&uniqueCompared) ?
+        mcpjson::Quote(std::to_wstring(uniqueCompared)) : std::wstring(L"null"));
+    json += L",\"unique_accounting_complete\":" + std::wstring(coverage.Complete() ? L"true" : L"false") +
+        L",\"ranges_truncated\":" + std::wstring(coverage.RangesTruncated ? L"true" : L"false") + L"}";
     json += L",\"provenance\":{\"acquisition\":" + mcpjson::Quote(b.Acquisition) + L",\"collection_id\":" + mcpjson::Quote(b.CollectionId) +
         L",\"source\":" + mcpjson::Quote(b.Receipt.Reference.Context.Source) + L",\"dependency_group\":" + mcpjson::Quote(b.Receipt.Reference.Context.DependencyGroup) + L"}";
     json += L",\"original_receipt\":" + KmonHuntReceiptJson(b.Receipt) + L",\"page_digest\":" + mcpjson::Quote(r.PageDigest);

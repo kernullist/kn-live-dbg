@@ -2,6 +2,7 @@
 
 #include "AddressSpaceDescriptor.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -102,6 +103,54 @@ struct ObservationAnchor
     std::vector<uint8_t> Bytes;
 };
 
+// The extra input slot permits a bounded insertion before coalescing.
+inline bool NormalizeObservationRanges(const std::vector<ObservationRange>& ranges,
+    std::vector<ObservationRange>* normalized, uint64_t* uniqueBytes)
+{
+    if (normalized == nullptr || uniqueBytes == nullptr)
+    {
+        return false;
+    }
+    if (ranges.size() > 257)
+    {
+        normalized->clear();
+        *uniqueBytes = 0;
+        return false;
+    }
+    auto ordered = ranges;
+    normalized->clear();
+    *uniqueBytes = 0;
+    for (const auto& range : ordered)
+    {
+        if (range.Size == 0 || range.Address > UINT64_MAX - range.Size)
+        {
+            return false;
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b)
+    {
+        return a.Address < b.Address;
+    });
+    for (const auto& range : ordered)
+    {
+        if (!normalized->empty() && range.Address <= normalized->back().Address + normalized->back().Size)
+        {
+            auto& previous = normalized->back();
+            previous.Size = (std::max)(previous.Address + previous.Size, range.Address + range.Size) - previous.Address;
+        }
+        else
+        {
+            normalized->push_back(range);
+        }
+    }
+    for (const auto& range : *normalized)
+    {
+        // Disjoint bounded intervals cannot exceed the address universe.
+        *uniqueBytes += range.Size;
+    }
+    return true;
+}
+
 struct ObservationCoverage
 {
     uint64_t RequestedBytes = 0;
@@ -121,9 +170,44 @@ struct ObservationCoverage
 
     bool Complete() const
     {
-        return Attempted && TraversalComplete && InventoryAvailable && LostEvents == 0 &&
+        uint64_t unique = 0;
+        return Attempted && TraversalComplete && InventoryAvailable && LostEvents == 0 && !RangesTruncated &&
             FailedBytes == 0 && SkippedBytes == 0 && RequestedBytes != 0 &&
-            ComparedBytes == RequestedBytes;
+            Failed.empty() && Skipped.empty() && ComparedBytes == RequestedBytes &&
+            UniqueComparedBytes(&unique) && unique == RequestedBytes;
+    }
+
+    bool UniqueComparedBytes(uint64_t* bytes) const
+    {
+        std::vector<ObservationRange> normalized;
+        if (bytes == nullptr)
+        {
+            return false;
+        }
+        *bytes = 0;
+        return Compared.size() <= 256 && NormalizeObservationRanges(Compared, &normalized, bytes);
+    }
+
+    // Complete() checks unique-byte accounting, not the requested addresses.
+    // Callers making a range-specific claim must also prove the exact union.
+    bool CompleteFor(const std::vector<ObservationRange>& requested) const
+    {
+        std::vector<ObservationRange> expected, actual;
+        uint64_t requestedBytes = 0, comparedBytes = 0;
+        if (!Complete() || requested.size() > 256 ||
+            !NormalizeObservationRanges(requested, &expected, &requestedBytes) || requestedBytes != RequestedBytes ||
+            !NormalizeObservationRanges(Compared, &actual, &comparedBytes) || actual.size() != expected.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            if (actual[i].Address != expected[i].Address || actual[i].Size != expected[i].Size)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     const wchar_t* Status() const
@@ -134,23 +218,44 @@ struct ObservationCoverage
 
 inline void AddObservationRange(std::vector<ObservationRange>* ranges, ObservationRange range, bool* truncated)
 {
-    if (range.Size == 0)
+    if (ranges == nullptr || truncated == nullptr || range.Size == 0)
     {
         return;
     }
-    if (!ranges->empty() && ranges->back().Address <= UINT64_MAX - ranges->back().Size &&
-        ranges->back().Address + ranges->back().Size == range.Address)
-    {
-        ranges->back().Size += range.Size;
-    }
-    else if (ranges->size() < 256)
-    {
-        ranges->push_back(range);
-    }
-    else
+    if (range.Address > UINT64_MAX - range.Size || ranges->size() > 256)
     {
         *truncated = true;
+        return;
     }
+    if (ranges->size() == 1 && ranges->back().Size != 0 &&
+        ranges->back().Address <= UINT64_MAX - ranges->back().Size && range.Address >= ranges->back().Address)
+    {
+        auto& previous = ranges->back();
+        if (range.Address <= previous.Address + previous.Size)
+        {
+            previous.Size = (std::max)(previous.Address + previous.Size, range.Address + range.Size) - previous.Address;
+            return;
+        }
+        if (ranges->size() < 256)
+        {
+            ranges->push_back(range);
+        }
+        else
+        {
+            *truncated = true;
+        }
+        return;
+    }
+    auto candidates = *ranges;
+    candidates.push_back(range);
+    std::vector<ObservationRange> normalized;
+    uint64_t unique = 0;
+    if (!NormalizeObservationRanges(candidates, &normalized, &unique) || normalized.size() > 256)
+    {
+        *truncated = true;
+        return;
+    }
+    *ranges = std::move(normalized);
 }
 
 enum class ObservationRelation
@@ -228,6 +333,10 @@ inline void AppendObservationEvidence(
         evidence->emplace(L"coverage_reason", context.Coverage.Reason);
         evidence->emplace(L"requested_bytes", std::to_wstring(context.Coverage.RequestedBytes));
         evidence->emplace(L"compared_bytes", std::to_wstring(context.Coverage.ComparedBytes));
+        uint64_t uniqueCompared = 0;
+        evidence->emplace(L"unique_compared_bytes", context.Coverage.UniqueComparedBytes(&uniqueCompared) ?
+            std::to_wstring(uniqueCompared) : L"unavailable");
+        evidence->emplace(L"coverage_denominator", L"declared_byte_count");
         evidence->emplace(L"failed_bytes", std::to_wstring(context.Coverage.FailedBytes));
         evidence->emplace(L"skipped_bytes", std::to_wstring(context.Coverage.SkippedBytes));
         evidence->emplace(L"ranges_truncated", context.Coverage.RangesTruncated ? L"true" : L"false");
@@ -273,6 +382,8 @@ inline bool ObservationModelSelfTest()
     coverage.ComparedBytes = 256;
     ok = ok && !coverage.Complete();
     coverage.ComparedBytes = 4096;
+    ok = ok && !coverage.Complete();
+    coverage.Compared = {{0x10000, 4096}};
     ok = ok && coverage.Complete();
     coverage.LostEvents = 1;
     ok = ok && !coverage.Complete();

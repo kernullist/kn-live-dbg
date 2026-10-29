@@ -215,6 +215,18 @@ namespace
             explanation.find(L"\"image_verification_replayed\":false") != std::wstring::npos &&
             explanation.find(L"execution_telemetry_for_execution_claims") != std::wstring::npos,
             "why keeps execution and image verification requirements explicit");
+        auto repeated = b;
+        auto& repeatedCoverage = repeated.Receipt.Reference.Context.Coverage;
+        repeatedCoverage.InventoryAvailable = true;
+        repeatedCoverage.TraversalComplete = true;
+        repeatedCoverage.Compared = {{0x11000, 16}, {0x11000, 16}};
+        Check(ParseEvidenceBundle(EvidenceBundleJson(repeated), &parsed, &error) &&
+            !parsed.Receipt.Reference.Context.Coverage.Complete(), "legacy repeated byte accounting persists without a complete claim");
+        const auto repeatedExplanation = EvidenceReplayJson(parsed, ReplayEvidence(parsed), L"fixture_digest");
+        Check(repeatedExplanation.find(L"\"unique_compared_bytes\":\"16\"") != std::wstring::npos &&
+            repeatedExplanation.find(L"\"unique_accounting_complete\":false") != std::wstring::npos &&
+            repeatedExplanation.find(L"\"exact_requested_ranges_available\":false") != std::wstring::npos,
+            "replay explains unique coverage separately from its unavailable exact denominator");
         auto transfer = b;
         transfer.Spans[0].Bytes[0] = 0xe9;
         const int32_t delta = 0x2000 - 5;

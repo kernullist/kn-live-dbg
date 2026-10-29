@@ -23,6 +23,26 @@ These changes do not establish a system-wide LA57 support claim. Other scanners,
 source/VM/epoch identity, translation permissions and actual LA57 Windows
 compatibility remain separate acceptance work in [W02](FEATURE_PLAN.md#kernel-investigation-platform).
 
+## Comparison coverage
+
+`ObservationCoverage::Complete()` requires a bounded, valid union of compared
+intervals equal to both the declared requested byte count and the comparison
+counter. Duplicate visits cannot substitute for unvisited bytes. Truncated range
+lists, failure/skip intervals, event loss and incomplete traversal prevent a
+complete result. `CompleteFor(requestedRanges)` additionally requires equality
+with the exact requested address union; the image verifier uses that check before
+promoting an unchanged page to `OwnedVerified`. Neither result proves execution,
+collector authenticity or whole-system coverage.
+
+Range accumulation coalesces overlaps and out-of-order intervals within the
+existing 256-range limit, rejecting overflow without altering retained ranges.
+The v1 evidence format preserves original counters and ranges. Replay reports
+`original_comparison_coverage` with the recomputed unique byte count and states
+that the exact requested address denominator is unavailable in that format.
+It does not rewrite historical counters or claim to replay image verification.
+Discovery, temporal, semantic, persistence and trust coverage still need separate
+ledgers and proof requirements; unique byte accounting alone does not finish W05.
+
 ## Bounded observation sources
 
 `IObservationSource` admits at most 4096 bytes per primitive read. Requests bind

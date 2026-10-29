@@ -481,7 +481,7 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
             result.Coverage.Reason = L"compared_function_override_target_set";
         }
         result.Ownership = !result.Changes.empty() ? CodeOwnership::OwnedModified :
-            (result.Coverage.Complete() ? CodeOwnership::OwnedVerified : CodeOwnership::OwnedUnverified);
+            (result.Coverage.CompleteFor({{imageBase + rva, size}}) ? CodeOwnership::OwnedVerified : CodeOwnership::OwnedUnverified);
     } while (false);
     if (!result.Coverage.TraversalComplete)
     {
