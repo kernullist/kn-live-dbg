@@ -172,6 +172,39 @@ inline std::vector<uint32_t> KmonNextPids(
 
 using KmonHandleKey = std::pair<uint64_t, uint64_t>;
 
+// Reference collection has its own rotation; deep VAD/image work must not
+// consume its admission slots. One attempt per interval bounds added work.
+struct KmonReferenceSchedule
+{
+    uint32_t LastPid = 0;
+    uint64_t LastMs = 0;
+    bool Started = false;
+    bool Due(uint64_t now) const
+    {
+        return !Started || (now >= LastMs && now - LastMs >= 2000);
+    }
+    uint32_t Select(std::vector<uint32_t> pids, uint64_t now, uint32_t self)
+    {
+        if (!Due(now)) { return 0; }
+        Started = true;
+        LastMs = now;
+        pids.erase(std::remove_if(pids.begin(), pids.end(), [self](uint32_t pid)
+        {
+            return pid <= 4 || pid == self;
+        }), pids.end());
+        const auto selected = KmonNextPids(std::move(pids), 1, &LastPid);
+        return selected.empty() ? 0 : selected.front();
+    }
+    void Complete(uint64_t now) { LastMs = (std::max)(LastMs, now); }
+};
+
+inline uint64_t KmonReferenceDrainBudget(size_t pending, uint64_t now, uint64_t oldest)
+{
+    // Leave headroom before the 30-second freshness cutoff while retaining a
+    // finite service slice for layout/image work. Individual reads cannot be preempted.
+    return pending >= 128 || (now >= oldest && now - oldest >= 5000) ? 250 : 75;
+}
+
 inline void KmonRequestUserLayoutLead(uint32_t pid, uint64_t created, uint64_t now, bool watched,
     const std::map<std::pair<uint32_t, uint64_t>, uint64_t>& lastScan,
     std::map<std::pair<uint32_t, uint64_t>, uint64_t>* leads, bool changed = false)
@@ -299,6 +332,52 @@ struct KmonHandleHistory
 inline bool KmonHandleTrackingSelfTest()
 {
     bool ok = NativeHandleSnapshotSelfTest();
+    KmonReferenceSchedule references;
+    std::set<uint32_t> referenceVisits;
+    const std::vector<uint32_t> referenceTargets{0, 4, 55, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 21};
+    // Eleven watches exceed the four-per-pass deep quota. Reference visits
+    // continue at service boundaries while that deep pass is still running.
+    for (uint64_t now = 0; now <= 20000; now += 2000)
+    {
+        const auto pid = references.Select(referenceTargets, now, 55);
+        ok = ok && pid >= 11 && pid <= 21;
+        referenceVisits.insert(pid);
+        references.Complete(now);
+        ok = ok && references.Select(referenceTargets, now + 1999, 55) == 0;
+    }
+    ok = ok && referenceVisits.size() == 11;
+    references.Complete(25000);
+    ok = ok && !references.Due(26999) && !references.Due(1) && references.Due(27000);
+    ok = ok && references.Select({11, 13, 22, 23}, 27000, 55) == 22 &&
+        references.Select({11, 13, 22, 23}, 29000, 55) == 23 &&
+        references.Select({11, 13, 23}, 31000, 55) == 11;
+    // An unavailable/removed target still consumes only one attempt, never
+    // a catch-up burst or another tier's cursor.
+    references.Complete(60000);
+    ok = ok && references.Select({13}, 100000, 55) == 13 &&
+        references.Select({13}, 100000, 55) == 0;
+    references = {};
+    ok = ok && references.Select({0, 4, 55}, 0, 55) == 0 &&
+        references.Select({13}, 1, 55) == 0 && references.Select({13}, 2000, 55) == 13;
+    // A finite metadata burst with expensive verification must drain before
+    // expiry when analysis boundaries are sparse. The former single 75ms
+    // slice demonstrably leaves work past the cutoff under the same workload.
+    const auto remainingBurst = [](bool pressureService)
+    {
+        size_t pending = 256;
+        for (uint64_t now = 4000; now < 30000 && pending != 0; now += 4000)
+        {
+            for (int turn = 0; turn < (pressureService ? 2 : 1) && pending != 0; ++turn)
+            {
+                const uint64_t budget = pressureService ? KmonReferenceDrainBudget(pending, now, 0) : 75;
+                pending -= (std::min)(pending, static_cast<size_t>(budget / 4));
+            }
+        }
+        return pending;
+    };
+    ok = ok && remainingBurst(false) != 0 && remainingBurst(true) == 0 &&
+        KmonReferenceDrainBudget(1, 4999, 0) == 75 && KmonReferenceDrainBudget(1, 5000, 0) == 250 &&
+        KmonReferenceDrainBudget(127, 0, 1) == 75 && KmonReferenceDrainBudget(128, 0, 1) == 250;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> scanTimes{{{10, 1}, 10000}}, leads;
     KmonRequestUserLayoutLead(10, 1, 39999, true, scanTimes, &leads);
     KmonRequestUserLayoutLead(10, 0, 40000, true, scanTimes, &leads);

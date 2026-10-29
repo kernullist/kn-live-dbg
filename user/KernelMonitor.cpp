@@ -4340,9 +4340,9 @@ namespace
         const std::vector<std::wstring>& modulePaths,
         const std::vector<std::pair<uint64_t, uint32_t>>& moduleRanges,
         uint32_t* hits,
-        const std::function<void(uint64_t, uint64_t)>& observe = {})
+        const std::function<void(uint64_t, uint64_t)>& observe = {},
+        const std::function<bool()>& service = {})
     {
-        HANDLE referenceFile = INVALID_HANDLE_VALUE;
         const uint32_t originalHits = hits != nullptr ? *hits : 0;
         bool referenceStable = false;
         do
@@ -4365,8 +4365,10 @@ namespace
             {
                 return ReadProcessBytes(device, symbols, processHandle, pid, address, static_cast<uint32_t>(count), bytes);
             };
-            referenceFile = CreateFileW(imagePath.c_str(), GENERIC_READ,
+            HANDLE referenceFile = CreateFileW(imagePath.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+            const std::unique_ptr<void, decltype(&CloseHandle)> referenceFileOwner(
+                referenceFile == INVALID_HANDLE_VALUE ? nullptr : referenceFile, &CloseHandle);
             std::vector<uint8_t> currentHeaders;
             if (!executable_image::ReadDiskPeMetadata(imagePath, &reference, nullptr) ||
                 referenceFile == INVALID_HANDLE_VALUE || headers.empty() || headers.size() > 0x10000 ||
@@ -4394,8 +4396,10 @@ namespace
             constexpr uint32_t kMaxDescriptors = 64;
             constexpr uint32_t kMaxThunks = 256;
             const uint32_t thunkSize = is64 ? 8u : 4u;
-            for (uint32_t i = 0; i < count && i < kMaxDescriptors; ++i)
+            bool cancelled = false;
+            for (uint32_t i = 0; i < count && i < kMaxDescriptors && !cancelled; ++i)
             {
+                if (service && !service()) { cancelled = true; break; }
                 if (*hits >= 4)
                 {
                     break;
@@ -4490,6 +4494,10 @@ namespace
                 }
                 for (uint32_t t = 0; t < kMaxThunks; ++t)
                 {
+                    // Thousands of small cross-process reads can outlive the
+                    // reference freshness window. No borrowed collector state
+                    // is held here; the file and live identity are requalified.
+                    if (service && !service()) { cancelled = true; break; }
                     if (*hits >= 4)
                     {
                         break;
@@ -4594,6 +4602,7 @@ namespace
                     ++(*hits);
                 }
             }
+            if (cancelled) { break; }
             referenceStable = executable_image::DiskFileIdentityMatches(referenceFile, reference) &&
                 QualifyExecutableReference(reference, imageBase, imageReader, nullptr);
         } while (false);
@@ -4601,10 +4610,57 @@ namespace
         {
             *hits = originalHits;
         }
-        if (referenceFile != INVALID_HANDLE_VALUE)
+    }
+
+    bool KmonImportServiceSelfTest()
+    {
+        const auto module = GetModuleHandleW(L"kernel32.dll");
+        wchar_t path[32768] = {};
+        const auto length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+        std::vector<uint8_t> headers;
+        KmonPeLayout layout = {};
+        if (module == nullptr || length == 0 || length >= std::size(path) ||
+            !ReadDiskPeHead(path, &headers) || !ParseKmonPeLayout(headers, &layout)) { return false; }
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (snapshot == INVALID_HANDLE_VALUE) { return false; }
+        const std::unique_ptr<void, decltype(&CloseHandle)> snapshotOwner(snapshot, &CloseHandle);
+        std::vector<std::wstring> paths;
+        std::vector<std::pair<uint64_t, uint32_t>> ranges;
+        MODULEENTRY32W entry = {};
+        entry.dwSize = sizeof(entry);
+        if (!Module32FirstW(snapshot, &entry)) { return false; }
+        do
         {
-            CloseHandle(referenceFile);
-        }
+            paths.push_back(entry.szExePath);
+            ranges.emplace_back(reinterpret_cast<uint64_t>(entry.modBaseAddr), entry.modBaseSize);
+        } while (Module32NextW(snapshot, &entry));
+        if (GetLastError() != ERROR_NO_MORE_FILES) { return false; }
+        using Slots = std::vector<std::pair<uint64_t, uint64_t>>;
+        const auto scan = [&](Slots& slots, uint32_t* hits, const std::function<bool()>& service)
+        {
+            ScanLiveImportThunks(path, headers, layout.ImportRva, layout.ImportSize, 12, 16, 20,
+                layout.Is64, reinterpret_cast<uint64_t>(module), GetCurrentProcess(), nullptr, nullptr,
+                GetCurrentProcessId(), layout.SizeOfImage, paths, ranges, hits,
+                [&](uint64_t target, uint64_t slot) { slots.emplace_back(target, slot); }, service);
+        };
+        Slots baseline, serviced, stopped;
+        uint32_t baselineHits = 0, servicedHits = 0, stoppedHits = 0;
+        size_t turns = 0;
+        scan(baseline, &baselineHits, {});
+        scan(serviced, &servicedHits, [&]() { ++turns; return true; });
+        if (baseline.size() < 8 || baseline != serviced || baselineHits != servicedHits ||
+            turns <= baseline.size()) { return false; }
+        DWORD before = 0, after = 0;
+        if (!GetProcessHandleCount(GetCurrentProcess(), &before)) { return false; }
+        turns = 0;
+        scan(stopped, &stoppedHits, [&]() { return ++turns < 8; });
+        if (turns != 8 || stopped.size() >= baseline.size() || stoppedHits != 0) { return false; }
+        // A service failure must also unwind the retained disk handle.
+        struct ServiceFailure {};
+        bool threw = false;
+        try { scan(stopped, &stoppedHits, []() -> bool { throw ServiceFailure{}; }); }
+        catch (const ServiceFailure&) { threw = true; }
+        return threw && GetProcessHandleCount(GetCurrentProcess(), &after) && before == after;
     }
 
     void ScanLiveCallTablePointers(
@@ -8521,6 +8577,8 @@ bool KernelMonitor::Start(
             ExecutionReferenceQueued = 0;
             ExecutionReferenceProcessed = 0;
             ExecutionReferenceExpired = 0;
+            ExecutionReferenceMaxWaitMs = 0;
+            ExecutionReferencePeak = 0;
             ExecutionReferenceQueueDropsByRole.clear();
             ReferenceScanCursors.clear();
             ReferenceCursorEvicted = 0;
@@ -17076,6 +17134,52 @@ void KernelMonitor::ScanUserExecutionEvidence(
     }
 }
 
+void KernelMonitor::ServiceWatchedReferences()
+{
+    const uint64_t now = GetTickCount64();
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    if (StopRequested.load() || !WatchedReferenceSchedule.Due(now) || !GetLiveTargets(&device, &symbols)) { return; }
+    auto options = CurrentOptions();
+    std::vector<uint32_t> namedPids;
+    const bool inventoryComplete = options.WatchNames.empty() || CollectToolhelpPidsByName(options.WatchNames, &namedPids);
+    options.WatchPids.insert(options.WatchPids.end(), namedPids.begin(), namedPids.end());
+    const auto pid = WatchedReferenceSchedule.Select(std::move(options.WatchPids), now, GetCurrentProcessId());
+    struct Finish
+    {
+        KmonReferenceSchedule& Schedule;
+        ~Finish() { Schedule.Complete(GetTickCount64()); }
+    } finish{WatchedReferenceSchedule};
+    if (pid == 0 && inventoryComplete) { return; }
+
+    KmonEvent visit;
+    visit.Kind = L"coverage.user_reference_schedule";
+    visit.ProcessId = pid;
+    visit.Observation.Source = L"watched_reference_scheduler";
+    visit.Summary = L"bounded reference visit independent of deep process scans";
+    visit.Evidence[L"watch_inventory_complete"] = inventoryComplete ? L"true" : L"false";
+    visit.Evidence[L"source_status"] = L"unavailable";
+    HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
+    auto identity = process != nullptr ? ObserveProcessIdentity(pid, process) : ObservationIdentity{};
+    if (process != nullptr && identity.CreateTime != 0 && !StopRequested.load())
+    {
+        visit.Observation.Identity = identity;
+        // Callback collection obtains its own bounded module inventory. The
+        // thread/APC reader does not infer image ownership from an empty view;
+        // queued code is qualified later by the normal execution verifier.
+        ScanUserExecutionSurfaces(process, identity, {}, false);
+        visit.Evidence[L"source_status"] = L"attempted";
+    }
+    else
+    {
+        visit.Evidence[L"reason"] = StopRequested.load() ? L"stopping" :
+            pid == 0 ? L"watch_inventory_unavailable" : L"process_identity_unavailable";
+    }
+    visit.Evidence[L"service_ms"] = std::to_wstring(GetTickCount64() - now);
+    RecordEvent(std::move(visit));
+}
+
 void KernelMonitor::ScanUserModeHostility()
 {
     DeviceClient* device = nullptr;
@@ -18117,7 +18221,7 @@ void KernelMonitor::ScanUserModeHostility()
                                     diskLayout.SizeOfImage,
                                     modulePaths,
                                     moduleRanges,
-                                    &iatHits);
+                                    &iatHits, {}, serviceMemoryAnalysis);
                                 ScanLiveImportThunks(
                                     imagePath,
                                     diskHeaders,
@@ -18135,7 +18239,7 @@ void KernelMonitor::ScanUserModeHostility()
                                     diskLayout.SizeOfImage,
                                     modulePaths,
                                     moduleRanges,
-                                    &iatHits);
+                                    &iatHits, {}, serviceMemoryAnalysis);
                                 if (iatHits > 0)
                                 {
                                     EmitUnique(
@@ -19508,7 +19612,7 @@ void KernelMonitor::ScanUserModeHostility()
                             moduleLayout.SizeOfImage,
                             modulePaths,
                             moduleRanges,
-                            &dllIatHits, observeIat);
+                            &dllIatHits, observeIat, serviceMemoryAnalysis);
                         ScanLiveImportThunks(
                             modulePath,
                             moduleHeaders,
@@ -19526,7 +19630,7 @@ void KernelMonitor::ScanUserModeHostility()
                             moduleLayout.SizeOfImage,
                             modulePaths,
                             moduleRanges,
-                            &dllIatHits, observeIat);
+                            &dllIatHits, observeIat, serviceMemoryAnalysis);
                         if (dllIatHits > 0)
                         {
                             EmitUnique(
@@ -26029,6 +26133,7 @@ bool KernelMonitorSelfTest()
 
         std::unordered_set<std::wstring> imported;
         KmonPeLayout importLayout = {};
+        if (!KmonImportServiceSelfTest()) { break; }
         CollectImportedDllNames(L"", std::vector<uint8_t>(), importLayout, &imported);
         if (!imported.empty())
         {

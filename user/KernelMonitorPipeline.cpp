@@ -175,6 +175,7 @@ void KernelMonitor::ResetPipeline()
     UserLastScanMs.clear();
     UserLayoutLeads.clear();
     UrgentUserPidCursor = 0;
+    WatchedReferenceSchedule = {};
     UserMemoryAnalysisYields.store(0);
     HeapPageCursors.clear();
     HighPriorityPidCursor = 0;
@@ -195,13 +196,24 @@ void KernelMonitor::ServicePendingAnalysis(const wchar_t* before)
     struct Reset { bool& Flag; ~Reset() { Flag = false; } } reset{ServicingAnalysis};
     // All verifier/catalog state stays on the analysis thread. Yield at safe
     // scan boundaries instead of waiting for an entire multi-scanner pass.
+    const auto serviceReferences = [this]()
+    {
+        if (!ExecutionReferences.empty())
+        {
+            ScanExecutionReferences(128, KmonReferenceDrainBudget(ExecutionReferences.size(),
+                GetTickCount64(), ExecutionReferences.front().ObservedMs));
+        }
+    };
+    // Older work gets a bounded turn before ingestion can add another burst.
+    serviceReferences();
     DrainLayoutCandidates(false, before);
     IngestLiveTimeline();
     IngestThreatIntel();
     DrainIotraceEvents();
     DrainPipelineEvents();
     DrainLayoutCandidates(false, L"after_event_ingestion");
-    ScanExecutionReferences(128, 75);
+    ServiceWatchedReferences();
+    serviceReferences();
     ContinueImageSweeps();
 }
 
@@ -1076,6 +1088,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"execution_references_queued"] = std::to_wstring(ExecutionReferenceQueued);
         event.Evidence[L"execution_references_processed"] = std::to_wstring(ExecutionReferenceProcessed);
         event.Evidence[L"execution_references_expired"] = std::to_wstring(ExecutionReferenceExpired);
+        event.Evidence[L"execution_references_max_queue_wait_ms"] = std::to_wstring(ExecutionReferenceMaxWaitMs);
+        event.Evidence[L"execution_references_peak"] = std::to_wstring(ExecutionReferencePeak);
         event.Evidence[L"reference_scan_cursors"] = std::to_wstring(ReferenceScanCursors.size());
         event.Evidence[L"reference_cursor_evicted"] = std::to_wstring(ReferenceCursorEvicted);
         event.Evidence[L"reference_scan_policy"] = L"rotating static sources: IAT/table 16, kernel tables 64; not complete path coverage";

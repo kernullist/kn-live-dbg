@@ -368,6 +368,7 @@ private:
     bool QueueLayoutCandidate(ProcessLayoutCandidate candidate);
     bool QueueLayoutNotice(const ProcessLayoutNotice& notice);
     void ServicePendingAnalysis(const wchar_t* before = L"scanner_boundary");
+    void ServiceWatchedReferences();
     void CaptureLoop();
     void CaptureWriterLoop();
     void DrainPipelineEvents(bool finalDrain = false);
@@ -653,6 +654,7 @@ private:
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserLastScanMs;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserLayoutLeads;
     uint32_t UrgentUserPidCursor = 0;
+    KmonReferenceSchedule WatchedReferenceSchedule;
     std::atomic<uint64_t> UserMemoryAnalysisYields{0};
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> HeapPageCursors;
 
@@ -755,6 +757,8 @@ private:
     uint64_t ExecutionReferenceQueued = 0;
     uint64_t ExecutionReferenceProcessed = 0;
     uint64_t ExecutionReferenceExpired = 0;
+    uint64_t ExecutionReferenceMaxWaitMs = 0;
+    size_t ExecutionReferencePeak = 0;
     std::map<std::wstring, uint64_t> ExecutionReferenceQueueDropsByRole;
     std::map<std::wstring, size_t> ReferenceScanCursors;
     uint64_t ReferenceCursorEvicted = 0;

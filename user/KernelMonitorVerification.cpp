@@ -846,6 +846,7 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     ++ExecutionReferenceQueued;
     ExecutionReferences.push_back({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
         GetTickCount64(), actual, role, anchors, expectedPeb});
+    ExecutionReferencePeak = (std::max)(ExecutionReferencePeak, ExecutionReferences.size());
 }
 
 void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, bool finalDrain)
@@ -870,7 +871,9 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             std::lock_guard<std::mutex> lock(HuntMutex);
             HuntIndex.Retire(work.Identity, work.Target, work.Slot, work.Role);
         }
-        if (GetTickCount64() - work.ObservedMs > 30000)
+        const uint64_t waited = GetTickCount64() - work.ObservedMs;
+        ExecutionReferenceMaxWaitMs = (std::max)(ExecutionReferenceMaxWaitMs, waited);
+        if (waited > 30000)
         {
             ++ExecutionReferenceDropped;
             ++ExecutionReferenceExpired;

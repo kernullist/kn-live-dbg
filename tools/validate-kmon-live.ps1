@@ -34,6 +34,7 @@ if ($RequireFreshLayouts -and -not $AllProcessLayouts) {
 }
 . (Join-Path $PSScriptRoot 'owned-process-wait.ps1')
 . (Join-Path $PSScriptRoot 'kmon-secondary-observation.ps1')
+. (Join-Path $PSScriptRoot 'kmon-reference-coverage.ps1')
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -69,6 +70,7 @@ $errTask = $null
 $failure = ''
 $runs = @()
 $started = [DateTime]::UtcNow
+$observationEnd = $null
 $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
 function Get-KmonEventLayer($Event)
 {
@@ -169,6 +171,7 @@ try {
         $monitor.StandardInput.WriteLine('!kmon status')
         Start-Sleep -Seconds 5
     }
+    $observationEnd = [DateTime]::UtcNow
     if ($AllProcessLayouts) { $monitor.StandardInput.WriteLine("!kmon layouts /json /save `"$output\layouts-inventory.json`"") }
     foreach ($run in $runs) {
         $monitor.StandardInput.WriteLine("!kmon cases /pid $($run.pid) /save `"$output\cases-$($run.scenario).json`"")
@@ -283,7 +286,8 @@ try {
     }
     $results = @(foreach ($run in $runs) {
         $own = @($events | Where-Object { $_.pid -eq $run.pid })
-        $referenceObservations = @($own | Where-Object { $_.kind -eq 'coverage.user_references' }).Count
+        $referenceCoverage = Get-KmonReferenceCoverage $own $run.pid $run.started_utc `
+            $(if ($observationEnd) { $observationEnd } else { [DateTime]::UtcNow })
         $comparedPages = $comparedPagesByPid[[long]$run.pid].Count
         $controlledName = ''; $controlledPath = ''; $controlledRva = 0
         $secondary = $run.scenario -match '^alias(32|64)-(clean|code|reloc)$'
@@ -420,7 +424,8 @@ try {
                 $imageCompletions[-1].failed_bytes -eq 0 -and $imageCompletions[-1].skipped_bytes -eq 0
         }
         [ordered]@{
-            scenario=$run.scenario; pid=$run.pid; user_reference_observations=$referenceObservations; expected_events=$expected.Count
+            scenario=$run.scenario; pid=$run.pid; user_reference_observations=$referenceCoverage.observations; expected_events=$expected.Count
+            user_reference_coverage=$referenceCoverage
             unique_image_pages_compared=$comparedPages
             unexpected_events=$unexpected.Count
             expected_drop_path_leads=$expectedLoadLeads.Count
@@ -429,7 +434,7 @@ try {
             layout_change_observations=@($own | Where-Object { $_.kind -eq 'finding.layout_change' -and $_.evidence.event_category -eq 'observation' }).Count
             image_completions=$imageCompletions; image_sweeps_completed=$imagesComplete
             secondary_image_base=$secondaryBase; secondary_relocation_base=$secondaryRelocationBase
-            passed=($referenceObservations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0 -and
+            passed=($referenceCoverage.examined_observations -gt 0 -and ($negative -or $expected.Count -gt 0) -and $unexpected.Count -eq 0 -and
                 (-not $RequireImageCompletion -or $imagesComplete))
             first_detection_seconds=$(if ($expected.Count) { ([DateTime]$expected[0].ts - [DateTime]$run.started_utc).TotalSeconds } else { $null })
         }
@@ -582,6 +587,7 @@ try {
     [ordered]@{
         schema='kn-live-dbg.kmon-live-validation.v1'; passed=$passed
         started_utc=$started.ToString('o'); completed_utc=[DateTime]::UtcNow.ToString('o')
+        observation_end_utc=$(if ($observationEnd) { $observationEnd.ToString('o') } else { $null })
         binary_sha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
         fixture_sha256=$(if ($SkipFixtures) { '' } else { (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash })
         observe_seconds=$ObserveSeconds; scenarios=$results; event_count=$eventCount

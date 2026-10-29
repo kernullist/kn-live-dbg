@@ -57,6 +57,7 @@ Two earlier all-process runs on an intermediate build, lasting 60 and 180 second
 Their queue/drain checks passed, with three and 14 bundles respectively committed
 without publication loss, and no unexpected fixture findings. These are not
 complete all-process passes; the focused pass does not close that coverage gap.
+The reference-service results below address the six-control observation gap.
 One earlier whole-app self-test also failed an unchanged AI child-process capture
 check; the isolated suite and a quiet whole-app rerun passed. Its exact cause was
 not established.
@@ -67,6 +68,60 @@ required elevation and loaded a driver before reaching file-only commands.
 their byte budget and file-reparse policy on the opened handle. The tests do not
 cover every power-loss outcome, long-running workload, Windows build or external
 malware corpus.
+
+## All-process reference service: 2026-10-29
+
+The final Release x64 executable had SHA-256
+`a2c0aa5a30997b81d4c4b4139507a1700995934688224ac92d8eb450562e96f1`.
+The baseline and both final runs used the same six owned controls and fixture
+binary, with a 180-second observation window, `-AllProcessLayouts`,
+`-RequireQueueHealth` and `-RequireCompletedWork`.
+
+The baseline missed the read-only control's reference visit entirely. Reference
+collection waited behind the deep process quota and memory/image work. A separate
+watched rotation improved visitation, but two intermediate candidates still
+failed the queue gate with 18 and 16 expired references. One recorded IAT walk
+held the analysis thread between service boundaries for 32.7 seconds. The final
+change services queued references before and after ingestion, increases their
+bounded budget under pressure, and yields between IAT descriptors/thunks without
+reducing the walk or extending the 30-second freshness limit.
+
+| Observation | Baseline | Final run A | Final run B |
+| --- | --- | --- | --- |
+| Examined reference visits per control | 0–2 | 6 | 5–6 |
+| Latest first visit | 178.9 s; one control unvisited | 26.9 s | 41.4 s |
+| Largest reference gap, including window edges | About 180.6 s | 57.5 s | 70.0 s |
+| Maximum queued-reference wait | Not recorded | 5.3 s | 13.1 s |
+| Expired/dropped references | 0/0 | 0/0 | 0/0 |
+| Required positive kinds / unexpected fixture findings | All observed / 0 | All observed / 0 | All observed / 0 |
+
+The baseline gap uses the last fixture's creation time plus 180 seconds because
+the old runner did not record the observation endpoint. Final runs record that
+endpoint explicitly. An independent JSONL aggregation matched all final visit
+counts, completed thread inventories, first-visit delays and maximum gaps.
+Unavailable, failed, empty-thread, wrong-instance and out-of-window rows cannot
+satisfy the updated fixture gate. Completed thread inventories do not establish
+complete APC/callback coverage or execution.
+
+Both final runs verified all-process layout collection, traversed the fixture,
+KERNEL32, KERNELBASE and ntdll images for all six controls, passed the queue and
+drain gates, kept the same boot and left no owned services. The whole host was
+not fully verified: background image work remained at shutdown, layout/read
+failures remained, and detection/visit latency varied between runs.
+
+The final native suite passed: timeline 28, MCP catalog 89, console 558, commands
+2,987, remote protocol 66 and connect arguments 4. The IAT regression compared
+the exact baseline/serviced slot sequence and hit count, and checked cancellation
+and exception cleanup with balanced process handle counts. Scheduling/burst
+controls and KMON ASan passed, including hunting 11,345, pages 54 and false-positive
+controls 49. PowerShell 5 and 7 coverage counterexamples passed. An earlier native
+run again failed the unchanged AI process-capture test; isolated output/limit/
+timeout diagnostics and subsequent whole-app tests passed without weakening its
+assertions. The earlier failure's exact cause remains unestablished.
+
+Raw evidence is retained locally under `.build/kmon-reference-fairness-20261029`.
+These are bounded host/fixture observations, not a general miss/false-positive
+rate or a completion guarantee for changing workloads.
 
 ## Earlier development evidence
 

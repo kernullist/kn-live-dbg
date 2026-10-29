@@ -144,6 +144,15 @@ console output, fixture PIDs, case/layout exports and `validation.json`,
 including first detection times, executable hashes, final pipeline coverage
 counters and cleanup results. Case/layout identities and every completed
 capture's file length and SHA-256 are checked against their event records.
+Each fixture also needs an examined thread-metadata observation during the
+live window, with its exact process creation time, a boot identity, a successful
+bounded source result and at least one thread record. An unavailable/failed
+coverage event cannot satisfy that gate. `user_reference_coverage` separates
+examined visits from unexamined events and completed thread inventories; it
+reports first-visit delay and the largest gap, including both window edges.
+These visits do not establish complete APC/callback coverage or execution.
+The driver-free counterexamples run with
+`powershell -NoProfile -File tools/test-kmon-reference-coverage.ps1`.
 It refuses an existing KnLiveDbg service and keeps its creation-time process
 handle across the console's PPL transition. A timeout, missing expected event,
 early child exit or fallback service cleanup fails the run.
