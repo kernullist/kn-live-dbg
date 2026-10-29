@@ -22,6 +22,8 @@
 #include "HiveScanner.h"
 #include "HvPostureScanner.h"
 #include "DumpAnalyzer.h"
+#include "DumpObservationSource.h"
+#include "ObservationSourceJson.h"
 #include "DmaPostureScanner.h"
 #include "InputStackScanner.h"
 #include "IntegrityScanner.h"
@@ -23030,6 +23032,7 @@ static void PrintKmonHelp()
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
+    std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23367,10 +23370,38 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon inventory|evidence|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|inventory|evidence|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"dump-read")
+    {
+        uint64_t address = 0, length = 0;
+        if (args.size() < 5 || args.size() > 6 || args[2].empty() ||
+            !ParseUnsigned(args[3], 16, &address) || !ParseUnsigned(args[4], 10, &length) || length == 0 || length > 4096 ||
+            (args.size() == 6 && ToLower(args[5]) != L"/json"))
+        {
+            std::wcerr << L"usage: !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
+            return 2;
+        }
+        std::wstring error;
+        auto source = OpenDumpObservationSource(args[2], &error);
+        if (!source)
+        {
+            std::wcout << L"{\"schema\":\"kn.observation_read.v1\",\"status\":\"unavailable\",\"error\":"
+                << mcpjson::Quote(error) << L",\"collector_authenticated\":false,\"spans\":[]}\n";
+            return 1;
+        }
+        ObservationReadRequest request;
+        request.SourceId = source->Capabilities().SourceId;
+        request.Address = address;
+        request.Length = static_cast<uint32_t>(length);
+        request.ByteBudget = length;
+        request.Cancellation = &g_StopRequested;
+        const auto result = source->Read(request);
+        std::wcout << ObservationReadJson(source->Capabilities(), request, result) << L"\n";
+        return result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1;
+    }
     if (action == L"inventory")
     {
         if (args.size() < 4 || args.size() > 5 || args[2].empty() || args[3].empty() ||
@@ -23481,7 +23512,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon inventory, evidence, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon dump-read, inventory, evidence, replay, or why\n";
     return 2;
 }
 
@@ -24309,7 +24340,7 @@ static void HandleKmonCommand(
             break;
         }
 
-        if (action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
+        if (action == L"dump-read" || action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;
@@ -53162,7 +53193,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon inventory|evidence|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|inventory|evidence|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";

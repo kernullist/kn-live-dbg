@@ -293,6 +293,35 @@ See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFI
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).
 
+## Offline dump observation source
+
+`DumpObservationSource` and the existing dump analyzer share one qualified
+LA48/LA57 translation implementation, including 4 KiB, 2 MiB and 1 GiB leaves.
+The new offline source validates AMD64 full-dump run counts, physical bounds,
+overlap, declared page counts and file extents before admitting reads. It holds
+one disk-file handle with writes/deletes denied, rejects final reparse points
+and device namespace paths, and serializes file-position operations. Its source
+ID identifies the open connection; it is not a durable artifact hash or a trusted
+capture identity. File metadata checks cannot authenticate the original memory.
+
+CR4 evidence or a unique reciprocal module-list probe selects the paging depth.
+Contradictions and ambiguous/missing evidence fail the new source open. The
+existing descriptive analyzer retains its legacy warning-bearing inference.
+Payload reads use the common 4 KiB admission/budget/cancellation contract;
+page-table metadata is additional bounded work, at most five entries per page
+and two pages per primitive read. Synchronous file I/O has no immediate deadline
+cancellation guarantee. Missing captured table/data pages, nonpresent PTEs,
+unsupported entries and file I/O failures retain different states. A source
+change discards all bytes collected in that primitive. Integer and Unicode
+parsers consume only complete declared reads through the same interface.
+
+`--offline !kmon dump-read` exposes `kn.observation_read.v1` with sparse bytes,
+address width, source and timing. Its output is private capture data; the
+publication scanner rejects it even after renaming. The source uses the dump's
+declared root only, does not synthesize uncaptured pages and does not establish
+live execution, VTL1 access or support for bitmap/triage/minidump formats.
+Read ticks describe this collector's file access, not the target's execution time.
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

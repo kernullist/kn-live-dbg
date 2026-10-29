@@ -128,6 +128,7 @@
     <ClCompile Include="HiveScanner.cpp" />
     <ClCompile Include="HvPostureScanner.cpp" />
     <ClCompile Include="DumpAnalyzer.cpp" />
+    <ClCompile Include="DumpObservationSource.cpp" />
     <ClCompile Include="DmaPostureScanner.cpp" />
     <ClCompile Include="InputStackScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
@@ -226,6 +227,7 @@
     <ClInclude Include="SourceCapabilities.h" />
     <ClInclude Include="AddressSpaceDescriptor.h" />
     <ClInclude Include="ObservationSource.h" />
+    <ClInclude Include="ObservationSourceJson.h" />
     <ClInclude Include="BundleObservationSource.h" />
     <ClInclude Include="NativeObservationSource.h" />
     <ClInclude Include="SessionWritePolicy.h" />
@@ -244,6 +246,7 @@
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="HvPostureScanner.h" />
     <ClInclude Include="DumpAnalyzer.h" />
+    <ClInclude Include="DumpObservationSource.h" />
     <ClInclude Include="DmaPostureScanner.h" />
     <ClInclude Include="InputStackScanner.h" />
     <ClInclude Include="IntegrityScanner.h" />

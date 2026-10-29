@@ -7,6 +7,28 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Shared dump source checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`d14a5e4e87a8d561919939b92ba28a04fac598dc8c1d1ee45a8834d67622f9ea`.
+This code-only checkpoint adds the offline dump source and routes existing dump
+translation/integer/string reads through it. The driver source did not change.
+
+| Check | Observed result |
+| --- | --- |
+| ASan dump source | 107 checks passed: LA48/LA57, 4 KiB/2 MiB/1 GiB leaves, sparse/nonpresent pages, concurrent readers, file sharing, wrong source IDs, cancellation, malformed runs, paging ambiguity/contradiction and replacement fault injection |
+| Public dump CLI | 102 fresh-process checks passed; one final-reparse-point control skipped because symlink creation required a privilege |
+| Driver-free EXE | Timeline 28, MCP 89, console 558, commands 2,998, remote 66 and connect arguments passed; includes the existing dump paging controls; capabilities describe 13 selected contracts and 261 routes |
+| Shared-source regression | Evidence ASan 449 checks and offline evidence CLI 99 checks passed; one symlink control skipped; no live evidence replayed |
+| Publication controls | Eight interrupted bundle writes yielded three valid files and five absent files; completed publication and restart passed; ten publication-scanner regression tests passed |
+
+All dump inputs were generated fixtures. A malformed-CR3 test initially cleared
+the field to zero (an unavailable value); it was corrected to a different nonzero
+root to test the intended contradiction. No actual LA57 target, crash dump from
+a live kernel, driver load or host security change was used. A process-scoped
+source ID and file metadata checks do not authenticate capture contents. Logs
+are retained under `.build/architecture/w03-dump-*`.
+
 ## Inventory continuation checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

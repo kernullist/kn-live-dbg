@@ -12,6 +12,7 @@ enum class ObservationReadState
     Complete,
     Partial,
     NotCaptured,
+    NotPresent,
     Failed,
     Conflict,
     Skipped,

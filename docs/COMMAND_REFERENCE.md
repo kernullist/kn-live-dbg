@@ -14,6 +14,16 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
+`KnLiveDbg.exe --offline !kmon dump-read <file.dmp> <hex-address> <length> /json`
+reads 1..4,096 bytes through the shared observation source. Supported inputs are
+AMD64 PAGE/DU64 full-dump physical runs with a qualified four/five-level root.
+Addresses are hexadecimal; lengths are decimal unless explicitly prefixed.
+`complete`, `partial`, `not_captured`, `not_present`, `read_failed` and
+`unsupported` remain distinct. A nonpresent PTE does not prove that the process
+has no virtual allocation. Sparse spans contain bytes only where captured.
+The command exits 0 for a complete read, 1 for unavailable/partial/failed reads,
+and 2 for invalid grammar. It opens no driver or symbol session.
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

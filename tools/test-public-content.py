@@ -29,7 +29,7 @@ class PublicContentTests(unittest.TestCase):
 
     def test_renamed_evidence_stays_private(self):
         for schema in ("kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
-                       "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1"):
+                       "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1"):
             data = json.dumps({"schema": schema, "payload": {"bytes_hex": "c3"}})
             for encoding in ("utf-8", "utf-16"):
                 self.assertIn("private-evidence-bundle",

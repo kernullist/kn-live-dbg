@@ -1,4 +1,5 @@
 #include "DumpAnalyzer.h"
+#include "DumpObservationSource.h"
 
 #include "McpJson.h"
 #include "MemoryDumper.h"
@@ -22,8 +23,6 @@ namespace
     constexpr uint64_t kKernelSpaceMin4 = 0xffff800000000000ull;
     constexpr uint64_t kKernelSpaceMin5 = 0xff00000000000000ull;
     constexpr uint64_t kPtePhysMask = 0x000ffffffffff000ull;
-    constexpr uint64_t kPdeLargePhysMask = 0x000fffffffe00000ull;
-    constexpr uint64_t kPdpteLargePhysMask = 0x000fffffc0000000ull;
     constexpr uint64_t kCr4Pae = 1ull << 5;
     constexpr uint64_t kCr4La57 = 1ull << 12;
     constexpr uint32_t kDumpAmd64ContextBytes = 0x4D0;
@@ -193,222 +192,61 @@ namespace
         return ok;
     }
 
-    bool ReadPhysicalBytes(
-        std::ifstream& file,
-        const std::vector<DumpPhysicalRun>& runs,
-        uint64_t physical,
-        uint32_t length,
-        std::vector<uint8_t>* bytes)
+    DumpPhysicalReader PhysicalReader(std::ifstream& file, const std::vector<DumpPhysicalRun>& runs)
     {
-        bool ok = false;
-
-        do
+        return [&file, &runs](uint64_t address, uint32_t length, std::vector<uint8_t>* bytes)
         {
-            uint64_t fileOffset = 0;
-            uint64_t remaining = 0;
-            if (!PhysicalToFileOffset(runs, physical, &fileOffset, &remaining))
+            bytes->clear();
+            uint64_t offset = 0, remaining = 0;
+            if (!PhysicalToFileOffset(runs, address, &offset, &remaining) || length > remaining)
             {
-                break;
+                return ObservationReadState::NotCaptured;
             }
-            if (length == 0 || remaining < length)
+            if (!ReadFileBytes(file, offset, length, bytes))
             {
-                break;
+                bytes->clear();
+                return ObservationReadState::Failed;
             }
-            if (!ReadFileBytes(file, fileOffset, length, bytes))
-            {
-                break;
-            }
-            ok = true;
-        } while (false);
-
-        return ok;
+            return ObservationReadState::Complete;
+        };
     }
 
-    bool TranslateVa(
-        std::ifstream& file,
-        const std::vector<DumpPhysicalRun>& runs,
-        uint64_t dtb,
-        uint64_t va,
-        uint32_t pagingLevels,
-        uint64_t* physical)
+    DumpObservationSource ReaderView(std::ifstream& file, const std::vector<DumpPhysicalRun>& runs,
+        uint64_t root, uint32_t levels)
     {
-        bool ok = false;
-
-        do
-        {
-            if (physical == nullptr || (pagingLevels != 4 && pagingLevels != 5))
-            {
-                break;
-            }
-            if (!IsCanonicalVa(va, pagingLevels))
-            {
-                break;
-            }
-
-            const uint64_t cr3 = dtb & kPtePhysMask;
-            if (cr3 == 0)
-            {
-                break;
-            }
-            const uint64_t pml5Index = (va >> 48) & 0x1ffull;
-            const uint64_t pml4Index = (va >> 39) & 0x1ffull;
-            const uint64_t pdptIndex = (va >> 30) & 0x1ffull;
-            const uint64_t pdIndex = (va >> 21) & 0x1ffull;
-            const uint64_t ptIndex = (va >> 12) & 0x1ffull;
-            const uint64_t pageOffset = va & 0xfffull;
-
-            auto readPte = [&](uint64_t tablePhysical, uint64_t index, uint64_t* entry) -> bool
-            {
-                if (entry == nullptr || index > 511ull)
-                {
-                    return false;
-                }
-                uint64_t entryPhys = 0;
-                if (!TryAddU64(tablePhysical, index * 8ull, &entryPhys))
-                {
-                    return false;
-                }
-                std::vector<uint8_t> bytes;
-                if (!ReadPhysicalBytes(file, runs, entryPhys, 8, &bytes) || bytes.size() != 8)
-                {
-                    return false;
-                }
-                memcpy(entry, bytes.data(), sizeof(uint64_t));
-                return (*entry & 1ull) != 0;
-            };
-
-            uint64_t table = cr3;
-            if (pagingLevels >= 5)
-            {
-                uint64_t pml5e = 0;
-                if (!readPte(table, pml5Index, &pml5e) || !KnDbgPresentPagingEntryValid(pml5e, 5))
-                {
-                    break;
-                }
-                table = pml5e & kPtePhysMask;
-                if (table == 0)
-                {
-                    break;
-                }
-            }
-
-            uint64_t pml4e = 0;
-            uint64_t pdpte = 0;
-            uint64_t pde = 0;
-            uint64_t pte = 0;
-            if (!readPte(table, pml4Index, &pml4e) || !KnDbgPresentPagingEntryValid(pml4e, 4))
-            {
-                break;
-            }
-            table = pml4e & kPtePhysMask;
-            if (table == 0)
-            {
-                break;
-            }
-            if (!readPte(table, pdptIndex, &pdpte) || !KnDbgPresentPagingEntryValid(pdpte, 3))
-            {
-                break;
-            }
-            if ((pdpte & (1ull << 7)) != 0)
-            {
-                *physical = (pdpte & kPdpteLargePhysMask) + (va & 0x3fffffffull);
-                ok = true;
-                break;
-            }
-            table = pdpte & kPtePhysMask;
-            if (table == 0)
-            {
-                break;
-            }
-            if (!readPte(table, pdIndex, &pde) || !KnDbgPresentPagingEntryValid(pde, 2))
-            {
-                break;
-            }
-            if ((pde & (1ull << 7)) != 0)
-            {
-                *physical = (pde & kPdeLargePhysMask) + (va & 0x1fffffull);
-                ok = true;
-                break;
-            }
-            table = pde & kPtePhysMask;
-            if (table == 0)
-            {
-                break;
-            }
-            if (!readPte(table, ptIndex, &pte) || !KnDbgPresentPagingEntryValid(pte, 1))
-            {
-                break;
-            }
-            *physical = (pte & kPtePhysMask) + pageOffset;
-            ok = true;
-        } while (false);
-
-        return ok;
+        static std::atomic<uint64_t> serial{0};
+        return DumpObservationSource(L"dump_analyzer_ephemeral:" + std::to_wstring(++serial),
+            root, levels, PhysicalReader(file, runs));
     }
 
-    bool ReadVirtualU64(
-        std::ifstream& file,
-        const std::vector<DumpPhysicalRun>& runs,
-        uint64_t dtb,
-        uint64_t va,
-        uint32_t pagingLevels,
-        uint64_t* value)
+    bool TranslateVa(std::ifstream& file, const std::vector<DumpPhysicalRun>& runs,
+        uint64_t dtb, uint64_t va, uint32_t pagingLevels, uint64_t* physical)
     {
-        bool ok = false;
-
-        do
+        const auto translated = TranslateDumpAddress(PhysicalReader(file, runs), dtb, pagingLevels, va);
+        if (physical == nullptr || translated.State != ObservationReadState::Complete)
         {
-            if (value == nullptr)
-            {
-                break;
-            }
-            uint8_t raw[8] = {};
-            uint32_t copied = 0;
-            while (copied < 8)
-            {
-                uint64_t chunkVa = 0;
-                if (!TryAddU64(va, copied, &chunkVa))
-                {
-                    break;
-                }
-                uint64_t physical = 0;
-                if (!TranslateVa(file, runs, dtb, chunkVa, pagingLevels, &physical))
-                {
-                    break;
-                }
-                uint64_t fileOffset = 0;
-                uint64_t remaining = 0;
-                if (!PhysicalToFileOffset(runs, physical, &fileOffset, &remaining) || remaining == 0)
-                {
-                    break;
-                }
-                const uint32_t pageLeft = static_cast<uint32_t>(kPageSize - (physical & 0xfffull));
-                uint32_t chunk = (std::min)(8u - copied, pageLeft);
-                if (remaining < chunk)
-                {
-                    chunk = static_cast<uint32_t>(remaining);
-                }
-                if (chunk == 0)
-                {
-                    break;
-                }
-                std::vector<uint8_t> bytes;
-                if (!ReadFileBytes(file, fileOffset, chunk, &bytes) || bytes.size() != chunk)
-                {
-                    break;
-                }
-                memcpy(raw + copied, bytes.data(), bytes.size());
-                copied += chunk;
-            }
-            if (copied != 8)
-            {
-                break;
-            }
-            memcpy(value, raw, sizeof(uint64_t));
-            ok = true;
-        } while (false);
+            return false;
+        }
+        *physical = translated.PhysicalAddress;
+        return true;
+    }
 
-        return ok;
+    bool ReadVirtualU64(std::ifstream& file, const std::vector<DumpPhysicalRun>& runs,
+        uint64_t dtb, uint64_t va, uint32_t pagingLevels, uint64_t* value)
+    {
+        if (value == nullptr)
+        {
+            return false;
+        }
+        *value = 0;
+        auto source = ReaderView(file, runs, dtb, pagingLevels);
+        std::vector<uint8_t> bytes;
+        if (!ReadObservationExact(source, va, 8, &bytes))
+        {
+            return false;
+        }
+        std::memcpy(value, bytes.data(), 8);
+        return true;
     }
 
     bool ReadVirtualUnicode(
@@ -457,50 +295,11 @@ namespace
             {
                 copy = 512;
             }
-            std::vector<uint8_t> raw(copy);
-            uint32_t copied = 0;
-            while (copied < copy)
+            auto source = ReaderView(file, runs, dtb, pagingLevels);
+            std::vector<uint8_t> raw;
+            if (ReadObservationExact(source, buffer, copy, &raw))
             {
-                uint64_t chunkVa = 0;
-                if (!TryAddU64(buffer, copied, &chunkVa))
-                {
-                    break;
-                }
-                uint64_t physical = 0;
-                if (!TranslateVa(file, runs, dtb, chunkVa, pagingLevels, &physical))
-                {
-                    break;
-                }
-                uint64_t fileOffset = 0;
-                uint64_t remaining = 0;
-                if (!PhysicalToFileOffset(runs, physical, &fileOffset, &remaining) || remaining == 0)
-                {
-                    break;
-                }
-                const uint32_t pageLeft = static_cast<uint32_t>(kPageSize - (physical & 0xfffull));
-                uint32_t chunk = (std::min)(copy - copied, pageLeft);
-                if (remaining < chunk)
-                {
-                    chunk = static_cast<uint32_t>(remaining);
-                }
-                if (chunk == 0)
-                {
-                    break;
-                }
-                std::vector<uint8_t> bytes;
-                if (!ReadFileBytes(file, fileOffset, chunk, &bytes) || bytes.size() != chunk)
-                {
-                    break;
-                }
-                memcpy(raw.data() + copied, bytes.data(), bytes.size());
-                copied += chunk;
-            }
-            if (copied >= 2)
-            {
-                const uint32_t even = copied - (copied % 2u);
-                value->assign(
-                    reinterpret_cast<const wchar_t*>(raw.data()),
-                    even / sizeof(wchar_t));
+                value->assign(reinterpret_cast<const wchar_t*>(raw.data()), raw.size() / sizeof(wchar_t));
                 ok = true;
             }
         } while (false);
