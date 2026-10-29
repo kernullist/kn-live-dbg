@@ -13,6 +13,10 @@
 *.kncase.pending-*
 *.knledger
 *.knledger.pending-*
+*.knindex
+*.knindex.pending-*
+*.knchunk
+*.knchunk.pending-*
 auth.json
 credentials.json
 id_rsa

@@ -721,7 +721,8 @@ namespace
                 { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
-        { L"evidence", L"!kmon evidence <directory> [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
+        { L"inventory", L"!kmon inventory <directory> <new-snapshot-directory> [/json]", L"publish an immutable index of retained evidence" },
+        { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
         { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },
         { L"why", L"!kmon why <file.kncase> [/json]", L"evidence provenance, supported facts and missing requirements" },
         { L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"TLS, KCT and WorkerFactory references" },
@@ -747,7 +748,9 @@ namespace
         { L"/pid", L"/pid <PID>", L"filter historical receipts before limiting output" },
         { L"/role", L"/role <name>", L"exact original reference role" },
         { L"/limit", L"/limit <count>", L"1..256 bundles per page" },
-        { L"/cursor", L"/cursor <token>", L"continue an unchanged inventory with the same filters" },
+        { L"/cursor", L"/cursor <token>", L"continue results within the current inventory window" },
+        { L"/inventory", L"/inventory <snapshot-directory>", L"read an immutable inventory snapshot" },
+        { L"/inventory-cursor", L"/inventory-cursor <token>", L"continue inventory after draining current result pages" },
         { L"/json", L"/json", L"structured evidence inventory and gaps" },
     };
     const CompletionHint kKmonReplayTokens[] =

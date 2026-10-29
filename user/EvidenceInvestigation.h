@@ -40,10 +40,27 @@ struct EvidenceQueryResult
     size_t DuplicateFiles = 0;
     size_t ImportedFiles = 0;
     bool InventoryComplete = true;
+    bool UsesSnapshot = false;
+    bool PublicationClosureEvaluated = true;
+    std::wstring SnapshotDigest;
+    std::wstring InventoryCursor;
+    std::wstring NextInventoryCursor;
+    size_t SnapshotEntries = 0;
+    size_t InventoryOffset = 0;
+    size_t InspectedFiles = 0;
+    size_t ReadBytes = 0;
+};
+
+struct EvidenceInventoryOptions
+{
+    std::wstring Path;
+    std::wstring Cursor;
+    size_t WindowFiles = 4096;
+    size_t ReadBudget = 64 * 1024 * 1024;
 };
 
 EvidenceQueryResult QueryEvidenceDirectory(const std::wstring& directory, const KmonHuntFilter& filter = {},
-    const KmonHuntQueryOptions& options = {});
+    const KmonHuntQueryOptions& options = {}, const EvidenceInventoryOptions& inventory = {});
 std::wstring EvidenceQueryJson(const EvidenceQueryResult& result, const KmonHuntFilter& filter);
 
 struct EvidenceReplayResult

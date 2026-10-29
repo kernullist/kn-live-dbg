@@ -7,6 +7,28 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Inventory continuation checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`bb1fcad6b14f1e90650162b9be9a280e7ddfa54baa5d00dd77281d696a64c951`.
+The toolchain matches the architecture checkpoint below. The driver source did
+not change in this step, and no driver was loaded.
+
+| Check | Observed result |
+| --- | --- |
+| Driver-free EXE | Timeline 28, MCP 89, console 558, commands 2,993, remote 66 and connect arguments passed; capabilities remain 12 selected contracts and 261 routes |
+| ASan evidence | 449 checks passed, including 4,101-file inventory traversal, distinct result/inventory cursors, byte-budget continuation, stale snapshots, missing members/chunks, resealed path traversal and interrupted construction |
+| Fresh-process offline CLI | 99 checks passed, including snapshot creation, result continuation, inventory continuation and two interrupted snapshot builders; one symlink control skipped; no live replay |
+| Existing publication controls | Eight interrupted bundle writes yielded four valid publications and four absent files; completed publication and fresh-process recovery passed |
+| Publication scanner regression | Ten tests passed, including renamed inventory manifests/chunks and temporary files |
+
+The initial ASan inventory test exceeded the 120-second construction deadline
+while repeatedly parsing identical files. A bounded exact-content parse cache
+resolved that fixture; each file is still reopened and reread. This is not a
+performance claim for arbitrary unique million-file inventories. Construction
+budgets remain enforced; resumable construction and global cross-window closure
+remain open. Logs are retained locally under `.build/architecture/w06-*`.
+
 ## Architecture foundation checkpoint: 2026-10-29
 
 The capability, address descriptor, bounded read-source and unique-coverage work

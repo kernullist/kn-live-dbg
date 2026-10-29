@@ -144,6 +144,7 @@
     <ClCompile Include="AnalystSnapshot.cpp" />
     <ClCompile Include="EvidenceBundle.cpp" />
     <ClCompile Include="EvidenceInvestigation.cpp" />
+    <ClCompile Include="EvidenceInventory.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
     <ClCompile Include="GameBuildManifestGenerator.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
@@ -209,6 +210,7 @@
     <ClInclude Include="AnalystSnapshot.h" />
     <ClInclude Include="EvidenceBundle.h" />
     <ClInclude Include="EvidenceInvestigation.h" />
+    <ClInclude Include="EvidenceInventory.h" />
     <ClInclude Include="ExecutionSurfaceCore.h" />
     <ClInclude Include="ExecutionSurfaceScanner.h" />
     <ClInclude Include="AiCapabilityCatalog.h" />

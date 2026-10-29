@@ -260,6 +260,29 @@ up to 128 MiB of bundles per session, reports rejected/failed publications and
 drains admitted work at normal shutdown. A private `.knledger` records closure
 and publication accounting; a missing ledger leaves closure unknown.
 `evidence` queries bounded file inventories before limiting matching results.
+An explicit `inventory` export creates a new immutable membership snapshot of
+v1 publications. It streams at most 1,048,576 directory entries and 8 GiB of
+source reads within a 120-second cooperative deadline. Each 128-member chunk
+records bounded basenames, validated content digests, byte lengths and invalid
+members. Content-addressed `.knchunk` files precede atomic publication of
+`manifest.knindex`; incomplete builds have no readable final manifest. Chunk
+and manifest hashes detect damage, not a malicious collector. Source directory
+identity is bound using its volume/file ID, and final reparse points are rejected.
+Directory enumeration itself is non-atomic. Interrupted construction must be
+restarted in a new output directory; no build-resume claim is made.
+
+With `/inventory`, a query verifies the manifest and consumes at most 4,096
+members and 64 MiB of source bytes per window. Metadata reads are separately
+bounded by a 2 MiB manifest and 256 KiB chunks. Each source file is reopened and
+matched against its recorded content and length. A single-entry parse cache
+reuses only exactly equal decoded input after the read, never a pathname alone.
+Missing or changed members remain gaps; new files do not alter membership.
+`next_cursor` pages results in the same window; only after those results drain
+does `next_inventory_cursor` advance the inventory. Cursors bind the snapshot,
+query/filter and budgets; a result cursor also binds current-window validity.
+Counts and deduplication apply to the current window. Global publication closure
+is evaluated only when one window covers the entire snapshot. The legacy query
+without `/inventory` retains its original bounded-directory contract.
 The `--offline !kmon` entry point runs these file commands before elevation,
 driver service or symbol initialization.
 `replay` and `why` reconstruct supported static transfers using the original byte

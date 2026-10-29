@@ -37,7 +37,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"uncaptured_pages;not_all_dump_formats;not_live_execution"},
         {L"evidence", L"query", L"bundle", L"implemented", L"recorded_bundle",
             L"valid_kncase_v1;readable_directory",
-            L"bounded_inventory;result_cursor_does_not_resume_inventory"},
+            L"legacy_bounded_inventory;optional_immutable_snapshot;separate_inventory_and_result_cursors;window_scoped_counts"},
         {L"evidence", L"replay", L"bundle", L"implemented", L"recorded_bundle",
             L"valid_kncase_v1;declared_read_set",
             L"page_digest_and_static_path_only;image_verification_not_replayed"},

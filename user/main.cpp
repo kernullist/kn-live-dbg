@@ -30,6 +30,7 @@
 #include "ExecutionSurfaceScanner.h"
 #include "AnalystSnapshot.h"
 #include "EvidenceInvestigation.h"
+#include "EvidenceInventory.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -23028,7 +23029,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
-    std::wcout << L"  !kmon evidence <directory> [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
+    std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
+    std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
     std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
@@ -23365,14 +23367,29 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon evidence|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon inventory|evidence|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"inventory")
+    {
+        if (args.size() < 4 || args.size() > 5 || args[2].empty() || args[3].empty() ||
+            (args.size() == 5 && ToLower(args[4]) != L"/json"))
+        {
+            std::wcerr << L"!kmon inventory: usage: !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
+            return 2;
+        }
+        EvidenceInventoryBuildOptions buildOptions;
+        buildOptions.Cancellation = &g_StopRequested;
+        const auto result = BuildEvidenceInventory(args[2], args[3], buildOptions);
+        std::wcout << EvidenceInventoryBuildJson(result) << L"\n";
+        return result.Status == L"ok" ? 0 : 1;
+    }
     if (action == L"evidence")
     {
         KmonHuntFilter filter;
         KmonHuntQueryOptions options;
+        EvidenceInventoryOptions inventory;
         bool jsonOutput = false;
         bool valid = args.size() >= 3 && !args[2].empty();
         std::set<std::wstring> seen;
@@ -23381,7 +23398,8 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
             const auto option = ToLower(args[i]);
             if (!seen.insert(option).second) { valid = false; break; }
             if (option == L"/json") { jsonOutput = true; }
-            else if ((option == L"/pid" || option == L"/role" || option == L"/limit" || option == L"/cursor") &&
+            else if ((option == L"/pid" || option == L"/role" || option == L"/limit" || option == L"/cursor" ||
+                option == L"/inventory" || option == L"/inventory-cursor") &&
                 i + 1 < args.size() && !args[i + 1].empty())
             {
                 const auto value = args[++i];
@@ -23397,16 +23415,26 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
                     options.Limit = static_cast<size_t>(number);
                 }
                 else if (option == L"/role") { valid = value.size() <= 128 && value.front() != L'/'; filter.Role = value; }
+                else if (option == L"/inventory")
+                {
+                    valid = value.size() <= 30000 && value.front() != L'/';
+                    inventory.Path = value;
+                }
+                else if (option == L"/inventory-cursor")
+                {
+                    valid = value.size() <= 1200 && value.front() != L'/';
+                    inventory.Cursor = value;
+                }
                 else { valid = value.size() <= 1200 && value.front() != L'/'; options.Cursor = value; }
             }
             else { valid = false; }
         }
-        if (!valid)
+        if (!valid || (!inventory.Cursor.empty() && inventory.Path.empty()))
         {
-            std::wcerr << L"!kmon evidence: usage: !kmon evidence <directory> [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json]\n";
+            std::wcerr << L"!kmon evidence: usage: !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json]\n";
             return 2;
         }
-        const auto result = QueryEvidenceDirectory(args[2], filter, options);
+        const auto result = QueryEvidenceDirectory(args[2], filter, options, inventory);
         if (jsonOutput) { std::wcout << EvidenceQueryJson(result, filter) << L"\n"; return result.Status == L"ok" ? 0 : 1; }
         for (const auto& row : result.Cases)
         {
@@ -23419,6 +23447,14 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
             << L" inventory_complete=" << result.InventoryComplete << L" unclosed_collections=" << result.UnclosedCollections
             << L" unavailable_written_bundles=" << result.UnavailableWrittenBundles << L" collection_complete=false\n";
         if (!result.NextCursor.empty()) { std::wcout << L"[kmon.evidence] next_cursor=" << result.NextCursor << L"\n"; }
+        if (!result.InventoryCursor.empty())
+        {
+            std::wcout << L"[kmon.evidence] inventory_cursor=" << result.InventoryCursor << L"\n";
+        }
+        if (!result.NextInventoryCursor.empty())
+        {
+            std::wcout << L"[kmon.evidence] next_inventory_cursor=" << result.NextInventoryCursor << L"\n";
+        }
         return result.Status == L"ok" ? 0 : 1;
     }
     if (action == L"replay" || action == L"why")
@@ -23445,7 +23481,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon evidence, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon inventory, evidence, replay, or why\n";
     return 2;
 }
 
@@ -24273,7 +24309,7 @@ static void HandleKmonCommand(
             break;
         }
 
-        if (action == L"evidence" || action == L"replay" || action == L"why")
+        if (action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;
@@ -32592,6 +32628,10 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
         if (command == L"!kmon" && args.size() >= 2)
         {
             const auto action = ToLower(args[1]);
+            if (action == L"inventory")
+            {
+                writeLike = true;
+            }
             if (action == L"cases" || action == L"surfaces" || action == L"layouts")
             {
                 for (size_t i = 2; i < args.size(); ++i)
@@ -53122,7 +53162,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon evidence|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon inventory|evidence|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";

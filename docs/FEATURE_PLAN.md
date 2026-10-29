@@ -50,7 +50,7 @@ backend/build/security-state combination.
 | W03 Read-set source | Bounded source interface now connects selected native kernel readers and immutable bundle replay, with sparse statuses, budgets and cancellation; dump/DbgEng/user-process adapters, translation DTOs and operation-wide deadlines remain open | W02 |
 | W04 Schema broker | Exact image/PDB/type package, qualified partial states, artifact verification and isolated untrusted parsing | W02-W03 |
 | W05 Proof/coverage | Unique interval accounting and exact requested-range checks now gate complete comparison; temporal/semantic/persistence/trust ledgers and claim-specific proof requirements remain open | W02-W04 |
-| W06 Evidence store v2 | Recoverable journal/index, inventory and result continuations, stable snapshots, v1 import, interruption/corruption/large inventory controls | W03,W05 |
+| W06 Evidence store v2 | Explicit immutable inventory snapshots and separate inventory/result continuations now query v1 publications beyond the legacy directory cap; recoverable publication journal, resumable snapshot construction and global cross-window deduplication remain open | W03,W05 |
 | W07 Exact reference replay | Exact reference artifact and normalization recipe, original-policy replay distinct from current reanalysis, preserved exclusions | W04-W06 |
 | W08 Scheduler SLO | Deadline/age/fairness and first capture metrics; fixed-cohort/churn and current six/thirteen-control validation | W03,W05 |
 | W09 Entity graph | Scoped process/thread/image/object/device/IRP entities and typed evidence edges, bounded explanation queries | W03-W06 |

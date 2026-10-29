@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -46,7 +46,9 @@ def path_rule(name: str) -> str | None:
     base = path.name.lower()
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
-    if path.suffix.lower() in PRIVATE_EXTENSIONS or ".kncase.pending-" in base or ".knledger.pending-" in base:
+    if path.suffix.lower() in PRIVATE_EXTENSIONS or any(
+        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk")
+    ):
         return "private-container-or-capture"
     return None
 
@@ -87,7 +89,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             try:
                 document = json.loads(text)
                 if isinstance(document, dict) and document.get("schema") in {
-                    "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1"
+                    "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
+                    "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1"
                 }:
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):

@@ -1,4 +1,5 @@
 #include "EvidenceInvestigation.h"
+#include "EvidenceInventory.h"
 #include "BundleObservationSource.h"
 #include "ContentHash.h"
 #include "KmonHuntingJson.h"
@@ -51,12 +52,16 @@ bool ParseEvidenceSession(const std::wstring& json, EvidenceSessionSummary* sess
 }
 
 EvidenceQueryResult QueryEvidenceDirectory(const std::wstring& directory, const KmonHuntFilter& filter,
-    const KmonHuntQueryOptions& options)
+    const KmonHuntQueryOptions& options, const EvidenceInventoryOptions& inventoryOptions)
 {
+    if (!inventoryOptions.Path.empty())
+    {
+        return QueryEvidenceInventory(directory, filter, options, inventoryOptions);
+    }
     EvidenceQueryResult result;
     result.Limit = options.Limit;
     if (options.Limit == 0 || options.Limit > 256 || filter.Role.size() > 128 ||
-        filter.Role.find(L'\0') != std::wstring::npos || options.Cursor.size() > 1200)
+        filter.Role.find(L'\0') != std::wstring::npos || options.Cursor.size() > 1200 || !inventoryOptions.Cursor.empty())
     {
         result.Status = L"invalid_query";
         return result;
@@ -168,6 +173,16 @@ std::wstring EvidenceQueryJson(const EvidenceQueryResult& r, const KmonHuntFilte
     const size_t omitted = ok ? r.Matched - r.Offset - r.Cases.size() : 0;
     std::wstring json = L"{\"schema\":\"kmon.evidence_query.v1\",\"input_trust\":\"unverified_local_bundles\",\"query_scope\":\"validated_bundle_inventory\"";
     json += L",\"status\":" + mcpjson::Quote(r.Status) + L",\"inventory_digest\":" + mcpjson::Quote(r.InventoryDigest);
+    if (r.UsesSnapshot)
+    {
+        json += L",\"inventory_mode\":\"immutable_snapshot_window\",\"matched_scope\":\"current_window\",\"deduplication_scope\":\"current_window\"";
+        json += L",\"snapshot_digest\":" + mcpjson::Quote(r.SnapshotDigest) + L",\"snapshot_entries\":" + std::to_wstring(r.SnapshotEntries);
+        json += L",\"inventory_offset\":" + std::to_wstring(r.InventoryOffset) + L",\"inspected_files\":" + std::to_wstring(r.InspectedFiles);
+        json += L",\"read_bytes\":" + std::to_wstring(r.ReadBytes);
+        json += L",\"inventory_cursor\":" + mcpjson::Quote(r.InventoryCursor) + L",\"next_inventory_cursor\":" +
+            (r.NextInventoryCursor.empty() ? L"null" : mcpjson::Quote(r.NextInventoryCursor));
+        json += L",\"publication_closure_evaluated\":" + std::wstring(r.PublicationClosureEvaluated ? L"true" : L"false");
+    }
     json += L",\"matched\":" + (ok ? std::to_wstring(r.Matched) : L"null") + L",\"returned\":" + std::to_wstring(r.Cases.size());
     json += L",\"page_offset\":" + std::to_wstring(r.Offset) + L",\"omitted_by_budget\":" + (ok ? std::to_wstring(omitted) : L"null");
     json += L",\"filter_pid\":" + (filter.HasPid ? std::to_wstring(filter.ProcessId) : L"null") + L",\"filter_role\":" + mcpjson::Quote(filter.Role);

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 
 def main():
@@ -27,7 +28,7 @@ def main():
     def run(words, expected=None, structured=False):
         result = subprocess.run(
             [str(args.executable.resolve()), "--offline", *map(str, words)],
-            capture_output=True, timeout=60,
+            capture_output=True, timeout=150 if len(words) > 1 and words[1] == "inventory" else 60,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         check(result.returncode == expected if expected is not None else result.returncode in (0, 1),
@@ -76,6 +77,57 @@ def main():
     empty = query(args.fixtures / "empty", expected=0)
     check(empty["matched"] == 0 and not empty["publication_closure_known"], "empty inventory has unknown closure")
     run(["!kmon", "replay", args.fixtures / "truncated.kncase", "/json"], 1)
+
+    with tempfile.TemporaryDirectory(prefix="kmon-inventory-") as folder:
+        snapshot = Path(folder) / "snapshot"
+        built = run(["!kmon", "inventory", inventory, snapshot, "/json"], 0, True)
+        check(built["status"] == "ok" and int(built["entries"]) == 302 and
+              int(built["invalid_files"]) == 1, "snapshot records every source member and invalid file")
+        repeated = run(["!kmon", "inventory", inventory, snapshot, "/json"], 1, True)
+        check(repeated["status"] == "output_exists_or_unavailable", "published snapshot cannot be overwritten")
+        page = query(inventory, "/inventory", snapshot, "/limit", "128", expected=1)
+        pids = []
+        while True:
+            check(page["inventory_mode"] == "immutable_snapshot_window" and
+                  page["snapshot_digest"] == built["snapshot_digest"], "fresh process retains snapshot identity")
+            pids.extend(row["receipt"]["reference"]["pid"] for row in page["cases"])
+            if not page["next_cursor"]:
+                break
+            page = query(inventory, "/inventory", snapshot, "/limit", "128",
+                         "/inventory-cursor", page["inventory_cursor"], "/cursor", page["next_cursor"], expected=1)
+        check(len(pids) == len(set(pids)) == 300 and page["next_inventory_cursor"] is None,
+              "separate result pages recover every snapshot match after process restart")
+        wrong_root = query(args.fixtures, "/inventory", snapshot, expected=1)
+        check(wrong_root["status"] == "source_directory_changed", "snapshot binds the source directory identity")
+        large_source = args.fixtures / "large-index-source"
+        large_snapshot = Path(folder) / "large"
+        run(["!kmon", "inventory", large_source, large_snapshot, "/json"], 0, True)
+        head = query(large_source, "/inventory", large_snapshot, expected=1)
+        tail = query(large_source, "/inventory", large_snapshot,
+                     "/inventory-cursor", head["next_inventory_cursor"], expected=1)
+        check(head["inspected_files"] == 4096 and tail["inspected_files"] == 5 and
+              tail["next_inventory_cursor"] is None and tail["next_cursor"] is None and
+              not tail["publication_closure_evaluated"], "inventory cursor reaches the tail beyond the legacy cap")
+        # Stop only owned child processes; incomplete chunks must never be readable.
+        for delay in (0.01, 0.1):
+            interrupted = Path(folder) / ("interrupted-" + str(delay))
+            child = subprocess.Popen([str(args.executable.resolve()), "--offline", "!kmon", "inventory",
+                                      str(large_source), str(interrupted), "/json"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                time.sleep(delay)
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=10)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=10)
+            observed = query(large_source, "/inventory", interrupted, expected=1)
+            check(observed["status"] == "invalid_inventory" or
+                  (observed["status"] == "partial_inventory" and observed["snapshot_entries"] == 4101),
+                  "interrupted snapshot is absent or contains its entire declared inventory")
     for words in ([], ["!kmon", "start"], ["write", "on"], ["!kmon", "why"],
                   ["!kmon", "evidence", inventory, "/limit", "0"]):
         check(b"usage" in run(words, 2).stderr, "unsupported offline command is rejected before live startup")

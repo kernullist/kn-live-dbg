@@ -8,6 +8,10 @@ command definitions in the local and remote consoles.
 Saved KMON evidence can also be investigated without elevation, driver loading,
 or symbols: `KnLiveDbg.exe --offline !kmon evidence <directory> /json`,
 `--offline !kmon replay <file.kncase> /json`, or `--offline !kmon why <file.kncase>`.
+Use `--offline !kmon inventory <directory> <new-snapshot-directory> /json` to
+publish a private inventory, then add `/inventory <snapshot-directory>` to
+`evidence`. Its result and inventory cursors have different scopes; follow the
+[offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
 ## Session and memory

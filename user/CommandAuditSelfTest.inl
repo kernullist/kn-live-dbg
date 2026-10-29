@@ -473,6 +473,14 @@ static int RunCommandAuditSelfTest()
     check(!IsWriteLikeCommandLine(L"!kmon evidence x /pid 55 /json") &&
         !IsWriteLikeCommandLine(L"!kmon replay x.kncase /json") && !IsWriteLikeCommandLine(L"!kmon why x.kncase /json"),
         L"offline evidence inspection is read-only");
+    check(IsWriteLikeCommandLine(L"!kmon inventory x new-output /json") &&
+        !IsWriteLikeCommandLine(L"!kmon evidence x /inventory saved-index /json"),
+        L"inventory publication is an explicit file export while snapshot queries are read-only");
+    for (const auto& line : {L"!kmon inventory x", L"!kmon inventory x y /bad", L"!kmon evidence x /inventory",
+        L"!kmon evidence x /inventory /json", L"!kmon evidence x /inventory-cursor token"})
+    {
+        check(run(line).Error.find(L"usage") != std::wstring::npos, L"inventory arguments fail before file creation");
+    }
     check(huntCases.Error.empty() && huntCases.Output.find(L"kmon.hunt.v1") != std::wstring::npos &&
         huntCases.Output.find(L"\"communication_proven\":false") != std::wstring::npos,
         L"kmon cases JSON is available without a driver");
