@@ -59,7 +59,7 @@ backend/build/security-state combination.
 | W12 Wait/I/O diagnosis | Selected native IRP snapshots now preserve requests without completions and expose per-observation thread/request/stack/reference graphs, optional state fields and unknown outcomes. Referenced request lifetimes, transition providers, wait/lock graphs and false-cycle controls remain open | W04,W09 |
 | W13 Trace/VMI | Bounded offline normalized-sample import now preserves CPU/VM/VTL/clock/loss and hash-checked code bytes, with source-bound paging and qualified producer-reported levels. Raw trace decoders, authenticated live providers, VMI access and compatibility gates remain open | W02-W09 |
 | W14 Security/AI | Kernel sessions default to write-off with verified mode transitions; MCP retains bounded operation IDs/states and late engine outcomes without automatic retry. Full offline/observe/collect/lab partition, protected transport, durable/idempotent operations, remote outcome lookup and evidence-checked AI plans remain open | W01 onward |
-| W15 Independent validation | Versioned corpus and ground truth; family-separated comparisons, false positives, latency and safety by environment | Each package |
+| W15 Independent validation | Versioned private corpus/result evaluator now checks family/group/artifact partition leakage and reports missing/failed denominators, per-family precision/recall and imported latency by scope. Authorized corpora, authenticated ground truth, independent uncertainty estimates, external-tool comparisons and live safety/overhead remain open | Each package |
 
 Integration proceeds through source/address/proof and observe/collect boundaries,
 then durable replay and scheduling, then entity/rule/diagnostic queries, and

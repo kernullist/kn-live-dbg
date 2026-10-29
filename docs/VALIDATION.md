@@ -7,6 +7,28 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Corpus evaluator checkpoint: 2026-10-30
+
+The Python 3.11 evaluator passed 13 test groups with independently specified
+synthetic denominators, missing/errored/unavailable cases, unknown truth,
+correlated variants, family/group/artifact split leakage, exact corpus/scope
+identity, duplicate assessments, strict JSON, closed schemas, unsigned latency,
+8 MiB inputs, 4,096 cases and 512 comparison scopes. Public CLI success and
+failure checks verify valid JSON output and empty stdout on rejected inputs.
+The documented fixture example produced end-to-end recall 2/7 and observable
+recall 2/4; these are synthetic arithmetic controls, not detection-rate results.
+
+Publication-scanner regressions passed ten tests, including the three private
+benchmark schemas. Document links and the executable example passed. No
+additional actionable defects were found in the reviewed scope. Logs are
+`.build/architecture/w15-corpus-tests-final.log` and
+`.build/architecture/w15-corpus-public-tests.log`; the generated example report
+remains private under `.build/architecture/`. This stage changed only Python
+tooling, publication rules and documents; it did not rebuild or revalidate the
+unchanged native binary. No collector, driver or external analysis tool ran.
+Imported evidence hashes and ground truth are declarations, not authenticated
+artifacts. Independent corpora, sampling uncertainty and live safety remain open.
+
 ## MCP operation outcome checkpoint: 2026-10-30
 
 Final Release x64 EXE SHA-256:
