@@ -1,4 +1,5 @@
 #include "../user/ImageVerificationRecipe.h"
+#include "../user/ImageProof.h"
 #include "../user/ReferenceArtifact.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
@@ -275,6 +276,103 @@ int wmain(int argc, wchar_t** argv)
     Check(modified.RecordedResult.find(L"owned_modified") != std::wstring::npos &&
         modified.RecordedResult.find(L"\"skipped_bytes\":\"8\"") != std::wstring::npos && changed.PageReads == 2,
         "confirmed changed bytes and loader exclusions survive replay");
+    executable_image::DiskPeMetadata metadata;
+    Check(executable_image::ReadDiskPeMetadata(image.wstring(), &metadata, &error), "proof control reference parses");
+    const auto compare = [&](Source& source, uint32_t rva)
+    {
+        const ObservationReader reader = [&](uint64_t address, size_t length, std::vector<uint8_t>* bytes)
+        {
+            return ReadObservationExact(source, address, length, bytes);
+        };
+        return CompareExecutableRange(image.wstring(), metadata, Source::Base, rva, 4096, reader);
+    };
+    const auto cleanComparison = compare(clean, 0x2000);
+    const auto changedComparison = compare(changed, 0x1000);
+    const auto cleanProof = AssessImageProof(original, cleanComparison, true, false);
+    Check(cleanProof.InputConsistent && cleanProof.Matches.Status == L"supported" &&
+        cleanProof.Differs.Status == L"contradicted" && cleanProof.ComparedBytes == 4096 &&
+        cleanProof.UniqueTargetBytesRetained == 4096, "complete normalized bytes support only the scoped match claim");
+    const auto changedProof = AssessImageProof(modified, changedComparison, true, false);
+    Check(changedProof.Differs.Status == L"supported" && changedProof.Matches.Status == L"contradicted" &&
+        changedProof.SkippedBytes == 8 && changedProof.ChangedRanges.size() == 1 &&
+        changedProof.ChangedRanges.front().Address == Source::Base + 0x1150 &&
+        changedProof.SupportingReadIndices.size() == 2,
+        "confirmed difference claims contain absolute changed ranges while preserving exclusions");
+    Check(mcpjson::ValidateDocument(ImageProofJson(modified, changedProof)), "proof ledger emits valid JSON");
+    auto invalidComparison = cleanComparison;
+    invalidComparison.Coverage.Compared.push_back(invalidComparison.Coverage.Compared.front());
+    invalidComparison.Coverage.ComparedBytes *= 2;
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "duplicate compared visits cannot inflate unique proof coverage");
+    invalidComparison = cleanComparison;
+    invalidComparison.Coverage.Compared.front().Address += 4096;
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "equal byte counts at different addresses do not prove this range");
+    invalidComparison = cleanComparison;
+    invalidComparison.Coverage.Failed.push_back({Source::Base + 0x2000, 1});
+    invalidComparison.Coverage.FailedBytes = 1;
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "one byte cannot be both compared and failed in a proof ledger");
+    invalidComparison = changedComparison;
+    invalidComparison.Changes.front().Address += Source::Base;
+    Check(!AssessImageProof(modified, invalidComparison, true, false).InputConsistent,
+        "verifier RVA changes cannot be silently treated as absolute input ranges");
+    invalidComparison = changedComparison;
+    invalidComparison.Changes.push_back({0x1100, 1});
+    Check(!AssessImageProof(modified, invalidComparison, true, false).InputConsistent,
+        "excluded bytes cannot support a modified claim");
+    invalidComparison = cleanComparison;
+    invalidComparison.Observed.clear();
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "ownership labels without actual compared bytes do not support a claim");
+    invalidComparison = cleanComparison;
+    invalidComparison.Coverage.LostEvents = 1;
+    Check(AssessImageProof(original, invalidComparison, true, false).Matches.Status == L"not_established",
+        "lost evidence prevents a complete match claim");
+    Check(AssessImageProof(original, cleanComparison, false, false).Matches.Status == L"not_established",
+        "matching bytes without mapped identity qualification remain inconclusive");
+    invalidComparison = cleanComparison;
+    invalidComparison.RelocationBase += 0x10000;
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "a changed normalization base cannot satisfy the direct recipe proof");
+    invalidComparison = cleanComparison;
+    invalidComparison.SecondaryImageView = true;
+    Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
+        "a secondary view needs its own supported proof policy");
+    auto unknownPolicy = original;
+    unknownPolicy.Policy = L"unknown-original-policy";
+    Check(AssessImageProof(unknownPolicy, cleanComparison, true, false).Matches.Status == L"not_established" &&
+        AssessImageProof(unknownPolicy, cleanComparison, true, true).Matches.Status == L"supported",
+        "unknown original policy requires explicit current reanalysis before proving a claim");
+    auto missingConfirmation = modified;
+    const auto confirmation = std::find_if(missingConfirmation.Reads.begin(), missingConfirmation.Reads.end(), [](const auto& read)
+    {
+        return read.Address == Source::Base + 0x1000 && read.Length == 4096;
+    });
+    Check(confirmation != missingConfirmation.Reads.end(), "confirmation control has an original range read");
+    if (confirmation != missingConfirmation.Reads.end())
+    {
+        missingConfirmation.Reads.erase(confirmation);
+    }
+    Check(AssessImageProof(missingConfirmation, changedComparison, true, true).Differs.Status == L"not_established",
+        "current reanalysis cannot invent a missing original confirmation read");
+    auto wrongBytes = original;
+    for (auto& read : wrongBytes.Reads)
+    {
+        if (read.Address == Source::Base + 0x2000)
+        {
+            read.Result.Spans.front().Bytes.front() ^= 1;
+        }
+    }
+    Check(AssessImageProof(wrongBytes, cleanComparison, true, false).Matches.Status == L"not_established",
+        "comparison bytes must be backed by a matching retained read");
+    auto cancelledBytes = original;
+    for (auto& read : cancelledBytes.Reads)
+    {
+        read.Result.CancellationObserved = true;
+    }
+    Check(AssessImageProof(cancelledBytes, cleanComparison, true, false).Matches.Status == L"not_established",
+        "cancelled retained reads do not satisfy claim requirements");
     ImageVerificationRecipe loaded;
     const auto encoded = ImageRecipeJson(modified);
     Check(ParseImageRecipe(encoded, &loaded, &error) && ImageRecipeJson(loaded) == encoded, "canonical recipe round trip");

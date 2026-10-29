@@ -341,5 +341,6 @@ std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay)
         L",\"recorded_policy\":" + mcpjson::Quote(replay.RecordedPolicy) + L",\"current_policy\":" + mcpjson::Quote(ImageRecipePolicy) +
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"rereads_are_recorded\":true,\"recorded_result\":" +
         (replay.RecordedResult.empty() ? L"null" : replay.RecordedResult) + L",\"result\":" +
-        (replay.CurrentResult.empty() ? L"null" : replay.CurrentResult) + L"}";
+        (replay.CurrentResult.empty() ? L"null" : replay.CurrentResult) +
+        L",\"proof\":" + (replay.Proof.empty() ? L"null" : replay.Proof) + L"}";
 }

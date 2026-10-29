@@ -417,6 +417,44 @@ directories currently have explicit/manual retention and no automatic expiry or
 cross-case deduplication. Use locally trusted reference files until parser
 isolation is available.
 
+### Claim-specific image proof
+
+Successful `replay-image` adds a `kn.image_proof.v1` report generated from the
+fresh typed verifier result. It does not authorize a claim from the saved
+ownership label alone. The proof policy is versioned separately as
+`kn.image_proof.direct.v1`; adding the report does not change the recorded
+comparison recipe or its original-policy result.
+
+Two scoped claims are implemented. `recorded_range_matches_reference_policy`
+requires qualified mapped identity, the direct normalization basis, complete
+unique coverage of the requested addresses, actual comparison bytes and a
+matching retained read. `recorded_range_differs_reference_policy` requires
+validated difference bytes inside compared ranges and at least two distinct
+recorded reads that confirm the compared bytes. Its output ranges are absolute
+addresses; the verifier's stored change ranges are RVAs. Excluded bytes remain
+outside the claim, even when other bytes support a difference. Each claim emits
+`supports`, `contradicts`, `unfulfilled_requirements` and
+`next_best_observation`, with recipe-hash/read-index evidence references.
+
+The report keeps seven ledgers separate:
+
+| Ledger | Meaning in this implementation |
+| --- | --- |
+| Discovery | The explicitly requested range; no complete image inventory |
+| Address | Unique compared/skipped/failed/unvisited bytes within that range; contradictory or out-of-range accounting is invalid |
+| Temporal | Original collector read intervals; no target execution time or continuous target coverage |
+| Semantic | Qualified mapped identity and the supported direct comparison policy; hotpatch epoch and full function equivalence remain unproved |
+| Persistence | Verified retained artifact, requested read bytes, retained bytes including repeats, and unique retained target bytes; not a full source snapshot |
+| Replay | Original result reproduction or explicitly selected current reanalysis, with both policy identifiers |
+| Trust | Unauthenticated local evidence; no approved distribution or established security domain |
+
+Failed replay emits `proof=null`. A supported byte-range claim does not prove
+execution, writer identity, maliciousness, authorization of a change, whole-image
+integrity or continuous observation. These limits apply equally to current
+reanalysis; rereading the saved source cannot create another target observation.
+This is a selected image proof path. Generic cross-view, object-lifetime,
+deadlock, writer-attribution and live temporal policies remain separate work.
+
 ## Offline dump observation source
 
 `DumpObservationSource` and the existing dump analyzer share one qualified

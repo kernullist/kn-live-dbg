@@ -41,6 +41,7 @@ struct ImageRecipeReplay
     std::wstring RecipeSha256;
     std::wstring CurrentResult;
     std::wstring RecordedResult;
+    std::wstring Proof;
 };
 
 std::wstring ImageRecipeJson(const ImageVerificationRecipe& recipe);

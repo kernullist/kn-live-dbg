@@ -55,9 +55,43 @@ def main():
         check(replay["status"] == "replayed" and replay["mode"] == "original_policy" and
               replay["result"] == replay["recorded_result"] == result["result"] and
               replay["recorded_policy"] == replay["current_policy"] == recipe["payload"]["policy"], "fresh-process exact replay")
+        proof = replay["proof"]
+        check(proof["schema"] == "kn.image_proof.v1" and proof["input_consistent"] and
+              proof["recipe_sha256"] == recipe["recipe_sha256"], "proof binds the exact replayed recipe")
+        claims = {claim["name"]: claim for claim in proof["claims"]}
+        match, difference = (claims["recorded_range_matches_reference_policy"],
+                             claims["recorded_range_differs_reference_policy"])
+        check(match["status"] == "supported" and difference["status"] == "contradicted" and
+              not match["unfulfilled_requirements"] and difference["contradicts"], "claim-specific support and contradiction")
+        check(match["ranges"] == [{"address": str(0x180002000), "length": "4096"}], "claim is confined to the requested range")
+        ledgers = proof["ledgers"]
+        check(set(ledgers) == {"discovery", "address", "temporal", "semantic", "persistence", "replay", "trust"},
+              "all seven coverage dimensions remain separate")
+        address = ledgers["address"]
+        check(address["status"] == "complete" and int(address["requested_bytes"]) ==
+              sum(int(address[key]) for key in ("compared_bytes", "failed_bytes", "skipped_bytes", "unvisited_bytes")),
+              "comparison byte accounting is conserved")
+        reads = recipe["payload"]["reads"]
+        persisted = sum(len(bytes.fromhex(span["bytes"])) for read in reads for span in read["spans"])
+        check(int(ledgers["persistence"]["retained_read_bytes_including_repeats"]) == persisted and
+              int(ledgers["persistence"]["requested_read_bytes"]) == sum(int(read["length"]) for read in reads) and
+              ledgers["persistence"]["unique_target_bytes_retained"] == "4096", "independent persisted-byte denominator")
+        check(ledgers["temporal"]["intervals"] == [
+            {"read_index": str(index), "started_tick": read["started_tick"], "ended_tick": read["ended_tick"]}
+            for index, read in enumerate(reads)] and not ledgers["temporal"]["continuous_observation"] and
+              not ledgers["temporal"]["target_time_available"], "collector read intervals are not target execution time")
+        for reference in proof["evidence_refs"]:
+            prefix, index = reference.rsplit(":", 1)
+            check(prefix == "recipe:" + recipe["recipe_sha256"] + "#read" and int(index) < len(reads),
+                  "every claim read reference resolves to the retained recipe")
+        check(not ledgers["trust"]["collector_authenticated"] and not ledgers["trust"]["approved_distribution"] and
+              {"execution", "writer_identity", "maliciousness", "whole_image_integrity"} <= set(proof["not_proven"]),
+              "byte comparison does not establish stronger claims")
         current = run("replay-image", case, "/current", "/json")
         check(current["mode"] == "current_reanalysis" and current["status"] == "reanalyzed" and
               not current["collector_authenticated"] and not current["execution_observed"], "reanalysis is distinct from new observation")
+        check(current["proof"]["ledgers"]["replay"]["status"] == "current_policy_reanalysis",
+              "proof distinguishes current reanalysis from original result reproduction")
         run("verify-image", image, dump, "180000000", "2000", "4096", case, exit_code=1)
         check(manifest.read_bytes() == original, "existing case cannot be overwritten")
         for arguments in (("verify-image",), ("replay-image",), ("replay-image", case, "/unknown"),
@@ -96,7 +130,9 @@ def main():
             else:
                 payload["collector_authenticated"] = True
             publish(changed)
-            check(run("replay-image", case, exit_code=1)["status"] == status, "recomputed digest does not override validation")
+            rejected = run("replay-image", case, exit_code=1)
+            check(rejected["status"] == status, "recomputed digest does not override validation")
+            check(rejected["proof"] is None, "failed replay cannot expose a retained success proof")
             if mutation == "policy":
                 current = run("replay-image", case, "/current")
                 check(current["status"] == "reanalyzed" and current["recorded_policy"] == "unknown_original_policy" and
@@ -120,7 +156,18 @@ def main():
         check(excluded_result["result"]["ownership"] == "owned_unverified" and
               excluded_result["result"]["skipped_bytes"] == "8" and excluded_result["result"]["compared_bytes"] == "4088",
               "loader exclusions cannot become completely verified bytes")
-        check(run("replay-image", excluded)["result"] == excluded_result["result"], "exclusions survive replay exactly")
+        excluded_replay = run("replay-image", excluded)
+        check(excluded_replay["result"] == excluded_result["result"], "exclusions survive replay exactly")
+        check(excluded_replay["proof"]["ledgers"]["address"]["status"] == "partial" and
+              excluded_replay["proof"]["ledgers"]["address"]["skipped_bytes"] == "8" and
+              all(claim["status"] == "not_established" and claim["unfulfilled_requirements"] and
+                  claim["next_best_observation"] for claim in excluded_replay["proof"]["claims"]),
+              "equal excluded bytes cannot establish a full match or difference")
+        changed_replay = run("replay-image", fixtures / "modified")
+        changed_proof = changed_replay["proof"]
+        check(changed_proof["claims"][1]["status"] == "supported" and changed_proof["claims"][0]["status"] == "contradicted" and
+              changed_proof["claims"][1]["ranges"] == [{"address": str(0x180001150), "length": "1"}] and
+              len(changed_proof["evidence_refs"]) == 2, "stable differences have exact byte scope and two retained reads")
         sparse = root / "sparse"
         shutil.copytree(fixtures / "sparse", sparse)
         sparse_manifest = sparse / "recipe.knverify"

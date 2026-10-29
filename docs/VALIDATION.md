@@ -7,6 +7,32 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image proof checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`bf67a2d22b9795cfda1654bb06f59c3c25d790bc4fa6f48c0a313bc8787f32bd`.
+The image recipe/proof harness passed 68 ASan checks. Controls reject inflated
+duplicate coverage, equal counts at different addresses, overlapping failed and
+compared bytes, RVA/absolute-address confusion, excluded or missing difference
+bytes, loss, wrong normalization bases, unsupported secondary views, cancelled
+reads, missing confirmation and implicit original-policy substitution. Six
+interrupted publications left three valid cases and three without a final recipe.
+
+The public CLI passed 101 checks, including independent read-byte accounting,
+resolving proof references, separate acquisition/target time, scoped claims,
+explicit unmet requirements and `proof=null` after failed replay. Eight replays
+of retained fixtures from the preceding W07 checkpoint passed in original and
+current modes; original comparisons still matched their saved results. The
+recipe format and direct comparison policy were not changed by this stage.
+
+Release build and driver-free checks passed: timeline 28, MCP 89, console 558,
+commands 2,998, remote 66 and connect arguments; capabilities 17 selected
+contracts/261 routes. Publication-scanner tests passed 10 tests. Logs are under
+`.build/architecture/w05-proof-*`. No driver or target image was launched, and
+existing compiler/LTCG warnings remain. These controls validate selected offline
+image claims, not live temporal coverage, collector trust, execution, writer
+attribution or detection rates.
+
 ## Exact reference replay checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

@@ -1,6 +1,7 @@
 #include "ImageVerificationRecipe.h"
 #include "AnalystSnapshot.h"
 #include "ContentHash.h"
+#include "ImageProof.h"
 #include "McpJson.h"
 #include "ReferenceArtifact.h"
 #include <filesystem>
@@ -144,7 +145,8 @@ namespace
     }
 
     std::wstring Execute(const ReferenceArtifact& artifact, const executable_image::DiskPeMetadata& metadata,
-        const ImageVerificationRecipe& recipe, const ObservationReader& reader)
+        const ImageVerificationRecipe& recipe, const ObservationReader& reader,
+        ExecutablePageResult* comparison = nullptr, bool* referenceQualified = nullptr)
     {
         ExecutablePageResult result;
         result.Rva = recipe.Rva;
@@ -173,7 +175,16 @@ namespace
             result.Coverage.Failed.push_back({recipe.ImageBase + recipe.Rva, recipe.Length});
             result.Coverage.Reason = reason;
         }
-        return ResultJson(result, qualified);
+        const auto json = ResultJson(result, qualified);
+        if (comparison != nullptr)
+        {
+            *comparison = std::move(result);
+        }
+        if (referenceQualified != nullptr)
+        {
+            *referenceQualified = qualified;
+        }
+        return json;
     }
 
     bool ExactBytes(const ImageRecipeRead& read, std::vector<uint8_t>* bytes)
@@ -402,7 +413,9 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         }
         return ExactBytes(p.Reads[cursor++], bytes);
     };
-    result.CurrentResult = Execute(artifact, metadata, p, reader);
+    ExecutablePageResult comparison;
+    bool referenceQualified = false;
+    result.CurrentResult = Execute(artifact, metadata, p, reader, &comparison, &referenceQualified);
     if (!artifact.Unchanged())
     {
         result.CurrentResult.clear();
@@ -420,6 +433,7 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
     else
     {
         result.Status = currentReanalysis ? L"reanalyzed" : L"replayed";
+        result.Proof = ImageProofJson(p, AssessImageProof(p, comparison, referenceQualified, currentReanalysis));
         if (error != nullptr)
         {
             error->clear();

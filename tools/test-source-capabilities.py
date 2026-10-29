@@ -43,6 +43,7 @@ def main():
     assert "parser_not_isolated" in schema["limits"] and "no_runtime_qualification" in schema["limits"]
     assert "exact_reference_blob" in by_key[("image", "replay_verification", "recipe")]["requirements"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
+    assert "claim_specific_requirements" in by_key[("proof", "image_range", "recipe")]["requirements"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

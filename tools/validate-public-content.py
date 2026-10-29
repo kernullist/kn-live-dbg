@@ -91,7 +91,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                 if isinstance(document, dict) and document.get("schema") in {
                     "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.type_schema.v1",
-                    "kn.image_recipe.v1", "kn.image_replay.v1", "kn.image_capture.v1"
+                    "kn.image_recipe.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_proof.v1"
                 }:
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):

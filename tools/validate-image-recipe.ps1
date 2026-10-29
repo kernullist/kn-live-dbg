@@ -22,7 +22,8 @@ if ($Sanitize)
 }
 $program = Join-Path $output 'image-recipe-selftest.exe'
 $sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp',
-    'user\ImageVerificationRecipe.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
+    'user\ImageVerificationRecipe.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
+    'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
 {
     '"' + (Join-Path $repo $source) + '"'
 }

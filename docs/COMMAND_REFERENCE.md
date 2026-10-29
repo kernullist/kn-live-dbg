@@ -40,6 +40,10 @@ become completely verified bytes. No live target or original image path is neede
 Exit 0 means successful publication/replay, not that the image is clean; exit 1
 means unavailable/failed work and exit 2 means invalid grammar. See
 [exact reference replay](ARCHITECTURE.md#exact-image-reference-replay) for limits.
+Successful replay also returns a `proof` object with two scoped match/difference
+claims, unmet requirements, evidence references and separate coverage ledgers.
+Failed replay returns `proof=null`. A supported comparison claim proves neither
+execution nor maliciousness; see [image proof](ARCHITECTURE.md#claim-specific-image-proof).
 
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
