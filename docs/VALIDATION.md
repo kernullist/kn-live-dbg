@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Schema parser containment checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`fde987233571dab5ee623004d8fb9702507e9542ea280bb46adae84146e64fac`.
+Actual owned child-process controls passed 19 in both Release and ASan builds.
+They cover reduced-token/private-desktop entry, argument quoting, stripped
+environment, excluded inheritable handles, denial of parent mutation access,
+commit and descendant limits, bounded output, timeout/cancellation, child crash,
+nonzero exit and cleanup after the owned supervisor is terminated. The native
+crash exits with the access-violation status; ASan intercepts it and exits 1.
+Both must discard child output and preserve the supervising test process.
+
+Actual PE/PDB identity and schema controls passed 52 under ASan. The public
+schema CLI passed 75 checks, including isolated generation, an independent
+Python artifact hash/canonical encoding oracle, old `parser_isolated=false`
+packages and rejection of an uncontained direct worker entry. One symbolic-link
+control was skipped because this environment could not create that link.
+
+The first restricted worker failed during DLL initialization until its logon
+SID was retained in the restricting set. An attempted mandatory-policy change
+required an unavailable privilege; the final code validates the inherited
+no-write-up policy and fails closed if it is absent. A narrow-string privilege
+constant in the non-Unicode harness was corrected to the explicit wide API
+literal. These were diagnosed before the passing final controls.
+
+Release build and driver-free timeline 28, MCP 89, console 558, commands 2,998,
+remote 66, connect arguments and capabilities 19 contracts/261 routes passed.
+Logs are under `.build/architecture/w04-worker-*`. Existing LTCG alignment
+warnings remain. No driver was loaded or host security policy changed. This
+validates the selected offline schema CLI on this host; live symbol consumers,
+filesystem/network sandboxing, approved distribution and target compatibility
+remain outside this checkpoint.
+
 ## Retained fact graph checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

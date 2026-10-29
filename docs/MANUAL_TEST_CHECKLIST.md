@@ -30,6 +30,7 @@ python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 .\tools\validate-analyst-features.ps1 -Sanitize
 .\tools\validate-evidence-bundle.ps1 -Sanitize
+.\tools\validate-parser-worker.ps1 -Sanitize
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-kmon-reference-coverage.ps1
 .\tools\validate-minifilter-detach-e2e-selftest.ps1
 .\tools\validate-evasion-research-ledger-selftest.ps1

@@ -312,7 +312,7 @@ DbgHelp/DIA serialization lock remain in place.
 
 GUID/age matching prevents ordinary wrong-build and replaced-cache confusion;
 it is not a content hash, an approved distribution signature or collector
-authentication. Full loaded-image identity binding, isolated untrusted parsing
+authentication. Full loaded-image identity binding, isolation of live symbol consumers
 and symbol acquisition deadlines remain separate work.
 `tools/validate-pdb-identity.ps1 -Sanitize` compiles two owned PE/PDB pairs and
 checks the actual DIA provider against matching, wrong-age, wrong-PDB and cache
@@ -354,13 +354,53 @@ Inspection accepts only canonical versioned JSON with its payload SHA-256 and
 valid path/extent/expansion relationships; a self-consistent hash is not approval.
 
 These are layout packages, not runtime object validation or authenticated symbol
-distribution. Their contract explicitly records `parser_isolated=false`,
-`runtime_invariants_checked=false` and `trusted_distribution=false`. Generation
-still runs DIA in the offline command process, so only locally trusted artifacts
-should be supplied until the isolated broker is implemented. Attaching package
-hashes to every typed observation, supported-build fixture attestations and
-broker isolation remain open. Files and renamed JSON packages are excluded from
-public source publication by the repository's sensitive-content gate.
+distribution. `runtime_invariants_checked=false` and `trusted_distribution=false`
+remain fixed. `parser_isolated` is producer-reported provenance: new CLI exports
+record true, direct-library and legacy exports retain false. Inspecting a package
+does not authenticate this field or retroactively run its parser in isolation.
+Attaching package hashes to typed observations, supported-build fixture
+attestations and isolation of live symbol consumers remain open. Files and
+renamed JSON packages are excluded by the sensitive-content gate.
+
+### Schema parser process boundary
+
+The public schema creation command now starts the same executable in an internal
+worker mode. Only that child loads the PE/PDB and DIA provider. The worker checks
+its token, private desktop and job limits before parsing. Parent-side success
+requires a zero child exit, strict bounded UTF-8/canonical package parsing and an
+exact requested type name. Only the parent publishes the package; timeout,
+crash, output overflow or setup failure cannot publish partial child output.
+There is no in-process fallback. Existing schema inspection remains a bounded
+JSON operation in the command process, and other SymbolEngine consumers are
+unchanged.
+
+The child receives a filtered primary token: administrator SID is deny-only,
+privileges other than traverse are removed, integrity is low and the inherited
+no-write-up policy is checked. Its restricting SID list retains the current user,
+standard read-access groups and logon SID needed by the window station. A new
+private low-integrity desktop is created and released with the request. These
+choices follow the Windows [restricted token contract](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken)
+and [mandatory integrity model](https://learn.microsoft.com/en-us/windows/win32/secauthz/mandatory-integrity-control).
+The initial environment contains only OS-derived SystemRoot/WINDIR. Handle
+inheritance is limited to one output pipe and a NUL input handle; controller,
+token and credential environment handles/values are not forwarded.
+
+Windows 10 or later is required for atomic job assignment through
+[PROC_THREAD_ATTRIBUTE_JOB_LIST](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+The job allows one process, limits committed memory to 512 MiB and kills its
+worker when the final parent job handle closes. A suspended child is resumed
+only after creation with those restrictions. Parent supervision caps stdout and
+stderr together at 2 MiB, checks cancellation and enforces a 60-second elapsed
+budget once process creation returns. Failed cleanup is explicit; synchronous
+OS process creation/termination is not a hard real-time deadline. A large PDB
+can fail the memory budget even if it passes the input-file size limit. Existing
+host job or desktop restrictions can make setup unavailable.
+
+This boundary contains selected parser faults and resource use. It is not an
+AppContainer, a filesystem allowlist, an egress policy or authenticated parser
+attestation. The child retains some access under the same user, and artifact
+hashes/provider paths do not establish approved distribution. Network-denied
+artifact brokering and isolation of all untrusted parsers remain open.
 
 ## Capture scheduling and latency
 

@@ -69,7 +69,10 @@ and urgency thresholds are not latency guarantees. See
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
 DIA provider. Names are case-sensitive. It opens no live device and downloads no
-symbols. Supply locally trusted artifacts: DIA parsing is not process-isolated.
+symbols. PE/PDB/DIA parsing runs in a child with a restricted low-integrity
+token, private desktop, allowlisted handles/environment, 512 MiB commit limit,
+one-process job and 60-second parent timeout. Unsupported containment fails
+without an in-process fallback. This is not a filesystem or network sandbox.
 `KnLiveDbg.exe --schema inspect <package>` verifies the stored checksum and
 bounded field relationships without loading DIA or requiring the original files.
 Both return canonical `kn.type_schema.v1` JSON on success (exit 0); invalid input,

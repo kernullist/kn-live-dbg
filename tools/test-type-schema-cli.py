@@ -49,8 +49,17 @@ def main():
                             ("provider_sha256", exe.parent / "msdia140.dll")):
             check(payload[field] == hashlib.sha256(path.read_bytes()).hexdigest(), "artifact hash matches actual bytes")
         check(not payload["trusted_distribution"] and not payload["runtime_invariants_checked"] and
-              not payload["parser_isolated"], "package does not upgrade its evidence or isolation")
+              payload["parser_isolated"], "worker provenance does not upgrade artifact trust or runtime evidence")
         check(json.loads(run("inspect", output).stdout) == package, "fresh process reconstructs the same package")
+        legacy = copy.deepcopy(package)
+        legacy["payload"]["parser_isolated"] = False
+        legacy_path = root / "legacy.knschema"
+        legacy_path.write_text(encode(legacy), encoding="utf-8")
+        check(not json.loads(run("inspect", legacy_path).stdout)["payload"]["parser_isolated"],
+              "legacy in-process package remains explicitly unisolated")
+        worker = subprocess.run([str(exe), "--schema-worker", str(image), str(pdb), "PdbIdentityFixture"],
+                                capture_output=True, timeout=60)
+        check(worker.returncode != 0 and not worker.stdout, "direct internal worker invocation cannot bypass containment")
         run("create", image, pdb, "PdbIdentityFixture", output, success=False)
         check(output.read_bytes() == data, "collision preserves existing publication")
         for arguments in ((), ("inspect",), ("inspect", output, "extra"), ("unknown", output),

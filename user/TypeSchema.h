@@ -35,6 +35,8 @@ struct TypeSchemaPackage
     std::wstring ProviderVersion;
     std::wstring TypeName;
     uint64_t TypeBytes = 0;
+    // Producer-reported provenance; a package checksum does not authenticate it.
+    bool ParserIsolated = false;
     std::vector<TypeSchemaField> Fields;
     std::vector<TypeSchemaGap> Gaps;
 };
@@ -52,3 +54,4 @@ bool SaveTypeSchema(const std::wstring& path, const TypeSchemaPackage& package, 
 bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, const std::wstring& typeName,
     const std::wstring& provider, TypeSchemaPackage* package, std::wstring* error);
 int RunTypeSchemaCommand(int argc, wchar_t** argv);
+int RunTypeSchemaWorkerCommand(int argc, wchar_t** argv);

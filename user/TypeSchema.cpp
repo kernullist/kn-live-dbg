@@ -127,7 +127,8 @@ namespace
             L",\"provider_version\":" + mcpjson::Quote(p.ProviderVersion) + L",\"type_name\":" + mcpjson::Quote(p.TypeName) +
             L",\"type_bytes\":" + Number(p.TypeBytes) +
             L",\"root_interpretation\":\"direct_object_bytes\",\"validation\":\"pdb_identity_and_layout_bounds\","
-            L"\"trusted_distribution\":false,\"runtime_invariants_checked\":false,\"parser_isolated\":false,\"fields\":[";
+            L"\"trusted_distribution\":false,\"runtime_invariants_checked\":false,\"parser_isolated\":" +
+            std::wstring(p.ParserIsolated ? L"true" : L"false") + L",\"fields\":[";
         bool first = true;
         for (const auto& f : p.Fields)
         {
@@ -272,7 +273,7 @@ bool ParseTypeSchema(const std::wstring& json, TypeSchemaPackage* package, std::
         return false;
     }
     TypeSchemaPackage p;
-    std::wstring payload, raw;
+    std::wstring payload, raw, isolation;
     std::vector<std::wstring> rows;
     if (!mcpjson::FindRawValue(json, L"payload", &payload) ||
         !mcpjson::GetString(payload, L"image_sha256", &p.ImageSha256) ||
@@ -282,10 +283,12 @@ bool ParseTypeSchema(const std::wstring& json, TypeSchemaPackage* package, std::
         !mcpjson::GetString(payload, L"provider_sha256", &p.ProviderSha256) ||
         !mcpjson::GetString(payload, L"provider_version", &p.ProviderVersion) ||
         !mcpjson::GetString(payload, L"type_name", &p.TypeName) || !Number(payload, L"type_bytes", &p.TypeBytes) ||
+        !mcpjson::FindRawValue(payload, L"parser_isolated", &isolation) || (isolation != L"true" && isolation != L"false") ||
         !mcpjson::FindRawValue(payload, L"fields", &raw) || !Array(raw, &rows, TypeSchemaMaxFields))
     {
         return false;
     }
+    p.ParserIsolated = isolation == L"true";
     for (const auto& row : rows)
     {
         TypeSchemaField f;

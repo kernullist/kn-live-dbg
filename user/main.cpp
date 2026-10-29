@@ -53398,6 +53398,10 @@ int wmain(int argc, wchar_t** argv)
     {
         return RunGameManifestCommand(argc, argv);
     }
+    if (argc >= 2 && ToLower(argv[1]) == L"--schema-worker")
+    {
+        return RunTypeSchemaWorkerCommand(argc, argv);
+    }
     if (argc >= 2 && ToLower(argv[1]) == L"--schema")
     {
         return RunTypeSchemaCommand(argc, argv);

@@ -43,7 +43,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"legacy_bounded_inventory;optional_immutable_snapshot;separate_inventory_and_result_cursors;window_scoped_counts"},
         {L"schema", L"export_type", L"local_pdb", L"implemented", L"offline_artifacts",
             L"exact_amd64_image_pdb_identity;stable_local_files;packaged_dia_provider",
-            L"layout_bounds_only;explicit_nested_paths;no_pointer_follow;no_runtime_qualification;parser_not_isolated"},
+            L"layout_bounds_only;explicit_nested_paths;no_pointer_follow;no_runtime_qualification;cli_parser_process_containment;other_symbol_paths_not_isolated;no_filesystem_or_network_sandbox"},
         {L"evidence", L"replay", L"bundle", L"implemented", L"recorded_bundle",
             L"valid_kncase_v1;declared_read_set",
             L"page_digest_and_static_path_only;image_verification_not_replayed"},
