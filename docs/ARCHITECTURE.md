@@ -123,6 +123,25 @@ completion latency. Enumeration coverage remains scoped to supplied ETHREADs.
 IRP allocation references, cross-observation joins, raw-read replay, dispatch/
 completion event providers, wait/lock graphs and deadlock diagnosis remain open.
 
+## Imported execution samples
+
+`--offline !kmon trace` imports the versioned normalized format described in
+[the trace contract](TRACE_IMPORT.md). It returns before live driver/symbol
+initialization and reads a bounded local file through `ReferenceArtifact`.
+The lease denies ordinary writes/deletes; the exact input SHA-256 and page limit
+bind continuation cursors. Source/boot/VM/VTL/clock, process/thread generation,
+address-space root/epoch, retained code hashes and explicit loss intervals remain
+separate fields. Missing context does not borrow the current host's identity.
+
+`qualified_reported_level` describes internally consistent producer metadata:
+X0 references, X1 saved context or X2 CPU samples. It is not authenticated
+execution. `execution_observed`, independent execution verification, control-flow,
+write and actor claims remain false. Conflicting retained code versions or
+context mismatches stay unqualified. Hash agreement verifies supplied bytes,
+not their original acquisition or runtime mapping. Pagination completion does
+not mean continuous or loss-free execution coverage. Raw PT/TTD/ETW decoders,
+actual live collection and VMI providers remain unsupported by this adapter.
+
 ## Comparison coverage
 
 `ObservationCoverage::Complete()` requires a bounded, valid union of compared

@@ -15,7 +15,7 @@ public:
     ~ReferenceArtifact();
     ReferenceArtifact(const ReferenceArtifact&) = delete;
     ReferenceArtifact& operator=(const ReferenceArtifact&) = delete;
-    bool Open(const std::wstring& path, std::wstring* error);
+    bool Open(const std::wstring& path, std::wstring* error, size_t maximumBytes = ReferenceArtifactMaxBytes);
     bool Unchanged();
     const std::wstring& Path() const;
     const std::wstring& Sha256() const;

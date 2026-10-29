@@ -199,6 +199,9 @@
     <ClCompile Include="PendingIrpScannerTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ExecutionTrace.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KmonTemporalEvidence.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -379,6 +382,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExecutionTrace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HvPostureScanner.h">

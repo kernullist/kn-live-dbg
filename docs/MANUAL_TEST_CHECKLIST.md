@@ -83,6 +83,14 @@ optional fields and an independent JSON/graph oracle. A final successful status,
 cancel bit or empty stack must not produce a completed/cancelled outcome. These
 controls do not exercise a live IRP lifetime, driver cancellation or wait graph.
 
+`tools/validate-execution-trace.ps1 -Sanitize` builds the actual importer and
+bounded artifact reader. Run `python tools/test-execution-trace.py --exe
+x64/Release/KnLiveDbg.exe` after the native build to verify public dispatch,
+identity/loss/code-version boundaries, immutable paging, Unicode output and
+malformed/capped input. These fixtures do not decode raw trace packets or prove
+that the producer observed execution. Shared reference-reader changes also
+require `tools/validate-image-recipe.ps1 -Sanitize`.
+
 ## Live-host prerequisites
 
 - Use a Windows x64 lab host/VM with the required signing configuration and

@@ -9,6 +9,7 @@
 #include "CloudFileScanner.h"
 #include "CommandRegistry.h"
 #include "SourceCapabilities.h"
+#include "ExecutionTrace.h"
 #include "CommandInput.h"
 #include "CompletionHints.h"
 #include "DbgEngBackend.h"
@@ -23044,6 +23045,7 @@ static void PrintKmonHelp()
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
+    std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples\n";
     std::wcout << L"  !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
@@ -23385,10 +23387,14 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"trace")
+    {
+        return RunExecutionTraceCommand(std::vector<std::wstring>(args.begin() + 2, args.end()), &g_StopRequested);
+    }
     if (action == L"verify-image")
     {
         uint64_t base = 0, rva = 0, length = 0;
@@ -23686,7 +23692,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon dump-read, verify-image, replay-image, inventory, evidence, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, replay-image, inventory, evidence, graph, replay, or why\n";
     return 2;
 }
 
@@ -53368,7 +53374,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";

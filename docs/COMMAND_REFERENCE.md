@@ -190,6 +190,20 @@ The final outcome stays unknown; addresses and flags do not establish a request
 lifetime, a completed/cancelled operation or a deadlock. The normal KMON event
 query and JSON log expose these records; routine snapshots do not print live.
 
+Normalized external samples can be inspected without a live target:
+
+```text
+KnLiveDbg.exe --offline !kmon trace capture.kntrace /limit 64 /json
+KnLiveDbg.exe --offline !kmon trace capture.kntrace /limit 64 /cursor <next_cursor> /json
+```
+
+The [trace input contract](TRACE_IMPORT.md) defines required identity, clock,
+code-version and loss fields. The importer accepts normalized JSON, not raw
+PT/ETL/TTD buffers. Its qualified reported level remains a producer claim;
+neither parsing nor a code hash authenticates actual execution. Changed input or
+page limits invalidate the cursor. Error exit 1 returns an unavailable result;
+invalid command arguments exit 2.
+
 ## Whole-host hunt
 
 ```text

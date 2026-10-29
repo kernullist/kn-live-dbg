@@ -203,6 +203,7 @@
     <ClCompile Include="TypeSchema.cpp" />
     <ClCompile Include="TypeSchemaGenerator.cpp" />
     <ClCompile Include="TypeSchemaCommand.cpp" />
+    <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
@@ -262,6 +263,7 @@
     <ClInclude Include="HiddenProcessPolicy.h" />
     <ClInclude Include="ExecutionEvidenceJson.h" />
     <ClInclude Include="ExecutionEvidence.h" />
+    <ClInclude Include="ExecutionTrace.h" />
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="HvPostureScanner.h" />
     <ClInclude Include="DumpAnalyzer.h" />

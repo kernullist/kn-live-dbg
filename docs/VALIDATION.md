@@ -7,6 +7,36 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Normalized trace import checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`721f291d38edf9ab27b491d3bf15f0635ed0f7f92dccb861038c3716b8f83f9f`.
+The actual importer and bounded file reader passed 93 independently generated
+CLI controls under ASan, then the same 93 through the public native offline
+entry. Controls cover source kinds, unknown context, LA48/LA57, loss/gap
+consistency, code hashes/conflicts, immutable cross-process paging, integer
+precision, Unicode, invalid schemas, collection limits and the 2 MiB boundary.
+An already-cancelled library call clears stale output. The documented input
+example also passed through the public native command.
+
+Adversarial Unicode input reproduced truncated redirected JSON from wide-stream
+output; explicit UTF-8 output fixed it. Review also rejects unpaired surrogate
+identifiers and downgrades conflicting code contexts. No additional actionable
+defects were found in the reviewed scope. The shared artifact reader's existing
+image-recipe ASan suite passed 68 controls and six interrupted publications
+(three valid, three absent). Its default 64 MiB limit is unchanged; the importer
+requests a smaller limit before allocation.
+
+Final Release/native gates passed timeline 28, MCP 89, console 558, commands
+2,998, remote 66 and connect arguments. Capabilities passed 22 selected
+contracts/261 routes; publication-scanner regressions passed ten tests. Logs
+are under `.build/architecture/w13-trace-*`, with successful `-core-final`,
+`-build-second`, `-native-all`, `-native-cli` and `-recipe-regression` gates.
+Existing compiler/LTCG warnings remain. No driver was loaded or host security
+policy changed. These tests import synthetic normalized records; they do not
+validate a raw trace decoder, producer authenticity, live CPU/VTL collection,
+runtime code mapping, execution completeness or writer attribution.
+
 ## Pending IRP observation checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

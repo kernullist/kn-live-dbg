@@ -1,6 +1,7 @@
 # Documentation
 
-These guides describe **main through e73932d**, reviewed on **2026-10-29**.
+These guides describe **main development**, including the selected platform
+checkpoints dated **2026-10-29 and 2026-10-30**.
 The latest published release remains **v0.0.36 / 6646461**. Retained evidence,
 offline investigation and the subsequent reference/TI queue changes belong to
 main; consult the release notes for shipped behavior. This documentation update
@@ -13,6 +14,7 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 | [Project README](../README.md) | Download, quick start, scope |
 | [Build and release](BUILD_AND_RELEASE.md) | Toolchain, signing, versioning, package validation, public-content checks |
 | [Command guide](COMMAND_REFERENCE.md) | Memory, scanners, snapshots, collection, dumps |
+| [Trace import](TRACE_IMPORT.md) | Normalized external samples, code/loss scope and producer-claim limits |
 | [Command coverage](WINDBG_COMMAND_COVERAGE.md) | Native and DbgEng routing |
 | [AI workflows](AI_ASSISTED_WORKFLOWS.md) | Configuration, plans, confirmation, logs |
 | [MCP setup](MCP_SETUP.md) / [한국어](MCP_SETUP.ko.md) | HTTP setup, permissions, troubleshooting |

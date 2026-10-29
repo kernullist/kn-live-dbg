@@ -56,6 +56,9 @@ def main():
     assert "saved_context_not_cpu_sample" in by_key[("execution", "classify_reference", "native")]["limits"]
     assert "single_observation_ids" in by_key[("io", "request_graph", "native")]["limits"]
     assert "no_request_lifetime_or_completion_inference" in by_key[("io", "request_graph", "native")]["limits"]
+    trace = by_key[("execution", "trace_import", "trace")]
+    assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
+    assert "no_raw_decoder_or_live_backend" in trace["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

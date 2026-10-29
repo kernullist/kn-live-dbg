@@ -57,7 +57,7 @@ backend/build/security-state combination.
 | W10 Kernel rules | Process cross-view candidates now require complete fresh inventories and matching PID/EPROCESS/CreateTime/lifecycle samples; unverified and reconciled records are retained. Other object families, raw-read replay, unowned-code/device-channel and security-state rules remain open | W07-W09 |
 | W11 User/runtime | Selected native references now report X0/X1 or unqualified, retain PSS thread/time metadata and separate VAD reference correlation from execution claims. Additional callback/thread-pool/WOW64/JIT layouts and game-object lifetimes remain open | W07-W09 |
 | W12 Wait/I/O diagnosis | Selected native IRP snapshots now preserve requests without completions and expose per-observation thread/request/stack/reference graphs, optional state fields and unknown outcomes. Referenced request lifetimes, transition providers, wait/lock graphs and false-cycle controls remain open | W04,W09 |
-| W13 Trace/VMI | Versioned import first; CPU/VM/VTL/code/loss scope; actual backend access and compatibility gates | W02-W09 |
+| W13 Trace/VMI | Bounded offline normalized-sample import now preserves CPU/VM/VTL/clock/loss and hash-checked code bytes, with source-bound paging and qualified producer-reported levels. Raw trace decoders, authenticated live providers, VMI access and compatibility gates remain open | W02-W09 |
 | W14 Security/AI | Kernel sessions now default to write-off with verified mode transitions and MCP failure containment; full offline/observe/collect/lab partition, protected transport, operation outcomes and evidence-checked AI plans remain open | W01 onward |
 | W15 Independent validation | Versioned corpus and ground truth; family-separated comparisons, false positives, latency and safety by environment | Each package |
 
@@ -76,7 +76,7 @@ ABI, selected source contracts and command routes generated from the registry.
 `inventory_complete=false` means the selected operations are not the entire
 product inventory. `implementation` describes code, while `availability` remains
 `not_probed`; OS build, active address width and security state are not inferred.
-The output preserves unsupported VTL1 access and trace/VMI paths, experimental
+The output preserves unsupported native VTL1 access and live trace/VMI paths, experimental
 dispatch interposition, bounded inventory and incomplete image replay.
 
 Use `python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe`

@@ -32,10 +32,11 @@ namespace
         return text;
     }
 
-    bool Read(HANDLE file, std::vector<uint8_t>* bytes)
+    bool Read(HANDLE file, std::vector<uint8_t>* bytes, size_t maximumBytes)
     {
         LARGE_INTEGER size{}, zero{};
-        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || static_cast<uint64_t>(size.QuadPart) > ReferenceArtifactMaxBytes ||
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+            static_cast<uint64_t>(size.QuadPart) > (std::min)(maximumBytes, ReferenceArtifactMaxBytes) ||
             !SetFilePointerEx(file, zero, nullptr, FILE_BEGIN))
         {
             return false;
@@ -68,11 +69,11 @@ ReferenceArtifact::~ReferenceArtifact()
     }
 }
 
-bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error)
+bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size_t maximumBytes)
 {
     if (error != nullptr)
     {
-        *error = L"reference must be a stable local regular file of 1..64 MiB";
+        *error = L"reference must be a stable local regular file within the byte limit";
     }
     const auto absolute = LocalPath(path);
     if (File != INVALID_HANDLE_VALUE || absolute.empty())
@@ -85,7 +86,7 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error)
     if (File == INVALID_HANDLE_VALUE || GetFileType(File) != FILE_TYPE_DISK ||
         !GetFileInformationByHandleEx(File, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
         (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &Data))
+        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &Data, maximumBytes))
     {
         return false;
     }
@@ -126,7 +127,7 @@ bool ReferenceArtifact::Unchanged()
     FILE_ID_INFO identity{};
     std::vector<uint8_t> current;
     return owner && GetFileInformationByHandleEx(reopened, FileIdInfo, &identity, sizeof(identity)) &&
-        std::memcmp(&identity, &Identity, sizeof(identity)) == 0 && Read(File, &current) && current == Data;
+        std::memcmp(&identity, &Identity, sizeof(identity)) == 0 && Read(File, &current, Data.size()) && current == Data;
 }
 
 const std::wstring& ReferenceArtifact::Path() const
