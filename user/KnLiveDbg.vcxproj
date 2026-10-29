@@ -314,6 +314,7 @@
     <ClInclude Include="SnapshotModel.h" />
     <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
+    <ClInclude Include="PdbIdentity.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />
     <ClInclude Include="WdFilterRuntimeScanner.h" />

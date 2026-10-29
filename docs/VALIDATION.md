@@ -7,6 +7,25 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## PDB identity checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`d62a8773b2b500e9e3a011bf91f1fe24ca0a0ce212cc3be5b82a831a8cdebe59`.
+The actual installed DIA provider passed 28 ASan harness checks using two owned
+PE/PDB pairs. The controls reproduce acceptance of an unrelated PDB through
+the old unvalidated API, then verify signature/age rejection, a replaced cache
+path, image-based load identity checks, unavailable identity and stale module
+base/size checks. No target image was executed or driver loaded by the harness.
+
+Release build and the driver-free suite passed: timeline 28, MCP 89, console 558,
+commands 2,998, remote 66 and connect arguments. Capability validation passed
+with 13 selected contracts and 261 command routes. Earlier dump/evidence gates
+remain evidence for those unchanged components; they were not relabeled as new
+runs. Logs are under `.build/architecture/w04-pdb-*`.
+
+This validates the PDB identity boundary, not a live kernel layout, immutable
+schema package, trusted symbol distribution or isolated parser process.
+
 ## Shared dump source checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

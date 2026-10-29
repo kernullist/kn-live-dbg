@@ -1,4 +1,6 @@
 #include "SymbolEngine.h"
+#include "PdbIdentity.h"
+#include "ExecutableImage.h"
 
 #include <dia2.h>
 #include <winternl.h>
@@ -1620,42 +1622,75 @@ bool SymbolEngine::LoadDiaDataForModule(const KernelModuleInfo& module, IDiaData
             break;
         }
 
-        std::wstring lastError;
-        std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
-        if (!pdbPath.empty())
+        IMAGEHLP_MODULEW64 loaded{};
+        loaded.SizeOfStruct = sizeof(loaded);
+        const bool hasLoaded = SymGetModuleInfoW64(process_, module.Base, &loaded) != FALSE;
+        if (hasLoaded && !symbol_identity::ModuleRecordMatches(loaded, module.Base, module.Size))
         {
-            HRESULT hr = source->loadDataFromPdb(pdbPath.c_str());
-            if (SUCCEEDED(hr))
+            if (error != nullptr)
             {
-                ok = true;
+                *error = L"DIA rejected unmatched module symbol identity";
+            }
+            break;
+        }
+        auto expected = symbol_identity::FromMatchedModule(loaded);
+        const auto imagePath = ResolveModuleImagePath(module);
+        executable_image::DiskPeMetadata image;
+        bool imageQualified = false;
+        if (!expected.Valid())
+        {
+            imageQualified = !imagePath.empty() && executable_image::ReadDiskPeMetadata(imagePath, &image, nullptr) &&
+                image.HasPdbIdentity && image.SizeOfImage == module.Size &&
+                (!hasLoaded || ((loaded.ImageSize == 0 || loaded.ImageSize == image.SizeOfImage) &&
+                    (loaded.TimeDateStamp == 0 || loaded.TimeDateStamp == image.TimeDateStamp) &&
+                    (loaded.CheckSum == 0 || loaded.CheckSum == image.CheckSum)));
+            if (!imageQualified)
+            {
+                if (error != nullptr)
+                {
+                    *error = L"DIA expected PDB identity is unavailable or the image changed";
+                }
                 break;
             }
-
-            lastError = HResultText(L"IDiaDataSource::loadDataFromPdb failed", hr);
+            expected.Guid = image.PdbGuid;
+            expected.Age = image.PdbAge;
         }
-
-        std::wstring imagePath = ResolveModuleImagePath(module);
-        if (imagePath.empty())
+        if (!expected.Valid())
         {
             if (error != nullptr)
             {
-                *error = lastError.empty() ? L"DIA loadDataForExe failed: no module image path" : lastError;
+                *error = L"DIA expected PDB signature or age is unavailable";
             }
             break;
         }
-
-        HRESULT hr = source->loadDataForExe(imagePath.c_str(), symbolPath_.c_str(), nullptr);
-        if (FAILED(hr))
+        const auto pdbPath = GetLoadedPdbPath(process_, module.Base);
+        HRESULT hr = E_FAIL;
+        if (!pdbPath.empty())
+        {
+            hr = symbol_identity::LoadMatchingPdb(source, pdbPath, expected);
+        }
+        else if (!imagePath.empty())
+        {
+            hr = source->loadDataForExe(imagePath.c_str(), symbolPath_.c_str(), nullptr);
+            if (hr == S_OK && !symbol_identity::VerifyDiaIdentity(source, expected))
+            {
+                hr = HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
+            }
+        }
+        if (hr != S_OK || (imageQualified && !executable_image::DiskReferenceIdentityMatches(imagePath, image)))
         {
             if (error != nullptr)
             {
-                std::wstring exeError = HResultText(L"IDiaDataSource::loadDataForExe failed", hr);
-                *error = lastError.empty() ? exeError : lastError + L"; " + exeError;
+                *error = hr == S_OK ? L"DIA image identity changed during symbol loading" :
+                    HResultText(L"DIA PDB identity validation failed", hr);
             }
             break;
         }
-
         ok = true;
+        if (error != nullptr)
+        {
+            error->clear();
+        }
     } while (false);
 
     return ok;

@@ -293,6 +293,31 @@ See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFI
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).
 
+## PDB identity boundary
+
+Before DIA supplies type data, `SymbolEngine` binds the load to an expected PDB
+signature and age from matched DbgHelp module metadata. Unmatched PDB/DBG flags,
+different module bases and conflicting known image sizes are rejected. When that
+identity is unavailable, the existing PE reader extracts CodeView identity from
+the resolved image and checks the known size/timestamp/checksum constraints;
+the file identity is checked again after symbol loading.
+
+Direct PDB loads use Microsoft's
+[signature-and-age validation API](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiadatasource-loadandvalidatedatafrompdb?view=visualstudio),
+then independently compare the opened session's identity. Image-based DIA loads
+also receive the post-load comparison. A missing property is unavailable, not a
+zero-valued match. A rejected selected PDB does not become an unchecked fallback
+load on the same data-source object. Existing qualified layout caching and the
+DbgHelp/DIA serialization lock remain in place.
+
+GUID/age matching prevents ordinary wrong-build and replaced-cache confusion;
+it is not a content hash, an approved distribution signature or collector
+authentication. Immutable schema packages, full loaded-image identity binding,
+isolated untrusted parsing and symbol acquisition deadlines remain separate work.
+`tools/validate-pdb-identity.ps1 -Sanitize` compiles two owned PE/PDB pairs and
+checks the actual DIA provider against matching, wrong-age, wrong-PDB and cache
+replacement controls without loading a driver or target image.
+
 ## Offline dump observation source
 
 `DumpObservationSource` and the existing dump analyzer share one qualified
