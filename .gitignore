@@ -19,6 +19,10 @@
 *.knchunk.pending-*
 *.knschema
 *.knschema.pending-*
+*.knblob
+*.knblob.pending-*
+*.knverify
+*.knverify.pending-*
 auth.json
 credentials.json
 id_rsa

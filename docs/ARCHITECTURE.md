@@ -362,6 +362,61 @@ hashes to every typed observation, supported-build fixture attestations and
 broker isolation remain open. Files and renamed JSON packages are excluded from
 public source publication by the repository's sensitive-content gate.
 
+## Exact image reference replay
+
+`--offline !kmon verify-image` now connects the dump observation source to the
+existing executable verifier and a private image case. Each case retains the
+complete reference PE as `<sha256>.knblob`, then atomically publishes
+`recipe.knverify` last. Original file identity/path and capture time remain
+provenance; replay opens only the retained content-addressed artifact. Both
+files are private local evidence, not public source inputs.
+
+The `kn.image_recipe.v1` payload records the policy version, source identity and
+address width, requested image base/RVA/range, ordered read results, sparse raw
+spans, clock intervals and the original comparison. Its normalization record
+preserves PE/PDB identity, section RVA/file mapping, relocation basis and
+overlapping relocations, loader/dynamic exclusions and declared REL32 targets.
+The reference artifact supplies the original bytes for all those inputs.
+Before and after comparison, mapped PE/PDB identity must qualify and the header
+base must remain equal. Missing, unstable, excluded and compared bytes keep
+separate coverage; excluded bytes cannot produce a fully verified result.
+Every retained byte span must belong to the declared address width, source and
+consistency model, including bytes inside a partially available read.
+
+Default `replay-image` uses the recorded policy only when this binary implements
+that version. It verifies the artifact hash, recomputes normalization, consumes
+the exact original sequence of read requests/results, reruns the verifier and
+compares the complete result with the stored one. Missing reference, corrupted
+artifact, unavailable policy, changed normalization, read-set mismatch and
+result mismatch have distinct failure states. An old stored verdict is never a
+substitute for a missing artifact. Future semantic changes to the direct verifier
+or reference parser must introduce a new policy version or retain the old engine.
+
+`replay-image /current` explicitly selects current reanalysis. It reports both
+policy identifiers and retains the original result separately. Its reader can
+combine available recorded spans but rejects contradictory repeated bytes and
+overlapping unavailable/cancelled observations. These rereads are historical
+data accesses, not new kernel observations. Neither mode proves execution,
+collector authenticity, signer approval or an approved original distribution.
+Hotpatch epoch is explicitly unavailable.
+
+This path supports AMD64 direct mapping relocation bases and one range of
+1..4,096 bytes. A third header relocation base remains unqualified; the live
+sweep's independently qualified secondary image view is not silently reproduced
+by this recipe version. Limits are 64 MiB reference, 64 ordered reads and 128 KiB
+requested read bytes, with a 2 MiB recipe. File reads check a cooperative 30-second
+budget; synchronous I/O and PE parsing have no hard cancellation deadline.
+Native monitor publication, secondary-view recipes, signed reference distribution
+and isolated parsing remain open. Existing `.kncase` replay still reports
+`image_verification_replayed=false`; it does not implicitly discover these cases.
+
+Capture requires a new directory and never replaces existing output. A failed
+or interrupted capture can leave an unreferenced blob or temporary file, but no
+valid final recipe; callers treat the missing final marker as incomplete. Case
+directories currently have explicit/manual retention and no automatic expiry or
+cross-case deduplication. Use locally trusted reference files until parser
+isolation is available.
+
 ## Offline dump observation source
 
 `DumpObservationSource` and the existing dump analyzer share one qualified

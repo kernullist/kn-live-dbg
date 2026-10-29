@@ -24,6 +24,23 @@ has no virtual allocation. Sparse spans contain bytes only where captured.
 The command exits 0 for a complete read, 1 for unavailable/partial/failed reads,
 and 2 for invalid grammar. It opens no driver or symbol session.
 
+`KnLiveDbg.exe --offline !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length> <new-directory> /json`
+captures one 1..4,096-byte executable comparison and its exact reference into a
+new private directory. The dump must meet `dump-read` requirements. Base and RVA
+are hexadecimal. Supply locally trusted reference files; parsing is not isolated.
+The result's ownership and coverage determine the byte-comparison outcome;
+`status=recorded` means the case was published, including when reads are partial.
+
+`KnLiveDbg.exe --offline !kmon replay-image <directory> /json` reruns the recorded
+policy against the retained artifact and ordered raw reads. Add `/current` to
+perform current reanalysis instead; both policy identifiers and the original
+result remain visible. Missing/corrupt artifacts or unsupported original policy
+fail explicitly. Loader exclusions, partial reads and conflicting rereads cannot
+become completely verified bytes. No live target or original image path is needed.
+Exit 0 means successful publication/replay, not that the image is clean; exit 1
+means unavailable/failed work and exit 2 means invalid grammar. See
+[exact reference replay](ARCHITECTURE.md#exact-image-reference-replay) for limits.
+
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
 DIA provider. Names are case-sensitive. It opens no live device and downloads no

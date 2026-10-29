@@ -224,8 +224,12 @@ static bool ReadExecutableIdentity(const DiskPeMetadata& metadata, uint64_t imag
 }
 
 bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBase,
-    const ObservationReader& reader, std::wstring* reason)
+    const ObservationReader& reader, std::wstring* reason, uint64_t* qualifiedHeaderBase)
 {
+    if (qualifiedHeaderBase != nullptr)
+    {
+        *qualifiedHeaderBase = 0;
+    }
     uint64_t headerBase = 0;
     if (!ReadExecutableIdentity(metadata, imageBase, reader, reason, &headerBase)) { return false; }
     // A live header alone cannot establish a third relocation base. The full
@@ -234,6 +238,10 @@ bool QualifyExecutableReference(const DiskPeMetadata& metadata, uint64_t imageBa
     {
         if (reason) { *reason = L"live_image_relocation_base_ambiguous"; }
         return false;
+    }
+    if (qualifiedHeaderBase != nullptr)
+    {
+        *qualifiedHeaderBase = headerBase;
     }
     return true;
 }

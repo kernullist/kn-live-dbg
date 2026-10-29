@@ -61,7 +61,8 @@ bool QualifyExecutableReference(
     const executable_image::DiskPeMetadata& metadata,
     uint64_t imageBase,
     const ObservationReader& reader,
-    std::wstring* reason);
+    std::wstring* reason,
+    uint64_t* qualifiedHeaderBase = nullptr);
 
 // Reads reference bytes with base relocations applied, including non-code metadata.
 bool ReadNormalizedImageRange(const std::wstring& path,

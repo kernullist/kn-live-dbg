@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Exact reference replay checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`283aa3c96305049000405549785e0baf3e53021dc796fb7a5affa8cc56cf7184`.
+The image recipe harness passed 49 ASan checks using an owned PE, mapped-byte
+source and full-dump fixture. Controls cover cross-page relocation, loader
+exclusions, stable modifications, unstable rereads, sparse bytes, wrong mapped
+PDB identity, ambiguous or changing header bases, missing/corrupt artifacts,
+changed original files, policy selection, canonical address bounds and
+recomputed-hash tampering. Review reproduced partial reads accepting mismatched
+source/consistency labels; retained bytes now require matching provenance in
+either replay mode. Six
+interrupted publications left three valid replayable cases and three without a
+final recipe. No incomplete final recipe was accepted.
+
+The public offline CLI passed 79 checks, including an independent Python digest
+calculation and exact artifact-byte comparison. Shared verifier/core ASan checks
+passed, including hunting 11,345, pages 54 and false-positive controls 49. Release
+build and driver-free checks passed: timeline 28, MCP 89, console 558, commands
+2,998, remote 66 and connect arguments. Capability checks passed with 16 selected
+contracts/261 routes; publication-scanner regression tests passed 10 tests.
+Logs are under `.build/architecture/w07-recipe-*`. The initial harness compile
+failed on its `LARGE_INTEGER` fixture assignment. A later script formatting edit
+also caused a PowerShell parameter error before compilation. Both were corrected;
+the unchanged substantive assertions and new regression controls passed above.
+
+This validates selected offline direct-mapping cases, not native monitor capture,
+secondary image-view reproduction, signer approval, collector authenticity or
+live execution. No driver or target image was launched. Existing compiler/LTCG
+warnings remain recorded in the build log.
+
 ## Type schema checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

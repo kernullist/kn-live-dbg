@@ -67,6 +67,7 @@
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "TypeSchema.h"
+#include "ImageVerificationRecipe.h"
 #include "UserModeHunter.h"
 #include "VbsScanner.h"
 #include "WdFilterRuntimeScanner.h"
@@ -23034,6 +23035,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
+    std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
+    std::wcout << L"  !kmon replay-image <directory> [/current] [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23371,10 +23374,79 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|inventory|evidence|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"verify-image")
+    {
+        uint64_t base = 0, rva = 0, length = 0;
+        if (args.size() < 8 || args.size() > 9 || args[2].empty() || args[3].empty() || args[7].empty() ||
+            !ParseUnsigned(args[4], 16, &base) || !ParseUnsigned(args[5], 16, &rva) || rva > UINT32_MAX ||
+            !ParseUnsigned(args[6], 10, &length) || length == 0 || length > 4096 ||
+            (args.size() == 9 && ToLower(args[8]) != L"/json"))
+        {
+            std::wcerr << L"usage: !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
+            return 2;
+        }
+        std::wstring error;
+        ImageVerificationRecipe recipe;
+        bool captured = false;
+        try
+        {
+            auto source = OpenDumpObservationSource(args[3], &error);
+            captured = source && CaptureImageRecipe(args[2], *source, base, static_cast<uint32_t>(rva),
+                static_cast<uint32_t>(length), args[7], &recipe, &error, &g_StopRequested);
+        }
+        catch (const std::exception&)
+        {
+            error = L"image capture could not materialize bounded artifacts";
+        }
+        std::wcout << L"{\"schema\":\"kn.image_capture.v1\",\"status\":" << mcpjson::Quote(captured ? L"recorded" : L"failed")
+            << L",\"reference_sha256\":" << mcpjson::Quote(recipe.ReferenceSha256) << L",\"source_id\":" << mcpjson::Quote(recipe.SourceId)
+            << L",\"consistency\":" << mcpjson::Quote(recipe.SourceConsistency) << L",\"policy\":" << mcpjson::Quote(recipe.Policy)
+            << L",\"collector_authenticated\":false,\"execution_observed\":false,\"error\":"
+            << mcpjson::Quote(error) << L",\"result\":" << (captured ? recipe.RecordedResult : L"null") << L"}\n";
+        return captured ? 0 : 1;
+    }
+    if (action == L"replay-image")
+    {
+        bool current = false, json = false, valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty();
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            if (option == L"/current" && !current)
+            {
+                current = true;
+            }
+            else if (option == L"/json" && !json)
+            {
+                json = true;
+            }
+            else
+            {
+                valid = false;
+            }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon replay-image <directory> [/current] [/json]\n";
+            return 2;
+        }
+        std::wstring error;
+        ImageRecipeReplay replay;
+        try
+        {
+            replay = ReplayImageRecipe(args[2], current, &error);
+        }
+        catch (const std::exception&)
+        {
+            replay.Status = L"replay_failed";
+            replay.Mode = current ? L"current_reanalysis" : L"original_policy";
+        }
+        std::wcout << ImageRecipeReplayJson(replay) << L"\n";
+        return replay.Status == L"replayed" || replay.Status == L"reanalyzed" ? 0 : 1;
+    }
     if (action == L"dump-read")
     {
         uint64_t address = 0, length = 0;
@@ -23513,7 +23585,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon dump-read, inventory, evidence, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon dump-read, verify-image, replay-image, inventory, evidence, replay, or why\n";
     return 2;
 }
 
@@ -24341,7 +24413,8 @@ static void HandleKmonCommand(
             break;
         }
 
-        if (action == L"dump-read" || action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
+        if (action == L"dump-read" || action == L"verify-image" || action == L"replay-image" ||
+            action == L"inventory" || action == L"evidence" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;
@@ -53194,7 +53267,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|inventory|evidence|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon dump-read|verify-image|replay-image|inventory|evidence|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";

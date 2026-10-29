@@ -142,6 +142,22 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 
 생성은 최대 1,048,576개 디렉터리 항목·읽기 8GiB·협력적 제한 시간 120초를 사용한다. 다음 파일의 최대 크기 2MiB를 예약할 여유가 없으면 읽기 전에 멈춘다. 제한·취소·실패 시 남은 조각만으로 정상 스냅샷을 만들지 않으며 새 출력 디렉터리에서 다시 생성해야 한다. 동기 파일 I/O 자체를 즉시 취소하는 계약은 아니다. `.knindex`, `.knchunk`와 임시 파일도 비공개 조사 자료로 Git 및 공개 정보 검사에서 제외한다.
 
+## 원본 이미지 비교 재생
+
+덤프에서 읽은 코드와 정확한 참조 파일을 함께 보존하려면 별도의 이미지 case를 만든다.
+
+```text
+KnLiveDbg.exe --offline !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length> <new-directory> /json
+KnLiveDbg.exe --offline !kmon replay-image <directory> /json
+KnLiveDbg.exe --offline !kmon replay-image <directory> /current /json
+```
+
+생성 시 전체 참조 PE를 SHA-256 이름의 `.knblob`에 저장하고, 읽기 순서·원본 바이트·정규화 입력·비교 결과를 담은 `recipe.knverify`를 마지막에 게시한다. 원래 참조 경로의 파일이나 대상이 사라져도 이 두 파일로 비교를 다시 실행한다. 기존 `.kncase` 재생과는 별도 경로다.
+
+기본 재생은 당시 정책과 읽기 순서를 그대로 요구한다. 참조 손상·누락, 지원하지 않는 과거 정책, 정규화 또는 결과 불일치를 구분한다. `/current`는 현재 정책으로 다시 분석하며 당시 결과와 두 정책 식별자를 별도로 표시한다. 서로 다른 반복 읽기 바이트를 하나의 정상 스냅샷으로 합치지 않으며, loader 제외 범위도 검증 완료 바이트에 포함하지 않는다.
+
+한 번에 AMD64 이미지의 최대 4KiB 범위를 기록한다. 참조는 최대 64MiB, 읽기는 64회·요청 128KiB, 명세는 2MiB다. 제3의 relocation base를 사용하는 alias는 별도 독립 근거가 없어 미검증으로 남긴다. 종료 코드 0은 게시 또는 재생 성공이며, 실제 판정은 `result.ownership`과 coverage를 확인한다. 수집기 인증·서명 승인·실행 관측을 제공하지 않는다. 파서 격리 전에는 신뢰할 수 있는 로컬 참조만 입력한다. case는 자동 삭제되지 않으며 실패 중 남은 파일도 수동 보존·정리 대상이다.
+
 ## 검증
 
 ```powershell
@@ -152,8 +168,10 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 .\tools\validate-evidence-bundle.ps1 -Sanitize
+.\tools\validate-image-recipe.ps1 -Sanitize
 # 위 도구가 출력한 run 디렉터리를 지정한다.
 python tools\test-evidence-cli.py --executable x64\Release\KnLiveDbg.exe --fixtures <run-directory>
+python tools\test-image-recipe-cli.py --exe x64\Release\KnLiveDbg.exe --fixtures <image-recipe-run-directory>
 ```
 
 하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실호스트 대조군과 별도 미검증 범위는 [검증 현황](VALIDATION.md)에서 구분한다.
