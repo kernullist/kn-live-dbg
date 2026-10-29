@@ -46,7 +46,7 @@ backend/build/security-state combination.
 | Package | Implementation and acceptance scope | Dependencies |
 | --- | --- | --- |
 | W01 Baseline/capability | Selected compiled source contracts and command routes via `--capabilities`; runtime capability probes and a measured build/security matrix remain open | None |
-| W02 Address/identity | Shared address-space descriptor, LA48/LA57 boundaries, source/epoch isolation, v1 adaptation through admission, storage and replay | W01 |
+| W02 Address/identity | Address descriptor now covers hunting admission/page scheduling, pending IRP reads and evidence replay; source/epoch isolation, remaining scanner migration and real LA57 validation remain open | W01 |
 | W03 Read-set source | Read-only source interface; sparse statuses, budgets, cancellation, identity and side effects; same parser on live and stored bytes | W02 |
 | W04 Schema broker | Exact image/PDB/type package, qualified partial states, artifact verification and isolated untrusted parsing | W02-W03 |
 | W05 Proof/coverage | Unique intervals, temporal/semantic/persistence/replay scope, deterministic claim requirements and counterexamples | W02-W04 |

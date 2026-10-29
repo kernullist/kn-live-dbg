@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AddressSpaceDescriptor.h"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -180,6 +182,7 @@ inline const wchar_t* ObservationRelationName(ObservationRelation relation)
 struct ObservationContext
 {
     ObservationIdentity Identity;
+    AddressSpaceDescriptor AddressSpace;
     ObservationCoverage Coverage;
     uint64_t Timestamp = 0;
     uint64_t MonotonicMs = 0;
@@ -202,6 +205,8 @@ inline void AppendObservationEvidence(
     {
         // Existing producer-specific evidence takes precedence over defaults.
         evidence->emplace(L"observation_schema", L"kmon.observation.v1");
+        evidence->emplace(L"virtual_address_bits", std::to_wstring(context.AddressSpace.VirtualAddressBits));
+        evidence->emplace(L"address_space_legacy_assumed", context.AddressSpace.LegacyAssumed ? L"true" : L"false");
         evidence->emplace(L"boot_id", context.Identity.BootId.empty() ? L"unknown" : context.Identity.BootId);
         evidence->emplace(L"process_create_time", std::to_wstring(context.Identity.CreateTime));
         evidence->emplace(L"eprocess", std::to_wstring(context.Identity.Eprocess));

@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include "AddressSpaceDescriptor.h"
 #include "../shared/KnLiveDbgManagedCallbacks.h"
 
 struct PhysicalTranslationInfo
@@ -157,6 +159,7 @@ public:
         std::wstring* error);
 
     bool QueryVersion(std::wstring* error);
+    AddressSpaceDescriptor AddressSpace() const;
     bool QuerySessionStatus(DriverSessionStatus* status, std::wstring* error);
     bool ResolveProcess(
         uint32_t processId,
@@ -284,6 +287,7 @@ private:
         DWORD* deviceError = nullptr);
 
     HANDLE device_;
+    std::atomic<uint32_t> pagingLevels_{0};
     HANDLE managedCallbackPort_ = INVALID_HANDLE_VALUE;
     std::mutex managedCallbackMutex_;
 };

@@ -6,6 +6,11 @@
 
 uint64_t KernelMonitor::ObserveExecutableRegion(ExecutableRegionObservation observation)
 {
+    const auto space = ObservationAddressSpace();
+    if (space.Valid())
+    {
+        observation.Context.AddressSpace = space;
+    }
     if (observation.Context.Timestamp == 0)
     {
         observation.Context.Timestamp = ObservationFileTime();

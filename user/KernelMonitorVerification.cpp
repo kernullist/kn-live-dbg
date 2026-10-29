@@ -93,7 +93,7 @@ namespace
             pcb.Offset >= 0x10000 || dtb.Offset >= 0x10000 || create.Offset >= 0x10000 ||
             pcb.Offset + dtb.Offset > 0x10000 - 8 ||
             !device.ResolveProcess(identity.ProcessId, static_cast<uint32_t>(pcb.Offset + dtb.Offset), 0, context, nullptr) ||
-            context->Eprocess < 0xFFFF800000000000ull || context->Eprocess > UINT64_MAX - create.Offset - 8 ||
+            !device.AddressSpace().KernelRange(context->Eprocess, create.Offset + 8) ||
             (identity.Eprocess != 0 && identity.Eprocess != context->Eprocess))
         {
             return false;
@@ -635,7 +635,7 @@ void KernelMonitor::ContinueImageSweeps()
         if (size == 0 || size > 4096 || address > UINT64_MAX - size || !sameProcess()) { return false; }
         if (pid == 0)
         {
-            return address >= 0xFFFF800000000000ull && device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+            return device->AddressSpace().KernelRange(address, size) && device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
         }
         MEMORY_BASIC_INFORMATION before{}, after{};
         const bool known = process != nullptr && VirtualQueryEx(process, reinterpret_cast<void*>(address),
@@ -769,7 +769,7 @@ void KernelMonitor::ScanKernelExecutableImages()
         KernelImageCursor = it->Base;
         const ObservationReader reader = [device](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
-            return address >= 0xFFFF800000000000ull && size <= 4096 &&
+            return device->AddressSpace().KernelRange(address, size) && size <= 4096 &&
                 device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
         };
         ScanExecutableImage(KmonNormalizeDriverPath(it->ImagePath), it->Base, ObserveProcessIdentity(0), reader, 16);
@@ -994,7 +994,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             }
             if (work.Identity.ProcessId == 0)
             {
-                const bool read = address >= 0xFFFF800000000000ull &&
+                const bool read = device->AddressSpace().KernelRange(address, size) &&
                     device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
                 kernelReaderUsed = kernelReaderUsed || read;
                 return read;
@@ -1327,6 +1327,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             for (auto& pending : pendingReferences)
             {
                 auto& reference = pending.second;
+                reference.Context.AddressSpace = device->AddressSpace();
                 KmonHuntReceipt receipt;
                 reference.Id = HuntIndex.Observe(reference, GetTickCount64(), &receipt);
                 if (!receipt.Disposition.empty())

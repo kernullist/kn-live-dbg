@@ -127,6 +127,28 @@ namespace
     {
         auto& c = r->Context;
         auto& i = c.Identity;
+        std::wstring addressSpace;
+        if (mcpjson::FindRawValue(json, L"address_space", &addressSpace))
+        {
+            uint64_t virtualBits = 0, pointerBytes = 0, physicalBits = 0;
+            auto& space = c.AddressSpace;
+            if (!Number(addressSpace, L"virtual_bits", &virtualBits) || virtualBits > UINT8_MAX ||
+                !Number(addressSpace, L"pointer_bytes", &pointerBytes) || pointerBytes > UINT8_MAX ||
+                !Number(addressSpace, L"physical_bits", &physicalBits) || physicalBits > UINT8_MAX ||
+                !Number(addressSpace, L"user_maximum", &space.UserMaximum) ||
+                !Number(addressSpace, L"kernel_minimum", &space.KernelMinimum) ||
+                !Boolean(addressSpace, L"legacy_assumed", &space.LegacyAssumed))
+            {
+                return false;
+            }
+            space.VirtualAddressBits = static_cast<uint8_t>(virtualBits);
+            space.PointerBytes = static_cast<uint8_t>(pointerBytes);
+            space.PhysicalAddressBits = static_cast<uint8_t>(physicalBits);
+            if (!space.Valid())
+            {
+                return false;
+            }
+        }
         uint64_t pid = 0, session = 0;
         std::wstring ownership;
         bool execution = true;
@@ -169,7 +191,8 @@ namespace
         const std::set<std::wstring> dispositions = {L"current", L"historical_only", L"identity_conflict", L"future_event",
             L"prior_process_instance", L"current_capacity"};
         const std::set<std::wstring> acquisitions = {L"local_user_reader", L"local_kernel_reader", L"local_mixed_reader", L"synthetic_fixture"};
-        if (!Text(b.CollectionId, 128) || !c.Identity.HasCanonicalKey() || !Text(c.Identity.BootId, 128) || !Text(r.Role, 64) || r.Role.empty() ||
+        if (!c.AddressSpace.Valid() || !c.AddressSpace.Range(r.Address, 1, c.Identity.ProcessId == 0) ||
+            !Text(b.CollectionId, 128) || !c.Identity.HasCanonicalKey() || !Text(c.Identity.BootId, 128) || !Text(r.Role, 64) || r.Role.empty() ||
             !Text(c.Source, 128) || !Text(c.DependencyGroup, 128) || !Text(c.ReferenceSource, 128) ||
             !Text(coverage.Reason, 128) || c.MonotonicMs == 0 || c.ArrivalSequence == 0 ||
             c.ArrivalMonotonicMs == 0 || dispositions.count(b.Receipt.Disposition) == 0 || acquisitions.count(b.Acquisition) == 0 ||
@@ -193,19 +216,21 @@ namespace
         for (const auto& span : b.Spans)
         {
             if (span.RequestedBytes == 0 || span.RequestedBytes > 4096 || span.Address > UINT64_MAX - span.RequestedBytes ||
+                (span.State == L"valid" && !c.AddressSpace.UserRange(span.Address, span.RequestedBytes) &&
+                    !c.AddressSpace.KernelRange(span.Address, span.RequestedBytes)) ||
                 (span.Role != L"target_head" && span.Role != L"target_page" && span.Role != L"pointer_slot" && span.Role != L"reference_anchor") ||
                 (span.State != L"valid" && span.State != L"read_failed" && span.State != L"skipped") ||
                 (span.State == L"valid" ? span.Bytes.size() != span.RequestedBytes : !span.Bytes.empty())) { return false; }
         }
         return true;
     }
-    std::wstring Payload(const EvidenceBundle& b)
+    std::wstring Payload(const EvidenceBundle& b, bool includeAddressSpace)
     {
         const auto& c = b.Receipt.Reference.Context;
         std::wstring out = L"{\"schema\":\"kmon.evidence.v1\",\"acquisition\":" + mcpjson::Quote(b.Acquisition) +
             L",\"capture_started_ms\":" + Decimal(b.CaptureStartedMs) + L",\"capture_ended_ms\":" + Decimal(b.CaptureEndedMs) +
             L",\"reference_consistent\":" + Bool(b.ReferenceConsistent) + L",\"capture_truncated\":" + Bool(b.CaptureTruncated) +
-            L",\"read_set_complete\":" + Bool(EvidenceReadSetComplete(b)) + L",\"receipt\":" + KmonHuntReceiptJson(b.Receipt) +
+            L",\"read_set_complete\":" + Bool(EvidenceReadSetComplete(b)) + L",\"receipt\":" + KmonHuntReceiptJson(b.Receipt, includeAddressSpace) +
             L",\"allocation_base\":" + Decimal(c.AllocationBase) + L",\"reference_source\":" + mcpjson::Quote(c.ReferenceSource) +
             L",\"observation_coverage\":" + CoverageJson(c.Coverage) + L",\"span_count\":" + Decimal(b.Spans.size()) + L",\"spans\":[";
         bool first = true;
@@ -245,7 +270,9 @@ bool EvidenceRead(const EvidenceBundle& b, uint64_t address, size_t size, std::v
 {
     if (bytes == nullptr) { return false; }
     bytes->clear();
-    if (size == 0 || size > 4096 || address > UINT64_MAX - size) { return false; }
+    const auto& space = b.Receipt.Reference.Context.AddressSpace;
+    if (size == 0 || size > 4096 || address > UINT64_MAX - size ||
+        (!space.UserRange(address, size) && !space.KernelRange(address, size))) { return false; }
     std::vector<uint8_t> result(size), present(size);
     for (const auto& span : b.Spans)
     {
@@ -267,13 +294,18 @@ bool EvidenceRead(const EvidenceBundle& b, uint64_t address, size_t size, std::v
     return true;
 }
 
-std::wstring EvidenceBundleJson(const EvidenceBundle& bundle)
+static std::wstring SerializeEvidenceBundle(const EvidenceBundle& bundle, bool includeAddressSpace)
 {
     if (!Valid(bundle)) { return {}; }
-    const auto payload = Payload(bundle);
+    const auto payload = Payload(bundle, includeAddressSpace);
     const auto hash = Digest(payload);
     if (hash.size() != 64 || payload.size() > EvidenceBundleMaxJsonBytes) { return {}; }
     return L"{\"schema\":\"kmon.bundle.v1\",\"payload_sha256\":" + mcpjson::Quote(hash) + L",\"payload\":" + payload + L"}";
+}
+
+std::wstring EvidenceBundleJson(const EvidenceBundle& bundle)
+{
+    return SerializeEvidenceBundle(bundle, true);
 }
 
 bool ParseEvidenceBundle(const std::wstring& json, EvidenceBundle* bundle, std::wstring* error)
@@ -315,7 +347,9 @@ bool ParseEvidenceBundle(const std::wstring& json, EvidenceBundle* bundle, std::
         (!mcpjson::GetString(payload, L"collection_id", &parsed.CollectionId) || parsed.CollectionId.empty())) { return false; }
     // New format: require the exact canonical form. This also validates every
     // derived checksum/count/closure claim and rejects unknown or aliased fields.
-    if (!Valid(parsed) || EvidenceBundleJson(parsed) != json) { return false; }
+    std::wstring addressSpace;
+    const bool hasAddressSpace = mcpjson::FindRawValue(reference, L"address_space", &addressSpace);
+    if (!Valid(parsed) || SerializeEvidenceBundle(parsed, hasAddressSpace) != json) { return false; }
     *bundle = std::move(parsed);
     if (error != nullptr) { error->clear(); }
     return true;

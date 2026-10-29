@@ -1,5 +1,28 @@
 # Architecture
 
+## Observation address contract
+
+`AddressSpaceDescriptor` separates x64 canonicality from an optional OS user
+ceiling/kernel floor and actual mapping validity. The main driver's ABI version
+response supplies the active four/five-level paging mode. An unopened, failed
+version query or closed `DeviceClient` has an unavailable descriptor; the native
+path does not silently select LA48. Physical address width remains unknown until
+a source supplies it.
+
+Hunting admission, executable-page scheduling, selected hunting readers and the
+pending-IRP parser use this descriptor. KMON receipts carry it through `.kncase`
+publication and offline replay. Legacy v1 receipts without `address_space` use
+an explicit `legacy_assumed=true`, LA48 compatibility contract. Parsing still
+checks exact canonical serialization and checksums for each supported form;
+unknown widths, malformed descriptors and noncanonical spans are rejected.
+New files include the additive descriptor and require the updated reader.
+Importing a legacy file does not rewrite it; exporting it with the new metadata
+produces a different content hash.
+
+These changes do not establish a system-wide LA57 support claim. Other scanners,
+source/VM/epoch identity, translation permissions and actual LA57 Windows
+compatibility remain separate acceptance work in [W02](FEATURE_PLAN.md#kernel-investigation-platform).
+
 This describes main at the [documented source revision](README.md), including
 changes after v0.0.36. For operator syntax use
 [the command guide](COMMAND_REFERENCE.md); for measured behavior use

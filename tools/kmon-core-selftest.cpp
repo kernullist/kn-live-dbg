@@ -11,6 +11,7 @@
 #include "../user/KmonHunting.h"
 #include "kmon-hunting-selftest.h"
 #include "kmon-fp-selftest.h"
+#include "address-space-selftest.h"
 
 #include <iostream>
 
@@ -56,7 +57,7 @@ bool ArbitraryImageSelfTest()
 
 int main()
 {
-    const bool pure = KmonHandleTrackingSelfTest() && ObservationModelSelfTest() && KmonHuntingPolicySelfTest();
+    const bool pure = KmonHandleTrackingSelfTest() && ObservationModelSelfTest() && KmonHuntingPolicySelfTest() && AddressSpaceSelfTest();
     std::cout << "[kmon.core] handle ABI, rotation, lifecycle, channel controls: "
         << (pure ? "PASS" : "FAIL") << "\n";
     HANDLE file = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,

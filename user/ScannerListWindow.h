@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AddressSpaceDescriptor.h"
+
 #include <cstdint>
 #include <cstddef>
 #include <set>
@@ -36,9 +38,9 @@ struct ScannerListWindow
     bool Complete = false;
 };
 
-inline bool ScannerListPointer(uint64_t address)
+inline bool ScannerListPointer(uint64_t address, const AddressSpaceDescriptor& space = {})
 {
-    return address >= 0xffff800000000000ull && address <= ~0ull - 16 && (address & 7) == 0;
+    return space.KernelRange(address, 16) && address <= ~0ull - 16 && (address & 7) == 0;
 }
 
 // Equal observations validate this window, not object lifetime or root membership
@@ -86,13 +88,14 @@ bool ValidateScannerListWindow(Reader& read, const ScannerListWindow& window)
 
 template<typename Reader>
 bool ReadScannerListWindow(Reader& read, uint64_t head, uint64_t tailSlot, bool singlyLinked,
-    size_t limit, const ScannerListCursor& cursor, ScannerListWindow* window)
+    size_t limit, const ScannerListCursor& cursor, ScannerListWindow* window,
+    const AddressSpaceDescriptor& space = {})
 {
     *window = {};
     window->Head = head;
     window->TailSlot = tailSlot;
     window->SinglyLinked = singlyLinked;
-    if (!ScannerListPointer(head) || !ScannerListPointer(tailSlot & ~7ull) || limit == 0 || limit > 4096 ||
+    if (!ScannerListPointer(head, space) || !ScannerListPointer(tailSlot & ~7ull, space) || limit == 0 || limit > 4096 ||
         !read(head, &window->First) || !read(tailSlot, &window->Last))
     {
         return false;
@@ -104,10 +107,10 @@ bool ReadScannerListWindow(Reader& read, uint64_t head, uint64_t tailSlot, bool 
     {
         uint64_t next = 0;
         uint64_t back = 0;
-        const bool valid = cursor.Head == head && cursor.Entry != head && ScannerListPointer(cursor.Entry) &&
+        const bool valid = cursor.Head == head && cursor.Entry != head && ScannerListPointer(cursor.Entry, space) &&
             read(cursor.Entry, &next) && next == cursor.Forward &&
             (singlyLinked || (read(cursor.Entry + 8, &back) && back == cursor.Backward &&
-                ScannerListPointer(back) && read(back, &previous) && previous == cursor.Entry));
+                ScannerListPointer(back, space) && read(back, &previous) && previous == cursor.Entry));
         if (valid)
         {
             window->Anchor = cursor;
@@ -130,10 +133,10 @@ bool ReadScannerListWindow(Reader& read, uint64_t head, uint64_t tailSlot, bool 
         ++window->NodesVisited;
         ScannerListNode node;
         node.Address = current;
-        if (!ScannerListPointer(current) || current == head || !visited.insert(current).second ||
+        if (!ScannerListPointer(current, space) || current == head || !visited.insert(current).second ||
             !read(current, &node.Forward) ||
             (!singlyLinked && (!read(current + 8, &node.Backward) || node.Backward != previous)) ||
-            (node.Forward != terminator && !ScannerListPointer(node.Forward)))
+            (node.Forward != terminator && !ScannerListPointer(node.Forward, space)))
         {
             window->Nodes.clear();
             return false;
@@ -159,7 +162,8 @@ bool ReadScannerListWindow(Reader& read, uint64_t head, uint64_t tailSlot, bool 
 }
 
 template<typename Reader, typename Writer>
-bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head)
+bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head,
+    const AddressSpaceDescriptor& space = {})
 {
     const uint64_t a = head + 0x100;
     const uint64_t b = head + 0x200;
@@ -174,11 +178,11 @@ bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head)
     write(c + 8, b);
     ScannerListWindow first;
     ScannerListWindow second;
-    if (!ReadScannerListWindow(read, head, head + 8, false, 2, {}, &first) || first.Complete ||
+    if (!ReadScannerListWindow(read, head, head + 8, false, 2, {}, &first, space) || first.Complete ||
         first.ReachedEnd || first.Nodes.size() != 2 || first.Next.Entry != b ||
-        !ReadScannerListWindow(read, head, head + 8, false, 2, first.Next, &second) ||
+        !ReadScannerListWindow(read, head, head + 8, false, 2, first.Next, &second, space) ||
         !second.ReachedEnd || second.Complete || second.Nodes.size() != 1 || second.Nodes.front().Address != c ||
-        !ReadScannerListWindow(read, head, head + 8, false, 3, second.Next, &second) || !second.Complete)
+        !ReadScannerListWindow(read, head, head + 8, false, 3, second.Next, &second, space) || !second.Complete)
     {
         return false;
     }
@@ -186,7 +190,7 @@ bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head)
     write(b + 8, b);
     write(a, c);
     write(c + 8, a);
-    if (!ReadScannerListWindow(read, head, head + 8, false, 3, first.Next, &second) ||
+    if (!ReadScannerListWindow(read, head, head + 8, false, 3, first.Next, &second, space) ||
         !second.Restarted || second.Nodes.size() != 2)
     {
         return false;
@@ -197,7 +201,7 @@ bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head)
     write(other + 8, b);
     write(b, other);
     write(b + 8, other);
-    if (!ReadScannerListWindow(read, head, head + 8, false, 3, first.Next, &second) || !second.Restarted)
+    if (!ReadScannerListWindow(read, head, head + 8, false, 3, first.Next, &second, space) || !second.Restarted)
     {
         return false;
     }
@@ -209,10 +213,10 @@ bool ScannerListWindowFixture(Reader& read, Writer& write, uint64_t head)
     write(head, a);
     write(head + 8, a);
     write(a, a);
-    if (ReadScannerListWindow(read, head, head + 8, true, 3, {}, &second))
+    if (ReadScannerListWindow(read, head, head + 8, true, 3, {}, &second, space))
     {
         return false;
     }
     write(a, 0);
-    return ReadScannerListWindow(read, head, head + 8, true, 1, {}, &second) && second.Complete;
+    return ReadScannerListWindow(read, head, head + 8, true, 1, {}, &second, space) && second.Complete;
 }

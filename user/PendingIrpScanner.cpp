@@ -7,7 +7,6 @@
 
 namespace
 {
-    constexpr uint64_t kKernelMinimum = 0xffff800000000000ull;
     constexpr uint32_t kMaximumStackCount = 64;
 
     struct IrpLayout
@@ -32,11 +31,6 @@ namespace
         uint32_t Completion = 0;
         uint32_t Context = 0;
     };
-
-    bool KernelRange(uint64_t address, size_t bytes)
-    {
-        return address >= kKernelMinimum && bytes != 0 && address <= ~0ull - bytes;
-    }
 
     bool ResolveNestedField(SymbolEngine& symbols, const TypeLayoutInfo& layout,
         const std::vector<std::wstring>& path, size_t part, uint32_t accumulated,
@@ -133,20 +127,22 @@ namespace
     }
 
     template<typename Reader>
-    bool ReadScalar(Reader& read, uint64_t base, uint32_t offset, uint64_t* value)
+    bool ReadScalar(Reader& read, uint64_t base, uint32_t offset, uint64_t* value,
+        const AddressSpaceDescriptor& space)
     {
         std::vector<uint8_t> bytes;
-        return KernelRange(base, static_cast<size_t>(offset) + 8) &&
+        return space.KernelRange(base, static_cast<size_t>(offset) + 8) &&
             read(base + offset, 8, &bytes) && bytes.size() == 8 && Extract(bytes, 0, value);
     }
 
     template<typename Reader>
-    bool WalkIrpList(Reader& read, uint64_t head, size_t maximum, std::vector<uint64_t>* nodes)
+    bool WalkIrpList(Reader& read, uint64_t head, size_t maximum, std::vector<uint64_t>* nodes,
+        const AddressSpaceDescriptor& space)
     {
         nodes->clear();
         uint64_t first = 0;
         uint64_t last = 0;
-        if (!ReadScalar(read, head, 0, &first) || !ReadScalar(read, head, 8, &last))
+        if (!ReadScalar(read, head, 0, &first, space) || !ReadScalar(read, head, 8, &last, space))
         {
             return false;
         }
@@ -158,7 +154,7 @@ namespace
             uint64_t next = 0;
             uint64_t back = 0;
             if ((current & 7) != 0 || nodes->size() >= maximum || !visited.insert(current).second ||
-                !ReadScalar(read, current, 0, &next) || !ReadScalar(read, current, 8, &back) || back != previous)
+                !ReadScalar(read, current, 0, &next, space) || !ReadScalar(read, current, 8, &back, space) || back != previous)
             {
                 return false;
             }
@@ -168,16 +164,17 @@ namespace
         }
         uint64_t firstAfter = 0;
         uint64_t lastAfter = 0;
-        return previous == last && ReadScalar(read, head, 0, &firstAfter) && ReadScalar(read, head, 8, &lastAfter) &&
+        return previous == last && ReadScalar(read, head, 0, &firstAfter, space) && ReadScalar(read, head, 8, &lastAfter, space) &&
             first == firstAfter && last == lastAfter;
     }
 
     template<typename Reader>
     bool CaptureIrp(Reader& read, const IrpLayout& layout, uint64_t irp,
-        const PendingIrpThreadInput& thread, uint64_t createTime, std::vector<PendingIrpCompletionRecord>* records)
+        const PendingIrpThreadInput& thread, uint64_t createTime, std::vector<PendingIrpCompletionRecord>* records,
+        const AddressSpaceDescriptor& space)
     {
         std::vector<uint8_t> header;
-        if (!KernelRange(irp, layout.IrpSize) || !read(irp, layout.IrpSize, &header) || header.size() != layout.IrpSize)
+        if (!space.KernelRange(irp, layout.IrpSize) || !read(irp, layout.IrpSize, &header) || header.size() != layout.IrpSize)
         {
             return false;
         }
@@ -197,7 +194,7 @@ namespace
             return false;
         }
         const size_t required = layout.IrpSize + static_cast<size_t>(stackCount) * layout.StackSize;
-        if (required > packetSize || !KernelRange(irp, required) ||
+        if (required > packetSize || !space.KernelRange(irp, required) ||
             currentStack != irp + layout.IrpSize + static_cast<uint64_t>(currentLocation - 1) * layout.StackSize)
         {
             return false;
@@ -244,8 +241,10 @@ namespace
 
     template<typename Reader>
     void CollectPendingIrps(Reader& read, const IrpLayout& layout,
-        std::vector<PendingIrpThreadInput> threads, const PendingIrpScanOptions& options, PendingIrpScanResult* result)
+        std::vector<PendingIrpThreadInput> threads, const PendingIrpScanOptions& options, PendingIrpScanResult* result,
+        const AddressSpaceDescriptor& space)
     {
+        result->AddressSpace = space;
         std::sort(threads.begin(), threads.end(), [](const PendingIrpThreadInput& left, const PendingIrpThreadInput& right)
         {
             return left.ThreadObject < right.ThreadObject;
@@ -274,10 +273,10 @@ namespace
             uint64_t tid = 0;
             uint64_t createTime = 0;
             if (thread.ProcessId == 0 || thread.ThreadId == 0 || !visitedThreads.insert(thread.ThreadObject).second ||
-                !ReadScalar(read, thread.ThreadObject, layout.ThreadPid, &pid) || pid != thread.ProcessId ||
-                !ReadScalar(read, thread.ThreadObject, layout.ThreadTid, &tid) || tid != thread.ThreadId ||
-                !ReadScalar(read, thread.ThreadObject, layout.ThreadCreateTime, &createTime) || createTime == 0 ||
-                !KernelRange(thread.ThreadObject, layout.ThreadIrpList + 16))
+                !ReadScalar(read, thread.ThreadObject, layout.ThreadPid, &pid, space) || pid != thread.ProcessId ||
+                !ReadScalar(read, thread.ThreadObject, layout.ThreadTid, &tid, space) || tid != thread.ThreadId ||
+                !ReadScalar(read, thread.ThreadObject, layout.ThreadCreateTime, &createTime, space) || createTime == 0 ||
+                !space.KernelRange(thread.ThreadObject, layout.ThreadIrpList + 16))
             {
                 ++result->UnstableObservations;
                 complete = false;
@@ -287,7 +286,7 @@ namespace
             const uint64_t head = thread.ThreadObject + layout.ThreadIrpList;
             auto readLink = [&](uint64_t address, uint64_t* value)
             {
-                return ReadScalar(read, address, 0, value);
+                return ReadScalar(read, address, 0, value, space);
             };
             ScannerListCursor cursor;
             if (thread.ThreadObject == options.Cursor.ThreadObject && createTime == options.Cursor.ThreadCreateTime)
@@ -296,7 +295,7 @@ namespace
             }
             const size_t budget = (std::min)(walkLimit - result->WalkNodes, irpLimit - result->IrpsInspected);
             ScannerListWindow window;
-            if (!ReadScannerListWindow(readLink, head, head + 8, false, budget, cursor, &window))
+            if (!ReadScannerListWindow(readLink, head, head + 8, false, budget, cursor, &window, space))
             {
                 result->WalkNodes += static_cast<uint32_t>(window.NodesVisited);
                 ++result->UnstableObservations;
@@ -313,14 +312,14 @@ namespace
             for (const ScannerListNode& node : window.Nodes)
             {
                 if (node.Address < layout.ThreadListEntry ||
-                    !KernelRange(node.Address - layout.ThreadListEntry, layout.IrpSize))
+                    !space.KernelRange(node.Address - layout.ThreadListEntry, layout.IrpSize))
                 {
                     complete = false;
                     continue;
                 }
                 const uint64_t irp = node.Address - layout.ThreadListEntry;
                 ++result->IrpsInspected;
-                if (!CaptureIrp(read, layout, irp, thread, createTime, &local))
+                if (!CaptureIrp(read, layout, irp, thread, createTime, &local, space))
                 {
                     ++result->UnstableObservations;
                     complete = false;
@@ -329,9 +328,9 @@ namespace
             uint64_t pidAfter = 0;
             uint64_t tidAfter = 0;
             uint64_t createAfter = 0;
-            if (!ReadScalar(read, thread.ThreadObject, layout.ThreadPid, &pidAfter) || pidAfter != pid ||
-                !ReadScalar(read, thread.ThreadObject, layout.ThreadTid, &tidAfter) || tidAfter != tid ||
-                !ReadScalar(read, thread.ThreadObject, layout.ThreadCreateTime, &createAfter) || createAfter != createTime ||
+            if (!ReadScalar(read, thread.ThreadObject, layout.ThreadPid, &pidAfter, space) || pidAfter != pid ||
+                !ReadScalar(read, thread.ThreadObject, layout.ThreadTid, &tidAfter, space) || tidAfter != tid ||
+                !ReadScalar(read, thread.ThreadObject, layout.ThreadCreateTime, &createAfter, space) || createAfter != createTime ||
                 !ValidateScannerListWindow(readLink, window))
             {
                 ++result->UnstableObservations;
@@ -376,6 +375,15 @@ bool PendingIrpScanner::Scan(const std::vector<PendingIrpThreadInput>& threads,
         return false;
     }
     *result = PendingIrpScanResult{};
+    const auto space = device_.AddressSpace();
+    if (!space.Valid())
+    {
+        if (error != nullptr)
+        {
+            *error = L"driver address-space capabilities unavailable";
+        }
+        return false;
+    }
     IrpLayout layout;
     if (!BuildIrpLayout(symbols_, &layout))
     {
@@ -388,10 +396,10 @@ bool PendingIrpScanner::Scan(const std::vector<PendingIrpThreadInput>& threads,
     result->LayoutFromPdb = true;
     auto read = [&](uint64_t address, uint32_t size, std::vector<uint8_t>* bytes)
     {
-        return KernelRange(address, size) && size <= 0x20000 &&
+        return space.KernelRange(address, size) && size <= 0x20000 &&
             device_.ReadMemory(address, size, bytes, nullptr) && bytes->size() == size;
     };
-    CollectPendingIrps(read, layout, threads, options, result);
+    CollectPendingIrps(read, layout, threads, options, result, space);
     const std::vector<KernelModuleInfo> modules = symbols_.Modules();
     for (PendingIrpCompletionRecord& record : result->Records)
     {
@@ -416,7 +424,7 @@ bool PendingIrpScanner::Scan(const std::vector<PendingIrpThreadInput>& threads,
     return true;
 }
 
-bool PendingIrpScannerSelfTest()
+static bool PendingIrpScannerSelfTestForSpace(const AddressSpaceDescriptor& space, uint64_t base)
 {
     IrpLayout layout;
     layout.ThreadSize = 0x80;
@@ -461,7 +469,6 @@ bool PendingIrpScannerSelfTest()
         }
         return true;
     };
-    const uint64_t base = 0xffff800000010000ull;
     std::vector<PendingIrpThreadInput> threads = {{base, 4, 40}, {base + 0x1000, 4, 44}};
     uint64_t lastIrp = 0;
     for (size_t threadIndex = 0; threadIndex < threads.size(); ++threadIndex)
@@ -498,7 +505,7 @@ bool PendingIrpScannerSelfTest()
     PendingIrpScanOptions options;
     options.ThreadInventoryComplete = true;
     PendingIrpScanResult first;
-    CollectPendingIrps(read, layout, threads, options, &first);
+    CollectPendingIrps(read, layout, threads, options, &first, space);
     if (first.Records.size() != 64 || first.CoverageComplete || first.NextCursor.ThreadObject != base ||
         first.NextCursor.IrpAddress == 0)
     {
@@ -514,7 +521,7 @@ bool PendingIrpScannerSelfTest()
     for (size_t pass = 0; pass < 65; ++pass)
     {
         second = {};
-        CollectPendingIrps(read, layout, threads, options, &second);
+        CollectPendingIrps(read, layout, threads, options, &second, space);
         if (second.UnstableObservations != 0 || second.WalkNodes > options.MaxIrps || second.IrpsInspected > options.MaxIrps)
         {
             return false;
@@ -535,13 +542,13 @@ bool PendingIrpScannerSelfTest()
     }
     auto scalarRead = [&](uint64_t address, uint64_t* value)
     {
-        return ReadScalar(read, address, 0, value);
+        return ReadScalar(read, address, 0, value, space);
     };
     auto scalarWrite = [&](uint64_t address, uint64_t value)
     {
         put(address, value);
     };
-    if (!ScannerListWindowFixture(scalarRead, scalarWrite, base + 0x400000))
+    if (!ScannerListWindowFixture(scalarRead, scalarWrite, base + 0x400000, space))
     {
         return false;
     }
@@ -567,7 +574,7 @@ bool PendingIrpScannerSelfTest()
             put(anchor + 8, anchor);
         }
         PendingIrpScanResult churn;
-        CollectPendingIrps(read, layout, threads, churnOptions, &churn);
+        CollectPendingIrps(read, layout, threads, churnOptions, &churn, space);
         if (churn.CoverageComplete || churn.WalkNodes > churnOptions.MaxIrps ||
             churn.IrpsInspected > churnOptions.MaxIrps ||
             (removed && (churn.NextCursor.ThreadObject != base || churn.NextCursor.IrpAddress != 0 ||
@@ -589,7 +596,7 @@ bool PendingIrpScannerSelfTest()
     options.Cursor = first.NextCursor;
     put(base + 16, static_cast<uint64_t>(999));
     PendingIrpScanResult replacement;
-    CollectPendingIrps(read, layout, threads, options, &replacement);
+    CollectPendingIrps(read, layout, threads, options, &replacement, space);
     if (replacement.Records.empty() || replacement.Records.front().Irp != first.Records.front().Irp ||
         replacement.Records.front().ThreadCreateTime != 999 || replacement.NextCursor.IrpAddress != 0 ||
         replacement.NextCursor.List.Entry != 0)
@@ -599,7 +606,7 @@ bool PendingIrpScannerSelfTest()
     PendingIrpScanOptions afterReplacementOptions = options;
     afterReplacementOptions.Cursor = replacement.NextCursor;
     PendingIrpScanResult afterReplacement;
-    CollectPendingIrps(read, layout, threads, afterReplacementOptions, &afterReplacement);
+    CollectPendingIrps(read, layout, threads, afterReplacementOptions, &afterReplacement, space);
     if (afterReplacement.Records.empty() || afterReplacement.Records.front().ThreadObject != threads[1].ThreadObject)
     {
         return false;
@@ -607,13 +614,13 @@ bool PendingIrpScannerSelfTest()
     put(base + 16, static_cast<uint64_t>(100));
     std::vector<PendingIrpCompletionRecord> records;
     put(lastIrp + 5, static_cast<uint8_t>(0));
-    if (CaptureIrp(read, layout, lastIrp, threads[1], 101, &records))
+    if (CaptureIrp(read, layout, lastIrp, threads[1], 101, &records, space))
     {
         return false;
     }
     put(lastIrp + 5, static_cast<uint8_t>(1));
     put(lastIrp + 8, lastIrp + 0x68);
-    if (CaptureIrp(read, layout, lastIrp, threads[1], 101, &records))
+    if (CaptureIrp(read, layout, lastIrp, threads[1], 101, &records, space))
     {
         return false;
     }
@@ -631,5 +638,12 @@ bool PendingIrpScannerSelfTest()
         }
         return true;
     };
-    return !CaptureIrp(changing, layout, lastIrp, threads[1], 101, &records) && records.empty();
+    return !CaptureIrp(changing, layout, lastIrp, threads[1], 101, &records, space) && records.empty();
+}
+
+
+bool PendingIrpScannerSelfTest()
+{
+    return PendingIrpScannerSelfTestForSpace(AddressSpaceDescriptor::FromPagingLevels(4), 0xffff800000010000ull) &&
+        PendingIrpScannerSelfTestForSpace(AddressSpaceDescriptor::FromPagingLevels(5), 0xff10000000010000ull);
 }

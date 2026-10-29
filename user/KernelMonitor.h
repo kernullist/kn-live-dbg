@@ -474,6 +474,7 @@ private:
     void NoteMapperWatchResidue(const std::wstring& layer, uint64_t physicalAddress);
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
+    AddressSpaceDescriptor ObservationAddressSpace() const;
     bool EmitUnique(
         const std::wstring& kind,
         const std::wstring& key,

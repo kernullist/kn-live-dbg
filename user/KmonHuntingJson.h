@@ -3,12 +3,22 @@
 #include "KmonHunting.h"
 #include "McpJson.h"
 
-inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
+inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row, bool includeAddressSpace = true)
 {
     const auto& context = row.Context;
     const auto& identity = context.Identity;
     std::wstring out = L"{\"id\":" + std::to_wstring(row.Id);
     out += L",\"boot_id\":" + mcpjson::Quote(identity.BootId);
+    if (includeAddressSpace)
+    {
+        const auto& space = context.AddressSpace;
+        out += L",\"address_space\":{\"virtual_bits\":" + mcpjson::Quote(std::to_wstring(space.VirtualAddressBits)) +
+            L",\"pointer_bytes\":" + mcpjson::Quote(std::to_wstring(space.PointerBytes)) +
+            L",\"physical_bits\":" + mcpjson::Quote(std::to_wstring(space.PhysicalAddressBits)) +
+            L",\"user_maximum\":" + mcpjson::Quote(std::to_wstring(space.UserMaximum)) +
+            L",\"kernel_minimum\":" + mcpjson::Quote(std::to_wstring(space.KernelMinimum)) +
+            L",\"legacy_assumed\":" + std::wstring(space.LegacyAssumed ? L"true" : L"false") + L"}";
+    }
     out += L",\"pid\":" + std::to_wstring(identity.ProcessId);
     out += L",\"create_time\":" + mcpjson::Quote(std::to_wstring(identity.CreateTime));
     out += L",\"eprocess\":" + mcpjson::Quote(std::to_wstring(identity.Eprocess));
@@ -40,11 +50,11 @@ inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
     return out;
 }
 
-inline std::wstring KmonHuntReceiptJson(const KmonHuntReceipt& receipt)
+inline std::wstring KmonHuntReceiptJson(const KmonHuntReceipt& receipt, bool includeAddressSpace = true)
 {
     return L"{\"schema\":\"kmon.receipt.v1\",\"current_disposition\":" + mcpjson::Quote(receipt.Disposition) +
         L",\"arrival_inferred\":" + std::wstring(receipt.ArrivalInferred ? L"true" : L"false") +
-        L",\"reference\":" + KmonHuntReferenceJson(receipt.Reference) + L"}";
+        L",\"reference\":" + KmonHuntReferenceJson(receipt.Reference, includeAddressSpace) + L"}";
 }
 
 inline std::wstring KmonHuntCasesJson(const std::vector<KmonHuntCase>& cases, uint64_t now, uint64_t evicted, uint64_t rejected,

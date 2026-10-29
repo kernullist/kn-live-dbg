@@ -78,15 +78,15 @@ public:
     }
 
     bool Observe(const ObservationIdentity& identity, ObservationRange range, uint64_t allocation,
-        const std::wstring& role, uint64_t now)
+        const std::wstring& role, uint64_t now, const AddressSpaceDescriptor& space = {})
     {
         if (identity.BootId.empty() || identity.BootId.size() > 128 || !KmonPageRole(role) ||
             now == 0 || now < LastMs || (range.Address & 4095) != 0 || (range.Size & 4095) != 0 ||
             range.Size == 0 || range.Address > UINT64_MAX - range.Size ||
-            (identity.ProcessId == 0 && (range.Address < 0xFFFF800000000000ull ||
+            (identity.ProcessId == 0 && (!space.KernelRange(range.Address, range.Size) ||
                 (role != L"kernel_page_candidate" && role != L"image_page_candidate"))) ||
             (identity.ProcessId != 0 && (identity.ProcessId <= 4 || identity.CreateTime == 0 ||
-                range.Address + range.Size > 0x0000800000000000ull || role == L"kernel_page_candidate")))
+                !space.UserRange(range.Address, range.Size) || role == L"kernel_page_candidate")))
         {
             ++Rejected;
             return false;

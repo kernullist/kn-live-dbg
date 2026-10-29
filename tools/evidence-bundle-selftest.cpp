@@ -71,6 +71,48 @@ namespace
         const auto json = EvidenceBundleJson(b);
         Check(!json.empty() && ParseEvidenceBundle(json, &parsed, &error) && EvidenceBundleJson(parsed) == json,
             "receipt raw bytes coverage and provenance round trip exactly");
+        std::wstring legacySpace;
+        std::wstring receiptJson, referenceJson, payloadJson;
+        mcpjson::FindRawValue(json, L"payload", &payloadJson);
+        mcpjson::FindRawValue(payloadJson, L"receipt", &receiptJson);
+        mcpjson::FindRawValue(receiptJson, L"reference", &referenceJson);
+        mcpjson::FindRawValue(referenceJson, L"address_space", &legacySpace);
+        Check(!legacySpace.empty() && ParseEvidenceBundle(Reseal(json,
+            L",\"address_space\":" + legacySpace, L""), &parsed, &error) &&
+            parsed.Receipt.Reference.Context.AddressSpace.LegacyAssumed,
+            "legacy v1 imports use explicit LA48 compatibility");
+        Check(!ParseEvidenceBundle(Reseal(json, L"\"virtual_bits\":\"48\"", L"\"virtual_bits\":\"64\""), &parsed, &error),
+            "unknown address widths are rejected even with a valid payload hash");
+        for (bool kernel : {false, true})
+        {
+            auto extended = Fixture();
+            auto& reference = extended.Receipt.Reference;
+            reference.Context.AddressSpace = AddressSpaceDescriptor::FromPagingLevels(5);
+            reference.Context.Identity.ProcessId = kernel ? 0 : 55;
+            reference.Address = reference.Root = kernel ? 0xff10000000010000ull : 0x0010000000010000ull;
+            reference.Slot = reference.Address + 4096;
+            reference.Context.Coverage.Compared[0].Address = reference.Address;
+            extended.Spans[0].Address = reference.Address;
+            extended.Spans[1].Address = reference.Slot;
+            std::memcpy(extended.Spans[1].Bytes.data(), &reference.Address, 8);
+            const auto extendedJson = EvidenceBundleJson(extended);
+            Check(!extendedJson.empty() && ParseEvidenceBundle(extendedJson, &parsed, &error) &&
+                parsed.Receipt.Reference.Context.AddressSpace.VirtualAddressBits == 57 &&
+                ReplayEvidence(parsed).Gaps.empty(), "LA57 user and kernel receipts persist and replay");
+            extended.Receipt.Reference.Context.AddressSpace = {};
+            Check(EvidenceBundleJson(extended).empty(), "LA57 address cannot be mislabeled as legacy LA48");
+        }
+        auto noncanonical = Fixture();
+        noncanonical.Spans[0].Address = 0x0000800000000000ull;
+        std::vector<uint8_t> rejectedBytes;
+        Check(EvidenceBundleJson(noncanonical).empty() &&
+            !EvidenceRead(noncanonical, noncanonical.Spans[0].Address, 32, &rejectedBytes) && rejectedBytes.empty(),
+            "noncanonical stored spans cannot become readable evidence");
+        noncanonical.Spans[0].State = L"read_failed";
+        noncanonical.Spans[0].Bytes.clear();
+        Check(ParseEvidenceBundle(EvidenceBundleJson(noncanonical), &parsed, &error) && !EvidenceReadSetComplete(parsed),
+            "failed noncanonical read attempts remain available as failure evidence");
+        Check(ParseEvidenceBundle(json, &parsed, &error), "restore baseline after address rejection controls");
         std::vector<uint8_t> bytes;
         Check(EvidenceReadSetComplete(parsed) && EvidenceRead(parsed, 0x11000, 32, &bytes) && bytes[0] == 0xc3,
             "raw read set reconstructs original target bytes");

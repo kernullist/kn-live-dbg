@@ -83,6 +83,7 @@ bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
 
 void DeviceClient::Close()
 {
+    pagingLevels_.store(0);
     // Keep the port and device close in the same critical section as control
     // requests. A concurrent status query must not reopen a lease between the
     // port close and the device becoming unavailable.
@@ -261,6 +262,7 @@ bool DeviceClient::Ioctl(
 bool DeviceClient::QueryVersion(std::wstring* error)
 {
     bool ok = false;
+    pagingLevels_.store(0);
 
     do
     {
@@ -280,10 +282,16 @@ bool DeviceClient::QueryVersion(std::wstring* error)
             break;
         }
 
+        pagingLevels_.store((response.Flags & KNDBG_VERSION_FLAG_LA57_ACTIVE) != 0 ? 5u : 4u);
         ok = true;
     } while (false);
 
     return ok;
+}
+
+AddressSpaceDescriptor DeviceClient::AddressSpace() const
+{
+    return AddressSpaceDescriptor::FromPagingLevels(pagingLevels_.load());
 }
 
 bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring* error)

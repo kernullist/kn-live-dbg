@@ -55,6 +55,7 @@ struct PendingIrpScanOptions
 
 struct PendingIrpScanResult
 {
+    AddressSpaceDescriptor AddressSpace;
     std::vector<PendingIrpCompletionRecord> Records;
     std::vector<std::wstring> Warnings;
     PendingIrpCursor NextCursor;

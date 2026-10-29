@@ -182,10 +182,10 @@ inline bool KmonFreshStack(const ObservationIdentity& identity, uint64_t eventTi
         eventTime >= identity.CreateTime && eventTime <= now && now - eventTime <= 50000000ull;
 }
 
-inline bool KmonChannelCandidate(uint64_t target, uint64_t slot, bool layoutVerified)
+inline bool KmonChannelCandidate(uint64_t target, uint64_t slot, bool layoutVerified,
+    const AddressSpaceDescriptor& space = {})
 {
-    return layoutVerified && target >= 0xFFFF800000000000ull &&
-        slot >= 0xFFFF800000000000ull && slot <= UINT64_MAX - sizeof(uint64_t);
+    return layoutVerified && space.KernelRange(target, 1) && space.KernelRange(slot, sizeof(uint64_t));
 }
 
 // The caller serializes access. Cases are investigation leads, not verdicts.
@@ -205,9 +205,9 @@ public:
         if (identity.BootId.empty() || identity.BootId.size() > 128 || reference.Role.empty() || reference.Role.size() > 64 ||
             context.Source.size() > 128 || context.DependencyGroup.size() > 128 || context.ReferenceSource.size() > 128 ||
             context.MonotonicMs == 0 || (reference.Address == 0 && !KmonPageRole(reference.Role)) ||
-            (identity.ProcessId == 0 && reference.Address < 0xFFFF800000000000ull) ||
+            (identity.ProcessId == 0 && !context.AddressSpace.KernelRange(reference.Address, 1)) ||
             (identity.ProcessId != 0 && ((reference.Address < 0x10000 && !KmonPageRole(reference.Role)) ||
-                reference.Address >= 0x0000800000000000ull)) ||
+                !context.AddressSpace.UserRange(reference.Address, 1))) ||
             (!KmonHuntOwnership(context.Ownership) && !((context.Ownership == CodeOwnership::Unknown ||
                 context.Ownership == CodeOwnership::OwnedUnverified) &&
                 KmonPageRole(reference.Role) && reference.PageExecutableVerified && context.MappingGeneration != 0)) ||

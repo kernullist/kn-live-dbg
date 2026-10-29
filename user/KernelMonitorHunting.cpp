@@ -14,7 +14,7 @@ namespace
     bool ReadHuntField(DeviceClient& device, uint64_t object, uint64_t offset, uint64_t* value)
     {
         bool ok = false;
-        if (offset < 0x10000 && object >= 0xFFFF800000000000ull && object <= UINT64_MAX - offset - 8)
+        if (offset < 0x10000 && device.AddressSpace().KernelRange(object, offset + 8))
         {
             std::vector<uint8_t> bytes;
             if (device.ReadMemory(object + offset, 8, &bytes, nullptr) && bytes.size() == 8)
@@ -33,12 +33,18 @@ std::vector<KmonHuntCase> KernelMonitor::HuntCases(const AnalystCaseFilter& filt
     return HuntIndex.Query(GetTickCount64(), filter).Cases;
 }
 
+AddressSpaceDescriptor KernelMonitor::ObservationAddressSpace() const
+{
+    std::lock_guard<std::mutex> lock(StateMutex);
+    return Device == nullptr ? AddressSpaceDescriptor::FromPagingLevels(0) : Device->AddressSpace();
+}
+
 void KernelMonitor::QueueExecutableRegionPages(const ExecutableRegionObservation& observation, const std::wstring& role)
 {
     if (observation.Executable && !observation.SessionUnverified)
     {
         ExecutablePages.Observe(observation.Context.Identity, observation.Range,
-            observation.Context.AllocationBase, role, GetTickCount64());
+            observation.Context.AllocationBase, role, GetTickCount64(), ObservationAddressSpace());
     }
 }
 
@@ -104,6 +110,7 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
 
 void KernelMonitor::QueueObservedStack(const TiEventRecord& record)
 {
+    const auto space = ObservationAddressSpace();
     const auto identity = ObserveProcessIdentity(record.ProcessId);
     if (!KmonFreshStack(identity, record.Timestamp, ObservationFileTime()))
     {
@@ -114,7 +121,7 @@ void KernelMonitor::QueueObservedStack(const TiEventRecord& record)
     for (size_t i = 0; i < record.CallstackAddresses.size() && i < 8; ++i)
     {
         const uint64_t address = record.CallstackAddresses[i];
-        if (address >= 0x10000 && address < 0x0000800000000000ull)
+        if (address >= 0x10000 && space.UserRange(address, 1))
         {
             QueueExecutionReference(address, 0, L"etw_stack_return", identity, record.Timestamp);
         }
@@ -226,7 +233,7 @@ void KernelMonitor::ScanUserExecutionSurfaces(HANDLE process, const ObservationI
         size_t references = 0;
         const auto queueUser = [&](uint64_t target, uint64_t slot, const wchar_t* role)
         {
-            if (!StopRequested.load() && references < 128 && target >= 0x10000 && target < 0x0000800000000000ull)
+            if (!StopRequested.load() && references < 128 && target >= 0x10000 && device->AddressSpace().UserRange(target, 1))
             {
                 QueueExecutionReference(target, slot, role, resolved);
                 ++references;
@@ -369,7 +376,7 @@ void KernelMonitor::ScanCommunicationSurfaces()
     std::vector<std::wstring> warnings;
     const auto queue = [&](uint64_t target, uint64_t slot, const wchar_t* role, bool layout)
     {
-        if (!StopRequested.load() && KmonChannelCandidate(target, slot, layout))
+        if (!StopRequested.load() && KmonChannelCandidate(target, slot, layout, device->AddressSpace()))
         {
             QueueExecutionReference(target, slot, role);
             ++verified;
@@ -465,7 +472,7 @@ void KernelMonitor::ScanCommunicationSurfaces()
             };
             for (const auto& target : targets)
             {
-                if (target.first >= 0xFFFF800000000000ull && candidates < 128 && !StopRequested.load())
+                if (device->AddressSpace().KernelRange(target.first, 1) && candidates < 128 && !StopRequested.load())
                 {
                     QueueExecutionReference(target.first, 0, target.second);
                     ++candidates;
