@@ -330,6 +330,9 @@
     <ClInclude Include="McpServer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="McpOperation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="McpSelfTest.h">
       <Filter>Header Files</Filter>
     </ClInclude>

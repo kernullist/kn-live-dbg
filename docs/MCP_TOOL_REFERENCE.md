@@ -1,7 +1,7 @@
 # MCP tool reference
 
-Source: [McpServer.cpp](https://github.com/kernullist/kn-live-dbg/blob/v0.0.36/user/McpServer.cpp), v0.0.36. The catalog has
-**67 tools in read-only mode** and **12 additional write tools**.
+Source: [McpServer.cpp](../user/McpServer.cpp), current main. The catalog has
+**68 tools in read-only mode** and **12 additional write tools**.
 `ti.subscribe` is listed in read-only mode, but its `start`/`stop` actions require
 write permission. Read-only describes target mutation policy; it does not mean
 no in-memory state, resource use, or audit output.
@@ -15,6 +15,7 @@ ranges are rejected. [Setup](MCP_SETUP.md) / [한국어](MCP_SETUP.ko.md).
 
 | Tool | Mode | Arguments | Meaning |
 | --- | --- | --- | --- |
+| `operations.get` | Read | `operation_id*` | Query bounded operation outcome metadata without an engine hop or retry; see the [state contract](MCP_SERVER_DESIGN.md#execution-boundary). |
 | `process.find` | Read | `image`: string, `pid`: string, `eprocess`: string | Find live processes by image name, PID, or EPROCESS address. |
 | `process.describe` | Read | `source`: string, `pid`: string, `eprocess`: string, `fields`: array | Describe an _EPROCESS (PID, DTB, PEB, threads, parent). |
 | `type.describe` | Read | `source`: string, `address`: string, `type`: string, `fields`: array | Dump a kernel structure (dt) at an address or for a process. |

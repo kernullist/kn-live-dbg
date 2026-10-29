@@ -295,6 +295,7 @@
     <ClInclude Include="PayloadTracer.h" />
     <ClInclude Include="McpJson.h" />
     <ClInclude Include="McpServer.h" />
+    <ClInclude Include="McpOperation.h" />
     <ClInclude Include="McpSelfTest.h" />
     <ClInclude Include="RemoteFirewall.h" />
     <ClInclude Include="RemoteProtocol.h" />

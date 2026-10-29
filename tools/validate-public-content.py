@@ -93,7 +93,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.type_schema.v1",
                     "kn.image_recipe.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_proof.v1", "kn.capture_scheduling.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
-                    "kn.execution_trace.v1", "kn.execution_trace_query.v1"
+                    "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1"
                 }:
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):

@@ -89,6 +89,16 @@ means the operation may continue and its outcome is unknown to the client;
 inspect state before retrying a mutation. MCP cancellation notifications do not
 cancel already dispatched work.
 
+Retain the returned `_meta["knlivedbg/operation"].operation_id` (also supplied
+as an additional tool text item). Call `operations.get` with that string to
+query the engine's eventual state without repeating the original request.
+Lookup works while the engine is busy, subject to the serial listener finishing
+its current response wait. Only the newest retained metadata is available:
+256 records, finished records evicted first, cleared on server restart.
+`not_retained` does not imply success or failure. This API retains no result
+payload and does not prove target effects, provide rollback or make repeated
+mutations idempotent. See the [operation contract](MCP_SERVER_DESIGN.md#execution-boundary).
+
 The automatic request audit is independent of `ai audit` and is written under
 `<exe-dir>\.kn-live-dbg\mcp-audit-<port>.jsonl`. It records decisions, results and
 bounded argument text. It is separate from the write-audit tail resource.

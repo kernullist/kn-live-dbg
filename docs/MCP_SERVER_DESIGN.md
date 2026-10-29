@@ -26,6 +26,33 @@ outcome. Running calls are not rolled back. Stop cancels queued work and joins
 the listener through the control/engine lifecycle. Cancellation notifications
 do not implement general operation cancellation.
 
+Each admitted engine job receives a random 128-bit `operation_id`, independent
+of the JSON-RPC request ID. The private `kn.mcp_operation.v1` metadata travels
+in tool result `_meta["knlivedbg/operation"]` and an additional text content
+item; the original `structuredContent` and first text item are preserved.
+Live resource responses carry the same `_meta`; resource errors put the metadata
+in `error.data`. The request audit also records the response-time snapshot.
+`operations.get {"operation_id":"<returned ID>"}` reads the ledger on the
+listener, without waiting for the engine or submitting another job.
+
+States are `queued`, `running`, `cancelled_before_execution`, `succeeded`,
+`failed` and `unknown_outcome`. Timeout after dispatch keeps the record active
+until the engine returns. An unhandled engine exception ends the operation
+with `unknown_outcome`. `operation_finished` includes pre-dispatch cancellation;
+`engine_finished` requires an actual dispatch. `succeeded`/`failed` describe
+the engine's returned error flag, not independently verified target effects.
+Timestamps are decimal-string collector boot ticks, not wall time or target time.
+
+The ledger retains at most 256 metadata records, evicts the oldest finished
+record first, and rejects admission if every slot is active. It does not retain
+result payloads. Restart clears it; a new initialization on the same running
+server does not. Lookup uses the existing shared server password/session, with
+no additional per-principal isolation. `not_retained` establishes no outcome.
+If the client disconnects before receiving an ID, this interface cannot recover
+that job by request ID. There is no automatic retry, idempotent resubmission,
+rollback, running-job cancellation, durable journal or standard MCP Tasks API.
+The separate remote protocol has no operation lookup adapter yet.
+
 ## Transport and permissions
 
 - HTTP `/mcp`, default all-interface port 51766, optional loopback/concrete bind.
@@ -61,8 +88,12 @@ those as current guarantees. The outstanding work is in [FEATURE_PLAN.md](FEATUR
 ## Validation
 
 `--self-test mcp-tools` checks catalog/validation/dispatch contracts without
-loading a driver. `--self-test mcp-http` separately exercises the loopback
+loading a driver. `tools/validate-mcp-operation.ps1 -Sanitize` checks ledger
+retention and timeout/completion races with an independent JSON oracle.
+`--self-test mcp-http` separately exercises the loopback
 transport and requires HTTP.sys registration rights. Run network fixtures
-sequentially. Live tool behavior, write verification and host cleanup require
+sequentially; the synthetic operation test deliberately waits for the 30-second
+response timeout, then queries while its fake engine is blocked and after its
+late completion. Live tool behavior, write verification and host cleanup require
 the [manual checklist](MANUAL_TEST_CHECKLIST.md); parser checks do not establish
 live kernel compatibility.

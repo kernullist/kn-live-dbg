@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "McpOperation.h"
 
 enum class McpRequestKind
 {
@@ -48,11 +49,14 @@ struct McpEngineResult
     bool IsError = false;
     std::wstring Text;
     std::wstring StructuredJson;
+    bool OutcomeUnknown = false;
+    std::wstring OperationJson;
 };
 
 struct McpJob
 {
     McpEngineRequest Request;
+    std::wstring OperationId;
     std::promise<McpEngineResult> ResultPromise;
 };
 
@@ -117,6 +121,7 @@ struct McpToolCatalogEntry
 std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
 bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
 bool McpRequestBodySelfTest();
+bool McpOperationWireSelfTest();
 bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error);
 
 class McpServer
@@ -158,9 +163,11 @@ public:
     std::wstring AuditPath() const;
 
     // Engine-thread interface. The engine waits on JobReadyEvent(), then drains
-    // pending jobs with TryPopJob() and fulfills each via the job's promise.
+    // pending jobs with TryPopJob() and publishes each via CompleteJob().
     HANDLE JobReadyEvent() const;
     std::shared_ptr<McpJob> TryPopJob();
+    void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result);
+    McpEngineResult OperationStatus(const std::wstring& operationId) const;
 
 private:
     friend int RunMcpToolCatalogSelfTest();
@@ -196,4 +203,5 @@ private:
     std::deque<std::shared_ptr<McpJob>> queue_;
     HANDLE jobReadyEvent_ = nullptr;
     size_t maxPending_ = 8;
+    McpOperationLedger operations_;
 };

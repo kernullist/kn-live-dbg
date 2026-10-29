@@ -59,6 +59,11 @@ def main():
     trace = by_key[("execution", "trace_import", "trace")]
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
+    operation = by_key[("session", "operation_status", "mcp")]
+    assert operation["implementation"] == "implemented"
+    assert "returned_operation_id" in operation["requirements"]
+    assert "no_effect_verification_or_rollback" in operation["limits"]
+    assert "no_idempotent_resubmission" in operation["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

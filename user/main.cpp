@@ -51868,15 +51868,17 @@ static void RunMcpEngineLoop(
                 dispatchResult.IsError = true;
                 dispatchResult.Text = L"tool raised an unhandled exception: " +
                     std::wstring(what, what + strlen(what));
+                dispatchResult.OutcomeUnknown = true;
             }
             catch (...)
             {
                 dispatchResult.IsError = true;
                 dispatchResult.Text = L"tool raised an unhandled exception (unknown type)";
+                dispatchResult.OutcomeUnknown = true;
             }
             try
             {
-                job->ResultPromise.set_value(dispatchResult);
+                g_McpServer.CompleteJob(job, std::move(dispatchResult));
             }
             catch (...)
             {

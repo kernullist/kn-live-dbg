@@ -301,6 +301,12 @@ int RunMcpToolCatalogSelfTest()
         Check(&context, queueServer.EnqueueAndWait(queueRequest, 0, &queueResult) && queueResult.IsError &&
             queueResult.Text.find(L"cancelled before execution") != std::wstring::npos && !queueServer.TryPopJob(),
             L"timeout-removes-pending-write");
+        std::wstring cancelledId;
+        std::wstring operationState;
+        Check(&context, mcpjson::GetString(queueResult.OperationJson, L"operation_id", &cancelledId) &&
+            IsMcpOperationId(cancelledId) &&
+            mcpjson::GetString(queueServer.OperationStatus(cancelledId).StructuredJson, L"state", &operationState) &&
+            operationState == L"cancelled_before_execution", L"queued-timeout-retains-operation-id");
         ResetEvent(queueServer.JobReadyEvent());
         auto runningWait = std::async(std::launch::async, [&]()
         {
@@ -313,8 +319,39 @@ int RunMcpToolCatalogSelfTest()
             queueResult.Text.find(L"outcome unknown") != std::wstring::npos, L"timeout-does-not-claim-running-write-cancelled");
         if (runningJob != nullptr)
         {
-            runningJob->ResultPromise.set_value(McpEngineResult{});
+            const auto before = queueServer.OperationStatus(runningJob->OperationId);
+            Check(&context, !before.IsError && mcpjson::GetString(before.StructuredJson, L"state", &operationState) &&
+                operationState == L"unknown_outcome" && queueResult.OutcomeUnknown,
+                L"running-timeout-query-without-engine-hop");
+            queueServer.CompleteJob(runningJob, McpEngineResult{});
+            const auto after = queueServer.OperationStatus(runningJob->OperationId);
+            Check(&context, !after.IsError && mcpjson::GetString(after.StructuredJson, L"state", &operationState) &&
+                operationState == L"succeeded", L"late-completion-retained-after-waiter-left");
+            McpEngineResult duplicate;
+            duplicate.IsError = true;
+            queueServer.CompleteJob(runningJob, duplicate);
+            Check(&context, queueServer.OperationStatus(runningJob->OperationId).StructuredJson == after.StructuredJson,
+                L"duplicate-completion-cannot-rewrite-outcome");
         }
+        Check(&context, queueServer.OperationStatus(L"bad-id").IsError &&
+            queueServer.OperationStatus(std::wstring(32, L'0')).IsError, L"missing-operation-not-a-success");
+        ResetEvent(queueServer.JobReadyEvent());
+        auto completedWait = std::async(std::launch::async, [&]()
+        {
+            return queueServer.EnqueueAndWait(queueRequest, 10000, &queueResult);
+        });
+        Check(&context, WaitForSingleObject(queueServer.JobReadyEvent(), 5000) == WAIT_OBJECT_0, L"normal-operation-enqueued");
+        auto completedJob = queueServer.TryPopJob();
+        Check(&context, completedJob != nullptr, L"normal-operation-dispatched");
+        McpEngineResult completedResult;
+        completedResult.IsError = true;
+        completedResult.OutcomeUnknown = true;
+        completedResult.StructuredJson = L"{\"fixture\":true}";
+        queueServer.CompleteJob(completedJob, completedResult);
+        Check(&context, completedWait.get() && queueResult.IsError && queueResult.OutcomeUnknown &&
+            queueResult.StructuredJson == completedResult.StructuredJson &&
+            mcpjson::GetString(queueResult.OperationJson, L"state", &operationState) && operationState == L"unknown_outcome",
+            L"exception-outcome-retained-with-original-payload");
         auto stopWait = std::async(std::launch::async, [&]()
         {
             return queueServer.EnqueueAndWait(queueRequest, 30000, &queueResult);
@@ -324,10 +361,20 @@ int RunMcpToolCatalogSelfTest()
         Check(&context, stopWait.wait_for(std::chrono::seconds(2)) == std::future_status::ready && stopWait.get() &&
             queueResult.IsError && !queueServer.TryPopJob(), L"stop-unblocks-transport-without-engine-drain");
         queueServer.Stop();
+        Check(&context, mcpjson::GetString(queueResult.OperationJson, L"state", &operationState) &&
+            operationState == L"cancelled_before_execution", L"stop-retains-queued-cancellation");
 
         std::vector<McpToolCatalogEntry> catalog = BuildMcpToolCatalogSnapshot();
         Check(&context, !catalog.empty(), L"catalog-not-empty");
         Check(&context, McpRequestBodySelfTest(), L"http-body-bounds-eof-and-read-failure");
+        Check(&context, McpOperationWireSelfTest(), L"operation-wire-preserves-payload-and-exposes-metadata");
+        CheckReadOnlyTool(&context, L"operations.get", {L"operation_id"});
+        std::wstring operationArgumentError;
+        Check(&context, ValidateMcpToolArguments(L"operations.get", L"{\"operation_id\":\"00000000000000000000000000000001\"}", &operationArgumentError) &&
+            !ValidateMcpToolArguments(L"operations.get", L"{}", &operationArgumentError) &&
+            !ValidateMcpToolArguments(L"operations.get", L"{\"operation_id\":1}", &operationArgumentError) &&
+            !ValidateMcpToolArguments(L"operations.get", L"{\"operation_id\":\"x\",\"retry\":true}", &operationArgumentError),
+            L"operation-query-closed-arguments");
         {
             std::wstring value;
             Check(&context, mcpjson::GetString(
@@ -581,10 +628,13 @@ int RunMcpTransportSelfTest()
     HINTERNET connection = session != nullptr ? WinHttpConnect(session, L"127.0.0.1", config.Port, 0) : nullptr;
     if (session != nullptr)
     {
-        WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+        WinHttpSetTimeouts(session, 5000, 5000, 5000, 45000);
     }
+    std::wstring sessionId;
+    std::wstring lastResponse;
     auto post = [&](const std::string& body, DWORD expectedStatus, const wchar_t* expectedText, const wchar_t* name)
     {
+        lastResponse.clear();
         HINTERNET request = connection != nullptr ? WinHttpOpenRequest(connection, L"POST", L"/mcp/", nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr;
         bool ok = false;
@@ -594,7 +644,11 @@ int RunMcpTransportSelfTest()
             {
                 break;
             }
-            const std::wstring headers = L"Authorization: Bearer " + config.Password + L"\r\nContent-Type: application/json\r\n";
+            std::wstring headers = L"Authorization: Bearer " + config.Password + L"\r\nContent-Type: application/json\r\n";
+            if (!sessionId.empty())
+            {
+                headers += L"Mcp-Session-Id: " + sessionId + L"\r\n";
+            }
             if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
                     const_cast<char*>(body.data()), static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) ||
                 !WinHttpReceiveResponse(request, nullptr))
@@ -625,8 +679,18 @@ int RunMcpTransportSelfTest()
                     break;
                 }
             }
-            const std::wstring decoded = mcpjson::Utf8ToWide(response);
-            ok = complete && mcpjson::ValidateDocument(decoded) && decoded.find(expectedText) != std::wstring::npos;
+            lastResponse = mcpjson::Utf8ToWide(response);
+            ok = complete && mcpjson::ValidateDocument(lastResponse) && lastResponse.find(expectedText) != std::wstring::npos;
+            wchar_t header[128] = {};
+            DWORD headerBytes = sizeof(header);
+            if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"Mcp-Session-Id", header, &headerBytes, WINHTTP_NO_HEADER_INDEX))
+            {
+                sessionId.assign(header, headerBytes / sizeof(wchar_t));
+                while (!sessionId.empty() && sessionId.back() == L'\0')
+                {
+                    sessionId.pop_back();
+                }
+            }
         } while (false);
         if (request != nullptr)
         {
@@ -648,6 +712,96 @@ int RunMcpTransportSelfTest()
     large.insert(large.size() - 2, "x");
     post(large, 413, L"-32700", L"http-body-over-limit-rejected");
     post(ping, 200, L"\"result\":{}", L"http-recovers-after-rejected-body");
+    post(R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}})", 200,
+        L"protocolVersion", L"http-operation-initialize");
+    Check(&context, !sessionId.empty(), L"http-session-header-retained");
+    std::promise<void> releaseEngine;
+    auto release = releaseEngine.get_future();
+    auto engine = std::async(std::launch::async, [&]()
+    {
+        if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0)
+        {
+            return false;
+        }
+        auto job = server.TryPopJob();
+        if (job == nullptr || release.wait_for(std::chrono::seconds(60)) != std::future_status::ready)
+        {
+            return false;
+        }
+        McpEngineResult result;
+        result.StructuredJson = L"{\"fixture\":true}";
+        server.CompleteJob(job, result);
+        return true;
+    });
+    post(R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"process.find","arguments":{}}})",
+        200, L"unknown_outcome", L"http-dispatched-operation-times-out");
+    std::wstring rpcResult;
+    std::wstring meta;
+    std::wstring operation;
+    std::wstring operationId;
+    Check(&context, mcpjson::FindRawValue(lastResponse, L"result", &rpcResult) &&
+        mcpjson::FindRawValue(rpcResult, L"_meta", &meta) &&
+        mcpjson::FindRawValue(meta, L"knlivedbg/operation", &operation) &&
+        mcpjson::GetString(operation, L"operation_id", &operationId) && IsMcpOperationId(operationId),
+        L"http-timeout-carries-operation-id");
+    const std::string query = mcpjson::WideToUtf8(L"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"operations.get\",\"arguments\":{\"operation_id\":" +
+        mcpjson::Quote(operationId) + L"}}}");
+    post(query, 200, L"\"state\":\"unknown_outcome\"", L"http-status-bypasses-blocked-engine");
+    Check(&context, !server.TryPopJob(), L"http-status-does-not-enqueue-another-operation");
+    releaseEngine.set_value();
+    Check(&context, engine.get(), L"http-late-engine-completion");
+    std::string finalQuery = query;
+    const auto requestId = finalQuery.find("\"id\":4");
+    if (requestId != std::string::npos)
+    {
+        finalQuery.replace(requestId, 6, "\"id\":5");
+    }
+    post(finalQuery, 200, L"\"state\":\"succeeded\"", L"http-late-completion-status");
+    post(R"({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"operations.get","arguments":{"operation_id":1}}})",
+        200, L"\"isError\":true", L"http-operation-invalid-arguments");
+    post(R"({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"operations.get","arguments":{"operation_id":"00000000000000000000000000000000"}}})",
+        200, L"not_retained", L"http-operation-unknown-id");
+    for (unsigned variant = 0; variant < 2; ++variant)
+    {
+        auto resourceEngine = std::async(std::launch::async, [&]()
+        {
+            if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0)
+            {
+                return false;
+            }
+            auto job = server.TryPopJob();
+            if (job == nullptr || job->Request.Kind != McpRequestKind::ResourceRead)
+            {
+                return false;
+            }
+            McpEngineResult result;
+            result.IsError = variant != 0;
+            result.Text = L"synthetic resource";
+            result.StructuredJson = L"{\"fixture\":true}";
+            server.CompleteJob(job, result);
+            return true;
+        });
+        const std::string body = "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(8 + variant) +
+            ",\"method\":\"resources/read\",\"params\":{\"uri\":\"kn://session/info\"}}";
+        post(body, 200, variant == 0 ? L"\"state\":\"succeeded\"" : L"\"state\":\"failed\"",
+            variant == 0 ? L"http-resource-success-metadata" : L"http-resource-error-metadata");
+        Check(&context, resourceEngine.get(), L"http-resource-engine-finished");
+        operation.clear();
+        bool metadataOk = false;
+        if (variant == 0)
+        {
+            metadataOk = mcpjson::FindRawValue(lastResponse, L"result", &rpcResult) &&
+                mcpjson::FindRawValue(rpcResult, L"_meta", &meta) &&
+                mcpjson::FindRawValue(meta, L"knlivedbg/operation", &operation);
+        }
+        else
+        {
+            metadataOk = mcpjson::FindRawValue(lastResponse, L"error", &rpcResult) &&
+                mcpjson::FindRawValue(rpcResult, L"data", &operation);
+        }
+        Check(&context, metadataOk && mcpjson::GetString(operation, L"operation_id", &operationId) &&
+            IsMcpOperationId(operationId), L"http-resource-operation-id-location");
+    }
     if (connection != nullptr)
     {
         WinHttpCloseHandle(connection);

@@ -25,6 +25,29 @@ EngineQueue를 구현한 것은 아니다.
 불명확하다. 실행 중인 호출을 rollback하지 않는다. stop은 대기 작업을 취소하고
 control/engine 종료 경로로 리스너를 join한다. 취소 알림은 범용 작업 취소 기능이 아니다.
 
+엔진 큐에 수용된 작업은 JSON-RPC 요청 ID와 별개인 128비트 `operation_id`를 받는다.
+비공개 `kn.mcp_operation.v1` 메타데이터를 도구 응답의
+`_meta["knlivedbg/operation"]`와 추가 텍스트 항목으로 반환한다.
+기존 `structuredContent`와 첫 텍스트 항목은 유지한다. 리소스 성공 응답은
+같은 `_meta`, 오류는 `error.data`에 담고 요청 감사에도 응답 시점 상태를 기록한다.
+`operations.get {"operation_id":"<반환된 ID>"}`는 리스너에서 바로 조회하므로
+실행 중인 엔진 작업을 기다리거나 재등록하지 않는다.
+
+상태는 `queued`, `running`, `cancelled_before_execution`, `succeeded`,
+`failed`, `unknown_outcome`이다. 실행 뒤 시간 초과는 엔진 반환 전까지 활성
+기록으로 남으며, 처리되지 않은 엔진 예외는 종료되어도 결과 불명으로 남는다.
+`operation_finished`는 실행 전 취소도 포함하지만 `engine_finished`는 실제
+dispatch가 있어야 참이다. 성공/실패는 엔진의 오류 플래그이며 대상 부작용을
+독립 검증했다는 뜻이 아니다. 시각은 수집기 부팅 기준 밀리초의 10진 문자열이다.
+
+메타데이터는 최대 256개이며 오래된 종료 기록부터 교체한다. 모두 활성 작업이면
+새 작업을 거절한다. 결과 본문은 저장하지 않는다. 서버 재시작은 기록을 지우고
+같은 서버의 재초기화는 유지한다. 기존 공유 비밀번호/세션으로 조회하며 별도
+사용자별 격리는 없다. `not_retained`는 실행 결과를 판정하지 않는다.
+ID를 받기 전에 연결이 끊기면 요청 ID로 복구할 수 없다. 자동 재시도·멱등 재전송·
+롤백·실행 중 취소·영속 저널·표준 MCP Tasks는 미지원이다. 별도 remote 프로토콜의
+작업 조회도 아직 연결되지 않았다.
+
 ## 전송과 권한
 
 - HTTP `/mcp`, 기본 모든 인터페이스의 51766, 선택적 loopback/특정 bind.

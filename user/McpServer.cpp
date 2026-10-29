@@ -250,11 +250,13 @@ namespace
     const McpToolArg kArgsTiSubscribe[] = { {L"action", L"string", false} };
     const McpToolArg kArgsSnapshotDiff[] = { {L"old", L"string", false}, {L"new", L"string", false}, {L"domain", L"string", false}, {L"risk", L"string", false}, {L"limit", L"string", false}, {L"summary", L"boolean", false} };
     const McpToolArg kArgsTiExport[] = { {L"path", L"string", true} };
+    const McpToolArg kArgsOperationGet[] = { {L"operation_id", L"string", true} };
 
 #define MCP_ARG_TABLE(arr) arr, (sizeof(arr) / sizeof((arr)[0]))
 
     const McpToolDef kTools[] =
     {
+        { L"operations.get", L"Read retained engine outcome metadata after a response timeout; never retries or cancels execution.", true, MCP_ARG_TABLE(kArgsOperationGet) },
         { L"process.find", L"Find live processes by image name, PID, or EPROCESS address.", true, MCP_ARG_TABLE(kArgsProcessFind) },
         { L"process.describe", L"Describe an _EPROCESS (PID, DTB, PEB, threads, parent).", true, MCP_ARG_TABLE(kArgsProcessDescribe) },
         { L"type.describe", L"Dump a kernel structure (dt) at an address or for a process.", true, MCP_ARG_TABLE(kArgsTypeDescribe) },
@@ -799,11 +801,12 @@ namespace
         return L"{\"jsonrpc\":\"2.0\",\"id\":" + id + L",\"result\":" + resultJson + L"}";
     }
 
-    std::wstring RpcError(const std::wstring& idRaw, int code, const std::wstring& message)
+    std::wstring RpcError(const std::wstring& idRaw, int code, const std::wstring& message, const std::wstring& data = L"")
     {
         std::wstring id = idRaw.empty() ? std::wstring(L"null") : idRaw;
         return L"{\"jsonrpc\":\"2.0\",\"id\":" + id + L",\"error\":{\"code\":" +
-               std::to_wstring(code) + L",\"message\":" + mcpjson::Quote(message) + L"}}";
+               std::to_wstring(code) + L",\"message\":" + mcpjson::Quote(message) +
+               (data.empty() ? L"" : L",\"data\":" + data) + L"}}";
     }
 
     std::wstring BuildToolResult(const McpEngineResult& result)
@@ -821,7 +824,15 @@ namespace
             out += mcpjson::Quote(result.Text);
             out += L"}";
         }
+        if (!result.OperationJson.empty())
+        {
+            out += L",{\"type\":\"text\",\"text\":" + mcpjson::Quote(result.OperationJson) + L"}";
+        }
         out += L"]";
+        if (!result.OperationJson.empty())
+        {
+            out += L",\"_meta\":{\"knlivedbg/operation\":" + result.OperationJson + L"}";
+        }
         if (!result.StructuredJson.empty())
         {
             out += L",\"structuredContent\":";
@@ -832,6 +843,31 @@ namespace
         out += L"}";
         return out;
     }
+}
+
+bool McpOperationWireSelfTest()
+{
+    McpEngineResult result;
+    result.IsError = true;
+    result.Text = L"synthetic timeout";
+    result.StructuredJson = L"{\"fixture\":true}";
+    McpOperationSnapshot snapshot;
+    snapshot.Id = std::wstring(32, L'1');
+    snapshot.Name = L"fixture.operation";
+    result.OperationJson = McpOperationJson(snapshot);
+    const auto wire = BuildToolResult(result);
+    std::wstring structured;
+    std::wstring meta;
+    std::wstring operation;
+    std::wstring error;
+    std::wstring data;
+    return mcpjson::IsObject(wire) &&
+        mcpjson::FindRawValue(wire, L"structuredContent", &structured) && structured == result.StructuredJson &&
+        mcpjson::FindRawValue(wire, L"_meta", &meta) &&
+        mcpjson::FindRawValue(meta, L"knlivedbg/operation", &operation) && operation == result.OperationJson &&
+        wire.find(mcpjson::Quote(result.OperationJson)) != std::wstring::npos &&
+        mcpjson::FindRawValue(RpcError(L"1", -32603, result.Text, result.OperationJson), L"error", &error) &&
+        mcpjson::FindRawValue(error, L"data", &data) && data == result.OperationJson;
 }
 
 bool SanitizeMcpPassword(
@@ -1615,9 +1651,53 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
         {
             job = queue_.front();
             queue_.pop_front();
+            if (!operations_.Start(job->OperationId, GetTickCount64()))
+            {
+                job.reset();
+            }
         }
     }
     return job;
+}
+
+void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result)
+{
+    // Serialize publication with queue removal and admission/eviction. The
+    // first engine completion wins, including after the waiter has timed out.
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    if (job == nullptr || !operations_.Complete(job->OperationId, result.IsError, result.OutcomeUnknown, GetTickCount64()))
+    {
+        return;
+    }
+    McpOperationSnapshot snapshot;
+    if (operations_.Get(job->OperationId, &snapshot))
+    {
+        result.OperationJson = McpOperationJson(snapshot);
+    }
+    job->ResultPromise.set_value(std::move(result));
+}
+
+McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) const
+{
+    McpEngineResult result;
+    McpOperationSnapshot snapshot;
+    if (!IsMcpOperationId(operationId))
+    {
+        result.IsError = true;
+        result.Text = L"operation_id must be exactly 32 lowercase hexadecimal characters";
+    }
+    else if (!operations_.Get(operationId, &snapshot))
+    {
+        result.IsError = true;
+        result.Text = L"operation metadata is not retained; this does not establish an execution outcome";
+        result.StructuredJson = L"{\"schema\":\"kn.mcp_operation.v1\",\"operation_id\":" + mcpjson::Quote(operationId) +
+            L",\"state\":\"not_retained\",\"outcome_known\":false,\"automatic_retry\":false}";
+    }
+    else
+    {
+        result.StructuredJson = McpOperationJson(snapshot);
+    }
+    return result;
 }
 
 bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result)
@@ -1626,8 +1706,10 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
     {
         return false;
     }
+    *result = McpEngineResult{};
     std::shared_ptr<McpJob> job = std::make_shared<McpJob>();
     job->Request = request;
+    job->OperationId = RandomHex(16);
     std::future<McpEngineResult> future = job->ResultPromise.get_future();
 
     {
@@ -1637,6 +1719,19 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
             return false;
         }
         queue_.push_back(job);
+        try
+        {
+            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64()))
+            {
+                queue_.pop_back();
+                return false;
+            }
+        }
+        catch (...)
+        {
+            queue_.pop_back();
+            throw;
+        }
     }
     SetEvent(jobReadyEvent_);
 
@@ -1646,16 +1741,32 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         if (stopRequested_.load() || std::chrono::steady_clock::now() >= deadline)
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
+            if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+            {
+                *result = future.get();
+                return true;
+            }
             const auto pending = std::find(queue_.begin(), queue_.end(), job);
             const bool cancelled = pending != queue_.end();
             if (cancelled)
             {
                 queue_.erase(pending);
+                operations_.CancelQueued(job->OperationId, GetTickCount64());
+            }
+            else
+            {
+                operations_.WaitEnded(job->OperationId);
             }
             result->IsError = true;
+            result->OutcomeUnknown = !cancelled;
             result->Text = cancelled
                 ? L"engine wait ended; request cancelled before execution"
                 : L"engine wait ended after dispatch; outcome unknown, inspect state before retrying";
+            McpOperationSnapshot snapshot;
+            if (operations_.Get(job->OperationId, &snapshot))
+            {
+                result->OperationJson = McpOperationJson(snapshot);
+            }
             return true;
         }
         future.wait_until((std::min)(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(50)));
@@ -1684,6 +1795,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         }
 
         config_ = config;
+        operations_.Reset();
         config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
         sessionId_.clear();
         token_.clear();
@@ -1886,9 +1998,9 @@ void McpServer::Stop()
 {
     std::lock_guard<std::mutex> lock(stopMutex_);
 
+    stopRequested_.store(true);
     if (stopEvent_ != nullptr)
     {
-        stopRequested_.store(true);
         SetEvent(stopEvent_);
     }
 
@@ -1915,6 +2027,12 @@ void McpServer::Stop()
             McpEngineResult result;
             result.IsError = true;
             result.Text = L"MCP server stopping";
+            operations_.CancelQueued(job->OperationId, GetTickCount64());
+            McpOperationSnapshot snapshot;
+            if (operations_.Get(job->OperationId, &snapshot))
+            {
+                result.OperationJson = McpOperationJson(snapshot);
+            }
             try
             {
                 job->ResultPromise.set_value(result);
@@ -2035,7 +2153,8 @@ void McpServer::ListenerThreadMain()
     // Append one forensic JSONL record per data-bearing MCP request. Always on
     // while the server runs (independent of the operator's `ai audit` setting).
     auto writeAudit = [&](const HTTP_REQUEST* request, const std::wstring& method, const std::wstring& name,
-                          const std::wstring& args, const std::wstring& decision, bool isError, size_t resultBytes)
+                          const std::wstring& args, const std::wstring& decision, bool isError, size_t resultBytes,
+                          const std::wstring& operation = L"")
     {
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
         record += L",\"session\":" + mcpjson::Quote(sessionId_);
@@ -2054,6 +2173,10 @@ void McpServer::ListenerThreadMain()
         record += L",\"isError\":";
         record += isError ? L"true" : L"false";
         record += L",\"resultBytes\":" + std::to_wstring(resultBytes);
+        if (!operation.empty())
+        {
+            record += L",\"operation\":" + operation;
+        }
         record += L",\"writeArmed\":";
         record += config_.AllowWrite ? L"true" : L"false";
         record += L"}";
@@ -2231,6 +2354,24 @@ void McpServer::ListenerThreadMain()
                 result.Text = L"writes are disabled; start the MCP server with --allow-write (lab mode)";
                 decision = L"writes-disabled";
             }
+            else if (name == L"operations.get")
+            {
+                // The engine can still be busy after a response timeout.
+                // This lookup must never queue behind that same operation.
+                std::wstring error;
+                std::wstring operationId;
+                if (!ValidateMcpToolArguments(name, argsRaw, &error) ||
+                    !mcpjson::GetString(argsRaw, L"operation_id", &operationId))
+                {
+                    result.IsError = true;
+                    result.Text = error.empty() ? L"operation_id is required" : error;
+                }
+                else
+                {
+                    result = OperationStatus(operationId);
+                }
+                decision = result.IsError ? L"operation-unavailable" : L"operation-status";
+            }
             else
             {
                 McpEngineRequest engineRequest;
@@ -2250,7 +2391,7 @@ void McpServer::ListenerThreadMain()
             }
 
             writeAudit(request, L"tools/call", name, argsRaw, decision, result.IsError,
-                       result.Text.size() + result.StructuredJson.size());
+                       result.Text.size() + result.StructuredJson.size(), result.OperationJson);
             sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolResult(result)));
             return;
         }
@@ -2267,6 +2408,7 @@ void McpServer::ListenerThreadMain()
             mcpjson::GetString(params, L"uri", &uri);
 
             std::wstring contentsText;
+            std::wstring operationJson;
             if (uri == L"kn://capabilities")
             {
                 // Static manifest; served transport-side without an engine hop.
@@ -2288,12 +2430,13 @@ void McpServer::ListenerThreadMain()
                 }
                 if (result.IsError)
                 {
-                    writeAudit(request, L"resources/read", uri, L"", L"unknown-resource", true, 0);
+                    writeAudit(request, L"resources/read", uri, L"", L"resource-error", true, 0, result.OperationJson);
                     std::wstring message = result.Text.empty() ? (L"unknown resource: " + uri) : result.Text;
-                    sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, message));
+                    sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, message, result.OperationJson));
                     return;
                 }
                 contentsText = result.StructuredJson.empty() ? result.Text : result.StructuredJson;
+                operationJson = result.OperationJson;
             }
             else
             {
@@ -2302,9 +2445,14 @@ void McpServer::ListenerThreadMain()
                 return;
             }
 
-            writeAudit(request, L"resources/read", uri, L"", L"ok", false, contentsText.size());
+            writeAudit(request, L"resources/read", uri, L"", L"ok", false, contentsText.size(), operationJson);
             std::wstring result = L"{\"contents\":[{\"uri\":" + mcpjson::Quote(uri) +
-                L",\"mimeType\":\"application/json\",\"text\":" + mcpjson::Quote(contentsText) + L"}]}";
+                L",\"mimeType\":\"application/json\",\"text\":" + mcpjson::Quote(contentsText) + L"}]";
+            if (!operationJson.empty())
+            {
+                result += L",\"_meta\":{\"knlivedbg/operation\":" + operationJson + L"}";
+            }
+            result += L"}";
             sendResponse(requestId, 200, "OK", RpcResult(idRaw, result));
             return;
         }

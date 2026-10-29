@@ -7,6 +7,40 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## MCP operation outcome checkpoint: 2026-10-30
+
+Final Release x64 EXE SHA-256:
+`dfa3ea661359379ab8cdde71669af52860af03c6dd3608f45721e5db8729c024`.
+The operation ledger passed 25 ASan controls, including 128 concurrent
+timeout/completion schedules, with seven independently checked JSON state
+records. Queued cancellation cannot dispatch; active unknown outcomes survive
+retention pressure; duplicate completion cannot replace the first outcome.
+Admission fails when all 256 metadata slots remain active.
+
+The native suite passed timeline 28, MCP 102, console 558, commands 3,000,
+remote 66 and connect arguments. This engine build's SHA-256 was
+`79746f8f0ea280091054992d7a3ae98e11efd136796de816b8724cba2ad8a33d`;
+the final build only extended HTTP resource tests. Final loopback HTTP controls
+passed 25 checks, including the real 30-second response wait, lookup while a
+fake engine remains blocked, late completion, argument rejection and operation
+IDs in tool/resource success/error replies. The fixture executed no kernel
+command and changed no URL ACL or firewall rule. It closed its owned listener.
+
+Capabilities passed 23 selected contracts/261 routes; publication-scanner
+regressions passed ten tests. The initial capability script invocation omitted
+its required `--exe`; the corrected command passed. Document links and the
+68 read/12 write catalog counts were checked. Logs are under
+`.build/architecture/w14-operation-*`, including `-core-final`, `-native-all`,
+`-http-final`, `-capabilities-final` and `-build-final`.
+
+Review preserved the existing payload schema, serialized queue/ledger updates,
+rechecked completion at the timeout boundary and separated cancelled operation
+completion from actual engine completion. No additional actionable defects were
+found in the reviewed scope. Existing compiler/LTCG warnings remain. These are
+synthetic engine/transport controls, not driver execution or mutation-effect
+validation. No VM or driver load was used. TLS, per-principal authorization,
+durable/idempotent operations and the remote protocol adapter remain open.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:
