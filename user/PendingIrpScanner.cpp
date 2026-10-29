@@ -1,4 +1,5 @@
 #include "PendingIrpScanner.h"
+#include "NativeObservationSource.h"
 
 #include <algorithm>
 #include <cstring>
@@ -394,10 +395,10 @@ bool PendingIrpScanner::Scan(const std::vector<PendingIrpThreadInput>& threads,
         return false;
     }
     result->LayoutFromPdb = true;
+    NativeObservationSource source(device_);
     auto read = [&](uint64_t address, uint32_t size, std::vector<uint8_t>* bytes)
     {
-        return space.KernelRange(address, size) && size <= 0x20000 &&
-            device_.ReadMemory(address, size, bytes, nullptr) && bytes->size() == size;
+        return space.KernelRange(address, size) && ReadObservationRange(source, address, size, bytes, 0x20000, true);
     };
     CollectPendingIrps(read, layout, threads, options, result, space);
     const std::vector<KernelModuleInfo> modules = symbols_.Modules();

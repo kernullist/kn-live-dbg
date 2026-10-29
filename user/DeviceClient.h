@@ -160,6 +160,7 @@ public:
 
     bool QueryVersion(std::wstring* error);
     AddressSpaceDescriptor AddressSpace() const;
+    uint64_t ObservationEpoch() const;
     bool QuerySessionStatus(DriverSessionStatus* status, std::wstring* error);
     bool ResolveProcess(
         uint32_t processId,
@@ -288,6 +289,7 @@ private:
 
     HANDLE device_;
     std::atomic<uint32_t> pagingLevels_{0};
+    std::atomic<uint64_t> observationEpoch_{0};
     HANDLE managedCallbackPort_ = INVALID_HANDLE_VALUE;
     std::mutex managedCallbackMutex_;
 };

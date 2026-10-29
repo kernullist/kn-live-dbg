@@ -3,6 +3,7 @@
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
 #include "../user/McpJson.h"
+#include "observation-source-selftest.h"
 
 #include <filesystem>
 #include <fstream>
@@ -66,6 +67,7 @@ namespace
     void Tests(const std::wstring& directory)
     {
         auto b = Fixture();
+        observation_source_test::Run(Check, b);
         EvidenceBundle parsed;
         std::wstring error;
         const auto json = EvidenceBundleJson(b);

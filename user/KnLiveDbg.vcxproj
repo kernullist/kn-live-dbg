@@ -223,6 +223,9 @@
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="SourceCapabilities.h" />
     <ClInclude Include="AddressSpaceDescriptor.h" />
+    <ClInclude Include="ObservationSource.h" />
+    <ClInclude Include="BundleObservationSource.h" />
+    <ClInclude Include="NativeObservationSource.h" />
     <ClInclude Include="CommandInput.h" />
     <ClInclude Include="CommandAuditSelfTest.inl" />
     <ClInclude Include="CompletionHints.h" />

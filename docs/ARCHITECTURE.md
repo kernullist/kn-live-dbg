@@ -23,6 +23,46 @@ These changes do not establish a system-wide LA57 support claim. Other scanners,
 source/VM/epoch identity, translation permissions and actual LA57 Windows
 compatibility remain separate acceptance work in [W02](FEATURE_PLAN.md#kernel-investigation-platform).
 
+## Bounded observation sources
+
+`IObservationSource` admits at most 4096 bytes per primitive read. Requests bind
+to a source ID, address descriptor, byte budget, cancellation token and explicit
+residency-change policy. Results retain contiguous sparse spans, timing in the
+collector steady-clock domain, consistency scope and possible side effects.
+Missing capture, read failure, skipped work, conflicting bytes, policy denial,
+identity change, unsupported requests and budget deferral remain distinct.
+Only complete reads can enter the existing byte-vector parser adapter. Gaps are
+never filled with zeroes. Cancellation is checked before and after a synchronous
+read; it does not interrupt an IOCTL already in progress.
+
+`NativeObservationSource` binds a kernel virtual-memory reader to a collector
+process creation time and device-open epoch, checks the paging descriptor around
+each read, and preserves short reads. This detects connection replacement; it is
+not a kernel-object lifetime proof, a boot/VM identity or an atomic snapshot.
+The caller still owns the device and serializes its lifecycle with scan work.
+Original native status is marked unavailable because the existing DeviceClient
+API does not expose it. Pending-IRP parsing uses bounded chunks up to its existing
+128 KiB total limit and retains its repeated-read comparison. The kernel virtual
+branches of execution-reference parsing use the same interface. Physical-page
+and user-process fallbacks retain their existing collectors.
+
+`BundleObservationSource` owns an immutable copy of a validated v1 bundle and
+binds its ID to the canonical payload hash, including identity and captured bytes.
+Replay uses this source with the existing code-target parser. Conflicting valid
+bytes remain conflicts regardless of read order; failed and skipped spans never
+override captured bytes. The hash establishes content identity, not acquisition
+authenticity. New timing fields measure replay access, not original capture time.
+
+Native virtual reads can change residency, as described by
+[MmCopyMemory](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-mmcopymemory).
+Migrated collectors explicitly opt in to preserve their prior behavior. This
+does not implement the separate driver-enforced observe/collect policy. Dump,
+DbgEng, user-process and translation adapters, operation-wide deadlines and
+identity revalidation remain open work. The evidence harness exercises the same
+target parser on owned current-process memory and stored bytes, alongside sparse,
+conflict, budget, cancellation, source-change and multi-chunk failure controls;
+that test does not validate a live kernel target.
+
 This describes main at the [documented source revision](README.md), including
 changes after v0.0.36. For operator syntax use
 [the command guide](COMMAND_REFERENCE.md); for measured behavior use

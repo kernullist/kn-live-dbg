@@ -3,6 +3,7 @@
 #include "KmonHuntingJson.h"
 #include "ExecutableImagePermissions.h"
 #include "ExecutionSurfaceScanner.h"
+#include "NativeObservationSource.h"
 
 #include <TlHelp32.h>
 #include <Psapi.h>
@@ -971,8 +972,10 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         bool userReaderUsed = false;
         uint64_t lastReadPhysical = 0;
         uint64_t pageHeadPhysical = 0;
+        NativeObservationSource nativeSource(*device);
         const ObservationReader reader = [device, symbols, process, &work, &executableMapping,
-            &physicalPageRead, &kernelReaderUsed, &userReaderUsed, &lastReadPhysical, &addressSpaceTried, &addressSpaceValid, &addressSpace]
+            &nativeSource, &physicalPageRead, &kernelReaderUsed, &userReaderUsed, &lastReadPhysical,
+            &addressSpaceTried, &addressSpaceValid, &addressSpace]
             (uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
             lastReadPhysical = 0;
@@ -994,14 +997,13 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             }
             if (work.Identity.ProcessId == 0)
             {
-                const bool read = device->AddressSpace().KernelRange(address, size) &&
-                    device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+                const bool read = ReadObservationExact(nativeSource, address, size, bytes, true);
                 kernelReaderUsed = kernelReaderUsed || read;
                 return read;
             }
             if (work.Role == L"instrumentation_callback" && work.Slot != 0 && address == work.Slot && size == 8)
             {
-                const bool read = device->ReadMemory(address, 8, bytes, nullptr);
+                const bool read = ReadObservationExact(nativeSource, address, 8, bytes, true);
                 kernelReaderUsed = kernelReaderUsed || read;
                 return read;
             }

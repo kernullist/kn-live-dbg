@@ -75,6 +75,8 @@ bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
             break;
         }
 
+        static std::atomic<uint64_t> nextEpoch{1};
+        observationEpoch_.store(nextEpoch.fetch_add(1));
         ok = true;
     } while (false);
 
@@ -83,6 +85,7 @@ bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
 
 void DeviceClient::Close()
 {
+    observationEpoch_.store(0);
     pagingLevels_.store(0);
     // Keep the port and device close in the same critical section as control
     // requests. A concurrent status query must not reopen a lease between the
@@ -292,6 +295,11 @@ bool DeviceClient::QueryVersion(std::wstring* error)
 AddressSpaceDescriptor DeviceClient::AddressSpace() const
 {
     return AddressSpaceDescriptor::FromPagingLevels(pagingLevels_.load());
+}
+
+uint64_t DeviceClient::ObservationEpoch() const
+{
+    return observationEpoch_.load();
 }
 
 bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring* error)

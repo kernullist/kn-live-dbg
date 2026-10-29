@@ -1,4 +1,5 @@
 #include "EvidenceInvestigation.h"
+#include "BundleObservationSource.h"
 #include "ContentHash.h"
 #include "KmonHuntingJson.h"
 #include "AnalystSnapshot.h"
@@ -201,7 +202,11 @@ EvidenceReplayResult ReplayEvidence(const EvidenceBundle& b)
 {
     EvidenceReplayResult result;
     const auto& r = b.Receipt.Reference;
-    const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* out) { return EvidenceRead(b, address, size, out); };
+    BundleObservationSource source(b);
+    const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* out)
+    {
+        return ReadObservationExact(source, address, size, out);
+    };
     if (!b.ReferenceConsistent) { result.Gaps.push_back(L"original_reference_consistency_unconfirmed"); }
     if (!EvidenceReadSetComplete(b)) { result.Gaps.push_back(L"declared_read_set_incomplete_or_conflicting"); }
     if (b.Receipt.Disposition == L"identity_conflict" || b.Receipt.Disposition == L"future_event") { result.Gaps.push_back(b.Receipt.Disposition); }

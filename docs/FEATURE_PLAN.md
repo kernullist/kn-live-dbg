@@ -47,7 +47,7 @@ backend/build/security-state combination.
 | --- | --- | --- |
 | W01 Baseline/capability | Selected compiled source contracts and command routes via `--capabilities`; runtime capability probes and a measured build/security matrix remain open | None |
 | W02 Address/identity | Address descriptor now covers hunting admission/page scheduling, pending IRP reads and evidence replay; source/epoch isolation, remaining scanner migration and real LA57 validation remain open | W01 |
-| W03 Read-set source | Read-only source interface; sparse statuses, budgets, cancellation, identity and side effects; same parser on live and stored bytes | W02 |
+| W03 Read-set source | Bounded source interface now connects selected native kernel readers and immutable bundle replay, with sparse statuses, budgets and cancellation; dump/DbgEng/user-process adapters, translation DTOs and operation-wide deadlines remain open | W02 |
 | W04 Schema broker | Exact image/PDB/type package, qualified partial states, artifact verification and isolated untrusted parsing | W02-W03 |
 | W05 Proof/coverage | Unique intervals, temporal/semantic/persistence/replay scope, deterministic claim requirements and counterexamples | W02-W04 |
 | W06 Evidence store v2 | Recoverable journal/index, inventory and result continuations, stable snapshots, v1 import, interruption/corruption/large inventory controls | W03,W05 |
