@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "PendingIrpReport.h"
 #include "KmonImportResolver.h"
 
 #include "ByovdScanner.h"
@@ -21183,6 +21184,7 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
+        event.Kind == L"io.request_observation" ||
         (event.Kind == L"coverage.layout" && (event.Task == L"complete" || event.Task == L"initial_observation")) ||
         event.Kind == L"coverage.page_candidates" ||
         event.Kind == L"coverage.image_permissions" ||
@@ -24078,6 +24080,20 @@ void KernelMonitor::ScanKernelThreads()
     if (irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored))
     {
         IrpCompletionCursor = irpResult.NextCursor;
+        for (const auto& request : irpResult.Requests)
+        {
+            KmonEvent event;
+            event.Kind = L"io.request_observation";
+            event.Observation.Source = L"irp_snapshot";
+            event.Observation.DependencyGroup = L"native_thread_irp_list";
+            event.Observation.AddressSpace = irpResult.AddressSpace;
+            event.ProcessId = request.Thread.ProcessId;
+            event.Summary = L"thread-linked IRP snapshot; final outcome is unknown";
+            event.Evidence[L"irp_observation_json"] = PendingIrpObservationJson(request, irpResult);
+            event.Evidence[L"referenced_lifetime"] = L"false";
+            event.Evidence[L"execution_observed"] = L"false";
+            RecordEvent(std::move(event));
+        }
         for (const PendingIrpCompletionRecord& record : irpResult.Records)
         {
             KernelCallbackRecord target;

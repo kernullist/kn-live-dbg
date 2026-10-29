@@ -94,6 +94,35 @@ booleans are false. Detection heuristics still use those reference correlations.
 Trace/VMI producers, X2-X4 validation, additional runtime layouts and game-object
 lifetimes remain separate work.
 
+## Pending I/O observation graphs
+
+The native pending-IRP reader retains every admitted request, including requests
+with no registered completion. It validates the supplied thread's PID, TID and
+creation time, its list window, the packet header and repeated packet/stack
+reads. The same reader is compiled into the standalone ASan fixture. Optional
+PDB-resolved `Cancel`, `PendingReturned`, `IoStatus.Status`, device and file fields
+remain null when unavailable; offsets and pointer targets are not guessed.
+
+KMON emits `io.request_observation` with a private `kn.irp_observation.v1` report
+in `irp_observation_json`. The ordinary observation ring/log and watch filters
+apply; routine snapshots are suppressed from live console printing. Each report
+retains one request, up to 64 inspected stack locations, and a graph of its
+observed thread-list membership, stack locations and pointer references. Graph
+IDs are local to the enclosing event. A valid address shape does not validate a
+device/file object, and equal addresses do not join request lifetimes across
+observations. The source defaults to 32 threads/64 requests per bounded turn,
+with hard limits of 128 threads/256 requests and 4,096 list visits.
+
+The state is `RequestObserved`, the outcome is `UnknownOutcome`, and the
+transition list stays empty. Neither an empty stack nor disappearance proves
+completion. A set cancel flag or successful status also does not prove the
+final result; the [Windows IRP contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_irp)
+does not allow the cancel flag alone to establish cancelled completion.
+Collector tick boundaries describe a non-atomic scan interval, not dispatch or
+completion latency. Enumeration coverage remains scoped to supplied ETHREADs.
+IRP allocation references, cross-observation joins, raw-read replay, dispatch/
+completion event providers, wait/lock graphs and deadlock diagnosis remain open.
+
 ## Comparison coverage
 
 `ObservationCoverage::Complete()` requires a bounded, valid union of compared

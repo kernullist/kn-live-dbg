@@ -182,6 +182,14 @@ and `permission_range_reference_observed` to inspect the existing correlations.
 The old execution booleans remain false for these sources. This is not a trace
 importer or a CPU execution/writer sensor.
 
+KMON's `io.request_observation` events include `irp_observation_json`, a bounded
+`kn.irp_observation.v1` report. It exposes the observed thread/request/stack
+relations, optional cancel/pending/status fields and reference pointers, including
+requests without a completion routine. Graph IDs apply only inside that event.
+The final outcome stays unknown; addresses and flags do not establish a request
+lifetime, a completed/cancelled operation or a deadlock. The normal KMON event
+query and JSON log expose these records; routine snapshots do not print live.
+
 ## Whole-host hunt
 
 ```text

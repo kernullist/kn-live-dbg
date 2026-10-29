@@ -180,6 +180,7 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="KmonUserEvidence.cpp" />
     <ClCompile Include="PendingIrpScanner.cpp" />
+    <ClCompile Include="PendingIrpScannerTests.cpp" />
     <ClCompile Include="KmonTemporalEvidence.cpp" />
     <ClCompile Include="KmonPlatformEvidence.cpp" />
     <ClCompile Include="KernelMonitor.cpp" />    <ClCompile Include="KernelMonitorInlinePatch.cpp" />
@@ -314,6 +315,8 @@
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="KmonUserEvidence.h" />
     <ClInclude Include="PendingIrpScanner.h" />
+    <ClInclude Include="PendingIrpReader.h" />
+    <ClInclude Include="PendingIrpReport.h" />
     <ClInclude Include="ScannerListWindow.h" />
     <ClInclude Include="KmonTemporalEvidence.h" />
     <ClInclude Include="KmonPlatformEvidence.h" />

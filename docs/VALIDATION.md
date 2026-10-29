@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Pending IRP observation checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`f47a773ccd337c6af2c0d5c613f901bea420b14a186f928c7a9ce142b4d9c03f`.
+The standalone ASan build of the actual reader passed 32 new LA48/LA57 snapshot
+controls and the existing bounded pagination, churn, packet and owner-generation
+controls. Six independently parsed JSON reports verify graph endpoints, absent
+optional fields, requests without completions, invalid pointer targets, empty
+stacks, export limits and unknown outcomes despite cancel/success fields.
+
+Review preserved successful legacy completion observations when optional fields
+are absent, discarded observations after owner/list changes, prevented pointer
+shape from becoming object validation, and classified routine snapshots as
+observations with quiet console display. The first integration build failed on
+an incorrect KmonEvent field name; the field was corrected before the passing
+build. No additional actionable defects were found in the reviewed scope.
+
+Final Release/native gates passed timeline 28, MCP 89, console 558, commands
+2,998, remote 66 and connect arguments. Capabilities passed 22 selected
+contracts/261 routes; publication-scanner regressions passed ten tests. Logs are
+under `.build/architecture/w12-irp-*`, using `-core-first`, `-build-second` and
+`-native-first` for the successful gates. Existing compiler/LTCG warnings remain.
+No driver was loaded or host security policy changed. Actual kernel layouts,
+KMON acquisition under target churn, request lifetimes, dispatch/completion
+latency and wait/lock diagnosis remain unvalidated; the graph records references
+inside one non-atomic observation and does not infer missing lifecycle events.
+
 ## Native execution evidence checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

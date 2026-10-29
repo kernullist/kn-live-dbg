@@ -76,6 +76,13 @@ bounded observation export, PE32/PE32+ callback widths and VAD thread/APC/stack
 references without an execution claim. These controls do not validate a CPU
 trace source or live callback execution.
 
+`tools/validate-pending-irp.ps1 -Sanitize` builds the actual reader independently
+of a device or symbol session. It checks LA48/LA57, bounded continuations, request
+and owner changes, requests without completions, malformed stack bounds, missing
+optional fields and an independent JSON/graph oracle. A final successful status,
+cancel bit or empty stack must not produce a completed/cancelled outcome. These
+controls do not exercise a live IRP lifetime, driver cancellation or wait graph.
+
 ## Live-host prerequisites
 
 - Use a Windows x64 lab host/VM with the required signing configuration and

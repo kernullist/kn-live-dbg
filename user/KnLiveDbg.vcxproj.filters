@@ -196,6 +196,9 @@
     <ClCompile Include="PendingIrpScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PendingIrpScannerTests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KmonTemporalEvidence.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -457,6 +460,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PendingIrpScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PendingIrpReader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PendingIrpReport.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ScannerListWindow.h">
