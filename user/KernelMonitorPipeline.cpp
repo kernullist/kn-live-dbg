@@ -1195,6 +1195,49 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
 bool KmonPipelineSelfTest()
 {
     {
+        KernelMonitor monitor;
+        const auto process = GetCurrentProcess();
+        const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), process);
+        if (!identity.HasCanonicalKey()) { return false; }
+        const auto pid = identity.ProcessId;
+        monitor.WatchPids.insert(pid);
+        monitor.WatchPromotedPids.insert(pid);
+        monitor.WatchChildPids[pid] = 42;
+        monitor.WatchPromotedCreated[pid] = identity.CreateTime - 1;
+        // Model a recycled PID before the deep scanner prunes promoted watches.
+        // The retained new process is valid but does not inherit the old child watch.
+        KmonReferenceSchedule schedule;
+        if (schedule.Select({pid}, 0, 0) != pid || monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchPromotedCreated[pid] = identity.CreateTime;
+        if (!monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchPromotedCreated.erase(pid);
+        if (monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchChildPids.clear();
+        monitor.WatchPromotedCreated[pid] = identity.CreateTime;
+        if (monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchNamesLower = {L"not-the-owned-process.invalid"};
+        if (monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        wchar_t path[32768] = {};
+        if (!GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)))) { return false; }
+        monitor.WatchNamesLower = {KmonBasenameLower(path)};
+        monitor.WatchPromotedCreated[pid] = identity.CreateTime - 1;
+        if (!monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchNamesLower = {L"*.sys"};
+        if (monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchNamesLower = {L"*.exe"};
+        if (!monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchNamesLower = {L"*"};
+        if (!monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        monitor.WatchNamesLower.clear();
+        monitor.WatchExplicitPids.insert(pid);
+        if (!monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+        auto changed = identity;
+        ++changed.CreateTime;
+        if (monitor.IsCurrentReferenceWatch(process, changed) || monitor.IsCurrentReferenceWatch(nullptr, identity)) { return false; }
+        monitor.WatchExplicitPids.clear();
+        if (monitor.IsCurrentReferenceWatch(process, identity)) { return false; }
+    }
+    {
         std::vector<uint8_t> header(4096);
         IMAGE_DOS_HEADER dos{}; dos.e_magic = IMAGE_DOS_SIGNATURE; dos.e_lfanew = 128;
         IMAGE_NT_HEADERS64 nt{};
@@ -2015,6 +2058,81 @@ bool KmonPipelineSelfTest()
                     pressure.CollectedLive.Size() == 0 && pressure.CollectedLive.Loss() == 0 &&
                     pressure.CollectionLost.load() == 3000 - retained && pressure.ShutdownEventsUnanalyzed == 0;
                 if (!preserved) { std::fprintf(stderr, "FAIL live source backpressure/shutdown capacity=%zu\n", sourceCapacity); }
+                ok = preserved && ok;
+                for (const auto& path : pressure.SessionLogPaths()) { DeleteFileW(path.c_str()); }
+            }
+            for (const size_t sourceCapacity : {4096u, 1024u})
+            {
+                // Seed a stopped subscriber's actual ring without starting ETW
+                // or writing source logs. Sequence 1 is the consumer baseline.
+                TiSubscriber upstream;
+                upstream.TraceLifecycle.Generation = 7;
+                upstream.NextRingSequence = 3002;
+                for (uint64_t sequence = sourceCapacity == 4096 ? 1 : 1978; sequence <= 3001; ++sequence)
+                {
+                    TiEventRecord raw;
+                    raw.Sequence = sequence;
+                    raw.Timestamp = ObservationFileTime();
+                    raw.TaskName = L"selftest-unclassified";
+                    upstream.Ring.push_back(std::move(raw));
+                }
+                KernelMonitor pressure;
+                pressure.Options.LogDirectory = unique;
+                pressure.Ti = &upstream;
+                pressure.TiTraceGeneration = 7;
+                pressure.TiCursorSequence = 1;
+                auto fence = upstream.RecentAfterSequenceWithStatus(pressure.TiCursorSequence, 1);
+                bool preserved = true;
+                if (sourceCapacity == 4096)
+                {
+                    // A restarted source and records past the frozen tail must
+                    // neither satisfy the old fence nor advance its cursor.
+                    upstream.TraceLifecycle.Generation = 8;
+                    preserved &= pressure.CollectTiPage(&upstream, &fence).empty() &&
+                        pressure.TiCursorSequence == 1 && pressure.TiTraceGeneration == 7;
+                    upstream.TraceLifecycle.Generation = 7;
+                    fence.LatestAssignedSequence = 17;
+                    const auto fenced = pressure.CollectTiPage(&upstream, &fence);
+                    preserved &= fenced.size() == 16 && pressure.TiCursorSequence == 17;
+                    for (size_t index = 0; index < fenced.size(); ++index)
+                    { preserved &= fenced[index].Sequence == index + 2; }
+                    pressure.TiCursorSequence = 1;
+                    for (size_t page = 0; page < 4; ++page)
+                    {
+                        const auto events = pressure.CollectTiPage(&upstream);
+                        preserved &= events.size() == 512;
+                        for (size_t index = 0; index < events.size(); ++index)
+                        {
+                            preserved &= events[index].Sequence == page * 512 + index + 2;
+                            preserved &= pressure.CollectedTi.Push(events[index]);
+                        }
+                    }
+                    preserved &= pressure.CollectedTi.Available() == 0 && pressure.TiCursorSequence == 2049 &&
+                        pressure.CollectTiPage(&upstream).empty() && pressure.TiCursorSequence == 2049;
+                    TiEventRecord consumed;
+                    preserved &= pressure.CollectedTi.Pop(&consumed) && consumed.Sequence == 2;
+                    const auto one = pressure.CollectTiPage(&upstream);
+                    preserved &= one.size() == 1 && pressure.TiCursorSequence == 2050;
+                    if (one.size() == 1) { preserved &= one.front().Sequence == 2050 && pressure.CollectedTi.Push(one.front()); }
+                }
+                else
+                {
+                    // Eviction beyond a shutdown boundary counts only the
+                    // missing records through that boundary, never later ones.
+                    pressure.TiCursorSequence = 1975;
+                    fence.LatestAssignedSequence = 1976;
+                    preserved &= pressure.CollectTiPage(&upstream, &fence).empty() &&
+                        pressure.TiCursorSequence == 1976 && pressure.CollectionLost.load() == 1;
+                    pressure.TiCursorSequence = 1;
+                    pressure.CollectionLost.store(0);
+                }
+                pressure.Stop(nullptr);
+                const uint64_t retained = sourceCapacity == 4096 ? 2999 : 1024;
+                preserved &= pressure.TiCursorSequence == 3001 && pressure.TiIngested.load() == retained &&
+                    pressure.ShutdownEventsProcessed == retained && pressure.CollectedTi.Size() == 0 &&
+                    pressure.CollectedTi.Loss() == 0 && pressure.CollectionLost.load() == (sourceCapacity == 4096 ? 0 : 1976) &&
+                    pressure.ShutdownEventsUnanalyzed == 0;
+                if (!preserved) { std::fprintf(stderr, "FAIL TI source backpressure/shutdown capacity=%zu\n", sourceCapacity); }
                 ok = preserved && ok;
                 for (const auto& path : pressure.SessionLogPaths()) { DeleteFileW(path.c_str()); }
             }

@@ -210,6 +210,7 @@ public:
     std::wstring ResolveImageBasename(uint32_t pid);
 
 private:
+    friend bool KmonPipelineSelfTest();
     static VOID WINAPI EventRecordCallbackThunk(PEVENT_RECORD eventRecord);
     static ULONG WINAPI BufferCallbackThunk(PEVENT_TRACE_LOGFILEW buffer);
     void OnEventRecord(PEVENT_RECORD eventRecord);

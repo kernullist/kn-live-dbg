@@ -123,6 +123,57 @@ Raw evidence is retained locally under `.build/kmon-reference-fairness-20261029`
 These are bounded host/fixture observations, not a general miss/false-positive
 rate or a completion guarantee for changing workloads.
 
+## Reference watch and TI queue review: 2026-10-29
+
+The follow-up Release x64 executable had SHA-256
+`507e4618cc8cc2a71a97be31957569d6a59fcd94ade277f81d4cca0b855bae1b`.
+Review found that the additional reference visits could inherit an old implicit
+watch after PID reuse, before the deep scanner pruned promoted watches. Visits
+now requalify the retained process handle against an explicit PID, a matching
+child creation time, or its current image name. Extension wildcards retain their
+suffix condition. Native controls seed stale/missing/matching watch identities;
+they do not claim to force actual OS PID reuse.
+
+An intermediate 180-second run examined all six controls and observed the four
+positive kinds without unexpected fixture findings, but **failed the queue
+gate** with 78 TI analysis drops at the 2,048-record capacity. The collector read
+up to 512 source records regardless of queue room and advanced past rejected
+records. It now reads only available capacity, retains excess work upstream,
+and processes a frozen source generation/sequence tail at shutdown. Actual
+source overwrite and work left at the shutdown deadline remain reported gaps.
+
+Two final 180-second runs used the same six controls and fixture binary with
+`-AllProcessLayouts -RequireQueueHealth -RequireCompletedWork`. One used the
+default PID-and-name watches; the other added `-NameOnlyFixtures` so explicit
+PIDs could not mask current-name qualification.
+
+| Observation | PID and name | Name only |
+| --- | --- | --- |
+| Examined reference visits per control | 5–7 | 5–6 |
+| Latest first visit | 29.1 s | 36.0 s |
+| Largest reference gap, including window edges | 48.4 s | 54.6 s |
+| Maximum queued-reference wait | 3.1 s | 8.2 s |
+| TI analysis drops / reported event loss | 0 / 0 | 0 / 0 |
+| Expired/dropped references / shutdown unanalyzed events | 0 / 0 / 0 | 0 / 0 / 0 |
+| Required positive kinds / unexpected fixture findings | All observed / 0 | All observed / 0 |
+
+Both runs passed the queue, drain and all-process scope gates, traversed the
+fixture and three fixed system images for all six controls, kept the same boot,
+and left no owned services. Independent JSONL aggregation matched the visit
+metrics and confirmed an instance-matched additional scheduled visit for every
+control within the observation window. The two final TI queue peaks were 556
+and 546; deterministic native controls separately exercised full capacity and
+one free slot, exact sequence order, frozen-tail clipping, generation changes,
+source-eviction accounting and shutdown across multiple batches.
+
+The final native suite passed: timeline 28, MCP catalog 89, console 558, commands
+2,987, remote protocol 66 and connect arguments 4. No new System event 41, 1001
+or 6008 was found during this review's live-test interval. Remaining background
+image work, 562/619 layout failures and 13/9 capture failures prevent a claim of
+complete host verification. These fixture results do not establish a general
+miss/false-positive rate or a latency guarantee. Raw evidence remains local under
+`.build/kmon-reference-fairness-20261029/review-64f23ef`.
+
 ## Earlier development evidence
 
 - The final KMON series used repeated 600-second full-process runs with nine

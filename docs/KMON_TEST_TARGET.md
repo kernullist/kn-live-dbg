@@ -133,6 +133,13 @@ mislabelled `private_exec_pe` or `private_exec_wiped`. `-ProbeDriver` additional
 loads the bundled probe and requires an observed driver lifecycle event.
 It does not enable raw I/O interposition.
 
+By default the runner adds both the fixture name and each child PID to the watch
+list. Add `-NameOnlyFixtures` to omit explicit child PID watches and exercise
+current-name qualification for the same controls. It can be combined with
+`-AllProcessLayouts`; the layout scope remains all processes. `validation.json`
+records `fixture_watch_policy` as `explicit_pid_and_name`, `name_only`, or `none`
+for `-SkipFixtures`. `-NameOnlyFixtures` cannot be combined with `-SkipFixtures`.
+
 `-RequireQueueHealth` requires zero reported event loss, layout/reference drops,
 capture/persistence/diagnostic/catalog queue drops, and reference cursor eviction.
 Reference expiration is included in reference drops. Pending work and ordinary

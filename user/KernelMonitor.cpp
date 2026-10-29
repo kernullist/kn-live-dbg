@@ -8803,6 +8803,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     std::thread worker;
     DeviceClient* device = nullptr;
     TimelineStore* timeline = nullptr;
+    TiSubscriber* ti = nullptr;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         StopRequested.store(true);
@@ -8810,6 +8811,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         LiveOutput.store(false);
         device = Device;
         timeline = Timeline;
+        ti = Ti;
         if (Worker.joinable())
         {
             worker = std::move(Worker);
@@ -8832,15 +8834,18 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     // Do not chase events emitted by shutdown itself beyond this boundary.
     const uint64_t nextLive = timeline == nullptr ? 0 : timeline->PeekNextEventId();
     const uint64_t liveFence = nextLive == 0 ? 0 : nextLive - 1;
+    const TiSequenceSnapshot tiFence = ti == nullptr ? TiSequenceSnapshot{} : ti->RecentAfterSequenceWithStatus(TiCursorSequence, 1);
     // No queue producer can append now. Classify the admitted/deferred events
     // through the normal identity-fenced paths before draining their work.
     const uint64_t layoutBefore = LayoutChecked.load() + LayoutRejected.load();
     const uint64_t referencesBefore = ExecutionReferenceProcessed;
     const uint64_t eventDrainStarted = GetTickCount64();
-    while ((CollectedTi.Size() != 0 || CollectedLive.Size() != 0 || LiveCursorEventId < liveFence) &&
+    while ((CollectedTi.Size() != 0 || CollectedLive.Size() != 0 || LiveCursorEventId < liveFence ||
+        TiCursorSequence < tiFence.LatestAssignedSequence) &&
         GetTickCount64() - eventDrainStarted < 5000)
     {
         CollectLivePage(timeline, liveFence);
+        for (auto& event : CollectTiPage(ti, &tiFence)) { CollectedTi.Push(std::move(event)); }
         const auto pending = CollectedTi.Size() + CollectedLive.Size();
         IngestLiveTimeline();
         IngestThreatIntel();
@@ -8851,6 +8856,19 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     }
     ShutdownDrainMs += GetTickCount64() - eventDrainStarted;
     ShutdownEventsUnanalyzed += CollectedTi.Size() + CollectedLive.Size();
+    if (TiCursorSequence < tiFence.LatestAssignedSequence)
+    {
+        const uint64_t deferred = tiFence.LatestAssignedSequence - TiCursorSequence;
+        ShutdownEventsUnanalyzed += deferred;
+        KmonEvent backlog;
+        backlog.Kind = L"coverage.shutdown_event";
+        backlog.Summary = L"upstream TI events remained unanalyzed at shutdown deadline";
+        backlog.Evidence[L"source_generation"] = std::to_wstring(tiFence.Generation);
+        backlog.Evidence[L"source_sequence_after"] = std::to_wstring(TiCursorSequence);
+        backlog.Evidence[L"source_sequence_through"] = std::to_wstring(tiFence.LatestAssignedSequence);
+        backlog.Evidence[L"deferred_source_events"] = std::to_wstring(deferred);
+        RecordEvent(std::move(backlog));
+    }
     if (LiveCursorEventId < liveFence)
     {
         const uint64_t deferred = liveFence - LiveCursorEventId;
@@ -9461,8 +9479,14 @@ void KernelMonitor::NoteTiRegionEvent(const TiEventRecord& record, DeviceClient*
     NoteRegionObservation(observation, L"etw_ti");
 }
 
-std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti)
+std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti, const TiSequenceSnapshot* fence)
 {
+    // The collector is the sole producer; Stop takes over only after joining
+    // it. Retain excess events upstream instead of advancing past a full queue.
+    // The subscriber interprets a zero limit as unlimited, so never pass zero.
+    const size_t room = (std::min<size_t>)(512, CollectedTi.Available());
+    if (ti == nullptr || room == 0 ||
+        (fence != nullptr && TiCursorSequence >= fence->LatestAssignedSequence)) { return {}; }
     const auto emitHealth = [&](const std::wstring& kind, const std::wstring& key,
         const std::wstring& driver, const std::wstring& layer, const std::wstring& summary,
         const std::wstring& notes)
@@ -9476,11 +9500,6 @@ std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti)
         event.Evidence[L"notes"] = notes;
         PipelineEvents.Push(std::move(event));
     };
-    if (ti == nullptr)
-    {
-        return {};
-    }
-
     const bool initial = LastTiIngestTickMs == 0;
     const uint64_t now = GetTickCount64();
     if (LastTiIngestTickMs != 0)
@@ -9492,7 +9511,7 @@ std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti)
     if (!KmonReadStableTiIngestPage(TiTraceGeneration, TiCursorSequence,
         [&](uint64_t cursor)
         {
-            return ti->RecentAfterSequenceWithStatus(cursor, 512);
+            return ti->RecentAfterSequenceWithStatus(cursor, room);
         }, [&]()
         {
             return ti->SnapshotStats();
@@ -9509,6 +9528,18 @@ std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti)
         return {};
     }
     TiSequenceSnapshot& snapshot = page.Snapshot;
+    if (fence != nullptr)
+    {
+        // A different trace generation cannot satisfy the frozen shutdown
+        // tail. Leave its unconsumed span visible to the shutdown gap counter.
+        if (snapshot.Generation != fence->Generation || page.Cursor > fence->LatestAssignedSequence)
+        { return {}; }
+        snapshot.LatestAssignedSequence = (std::min)(snapshot.LatestAssignedSequence, fence->LatestAssignedSequence);
+        snapshot.MissingBeforeFirst = (std::min)(snapshot.MissingBeforeFirst, fence->LatestAssignedSequence - page.Cursor);
+        const auto after = std::upper_bound(snapshot.Records.begin(), snapshot.Records.end(), fence->LatestAssignedSequence,
+            [](uint64_t sequence, const TiEventRecord& record) { return sequence < record.Sequence; });
+        snapshot.Records.erase(after, snapshot.Records.end());
+    }
     const bool changed = snapshot.Generation != TiTraceGeneration;
     if (changed)
     {
@@ -17134,6 +17165,29 @@ void KernelMonitor::ScanUserExecutionEvidence(
     }
 }
 
+bool KernelMonitor::IsCurrentReferenceWatch(HANDLE process, const ObservationIdentity& identity) const
+{
+    if (process == nullptr || identity.ProcessId <= 4 ||
+        !identity.SameInstance(ObserveProcessIdentity(identity.ProcessId, process))) { return false; }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (WatchExplicitPids.count(identity.ProcessId) != 0) { return true; }
+        const auto created = WatchPromotedCreated.find(identity.ProcessId);
+        if (WatchChildPids.count(identity.ProcessId) != 0 && WatchPids.count(identity.ProcessId) != 0 &&
+            created != WatchPromotedCreated.end() && created->second == identity.CreateTime) { return true; }
+        if (WatchNamesLower.empty()) { return false; }
+        if (std::find(WatchNamesLower.begin(), WatchNamesLower.end(), L"*") != WatchNamesLower.end()) { return true; }
+    }
+    // A Toolhelp name/PID pair can go stale before OpenProcess. Qualify the
+    // pinned object's current name instead of inheriting the old PID's watch.
+    std::vector<wchar_t> path(32768, L'\0');
+    DWORD length = static_cast<DWORD>(path.size());
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &length) || length == 0) { return false; }
+    const auto leaf = KmonBasenameLower(std::wstring(path.data(), length));
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    return NameEqualsWatch(leaf, WatchNamesLower);
+}
+
 void KernelMonitor::ServiceWatchedReferences()
 {
     const uint64_t now = GetTickCount64();
@@ -17165,11 +17219,18 @@ void KernelMonitor::ServiceWatchedReferences()
     if (process != nullptr && identity.CreateTime != 0 && !StopRequested.load())
     {
         visit.Observation.Identity = identity;
-        // Callback collection obtains its own bounded module inventory. The
-        // thread/APC reader does not infer image ownership from an empty view;
-        // queued code is qualified later by the normal execution verifier.
-        ScanUserExecutionSurfaces(process, identity, {}, false);
-        visit.Evidence[L"source_status"] = L"attempted";
+        if (IsCurrentReferenceWatch(process, identity))
+        {
+            // Callback collection obtains its own bounded module inventory. The
+            // thread/APC reader does not infer image ownership from an empty view;
+            // queued code is qualified later by the normal execution verifier.
+            ScanUserExecutionSurfaces(process, identity, {}, false);
+            visit.Evidence[L"source_status"] = L"attempted";
+        }
+        else
+        {
+            visit.Evidence[L"reason"] = L"watch_scope_unavailable_or_changed";
+        }
     }
     else
     {

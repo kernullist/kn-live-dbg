@@ -11,6 +11,7 @@ param(
     [switch]$ImageStressFixtures,
     [switch]$SecondaryViewFixtures,
     [switch]$AllProcessLayouts,
+    [switch]$NameOnlyFixtures,
     [switch]$RequireLayoutNameAccounting,
     [switch]$RequireFreshLayouts,
     [uint32[]]$ObservedProcessId = @(),
@@ -20,7 +21,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if ($SkipFixtures -and (-not $AllProcessLayouts -or $ObservedProcessId.Count -eq 0 -or $ImageSweepFixtures -or $ImageStressFixtures -or $SecondaryViewFixtures)) {
+if ($SkipFixtures -and (-not $AllProcessLayouts -or $ObservedProcessId.Count -eq 0 -or $ImageSweepFixtures -or $ImageStressFixtures -or $SecondaryViewFixtures -or $NameOnlyFixtures)) {
     throw '-SkipFixtures requires -AllProcessLayouts and an observed process, without fixture selectors.'
 }
 if ($SecondaryViewFixtures -and $ImageStressFixtures) {
@@ -160,7 +161,7 @@ try {
         }
         $runs += [ordered]@{scenario=$mode; pid=$child.Id; started_utc=$child.StartTime.ToUniversalTime().ToString('o')}
         $runs | ConvertTo-Json | Set-Content -LiteralPath "$output\fixtures.json" -Encoding UTF8
-        $monitor.StandardInput.WriteLine("!kmon add /pid $($child.Id)")
+        if (-not $NameOnlyFixtures) { $monitor.StandardInput.WriteLine("!kmon add /pid $($child.Id)") }
     }
     'observing' | Set-Content -LiteralPath "$output\status.txt"
     $deadline = [DateTime]::UtcNow.AddSeconds($ObserveSeconds)
@@ -603,6 +604,7 @@ try {
         image_stress_fixtures=[bool]$ImageStressFixtures
         secondary_view_fixtures=[bool]$SecondaryViewFixtures
         all_process_layouts=[bool]$AllProcessLayouts; all_process_scope_verified=$allProcessScope
+        fixture_watch_policy=$(if ($SkipFixtures) { 'none' } elseif ($NameOnlyFixtures) { 'name_only' } else { 'explicit_pid_and_name' })
         layout_process_count=$layoutProcessCount
         layout_name_accounting_required=[bool]$RequireLayoutNameAccounting; layout_name_accounting_passed=$layoutNameAccounting
         layout_names=$layoutNames

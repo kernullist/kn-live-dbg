@@ -362,13 +362,14 @@ private:
     void WorkerLoop();
     void CollectorLoop();
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
-    std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti);
+    std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti, const TiSequenceSnapshot* fence = nullptr);
     void LayoutLoop();
     void DrainLayoutCandidates(bool finalDrain = false, const wchar_t* before = L"layout_drain");
     bool QueueLayoutCandidate(ProcessLayoutCandidate candidate);
     bool QueueLayoutNotice(const ProcessLayoutNotice& notice);
     void ServicePendingAnalysis(const wchar_t* before = L"scanner_boundary");
     void ServiceWatchedReferences();
+    bool IsCurrentReferenceWatch(HANDLE process, const ObservationIdentity& identity) const;
     void CaptureLoop();
     void CaptureWriterLoop();
     void DrainPipelineEvents(bool finalDrain = false);
