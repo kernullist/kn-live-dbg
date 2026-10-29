@@ -86,6 +86,10 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 
 ## 저장 형식과 diff
 
+프로세스의 기본 키는 부팅 식별자·PID·생성 시각이다. EPROCESS와 세션은 선택 제약이며, 정보가 없는 관측을 매개로 서로 충돌하는 값을 합치지 않는다. 최신 원본 관측의 미확인 필드는 그대로 남기고 알려진 제약은 인덱스 안에서 별도로 유지한다. 이 제약도 보유 범위를 넘어서 영구 유지되는 것은 아니다.
+
+헌팅 참조를 받으면 원래 `observed_ms`와 별도로 `arrival_ms`·`arrival_sequence`를 기록한다. 순서가 늦거나 선택 식별자가 충돌해 최신 목록에 넣지 못하는 관측도 `kmon.receipt.v1`과 `current_disposition`에 남긴다. `receipt_history`는 최근 2,048개 수신 기록의 보유·퇴거·식별자 충돌 수를 표시한다. 현재 목록의 30초 만료는 유지되며, 이 수신 이력은 아직 메모리 보관이므로 재시작 후 복구를 보장하지 않는다. 구형 호출자의 관측 시각으로 도착 시각을 추정한 경우 `arrival_inferred=true`로 표시한다.
+
 - `kmon.surfaces.v1`: 부팅 ID, PID, 생성 시각, 수집 시각, coverage, 재개 위치, 메타데이터 행.
 - `kmon.hunt.v1`: 코드 검증 이후의 제한된 최근 사건과 페이지 관계.
 - `kmon.diff.v1`: 같은 종류의 두 스냅샷을 비교한 `newly_observed`, `changed`, `no_longer_observed`, `unchanged`.

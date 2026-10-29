@@ -23,6 +23,11 @@ inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
     out += L",\"dependency_group\":" + mcpjson::Quote(context.DependencyGroup);
     out += L",\"mapping_generation\":" + std::to_wstring(context.MappingGeneration);
     out += L",\"observed_ms\":" + std::to_wstring(context.MonotonicMs);
+    if (context.ArrivalSequence != 0)
+    {
+        out += L",\"arrival_ms\":" + mcpjson::Quote(std::to_wstring(context.ArrivalMonotonicMs));
+        out += L",\"arrival_sequence\":" + mcpjson::Quote(std::to_wstring(context.ArrivalSequence));
+    }
     out += L",\"observed_at\":" + mcpjson::Quote(std::to_wstring(context.Timestamp));
     out += L",\"reference_at\":" + mcpjson::Quote(std::to_wstring(row.ReferenceTimestamp));
     out += L",\"page_sha256\":" + mcpjson::Quote(row.PageSha256);
@@ -33,6 +38,13 @@ inline std::wstring KmonHuntReferenceJson(const KmonHuntReference& row)
     out += L",\"pfn\":" + mcpjson::Quote(std::to_wstring(context.Pfn));
     out += L",\"execution_observed\":false}";
     return out;
+}
+
+inline std::wstring KmonHuntReceiptJson(const KmonHuntReceipt& receipt)
+{
+    return L"{\"schema\":\"kmon.receipt.v1\",\"current_disposition\":" + mcpjson::Quote(receipt.Disposition) +
+        L",\"arrival_inferred\":" + std::wstring(receipt.ArrivalInferred ? L"true" : L"false") +
+        L",\"reference\":" + KmonHuntReferenceJson(receipt.Reference) + L"}";
 }
 
 inline std::wstring KmonHuntCasesJson(const std::vector<KmonHuntCase>& cases, uint64_t now, uint64_t evicted, uint64_t rejected,

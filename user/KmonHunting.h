@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <random>
 
 struct KmonHuntReference
@@ -29,6 +30,13 @@ struct KmonHuntCase
     KmonHuntReference Primary;
     KmonHuntReference Related;
     bool HasRelated = false;
+};
+
+struct KmonHuntReceipt
+{
+    KmonHuntReference Reference;
+    std::wstring Disposition;
+    bool ArrivalInferred = false;
 };
 
 struct KmonHuntFilter
@@ -188,13 +196,15 @@ public:
     {
     }
 
-    uint64_t Observe(KmonHuntReference reference)
+    uint64_t Observe(KmonHuntReference reference, uint64_t arrivalMs = 0, KmonHuntReceipt* receipt = nullptr)
     {
         AdvanceRevision();
+        if (receipt != nullptr) { *receipt = {}; }
         const auto& context = reference.Context;
         const auto& identity = context.Identity;
         if (identity.BootId.empty() || identity.BootId.size() > 128 || reference.Role.empty() || reference.Role.size() > 64 ||
-            context.MonotonicMs < LastMs || context.MonotonicMs == 0 || (reference.Address == 0 && !KmonPageRole(reference.Role)) ||
+            context.Source.size() > 128 || context.DependencyGroup.size() > 128 || context.ReferenceSource.size() > 128 ||
+            context.MonotonicMs == 0 || (reference.Address == 0 && !KmonPageRole(reference.Role)) ||
             (identity.ProcessId == 0 && reference.Address < 0xFFFF800000000000ull) ||
             (identity.ProcessId != 0 && ((reference.Address < 0x10000 && !KmonPageRole(reference.Role)) ||
                 reference.Address >= 0x0000800000000000ull)) ||
@@ -206,7 +216,47 @@ public:
             ++Rejected;
             return 0;
         }
-        LastMs = context.MonotonicMs;
+        reference.Context.ArrivalSequence = ++ArrivalSequence;
+        reference.Context.ArrivalMonotonicMs = arrivalMs == 0 ?
+            (std::max)(LastArrivalMs, context.MonotonicMs) : arrivalMs;
+        LastArrivalMs = (std::max)(LastArrivalMs, reference.Context.ArrivalMonotonicMs);
+        std::wstring disposition;
+        const uint64_t id = ObserveCurrent(reference, &disposition);
+        KmonHuntReceipt recorded{reference, disposition, arrivalMs == 0};
+        if (Receipts.size() == 2048) { Receipts.pop_front(); ++ReceiptsEvicted; }
+        Receipts.push_back(recorded);
+        if (receipt != nullptr) { *receipt = std::move(recorded); }
+        return id;
+    }
+
+    const std::deque<KmonHuntReceipt>& History() const { return Receipts; }
+    uint64_t ReceiptsEvicted = 0;
+    uint64_t IdentityConflicts = 0;
+    uint64_t IdentityStatesEvicted = 0;
+
+private:
+    uint64_t ObserveCurrent(KmonHuntReference& reference, std::wstring* disposition)
+    {
+        const auto& context = reference.Context;
+        const auto& identity = context.Identity;
+        const auto skip = [&](const wchar_t* reason)
+        {
+            *disposition = reason;
+            reference.Id = 0;
+            ++Rejected;
+            return uint64_t{0};
+        };
+        if (context.MonotonicMs > context.ArrivalMonotonicMs) { return skip(L"future_event"); }
+        if (context.MonotonicMs < LastMs || context.ArrivalMonotonicMs - context.MonotonicMs > 30000)
+        {
+            return skip(L"historical_only");
+        }
+        const auto assertion = IdentityAssertions.find(identity.CanonicalKey());
+        if (assertion != IdentityAssertions.end() && !assertion->second.CompatibleWith(identity))
+        {
+            ++IdentityConflicts;
+            return skip(L"identity_conflict");
+        }
         reference.PageComparable = reference.PageComparable && context.MappingGeneration != 0 && KmonHuntHash(reference.PageSha256);
         if (!reference.PageComparable)
         {
@@ -217,10 +267,10 @@ public:
             if (prior.Context.Identity.BootId == identity.BootId && prior.Context.Identity.ProcessId == identity.ProcessId &&
                 prior.Context.Identity.CreateTime > identity.CreateTime)
             {
-                ++Rejected;
-                return 0;
+                return skip(L"prior_process_instance");
             }
         }
+        LastMs = context.MonotonicMs;
         References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& prior)
         {
             const auto& old = prior.Context;
@@ -237,7 +287,9 @@ public:
                 reference.Id = prior->Id;
                 const uint64_t id = reference.Id;
                 References.erase(prior);
-                References.push_back(std::move(reference));
+                References.push_back(reference);
+                RememberIdentity(identity);
+                *disposition = L"current";
                 return id;
             }
         }
@@ -253,16 +305,38 @@ public:
             });
             if (KmonPageRole(reference.Role) && !KmonPageRole(oldest->Role))
             {
-                ++Rejected;
-                return 0;
+                return skip(L"current_capacity");
             }
             References.erase(oldest);
             ++Evicted;
         }
         reference.Id = ++NextId;
-        References.push_back(std::move(reference));
+        References.push_back(reference);
+        RememberIdentity(identity);
+        *disposition = L"current";
         return NextId;
     }
+
+    void RememberIdentity(const ObservationIdentity& identity)
+    {
+        const auto key = identity.CanonicalKey();
+        auto found = IdentityAssertions.find(key);
+        if (found != IdentityAssertions.end()) { found->second.MergeAssertions(identity); return; }
+        if (IdentityAssertions.size() == 512)
+        {
+            const auto unused = std::find_if(IdentityAssertions.begin(), IdentityAssertions.end(), [&](const auto& item)
+            {
+                return std::none_of(References.begin(), References.end(), [&](const auto& row)
+                {
+                    return row.Context.Identity.CanonicalKey() == item.first;
+                });
+            });
+            if (unused != IdentityAssertions.end()) { IdentityAssertions.erase(unused); ++IdentityStatesEvicted; }
+        }
+        IdentityAssertions.emplace(key, identity);
+    }
+
+public:
 
     KmonHuntQueryPage Query(uint64_t now, const KmonHuntFilter& filter = {},
         const KmonHuntQueryOptions& options = {}) const
@@ -397,6 +471,8 @@ public:
     void Retire(const ObservationIdentity& identity, uint64_t root, uint64_t slot, const std::wstring& role)
     {
         AdvanceRevision();
+        const auto assertion = IdentityAssertions.find(identity.CanonicalKey());
+        if (assertion != IdentityAssertions.end() && !assertion->second.CompatibleWith(identity)) { return; }
         References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& row)
         {
             return row.Context.Identity.SameInstance(identity) && (slot != 0 || row.Root == root) &&
@@ -414,6 +490,10 @@ private:
     uint64_t Revision = 0;
     size_t Capacity;
     uint64_t LastMs = 0;
+    uint64_t LastArrivalMs = 0;
+    uint64_t ArrivalSequence = 0;
+    std::deque<KmonHuntReceipt> Receipts;
+    std::map<ObservationIdentity::Key, ObservationIdentity> IdentityAssertions;
     uint64_t NextId = 0;
     std::vector<KmonHuntReference> References;
 };

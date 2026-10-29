@@ -31,6 +31,7 @@ struct ExecutableRegionRecord
     uint64_t LastSeenMs = 0;
     uint64_t RetiredAtMs = 0;
     bool Active = true;
+    ObservationIdentity IdentityAssertions;
     ExecutableRegionObservation Latest;
     std::map<std::wstring, ExecutableRegionObservation> Sources;
     std::set<std::wstring> DependencyGroups;
@@ -70,6 +71,16 @@ public:
         {
             ++Rejected;
             return 0;
+        }
+        ObservationIdentity assertions = observation.Context.Identity;
+        for (const auto generation : InstanceRecords(observation.Context.Identity))
+        {
+            if (!assertions.MergeAssertions(Records.at(generation).IdentityAssertions))
+            {
+                ++Rejected;
+                ++IdentityConflicts;
+                return 0;
+            }
         }
         ExecutableRegionRecord* previous = nullptr;
         for (const auto generation : InstanceRecords(observation.Context.Identity))
@@ -142,6 +153,7 @@ public:
         }
         LastSeenOrder.erase({previous->LastSeenMs, previous->Generation});
         previous->LastSeenMs = observation.Context.MonotonicMs;
+        previous->IdentityAssertions = std::move(assertions);
         previous->Latest = observation;
         previous->Latest.Context.MappingGeneration = previous->Generation;
         ByInstance[InstanceKey(observation.Context.Identity)].insert(previous->Generation);
@@ -180,7 +192,7 @@ public:
         for (const auto generation : InstanceRecords(identity))
         {
             const auto& record = Records.at(generation);
-            if (record.Active && record.Latest.Context.Identity.SameInstance(identity) &&
+            if (record.Active && record.IdentityAssertions.CompatibleWith(identity) &&
                 record.Latest.Range.Contains(address) && nowMs >= record.LastSeenMs &&
                 nowMs - record.LastSeenMs <= 30000 &&
                 (result == nullptr || record.LastSeenMs > result->LastSeenMs ||
@@ -202,7 +214,7 @@ public:
         {
             auto& record = Records.at(generation);
             const auto& old = record.Latest.Range;
-            if (record.Latest.Context.Identity.SameInstance(identity) && old.Overlaps(range))
+            if (record.IdentityAssertions.CompatibleWith(identity) && old.Overlaps(range))
             {
                 record.Active = false;
                 record.RetiredAtMs = (std::max)(record.RetiredAtMs, (std::max)(nowMs, record.LastSeenMs));
@@ -268,15 +280,14 @@ public:
     uint64_t Evicted = 0;
     uint64_t Rejected = 0;
     uint64_t StaleObservations = 0;
+    uint64_t IdentityConflicts = 0;
     uint64_t LinksEvicted = 0;
 
 private:
-    using ProcessKey = std::tuple<std::wstring, uint32_t, uint64_t>;
+    using ProcessKey = ObservationIdentity::Key;
     static ProcessKey InstanceKey(const ObservationIdentity& identity)
     {
-        // Match SameInstance's kernel special case. EPROCESS and session are
-        // optional qualifiers and must still be checked inside the bucket.
-        return {identity.BootId, identity.ProcessId, identity.ProcessId == 0 ? 0 : identity.CreateTime};
+        return identity.CanonicalKey();
     }
     const std::set<uint64_t>& InstanceRecords(const ObservationIdentity& identity) const
     {

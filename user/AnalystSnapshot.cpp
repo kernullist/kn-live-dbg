@@ -185,7 +185,12 @@ namespace
         *key += L":" + mcpjson::Quote(role) + L":" + std::to_wstring(root) + L":" +
             std::to_wstring(slot) + L":" + std::to_wstring(address);
         // Observation age and ephemeral index IDs do not constitute a changed lead.
-        for (const auto name : {L"id", L"observed_ms", L"observed_at", L"reference_at"})
+        for (const auto name : {L"arrival_ms", L"arrival_sequence"})
+        {
+            if (fields.count(name) != 0 && !Number(fields, name, &number)) { return false; }
+        }
+        if (fields.count(L"arrival_ms") != fields.count(L"arrival_sequence")) { return false; }
+        for (const auto name : {L"id", L"observed_ms", L"observed_at", L"reference_at", L"arrival_ms", L"arrival_sequence"})
         {
             fields.erase(name);
         }

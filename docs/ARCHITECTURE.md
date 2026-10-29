@@ -122,6 +122,16 @@ not a claim that collection was complete. JSONL and snapshots do not yet make
 every evicted relationship reconstructible; the
 [investigation milestone](FEATURE_PLAN.md#investigation-milestone) separates
 immutable evidence from the recent view.
+Process keys use boot identity, PID and nonzero creation time (the kernel uses
+the boot-scoped PID-zero key). Optional EPROCESS/session assertions constrain
+that key; their compatibility is not transitive. Hunting and executable-region
+reducers keep known constraints separately from the latest raw observation, so
+an unknown refresh cannot bridge conflicting known assertions. These constraints
+remain bounded by the indexes' retention, not by the lifetime of the whole boot.
+Hunting also records up to 2,048 receipts with original event time, arrival time,
+arrival sequence and current-view disposition. Delayed/conflicting receipts do
+not rewind the current view. This in-memory history reports eviction and is not
+yet a durable store; emitted receipt JSON remains subject to log collection loss.
 See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFICATION.md),
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).

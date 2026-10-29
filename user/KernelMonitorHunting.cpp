@@ -81,6 +81,12 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
     const uint64_t now = GetTickCount64();
     auto result = HuntIndex.Query(now, filter, options);
     auto json = KmonHuntQueryJson(result, filter, HuntIndex.Evicted, HuntIndex.Rejected);
+    json.pop_back();
+    json += L",\"receipt_history\":{\"retained\":" + std::to_wstring(HuntIndex.History().size()) +
+        L",\"capacity\":2048,\"evicted\":" + std::to_wstring(HuntIndex.ReceiptsEvicted) +
+        L",\"identity_conflicts\":" + std::to_wstring(HuntIndex.IdentityConflicts) +
+        L",\"identity_states_evicted\":" + std::to_wstring(HuntIndex.IdentityStatesEvicted) +
+        L",\"durable\":false}}";
     if (cases != nullptr)
     {
         *cases = result.Cases;

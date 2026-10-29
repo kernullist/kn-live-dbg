@@ -275,6 +275,8 @@ namespace
         KmonHuntCase item{L"cross_domain_content", ObservationRelation::Content, Reference(0), Reference(55), true};
         auto a = KmonHuntCasesJson({item}, 100, 0, 0);
         item.Primary.Id = 500;
+        item.Primary.Context.ArrivalSequence = 17;
+        item.Primary.Context.ArrivalMonotonicMs = 105;
         item.Primary.Context.MonotonicMs = 1000;
         item.Primary.Context.Timestamp = 133000000000000001ull;
         auto b = KmonHuntCasesJson({item}, 1000, 0, 0);

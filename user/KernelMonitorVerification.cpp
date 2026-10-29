@@ -1281,11 +1281,16 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             for (auto& pending : pendingReferences)
             {
                 auto& reference = pending.second;
-                reference.Id = HuntIndex.Observe(reference);
+                KmonHuntReceipt receipt;
+                reference.Id = HuntIndex.Observe(reference, GetTickCount64(), &receipt);
+                if (!receipt.Disposition.empty())
+                {
+                    event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_hunt_receipt"] = KmonHuntReceiptJson(receipt);
+                }
                 if (reference.Id != 0)
                 {
                     ++acceptedReferences;
-                    event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_hunt_reference"] = KmonHuntReferenceJson(reference);
+                    event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_hunt_reference"] = KmonHuntReferenceJson(receipt.Reference);
                 }
             }
         }

@@ -44,13 +44,35 @@ struct ObservationIdentity
     uint32_t SessionId = 0;
     bool SessionKnown = false;
 
-    bool SameInstance(const ObservationIdentity& other) const
+    using Key = std::tuple<std::wstring, uint32_t, uint64_t>;
+
+    bool HasCanonicalKey() const { return !BootId.empty() && (ProcessId == 0 || CreateTime != 0); }
+    Key CanonicalKey() const { return {BootId, ProcessId, ProcessId == 0 ? 0 : CreateTime}; }
+
+    bool SameCanonicalKey(const ObservationIdentity& other) const
     {
-        return !BootId.empty() && BootId == other.BootId && ProcessId == other.ProcessId &&
-            (ProcessId == 0 || (CreateTime != 0 && CreateTime == other.CreateTime)) &&
+        return HasCanonicalKey() && other.HasCanonicalKey() && CanonicalKey() == other.CanonicalKey();
+    }
+
+    // Compatibility is not transitive: an unknown assertion cannot join two
+    // conflicting known assertions. Reducers retain accumulated assertions.
+    bool CompatibleWith(const ObservationIdentity& other) const
+    {
+        return SameCanonicalKey(other) &&
             (Eprocess == 0 || other.Eprocess == 0 || Eprocess == other.Eprocess) &&
             (!SessionKnown || !other.SessionKnown || SessionId == other.SessionId);
     }
+
+    bool MergeAssertions(const ObservationIdentity& other)
+    {
+        if (!CompatibleWith(other)) { return false; }
+        if (Eprocess == 0) { Eprocess = other.Eprocess; }
+        if (!SessionKnown && other.SessionKnown) { SessionKnown = true; SessionId = other.SessionId; }
+        return true;
+    }
+
+    // Compatibility adapter for existing callers, not an equivalence relation.
+    bool SameInstance(const ObservationIdentity& other) const { return CompatibleWith(other); }
 };
 
 struct ObservationRange
@@ -161,6 +183,8 @@ struct ObservationContext
     ObservationCoverage Coverage;
     uint64_t Timestamp = 0;
     uint64_t MonotonicMs = 0;
+    uint64_t ArrivalMonotonicMs = 0;
+    uint64_t ArrivalSequence = 0;
     uint64_t MappingGeneration = 0;
     uint64_t AllocationBase = 0;
     uint64_t Pfn = 0;
@@ -185,6 +209,11 @@ inline void AppendObservationEvidence(
             std::to_wstring(context.Identity.SessionId) : L"unknown");
         evidence->emplace(L"observed_at", std::to_wstring(context.Timestamp));
         evidence->emplace(L"observed_tick_ms", std::to_wstring(context.MonotonicMs));
+        if (context.ArrivalSequence != 0)
+        {
+            evidence->emplace(L"arrival_tick_ms", std::to_wstring(context.ArrivalMonotonicMs));
+            evidence->emplace(L"arrival_sequence", std::to_wstring(context.ArrivalSequence));
+        }
         evidence->emplace(L"source", context.Source.empty() ? L"unspecified" : context.Source);
         evidence->emplace(L"dependency_group", context.DependencyGroup.empty() ? L"unspecified" : context.DependencyGroup);
         evidence->emplace(L"mapping_generation", std::to_wstring(context.MappingGeneration));
