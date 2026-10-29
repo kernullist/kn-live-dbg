@@ -16,7 +16,8 @@ class PublicContentTests(unittest.TestCase):
     def test_private_files(self):
         for name in (".env", ".env.production", "sub/.env.backup", "signing.pfx",
                      "capture.DMP", "auth.json", "mcp-endpoint.json", "sub/id_ed25519",
-                     ".build/trace.json", "sub/.kn-live-dbg/session.json", "run.log"):
+                     ".build/trace.json", "sub/.kn-live-dbg/session.json", "run.log",
+                     "capture.KNCASE", "capture.kncase.pending-123"):
             with self.subTest(name=name):
                 self.assertTrue(AUDIT.inspect(name, b"empty"))
 
@@ -24,6 +25,12 @@ class PublicContentTests(unittest.TestCase):
         text = b"KNLIVEDBG_OPENROUTER_API_KEY=sk-or-replace-me\nAPI_KEY=sk-replace-me\n"
         self.assertEqual(AUDIT.inspect(".env.example", text), [])
         self.assertEqual(AUDIT.inspect("notes.md", b"sha256=" + b"a1" * 32), [])
+
+    def test_renamed_evidence_stays_private(self):
+        data = json.dumps({"schema": "kmon.bundle.v1", "payload": {"bytes_hex": "c3"}})
+        for encoding in ("utf-8", "utf-16"):
+            self.assertIn("private-evidence-bundle",
+                          {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
     def test_real_shaped_secrets_are_not_reported_verbatim(self):
         samples = ["gh" + "p_" + "A" * 36, "sk-" + "proj-" + "B" * 50,

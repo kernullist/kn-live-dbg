@@ -102,6 +102,10 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 
 ## 검증
 
+영구 증거 저장 모듈은 `kmon.bundle.v1` 봉투와 `kmon.evidence.v1` 본문을 `.kncase` 한 파일에 저장한다. 수신 기록, 원래 검사 coverage, 수집 경로, 수집 구간과 원본 바이트를 포함하며 최대 128개 구간·구간당 4KiB·파일당 2MiB로 제한한다. 외부 조각 경로를 따라 읽지 않는다. 성공·실패·건너뛴 읽기를 구분하고, 겹치는 바이트가 서로 다르면 해당 읽기를 재구성하지 않는다. `read_set_complete`는 선언된 읽기 집합에만 적용되며 프로세스 전체 검사나 실행 관측을 뜻하지 않는다. 라이브 수집과 오프라인 명령 연결은 다음 통합 단계다.
+
+각 구간과 전체 본문의 SHA-256은 저장 내용의 일관성 검사다. 수집기의 신뢰나 공격자 부재를 인증하지 않는다. 임시 파일을 모두 쓰고 flush한 뒤 기존 파일을 덮어쓰지 않는 rename으로 공개한다. 잘린 파일, 메타데이터 모순, 알 수 없는 필드와 `.pending-*` 임시 파일은 정상 증거로 가져오지 않는다. 강제 종료 시험은 소유한 저장 프로세스에 한정하며 전원 손실·스토리지 장치 장애의 모든 결과를 보증하지 않는다. `.kncase`와 임시 파일은 Git에서 제외하고 공개 정보 검사에서도 차단한다.
+
 ```powershell
 .\tools\validate-analyst-features.ps1 -Sanitize
 .\tools\validate-analyst-features.ps1 -Configuration Debug
@@ -109,6 +113,7 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 .\tools\validate-command-audit.ps1 -Sanitize
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize
+.\tools\validate-evidence-bundle.ps1 -Sanitize
 ```
 
 하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실호스트 대조군과 별도 미검증 범위는 [검증 현황](VALIDATION.md)에서 구분한다.

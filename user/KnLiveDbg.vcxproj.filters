@@ -25,6 +25,9 @@
     <ClCompile Include="AnalystSnapshot.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="EvidenceBundle.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KernelMonitorLayout.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -256,6 +259,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AnalystSnapshot.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="EvidenceBundle.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProcessLayoutCore.h">

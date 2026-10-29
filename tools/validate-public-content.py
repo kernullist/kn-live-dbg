@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -46,7 +46,7 @@ def path_rule(name: str) -> str | None:
     base = path.name.lower()
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
-    if path.suffix.lower() in PRIVATE_EXTENSIONS:
+    if path.suffix.lower() in PRIVATE_EXTENSIONS or ".kncase.pending-" in base:
         return "private-container-or-capture"
     return None
 
@@ -82,6 +82,14 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         add("private-symbol-file")
     binary = b"\0" in data[:8192] and not data.startswith((b"\xff\xfe", b"\xfe\xff"))
     for text in text_views(data):
+        # Capture contents remain private even if the extension was changed.
+        if text.lstrip().startswith("{"):
+            try:
+                document = json.loads(text)
+                if isinstance(document, dict) and document.get("schema") == "kmon.bundle.v1":
+                    add("private-evidence-bundle")
+            except (ValueError, RecursionError):
+                pass
         for rule, pattern in RULES.items():
             for match in pattern.finditer(text):
                 add(rule, None if binary else text.count("\n", 0, match.start()) + 1)

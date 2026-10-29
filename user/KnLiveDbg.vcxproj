@@ -142,6 +142,7 @@
     <ClCompile Include="ProcessLayoutMonitor.cpp" />
     <ClCompile Include="ExecutionSurfaceScanner.cpp" />
     <ClCompile Include="AnalystSnapshot.cpp" />
+    <ClCompile Include="EvidenceBundle.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
     <ClCompile Include="GameBuildManifestGenerator.cpp" />
     <ClCompile Include="LeftoverCommon.cpp" />
@@ -205,6 +206,7 @@
   <ItemGroup>
     <ClInclude Include="AddressInspector.h" />
     <ClInclude Include="AnalystSnapshot.h" />
+    <ClInclude Include="EvidenceBundle.h" />
     <ClInclude Include="ExecutionSurfaceCore.h" />
     <ClInclude Include="ExecutionSurfaceScanner.h" />
     <ClInclude Include="AiCapabilityCatalog.h" />

@@ -132,6 +132,14 @@ Hunting also records up to 2,048 receipts with original event time, arrival time
 arrival sequence and current-view disposition. Delayed/conflicting receipts do
 not rewind the current view. This in-memory history reports eviction and is not
 yet a durable store; emitted receipt JSON remains subject to log collection loss.
+`EvidenceBundle` provides the durable boundary for the next integration stage:
+one private `.kncase` file contains a receipt, acquisition domain, original
+coverage, capture interval, and up to 128 sparse read spans of at most 4 KiB each.
+The canonical `kmon.bundle.v1` envelope hashes the payload and each raw span;
+imports reject inconsistent metadata, damaged bytes and unknown fields. A failed
+or skipped span remains an explicit hole. Publication reuses the create-new,
+flush and handle-rename path, preserving existing files and excluding pending
+files from readers. Live capture and offline commands are integrated separately.
 See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFICATION.md),
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).
