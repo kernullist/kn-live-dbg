@@ -18,7 +18,8 @@ class PublicContentTests(unittest.TestCase):
                      "capture.DMP", "auth.json", "mcp-endpoint.json", "sub/id_ed25519",
                      ".build/trace.json", "sub/.kn-live-dbg/session.json", "run.log",
                      "capture.KNCASE", "capture.kncase.pending-123", "session.knledger", "session.knledger.pending-123",
-                     "manifest.KNINDEX", "chunk.knchunk", "manifest.knindex.pending-123", "chunk.knchunk.pending-123"):
+                     "manifest.KNINDEX", "chunk.knchunk", "manifest.knindex.pending-123", "chunk.knchunk.pending-123",
+                     "types.KNSCHEMA", "types.knschema.pending-123"):
             with self.subTest(name=name):
                 self.assertTrue(AUDIT.inspect(name, b"empty"))
 
@@ -29,7 +30,7 @@ class PublicContentTests(unittest.TestCase):
 
     def test_renamed_evidence_stays_private(self):
         for schema in ("kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
-                       "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1"):
+                       "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.type_schema.v1"):
             data = json.dumps({"schema": schema, "payload": {"bytes_hex": "c3"}})
             for encoding in ("utf-8", "utf-16"):
                 self.assertIn("private-evidence-bundle",

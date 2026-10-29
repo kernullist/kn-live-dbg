@@ -24,6 +24,22 @@ has no virtual allocation. Sparse spans contain bytes only where captured.
 The command exits 0 for a complete read, 1 for unavailable/partial/failed reads,
 and 2 for invalid grammar. It opens no driver or symbol session.
 
+`KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
+private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
+DIA provider. Names are case-sensitive. It opens no live device and downloads no
+symbols. Supply locally trusted artifacts: DIA parsing is not process-isolated.
+`KnLiveDbg.exe --schema inspect <package>` verifies the stored checksum and
+bounded field relationships without loading DIA or requiring the original files.
+Both return canonical `kn.type_schema.v1` JSON on success (exit 0); invalid input,
+missing identity, unsafe paths, budget failure or output collisions exit 1.
+
+The package hash identifies the canonical payload; it does not authenticate the
+publisher. Fields have explicit path arrays, root-relative offsets, storage byte
+widths, and separate bit widths. Embedded objects expand to a bounded depth;
+pointers and arrays are retained as storage values. Gaps retain unsupported or
+unavailable layout portions. No runtime field values or kernel-object validity
+are claimed. See [schema contracts and limits](ARCHITECTURE.md#local-type-schema-packages).
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

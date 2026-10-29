@@ -194,6 +194,8 @@
     </ClCompile>
     <ClCompile Include="NativeDisassembler.cpp" />
     <ClCompile Include="SymbolEngine.cpp" />
+    <ClCompile Include="TypeSchema.cpp" />
+    <ClCompile Include="TypeSchemaGenerator.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
     <ClCompile Include="WdFilterRuntimeScanner.cpp" />
     <ClCompile Include="WfpScanner.cpp" />
@@ -315,6 +317,8 @@
     <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
     <ClInclude Include="PdbIdentity.h" />
+    <ClInclude Include="DiaTypeLayout.h" />
+    <ClInclude Include="TypeSchema.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />
     <ClInclude Include="WdFilterRuntimeScanner.h" />

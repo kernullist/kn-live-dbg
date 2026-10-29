@@ -7,6 +7,31 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Type schema checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`a45fb23e4183ab0ec3c376b97e6050efed702c0fe58e2cad47f04d46873fe71d`.
+The owned PE/PDB harness passed 52 ASan checks. It reproduces DIA `S_FALSE` for
+an ordinary member's unavailable bit position, checks ordinary/bitfield/nested
+sizes against compiler layout, and exercises exact image/PDB binding, schema
+round trips, create-new collisions, corrupt hashes, invalid extents, inheritance
+gaps and bounded recursive value expansion.
+
+The public `--schema` CLI passed 72 checks in fresh processes, including an
+independent Python payload/artifact hash calculation and malformed packages with
+recomputed hashes. One symlink case was skipped because the host could not create
+the test link. The Release build and driver-free suite passed: timeline 28,
+MCP 89, console 558, commands 2,998, remote 66 and connect arguments. Capability
+validation passed with 14 selected contracts and 261 routes. Publication-scanner
+regressions passed 10 tests, including renamed private schema packages.
+Logs are under `.build/architecture/w04-schema-*`.
+
+No driver, target image or isolated parser worker was started. The assertions
+cover local artifact identity and layout bounds, not live kernel layouts,
+trusted distribution or the still-pending parser security boundary. Existing
+LTCG alignment warnings and warnings in unchanged scanner code remain visible
+in the full build log; the build is not represented as warning-free.
+
 ## PDB identity checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

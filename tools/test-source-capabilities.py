@@ -38,6 +38,9 @@ def main():
     assert "image_verification_not_replayed" in by_key[("evidence", "replay", "bundle")]["limits"]
     assert "qualified_paging_depth" in by_key[("memory", "read_virtual", "dump")]["requirements"]
     assert "not_captured_vs_not_present" in by_key[("memory", "read_virtual", "dump")]["limits"]
+    schema = by_key[("schema", "export_type", "local_pdb")]
+    assert "exact_amd64_image_pdb_identity" in schema["requirements"]
+    assert "parser_not_isolated" in schema["limits"] and "no_runtime_qualification" in schema["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"
@@ -49,6 +52,7 @@ def main():
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
     assert "--capabilities" in help_result.stdout
+    assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout
     print(f"source capabilities passed: {len(keys)} contracts, {len(actual)} command routes")
 
 

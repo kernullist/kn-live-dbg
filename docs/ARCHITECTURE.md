@@ -312,11 +312,55 @@ DbgHelp/DIA serialization lock remain in place.
 
 GUID/age matching prevents ordinary wrong-build and replaced-cache confusion;
 it is not a content hash, an approved distribution signature or collector
-authentication. Immutable schema packages, full loaded-image identity binding,
-isolated untrusted parsing and symbol acquisition deadlines remain separate work.
+authentication. Full loaded-image identity binding, isolated untrusted parsing
+and symbol acquisition deadlines remain separate work.
 `tools/validate-pdb-identity.ps1 -Sanitize` compiles two owned PE/PDB pairs and
 checks the actual DIA provider against matching, wrong-age, wrong-PDB and cache
 replacement controls without loading a driver or target image.
+
+### Local type schema packages
+
+`--schema create <image> <pdb> <exact-type> <new-output>` exports one AMD64 UDT
+as private `kn.type_schema.v1` JSON, normally a `.knschema` file. The operation
+runs before controller construction and uses only the supplied local artifacts
+and the packaged DIA DLL. It performs no symbol download or live memory read.
+`--schema inspect <package>` checks and reconstructs the package without DIA.
+Existing successful layout caches and the DbgHelp lock remain in use.
+
+The package records PE/PDB/provider SHA-256, PE machine and image size, canonical
+PDB GUID (32 hexadecimal digits) and age, provider file version, root size and
+explicit field path arrays. Offsets are bytes from the root; storage sizes are
+bytes, while bit positions and widths are bits. Symbol tags and base-type codes
+use the DIA contract. Ordinary members have zero bit width. Embedded UDT fields
+can expand to eight path components; pointer values and array storage are leaves.
+Base classes, unsupported field types and depth limits remain explicit gaps.
+Unavailable member properties create a gap on their containing path. Bounds
+cover each field's root and embedded parent; unions may intentionally overlap.
+
+`DiaTypeLayout` also serves the existing DIA fallback. It requires `S_OK` for
+offset/size properties and uses `LocIsBitField` to distinguish units. Previously,
+`SUCCEEDED(get_bitPosition(...))` treated an unavailable `S_FALSE` property as a
+bitfield at bit zero. Actual compiler-generated PDB controls reproduce that case
+and compare the corrected offsets, storage and bit widths with C++ layout.
+
+Generation holds read-only, no-write/no-delete leases on local regular files,
+rejects final reparse points and device/stream paths, and rechecks identities and
+content after parsing. Limits are 512 MiB PE, 1 GiB PDB, 64 MiB provider, 8,192
+direct DIA data members, 4,096 package fields/gaps, 16 MiB root/type extent and
+2 MiB serialized output. Hashing and recursive traversal check cooperative
+30-second budgets; an individual synchronous I/O or DIA call is not interruptible.
+The existing create-new, flush-and-rename writer preserves output collisions.
+Inspection accepts only canonical versioned JSON with its payload SHA-256 and
+valid path/extent/expansion relationships; a self-consistent hash is not approval.
+
+These are layout packages, not runtime object validation or authenticated symbol
+distribution. Their contract explicitly records `parser_isolated=false`,
+`runtime_invariants_checked=false` and `trusted_distribution=false`. Generation
+still runs DIA in the offline command process, so only locally trusted artifacts
+should be supplied until the isolated broker is implemented. Attaching package
+hashes to every typed observation, supported-build fixture attestations and
+broker isolation remain open. Files and renamed JSON packages are excluded from
+public source publication by the repository's sensitive-content gate.
 
 ## Offline dump observation source
 

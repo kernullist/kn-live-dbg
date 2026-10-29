@@ -1,5 +1,8 @@
 #include "../user/PdbIdentity.h"
 #include "../user/ExecutableImage.h"
+#include "../user/DiaTypeLayout.h"
+#include "../user/TypeSchema.h"
+#include "pdb-identity-fixture.h"
 #include <wrl/client.h>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +74,52 @@ int wmain(int argc, wchar_t** argv)
         auto source = fresh();
         Check(symbol_identity::LoadMatchingPdb(source.Get(), aPdb.wstring(), expectedA) == S_OK,
             "matching image/PDB identity loads successfully");
+        ComPtr<IDiaSession> session;
+        ComPtr<IDiaSymbol> global;
+        ComPtr<IDiaEnumSymbols> types;
+        ComPtr<IDiaSymbol> type;
+        ULONG fetched = 0;
+        Check(source && source->openSession(&session) == S_OK && session &&
+            session->get_globalScope(&global) == S_OK && global &&
+            global->findChildren(SymTagUDT, L"PdbIdentityFixture", nsCaseSensitive, &types) == S_OK && types &&
+            types->Next(1, &type, &fetched) == S_OK && fetched == 1 && type,
+            "owned fixture type is available");
+        TypeLayoutInfo layout;
+        Check(dia_layout::ReadLayout(type.Get(), &layout) && layout.Size == sizeof(PdbIdentityFixture) &&
+            layout.FieldsComplete && layout.UnavailableFields == 0, "DIA type size matches compiler layout");
+        const auto field = [&](const wchar_t* name) -> const TypeFieldInfo*
+        {
+            for (const auto& item : layout.Fields)
+            {
+                if (item.Name == name)
+                {
+                    return &item;
+                }
+            }
+            return nullptr;
+        };
+        const auto value = field(L"Value"), flags = field(L"Flags"), reserved = field(L"Reserved");
+        const auto nested = field(L"Nested"), pointer = field(L"Next");
+        Check(value && !value->IsBitField && value->Offset == offsetof(PdbIdentityFixture, Value) &&
+            value->Length == sizeof(PdbIdentityFixture::Value), "ordinary member offset and byte width are exact");
+        Check(flags && flags->IsBitField && flags->Length == 3 && flags->BitPosition == 0 &&
+            flags->StorageLength == sizeof(unsigned int) && reserved && reserved->IsBitField &&
+            reserved->Length == 5 && reserved->BitPosition == 3, "bit widths are distinct from storage byte widths");
+        Check(nested && !nested->IsBitField && nested->Length == sizeof(PdbNestedFixture) &&
+            nested->Offset == offsetof(PdbIdentityFixture, Nested) && pointer && !pointer->IsBitField &&
+            pointer->Length == sizeof(void*) && field(L"StaticValue") == nullptr,
+            "embedded types and pointer widths are exact and static data is excluded");
+        ComPtr<IDiaEnumSymbols> values;
+        ComPtr<IDiaSymbol> rawValue;
+        DWORD unavailablePosition = 0;
+        fetched = 0;
+        Check(type && type->findChildren(SymTagData, L"Value", nsCaseSensitive, &values) == S_OK && values &&
+            values->Next(1, &rawValue, &fetched) == S_OK && fetched == 1 && rawValue &&
+            rawValue->get_bitPosition(&unavailablePosition) == S_FALSE && SUCCEEDED(S_FALSE),
+            "old SUCCEEDED bit-position test accepts an unavailable property");
+        TypeFieldInfo rejected;
+        Check(dia_layout::ReadMember(rawValue.Get(), 1, &rejected) == dia_layout::MemberState::Unavailable,
+            "out-of-bounds member cannot become a typed field");
     }
     {
         auto source = fresh();
@@ -140,6 +189,76 @@ int wmain(int argc, wchar_t** argv)
         !symbol_identity::ModuleRecordMatches(record, 0x140010000, 0x1000) &&
         !symbol_identity::ModuleRecordMatches(record, 0x140000000, 0x2000),
         "module base and known image size cannot silently reuse a stale symbol record");
+    TypeSchemaPackage package;
+    Check(GenerateTypeSchema(aImage.wstring(), aPdb.wstring(), L"PdbIdentityFixture", argv[1], &package, &error),
+        "standalone package binds exact input and provider content");
+    Check(package.TypeBytes == sizeof(PdbIdentityFixture) && package.PdbAge == a.PdbAge && package.Gaps.empty(),
+        "package uses compiler size and does not invent missing fields");
+    const TypeSchemaField* nestedCounter = nullptr;
+    bool followedPointer = false;
+    for (const auto& f : package.Fields)
+    {
+        if (f.Path == std::vector<std::wstring>{L"Nested", L"Counter"})
+        {
+            nestedCounter = &f;
+        }
+        followedPointer = followedPointer || (f.Path.size() > 1 && f.Path.front() == L"Next");
+    }
+    Check(nestedCounter && nestedCounter->Offset == offsetof(PdbIdentityFixture, Nested) + offsetof(PdbNestedFixture, Counter) &&
+        nestedCounter->StorageBytes == sizeof(PdbNestedFixture::Counter) && !followedPointer,
+        "nested paths have compiler offsets while pointers remain values");
+    const auto json = TypeSchemaJson(package);
+    TypeSchemaPackage loaded;
+    Check(!json.empty() && ParseTypeSchema(json, &loaded, &error) && TypeSchemaJson(loaded) == json,
+        "canonical package survives a DTO round trip");
+    const auto saved = root / L"fixture.knschema";
+    Check(SaveTypeSchema(saved.wstring(), package, &error) && !SaveTypeSchema(saved.wstring(), package, &error) &&
+        LoadTypeSchema(saved.wstring(), &loaded, &error) && TypeSchemaJson(loaded) == json,
+        "atomic publication refuses collisions and retains original package");
+    auto invalid = package;
+    invalid.Fields.front().StorageBytes = UINT64_MAX;
+    Check(!ValidateTypeSchema(invalid, nullptr) && TypeSchemaJson(invalid).empty(), "overflowing field extent rejected");
+    invalid = package;
+    invalid.Fields.push_back(invalid.Fields.front());
+    Check(!ValidateTypeSchema(invalid, nullptr), "duplicate field path rejected");
+    invalid = package;
+    invalid.Fields.front().BitPosition = invalid.Fields.front().StorageBytes * 8;
+    invalid.Fields.front().BitWidth = 1;
+    Check(!ValidateTypeSchema(invalid, nullptr), "bitfield outside storage rejected");
+    invalid = package;
+    for (auto& f : invalid.Fields)
+    {
+        if (f.Path == std::vector<std::wstring>{L"Nested", L"Counter"})
+        {
+            f.Offset = 0;
+        }
+    }
+    Check(!ValidateTypeSchema(invalid, nullptr), "child outside embedded parent rejected");
+    std::wstring changed = json;
+    const auto digestStart = changed.find(L"package_sha256\":\"");
+    if (digestStart != std::wstring::npos)
+    {
+        changed[digestStart + 17] = changed[digestStart + 17] == L'a' ? L'b' : L'a';
+    }
+    Check(!ParseTypeSchema(changed, &loaded, &error), "changed envelope digest rejected");
+    Check(!ParseTypeSchema(json + L" ", &loaded, &error) &&
+        !ParseTypeSchema(L"{\"unknown\":true," + json.substr(1), &loaded, &error),
+        "canonical reader rejects trailing bytes and unknown fields");
+    Check(!GenerateTypeSchema(aImage.wstring(), bPdb.wstring(), L"PdbIdentityFixture", argv[1], &loaded, &error),
+        "wrong-build PDB cannot generate a schema package");
+    Check(!GenerateTypeSchema(aImage.wstring(), aPdb.wstring(), L"MissingType", argv[1], &loaded, &error),
+        "missing type cannot generate an empty success package");
+    Check(!GenerateTypeSchema(aImage.wstring(), aPdb.wstring(), L"pdbidentityfixture", argv[1], &loaded, &error),
+        "type selection preserves exact case");
+    Check(!GenerateTypeSchema(aImage.wstring(), aPdb.wstring() + std::wstring(1, L'\0') + L"suffix",
+        L"PdbIdentityFixture", argv[1], &loaded, &error), "embedded NUL input path rejected");
+    Check(GenerateTypeSchema(aImage.wstring(), aPdb.wstring(), L"PdbDerivedFixture", argv[1], &loaded, &error) &&
+        loaded.Fields.size() == 1 && loaded.Fields.front().Offset == sizeof(PdbNestedFixture) &&
+        loaded.Gaps.size() == 1 && loaded.Gaps.front().Reason == L"base_classes_not_expanded",
+        "inherited layout is explicitly partial, not silently complete");
+    Check(GenerateTypeSchema(aImage.wstring(), aPdb.wstring(), L"PdbDepthFixture<10>", argv[1], &loaded, &error) &&
+        loaded.Fields.size() == TypeSchemaMaxDepth && loaded.Gaps.size() == 1 &&
+        loaded.Gaps.front().Reason == L"depth_limit", "nested value expansion stops at the declared depth cap");
     factory.Reset();
     FreeLibrary(provider);
     CoUninitialize();

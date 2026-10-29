@@ -1,15 +1,9 @@
-#ifndef FIXTURE_VARIANT
-#define FIXTURE_VARIANT 1
-#endif
-
-struct PdbIdentityFixture
-{
-    unsigned long Version;
-    unsigned char Padding[FIXTURE_VARIANT * 16];
-    unsigned long long Value;
-};
+#include "pdb-identity-fixture.h"
 
 __declspec(dllexport) volatile PdbIdentityFixture FixtureValue{};
+unsigned long PdbIdentityFixture::StaticValue = 42;
+__declspec(dllexport) volatile PdbDerivedFixture DerivedValue{};
+__declspec(dllexport) volatile PdbDepthFixture<10> DeepValue{};
 
 int main()
 {

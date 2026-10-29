@@ -17,7 +17,8 @@ if ($Sanitize) {
 }
 $program = Join-Path $output 'pdb-identity-selftest.exe'
 $fixture = Join-Path $repo 'tools\pdb-identity-fixture.cpp'
-$sources = @('tools\pdb-identity-selftest.cpp', 'user\ExecutableImage.cpp') |
+$sources = @('tools\pdb-identity-selftest.cpp', 'user\ExecutableImage.cpp', 'user\TypeSchema.cpp',
+    'user\TypeSchemaGenerator.cpp', 'user\AnalystSnapshot.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $commands = @('@echo off', ('call "{0}" >nul' -f $environment.VcVarsPath))
 foreach ($item in @(@('a', 1), @('b', 2))) {

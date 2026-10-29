@@ -66,6 +66,7 @@
 #include "IdtScanner.h"
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
+#include "TypeSchema.h"
 #include "UserModeHunter.h"
 #include "VbsScanner.h"
 #include "WdFilterRuntimeScanner.h"
@@ -53200,6 +53201,9 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest verify <manifest> <image>\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest self-test\n";
+        std::wcout << L"  KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>\n";
+        std::wcout << L"  KnLiveDbg.exe --schema inspect <package>\n";
+        std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
         std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
         std::wcout << L"            connect-argv, all, platform-query, cloudfiles-query <path>,\n";
@@ -53227,6 +53231,10 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
     {
         return RunGameManifestCommand(argc, argv);
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--schema")
+    {
+        return RunTypeSchemaCommand(argc, argv);
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
     {

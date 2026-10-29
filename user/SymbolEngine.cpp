@@ -1,5 +1,6 @@
 #include "SymbolEngine.h"
 #include "PdbIdentity.h"
+#include "DiaTypeLayout.h"
 #include "ExecutableImage.h"
 
 #include <dia2.h>
@@ -2510,98 +2511,23 @@ bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t p
                 continue;
             }
 
-            ULONG fetched = 0;
-            TypeLayoutInfo local = {};
+            TypeLayoutInfo local;
+            if (!dia_layout::ReadLayout(udt, &local, DiaDescribeType))
+            {
+                lastError = L"DIA type members are unavailable, out of bounds, or exceed the layout limit";
+                ReleaseCom(udt);
+                ReleaseCom(udtEnum);
+                ReleaseCom(global);
+                ReleaseCom(session);
+                ReleaseCom(source);
+                continue;
+            }
             local.Name = typeName;
             local.ModuleBase = module.Base;
-            local.TypeId = 0;
-            local.Size = 0;
-
-            ULONGLONG typeLength = 0;
-            if (SUCCEEDED(udt->get_length(&typeLength)))
+            for (auto& field : local.Fields)
             {
-                local.Size = typeLength;
+                field.ModuleBase = module.Base;
             }
-
-            IDiaEnumSymbols* dataEnum = nullptr;
-            hr = udt->findChildren(SymTagData, nullptr, nsNone, &dataEnum);
-            if (SUCCEEDED(hr) && dataEnum != nullptr)
-            {
-                while (true)
-                {
-                    IDiaSymbol* data = nullptr;
-                    fetched = 0;
-                    hr = dataEnum->Next(1, &data, &fetched);
-                    if (FAILED(hr) || fetched != 1 || data == nullptr)
-                    {
-                        ReleaseCom(data);
-                        break;
-                    }
-
-                    TypeFieldInfo field = {};
-                    field.ModuleBase = module.Base;
-                    field.TypeId = 0;
-                    field.ChildTypeId = 0;
-                    field.Offset = 0;
-                    field.Length = 0;
-                    field.Tag = SymTagData;
-                    field.ChildTag = 0;
-                    field.BaseType = 0;
-                    field.IsBitField = false;
-                    field.BitPosition = 0;
-                    field.Name = DiaSymbolName(data);
-
-                    LONG offset = 0;
-                    if (FAILED(data->get_offset(&offset)) || offset < 0 || field.Name.empty())
-                    {
-                        ReleaseCom(data);
-                        continue;
-                    }
-
-                    field.Offset = static_cast<ULONG>(offset);
-
-                    ULONGLONG dataLength = 0;
-                    if (SUCCEEDED(data->get_length(&dataLength)))
-                    {
-                        field.Length = dataLength;
-                    }
-
-                    DWORD bitPosition = 0;
-                    if (SUCCEEDED(data->get_bitPosition(&bitPosition)))
-                    {
-                        field.IsBitField = true;
-                        field.BitPosition = bitPosition;
-                    }
-
-                    IDiaSymbol* dataType = nullptr;
-                    if (SUCCEEDED(data->get_type(&dataType)) && dataType != nullptr)
-                    {
-                        DWORD childTag = 0;
-                        dataType->get_symTag(&childTag);
-                        field.ChildTag = childTag;
-                        dataType->get_baseType(&field.BaseType);
-                        if (field.Length == 0 || !field.IsBitField)
-                        {
-                            ULONGLONG childLength = 0;
-                            if (SUCCEEDED(dataType->get_length(&childLength)))
-                            {
-                                field.Length = childLength;
-                            }
-                        }
-                        field.TypeName = DiaDescribeType(dataType, 0);
-                    }
-                    ReleaseCom(dataType);
-
-                    if (field.TypeName.empty())
-                    {
-                        field.TypeName = L"<unknown>";
-                    }
-
-                    local.Fields.push_back(field);
-                    ReleaseCom(data);
-                }
-            }
-            ReleaseCom(dataEnum);
 
             std::sort(
                 local.Fields.begin(),
@@ -2696,6 +2622,8 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
         layout->TypeId = typeId;
         layout->Size = 0;
         layout->Fields.clear();
+        layout->FieldsComplete = false;
+        layout->UnavailableFields = 0;
 
         // Nested field walks (ETHREAD UniqueThread, dotted EPROCESS paths) pass
         // ChildTypeId values that are often pointers, arrays, or typedefs.

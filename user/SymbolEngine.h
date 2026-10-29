@@ -41,6 +41,7 @@ struct TypeFieldInfo
     DWORD BaseType = 0;
     bool IsBitField = false;
     ULONG BitPosition = 0;
+    ULONG64 StorageLength = 0;
 };
 
 struct TypeLayoutInfo
@@ -50,6 +51,9 @@ struct TypeLayoutInfo
     ULONG TypeId = 0;
     ULONG64 Size = 0;
     std::vector<TypeFieldInfo> Fields;
+    // Data-member coverage only; providers without an explicit result leave it false.
+    bool FieldsComplete = false;
+    uint32_t UnavailableFields = 0;
 };
 
 struct TypeMatchInfo
