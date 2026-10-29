@@ -634,6 +634,9 @@
     <ClInclude Include="ObservationModel.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessObservationSource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ObservationWindows.h">
       <Filter>Header Files</Filter>
     </ClInclude>

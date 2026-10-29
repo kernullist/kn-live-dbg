@@ -30,6 +30,7 @@ struct ObservationSourceCapabilities
     AddressSpaceDescriptor AddressSpace;
     uint32_t MaximumReadBytes = 4096;
     bool KernelOnly = false;
+    bool UserOnly = false;
     bool MayChangeResidency = false;
 };
 
@@ -101,6 +102,7 @@ public:
             if (request.Length == 0 || request.Length > 4096 || request.Length > caps.MaximumReadBytes ||
                 request.Address > UINT64_MAX - request.Length ||
                 !caps.AddressSpace.Valid() ||
+                (caps.UserOnly && !caps.AddressSpace.UserRange(request.Address, request.Length)) ||
                 (!caps.AddressSpace.KernelRange(request.Address, request.Length) &&
                     (caps.KernelOnly || !caps.AddressSpace.UserRange(request.Address, request.Length))))
             {
@@ -214,6 +216,7 @@ inline bool ReadObservationRange(IObservationSource& source, uint64_t address, s
     bytes->clear();
     const auto caps = source.Capabilities();
     if (length == 0 || length > 0x20000 || length > byteBudget || caps.MaximumReadBytes == 0 ||
+        (caps.UserOnly && !caps.AddressSpace.UserRange(address, length)) ||
         address > UINT64_MAX - length || (!caps.AddressSpace.KernelRange(address, length) &&
             (caps.KernelOnly || !caps.AddressSpace.UserRange(address, length))))
     {

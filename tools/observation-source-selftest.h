@@ -79,6 +79,14 @@ namespace observation_source_test
         check(controlled.Read(request).State == ObservationReadState::Unsupported, "kernel source cannot read a collector user VA");
         controlled.Caps.KernelOnly = false;
         std::vector<uint8_t> bytes{1};
+        controlled.Caps.UserOnly = true;
+        request.Address = 0xffff800000001000ull;
+        const auto beforeUserOnly = controlled.Calls;
+        check(controlled.Read(request).State == ObservationReadState::Unsupported &&
+            !ReadObservationRange(controlled, request.Address, 64, &bytes, 64, true) && bytes.empty() &&
+            controlled.Calls == beforeUserOnly, "user source rejects kernel ranges before provider invocation");
+        controlled.Caps.UserOnly = false;
+        request.Address = 0x11000;
         const auto beforeLarge = controlled.Calls;
         check(ReadObservationRange(controlled, 0x11000, 8193, &bytes, 8193, true) &&
             bytes.size() == 8193 && controlled.Calls == beforeLarge + 3, "IRP-sized reads use bounded chunks without losing coverage");

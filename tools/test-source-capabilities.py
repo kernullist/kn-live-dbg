@@ -64,6 +64,9 @@ def main():
     assert "returned_operation_id" in operation["requirements"]
     assert "no_effect_verification_or_rollback" in operation["limits"]
     assert "no_idempotent_resubmission" in operation["limits"]
+    process_source = by_key[("memory", "read_virtual", "process_handle")]
+    assert "expected_pid_create_time" in process_source["requirements"]
+    assert "no_liveness_or_atomic_snapshot_claim" in process_source["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

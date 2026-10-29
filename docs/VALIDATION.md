@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process-handle observation source checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`cd02b63efc70d9a1320efec8113d4d049e2baba0f6dfa0a4dce7855de8bf00ce`.
+The actual Win32 source passed 23 ASan controls and six independent JSON
+observations. Owned-page checks cover retained handle ownership after caller
+closure, exact PID/creation identity, unchanged access rights, required residency
+consent, cancellation, budgets, user-only admission, inaccessible/partial reads,
+multi-chunk discard and 512 successful plus 512 rejected constructor lifetimes
+without a handle-count increase. The source does not assert current liveness.
+
+Shared-source regressions passed 522 ASan evidence controls and eight interrupted
+publications (four valid final bundles, four absent), with restart reads.
+The dump source passed 107 ASan controls and 102 public CLI assertions; one
+symlink control was skipped by the environment. The additive native-status JSON
+field remained compatible with these owned dump inputs. Release and native
+suites passed timeline 28, MCP 102, console 558, commands 3,000, remote 66 and
+connect arguments. Capabilities passed 24 selected contracts/261 routes.
+Publication-scanner regression code and inputs are unchanged from the preceding
+ten-test corpus checkpoint; the prospective index is scanned separately.
+
+Review required RAII ownership even if constructor string allocation throws,
+rejected kernel addresses before invoking the provider, preserved original
+Win32 errors and cleared failed assembled bytes. A first multi-file patch used
+a missing project-filter anchor and applied no changes; the corrected patch
+was built and tested. No additional actionable defects were found in the
+reviewed scope. Logs are under `.build/architecture/w03-process-*`, including
+`-source-first`, `-bundle-regression`, `-dump-regression`, `-dump-cli`,
+`-build-first`, `-native-all` and `-capabilities`. Existing compiler/LTCG warnings
+remain. No driver or external target was used. The selected native image-reader
+integration was compiled, but its live scanner/native-fallback behavior,
+protected processes, real LA57 and full recipe publication remain unvalidated.
+
 ## Corpus evaluator checkpoint: 2026-10-30
 
 The Python 3.11 evaluator passed 13 test groups with independently specified

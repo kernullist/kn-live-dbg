@@ -246,6 +246,7 @@
     <ClInclude Include="ObservationSourceJson.h" />
     <ClInclude Include="BundleObservationSource.h" />
     <ClInclude Include="NativeObservationSource.h" />
+    <ClInclude Include="ProcessObservationSource.h" />
     <ClInclude Include="SessionWritePolicy.h" />
     <ClInclude Include="CommandInput.h" />
     <ClInclude Include="CommandAuditSelfTest.inl" />

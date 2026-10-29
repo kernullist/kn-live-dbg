@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "ProcessObservationSource.h"
 #include "PendingIrpReport.h"
 #include "KmonImportResolver.h"
 
@@ -19405,19 +19406,27 @@ void KernelMonitor::ScanUserModeHostility()
             ProcessAddressContext imageReadContext{};
             bool imageReadContextTried = false;
             bool imageReadContextValid = false;
+            ProcessObservationSource processImageSource(processHandle, codeIdentity.ProcessId,
+                codeIdentity.CreateTime, device != nullptr && device->IsOpen() ? device->AddressSpace() : AddressSpaceDescriptor{});
             const ObservationReader imageReader = [&](
                 uint64_t address, size_t size, std::vector<uint8_t>* bytes)
             {
-                if (size > 4096 || address > UINT64_MAX - size || codeIdentity.CreateTime == 0)
+                if (bytes == nullptr)
                 {
                     return false;
                 }
-                bytes->resize(size);
-                SIZE_T read = 0;
-                if (processHandle != nullptr && ReadProcessMemory(processHandle,
-                    reinterpret_cast<LPCVOID>(address), bytes->data(), size, &read) && read == size)
+                bytes->clear();
+                if (size == 0 || size > 4096 || address > UINT64_MAX - size || codeIdentity.CreateTime == 0)
+                {
+                    return false;
+                }
+                if (ReadObservationExact(processImageSource, address, size, bytes, true))
                 {
                     return true;
+                }
+                if (device == nullptr || symbols == nullptr || !device->IsOpen())
+                {
+                    return false;
                 }
                 if (!imageReadContextTried)
                 {

@@ -185,6 +185,27 @@ API does not expose it. Pending-IRP parsing uses bounded chunks up to its existi
 branches of execution-reference parsing use the same interface. Physical-page
 and user-process fallbacks retain their existing collectors.
 
+`ProcessObservationSource` now supplies the handle-based branch of the user
+image comparison reader. It owns a non-inheritable duplicate of the supplied
+process handle, preserves its access rights, and matches the expected PID and
+creation time before and after each `ReadProcessMemory` call. Closing the
+caller's handle cannot redirect a retained source to a reused handle value.
+Its source identity includes the collector and target process generations and
+the declared user address shape. It does not qualify target object layouts,
+WOW64/JIT semantics, address-space mapping epochs or boot/VM identity.
+
+This source admits user ranges only, requires explicit residency consent, and
+discards every failed or short copy. A failed later chunk also discards the
+earlier assembled bytes. Original Win32 read status is retained; the common
+read JSON exposes `native_status` as an integer or null when unavailable.
+Creation-time matching is not proof that a process remains alive:
+[`GetProcessTimes` exit time is undefined for a live process](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes).
+The owned handle identifies the object; reads still may fail after exit or
+mapping/protection changes, and cancellation cannot interrupt the synchronous
+Win32 call. The existing PID/EPROCESS/creation-qualified native fallback remains
+separate. These branches do not yet publish a unified per-read receipt or native
+verification recipe. Other user-process readers retain their previous paths.
+
 `BundleObservationSource` owns an immutable copy of a validated v1 bundle and
 binds its ID to the canonical payload hash, including identity and captured bytes.
 Replay uses this source with the existing code-target parser. Conflicting valid
@@ -195,12 +216,20 @@ authenticity. New timing fields measure replay access, not original capture time
 Native virtual reads can change residency, as described by
 [MmCopyMemory](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-mmcopymemory).
 Migrated collectors explicitly opt in to preserve their prior behavior. This
-does not implement the separate driver-enforced observe/collect policy. Dump,
-DbgEng, user-process and translation adapters, operation-wide deadlines and
-identity revalidation remain open work. The evidence harness exercises the same
+does not implement the separate driver-enforced observe/collect policy. The
+qualified dump adapter is described later in this file. DbgEng, broader
+user-process/translation migration, operation-wide deadlines and target-object
+lifetime qualification remain open work. The evidence harness exercises the same
 target parser on owned current-process memory and stored bytes, alongside sparse,
 conflict, budget, cancellation, source-change and multi-chunk failure controls;
 that test does not validate a live kernel target.
+
+`tools/validate-process-source.ps1 -Sanitize` exercises the actual Win32 adapter
+against owned pages and handles: caller-handle closure, missing access,
+identity mismatch, denied collection, cancellation, sparse/protected pages,
+discarded partial reads and handle cleanup. Its independent JSON oracle checks
+status/identity/side-effect fields without treating test assertions as malware
+samples or as evidence of actual LA57, HVCI or protected-process support.
 
 This describes main at the [documented source revision](README.md), including
 changes after v0.0.36. For operator syntax use
