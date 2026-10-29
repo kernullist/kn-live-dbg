@@ -28,6 +28,7 @@
 #include "KmonPlatformEvidence.h"
 #include "ExecutionSurfaceScanner.h"
 #include "AnalystSnapshot.h"
+#include "EvidenceInvestigation.h"
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -23026,6 +23027,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon surfaces <pid> [/json] [/save path] [/module-start N] [/handle-start N]\n";
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
+    std::wcout << L"  !kmon evidence <directory> [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
+    std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
     std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
     std::wcout << L"  Event categories are observation, lead, coverage, and sensor. Kind names are\n";
@@ -23357,6 +23360,94 @@ static bool ParseKmonStartArgs(
     return true;
 }
 
+static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
+{
+    if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
+    {
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon evidence|replay|why <path> [options]\n";
+        return 2;
+    }
+    const auto action = ToLower(args[1]);
+    if (action == L"evidence")
+    {
+        KmonHuntFilter filter;
+        KmonHuntQueryOptions options;
+        bool jsonOutput = false;
+        bool valid = args.size() >= 3 && !args[2].empty();
+        std::set<std::wstring> seen;
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            if (!seen.insert(option).second) { valid = false; break; }
+            if (option == L"/json") { jsonOutput = true; }
+            else if ((option == L"/pid" || option == L"/role" || option == L"/limit" || option == L"/cursor") &&
+                i + 1 < args.size() && !args[i + 1].empty())
+            {
+                const auto value = args[++i];
+                uint64_t number = 0;
+                if (option == L"/pid")
+                {
+                    valid = ParseUnsigned(value, 10, &number) && number <= UINT32_MAX;
+                    filter.HasPid = true; filter.ProcessId = static_cast<uint32_t>(number);
+                }
+                else if (option == L"/limit")
+                {
+                    valid = ParseUnsigned(value, 10, &number) && number >= 1 && number <= 256;
+                    options.Limit = static_cast<size_t>(number);
+                }
+                else if (option == L"/role") { valid = value.size() <= 128 && value.front() != L'/'; filter.Role = value; }
+                else { valid = value.size() <= 1200 && value.front() != L'/'; options.Cursor = value; }
+            }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"!kmon evidence: usage: !kmon evidence <directory> [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json]\n";
+            return 2;
+        }
+        const auto result = QueryEvidenceDirectory(args[2], filter, options);
+        if (jsonOutput) { std::wcout << EvidenceQueryJson(result, filter) << L"\n"; return result.Status == L"ok" ? 0 : 1; }
+        for (const auto& row : result.Cases)
+        {
+            std::wcout << L"[kmon.evidence] " << row.FileName << L" pid=" << row.Receipt.Reference.Context.Identity.ProcessId
+                << L" role=" << row.Receipt.Reference.Role << L" at_receipt=" << row.Receipt.Disposition
+                << L" read_set_complete=" << row.ReadSetComplete << L"\n";
+        }
+        std::wcout << L"[kmon.evidence.summary] status=" << result.Status << L" matched=" << result.Matched
+            << L" returned=" << result.Cases.size() << L" invalid_files=" << result.InvalidFiles
+            << L" inventory_complete=" << result.InventoryComplete << L" unclosed_collections=" << result.UnclosedCollections
+            << L" unavailable_written_bundles=" << result.UnavailableWrittenBundles << L" collection_complete=false\n";
+        if (!result.NextCursor.empty()) { std::wcout << L"[kmon.evidence] next_cursor=" << result.NextCursor << L"\n"; }
+        return result.Status == L"ok" ? 0 : 1;
+    }
+    if (action == L"replay" || action == L"why")
+    {
+        if (args.size() < 3 || args.size() > 4 || args[2].empty() || (args.size() == 4 && ToLower(args[3]) != L"/json"))
+        {
+            std::wcerr << L"!kmon " << action << L": usage: !kmon " << action << L" <file.kncase> [/json]\n";
+            return 2;
+        }
+        EvidenceBundle bundle;
+        std::wstring error, digest;
+        if (!LoadEvidenceBundle(args[2], &bundle, &error, &digest)) { std::wcerr << L"!kmon " << action << L": " << error << L"\n"; return 1; }
+        const auto result = ReplayEvidence(bundle);
+        if (args.size() == 4) { std::wcout << EvidenceReplayJson(bundle, result, digest) << L"\n"; return result.Gaps.empty() ? 0 : 1; }
+        std::wcout << L"[kmon." << action << L"] evidence=" << digest << L" acquisition=" << bundle.Acquisition
+            << L" slot=" << result.Slot << L" page_digest=" << result.PageDigest << L" termination=" << result.Chain.Termination << L"\n";
+        for (const auto& hop : result.Chain.Hops)
+        {
+            std::wcout << L"  stored_head=" << HexText(hop.Address) << L" target=" << HexText(hop.Target) << L" bytes=" << hop.Bytes.size() << L"\n";
+        }
+        for (const auto& gap : result.Gaps) { std::wcout << L"  gap=" << gap << L"\n"; }
+        std::wcout << L"  stored static facts only; execution_observed=false communication_proven=false actor_attributed=false\n"
+            << L"  Missing requirements: trusted reference image, execution telemetry, authenticated acquisition, independent attribution evidence.\n";
+        return result.Gaps.empty() ? 0 : 1;
+    }
+
+    std::wcerr << L"usage: --offline permits only !kmon evidence, replay, or why\n";
+    return 2;
+}
+
 static void HandleKmonCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
@@ -23666,6 +23757,9 @@ static void HandleKmonCommand(
             std::wcout << L"  capture_queued=" << stats.CaptureQueued
                        << L" pending=" << stats.CapturePending << L" failed=" << stats.CaptureFailed
                        << L" first_max_ms=" << stats.CaptureFirstMaxMs << L"\n";
+            std::wcout << L"  evidence_queued=" << stats.EvidenceQueued << L" written=" << stats.EvidenceWritten
+                       << L" failed=" << stats.EvidenceFailed << L" dropped=" << stats.EvidenceDropped
+                       << L" bytes=" << stats.EvidenceBytes << L"\n";
             std::wcout << L"  user_cursor=" << stats.UserScanCursor
                        << L" oldest_age_ms=" << stats.UserOldestScanMs
                        << L" budget_exceeded=" << stats.AnalysisBudgetExceeded
@@ -24175,6 +24269,12 @@ static void HandleKmonCommand(
             }
             std::wcout << L"[kmon.surfaces] rows=" << result.Rows.size() << L" next_module=" << result.NextModule
                 << L" next_handle=" << result.NextHandle << L" execution_observed=false; /json shows all rows\n";
+            break;
+        }
+
+        if (action == L"evidence" || action == L"replay" || action == L"why")
+        {
+            RunKmonOfflineCommand(args);
             break;
         }
 
@@ -53009,6 +53109,8 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"KnLiveDbg.exe command-line usage:\n";
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon evidence|replay|why <path> [options]\n";
+        std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";
@@ -53023,6 +53125,11 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
+    if (argc >= 2 && ToLower(argv[1]) == L"--offline")
+    {
+        // Return before any driver service, symbol engine, or live monitor is constructed.
+        return RunKmonOfflineCommand(std::vector<std::wstring>(argv + 2, argv + argc));
+    }
     if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
     {
         return RunGameManifestCommand(argc, argv);

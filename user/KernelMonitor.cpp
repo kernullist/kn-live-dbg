@@ -8202,6 +8202,11 @@ KmonStats KernelMonitor::SnapshotStats() const
     stats.CollectionLost = CollectionLost.load() + CollectedTi.Loss() + CollectedLive.Loss();
     stats.TiSessionLost = TiSessionLost.load();
     stats.CaptureQueued = CaptureQueued.load();
+    stats.EvidenceQueued = EvidenceQueued.load();
+    stats.EvidenceWritten = EvidenceWritten.load();
+    stats.EvidenceFailed = EvidenceFailed.load();
+    stats.EvidenceDropped = EvidenceDropped.load();
+    stats.EvidenceBytes = EvidenceBytes.load();
     stats.CaptureFailed = CaptureFailed.load();
     stats.CaptureFirstMaxMs = CaptureFirstMaxMs.load();
     stats.UserScanCursor = UserScanCursor.load();

@@ -13,7 +13,8 @@ if ($Sanitize) {
     Copy-Item -LiteralPath $environment.AsanRuntimePath -Destination $output -Force
 }
 $program = Join-Path $output 'evidence-bundle-selftest.exe'
-$sources = @('tools\evidence-bundle-selftest.cpp', 'user\EvidenceBundle.cpp', 'user\AnalystSnapshot.cpp') |
+$sources = @('tools\evidence-bundle-selftest.cpp', 'user\EvidenceBundle.cpp', 'user\EvidenceInvestigation.cpp',
+    'user\CodeTargetResolver.cpp', 'user\AnalystSnapshot.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $commands = @('@echo off', ('call "{0}" >nul' -f $environment.VcVarsPath),
     ('cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {0} {1} /Fe:"{2}" /Fo:"{3}" /Fd:"{3}evidence.pdb" /link /INCREMENTAL:NO' -f

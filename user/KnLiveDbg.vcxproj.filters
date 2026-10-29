@@ -28,6 +28,9 @@
     <ClCompile Include="EvidenceBundle.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="EvidenceInvestigation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KernelMonitorLayout.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -262,6 +265,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="EvidenceBundle.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="EvidenceInvestigation.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProcessLayoutCore.h">

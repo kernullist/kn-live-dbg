@@ -168,8 +168,8 @@ namespace
         const auto& coverage = c.Coverage;
         const std::set<std::wstring> dispositions = {L"current", L"historical_only", L"identity_conflict", L"future_event",
             L"prior_process_instance", L"current_capacity"};
-        const std::set<std::wstring> acquisitions = {L"local_user_reader", L"local_kernel_reader", L"synthetic_fixture"};
-        if (!c.Identity.HasCanonicalKey() || !Text(c.Identity.BootId, 128) || !Text(r.Role, 64) || r.Role.empty() ||
+        const std::set<std::wstring> acquisitions = {L"local_user_reader", L"local_kernel_reader", L"local_mixed_reader", L"synthetic_fixture"};
+        if (!Text(b.CollectionId, 128) || !c.Identity.HasCanonicalKey() || !Text(c.Identity.BootId, 128) || !Text(r.Role, 64) || r.Role.empty() ||
             !Text(c.Source, 128) || !Text(c.DependencyGroup, 128) || !Text(c.ReferenceSource, 128) ||
             !Text(coverage.Reason, 128) || c.MonotonicMs == 0 || c.ArrivalSequence == 0 ||
             c.ArrivalMonotonicMs == 0 || dispositions.count(b.Receipt.Disposition) == 0 || acquisitions.count(b.Acquisition) == 0 ||
@@ -218,7 +218,9 @@ namespace
                 L",\"sha256\":" + mcpjson::Quote(span.Bytes.empty() ? L"" : ContentHash::Bytes(span.Bytes)) +
                 L",\"bytes_hex\":" + mcpjson::Quote(Hex(span.Bytes)) + L"}";
         }
-        return out + L"]}";
+        out += L"]";
+        if (!b.CollectionId.empty()) { out += L",\"collection_id\":" + mcpjson::Quote(b.CollectionId); }
+        return out + L"}";
     }
     bool BundlePath(const std::wstring& path)
     {
@@ -308,6 +310,9 @@ bool ParseEvidenceBundle(const std::wstring& json, EvidenceBundle* bundle, std::
             !mcpjson::GetString(row, L"bytes_hex", &hex) || !Unhex(hex, &span.Bytes)) { return false; }
         parsed.Spans.push_back(std::move(span));
     }
+    std::wstring collection;
+    if (mcpjson::FindRawValue(payload, L"collection_id", &collection) &&
+        (!mcpjson::GetString(payload, L"collection_id", &parsed.CollectionId) || parsed.CollectionId.empty())) { return false; }
     // New format: require the exact canonical form. This also validates every
     // derived checksum/count/closure claim and rejects unknown or aliased fields.
     if (!Valid(parsed) || EvidenceBundleJson(parsed) != json) { return false; }
@@ -327,14 +332,20 @@ bool SaveEvidenceBundle(const std::wstring& path, const EvidenceBundle& bundle, 
     return SaveObservationJson(path, json, error);
 }
 
-bool LoadEvidenceBundle(const std::wstring& path, EvidenceBundle* bundle, std::wstring* error)
+bool LoadEvidenceBundle(const std::wstring& path, EvidenceBundle* bundle, std::wstring* error, std::wstring* digest,
+    size_t maximumBytes, size_t* bytesRead)
 {
+    if (bytesRead != nullptr) { *bytesRead = 0; }
     if (bundle != nullptr) { *bundle = {}; }
+    if (digest != nullptr) { digest->clear(); }
     std::wstring json;
     if (!BundlePath(path))
     {
         if (error != nullptr) { *error = L"only published .kncase files can be opened"; }
         return false;
     }
-    return ReadAnalystSnapshot(path, &json, error) && ParseEvidenceBundle(json, bundle, error);
+    if (!ReadAnalystSnapshot(path, &json, error, (std::min)(maximumBytes, EvidenceBundleMaxJsonBytes), bytesRead, true) ||
+        !ParseEvidenceBundle(json, bundle, error)) { return false; }
+    if (digest != nullptr) { mcpjson::GetString(json, L"payload_sha256", digest); }
+    return true;
 }

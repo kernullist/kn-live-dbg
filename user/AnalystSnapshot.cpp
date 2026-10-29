@@ -648,8 +648,10 @@ bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std
     return ok;
 }
 
-bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error)
+bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
+    size_t maximumBytes, size_t* bytesRead, bool directFile)
 {
+    if (bytesRead != nullptr) { *bytesRead = 0; }
     bool ok = false;
     std::wstring ignored;
     if (error == nullptr)
@@ -668,15 +670,23 @@ bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstr
     {
         return false;
     }
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | (directFile ? FILE_FLAG_OPEN_REPARSE_POINT : 0), nullptr);
     if (file != INVALID_HANDLE_VALUE)
     {
         LARGE_INTEGER length = {};
-        if (GetFileType(file) == FILE_TYPE_DISK && GetFileSizeEx(file, &length) && length.QuadPart > 0 && length.QuadPart <= MaxSnapshotBytes)
+        BY_HANDLE_FILE_INFORMATION information = {};
+        if (GetFileType(file) == FILE_TYPE_DISK &&
+            (!directFile || (GetFileInformationByHandle(file, &information) &&
+                (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0)) &&
+            GetFileSizeEx(file, &length) && length.QuadPart > 0 &&
+            static_cast<uint64_t>(length.QuadPart) <= (std::min)(MaxSnapshotBytes, maximumBytes))
         {
             std::string bytes(static_cast<size_t>(length.QuadPart), '\0');
             DWORD read = 0;
-            if (ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size())
+            const bool complete = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+            if (bytesRead != nullptr) { *bytesRead = read; }
+            if (complete)
             {
                 if (bytes.size() >= 3 && bytes.compare(0, 3, "\xEF\xBB\xBF") == 0)
                 {

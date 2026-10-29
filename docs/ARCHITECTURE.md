@@ -120,7 +120,7 @@ query time, filter and page size; mutation or expiry rejects a stale cursor
 instead of silently changing page membership. This is a query-scope contract,
 not a claim that collection was complete. JSONL and snapshots do not yet make
 every evicted relationship reconstructible; the
-[investigation milestone](FEATURE_PLAN.md#investigation-milestone) separates
+[retained investigation path](FEATURE_PLAN.md#retained-investigation-path) separates
 immutable evidence from the recent view.
 Process keys use boot identity, PID and nonzero creation time (the kernel uses
 the boot-scoped PID-zero key). Optional EPROCESS/session assertions constrain
@@ -131,15 +131,26 @@ remain bounded by the indexes' retention, not by the lifetime of the whole boot.
 Hunting also records up to 2,048 receipts with original event time, arrival time,
 arrival sequence and current-view disposition. Delayed/conflicting receipts do
 not rewind the current view. This in-memory history reports eviction and is not
-yet a durable store; emitted receipt JSON remains subject to log collection loss.
-`EvidenceBundle` provides the durable boundary for the next integration stage:
+itself a durable store; emitted receipt JSON remains subject to log collection loss.
+`EvidenceBundle` provides the durable boundary:
 one private `.kncase` file contains a receipt, acquisition domain, original
 coverage, capture interval, and up to 128 sparse read spans of at most 4 KiB each.
 The canonical `kmon.bundle.v1` envelope hashes the payload and each raw span;
 imports reject inconsistent metadata, damaged bytes and unknown fields. A failed
 or skipped span remains an explicit hole. Publication reuses the create-new,
 flush and handle-rename path, preserving existing files and excluding pending
-files from readers. Live capture and offline commands are integrated separately.
+files from readers. Confirmed KMON references enter a separate 64-item queue
+consumed fairly with raw pages by the existing capture writer. The writer admits
+up to 128 MiB of bundles per session, reports rejected/failed publications and
+drains admitted work at normal shutdown. A private `.knledger` records closure
+and publication accounting; a missing ledger leaves closure unknown.
+`evidence` queries bounded file inventories before limiting matching results.
+The `--offline !kmon` entry point runs these file commands before elevation,
+driver service or symbol initialization.
+`replay` and `why` reconstruct supported static transfers using the original byte
+reader, report missing/conflicting spans and verify stored page digests. They do
+not reopen a target process, authenticate the collector, redo image normalization
+without its reference inputs, or turn static observations into execution claims.
 See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFICATION.md),
 [analyst surfaces](KMON_ANALYST_SURFACES.md), and
 [process layouts](KMON_PROCESS_LAYOUTS.md).

@@ -36,6 +36,9 @@ PID는 십진수다. 다음 명령은 대상 메모리나 콜백을 수정하지
 !kmon cases /save "D:\evidence\cases-before.json"
 !kmon cases /save "D:\evidence\cases-after.json"
 !kmon diff "D:\evidence\cases-before.json" "D:\evidence\cases-after.json"
+!kmon evidence "D:\evidence\cases" /pid 1234 /limit 64 /json
+!kmon replay "D:\evidence\cases\selected.kncase" /json
+!kmon why "D:\evidence\cases\selected.kncase"
 ```
 
 출력 디렉터리는 먼저 만들어야 한다. 파일은 UTF-8 JSON으로 저장하며 기존 파일을 덮어쓰지 않는다. 임시 파일을 완전히 기록한 뒤 이름을 바꾼다. 저장에 실패하면 성공으로 표시하지 않는다. 프로세스 강제 종료 때 남은 `.pending-*` 파일은 완성된 스냅샷이 아니다.
@@ -100,11 +103,29 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 
 사건 스냅샷의 관측 범위는 필드 이름과 정규화한 값을 함께 비교한다. `filter_pid`는 NULL 또는 32비트 부호 없는 정수, `filter_role`은 최대 128자의 문자열, `candidate_limit`은 1~256으로 제한한다. 새 응답의 `query_schema=kmon.case_query.v1`은 페이지 위치·반환 수·남은 수·완료 여부도 검증한다. 실패한 조회를 정상 스냅샷으로 저장하지 않는다. 이 선택 필드가 없는 이전 `kmon.hunt.v1` 스냅샷도 읽을 수 있다. 짝이 맞지 않는 UTF-16 surrogate escape와 파서가 해석하는 객체의 멤버 이름에 포함된 NUL은 거부하며, 잘못된 식별자를 대체 문자로 바꿔 다른 관측과 합치지 않는다.
 
+## 영구 증거와 오프라인 조사
+
+실행 중인 콘솔에서는 위 명령을 사용한다. 프로그램을 새로 시작해 조사할 때는 아래처럼 `--offline`을 지정한다. 이 진입점은 관리자 권한, 드라이버, 심볼 초기화 전에 증거 명령만 실행하고 종료한다. 종료 코드는 정상 조회·선언된 범위 재생이면 0, 불완전·접근 실패·손상·커서 오류이면 1, 잘못된 명령이면 2다. 코드 0도 전체 수집 완료나 수집기 신뢰를 뜻하지 않는다.
+
+```powershell
+.\KnLiveDbg.exe --offline !kmon evidence "D:\evidence\cases" /pid 1234 /json
+.\KnLiveDbg.exe --offline !kmon replay "D:\evidence\cases\selected.kncase" /json
+.\KnLiveDbg.exe --offline !kmon why "D:\evidence\cases\selected.kncase"
+```
+
+영구 증거 저장 모듈은 `kmon.bundle.v1` 봉투와 `kmon.evidence.v1` 본문을 `.kncase` 한 파일에 저장한다. 수신 기록, 원래 검사 coverage, 수집 경로, 수집 구간과 원본 바이트를 포함하며 최대 128개 구간·구간당 4KiB·파일당 2MiB로 제한한다. 외부 조각 경로를 따라 읽지 않는다. 성공·실패·건너뛴 읽기를 구분하고, 겹치는 바이트가 서로 다르면 해당 읽기를 재구성하지 않는다. `read_set_complete`는 선언된 읽기 집합에만 적용되며 프로세스 전체 검사나 실행 관측을 뜻하지 않는다.
+
+실제 KMON은 참조 재확인에 성공한 수신 기록과 당시 읽은 바이트를 로그 디렉터리의 `cases` 아래에 저장한다. 저장 큐는 64개, 세션당 파일 바이트 예산은 128MiB다. `status`와 `cases /json`의 `bundle_store`에서 대기·성공·실패·손실을 구분한다. 정상 종료는 대기 항목을 처리한 후 `kmon.evidence_session.v1` 형식의 `.knledger`에 접수·저장·실패·큐 손실 수를 남긴다. 강제 종료로 이 기록이 없으면 종료 상태는 미확인이다. 이 범위는 영구 저장을 시도한 헌팅 참조이며, 전체 수집이나 모든 검사 경로를 포함한다는 뜻이 아니다. 세션 간 자동 삭제는 하지 않는다.
+
+`evidence`는 드라이버 없이 `.kncase`와 `.knledger`를 읽는다. 디렉터리 항목 4,096개와 실제 읽기 64MiB를 상한으로 삼고, 검증에 성공한 묶음에서 PID·역할을 적용한 뒤 페이지 제한을 적용한다. 복사한 같은 본문은 해시로 중복 제거한다. 손상 파일·종료 기록과 맞지 않는 파일 수는 `partial_inventory`, 접근할 수 없는 디렉터리는 `unavailable`로 표시한다. `unclosed_collections`와 `unavailable_written_bundles`로 종료 미확인과 기록상 저장됐지만 현재 조회에서 사용할 수 없는 묶음을 구분한다. `next_cursor`는 동일한 필터·제한과 파일 목록 지문에 묶이며 목록 변경 시 다시 조회해야 한다. `collection_complete=false`는 유지한다.
+
+`replay`와 `why`는 저장된 바이트로 슬롯·정적 분기·페이지 해시를 다시 계산한다. 원래 프로세스가 종료됐거나 최신 인덱스가 만료·퇴거된 뒤에도 파일에 남은 사실을 조사할 수 있다. 빈 구간을 0으로 채우거나 간접 분기 대상을 추측하지 않는다. 원래의 소유권 분류는 수신 기록이며, 신뢰 기준 이미지와 정규화 입력 없이 이미지 검사를 재수행한 것으로 표시하지 않는다. 실행 관측, 통신, 행위자 귀속, 수집기 인증은 별도 증거가 필요하며 `unfulfilled_requirements`에 표시한다.
+
+`publication_closure_known`은 유효한 종료 기록과 현재 파일 수의 대조가 끝났는지를 나타낸다. 종료 기록이 없는 빈 디렉터리는 이 값이 false다. 기록의 실패·큐 손실 수와 별도로 읽어야 하며, 서명된 수집 증명은 아니다.
+
+각 구간과 전체 본문의 SHA-256은 저장 내용의 일관성 검사다. 수집기의 신뢰나 공격자 부재를 인증하지 않는다. 임시 파일을 모두 쓰고 flush한 뒤 기존 파일을 덮어쓰지 않는 rename으로 공개한다. 잘린 파일, 메타데이터 모순, 알 수 없는 필드와 `.pending-*` 임시 파일은 정상 증거로 가져오지 않는다. 증거 파일 자체의 reparse point도 열린 핸들에서 거부한다. 강제 종료 시험은 소유한 저장 프로세스에 한정하며 전원 손실·스토리지 장치 장애의 모든 결과를 보증하지 않는다. `.kncase`, `.knledger`와 임시 파일은 Git에서 제외하고 공개 정보 검사에서도 차단한다.
+
 ## 검증
-
-영구 증거 저장 모듈은 `kmon.bundle.v1` 봉투와 `kmon.evidence.v1` 본문을 `.kncase` 한 파일에 저장한다. 수신 기록, 원래 검사 coverage, 수집 경로, 수집 구간과 원본 바이트를 포함하며 최대 128개 구간·구간당 4KiB·파일당 2MiB로 제한한다. 외부 조각 경로를 따라 읽지 않는다. 성공·실패·건너뛴 읽기를 구분하고, 겹치는 바이트가 서로 다르면 해당 읽기를 재구성하지 않는다. `read_set_complete`는 선언된 읽기 집합에만 적용되며 프로세스 전체 검사나 실행 관측을 뜻하지 않는다. 라이브 수집과 오프라인 명령 연결은 다음 통합 단계다.
-
-각 구간과 전체 본문의 SHA-256은 저장 내용의 일관성 검사다. 수집기의 신뢰나 공격자 부재를 인증하지 않는다. 임시 파일을 모두 쓰고 flush한 뒤 기존 파일을 덮어쓰지 않는 rename으로 공개한다. 잘린 파일, 메타데이터 모순, 알 수 없는 필드와 `.pending-*` 임시 파일은 정상 증거로 가져오지 않는다. 강제 종료 시험은 소유한 저장 프로세스에 한정하며 전원 손실·스토리지 장치 장애의 모든 결과를 보증하지 않는다. `.kncase`와 임시 파일은 Git에서 제외하고 공개 정보 검사에서도 차단한다.
 
 ```powershell
 .\tools\validate-analyst-features.ps1 -Sanitize
@@ -114,6 +135,8 @@ TLS의 PE 헤더·디렉터리·읽은 콜백 배열과 KCT의 PEB 루트를 참
 .\tools\validate-kmon-core.ps1 -Sanitize
 .\tools\validate-kmon-hunting.ps1 -Sanitize
 .\tools\validate-evidence-bundle.ps1 -Sanitize
+# 위 도구가 출력한 run 디렉터리를 지정한다.
+python tools\test-evidence-cli.py --executable x64\Release\KnLiveDbg.exe --fixtures <run-directory>
 ```
 
 하네스는 변형한 PE32/PE32+ 구조, 읽기 실패와 루트 교체, 종료·예산 경계, PID 재사용, 64비트 JSON, 중복·잘린 입력, 원자적 저장과 덮어쓰기 거부를 검사한다. 실제 수집 경로는 자신이 만든 정상 TLS 콜백·스레드풀과 실행 권한이 없는 자체 이미지 후보로 확인한다. 서로 다른 보호 속성의 경계와 Guard·NoAccess 음성 대조, Unicode 경계 조합도 검사한다. 다른 프로세스에 코드를 주입하거나 커널 드라이버를 로드하지 않는다. [초기 검증 기록](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_VALIDATION_20260920.md)과 [후속 적대적 리뷰](https://github.com/kernullist/kn-live-dbg/blob/v0.0.35/docs/KMON_ANALYST_REVIEW_20260920.md)에 실행 결과와 수정 내역을 구분해 기록했다. 실호스트 대조군과 별도 미검증 범위는 [검증 현황](VALIDATION.md)에서 구분한다.

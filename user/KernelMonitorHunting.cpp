@@ -86,7 +86,11 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"capacity\":2048,\"evicted\":" + std::to_wstring(HuntIndex.ReceiptsEvicted) +
         L",\"identity_conflicts\":" + std::to_wstring(HuntIndex.IdentityConflicts) +
         L",\"identity_states_evicted\":" + std::to_wstring(HuntIndex.IdentityStatesEvicted) +
-        L",\"durable\":false}}";
+        L",\"durable\":false},\"bundle_store\":{\"collection_id\":" + mcpjson::Quote(std::to_wstring(EvidenceCollectionEpoch.load())) +
+        L",\"queued\":" + std::to_wstring(EvidenceQueued.load()) + L",\"written\":" + std::to_wstring(EvidenceWritten.load()) +
+        L",\"failed\":" + std::to_wstring(EvidenceFailed.load()) + L",\"dropped\":" + std::to_wstring(EvidenceDropped.load()) +
+        L",\"pending\":" + std::to_wstring(CapturedEvidenceBundles.Size()) +
+        L",\"bytes\":" + std::to_wstring(EvidenceBytes.load()) + L",\"ledger_failed\":" + std::to_wstring(EvidenceLedgerFailed.load()) + L"}}";
     if (cases != nullptr)
     {
         *cases = result.Cases;

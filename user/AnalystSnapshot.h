@@ -8,7 +8,8 @@ std::vector<KmonHuntCase> FilterAnalystCases(const std::vector<KmonHuntCase>& ca
 bool SaveAnalystSnapshot(const std::wstring& path, const std::wstring& json, std::wstring* error);
 // Atomic create-new export for internally generated observation schemas.
 bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std::wstring* error);
-bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error);
+bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
+    size_t maximumBytes = 32 * 1024 * 1024, size_t* bytesRead = nullptr, bool directFile = false);
 
 struct AnalystSnapshotChange
 {

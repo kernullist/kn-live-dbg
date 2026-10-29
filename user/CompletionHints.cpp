@@ -721,6 +721,9 @@ namespace
                 { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
+        { L"evidence", L"!kmon evidence <directory> [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
+        { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },
+        { L"why", L"!kmon why <file.kncase> [/json]", L"evidence provenance, supported facts and missing requirements" },
         { L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"TLS, KCT and WorkerFactory references" },
         { L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"process memory layout history and changes" },
         { L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations" },
@@ -737,6 +740,19 @@ namespace
         { L"/limit", L"/limit <count>", L"1..256 matching cases per page (default 256)" },
         { L"/cursor", L"/cursor <token>", L"next_cursor with unchanged filters and limit; restart if stale" },
         { L"/save", L"/save <path>", L"persist UTF-8 JSON to a new file" },
+    };
+
+    const CompletionHint kKmonEvidenceTokens[] =
+    {
+        { L"/pid", L"/pid <PID>", L"filter historical receipts before limiting output" },
+        { L"/role", L"/role <name>", L"exact original reference role" },
+        { L"/limit", L"/limit <count>", L"1..256 bundles per page" },
+        { L"/cursor", L"/cursor <token>", L"continue an unchanged inventory with the same filters" },
+        { L"/json", L"/json", L"structured evidence inventory and gaps" },
+    };
+    const CompletionHint kKmonReplayTokens[] =
+    {
+        { L"/json", L"/json", L"structured static facts, provenance and unfulfilled requirements" },
     };
 
     const CompletionHint kKmonSurfaceTokens[] =
@@ -1634,8 +1650,11 @@ namespace
         SCOPE(L"clear", L"!kmon clear", L"clear command", kHelpOnlyTokens),
         SCOPE(L"iotrace", L"!kmon iotrace <driver> on | !kmon iotrace off|status", L"lab-only IOCTL dispatch interposition", kKmonIoTokens),
         SCOPE(L"diff", L"!kmon diff <before.json> <after.json> [/json]", L"compare saved observations", kKmonDiffTokens),
-        SCOPE(L"", L"!kmon [start] [options] | stop | status | add | remove | iotrace | watch | recent | cases | surfaces | layouts | diff | save | clear", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
+        SCOPE(L"", L"!kmon [start] [options] | stop | status | add | remove | iotrace | watch | recent | cases | surfaces | layouts | diff | evidence | replay | why | save | clear", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
         SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent investigation leads", kKmonCaseTokens),
+        SCOPE(L"evidence", L"!kmon evidence <directory> [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"offline retained evidence inventory", kKmonEvidenceTokens),
+        SCOPE(L"replay", L"!kmon replay <file.kncase> [/json]", L"offline original-byte replay", kKmonReplayTokens),
+        SCOPE(L"why", L"!kmon why <file.kncase> [/json]", L"supported facts and missing evidence", kKmonReplayTokens),
         SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"static callback references", kKmonSurfaceTokens),
         SCOPE(L"layouts", L"!kmon layouts [/pid N [/initial]] [/json] [/save path]", L"memory layout observations", kKmonLayoutTokens),
         SCOPE(L"opts", L"!kmon [start] [/pid <PID>] [/name <image>] [/driver <sys>] [/verbose] [/background] [/throttle <N>] [/log <dir>] [/manifest <path>] [/layout-ms <1000..60000>]", L"kmon start options", kKmonOptTokens),

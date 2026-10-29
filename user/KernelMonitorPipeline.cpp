@@ -1,5 +1,7 @@
 #include "KernelMonitor.h"
 #include "ContentHash.h"
+#include "McpJson.h"
+#include "EvidenceInvestigation.h"
 
 #include <algorithm>
 #include <chrono>
@@ -111,6 +113,14 @@ void KernelMonitor::ResetPipeline()
     PriorityCaptures.Reset();
     ContinuedCaptures.Reset();
     CapturedPages.Reset();
+    CapturedEvidenceBundles.Reset();
+    EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
+    EvidenceQueued.store(0);
+    EvidenceWritten.store(0);
+    EvidenceFailed.store(0);
+    EvidenceDropped.store(0);
+    EvidenceBytes.store(0);
+    EvidenceLedgerFailed.store(0);
     PipelineEvents.Reset();
     CapturedRegions.Reset();
     CaptureStopping.store(false);
@@ -796,15 +806,87 @@ void KernelMonitor::CaptureLoop()
     CaptureWorkerDone.store(true);
 }
 
+uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
+{
+    CapturedEvidence evidence;
+    evidence.Id = NextCaptureId.fetch_add(1);
+    bundle.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
+    evidence.Bundle = std::move(bundle);
+    const uint64_t id = evidence.Id;
+    if (!CapturedEvidenceBundles.Push(std::move(evidence))) { EvidenceDropped.fetch_add(1); return 0; }
+    EvidenceQueued.fetch_add(1);
+    return id;
+}
+
+void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
+{
+    bool written = false;
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        if (directory.empty()) { directory = L"."; }
+        const auto folder = std::filesystem::path(directory) / L"cases";
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        const auto path = folder / (L"case-" + evidence.Bundle.CollectionId + L"-" + std::to_wstring(evidence.Id) + L".kncase");
+        const auto json = EvidenceBundleJson(evidence.Bundle);
+        const auto bytes = mcpjson::WideToUtf8(json).size();
+        std::wstring failure = L"invalid_bundle_or_session_byte_budget";
+        if (!error && !json.empty() && bytes <= 128ull * 1024 * 1024 - EvidenceBytes.load())
+        {
+            written = SaveEvidenceBundle(path.wstring(), evidence.Bundle, &failure);
+            if (written) { EvidenceBytes.fetch_add(bytes); }
+        }
+        KmonEvent event;
+        event.Kind = L"coverage.evidence_bundle";
+        event.ProcessId = evidence.Bundle.Receipt.Reference.Context.Identity.ProcessId;
+        event.Observation = evidence.Bundle.Receipt.Reference.Context;
+        event.Summary = written ? L"immutable evidence bundle committed" : L"evidence bundle publication failed";
+        event.Evidence[L"evidence_id"] = std::to_wstring(evidence.Id);
+        event.Evidence[L"collection_id"] = evidence.Bundle.CollectionId;
+        event.Evidence[L"evidence_path"] = written ? path.wstring() : L"";
+        event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
+        event.Evidence[L"failure"] = written ? L"" : failure;
+        PipelineEvents.Push(std::move(event));
+    }
+    catch (...) {}
+    if (written) { EvidenceWritten.fetch_add(1); }
+    else { EvidenceFailed.fetch_add(1); }
+}
+
+void KernelMonitor::CloseEvidenceCollection() noexcept
+{
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        if (directory.empty()) { directory = L"."; }
+        const auto folder = std::filesystem::path(directory) / L"cases";
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        const auto collectionId = std::to_wstring(EvidenceCollectionEpoch.load());
+        const auto json = EvidenceSessionJson({collectionId, EvidenceQueued.load(), EvidenceWritten.load(),
+            EvidenceFailed.load(), EvidenceDropped.load(), EvidenceBytes.load()});
+        std::wstring failure;
+        if (!error && !json.empty() && SaveObservationJson((folder / (L"session-" + collectionId + L".knledger")).wstring(), json, &failure)) { return; }
+    }
+    catch (...) {}
+    EvidenceLedgerFailed.fetch_add(1);
+}
+
 void KernelMonitor::CaptureWriterLoop()
 {
     CaptureWriterDone.store(false);
-    while (!WriterStopping.load() || CapturedPages.Size() != 0)
+    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0)
     {
+        CapturedEvidence evidence;
+        const bool haveEvidence = CapturedEvidenceBundles.Pop(&evidence);
+        if (haveEvidence) { PersistEvidenceBundle(evidence); }
         CapturedPage page;
         if (!CapturedPages.Pop(&page))
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (!haveEvidence) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
             continue;
         }
         try
@@ -919,6 +1001,7 @@ void KernelMonitor::CaptureWriterLoop()
             CaptureFailed.fetch_add(1);
         }
     }
+    CloseEvidenceCollection();
     CaptureWriterDone.store(true);
 }
 
@@ -1003,6 +1086,13 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"final_drain"] = finalDrain ? L"true" : L"false";
         event.Evidence[L"first_capture_max_ms"] = std::to_wstring(CaptureFirstMaxMs.load());
         event.Evidence[L"capture_failures"] = std::to_wstring(CaptureFailed.load());
+        event.Evidence[L"evidence_bundles_queued"] = std::to_wstring(EvidenceQueued.load());
+        event.Evidence[L"evidence_bundles_written"] = std::to_wstring(EvidenceWritten.load());
+        event.Evidence[L"evidence_bundles_failed"] = std::to_wstring(EvidenceFailed.load());
+        event.Evidence[L"evidence_bundles_dropped"] = std::to_wstring(EvidenceDropped.load());
+        event.Evidence[L"evidence_bundles_pending"] = std::to_wstring(CapturedEvidenceBundles.Size());
+        event.Evidence[L"evidence_bundle_bytes"] = std::to_wstring(EvidenceBytes.load());
+        event.Evidence[L"evidence_ledger_failed"] = std::to_wstring(EvidenceLedgerFailed.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
         event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());
@@ -1631,6 +1721,32 @@ bool KmonPipelineSelfTest()
             }
             // The source disappears while persistence is deliberately paused.
             // The writer must consume preserved bytes rather than reread it.
+            EvidenceBundle ownedEvidence;
+            ownedEvidence.Acquisition = L"local_user_reader";
+            ownedEvidence.CaptureStartedMs = GetTickCount64();
+            KmonHuntReference ownedReference;
+            ownedReference.Context.Identity = identity;
+            ownedReference.Context.MonotonicMs = GetTickCount64();
+            ownedReference.Context.Timestamp = ObservationFileTime();
+            ownedReference.Context.Source = L"owned_pointer_fixture";
+            ownedReference.Context.DependencyGroup = L"owned_fixture_memory";
+            ownedReference.Context.Ownership = CodeOwnership::UnownedExecutable;
+            ownedReference.Address = ownedReference.Root = reinterpret_cast<uint64_t>(allocation);
+            const uint64_t pointer = ownedReference.Address;
+            ownedReference.Slot = reinterpret_cast<uint64_t>(&pointer);
+            ownedReference.Role = L"manifest_vtable";
+            ownedReference.SlotStable = true;
+            std::vector<uint8_t> ownedHead(32), ownedSlot(8);
+            SIZE_T headRead = 0, slotRead = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), allocation, ownedHead.data(), ownedHead.size(), &headRead) || headRead != ownedHead.size() ||
+                !ReadProcessMemory(GetCurrentProcess(), &pointer, ownedSlot.data(), ownedSlot.size(), &slotRead) || slotRead != ownedSlot.size()) { break; }
+            ownedEvidence.Spans = {{ownedReference.Address, 32, L"target_head", L"valid", ownedHead},
+                {ownedReference.Slot, 8, L"pointer_slot", L"valid", ownedSlot}};
+            ownedEvidence.CaptureEndedMs = GetTickCount64();
+            ownedEvidence.ReferenceConsistent = true;
+            if (monitor.HuntIndex.Observe(ownedReference, GetTickCount64(), &ownedEvidence.Receipt) == 0) { break; }
+            const uint64_t evidenceId = monitor.QueueEvidenceBundle(std::move(ownedEvidence));
+            if (evidenceId == 0) { break; }
             VirtualFree(allocation, 0, MEM_RELEASE);
             allocation = nullptr;
             monitor.CaptureStopping.store(true);
@@ -1641,6 +1757,28 @@ bool KmonPipelineSelfTest()
             const auto captures = monitor.SessionCapturePaths();
             ok = captures.size() == 1 && ContentHash::File(captures[0]) == ContentHash::Bytes(expected) &&
                 monitor.CaptureFailed.load() == 0 && monitor.CaptureFirstMaxMs.load() < 3000;
+            EvidenceBundle recovered;
+            std::wstring recoveryError;
+            const auto evidencePath = std::wstring(unique) + L"\\cases\\case-" +
+                std::to_wstring(monitor.EvidenceCollectionEpoch.load()) + L"-" + std::to_wstring(evidenceId) + L".kncase";
+            ok = ok && monitor.EvidenceWritten.load() == 1 && monitor.EvidenceFailed.load() == 0 &&
+                monitor.EvidenceLedgerFailed.load() == 0 && LoadEvidenceBundle(evidencePath, &recovered, &recoveryError) &&
+                ReplayEvidence(recovered).ReferenceReached && ReplayEvidence(recovered).Gaps.empty();
+            if (ok)
+            {
+                KernelMonitor pressure;
+                for (size_t i = 0; i < 65; ++i) { pressure.QueueEvidenceBundle(recovered); }
+                ok = pressure.EvidenceQueued.load() == 64 && pressure.EvidenceDropped.load() == 1 &&
+                    pressure.CapturedEvidenceBundles.Size() == 64;
+                KernelMonitor exhausted;
+                exhausted.Options.LogDirectory = std::wstring(unique) + L"\\budget";
+                exhausted.EvidenceBytes.store(128ull * 1024 * 1024);
+                exhausted.QueueEvidenceBundle(recovered);
+                exhausted.WriterStopping.store(true);
+                exhausted.CaptureWriterLoop();
+                ok = ok && exhausted.EvidenceWritten.load() == 0 && exhausted.EvidenceFailed.load() == 1 &&
+                    exhausted.CapturedEvidenceBundles.Size() == 0;
+            }
             monitor.CaptureStopping.store(false);
             monitor.CandidateCaptures.at(42).LastAttemptMs = 0;
             ok = ok && !monitor.QueueCapture(L"selftest_rx", 0x10000, 4096,

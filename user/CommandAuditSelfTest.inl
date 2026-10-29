@@ -456,6 +456,23 @@ static int RunCommandAuditSelfTest()
             L"layout interval accepted");
     }
     const auto huntCases = run(L"!kmon cases /json");
+    check(CompletionCandidateExists({L"!kmon"}, L"evidence") &&
+        CompletionCandidateExists({L"!kmon", L"evidence"}, L"/cursor") &&
+        CompletionCandidateExists({L"!kmon", L"why"}, L"/json"), L"offline evidence completion");
+    const auto absentEvidence = run(L"!kmon evidence missing-fixture-directory /pid 55 /json");
+    check(absentEvidence.Error.empty() && absentEvidence.Output.find(L"kmon.evidence_query.v1") != std::wstring::npos &&
+        absentEvidence.Output.find(L"\"status\":\"unavailable\"") != std::wstring::npos && !device.IsOpen(),
+        L"offline evidence query reports unavailable scope without opening driver");
+    for (const auto& line : {L"!kmon evidence", L"!kmon evidence x /limit 0", L"!kmon evidence x /pid -1",
+        L"!kmon evidence x /pid 1 /pid 2", L"!kmon evidence x /json /json", L"!kmon evidence x /role /json",
+        L"!kmon evidence x /cursor", L"!kmon evidence x /limit 257", L"!kmon evidence x /unknown",
+        L"!kmon replay", L"!kmon replay x /bad", L"!kmon why", L"!kmon why x /json extra"})
+    {
+        check(run(line).Error.find(L"usage") != std::wstring::npos, L"offline evidence parser rejects malformed command");
+    }
+    check(!IsWriteLikeCommandLine(L"!kmon evidence x /pid 55 /json") &&
+        !IsWriteLikeCommandLine(L"!kmon replay x.kncase /json") && !IsWriteLikeCommandLine(L"!kmon why x.kncase /json"),
+        L"offline evidence inspection is read-only");
     check(huntCases.Error.empty() && huntCases.Output.find(L"kmon.hunt.v1") != std::wstring::npos &&
         huntCases.Output.find(L"\"communication_proven\":false") != std::wstring::npos,
         L"kmon cases JSON is available without a driver");

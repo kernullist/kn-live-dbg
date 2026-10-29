@@ -10,6 +10,7 @@
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
 #include "AnalystSnapshot.h"
+#include "EvidenceBundle.h"
 #include "KmonWorkQueue.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
@@ -143,6 +144,11 @@ struct KmonStats
     uint64_t CollectionLost = 0;
     uint64_t TiSessionLost = 0;
     uint64_t CaptureQueued = 0;
+    uint64_t EvidenceQueued = 0;
+    uint64_t EvidenceWritten = 0;
+    uint64_t EvidenceFailed = 0;
+    uint64_t EvidenceDropped = 0;
+    uint64_t EvidenceBytes = 0;
     uint64_t CaptureFailed = 0;
     uint64_t CaptureFirstMaxMs = 0;
     uint64_t CapturePending = 0;
@@ -580,6 +586,22 @@ private:
         std::wstring Role;
         std::vector<uint8_t> Bytes;
     };
+    struct CapturedEvidence
+    {
+        uint64_t Id = 0;
+        EvidenceBundle Bundle;
+    };
+    uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
+    void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
+    void CloseEvidenceCollection() noexcept;
+    std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};
+    KmonWorkQueue<CapturedEvidence> CapturedEvidenceBundles{64};
+    std::atomic<uint64_t> EvidenceQueued{0};
+    std::atomic<uint64_t> EvidenceWritten{0};
+    std::atomic<uint64_t> EvidenceFailed{0};
+    std::atomic<uint64_t> EvidenceDropped{0};
+    std::atomic<uint64_t> EvidenceBytes{0};
+    std::atomic<uint64_t> EvidenceLedgerFailed{0};
     KmonWorkQueue<TiEventRecord> CollectedTi{2048};
     KmonWorkQueue<TimelineEvent> CollectedLive{2048};
     KmonWorkQueue<CaptureRequest> PriorityCaptures{256};

@@ -861,6 +861,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         GetTickCount64() - begin < budgetMs; ++n)
     {
         auto work = std::move(ExecutionReferences.front());
+        const uint64_t captureStartedMs = GetTickCount64();
         ExecutionReferences.pop_front();
         ++ExecutionReferenceProcessed;
         const auto referenceKey = ReferenceKey(work.Target, work.Slot, work.Role, work.Identity);
@@ -963,10 +964,12 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             continue;
         }
         bool physicalPageRead = false;
+        bool kernelReaderUsed = false;
+        bool userReaderUsed = false;
         uint64_t lastReadPhysical = 0;
         uint64_t pageHeadPhysical = 0;
         const ObservationReader reader = [device, symbols, process, &work, &executableMapping,
-            &physicalPageRead, &lastReadPhysical, &addressSpaceTried, &addressSpaceValid, &addressSpace]
+            &physicalPageRead, &kernelReaderUsed, &userReaderUsed, &lastReadPhysical, &addressSpaceTried, &addressSpaceValid, &addressSpace]
             (uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
             lastReadPhysical = 0;
@@ -981,18 +984,23 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                     device->ReadPhysical(mapping.PhysicalAddress, 4096, bytes, nullptr) && bytes->size() == 4096)
                 {
                     physicalPageRead = true;
+                    kernelReaderUsed = true;
                     lastReadPhysical = mapping.PhysicalAddress;
                     return true;
                 }
             }
             if (work.Identity.ProcessId == 0)
             {
-                return address >= 0xFFFF800000000000ull &&
+                const bool read = address >= 0xFFFF800000000000ull &&
                     device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+                kernelReaderUsed = kernelReaderUsed || read;
+                return read;
             }
             if (work.Role == L"instrumentation_callback" && work.Slot != 0 && address == work.Slot && size == 8)
             {
-                return device->ReadMemory(address, 8, bytes, nullptr);
+                const bool read = device->ReadMemory(address, 8, bytes, nullptr);
+                kernelReaderUsed = kernelReaderUsed || read;
+                return read;
             }
             MEMORY_BASIC_INFORMATION protection = {};
             if (process != nullptr && VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &protection,
@@ -1005,6 +1013,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             if (process != nullptr && ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address),
                 bytes->data(), size, &read) && read == size)
             {
+                userReaderUsed = true;
                 return true;
             }
             if (!addressSpaceTried)
@@ -1012,8 +1021,10 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                 addressSpaceTried = true;
                 addressSpaceValid = ResolveObservationProcess(*device, *symbols, work.Identity, &addressSpace);
             }
-            return addressSpaceValid && device->ReadProcessVirtual(work.Identity.ProcessId, addressSpace.Eprocess,
+            const bool captured = addressSpaceValid && device->ReadProcessVirtual(work.Identity.ProcessId, addressSpace.Eprocess,
                 work.Identity.CreateTime, address, static_cast<uint32_t>(size), bytes, nullptr);
+            kernelReaderUsed = kernelReaderUsed || captured;
+            return captured;
         };
         if (!ObservationAnchorsMatch(work.Anchors, reader))
         {
@@ -1131,6 +1142,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         size_t acceptedReferences = 0;
         bool referenceSnapshotValid = !chain.ReferenceChecked || chain.ReferenceStable;
         std::vector<std::pair<size_t, KmonHuntReference>> pendingReferences;
+        std::map<size_t, EvidenceSpan> evidencePages;
         for (size_t i = 0; i < chain.Hops.size(); ++i)
         {
             const auto& hop = chain.Hops[i];
@@ -1163,7 +1175,9 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                 std::vector<uint8_t> page;
                 uint64_t capturePhysical = 0;
                 bool comparable = false;
-                if (captures < 2 && reader(base, 4096, &page) && page.size() == 4096)
+                const bool pageAttempted = captures < 2;
+                const bool pageCaptured = pageAttempted && reader(base, 4096, &page) && page.size() == 4096;
+                if (pageCaptured)
                 {
                     capturePhysical = lastReadPhysical;
                     ++captures;
@@ -1253,19 +1267,48 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                     event.Evidence[key + L"capture_id"] = std::to_wstring(
                         QueueCapturedBytes(L"hunt_reference", base, reference.Context, page));
                 }
+                evidencePages.emplace(i, EvidenceSpan{base, 4096, L"target_page",
+                    pageCaptured ? L"valid" : (pageAttempted ? L"read_failed" : L"skipped"),
+                    pageCaptured ? std::move(page) : std::vector<uint8_t>{}});
                 pendingReferences.emplace_back(i, std::move(reference));
             }
         }
+        std::vector<EvidenceSpan> confirmedReads;
+        bool evidenceTruncated = false;
+        for (const auto& hop : chain.Hops)
+        {
+            if (hop.Bytes.empty())
+            {
+                confirmedReads.push_back({hop.Address, (std::min<uint64_t>)(32, 4096 - (hop.Address & 4095)),
+                    L"target_head", L"read_failed", {}});
+            }
+        }
+        const ObservationReader evidenceReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        {
+            const bool read = reader(address, size, bytes) && bytes->size() == size;
+            if (confirmedReads.size() >= EvidenceBundleMaxSpans - 1) { evidenceTruncated = true; }
+            else if (size != 0 && size <= 4096)
+            {
+                const bool head = std::any_of(chain.Hops.begin(), chain.Hops.end(), [&](const auto& hop) { return hop.Address == address; });
+                const bool slot = address == work.Slot || std::any_of(chain.Hops.begin(), chain.Hops.end(),
+                    [&](const auto& hop) { return hop.Slot != 0 && hop.Slot == address; });
+                confirmedReads.push_back({address, size, slot ? L"pointer_slot" : head ? L"target_head" : L"reference_anchor",
+                    read ? L"valid" : L"read_failed", read ? *bytes : std::vector<uint8_t>{}});
+            }
+            else { evidenceTruncated = true; }
+            return read;
+        };
         referenceSnapshotValid = referenceSnapshotValid && sameProcess() &&
-            ObservationAnchorsMatch(work.Anchors, reader) &&
-            (pageCheck || CodeTargetChainMatches(chain, reader)) &&
-            (!pointerSlot || CodeTargetSlotMatches(work.Target, work.Slot, reader));
+            ObservationAnchorsMatch(work.Anchors, evidenceReader) &&
+            (pageCheck || CodeTargetChainMatches(chain, evidenceReader)) &&
+            (!pointerSlot || CodeTargetSlotMatches(work.Target, work.Slot, evidenceReader));
         if (referenceSnapshotValid && pid != 0 && addressSpaceValid)
         {
             ProcessAddressContext current = {};
             referenceSnapshotValid = ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current) &&
                 current.Eprocess == addressSpace.Eprocess && current.DirectoryTableBase == addressSpace.DirectoryTableBase;
         }
+        const uint64_t captureEndedMs = GetTickCount64();
         if (referenceSnapshotValid)
         {
             for (size_t i = 0; i < chain.Hops.size(); ++i)
@@ -1286,6 +1329,17 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                 if (!receipt.Disposition.empty())
                 {
                     event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_hunt_receipt"] = KmonHuntReceiptJson(receipt);
+                    EvidenceBundle bundle;
+                    bundle.Receipt = receipt;
+                    bundle.Acquisition = kernelReaderUsed ? (userReaderUsed ? L"local_mixed_reader" : L"local_kernel_reader") : L"local_user_reader";
+                    bundle.CaptureStartedMs = captureStartedMs;
+                    bundle.CaptureEndedMs = captureEndedMs;
+                    bundle.ReferenceConsistent = true;
+                    bundle.CaptureTruncated = evidenceTruncated;
+                    bundle.Spans = confirmedReads;
+                    bundle.Spans.push_back(evidencePages.at(pending.first));
+                    event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_bundle_queued_id"] =
+                        std::to_wstring(QueueEvidenceBundle(std::move(bundle)));
                 }
                 if (reference.Id != 0)
                 {

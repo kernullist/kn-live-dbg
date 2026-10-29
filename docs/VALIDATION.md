@@ -1,8 +1,9 @@
 # Validation status
 
-The released baseline is **v0.0.36 / 6646461**. The latest recorded runtime
-validation is **2026-10-25**; the **2026-10-27** documentation review does not
-renew those observations. Follow the [manual checklist](MANUAL_TEST_CHECKLIST.md)
+The released baseline is **v0.0.36 / 6646461**. Development verification of the
+retained investigation path was recorded on **2026-10-29**, separately from the
+**2026-10-25** release validation. The **2026-10-27** documentation review did not
+renew runtime observations. Follow the [manual checklist](MANUAL_TEST_CHECKLIST.md)
 to validate another binary or host.
 
 ## Release candidate
@@ -26,7 +27,48 @@ residue were observed in that interval. Raw release evidence was retained under
 `.build/release-0.0.36-20261025`; it is local evidence, not a bundled artifact.
 The released ZIP and manifest identify distributed files independently.
 
-## Development evidence
+## Retained investigation path: 2026-10-29
+
+The final Release x64 user executable had SHA-256
+`da6481ec96c9f122869fd8153fb8643c109e5d245882daf6400b7075ee8cd014`.
+It used the existing test-signed driver; this work did not change driver code
+or publish a new release. Stage-specific controls and final integration results
+were retained locally under `.build/design-implementation-20261029`.
+
+| Check | Observed result |
+| --- | --- |
+| Scoped queries and identity | Hunting ASan 11,345, page controls 54 and analyst ASan 6,602 passed; targets beyond 256, cursor changes, delayed receipts and optional-identity conflicts covered |
+| Durable query and replay | Evidence ASan 374 passed; expiry/eviction/restart, missing/corrupt spans, closure accounting and read-byte limits covered |
+| Interrupted publication | Final run: eight writer interruptions, one valid final file and seven absent final files; completed full-size publication and fresh-process recovery passed |
+| Final executable self-tests | Timeline 28, MCP catalog 89, console 558, commands 2,987, remote protocol 66 and connect arguments 4 passed |
+| Public offline CLI | Non-admin fresh-process checks: 110 passed, including all six final live bundles; privileged symlink checks: 180 passed, including 14 bundles from an earlier run |
+| Focused live controls | One 180-second run with four positive and two negative owned controls passed; all required positive kinds observed, no unexpected fixture findings, six of six evidence bundles published without failures or queue drops |
+
+The live run ended with drained work, unchanged boot time and no owned services
+remaining. Original emitted receipts were cross-checked against all 23 bundles
+from three runs. Offline replay of 20 bundles from the last two runs reconstructed
+their declared stored facts; it did not repeat image-reference verification or
+establish execution, communication, collector trust or actor attribution.
+The console self-test also covered native writer queue and session-byte limits,
+and replayed an owned allocation's saved bytes after that allocation was freed.
+
+Two earlier all-process runs on an intermediate build, lasting 60 and 180 seconds,
+**failed the fixture coverage gate** because some reference scans had not run.
+Their queue/drain checks passed, with three and 14 bundles respectively committed
+without publication loss, and no unexpected fixture findings. These are not
+complete all-process passes; the focused pass does not close that coverage gap.
+One earlier whole-app self-test also failed an unchanged AI child-process capture
+check; the isolated suite and a quiet whole-app rerun passed. Its exact cause was
+not established.
+
+The review corrected an offline integration defect: ordinary controller startup
+required elevation and loaded a driver before reaching file-only commands.
+`--offline !kmon` now returns before live initialization. Imports also enforce
+their byte budget and file-reparse policy on the opened handle. The tests do not
+cover every power-loss outcome, long-running workload, Windows build or external
+malware corpus.
+
+## Earlier development evidence
 
 - The final KMON series used repeated 600-second full-process runs with nine
   positive and four negative controls and the actual x86 vctip System.Data.dll

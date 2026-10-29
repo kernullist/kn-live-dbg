@@ -5,6 +5,11 @@ This guide describes workflows and output contracts. `help <command>` and
 available without elevation, a driver, or symbols. Tab completion uses the same
 command definitions in the local and remote consoles.
 
+Saved KMON evidence can also be investigated without elevation, driver loading,
+or symbols: `KnLiveDbg.exe --offline !kmon evidence <directory> /json`,
+`--offline !kmon replay <file.kncase> /json`, or `--offline !kmon why <file.kncase>`.
+See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
+
 ## Session and memory
 
 ```text
