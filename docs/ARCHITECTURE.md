@@ -23,6 +23,47 @@ These changes do not establish a system-wide LA57 support claim. Other scanners,
 source/VM/epoch identity, translation permissions and actual LA57 Windows
 compatibility remain separate acceptance work in [W02](FEATURE_PLAN.md#kernel-investigation-platform).
 
+## Process cross-view qualification
+
+`!hiddenproc` first discovers PID candidates from ActiveProcessLinks, SPI,
+Toolhelp, handle owners and CID entries. Those observations and image labels
+remain discovery hints. A second, bounded comparison binds each admitted
+candidate to `(PID, EPROCESS, CreateTime)` before and after fresh kernel/SPI/
+Toolhelp inventories. Each boundary sample brackets lifecycle reads with repeated
+identity reads and CID resolution. No fixed EPROCESS layout or reserved SPI
+creation-time offset substitutes for a missing symbol field.
+
+The kernel walk requires unique PIDs, bounded canonical pointers from the active
+address descriptor, reciprocal back links, return to the list head and unchanged
+head links. A sampled cross-view discrepancy requires all three comparison
+inventories to finish, matching lifetime samples, readable ExitTime/ActiveThreads
+at both boundaries and no observed exit/delete/rundown transition. Kernel-only
+candidates also require stable AuxiliaryProcess state. Confirmed auxiliary
+clones, terminating objects and reconciled candidates remain auditable records.
+Missing fields, failed reads, identity changes and budgets produce `unverified`.
+SPI and Toolhelp share a process-list dependency and do not count as two
+independent proofs. Equality of sampled fields is not an atomic snapshot or an
+authentication of a potentially compromised kernel.
+
+At most 128 candidates enter confirmation per scan, in PID order, under a shared
+cooperative five-second budget. In-flight IOCTLs and API calls are not interrupted;
+discovery is outside that budget. Excess candidates stay in the result. The
+additive `lifetime-cross-view-v2` policy in `kn-live-dbg.hidden-process.v1` separates
+discovery membership from qualification views, before/after samples and failure
+reasons. Unknown lifecycle values are null inside qualification; legacy scalar
+fields require their `has_*` flags. `inventory_complete` describes discovery;
+`coverage_complete` also requires no unverified candidates. Neither establishes
+that every hidden process was discoverable. Raw backing reads, generic proof
+ledgers and offline replay for this scanner remain open.
+
+KMON emits admitted discrepancies as `process.hidden` with a sampled-discrepancy
+summary, and unverified candidates as `coverage.process_cross_view`. Candidates
+without a bound lifetime are emitted per scan; a PID alone cannot deduplicate
+them across scans. Only admitted lifetimes enter suspect tracking. A subsequent
+raw EPROCESS capture is explicitly outside the qualification window and does not
+extend its lifetime guarantee.
+No state establishes deliberate hiding, execution, a writer or an actor.
+
 ## Comparison coverage
 
 `ObservationCoverage::Complete()` requires a bounded, valid union of compared

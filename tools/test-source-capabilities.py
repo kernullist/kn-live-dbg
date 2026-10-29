@@ -48,6 +48,10 @@ def main():
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     assert "claim_specific_requirements" in by_key[("proof", "image_range", "recipe")]["requirements"]
     assert "no_hard_deadline_or_measured_slo" in by_key[("scheduler", "capture_timing", "native")]["limits"]
+    cross_view = by_key[("process", "cross_view", "native")]
+    assert "matching_pid_eprocess_create_time" in cross_view["requirements"]
+    assert "unverified_candidates_retained" in cross_view["limits"]
+    assert "shared_api_dependency" in cross_view["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

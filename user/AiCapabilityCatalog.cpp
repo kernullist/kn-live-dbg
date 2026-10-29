@@ -532,7 +532,7 @@ namespace
         { L"driver.object", L"Inspect one DRIVER_OBJECT and its device/attached stacks.", L"driver/name/target/address", L"!drvobj", AiCapabilityCost::Cheap },
         { L"device.stack", L"Walk a DEVICE_OBJECT AttachedDevice/AttachedTo stack.", L"address/va/device", L"!devstack", AiCapabilityCost::Cheap },
         { L"handles.list", L"Enumerate process handles and flag VM/DUP cross-process access.", L"optional pid, target, limit", L"!handles", AiCapabilityCost::Cheap },
-        { L"hiddenproc.list", L"Cross-view hidden processes: ActiveProcessLinks vs SPI vs Toolhelp vs handle owners.", L"{}", L"!hiddenproc", AiCapabilityCost::Cheap },
+        { L"hiddenproc.list", L"Lifetime-qualified process cross-view discrepancies and explicit unverified candidates; no actor attribution.", L"{}", L"!hiddenproc", AiCapabilityCost::Cheap },
         { L"wdfilter.list", L"Walk WdFilter RuntimeDriver leftovers after a mapper unloads.", L"{}", L"!wdfilter", AiCapabilityCost::Cheap },
         { L"inputstack.list", L"Walk keyboard/mouse class attached-device stacks.", L"{}", L"!inputstack", AiCapabilityCost::Cheap },
         { L"dma.posture", L"Report IOMMU firmware, Kernel DMA Protection, and removable PCI buses.", L"{}", L"!dma", AiCapabilityCost::Cheap },

@@ -19585,11 +19585,12 @@ static void PrintHiddenProcHelp()
     std::wcout << L"  !hiddenproc [/json <path>]\n";
     std::wcout << L"\n";
     std::wcout << L"cross-views ActiveProcessLinks, SystemProcessInformation, Toolhelp, handle-table\n";
-    std::wcout << L"owners, and PsLookupProcessByProcessId (CID). DKOM unlink hides a process from the\n";
-    std::wcout << L"kernel list AND SPI/Toolhelp; those still show up as handle owners and CID hits.\n";
-    std::wcout << L"PssCaptureSnapshot clones and leftovers (ExitTime set or ActiveThreads==0) are\n";
-    std::wcout << L"ignored even when they still have CID slots. API-only findings need both SPI and\n";
-    std::wcout << L"Toolhelp sandwiches to succeed, and the same API to see the PID before and after.\n";
+    std::wcout << L"owners, and CID discovery. SPI and Toolhelp share the process-list dependency.\n";
+    std::wcout << L"Candidates require complete fresh inventories bracketed by matching PID,\n";
+    std::wcout << L"EPROCESS, CreateTime and readable lifecycle fields. Missing reads, PID reuse\n";
+    std::wcout << L"and budget limits remain unverified records. Qualification is limited to 128\n";
+    std::wcout << L"candidates and a cooperative 5-second budget; in-flight calls are not interrupted.\n";
+    std::wcout << L"A sampled discrepancy does not establish deliberate hiding or actor identity.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
     std::wcout << L"  /json <path>  write kn-live-dbg.hidden-process.v1.\n";
@@ -19678,6 +19679,11 @@ static void HandleHiddenProcCommand(
                 tag = L"[hiddenproc.suspicious]";
                 color = KNDBG_COLOR_WARN;
             }
+            else if (record.Unverified)
+            {
+                tag = L"[hiddenproc.unverified]";
+                color = KNDBG_COLOR_WARN;
+            }
             else if (record.Auxiliary || record.Terminating)
             {
                 tag = L"[hiddenproc.ignored]";
@@ -19686,7 +19692,7 @@ static void HandleHiddenProcCommand(
             PrintColoredText(tag, color);
             std::wcout << L" pid=" << record.ProcessId
                        << L" " << record.ImageName
-                       << L" kernel=" << (record.InKernelList ? L"y" : L"n")
+                       << L" discovery_kernel=" << (record.InKernelList ? L"y" : L"n")
                        << L" spi=" << (record.InSystemProcessInfo ? L"y" : L"n")
                        << L" toolhelp=" << (record.InToolhelp ? L"y" : L"n")
                        << L" handles=" << (record.InHandleOwners ? L"y" : L"n")
@@ -19704,6 +19710,8 @@ static void HandleHiddenProcCommand(
                    << L" handle_owners=" << result.HandleOwnerCount
                    << L" cid=" << result.CidTableCount
                    << L" suspicious=" << result.SuspiciousCount
+                   << L" unverified=" << result.UnverifiedCount
+                   << L" reconciled=" << result.ReconciledCount
                    << L" ignored=" << result.IgnoredCount
                    << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
     } while (false);
@@ -23141,7 +23149,7 @@ std::wcout << L"                          holding stubs whose destination no mod
 std::wcout << L"  mapper.stub             same stub body inside an allocation the big-pool table reports\n";
     std::wcout << L"  inject.kernel_phys      mapper.watch + hidden/protect-changed PTEs on a watch PID with\n";
     std::wcout << L"                          kpage/pool/dataptr residue or overlay_slot and no TI WriteVM/ProtectVM\n";
-    std::wcout << L"  process.hidden          DKOM unlink / SPI hide / handle+CID-only; full PspCidTable walk (~5s)\n";
+    std::wcout << L"  process.hidden          lifetime-qualified cross-view discrepancy; unverified candidates in coverage.process_cross_view\n";
     std::wcout << L"  process.masquerade      Windows-named image from a non-inbox path\n";
     std::wcout << L"  process.hollow          EXE replace at PEB ImageBase: unmapped/private/unbacked,\n";
     std::wcout << L"                          mapped-path mismatch, W+X (builtin and /name|/pid), no MZ, stamp/arch,\n";

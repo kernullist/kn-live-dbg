@@ -31,6 +31,7 @@ python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe
 .\tools\validate-analyst-features.ps1 -Sanitize
 .\tools\validate-evidence-bundle.ps1 -Sanitize
 .\tools\validate-parser-worker.ps1 -Sanitize
+.\tools\validate-hidden-process.ps1 -Sanitize
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-kmon-reference-coverage.ps1
 .\tools\validate-minifilter-detach-e2e-selftest.ps1
 .\tools\validate-evasion-research-ledger-selftest.ps1
@@ -59,6 +60,15 @@ After grammar/help changes, check startup and scoped help, quoted paths,
 unknown/duplicate options, nested help completion, local/remote consistency,
 and that invalid input fails before side effects. Query-runner `--help` exits 0;
 argument errors exit 2 without driver setup or a traceback.
+
+The hidden-process harness uses synthetic kernel lists and lifecycle reads. It
+checks PID/EPROCESS/creation-time reuse, incomplete/changed lists, unread fields,
+exit transitions, budget stops and an independent JSON oracle. It does not load
+a driver. Native `--self-test all` also exercises the policy and existing SPI
+parser controls. Live acceptance, when an authorized lab is available, still
+needs ordinary creation/exit churn, snapshot clones, missing layouts and partial
+reads on each supported build; retain unverified candidates and distinguish
+discovery membership from qualification. Do not infer a live pass from fixtures.
 
 ## Live-host prerequisites
 

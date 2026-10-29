@@ -120,7 +120,8 @@ mapping or exited PID is not a stable identity. Unreadable display bytes remain
 | `e*`, `pe*`, `f`, `m`, `setfield` | Explicit mutations; require write mode |
 | `c`, `s` | Compare and search ranges |
 
-Native write mode begins enabled. `write off` disarms it. Address-only native
+Native write mode begins disabled. `write on` explicitly arms it after the
+driver confirms the transition; `write off` disarms it. Address-only native
 edit forms can prompt locally; remote edits require values on the command line.
 Small recognized writes can show backup/restore and verification evidence.
 Do not treat a failed or short backup as a complete restore plan.
@@ -140,6 +141,21 @@ Do not treat a failed or short backup as a complete restore plan.
 `ps` / `ps -f <image>` is the simple native process list. `!process` and other
 WinDbg names have routing-specific behavior; consult the
 [coverage table](WINDBG_COMMAND_COVERAGE.md) before assuming native support.
+
+`!hiddenproc [/json <path>]` keeps discovery membership separate from a fresh
+lifetime-bracketed kernel/SPI/Toolhelp comparison. Its additive
+`lifetime-cross-view-v2` policy reports `cross_view_discrepancy`, `unverified`,
+`auxiliary`, `terminating` or `reconciled`. Check `qualification.before/after`,
+comparison completeness and `reason`; an unread lifecycle value is null there.
+`eprocess_scope` distinguishes a qualified object from a discovery hint;
+`discovery_eprocess` preserves the original address. Image labels are PID-based
+discovery hints and are not an assertion about the confirmed lifetime.
+Legacy `suspicious` counts admitted sampled discrepancies, not proven hiding or
+actor attribution. SPI and Toolhelp have a shared process-list dependency.
+Confirmation covers at most 128 candidates with a cooperative five-second
+budget, excluding initial discovery. Remaining candidates stay unverified;
+zero suspicious records with incomplete coverage is not a clean bill of health.
+The report contains private process evidence and must not be committed.
 
 CI/VBS structured output is `kn-live-dbg.vbs.v2`. Unavailable values are `null`;
 HVCI flags and CI debugger mode have distinct meanings. The removed v1 fields

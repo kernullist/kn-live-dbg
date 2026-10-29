@@ -7,6 +7,34 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process cross-view qualification checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`2dad5f77553c46bb0c6a9925b4304ec0fd1ebc3b64e885dea97fb97fb5dab5f2`.
+The standalone ASan harness passed 226 controls covering complete and incomplete
+comparisons, PID/object/creation-time changes, unavailable lifecycle and auxiliary
+fields, exit/delete/rundown transitions, failed/changed list reads, duplicate PIDs,
+cycles, truncation, cooperative stops and LA48/LA57 address-shape separation.
+An independent Python JSON oracle checked seven retained outcomes, null unknown
+fields, discovery versus qualification scope and legacy object-address projection.
+
+Review fixed escalation without readable lifetime state, loss of unverified
+candidates, incomplete-list ambiguity, Toolhelp handle cleanup on allocation
+failure, old discovery addresses in qualified reports and PID-only deduplication
+of unbound KMON candidates. No additional actionable defects were found in the
+reviewed scope. The full native suite passed timeline 28, MCP 89, console 558,
+commands 2,998, remote 66 and connect arguments; capabilities passed 20 selected
+contracts/261 routes. Publication-scanner regressions passed 10 tests.
+
+Logs are under `.build/architecture/w10-hidden-*`; the final build/native gates
+use the `-commit` suffix. Existing C4744 alignment warnings remain, with existing
+C4244 conversions also reported when KernelMonitor was rebuilt. These controls
+use owned synthetic data and do not execute a live kernel scanner. Target churn,
+actual layouts, snapshot clones, the 128-candidate/elapsed-budget acquisition
+path and live false-positive behavior remain unvalidated on a target. No driver
+was loaded or host security policy changed. Raw-read replay and generic proof
+ledgers for this scanner remain open.
+
 ## Schema parser containment checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

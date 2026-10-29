@@ -1,7 +1,6 @@
 #include "HiddenProcessScanner.h"
 
 #include "HandleTableScanner.h"
-#include "McpJson.h"
 #include "UserModeHunter.h"
 
 #include <Windows.h>
@@ -12,14 +11,11 @@
 #include <limits>
 #include <map>
 #include <new>
-#include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace
 {
-    constexpr uint64_t kKernelSpaceMin = 0xffff800000000000ull;
     constexpr ULONG kSystemProcessInformation = 5;
     constexpr uint32_t kMaxProcesses = 8192;
     constexpr uint32_t kMaxInfoBytes = 32u * 1024u * 1024u;
@@ -61,504 +57,11 @@ namespace
         offsetof(SystemProcessInfoHeader, UniqueProcessId) == 0x50,
         "x64 SYSTEM_PROCESS_INFORMATION UniqueProcessId offset");
 
-    struct ProcessView
-    {
-        uint32_t Pid = 0;
-        uint64_t Eprocess = 0;
-        std::wstring Image;
-        bool Kernel = false;
-        bool Spi = false;
-        bool Toolhelp = false;
-        bool HandleOwner = false;
-        bool CidTable = false;
-        bool UserBefore = false;
-        bool UserAfter = false;
-        bool SpiBefore = false;
-        bool SpiAfter = false;
-        bool ToolhelpBefore = false;
-        bool ToolhelpAfter = false;
-        bool Auxiliary = false;
-        bool ProcessExiting = false;
-        bool ProcessDelete = false;
-        bool ProcessRundown = false;
-        bool HasActiveThreads = false;
-        bool HasExitTime = false;
-        bool HasLifecycle = false;
-        bool PidRevalidated = false;
-        bool HasAuxiliaryResolved = false;
-        uint32_t ActiveThreads = 0;
-        uint64_t ExitTime = 0;
-    };
-
     struct UserInventory
     {
         std::map<uint32_t, std::wstring> Images;
         uint32_t Count = 0;
     };
-
-    struct HiddenProcessClassifyInput
-    {
-        uint32_t Pid = 0;
-        bool Kernel = false;
-        bool Spi = false;
-        bool Toolhelp = false;
-        bool HandleOwner = false;
-        bool CidTable = false;
-        bool UserBefore = false;
-        bool UserAfter = false;
-        bool SpiBefore = false;
-        bool SpiAfter = false;
-        bool ToolhelpBefore = false;
-        bool ToolhelpAfter = false;
-        bool KernelWalkOk = false;
-        bool KernelInventoryComplete = false;
-        bool UserWalkOk = false;
-        bool SpiWalkOk = false;
-        bool ToolhelpWalkOk = false;
-        bool CidConfirmAvailable = false;
-        bool LifecycleLayoutAvailable = false;
-        bool HasLifecycle = false;
-        bool PidRevalidated = false;
-        bool HasAuxiliaryResolved = false;
-        bool HasActiveThreads = false;
-        uint32_t ActiveThreads = 0;
-        bool HasExitTime = false;
-        uint64_t ExitTime = 0;
-        bool Auxiliary = false;
-        bool ProcessExiting = false;
-        bool ProcessDelete = false;
-        bool ProcessRundown = false;
-    };
-
-    struct HiddenProcessClassifyResult
-    {
-        bool Suspicious = false;
-        bool Ignored = false;
-        bool IgnoredAuxiliary = false;
-        bool IgnoredTerminating = false;
-        bool IgnoredRace = false;
-        std::wstring Notes;
-    };
-
-    bool IsKernelAddress(uint64_t value)
-    {
-        return value >= kKernelSpaceMin;
-    }
-
-    bool TryAddOffset(uint64_t base, uint64_t offset, uint64_t* result)
-    {
-        if (result == nullptr || offset > (std::numeric_limits<uint64_t>::max)() - base)
-        {
-            return false;
-        }
-        *result = base + offset;
-        return true;
-    }
-
-    bool ReadU64(DeviceClient& device, uint64_t address, uint64_t* value)
-    {
-        std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(address, sizeof(uint64_t), &bytes, nullptr) ||
-            bytes.size() != sizeof(uint64_t))
-        {
-            return false;
-        }
-        memcpy(value, bytes.data(), sizeof(uint64_t));
-        return true;
-    }
-
-    bool ReadInteger(DeviceClient& device, uint64_t address, size_t width, uint64_t* value)
-    {
-        if (value == nullptr || width == 0 || width > sizeof(uint64_t))
-        {
-            return false;
-        }
-
-        std::vector<uint8_t> bytes;
-        if (!device.ReadMemory(address, static_cast<uint32_t>(width), &bytes, nullptr) ||
-            bytes.size() != width)
-        {
-            return false;
-        }
-
-        uint64_t parsed = 0;
-        memcpy(&parsed, bytes.data(), width);
-        *value = parsed;
-        return true;
-    }
-
-    size_t FieldStorageWidth(const TypeFieldInfo& field, size_t fallback)
-    {
-        size_t width = fallback;
-        if (field.IsBitField)
-        {
-            const uint64_t bitEnd = static_cast<uint64_t>(field.BitPosition) + field.Length;
-            if (bitEnd <= 8)
-            {
-                width = 1;
-            }
-            else if (bitEnd <= 16)
-            {
-                width = 2;
-            }
-            else if (bitEnd <= 32)
-            {
-                width = 4;
-            }
-            else
-            {
-                width = 8;
-            }
-        }
-        else if (field.Length > 0 && field.Length <= sizeof(uint64_t))
-        {
-            width = static_cast<size_t>(field.Length);
-        }
-        return width;
-    }
-
-    bool ReadFieldInteger(
-        DeviceClient& device,
-        uint64_t base,
-        const TypeFieldInfo& field,
-        size_t fallbackWidth,
-        uint64_t* value)
-    {
-        if (value == nullptr)
-        {
-            return false;
-        }
-
-        uint64_t address = 0;
-        if (!TryAddOffset(base, field.Offset, &address))
-        {
-            return false;
-        }
-
-        uint64_t raw = 0;
-        if (!ReadInteger(device, address, FieldStorageWidth(field, fallbackWidth), &raw))
-        {
-            return false;
-        }
-
-        if (field.IsBitField)
-        {
-            if (field.Length == 0 ||
-                field.Length > 64 ||
-                field.BitPosition >= 64 ||
-                field.Length > 64 - field.BitPosition)
-            {
-                return false;
-            }
-            const uint64_t mask = field.Length == 64
-                ? (std::numeric_limits<uint64_t>::max)()
-                : ((1ull << field.Length) - 1ull);
-            raw = (raw >> field.BitPosition) & mask;
-        }
-
-        *value = raw;
-        return true;
-    }
-
-    bool ReadBitFlag(
-        DeviceClient& device,
-        uint64_t eprocess,
-        const TypeFieldInfo& field,
-        bool resolved,
-        bool* value)
-    {
-        if (!resolved || value == nullptr)
-        {
-            return false;
-        }
-
-        uint64_t raw = 0;
-        if (!ReadFieldInteger(device, eprocess, field, sizeof(uint32_t), &raw))
-        {
-            return false;
-        }
-        *value = raw != 0;
-        return true;
-    }
-
-    std::wstring AsciiToWide(const char* text, size_t maxLen)
-    {
-        std::wstring out;
-        if (text == nullptr)
-        {
-            return out;
-        }
-        for (size_t i = 0; i < maxLen && text[i] != 0; ++i)
-        {
-            out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(text[i])));
-        }
-        return out;
-    }
-
-    bool IsTerminatingView(const HiddenProcessClassifyInput& input)
-    {
-        // Match hunt leftovers. ProcessExiting/Delete/Rundown fire while
-        // threads still run, so flags alone are not proof the object is a
-        // zombie. Scan CID-confirms every still-allocated EPROCESS; a CID
-        // slot is not evidence that a leftover is live and hidden.
-        if (input.HasExitTime && input.ExitTime != 0)
-        {
-            return true;
-        }
-        return input.HasActiveThreads && input.ActiveThreads == 0;
-    }
-
-    bool HasStableSameApiPresence(const HiddenProcessClassifyInput& input)
-    {
-        return (input.SpiBefore && input.SpiAfter) ||
-            (input.ToolhelpBefore && input.ToolhelpAfter);
-    }
-
-    HiddenProcessClassifyResult ClassifyHiddenProcess(const HiddenProcessClassifyInput& input)
-    {
-        HiddenProcessClassifyResult result = {};
-        if (input.Pid <= 4 || !input.KernelWalkOk || !input.UserWalkOk)
-        {
-            return result;
-        }
-
-        const uint32_t userViews =
-            static_cast<uint32_t>(input.Spi) +
-            static_cast<uint32_t>(input.Toolhelp);
-
-        if (input.Kernel && userViews == 0)
-        {
-            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes =
-                    L"SPI or Toolhelp inventory was incomplete; kernel-only process was not escalated";
-                return result;
-            }
-            // CID confirmation runs before UniqueProcessId is re-read on the
-            // walked EPROCESS. Stale Auxiliary/ExitTime from that window
-            // must not look like a live hide, and must not count as a clone.
-            if (!input.PidRevalidated)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes = L"kernel-only process disappeared before lifecycle revalidation";
-                return result;
-            }
-            // PssCaptureSnapshot clones stay in ActiveProcessLinks, are
-            // omitted from SPI by design, and still have CID slots.
-            if (input.Auxiliary)
-            {
-                result.Ignored = true;
-                result.IgnoredAuxiliary = true;
-                result.Notes = L"ActiveProcessLinks auxiliary/snapshot clone omitted from SPI";
-                return result;
-            }
-            if (IsTerminatingView(input))
-            {
-                result.Ignored = true;
-                result.IgnoredTerminating = true;
-                result.Notes = L"exiting process still linked in ActiveProcessLinks";
-                return result;
-            }
-            result.Suspicious = true;
-            result.Notes = L"present in ActiveProcessLinks but absent from SPI and Toolhelp";
-            return result;
-        }
-
-        if (!input.Kernel && userViews > 0)
-        {
-            if (!input.KernelInventoryComplete)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes = L"ActiveProcessLinks walk was incomplete; API-only process was not escalated";
-                return result;
-            }
-            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes =
-                    L"SPI or Toolhelp inventory was incomplete; API-only process was not escalated";
-                return result;
-            }
-            if (!HasStableSameApiPresence(input))
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes = L"user-mode view was not stable on the same API across both snapshots";
-                return result;
-            }
-            if (IsTerminatingView(input))
-            {
-                result.Ignored = true;
-                result.IgnoredTerminating = true;
-                result.Notes = L"exiting process still visible to user-mode enumeration";
-                return result;
-            }
-            result.Suspicious = true;
-            result.Notes = L"visible to user-mode enumeration but missing from ActiveProcessLinks";
-            return result;
-        }
-
-        // DKOM unlink from ActiveProcessLinks hides the process from the
-        // kernel walk AND from SPI/Toolhelp (both consume that list). The
-        // process still owns handles and still has a CID slot.
-        if (!input.Kernel && userViews == 0 && input.Pid > 4)
-        {
-            if (!input.KernelInventoryComplete)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes =
-                    L"ActiveProcessLinks walk was incomplete; CID/handle-only process was not escalated";
-                return result;
-            }
-            if (!input.SpiWalkOk || !input.ToolhelpWalkOk)
-            {
-                result.Ignored = true;
-                result.IgnoredRace = true;
-                result.Notes =
-                    L"SPI or Toolhelp inventory was incomplete; CID/handle-only process was not escalated";
-                return result;
-            }
-            if (IsTerminatingView(input))
-            {
-                result.Ignored = true;
-                result.IgnoredTerminating = true;
-                result.Notes = L"exiting CID/handle process omitted from lists";
-                return result;
-            }
-            if (input.CidTable)
-            {
-                result.Suspicious = true;
-                result.Notes =
-                    L"live CID process missing from ActiveProcessLinks, SPI, and Toolhelp";
-                return result;
-            }
-            if (input.HandleOwner)
-            {
-                if (input.CidConfirmAvailable && !input.CidTable)
-                {
-                    result.Ignored = true;
-                    result.IgnoredRace = true;
-                    result.Notes =
-                        L"handle owner disappeared before CID revalidation";
-                    return result;
-                }
-                result.Suspicious = true;
-                result.Notes =
-                    L"handle-table owner missing from ActiveProcessLinks, SPI, and Toolhelp";
-                return result;
-            }
-        }
-
-        return result;
-    }
-
-    HiddenProcessClassifyInput MakeClassifyInput(
-        const ProcessView& view,
-        bool kernelWalkOk,
-        bool kernelInventoryComplete,
-        bool userWalkOk,
-        bool spiWalkOk,
-        bool toolhelpWalkOk,
-        bool cidConfirmAvailable,
-        bool lifecycleLayoutAvailable)
-    {
-        HiddenProcessClassifyInput input = {};
-        input.Pid = view.Pid;
-        input.Kernel = view.Kernel;
-        input.Spi = view.Spi;
-        input.Toolhelp = view.Toolhelp;
-        input.HandleOwner = view.HandleOwner;
-        input.CidTable = view.CidTable;
-        input.UserBefore = view.UserBefore;
-        input.UserAfter = view.UserAfter;
-        input.SpiBefore = view.SpiBefore;
-        input.SpiAfter = view.SpiAfter;
-        input.ToolhelpBefore = view.ToolhelpBefore;
-        input.ToolhelpAfter = view.ToolhelpAfter;
-        input.KernelWalkOk = kernelWalkOk;
-        input.KernelInventoryComplete = kernelInventoryComplete;
-        input.UserWalkOk = userWalkOk;
-        input.SpiWalkOk = spiWalkOk;
-        input.ToolhelpWalkOk = toolhelpWalkOk;
-        input.CidConfirmAvailable = cidConfirmAvailable;
-        input.LifecycleLayoutAvailable = lifecycleLayoutAvailable;
-        input.HasLifecycle = view.HasLifecycle;
-        input.PidRevalidated = view.PidRevalidated;
-        input.HasAuxiliaryResolved = view.HasAuxiliaryResolved;
-        input.HasActiveThreads = view.HasActiveThreads;
-        input.ActiveThreads = view.ActiveThreads;
-        input.HasExitTime = view.HasExitTime;
-        input.ExitTime = view.ExitTime;
-        input.Auxiliary = view.Auxiliary;
-        input.ProcessExiting = view.ProcessExiting;
-        input.ProcessDelete = view.ProcessDelete;
-        input.ProcessRundown = view.ProcessRundown;
-        return input;
-    }
-
-    void MergeUserInventory(
-        std::map<uint32_t, ProcessView>& views,
-        const UserInventory& inventory,
-        bool spi,
-        bool toolhelp,
-        bool before)
-    {
-        for (const auto& item : inventory.Images)
-        {
-            ProcessView& view = views[item.first];
-            view.Pid = item.first;
-            if (spi)
-            {
-                view.Spi = true;
-                if (before)
-                {
-                    view.SpiBefore = true;
-                }
-                else
-                {
-                    view.SpiAfter = true;
-                }
-            }
-            if (toolhelp)
-            {
-                view.Toolhelp = true;
-                if (before)
-                {
-                    view.ToolhelpBefore = true;
-                }
-                else
-                {
-                    view.ToolhelpAfter = true;
-                }
-            }
-            if (before)
-            {
-                view.UserBefore = true;
-            }
-            else
-            {
-                view.UserAfter = true;
-            }
-            if (view.Image.empty() && !item.second.empty())
-            {
-                view.Image = item.second;
-            }
-        }
-    }
-
-    void AdoptInventoryCount(uint32_t* count, uint32_t snapshotCount)
-    {
-        if (count != nullptr && snapshotCount > *count)
-        {
-            *count = snapshotCount;
-        }
-    }
 
     bool ParseSystemProcessInformationBuffer(
         const uint8_t* data,
@@ -910,6 +413,15 @@ namespace
         }
 
         PROCESSENTRY32W entry = {};
+        struct SnapshotOwner
+        {
+            HANDLE Value;
+            ~SnapshotOwner()
+            {
+                CloseHandle(Value);
+            }
+        };
+        SnapshotOwner owner{snap};
         entry.dwSize = sizeof(entry);
         UserInventory parsed = {};
         bool ok = false;
@@ -919,7 +431,15 @@ namespace
             DWORD nextError = ERROR_SUCCESS;
             do
             {
-                parsed.Images[entry.th32ProcessID] = entry.szExeFile;
+                if (!parsed.Images.emplace(entry.th32ProcessID, entry.szExeFile).second)
+                {
+                    more = TRUE;
+                    if (warning != nullptr)
+                    {
+                        *warning = L"CreateToolhelp32Snapshot contained a duplicate PID";
+                    }
+                    break;
+                }
                 if (parsed.Images.size() >= kMaxProcesses)
                 {
                     more = TRUE;
@@ -952,7 +472,6 @@ namespace
                 ok = true;
             }
         }
-        CloseHandle(snap);
         if (!ok)
         {
             if (warning != nullptr && warning->empty())
@@ -966,991 +485,364 @@ namespace
         return true;
     }
 
-    struct LifecycleLayout
+
+    class DeviceProcessReader final : public HiddenProcessReader
     {
-        TypeFieldInfo ExitTime = {};
-        TypeFieldInfo ActiveThreads = {};
-        TypeFieldInfo Auxiliary = {};
-        TypeFieldInfo ProcessExiting = {};
-        TypeFieldInfo ProcessDelete = {};
-        TypeFieldInfo ProcessRundown = {};
-        bool HasExitTime = false;
-        bool HasActiveThreads = false;
-        bool HasAuxiliary = false;
-        bool HasProcessExiting = false;
-        bool HasProcessDelete = false;
-        bool HasProcessRundown = false;
+    public:
+        DeviceProcessReader(DeviceClient& device, uint32_t dtbOffset) :
+            Device(device), DtbOffset(dtbOffset)
+        {
+        }
+
+        bool Read(uint64_t address, uint8_t bytes, uint64_t* value) override
+        {
+            std::vector<uint8_t> data;
+            if (Stopped() || value == nullptr || bytes == 0 || bytes > 8 ||
+                !Device.ReadMemory(address, bytes, &data, nullptr) || data.size() != bytes)
+            {
+                return false;
+            }
+            *value = 0;
+            memcpy(value, data.data(), bytes);
+            return true;
+        }
+
+        bool Resolve(uint32_t pid, uint64_t* eprocess) override
+        {
+            ProcessAddressContext context = {};
+            if (Stopped() || eprocess == nullptr || DtbOffset == 0 ||
+                !Device.ResolveProcess(pid, DtbOffset, 0, &context, nullptr) ||
+                context.ProcessId != pid || context.Eprocess == 0)
+            {
+                return false;
+            }
+            *eprocess = context.Eprocess;
+            return true;
+        }
+
+        bool Stopped() const override
+        {
+            return Deadline != 0 && GetTickCount64() >= Deadline;
+        }
+
+        uint64_t Deadline = 0;
+
+    private:
+        DeviceClient& Device;
+        uint32_t DtbOffset;
     };
 
-    bool ReadProcessLifecycle(
-        DeviceClient& device,
-        const LifecycleLayout& layout,
-        ProcessView* view)
+    HiddenProcessField ResolveProcessField(SymbolEngine& symbols, const wchar_t* name)
     {
-        if (view == nullptr || view->Eprocess == 0)
+        TypeFieldInfo field;
+        HiddenProcessField result;
+        if (!symbols.FindField(L"nt!_EPROCESS", name, &field, nullptr) || field.Offset > 0x10000)
         {
-            return false;
+            return result;
         }
-
-        if (layout.HasActiveThreads)
+        result.Offset = field.Offset;
+        if (field.IsBitField)
         {
-            uint64_t threads = 0;
-            if (ReadFieldInteger(device, view->Eprocess, layout.ActiveThreads, sizeof(uint32_t), &threads))
+            if (field.Length == 0 || field.Length > 64 || field.BitPosition >= 64 ||
+                field.Length > 64 - field.BitPosition)
             {
-                view->ActiveThreads = static_cast<uint32_t>(threads);
-                view->HasActiveThreads = true;
+                return result;
             }
+            const uint64_t end = field.BitPosition + field.Length;
+            result.Bytes = end <= 8 ? 1 : end <= 16 ? 2 : end <= 32 ? 4 : 8;
+            result.BitPosition = static_cast<uint8_t>(field.BitPosition);
+            result.BitCount = static_cast<uint8_t>(field.Length);
         }
-        if (layout.HasExitTime)
+        else
         {
-            uint64_t exitTime = 0;
-            if (ReadFieldInteger(device, view->Eprocess, layout.ExitTime, sizeof(uint64_t), &exitTime))
+            if (field.Length != 1 && field.Length != 2 && field.Length != 4 && field.Length != 8)
             {
-                view->ExitTime = exitTime;
-                view->HasExitTime = true;
+                return result;
             }
+            result.Bytes = static_cast<uint8_t>(field.Length);
         }
-
-        bool flag = false;
-        if (ReadBitFlag(device, view->Eprocess, layout.Auxiliary, layout.HasAuxiliary, &flag))
-        {
-            view->Auxiliary = flag;
-            view->HasAuxiliaryResolved = true;
-        }
-        if (ReadBitFlag(device, view->Eprocess, layout.ProcessExiting, layout.HasProcessExiting, &flag))
-        {
-            view->ProcessExiting = flag;
-        }
-        if (ReadBitFlag(device, view->Eprocess, layout.ProcessDelete, layout.HasProcessDelete, &flag))
-        {
-            view->ProcessDelete = flag;
-        }
-        if (ReadBitFlag(device, view->Eprocess, layout.ProcessRundown, layout.HasProcessRundown, &flag))
-        {
-            view->ProcessRundown = flag;
-        }
-
-        // Flags alone are not proof the EPROCESS is still the same live object.
-        view->HasLifecycle = view->HasActiveThreads || view->HasExitTime;
-        return view->HasLifecycle;
+        result.Available = true;
+        return result;
     }
 
-    bool ConfirmCidProcess(
-        DeviceClient& device,
-        uint32_t pid,
-        const TypeFieldInfo& dtbField,
-        const TypeFieldInfo& imageField,
-        const LifecycleLayout& lifecycle,
-        ProcessView* view)
+    void MergeUserInventory(std::map<uint32_t, HiddenProcessRecord>& views,
+        const UserInventory& inventory, bool spi)
     {
-        bool ok = false;
-        do
+        for (const auto& item : inventory.Images)
         {
-            if (view == nullptr || pid <= 4 || dtbField.Offset == 0)
+            auto& view = views[item.first];
+            view.ProcessId = item.first;
+            if (spi)
             {
-                break;
+                view.InSystemProcessInfo = true;
             }
+            else
+            {
+                view.InToolhelp = true;
+            }
+            if (view.ImageName.empty())
+            {
+                view.ImageName = item.second;
+            }
+        }
+    }
 
-            ProcessAddressContext ctx = {};
-            std::wstring ignored;
-            if (!device.ResolveProcess(
-                    pid,
-                    static_cast<uint32_t>(dtbField.Offset),
-                    0,
-                    &ctx,
-                    &ignored) ||
-                ctx.Eprocess == 0)
-            {
-                break;
-            }
-
-            view->Pid = pid;
-            if (view->Eprocess != 0 && view->Eprocess != ctx.Eprocess)
-            {
-                break;
-            }
-            if (view->Eprocess == 0)
-            {
-                view->Eprocess = ctx.Eprocess;
-            }
-            view->CidTable = true;
-            // Kernel-list hits re-read UniqueProcessId on the walked EPROCESS
-            // before lifecycle is trusted. Filling ExitTime/Auxiliary here
-            // would leave stale leftover bits after that re-read fails.
-            if (!view->Kernel)
-            {
-                ReadProcessLifecycle(device, lifecycle, view);
-            }
-            if (view->Image.empty() && imageField.Offset != 0)
-            {
-                std::vector<uint8_t> nameBytes;
-                uint32_t nameLen = 16;
-                if (imageField.Length >= 1 && imageField.Length <= 16)
-                {
-                    nameLen = static_cast<uint32_t>(imageField.Length);
-                }
-                uint64_t imageAddress = 0;
-                if (TryAddOffset(ctx.Eprocess, imageField.Offset, &imageAddress) &&
-                    device.ReadMemory(
-                        imageAddress,
-                        nameLen,
-                        &nameBytes,
-                        nullptr) &&
-                    !nameBytes.empty())
-                {
-                    view->Image = AsciiToWide(
-                        reinterpret_cast<const char*>(nameBytes.data()),
-                        strnlen(
-                            reinterpret_cast<const char*>(nameBytes.data()),
-                            nameBytes.size()));
-                }
-            }
-            ok = true;
-        } while (false);
-        return ok;
+    HiddenProcessMembership DiscoveryMembership(const HiddenProcessRecord& record)
+    {
+        HiddenProcessMembership result;
+        result.Kernel = record.InKernelList;
+        result.Spi = record.InSystemProcessInfo;
+        result.Toolhelp = record.InToolhelp;
+        result.Cid = record.InCidTable;
+        result.Handles = record.InHandleOwners;
+        return result;
     }
 }
 
 HiddenProcessScanner::HiddenProcessScanner(DeviceClient& device, SymbolEngine& symbols) :
-    device_(device),
-    symbols_(symbols)
+    device_(device), symbols_(symbols)
 {
 }
 
 bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result, std::wstring* error)
 {
-    std::vector<uint32_t> none;
-    return Scan(result, none, error);
+    return Scan(result, {}, error);
 }
 
-bool HiddenProcessScanner::Scan(
-    HiddenProcessScanResult* result,
-    const std::vector<uint32_t>& extraCandidatePids,
-    std::wstring* error)
+bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result,
+    const std::vector<uint32_t>& extraCandidatePids, std::wstring* error)
 {
-    bool ok = false;
-
+    if (result == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = L"invalid hidden-process result output";
+        }
+        return false;
+    }
+    *result = HiddenProcessScanResult{};
     try
     {
-    do
-    {
-        if (result == nullptr)
+        HiddenProcessLayout layout;
+        layout.Pid = ResolveProcessField(symbols_, L"UniqueProcessId");
+        layout.CreateTime = ResolveProcessField(symbols_, L"CreateTime");
+        layout.ActiveThreads = ResolveProcessField(symbols_, L"ActiveThreads");
+        layout.ExitTime = ResolveProcessField(symbols_, L"ExitTime");
+        layout.Auxiliary = ResolveProcessField(symbols_, L"AuxiliaryProcess");
+        layout.ProcessExiting = ResolveProcessField(symbols_, L"ProcessExiting");
+        layout.ProcessDelete = ResolveProcessField(symbols_, L"ProcessDelete");
+        layout.ProcessRundown = ResolveProcessField(symbols_, L"ProcessRundown");
+        TypeFieldInfo links = {};
+        layout.LinksAvailable = symbols_.FindField(L"nt!_EPROCESS", L"ActiveProcessLinks", &links, nullptr) &&
+            !links.IsBitField && links.Length == 16 && links.Offset <= 0x10000 &&
+            symbols_.ResolveSymbol(L"nt!PsActiveProcessHead", &layout.ListHead, nullptr);
+        layout.LinksOffset = links.Offset;
+        TypeFieldInfo dtb = {};
+        const bool hasDtb =
+            (symbols_.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtb, nullptr) ||
+                symbols_.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtb, nullptr) ||
+                symbols_.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtb, nullptr)) &&
+            !dtb.IsBitField && dtb.Length == 8 && dtb.Offset > 0 && dtb.Offset <= 0x4000;
+        DeviceProcessReader reader(device_, hasDtb ? dtb.Offset : 0);
+        const auto addressSpace = device_.AddressSpace();
+        if (!layout.CreateTime.Available || !layout.ExitTime.Available ||
+            !layout.ActiveThreads.Available || !layout.Auxiliary.Available || !hasDtb ||
+            !layout.ProcessExiting.Available || !layout.ProcessDelete.Available || !layout.ProcessRundown.Available)
         {
-            if (error != nullptr)
-            {
-                *error = L"invalid hidden-process result output";
-            }
-            break;
+            result->Warnings.push_back(L"process identity or lifecycle layout was incomplete; affected candidates remain unverified");
         }
 
-        *result = HiddenProcessScanResult{};
-        std::map<uint32_t, ProcessView> views;
-
-        UserInventory spiBefore = {};
-        std::wstring spiWarning;
-        const bool spiBeforeOk = CollectSystemProcessInformation(&spiBefore, &spiWarning);
-        if (spiBeforeOk)
+        std::map<uint32_t, HiddenProcessRecord> views;
+        UserInventory spi;
+        UserInventory toolhelp;
+        std::wstring warning;
+        const bool spiOk = CollectSystemProcessInformation(&spi, &warning);
+        if (!spiOk)
         {
-            MergeUserInventory(views, spiBefore, true, false, true);
-            AdoptInventoryCount(&result->SystemProcessInfoCount, spiBefore.Count);
+            result->Warnings.push_back(warning);
         }
-        else if (!spiWarning.empty())
+        MergeUserInventory(views, spi, true);
+        result->SystemProcessInfoCount = spi.Count;
+        warning.clear();
+        const bool toolhelpOk = CollectToolhelpProcesses(&toolhelp, &warning);
+        if (!toolhelpOk)
         {
-            result->Warnings.push_back(spiWarning);
+            result->Warnings.push_back(warning);
         }
-
-        UserInventory toolhelpBefore = {};
-        std::wstring toolhelpWarning;
-        const bool toolhelpBeforeOk = CollectToolhelpProcesses(&toolhelpBefore, &toolhelpWarning);
-        if (toolhelpBeforeOk)
+        MergeUserInventory(views, toolhelp, false);
+        result->ToolhelpCount = toolhelp.Count;
+        const auto kernel = ReadHiddenProcessKernelView(reader, addressSpace, layout);
+        result->KernelListCount = static_cast<uint32_t>(kernel.Entries.size());
+        if (!kernel.Complete)
         {
-            MergeUserInventory(views, toolhelpBefore, false, true, true);
-            AdoptInventoryCount(&result->ToolhelpCount, toolhelpBefore.Count);
+            result->Warnings.push_back(kernel.Reason);
         }
-        else if (!toolhelpWarning.empty())
+        for (const auto& item : kernel.Entries)
         {
-            result->Warnings.push_back(toolhelpWarning);
-        }
-
-        TypeFieldInfo linksField = {};
-        TypeFieldInfo pidField = {};
-        TypeFieldInfo imageField = {};
-        std::wstring ignored;
-        uint64_t listHead = 0;
-        bool kernelInventoryComplete = false;
-        if (symbols_.FindField(L"nt!_EPROCESS", L"ActiveProcessLinks", &linksField, &ignored) &&
-            symbols_.FindField(L"nt!_EPROCESS", L"UniqueProcessId", &pidField, &ignored) &&
-            symbols_.ResolveSymbol(L"nt!PsActiveProcessHead", &listHead, &ignored) &&
-            listHead != 0)
-        {
-            symbols_.FindField(L"nt!_EPROCESS", L"ImageFileName", &imageField, &ignored);
-            uint64_t flink = 0;
-            if (ReadU64(device_, listHead, &flink))
-            {
-                uint32_t walked = 0;
-                uint64_t current = flink;
-                bool kernelWalkAborted = false;
-                std::unordered_set<uint64_t> visited;
-                visited.insert(listHead);
-                while (current != 0 &&
-                    current != listHead &&
-                    IsKernelAddress(current) &&
-                    walked < kMaxProcesses)
-                {
-                    if (!visited.insert(current).second)
-                    {
-                        result->Warnings.push_back(L"ActiveProcessLinks walk hit a cycle");
-                        kernelWalkAborted = true;
-                        break;
-                    }
-                    if (current < linksField.Offset)
-                    {
-                        result->Warnings.push_back(L"ActiveProcessLinks entry underflowed the list offset");
-                        kernelWalkAborted = true;
-                        break;
-                    }
-                    const uint64_t eprocess = current - linksField.Offset;
-                    uint64_t pidValue = 0;
-                    if (!ReadFieldInteger(
-                            device_,
-                            eprocess,
-                            pidField,
-                            sizeof(uint64_t),
-                            &pidValue))
-                    {
-                        result->Warnings.push_back(L"ActiveProcessLinks UniqueProcessId read failed");
-                        kernelWalkAborted = true;
-                        break;
-                    }
-                    if (pidValue > (std::numeric_limits<uint32_t>::max)())
-                    {
-                        result->Warnings.push_back(L"ActiveProcessLinks UniqueProcessId was outside the 32-bit PID range");
-                        kernelWalkAborted = true;
-                        break;
-                    }
-
-                    const uint32_t pid = static_cast<uint32_t>(pidValue);
-                    ProcessView& view = views[pid];
-                    view.Pid = pid;
-                    if (view.Kernel && view.Eprocess != 0 && view.Eprocess != eprocess)
-                    {
-                        result->Warnings.push_back(
-                            L"ActiveProcessLinks contained a duplicate PID with a different EPROCESS");
-                    }
-                    else
-                    {
-                        view.Eprocess = eprocess;
-                        view.Kernel = true;
-                    }
-                    if (view.Image.empty() && imageField.Offset != 0)
-                    {
-                        uint64_t imageAddress = 0;
-                        std::vector<uint8_t> nameBytes;
-                        uint32_t nameLen = imageField.Length > 16 ? 16 : static_cast<uint32_t>(imageField.Length);
-                        if (nameLen > 0 &&
-                            TryAddOffset(eprocess, imageField.Offset, &imageAddress) &&
-                            device_.ReadMemory(imageAddress, nameLen, &nameBytes, nullptr) &&
-                            !nameBytes.empty())
-                        {
-                            view.Image = AsciiToWide(
-                                reinterpret_cast<const char*>(nameBytes.data()),
-                                strnlen(
-                                    reinterpret_cast<const char*>(nameBytes.data()),
-                                    nameBytes.size()));
-                        }
-                    }
-
-                    uint64_t next = 0;
-                    if (!ReadU64(device_, current, &next) || next == current)
-                    {
-                        result->Warnings.push_back(L"ActiveProcessLinks Flink read failed");
-                        kernelWalkAborted = true;
-                        break;
-                    }
-                    ++walked;
-                    current = next;
-                }
-                result->KernelListCount = walked;
-                if (!kernelWalkAborted && current == listHead && walked > 0)
-                {
-                    kernelInventoryComplete = true;
-                }
-                else if (walked > 0 && current != listHead)
-                {
-                    kernelWalkAborted = true;
-                }
-                if (kernelWalkAborted)
-                {
-                    result->Warnings.push_back(L"kernel ActiveProcessLinks walk was incomplete");
-                }
-            }
-        }
-        else
-        {
-            result->Warnings.push_back(L"kernel ActiveProcessLinks walk was not resolved");
-        }
-
-        UserInventory spiAfter = {};
-        spiWarning.clear();
-        const bool spiAfterOk = CollectSystemProcessInformation(&spiAfter, &spiWarning);
-        if (spiAfterOk)
-        {
-            MergeUserInventory(views, spiAfter, true, false, false);
-            AdoptInventoryCount(&result->SystemProcessInfoCount, spiAfter.Count);
-        }
-        else if (!spiWarning.empty())
-        {
-            result->Warnings.push_back(L"second " + spiWarning);
-        }
-
-        UserInventory toolhelpAfter = {};
-        toolhelpWarning.clear();
-        const bool toolhelpAfterOk = CollectToolhelpProcesses(&toolhelpAfter, &toolhelpWarning);
-        if (toolhelpAfterOk)
-        {
-            MergeUserInventory(views, toolhelpAfter, false, true, false);
-            AdoptInventoryCount(&result->ToolhelpCount, toolhelpAfter.Count);
-        }
-        else if (!toolhelpWarning.empty())
-        {
-            result->Warnings.push_back(L"second " + toolhelpWarning);
+            auto& view = views[item.first];
+            view.ProcessId = item.first;
+            view.InKernelList = true;
+            view.Eprocess = item.second.Eprocess;
         }
 
         HandleTableScanner handles(device_, symbols_);
-        HandleTableScanOptions handleOptions = {};
+        HandleTableScanOptions handleOptions;
         handleOptions.CollectRecords = false;
-        HandleTableScanResult handleResult = {};
-        std::wstring handleError;
-        if (handles.Scan(handleOptions, &handleResult, &handleError))
+        HandleTableScanResult handleResult;
+        warning.clear();
+        const bool handlesOk = handles.Scan(handleOptions, &handleResult, &warning);
+        if (!handlesOk || !handleResult.CoverageComplete || handleResult.Truncated)
         {
-            if (handleResult.Truncated || !handleResult.CoverageComplete)
-            {
-                result->Warnings.push_back(L"handle-owner view used a truncated handle snapshot");
-            }
-            for (const std::wstring& warning : handleResult.Warnings)
-            {
-                result->Warnings.push_back(L"handle-owner view: " + warning);
-            }
-            for (uint32_t pid : handleResult.OwnerPids)
-            {
-                ProcessView& view = views[pid];
-                view.Pid = pid;
-                view.HandleOwner = true;
-            }
-            result->HandleOwnerCount = static_cast<uint32_t>(handleResult.OwnerPids.size());
+            result->Warnings.push_back(L"handle-owner discovery was incomplete: " + warning);
         }
-        else if (!handleError.empty())
+        for (const auto& handleWarning : handleResult.Warnings)
         {
-            result->Warnings.push_back(L"handle-owner view failed: " + handleError);
+            result->Warnings.push_back(L"handle-owner view: " + handleWarning);
         }
-
-        LifecycleLayout lifecycle = {};
-        lifecycle.HasExitTime = symbols_.FindField(L"nt!_EPROCESS", L"ExitTime", &lifecycle.ExitTime, &ignored);
-        lifecycle.HasActiveThreads =
-            symbols_.FindField(L"nt!_EPROCESS", L"ActiveThreads", &lifecycle.ActiveThreads, &ignored);
-        lifecycle.HasAuxiliary =
-            symbols_.FindField(L"nt!_EPROCESS", L"AuxiliaryProcess", &lifecycle.Auxiliary, &ignored);
-        lifecycle.HasProcessExiting =
-            symbols_.FindField(L"nt!_EPROCESS", L"ProcessExiting", &lifecycle.ProcessExiting, &ignored);
-        lifecycle.HasProcessDelete =
-            symbols_.FindField(L"nt!_EPROCESS", L"ProcessDelete", &lifecycle.ProcessDelete, &ignored);
-        lifecycle.HasProcessRundown =
-            symbols_.FindField(L"nt!_EPROCESS", L"ProcessRundown", &lifecycle.ProcessRundown, &ignored);
-        if (!lifecycle.HasExitTime || !lifecycle.HasActiveThreads)
-        {
-            result->Warnings.push_back(L"kernel process lifecycle fields were not fully resolved");
-        }
-        if (!lifecycle.HasAuxiliary)
-        {
-            result->Warnings.push_back(
-                L"AuxiliaryProcess was not resolved; PssCaptureSnapshot clones may be reported as hidden");
-        }
-
-        const bool userInventoryComplete =
-            spiBeforeOk && spiAfterOk &&
-            toolhelpBeforeOk && toolhelpAfterOk &&
-            result->SystemProcessInfoCount > 0 &&
-            result->ToolhelpCount > 0;
-
-        const bool kernelWalkOk = result->KernelListCount > 0;
-        const bool userWalkOk =
-            result->SystemProcessInfoCount > 0 ||
-            result->ToolhelpCount > 0;
-        const bool lifecycleLayoutAvailable =
-            lifecycle.HasExitTime || lifecycle.HasActiveThreads;
-
-        TypeFieldInfo dtbField = {};
-        const bool hasDtb =
-            symbols_.FindField(L"nt!_KPROCESS", L"DirectoryTableBase", &dtbField, &ignored) ||
-            symbols_.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtbField, &ignored) ||
-            symbols_.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtbField, &ignored);
-        if (!hasDtb)
-        {
-            result->Warnings.push_back(
-                L"DirectoryTableBase was not resolved; CID confirmation is unavailable");
-        }
-
-        auto confirmIfMissingFromLists = [&](uint32_t pid)
-        {
-            if (pid <= 4 || !hasDtb)
-            {
-                return;
-            }
-            ProcessView& view = views[pid];
-            view.Pid = pid;
-            if (view.Kernel && view.Spi && view.Toolhelp)
-            {
-                return;
-            }
-            if (view.CidTable)
-            {
-                return;
-            }
-            if (ConfirmCidProcess(
-                    device_,
-                    pid,
-                    dtbField,
-                    imageField,
-                    lifecycle,
-                    &view))
-            {
-                ++result->CidTableCount;
-            }
-        };
-
         for (uint32_t pid : handleResult.OwnerPids)
         {
-            confirmIfMissingFromLists(pid);
+            auto& view = views[pid];
+            view.ProcessId = pid;
+            view.InHandleOwners = true;
+        }
+        result->HandleOwnerCount = static_cast<uint32_t>(handleResult.OwnerPids.size());
+
+        std::vector<uint32_t> cidPids;
+        bool cidComplete = false;
+        warning.clear();
+        EnumerateCidProcessIds(device_, symbols_, &cidPids, &warning, &cidComplete);
+        if (!cidComplete)
+        {
+            result->Warnings.push_back(L"CID discovery was incomplete: " + warning);
+        }
+        for (uint32_t pid : cidPids)
+        {
+            auto& view = views[pid];
+            view.ProcessId = pid;
+            view.InCidTable = true;
         }
         for (uint32_t pid : extraCandidatePids)
         {
-            confirmIfMissingFromLists(pid);
-        }
-
-        std::vector<uint32_t> cidPids;
-        std::wstring cidWarning;
-        bool cidWalkComplete = false;
-        if (EnumerateCidProcessIds(
-                device_,
-                symbols_,
-                &cidPids,
-                &cidWarning,
-                &cidWalkComplete))
-        {
-            for (uint32_t pid : cidPids)
+            uint64_t object = 0;
+            if (pid > 4 && reader.Resolve(pid, &object))
             {
-                confirmIfMissingFromLists(pid);
+                auto& view = views[pid];
+                view.ProcessId = pid;
+                view.InCidTable = true;
+                if (view.Eprocess == 0)
+                {
+                    view.Eprocess = object;
+                }
             }
         }
-        else
+        std::vector<HiddenProcessRecord*> candidates;
+        for (auto& item : views)
         {
-            cidWalkComplete = false;
-            if (!cidWarning.empty())
+            auto& view = item.second;
+            result->CidTableCount += view.InCidTable ? 1 : 0;
+            if (IsHiddenProcessCandidate(view.ProcessId, DiscoveryMembership(view)))
             {
-                result->Warnings.push_back(cidWarning);
+                candidates.push_back(&view);
             }
         }
-        if (!cidWalkComplete)
-        {
-            result->Warnings.push_back(
-                L"PspCidTable process walk was incomplete; CID-only hidden processes may be missed");
-        }
 
-        result->CoverageComplete =
-            kernelInventoryComplete &&
-            userInventoryComplete &&
-            cidWalkComplete;
-
-        std::vector<uint32_t> kernelOnlyPids;
-        for (const auto& pair : views)
+        result->InventoryComplete = kernel.Complete && spiOk && toolhelpOk && cidComplete &&
+            handlesOk && handleResult.CoverageComplete && !handleResult.Truncated;
+        result->CoverageComplete = result->InventoryComplete;
+        // Discovery is only a PID-based hint. Bind fresh observations to a
+        // sampled lifetime before drawing any absence conclusion.
+        constexpr size_t kMaxQualifiedCandidates = 128;
+        constexpr uint64_t kQualificationBudgetMs = 5000;
+        reader.Deadline = GetTickCount64() + kQualificationBudgetMs;
+        for (size_t i = 0; i < candidates.size(); ++i)
         {
-            if (pair.second.Kernel &&
-                !pair.second.Spi &&
-                !pair.second.Toolhelp &&
-                pair.first > 4)
+            auto& q = candidates[i]->Qualification;
+            if (i >= kMaxQualifiedCandidates || reader.Stopped())
             {
-                kernelOnlyPids.push_back(pair.first);
-            }
-        }
-        for (uint32_t pid : kernelOnlyPids)
-        {
-            confirmIfMissingFromLists(pid);
-        }
-
-        for (auto& pair : views)
-        {
-            ProcessView& view = pair.second;
-            if (view.Pid == 0)
-            {
+                q.BudgetExceeded = true;
                 continue;
             }
-
-            const bool kernelOnly =
-                kernelWalkOk &&
-                userWalkOk &&
-                view.Kernel &&
-                !view.Spi &&
-                !view.Toolhelp &&
-                view.Pid > 4;
-            if (kernelOnly)
-            {
-                uint64_t livePid = 0;
-                if (ReadFieldInteger(
-                        device_,
-                        view.Eprocess,
-                        pidField,
-                        sizeof(uint64_t),
-                        &livePid) &&
-                    livePid <= (std::numeric_limits<uint32_t>::max)() &&
-                    static_cast<uint32_t>(livePid) == view.Pid)
-                {
-                    view.PidRevalidated = true;
-                    ReadProcessLifecycle(device_, lifecycle, &view);
-                }
-            }
-
-            const HiddenProcessClassifyInput classifiedInput =
-                MakeClassifyInput(
-                    view,
-                    kernelWalkOk,
-                    kernelInventoryComplete,
-                    userWalkOk,
-                    spiBeforeOk && spiAfterOk,
-                    toolhelpBeforeOk && toolhelpAfterOk,
-                    hasDtb,
-                    lifecycleLayoutAvailable);
-            const HiddenProcessClassifyResult classified = ClassifyHiddenProcess(classifiedInput);
-
-            HiddenProcessRecord record = {};
-            record.ProcessId = view.Pid;
-            record.Eprocess = view.Eprocess;
-            record.ImageName = view.Image;
-            record.InKernelList = view.Kernel;
-            record.InSystemProcessInfo = view.Spi;
-            record.InToolhelp = view.Toolhelp;
-            record.InHandleOwners = view.HandleOwner;
-            record.InCidTable = view.CidTable;
-            record.Auxiliary = view.Auxiliary;
-            record.Terminating = IsTerminatingView(classifiedInput);
-            record.HasActiveThreads = view.HasActiveThreads;
-            record.HasExitTime = view.HasExitTime;
-            record.ActiveThreads = view.ActiveThreads;
-            record.ExitTime = view.ExitTime;
-            record.Suspicious = classified.Suspicious;
-            record.Notes = classified.Notes;
-
-            if (classified.Ignored)
-            {
-                ++result->IgnoredCount;
-                if (classified.IgnoredAuxiliary)
-                {
-                    ++result->IgnoredAuxiliaryCount;
-                }
-                if (classified.IgnoredTerminating)
-                {
-                    ++result->IgnoredTerminatingCount;
-                }
-                if (classified.IgnoredRace)
-                {
-                    ++result->IgnoredRaceCount;
-                }
-                // Keep kernel-only clones/zombies in the record list so the
-                // ignore decision is auditable. One-sided API races stay out.
-                if ((classified.IgnoredAuxiliary || classified.IgnoredTerminating) &&
-                    view.Kernel &&
-                    !view.Spi &&
-                    !view.Toolhelp)
-                {
-                    result->Records.push_back(record);
-                }
-                continue;
-            }
-
-            if (record.Suspicious)
-            {
-                ++result->SuspiciousCount;
-                result->Records.push_back(record);
-            }
+            q.Attempted = true;
+            q.Before = ReadHiddenProcessLifetime(reader, addressSpace, layout, candidates[i]->ProcessId);
         }
 
-        ok = true;
-    } while (false);
+        if (!candidates.empty() && !reader.Stopped())
+        {
+            result->ComparisonStartedMs = GetTickCount64();
+            const auto comparisonKernel = ReadHiddenProcessKernelView(reader, addressSpace, layout);
+            UserInventory comparisonSpi;
+            UserInventory comparisonToolhelp;
+            warning.clear();
+            const bool comparisonSpiOk = !reader.Stopped() && CollectSystemProcessInformation(&comparisonSpi, &warning);
+            if (!comparisonSpiOk && !warning.empty())
+            {
+                result->Warnings.push_back(L"comparison: " + warning);
+            }
+            warning.clear();
+            const bool comparisonToolhelpOk = !reader.Stopped() && CollectToolhelpProcesses(&comparisonToolhelp, &warning);
+            if (!comparisonToolhelpOk && !warning.empty())
+            {
+                result->Warnings.push_back(L"comparison: " + warning);
+            }
+            result->ComparisonFinishedMs = GetTickCount64();
+            if (!comparisonKernel.Complete)
+            {
+                result->Warnings.push_back(L"comparison: " + comparisonKernel.Reason);
+            }
+            for (auto* candidate : candidates)
+            {
+                auto& q = candidate->Qualification;
+                if (!q.Attempted)
+                {
+                    continue;
+                }
+                q.KernelComplete = comparisonKernel.Complete;
+                q.SpiComplete = comparisonSpiOk;
+                q.ToolhelpComplete = comparisonToolhelpOk;
+                const auto found = comparisonKernel.Entries.find(candidate->ProcessId);
+                q.Views.Kernel = found != comparisonKernel.Entries.end();
+                if (q.Views.Kernel)
+                {
+                    q.KernelIdentity = found->second;
+                }
+                q.Views.Spi = comparisonSpi.Images.count(candidate->ProcessId) != 0;
+                q.Views.Toolhelp = comparisonToolhelp.Images.count(candidate->ProcessId) != 0;
+                q.After = ReadHiddenProcessLifetime(reader, addressSpace, layout, candidate->ProcessId);
+                q.BudgetExceeded = reader.Stopped();
+            }
+        }
+        for (auto* candidate : candidates)
+        {
+            if (reader.Stopped() && !candidate->Qualification.After.IdentityValid)
+            {
+                candidate->Qualification.BudgetExceeded = true;
+            }
+            AddHiddenProcessDecision(*result, std::move(*candidate));
+        }
+        if (result->UnverifiedCount != 0)
+        {
+            result->Warnings.push_back(L"unverified cross-view candidates remain; zero suspicious records is not a clean result");
+        }
     }
     catch (const std::bad_alloc&)
     {
-        if (result != nullptr)
-        {
-            *result = HiddenProcessScanResult{};
-        }
+        *result = HiddenProcessScanResult{};
         if (error != nullptr)
         {
             *error = L"out of memory during hidden-process scan";
         }
         return false;
     }
-
-    return ok;
-}
-
-std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
-{
-    std::wstringstream json;
-    json << L"{\"schema\":\"kn-live-dbg.hidden-process.v1\"";
-    json << L",\"kernel_list\":" << result.KernelListCount;
-    json << L",\"spi\":" << result.SystemProcessInfoCount;
-    json << L",\"toolhelp\":" << result.ToolhelpCount;
-    json << L",\"handle_owners\":" << result.HandleOwnerCount;
-    json << L",\"cid_table\":" << result.CidTableCount;
-    json << L",\"suspicious\":" << result.SuspiciousCount;
-    json << L",\"ignored\":" << result.IgnoredCount;
-    json << L",\"ignored_auxiliary\":" << result.IgnoredAuxiliaryCount;
-    json << L",\"ignored_terminating\":" << result.IgnoredTerminatingCount;
-    json << L",\"ignored_race\":" << result.IgnoredRaceCount;
-    json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
-    json << L",\"records\":[";
-    bool first = true;
-    for (const HiddenProcessRecord& record : result.Records)
-    {
-        if (!first)
-        {
-            json << L",";
-        }
-        first = false;
-        json << L"{\"pid\":" << record.ProcessId;
-        json << L",\"eprocess\":\"0x" << std::hex << record.Eprocess << std::dec << L"\"";
-        json << L",\"image\":\"" << mcpjson::Escape(record.ImageName) << L"\"";
-        json << L",\"kernel\":" << (record.InKernelList ? L"true" : L"false");
-        json << L",\"spi\":" << (record.InSystemProcessInfo ? L"true" : L"false");
-        json << L",\"toolhelp\":" << (record.InToolhelp ? L"true" : L"false");
-        json << L",\"handle_owner\":" << (record.InHandleOwners ? L"true" : L"false");
-        json << L",\"cid_table\":" << (record.InCidTable ? L"true" : L"false");
-        json << L",\"auxiliary\":" << (record.Auxiliary ? L"true" : L"false");
-        json << L",\"terminating\":" << (record.Terminating ? L"true" : L"false");
-        json << L",\"has_active_threads\":" << (record.HasActiveThreads ? L"true" : L"false");
-        json << L",\"active_threads\":" << record.ActiveThreads;
-        json << L",\"has_exit_time\":" << (record.HasExitTime ? L"true" : L"false");
-        json << L",\"exit_time\":\"0x" << std::hex << record.ExitTime << std::dec << L"\"";
-        json << L",\"suspicious\":" << (record.Suspicious ? L"true" : L"false");
-        json << L",\"notes\":\"" << mcpjson::Escape(record.Notes) << L"\"}";
-    }
-    json << L"]}";
-    return json.str();
+    return true;
 }
 
 bool HiddenProcessViewSelfTest()
 {
-    bool ok = false;
-
-    do
-    {
-        if (!ToolhelpProcessWalkComplete(20, false, ERROR_NO_MORE_FILES) ||
-            ToolhelpProcessWalkComplete(20, false, ERROR_SUCCESS) ||
-            ToolhelpProcessWalkComplete(20, false, ERROR_ACCESS_DENIED) ||
-            ToolhelpProcessWalkComplete(20, true, ERROR_NO_MORE_FILES) ||
-            ToolhelpProcessWalkComplete(0, false, ERROR_NO_MORE_FILES) ||
-            ToolhelpProcessWalkComplete(kMaxProcesses, false, ERROR_NO_MORE_FILES))
-        {
-            break;
-        }
-        HiddenProcessClassifyInput hidden = {};
-        hidden.Pid = 1234;
-        hidden.Kernel = true;
-        hidden.KernelWalkOk = true;
-        hidden.UserWalkOk = true;
-        hidden.SpiWalkOk = true;
-        hidden.ToolhelpWalkOk = true;
-        hidden.HasLifecycle = true;
-        hidden.HasAuxiliaryResolved = true;
-        hidden.HasActiveThreads = true;
-        hidden.ActiveThreads = 4;
-        hidden.HasExitTime = true;
-        hidden.ExitTime = 0;
-        hidden.LifecycleLayoutAvailable = true;
-        hidden.PidRevalidated = true;
-        const HiddenProcessClassifyResult hiddenResult = ClassifyHiddenProcess(hidden);
-        if (!hiddenResult.Suspicious || hiddenResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput clone = hidden;
-        clone.Auxiliary = true;
-        const HiddenProcessClassifyResult cloneResult = ClassifyHiddenProcess(clone);
-        if (cloneResult.Suspicious || !cloneResult.IgnoredAuxiliary)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput cloneCid = clone;
-        cloneCid.CidTable = true;
-        cloneCid.HandleOwner = true;
-        const HiddenProcessClassifyResult cloneCidResult = ClassifyHiddenProcess(cloneCid);
-        if (cloneCidResult.Suspicious || !cloneCidResult.IgnoredAuxiliary)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput threadless = hidden;
-        threadless.ActiveThreads = 0;
-        threadless.CidTable = true;
-        const HiddenProcessClassifyResult threadlessResult = ClassifyHiddenProcess(threadless);
-        if (threadlessResult.Suspicious || !threadlessResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput threadlessNoAuxField = threadless;
-        threadlessNoAuxField.HasAuxiliaryResolved = false;
-        const HiddenProcessClassifyResult threadlessNoAuxFieldResult =
-            ClassifyHiddenProcess(threadlessNoAuxField);
-        if (threadlessNoAuxFieldResult.Suspicious || !threadlessNoAuxFieldResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput exiting = hidden;
-        exiting.ProcessExiting = true;
-        const HiddenProcessClassifyResult exitingResult = ClassifyHiddenProcess(exiting);
-        if (!exitingResult.Suspicious || exitingResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput kernelCidZombie = hidden;
-        kernelCidZombie.CidTable = true;
-        kernelCidZombie.HandleOwner = true;
-        kernelCidZombie.ExitTime = 1;
-        const HiddenProcessClassifyResult kernelCidZombieResult =
-            ClassifyHiddenProcess(kernelCidZombie);
-        if (kernelCidZombieResult.Suspicious || !kernelCidZombieResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput vanished = hidden;
-        vanished.HasLifecycle = false;
-        vanished.HasActiveThreads = false;
-        vanished.HasExitTime = false;
-        vanished.PidRevalidated = false;
-        vanished.LifecycleLayoutAvailable = true;
-        const HiddenProcessClassifyResult vanishedResult = ClassifyHiddenProcess(vanished);
-        if (vanishedResult.Suspicious || !vanishedResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput staleCid = hidden;
-        staleCid.PidRevalidated = false;
-        staleCid.CidTable = true;
-        const HiddenProcessClassifyResult staleCidResult = ClassifyHiddenProcess(staleCid);
-        if (staleCidResult.Suspicious || !staleCidResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput staleCidAux = staleCid;
-        staleCidAux.Auxiliary = true;
-        const HiddenProcessClassifyResult staleCidAuxResult = ClassifyHiddenProcess(staleCidAux);
-        if (staleCidAuxResult.Suspicious ||
-            !staleCidAuxResult.IgnoredRace ||
-            staleCidAuxResult.IgnoredAuxiliary)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput liveUnread = vanished;
-        liveUnread.PidRevalidated = true;
-        const HiddenProcessClassifyResult liveUnreadResult = ClassifyHiddenProcess(liveUnread);
-        if (!liveUnreadResult.Suspicious || liveUnreadResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput noLayout = vanished;
-        noLayout.PidRevalidated = true;
-        noLayout.LifecycleLayoutAvailable = false;
-        const HiddenProcessClassifyResult noLayoutResult = ClassifyHiddenProcess(noLayout);
-        if (!noLayoutResult.Suspicious || noLayoutResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput visible = {};
-        visible.Pid = 4321;
-        visible.KernelWalkOk = true;
-        visible.UserWalkOk = true;
-        visible.Spi = true;
-        visible.Toolhelp = true;
-        visible.UserBefore = true;
-        visible.UserAfter = true;
-        visible.SpiBefore = true;
-        visible.SpiAfter = true;
-        visible.ToolhelpBefore = true;
-        visible.ToolhelpAfter = true;
-        visible.SpiWalkOk = true;
-        visible.ToolhelpWalkOk = true;
-        visible.KernelInventoryComplete = true;
-        const HiddenProcessClassifyResult visibleResult = ClassifyHiddenProcess(visible);
-        if (!visibleResult.Suspicious || visibleResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput race = visible;
-        race.UserAfter = false;
-        race.SpiAfter = false;
-        race.ToolhelpAfter = false;
-        const HiddenProcessClassifyResult raceResult = ClassifyHiddenProcess(race);
-        if (raceResult.Suspicious || !raceResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput singleSnapshot = race;
-        const HiddenProcessClassifyResult singleSnapshotResult = ClassifyHiddenProcess(singleSnapshot);
-        if (singleSnapshotResult.Suspicious || !singleSnapshotResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput mixedApi = visible;
-        mixedApi.SpiAfter = false;
-        mixedApi.ToolhelpBefore = false;
-        mixedApi.Toolhelp = true;
-        mixedApi.Spi = true;
-        const HiddenProcessClassifyResult mixedApiResult = ClassifyHiddenProcess(mixedApi);
-        if (mixedApiResult.Suspicious || !mixedApiResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput apiNoSpi = visible;
-        apiNoSpi.SpiWalkOk = false;
-        const HiddenProcessClassifyResult apiNoSpiResult = ClassifyHiddenProcess(apiNoSpi);
-        if (apiNoSpiResult.Suspicious || !apiNoSpiResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput apiZombie = visible;
-        apiZombie.HasExitTime = true;
-        apiZombie.ExitTime = 1;
-        apiZombie.HasLifecycle = true;
-        const HiddenProcessClassifyResult apiZombieResult = ClassifyHiddenProcess(apiZombie);
-        if (apiZombieResult.Suspicious || !apiZombieResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput kernelNoSpi = hidden;
-        kernelNoSpi.SpiWalkOk = false;
-        const HiddenProcessClassifyResult kernelNoSpiResult = ClassifyHiddenProcess(kernelNoSpi);
-        if (kernelNoSpiResult.Suspicious || !kernelNoSpiResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput incompleteWalk = visible;
-        incompleteWalk.KernelInventoryComplete = false;
-        const HiddenProcessClassifyResult incompleteWalkResult = ClassifyHiddenProcess(incompleteWalk);
-        if (incompleteWalkResult.Suspicious || !incompleteWalkResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput incompleteCid = {};
-        incompleteCid.Pid = 3333;
-        incompleteCid.CidTable = true;
-        incompleteCid.KernelWalkOk = true;
-        incompleteCid.UserWalkOk = true;
-        incompleteCid.KernelInventoryComplete = false;
-        const HiddenProcessClassifyResult incompleteCidResult = ClassifyHiddenProcess(incompleteCid);
-        if (incompleteCidResult.Suspicious || !incompleteCidResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput handleOnly = {};
-        handleOnly.Pid = 2222;
-        handleOnly.HandleOwner = true;
-        handleOnly.CidTable = true;
-        handleOnly.KernelWalkOk = true;
-        handleOnly.UserWalkOk = true;
-        handleOnly.KernelInventoryComplete = true;
-        handleOnly.SpiWalkOk = true;
-        handleOnly.ToolhelpWalkOk = true;
-        const HiddenProcessClassifyResult handleOnlyResult = ClassifyHiddenProcess(handleOnly);
-        if (!handleOnlyResult.Suspicious || handleOnlyResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput handleNoCid = handleOnly;
-        handleNoCid.CidTable = false;
-        handleNoCid.CidConfirmAvailable = true;
-        const HiddenProcessClassifyResult handleNoCidResult = ClassifyHiddenProcess(handleNoCid);
-        if (handleNoCidResult.Suspicious || !handleNoCidResult.IgnoredRace)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput handleAux = handleOnly;
-        handleAux.Auxiliary = true;
-        const HiddenProcessClassifyResult handleAuxResult = ClassifyHiddenProcess(handleAux);
-        if (!handleAuxResult.Suspicious || handleAuxResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput cidOnly = {};
-        cidOnly.Pid = 3333;
-        cidOnly.CidTable = true;
-        cidOnly.KernelWalkOk = true;
-        cidOnly.UserWalkOk = true;
-        cidOnly.KernelInventoryComplete = true;
-        cidOnly.SpiWalkOk = true;
-        cidOnly.ToolhelpWalkOk = true;
-        const HiddenProcessClassifyResult cidOnlyResult = ClassifyHiddenProcess(cidOnly);
-        if (!cidOnlyResult.Suspicious || cidOnlyResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput cidExiting = cidOnly;
-        cidExiting.ProcessExiting = true;
-        cidExiting.HasLifecycle = true;
-        const HiddenProcessClassifyResult cidExitingResult = ClassifyHiddenProcess(cidExiting);
-        if (!cidExitingResult.Suspicious || cidExitingResult.Ignored)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput cidFakeExit = cidOnly;
-        cidFakeExit.HasExitTime = true;
-        cidFakeExit.ExitTime = 1;
-        const HiddenProcessClassifyResult cidFakeExitResult = ClassifyHiddenProcess(cidFakeExit);
-        if (cidFakeExitResult.Suspicious || !cidFakeExitResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        HiddenProcessClassifyInput cidThreadless = cidOnly;
-        cidThreadless.HasActiveThreads = true;
-        cidThreadless.ActiveThreads = 0;
-        cidThreadless.HasLifecycle = true;
-        const HiddenProcessClassifyResult cidThreadlessResult = ClassifyHiddenProcess(cidThreadless);
-        if (cidThreadlessResult.Suspicious || !cidThreadlessResult.IgnoredTerminating)
-        {
-            break;
-        }
-
-        if (!HiddenProcessSpiParseSelfTest())
-        {
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+    return ToolhelpProcessWalkComplete(20, false, ERROR_NO_MORE_FILES) &&
+        !ToolhelpProcessWalkComplete(20, false, ERROR_SUCCESS) &&
+        !ToolhelpProcessWalkComplete(20, false, ERROR_ACCESS_DENIED) &&
+        !ToolhelpProcessWalkComplete(20, true, ERROR_NO_MORE_FILES) &&
+        !ToolhelpProcessWalkComplete(0, false, ERROR_NO_MORE_FILES) &&
+        !ToolhelpProcessWalkComplete(kMaxProcesses, false, ERROR_NO_MORE_FILES) &&
+        HiddenProcessSpiParseSelfTest() && HiddenProcessPolicySelfTest();
 }

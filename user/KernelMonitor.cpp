@@ -10024,7 +10024,7 @@ void KernelMonitor::ScanHiddenProcesses()
             L"scan_failed:hidden:coverage",
             std::wstring(),
             L"hiddenproc",
-            L"hidden-process coverage was incomplete; kernel-only and API-only findings stay fail-closed",
+            L"process cross-view inventory or qualification was incomplete; unverified candidates remain",
             notes);
     }
 
@@ -10034,34 +10034,39 @@ void KernelMonitor::ScanHiddenProcesses()
 
     for (const HiddenProcessRecord& record : result.Records)
     {
-        if (!record.Suspicious)
+        if (!record.Suspicious && !record.Unverified)
         {
             continue;
         }
 
-        const uint64_t created = (record.Eprocess != 0)
-            ? QueryEprocessCreateTime(device, symbols, nullptr, record.Eprocess)
-            : 0;
+        const auto& q = record.Qualification;
+        const uint64_t created = record.Decision.StableLifetime ? q.After.CreateTime : 0;
+        const uint64_t object = record.Decision.StableLifetime ? q.After.Eprocess : 0;
         bool already = false;
         {
             std::lock_guard<std::mutex> watchLock(WatchMutex);
-            if (record.ProcessId > 4 && record.Eprocess != 0 && created != 0)
+            if (record.Suspicious && record.ProcessId > 4 && object != 0 && created != 0)
             {
                 if (SuspectProcesses.size() < 4096 ||
                     SuspectProcesses.find(record.ProcessId) != SuspectProcesses.end())
                 {
                     SuspectProcess& suspect = SuspectProcesses[record.ProcessId];
                     suspect.Pid = record.ProcessId;
-                    suspect.Eprocess = record.Eprocess;
+                    suspect.Eprocess = object;
                     suspect.CreateTime = created;
                     suspect.LastObservedMs = GetTickCount64();
                     suspect.Image = record.ImageName;
                 }
             }
-            const std::wstring hideKey =
-                L"hidden:" + std::to_wstring(record.ProcessId) + L":" +
-                HexU64(record.Eprocess) + L":" + std::to_wstring(created);
-            already = !EmittedMapperKeys.insert(hideKey).second;
+            // An unbound PID cannot identify a lifetime across scans.
+            if (record.Decision.StableLifetime)
+            {
+                const std::wstring hideKey =
+                    std::wstring(record.Unverified ? L"hidden_unverified:" : L"hidden:") +
+                    std::to_wstring(record.ProcessId) + L":" + HexU64(object) + L":" +
+                    std::to_wstring(created) + L":" + record.Decision.Reason;
+                already = !EmittedMapperKeys.insert(hideKey).second;
+            }
         }
         if (already)
         {
@@ -10070,10 +10075,11 @@ void KernelMonitor::ScanHiddenProcesses()
 
         KmonEvent event = {};
         event.Timestamp = ts;
-        event.Kind = L"process.hidden";
+        event.Kind = record.Unverified ? L"coverage.process_cross_view" : L"process.hidden";
         event.ProcessId = record.ProcessId;
         event.Image = record.ImageName;
-        event.Summary = L"hidden process pid=" + std::to_wstring(record.ProcessId);
+        event.Summary = std::wstring(record.Unverified ? L"unverified cross-view candidate pid=" :
+            L"sampled process cross-view discrepancy pid=") + std::to_wstring(record.ProcessId);
         if (!record.ImageName.empty())
         {
             event.Summary += L" " + record.ImageName;
@@ -10083,16 +10089,30 @@ void KernelMonitor::ScanHiddenProcesses()
         event.Evidence[L"in_toolhelp"] = record.InToolhelp ? L"true" : L"false";
         event.Evidence[L"in_handles"] = record.InHandleOwners ? L"true" : L"false";
         event.Evidence[L"in_cid"] = record.InCidTable ? L"true" : L"false";
+        event.Evidence[L"membership_scope"] = L"discovery";
+        event.Evidence[L"image_scope"] = L"discovery_pid_hint";
+        event.Evidence[L"qualification_state"] = HiddenProcessDispositionName(record.Decision.Disposition);
+        event.Evidence[L"qualification_reason"] = record.Decision.Reason;
+        event.Evidence[L"qualified_eprocess"] = HexU64(object);
+        event.Evidence[L"qualified_create_time"] = std::to_wstring(created);
+        event.Evidence[L"api_dependency"] = L"shared_process_list";
+        event.Evidence[L"consistency"] = L"live_non_atomic";
+        HiddenProcessScanResult scoped;
+        scoped.InventoryComplete = result.InventoryComplete;
+        scoped.CoverageComplete = result.InventoryComplete;
+        scoped.ComparisonStartedMs = result.ComparisonStartedMs;
+        scoped.ComparisonFinishedMs = result.ComparisonFinishedMs;
+        AddHiddenProcessDecision(scoped, record);
+        event.Evidence[L"cross_view_json"] = BuildHiddenProcessJson(scoped);
         event.Evidence[L"notes"] = record.Notes;
         event.Evidence[L"followup"] = L"!hiddenproc; !vad " + std::to_wstring(record.ProcessId);
-        // EPROCESS capture at detection time: DKOM unlink evidence and the
-        // Protection field state are volatile if the cheat re-links.
-        if (record.Eprocess != 0)
+        // This subsequent raw capture is outside the qualification window.
+        if (record.Suspicious && object != 0)
         {
             std::wstring eprocessCaptureNote;
             CaptureRegion(
                 L"hidden_eprocess",
-                record.Eprocess,
+                object,
                 0x800,
                 0,
                 false,
@@ -10104,6 +10124,7 @@ void KernelMonitor::ScanHiddenProcesses()
             if (!eprocessCaptureNote.empty())
             {
                 event.Evidence[L"eprocess_capture"] = eprocessCaptureNote;
+                event.Evidence[L"eprocess_capture_scope"] = L"subsequent_raw_address_read;object_lifetime_not_revalidated";
             }
         }
         RecordEvent(std::move(event));

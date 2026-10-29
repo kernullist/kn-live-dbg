@@ -125,6 +125,9 @@
     <ClCompile Include="HalDispatchScanner.cpp" />
     <ClCompile Include="HandleTableScanner.cpp" />
     <ClCompile Include="HiddenProcessScanner.cpp" />
+    <ClCompile Include="HiddenProcessReport.cpp" />
+    <ClCompile Include="HiddenProcessPolicyTests.cpp" />
+    <ClCompile Include="HiddenProcessPolicy.cpp" />
     <ClCompile Include="HiveScanner.cpp" />
     <ClCompile Include="HvPostureScanner.cpp" />
     <ClCompile Include="DumpAnalyzer.cpp" />
@@ -254,6 +257,8 @@
     <ClInclude Include="HalDispatchScanner.h" />
     <ClInclude Include="HandleTableScanner.h" />
     <ClInclude Include="HiddenProcessScanner.h" />
+    <ClInclude Include="HiddenProcessReport.h" />
+    <ClInclude Include="HiddenProcessPolicy.h" />
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="HvPostureScanner.h" />
     <ClInclude Include="DumpAnalyzer.h" />
