@@ -21,8 +21,9 @@ for their scope and remaining gaps.
    its test-signed drivers. Keep the EXE, SYS files, and runtime DLLs together.
 2. Run `KnLiveDbg.exe` elevated. Startup manages the main service and loads the
    kernel symbols into the EXE-local `symbols` cache.
-3. At `knkd>`, use `help`, `help <command>`, or Tab completion. Native writes are
-   enabled by default; use `write off` for a read-only interactive session.
+3. At `knkd>`, use `help`, `help <command>`, or Tab completion. Current main starts
+   with native writes disabled. Use `write on` explicitly for lab mutations and
+   `write off` afterward; deploy its matching SYS with the default-deny flag.
 4. Use `q` for normal shutdown and service cleanup. Save evidence before leaving.
 
 ```powershell

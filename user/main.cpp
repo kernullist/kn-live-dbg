@@ -27645,7 +27645,7 @@ static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const Symbol
     stream << L"- number base: " << state.NumberBase << L"\n";
     stream << L"- symbol path: " << symbols.SymbolPath() << L"\n";
     stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
-    stream << L"- write mode is enabled by default per device handle unless the operator ran write off\n";
+    stream << L"- native write mode is off by default; explicit write on is required for lab mutations\n";
     stream << L"- native e* user VA writes use procctx or /process; kernel VA writes use System(pid 4)\n";
     stream << L"- address arguments support arithmetic such as nt!Symbol+20 or 0xfffff80000000000-10\n";
     stream << L"Rules:\n";
@@ -51544,13 +51544,16 @@ static void RunMcpEngineLoop(
     AiPlanState& aiState)
 {
     std::wstring writeModeError;
-    if (g_McpServer.AllowWrite())
+    if (!device.SetWriteMode(g_McpServer.AllowWrite(), &writeModeError))
     {
-        device.SetWriteMode(true, &writeModeError);
-    }
-    else
-    {
-        device.SetWriteMode(false, &writeModeError);
+        StopMcpServer();
+        std::wcerr << L"[mcp] engine not started: " << writeModeError << L"\n";
+        std::wstring disarmError;
+        if (!device.SetWriteMode(false, &disarmError))
+        {
+            std::wcerr << L"[mcp] disarm failed: " << disarmError << L"\n";
+        }
+        return;
     }
 
     std::wcout << L"[mcp] engine active: " << g_McpServer.BindAddress()
@@ -51638,8 +51641,11 @@ static void RunMcpEngineLoop(
 
     StopMcpServer();
 
-    // Restore the interactive session's default write mode.
-    device.SetWriteMode(true, &writeModeError);
+    // Leaving a remote engine must not implicitly arm the local session.
+    if (!device.SetWriteMode(false, &writeModeError))
+    {
+        std::wcerr << L"[mcp] disarm failed: " << writeModeError << L"\n";
+    }
     std::wcout << L"[mcp] engine stopped\n";
 }
 
@@ -52779,9 +52785,14 @@ static void RunRemoteEngineLoop(
         if (writeOffRequested.exchange(false))
         {
             std::wstring writeError;
-            device.SetWriteMode(false, &writeError);
-            g_RemoteServer.SetHelloWriteMode(false);
+            const bool disarmed = device.SetWriteMode(false, &writeError);
             ResetEvent(g_RemoteServer.WriteOffEvent());
+            if (!disarmed)
+            {
+                std::wcerr << L"[remote] disarm failed; engine stopping: " << writeError << L"\n";
+                break;
+            }
+            g_RemoteServer.SetHelloWriteMode(false);
             std::wcout << L"[remote] write off\n";
         }
 

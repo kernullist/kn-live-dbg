@@ -114,8 +114,22 @@ The main ABI is **17**, defined in [KnLiveDbgIoctl.h](https://github.com/kernull
 Requests carry sizes; variable payloads use their header offset rather than
 assuming a fixed trailing-array size. User-mode code validates responses and
 preserves short reads as incomplete data. Write-like calls require the
-per-handle write mode and their acknowledgment fields. The interactive default
-is write-on; MCP disarms it when entering read-only mode.
+per-handle write mode and their acknowledgment fields. New handles on current
+main start with writes disabled. The version reply advertises
+`KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED`; the updated client rejects older
+drivers without that flag even when their structure ABI is still 17. Keep the
+EXE and SYS together. Explicit `write on` retains the lab mutation workflow.
+The shared ACK value is a protocol check, not authentication against an
+administrator who already owns the controller session.
+
+Write-mode transitions validate the returned request and then read session status
+to confirm the requested gate and controller identity. MCP does not dispatch jobs
+after an unconfirmed transition, and leaving MCP requests write-off instead of
+automatically arming the REPL. A failed remote-console write-off stops that engine
+without publishing a false write-off status. Failure can leave the actual gate
+unknown; the error says so. These controls do not split observation from event
+collection, constrain every user-mode/DbgEng action, or provide protected remote
+transport. Four operating modes and narrower collection rights remain W14 work.
 
 Virtual and physical reads use `MmCopyMemory`. Page-table translation supports
 four/five-level walks and effective permissions across parent entries.

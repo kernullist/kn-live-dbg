@@ -38,7 +38,9 @@ do not implement general operation cancellation.
   being an action on a read-catalog entry.
 - No raw console/kd tool. Callback mutation remains limited to the cooperative
   fixture; arbitrary PID process-protection control is a separate write tool.
-- Returning to the local REPL restores its default write-on policy.
+- Current main requires a confirmed kernel write-mode transition before engine
+  dispatch. Returning to the local REPL requests write-off; failures report an
+  unconfirmed state and never automatically enable writes.
 
 ## Parsing and results
 

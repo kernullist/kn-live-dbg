@@ -73,7 +73,8 @@ cooperative fixture's supported CREATE bodies.
 There is no per-write confirmation dialog or `mcp write-confirm` command.
 Recognized writes use the dispatcher's preflight/backup/verification path and
 audit; this is not a transaction or universal rollback guarantee. After `off`,
-the REPL returns to its default **write-on** mode. Use `write off` if needed.
+current main requests **write-off** before returning to the REPL. A failed
+transition is reported as unconfirmed. Use `write on` explicitly for lab changes.
 
 ## Results, timeout and audit
 

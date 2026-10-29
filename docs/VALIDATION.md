@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Architecture foundation checkpoint: 2026-10-29
+
+The capability, address descriptor, bounded read-source and unique-coverage work
+was followed by a native default-write-denied change. This is a development
+checkpoint, with live kernel acceptance still pending. Release x64 was built
+with MSVC 14.44 and Windows SDK/WDK 10.0.26100.0, using the process-local
+`WDKBuildFolder=10.0.26100.0` workaround for the installed WDK task path.
+
+The resulting EXE SHA-256 is
+`a4d4690fe9e2c47935472ba78ab2a1445a9bb3b1dd7693c199f9f733a0e58c41`;
+the SYS SHA-256 is
+`b54aab7db6c4fe9f4dff87451844441e395bc433417e4d928360e4594ea4e1f9`.
+The build signed and staged the lab binaries; it did not load them.
+
+| Check | Observed result |
+| --- | --- |
+| Final EXE driver-free checks | Timeline 28, MCP 89, console 558, command 2,987 and remote 66 checks passed; compiled capabilities cover 12 selected contracts and 261 command routes |
+| Final offline CLI | 56 checks passed; one symlink control skipped; no live evidence replayed |
+| ASan core | Address/coverage bitmap controls and write-policy failure injection passed, along with hunting 11,345, page 54 and false-positive 49 controls |
+| Evidence source and coverage | 412 checks passed before the write-policy-only change; same target parser on owned user memory and immutable evidence, sparse/conflicting spans, cancellation, source replacement and byte budgets |
+| Persistence controls | Eight interrupted writes yielded two valid publications and six absent files; completed publication and fresh-process recovery passed |
+| Image/layout integration | 105,120 ASan checks passed on the unique-coverage change, including reference/relocation controls |
+
+Local logs are under `.build/architecture`. No new live driver load/unload,
+Driver Verifier, LA57 machine test, security-policy change, external malware/game
+corpus, trace/VMI backend or independent detection benchmark was performed.
+Fault injection confirms the user-mode transition decision, not the kernel
+integration contract. The new default-deny capability requires the matching SYS;
+the earlier release's live results do not validate that change. Package-level
+acceptance gaps remain in [the roadmap](FEATURE_PLAN.md#kernel-investigation-platform).
+
 ## Release candidate
 
 The [v0.0.36 release notes](RELEASE_NOTES_0.0.36.md#validation-evidence) identify

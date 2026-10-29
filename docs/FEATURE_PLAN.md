@@ -58,7 +58,7 @@ backend/build/security-state combination.
 | W11 User/runtime | Qualified callback/thread-pool/WOW64/JIT providers and game object lifetime; registrations separate from execution | W07-W09 |
 | W12 Wait/I/O diagnosis | Qualified wait/lock/IRP graphs, observed transitions and false-cycle controls | W04,W09 |
 | W13 Trace/VMI | Versioned import first; CPU/VM/VTL/code/loss scope; actual backend access and compatibility gates | W02-W09 |
-| W14 Security/AI | Offline/observe/collect/lab policy, kernel enforcement, protected transport and operation outcomes, evidence-checked AI plans | W01 onward |
+| W14 Security/AI | Kernel sessions now default to write-off with verified mode transitions and MCP failure containment; full offline/observe/collect/lab partition, protected transport, operation outcomes and evidence-checked AI plans remain open | W01 onward |
 | W15 Independent validation | Versioned corpus and ground truth; family-separated comparisons, false positives, latency and safety by environment | Each package |
 
 Integration proceeds through source/address/proof and observe/collect boundaries,

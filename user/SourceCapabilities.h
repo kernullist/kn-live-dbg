@@ -20,6 +20,9 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
 {
     static const std::vector<SourceCapability> capabilities =
     {
+        {L"session", L"mutation_gate", L"native", L"implemented", L"per_handle",
+            L"default_write_denied_driver_flag;explicit_write_enable;confirmed_session_status",
+            L"not_an_observe_collect_partition;read_side_effects_possible;administrator_not_a_trust_boundary"},
         {L"memory", L"read_virtual", L"native", L"implemented", L"live_non_atomic",
             L"matching_driver_abi;controller_session;readable_mapping",
             L"partial_reads;residency_changes_possible;no_vtl1_access_contract"},

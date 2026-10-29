@@ -1,6 +1,7 @@
 #include "DeviceClient.h"
 #include "CommandInput.h"
 #include "NativeHandleSnapshot.h"
+#include "SessionWritePolicy.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 
@@ -276,11 +277,20 @@ bool DeviceClient::QueryVersion(std::wstring* error)
             break;
         }
 
-        if (returned < sizeof(response) || response.AbiVersion != KNDBG_ABI_VERSION)
+        if (returned < sizeof(response) || response.Size != sizeof(response) || response.AbiVersion != KNDBG_ABI_VERSION)
         {
             if (error != nullptr)
             {
                 *error = L"Driver ABI version mismatch";
+            }
+            break;
+        }
+
+        if ((response.Flags & KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED) == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = L"Driver lacks default-write-denied support; deploy the matching SYS";
             }
             break;
         }
@@ -324,11 +334,11 @@ bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring*
             break;
         }
 
-        if (returned < sizeof(response))
+        if (returned < sizeof(response) || response.Size != sizeof(response))
         {
             if (error != nullptr)
             {
-                *error = L"Short session status response";
+                *error = L"Invalid session status response";
             }
             break;
         }
@@ -769,13 +779,30 @@ bool DeviceClient::ResolveProcess(
 
 bool DeviceClient::SetWriteMode(bool enabled, std::wstring* error)
 {
-    KNDBG_WRITE_MODE_REQUEST request = {};
-    request.Size = sizeof(request);
-    request.EnableWrite = enabled ? 1u : 0u;
-    request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
-
-    DWORD returned = 0;
-    return Ioctl(IOCTL_KNDBG_SET_WRITE_MODE, &request, sizeof(request), sizeof(request), &returned, error);
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return ConfirmSessionWritePolicy(enabled, [&](bool wanted)
+    {
+        KNDBG_WRITE_MODE_REQUEST request = {};
+        request.Size = sizeof(request);
+        request.EnableWrite = wanted ? 1u : 0u;
+        request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
+        DWORD returned = 0;
+        return Ioctl(IOCTL_KNDBG_SET_WRITE_MODE, &request, sizeof(request), sizeof(request), &returned, error) &&
+            SessionWriteReplyMatches(request, returned, wanted);
+    }, [&](bool* actual)
+    {
+        DriverSessionStatus status{};
+        if (!QuerySessionStatus(&status, error))
+        {
+            return false;
+        }
+        *actual = (status.Flags & KNDBG_SESSION_FLAG_WRITE_ENABLED) != 0;
+        return (status.Flags & KNDBG_SESSION_FLAG_OWNER_ACTIVE) != 0 &&
+            status.OwnerPid == GetCurrentProcessId() && status.CurrentPid == GetCurrentProcessId() && status.OpenHandleCount != 0;
+    }, error);
 }
 
 bool DeviceClient::ReadMemory(

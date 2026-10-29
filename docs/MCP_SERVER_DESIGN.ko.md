@@ -35,7 +35,9 @@ control/engine 종료 경로로 리스너를 join한다. 취소 알림은 범용
   변경을 허용하며 읽기 목록에 있는 `ti.subscribe`의 start/stop도 이 권한이 필요하다.
 - raw 콘솔/kd 도구는 없다. 콜백 변경은 협력형 fixture에만 허용한다.
   별도 process-protection 쓰기 도구는 명시한 PID도 지원한다.
-- 로컬 REPL 복귀 시 기본 write-on 정책으로 돌아온다.
+- 현재 main은 커널 쓰기 모드 확인에 성공해야 엔진 작업을 실행한다.
+  로컬 REPL 복귀 시 write-off를 요청하며, 실패하면 상태 미확인으로 보고한다.
+  자동으로 쓰기를 활성화하지 않는다.
 
 ## 파싱과 결과
 

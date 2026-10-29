@@ -1532,7 +1532,7 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->DriverMajor = 0;
         response->DriverMinor = 6;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
-        response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER;
+        response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER | KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED;
         if (KnDbgIsLa57Active())
         {
             response->Flags |= KNDBG_VERSION_FLAG_LA57_ACTIVE;
@@ -2573,6 +2573,11 @@ static NTSTATUS KnDbgHandleWriteMode(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID B
         }
 
         KNDBG_WRITE_MODE_REQUEST* request = reinterpret_cast<KNDBG_WRITE_MODE_REQUEST*>(Buffer);
+        if (request->EnableWrite > 1)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
         if (request->Acknowledge != KNDBG_WRITE_ACK_MAGIC)
         {
             status = STATUS_ACCESS_DENIED;
@@ -3571,7 +3576,7 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
 
             RtlZeroMemory(fileContext, sizeof(KNDBG_FILE_CONTEXT));
-            fileContext->WriteEnabled = TRUE;
+            fileContext->WriteEnabled = FALSE;
             status = KnDbgAcquireController(fileContext);
             if (!NT_SUCCESS(status))
             {

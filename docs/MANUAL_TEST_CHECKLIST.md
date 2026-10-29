@@ -5,6 +5,16 @@ configuration, Windows build, and test interval. [Validation status](VALIDATION.
 contains dated observations; it does not check off a new build or host.
 Preserve failed runs, partial coverage and cleanup errors.
 
+## Native session policy
+
+Current main changes native session defaults. In an authorized isolated lab with
+the matching EXE/SYS, additionally check a fresh `drvstatus` reports write-off,
+mutation requests are denied before `write on`, explicit on/off transitions agree
+with `drvstatus`, and exiting MCP leaves write-off. Exercise mismatched older
+drivers and failed mode/status replies: startup or engine dispatch must fail
+closed. Driver-free fault injection covers the acknowledgment/status decision;
+it does not replace these live kernel integration checks.
+
 ## Driver-free gates
 
 From the source root, after building the configuration under test, use a shell

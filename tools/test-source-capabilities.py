@@ -29,6 +29,10 @@ def main():
         assert capability["availability"] == "not_probed"
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
+    policy = by_key[("session", "mutation_gate", "native")]
+    assert "default_write_denied_driver_flag" in policy["requirements"]
+    assert "confirmed_session_status" in policy["requirements"]
+    assert "not_an_observe_collect_partition" in policy["limits"]
     assert by_key[("security", "inspect_vtl1_memory", "native")]["implementation"] == "unsupported"
     assert by_key[("io", "interpose_dispatch", "native")]["implementation"] == "experimental"
     assert "image_verification_not_replayed" in by_key[("evidence", "replay", "bundle")]["limits"]

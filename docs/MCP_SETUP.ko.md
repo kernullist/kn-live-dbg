@@ -65,7 +65,8 @@ TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공�
 
 개별 쓰기 확인창과 `mcp write-confirm` 명령은 없다. 지원되는 쓰기는 dispatcher의
 사전 읽기·백업·검증·감사를 사용하지만 전체 transaction이나 복구를 보장하지 않는다.
-`off` 뒤 REPL은 기본 **write-on**으로 복귀한다. 필요하면 `write off`를 실행한다.
+현재 main은 `off` 뒤 **write-off**를 요청하고 REPL로 복귀한다. 전환 실패 시
+상태 미확인으로 보고한다. 실험 변경에는 명시적으로 `write on`을 실행한다.
 
 ## 결과·시간 초과·감사
 

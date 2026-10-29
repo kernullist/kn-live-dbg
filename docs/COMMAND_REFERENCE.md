@@ -12,6 +12,11 @@ See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
 ## Session and memory
 
+Current main starts with the native mutation gate off. Use `write on` explicitly
+for an authorized lab change and `write off` afterward. The client requires the
+matching driver with the default-write-denied capability flag. Returning from
+MCP requests write-off; a failed transition is reported as an unknown write state.
+
 ```text
 drvstatus
 write off
