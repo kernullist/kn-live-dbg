@@ -52,6 +52,8 @@ def main():
     assert "matching_pid_eprocess_create_time" in cross_view["requirements"]
     assert "unverified_candidates_retained" in cross_view["limits"]
     assert "shared_api_dependency" in cross_view["limits"]
+    assert "x0_or_x1_only" in by_key[("execution", "classify_reference", "native")]["limits"]
+    assert "saved_context_not_cpu_sample" in by_key[("execution", "classify_reference", "native")]["limits"]
     registry = (root / "user/CommandRegistry.cpp").read_text(encoding="utf-8-sig")
     expected = re.findall(r'Make\(L"([^"\n]+)",\s*L"([^"\n]*)",[^\n]*?CommandSupport::(\w+)\)', registry)
     assert expected, "command registry was not parsed"

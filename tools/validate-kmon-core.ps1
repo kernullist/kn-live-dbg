@@ -46,3 +46,8 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "kmon core self-test failed: $LASTEXITCODE"
 }
+& python (Join-Path $PSScriptRoot 'test-execution-evidence.py') --exe $exe
+if ($LASTEXITCODE -ne 0)
+{
+    throw "execution evidence JSON oracle failed: $LASTEXITCODE"
+}

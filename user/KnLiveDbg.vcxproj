@@ -259,6 +259,8 @@
     <ClInclude Include="HiddenProcessScanner.h" />
     <ClInclude Include="HiddenProcessReport.h" />
     <ClInclude Include="HiddenProcessPolicy.h" />
+    <ClInclude Include="ExecutionEvidenceJson.h" />
+    <ClInclude Include="ExecutionEvidence.h" />
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="HvPostureScanner.h" />
     <ClInclude Include="DumpAnalyzer.h" />

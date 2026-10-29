@@ -372,6 +372,12 @@
     <ClInclude Include="HiddenProcessPolicy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ExecutionEvidenceJson.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ExecutionEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="HvPostureScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>

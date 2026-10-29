@@ -11514,7 +11514,8 @@ bool KernelMonitor::EmitUnique(
     const std::wstring& layer,
     const std::wstring& summary,
     const std::wstring& notes,
-    uint32_t processId)
+    uint32_t processId,
+    const std::map<std::wstring, std::wstring>& evidence)
 {
     bool claimed = false;
     {
@@ -11586,6 +11587,7 @@ bool KernelMonitor::EmitUnique(
         event.Evidence[L"followup"] =
             L"!callbacks; !inputstack; !ssdt; !idt; !msrcheck; !mapper; !kpage /pe; !pool pe";
     }
+    event.Evidence.insert(evidence.begin(), evidence.end());
     RecordEvent(std::move(event));
     return true;
 }
@@ -17148,19 +17150,29 @@ void KernelMonitor::ScanUserExecutionEvidence(
         {
             continue;
         }
+        const auto input = KmonNativeExecutionEvidence(address, target.ProcessId, target.CreateTime, evidence.IdentityStable);
+        const auto assessment = AssessNativeExecutionEvidence(input);
+        const std::map<std::wstring, std::wstring> typedEvidence =
+        {
+            {L"execution_evidence_json", NativeExecutionEvidenceJson(input, address.Provenance)},
+            {L"execution_level", assessment.Level},
+            {L"execution_observed", L"false"},
+            {L"observation_retention", L"deduplicated_reference"},
+            {L"actor_attributed", L"false"}
+        };
         EmitUnique(apcArgument ? L"process.provenance" : L"process.execution",
             L"execution:" + std::to_wstring(target.ProcessId) + L":" +
             HexU64(target.CreateTime) + L":" + std::to_wstring(static_cast<uint32_t>(address.Kind)) +
-            L":" + std::to_wstring(address.ThreadId) + L":" + HexU64(address.Address), image,
-            L"execution_evidence", apcArgument ? L"APC argument address candidate; dispatch role is unverified" :
-                L"process execution or exception-routing observation",
+            L":" + std::to_wstring(address.ThreadId) + L":" + HexU64(address.ThreadCreateTime) +
+            L":" + HexU64(address.Address), image,
+            L"execution_evidence", std::wstring(assessment.Observation) + L"; execution not established",
             L"kind=" + std::to_wstring(static_cast<uint32_t>(address.Kind)) + L" address=" + HexU64(address.Address) +
             L" tid=" + std::to_wstring(address.ThreadId) + L" private_exec=" + std::to_wstring(address.PrivateExecutable) +
             L" loader_owned=" + std::to_wstring(address.InLoaderModule) + L" ownership_known=" +
             std::to_wstring(address.OwnershipKnown) + L" guard=" + std::to_wstring(address.GuardPage) +
             L" debug_condition=" + std::to_wstring(address.DebugCondition) +
             L" runtime_range_observed=" + std::to_wstring(address.RuntimeRangeObserved) + L" " + address.Provenance,
-            target.ProcessId);
+            target.ProcessId, typedEvidence);
     }
     const KmonEvidenceCoverage* coverages[] = {&evidence.Snapshot.Coverage, &evidence.ApcCoverage,
         &evidence.SavedContextCoverage, &evidence.TlsCoverage, &evidence.HandlerCoverage,

@@ -75,6 +75,9 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"separate_authorized_backend", L"vtl0_posture_is_not_vtl1_memory"},
         {L"execution", L"trace_import", L"trace", L"unsupported", L"unavailable",
             L"versioned_trace_adapter", L"static_references_do_not_establish_execution"},
+        {L"execution", L"classify_reference", L"native", L"implemented", L"source_metadata",
+            L"typed_source_kind;qualified_process_identity;source_specific_context_fields",
+            L"x0_or_x1_only;saved_context_not_cpu_sample;no_execution_write_or_actor_attribution"},
         {L"execution", L"observe_writes", L"vmi", L"unsupported", L"unavailable",
             L"authorized_vm_backend", L"shared_pfn_does_not_attribute_a_writer"}
     };

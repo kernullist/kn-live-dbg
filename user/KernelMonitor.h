@@ -484,7 +484,8 @@ private:
         const std::wstring& layer,
         const std::wstring& summary,
         const std::wstring& notes,
-        uint32_t processId = 0);
+        uint32_t processId = 0,
+        const std::map<std::wstring, std::wstring>& evidence = {});
     bool EmitUniqueBounded(
         size_t limit,
         size_t* emitted,

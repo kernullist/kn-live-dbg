@@ -7,6 +7,31 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Native execution evidence checkpoint: 2026-10-30
+
+Release x64 EXE SHA-256:
+`bb26ce2627d29da476e1c7f86e4bb2cf7588beb479af2320d0083c9e090830ec`.
+The core ASan harness passed 835 native-evidence controls and an independent
+Python JSON oracle checked ten source/missing-context cases. Existing capture
+scheduling 130, hunting 11,345, pages 54 and false-positive 49 controls passed.
+Native command controls exercise the actual VAD finding producer for thread
+starts, queued APCs and stack values, plus PSS metadata conversion, bounded
+exports, PE32/PE32+ callback widths and rejection of contradictory machine/magic.
+
+Review corrected references emitted as actual execution, lost PSS lifetime/time
+metadata, thread-generation deduplication and unchecked PE architecture pairs.
+No additional actionable defects were found in the reviewed scope. Final Release
+build and the native suite passed timeline 28, MCP 89, console 558, commands
+2,998, remote 66 and connect arguments. Capabilities passed 21 selected
+contracts/261 routes. Publication-scanner regressions passed ten tests.
+
+Logs are under `.build/architecture/w11-execution-*`; final build/native gates
+use `-commit`, and the core ASan run uses `-core-final`. Existing compiler/LTCG
+warnings remain. These are owned synthetic controls, not live PSS/APC execution
+acceptance. No driver was loaded or host security policy changed. X2-X4,
+CPU/code-version binding, trace/VMI sources and actual actor attribution remain
+unsupported by these adapters.
+
 ## Process cross-view qualification checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

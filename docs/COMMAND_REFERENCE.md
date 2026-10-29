@@ -171,6 +171,17 @@ absence. `!kpage` checks executable mappings outside known modules, and `/deep`
 adds a slower PFN path. `!pool pe` and `!payload` supply independent byte/reference
 evidence. Firmware-table inspection reads registrations without invoking handlers.
 
+Native user evidence in hunt includes a bounded `native_observations` list under
+`execution_evidence`. Each `kn.execution_evidence.v1` record identifies its X0
+reference, X1 metadata or unqualified state. PSS/saved RIP, a thread start, a
+queued APC and a raw stack value do not assert execution. CPU/code-version
+fields remain null. KMON's legacy `process.execution` category carries the same
+distinction in `execution_evidence_json`; it is a deduplicated reference stream.
+For VAD findings, use `execution_reference_observed`, `wx_reference_observed`
+and `permission_range_reference_observed` to inspect the existing correlations.
+The old execution booleans remain false for these sources. This is not a trace
+importer or a CPU execution/writer sensor.
+
 ## Whole-host hunt
 
 ```text

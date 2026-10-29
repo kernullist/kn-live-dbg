@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ProcessTriageScanner.h"
+#include "ExecutionEvidenceJson.h"
 
 #include <array>
 #include <memory>
@@ -145,6 +146,9 @@ struct KmonUserAddressEvidence
     uint64_t ModuleBase = 0;
     uint64_t AllocationBase = 0;
     uint32_t ThreadId = 0;
+    uint64_t ThreadCreateTime = 0;
+    uint64_t ContextCaptureTime = 0;
+    uint32_t PointerBytes = 8;
     uint32_t Protection = 0;
     uint32_t MemoryType = 0;
     uint32_t DebugRegister = 0;
@@ -156,6 +160,46 @@ struct KmonUserAddressEvidence
     bool RuntimeRangeObserved = false;
     std::wstring Provenance;
 };
+
+inline NativeExecutionEvidence KmonNativeExecutionEvidence(const KmonUserAddressEvidence& row,
+    uint32_t pid, uint64_t created, bool identityStable)
+{
+    NativeExecutionEvidence input;
+    input.ProcessId = pid;
+    input.ProcessCreateTime = created;
+    input.ProcessIdentityStable = identityStable;
+    input.ThreadId = row.ThreadId;
+    input.ThreadCreateTime = row.ThreadCreateTime;
+    input.CaptureTime = row.ContextCaptureTime;
+    input.PointerBytes = row.PointerBytes;
+    input.Address = row.Address;
+    switch (row.Kind)
+    {
+    case KmonUserEvidenceKind::SnapshotInstructionPointer:
+        input.Kind = NativeExecutionEvidenceKind::CapturedThreadContext;
+        break;
+    case KmonUserEvidenceKind::HardwareBreakpoint:
+        input.Kind = NativeExecutionEvidenceKind::HardwareBreakpoint;
+        break;
+    case KmonUserEvidenceKind::SavedTrapInstructionPointer:
+        input.Kind = NativeExecutionEvidenceKind::SavedTrapContext;
+        break;
+    case KmonUserEvidenceKind::UserApcRoutine:
+        input.Kind = NativeExecutionEvidenceKind::QueuedApcRoutine;
+        break;
+    case KmonUserEvidenceKind::UserApcArgumentCandidate:
+        input.Kind = NativeExecutionEvidenceKind::ApcArgument;
+        break;
+    case KmonUserEvidenceKind::TlsCallback:
+    case KmonUserEvidenceKind::VectoredExceptionHandler:
+    case KmonUserEvidenceKind::VectoredContinueHandler:
+        input.Kind = NativeExecutionEvidenceKind::PointerRegistration;
+        break;
+    default:
+        break;
+    }
+    return input;
+}
 
 struct KmonUserCallbackCursor
 {
@@ -215,6 +259,26 @@ struct KmonUserEvidenceResult
     bool IdentityStable = false;
     bool CallbackCursorEvicted = false;
 };
+
+inline std::wstring KmonNativeEvidenceObservationsJson(const KmonUserEvidenceResult& result)
+{
+    constexpr size_t kLimit = 128;
+    std::wstring out = L"{\"records_total\":" + std::to_wstring(result.Addresses.size());
+    out += L",\"truncated\":" + std::wstring(result.Addresses.size() > kLimit ? L"true" : L"false");
+    out += L",\"execution_observed\":false,\"records\":[";
+    for (size_t i = 0; i < result.Addresses.size() && i < kLimit; ++i)
+    {
+        if (i != 0)
+        {
+            out += L",";
+        }
+        const auto& row = result.Addresses[i];
+        out += NativeExecutionEvidenceJson(KmonNativeExecutionEvidence(row,
+            result.ProcessId, result.ProcessCreateTime, result.IdentityStable), row.Provenance);
+    }
+    out += L"]}";
+    return out;
+}
 
 bool CollectKmonUserEvidence(
     DeviceClient& device,

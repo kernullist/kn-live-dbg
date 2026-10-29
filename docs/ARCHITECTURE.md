@@ -64,6 +64,36 @@ raw EPROCESS capture is explicitly outside the qualification window and does not
 extend its lifetime guarantee.
 No state establishes deliberate hiding, execution, a writer or an actor.
 
+## Native execution evidence levels
+
+The selected native user-evidence adapters now emit `kn.execution_evidence.v1`.
+TLS/VEH/VCH registrations, configured debug registers and APC argument candidates
+remain X0 references. Thread-start metadata, raw stack values, queued APC routines,
+saved trap context and captured PSS context are X1 metadata when their declared
+scope is available. Neither grade sets `execution_observed`, `write_observed`,
+`control_flow_observed` or `actor_attributed`. Unknown source kinds, process
+identity, address formats or required captured-context fields stay `unqualified`.
+
+PSS conversions preserve thread creation time, capture time and pointer storage
+width. The [PSS thread entry contract](https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/ns-processsnapshot-pss_thread_entry)
+defines those timestamps and a captured context; it does not supply a current
+CPU identifier. The adapter therefore keeps CPU/code-version fields null and
+does not promote a saved RIP to an X2 CPU execution sample. Missing context
+timestamps and reversed creation/capture order remain unqualified. The selected
+native user readers still use their explicit legacy LA48 address format; the
+assessment reports that assumption and does not extend their live LA57 support.
+
+Hunt exports up to 128 typed native observations per process with total and
+truncation fields. KMON retains the existing `process.execution` event category
+for compatibility, but summaries and `execution_evidence_json` identify the
+actual reference or metadata kind. These are deduplicated reference records,
+not a complete instruction history; known PSS thread generations participate in
+the key. VAD correlations use `execution_reference_observed`, `wx_reference_observed`
+and `permission_range_reference_observed`; the corresponding legacy execution
+booleans are false. Detection heuristics still use those reference correlations.
+Trace/VMI producers, X2-X4 validation, additional runtime layouts and game-object
+lifetimes remain separate work.
+
 ## Comparison coverage
 
 `ObservationCoverage::Complete()` requires a bounded, valid union of compared

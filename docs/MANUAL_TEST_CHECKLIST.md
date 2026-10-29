@@ -70,6 +70,12 @@ needs ordinary creation/exit churn, snapshot clones, missing layouts and partial
 reads on each supported build; retain unverified candidates and distinguish
 discovery membership from qualification. Do not infer a live pass from fixtures.
 
+The core validator also checks native execution evidence levels and an independent
+JSON oracle. Native command self-tests cover typed user-evidence conversion,
+bounded observation export, PE32/PE32+ callback widths and VAD thread/APC/stack
+references without an execution claim. These controls do not validate a CPU
+trace source or live callback execution.
+
 ## Live-host prerequisites
 
 - Use a Windows x64 lab host/VM with the required signing configuration and

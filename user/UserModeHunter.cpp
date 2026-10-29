@@ -5532,7 +5532,7 @@ namespace
         return observed;
     }
 
-    bool HuntAddressHasSnapshotExecution(const HuntProcessRecord& process, uint64_t address)
+    bool HuntAddressHasCapturedContext(const HuntProcessRecord& process, uint64_t address)
     {
         bool observed = false;
         if (!process.UserEvidence.IdentityStable)
@@ -17607,7 +17607,7 @@ namespace
             range->WritableExecutable;
     }
 
-    bool VadRangeHasExecutionEvidence(
+    bool VadRangeHasExecutionReference(
         const HuntProcessRecord& process,
         const ProcessVadRecord& vad,
         uint64_t rangeStart,
@@ -17615,13 +17615,13 @@ namespace
         bool includeStackReferences,
         bool requireWritableExecutable);
 
-    bool VadHasExecutionEvidence(
+    bool VadHasExecutionReference(
         const HuntProcessRecord& process,
         const ProcessVadRecord& vad,
         bool includeStackReferences,
         bool requireWritableExecutable)
     {
-        return VadRangeHasExecutionEvidence(
+        return VadRangeHasExecutionReference(
             process,
             vad,
             vad.StartAddress,
@@ -17630,7 +17630,7 @@ namespace
             requireWritableExecutable);
     }
 
-    bool VadRangeHasExecutionEvidence(
+    bool VadRangeHasExecutionReference(
         const HuntProcessRecord& process,
         const ProcessVadRecord& vad,
         uint64_t rangeStart,
@@ -17739,7 +17739,7 @@ namespace
         const ProcessVadRecord* vad =
             FindVadContaining(process, module.Base);
         return vad != nullptr &&
-            !VadHasExecutionEvidence(
+            !VadHasExecutionReference(
                 process,
                 *vad,
                 false,
@@ -17901,8 +17901,8 @@ namespace
                                 {
                                     continue;
                                 }
-                                const bool permissionRangeExecutionObserved =
-                                    VadRangeHasExecutionEvidence(
+                                const bool permissionRangeReferenceObserved =
+                                    VadRangeHasExecutionReference(
                                         *process,
                                         vad,
                                         overlapLiveStart,
@@ -17912,12 +17912,12 @@ namespace
                                 const bool executePermissionDrift =
                                     liveExecutable &&
                                     !section.Executable &&
-                                    permissionRangeExecutionObserved;
+                                    permissionRangeReferenceObserved;
                                 const bool writePermissionDrift =
                                     liveWritableExecutable &&
                                     section.Executable &&
                                     !section.Writable &&
-                                    permissionRangeExecutionObserved;
+                                    permissionRangeReferenceObserved;
                                 const bool defaultWritableExecutableSection =
                                     (liveWritableExecutable ||
                                      liveCopyOnWriteExecutable) &&
@@ -17927,7 +17927,7 @@ namespace
                                     liveWritableExecutable &&
                                     section.Executable &&
                                     !section.Writable &&
-                                    permissionRangeExecutionObserved &&
+                                    permissionRangeReferenceObserved &&
                                     metadata.HasEntryPoint &&
                                     metadata.EntryPointRva >= overlapStart &&
                                     metadata.EntryPointRva < overlapEnd;
@@ -17950,8 +17950,10 @@ namespace
                                     evidenceLiveEnd = liveEnd;
                                     evidenceLiveProtection = liveProtection;
                                     imageSectionEvidence[
-                                        L"permission_range_execution_observed"] =
-                                        permissionRangeExecutionObserved
+                                        L"permission_range_execution_observed"] = L"false";
+                                    imageSectionEvidence[
+                                        L"permission_range_reference_observed"] =
+                                        permissionRangeReferenceObserved
                                             ? L"true"
                                             : L"false";
                                 }
@@ -18189,28 +18191,28 @@ namespace
                     defaultImageRwxSection ||
                     (unbackedMappedExecutable && !weakMappedRuntimeCode);
                 // Raw stack slots routinely contain legitimate JIT and
-                // emulator return addresses.  Treat them as execution
+                // emulator return addresses.  Treat them as reference
                 // corroboration only after the VAD already has PE/header,
                 // large-region, or image-permission evidence.  Thread starts
                 // and queued APC routines remain strong enough on their own.
-                bool executionObserved = VadHasExecutionEvidence(
+                bool executionReferenceObserved = VadHasExecutionReference(
                     *process,
                     vad,
                     strongVadEvidence,
                     false);
                 bool genericWxOnly = wx && !strongVadEvidence;
                 bool weakPrivateExecutableOnly = privateExecutable && !wx && !strongVadEvidence;
-                bool writableExecutableExecutionObserved =
+                bool writableExecutableReferenceObserved =
                     genericWxOnly &&
-                    VadHasExecutionEvidence(
+                    VadHasExecutionReference(
                         *process,
                         vad,
                         false,
                         true);
-                bool relevantExecutionObserved =
+                bool relevantReferenceObserved =
                     genericWxOnly
-                        ? writableExecutableExecutionObserved
-                        : executionObserved;
+                        ? writableExecutableReferenceObserved
+                        : executionReferenceObserved;
                 bool identityCorroborated =
                     process->BuiltinProfileMatched &&
                     !process->BuiltinProfileViolations.empty();
@@ -18234,7 +18236,7 @@ namespace
                 // size, image permission drift, or a violated built-in
                 // identity profile still promotes the region below.
                 if ((genericWxOnly || weakPrivateExecutableOnly || weakMappedRuntimeCode) &&
-                    !relevantExecutionObserved &&
+                    !relevantReferenceObserved &&
                     !identityCorroborated)
                 {
                     continue;
@@ -18348,9 +18350,11 @@ namespace
                     evidence[item.first] = item.second;
                 }
                 evidence[L"strong_code_provenance"] = strongVadEvidence ? L"true" : L"false";
-                evidence[L"execution_observed"] = relevantExecutionObserved ? L"true" : L"false";
-                evidence[L"wx_execution_observed"] =
-                    writableExecutableExecutionObserved ? L"true" : L"false";
+                evidence[L"execution_observed"] = L"false";
+                evidence[L"execution_reference_observed"] = relevantReferenceObserved ? L"true" : L"false";
+                evidence[L"wx_execution_observed"] = L"false";
+                evidence[L"wx_reference_observed"] =
+                    writableExecutableReferenceObserved ? L"true" : L"false";
                 if (vad.PeProbeAttempted)
                 {
                     evidence[L"pe_mz_wiped"] = vad.PeProbe.MzWiped ? L"true" : L"false";
@@ -18370,7 +18374,7 @@ namespace
                 if (largePrivateExecutable ||
                     imageExecutePermissionDrift ||
                     imageWritePermissionDrift ||
-                    (peBackedPrivateCode && executionObserved))
+                    (peBackedPrivateCode && executionReferenceObserved))
                 {
                     risk = L"high";
                     confidence = L"high";
@@ -18380,6 +18384,7 @@ namespace
                     risk = L"low";
                     confidence = L"medium";
                     evidence[L"private_pe_without_execution_observed"] = L"true";
+                    evidence[L"private_pe_without_execution_reference"] = L"true";
                 }
                 if (imageSectionPermissionSuspicious)
                 {
@@ -18916,30 +18921,30 @@ namespace
                     bool identityCorroborated =
                         process.BuiltinProfileMatched &&
                         !process.BuiltinProfileViolations.empty();
-                    bool waitingThreadHijack =
+                    bool capturedPrivateContextCorrelation =
                         ref.ValueInPrivateExecVad &&
                         ref.ValueOutsideUserModules &&
-                        HuntAddressHasSnapshotExecution(process, ref.Value) &&
+                        HuntAddressHasCapturedContext(process, ref.Value) &&
                         !HuntAddressHasRuntimeProvenance(process, ref.Value);
-                    if (!strongStackEvidence && !identityCorroborated && !waitingThreadHijack)
+                    if (!strongStackEvidence && !identityCorroborated && !capturedPrivateContextCorrelation)
                     {
                         // Preserve the raw stack-reference record and counters,
                         // but a pointer to ordinary JIT/dynamic code is not an
                         // anomaly without stronger provenance.
                         continue;
                     }
-                    if (waitingThreadHijack)
+                    if (capturedPrivateContextCorrelation)
                     {
-                        AddUnique(&reasons, L"captured_private_execution_and_stack_reference");
+                        AddUnique(&reasons, L"captured_private_context_and_stack_reference");
                     }
                     AddBuiltinInjectionReasonIfNeeded(
                         process,
                         &reasons,
                         &evidence,
-                        strongStackEvidence || identityCorroborated || waitingThreadHijack);
+                        strongStackEvidence || identityCorroborated || capturedPrivateContextCorrelation);
 
                     std::wstring risk =
-                        strongStackEvidence || identityCorroborated || waitingThreadHijack
+                        strongStackEvidence || identityCorroborated || capturedPrivateContextCorrelation
                             ? L"high"
                             : L"low";
                     std::wstring confidence = strongStackEvidence ? L"high" : L"medium";
@@ -20397,6 +20402,12 @@ namespace
                 evidence[L"address"] = HuntHex(record.Address, 16);
                 evidence[L"provenance"] = record.Provenance;
                 evidence[L"runtime_range_observed"] = record.RuntimeRangeObserved ? L"true" : L"false";
+                const auto input = KmonNativeExecutionEvidence(record, process.ProcessId,
+                    process.UserEvidence.ProcessCreateTime,
+                    process.UserEvidence.IdentityStable && process.UserEvidence.ProcessId == process.ProcessId);
+                evidence[L"execution_evidence_json"] = NativeExecutionEvidenceJson(input, record.Provenance);
+                evidence[L"execution_level"] = AssessNativeExecutionEvidence(input).Level;
+                evidence[L"execution_observed"] = L"false";
                 const ProcessVadRecord* vad = FindVadContaining(process, record.Address);
                 const bool strong = vad != nullptr && VadClassificationHasStrongCodeEvidence(vad->Classification);
                 std::wstring reason = L"captured_instruction_pointer_private_exec";
@@ -24485,7 +24496,7 @@ bool HuntInProcessHookSelfTest()
         game.UserEvidence.Snapshot.Threads.push_back(captured);
         HuntResult executionResult;
         AddHardwareBreakpointFindings(&executionResult, game);
-        if (executionResult.Findings.size() != 1 || !HuntAddressHasSnapshotExecution(game, 0x200100))
+        if (executionResult.Findings.size() != 1 || !HuntAddressHasCapturedContext(game, 0x200100))
         {
             break;
         }
@@ -24524,7 +24535,7 @@ bool HuntInProcessHookSelfTest()
             break;
         }
         game.UserEvidence.IdentityStable = false;
-        if (HuntAddressHasRuntimeProvenance(game, 0x200100) || HuntAddressHasSnapshotExecution(game, 0x200100))
+        if (HuntAddressHasRuntimeProvenance(game, 0x200100) || HuntAddressHasCapturedContext(game, 0x200100))
         {
             break;
         }
@@ -25973,6 +25984,58 @@ bool HuntDynamicRelocationMaskSelfTest()
 
 bool HuntEffectiveVadProtectionSelfTest()
 {
+    // Exercise the finding producer: references must survive without becoming
+    // an execution claim. This fixture never opens a device or symbol session.
+    DeviceClient closedDevice;
+    SymbolEngine closedSymbols;
+    for (uint32_t source = 0; source < 3; ++source)
+    {
+        HuntProcessRecord referenceProcess;
+        referenceProcess.ProcessId = 100;
+        ProcessVadRecord referenceVad;
+        referenceVad.StartAddress = 0x20000;
+        referenceVad.EndAddress = 0x21fff;
+        referenceVad.Size = 0x2000;
+        referenceVad.HasPrivateMemory = true;
+        referenceVad.PrivateMemory = true;
+        referenceVad.Executable = true;
+        referenceVad.WritableExecutable = true;
+        referenceVad.PeHeaderFound = source == 2;
+        referenceProcess.VadRecords.push_back(referenceVad);
+        ProcessThreadRecord referenceThread;
+        referenceThread.ThreadId = 104;
+        referenceThread.HasThreadId = true;
+        if (source == 0)
+        {
+            referenceThread.HasStartAddress = true;
+            referenceThread.StartAddress = 0x20100;
+        }
+        else if (source == 1)
+        {
+            ProcessApcQueueRecord queue;
+            ProcessApcEntryRecord apc;
+            apc.HasNormalRoutine = true;
+            apc.NormalRoutine = 0x20100;
+            queue.Entries.push_back(apc);
+            referenceThread.ApcQueues.push_back(queue);
+        }
+        else
+        {
+            ProcessStackReferenceRecord reference;
+            reference.Value = 0x20100;
+            referenceThread.StackReferences.push_back(reference);
+        }
+        referenceProcess.ThreadRecords.push_back(referenceThread);
+        HuntResult referenceResult;
+        AddVadFindings(closedDevice, closedSymbols, &referenceResult, &referenceProcess);
+        if (referenceResult.Findings.size() != 1 ||
+            referenceResult.Findings[0].Evidence[L"execution_observed"] != L"false" ||
+            referenceResult.Findings[0].Evidence[L"wx_execution_observed"] != L"false" ||
+            referenceResult.Findings[0].Evidence[L"execution_reference_observed"] != L"true" || closedDevice.IsOpen())
+        {
+            return false;
+        }
+    }
     HuntProcessRecord cfgProcess = {};
     cfgProcess.PebLdrLoadEnumerated = true;
     cfgProcess.ToolhelpModuleEnumerated = true;
@@ -26065,7 +26128,7 @@ bool HuntEffectiveVadProtectionSelfTest()
 
     if (!VadAddressIsExecutable(vad, 0x1100) ||
         VadAddressIsWritableExecutable(vad, 0x1100) ||
-        VadHasExecutionEvidence(process, vad, false, true))
+        VadHasExecutionReference(process, vad, false, true))
     {
         return false;
     }
@@ -26122,15 +26185,15 @@ bool HuntEffectiveVadProtectionSelfTest()
 
     process.ThreadRecords[0].StartAddress = 0x2100;
     if (!VadAddressIsWritableExecutable(vad, 0x2100) ||
-        !VadHasExecutionEvidence(process, vad, false, true) ||
-        VadRangeHasExecutionEvidence(
+        !VadHasExecutionReference(process, vad, false, true) ||
+        VadRangeHasExecutionReference(
             process,
             vad,
             0x1000,
             0x1fff,
             false,
             false) ||
-        !VadRangeHasExecutionEvidence(
+        !VadRangeHasExecutionReference(
             process,
             vad,
             0x2000,
@@ -29106,7 +29169,8 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"handlers_available\":" << (process.UserEvidence.HandlerCoverage.Available ? L"true" : L"false");
         json << L",\"handlers_complete\":" << (process.UserEvidence.HandlerCoverage.Complete ? L"true" : L"false");
         json << L",\"runtime_ranges\":" << process.UserEvidence.RuntimeRanges.size();
-        json << L",\"runtime_detail\":\"" << HuntJsonEscape(process.UserEvidence.RuntimeCoverage.Detail) << L"\"}";
+        json << L",\"runtime_detail\":\"" << HuntJsonEscape(process.UserEvidence.RuntimeCoverage.Detail) << L"\"";
+        json << L",\"native_observations\":" << KmonNativeEvidenceObservationsJson(process.UserEvidence) << L"}";
         const KmonFileIdentity& identity = process.UserEvidence.ImageIdentity;
         json << L",\"opened_image_identity\":{\"stable\":" << (identity.Stable ? L"true" : L"false");
         json << L",\"volume\":\"" << HuntHex(identity.VolumeSerial, 16) << L"\",\"file_id\":\"";

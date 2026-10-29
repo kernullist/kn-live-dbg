@@ -1090,7 +1090,8 @@ namespace
                 break;
             }
             IMAGE_DATA_DIRECTORY debug = {};
-            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC && prefix.File.SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER64))
+            if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC && prefix.File.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                prefix.File.SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER64))
             {
                 IMAGE_OPTIONAL_HEADER64 optional = {};
                 if (!read(module.Base + optionalRva, &optional, sizeof(optional)) ||
@@ -1103,7 +1104,8 @@ namespace
                 result->Tls = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
                 debug = optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
             }
-            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC && prefix.File.SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER32))
+            else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC && prefix.File.Machine == IMAGE_FILE_MACHINE_I386 &&
+                prefix.File.SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER32))
             {
                 IMAGE_OPTIONAL_HEADER32 optional = {};
                 if (!read(module.Base + optionalRva, &optional, sizeof(optional)) ||
@@ -1275,6 +1277,7 @@ namespace
             }
             KmonUserAddressEvidence evidence;
             evidence.Kind = KmonUserEvidenceKind::TlsCallback;
+            evidence.PointerBytes = pe.PointerSize;
             evidence.Address = callback;
             evidence.RecordAddress = table + offset;
             evidence.ModuleBase = module.Base;
@@ -1364,6 +1367,7 @@ namespace
                 evidence.Address = encoded;
                 evidence.RecordAddress = current - layout.EntryLinkOffset;
                 evidence.ModuleBase = layout.ModuleBase;
+                evidence.PointerBytes = layout.PointerSize;
                 evidence.Provenance = layout.SymbolProvenance;
                 pending.push_back(std::move(evidence));
                 previous = current;
@@ -1884,6 +1888,9 @@ bool CollectKmonUserEvidence(DeviceClient& device, SymbolEngine& symbols,
                     evidence.Kind = KmonUserEvidenceKind::SnapshotInstructionPointer;
                     evidence.Address = context.InstructionPointer;
                     evidence.ThreadId = context.ThreadId;
+                    evidence.ThreadCreateTime = context.CreateTime;
+                    evidence.ContextCaptureTime = context.CaptureTime;
+                    evidence.PointerBytes = context.Wow64 ? 4 : 8;
                     evidence.Provenance = context.Wow64 ? L"PSS WOW64 control context" : L"PSS AMD64 control context";
                     result->Addresses.push_back(std::move(evidence));
                 }
@@ -1897,6 +1904,9 @@ bool CollectKmonUserEvidence(DeviceClient& device, SymbolEngine& symbols,
                         }
                         KmonUserAddressEvidence evidence;
                         evidence.Kind = KmonUserEvidenceKind::HardwareBreakpoint;
+                        evidence.ThreadCreateTime = context.CreateTime;
+                        evidence.ContextCaptureTime = context.CaptureTime;
+                        evidence.PointerBytes = context.Wow64 ? 4 : 8;
                         evidence.Address = context.DebugAddress[index];
                         evidence.ThreadId = context.ThreadId;
                         evidence.DebugRegister = index;
@@ -2098,6 +2108,47 @@ bool KmonUserEvidenceSelfTest()
     bool ok = false;
     do
     {
+        KmonUserEvidenceResult gradeFixture;
+        gradeFixture.ProcessId = 100;
+        gradeFixture.ProcessCreateTime = 1000;
+        gradeFixture.IdentityStable = true;
+        for (uint32_t kind = 0; kind < 8; ++kind)
+        {
+            KmonUserAddressEvidence row;
+            row.Kind = static_cast<KmonUserEvidenceKind>(kind);
+            row.Address = 0x20000;
+            row.ThreadId = 104;
+            row.ThreadCreateTime = 1100;
+            row.ContextCaptureTime = 1200;
+            const auto input = KmonNativeExecutionEvidence(row, 100, 1000, true);
+            const auto grade = AssessNativeExecutionEvidence(input);
+            const bool metadata = row.Kind == KmonUserEvidenceKind::SnapshotInstructionPointer ||
+                row.Kind == KmonUserEvidenceKind::SavedTrapInstructionPointer ||
+                row.Kind == KmonUserEvidenceKind::UserApcRoutine;
+            if (std::wstring(grade.Level) != (metadata ? L"X1" : L"X0") || grade.ExecutionObserved ||
+                input.ThreadCreateTime != row.ThreadCreateTime || input.CaptureTime != row.ContextCaptureTime)
+            {
+                return false;
+            }
+            gradeFixture.Addresses.push_back(row);
+        }
+        gradeFixture.Addresses.resize(129, gradeFixture.Addresses.front());
+        const auto gradeJson = KmonNativeEvidenceObservationsJson(gradeFixture);
+        size_t gradeRecords = 0;
+        for (size_t at = 0; (at = gradeJson.find(L"\"schema\":\"kn.execution_evidence.v1\"", at)) != std::wstring::npos; ++at)
+        {
+            ++gradeRecords;
+        }
+        if (gradeRecords != 128 || gradeJson.find(L"\"truncated\":true") == std::wstring::npos ||
+            gradeJson.find(L"\"execution_observed\":true") != std::wstring::npos)
+        {
+            break;
+        }
+        gradeFixture.IdentityStable = false;
+        if (KmonNativeEvidenceObservationsJson(gradeFixture).find(L"\"level\":\"X1\"") != std::wstring::npos)
+        {
+            break;
+        }
         RuntimeSessionHealth health;
         if (!UpdateRuntimeSessionHealth(&health, 1, ERROR_SUCCESS, 0, 0) || !health.Known ||
             UpdateRuntimeSessionHealth(&health, 1, ERROR_SUCCESS, 0, 0) ||
@@ -2488,6 +2539,7 @@ bool KmonUserEvidenceSelfTest()
         write(0, &dos, sizeof(dos));
         IMAGE_NT_HEADERS64 nt = {};
         nt.Signature = IMAGE_NT_SIGNATURE;
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
         nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
         nt.FileHeader.TimeDateStamp = 99;
         nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
@@ -2514,10 +2566,54 @@ bool KmonUserEvidenceSelfTest()
         KmonEvidenceCoverage coverage;
         coverage.Complete = true;
         CollectTlsCallbacks(reader, module, 2, &records, &coverage);
-        if (records.size() != 2 || coverage.Failures != 0 || coverage.Truncated || records[1].Address != callbacks[1])
+        if (records.size() != 2 || coverage.Failures != 0 || coverage.Truncated ||
+            records[1].Address != callbacks[1] || records[1].PointerBytes != 8)
         {
             break;
         }
+        const auto nativeImage = memory;
+        IMAGE_NT_HEADERS32 nt32 = {};
+        nt32.Signature = IMAGE_NT_SIGNATURE;
+        nt32.FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+        nt32.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+        nt32.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        nt32.OptionalHeader.SizeOfImage = static_cast<uint32_t>(memory.size());
+        nt32.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        nt32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {0x300, sizeof(IMAGE_TLS_DIRECTORY32)};
+        IMAGE_TLS_DIRECTORY32 tls32 = {};
+        tls32.AddressOfCallBacks = static_cast<uint32_t>(module.Base + 0x800);
+        const uint32_t callbacks32[] = {0x500000, 0x600000, 0};
+        write(0x80, &nt32, sizeof(nt32));
+        write(0x300, &tls32, sizeof(tls32));
+        write(0x800, callbacks32, sizeof(callbacks32));
+        records.clear();
+        coverage = {};
+        CollectTlsCallbacks(reader, module, 2, &records, &coverage);
+        if (records.size() != 2 || coverage.Failures != 0 || records[1].PointerBytes != 4 ||
+            records[1].Address != callbacks32[1])
+        {
+            break;
+        }
+        nt32.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        write(0x80, &nt32, sizeof(nt32));
+        records.clear();
+        coverage = {};
+        CollectTlsCallbacks(reader, module, 2, &records, &coverage);
+        if (!records.empty() || coverage.Failures == 0)
+        {
+            break;
+        }
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+        write(0x80, &nt, sizeof(nt));
+        records.clear();
+        coverage = {};
+        CollectTlsCallbacks(reader, module, 2, &records, &coverage);
+        if (!records.empty() || coverage.Failures == 0)
+        {
+            break;
+        }
+        nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        memory = nativeImage;
         records.clear();
         coverage = {};
         CollectTlsCallbacks(reader, module, 1, &records, &coverage);
