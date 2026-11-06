@@ -2,6 +2,7 @@
 
 #include "ExecutableImage.h"
 #include "ObservationModel.h"
+#include "ReferenceArtifact.h"
 
 #include <functional>
 #include <map>
@@ -57,6 +58,15 @@ struct ExecutableSweep
     bool Initialize(const executable_image::DiskPeMetadata& metadata);
 };
 
+struct ExecutableSweepReference
+{
+    std::shared_ptr<const RetainedReferenceArtifact> Artifact;
+    std::wstring CaptureStatus = L"not_attempted";
+    std::wstring Failure;
+    bool ContentRechecked = false;
+    bool ContentStable = false;
+};
+
 bool QualifyExecutableReference(
     const executable_image::DiskPeMetadata& metadata,
     uint64_t imageBase,
@@ -85,6 +95,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(
     size_t pageBudget,
     uint64_t nowMs,
     ExecutableSweep* sweep,
-    uint64_t budgetMs = 0);
+    uint64_t budgetMs = 0,
+    ExecutableSweepReference* capturedReference = nullptr);
 
 bool ExecutableImageVerifierSelfTest();

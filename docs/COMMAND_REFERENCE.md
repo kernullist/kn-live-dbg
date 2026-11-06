@@ -116,9 +116,13 @@ or inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication
 events (`coverage.image_reads`); a queued ID alone does not mean the file was
 written. Hunt JSON `image_read_store` and `coverage.pipeline` report bounded
-queue/store loss. Inspect the final `.knreadledger` after stopping. These raw
-archives do not contain a complete reference/verification recipe and are not
-accepted by `replay-image`. See [read receipts](ARCHITECTURE.md#ordered-read-receipts-and-operation-budgets).
+queue/store loss. Inspect the final `.knreadledger` after stopping. V2 archives
+also report exact reference capture and separate publication status in the
+shared `image-references/*.knblob` store. A committed raw archive may still have
+a failed or missing reference; check both statuses and the reference counters.
+Normalization, secondary-view inputs and slice recipes remain incomplete, so
+these archives are not accepted by `replay-image`. See
+[read receipts](ARCHITECTURE.md#ordered-read-receipts-and-operation-budgets).
 
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged

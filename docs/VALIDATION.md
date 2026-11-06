@@ -7,6 +7,53 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## KMON exact reference retention checkpoint: 2026-11-07
+
+This P03/minimal-P06 substep pins the comparison reference before target reads,
+retains bytes from that exact file object, and rechecks content before releasing
+the source lease. Changed/inconclusive KMON slices use `kn.image_reads.v2` with
+separate capture and publication status. The writer verifies or creates shared
+content-addressed reference blobs before publishing the referring archive.
+Queue reference reservations and newly published reference bytes each have a
+128 MiB limit, separate from the existing raw archive budget. Failed or missing
+references remain explicit while original raw reads can still be preserved.
+
+Release x64 EXE SHA-256:
+`7c59bf0b0ca56f8996a71e52b9e59f323c614ed50a47ce346966a81f7315794d`.
+ASan reference-blob harness SHA-256:
+`7d71cbb0711fa0e9c45206fd592c389d825e396dac78ea867e4e41a2df099a0b`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+Existing C4244 conversion and C4744 `NextQueryEpoch` alignment warnings remain.
+
+`validate-reference-blobs.ps1 -Sanitize` passed 23 controls and the independent
+Python SHA-256/JSON oracle. Real owned-file handles exercise rename/path
+replacement, independent read position, write exclusion, source deletion before
+publication, exact-byte reuse at zero new-byte budget, forged hashes, corrupt
+existing blobs, size limits, invalid/device handles and cleanup. An existing
+writable mapped view denied the read-only exclusion lease; this does not test
+privileged mutation through an acquired lease.
+
+`--self-test all` passed timeline 28, MCP 102, console 558, command registry
+3,000 and remote 66 checks. Its actual KMON comparison/writer integration passed
+36 controls, including source/reference removal before publication, unchanged
+original routed bytes, exact shared reference, pressure/reservation release,
+missing/corrupt/budget-denied references, reference rejection before target reads,
+output collisions and final ledger balances with zero reference reservations.
+`validate-image-recipe.ps1 -Sanitize` passed 92 v1/v2 controls; six interrupted
+publications per format left three valid and three absent final recipes.
+The final EXE passed 101 legacy CLI checks and 168 live CLI checks with three
+owned nonexecuting PE-buffer children, all exited. Public-content regressions
+passed 11 checks, including renamed private v2 read archives.
+
+These are owned user-mode/synthetic comparisons, not OS-loaded module or native
+driver lifecycle validation. No driver-load, service-start, Verifier, reboot or
+security-policy changes were made. Full reference acquisition/rechecks and blob
+verification still run per slice; the 25 ms sweep yield is not an end-to-end
+latency guarantee. Caching/stage budgets, clean-only retention, normalization,
+secondary-view inputs, complete slice recipes and sweep manifests, journal
+restart/global retention and full VS1 remain open. No additional defects were
+found in the reviewed implementation scope. The P01–P16 goal remains active.
+
 ## KMON original image read archive checkpoint: 2026-11-07
 
 This P02/P03 substep connects KMON's initial user/kernel image comparisons and

@@ -112,7 +112,7 @@ KMON's initial user/kernel image comparisons and background image continuations
 use this router, including handle-to-native fallback. A slice shares limits of
 16 MiB requested bytes, 4,096 source calls/receipts, 65,536 spans and five seconds;
 the existing 25 ms sweep yield remains cooperative. Changed or inconclusive
-slices queue their original attempts and parser selections as `kn.image_reads.v1`
+slices queue their original attempts and parser selections as `kn.image_reads.v2`
 under `image-reads/reads-<collection>-<id>.knreads`. The private payload has a
 SHA-256 integrity hash, not collector authentication. The writer uses create-new
 atomic publication, with an eight-item queue, 2 MiB per file and 128 MiB per
@@ -122,11 +122,31 @@ JSON `image_read_store` report counts. A final `.knreadledger` records queued,
 written, failed, dropped and pending totals after producer/writer drain. Live
 snapshots are not final ledgers. These counters do not alter `.kncase` inventory.
 
-Clean-only slices are not selected for this archive. The archive does not retain
-the exact reference PE, local secondary-view reads or normalization and is not
-an executable verification recipe. Complete background reference/recipe and
-sweep-manifest publication, source-initialization receipts, other KMON reader
-paths and native lifecycle validation remain open. Single-source v2 recipe
+The sweep pins its reference before the first target read. Retention reopens
+that exact file object with an independent read pointer, captures up to 64 MiB,
+and rechecks its bytes before releasing the lease. Queued snapshots keep the
+bytes and original file identity, not a handle that would pin the source file
+until publication. The writer publishes or verifies
+`image-references/<sha256>.knblob` before committing the referring archive. It
+holds a write/delete exclusion lease on the verified blob through that commit.
+Existing content must match both hash and bytes; a corrupt blob is never replaced.
+The hash is content identity, not an approved reference or collector identity.
+
+New reference blobs have a separate 128 MiB session limit; reuse of a verified
+blob is allowed at that limit. Queue reservations limit retained reference bytes
+to 128 MiB, conservatively charging each queued item even when snapshots share
+storage. This is not a total process-memory bound. Capture and publication status,
+created/reused/failed/missing counts, new bytes and outstanding reservations stay
+separate from raw archive counts. A missing or failed reference does not discard
+the raw reads or imply replay readiness. Acquisition/rechecks and existing-blob
+verification still read full file contents per slice; caching and reference-stage
+latency budgets remain P09 work. The 25 ms yield is not an end-to-end deadline.
+
+Clean-only slices are not selected for this archive. Local secondary-view reads
+and normalization are not retained, so the archive is not an executable
+verification recipe. Complete background recipes and sweep-manifest publication,
+source-initialization receipts, other KMON reader paths, crash recovery/global
+retention and native lifecycle validation remain open. Single-source v2 recipe
 validation remains strict; routed fallback sets cannot be substituted into it.
 
 ## Typed translation receipts

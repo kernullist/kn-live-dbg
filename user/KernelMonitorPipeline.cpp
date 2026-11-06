@@ -15,6 +15,34 @@
 
 namespace
 {
+    std::wstring ImageReadArchiveJson(const std::wstring& originalPayload, const ExecutableSweepReference* reference,
+        const std::wstring& persistence, const std::wstring& failure)
+    {
+        auto payload = originalPayload;
+        if (payload.empty() || payload.back() != L'}') { return L""; }
+        if (reference != nullptr)
+        {
+            payload.pop_back();
+            const auto& artifact = reference->Artifact;
+            payload += L",\"reference\":{\"capture\":" + mcpjson::Quote(reference->CaptureStatus) +
+                L",\"capture_failure\":" + mcpjson::Quote(reference->Failure) +
+                L",\"content_rechecked\":" + (reference->ContentRechecked ? L"true" : L"false") +
+                L",\"content_stable\":" + (reference->ContentStable ? L"true" : L"false") +
+                L",\"original_path\":" + mcpjson::Quote(artifact == nullptr ? L"" : artifact->OriginalPath) +
+                L",\"original_file_identity\":" + mcpjson::Quote(artifact == nullptr ? L"" : artifact->OriginalFileIdentity) +
+                L",\"sha256\":" + mcpjson::Quote(artifact == nullptr ? L"" : artifact->Sha256) +
+                L",\"bytes\":" + std::to_wstring(artifact == nullptr ? 0 : artifact->Bytes.size()) +
+                L",\"persistence\":" + mcpjson::Quote(persistence) + L",\"persistence_failure\":" + mcpjson::Quote(failure) +
+                L",\"store\":\"image-references\",\"collector_authenticated\":false,\"approved_reference\":false}}";
+        }
+        const auto bytes = mcpjson::WideToUtf8(payload);
+        ContentHash hash;
+        if (bytes.size() > EvidenceBundleMaxJsonBytes - 256 || !hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size())) { return L""; }
+        const auto digest = hash.Finish();
+        return digest.empty() ? L"" : L"{\"schema\":" + mcpjson::Quote(reference == nullptr ? L"kn.image_reads.v1" : L"kn.image_reads.v2") +
+            L",\"payload_sha256\":" + mcpjson::Quote(digest) + L",\"payload\":" + payload + L"}";
+    }
+
     // Only describe an unreadable whole-page range covered exclusively by a
     // discardable section in the header actually captured from this image.
     // Invalid/overlapping/truncated metadata never grants an exclusion.
@@ -123,6 +151,11 @@ void KernelMonitor::ResetPipeline()
     ImageReadsDropped.store(0);
     ImageReadsBytes.store(0);
     ImageReadsLedgerFailed.store(0);
+    ImageReferenceBlobsCreated.store(0);
+    ImageReferenceBlobsReused.store(0);
+    ImageReferenceBlobsFailed.store(0);
+    ImageReferenceBytes.store(0);
+    ImageReferencesMissing.store(0);
     EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
     EvidenceQueued.store(0);
     EvidenceWritten.store(0);
@@ -861,7 +894,7 @@ uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
 }
 
 uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
-    const std::wstring& image, uint64_t imageBase)
+    const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference)
 {
     uint64_t estimate = reads.Attempts.Reads.size() * 1400ull;
     for (const auto& receipt : reads.Attempts.Reads)
@@ -873,20 +906,31 @@ uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads,
     const auto payload = L"{\"image\":" + mcpjson::Quote(image) + L",\"image_base\":" + n(imageBase) +
         L",\"boot_id\":" + mcpjson::Quote(identity.BootId) + L",\"pid\":" + n(identity.ProcessId) +
         L",\"creation_time\":" + n(identity.CreateTime) + L",\"reads\":" + ObservationRoutedReadSetJson(reads) + L"}";
-    const auto bytes = mcpjson::WideToUtf8(payload);
-    ContentHash hash;
-    if (bytes.size() > EvidenceBundleMaxJsonBytes - 256 || !hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()))
-    {
-        ImageReadsDropped.fetch_add(1);
-        return 0;
-    }
-    const auto digest = hash.Finish();
-    if (digest.empty()) { ImageReadsDropped.fetch_add(1); return 0; }
     CapturedImageReads item;
     item.Id = NextCaptureId.fetch_add(1);
     item.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
     item.Identity = identity;
-    item.Json = L"{\"schema\":\"kn.image_reads.v1\",\"payload_sha256\":" + mcpjson::Quote(digest) + L",\"payload\":" + payload + L"}";
+    item.Payload = payload;
+    item.HasReference = reference != nullptr;
+    if (reference != nullptr) { item.Reference = *reference; }
+    if (item.Reference.Artifact != nullptr)
+    {
+        item.ReferenceCharge = std::make_shared<ImageReferenceCharge>();
+        item.ReferenceCharge->Total = ImageReferenceReservedBytes;
+        const uint64_t size = item.Reference.Artifact->Bytes.size();
+        auto reserved = ImageReferenceReservedBytes->load();
+        do
+        {
+            if (reserved > 128ull * 1024 * 1024 || size > 128ull * 1024 * 1024 - reserved)
+            {
+                ImageReadsDropped.fetch_add(1);
+                return 0;
+            }
+        } while (!ImageReferenceReservedBytes->compare_exchange_weak(reserved, reserved + size));
+        item.ReferenceCharge->Bytes = size;
+    }
+    item.Json = ImageReadArchiveJson(payload, reference, L"pending", L"");
+    if (item.Json.empty()) { ImageReadsDropped.fetch_add(1); return 0; }
     const auto id = item.Id;
     if (!CapturedImageReadSets.Push(std::move(item))) { ImageReadsDropped.fetch_add(1); return 0; }
     ImageReadsQueued.fetch_add(1);
@@ -906,10 +950,37 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         const auto path = folder / (L"reads-" + reads.CollectionId + L"-" + std::to_wstring(reads.Id) + L".knreads");
         const auto bytes = mcpjson::WideToUtf8(reads.Json).size();
         std::wstring failure = ec ? L"read_set_directory_unavailable" : L"invalid_read_set_or_session_byte_budget";
+        std::wstring referencePersistence = L"not_attempted", referenceFailure;
+        std::unique_ptr<ReferenceArtifact> referenceLease;
         if (!ec && !reads.Json.empty() && bytes <= EvidenceBundleMaxJsonBytes && bytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
         {
-            written = SaveObservationJson(path.wstring(), reads.Json, &failure);
-            if (written) { ImageReadsBytes.fetch_add(bytes); }
+            if (reads.HasReference)
+            {
+                const auto& artifact = reads.Reference.Artifact;
+                if (artifact == nullptr)
+                {
+                    referencePersistence = L"not_captured";
+                    ImageReferencesMissing.fetch_add(1);
+                }
+                else
+                {
+                    bool created = false;
+                    const auto root = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-references";
+                    const bool ready = PublishReferenceBlob(root.wstring(), *artifact, 128ull * 1024 * 1024 - ImageReferenceBytes.load(),
+                        &referenceLease, &created, &referenceFailure);
+                    if (created) { ImageReferenceBytes.fetch_add(artifact->Bytes.size()); ImageReferenceBlobsCreated.fetch_add(1); }
+                    if (ready && !created) { ImageReferenceBlobsReused.fetch_add(1); }
+                    if (!ready) { ImageReferenceBlobsFailed.fetch_add(1); }
+                    referencePersistence = ready ? L"committed" : L"failed";
+                }
+            }
+            const auto json = reads.HasReference ? ImageReadArchiveJson(reads.Payload, &reads.Reference, referencePersistence, referenceFailure) : reads.Json;
+            const auto finalBytes = mcpjson::WideToUtf8(json).size();
+            if (!json.empty() && finalBytes <= EvidenceBundleMaxJsonBytes && finalBytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
+            {
+                written = SaveObservationJson(path.wstring(), json, &failure);
+                if (written) { ImageReadsBytes.fetch_add(finalBytes); }
+            }
         }
         KmonEvent event;
         event.Kind = L"coverage.image_reads";
@@ -922,6 +993,8 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
         event.Evidence[L"verification_recipe_preserved"] = L"false";
+        event.Evidence[L"reference_persistence"] = referencePersistence;
+        event.Evidence[L"reference_failure"] = referenceFailure;
         PipelineEvents.Push(std::move(event));
     }
     catch (...) {}
@@ -942,7 +1015,13 @@ void KernelMonitor::CloseImageReadCollection() noexcept
         const auto json = L"{\"schema\":\"kn.image_read_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
             L",\"queued\":" + std::to_wstring(ImageReadsQueued.load()) + L",\"written\":" + std::to_wstring(ImageReadsWritten.load()) +
             L",\"failed\":" + std::to_wstring(ImageReadsFailed.load()) + L",\"dropped\":" + std::to_wstring(ImageReadsDropped.load()) +
-            L",\"pending\":" + std::to_wstring(CapturedImageReadSets.Size()) + L",\"bytes\":" + std::to_wstring(ImageReadsBytes.load()) + L"}";
+            L",\"pending\":" + std::to_wstring(CapturedImageReadSets.Size()) + L",\"bytes\":" + std::to_wstring(ImageReadsBytes.load()) +
+            L",\"reference_blobs_created\":" + std::to_wstring(ImageReferenceBlobsCreated.load()) +
+            L",\"reference_blobs_reused\":" + std::to_wstring(ImageReferenceBlobsReused.load()) +
+            L",\"reference_blobs_failed\":" + std::to_wstring(ImageReferenceBlobsFailed.load()) +
+            L",\"reference_bytes\":" + std::to_wstring(ImageReferenceBytes.load()) +
+            L",\"reference_reserved_bytes\":" + std::to_wstring(ImageReferenceReservedBytes->load()) +
+            L",\"reference_captures_missing\":" + std::to_wstring(ImageReferencesMissing.load()) + L"}";
         if (!ec && SaveObservationJson((folder / (L"session-" + id + L".knreadledger")).wstring(), json, nullptr)) { return; }
     }
     catch (...) {}
@@ -1244,6 +1323,12 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_read_sets_pending"] = std::to_wstring(CapturedImageReadSets.Size());
         event.Evidence[L"image_read_set_bytes"] = std::to_wstring(ImageReadsBytes.load());
         event.Evidence[L"image_read_ledger_failed"] = std::to_wstring(ImageReadsLedgerFailed.load());
+        event.Evidence[L"image_reference_blobs_created"] = std::to_wstring(ImageReferenceBlobsCreated.load());
+        event.Evidence[L"image_reference_blobs_reused"] = std::to_wstring(ImageReferenceBlobsReused.load());
+        event.Evidence[L"image_reference_blobs_failed"] = std::to_wstring(ImageReferenceBlobsFailed.load());
+        event.Evidence[L"image_reference_bytes"] = std::to_wstring(ImageReferenceBytes.load());
+        event.Evidence[L"image_reference_reserved_bytes"] = std::to_wstring(ImageReferenceReservedBytes->load());
+        event.Evidence[L"image_reference_captures_missing"] = std::to_wstring(ImageReferencesMissing.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
         event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());

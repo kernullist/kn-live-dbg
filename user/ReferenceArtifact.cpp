@@ -82,11 +82,28 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size
     }
     File = CreateFileW(absolute.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return Initialize(error, maximumBytes);
+}
+
+bool ReferenceArtifact::OpenHandle(HANDLE file, std::wstring* error, size_t maximumBytes)
+{
+    if (error != nullptr) { *error = L"reference handle must identify a stable local regular file within the byte limit"; }
+    if (File != INVALID_HANDLE_VALUE || file == nullptr || file == INVALID_HANDLE_VALUE || GetFileType(file) != FILE_TYPE_DISK)
+    {
+        return false;
+    }
+    File = ReOpenFile(file, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+    return Initialize(error, maximumBytes);
+}
+
+bool ReferenceArtifact::Initialize(std::wstring* error, size_t maximumBytes)
+{
+    auto content = std::make_shared<RetainedReferenceArtifact>();
     FILE_ATTRIBUTE_TAG_INFO attributes{};
     if (File == INVALID_HANDLE_VALUE || GetFileType(File) != FILE_TYPE_DISK ||
         !GetFileInformationByHandleEx(File, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
         (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &Data, maximumBytes))
+        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &content->Bytes, maximumBytes))
     {
         return false;
     }
@@ -96,18 +113,21 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size
     {
         return false;
     }
-    FinalPath.assign(pathBuffer.data(), length);
+    content->OriginalPath.assign(pathBuffer.data(), length);
     // Keep a local DOS path for callers that reject device namespaces.
-    if (FinalPath.rfind(L"\\\\?\\", 0) != 0 || FinalPath[5] != L':')
+    if (content->OriginalPath.rfind(L"\\\\?\\", 0) != 0 || content->OriginalPath[5] != L':')
     {
         return false;
     }
-    FinalPath.erase(0, 4);
-    Hash = ContentHash::Bytes(Data);
-    if (Hash.empty())
+    content->OriginalPath.erase(0, 4);
+    content->Sha256 = ContentHash::Bytes(content->Bytes);
+    if (content->Sha256.empty())
     {
         return false;
     }
+    content->OriginalFileIdentity = std::to_wstring(Identity.VolumeSerialNumber) + L":" +
+        Hex(Identity.FileId.Identifier, sizeof(Identity.FileId.Identifier));
+    Content = std::move(content);
     if (error != nullptr)
     {
         error->clear();
@@ -115,39 +135,47 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size
     return true;
 }
 
+std::shared_ptr<const RetainedReferenceArtifact> ReferenceArtifact::Snapshot() const
+{
+    return Content;
+}
+
 bool ReferenceArtifact::Unchanged()
 {
-    if (Hash.empty())
+    if (Content == nullptr)
     {
         return false;
     }
-    HANDLE reopened = CreateFileW(FinalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    HANDLE reopened = CreateFileW(Content->OriginalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     const std::unique_ptr<void, decltype(&CloseHandle)> owner(reopened == INVALID_HANDLE_VALUE ? nullptr : reopened, &CloseHandle);
     FILE_ID_INFO identity{};
     std::vector<uint8_t> current;
     return owner && GetFileInformationByHandleEx(reopened, FileIdInfo, &identity, sizeof(identity)) &&
-        std::memcmp(&identity, &Identity, sizeof(identity)) == 0 && Read(File, &current, Data.size()) && current == Data;
+        std::memcmp(&identity, &Identity, sizeof(identity)) == 0 && Read(File, &current, Content->Bytes.size()) && current == Content->Bytes;
 }
 
 const std::wstring& ReferenceArtifact::Path() const
 {
-    return FinalPath;
+    static const std::wstring empty;
+    return Content == nullptr ? empty : Content->OriginalPath;
 }
 
 const std::wstring& ReferenceArtifact::Sha256() const
 {
-    return Hash;
+    static const std::wstring empty;
+    return Content == nullptr ? empty : Content->Sha256;
 }
 
 const std::vector<uint8_t>& ReferenceArtifact::Bytes() const
 {
-    return Data;
+    static const std::vector<uint8_t> empty;
+    return Content == nullptr ? empty : Content->Bytes;
 }
 
 std::wstring ReferenceArtifact::FileIdentity() const
 {
-    return std::to_wstring(Identity.VolumeSerialNumber) + L":" + Hex(Identity.FileId.Identifier, sizeof(Identity.FileId.Identifier));
+    return Content == nullptr ? L"" : Content->OriginalFileIdentity;
 }
 
 bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error)
@@ -191,4 +219,52 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
         error->clear();
     }
     return ok;
+}
+
+bool PublishReferenceBlob(const std::wstring& directory, const RetainedReferenceArtifact& artifact,
+    uint64_t maximumNewBytes, std::unique_ptr<ReferenceArtifact>* lease, bool* created, std::wstring* error)
+{
+    if (lease != nullptr) { lease->reset(); }
+    if (created != nullptr) { *created = false; }
+    if (error != nullptr) { *error = L"invalid_retained_reference"; }
+    if (lease == nullptr || created == nullptr || artifact.Bytes.empty() || artifact.Bytes.size() > ReferenceArtifactMaxBytes ||
+        artifact.Sha256.size() != 64 || artifact.Sha256 != ContentHash::Bytes(artifact.Bytes)) { return false; }
+    const auto root = LocalPath(directory);
+    if (root.empty()) { return false; }
+    const auto path = (std::filesystem::path(root) / (artifact.Sha256 + L".knblob")).wstring();
+    const auto acquire = [&]()
+    {
+        auto candidate = std::make_unique<ReferenceArtifact>();
+        if (!candidate->Open(path, nullptr) || candidate->Sha256() != artifact.Sha256 || candidate->Bytes() != artifact.Bytes)
+        {
+            return false;
+        }
+        *lease = std::move(candidate);
+        if (error != nullptr) { error->clear(); }
+        return true;
+    };
+    if (acquire()) { return true; }
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        if (error != nullptr) { *error = L"reference_store_existing_blob_unverified"; }
+        return false;
+    }
+    if (artifact.Bytes.size() > maximumNewBytes)
+    {
+        if (error != nullptr) { *error = L"reference_store_byte_budget"; }
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    if (ec)
+    {
+        if (error != nullptr) { *error = L"reference_store_directory_unavailable"; }
+        return false;
+    }
+    *created = PublishReferenceArtifact(path, artifact.Bytes, error);
+    // A simultaneous publisher may have won CREATE_NEW. Reuse only after
+    // opening and comparing the actual existing content; never replace it.
+    if (acquire()) { return true; }
+    if (error != nullptr) { *error = L"reference_store_publication_or_verification_failed"; }
+    return false;
 }

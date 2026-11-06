@@ -136,6 +136,11 @@ bool KmonImageReadIntegrationSelfTest()
         primary.Partial = true;
         const auto disk = Fixture(&secondary.Bytes);
         if (!Write(reference, disk)) { throw std::runtime_error("fixture write failed"); }
+        executable_image::DiskPeMetadata expectedReference;
+        if (!executable_image::ReadDiskPeMetadata(reference.wstring(), &expectedReference, nullptr))
+        {
+            throw std::runtime_error("fixture metadata failed");
+        }
         secondary.Bytes[0x1050] ^= 1;
         ObservationIdentity identity;
         identity.BootId = L"synthetic:boot"; identity.ProcessId = 42; identity.CreateTime = 1;
@@ -153,6 +158,9 @@ bool KmonImageReadIntegrationSelfTest()
             "actual-sweep-queues-original-modified-read-set")) { throw std::runtime_error("comparison failed"); }
         check(primary.Calls == secondary.Calls && secondary.PageReads == 2,
             "actual-page-comparison-and-stability-check-both-recorded");
+        check(retained.HasReference && retained.Reference.Artifact != nullptr && retained.Reference.ContentRechecked &&
+            retained.Reference.ContentStable && retained.Reference.Artifact->Bytes == disk &&
+            retained.Reference.Artifact->Sha256 == ContentHash::Bytes(disk), "exact-reference-captured-and-rechecked-before-lease-release");
         const auto payload = Raw(retained.Json, L"payload");
         const auto routed = Raw(payload, L"reads");
         const auto attempts = Raw(routed, L"attempts");
@@ -194,22 +202,45 @@ bool KmonImageReadIntegrationSelfTest()
         primary.Bytes.clear(); secondary.Bytes.clear();
         const auto calls = secondary.Calls.size();
         check(DeleteFileW(reference.c_str()) != FALSE, "reference-removable-after-original-comparison");
+        {
+            ExecutableSweep stale;
+            stale.Initialize(expectedReference);
+            stale.Coverage.ComparedBytes = 4096;
+            stale.Pages[0x1000] = CodeOwnership::OwnedVerified;
+            ExecutableSweepReference unavailable;
+            unsigned targetReads = 0;
+            const auto results = AdvanceExecutableSweep(reference.wstring(), expectedReference, Base,
+                [&](uint64_t, size_t, std::vector<uint8_t>*) { ++targetReads; return false; }, 1, 1, &stale, 0, &unavailable);
+            check(results.empty() && targetReads == 0 && stale.Pages.empty() && stale.Coverage.ComparedBytes == 0 &&
+                !stale.Coverage.InventoryAvailable && unavailable.Artifact == nullptr &&
+                unavailable.CaptureStatus == L"reference_unavailable_or_changed", "missing-reference-denies-target-read-and-clears-stale-coverage");
+        }
         check(monitor.CapturedImageReadSets.Push(retained), "writer-receives-original-queued-json");
+        retained.ReferenceCharge.reset(); // Only the requeued item owns the queue reservation.
         monitor.WriterStopping.store(true);
         monitor.CaptureWriterLoop();
         const auto path = root / L"image-reads" / (L"reads-" + retained.CollectionId + L"-" + std::to_wstring(retained.Id) + L".knreads");
         std::wstring persisted;
-        check(ReadAnalystSnapshot(path.wstring(), &persisted, nullptr) && persisted == retained.Json &&
+        check(ReadAnalystSnapshot(path.wstring(), &persisted, nullptr) &&
+            Raw(Raw(persisted, L"payload"), L"reads") == routed && Text(persisted, L"schema") == L"kn.image_reads.v2" &&
             secondary.Calls.size() == calls && monitor.ImageReadsWritten.load() == 1 && monitor.ImageReadsFailed.load() == 0 &&
             monitor.ImageReadsLedgerFailed.load() == 0 && monitor.CapturedImageReadSets.Size() == 0 && monitor.CaptureWriterDone.load(),
             "shutdown-writer-persists-originals-after-source-disappearance");
+        const auto storedReference = Raw(Raw(persisted, L"payload"), L"reference");
+        check(Text(storedReference, L"persistence") == L"committed" && Text(storedReference, L"sha256") == ContentHash::Bytes(disk) &&
+            monitor.ImageReferenceBlobsCreated.load() == 1 && monitor.ImageReferenceBytes.load() == disk.size() &&
+            ContentHash::File((root / L"image-references" / (ContentHash::Bytes(disk) + L".knblob")).wstring()) == ContentHash::Bytes(disk),
+            "writer-commits-exact-original-reference-before-referring-archive");
         const auto payloadBytes = mcpjson::WideToUtf8(Raw(persisted, L"payload"));
         check(ContentHash::Bytes(std::vector<uint8_t>(payloadBytes.begin(), payloadBytes.end())) == Text(persisted, L"payload_sha256"),
             "payload-content-hash-matches-persisted-bytes");
         std::wstring ledger;
         check(ReadAnalystSnapshot((root / L"image-reads" / (L"session-" + retained.CollectionId + L".knreadledger")).wstring(), &ledger, nullptr) &&
             Raw(ledger, L"queued") == L"1" && Raw(ledger, L"written") == L"1" && Raw(ledger, L"failed") == L"0" &&
-            Raw(ledger, L"pending") == L"0" && Raw(ledger, L"dropped") == L"0", "final-image-read-ledger-balances");
+            Raw(ledger, L"pending") == L"0" && Raw(ledger, L"dropped") == L"0" &&
+            Raw(ledger, L"reference_blobs_created") == L"1" && Raw(ledger, L"reference_blobs_failed") == L"0" &&
+            Raw(ledger, L"reference_bytes") == std::to_wstring(disk.size()) && Raw(ledger, L"reference_reserved_bytes") == L"0",
+            "final-image-read-ledger-balances");
         monitor.DrainPipelineEvents(true);
         bool final = false;
         for (const auto& event : monitor.Ring)
@@ -247,12 +278,51 @@ bool KmonImageReadIntegrationSelfTest()
         const auto set = router.Snapshot();
         KernelMonitor pressure;
         pressure.Options.LogDirectory = (root / L"pressure").wstring();
-        for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base); }
+        for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }
         check(pressure.ImageReadsQueued.load() == 8 && pressure.ImageReadsDropped.load() == 1 &&
             pressure.CapturedImageReadSets.Size() == 8, "queue-pressure-counts-rejected-original-set");
         pressure.WriterStopping.store(true); pressure.CaptureWriterLoop();
         check(pressure.ImageReadsWritten.load() == 8 && pressure.ImageReadsFailed.load() == 0 &&
             pressure.CapturedImageReadSets.Size() == 0, "shutdown-drains-full-image-read-queue");
+        check(pressure.ImageReferenceBlobsCreated.load() == 1 && pressure.ImageReferenceBlobsReused.load() == 7 &&
+            pressure.ImageReferenceBytes.load() == disk.size() && pressure.ImageReferenceReservedBytes->load() == 0,
+            "slice-archives-share-one-content-addressed-reference-and-release-reservations");
+        {
+            KernelMonitor busy;
+            busy.ImageReferenceReservedBytes->store(128ull * 1024 * 1024);
+            check(busy.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference) == 0 &&
+                busy.ImageReadsDropped.load() == 1 && busy.CapturedImageReadSets.Size() == 0 &&
+                busy.ImageReferenceReservedBytes->load() == 128ull * 1024 * 1024, "reference-queue-memory-budget-is-shared-and-fail-closed");
+            busy.ImageReferenceReservedBytes->store(0);
+        }
+        for (unsigned mode = 0; mode < 3; ++mode)
+        {
+            KernelMonitor missing;
+            const auto folder = root / (L"reference-failure-" + std::to_wstring(mode));
+            missing.Options.LogDirectory = folder.wstring();
+            auto capture = retained.Reference;
+            if (mode == 0) { missing.ImageReferenceBytes.store(128ull * 1024 * 1024); }
+            if (mode == 1)
+            {
+                std::filesystem::create_directories(folder / L"image-references");
+                check(Write(folder / L"image-references" / (capture.Artifact->Sha256 + L".knblob"), {0x51}), "create-owned-corrupt-blob-control");
+            }
+            if (mode == 2) { capture = {}; capture.CaptureStatus = L"retention_unavailable"; }
+            const auto id = missing.QueueImageReadSet(set, identity, L"synthetic", Base, &capture);
+            missing.WriterStopping.store(true); missing.CaptureWriterLoop();
+            std::wstring archive;
+            const auto file = folder / L"image-reads" / (L"reads-" + std::to_wstring(missing.EvidenceCollectionEpoch.load()) +
+                L"-" + std::to_wstring(id) + L".knreads");
+            check(ReadAnalystSnapshot(file.wstring(), &archive, nullptr) && missing.ImageReadsWritten.load() == 1 &&
+                Text(Raw(Raw(archive, L"payload"), L"reference"), L"persistence") == (mode == 2 ? L"not_captured" : L"failed") &&
+                missing.ImageReferenceBlobsFailed.load() == (mode == 2 ? 0u : 1u) &&
+                missing.ImageReferencesMissing.load() == (mode == 2 ? 1u : 0u), "reference-gaps-preserve-raw-archive-without-replay-claim");
+            if (mode == 1)
+            {
+                check(ContentHash::File((folder / L"image-references" / (capture.Artifact->Sha256 + L".knblob")).wstring()) ==
+                    ContentHash::Bytes({0x51}), "corrupt-existing-blob-is-never-replaced");
+            }
+        }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
             KernelMonitor rejected;

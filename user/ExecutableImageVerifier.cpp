@@ -511,8 +511,9 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
 
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
-    uint64_t budgetMs)
+    uint64_t budgetMs, ExecutableSweepReference* capturedReference)
 {
+    if (capturedReference != nullptr) { *capturedReference = {}; }
     const uint64_t started = GetTickCount64();
     std::vector<ExecutablePageResult> results;
     if (sweep == nullptr || sweep->Ranges.empty() || pageBudget == 0)
@@ -543,24 +544,44 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Coverage.InventoryAvailable = false;
         sweep->Coverage.Reason = reason;
     };
-    std::wstring reason;
-    uint64_t headerBase = 0;
-    if (!ReadExecutableIdentity(metadata, imageBase, reader, &reason, &headerBase))
-    {
-        reject(reason);
-        return results;
-    }
-    sweep->Coverage.Attempted = true;
-    sweep->Coverage.InventoryAvailable = true;
+    // Pin and qualify the exact reference object before any target read.
     const auto reference = CreateFileW(NormalizeReferencePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
     const std::unique_ptr<void, decltype(&CloseHandle)> referenceOwner(
         reference == INVALID_HANDLE_VALUE ? nullptr : reference, &CloseHandle);
     if (reference == INVALID_HANDLE_VALUE || !DiskFileIdentityMatches(reference, metadata))
     {
-        sweep->Coverage.Reason = L"reference_unavailable_or_changed";
+        if (capturedReference != nullptr) { capturedReference->CaptureStatus = L"reference_unavailable_or_changed"; }
+        reject(L"reference_unavailable_or_changed");
         return results;
     }
+    ReferenceArtifact retained;
+    if (capturedReference != nullptr)
+    {
+        if (retained.OpenHandle(reference, &capturedReference->Failure))
+        {
+            capturedReference->Artifact = retained.Snapshot();
+            capturedReference->CaptureStatus = L"captured";
+        }
+        else { capturedReference->CaptureStatus = L"retention_unavailable"; }
+    }
+    const auto finishReference = [&]()
+    {
+        if (capturedReference == nullptr || capturedReference->Artifact == nullptr) { return true; }
+        capturedReference->ContentRechecked = true;
+        capturedReference->ContentStable = retained.Unchanged();
+        return capturedReference->ContentStable;
+    };
+    std::wstring reason;
+    uint64_t headerBase = 0;
+    if (!ReadExecutableIdentity(metadata, imageBase, reader, &reason, &headerBase))
+    {
+        reject(reason);
+        finishReference();
+        return results;
+    }
+    sweep->Coverage.Attempted = true;
+    sweep->Coverage.InventoryAvailable = true;
     ReferenceImageView localImage;
     const bool secondary = headerBase != metadata.ImageBase && headerBase != imageBase;
     uint64_t relocationBase = imageBase;
@@ -577,6 +598,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
             localBase > UINT64_MAX - metadata.SizeOfImage)
         {
             reject(L"live_image_relocation_base_ambiguous");
+            finishReference();
             return results;
         }
         relocationBase = localBase;
@@ -584,6 +606,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     if (sweep->NextRange != 0 && (sweep->RelocationBase != relocationBase || sweep->SecondaryImageView != secondary))
     {
         reject(L"image_relocation_basis_changed");
+        finishReference();
         return results;
     }
     sweep->RelocationBase = relocationBase;
@@ -635,12 +658,13 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     {
         return page.Coverage.ComparedBytes != 0;
     });
-    const bool sameReference = DiskFileIdentityMatches(reference, metadata) && DiskReferenceIdentityMatches(path, metadata);
     uint64_t finalHeaderBase = 0, finalLocalBase = 0;
     const bool sameImage = !hasComparedBytes ||
         (ReadExecutableIdentity(metadata, imageBase, reader, &reason, &finalHeaderBase) && finalHeaderBase == headerBase &&
             (!secondary || (ReadExecutableIdentity(metadata, localImage.Base(), localReader, nullptr, &finalLocalBase) &&
                 finalLocalBase == relocationBase)));
+    const bool retainedStable = finishReference();
+    const bool sameReference = retainedStable && DiskFileIdentityMatches(reference, metadata) && DiskReferenceIdentityMatches(path, metadata);
     if (!sameReference || !sameImage)
     {
         // The mapping may have changed after the initial identity read.

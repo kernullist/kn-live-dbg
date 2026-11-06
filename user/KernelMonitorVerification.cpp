@@ -373,16 +373,18 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
             return router->ReadExact(address, size, bytes);
         };
     }
-    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, 25);
+    ExecutableSweepReference capturedReference;
+    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, 25,
+        router == nullptr ? nullptr : &capturedReference);
     uint64_t readSetId = 0;
     std::wstring readPersistence = routing == nullptr ? L"unrecorded_reader" : L"not_selected_for_retention";
     // Preserve the original attempt set for changed or inconclusive slices.
-    // This is not a verification recipe: exact reference/normalization
-    // retention remains a distinct transaction publication step.
+    // This is not a verification recipe: normalization, secondary-view inputs
+    // and slice-policy replay remain a distinct transaction publication step.
     if (router != nullptr && (pages.empty() || std::any_of(pages.begin(), pages.end(), [](const auto& page)
         { return page.Ownership != CodeOwnership::OwnedVerified; })))
     {
-        readSetId = QueueImageReadSet(router->Snapshot(), identity, path, base);
+        readSetId = QueueImageReadSet(router->Snapshot(), identity, path, base, &capturedReference);
         readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
     }
     // Completed small images must not continually restart while larger images

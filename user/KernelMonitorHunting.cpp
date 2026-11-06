@@ -101,7 +101,14 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"queued\":" + std::to_wstring(ImageReadsQueued.load()) + L",\"written\":" + std::to_wstring(ImageReadsWritten.load()) +
         L",\"failed\":" + std::to_wstring(ImageReadsFailed.load()) + L",\"dropped\":" + std::to_wstring(ImageReadsDropped.load()) +
         L",\"pending\":" + std::to_wstring(CapturedImageReadSets.Size()) + L",\"bytes\":" + std::to_wstring(ImageReadsBytes.load()) +
-        L",\"ledger_failed\":" + std::to_wstring(ImageReadsLedgerFailed.load()) + L",\"verification_recipe_preserved\":false}}";
+        L",\"ledger_failed\":" + std::to_wstring(ImageReadsLedgerFailed.load()) +
+        L",\"reference_blobs_created\":" + std::to_wstring(ImageReferenceBlobsCreated.load()) +
+        L",\"reference_blobs_reused\":" + std::to_wstring(ImageReferenceBlobsReused.load()) +
+        L",\"reference_blobs_failed\":" + std::to_wstring(ImageReferenceBlobsFailed.load()) +
+        L",\"reference_bytes\":" + std::to_wstring(ImageReferenceBytes.load()) +
+        L",\"reference_reserved_bytes\":" + std::to_wstring(ImageReferenceReservedBytes->load()) +
+        L",\"reference_captures_missing\":" + std::to_wstring(ImageReferencesMissing.load()) +
+        L",\"verification_recipe_preserved\":false}}";
     if (cases != nullptr)
     {
         *cases = result.Cases;
