@@ -38,6 +38,32 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
+`KnLiveDbg.exe --offline !kmon init-store <new-root> [/acl-only] [/json]`
+creates a new private local root under an existing directory. By default it
+requires EFS encryption and a protected current-user/SYSTEM ACL. `/acl-only`
+explicitly omits the encryption requirement. An existing root is rejected;
+an EFS failure never silently downgrades. Failed initialization may leave an
+empty or policy-bearing private staging directory, reported as
+`temporary_directory`, for manual inspection.
+
+`KnLiveDbg.exe --offline !kmon privacy <root> [/audit] [/json]` verifies the
+root's policy, principal, physical identity and protections. `/audit` also checks
+the existing descendants within explicit entry/depth/time bounds. Both commands
+always emit private `kn.evidence_privacy.v1` JSON; exit 0 means `ready`, 1 means
+unavailable/denied/incomplete, 2 means invalid grammar and 3 means output failure.
+Redirected JSON is UTF-8. An output failure does not undo an already initialized
+root; inspect that explicit path again. These commands do not start a
+driver or acquisition session. Windows may activate its EFS service for encryption.
+
+Use `!kmon start /private-log <root>` to require that policy and an initial tree
+audit for a KMON session. This option is mutually exclusive with `/log`, applies
+only at the first start, and never creates or falls back to an ordinary root.
+Stop the session before moving the root or replacing its policy. EFS account
+keys must remain available for later replay; the tool does not export or back
+them up. Administrator/recovery-agent access, owner changes, exports outside the
+root and external transfer/redaction require separate controls. See the
+[privacy scope and limits](ARCHITECTURE.md#private-evidence-roots).
+
 `KnLiveDbg.exe --offline !kmon journal <collection-directory> [/index] [/json]`
 verifies a stopped `collections/<collection-id>` image collection and returns
 private `kn.evidence_journal_recovery.v1` JSON. It reports the committed prefix,

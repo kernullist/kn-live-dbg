@@ -65,6 +65,9 @@ def main():
     assert gc["availability"] == "not_probed" and "durable_intent_before_delete" in gc["requirements"]
     assert "committed_roots_and_failure_ledgers_protected" in gc["limits"]
     retention = by_key[("evidence", "retention", "native")]
+    privacy = by_key[("evidence", "privacy", "local_files")]
+    assert privacy["availability"] == "not_probed" and privacy["consistency"] == "observed_os_access_controls"
+    assert "efs_default" in privacy["requirements"] and "no_transfer_authority" in privacy["limits"]
     assert retention["availability"] == "not_probed" and retention["consistency"] == "recording_session_partitions"
     assert "complete_journal_batch_before_repeat_demotion" in retention["requirements"] and "image_pipeline_only" in retention["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]

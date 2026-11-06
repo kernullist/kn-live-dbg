@@ -203,8 +203,8 @@ the policy does not reserve physical disk space or guarantee crash-time closure.
 
 This policy applies to the routed image pipeline. Committed artifact protection
 continues to come from journal membership and the store's GC rules. Priority
-admission for other evidence families, cross-session retention, privacy controls
-and committed-root retirement remain separate P06 requirements.
+admission for other evidence families, cross-session retention, transfer/redaction
+privacy controls and committed-root retirement remain separate P06 requirements.
 
 ## Original KMON slice replay
 
@@ -400,7 +400,8 @@ unreadable artifacts remain protected and make artifact inventory partial.
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
 revalidates its own policy and leases. Committed-root retirement, cross-collection
-retention priorities and privacy controls remain P06 work.
+retention priorities and transfer/redaction controls remain P06 work.
+Local ACL/EFS admission is described under [private evidence roots](#private-evidence-roots).
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
@@ -470,9 +471,77 @@ Uncommitted recipe dependencies are not resolved: explicit removal of an
 uncommitted reference can make another uncommitted artifact unusable. This scope
 is declared as `uncommitted_dependents_resolved:false`; committed dependencies
 stay protected by journal membership. Priority-based GC selection, retirement
-of committed roots, full dependency-impact analysis, privacy controls and
-large-store continuation remain required work. All policy/audit/report artifacts
+of committed roots, full dependency-impact analysis, transfer/redaction controls
+and large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.
+
+## Private evidence roots
+
+Offline `!kmon init-store <new-root>` initializes a local root with a protected
+DACL granting inheritable full file access only to the effective current token's
+user SID and SYSTEM. EFS is required by default. `/acl-only` explicitly selects
+access control without requiring encryption; failed EFS initialization never
+downgrades to that policy. Existing roots are neither adopted nor modified.
+
+Only fixed, removable and RAM-disk local drive paths are admitted. UNC/mapped
+network roots, alternate streams, device names and ambiguous trailing dots or
+spaces are rejected before output creation. Unicode names and spaces within
+normal components are supported. Initialization creates a randomly named private
+sibling, checks its owner/DACL
+and full 128-bit file ID, volume and creation time, enables EFS, then verifies
+the encrypted attribute. Only then does it publish `store.knprivacy` with
+`kn.evidence_private_store.v1`, the selected policy, principal and physical root
+identity. The directory is renamed by its held handle without replacement. A
+collision preserves both outputs; interruption can leave a private staging
+directory, whose path is reported on ordinary failure. There is no automatic
+recursive cleanup. Directory pins request data/list access as well as metadata
+access so that Windows enforces their no-delete sharing. Write sharing remains
+necessary for normal child publication. Policy handles deny write/delete sharing.
+
+EFS protects the stored file while Windows exposes the original plaintext to an
+authorized reader. Existing original-byte hashes, journals, CAS references and
+replay formats therefore stay unchanged. Newly created descendants inherit EFS
+and the private DACL. These behaviors follow Windows
+[file encryption](https://learn.microsoft.com/en-us/windows/win32/fileio/file-encryption)
+and [EncryptFileW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-encryptfilew);
+the initializer verifies the resulting metadata instead of treating API success
+alone as an encryption guarantee. Filesystem support and the account's EFS key
+availability remain prerequisites. No key export, backup or recovery provisioning
+is performed.
+
+`!kmon privacy <root>` verifies the canonical policy, current principal, physical
+root, protected root DACL and policy file. `/audit` also walks the existing tree,
+rejecting reparse points, multiply linked files, extra ACL principals, directories
+that do not propagate the private grants, and unencrypted objects when required.
+The walk holds active ancestor directories, permits at most 128 descendant levels
+and 65,536 entries, and checks a cooperative 120-second deadline. `checked_entries`
+counts descendants, including the policy once. A root-only inspection is not a
+successful tree audit. Enumeration/permission failures and exhausted bounds remain
+explicit failures; there is no partial-success audit.
+
+KMON `/private-log <root>` requires this initialized policy and a successful
+initial tree audit before logging or starting acquisition workers. It binds all
+session writers to the audited absolute root, retains the root/policy guard
+through rotation and worker drain, and validates each opened JSONL file's handle
+before writing. The guard is released after stop. A failed subsequent Start call
+cannot discard an existing session's guard. `/log` remains available without
+privacy admission, and cannot be combined with `/private-log`. The offline init
+and audit commands do not start a controller or expose a live/MCP initialization
+route.
+
+This is an observed OS access-control boundary. The owner, SYSTEM, administrators
+and configured EFS recovery agents are trusted. A privileged actor or the owner
+can change security descriptors, encryption and reparse metadata; an audit is
+not an atomic snapshot or continuous tamper monitor. Handle-based
+[GetSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
+does not remove that concurrency limit. Parent directory permissions may also
+allow deletion: confidentiality does not establish availability. Ordinary exports,
+console logging and copies outside the private root need their own policy. This
+does not authenticate the collector, prove power-loss durability or authorize
+external transfer. Transfer minimization/approval, linked redaction derivatives,
+key recovery operations and broader P06 retention remain open. Reports and
+`.knprivacy` files, including pending files, are private evidence; no automatic
+external upload is added.
 
 ## Replayed image sweep graph
 

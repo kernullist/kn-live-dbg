@@ -7,6 +7,82 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Private evidence root checkpoint: 2026-11-07
+
+This P06 step adds offline `init-store`/`privacy` and opt-in KMON `/private-log`.
+New roots require a protected current-principal/SYSTEM DACL and EFS by default;
+ACL-only mode requires an explicit option. Root identity and canonical policy
+admission preserve the existing plaintext hashes, original artifacts and replay
+formats. See [private evidence roots](ARCHITECTURE.md#private-evidence-roots).
+The rest of P06 and P01-P16 / VS1-VS4 remains open.
+
+The final Release EXE SHA-256 is
+`761af60a63fe8ef190ce2456c2d8bdd289940dd54e5c93d8d93f9fab1235b853`.
+The standalone privacy ASan harness SHA-256 is
+`542a3c41dbac0d060cd2066fb3052f6e50eccad889d3bfd21bc3331c92235ae9`.
+`tools/build.ps1 -Configuration Release -WindowsTargetPlatformVersion 10.0.26100.0`
+completed with VS 2022 Build Tools 17.14.60, MSVC 14.44.35207 and SDK/WDK
+10.0.26100.0, using the existing test certificate. The final build log is
+`.build/p06-privacy-utf8-build.log`; existing `NextQueryEpoch` C4744 link warnings
+remain. The earlier broader build also reported the existing C4244 fill warning.
+
+`tools/validate-evidence-privacy.ps1 -Sanitize` passed 770 independent Python
+checks against the core (`.build/p06-privacy-path-asan.log`). The host was
+Windows 11 Pro x64, OS version 10.0.28000, with an NTFS fixture volume. The final EXE
+passed 780 CLI checks (`.build/p06-privacy-diagnostic-cli.log`), including Unicode
+JSON and broken-output exit status. The independently inspected owned NTFS
+fixtures established actual owner/DACL grants, full physical identity, exact
+policy hashes, EFS attributes and new-file encryption inheritance. An owned
+restricted token with disabled privileges and a World restricting SID was
+actually denied the original bytes; no separate Windows account was created.
+This is OS metadata/access testing, not a raw-media ciphertext examination.
+
+Controls reject copied/noncanonical/malformed/oversize policies, wrong principal,
+widened root/file ACLs, missing directory inheritance, policy hardlinks,
+descendant/root junctions, plaintext children under EFS, ambiguous trailing
+dot/space names, alternate streams and DOS device names. Unicode and spaced
+paths pass. Observed guard lifetime excludes root deletion and policy overwrite;
+a second rejected Open retains the first guard. A destination created after
+policy publication is preserved when the actual final rename fails. Four
+observed initialization interruptions distinguish private staging from a ready
+published root. Every child and pipe reader was reaped. These fixtures and
+interruption remnants stay private under `.build/evidence-privacy/Release-asan`.
+
+Adversarial review fixed metadata-only directory handles that did not enforce
+share exclusion, premature release of an active session guard after a rejected
+Start, pre-validation Windows path normalization, Unicode CLI truncation and a
+missing pending-policy public-content classification. Descendant inheritance,
+single policy counting and guard reentry are also covered. No additional
+actionable defects were found in the reviewed scope.
+
+The isolated final `--self-test all` run passed timeline 28, MCP 102, KMON image
+integration 119, console 558, command audit 3,006 across 261 routes and remote 66
+(`.build/p06-privacy-final-selftests.log`). Actual KMON ACL and EFS roots exercised
+JSONL writes/rotation, retained source bytes after the original disappeared,
+reference/read/recipe publication, journal closure/recovery, original-policy
+replay, stopped-store inventory and handle cleanup. The complete KMON fixture
+tree was removed. The capability checks passed 31 contracts; the generated
+support matrix matches the final EXE and retains `not_probed`. Public-content
+classifier tests passed 11 controls, including renamed and pending privacy data.
+
+One earlier final-binary CLI run stopped on an initialization failure before
+publishing its target (`.build/p06-privacy-utf8-cli.log`). The test then did not
+retain the exact returned issue, so its cause is unresolved. Inspection found
+the retained staging directory and policy valid; a targeted new initialization
+and the subsequent diagnostic suite passed. Diagnostics now include status/issue.
+This observation is not relabeled as resolved or as an encryption downgrade.
+The older concurrent-load process-capture deadline observation likewise remains
+separate from this isolated suite pass.
+
+No native driver load or reboot was requested. Windows automatically activated
+its Manual-start EFS service; it remained OS-managed and running afterward.
+No owned test processes remained. EFS recovery-agent/key backup, hostile owner
+or administrator changes, atomic/continuous security monitoring, other filesystems,
+large-tree exhaustion, transfer minimization/approval, linked redaction and
+media/power-loss guarantees are not established by these checks. Committed-root
+retirement, broader retention policies and the remaining architecture gates
+remain required work.
+
 ## Image retention priority checkpoint: 2026-11-07
 
 This P06 step connects retention priority to the actual KMON routed-image queue,

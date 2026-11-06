@@ -456,6 +456,18 @@ static int RunCommandAuditSelfTest()
             L"layout interval accepted");
     }
     const auto huntCases = run(L"!kmon cases /json");
+    for (const auto& args : std::vector<std::vector<std::wstring>>{
+        {L"/private-log"}, {L"/private-log", L""}, {L"/private-log", L"x", L"/log", L"y"},
+        {L"/log", L"x", L"/private-log", L"y"}, {L"/private-log", L"x", L"/private-log", L"y"}})
+    {
+        KmonOptions options; std::wstring error;
+        check(!ParseKmonStartArgs(args, 0, &options, &error), L"private log cannot silently downgrade or duplicate destinations");
+    }
+    {
+        KmonOptions options; std::wstring error;
+        check(ParseKmonStartArgs({L"/private-log", L"owned-root"}, 0, &options, &error) &&
+            options.PrivateLogRequired && options.LogDirectory == L"owned-root", L"private log explicit opt-in parsed");
+    }
     check(CompletionCandidateExists({L"!kmon"}, L"evidence") &&
         CompletionCandidateExists({L"!kmon", L"evidence"}, L"/cursor") &&
         CompletionCandidateExists({L"!kmon", L"why"}, L"/json"), L"offline evidence completion");

@@ -8334,6 +8334,7 @@ bool KernelMonitor::Start(
 {
     std::lock_guard<std::recursive_mutex> lifecycleLock(LifecycleMutex);
     bool ok = false;
+    bool initialLogAttempt = false;
 
     do
     {
@@ -8386,6 +8387,11 @@ bool KernelMonitor::Start(
             }
             if (nextOptions.LogDirectory.empty())
             {
+                if (nextOptions.PrivateLogRequired)
+                {
+                    if (error) { *error = L"private-log requires an initialized root"; }
+                    break;
+                }
                 nextOptions.LogDirectory = ExeDirectory();
             }
             if (nextOptions.DataDirectory.empty())
@@ -8443,13 +8449,17 @@ bool KernelMonitor::Start(
             Options = nextOptions;
             {
                 std::lock_guard<std::mutex> logLock(LogMutex);
+                initialLogAttempt = true;
                 CloseLogLocked();
+                LogPrivacy.reset();
+                LogPrivacyError.clear();
                 if (!EnsureLogOpenLocked())
                 {
                     Options = previousOptions;
                     if (error != nullptr)
                     {
-                        *error = L"could not open kmon log in " + nextOptions.LogDirectory;
+                        *error = L"could not open kmon log in " + nextOptions.LogDirectory +
+                            (LogPrivacyError.empty() ? L"" : L": " + LogPrivacyError);
                     }
                     LiveOutput.store(false);
                     break;
@@ -8731,6 +8741,12 @@ bool KernelMonitor::Start(
             CaptureWriter.join();
         }
     }
+    if (!ok && initialLogAttempt)
+    {
+        std::lock_guard<std::mutex> logLock(LogMutex);
+        CloseLogLocked();
+        LogPrivacy.reset();
+    }
     return ok;
 }
 
@@ -9004,6 +9020,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     {
         std::lock_guard<std::mutex> logLock(LogMutex);
         CloseLogLocked();
+        LogPrivacy.reset();
     }
     if (error != nullptr)
     {
@@ -21693,18 +21710,38 @@ bool KernelMonitor::EnsureLogOpenLocked()
             break;
         }
 
-        CreateDirectoryW(Options.LogDirectory.c_str(), nullptr);
+        if (Options.PrivateLogRequired && !LogPrivacy)
+        {
+            auto guard = std::make_unique<EvidencePrivacyGuard>();
+            EvidencePrivacyReport report;
+            if (!guard->Open(Options.LogDirectory, true, &report))
+            {
+                LogPrivacyError = report.Issue;
+                break;
+            }
+            // Bind relative caller input to the audited absolute root for every writer.
+            Options.LogDirectory = report.RootPath;
+            LogPrivacy = std::move(guard);
+        }
+        if (!Options.PrivateLogRequired) { CreateDirectoryW(Options.LogDirectory.c_str(), nullptr); }
         LogActivePath = BuildLogFilePath(LogActiveRotation);
+        const auto native = Options.PrivateLogRequired ? L"\\\\?\\" + LogActivePath : LogActivePath;
         LogHandle = CreateFileW(
-            LogActivePath.c_str(),
-            GENERIC_WRITE,
+            native.c_str(),
+            GENERIC_WRITE | (Options.PrivateLogRequired ? READ_CONTROL : 0),
             FILE_SHARE_READ,
             nullptr,
             OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | (Options.PrivateLogRequired ? FILE_FLAG_OPEN_REPARSE_POINT : 0),
             nullptr);
         if (LogHandle == INVALID_HANDLE_VALUE)
         {
+            break;
+        }
+        if (Options.PrivateLogRequired && !LogPrivacy->CheckFile(LogHandle))
+        {
+            LogPrivacyError = L"private_log_file_protection_mismatch";
+            CloseHandle(LogHandle); LogHandle = INVALID_HANDLE_VALUE;
             break;
         }
         LogLastFlushTickMs = 0;

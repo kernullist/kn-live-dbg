@@ -36,6 +36,7 @@
 #include "EvidenceInvestigation.h"
 #include "EvidenceInventory.h"
 #include "EvidenceJournal.h"
+#include "EvidencePrivacy.h"
 #include "EvidenceRetention.h"
 #include "EvidenceGraph.h"
 #include "ImageSweepGraph.h"
@@ -23006,7 +23007,7 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
 static void PrintKmonHelp()
 {
     std::wcout << L"!kmon command (unknown kernel drop / map / hidden monitor):\n";
-    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir>] [/manifest <path>] [/throttle N] [/layout-ms N]\n";
+    std::wcout << L"  !kmon [start] [/name <game.exe>] [/pid N] [/driver name] [/verbose] [/background] [/log <dir> | /private-log <root>] [/manifest <path>] [/throttle N] [/layout-ms N]\n";
     std::wcout << L"  !kmon stop | status | recent [N] | save <path> | clear\n";
     std::wcout << L"  !kmon add /pid|/name|/driver <v>     while collecting; later start extends watches\n";
     std::wcout << L"  !kmon remove /pid|/name|/driver <v>\n";
@@ -23049,6 +23050,9 @@ static void PrintKmonHelp()
     std::wcout << L"                  object event already prints regardless; /all-drivers is the\n";
     std::wcout << L"                  same switch\n";
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
+    std::wcout << L"  /private-log root  require initialized private root, audit before acquisition\n";
+    std::wcout << L"  --offline !kmon init-store <new-root> [/acl-only] [/json]  require EFS by default\n";
+    std::wcout << L"  --offline !kmon privacy <root> [/audit] [/json]  inspect OS protections\n";
     std::wcout << L"  /layout-ms N    memory layout rescan target, 1000..60000 ms (default 5000)\n";
     std::wcout << L"  no /pid or /name: discover all processes every second, including new instances\n";
     std::wcout << L"  !kmon layouts [/pid N [/initial]] [/json] [/save path]\n";
@@ -23073,7 +23077,7 @@ static void PrintKmonHelp()
     std::wcout << L"  Event categories are observation, lead, coverage, and sensor. Kind names are\n";
     std::wcout << L"  stable identifiers; maliciousness=not_established under assessment_policy=evidence_v1.\n";
     std::wcout << L"  /json prints JSON; /save <path> writes a new file. Neither marks a clean baseline.\n";
-    std::wcout << L"  /log /verbose /manifest /throttle /layout-ms apply on first start; later start extends watches.\n";
+    std::wcout << L"  /log /private-log /verbose /manifest /throttle /layout-ms apply on first start; later start extends watches.\n";
     std::wcout << L"\n";
     std::wcout << L"default screen is not a TI firehose and not every normal action:\n";
     std::wcout << L"  shown:  every driver lifecycle event (drop_load, official load/unload, device\n";
@@ -23370,14 +23374,15 @@ static bool ParseKmonStartArgs(
             i += 2;
             continue;
         }
-        if (opt == L"/log")
+        if (opt == L"/log" || opt == L"/private-log")
         {
-            if (i + 1 >= args.size())
+            if (i + 1 >= args.size() || args[i + 1].empty() || !options->LogDirectory.empty())
             {
-                *error = L"/log requires a path";
+                *error = L"specify exactly one /log <path> or /private-log <initialized-root>";
                 return false;
             }
             options->LogDirectory = args[i + 1];
+            options->PrivateLogRequired = opt == L"/private-log";
             i += 2;
             continue;
         }
@@ -23403,10 +23408,32 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|evidence|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|evidence|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"init-store" || action == L"privacy")
+    {
+        bool option = false, json = false, valid = args.size() >= 3 && !args[2].empty();
+        if (valid && (ToLower(args[2]) == L"/json" || ToLower(args[2]) == L"/audit" || ToLower(args[2]) == L"/acl-only")) { valid = false; }
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto flag = ToLower(args[i]);
+            if (flag == L"/json" && !json) { json = true; }
+            else if (flag == (action == L"init-store" ? L"/acl-only" : L"/audit") && !option) { option = true; }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: --offline !kmon init-store <new-root> [/acl-only] [/json]\n"
+                L"       --offline !kmon privacy <root> [/audit] [/json]\n";
+            return 2;
+        }
+        const auto report = action == L"init-store" ? InitializeEvidencePrivateStore(args[2], !option) : InspectEvidencePrivacy(args[2], option);
+        // This shared writer uses UTF-8 for pipes/files and Unicode for consoles.
+        if (!WriteCapabilityJson(EvidencePrivacyJson(report))) { return 3; }
+        return report.Status == L"ready" ? 0 : 1;
+    }
     if (action == L"trace")
     {
         return RunExecutionTraceCommand(std::vector<std::wstring>(args.begin() + 2, args.end()), &g_StopRequested);
@@ -23881,7 +23908,7 @@ static void HandleKmonCommand(
                     extra.ThrottlePerSecond != KmonOptions{}.ThrottlePerSecond;
                 if (firstStartOnly)
                 {
-                    std::wcerr << L"!kmon: /verbose, /log, /manifest, and /throttle apply only on the first start";
+                    std::wcerr << L"!kmon: /verbose, /log, /private-log, /manifest, and /throttle apply only on the first start";
                     if (addedWatch)
                     {
                         std::wcerr << L"; watches were updated";
@@ -24030,6 +24057,7 @@ static void HandleKmonCommand(
             std::wcout << L" started. logging unknown drop/map/hidden events and post-arm kernel image loads.\n";
             KmonOptions current = kmon.CurrentOptions();
             std::wcout << L"     log directory=" << current.LogDirectory
+                       << L" private_log=" << (current.PrivateLogRequired ? L"required" : L"off")
                        << L" verbose_flag=" << (current.VerboseDrivers ? L"yes" : L"no") << L"\n";
             std::wcout << L"     watch:";
             if (current.WatchPids.empty() &&
@@ -24093,7 +24121,8 @@ static void HandleKmonCommand(
             KmonOptions opt = kmon.CurrentOptions();
             PrintColoredText(L"[kmon.status]", KNDBG_COLOR_TITLE);
             std::wcout << L" active=" << (kmon.IsActive() ? L"yes" : L"no")
-                       << L" live=" << (kmon.IsLiveOutputEnabled() ? L"yes" : L"no") << L"\n";
+                       << L" live=" << (kmon.IsLiveOutputEnabled() ? L"yes" : L"no")
+                       << L" private_log=" << (opt.PrivateLogRequired ? L"required" : L"off") << L"\n";
             std::wcout << L"  kept=" << stats.EventsKept
                        << L" dropped=" << stats.EventsDropped
                        << L" logged=" << stats.EventsLogged
@@ -53486,7 +53515,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";

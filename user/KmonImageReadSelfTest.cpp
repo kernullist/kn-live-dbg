@@ -262,6 +262,66 @@ bool KmonImageReadIntegrationSelfTest()
                 { return node.Kind == L"executable_range_comparison" && node.State == L"changed_bytes_established"; }) == 1,
             "actual-kmon-changed-range-graph-derives-from-replayed-originals");
         std::wstring sweepJson;
+        {
+            KernelMonitor denied;
+            denied.Options.PrivateLogRequired = true;
+            denied.Options.LogDirectory = (root / L"missing-private-root").wstring();
+            check(!denied.EnsureLogOpenLocked() && !std::filesystem::exists(denied.Options.LogDirectory),
+                "private-log-denies-uninitialized-root-without-creating-output");
+        }
+        for (const bool efs : {false, true})
+        {
+            const auto folder = root / (efs ? L"private-efs" : L"private-acl");
+            const auto initialized = InitializeEvidencePrivateStore(folder.wstring(), efs);
+            if (efs && initialized.Status != L"ready")
+            {
+                check(initialized.EfsRequired && initialized.Issue.find(L"efs_initialization_failed_") == 0 &&
+                    !std::filesystem::exists(folder), "unavailable-EFS-is-explicit-without-fallback");
+                std::fprintf(stderr, "[kmon.privacy] efs=unavailable\n");
+                continue;
+            }
+            check(initialized.Status == L"ready", "private-root-initialized");
+            KernelMonitor secure;
+            secure.Options.LogDirectory = folder.wstring(); secure.Options.PrivateLogRequired = true;
+            check(secure.EnsureLogOpenLocked() && secure.LogPrivacy && secure.LogPrivacy->CheckFile(secure.LogHandle),
+                "actual-KMON-log-handle-satisfies-private-policy");
+            const auto previousHandle = secure.LogHandle;
+            std::wstring startError;
+            secure.Active.store(true);
+            check(!secure.Start({}, nullptr, nullptr, nullptr, nullptr, &startError) && secure.LogHandle == previousHandle && secure.LogPrivacy,
+                "rejected-start-preserves-existing-private-session-guard");
+            secure.Active.store(false);
+            KmonEvent event; event.Kind = L"privacy.fixture"; event.Summary = L"owned test event";
+            check(secure.WriteLogLine(event), "actual-private-JSONL-writer");
+            secure.RotateLogLocked();
+            check(secure.LogPrivacy && secure.EnsureLogOpenLocked() && secure.WriteLogLine(event), "rotation-retains-private-root-guard");
+            Source owned(L"synthetic:kmon:privacy");
+            const auto ownedDisk = Fixture(&owned.Bytes); owned.Bytes[0x1050] ^= 1;
+            const auto ownedReference = folder / L"fixture.exe";
+            check(Write(ownedReference, ownedDisk), "owned-private-reference");
+            ObservationReadRouting route; route.Primary = &owned; route.TargetId = L"synthetic:privacy";
+            route.AddressSpaceId = L"synthetic:privacy:user";
+            check(secure.ScanExecutableImage(ownedReference.wstring(), Base, identity, {}, 16, &route) == CodeOwnership::OwnedModified,
+                "private-store-actual-image-comparison");
+            check(DeleteFileW(ownedReference.c_str()) != FALSE, "private-original-source-removed-before-persistence");
+            owned.Bytes.clear();
+            secure.WriterStopping.store(true); secure.CaptureWriterLoop();
+            const auto collection = folder / L"collections" / std::to_wstring(secure.EvidenceCollectionEpoch.load());
+            const auto recovery = RecoverEvidenceJournal(collection.wstring());
+            check(secure.ImageReadsWritten.load() == 1 && secure.ImageReadsFailed.load() == 0 && recovery.Closed && recovery.SweepPaths.size() == 1,
+                "private-raw-reference-recipe-and-closure-journal-committed");
+            check(recovery.SweepPaths.size() == 1 && ReplayImageRecipe((folder / recovery.SweepPaths.front()).wstring(), false, nullptr).Status == L"replayed",
+                "private-originals-replay-through-existing-reader-after-source-removal");
+            std::wstring stopError;
+            check(secure.Stop(&stopError) && !secure.LogPrivacy && secure.LogHandle == INVALID_HANDLE_VALUE,
+                "stopped-private-session-releases-policy-root-and-log-handles");
+            const auto privacy = InspectEvidencePrivacy(folder.wstring(), true);
+            check(privacy.Status == L"ready" && privacy.AuditComplete && privacy.CheckedEntries >= 10 && privacy.EfsRequired == efs,
+                "all-actual-KMON-descendants-inherit-selected-protection");
+            const auto inventory = InspectEvidenceStore(folder.wstring());
+            check(inventory.Status == L"verified" && inventory.MembershipComplete, "private-root-compatible-with-stopped-store-inventory");
+            if (efs) { std::fprintf(stderr, "[kmon.privacy] efs=verified\n"); }
+        }
         ImageSweepManifest sweepManifest;
         check(ReadAnalystSnapshot(sweepPath.wstring(), &sweepJson, nullptr) && ParseImageSweepManifest(sweepJson, &sweepManifest),
             "actual-kmon-manifest-canonical-membership");

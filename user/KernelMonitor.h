@@ -10,6 +10,7 @@
 #include "ImageSweepManifest.h"
 #include "EvidenceJournal.h"
 #include "EvidenceStore.h"
+#include "EvidencePrivacy.h"
 #include "ImageRetentionPolicy.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
@@ -83,6 +84,7 @@ struct KmonOptions
     uint32_t ThrottlePerSecond = 50;
     uint32_t RingCapacity = 65536;
     std::wstring LogDirectory;
+    bool PrivateLogRequired = false;
     std::wstring GameManifestPath;
     // Root for on-disk scanner data (data\byovd\...); under --cloak the
     // process runs from a %TEMP% copy without the data tree, so main.cpp
@@ -990,6 +992,8 @@ private:
     std::atomic<uint64_t> ThrottleSuppressed{0};
 
     mutable std::mutex LogMutex;
+    std::unique_ptr<EvidencePrivacyGuard> LogPrivacy;
+    std::wstring LogPrivacyError;
     HANDLE LogHandle = INVALID_HANDLE_VALUE;
     uint64_t LogCurrentBytes = 0;
     std::wstring LogActivePath;
