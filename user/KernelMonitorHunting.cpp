@@ -106,7 +106,8 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"reference_blobs_reused\":" + std::to_wstring(ImageReferenceBlobsReused.load()) +
         L",\"reference_blobs_failed\":" + std::to_wstring(ImageReferenceBlobsFailed.load()) +
         L",\"reference_bytes\":" + std::to_wstring(ImageReferenceBytes.load()) +
-        L",\"reference_reserved_bytes\":" + std::to_wstring(ImageReferenceReservedBytes->load()) +
+        L",\"retention\":" + ImageRetention.Json() +
+            L",\"reference_reserved_bytes\":" + std::to_wstring(ImageRetention.ReferenceHeld()) +
         L",\"reference_captures_missing\":" + std::to_wstring(ImageReferencesMissing.load()) +
         L",\"slice_recipes_queued\":" + std::to_wstring(ImageSlicesQueued.load()) +
         L",\"slice_recipes_written\":" + std::to_wstring(ImageSlicesWritten.load()) +

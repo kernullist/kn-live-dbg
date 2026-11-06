@@ -10,6 +10,7 @@
 #include "ImageSweepManifest.h"
 #include "EvidenceJournal.h"
 #include "EvidenceStore.h"
+#include "ImageRetentionPolicy.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
@@ -610,16 +611,8 @@ private:
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
         const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr,
         const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr,
-        const ImageSweepContext* sweep = nullptr);
-    struct ImageReferenceCharge
-    {
-        ImageReferenceCharge() = default;
-        ImageReferenceCharge(const ImageReferenceCharge&) = delete;
-        ImageReferenceCharge& operator=(const ImageReferenceCharge&) = delete;
-        std::shared_ptr<std::atomic<uint64_t>> Total;
-        uint64_t Bytes = 0;
-        ~ImageReferenceCharge() { if (Total != nullptr) { Total->fetch_sub(Bytes); } }
-    };
+        const ImageSweepContext* sweep = nullptr, const std::vector<ExecutablePageResult>* pages = nullptr,
+        uint64_t retentionEpisode = 0);
     struct CapturedImageReads
     {
         uint64_t Id = 0;
@@ -629,7 +622,7 @@ private:
         bool HasReference = false;
         bool HasSliceInputs = false;
         ExecutableSweepReference Reference;
-        std::shared_ptr<ImageReferenceCharge> ReferenceCharge;
+        std::shared_ptr<ImageRetentionPolicy::Ticket> Retention;
         std::wstring Json;
         std::wstring SliceJson;
         std::optional<ImageSweepContext> Sweep;
@@ -653,8 +646,8 @@ private:
     std::atomic<uint64_t> ImageSweepManifestsWritten{0}, ImageSweepManifestsFailed{0}, ImageSweepManifestBytes{0};
     std::atomic<uint64_t> ImageSweepManifestPending{0}, ImageSweepManifestAdmissionDenied{0}, ImageSweepManifestEntryDrops{0};
     std::atomic<uint64_t> ImageSweepsStarted{0}, ImageSweepTerminalsObserved{0}, ImageSweepMetadataFailures{0};
-    KmonWorkQueue<CapturedImageReads> CapturedImageReadSets{8};
-    const std::shared_ptr<std::atomic<uint64_t>> ImageReferenceReservedBytes = std::make_shared<std::atomic<uint64_t>>(0);
+    ImageRetentionQueue<CapturedImageReads> CapturedImageReadSets;
+    ImageRetentionPolicy ImageRetention;
     std::atomic<uint64_t> ImageReadsQueued{0}, ImageReadsWritten{0}, ImageReadsFailed{0}, ImageReadsDropped{0};
     std::atomic<uint64_t> ImageReadsBytes{0}, ImageReadsLedgerFailed{0};
     std::atomic<uint64_t> ImageReferenceBlobsCreated{0}, ImageReferenceBlobsReused{0}, ImageReferenceBlobsFailed{0};
@@ -733,6 +726,7 @@ private:
         ExecutableSweep Sweep;
         ImageSweepIdentity RecordingSweep;
         uint64_t RecordingSlice = 0;
+        uint64_t RetentionEpisode = 0; // Collector work/requalification episode, not an OS mapping generation.
         ObservationIdentity Identity;
         std::wstring Path;
         uint64_t Base = 0;

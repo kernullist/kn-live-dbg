@@ -168,6 +168,8 @@ bool KmonImageReadIntegrationSelfTest()
             slice.Policy == ImageSliceDirectPolicy && monitor.ImageSlicesQueued.load() == 1,
             "actual-sweep-retains-original-routed-slice-recipe");
         const auto payload = Raw(retained.Json, L"payload");
+        check(Text(Raw(payload, L"retention"), L"class") == L"first_difference",
+            "actual-original-difference-uses-protected-admission-class");
         const auto routed = Raw(payload, L"reads");
         const auto attempts = Raw(routed, L"attempts");
         const auto reads = Array(attempts, L"reads"), parser = Array(routed, L"parser_reads");
@@ -222,7 +224,7 @@ bool KmonImageReadIntegrationSelfTest()
                 unavailable.CaptureStatus == L"reference_unavailable_or_changed", "missing-reference-denies-target-read-and-clears-stale-coverage");
         }
         check(monitor.CapturedImageReadSets.Push(retained), "writer-receives-original-queued-json");
-        retained.ReferenceCharge.reset(); // Only the requeued item owns the queue reservation.
+        retained.Retention.reset(); // Only the requeued item owns the queue reservation.
         monitor.WriterStopping.store(true);
         monitor.CaptureWriterLoop();
         const auto path = root / L"image-reads" / (L"reads-" + retained.CollectionId + L"-" + std::to_wstring(retained.Id) + L".knreads");
@@ -497,8 +499,8 @@ bool KmonImageReadIntegrationSelfTest()
             KernelMonitor blocked;
             const auto directory = root / (L"slice-failure-" + std::to_wstring(mode));
             blocked.Options.LogDirectory = directory.wstring();
-            if (mode == 0) { blocked.ImageSliceBytes.store(128ull * 1024 * 1024); }
-            if (mode == 2) { blocked.ImageReferenceBytes.store(128ull * 1024 * 1024); }
+            if (mode == 0) { blocked.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Recipe, 32ull * 1024 * 1024); }
+            if (mode == 2) { blocked.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Reference, 64ull * 1024 * 1024); }
             const auto id = blocked.QueueImageReadSet(slice.TargetReads, identity, L"synthetic", Base,
                 &retained.Reference, retained.SliceJson, &slice.Slice);
             const auto blockedSlicePath = directory / L"image-reads" /
@@ -522,30 +524,101 @@ bool KmonImageReadIntegrationSelfTest()
         KernelMonitor pressure;
         pressure.Options.LogDirectory = (root / L"pressure").wstring();
         for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }
-        check(pressure.ImageReadsQueued.load() == 8 && pressure.ImageReadsDropped.load() == 1 &&
-            pressure.CapturedImageReadSets.Size() == 8, "queue-pressure-counts-rejected-original-set");
+        check(pressure.ImageReadsQueued.load() == 2 && pressure.ImageReadsDropped.load() == 7 &&
+            pressure.CapturedImageReadSets.Size() == 2, "queue-pressure-counts-rejected-original-set");
         pressure.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing);
         check(pressure.ImageSweepsStarted.load() == 1 && pressure.ImageSweepTerminalsObserved.load() == 1 &&
-            pressure.ImageReadsDropped.load() == 2, "entirely-dropped-sweep-remains-in-session-denominators");
+            pressure.ImageReadsDropped.load() == 8, "entirely-dropped-sweep-remains-in-session-denominators");
         pressure.WriterStopping.store(true); pressure.CaptureWriterLoop();
-        check(pressure.ImageReadsWritten.load() == 8 && pressure.ImageReadsFailed.load() == 0 &&
+        check(pressure.ImageReadsWritten.load() == 2 && pressure.ImageReadsFailed.load() == 0 &&
             pressure.CapturedImageReadSets.Size() == 0, "shutdown-drains-full-image-read-queue");
-        check(pressure.ImageReferenceBlobsCreated.load() == 1 && pressure.ImageReferenceBlobsReused.load() == 7 &&
-            pressure.ImageReferenceBytes.load() == disk.size() && pressure.ImageReferenceReservedBytes->load() == 0,
+        check(pressure.ImageReferenceBlobsCreated.load() == 1 && pressure.ImageReferenceBlobsReused.load() == 1 &&
+            pressure.ImageReferenceBytes.load() == disk.size() && pressure.ImageRetention.ReferenceHeld() == 0,
             "slice-archives-share-one-content-addressed-reference-and-release-reservations");
         std::wstring pressureLedger;
         check(ReadAnalystSnapshot((root / L"pressure" / L"image-reads" /
             (L"session-" + std::to_wstring(pressure.EvidenceCollectionEpoch.load()) + L".knreadledger")).wstring(), &pressureLedger, nullptr) &&
             Raw(pressureLedger, L"sweeps_started") == L"1" && Raw(pressureLedger, L"sweep_terminals_observed") == L"1" &&
-            Raw(pressureLedger, L"sweep_manifests_written") == L"0" && Raw(pressureLedger, L"dropped") == L"2",
+            Raw(pressureLedger, L"sweep_manifests_written") == L"0" && Raw(pressureLedger, L"dropped") == L"8",
             "final-ledger-exposes-sweep-with-no-retained-slices");
         {
+            KernelMonitor priority;
+            const auto folder = root / L"priority";
+            priority.Options.LogDirectory = folder.wstring();
+            priority.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference);
+            priority.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference);
+            auto gap = set;
+            gap.UnrecordedParserCalls = 1;
+            priority.QueueImageReadSet(gap, identity, L"synthetic", Base, &retained.Reference);
+            priority.QueueImageReadSet(gap, identity, L"synthetic", Base, &retained.Reference);
+            for (const auto stream : {ImageRetentionStream::Reads, ImageRetentionStream::Reference, ImageRetentionStream::Recipe})
+            {
+                check(priority.ImageRetention.Consume(ImageRetentionClass::Routine, stream,
+                    priority.ImageRetention.Remaining(ImageRetentionClass::Routine, stream)), "exhaust-only-routine-file-budget");
+            }
+            secondary.Bytes[0x1050] ^= 1;
+            check(priority.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedModified &&
+                priority.ImageReadsQueued.load() == 5 && priority.ImageReadsDropped.load() == 0,
+                "routine-and-gap-queue-pressure-cannot-consume-first-difference-reserve");
+            priority.WriterStopping.store(true); priority.CaptureWriterLoop();
+            std::wstring finalLedger;
+            check(ReadAnalystSnapshot((folder / L"image-reads" / (L"session-" + std::to_wstring(priority.EvidenceCollectionEpoch.load()) +
+                L".knreadledger")).wstring(), &finalLedger, nullptr), "priority-final-ledger-persisted-outside-data-budgets");
+            const auto classes = Array(Raw(finalLedger, L"retention"), L"classes");
+            check(classes.size() == 3 && Text(classes[0], L"complete") == L"1" && Text(classes[0], L"in_flight") == L"0" &&
+                Text(classes[1], L"finished") == L"2" && Text(classes[2], L"finished") == L"2" &&
+                Text(classes[2], L"complete") == L"0" && Raw(finalLedger, L"failed") == L"2" &&
+                priority.ImageRetention.ReferenceHeld() == 0, "partition-outcomes-and-failure-denominators-survive-shutdown");
+            bool replayedPriority = false;
+            for (const auto& entry : std::filesystem::directory_iterator(folder / L"image-reads"))
+            {
+                if (entry.path().extension() == L".knslice")
+                {
+                    const auto replay = ReplayImageRecipe(entry.path().wstring(), false, nullptr);
+                    replayedPriority |= replay.Status == L"replayed" && Text(replay.Proof, L"changed_bytes") == L"1";
+                }
+            }
+            check(replayedPriority && InspectEvidenceStore(folder.wstring()).Status == L"verified",
+                "protected-first-difference-is-journaled-and-replays-despite-routine-budget-exhaustion");
+            secondary.Bytes[0x1050] ^= 1;
+        }
+        {
+            KernelMonitor repeated;
+            repeated.Options.LogDirectory = (root / L"priority-retry").wstring();
+            secondary.Bytes[0x1050] ^= 1;
+            auto target = identity;
+            for (unsigned attempt = 0; attempt < 6; ++attempt)
+            {
+                if (attempt == 3) { secondary.Bytes[0x1051] ^= 1; }
+                if (attempt == 4) { ++target.CreateTime; }
+                if (attempt == 5) { repeated.ImageWork.clear(); }
+                for (auto& work : repeated.ImageWork) { work.second.NextSweepDueMs = 0; }
+                repeated.ScanExecutableImage(reference.wstring(), Base, target, {}, 16, &routing);
+                KernelMonitor::CapturedImageReads item;
+                check(repeated.CapturedImageReadSets.Pop(&item) && item.Retention &&
+                    item.Retention->Class == (attempt == 2 ? ImageRetentionClass::Routine : ImageRetentionClass::FirstDifference),
+                    "failed-first-retries-repeat-demotes-new-bytes-lifetime-or-work-episode-remain-first");
+                if (attempt == 0)
+                {
+                    const auto collision = std::filesystem::path(repeated.Options.LogDirectory) / L"image-reads" /
+                        (L"reads-" + item.CollectionId + L"-" + std::to_wstring(item.Id) + L".knreads");
+                    std::filesystem::create_directories(collision.parent_path());
+                    check(Write(collision, {0x51}), "owned-first-publication-failure");
+                }
+                repeated.PersistImageReadSet(item);
+            }
+            repeated.WriterStopping.store(true); repeated.CaptureWriterLoop();
+            check(repeated.ImageReadsWritten.load() == 5 && repeated.ImageReadsFailed.load() == 1 &&
+                repeated.ImageJournalReadsCommitted.load() == 6 && repeated.ImageRetention.ReferenceHeld() == 0,
+                "partial-journal-batch-does-not-spend-first-difference-priority");
+            secondary.Bytes[0x1050] ^= 1; secondary.Bytes[0x1051] ^= 1;
+        }
+        {
             KernelMonitor busy;
-            busy.ImageReferenceReservedBytes->store(128ull * 1024 * 1024);
+            const auto occupied = busy.ImageRetention.Acquire({}, 64ull * 1024 * 1024);
             check(busy.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference) == 0 &&
                 busy.ImageReadsDropped.load() == 1 && busy.CapturedImageReadSets.Size() == 0 &&
-                busy.ImageReferenceReservedBytes->load() == 128ull * 1024 * 1024, "reference-queue-memory-budget-is-shared-and-fail-closed");
-            busy.ImageReferenceReservedBytes->store(0);
+                busy.ImageRetention.ReferenceHeld() == 64ull * 1024 * 1024, "reference-memory-pressure-is-counted-in-its-own-class");
         }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
@@ -553,7 +626,7 @@ bool KmonImageReadIntegrationSelfTest()
             const auto folder = root / (L"reference-failure-" + std::to_wstring(mode));
             missing.Options.LogDirectory = folder.wstring();
             auto capture = retained.Reference;
-            if (mode == 0) { missing.ImageReferenceBytes.store(128ull * 1024 * 1024); }
+            if (mode == 0) { missing.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Reference, 64ull * 1024 * 1024); }
             if (mode == 1)
             {
                 std::filesystem::create_directories(folder / L"image-references");
@@ -579,7 +652,7 @@ bool KmonImageReadIntegrationSelfTest()
         {
             KernelMonitor rejected;
             rejected.Options.LogDirectory = mode == 1 ? reference.wstring() : (root / (L"rejected-" + std::to_wstring(mode))).wstring();
-            if (mode == 0) { rejected.ImageReadsBytes.store(128ull * 1024 * 1024); }
+            if (mode == 0) { rejected.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Reads, 32ull * 1024 * 1024); }
             rejected.QueueImageReadSet(set, identity, L"synthetic", Base);
             std::filesystem::path collision;
             if (mode == 2)
@@ -614,6 +687,27 @@ bool KmonImageReadIntegrationSelfTest()
         KernelMonitor oversized;
         check(oversized.QueueImageReadSet(set, identity, std::wstring(EvidenceBundleMaxJsonBytes, L'x'), Base) == 0 &&
             oversized.ImageReadsDropped.load() == 1 && oversized.CapturedImageReadSets.Size() == 0, "oversize-archive-rejected-before-queue");
+        {
+            KernelMonitor restarting;
+            std::atomic<bool> observed{false}, stopping{false}, valid{true};
+            std::atomic<uint64_t> queries{0};
+            std::thread reader([&]
+            {
+                while (!stopping.load())
+                {
+                    const auto json = restarting.HuntCasesJson({});
+                    const auto retention = Raw(Raw(json, L"image_read_store"), L"retention");
+                    if (!mcpjson::ValidateDocument(json) || Text(retention, L"schema") != L"kn.image_retention.v1" ||
+                        Array(retention, L"classes").size() != 3) { valid.store(false); }
+                    queries.fetch_add(1); observed.store(true);
+                }
+            });
+            while (!observed.load()) { std::this_thread::yield(); }
+            for (unsigned i = 0; i < 100; ++i) { restarting.ResetPipeline(); }
+            stopping.store(true); reader.join();
+            check(valid.load() && queries.load() != 0 && restarting.ImageRetention.ReferenceHeld() == 0,
+                "live-hunt-reader-overlaps-session-policy-reset-without-stale-state-access");
+        }
     }
     catch (const std::exception&)
     {

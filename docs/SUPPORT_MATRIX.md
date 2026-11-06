@@ -33,6 +33,7 @@ backends are not implied by an x64 address width.
 | evidence / store | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_stopped_store |
 | evidence / gc | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_explicit_policy |
 | image / capture_verification | dump | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_dump |
+| evidence / retention | native | implemented | collector_specific;extended_address_pipeline_unvalidated | recording_session_partitions |
 | image / replay_verification | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |
 | image / capture_verification | process_handle | implemented | cli_legacy_la48_with_os_user_ceiling;user_only;pointer_bytes_8 | handle_bound_single_read |
 | proof / image_range | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |

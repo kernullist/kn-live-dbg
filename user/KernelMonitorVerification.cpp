@@ -298,6 +298,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
         }
         it = ImageWork.emplace(key, ImageVerificationWork{}).first;
         it->second.Identity = identity;
+        it->second.RetentionEpisode = NextCaptureId.fetch_add(1);
         it->second.Path = path;
         it->second.Base = base;
         it->second.PriorTraversalMs = priorTraversal;
@@ -318,6 +319,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             // A DLL can be unloaded and replaced at the same base/path. Never
             // let a failed cached reference disable verification indefinitely.
             work.Loaded = false;
+            work.RetentionEpisode = NextCaptureId.fetch_add(1);
             work.LayoutIdentityReported = false;
             work.LastAttemptMs = 0;
             work.ManifestChecked = false;
@@ -422,7 +424,7 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         if (context.Slice.Terminal) { ImageSweepTerminalsObserved.fetch_add(1); }
         context.Slice.Reason = work->Sweep.Coverage.Reason;
         if (capturedReference.Artifact != nullptr) { context.Slice.ReferenceSha256 = capturedReference.Artifact->Sha256; }
-        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice, &context);
+        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice, &context, &pages, work->RetentionEpisode);
         readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
     }
     // Completed small images must not continually restart while larger images

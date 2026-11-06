@@ -7,6 +7,68 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image retention priority checkpoint: 2026-11-07
+
+This P06 step connects retention priority to the actual KMON routed-image queue,
+writer, journal and final failure ledger. First differences, observation gaps
+and repeat/clean slices have separate 4/2/2 admission slots. Raw and recipe file
+budgets are each partitioned 64/32/32 MiB; each class can retain one 64 MiB
+reference. New-reference and outstanding-reference accounting therefore each
+have an aggregate 192 MiB ceiling, replacing the previous shared 128 MiB limit.
+This is an explicit reference-budget change, not a total process-RAM or reserved
+disk-space guarantee. See the [policy contract](ARCHITECTURE.md#image-retention-priority).
+
+Final Release EXE SHA-256:
+`1f22327bc80c1ae9a141bc64e7f9614013a23a537c2e00566e4615cfefd74fff`.
+ASan policy harness SHA-256:
+`2d032c09d17742a81281d70094cb7540d1879d5d42fe182dca4c5a813a4f3970`.
+Builds passed with VS 2022 Build Tools 17.14.60 / MSVC 14.44.35207 and
+SDK/WDK 10.0.26100.0. Existing C4744 `NextQueryEpoch` warnings remain; the
+initial broader rebuild also reproduced the unchanged `KernelMonitor.cpp`
+C4244 fill conversion warning.
+
+The ASan harness passed **34 controls** and the independent Python oracle
+passed **109 accounting invariants**, including **9,000 concurrent admission
+attempts** across the three classes. The oracle checks fixed external expected
+byte/count totals, class limits, refusal/admission/finish denominators, zero
+outstanding charges and bounded high-water values. Controls exercise queue
+ordering, full lanes without eviction, final-owner release, failed-first retry,
+pending/saved duplicates, key exhaustion, unknown identities and stream limits.
+These are owned policy controls, not malware samples or measured production SLOs.
+
+The final EXE passed **92 KMON image integration checks**. Owned original-read
+fixtures fill routine and gap queues, exhaust routine file budgets and still
+publish/replay the first changed image range through the real writer and journal.
+The final protected ledger preserves both successful and failed class outcomes.
+A collision leaves a partial journal batch; the next original attempt retains
+first priority. Successful repeats demote, while changed bytes, process lifetime
+assertions and a new collector work episode receive new first-priority keys.
+All owned fixture files are cleaned by the harness after validation.
+
+Review added collector work/requalification episodes and source IDs to the
+fingerprint so a recycled work entry cannot inherit old priority decisions.
+Unknown identity or failed hashing does not earn a reusable key. Saved-key
+eligibility requires the complete raw/reference/recipe journal batch, and
+allocation/preparation failure releases admission ownership. Review also found
+that live hunt readers could overlap session policy replacement; replacement
+now uses the hunt-reader lock. The final integration controls observe a reader
+before performing 100 session resets and verify valid reports throughout.
+This bounded overlap is not a race-detector or universal scheduling proof.
+
+An isolated final `--self-test all` passed: timeline **28**, MCP **102**, KMON
+image **92**, console **558**, commands **3,000 / 261 routes**, remote **66**.
+Compiled capability contracts passed **30 / 261 routes**, the generated support
+matrix matched, and the public-content classifier passed **11 tests**. The new
+retention capability remains `not_probed`. No owned test processes remained.
+
+No driver was loaded, service started, Verifier enabled, reboot performed or
+security policy changed. The image fixtures use owned nonexecuting bytes; they
+do not validate native loaded-image/mapping lifetimes or a live kernel support
+matrix. Cross-session priority, other evidence families, committed-root retirement,
+privacy, large-store continuation and full P01-P16 / VS1-VS4 acceptance remain
+open. The historical concurrent-load process-capture deadline failure remains
+unresolved separately; this isolated passing suite does not close it.
+
 ## Explicit image-artifact GC checkpoint: 2026-11-07
 
 This P06 step adds offline `!kmon gc` preflight/apply/resume and a create-new

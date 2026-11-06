@@ -115,8 +115,10 @@ the existing 25 ms sweep yield remains cooperative. Clean, changed and inconclus
 slices queue their original attempts and parser selections as `kn.image_reads.v3`
 under `image-reads/reads-<collection>-<id>.knreads`. The private payload has a
 SHA-256 integrity hash, not collector authentication. The writer uses create-new
-atomic publication, with an eight-item queue, 2 MiB per file and 128 MiB per
-session. Overflow is counted, never silently replaced by a fresh target read.
+atomic publication, with eight admitted/in-flight items, 2 MiB per file and
+128 MiB of raw files per session, partitioned by the
+[retention policy](#image-retention-priority). Overflow is counted, never
+silently replaced by a fresh target read.
 `coverage.image_reads` reports publication; `coverage.pipeline` and the hunt
 JSON `image_read_store` report counts. A final `.knreadledger` records queued,
 written, failed, dropped and pending totals after producer/writer drain. Live
@@ -132,10 +134,12 @@ holds a write/delete exclusion lease on the verified blob through that commit.
 Existing content must match both hash and bytes; a corrupt blob is never replaced.
 The hash is content identity, not an approved reference or collector identity.
 
-New reference blobs have a separate 128 MiB session limit; reuse of a verified
-blob is allowed at that limit. Queue reservations limit retained reference bytes
-to 128 MiB, conservatively charging each queued item even when snapshots share
-storage. This is not a total process-memory bound. Capture and publication status,
+New reference blobs have a separate 192 MiB session limit (64 MiB per retention
+class); reuse of a verified blob is allowed at its class limit. Admission reserves
+up to 64 MiB of reference bytes per class, conservatively charging each queued or
+in-flight item even when snapshots share storage. The aggregate reference-memory
+charge is at most 192 MiB, allowing every class to hold one largest supported
+reference. This is not a total process-memory bound. Capture and publication status,
 created/reused/failed/missing counts, new bytes and outstanding reservations stay
 separate from raw archive counts. A missing or failed reference does not discard
 the raw reads or imply replay readiness. Acquisition/rechecks and existing-blob
@@ -147,6 +151,60 @@ secondary-view reads, including incomplete inputs that cannot form a recipe.
 Raw archive publication alone does not establish successful policy replay.
 Single-source v2 recipe validation remains strict; routed fallback sets cannot
 be substituted into it.
+
+## Image retention priority
+
+KMON routed image publication uses `kn.image_retention_partition.v1`. A first
+observed byte difference is a retention candidate, not a maliciousness claim.
+Three independent admission lanes keep routine traffic from consuming the
+capacity reserved for that candidate or for an observation gap:
+
+| Class | Admitted/in-flight slots | Reference memory | New raw files | New reference blobs | New recipes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `first_difference` | 4 | 64 MiB | 64 MiB | 64 MiB | 64 MiB |
+| `observation_gap` | 2 | 64 MiB | 32 MiB | 64 MiB | 32 MiB |
+| `repeat_or_clean` | 2 | 64 MiB | 32 MiB | 64 MiB | 32 MiB |
+
+The writer visits nonempty lanes in round-robin order and preserves FIFO order
+inside each lane. Admission does not evict an already queued original. Slots and
+reference charges remain owned until the final item owner releases them, even
+after a dequeue. A class cannot borrow another class's budget. Successful new
+physical publications consume their class/stream bytes; verified reference reuse
+does not. These are accounting limits, not filesystem space reservations or
+hard latency guarantees.
+
+First-difference keys bind exact observed/expected page hashes, reference hash,
+RVA/base and relocation basis, route/source IDs, identity assertions and the
+collector's image-work episode. There are at most 8,192 keys per recording session
+and 256 per read set. Unknown identity or fingerprint failure retains first
+priority without a reusable key. A key-capacity refusal is counted explicitly;
+it does not silently classify a new difference as routine. These keys neither
+prove an atomic mapping lifetime nor join evidence across sessions.
+
+A pending duplicate uses ordinary capacity. A saved key is earned only after
+the original read file, required reference and recipe all publish and the
+corresponding journal batch commits. A partial batch does not earn that key.
+After all unsuccessful pending attempts release their reservations, the next
+attempt can use first priority again. Reference requalification or a new
+collector image-work episode starts distinct keys. Retention keys are not a
+persistent cache: restarting a collection starts new priority accounting.
+
+Unrecorded or rejected parser reads, cancelled/deadline-limited read sets,
+missing/unstable references, ineligible recipes and unverified page results use
+the gap lane when they do not contain a new difference. Raw originals remain
+useful when a reference or recipe cannot be retained. The archive records its
+retention class and episode; `coverage.image_reads` exposes the class. Live hunt
+and pipeline summaries and the final protected `.knreadledger` include
+`kn.image_retention.v1`: per-class attempts, admission refusals, abandoned/finished/
+complete outcomes, high-water/in-flight counts and each stream's named bytes.
+The final ledger is published outside those data budgets, so exhausted or dropped
+work stays in its denominator. Filesystem or closure failure is still reported;
+the policy does not reserve physical disk space or guarantee crash-time closure.
+
+This policy applies to the routed image pipeline. Committed artifact protection
+continues to come from journal membership and the store's GC rules. Priority
+admission for other evidence families, cross-session retention, privacy controls
+and committed-root retirement remain separate P06 requirements.
 
 ## Original KMON slice replay
 
@@ -341,8 +399,8 @@ unreadable artifacts remain protected and make artifact inventory partial.
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
-revalidates its own policy and leases. Committed-root retirement, retention
-priorities and privacy controls remain P06 work.
+revalidates its own policy and leases. Committed-root retirement, cross-collection
+retention priorities and privacy controls remain P06 work.
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
@@ -411,7 +469,7 @@ not establish reclaimed disk blocks, secure erasure or power-loss durability.
 Uncommitted recipe dependencies are not resolved: explicit removal of an
 uncommitted reference can make another uncommitted artifact unusable. This scope
 is declared as `uncommitted_dependents_resolved:false`; committed dependencies
-stay protected by journal membership. Automatic priority allocation, retirement
+stay protected by journal membership. Priority-based GC selection, retirement
 of committed roots, full dependency-impact analysis, privacy controls and
 large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.

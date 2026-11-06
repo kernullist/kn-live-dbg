@@ -360,6 +360,12 @@ No sample detection percentage follows from the fixture count.
 
 ## KMON
 
+Routed image collection exposes its retention class in `coverage.image_reads`.
+The hunt JSON `image_read_store.retention`, pipeline `image_retention` evidence
+and final `.knreadledger` report separate first-difference, observation-gap and
+repeat/clean budgets and outcomes. These fixed session budgets require no new
+command option. See [admission, retry and byte-accounting semantics](ARCHITECTURE.md#image-retention-priority).
+
 ```text
 !kmon start /name game.exe /background /log C:\kmon-evidence
 !kmon status
