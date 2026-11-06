@@ -296,6 +296,64 @@ rename; the observed-process-interruption tests do not establish power-loss
 durability or collector authenticity. All journal/index/recovery artifacts are
 private evidence.
 
+## Image store membership inventory
+
+`!kmon store <artifact-root> [/artifacts] /json` returns private
+`kn.evidence_store_inventory.v1` for the root's `collections`, `image-reads`,
+`image-references` and `image-sweeps` namespaces. Legacy `.kncase`/`.knverify`
+and immutable `.knindex` stores retain their existing adapters and are excluded
+from these denominators. This command creates a zero-byte `store.knstorelock`
+in an existing local root if needed; it requires write access to that lock.
+
+Participating KMON writers take a shared store lease before publishing any
+original/reference/recipe/sweep/ledger file and retain it through closure,
+including when journal publication fails. Journal writers/recovery also take a
+shared lease. Inventory takes an exclusive lease first, then pins the catalog,
+collection journals and exact original files together. A live publisher makes
+inventory unavailable (`store_busy`). Conversely, a newly publishing KMON writer
+is denied during inventory, counts `store_admission_failed` (final pipeline:
+`image_store_admission_failed`) and retains the ordinary file/ledger failure
+counts. It does not retry by reacquiring target memory. Inventory is intended for
+stopped stores. This coordination is not an ACL, authentication boundary or
+protection against an older/nonparticipating publisher.
+
+Each accepted journal prefix contributes original member references. The report
+distinguishes reference multiplicity, unique paths per collection, unique paths
+across the store and unique content hashes. Shared paths are hashed once while
+their immutable leases remain held; equal content at distinct paths is still
+read separately. These are named-file byte counts, not allocated disk blocks,
+compression, filesystem hard-link accounting or target coverage. Root receipts
+and sorted artifact rows have separate canonical JSON hashes; neither is an
+authenticated external anchor. Membership/schema/hash verification is not image
+policy replay. Index contents do not establish membership.
+
+`membership_complete` requires a complete observed catalog and every root to
+verify as closed. An open root, malformed catalog entry or corrupt journal
+protects unattributed files; verified non-ledger files receive
+`unresolved_membership_protected`. Files
+outside accepted prefixes never become committed by discovery. Committed
+reference blobs, original observations and failure ledgers have distinct
+protected retention reasons. A verified unattributed file under entirely closed
+roots remains protected if it is a session failure ledger, including when its
+journal was never created. Any other verified unattributed file under closed
+roots is only `uncommitted_requires_policy`; unknown, pending, malformed or
+unreadable artifacts remain protected and make artifact inventory partial.
+`kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
+not a GC policy. Reports release all leases on return and always declare
+`deletion_authorized:false`. Deletion, retention priorities, privacy controls
+and durable deletion receipts remain separate P06 work.
+
+Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
+entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
+Existing per-collection bounds remain; the separate unattributed-file reader is
+also limited to 1 GiB. The shared 120-second deadline is cooperative between
+synchronous operations. Exhaustion yields partial/unavailable status; separate
+flags distinguish verified journal membership from an incomplete artifact scan.
+`/artifacts` uses a 16 Mi UTF-16 code-unit detail budget and reports
+emitted/omitted row counts; the
+aggregate counters and complete captured-row digest remain available. Large-store
+continuation is still required; this bounded audit does not implement it.
+
 ## Replayed image sweep graph
 
 `!kmon graph <sweep.knsweep> /json` projects a successful original-policy replay

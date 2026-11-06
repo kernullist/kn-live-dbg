@@ -1,4 +1,5 @@
 #include "../user/EvidenceJournal.h"
+#include "../user/EvidenceStore.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
 #include "../user/McpJson.h"
@@ -38,7 +39,7 @@ namespace
         const auto digest = ContentHash::Bytes(Blob);
         return {L"image-references/" + digest + L".knblob", digest, L"raw.bytes", Blob.size()};
     }
-    EvidenceJournalTransaction Batch(const fs::path& root, const std::wstring& id, const std::wstring& stage = L"")
+    EvidenceJournalTransaction Batch(const fs::path& root, const std::wstring& id, const std::wstring& stage = L"", const std::wstring& collection = L"7")
     {
         EvidenceJournalTransaction t;
         t.Kind = L"image_reads"; t.Id = id;
@@ -46,7 +47,7 @@ namespace
         if (!fs::exists(root / blob.Path)) { Check(Write(root / blob.Path, Blob), "publish-owned-reference"); }
         t.Members.push_back(blob);
         Stage(stage, L"raw");
-        const auto prefix = L"image-reads/reads-7-" + id;
+        const auto prefix = L"image-reads/reads-" + collection + L"-" + id;
         for (const auto& suffix : {L".knreads", L".knslice"})
         {
             const auto schema = std::wstring(suffix) == L".knreads" ? L"kn.image_reads.v3" : L"kn.image_slice.v2";
@@ -58,34 +59,36 @@ namespace
         }
         return t;
     }
-    EvidenceJournalTransaction Sweep(const fs::path& root)
+    EvidenceJournalTransaction Sweep(const fs::path& root, const std::wstring& collection = L"7")
     {
         EvidenceJournalTransaction t;
         t.Kind = L"image_sweep"; t.Id = L"1";
         const std::wstring json = L"{\"schema\":\"kn.image_sweep.v1\",\"fixture\":\"membership_only_not_replay\"}";
         fs::create_directories(root / L"image-sweeps");
-        Check(SaveObservationJson((root / L"image-sweeps/sweep-7-1.knsweep").wstring(), json, nullptr), "publish-owned-sweep-root");
-        t.Members.push_back(EvidenceJournalJsonMember(L"image-sweeps/sweep-7-1.knsweep", json));
-        t.Requires = {BlobMember().Path, L"image-reads/reads-7-1.knreads", L"image-reads/reads-7-1.knslice"};
+        const auto path = L"image-sweeps/sweep-" + collection + L"-1.knsweep";
+        Check(SaveObservationJson((root / path).wstring(), json, nullptr), "publish-owned-sweep-root");
+        t.Members.push_back(EvidenceJournalJsonMember(path, json));
+        t.Requires = {BlobMember().Path, L"image-reads/reads-" + collection + L"-1.knreads", L"image-reads/reads-" + collection + L"-1.knslice"};
         return t;
     }
-    EvidenceJournalTransaction Closure(const fs::path& root)
+    EvidenceJournalTransaction Closure(const fs::path& root, const std::wstring& collection = L"7")
     {
         EvidenceJournalTransaction t;
         t.Kind = L"closure"; t.Id = L"0";
         const std::wstring json = L"{\"schema\":\"kn.image_read_session.v1\",\"queued\":1,\"written\":1}";
         fs::create_directories(root / L"image-reads");
-        Check(SaveObservationJson((root / L"image-reads/session-7.knreadledger").wstring(), json, nullptr), "publish-owned-closure-ledger");
-        t.Members.push_back(EvidenceJournalJsonMember(L"image-reads/session-7.knreadledger", json));
+        const auto path = L"image-reads/session-" + collection + L".knreadledger";
+        Check(SaveObservationJson((root / path).wstring(), json, nullptr), "publish-owned-closure-ledger");
+        t.Members.push_back(EvidenceJournalJsonMember(path, json));
         return t;
     }
-    int Produce(const fs::path& root, const std::wstring& stage)
+    int Produce(const fs::path& root, const std::wstring& stage, const std::wstring& collection = L"7", bool repeat = false)
     {
         EvidenceJournal journal;
         std::wstring error;
-        if (!journal.Open(root.wstring(), L"7", &error)) { return 1; }
+        if (!journal.Open(root.wstring(), collection, &error)) { return 1; }
         Stage(stage, L"session");
-        auto batch = Batch(root, L"1", stage);
+        auto batch = Batch(root, L"1", stage, collection);
         if (stage == L"journal_before_index")
         {
             Check(Write(root / L"collections/7/indexes", {0x78}), "owned-index-blocker");
@@ -94,11 +97,12 @@ namespace
         Check(commit.Committed && (stage == L"journal_before_index" ? !commit.Indexed : commit.Indexed), "commit-original-files-before-index");
         Stage(stage, L"journal_before_index");
         Stage(stage, L"index");
-        auto sweep = Sweep(root);
+        if (repeat) { Check(journal.Commit(Batch(root, L"2", L"", collection)).Committed, "repeat-reference-within-collection"); }
+        auto sweep = Sweep(root, collection);
         Stage(stage, L"sweep_file");
         Check(journal.Commit(sweep).Committed, "commit-dependent-sweep");
         Stage(stage, L"sweep_commit");
-        auto closure = Closure(root);
+        auto closure = Closure(root, collection);
         Stage(stage, L"ledger_file");
         Check(journal.Commit(closure).Committed && journal.State().Closed, "commit-closure");
         Stage(stage, L"closure");
@@ -117,6 +121,7 @@ namespace
         {
             EvidenceJournal journal;
             Check(journal.Open(root.wstring(), L"7", &error), "create-session");
+            Check(InspectEvidenceStore(root.wstring()).Issue == L"store_busy", "store-inspection-excludes-live-journal");
             Check(RecoverEvidenceJournal((root / L"collections/7").wstring()).Issue == L"collection_busy_or_lock_unavailable",
                 "recovery-does-not-mislabel-active-writer-as-final");
             EvidenceJournal competitor;
@@ -174,6 +179,30 @@ namespace
         final = RecoverEvidenceJournal((root / L"collections/7").wstring());
         Check(final.UniquePaths == 7 && final.CommittedSegments == 4, "orphan-file-never-becomes-collection-member");
         std::wcout << EvidenceJournalRecoveryJson(final) << '\n';
+        {
+            EvidenceStoreLease barrier, failed;
+            Check(barrier.Acquire(root.wstring(), true, &error), "exclusive-store-barrier-after-journal-release");
+            Check(!failed.Acquire(root.wstring(), false, &error) && error == L"store_busy", "publisher-excluded-before-files");
+            Check(!barrier.Acquire(root.wstring(), true, &error) && error == L"store_lease_already_owned" &&
+                InspectEvidenceStore(root.wstring()).Issue == L"store_busy", "failed-reacquire-keeps-original-lease");
+        }
+        EvidenceStoreLease invalid;
+        Check(!invalid.Acquire(root.wstring() + std::wstring(L"\0tail", 5), false, &error) && error == L"invalid_store_root",
+            "store-rejects-null-root");
+        Check(InspectEvidenceStore(root.wstring()).Status == L"partial", "invalid-orphan-keeps-store-partial");
+        {
+            EvidenceStoreInventory bounded;
+            EvidenceStoreArtifact artifact;
+            artifact.Artifact = BlobMember(); artifact.Verified = true;
+            artifact.Retention = L"committed_reference_protected";
+            artifact.Collections = {L"12345678901234567890"};
+            bounded.Artifacts.assign(65536, artifact);
+            const auto json = EvidenceStoreInventoryJson(bounded, true);
+            std::wstring omitted;
+            Check(json.size() < 16 * 1024 * 1024 + 4096 && mcpjson::ValidateDocument(json) &&
+                mcpjson::GetString(json, L"artifact_rows_omitted", &omitted) && std::stoull(omitted) > 0,
+                "bounded-detail-output-reports-omitted-artifacts");
+        }
     }
 }
 
@@ -181,6 +210,21 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        if (argc == 3 && std::wstring(argv[1]) == L"--store")
+        {
+            const auto result = InspectEvidenceStore(argv[2]);
+            std::wcout << EvidenceStoreInventoryJson(result, true) << '\n';
+            return result.Status == L"verified" ? 0 : 1;
+        }
+        if (argc == 4 && std::wstring(argv[1]) == L"--store-hold")
+        {
+            EvidenceStoreLease lease;
+            std::wstring error;
+            if (!lease.Acquire(argv[2], std::wstring(argv[3]) == L"exclusive", &error, true)) { return 1; }
+            Stage(L"store_held", L"store_held");
+            return 0;
+        }
+        if (argc == 4 && std::wstring(argv[1]) == L"--produce-collection") { return Produce(argv[2], L"", argv[3], true); }
         if (argc >= 3 && std::wstring(argv[1]) == L"--recover")
         {
             const auto r = RecoverEvidenceJournal(argv[2], argc == 4 && std::wstring(argv[3]) == L"--index");

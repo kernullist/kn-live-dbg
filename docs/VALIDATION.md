@@ -7,6 +7,65 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Coordinated image-store inventory checkpoint: 2026-11-07
+
+This P06 step adds `!kmon store` for exact membership and dedup accounting across
+the stopped image-collection namespace. Participating publishers hold a shared
+store lease before any original-file publication; inventory holds the exclusive
+lease while verifying every captured root and original member. Open or unresolved
+roots protect unattributed files. Committed originals/references and session
+failure ledgers remain protected, including a ledger whose journal was never
+created. This is a retention classification receipt with no deletion authority.
+
+Final Release EXE SHA-256:
+`719ebbb424a758212218d4333c088fc930efb5e1a72308e4247cea20353017d0`.
+ASan journal/store harness SHA-256:
+`58e82ae379b022c84e9d811a685900105d24a2de28f94cce867abf609449b61a`.
+Toolchain: VS 2022 Build Tools 17.14.60 / MSVC 14.44.35207, SDK/WDK
+10.0.26100.0. Release builds passed with the existing C4744 `NextQueryEpoch`
+alignment warning; the broader rebuild also reproduced the existing C4244 fill
+conversion warning in unchanged `KernelMonitor.cpp`.
+
+`tools/validate-evidence-journal.ps1 -Sanitize` passed **42 C++ controls**,
+**1,952 journal checks** and **476 independent store checks**. The final EXE
+passed **492 store CLI checks**, including summary/detail omission and five
+invalid grammars. Store controls independently recompute physical hashes,
+hash-linked membership, root/artifact receipt hashes, reference multiplicity,
+per-collection paths, global named-file bytes, unique content and actual read
+bytes. Repeated references within and across collections share one pinned
+physical read; equal content at distinct paths remains separately verified.
+The final EXE also passed the **1,952-check journal CLI oracle**, including ten
+observed-stage interruptions and zero remaining owned children.
+
+Controls cover unknown tails, corrupt shared references, malformed roots,
+uncommitted failure ledgers, pending/unmanaged files, lock collisions, NUL input,
+root/namespace/collection junctions, case-only filenames, long paths, catalog
+limits and bounded detail output. Shared/exclusive publisher tests observe each
+child's held-lease signal before making competing calls, then terminate/reap the
+owned child and verify lock release. Reports are revalidated after original-byte
+changes; a previous report never grants deletion permission. Fixture creation
+initially hit Python's Windows path limit; extended syntax was applied only to
+fixture creation, with the original unprefixed long path still sent to the product.
+
+The final EXE's isolated `--self-test all` passed: timeline **28**, MCP **102**,
+KMON image **75**, console **558**, commands **3,000 / 261 routes**, remote **66**.
+KMON controls exercise denial before read/sweep/ledger publication, explicit
+failure counts, release on closure and subsequent exact inventory. Review found
+and fixed loss of the existing directory-failure reason and clearing of the
+manifest budget reason during successful admission. The original failure label
+is preserved; the store admission issue is an additional field. Compiled
+capability checks passed **28 contracts / 261 routes**, and the public-content
+classifier passed **11 tests**. Store availability remains `not_probed`.
+
+All observations use owned storage fixtures and synthetic, nonexecuting image
+inputs. No driver was loaded, service started, Verifier enabled, reboot performed
+or security policy changed. The [inventory bounds and coordination](ARCHITECTURE.md#image-store-membership-inventory)
+exclude legacy stores, nonparticipating publishers, disk allocation, authenticated
+provenance, image-policy replay and power-loss durability. GC with deletion
+receipts, retention priorities/privacy, large-store continuation and the broader
+P01-P16 / VS1-VS4 gates remain open. The earlier concurrent-load process-capture
+deadline failure remains unresolved; this isolated pass does not close that gate.
+
 ## Image collection journal and recovery checkpoint: 2026-11-07
 
 This bounded P06 step adds a collection journal to the original KMON image

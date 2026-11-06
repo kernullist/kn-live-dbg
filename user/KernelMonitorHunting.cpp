@@ -127,6 +127,7 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"journal_sweeps_failed\":" + std::to_wstring(ImageJournalSweepsFailed.load()) +
         L",\"journal_index_failed\":" + std::to_wstring(ImageJournalIndexFailed.load()) +
         L",\"journal_close_failed\":" + std::to_wstring(ImageJournalCloseFailed.load()) +
+        L",\"store_admission_failed\":" + std::to_wstring(ImageStoreAdmissionFailed.load()) +
         L",\"journal_closed\":" + (ImageJournalClosed.load() ? L"true" : L"false") +
         L",\"verification_recipe_preserved\":false}}";
     if (cases != nullptr)

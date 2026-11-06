@@ -53,6 +53,17 @@ failure, and 2 means invalid grammar. Pass a returned sweep path relative to the
 artifact root to `replay-image` or `graph` for separate policy verification.
 See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
 
+`KnLiveDbg.exe --offline !kmon store <artifact-root> [/artifacts] [/json]`
+audits stopped image collections together and returns private
+`kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
+exact member/path/content byte denominators and protected retention classes.
+`/artifacts` includes bounded per-path ownership detail with explicit omission
+counts. Active participating publishers make the audit unavailable; an exclusive
+audit also denies new publication attempts until it releases its lease. Use it
+after collection stops. Exit 0 means complete verified membership and artifact
+inventory, 1 means partial/unavailable, and 2 means invalid grammar. The returned
+report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
+
 `KnLiveDbg.exe --offline !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
 returns a private `kn.evidence_graph.v1` fact graph for a retained `.kncase` bundle.
 The default root is its evidence node, depth is 2, record limit is 64 and

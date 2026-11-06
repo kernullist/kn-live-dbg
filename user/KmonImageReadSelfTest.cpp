@@ -279,6 +279,17 @@ bool KmonImageReadIntegrationSelfTest()
             check(denied.ImageSweepManifestsWritten.load() == 0 && denied.ImageSweepManifestsFailed.load() == 1 &&
                 (mode == 0 ? !std::filesystem::exists(manifestFile) : ContentHash::File(manifestFile.wstring()) == ContentHash::Bytes({0x7B, 0x7D})),
                 "manifest-publication-budget-or-collision-is-explicit-and-nondestructive");
+            if (mode == 0)
+            {
+                bool budgetReported = false;
+                for (const auto& event : denied.PipelineEvents.Drain(8))
+                {
+                    const auto failure = event.Evidence.find(L"failure");
+                    budgetReported |= event.Kind == L"coverage.image_sweep_manifest" && failure != event.Evidence.end() &&
+                        failure->second == L"invalid_manifest_or_session_byte_budget";
+                }
+                check(budgetReported, "successful-store-admission-preserves-manifest-budget-reason");
+            }
         }
         check(!Raw(Raw(persisted, L"payload"), L"slice_inputs").empty(), "raw-archive-retains-slice-inputs-separately-from-recipe");
         const auto payloadBytes = mcpjson::WideToUtf8(Raw(persisted, L"payload"));
@@ -454,6 +465,33 @@ bool KmonImageReadIntegrationSelfTest()
                 blockedJournal.ImageJournalCloseFailed.load() == 1 && blockedJournal.ImageJournal == nullptr,
                 "original-file-publication-is-distinct-from-failed-collection-commit-and-closure");
         }
+        {
+            const auto folder = root / L"store-busy";
+            std::wstring issue;
+            {
+                EvidenceStoreLease audit;
+                check(audit.Acquire(folder.wstring(), true, &issue, true), "owned-exclusive-store-barrier");
+                KernelMonitor blocked;
+                blocked.Options.LogDirectory = folder.wstring();
+                blocked.QueueImageReadSet(set, identity, L"synthetic", Base);
+                blocked.WriterStopping.store(true); blocked.CaptureWriterLoop();
+                check(blocked.ImageReadsWritten.load() == 0 && blocked.ImageReadsFailed.load() == 1 &&
+                    blocked.ImageReadsLedgerFailed.load() == 1 && blocked.ImageStoreAdmissionFailed.load() == 2 &&
+                    blocked.ImageStoreLease == nullptr && !std::filesystem::exists(folder / L"image-reads"),
+                    "store-barrier-denial-counted-without-original-file-publication");
+                blocked.PersistImageSweepManifest(sweepManifest);
+                check(blocked.ImageStoreAdmissionFailed.load() == 3 && blocked.ImageSweepManifestsFailed.load() == 1 &&
+                    !std::filesystem::exists(folder / L"image-sweeps"), "store-barrier-also-precedes-sweep-publication");
+            }
+            KernelMonitor resumed;
+            resumed.Options.LogDirectory = folder.wstring();
+            resumed.QueueImageReadSet(set, identity, L"synthetic", Base);
+            resumed.WriterStopping.store(true); resumed.CaptureWriterLoop();
+            const auto inventory = InspectEvidenceStore(folder.wstring());
+            check(inventory.Status == L"verified" && inventory.ClosedCollections == 1 && inventory.UnattributedFiles == 0 &&
+                resumed.ImageStoreAdmissionFailed.load() == 0 && resumed.ImageStoreLease == nullptr,
+                "actual-writer-closes-and-releases-store-for-exact-inventory");
+        }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
             KernelMonitor blocked;
@@ -564,8 +602,10 @@ bool KmonImageReadIntegrationSelfTest()
                 for (const auto& event : rejected.PipelineEvents.Drain(8))
                 {
                     const auto reason = event.Evidence.find(L"failure");
+                    const auto admission = event.Evidence.find(L"store_admission_failure");
                     reported |= event.Kind == L"coverage.image_reads" && reason != event.Evidence.end() &&
-                        reason->second == L"read_set_directory_unavailable";
+                        reason->second == L"read_set_directory_unavailable" && admission != event.Evidence.end() &&
+                        (admission->second == L"store_directory_creation_failed" || admission->second == L"store_directory_missing_or_reparse");
                 }
                 check(reported, "directory-failure-is-not-reported-as-byte-budget");
             }

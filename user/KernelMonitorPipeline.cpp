@@ -153,6 +153,7 @@ void KernelMonitor::ResetPipeline()
     ImageReadsBytes.store(0);
     ImageReadsLedgerFailed.store(0);
     ImageJournal.reset();
+    ImageStoreLease.reset(); ImageStoreAdmissionFailed.store(0);
     ImageJournalReadsCommitted.store(0); ImageJournalReadsFailed.store(0);
     ImageJournalSweepsCommitted.store(0); ImageJournalSweepsFailed.store(0);
     ImageJournalIndexFailed.store(0); ImageJournalCloseFailed.store(0); ImageJournalClosed.store(false);
@@ -985,16 +986,20 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
         const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-reads";
         std::error_code ec;
-        std::filesystem::create_directories(folder, ec);
+        std::wstring storeFailure;
+        const bool admitted = EnsureImageStoreLease(&storeFailure);
+        if (admitted) { std::filesystem::create_directories(folder, ec); }
         const auto path = folder / (L"reads-" + reads.CollectionId + L"-" + std::to_wstring(reads.Id) + L".knreads");
         auto slicePath = path;
         slicePath.replace_extension(L".knslice");
         const auto bytes = mcpjson::WideToUtf8(reads.Json).size();
-        std::wstring failure = ec ? L"read_set_directory_unavailable" : L"invalid_read_set_or_session_byte_budget";
+        std::wstring failure = !admitted ? storeFailure : ec ? L"read_set_directory_unavailable" : L"invalid_read_set_or_session_byte_budget";
+        if (storeFailure == L"store_directory_creation_failed" || storeFailure == L"store_directory_missing_or_reparse")
+            { failure = L"read_set_directory_unavailable"; }
         std::wstring referencePersistence = L"not_attempted", referenceFailure;
         std::wstring sliceFailure = L"reference_or_read_set_not_ready";
         std::unique_ptr<ReferenceArtifact> referenceLease;
-        if (!ec && !reads.Json.empty() && bytes <= EvidenceBundleMaxJsonBytes && bytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
+        if (admitted && !ec && !reads.Json.empty() && bytes <= EvidenceBundleMaxJsonBytes && bytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
         {
             if (reads.HasReference)
             {
@@ -1057,6 +1062,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         event.Evidence[L"read_set_path"] = written ? path.wstring() : L"";
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
+        event.Evidence[L"store_admission_failure"] = admitted ? L"" : storeFailure;
         event.Evidence[L"verification_recipe_preserved"] = sliceWritten ? L"true" : L"false";
         event.Evidence[L"slice_recipe_path"] = sliceWritten ? slicePath.wstring() : L"";
         event.Evidence[L"slice_recipe_failure"] = sliceWritten ? L"" : (reads.SliceJson.empty() ? L"original_inputs_not_recipe_eligible" : sliceFailure);
@@ -1078,12 +1084,32 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
     RecordImageSweepPublication(reads, written, sliceWritten, referenceWritten, rawHash, recipeHash);
 }
 
+bool KernelMonitor::EnsureImageStoreLease(std::wstring* error) noexcept
+{
+    if (ImageStoreLease != nullptr) { return true; }
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        auto lease = std::make_unique<EvidenceStoreLease>();
+        if (lease->Acquire(directory.empty() ? L"." : directory, false, error, true))
+        {
+            ImageStoreLease = std::move(lease);
+            return true;
+        }
+    }
+    catch (...) { if (error) { *error = L"store_admission_exception"; } }
+    ImageStoreAdmissionFailed.fetch_add(1);
+    return false;
+}
+
 EvidenceJournalCommit KernelMonitor::JournalImageFiles(EvidenceJournalTransaction transaction) noexcept
 {
     EvidenceJournalCommit result;
     try
     {
         if (transaction.Members.empty()) { result.Issue = L"no_published_members"; return result; }
+        if (!EnsureImageStoreLease(&result.Issue)) { return result; }
         if (ImageJournal == nullptr)
         {
             std::wstring directory;
@@ -1114,9 +1140,12 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
         const auto bytes = mcpjson::WideToUtf8(json).size();
         std::wstring failure = L"invalid_manifest_or_session_byte_budget";
         std::error_code ec;
-        std::filesystem::create_directories(folder, ec);
+        std::wstring storeFailure;
+        const bool admitted = EnsureImageStoreLease(&storeFailure);
+        if (!admitted) { failure = storeFailure; }
+        if (admitted) { std::filesystem::create_directories(folder, ec); }
         const auto used = ImageSweepManifestBytes.load();
-        if (!ec && !json.empty() && used <= 128ull * 1024 * 1024 && bytes <= 128ull * 1024 * 1024 - used)
+        if (admitted && !ec && !json.empty() && used <= 128ull * 1024 * 1024 && bytes <= 128ull * 1024 * 1024 - used)
         {
             written = SaveObservationJson(path.wstring(), json, &failure);
             if (written)
@@ -1140,6 +1169,7 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
         }
         KmonEvent event;
         event.Kind = L"coverage.image_sweep_manifest";
+        event.Evidence[L"store_admission_failure"] = admitted ? L"" : storeFailure;
         event.ProcessId = manifest.Sweep.Identity.ProcessId;
         event.Observation.Identity = manifest.Sweep.Identity;
         event.Summary = commit.Committed ? L"temporal image sweep journal committed" :
@@ -1198,7 +1228,8 @@ void KernelMonitor::CloseImageReadCollection() noexcept
         { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
         const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-reads";
         std::error_code ec;
-        std::filesystem::create_directories(folder, ec);
+        const bool admitted = EnsureImageStoreLease(nullptr);
+        if (admitted) { std::filesystem::create_directories(folder, ec); }
         const auto id = std::to_wstring(EvidenceCollectionEpoch.load());
         const auto json = L"{\"schema\":\"kn.image_read_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
             L",\"queued\":" + std::to_wstring(ImageReadsQueued.load()) + L",\"written\":" + std::to_wstring(ImageReadsWritten.load()) +
@@ -1228,9 +1259,10 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             L",\"journal_read_batches_failed\":" + std::to_wstring(ImageJournalReadsFailed.load()) +
             L",\"journal_sweeps_committed\":" + std::to_wstring(ImageJournalSweepsCommitted.load()) +
             L",\"journal_sweeps_failed\":" + std::to_wstring(ImageJournalSweepsFailed.load()) +
-            L",\"journal_index_failures_before_closure\":" + std::to_wstring(ImageJournalIndexFailed.load()) + L"}";
+            L",\"journal_index_failures_before_closure\":" + std::to_wstring(ImageJournalIndexFailed.load()) +
+            L",\"store_admission_failures\":" + std::to_wstring(ImageStoreAdmissionFailed.load()) + L"}";
         const auto name = L"session-" + id + L".knreadledger";
-        if (!ec && SaveObservationJson((folder / name).wstring(), json, nullptr))
+        if (admitted && !ec && SaveObservationJson((folder / name).wstring(), json, nullptr))
         {
             EvidenceJournalTransaction closure;
             closure.Kind = L"closure"; closure.Id = L"0";
@@ -1239,6 +1271,7 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             ImageJournalClosed.store(commit.Committed);
             if (!commit.Committed) { ImageJournalCloseFailed.fetch_add(1); }
             ImageJournal.reset();
+            ImageStoreLease.reset();
             return;
         }
     }
@@ -1246,6 +1279,7 @@ void KernelMonitor::CloseImageReadCollection() noexcept
     ImageReadsLedgerFailed.fetch_add(1);
     ImageJournalCloseFailed.fetch_add(1);
     ImageJournal.reset();
+    ImageStoreLease.reset();
 }
 
 void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
@@ -1570,6 +1604,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_journal_index_failed"] = std::to_wstring(ImageJournalIndexFailed.load());
         event.Evidence[L"image_journal_close_failed"] = std::to_wstring(ImageJournalCloseFailed.load());
         event.Evidence[L"image_journal_closed"] = ImageJournalClosed.load() ? L"true" : L"false";
+        event.Evidence[L"image_store_admission_failed"] = std::to_wstring(ImageStoreAdmissionFailed.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
         event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());

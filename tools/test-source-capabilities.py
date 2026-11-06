@@ -58,6 +58,9 @@ def main():
     journal = by_key[("evidence", "journal", "local_files")]
     assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
     assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
+    store = by_key[("evidence", "store", "local_files")]
+    assert store["availability"] == "not_probed" and store["consistency"] == "coordinated_stopped_store"
+    assert "participating_publishers" in store["requirements"] and "no_deletion_authority_or_disk_allocation" in store["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]

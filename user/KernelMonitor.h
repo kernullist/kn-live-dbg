@@ -9,6 +9,7 @@
 #include "ExecutableImageVerifier.h"
 #include "ImageSweepManifest.h"
 #include "EvidenceJournal.h"
+#include "EvidenceStore.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
@@ -637,6 +638,9 @@ private:
     void CloseImageReadCollection() noexcept;
     EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction) noexcept;
     std::unique_ptr<EvidenceJournal> ImageJournal; // Capture writer only; owns publication leases.
+    std::unique_ptr<EvidenceStoreLease> ImageStoreLease; // Held before the first original file until closure.
+    bool EnsureImageStoreLease(std::wstring* error) noexcept;
+    std::atomic<uint64_t> ImageStoreAdmissionFailed{0};
     std::atomic<uint64_t> ImageJournalReadsCommitted{0}, ImageJournalReadsFailed{0};
     std::atomic<uint64_t> ImageJournalSweepsCommitted{0}, ImageJournalSweepsFailed{0};
     std::atomic<uint64_t> ImageJournalIndexFailed{0}, ImageJournalCloseFailed{0};

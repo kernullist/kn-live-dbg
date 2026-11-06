@@ -39,6 +39,8 @@ struct EvidenceJournalCommit
     uint64_t Sequence = 0;
 };
 
+struct EvidenceStoreInventory;
+
 // One writer owns the collection lock and immutable-file leases. Recovery uses
 // the same lock: no live snapshot can be mistaken for a final committed prefix.
 // The caller owns raw-file publication; the journal never deletes or replaces it.
@@ -54,6 +56,7 @@ public:
     const EvidenceJournalRecovery& State() const;
 private:
     friend EvidenceJournalRecovery RecoverEvidenceJournal(const std::wstring&, bool);
+    friend EvidenceStoreInventory InspectEvidenceStore(const std::wstring&);
     struct Impl;
     std::unique_ptr<Impl> Data;
 };

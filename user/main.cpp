@@ -23063,6 +23063,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
+    std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23619,6 +23620,25 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         }
         std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
+    }
+    if (action == L"store")
+    {
+        bool artifacts = false, valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty();
+        std::set<std::wstring> seen;
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            valid = seen.insert(option).second && (option == L"/json" || option == L"/artifacts");
+            if (option == L"/artifacts") { artifacts = true; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon store <artifact-root> [/artifacts] [/json]\n";
+            return 2;
+        }
+        const auto result = InspectEvidenceStore(args[2]);
+        std::wcout << EvidenceStoreInventoryJson(result, artifacts) << L"\n";
+        return result.Status == L"verified" ? 0 : 1;
     }
     if (action == L"journal")
     {
@@ -24578,7 +24598,7 @@ static void HandleKmonCommand(
         }
 
         if (action == L"dump-read" || action == L"verify-image" || action == L"replay-image" ||
-            action == L"inventory" || action == L"journal" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
+            action == L"inventory" || action == L"journal" || action == L"store" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;

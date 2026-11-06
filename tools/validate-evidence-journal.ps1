@@ -25,4 +25,6 @@ $fixtures = Join-Path $output ('run-' + [Guid]::NewGuid().ToString('N'))
 if ($LASTEXITCODE -ne 0) { throw "Evidence journal controls failed: $LASTEXITCODE; fixtures=$fixtures" }
 & python (Join-Path $PSScriptRoot 'test-evidence-journal.py') --exe $exe --fixtures $fixtures
 if ($LASTEXITCODE -ne 0) { throw "Evidence journal independent validation failed: $LASTEXITCODE; fixtures=$fixtures" }
+& python (Join-Path $PSScriptRoot 'test-evidence-store.py') --exe $exe --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw "Evidence store independent validation failed: $LASTEXITCODE" }
 Write-Output "[journal.validation] fixtures=$fixtures"
