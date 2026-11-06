@@ -45,6 +45,9 @@ inline std::wstring ObservationReadSetJson(const ObservationReadSet& set)
             L",\"deadline_exceeded\":" + b(read.DeadlineExceeded) + L",\"admission_reason\":" + mcpjson::Quote(read.AdmissionReason) +
             L",\"requested_source_id\":" + mcpjson::Quote(read.Request.SourceId) +
             L",\"source_id_at_admission\":" + mcpjson::Quote(read.Source.SourceId) +
+            L",\"source_contract\":{\"consistency\":" + mcpjson::Quote(read.Source.Consistency) +
+            L",\"maximum_read_bytes\":" + n(read.Source.MaximumReadBytes) + L",\"kernel_only\":" + b(read.Source.KernelOnly) +
+            L",\"user_only\":" + b(read.Source.UserOnly) + L",\"may_change_residency\":" + b(read.Source.MayChangeResidency) + L"}" +
             L",\"address\":" + n(read.Request.Address) + L",\"requested_bytes\":" + n(read.Request.Length) +
             L",\"per_read_byte_budget\":" + n(read.Request.ByteBudget) +
             L",\"residency_consent\":" + b(read.Request.AllowResidencyChanges) +

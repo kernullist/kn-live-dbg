@@ -791,6 +791,27 @@ separate coverage; excluded bytes cannot produce a fully verified result.
 Every retained byte span must belong to the declared address width, source and
 consistency model, including bytes inside a partially available read.
 
+`--verify-process-image` adds a handle-based live transaction in
+`kn.image_recipe.v2`. It uses a duplicated handle bound to the requested PID and
+creation FILETIME, explicit residency consent and one shared operation budget.
+The actual qualifier, comparator and confirmation reads produce the saved
+`kn.read_set.v1`; there is no post-verdict acquisition for the recipe. Receipts
+retain the full source contract, request, consent, original status and reported
+copy count, any native transport metadata, and operation/read identifiers.
+The recipe reader verifies counters, ordering, source consistency and parser
+projection before replay. Pending, abandoned, missing, overrun, cross-source or
+fallback receipts cannot become an executable recipe under this single-source
+format. A recorded failed or denied read remains a failed or denied parser input.
+
+The live CLI requests only process read/query access and returns before driver,
+service, symbol or monitor initialization. It uses the Win32 user-address ceiling
+with an explicitly assumed legacy LA48 shape; it does not infer CR4.LA57. The
+default acquisition budget is five seconds, 64 source calls/receipts and 128 KiB
+requested bytes; synchronous reads cannot be preempted. Reference opening,
+hashing and parsing precede that acquisition budget. Both v1 and v2 retain the
+same direct comparison policy and support post-exit replay. V1 remains readable;
+its writer refuses new metadata that it cannot represent rather than dropping it.
+
 Default `replay-image` uses the recorded policy only when this binary implements
 that version. It verifies the artifact hash, recomputes normalization, consumes
 the exact original sequence of read requests/results, reruns the verifier and
@@ -814,7 +835,7 @@ sweep's independently qualified secondary image view is not silently reproduced
 by this recipe version. Limits are 64 MiB reference, 64 ordered reads and 128 KiB
 requested read bytes, with a 2 MiB recipe. File reads check a cooperative 30-second
 budget; synchronous I/O and PE parsing have no hard cancellation deadline.
-Native monitor publication, secondary-view recipes, signed reference distribution
+Background KMON/native-fallback publication, secondary-view recipes, signed reference distribution
 and isolated parsing remain open. Existing `.kncase` replay still reports
 `image_verification_replayed=false`; it does not implicitly discover these cases.
 

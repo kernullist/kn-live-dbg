@@ -7,6 +7,61 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Handle-based live image transaction checkpoint: 2026-11-07
+
+This P03 substep adds `--verify-process-image` and `kn.image_recipe.v2`.
+The selected comparison records its original handle-source reads through one
+shared operation, including qualification and confirmation, and retains the
+exact reference artifact and normalization. V1 remains readable and the dump
+capture command retains its v1 output. Background KMON/native fallback, secondary
+image views, real loaded-module lifetime, durable journal integration and full
+VS1 completion remain open. The P01–P16 design goal is not complete.
+
+Release x64 EXE SHA-256:
+`f4b301822fb886627e36b070a75924f2c3a9b3fc5aaa94dc80191988acd31ff7`.
+ASan image-recipe harness SHA-256:
+`cf006436464e7afbd6ccfadf0fcd51635cfce0485e6cb5ae10c71c5165e046fe`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+Existing C4744 warnings on `KmonHuntIndex::NextQueryEpoch` remain.
+
+`validate-image-recipe.ps1 -Sanitize` passed 92 combined v1/v2 controls, including
+original raw metadata, explicit consent, policy/budget denials, receipt gaps,
+operation/source mismatch, projection tampering and unchanged replay policy.
+Six interrupted publications per format each produced three valid final recipes
+and three absent finals; fresh-process replay verified the valid finals.
+`test-live-image-recipe.py` passed 168 checks through the actual EXE. Three owned
+children held normal, changed and inaccessible PE-buffer ranges. Readiness and
+exit were observed through IPC and process completion. After each child exited,
+the original reference was replaced and removed; original-policy replay still
+matched the actual comparison. Independently rehashed contradictory receipts
+were rejected. Output collision preserved existing cases, and failed stdout
+delivery returned an error while leaving the published case replayable.
+All three children exited; none remained. Their buffers were private RW memory,
+not OS-loaded or executed images. The legacy offline image CLI passed 101 checks.
+
+The process-source ASan harness passed 25 controls/six JSON observations;
+the recorder passed 48 controls and 13 operations/14 JSON snapshots. Translation
+receipt ASan passed 65 controls/13 JSON observations, and the actual dump CLI
+passed 227 checks with one symlink-privilege skip. Runtime policy passed 28
+controls, and the actual runtime probe, 25 compiled contracts/261 routes,
+generated support matrix and 11 publication-scanner regressions passed.
+Linked self-tests passed: timeline 28, MCP 102, console 558, commands 3,000 and
+remote 66.
+
+Review prevents v1 from silently discarding new metadata and confines runtime
+availability to the operation actually probed: a successful owned byte sample
+does not advertise image-capture availability. V2 validates the entire receipt
+projection, source contract, consent and accounting before it becomes replay
+input. Final review found no additional actionable defects in this scope.
+Reported copy counts and Win32 errors follow
+[ReadProcessMemory](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-readprocessmemory);
+handle qualification uses the requested creation time from
+[GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes).
+These checks do not prove atomicity, mapping lifetime, LA57, native acquisition,
+collector authenticity, execution or maliciousness. No driver was loaded,
+service started, Verifier enabled, reboot requested or security policy changed
+for this substep.
+
 ## Typed dump translation checkpoint: 2026-11-07
 
 This P02 substep adds a physical address domain, a typed page-table walker and

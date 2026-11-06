@@ -69,6 +69,8 @@ int main()
     const auto read = source.Read(request);
     Check(read.State == ObservationReadState::Complete && read.IdentityRevalidated && read.NativeStatus == ERROR_SUCCESS &&
         read.Spans.size() == 1 && read.Spans[0].Bytes == std::vector<uint8_t>(64, 0x5a), "read-after-caller-closes-original");
+    Check(read.TransferredBytesKnown && read.TransferredBytes == 64 && read.BackendCopyAttemptKnown && read.BackendCopyAttempted &&
+        read.BackendContract == L"win32_read_process_memory" && !read.TransportAttempted, "original-win32-copy-count-without-invented-ioctl");
     Emit(source, request);
     std::vector<uint8_t> bytes;
     Check(ReadObservationRange(source, request.Address, 8192, &bytes, 8192, true) && bytes == std::vector<uint8_t>(8192, 0x5a),
@@ -109,6 +111,8 @@ int main()
     Check(!directRead && failed.State == ObservationReadState::Failed && failed.IdentityRevalidated &&
         failed.NativeStatusDomain == L"win32" && failed.NativeStatus == directError && failed.Spans[0].Bytes.empty(),
         "failed-read-keeps-native-status-without-bytes");
+    Check(failed.TransferredBytesKnown && failed.TransferredBytes == copied && failed.BackendCopyAttempted,
+        "failed-copy-preserves-original-count-without-parser-bytes");
     Emit(source, request);
     Check(!ReadObservationRange(source, userAddress, 8192, &bytes, 8192, true) && bytes.empty(), "later-hole-discards-earlier-chunk");
     Check(!ReadObservationExact(source, userAddress + 2048, 4096, &bytes, true) && bytes.empty(), "cross-hole-discards-partial-copy");

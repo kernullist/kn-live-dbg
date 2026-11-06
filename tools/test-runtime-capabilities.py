@@ -46,10 +46,13 @@ def main():
         assert stages["environment_regression"] == "not_performed"
         if capability["implementation"] == "unsupported":
             assert capability["availability"] == "unsupported"
-        elif capability["backend"] == "process_handle":
+        elif capability["backend"] == "process_handle" and capability["domain"] == "memory" and capability["operation"] == "read_virtual":
             assert capability["availability"] == "available"
             assert capability["availability_scope"] == "owned_control_range_only"
             assert stages["source_opened"] == stages["sample_read"] == "passed"
+        elif capability["backend"] == "process_handle":
+            assert capability["availability"] == capability["availability_scope"] == "not_probed"
+            assert stages["source_opened"] == stages["sample_read"] == "not_probed"
         elif capability["backend"] == "native":
             assert capability["availability"] == ("partial" if native_ready else "unavailable")
             assert stages["sample_read"] == "not_probed"

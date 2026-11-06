@@ -54,6 +54,7 @@ namespace
         bool SawDeadline = false;
         size_t ReadsAfterDeadline = 0;
         bool ChangeDomain = false;
+        bool NativeMetadata = false;
         size_t PageReads = 0;
         size_t HeaderReads = 0;
         Source()
@@ -71,6 +72,7 @@ namespace
             Caps.AddressDomain = ObservationAddressDomain::Physical;
             Caps.AddressSpace.PhysicalAddressBits = 52;
         }
+        void ResidencyConsentRequired() { Caps.MayChangeResidency = true; }
     protected:
         ObservationReadResult ReadSpans(const ObservationReadRequest& request) override
         {
@@ -79,6 +81,18 @@ namespace
             result.OperationDeadlineExceeded = DeadlineExceeded && (!DeadlineOnPageOnly || request.Address == Base + 0x1000);
             SawDeadline = SawDeadline || result.OperationDeadlineExceeded;
             result.IdentityRevalidated = true;
+            if (NativeMetadata)
+            {
+                result.NativeStatusDomain = L"ntstatus";
+                result.TransferredBytesKnown = true;
+                result.TransferredBytes = request.Length;
+                result.TransportAttempted = result.TransportSucceeded = true;
+                result.BackendCopyAttemptKnown = result.BackendCopyAttempted = true;
+                result.NativeReadKind = 2;
+                result.DriverAbi = 17;
+                result.SourceEpoch = 7;
+                result.BackendContract = L"synthetic_raw_status_control";
+            }
             ObservationReadSpan span;
             span.Address = request.Address;
             span.RequestedBytes = request.Length;
@@ -235,7 +249,7 @@ int wmain(int argc, wchar_t** argv)
         std::wstring error;
         return ReplayImageRecipe(argv[2], false, &error).Status == L"replayed" ? 0 : 1;
     }
-    if (argc == 3 && std::wstring(argv[1]) == L"--publish")
+    if (argc == 3 && (std::wstring(argv[1]) == L"--publish" || std::wstring(argv[1]) == L"--publish-observed"))
     {
         const std::filesystem::path root(argv[2]);
         Source source;
@@ -245,6 +259,16 @@ int wmain(int argc, wchar_t** argv)
         Write(image, bytes);
         ImageVerificationRecipe recipe;
         std::wstring error;
+        if (std::wstring(argv[1]) == L"--publish-observed")
+        {
+            ImageRecipeCaptureOptions options;
+            options.TargetId = L"owned-publication-fixture";
+            options.AddressSpaceId = L"owned-fixture-user-space";
+            options.AllowResidencyChanges = true;
+            source.ResidencyConsentRequired();
+            return CaptureObservedImageRecipe(image.wstring(), source, Source::Base, 0x1000, 4096,
+                (root / L"case").wstring(), options, &recipe, &error) ? 0 : 1;
+        }
         return CaptureImageRecipe(image.wstring(), source, Source::Base, 0x1000, 4096,
             (root / L"case").wstring(), &recipe, &error) ? 0 : 1;
     }
@@ -300,6 +324,74 @@ int wmain(int argc, wchar_t** argv)
     }
     Check(original.RecordedResult.find(L"owned_verified") != std::wstring::npos,
         "cross-page relocation is normalized using the retained raw image");
+    ImageRecipeCaptureOptions observedOptions;
+    observedOptions.TargetId = L"owned-fixture-process";
+    observedOptions.AddressSpaceId = L"owned-fixture-user-space";
+    observedOptions.AllowResidencyChanges = true;
+    Source observed;
+    Fixture(&observed);
+    observed.ResidencyConsentRequired();
+    observed.NativeMetadata = true;
+    ImageVerificationRecipe observedRecipe;
+    const auto observedCase = root / L"observed";
+    Check(CaptureObservedImageRecipe(image.wstring(), observed, Source::Base, 0x2000, 4096,
+        observedCase.wstring(), observedOptions, &observedRecipe, &error), "v2 original operation capture");
+    if (observedRecipe.Reads.empty()) { return 1; }
+    Check(observedRecipe.FormatVersion == 2 && observedRecipe.ReadSet.Reads.size() == observedRecipe.Reads.size() &&
+        observedRecipe.ReadSet.TotalAttempts == observedRecipe.Reads.size() && observedRecipe.Reads.front().Result.SideEffectsPossible &&
+        observedRecipe.ReadSet.Reads.front().Request.AllowResidencyChanges, "v2 records actual consent and every original attempt");
+    ImageVerificationRecipe observedParsed;
+    const auto observedJson = ImageRecipeJson(observedRecipe);
+    Check(ParseImageRecipe(observedJson, &observedParsed, &error) && ImageRecipeJson(observedParsed) == observedJson &&
+        observedParsed.Reads.front().Result.DriverAbi == 17 && observedParsed.Reads.front().Result.SourceEpoch == 7 &&
+        observedParsed.Reads.front().Result.TransportSucceeded && observedParsed.Reads.front().Result.TransferredBytesKnown,
+        "v2 round trip preserves raw transport and backend metadata");
+    Check(ReplayImageRecipe(observedCase.wstring(), false, &error).Status == L"replayed" &&
+        ReplayImageRecipe(observedCase.wstring(), true, &error).Status == L"reanalyzed", "v2 original replay and current reanalysis");
+    const auto invalidObserved = [&](const auto& mutate, const char* reason)
+    {
+        auto invalidRecipe = observedRecipe;
+        mutate(invalidRecipe);
+        Check(ImageRecipeJson(invalidRecipe).empty(), reason);
+    };
+    invalidObserved([](auto& p) { ++p.ReadSet.ChargedBytes; }, "v2 rejects inconsistent charged-byte accounting");
+    invalidObserved([](auto& p) { ++p.ReadSet.StoredSpans; }, "v2 rejects inconsistent span accounting");
+    invalidObserved([](auto& p) { ++p.ReadSet.TotalAttempts; }, "v2 rejects missing original receipt");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.front().Completed = false; }, "v2 rejects pending original reads");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.front().Abandoned = true; }, "v2 rejects abandoned original reads");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.front().Request.AllowResidencyChanges = false; }, "v2 cannot erase required residency consent");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.back().Source.MaximumReadBytes = 32; }, "v2 rejects a changed source contract");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.front().Request.FallbackFromReceipt = 1; }, "v2 single-source policy rejects undeclared fallback");
+    invalidObserved([](auto& p) { p.Reads.front().Result.NativeStatus = 1; }, "v2 parser projection cannot change original raw status");
+    invalidObserved([](auto& p) { p.ReadSet.Reads.front().Result.OperationId += L":other"; }, "v2 rejects a cross-operation read");
+    invalidObserved([](auto& p) { p.ReadSet.SnapshotTick = p.ReadSet.StartedTick + p.ReadSet.Budget.MaximumElapsedMs; },
+        "v2 does not publish a completed acquisition after its deadline");
+    invalidObserved([](auto& p) { p.FormatVersion = 1; }, "v2 metadata cannot be silently downgraded to v1");
+    auto deniedOptions = observedOptions;
+    deniedOptions.AllowResidencyChanges = false;
+    Source noConsent;
+    Fixture(&noConsent);
+    noConsent.ResidencyConsentRequired();
+    ImageVerificationRecipe noConsentRecipe;
+    const auto noConsentCase = root / L"observed-no-consent";
+    Check(CaptureObservedImageRecipe(image.wstring(), noConsent, Source::Base, 0x2000, 4096,
+        noConsentCase.wstring(), deniedOptions, &noConsentRecipe, &error) && noConsent.HeaderReads == 0 &&
+        noConsentRecipe.ReadSet.ChargedSourceCalls == 0 && noConsentRecipe.Reads.front().Result.State == ObservationReadState::PolicyDenied &&
+        ReplayImageRecipe(noConsentCase.wstring(), false, &error).Status == L"replayed", "v2 persists a policy denial without invoking the source");
+    auto zeroBudget = observedOptions;
+    zeroBudget.Budget.MaximumBytes = 0;
+    ImageVerificationRecipe budgetRecipe;
+    const auto callsBefore = observed.HeaderReads;
+    Check(CaptureObservedImageRecipe(image.wstring(), observed, Source::Base, 0x2000, 4096,
+        (root / L"observed-budget").wstring(), zeroBudget, &budgetRecipe, &error) && observed.HeaderReads == callsBefore &&
+        budgetRecipe.Reads.front().Result.State == ObservationReadState::BudgetDeferred,
+        "v2 shared budget rejects a parser call before acquisition and preserves denial");
+    auto oneReceipt = observedOptions;
+    oneReceipt.Budget.MaximumReceipts = 1;
+    Check(!CaptureObservedImageRecipe(image.wstring(), observed, Source::Base, 0x2000, 4096,
+        (root / L"observed-receipt-limit").wstring(), oneReceipt, &budgetRecipe, &error) &&
+        !std::filesystem::exists(root / L"observed-receipt-limit" / L"recipe.knverify"),
+        "unrecorded attempts prevent final recipe publication");
     auto overrunRecipe = original;
     overrunRecipe.Reads[0].Result.OperationDeadlineExceeded = true;
     Check(ImageRecipeJson(overrunRecipe).empty(), "v1 recipe refuses to silently discard deadline state");

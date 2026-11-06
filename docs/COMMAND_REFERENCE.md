@@ -76,8 +76,21 @@ are hexadecimal. Supply locally trusted reference files; parsing is not isolated
 The result's ownership and coverage determine the byte-comparison outcome;
 `status=recorded` means the case was published, including when reads are partial.
 
+`KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency`
+captures the same direct comparison from a live process into a v2 case. PID,
+creation FILETIME and length are decimal; base and RVA are hexadecimal. The
+supplied generation must match the opened handle, and the caller needs process
+read/query access. `--allow-residency` is required because reads can affect page
+residency. The command always emits `kn.image_capture.v2` JSON and opens no driver
+or symbols. It records the original ordered read receipts, consent and Win32
+status/copy counts. It supports one AMD64 direct-image range of 1..4,096 bytes,
+with a legacy LA48 assumption and the OS user ceiling recorded explicitly.
+It has no native fallback or background-monitor capture. Successful publication
+may still report an unverified or modified range. Exit 3 means stdout delivery
+failed; a case already published before that failure remains on disk.
+
 `KnLiveDbg.exe --offline !kmon replay-image <directory> /json` reruns the recorded
-policy against the retained artifact and ordered raw reads. Add `/current` to
+policy against either v1 or v2's retained artifact and ordered raw reads. Add `/current` to
 perform current reanalysis instead; both policy identifiers and the original
 result remain visible. Missing/corrupt artifacts or unsupported original policy
 fail explicitly. Loader exclusions, partial reads and conflicting rereads cannot

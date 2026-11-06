@@ -2,6 +2,7 @@
 
 #include "ExecutableImageVerifier.h"
 #include "ObservationSource.h"
+#include "RecordingObservationSource.h"
 
 constexpr size_t ImageRecipeMaxBytes = 2 * 1024 * 1024;
 constexpr size_t ImageRecipeMaxReads = 64;
@@ -17,6 +18,7 @@ struct ImageRecipeRead
 
 struct ImageVerificationRecipe
 {
+    uint32_t FormatVersion = 1;
     std::wstring Policy = ImageRecipePolicy;
     std::wstring ReferenceSha256;
     std::wstring OriginalReference;
@@ -31,6 +33,17 @@ struct ImageVerificationRecipe
     std::wstring Normalization;
     std::wstring RecordedResult;
     std::vector<ImageRecipeRead> Reads;
+    // v2 retains the original single-source operation. Reads is its validated
+    // parser projection, never a second acquisition or an independent record.
+    ObservationReadSet ReadSet;
+};
+
+struct ImageRecipeCaptureOptions
+{
+    std::wstring TargetId;
+    std::wstring AddressSpaceId;
+    bool AllowResidencyChanges = false;
+    ObservationOperationBudget Budget{ImageRecipeReadBudget, ImageRecipeMaxReads, ImageRecipeMaxReads, 65536, 5000};
 };
 
 struct ImageRecipeReplay
@@ -49,5 +62,8 @@ bool ParseImageRecipe(const std::wstring& json, ImageVerificationRecipe* recipe,
 bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
     uint32_t rva, uint32_t length, const std::wstring& newDirectory, ImageVerificationRecipe* recipe,
     std::wstring* error, const std::atomic<bool>* cancellation = nullptr);
+bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
+    uint32_t rva, uint32_t length, const std::wstring& newDirectory, const ImageRecipeCaptureOptions& options,
+    ImageVerificationRecipe* recipe, std::wstring* error, const std::atomic<bool>* cancellation = nullptr);
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay);

@@ -75,6 +75,8 @@ int main(int argc, char** argv)
         "descriptor support scoped to migrated paths");
     check(std::wstring(CapabilityAddressContract(L"execution", L"classify_reference", L"native")).find(L"unvalidated") != std::wstring::npos,
         "legacy collectors do not inherit descriptor support");
+    check(std::wstring(CapabilityAddressContract(L"image", L"capture_verification", L"process_handle")).find(L"cli_legacy_la48") != std::wstring::npos,
+        "live image CLI does not pretend it queried the target paging mode");
     std::cout << "runtime capability policy controls: " << checked << " passed=" << checked - failed << " failed=" << failed << "\n";
     return failed == 0 ? 0 : 1;
 }

@@ -22,7 +22,7 @@ if ($Sanitize)
 }
 $program = Join-Path $output 'image-recipe-selftest.exe'
 $sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp',
-    'user\ImageVerificationRecipe.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
+    'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
 {
     '"' + (Join-Path $repo $source) + '"'
@@ -43,45 +43,50 @@ if ($LASTEXITCODE -ne 0)
 {
     throw 'Image recipe controls failed'
 }
-$published = 0
-$absent = 0
-foreach ($delay in @(1, 25, 100, 250, 500, 1500))
+foreach ($format in @('v1', 'v2'))
 {
-    $target = Join-Path $output ('interrupt-' + $delay)
-    New-Item -ItemType Directory -Path $target | Out-Null
-    $process = Start-Process -FilePath $program -ArgumentList @('--publish', ('"' + $target + '"')) -WindowStyle Hidden -PassThru
-    try
+    $published = 0
+    $absent = 0
+    $publishOption = if ($format -eq 'v1') { '--publish' } else { '--publish-observed' }
+    foreach ($delay in @(1, 25, 100, 250, 500, 1500))
     {
-        Start-Sleep -Milliseconds $delay
-        $terminated = -not $process.HasExited
-        if ($terminated)
+        $target = Join-Path $output ('interrupt-' + $format + '-' + $delay)
+        New-Item -ItemType Directory -Path $target | Out-Null
+        $process = Start-Process -FilePath $program -ArgumentList @($publishOption, ('"' + $target + '"')) -WindowStyle Hidden -PassThru
+        try
         {
-            $process.Kill()
-        }
-        $process.WaitForExit()
-        if (-not $terminated -and $process.ExitCode -ne 0)
-        {
-            throw 'Image publication failed before interruption'
-        }
-        $case = Join-Path $target 'case'
-        if (Test-Path -LiteralPath (Join-Path $case 'recipe.knverify'))
-        {
-            & $program --replay $case
-            if ($LASTEXITCODE -ne 0)
+            Start-Sleep -Milliseconds $delay
+            $terminated = -not $process.HasExited
+            if ($terminated)
             {
-                throw 'Interrupted image publication exposed an invalid final recipe'
+                $process.Kill()
             }
-            ++$published
+            $process.WaitForExit()
+            if (-not $terminated -and $process.ExitCode -ne 0)
+            {
+                throw 'Image publication failed before interruption'
+            }
+            $case = Join-Path $target 'case'
+            if (Test-Path -LiteralPath (Join-Path $case 'recipe.knverify'))
+            {
+                & $program --replay $case
+                if ($LASTEXITCODE -ne 0)
+                {
+                    throw 'Interrupted image publication exposed an invalid final recipe'
+                }
+                ++$published
+            }
+            else
+            {
+                ++$absent
+            }
         }
-        else
+        finally
         {
-            ++$absent
+            if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+            $process.Dispose()
         }
     }
-    finally
-    {
-        $process.Dispose()
-    }
+    Write-Output "[image.recipe.publication] format=$format interrupted=6 valid=$published absent=$absent"
 }
-Write-Output "[image.recipe.publication] interrupted=6 valid=$published absent=$absent"
 Write-Output "[image.recipe.validation] fixtures=$output"

@@ -87,6 +87,10 @@ inline const wchar_t* CapabilityAddressContract(const std::wstring& domain,
 {
     if (backend == L"process_handle")
     {
+        if (domain == L"image" && operation == L"capture_verification")
+        {
+            return L"cli_legacy_la48_with_os_user_ceiling;user_only;pointer_bytes_8";
+        }
         return L"caller_descriptor_la48_la57;user_only;pointer_bytes_8";
     }
     if ((domain == L"memory" && (backend == L"native" || backend == L"dump")) ||

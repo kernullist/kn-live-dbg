@@ -52,6 +52,8 @@ def main():
     assert "other_symbol_paths_not_isolated" in schema["limits"] and "no_filesystem_or_network_sandbox" in schema["limits"]
     assert "exact_reference_blob" in by_key[("image", "replay_verification", "recipe")]["requirements"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
+    live_image = by_key[("image", "capture_verification", "process_handle")]
+    assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]
     assert "claim_specific_requirements" in by_key[("proof", "image_range", "recipe")]["requirements"]
     assert "no_hard_deadline_or_measured_slo" in by_key[("scheduler", "capture_timing", "native")]["limits"]
     cross_view = by_key[("process", "cross_view", "native")]

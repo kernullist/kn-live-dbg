@@ -30,6 +30,7 @@ backends are not implied by an x64 address width.
 | evidence / graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
 | image / capture_verification | dump | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_dump |
 | image / replay_verification | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |
+| image / capture_verification | process_handle | implemented | cli_legacy_la48_with_os_user_ceiling;user_only;pointer_bytes_8 | handle_bound_single_read |
 | proof / image_range | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |
 | scheduler / capture_timing | native | implemented | not_an_address_reader | collector_monotonic |
 | process / cross_view | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | live_non_atomic |

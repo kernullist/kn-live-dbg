@@ -155,6 +155,17 @@ malformed/capped input. These fixtures do not decode raw trace packets or prove
 that the producer observed execution. Shared reference-reader changes also
 require `tools/validate-image-recipe.ps1 -Sanitize`.
 
+For live image receipts, run `tools/validate-image-recipe.ps1 -Sanitize`, then
+`python tools/test-live-image-recipe.py --exe x64/Release/KnLiveDbg.exe --fixtures
+<image-recipe-run-directory>`. Require canonical v2 receipts, exact original-policy
+replay after each observed child exit and reference replacement/removal, denial
+before target reads when consent is absent, rejection of independently rehashed conflicting
+metadata, and zero remaining owned children. The child uses a private RW PE buffer
+without executing it; this does not validate an OS-loaded module, native fallback,
+LA57, mapping lifetime or background KMON publication. The ASan harness separately
+tests shared budgets, source changes, receipt gaps and v1/v2 interrupted publication.
+Keep the legacy `test-image-recipe-cli.py` gate to verify v1 compatibility.
+
 ## Live-host prerequisites
 
 - Use a Windows x64 lab host/VM with the required signing configuration and

@@ -57,6 +57,9 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
         {L"image", L"replay_verification", L"recipe", L"implemented", L"recorded_reads",
             L"valid_image_recipe;exact_reference_blob;explicit_policy_mode",
             L"original_ordered_reads;current_reanalysis_is_distinct;no_collector_authentication"},
+        {L"image", L"capture_verification", L"process_handle", L"implemented", L"handle_bound_single_read",
+            L"pid_creation_identity;read_query_access;explicit_residency_consent;exact_local_reference;new_private_case_directory",
+            L"single_range_4096;ordered_v2_receipts_not_atomic;legacy_la48_shape_with_os_user_ceiling;no_native_fallback;no_background_kmon_capture;no_mapping_lifetime_or_execution_claim"},
         {L"proof", L"image_range", L"recipe", L"implemented", L"recorded_reads",
             L"validated_replay;recomputed_typed_comparison;claim_specific_requirements",
             L"selected_range_only;acquisition_intervals_only;no_execution_writer_or_maliciousness_claim"},
@@ -131,6 +134,10 @@ inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, co
     bool first = true;
     for (const auto& capability : SourceCapabilities())
     {
+        // An owned byte sample does not exercise reference capture or replay.
+        const bool unsampledProcessOperation = std::wstring(capability.Backend) == L"process_handle" &&
+            (std::wstring(capability.Domain) != L"memory" || std::wstring(capability.Operation) != L"read_virtual");
+        const auto* contractProbe = unsampledProcessOperation ? nullptr : probe;
         if (!first)
         {
             out << L",";
@@ -140,12 +147,13 @@ inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, co
             << L",\"operation\":" << quote(capability.Operation)
             << L",\"backend\":" << quote(capability.Backend)
             << L",\"implementation\":" << quote(capability.Implementation)
-            << L",\"availability\":" << quote(CapabilityAvailability(capability.Implementation, capability.Backend, probe))
+            << L",\"availability\":" << quote(CapabilityAvailability(capability.Implementation, capability.Backend, contractProbe))
             << L",\"availability_scope\":" << quote(probe == nullptr ? L"none" :
+                contractProbe == nullptr ? L"not_probed" :
                 std::wstring(capability.Backend) == L"process_handle" ? L"owned_control_range_only" :
                 std::wstring(capability.Backend) == L"native" ? L"connection_contract_only" : L"not_probed")
             << L",\"validation\":\"not_performed_for_target_environment\""
-            << L",\"probe_stages\":" << CapabilityProbeStagesJson(capability.Backend, probe)
+            << L",\"probe_stages\":" << CapabilityProbeStagesJson(capability.Backend, contractProbe)
             << L",\"address_contract\":" << quote(CapabilityAddressContract(capability.Domain, capability.Operation, capability.Backend))
             << L",\"consistency\":" << quote(capability.Consistency)
             << L",\"requirements\":" << quote(capability.Requirements)

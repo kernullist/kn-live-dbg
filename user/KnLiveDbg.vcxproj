@@ -210,6 +210,8 @@
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
+    <ClCompile Include="ImageRecipeReadSet.cpp" />
+    <ClCompile Include="ProcessImageCapture.cpp" />
     <ClCompile Include="ImageVerificationRecipe.cpp" />
     <ClCompile Include="ImageProof.cpp" />
     <ClCompile Include="VbsScanner.cpp" />
@@ -357,6 +359,8 @@
     <ClInclude Include="ParserWorkerProcess.h" />
     <ClInclude Include="ReferenceArtifact.h" />
     <ClInclude Include="ImageVerificationRecipe.h" />
+    <ClInclude Include="ImageRecipeReadSet.h" />
+    <ClInclude Include="ProcessImageCapture.h" />
     <ClInclude Include="ImageProof.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />

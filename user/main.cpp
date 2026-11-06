@@ -71,6 +71,7 @@
 #include "SymbolEngine.h"
 #include "TypeSchema.h"
 #include "ImageVerificationRecipe.h"
+#include "ProcessImageCapture.h"
 #include "UserModeHunter.h"
 #include "VbsScanner.h"
 #include "WdFilterRuntimeScanner.h"
@@ -53404,6 +53405,8 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
+        std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
+        std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";
@@ -53434,6 +53437,10 @@ int wmain(int argc, wchar_t** argv)
             return WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT), &probe)) ? 0 : 2;
         }
         return WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT))) ? 0 : 2;
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--verify-process-image")
+    {
+        return RunProcessImageCaptureCommand(std::vector<std::wstring>(argv + 2, argv + argc), &g_StopRequested);
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--offline")
     {

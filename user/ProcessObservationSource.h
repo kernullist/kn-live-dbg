@@ -69,6 +69,11 @@ protected:
                 bytes.data(), bytes.size(), &copied);
             result.NativeStatusDomain = L"win32";
             result.NativeStatus = read ? ERROR_SUCCESS : GetLastError();
+            result.BackendCopyAttemptKnown = true;
+            result.BackendCopyAttempted = true;
+            result.BackendContract = L"win32_read_process_memory";
+            result.TransferredBytesKnown = copied <= request.Length;
+            result.TransferredBytes = result.TransferredBytesKnown ? static_cast<uint32_t>(copied) : 0;
             if (SameIdentity())
             {
                 result.IdentityRevalidated = true;

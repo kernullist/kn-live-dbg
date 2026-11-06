@@ -252,15 +252,27 @@ namespace
     }
 }
 
-bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
+static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
     uint32_t rva, uint32_t length, const std::wstring& newDirectory, ImageVerificationRecipe* recipe,
-    std::wstring* error, const std::atomic<bool>* cancellation)
+    std::wstring* error, const std::atomic<bool>* cancellation, const ImageRecipeCaptureOptions* options)
 {
     if (error != nullptr)
     {
         *error = L"image capture requires a bounded source, an exact reference and a new local directory";
     }
     const auto caps = source.Capabilities();
+    if (options != nullptr)
+    {
+        const auto& b = options->Budget;
+        const auto text = [](const std::wstring& value)
+        {
+            return !value.empty() && value.size() <= 2048 && value.find(L'\0') == std::wstring::npos &&
+                mcpjson::SanitizeUtf16(value) == value;
+        };
+        if (!text(options->TargetId) || !text(options->AddressSpaceId) || b.MaximumBytes > ImageRecipeReadBudget ||
+            b.MaximumSourceCalls > ImageRecipeMaxReads || b.MaximumReceipts == 0 || b.MaximumReceipts > ImageRecipeMaxReads ||
+            b.MaximumStoredSpans > 65536 || b.MaximumElapsedMs == 0 || b.MaximumElapsedMs > 60000) { return false; }
+    }
     if (recipe == nullptr || imageBase == 0 || imageBase > UINT64_MAX - rva || imageBase + rva > UINT64_MAX - length ||
         length == 0 || length > 4096 || caps.AddressDomain != ObservationAddressDomain::Virtual ||
         !caps.AddressSpace.Valid() || caps.SourceId.empty() ||
@@ -300,6 +312,7 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
         return false;
     }
     ImageVerificationRecipe p;
+    p.FormatVersion = options == nullptr ? 1 : 2;
     p.ReferenceSha256 = original.Sha256();
     p.OriginalReference = original.Path();
     p.OriginalFileIdentity = original.FileIdentity();
@@ -313,6 +326,16 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
     GetSystemTimeAsFileTime(&now);
     p.CapturedFileTime = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
     p.Normalization = Normalization(metadata, imageBase, rva, length);
+    std::shared_ptr<ObservationReadOperation> operation;
+    std::unique_ptr<RecordingObservationSource> recorded;
+    if (options != nullptr)
+    {
+        static std::atomic<uint64_t> sequence{0};
+        const auto id = L"image:" + std::to_wstring(GetCurrentProcessId()) + L":" +
+            std::to_wstring(p.CapturedFileTime) + L":" + std::to_wstring(++sequence);
+        operation = std::make_shared<ObservationReadOperation>(id, options->TargetId, options->AddressSpaceId, options->Budget);
+        recorded = std::make_unique<RecordingObservationSource>(source, operation);
+    }
     uint64_t remaining = ImageRecipeReadBudget;
     bool exhausted = false;
     bool sourceChanged = false;
@@ -336,10 +359,11 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
         request.Length = static_cast<uint32_t>(size);
         request.ByteBudget = remaining;
         request.Cancellation = cancellation;
+        request.AllowResidencyChanges = options != nullptr && options->AllowResidencyChanges;
         ImageRecipeRead read;
         read.Address = address;
         read.Length = request.Length;
-        read.Result = source.Read(request);
+        read.Result = (recorded == nullptr ? source : *recorded).Read(request);
         sourceChanged = sourceChanged || !SameObservationSourceContract(caps, source.Capabilities());
         exhausted = exhausted || read.Result.OperationDeadlineExceeded;
         remaining -= size;
@@ -347,6 +371,7 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
         return !sourceChanged && ExactBytes(p.Reads.back(), bytes);
     };
     p.RecordedResult = Execute(retained, metadata, p, recording);
+    if (operation != nullptr) { p.ReadSet = operation->Snapshot(); }
     if (exhausted || sourceChanged || !retained.Unchanged() || !original.Unchanged())
     {
         return false;
@@ -362,6 +387,20 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
         error->clear();
     }
     return true;
+}
+
+bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
+    uint32_t rva, uint32_t length, const std::wstring& newDirectory, ImageVerificationRecipe* recipe,
+    std::wstring* error, const std::atomic<bool>* cancellation)
+{
+    return CaptureImageRecipeImpl(image, source, imageBase, rva, length, newDirectory, recipe, error, cancellation, nullptr);
+}
+
+bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
+    uint32_t rva, uint32_t length, const std::wstring& newDirectory, const ImageRecipeCaptureOptions& options,
+    ImageVerificationRecipe* recipe, std::wstring* error, const std::atomic<bool>* cancellation)
+{
+    return CaptureImageRecipeImpl(image, source, imageBase, rva, length, newDirectory, recipe, error, cancellation, &options);
 }
 
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error)
