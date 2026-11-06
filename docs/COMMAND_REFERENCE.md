@@ -5,6 +5,19 @@ This guide describes workflows and output contracts. `help <command>` and
 available without elevation, a driver, or symbols. Tab completion uses the same
 command definitions in the local and remote consoles.
 
+`KnLiveDbg.exe --capabilities` prints selected compiled source contracts without
+opening a target. Add `--probe` to read a known 32-byte range in the command's own
+process and query an existing default native device's ABI/session. It never
+starts or loads the driver. The JSON reports source open, sample read, layout,
+semantic and environment validation separately: the owned read is available only
+for that control range, and native connection success remains partial. Unsupported
+backends stay unsupported and untested environments remain unvalidated. Exit 0
+means the report was produced, including denied/unavailable probe states; invalid
+arguments exit 1 before any probe, and output failures exit 2. Redirected JSON is
+UTF-8, including localized status text. Native calls have no hard timeout.
+Runtime probe JSON contains private process/address metadata and is not a public
+support certificate. See [generated address/backend contracts](SUPPORT_MATRIX.md).
+
 Saved KMON evidence can also be investigated without elevation, driver loading,
 or symbols: `KnLiveDbg.exe --offline !kmon evidence <directory> /json`,
 `--offline !kmon replay <file.kncase> /json`, or `--offline !kmon why <file.kncase>`.

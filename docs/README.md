@@ -1,7 +1,7 @@
 # Documentation
 
 These guides describe **main development**, including the selected platform
-checkpoints dated **2026-10-29 and 2026-10-30**.
+checkpoints dated **2026-10-29, 2026-10-30 and 2026-11-06**.
 The latest published release remains **v0.0.36 / 6646461**. Retained evidence,
 offline investigation and the subsequent reference/TI queue changes belong to
 main; consult the release notes for shipped behavior. This documentation update
@@ -38,6 +38,7 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 | [Remaining work](FEATURE_PLAN.md) | Open work, separated from implemented features |
 | [Platform packages](FEATURE_PLAN.md#kernel-investigation-platform) | Adopted full-kernel architecture, capability contract and dependency order |
 | [Integration packages](FEATURE_PLAN.md#full-kernel-integration-design-2026-11-06) | P01-P16 acceptance, investigation paths and separate implementation/validation states |
+| [Source support contracts](SUPPORT_MATRIX.md) | Generated backend/address contracts and runtime probe scope; no inferred environment validation |
 | [2026-11-06 design](KnLiveDbg_full_kernel_security_design_20261106_16c34da.md) | Original assessment at 16c34da, 22 domains, four investigation paths and 30 control families |
 
 ## Validation and releases

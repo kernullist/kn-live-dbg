@@ -53383,6 +53383,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
+        std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
@@ -53404,13 +53405,17 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc >= 2 && ToLower(argv[1]) == L"--capabilities")
     {
-        if (argc != 2)
+        if (argc != 2 && !(argc == 3 && ToLower(argv[2]) == L"--probe"))
         {
-            std::wcerr << L"usage: KnLiveDbg.exe --capabilities\n";
+            std::wcerr << L"usage: KnLiveDbg.exe --capabilities [--probe]\n";
             return 1;
         }
-        std::wcout << SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT)) << L"\n";
-        return 0;
+        if (argc == 3)
+        {
+            const auto probe = ProbeRuntimeCapabilities();
+            return WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT), &probe)) ? 0 : 2;
+        }
+        return WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT))) ? 0 : 2;
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--offline")
     {

@@ -23,6 +23,33 @@ These changes do not establish a system-wide LA57 support claim. Other scanners,
 source/VM/epoch identity, translation permissions and actual LA57 Windows
 compatibility remain separate acceptance work in [W02](FEATURE_PLAN.md#kernel-investigation-platform).
 
+## Runtime source capability probes
+
+The selected source/address contracts in [the generated support matrix](SUPPORT_MATRIX.md)
+come from the same `--capabilities` JSON used by clients. The default mode still
+opens no device. An explicit `--capabilities --probe` reads a 32-byte known range
+in its own process through the owned `ProcessObservationSource`, then attempts
+the default existing native device's open, ABI and session-status queries. It
+does not create/start services, load a driver, enable collection, change write
+mode or fetch symbols. Another controller or a differently named cloaked device
+can leave the default device unavailable; this does not imply host-wide absence.
+
+The owned range uses an explicit legacy LA48 shape and does not detect active
+paging. Only a successful native version query supplies the native 48/57-bit
+descriptor in the probe. Source open, sample read, layout, semantic validation
+and environment regression remain separate stages. A successful process probe
+marks availability for its control range only; native connection checks are at
+most `partial`. Unsupported VTL1/VMI stays unsupported, other backends stay
+unprobed, and no result grants a validated OS/CPU/security-state combination.
+Handles close before publication; this is a timestamped observation, not a lease
+for subsequent commands. Native wrappers still lack a raw status DTO; the probe
+preserves their explanation without inventing NTSTATUS. Runtime reports contain
+identity/address evidence and are rejected by the public-content scanner.
+
+`tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check`
+detects documentation drift without probing a target. Generation accepts only
+an unprobed compiled inventory and atomically replaces the Markdown output.
+
 ## Process cross-view qualification
 
 `!hiddenproc` first discovers PID candidates from ActiveProcessLinks, SPI,

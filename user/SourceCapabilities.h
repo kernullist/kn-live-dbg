@@ -2,6 +2,7 @@
 
 #include "CommandRegistry.h"
 #include "McpJson.h"
+#include "RuntimeCapabilities.h"
 #include "../shared/KnLiveDbgIoctl.h"
 #include <sstream>
 
@@ -64,7 +65,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"class_urgency_thresholds;log2_percentile_upper_bounds;no_hard_deadline_or_measured_slo"},
         {L"process", L"cross_view", L"native", L"implemented", L"live_non_atomic",
             L"complete_comparison_inventories;matching_pid_eprocess_create_time;readable_lifecycle",
-            L"128_candidate_confirmation;cooperative_5000ms;shared_api_dependency;unverified_candidates_retained;no_actor_or_hiding_mechanism_claim"},
+            L"128_candidate_confirmation;fair_session_queue;reserved_fresh_comparison;cooperative_5000ms;shared_api_dependency;unverified_candidates_retained;no_actor_or_hiding_mechanism_claim"},
         {L"debugger", L"execute", L"dbgeng", L"implemented", L"backend_defined",
             L"installed_runtime;successful_kdinit;target_permissions",
             L"command_text_bridge;no_typed_observation_source;no_implicit_fallback"},
@@ -111,19 +112,19 @@ inline const wchar_t* SourceCommandRoute(CommandSupport support)
     }
 }
 
-// This inventory never probes a target or opens a device. Implemented does not
-// imply that an operation is usable or validated on the caller's machine.
-inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion)
+// Serialization never probes a target. Runtime observations must be supplied
+// explicitly; compiled implementation alone is not availability or validation.
+inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, const RuntimeCapabilityProbe* probe = nullptr)
 {
     const auto quote = [](const std::wstring& value)
     {
         return L"\"" + mcpjson::Escape(value) + L"\"";
     };
     std::wostringstream out;
-    out << L"{\"schema\":\"kn.capabilities.v1\",\"scope\":\"compiled_contract\","
+    out << L"{\"schema\":\"kn.capabilities.v1\",\"scope\":" << quote(probe == nullptr ? L"compiled_contract" : L"runtime_probe") << L","
         << L"\"inventory_complete\":false,\"binary_version\":" << quote(binaryVersion)
         << L",\"driver_abi\":" << KNDBG_ABI_VERSION
-        << L",\"architecture\":\"x64\",\"target_probed\":false,"
+        << L",\"architecture\":\"x64\",\"target_probed\":" << (probe != nullptr ? L"true" : L"false") << L","
         << L"\"target\":{\"os_build\":null,\"security_state\":\"unknown\","
         << L"\"virtual_address_bits\":null,\"validation\":\"not_performed\"},"
         << L"\"capabilities\":[";
@@ -139,11 +140,23 @@ inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion)
             << L",\"operation\":" << quote(capability.Operation)
             << L",\"backend\":" << quote(capability.Backend)
             << L",\"implementation\":" << quote(capability.Implementation)
-            << L",\"availability\":\"not_probed\",\"consistency\":" << quote(capability.Consistency)
+            << L",\"availability\":" << quote(CapabilityAvailability(capability.Implementation, capability.Backend, probe))
+            << L",\"availability_scope\":" << quote(probe == nullptr ? L"none" :
+                std::wstring(capability.Backend) == L"process_handle" ? L"owned_control_range_only" :
+                std::wstring(capability.Backend) == L"native" ? L"connection_contract_only" : L"not_probed")
+            << L",\"validation\":\"not_performed_for_target_environment\""
+            << L",\"probe_stages\":" << CapabilityProbeStagesJson(capability.Backend, probe)
+            << L",\"address_contract\":" << quote(CapabilityAddressContract(capability.Domain, capability.Operation, capability.Backend))
+            << L",\"consistency\":" << quote(capability.Consistency)
             << L",\"requirements\":" << quote(capability.Requirements)
             << L",\"limits\":" << quote(capability.Limits) << L"}";
     }
-    out << L"],\"commands\":[";
+    out << L"]";
+    if (probe != nullptr)
+    {
+        out << L",\"probe\":" << RuntimeCapabilityProbeJson(*probe);
+    }
+    out << L",\"commands\":[";
     first = true;
     for (const auto& command : CommandRegistry::Commands())
     {

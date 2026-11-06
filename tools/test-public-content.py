@@ -55,6 +55,18 @@ class PublicContentTests(unittest.TestCase):
                 self.assertTrue(findings)
                 self.assertNotIn(sample, json.dumps(findings))
 
+    def test_runtime_capability_is_not_public_compiled_inventory(self):
+        compiled = {"schema": "kn.capabilities.v1", "target_probed": False}
+        self.assertFalse(AUDIT.inspect("capabilities.json", json.dumps(compiled).encode()))
+        runtime = {"schema": "kn.capabilities.v1", "target_probed": True}
+        for encoding in ("utf-8", "utf-16"):
+            findings = AUDIT.inspect("renamed.json", json.dumps(runtime).encode(encoding))
+            self.assertIn("private-runtime-probe", {f["rule"] for f in findings})
+        for overrides in ({"target_probed": False, "probe": {}}, {"target_probed": "true"},
+                          {"target_probed": False, "scope": "runtime_probe"}):
+            inconsistent = {**runtime, **overrides}
+            self.assertTrue(AUDIT.inspect("renamed.json", json.dumps(inconsistent).encode()))
+
     def test_utf16_and_binary_strings(self):
         secret = "gh" + "p_" + "A" * 36
         for data in (secret.encode("utf-16"), b"MZ\0\1" + secret.encode(),

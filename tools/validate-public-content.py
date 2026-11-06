@@ -88,6 +88,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         if text.lstrip().startswith("{"):
             try:
                 document = json.loads(text)
+                if (isinstance(document, dict) and document.get("schema") == "kn.capabilities.v1" and
+                        (document.get("target_probed") is not False or document.get("scope") == "runtime_probe" or "probe" in document)):
+                    add("private-runtime-probe")
                 if isinstance(document, dict) and document.get("schema") in {
                     "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.type_schema.v1",

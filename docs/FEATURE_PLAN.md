@@ -47,7 +47,7 @@ through the package dependencies and four investigation paths (VS1-VS4).
 | P01 Candidate fairness | Session-bound pending queue, reserved fresh comparison window, adaptive batch, failure/cancel denominators; 257/1,025 candidates and churn | Implemented in CLI and KMON | Owned ASan/JSON and full linked self-tests passed; live host/deployment unvalidated |
 | P02 Read and translation receipts | Ordered attempts/fallbacks, original error domains, operation-wide budgets, typed walk/permission receipts; parser remains all-or-none | Open | Sparse/status/root replacement controls required |
 | P03 Live verification transaction | Record the reads that decide a native image comparison; retain reference, exclusions, rechecks and policy; secondary-view recipes | Open | VS1 replay after target exit and reference replacement required |
-| P04 Runtime capability | Separate compiled, source opened, layout/read/semantic checks and scoped regression; generate address/backend docs from contracts | Open | Drift and denied/unavailable-source controls required |
+| P04 Runtime capability | Separate compiled, source opened, layout/read/semantic checks and scoped regression; generate address/backend docs from contracts | Selected owned-process/native-connection probes and generated matrix implemented; other backend probes and environment evidence remain open | Policy ASan, owned CLI, Unicode/error output and drift controls passed; no environment validation inferred |
 | P05 Artifact/schema broker | Isolate live layout consumers; bind target image, schema, required anchors and runtime invariants | Open | Wrong artifact, child failure and owned layout oracles required |
 | P06 Journal/index | Append-only publication, content storage, resumable index and global dedup/retention/closure; retain legacy adapters | Open | Interrupted writes and restart recovery required |
 | P07 Temporal graph | Join multiple publications only with target/source/lifetime/mapping/clock constraints; preserve immutable original facts | Open | Cross-VM, generation, ABA, late-arrival and unknown-bridge negatives required |
@@ -115,14 +115,21 @@ help/API documentation. Unsupported external adapters remain explicit gaps.
 initialization. Its `kn.capabilities.v1` JSON includes the binary version, main
 ABI, selected source contracts and command routes generated from the registry.
 `inventory_complete=false` means the selected operations are not the entire
-product inventory. `implementation` describes code, while `availability` remains
-`not_probed`; OS build, active address width and security state are not inferred.
+product inventory. `implementation` describes code, while default `availability`
+remains `not_probed`; OS build, active address width and security state are not inferred.
 The output preserves unsupported native VTL1 access and live trace/VMI paths, experimental
 dispatch interposition, bounded inventory and incomplete image replay.
 
 Use `python tools/test-source-capabilities.py --exe x64/Release/KnLiveDbg.exe`
 after building to check JSON, registry/ABI agreement, unsupported contracts,
 strict arguments and startup help. This gate does not establish live support.
+
+Explicit `--capabilities --probe` reports a known owned-process read and an
+existing native connection/ABI/session. Availability is restricted to those
+observations and never implies layout, semantic or environment validation.
+The [generated matrix](SUPPORT_MATRIX.md) follows the compiled address contracts;
+`tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check` rejects
+drift. Remaining source/layout probes grow with their owning packages.
 
 ## Remaining domain work
 

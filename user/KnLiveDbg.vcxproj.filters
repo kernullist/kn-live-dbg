@@ -94,6 +94,9 @@
     <ClCompile Include="DeviceClient.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RuntimeCapabilities.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="DriverService.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -364,6 +367,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="DeviceClient.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeCapabilities.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="DriverService.h">

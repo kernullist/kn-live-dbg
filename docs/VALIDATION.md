@@ -7,6 +7,47 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Scoped runtime capability checkpoint: 2026-11-06
+
+The selected P04 probe and generated source/address matrix extend the compiled
+inventory. Default `--capabilities` still performs no target probe. The explicit
+`--probe` path acquired a known 32-byte owned-process range through the real
+Win32 source. Opening the default native device was unavailable on this host;
+no driver was loaded or started. The native open/ABI/session success policy was
+checked with synthetic inputs, not a successful live driver connection.
+
+Release x64 EXE SHA-256:
+`09a97bda2659e09944e9149b48f21002e0f289d3e9c785b832152babfe0a22e5`.
+ASan policy harness SHA-256:
+`a6a82694d41a3d6d11721d03601d2436d33ce4786b972a1cf40606c0757e24b0`.
+The build used the same VS/MSVC/SDK/WDK configuration as the P01 checkpoint below.
+
+`validate-runtime-capabilities.ps1 -Sanitize` passed 22 policy controls for
+missing source/ABI/session, sample identity/control bytes, unsupported backends
+and refusal to promote connection checks into scanner/environment support.
+`test-source-capabilities.py` passed the existing 24 contracts and 261 routes
+with the additive stage/scope/address metadata. `test-runtime-capabilities.py`
+passed actual owned read, conservative native availability, strict arguments,
+public-matrix rejection of runtime reports, atomic generation/stale-check
+behavior, Unicode output and read-only stdout failure controls. The generated
+[matrix](SUPPORT_MATRIX.md) passed `--check`. Publication scanner regression
+tests passed all 11 cases, including renamed/inconsistent runtime reports.
+
+The first runtime CLI test failed because localized Windows status text truncated
+wide-stream JSON under the C locale. Explicit UTF-8 redirected writes and Unicode
+console writes fixed it; Korean, a supplementary character, quotes/newlines and
+output failure now have regression controls. The final reviewed scope had no
+additional actionable defects. Full solution build and `--self-test all` passed
+(timeline 28, MCP 102, console 558, commands 3,000, remote 66).
+
+These checks do not qualify a native layout, a protected process, another target,
+real LA57, VTL1, trace/VMI, or an OS/CPU/security-state support combination. The
+probe's owned address shape is explicitly legacy LA48; active native width remains
+unknown without the driver response. Other backend/layout probes and authenticated
+environment regression evidence remain open P04 work. Runtime reports are private
+evidence, and connection handles close before output. Native raw error domains
+and operation-wide deadlines remain P02 work. Signing trust remains unvalidated.
+
 ## Hidden-process scheduling checkpoint: 2026-11-06
 
 P01 of the [integration design](FEATURE_PLAN.md#full-kernel-integration-design-2026-11-06)

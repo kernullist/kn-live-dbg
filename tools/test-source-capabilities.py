@@ -27,6 +27,12 @@ def main():
     assert len(set(keys)) == len(keys)
     for capability in data["capabilities"]:
         assert capability["availability"] == "not_probed"
+        assert capability["availability_scope"] == "none"
+        assert capability["address_contract"]
+        assert capability["validation"] == "not_performed_for_target_environment"
+        assert capability["probe_stages"] == {
+            "source_opened": "not_probed", "sample_read": "not_probed", "layout_qualified": "not_probed",
+            "semantic_validation": "not_probed", "environment_regression": "not_performed"}
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
     policy = by_key[("session", "mutation_gate", "native")]
@@ -52,6 +58,7 @@ def main():
     assert "matching_pid_eprocess_create_time" in cross_view["requirements"]
     assert "unverified_candidates_retained" in cross_view["limits"]
     assert "shared_api_dependency" in cross_view["limits"]
+    assert "fair_session_queue" in cross_view["limits"]
     assert "x0_or_x1_only" in by_key[("execution", "classify_reference", "native")]["limits"]
     assert "saved_context_not_cpu_sample" in by_key[("execution", "classify_reference", "native")]["limits"]
     assert "single_observation_ids" in by_key[("io", "request_graph", "native")]["limits"]
@@ -78,6 +85,7 @@ def main():
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
     assert "--capabilities" in help_result.stdout
+    assert "--capabilities --probe" in help_result.stdout
     assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout
     print(f"source capabilities passed: {len(keys)} contracts, {len(actual)} command routes")
 

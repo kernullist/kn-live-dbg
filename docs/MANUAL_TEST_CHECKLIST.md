@@ -33,6 +33,18 @@ it does not replace these live kernel integration checks.
 
 ## Driver-free gates
 
+For scoped runtime capabilities, build first, then run
+`tools/validate-runtime-capabilities.ps1 -Sanitize` and
+`python tools/test-runtime-capabilities.py --exe x64/Release/KnLiveDbg.exe --policy-exe .build/runtime-capabilities/Release-asan/runtime-capabilities-selftest.exe`.
+The explicit runtime probe reads only a known owned-process range and attempts
+an existing native connection without starting a service or loading the driver.
+Default-device absence is an accepted unavailable result. A successful native
+connection still requires separate owned-driver integration and layout validation.
+Check generated docs with
+`python tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check`.
+Regenerate intentionally after a source contract changes; runtime JSON must never
+be used as public matrix input. Keep raw probe output in private local evidence.
+
 From the source root, after building the configuration under test, use a shell
 that permits the inspected repository scripts. The Windows PowerShell command
 below sets its execution policy for that process only.

@@ -119,6 +119,7 @@
     <ClCompile Include="CompletionHints.cpp" />
     <ClCompile Include="DbgEngBackend.cpp" />
     <ClCompile Include="DeviceClient.cpp" />
+    <ClCompile Include="RuntimeCapabilities.cpp" />
     <ClCompile Include="DriverService.cpp" />
     <ClCompile Include="EtwScanner.cpp" />
     <ClCompile Include="FirmwareTableScanner.cpp" />
@@ -243,6 +244,7 @@
     <ClInclude Include="CloakSession.h" />
     <ClInclude Include="CommandRegistry.h" />
     <ClInclude Include="SourceCapabilities.h" />
+    <ClInclude Include="RuntimeCapabilities.h" />
     <ClInclude Include="AddressSpaceDescriptor.h" />
     <ClInclude Include="ObservationSource.h" />
     <ClInclude Include="ObservationSourceJson.h" />
