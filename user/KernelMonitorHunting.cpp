@@ -113,6 +113,14 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"slice_recipes_failed\":" + std::to_wstring(ImageSlicesFailed.load()) +
         L",\"slice_recipes_unavailable\":" + std::to_wstring(ImageSlicesUnavailable.load()) +
         L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) +
+        L",\"sweep_manifests_written\":" + std::to_wstring(ImageSweepManifestsWritten.load()) +
+        L",\"sweep_manifests_failed\":" + std::to_wstring(ImageSweepManifestsFailed.load()) +
+        L",\"sweep_manifest_pending\":" + std::to_wstring(ImageSweepManifestPending.load()) +
+        L",\"sweep_manifest_admission_denied_slices\":" + std::to_wstring(ImageSweepManifestAdmissionDenied.load()) +
+        L",\"sweep_manifest_entry_drops\":" + std::to_wstring(ImageSweepManifestEntryDrops.load()) +
+        L",\"sweeps_started\":" + std::to_wstring(ImageSweepsStarted.load()) +
+        L",\"sweep_terminals_observed\":" + std::to_wstring(ImageSweepTerminalsObserved.load()) +
+        L",\"sweep_metadata_failures\":" + std::to_wstring(ImageSweepMetadataFailures.load()) +
         L",\"verification_recipe_preserved\":false}}";
     if (cases != nullptr)
     {

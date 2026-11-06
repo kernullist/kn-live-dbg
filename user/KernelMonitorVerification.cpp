@@ -359,6 +359,9 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     const uint64_t now = GetTickCount64();
     if (now < work->NextSweepDueMs) { return CodeOwnership::OwnedUnverified; }
     work->LastSweepMs = now;
+    FILETIME observedTime{};
+    GetSystemTimeAsFileTime(&observedTime);
+    const uint64_t observedFileTime = (uint64_t(observedTime.dwHighDateTime) << 32) | observedTime.dwLowDateTime;
     std::unique_ptr<ObservationReadRouter> router;
     ObservationReader observedReader = reader;
     std::wstring operationId;
@@ -373,6 +376,24 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         {
             return router->ReadExact(address, size, bytes);
         };
+        if (work->RecordingSweep.SweepId.empty() || work->Sweep.NextRange == 0 || work->Sweep.NextRange == work->Sweep.Ranges.size())
+        {
+            auto& recording = work->RecordingSweep;
+            recording = {};
+            recording.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
+            recording.SweepId = recording.CollectionId + L"-" + std::to_wstring(NextCaptureId.fetch_add(1));
+            recording.Identity = work->Identity;
+            recording.Image = work->Path;
+            recording.ImageBase = base;
+            recording.TargetId = routing->TargetId;
+            recording.AddressSpaceId = routing->AddressSpaceId;
+            recording.TotalRanges = static_cast<uint32_t>(work->Sweep.Ranges.size());
+            recording.ExpectedBytes = work->Sweep.Coverage.RequestedBytes;
+            recording.StartedTick = now;
+            recording.StartedFileTime = observedFileTime;
+            work->RecordingSlice = 0;
+            ImageSweepsStarted.fetch_add(1);
+        }
     }
     ExecutableSweepReference capturedReference;
     ExecutableSliceTrace slice;
@@ -386,7 +407,22 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     {
         const auto reads = router->Snapshot();
         const auto recipe = CaptureImageSliceRecipeJson(work->Reference, base, capturedReference, slice, reads, pages);
-        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice);
+        ImageSweepContext context;
+        context.Sweep = work->RecordingSweep;
+        // Never compress the ordinal when the bounded publication queue rejects
+        // an item: later entries and the terminal record must expose that hole.
+        context.Slice.Ordinal = ++work->RecordingSlice;
+        context.Slice.StartRange = slice.StartRange;
+        context.Slice.RangeCount = slice.PageCount;
+        context.Slice.StartedTick = reads.Attempts.StartedTick;
+        context.Slice.EndedTick = reads.Attempts.SnapshotTick;
+        context.Slice.ObservedFileTime = observedFileTime;
+        context.Slice.TraversalComplete = work->Sweep.Coverage.TraversalComplete;
+        context.Slice.Terminal = context.Slice.TraversalComplete || work->Sweep.NextRange == 0;
+        if (context.Slice.Terminal) { ImageSweepTerminalsObserved.fetch_add(1); }
+        context.Slice.Reason = work->Sweep.Coverage.Reason;
+        if (capturedReference.Artifact != nullptr) { context.Slice.ReferenceSha256 = capturedReference.Artifact->Sha256; }
+        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice, &context);
         readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
     }
     // Completed small images must not continually restart while larger images
@@ -468,6 +504,8 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         event.Evidence[L"read_operation_id"] = operationId;
         event.Evidence[L"read_set_queued_id"] = std::to_wstring(readSetId);
         event.Evidence[L"read_set_persistence"] = readPersistence;
+        event.Evidence[L"image_sweep_id"] = router == nullptr ? L"" : work->RecordingSweep.SweepId;
+        event.Evidence[L"image_sweep_slice"] = router == nullptr ? L"0" : std::to_wstring(work->RecordingSlice);
         event.Evidence[L"verification_recipe_preserved"] = L"false";
         event.Evidence[L"rva"] = std::to_wstring(page.Rva);
         event.Evidence[L"cycle"] = std::to_wstring(work->Sweep.Cycle);
@@ -507,6 +545,8 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         coverage.Evidence[L"read_operation_id"] = operationId;
         coverage.Evidence[L"read_set_queued_id"] = std::to_wstring(readSetId);
         coverage.Evidence[L"read_set_persistence"] = readPersistence;
+        coverage.Evidence[L"image_sweep_id"] = router == nullptr ? L"" : work->RecordingSweep.SweepId;
+        coverage.Evidence[L"image_sweep_slice"] = router == nullptr ? L"0" : std::to_wstring(work->RecordingSlice);
         coverage.Evidence[L"cursor"] = std::to_wstring(work->Sweep.NextRange);
         coverage.Evidence[L"remaining_pages"] = std::to_wstring(work->Sweep.Ranges.size() - work->Sweep.NextRange);
         coverage.Evidence[L"last_completion_ms"] = std::to_wstring(work->Sweep.LastCompleteMs);

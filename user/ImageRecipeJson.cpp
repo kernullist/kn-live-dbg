@@ -360,7 +360,9 @@ bool ParseImageRecipe(const std::wstring& json, ImageVerificationRecipe* recipe,
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay)
 {
     return L"{\"schema\":" + mcpjson::Quote(replay.Schema) + L",\"status\":" + mcpjson::Quote(replay.Status) +
-        L",\"mode\":" + mcpjson::Quote(replay.Mode) + L",\"recipe_sha256\":" + mcpjson::Quote(replay.RecipeSha256) +
+        L",\"mode\":" + mcpjson::Quote(replay.Mode) +
+        (replay.Schema == L"kn.image_sweep_replay.v1" ? L",\"manifest_sha256\":" + mcpjson::Quote(replay.ManifestSha256) :
+            L",\"recipe_sha256\":" + mcpjson::Quote(replay.RecipeSha256)) +
         L",\"recorded_policy\":" + mcpjson::Quote(replay.RecordedPolicy) + L",\"current_policy\":" + mcpjson::Quote(replay.CurrentPolicy) +
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"rereads_are_recorded\":true,\"recorded_result\":" +
         (replay.RecordedResult.empty() ? L"null" : replay.RecordedResult) + L",\"result\":" +

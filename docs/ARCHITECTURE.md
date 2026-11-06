@@ -184,9 +184,56 @@ completion, approved reference provenance, atomic mapping lifetime and execution
 are not established. `/current` explicitly returns unavailable for slice recipes;
 existing v1/v2 single-range recipe behavior is unchanged.
 
-Sweep manifests and graph associations, source-initialization receipts, other
-KMON reader paths, crash recovery/global retention, reference caching and native
-lifecycle validation remain open. These slices do not complete VS1.
+Graph associations, source-initialization receipts, other KMON reader paths,
+crash recovery/global retention, reference caching and native lifecycle validation
+remain open. These slices do not complete VS1.
+
+## Temporal image sweep manifests
+
+KMON assigns a distinct ID to each recorded sweep and advances its slice ordinal
+before queue admission. It publishes `image-sweeps/sweep-<id>.knsweep` using
+`kn.image_sweep.v1`. The manifest binds original raw payload and recipe hashes,
+reference identity, executable range indices, declared target identity and
+per-slice monotonic observation intervals. FILETIME anchors permit wall-clock
+correlation; elapsed observation time uses the collector's steady clock.
+Reference replacement and a restarted sweep receive a new ID.
+
+The writer records actual raw/recipe/reference publication outcomes. Missing
+ordinals remain missing. On orderly shutdown it publishes an incomplete manifest
+for any retained group without a terminal observation; the unobserved tail and
+final completion time remain unknown. Traversal completion does not imply that
+every byte was compared. Publication alone sets `complete_replay_established=false`.
+This is temporal membership, not an atomic mapping or code-version snapshot.
+
+Metadata is bounded to 128 active groups, 8,192 retained entries overall and
+2,048 entries per group. Admission and entry losses have separate counters.
+Manifests have a 2 MiB/file and 128 MiB/session limit, independent of raw, recipe
+and reference budgets. A sweep whose every slice misses the raw queue has no
+manifest; session started/terminal-observed counts retain that denominator.
+Inspect the final `.knreadledger` after drain, including metadata failures,
+publication failures and pending groups. Live counters are not a closure proof.
+
+`!kmon replay-image <sweep.knsweep> /json` verifies the manifest, declared artifacts,
+exact shared reference and executable schedule. It binds each recipe to its
+target, range and original observation interval, checks raw/recipe agreement,
+rejects duplicate or overlapping ranges, and runs each retained original slice
+policy. The shared reference lease remains held through the replay. Secondary
+observations must fit inside their enclosing target transaction interval.
+
+`kn.image_sweep_replay.v1` reports `kn.image_sweep_proof.v1` with separate missing
+entries, unknown tail, unobserved ranges, excluded/unreadable bytes and raw
+publication loss. A replayable subset can succeed while whole-sweep completion
+remains false. A missing or contradictory artifact declared as published fails
+without proof. The match claim covers the scheduled executable ranges only;
+it does not cover every PE section or prove execution, approved provenance or
+an atomic lifetime. `/current` is explicitly unavailable for manifests.
+
+Replay admits up to 256 MiB of raw/recipe JSON inputs, matching their combined
+session limits. Slice replay still performs full reference verification per
+slice; shared physical storage does not provide an I/O cache or a latency bound.
+Global journal commits, restart/orphan recovery, retention and graph links remain
+separate work. Individual atomic file publication is not a multi-artifact
+transaction or a power-loss durability guarantee.
 
 ## Typed translation receipts
 

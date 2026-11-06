@@ -6,6 +6,7 @@
 #include "ReferenceArtifact.h"
 #include "ImageComparisonJson.h"
 #include "ImageSliceRecipe.h"
+#include "ImageSweepManifest.h"
 #include <filesystem>
 
 namespace
@@ -420,6 +421,17 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
 {
     auto extension = std::filesystem::path(directory).extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
+    if (extension == L".knsweep")
+    {
+        if (!currentReanalysis) { return ReplayImageSweepManifest(directory, error); }
+        ImageRecipeReplay unsupported;
+        unsupported.Schema = L"kn.image_sweep_replay.v1";
+        unsupported.Mode = L"current_reanalysis";
+        unsupported.CurrentPolicy.clear();
+        unsupported.Status = L"sweep_current_reanalysis_unavailable";
+        if (error != nullptr) { *error = L"sweep manifests support original-policy replay only"; }
+        return unsupported;
+    }
     if (extension == L".knslice")
     {
         if (!currentReanalysis) { return ReplayImageSliceRecipe(directory, error); }

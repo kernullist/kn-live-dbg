@@ -242,6 +242,34 @@ bool KmonImageReadIntegrationSelfTest()
         check(replayed.Status == L"replayed" && replayed.CurrentResult == slice.RecordedResult &&
             !replayed.Proof.empty() && monitor.ImageSlicesWritten.load() == 1 && secondary.Calls.size() == calls,
             "actual-kmon-slice-replays-after-target-and-original-reference-removal");
+        const auto sweepPath = root / L"image-sweeps" / (L"sweep-" + (retained.Sweep ? retained.Sweep->Sweep.SweepId : L"missing") + L".knsweep");
+        const auto sweepReplay = ReplayImageRecipe(sweepPath.wstring(), false, nullptr);
+        check(sweepReplay.Status == L"replayed" && Text(sweepReplay.Proof, L"changed_bytes") == L"1" &&
+            Raw(sweepReplay.Proof, L"whole_sweep_complete") == L"true" &&
+            Raw(sweepReplay.Proof, L"executable_ranges_match_retained_reference") == L"false" &&
+            monitor.ImageSweepManifestsWritten.load() == 1 && monitor.ImageSweepManifestPending.load() == 0,
+            "actual-kmon-manifest-binds-original-raw-reference-and-recipe");
+        std::wstring sweepJson;
+        ImageSweepManifest sweepManifest;
+        check(ReadAnalystSnapshot(sweepPath.wstring(), &sweepJson, nullptr) && ParseImageSweepManifest(sweepJson, &sweepManifest),
+            "actual-kmon-manifest-canonical-membership");
+        for (unsigned mode = 0; mode < 2; ++mode)
+        {
+            KernelMonitor denied;
+            const auto destination = root / (L"manifest-failure-" + std::to_wstring(mode));
+            denied.Options.LogDirectory = destination.wstring();
+            const auto manifestFile = destination / L"image-sweeps" / sweepPath.filename();
+            if (mode == 0) { denied.ImageSweepManifestBytes.store(128ull * 1024 * 1024); }
+            else
+            {
+                std::filesystem::create_directories(manifestFile.parent_path());
+                check(Write(manifestFile, {0x7B, 0x7D}), "owned-manifest-collision");
+            }
+            denied.PersistImageSweepManifest(sweepManifest);
+            check(denied.ImageSweepManifestsWritten.load() == 0 && denied.ImageSweepManifestsFailed.load() == 1 &&
+                (mode == 0 ? !std::filesystem::exists(manifestFile) : ContentHash::File(manifestFile.wstring()) == ContentHash::Bytes({0x7B, 0x7D})),
+                "manifest-publication-budget-or-collision-is-explicit-and-nondestructive");
+        }
         check(!Raw(Raw(persisted, L"payload"), L"slice_inputs").empty(), "raw-archive-retains-slice-inputs-separately-from-recipe");
         const auto payloadBytes = mcpjson::WideToUtf8(Raw(persisted, L"payload"));
         check(ContentHash::Bytes(std::vector<uint8_t>(payloadBytes.begin(), payloadBytes.end())) == Text(persisted, L"payload_sha256"),
@@ -283,6 +311,64 @@ bool KmonImageReadIntegrationSelfTest()
         const auto cleanReplay = ReplayImageRecipe(cleanRecipe.wstring(), false, nullptr);
         check(cleanRecipeCount == 1 && cleanReplay.Status == L"replayed" && Text(cleanReplay.Proof, L"changed_bytes") == L"0" &&
             Text(cleanReplay.Proof, L"compared_bytes") == L"4096", "clean-original-slice-publishes-and-replays-complete-matching-range");
+        {
+            // Two actual KMON scheduling turns share one sweep, without a
+            // second acquisition after either original comparison.
+            auto twoDisk = disk;
+            twoDisk.resize(0x2400, 0x90);
+            uint32_t size = 0x3000;
+            std::memcpy(twoDisk.data() + 0x80 + offsetof(IMAGE_NT_HEADERS64, OptionalHeader.SizeOfImage), &size, sizeof(size));
+            size = 0x2000;
+            const size_t section = 0x80 + sizeof(IMAGE_NT_HEADERS64);
+            std::memcpy(twoDisk.data() + section + offsetof(IMAGE_SECTION_HEADER, Misc.VirtualSize), &size, sizeof(size));
+            std::memcpy(twoDisk.data() + section + offsetof(IMAGE_SECTION_HEADER, SizeOfRawData), &size, sizeof(size));
+            const auto twoPath = root / L"two-pages.exe";
+            check(Write(twoPath, twoDisk), "multi-slice-owned-reference");
+            secondary.Bytes.assign(0x3000, 0);
+            std::copy(twoDisk.begin(), twoDisk.begin() + 0x400, secondary.Bytes.begin());
+            std::copy(twoDisk.begin() + 0x400, twoDisk.end(), secondary.Bytes.begin() + 0x1000);
+            secondary.PageReads = 0;
+            KernelMonitor multiple;
+            multiple.Options.LogDirectory = (root / L"multiple").wstring();
+            const auto first = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
+            const auto second = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
+            KernelMonitor partialSweep;
+            partialSweep.Options.LogDirectory = (root / L"partial-sweep").wstring();
+            check(partialSweep.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+                partialSweep.ImageReadsQueued.load() == 1, "stop-control-observes-one-original-slice");
+            const auto partialId = partialSweep.ImageWork.empty() ? L"" : partialSweep.ImageWork.begin()->second.RecordingSweep.SweepId;
+            check(first == CodeOwnership::OwnedUnverified && second == CodeOwnership::OwnedVerified &&
+                multiple.ImageReadsQueued.load() == 2 && DeleteFileW(twoPath.c_str()), "multi-slice-originals-retained-before-reference-removal");
+            secondary.Bytes.clear();
+            multiple.WriterStopping.store(true); multiple.CaptureWriterLoop();
+            partialSweep.WriterStopping.store(true); partialSweep.CaptureWriterLoop();
+            const auto partialReplay = ReplayImageRecipe((root / L"partial-sweep" / L"image-sweeps" /
+                (L"sweep-" + partialId + L".knsweep")).wstring(), false, nullptr);
+            check(partialReplay.Status == L"replayed" && Raw(partialReplay.CurrentResult, L"tail_unknown") == L"true" &&
+                Raw(partialReplay.Proof, L"whole_sweep_complete") == L"false" &&
+                Text(partialReplay.Proof, L"unobserved_bytes") == L"4096" && partialSweep.ImageSweepManifestPending.load() == 0,
+                "actual-writer-stop-publishes-incomplete-sweep-with-unknown-tail");
+            std::wstring partialLedger;
+            check(ReadAnalystSnapshot((root / L"partial-sweep" / L"image-reads" /
+                (L"session-" + std::to_wstring(partialSweep.EvidenceCollectionEpoch.load()) + L".knreadledger")).wstring(), &partialLedger, nullptr) &&
+                Raw(partialLedger, L"sweeps_started") == L"1" && Raw(partialLedger, L"sweep_terminals_observed") == L"0" &&
+                Raw(partialLedger, L"sweep_manifests_written") == L"1" && Raw(partialLedger, L"reference_reserved_bytes") == L"0",
+                "stopped-incomplete-sweep-has-final-ledger-with-no-reference-reservation");
+            std::filesystem::path manifest;
+            size_t manifests = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(root / L"multiple" / L"image-sweeps"))
+            {
+                if (entry.path().extension() == L".knsweep") { manifest = entry.path(); ++manifests; }
+            }
+            const auto multipleReplay = ReplayImageRecipe(manifest.wstring(), false, nullptr);
+            check(manifests == 1 && multipleReplay.Status == L"replayed" &&
+                Raw(multipleReplay.Proof, L"whole_sweep_complete") == L"true" &&
+                Raw(multipleReplay.Proof, L"executable_ranges_match_retained_reference") == L"true" &&
+                Text(multipleReplay.Proof, L"compared_bytes") == L"8192" &&
+                multiple.ImageReferenceBlobsCreated.load() == 1 && multiple.ImageReferenceBlobsReused.load() == 1,
+                "multi-slice-manifest-replays-complete-original-sweep-with-one-shared-reference");
+        }
+        Fixture(&secondary.Bytes);
         secondary.Bytes[0x1050] ^= 1; secondary.Unstable = true; secondary.PageReads = 0;
         KernelMonitor unstable;
         unstable.Options.LogDirectory = (root / L"unstable").wstring();
@@ -351,12 +437,21 @@ bool KmonImageReadIntegrationSelfTest()
         for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }
         check(pressure.ImageReadsQueued.load() == 8 && pressure.ImageReadsDropped.load() == 1 &&
             pressure.CapturedImageReadSets.Size() == 8, "queue-pressure-counts-rejected-original-set");
+        pressure.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing);
+        check(pressure.ImageSweepsStarted.load() == 1 && pressure.ImageSweepTerminalsObserved.load() == 1 &&
+            pressure.ImageReadsDropped.load() == 2, "entirely-dropped-sweep-remains-in-session-denominators");
         pressure.WriterStopping.store(true); pressure.CaptureWriterLoop();
         check(pressure.ImageReadsWritten.load() == 8 && pressure.ImageReadsFailed.load() == 0 &&
             pressure.CapturedImageReadSets.Size() == 0, "shutdown-drains-full-image-read-queue");
         check(pressure.ImageReferenceBlobsCreated.load() == 1 && pressure.ImageReferenceBlobsReused.load() == 7 &&
             pressure.ImageReferenceBytes.load() == disk.size() && pressure.ImageReferenceReservedBytes->load() == 0,
             "slice-archives-share-one-content-addressed-reference-and-release-reservations");
+        std::wstring pressureLedger;
+        check(ReadAnalystSnapshot((root / L"pressure" / L"image-reads" /
+            (L"session-" + std::to_wstring(pressure.EvidenceCollectionEpoch.load()) + L".knreadledger")).wstring(), &pressureLedger, nullptr) &&
+            Raw(pressureLedger, L"sweeps_started") == L"1" && Raw(pressureLedger, L"sweep_terminals_observed") == L"1" &&
+            Raw(pressureLedger, L"sweep_manifests_written") == L"0" && Raw(pressureLedger, L"dropped") == L"2",
+            "final-ledger-exposes-sweep-with-no-retained-slices");
         {
             KernelMonitor busy;
             busy.ImageReferenceReservedBytes->store(128ull * 1024 * 1024);

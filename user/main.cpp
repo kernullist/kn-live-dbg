@@ -23058,7 +23058,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
-    std::wcout << L"  !kmon replay-image <directory|slice.knslice> [/current] [/json]\n";
+    std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23456,7 +23456,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         }
         if (!valid)
         {
-            std::wcerr << L"usage: !kmon replay-image <directory|slice.knslice> [/current] [/json]\n";
+            std::wcerr << L"usage: !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
             return 2;
         }
         std::wstring error;

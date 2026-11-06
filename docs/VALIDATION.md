@@ -7,6 +7,69 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Temporal image sweep checkpoint: 2026-11-07
+
+This P03 substep publishes bounded `kn.image_sweep.v1` manifests that bind the
+original slice recipes, raw payloads, reference identity, target labels, range
+indices and observation intervals. Slice ordinals advance before queue admission;
+missing entries, missing terminal observations and entirely dropped sweeps stay
+visible through manifests or final session denominators. Offline replay verifies
+the declared artifacts and shared reference, then reruns each original slice
+policy. It separates executable comparison, membership and publication completion.
+
+Release x64 EXE SHA-256:
+`b38967e0518269b13a4b1a5d1394f11a553d2ec867fa199bc8de391aa1f7a59e`.
+ASan slice/sweep harness SHA-256:
+`72c01c0a21bcfef28447f6dc716c2c52dc573db0afe5bcb1ce003ec2326032ae`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+The existing C4744 `NextQueryEpoch` alignment warnings remain; the broader
+rebuild also emitted the existing C4244 conversion warnings.
+
+`validate-image-slice.ps1 -Sanitize` passed 251 C++ controls, 369 independent
+slice checks and 233 independent sweep checks. The six sweep cases cover
+matching/modified/excluded ranges, a missing first slice, an unknown tail and
+actual owned secondary reference views. All original targets are synthetic
+nonexecuting bytes; reference views use `SEC_IMAGE_NO_EXECUTE`. Original reference
+paths and target bytes are removed before publication/replay. Hash, temporal
+membership and byte-total checks are independent of the C++ implementation.
+Negative controls include conflicting process generations, duplicate leaves,
+wrong schedules/targets, missing raw/recipe files, corrupt reference bytes,
+contradictory terminal/time fields, path escape and bounded metadata loss.
+
+The final EXE passed 269 sweep CLI, 413 slice CLI, 101 existing recipe CLI and
+168 live CLI checks. All three owned live PE-buffer children exited.
+`validate-image-recipe.ps1 -Sanitize` passed 92 compatibility controls; six
+interrupted publications per v1/v2 format left three valid and three absent
+final recipes. Public-content regressions passed 11 checks, including renamed
+private manifest/replay/proof formats.
+
+The final isolated `--self-test all` passed timeline 28, MCP 102, console 558,
+command registry 3,000 and remote 66 checks. Actual KMON comparison/writer
+integration passed 62 controls: two scheduling turns with one shared reference,
+original raw/recipe/manifest binding, writer stop after only the first slice,
+unknown-tail replay, manifest collision/byte limits, complete queue loss,
+final session denominators and zero outstanding reference reservations.
+An earlier concurrent full-suite run failed the existing bounded process-capture
+test; its five-second boundary was inspected. The same binary passed when run
+alone, and the final binary passed alone after the closure control was added.
+The test was not relaxed. The precise cause of the concurrent failure was not
+isolated; behavior under concurrent host load remains unvalidated.
+
+Review tightened terminal/end-time consistency and secondary-observation interval
+containment. The proof names executable ranges explicitly instead of implying a
+comparison of every PE section. The independent oracle also caught an intentional
+fixture byte change left behind when its IAT exclusion was removed; the fixture
+was corrected without changing the expected byte totals. No additional defects
+were found in the reviewed manifest implementation scope.
+
+Manifests and replay remain temporal, unauthenticated observations. A replayable
+subset is not a complete sweep; a completed comparison is not execution,
+approved reference provenance or an atomic mapping lifetime. No driver-load,
+service-start, Verifier, reboot or security-policy changes were made. Native
+loaded-image lifetime, graph associations, approved-change policy, full-file
+reference caching/stage budgets and P06 journal/restart/global retention remain
+open. The full P01-P16 / VS1-VS4 goal remains active.
+
 ## Original KMON slice replay checkpoint: 2026-11-07
 
 This P03 substep retains clean, changed and inconclusive original KMON slices.

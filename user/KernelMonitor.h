@@ -7,6 +7,7 @@
 #include "ObservationWindows.h"
 #include "CodeTargetResolver.h"
 #include "ExecutableImageVerifier.h"
+#include "ImageSweepManifest.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
@@ -606,7 +607,8 @@ private:
     uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
         const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr,
-        const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr);
+        const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr,
+        const ImageSweepContext* sweep = nullptr);
     struct ImageReferenceCharge
     {
         ImageReferenceCharge() = default;
@@ -628,9 +630,18 @@ private:
         std::shared_ptr<ImageReferenceCharge> ReferenceCharge;
         std::wstring Json;
         std::wstring SliceJson;
+        std::optional<ImageSweepContext> Sweep;
     };
     void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
     void CloseImageReadCollection() noexcept;
+    void RecordImageSweepPublication(const CapturedImageReads& reads, bool rawWritten, bool recipeWritten,
+        bool referenceWritten, const std::wstring& rawHash, const std::wstring& recipeHash) noexcept;
+    void PersistImageSweepManifest(const ImageSweepManifest& manifest) noexcept;
+    void CloseImageSweepManifests() noexcept;
+    ImageSweepManifestStore ImageSweepManifests; // Capture writer only.
+    std::atomic<uint64_t> ImageSweepManifestsWritten{0}, ImageSweepManifestsFailed{0}, ImageSweepManifestBytes{0};
+    std::atomic<uint64_t> ImageSweepManifestPending{0}, ImageSweepManifestAdmissionDenied{0}, ImageSweepManifestEntryDrops{0};
+    std::atomic<uint64_t> ImageSweepsStarted{0}, ImageSweepTerminalsObserved{0}, ImageSweepMetadataFailures{0};
     KmonWorkQueue<CapturedImageReads> CapturedImageReadSets{8};
     const std::shared_ptr<std::atomic<uint64_t>> ImageReferenceReservedBytes = std::make_shared<std::atomic<uint64_t>>(0);
     std::atomic<uint64_t> ImageReadsQueued{0}, ImageReadsWritten{0}, ImageReadsFailed{0}, ImageReadsDropped{0};
@@ -709,6 +720,8 @@ private:
     {
         executable_image::DiskPeMetadata Reference;
         ExecutableSweep Sweep;
+        ImageSweepIdentity RecordingSweep;
+        uint64_t RecordingSlice = 0;
         ObservationIdentity Identity;
         std::wstring Path;
         uint64_t Base = 0;

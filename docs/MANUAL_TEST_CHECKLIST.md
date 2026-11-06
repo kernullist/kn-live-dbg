@@ -82,6 +82,13 @@ reads use actual owned `SEC_IMAGE_NO_EXECUTE` views. The original target/referen
 are removed before replay. Include missing/corrupt blobs, order/fallback/identity
 contradictions, secondary-input tampering, output collision and recipe byte limits.
 
+The same ASan harness also produces original multi-slice sweep fixtures. Run
+`python tools/test-image-sweep.py --exe x64/Release/KnLiveDbg.exe --fixtures <reported-directory> --cli`
+for independent manifest/leaf digests, byte totals, temporal order and missing
+head/terminal controls. Include direct and secondary policies, matching/changed/
+excluded bytes, contradictory target/range/time membership, missing/corrupt
+declared artifacts, metadata limits and manifest output collisions.
+
 Run `tools/validate-reference-blobs.ps1 -Sanitize` for exact-handle acquisition
 after source rename/path replacement, independent read position, write exclusion,
 snapshot survival after source removal, content-addressed reuse at zero new-byte
@@ -101,7 +108,12 @@ identity replacement, mapping changes and cancellation. Record final host
 cleanup. Replay the published `.knslice` after target exit/reference replacement;
 verify separate recipe publication counters and exact policy reproduction.
 Do not count raw reads plus a reference blob as successful slice replay or a
-replayed slice as full sweep-manifest/graph publication.
+replayed slice as full sweep-manifest/graph publication. For `.knsweep` replay,
+check missing entries, unknown tail and complete executable comparison separately.
+After stop, reconcile started and terminal-observed sweep counts with manifest
+publication and metadata losses; an entirely dropped sweep has no manifest.
+Journal restart, graph associations and native lifetime validation remain
+independent gates.
 
 Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,
 sparse bytes, explicit fallback permission, shared budgets, metadata capacity,

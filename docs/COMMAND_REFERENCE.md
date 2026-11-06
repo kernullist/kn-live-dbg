@@ -130,9 +130,19 @@ shared reference blob. It returns `kn.image_slice_replay.v1` with the actual
 policy and an executed-range `kn.image_slice_proof.v1`. Exit 0 includes faithfully
 reproduced inconclusive results; it does not mean the whole image is clean.
 Missing or contradictory inputs return exit 1 without successful proof. `/current`
-is explicitly unavailable for slice recipes. Sweep manifests, graph associations
-and native loaded-image lifetime validation remain open. See
+is explicitly unavailable for slice recipes. Graph associations and native
+loaded-image lifetime validation remain open. See
 [original slice replay](ARCHITECTURE.md#original-kmon-slice-replay).
+
+`KnLiveDbg.exe --offline !kmon replay-image ".\evidence\image-sweeps\sweep-COLLECTION-ID.knsweep" /json`
+replays a temporal sweep manifest and its original slice recipes. The
+`kn.image_sweep_replay.v1` envelope identifies the manifest separately from recipe
+hashes. Inspect membership, comparison and whole-sweep completion independently:
+exit 0 can reproduce an incomplete sweep with a missing head or unknown tail.
+Missing/corrupt declared artifacts, conflicting target/range/time membership or
+failed slice replay return exit 1 without proof. `/current` remains unavailable.
+The match claim is limited to scheduled executable ranges and the recorded time
+interval. See [sweep manifests](ARCHITECTURE.md#temporal-image-sweep-manifests).
 
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged

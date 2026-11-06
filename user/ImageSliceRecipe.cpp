@@ -69,6 +69,8 @@ namespace
         if (s.SecondaryOpened)
         {
             if (!ValidObservationRoutedReadSet(s.SecondaryReads) || s.SecondaryReads.ParserReads.empty() ||
+                s.SecondaryReads.Attempts.StartedTick < p.TargetReads.Attempts.StartedTick ||
+                s.SecondaryReads.Attempts.SnapshotTick > p.TargetReads.Attempts.SnapshotTick ||
                 s.SecondaryReads.Attempts.TargetId != L"reference:" + p.ReferenceSha256 ||
                 s.SecondaryReads.Attempts.AddressSpaceId != L"reference_view:" + p.ReferenceSha256 + L":" + std::to_wstring(s.SecondaryViewBase) ||
                 s.SecondaryReads.Attempts.Budget.MaximumBytes > 4 * 1024 * 1024 ||

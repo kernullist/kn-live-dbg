@@ -162,6 +162,16 @@ void KernelMonitor::ResetPipeline()
     ImageSlicesFailed.store(0);
     ImageSlicesUnavailable.store(0);
     ImageSliceBytes.store(0);
+    ImageSweepManifests = {};
+    ImageSweepManifestsWritten.store(0);
+    ImageSweepManifestsFailed.store(0);
+    ImageSweepManifestBytes.store(0);
+    ImageSweepManifestPending.store(0);
+    ImageSweepManifestAdmissionDenied.store(0);
+    ImageSweepManifestEntryDrops.store(0);
+    ImageSweepsStarted.store(0);
+    ImageSweepTerminalsObserved.store(0);
+    ImageSweepMetadataFailures.store(0);
     EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
     EvidenceQueued.store(0);
     EvidenceWritten.store(0);
@@ -901,7 +911,7 @@ uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
 
 uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
     const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference, const std::wstring& sliceJson,
-    const ExecutableSliceTrace* slice)
+    const ExecutableSliceTrace* slice, const ImageSweepContext* sweep)
 {
     uint64_t estimate = reads.Attempts.Reads.size() * 1400ull;
     for (const auto& receipt : reads.Attempts.Reads)
@@ -922,6 +932,7 @@ uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads,
     }
     CapturedImageReads item;
     item.Id = NextCaptureId.fetch_add(1);
+    if (sweep != nullptr) { item.Sweep = *sweep; item.Sweep->Slice.ReadSetId = item.Id; }
     item.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
     item.Identity = identity;
     item.Payload = payload;
@@ -960,6 +971,8 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
 {
     bool written = false;
     bool sliceWritten = false;
+    bool referenceWritten = false;
+    std::wstring rawHash, recipeHash;
     try
     {
         std::wstring directory;
@@ -995,6 +1008,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
                     if (ready && !created) { ImageReferenceBlobsReused.fetch_add(1); }
                     if (!ready) { ImageReferenceBlobsFailed.fetch_add(1); }
                     referencePersistence = ready ? L"committed" : L"failed";
+                    referenceWritten = ready;
                 }
             }
             const auto json = reads.HasReference ? ImageReadArchiveJson(reads.Payload, &reads.Reference, referencePersistence, referenceFailure, reads.HasSliceInputs) : reads.Json;
@@ -1002,7 +1016,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
             if (!json.empty() && finalBytes <= EvidenceBundleMaxJsonBytes && finalBytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
             {
                 written = SaveObservationJson(path.wstring(), json, &failure);
-                if (written) { ImageReadsBytes.fetch_add(finalBytes); }
+                if (written) { ImageReadsBytes.fetch_add(finalBytes); mcpjson::GetString(json, L"payload_sha256", &rawHash); }
             }
             if (!reads.SliceJson.empty() && referenceLease != nullptr)
             {
@@ -1011,7 +1025,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
                 if (sliceBytes <= EvidenceBundleMaxJsonBytes && sliceBytes <= 128ull * 1024 * 1024 - ImageSliceBytes.load())
                 {
                     sliceWritten = SaveObservationJson(slicePath.wstring(), reads.SliceJson, &sliceFailure);
-                    if (sliceWritten) { ImageSliceBytes.fetch_add(sliceBytes); }
+                    if (sliceWritten) { ImageSliceBytes.fetch_add(sliceBytes); mcpjson::GetString(reads.SliceJson, L"recipe_sha256", &recipeHash); }
                 }
             }
         }
@@ -1022,6 +1036,8 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         event.Summary = written ? L"original image read attempts committed" : L"image read publication failed";
         event.Evidence[L"read_set_id"] = std::to_wstring(reads.Id);
         event.Evidence[L"collection_id"] = reads.CollectionId;
+        event.Evidence[L"image_sweep_id"] = reads.Sweep ? reads.Sweep->Sweep.SweepId : L"";
+        event.Evidence[L"image_sweep_slice"] = reads.Sweep ? std::to_wstring(reads.Sweep->Slice.Ordinal) : L"0";
         event.Evidence[L"read_set_path"] = written ? path.wstring() : L"";
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
@@ -1040,6 +1056,74 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         if (sliceWritten) { ImageSlicesWritten.fetch_add(1); }
         else { ImageSlicesFailed.fetch_add(1); }
     }
+    RecordImageSweepPublication(reads, written, sliceWritten, referenceWritten, rawHash, recipeHash);
+}
+
+void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest) noexcept
+{
+    bool written = false;
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-sweeps";
+        const auto path = folder / (L"sweep-" + manifest.Sweep.SweepId + L".knsweep");
+        const auto json = ImageSweepManifestJson(manifest);
+        const auto bytes = mcpjson::WideToUtf8(json).size();
+        std::wstring failure = L"invalid_manifest_or_session_byte_budget";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        const auto used = ImageSweepManifestBytes.load();
+        if (!ec && !json.empty() && used <= 128ull * 1024 * 1024 && bytes <= 128ull * 1024 * 1024 - used)
+        {
+            written = SaveObservationJson(path.wstring(), json, &failure);
+            if (written) { ImageSweepManifestBytes.fetch_add(bytes); }
+        }
+        KmonEvent event;
+        event.Kind = L"coverage.image_sweep_manifest";
+        event.ProcessId = manifest.Sweep.Identity.ProcessId;
+        event.Observation.Identity = manifest.Sweep.Identity;
+        event.Summary = written ? L"temporal image sweep membership committed" : L"image sweep manifest publication failed";
+        event.Evidence[L"image_sweep_id"] = manifest.Sweep.SweepId;
+        event.Evidence[L"manifest_path"] = written ? path.wstring() : L"";
+        event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
+        event.Evidence[L"failure"] = written ? L"" : failure;
+        event.Evidence[L"terminal_observed"] = manifest.TerminalObserved ? L"true" : L"false";
+        event.Evidence[L"missing_entries"] = std::to_wstring(manifest.ObservedSlices - manifest.Slices.size());
+        PipelineEvents.Push(std::move(event));
+    }
+    catch (...) {}
+    if (written) { ImageSweepManifestsWritten.fetch_add(1); }
+    else { ImageSweepManifestsFailed.fetch_add(1); }
+}
+
+void KernelMonitor::RecordImageSweepPublication(const CapturedImageReads& reads, bool rawWritten, bool recipeWritten,
+    bool referenceWritten, const std::wstring& rawHash, const std::wstring& recipeHash) noexcept
+{
+    if (!reads.Sweep) { return; }
+    try
+    {
+        auto context = *reads.Sweep;
+        context.Slice.RawWritten = rawWritten; context.Slice.RawPayloadSha256 = rawHash;
+        context.Slice.RecipeWritten = recipeWritten; context.Slice.RecipeSha256 = recipeHash;
+        context.Slice.ReferenceWritten = referenceWritten;
+        auto finished = ImageSweepManifests.Observe(context);
+        ImageSweepManifestPending.store(ImageSweepManifests.Pending());
+        ImageSweepManifestAdmissionDenied.store(ImageSweepManifests.AdmissionDeniedSlices());
+        ImageSweepManifestEntryDrops.store(ImageSweepManifests.EntryDrops());
+        if (finished) { PersistImageSweepManifest(*finished); }
+    }
+    catch (...) { ImageSweepMetadataFailures.fetch_add(1); }
+}
+
+void KernelMonitor::CloseImageSweepManifests() noexcept
+{
+    try
+    {
+        while (auto incomplete = ImageSweepManifests.TakeIncomplete()) { PersistImageSweepManifest(*incomplete); }
+        ImageSweepManifestPending.store(0);
+    }
+    catch (...) { ImageSweepMetadataFailures.fetch_add(1); }
 }
 
 void KernelMonitor::CloseImageReadCollection() noexcept
@@ -1066,7 +1150,16 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             L",\"slice_recipes_written\":" + std::to_wstring(ImageSlicesWritten.load()) +
             L",\"slice_recipes_failed\":" + std::to_wstring(ImageSlicesFailed.load()) +
             L",\"slice_recipes_unavailable\":" + std::to_wstring(ImageSlicesUnavailable.load()) +
-            L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) + L"}";
+            L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) +
+            L",\"sweep_manifests_written\":" + std::to_wstring(ImageSweepManifestsWritten.load()) +
+            L",\"sweep_manifests_failed\":" + std::to_wstring(ImageSweepManifestsFailed.load()) +
+            L",\"sweep_manifest_bytes\":" + std::to_wstring(ImageSweepManifestBytes.load()) +
+            L",\"sweep_manifest_pending\":" + std::to_wstring(ImageSweepManifestPending.load()) +
+            L",\"sweep_manifest_admission_denied_slices\":" + std::to_wstring(ImageSweepManifestAdmissionDenied.load()) +
+            L",\"sweep_manifest_entry_drops\":" + std::to_wstring(ImageSweepManifestEntryDrops.load()) +
+            L",\"sweeps_started\":" + std::to_wstring(ImageSweepsStarted.load()) +
+            L",\"sweep_terminals_observed\":" + std::to_wstring(ImageSweepTerminalsObserved.load()) +
+            L",\"sweep_metadata_failures\":" + std::to_wstring(ImageSweepMetadataFailures.load()) + L"}";
         if (!ec && SaveObservationJson((folder / (L"session-" + id + L".knreadledger")).wstring(), json, nullptr)) { return; }
     }
     catch (...) {}
@@ -1259,6 +1352,7 @@ void KernelMonitor::CaptureWriterLoop()
             CaptureFailed.fetch_add(1);
         }
     }
+    CloseImageSweepManifests();
     CloseImageReadCollection();
     CloseEvidenceCollection();
     CaptureWriterDone.store(true);
@@ -1379,6 +1473,14 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_slice_recipes_failed"] = std::to_wstring(ImageSlicesFailed.load());
         event.Evidence[L"image_slice_recipes_unavailable"] = std::to_wstring(ImageSlicesUnavailable.load());
         event.Evidence[L"image_slice_recipe_bytes"] = std::to_wstring(ImageSliceBytes.load());
+        event.Evidence[L"image_sweep_manifests_written"] = std::to_wstring(ImageSweepManifestsWritten.load());
+        event.Evidence[L"image_sweep_manifests_failed"] = std::to_wstring(ImageSweepManifestsFailed.load());
+        event.Evidence[L"image_sweep_manifest_pending"] = std::to_wstring(ImageSweepManifestPending.load());
+        event.Evidence[L"image_sweep_manifest_admission_denied_slices"] = std::to_wstring(ImageSweepManifestAdmissionDenied.load());
+        event.Evidence[L"image_sweep_manifest_entry_drops"] = std::to_wstring(ImageSweepManifestEntryDrops.load());
+        event.Evidence[L"image_sweeps_started"] = std::to_wstring(ImageSweepsStarted.load());
+        event.Evidence[L"image_sweep_terminals_observed"] = std::to_wstring(ImageSweepTerminalsObserved.load());
+        event.Evidence[L"image_sweep_metadata_failures"] = std::to_wstring(ImageSweepMetadataFailures.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
         event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());

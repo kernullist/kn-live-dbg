@@ -54,6 +54,7 @@ struct ImageRecipeReplay
     std::wstring RecordedPolicy;
     std::wstring CurrentPolicy = ImageRecipePolicy;
     std::wstring RecipeSha256;
+    std::wstring ManifestSha256;
     std::wstring CurrentResult;
     std::wstring RecordedResult;
     std::wstring Proof;
