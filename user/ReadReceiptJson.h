@@ -48,7 +48,8 @@ inline std::wstring ObservationReadSetJson(const ObservationReadSet& set)
             L",\"address\":" + n(read.Request.Address) + L",\"requested_bytes\":" + n(read.Request.Length) +
             L",\"per_read_byte_budget\":" + n(read.Request.ByteBudget) +
             L",\"residency_consent\":" + b(read.Request.AllowResidencyChanges) +
-            L",\"address_shape\":{\"virtual_bits\":" + n(space.VirtualAddressBits) +
+            L",\"address_domain\":" + mcpjson::Quote(read.Source.AddressDomain == ObservationAddressDomain::Physical ? L"physical" : L"virtual") +
+            L",\"address_shape\":{\"virtual_bits\":" + (read.Source.AddressDomain == ObservationAddressDomain::Physical ? std::wstring(L"null") : n(space.VirtualAddressBits)) +
             L",\"pointer_bytes\":" + n(space.PointerBytes) + L",\"physical_bits\":" +
             (space.PhysicalAddressBits == 0 ? std::wstring(L"null") : n(space.PhysicalAddressBits)) +
             L",\"legacy_assumed\":" + b(space.LegacyAssumed) + L",\"user_maximum\":" + n(space.UserMaximum) +

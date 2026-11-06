@@ -25,6 +25,21 @@ int main(int argc, char** argv)
     {
         return std::wstring(CapabilityAvailability(impl, backend, p));
     };
+    ObservationReadResult read;
+    read.State = ObservationReadState::Complete;
+    read.IdentityRevalidated = true;
+    check(CapabilityReadAccepted(read), "identity-qualified completed sample accepted");
+    read.OperationDeadlineExceeded = true;
+    check(!CapabilityReadAccepted(read), "completed overrun cannot grant sample availability");
+    read.OperationDeadlineExceeded = false;
+    read.CancellationObserved = true;
+    check(!CapabilityReadAccepted(read), "cancelled sample cannot grant availability");
+    read.CancellationObserved = false;
+    read.IdentityRevalidated = false;
+    check(!CapabilityReadAccepted(read), "sample requires identity qualification");
+    read.IdentityRevalidated = true;
+    read.State = ObservationReadState::Partial;
+    check(!CapabilityReadAccepted(read), "partial sample is not accepted as complete");
     check(available(nullptr, L"native") == L"not_probed", "compiled native stays unprobed");
     check(available(nullptr, L"vmi", L"unsupported") == L"not_probed", "legacy compiled availability unchanged");
     RuntimeCapabilityProbe probe;

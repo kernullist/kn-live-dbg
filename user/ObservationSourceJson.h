@@ -29,12 +29,15 @@ inline std::wstring ObservationReadJson(const ObservationSourceCapabilities& cap
     std::wstring json = L"{\"schema\":\"kn.observation_read.v1\",\"status\":" +
         mcpjson::Quote(ObservationReadStateName(result.State)) + L",\"source_id\":" + mcpjson::Quote(result.SourceId) +
         L",\"consistency\":" + mcpjson::Quote(result.Consistency) + L",\"address\":" + mcpjson::Quote(std::to_wstring(request.Address)) +
-        L",\"requested_bytes\":" + std::to_wstring(request.Length) + L",\"virtual_address_bits\":" +
-        std::to_wstring(caps.AddressSpace.VirtualAddressBits) + L",\"clock_domain\":" + mcpjson::Quote(result.ClockDomain) +
+        L",\"requested_bytes\":" + std::to_wstring(request.Length) + L",\"address_domain\":" +
+        mcpjson::Quote(caps.AddressDomain == ObservationAddressDomain::Physical ? L"physical" : L"virtual") +
+        L",\"physical_address_bits\":" + (caps.AddressSpace.PhysicalAddressBits == 0 ? std::wstring(L"null") : std::to_wstring(caps.AddressSpace.PhysicalAddressBits)) +
+        L",\"virtual_address_bits\":" + (caps.AddressDomain == ObservationAddressDomain::Physical ? std::wstring(L"null") : std::to_wstring(caps.AddressSpace.VirtualAddressBits)) + L",\"clock_domain\":" + mcpjson::Quote(result.ClockDomain) +
         L",\"started_tick\":" + mcpjson::Quote(std::to_wstring(result.StartedTick)) +
         L",\"ended_tick\":" + mcpjson::Quote(std::to_wstring(result.EndedTick)) +
         L",\"side_effects_possible\":" + (result.SideEffectsPossible ? L"true" : L"false") +
         L",\"cancellation_observed\":" + (result.CancellationObserved ? L"true" : L"false") +
+        L",\"operation_deadline_exceeded\":" + (result.OperationDeadlineExceeded ? L"true" : L"false") +
         L",\"identity_revalidated\":" + (result.IdentityRevalidated ? L"true" : L"false") +
         L",\"native_status_domain\":" + mcpjson::Quote(result.NativeStatusDomain) +
         L",\"native_status\":" + (result.NativeStatusDomain == L"unavailable" ? std::wstring(L"null") : std::to_wstring(result.NativeStatus)) +

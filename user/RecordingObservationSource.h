@@ -74,6 +74,12 @@ public:
 
     void Cancel() { Cancelled.store(true); }
 
+    bool MatchesTarget(const std::wstring& targetId, const std::wstring& addressSpaceId) const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        return Data.TargetId == targetId && Data.AddressSpaceId == addressSpaceId;
+    }
+
     ObservationReadSet Snapshot() const
     {
         std::lock_guard<std::mutex> lock(Mutex);
@@ -132,8 +138,9 @@ private:
                     return prior.Sequence == request.FallbackFromReceipt;
                 });
                 receipt.FallbackPermitted = request.AllowFallback && !request.FallbackReason.empty() &&
-                    from != op.Data.Reads.end() && from->Completed && !from->Result.CancellationObserved &&
+                    from != op.Data.Reads.end() && from->Completed && !from->Result.CancellationObserved && !from->Result.OperationDeadlineExceeded &&
                     from->Source.SourceId != source.SourceId && from->Request.Address == request.Address &&
+                    from->Source.AddressDomain == source.AddressDomain &&
                     from->Request.Length == request.Length &&
                     (from->Result.State == ObservationReadState::Failed || from->Result.State == ObservationReadState::Partial ||
                         from->Result.State == ObservationReadState::NotCaptured || from->Result.State == ObservationReadState::NotPresent ||
@@ -214,6 +221,7 @@ private:
                 auto& receipt = op.Data.Reads[Index];
                 result->ReadReceiptId = receipt.Sequence;
                 receipt.DeadlineExceeded = op.Expired(op.Tick());
+                result->OperationDeadlineExceeded = result->OperationDeadlineExceeded || receipt.DeadlineExceeded;
                 receipt.Result = *result;
                 op.Data.ReservedSpanSlots -= ReservedSpans;
                 ReservedSpans = 0;
@@ -247,6 +255,11 @@ public:
     }
 
     const ObservationSourceCapabilities& Capabilities() const override { return Source.Capabilities(); }
+
+    bool MatchesTarget(const std::wstring& targetId, const std::wstring& addressSpaceId) const
+    {
+        return Operation->MatchesTarget(targetId, addressSpaceId);
+    }
 
 protected:
     std::unique_ptr<ObservationReadScope> BeginReadScope(const ObservationReadRequest& request,

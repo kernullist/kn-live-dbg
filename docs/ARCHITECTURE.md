@@ -74,14 +74,15 @@ reserves its worst-case span count before delegation and refunds unused slots
 after completion. The elapsed interval includes time between reads, including
 parser and queue delays, but does not measure those costs separately. Cancellation
 and deadlines are cooperative: an in-flight synchronous call can overrun; its
-original bytes/status remain in evidence, later calls stop, and cancellation
-prevents parser consumption. These are source-call counts, not physical I/O counts.
+original bytes/status remain in evidence, later calls stop, and cancellation or
+an observed deadline overrun prevents parser consumption. These are delegated
+source-call counts, not underlying device or disk I/O counts.
 
 Each receipt retains the request, admitted source/address descriptor, validated
 sparse spans, raw status domain/code and source-validation reason. Malformed or
 identity-changed bytes are withheld while the original status remains available.
 An explicit fallback link must identify a completed failed/partial/unavailable
-read of the same range on another source, with a reason and permission. Cancelled,
+read of the same range and address domain on another source, with a reason and permission. Cancelled,
 identity-changed, policy-denied and budget-deferred reads cannot authorize fallback.
 The next source still passes its own admission and residency consent. Receipts
 remain separate; their bytes are not combined into an atomic snapshot.
@@ -91,11 +92,54 @@ serialize source close/replacement with use according to each adapter's contract
 Operation bookkeeping is thread safe; that does not make an arbitrary adapter
 concurrent. Target/address-space labels are caller-declared, not independently
 qualified by the recorder. `kn.read_set.v1` is private observation JSON, not an
-authenticated or durable publication format. Its current production consumer is
-the owned-process capability probe. Image transactions, scanner/fallback migration,
-typed translation and durable replay remain P02/P03 work. Native read status
+authenticated or durable publication format. Production consumers include the
+owned-process capability probe and the optional dump read receipts below.
+Image transactions, scanner/fallback migration, native typed translation and
+durable replay remain P02/P03 work. Native read status
 transport is described below; existing direct `DeviceClient` collectors still
 require migration to the observation/recording path.
+
+## Typed translation receipts
+
+`IObservationSource` distinguishes virtual and physical address domains.
+Physical admission uses an explicit 32..52-bit address ceiling and does not apply
+virtual canonicality or user/kernel classification to a physical address. A
+changed address descriptor, domain, residency policy or other source contract
+invalidates the current read even if its source ID stays the same. The caller
+must still serialize contract/lifecycle changes; these checks do not create a lease.
+
+`TranslateObservedAddress` reads every PML5/PML4/PDPT/PD/PT entry through one
+recorded physical source and operation budget. Its root carries source, target,
+address-space, root and epoch identities; the operation's target labels must
+match. Each `kn.translation_receipt.v1` contains entry addresses, raw values and
+the original read receipts, including failures. The walker supports 4 KiB,
+2 MiB and 1 GiB leaves, validates fixed reserved/alignment bits, and applies
+MAXPHYADDR, NXE and 1 GiB checks when that target context is known.
+
+Every successful path is read again, in root-to-leaf order, within the same
+budget. A changed root/epoch, changed entry, incomplete read, cancellation,
+deadline overrun or missing receipt withholds the mapping and permission result.
+Both versions of a conflicting entry remain in evidence. Matching rechecks do
+not rule out ABA, pin mappings or establish an atomic snapshot.
+
+Paging write/user bits are reduced across all levels; any upper NX bit denies
+the paging execute attribute. Unknown architecture context yields nullable
+permissions. These are paging-chain attributes, not effective CPU access or
+execution evidence: CR0.WP, CR4 features, CPL, protection keys, second-stage
+translation and other access controls are not evaluated. The decoder assumes
+ordinary IA-32e physical addresses; encrypted-address encodings and EPT/NPT are
+not additional supported profiles. See the
+[Intel system programming manual, paging and access rights](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+
+The root callback checks retained provider metadata; acquisition that establishes
+that context belongs in the provider's own evidence/budget. Native live root
+acquisition, lifecycle leases and scanner migration remain open. The current
+production integration is `dump-read /receipts`, described below.
+
+Virtual image-recipe capture rejects physical sources and stops after a source
+contract change or deadline overrun. The v1 recipe format refuses an overrun
+flag it cannot preserve. Runtime sample availability also requires a completed,
+identity-qualified read without cancellation or an observed overrun.
 
 ## Native read status transport
 
@@ -863,8 +907,8 @@ remain separate work.
 
 ## Offline dump observation source
 
-`DumpObservationSource` and the existing dump analyzer share one qualified
-LA48/LA57 translation implementation, including 4 KiB, 2 MiB and 1 GiB leaves.
+The ordinary `DumpObservationSource` path and the existing dump analyzer share
+their LA48/LA57 translation implementation, including 4 KiB, 2 MiB and 1 GiB leaves.
 The new offline source validates AMD64 full-dump run counts, physical bounds,
 overlap, declared page counts and file extents before admitting reads. It holds
 one disk-file handle with writes/deletes denied, rejects final reparse points
@@ -889,6 +933,25 @@ publication scanner rejects it even after renaming. The source uses the dump's
 declared root only, does not synthesize uncaptured pages and does not establish
 live execution, VTL1 access or support for bitmap/triage/minidump formats.
 Read ticks describe this collector's file access, not the target's execution time.
+
+Adding `/receipts` selects the typed walker and returns `kn.dump_read.v1`: the
+virtual read, ordered translation receipts and a shared physical read set. PTE
+reads, rechecks and payload reads all consume that operation's byte/call/span/
+receipt/deadline limits; they are the reads used for the result, not later
+evidence-only rereads. Physical file reads retain raw Win32 status and reported
+copy counts. A payload hole does not erase a successfully observed translation,
+and a failed translation cannot supply payload bytes or permissions. Original
+bytes remain usable as evidence after the source handle closes.
+
+This envelope covers the requested virtual range after source initialization.
+Header/run validation and paging-depth probes performed while opening the file
+are explicitly outside that read set. The physical source's 52-bit ceiling is
+the dump format's range limit, not observed target MAXPHYADDR. The dump metadata
+does not establish MAXPHYADDR, NXE or 1 GiB feature support, so the receipt's
+target fields and paging permissions remain unknown. Its decoded address is
+usable for locating captured file bytes, not a verified live CPU translation.
+The legacy output and other dump/image collectors retain their existing path;
+initialization receipts, wider migration and durable translation replay remain open.
 
 ## Cooperative callbacks and pending I/O
 

@@ -44,12 +44,14 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
             RecordingObservationSource recording(source, operation);
             const auto read = recording.Read(request);
             probe.ProcessReadAttempted = true;
-            probe.ProcessReadPassed = read.State == ObservationReadState::Complete && read.IdentityRevalidated;
+            probe.ProcessReadPassed = CapabilityReadAccepted(read);
             probe.ProcessBytesMatched = probe.ProcessReadPassed && read.Spans.size() == 1 &&
                 read.Spans.front().Bytes == std::vector<uint8_t>(control.begin(), control.end());
             probe.ProcessReadJson = ObservationReadJson(source.Capabilities(), request, read);
             probe.ProcessReadSetJson = ObservationReadSetJson(operation->Snapshot());
-            probe.ProcessReason = probe.ProcessBytesMatched ? L"owned_control_bytes_match" : ObservationReadStateName(read.State);
+            probe.ProcessReason = probe.ProcessBytesMatched ? L"owned_control_bytes_match" :
+                read.OperationDeadlineExceeded ? L"operation_deadline_exceeded" :
+                read.CancellationObserved ? L"cancelled" : ObservationReadStateName(read.State);
         }
         else
         {

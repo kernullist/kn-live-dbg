@@ -190,7 +190,7 @@ namespace
     bool ExactBytes(const ImageRecipeRead& read, std::vector<uint8_t>* bytes)
     {
         bytes->clear();
-        if (read.Result.State != ObservationReadState::Complete || read.Result.CancellationObserved)
+        if (read.Result.State != ObservationReadState::Complete || read.Result.CancellationObserved || read.Result.OperationDeadlineExceeded)
         {
             return false;
         }
@@ -262,7 +262,8 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
     }
     const auto caps = source.Capabilities();
     if (recipe == nullptr || imageBase == 0 || imageBase > UINT64_MAX - rva || imageBase + rva > UINT64_MAX - length ||
-        length == 0 || length > 4096 || !caps.AddressSpace.Valid() || caps.SourceId.empty() ||
+        length == 0 || length > 4096 || caps.AddressDomain != ObservationAddressDomain::Virtual ||
+        !caps.AddressSpace.Valid() || caps.SourceId.empty() ||
         newDirectory.empty() || newDirectory.size() > 29000 || newDirectory.find(L'\0') != std::wstring::npos ||
         newDirectory.rfind(L"\\\\", 0) == 0 || newDirectory.rfind(L"\\??\\", 0) == 0)
     {
@@ -314,9 +315,16 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
     p.Normalization = Normalization(metadata, imageBase, rva, length);
     uint64_t remaining = ImageRecipeReadBudget;
     bool exhausted = false;
+    bool sourceChanged = false;
     const ObservationReader recording = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
     {
         bytes->clear();
+        if (exhausted || sourceChanged) { return false; }
+        if (!SameObservationSourceContract(caps, source.Capabilities()))
+        {
+            sourceChanged = true;
+            return false;
+        }
         if (size == 0 || size > 4096 || size > remaining || p.Reads.size() == ImageRecipeMaxReads)
         {
             exhausted = true;
@@ -332,12 +340,14 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
         read.Address = address;
         read.Length = request.Length;
         read.Result = source.Read(request);
+        sourceChanged = sourceChanged || !SameObservationSourceContract(caps, source.Capabilities());
+        exhausted = exhausted || read.Result.OperationDeadlineExceeded;
         remaining -= size;
         p.Reads.push_back(std::move(read));
-        return ExactBytes(p.Reads.back(), bytes);
+        return !sourceChanged && ExactBytes(p.Reads.back(), bytes);
     };
     p.RecordedResult = Execute(retained, metadata, p, recording);
-    if (exhausted || !retained.Unchanged() || !original.Unchanged())
+    if (exhausted || sourceChanged || !retained.Unchanged() || !original.Unchanged())
     {
         return false;
     }

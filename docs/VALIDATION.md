@@ -7,6 +7,76 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Typed dump translation checkpoint: 2026-11-07
+
+This P02 substep adds a physical address domain, a typed page-table walker and
+`--offline !kmon dump-read ... /receipts`. The selected command records the actual
+table, recheck and payload reads under one budget. It preserves the original
+dump-read schema when the option is absent. Native root acquisition, other
+collectors, source-initialization receipts and durable translation replay remain
+open; this checkpoint does not complete P02.
+
+Release x64 EXE SHA-256:
+`8cbf2a0d508333f4df3c21741c786f18a2993603c3493a52a7ac4a421588c82d`.
+ASan translation harness SHA-256:
+`061eae5f43123bf93f9d82d46083aa11a5895eec1bfe8711991d52b23b283184`.
+ASan dump-source harness SHA-256:
+`a019b32013e0fca1b7426a65720525b1eb3a0a0b9499fb4cebabbaa2db912b0d`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+Existing compiler/linker warnings remained, including C4744 on the unchanged
+`KmonHuntIndex::NextQueryEpoch` atomic field. No driver code changed in this substep.
+
+`validate-translation-receipts.ps1 -Sanitize` passed 65 controls; its independent
+Python oracle checked 13 observations. Controls cover LA48/LA57, 4 KiB/2 MiB/1 GiB
+leaves, upper RW/U/S/NX restrictions, reserved bits, MAXPHYADDR, unknown features,
+root and epoch replacement during initial/recheck reads, conflicting entries,
+partial PTE reads, shared budgets, cancellation and receipt exhaustion. No failed
+walk returns a usable mapping or permission result. Physical addresses in the
+virtual canonical hole are tested without pretending they are virtual addresses.
+
+The dump-source ASan harness passed 139 controls using owned synthetic full-dump
+files. The actual EXE passed 227 CLI checks, including original-byte equality,
+physical read denominators/status, nonpresent versus uncaptured pages, invalid
+grammar and read-only stdout failure. One final-symlink CLI check was skipped
+because the host lacked symlink creation privilege. The fixtures also test
+concurrent ordinary file reads, write/delete sharing restrictions and retaining
+the original bytes after closing the source handle. These are file-source
+controls, not a native driver or a real LA57 host validation.
+
+Adversarial review corrected same-number cross-domain fallback, a changed source
+address contract retaining the same ID, a range assembled across different
+chunk contracts, and a root used with another operation's target labels. It also
+prevents parser/fallback use after an observed deadline
+overrun while preserving raw evidence, and distinguishes a caller-declared root
+from a file-backed root. Virtual image capture rejects physical sources and
+overruns instead of omitting those semantics from v1 recipes; capability sample
+availability respects the same deadline/cancellation boundary. The final
+reviewed scope had no additional actionable defects.
+
+Shared recorder checks passed 48 controls and 13 operations/14 JSON snapshots;
+native transport passed 139 controls/14 JSON observations; the owned process
+source passed 23 controls/six JSON observations. Evidence-bundle ASan passed 522
+controls and eight interrupted publications (three valid finals, five absent,
+restart checks passed). Runtime policy passed 27 controls, with the actual CLI
+probe also passing. All 24 contracts/261 routes, the generated matrix drift check,
+11 publication-scanner regressions and full linked self-tests passed (timeline
+28, MCP 102, console 558, commands 3,000, remote 66).
+
+Image-recipe ASan passed 73 controls, including physical-domain rejection,
+source-contract replacement and deadline overruns during header/payload reads.
+Six interrupted publications produced two valid final recipes and four absent
+finals. The final EXE passed 101 image capture/replay CLI checks using owned
+fixtures; no live target participated in those tests.
+
+The dump envelope explicitly excludes initialization header/probe reads. Its
+52-bit physical admission ceiling is not measured target MAXPHYADDR. Missing
+MAXPHYADDR/NXE/1 GiB context leaves permissions unknown; decoded addresses locate
+captured file bytes, not verified live CPU mappings. Repeated reads do not pin
+mappings or exclude ABA. Effective CPU access, encrypted-address profiles,
+EPT/NPT, live root leases, execution and real LA57 remain unvalidated. No driver
+was loaded, service started, Verifier enabled, reboot requested or security
+policy changed for this checkpoint.
+
 ## Native read status transport checkpoint: 2026-11-07
 
 This P02 substep adds an optional ABI 17 read-observation envelope without

@@ -24,6 +24,8 @@ enum class ObservationReadState
     Cancelled
 };
 
+enum class ObservationAddressDomain { Virtual, Physical };
+
 struct ObservationSourceCapabilities
 {
     std::wstring SourceId;
@@ -33,7 +35,32 @@ struct ObservationSourceCapabilities
     bool KernelOnly = false;
     bool UserOnly = false;
     bool MayChangeResidency = false;
+    ObservationAddressDomain AddressDomain = ObservationAddressDomain::Virtual;
 };
+
+inline bool SameObservationSourceContract(const ObservationSourceCapabilities& a, const ObservationSourceCapabilities& b)
+{
+    return a.SourceId == b.SourceId && a.Consistency == b.Consistency && a.AddressDomain == b.AddressDomain &&
+        a.MaximumReadBytes == b.MaximumReadBytes && a.KernelOnly == b.KernelOnly && a.UserOnly == b.UserOnly &&
+        a.MayChangeResidency == b.MayChangeResidency && a.AddressSpace.VirtualAddressBits == b.AddressSpace.VirtualAddressBits &&
+        a.AddressSpace.PointerBytes == b.AddressSpace.PointerBytes && a.AddressSpace.PhysicalAddressBits == b.AddressSpace.PhysicalAddressBits &&
+        a.AddressSpace.LegacyAssumed == b.AddressSpace.LegacyAssumed && a.AddressSpace.UserMaximum == b.AddressSpace.UserMaximum &&
+        a.AddressSpace.KernelMinimum == b.AddressSpace.KernelMinimum;
+}
+
+inline bool ObservationRangeSupported(const ObservationSourceCapabilities& caps, uint64_t address, uint64_t length)
+{
+    if (length == 0 || address > UINT64_MAX - length) { return false; }
+    if (caps.AddressDomain == ObservationAddressDomain::Physical)
+    {
+        const auto bits = caps.AddressSpace.PhysicalAddressBits;
+        return !caps.KernelOnly && !caps.UserOnly && bits >= 32 && bits <= 52 &&
+            address < (uint64_t{1} << bits) && length <= (uint64_t{1} << bits) - address;
+    }
+    return caps.AddressDomain == ObservationAddressDomain::Virtual && caps.AddressSpace.Valid() &&
+        (!caps.UserOnly || caps.AddressSpace.UserRange(address, length)) &&
+        (caps.AddressSpace.KernelRange(address, length) || (!caps.KernelOnly && caps.AddressSpace.UserRange(address, length)));
+}
 
 struct ObservationReadRequest
 {
@@ -68,6 +95,7 @@ struct ObservationReadResult
     uint64_t EndedTick = 0;
     bool SideEffectsPossible = false;
     bool CancellationObserved = false;
+    bool OperationDeadlineExceeded = false;
     bool IdentityRevalidated = false;
     // Legacy DeviceClient reads do not expose the original NTSTATUS.
     std::wstring NativeStatusDomain = L"unavailable";
@@ -130,11 +158,7 @@ public:
                 break;
             }
             if (request.Length == 0 || request.Length > 4096 || request.Length > caps.MaximumReadBytes ||
-                request.Address > UINT64_MAX - request.Length ||
-                !caps.AddressSpace.Valid() ||
-                (caps.UserOnly && !caps.AddressSpace.UserRange(request.Address, request.Length)) ||
-                (!caps.AddressSpace.KernelRange(request.Address, request.Length) &&
-                    (caps.KernelOnly || !caps.AddressSpace.UserRange(request.Address, request.Length))))
+                !ObservationRangeSupported(caps, request.Address, request.Length))
             {
                 result.State = ObservationReadState::Unsupported;
                 break;
@@ -155,7 +179,7 @@ public:
             }
             attempted = true;
             result = ReadSpans(request);
-            if (Capabilities().SourceId != caps.SourceId)
+            if (!SameObservationSourceContract(Capabilities(), caps))
             {
                 result.Spans.clear();
                 result.IdentityRevalidated = false;
@@ -246,7 +270,7 @@ inline bool ReadObservationExact(IObservationSource& source, uint64_t address, s
     request.AllowResidencyChanges = allowResidencyChanges;
     request.Cancellation = cancellation;
     const auto result = source.Read(request);
-    if (result.State != ObservationReadState::Complete || result.CancellationObserved)
+    if (result.State != ObservationReadState::Complete || result.CancellationObserved || result.OperationDeadlineExceeded)
     {
         return false;
     }
@@ -270,9 +294,7 @@ inline bool ReadObservationRange(IObservationSource& source, uint64_t address, s
     bytes->clear();
     const auto caps = source.Capabilities();
     if (length == 0 || length > 0x20000 || length > byteBudget || caps.MaximumReadBytes == 0 ||
-        (caps.UserOnly && !caps.AddressSpace.UserRange(address, length)) ||
-        address > UINT64_MAX - length || (!caps.AddressSpace.KernelRange(address, length) &&
-            (caps.KernelOnly || !caps.AddressSpace.UserRange(address, length))))
+        !ObservationRangeSupported(caps, address, length))
     {
         return false;
     }
@@ -280,6 +302,10 @@ inline bool ReadObservationRange(IObservationSource& source, uint64_t address, s
     assembled.reserve(length);
     while (assembled.size() < length)
     {
+        if (!SameObservationSourceContract(caps, source.Capabilities()))
+        {
+            return false;
+        }
         ObservationReadRequest request;
         request.SourceId = caps.SourceId;
         request.Address = address + assembled.size();
@@ -289,7 +315,7 @@ inline bool ReadObservationRange(IObservationSource& source, uint64_t address, s
         request.AllowResidencyChanges = allowResidencyChanges;
         request.Cancellation = cancellation;
         const auto result = source.Read(request);
-        if (result.State != ObservationReadState::Complete || result.CancellationObserved)
+        if (result.State != ObservationReadState::Complete || result.CancellationObserved || result.OperationDeadlineExceeded)
         {
             return false;
         }

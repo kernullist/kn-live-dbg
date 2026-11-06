@@ -561,6 +561,15 @@
     <ClInclude Include="NativeReadObservation.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="TranslationReceipt.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TranslationReceiptJson.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DumpReadObservationJson.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgReadObservation.h">
       <Filter>Header Files</Filter>
     </ClInclude>

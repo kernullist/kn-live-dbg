@@ -26,7 +26,7 @@ private `kn.read_set.v1` evidence, and its caller-declared target labels are not
 an authenticated target identity. `native_read_observation_contract` is null
 before successful ABI qualification, otherwise the advertised optional read
 feature flag. It does not qualify a native sample. Selected native sources use
-the versioned status transport; existing direct collectors and typed translation
+the versioned status transport; existing direct collectors and native typed translation
 remain separate integration work.
 
 Saved KMON evidence can also be investigated without elevation, driver loading,
@@ -60,6 +60,14 @@ Addresses are hexadecimal; lengths are decimal unless explicitly prefixed.
 has no virtual allocation. Sparse spans contain bytes only where captured.
 The command exits 0 for a complete read, 1 for unavailable/partial/failed reads,
 and 2 for invalid grammar. It opens no driver or symbol session.
+
+Add `/receipts` (with or without `/json`) to return `kn.dump_read.v1`, containing
+the virtual result, each page-table walk/recheck and the original physical
+table/payload reads under one shared budget. This private evidence includes
+failures and raw Win32 file status. It covers the requested range after source
+opening; initialization probes are not included. Unknown dump CPU features leave
+paging permissions null, and matching rechecks do not establish mapping lifetime
+or execution. The existing command without `/receipts` keeps its original schema.
 
 `KnLiveDbg.exe --offline !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length> <new-directory> /json`
 captures one 1..4,096-byte executable comparison and its exact reference into a

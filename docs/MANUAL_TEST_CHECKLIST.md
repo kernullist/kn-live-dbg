@@ -23,6 +23,15 @@ controls do not establish this live host result.
 
 ## Native session policy
 
+For typed translation, run `tools/validate-translation-receipts.ps1 -Sanitize`
+and `tools/validate-dump-source.ps1 -Sanitize`. Pass the latter's owned fixture
+directory to `python tools/test-dump-source-cli.py --executable x64/Release/KnLiveDbg.exe --fixtures <directory>`.
+Check LA48/LA57 shapes, all three leaf sizes, upper-level permissions, root/entry
+replacement, partial PTE reads, shared-budget exhaustion and physical/virtual
+domain separation. Compare `/receipts` with the original dump-read bytes and
+count every table, recheck and payload attempt. These synthetic dump controls do
+not establish real LA57, target MAXPHYADDR/NXE, live root lifetime or CPU access.
+
 Run `tools/validate-native-read.ps1 -Sanitize` for the production transport's
 versioned/legacy responses, request binding, raw NTSTATUS/Win32 separation,
 partial prefixes, count/status contradictions, malformed/truncated replies and

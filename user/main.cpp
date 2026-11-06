@@ -24,6 +24,7 @@
 #include "HvPostureScanner.h"
 #include "DumpAnalyzer.h"
 #include "DumpObservationSource.h"
+#include "DumpReadObservationJson.h"
 #include "ObservationSourceJson.h"
 #include "DmaPostureScanner.h"
 #include "InputStackScanner.h"
@@ -23054,7 +23055,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
     std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples\n";
     std::wcout << L"  !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
-    std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
+    std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory> [/current] [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
@@ -23474,18 +23475,27 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
     if (action == L"dump-read")
     {
         uint64_t address = 0, length = 0;
-        if (args.size() < 5 || args.size() > 6 || args[2].empty() ||
-            !ParseUnsigned(args[3], 16, &address) || !ParseUnsigned(args[4], 10, &length) || length == 0 || length > 4096 ||
-            (args.size() == 6 && ToLower(args[5]) != L"/json"))
+        bool receipts = false, json = false;
+        bool valid = args.size() >= 5 && args.size() <= 7;
+        for (size_t i = 5; valid && i < args.size(); ++i)
         {
-            std::wcerr << L"usage: !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]\n";
+            const auto option = ToLower(args[i]);
+            if (option == L"/receipts" && !receipts) { receipts = true; }
+            else if (option == L"/json" && !json) { json = true; }
+            else { valid = false; }
+        }
+        if (!valid || args[2].empty() ||
+            !ParseUnsigned(args[3], 16, &address) || !ParseUnsigned(args[4], 10, &length) || length == 0 || length > 4096)
+        {
+            std::wcerr << L"usage: !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
             return 2;
         }
         std::wstring error;
         auto source = OpenDumpObservationSource(args[2], &error);
         if (!source)
         {
-            std::wcout << L"{\"schema\":\"kn.observation_read.v1\",\"status\":\"unavailable\",\"error\":"
+            std::wcout << L"{\"schema\":" << mcpjson::Quote(receipts ? L"kn.dump_read.v1" : L"kn.observation_read.v1")
+                << L",\"status\":\"unavailable\",\"error\":"
                 << mcpjson::Quote(error) << L",\"collector_authenticated\":false,\"spans\":[]}\n";
             return 1;
         }
@@ -23495,6 +23505,14 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         request.Length = static_cast<uint32_t>(length);
         request.ByteBudget = length;
         request.Cancellation = &g_StopRequested;
+        if (receipts)
+        {
+            const auto observed = source->ReadWithReceipts(request);
+            std::wcout << DumpReadObservationJson(observed) << L"\n";
+            std::wcout.flush();
+            return observed.Result.State == ObservationReadState::Complete && !observed.Result.CancellationObserved &&
+                !observed.Result.OperationDeadlineExceeded && std::wcout.good() ? 0 : 1;
+        }
         const auto result = source->Read(request);
         std::wcout << ObservationReadJson(source->Capabilities(), request, result) << L"\n";
         return result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1;

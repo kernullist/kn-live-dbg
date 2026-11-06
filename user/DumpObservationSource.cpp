@@ -19,6 +19,16 @@ namespace
         uint64_t Offset = 0;
     };
 
+    class CallbackObservationSource final : public IObservationSource
+    {
+    public:
+        ObservationSourceCapabilities Caps;
+        std::function<ObservationReadResult(const ObservationReadRequest&)> Reader;
+        const ObservationSourceCapabilities& Capabilities() const override { return Caps; }
+    protected:
+        ObservationReadResult ReadSpans(const ObservationReadRequest& request) override { return Reader(request); }
+    };
+
     class DumpFile
     {
     public:
@@ -122,6 +132,73 @@ namespace
             return Unchanged() ? ObservationReadState::NotCaptured : ObservationReadState::IdentityChanged;
         }
 
+        ObservationReadResult PhysicalObserved(uint64_t address, uint32_t length)
+        {
+            ObservationReadResult result;
+            ObservationReadSpan span{address, length, ObservationReadState::NotCaptured, {}};
+            std::lock_guard<std::mutex> lock(Mutex);
+            if (!Unchanged())
+            {
+                result.State = ObservationReadState::IdentityChanged;
+                return result;
+            }
+            for (const auto& run : Runs)
+            {
+                if (address < run.Base || address - run.Base >= run.Bytes || length > run.Bytes - (address - run.Base)) { continue; }
+                const uint64_t offset = run.Offset + address - run.Base;
+                LARGE_INTEGER position{};
+                position.QuadPart = static_cast<LONGLONG>(offset);
+                result.NativeStatusDomain = L"win32";
+                result.TransferredBytesKnown = true;
+                result.BackendContract = L"win32_dump_file_read";
+                result.BackendCopyAttemptKnown = true;
+                span.State = ObservationReadState::Failed;
+                if (!SetFilePointerEx(Handle, position, nullptr, FILE_BEGIN))
+                {
+                    result.NativeStatus = GetLastError();
+                    break;
+                }
+                DWORD copied = 0;
+                std::vector<uint8_t> bytes(length);
+                result.BackendCopyAttempted = true;
+                const bool read = ReadFile(Handle, bytes.data(), length, &copied, nullptr) != FALSE;
+                result.NativeStatus = read ? ERROR_SUCCESS : GetLastError();
+                result.TransferredBytes = copied;
+                if (copied > length)
+                {
+                    result.ValidationReason = L"invalid_dump_copy_count";
+                    break;
+                }
+                if (!read && copied == length)
+                {
+                    result.ValidationReason = L"failed_dump_read_with_full_count";
+                    break;
+                }
+                if (copied != 0)
+                {
+                    span.RequestedBytes = copied;
+                    span.State = ObservationReadState::Complete;
+                    bytes.resize(copied);
+                    span.Bytes = std::move(bytes);
+                    if (copied < length)
+                    {
+                        result.Spans.push_back(std::move(span));
+                        span = {address + copied, length - copied, ObservationReadState::Failed, {}};
+                    }
+                }
+                break;
+            }
+            if (!Unchanged())
+            {
+                result.Spans.clear();
+                result.State = ObservationReadState::IdentityChanged;
+                result.ValidationReason = L"dump_identity_changed";
+                return result;
+            }
+            result.Spans.push_back(std::move(span));
+            return result;
+        }
+
         uint64_t Size = 0;
         std::wstring Id;
         std::vector<Run> Runs;
@@ -223,7 +300,8 @@ DumpAddressTranslation TranslateDumpAddress(const DumpPhysicalReader& reader,
 }
 
 DumpObservationSource::DumpObservationSource(std::wstring sourceId, uint64_t root, uint32_t pagingLevels,
-    DumpPhysicalReader reader) : Root(root), PagingLevels(pagingLevels), Reader(std::move(reader))
+    DumpPhysicalReader reader, DumpObservedPhysicalReader observedReader)
+    : Root(root), PagingLevels(pagingLevels), Reader(std::move(reader)), ObservedReader(std::move(observedReader))
 {
     Caps.SourceId = std::move(sourceId);
     Caps.Consistency = L"offline_dump";
@@ -277,7 +355,107 @@ ObservationReadResult DumpObservationSource::ReadSpans(const ObservationReadRequ
     return result;
 }
 
-std::unique_ptr<IObservationSource> OpenDumpObservationSource(const std::wstring& path, std::wstring* error)
+DumpReadObservation DumpObservationSource::ReadWithReceipts(const ObservationReadRequest& request, ObservationOperationBudget budget)
+{
+    DumpReadObservation observed;
+    observed.Source = Caps;
+    observed.Request = request;
+    observed.Request.Cancellation = nullptr;
+    if (Caps.SourceId.empty() || Caps.SourceId.size() > 1900)
+    {
+        observed.Result.SourceId = Caps.SourceId;
+        observed.Result.State = ObservationReadState::IdentityChanged;
+        observed.Result.ValidationReason = L"invalid_dump_source_identity";
+        return observed;
+    }
+    static std::atomic<uint64_t> serial{0};
+    auto operation = std::make_shared<ObservationReadOperation>(L"dump_read:" + std::to_wstring(++serial),
+        Caps.SourceId, Caps.SourceId + L":virtual", budget);
+    CallbackObservationSource physical;
+    physical.Caps.SourceId = Caps.SourceId + L":physical";
+    physical.Caps.Consistency = L"offline_dump";
+    physical.Caps.AddressDomain = ObservationAddressDomain::Physical;
+    // This is the file format's address ceiling, not observed target MAXPHYADDR.
+    physical.Caps.AddressSpace.PhysicalAddressBits = 52;
+    physical.Reader = [&](const ObservationReadRequest& item)
+    {
+        if (ObservedReader) { return ObservedReader(item.Address, item.Length); }
+        ObservationReadResult read;
+        ObservationReadSpan span{item.Address, item.Length, ObservationReadState::Failed, {}};
+        span.State = Reader(item.Address, item.Length, &span.Bytes);
+        if (span.State != ObservationReadState::Complete) { span.Bytes.clear(); }
+        read.Spans.push_back(std::move(span));
+        return read;
+    };
+    RecordingObservationSource recorded(physical, operation);
+    TranslationRootIdentity root;
+    root.SourceId = physical.Caps.SourceId;
+    root.TargetId = Caps.SourceId;
+    root.AddressSpaceId = Caps.SourceId + L":virtual";
+    root.RootId = Caps.SourceId + L":root";
+    root.Binding = FileHandleBound ? L"dump_header_and_open_handle" : L"caller_declared_dump_root";
+    root.Root = Root;
+    root.Epoch = 1; // A reopened file receives a different SourceId.
+    root.Space = Caps.AddressSpace;
+    CallbackObservationSource virtualSource;
+    virtualSource.Caps = Caps;
+    virtualSource.Reader = [&](const ObservationReadRequest& item)
+    {
+        ObservationReadResult result;
+        uint32_t done = 0;
+        while (done < item.Length)
+        {
+            const uint64_t current = item.Address + done;
+            const auto chunk = (std::min)(item.Length - done, static_cast<uint32_t>(PageBytes - (current & (PageBytes - 1))));
+            auto translated = TranslateObservedAddress(recorded, root, [&]() { return root; }, current, chunk, item.Cancellation);
+            const auto state = translated.State;
+            const auto translatedAddress = translated.PhysicalAddress;
+            observed.Translations.push_back(std::move(translated));
+            if (state == ObservationReadState::Complete)
+            {
+                ObservationReadRequest physicalRequest;
+                physicalRequest.SourceId = physical.Caps.SourceId;
+                physicalRequest.Address = translatedAddress;
+                physicalRequest.Length = chunk;
+                physicalRequest.ByteBudget = chunk;
+                physicalRequest.Cancellation = item.Cancellation;
+                const auto data = recorded.Read(physicalRequest);
+                result.CancellationObserved = result.CancellationObserved || data.CancellationObserved;
+                result.OperationDeadlineExceeded = result.OperationDeadlineExceeded || data.OperationDeadlineExceeded;
+                if (data.CancellationObserved || data.OperationDeadlineExceeded || data.Spans.empty())
+                {
+                    result.Spans.push_back({current, chunk, data.CancellationObserved ? ObservationReadState::Cancelled :
+                        data.OperationDeadlineExceeded ? ObservationReadState::BudgetDeferred : data.State, {}});
+                }
+                else
+                {
+                    for (auto span : data.Spans)
+                    {
+                        span.Address = current + span.Address - translatedAddress;
+                        result.Spans.push_back(std::move(span));
+                    }
+                }
+            }
+            else
+            {
+                result.Spans.push_back({current, chunk, state, {}});
+            }
+            if (result.Spans.back().State == ObservationReadState::IdentityChanged)
+            {
+                result.Spans = {{item.Address, item.Length, ObservationReadState::IdentityChanged, {}}};
+                break;
+            }
+            done += chunk;
+        }
+        return result;
+    };
+    observed.Result = virtualSource.Read(request);
+    observed.PhysicalReads = operation->Snapshot();
+    observed.Result.OperationId = observed.PhysicalReads.OperationId;
+    return observed;
+}
+
+std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstring& path, std::wstring* error)
 {
     std::wstring ignored;
     if (error == nullptr)
@@ -370,5 +548,8 @@ std::unique_ptr<IObservationSource> OpenDumpObservationSource(const std::wstring
         return {};
     }
     error->clear();
-    return std::make_unique<DumpObservationSource>(file->Id, header.DirectoryTableBase, levels, reader);
+    auto source = std::make_unique<DumpObservationSource>(file->Id, header.DirectoryTableBase, levels, reader,
+        [file](uint64_t address, uint32_t length) { return file->PhysicalObserved(address, length); });
+    source->FileHandleBound = true;
+    return source;
 }

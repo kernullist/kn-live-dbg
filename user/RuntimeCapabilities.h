@@ -1,6 +1,7 @@
 #pragma once
 
 #include "McpJson.h"
+#include "ObservationSource.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -29,6 +30,12 @@ struct RuntimeCapabilityProbe
 };
 
 RuntimeCapabilityProbe ProbeRuntimeCapabilities();
+
+inline bool CapabilityReadAccepted(const ObservationReadResult& read)
+{
+    return read.State == ObservationReadState::Complete && read.IdentityRevalidated &&
+        !read.CancellationObserved && !read.OperationDeadlineExceeded;
+}
 
 inline bool WriteCapabilityJson(const std::wstring& json)
 {

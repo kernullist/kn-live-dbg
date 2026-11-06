@@ -722,7 +722,7 @@ namespace
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
         { L"inventory", L"!kmon inventory <directory> <new-snapshot-directory> [/json]", L"publish an immutable index of retained evidence" },
-        { L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]", L"bounded offline reads with explicit missing pages and mapping failures" },
+        { L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]", L"bounded offline reads with explicit missing pages and mapping failures" },
         { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
         { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },
         { L"why", L"!kmon why <file.kncase> [/json]", L"evidence provenance, supported facts and missing requirements" },
@@ -757,6 +757,12 @@ namespace
     const CompletionHint kKmonReplayTokens[] =
     {
         { L"/json", L"/json", L"structured static facts, provenance and unfulfilled requirements" },
+    };
+
+    const CompletionHint kKmonDumpReadTokens[] =
+    {
+        { L"/json", L"/json", L"structured sparse dump read" },
+        { L"/receipts", L"/receipts", L"retain original physical reads and typed page-table receipts" },
     };
 
     const CompletionHint kKmonSurfaceTokens[] =
@@ -1657,7 +1663,7 @@ namespace
         SCOPE(L"", L"!kmon [start] [options] | stop | status | add | remove | iotrace | watch | recent | cases | surfaces | layouts | diff | evidence | replay | why | save | clear", L"unknown kernel drop/map/hidden tail (no filename)", kKmonRootTokens),
         SCOPE(L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent investigation leads", kKmonCaseTokens),
         SCOPE(L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"offline retained evidence inventory", kKmonEvidenceTokens),
-        SCOPE(L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/json]", L"offline sparse dump read", kKmonReplayTokens),
+        SCOPE(L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]", L"offline sparse dump read", kKmonDumpReadTokens),
         SCOPE(L"replay", L"!kmon replay <file.kncase> [/json]", L"offline original-byte replay", kKmonReplayTokens),
         SCOPE(L"why", L"!kmon why <file.kncase> [/json]", L"supported facts and missing evidence", kKmonReplayTokens),
         SCOPE(L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"static callback references", kKmonSurfaceTokens),

@@ -155,7 +155,7 @@ namespace
                 result.ClockDomain != L"collector_steady_clock_ms" || result.EndedTick < result.StartedTick ||
                 result.StartedTick < lastTick || result.State < ObservationReadState::Complete ||
                 result.State > ObservationReadState::Cancelled || result.Spans.size() > read.Length ||
-                !Text(result.NativeStatusDomain, 128) || result.SideEffectsPossible)
+                !Text(result.NativeStatusDomain, 128) || result.SideEffectsPossible || result.OperationDeadlineExceeded)
             {
                 return false;
             }

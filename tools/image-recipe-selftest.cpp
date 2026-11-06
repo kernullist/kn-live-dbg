@@ -49,6 +49,11 @@ namespace
         bool Unstable = false;
         bool Missing = false;
         bool ChangeHeaderBase = false;
+        bool DeadlineExceeded = false;
+        bool DeadlineOnPageOnly = false;
+        bool SawDeadline = false;
+        size_t ReadsAfterDeadline = 0;
+        bool ChangeDomain = false;
         size_t PageReads = 0;
         size_t HeaderReads = 0;
         Source()
@@ -61,10 +66,18 @@ namespace
         {
             return Caps;
         }
+        void PhysicalDomain()
+        {
+            Caps.AddressDomain = ObservationAddressDomain::Physical;
+            Caps.AddressSpace.PhysicalAddressBits = 52;
+        }
     protected:
         ObservationReadResult ReadSpans(const ObservationReadRequest& request) override
         {
             ObservationReadResult result;
+            if (SawDeadline) { ++ReadsAfterDeadline; }
+            result.OperationDeadlineExceeded = DeadlineExceeded && (!DeadlineOnPageOnly || request.Address == Base + 0x1000);
+            SawDeadline = SawDeadline || result.OperationDeadlineExceeded;
             result.IdentityRevalidated = true;
             ObservationReadSpan span;
             span.Address = request.Address;
@@ -104,6 +117,7 @@ namespace
                 span.Bytes.assign(Memory.begin() + start, Memory.begin() + start + request.Length);
             }
             result.Spans.push_back(std::move(span));
+            if (ChangeDomain) { PhysicalDomain(); }
             return result;
         }
     private:
@@ -245,6 +259,26 @@ int wmain(int argc, wchar_t** argv)
     Write(image, disk);
     Dump(root / L"owned.dmp", clean);
     std::wstring error;
+    Source physical = clean;
+    physical.PhysicalDomain();
+    ImageVerificationRecipe denied;
+    const auto physicalCase = root / L"physical-source";
+    Check(!CaptureImageRecipe(image.wstring(), physical, Source::Base, 0x1000, 4096, physicalCase.wstring(), &denied, &error) &&
+        physical.HeaderReads == 0 && !std::filesystem::exists(physicalCase),
+        "virtual image recipe rejects a physical source before acquisition or publication");
+    for (unsigned mode : {0u, 1u, 2u})
+    {
+        const bool domainChange = mode == 1;
+        Source invalidated = clean;
+        invalidated.DeadlineExceeded = !domainChange;
+        invalidated.DeadlineOnPageOnly = mode == 2;
+        invalidated.ChangeDomain = domainChange;
+        const auto invalidCase = root / (mode == 2 ? L"payload-deadline" : domainChange ? L"changed-domain" : L"deadline-exceeded");
+        Check(!CaptureImageRecipe(image.wstring(), invalidated, Source::Base, 0x1000, 4096, invalidCase.wstring(), &denied, &error) &&
+            invalidated.PageReads == (mode == 2 ? 1u : 0u) && invalidated.ReadsAfterDeadline == 0 &&
+            !std::filesystem::exists(invalidCase / L"recipe.knverify"),
+            "image capture cannot parse or publish after a contract change or deadline overrun");
+    }
     const auto capture = [&](const wchar_t* name, Source& source, uint32_t rva, ImageVerificationRecipe* p)
     {
         const auto directory = root / name;
@@ -266,6 +300,9 @@ int wmain(int argc, wchar_t** argv)
     }
     Check(original.RecordedResult.find(L"owned_verified") != std::wstring::npos,
         "cross-page relocation is normalized using the retained raw image");
+    auto overrunRecipe = original;
+    overrunRecipe.Reads[0].Result.OperationDeadlineExceeded = true;
+    Check(ImageRecipeJson(overrunRecipe).empty(), "v1 recipe refuses to silently discard deadline state");
     Source changed = clean;
     changed.Memory[0x1150] ^= 1;
     ImageVerificationRecipe modified;

@@ -1,5 +1,6 @@
 #include "../user/DumpObservationSource.h"
 #include "../user/ObservationSourceJson.h"
+#include "../user/DumpReadObservationJson.h"
 #include "../user/MemoryDumper.h"
 #include <mindumpdef.h>
 #include <filesystem>
@@ -89,6 +90,22 @@ int wmain(int argc, wchar_t** argv)
     }
     const std::filesystem::path root(argv[1]);
     std::wstring error;
+    unsigned callbackCalls = 0;
+    const DumpPhysicalReader emptyPage = [&](uint64_t, uint32_t length, std::vector<uint8_t>* bytes)
+    {
+        ++callbackCalls;
+        bytes->assign(length, 0);
+        return ObservationReadState::Complete;
+    };
+    DumpObservationSource declared(L"synthetic:declared", 0x1000, 4, emptyPage);
+    ObservationReadRequest declaredRequest{declared.Capabilities().SourceId, 0x100000, 8, 8};
+    const auto declaredRead = declared.ReadWithReceipts(declaredRequest);
+    Check(declaredRead.Translations[0].Root.Binding == L"caller_declared_dump_root",
+        "callback-only source does not claim an owned dump file handle");
+    DumpObservationSource invalid(L"synthetic:invalid", 0x1000, 0, emptyPage);
+    callbackCalls = 0;
+    Check(invalid.ReadWithReceipts(declaredRequest).Result.State == ObservationReadState::IdentityChanged && callbackCalls == 0,
+        "unqualified recorded source fails before allocating an operation or reading");
     for (uint32_t levels : {4u, 5u})
     {
         for (uint32_t leaf : {1u, 2u, 3u})
@@ -124,6 +141,24 @@ int wmain(int argc, wchar_t** argv)
             request.ByteBudget = 15;
             Check(source->Read(request).State == ObservationReadState::BudgetDeferred, "data byte budget enforced");
             request.ByteBudget = 16;
+            auto captured = source->ReadWithReceipts(request);
+            const auto entries = levels - leaf + 1;
+            Check(captured.Result.State == ObservationReadState::Partial && captured.Translations.size() == 2 &&
+                captured.PhysicalReads.ChargedBytes == 32 * entries + 16 &&
+                captured.PhysicalReads.ChargedSourceCalls == 4 * entries + 2,
+                "recorded dump counts both walks, both rechecks and both payload attempts");
+            Check(!captured.Translations[0].PagingPermissionsKnown && captured.Translations[0].HasMapping &&
+                captured.Translations[0].Root.Binding == L"dump_header_and_open_handle" &&
+                captured.PhysicalReads.Reads[0].Result.NativeStatusDomain == L"win32" &&
+                captured.PhysicalReads.Reads[0].Result.TransferredBytes == 8,
+                "dump keeps original file read status and leaves unknown architecture unqualified");
+            ObservationOperationBudget physicalBudget;
+            physicalBudget.MaximumBytes = 8;
+            const auto deferred = source->ReadWithReceipts(request, physicalBudget);
+            Check(deferred.Result.State == ObservationReadState::BudgetDeferred && deferred.PhysicalReads.ChargedBytes == 8 &&
+                !deferred.PhysicalReads.Reads.back().SourceInvoked,
+                "virtual request cannot bypass the shared physical walk budget");
+            Check(mcpjson::ValidateDocument(DumpReadObservationJson(captured)), "dump read receipt envelope parses");
             request.SourceId += L":stale";
             Check(source->Read(request).State == ObservationReadState::IdentityChanged, "source-token substitution denied");
             request.SourceId = source->Capabilities().SourceId;
@@ -158,6 +193,9 @@ int wmain(int argc, wchar_t** argv)
             }
             const auto oldId = source->Capabilities().SourceId;
             source.reset();
+            Check(captured.Result.Spans[0].Bytes == std::vector<uint8_t>(8, 0x42) &&
+                captured.PhysicalReads.Reads[0].Result.Spans[0].Bytes.size() == 8,
+                "original physical and virtual bytes outlive the dump handle");
             source = OpenDumpObservationSource(path.wstring(), &error);
             Check(source && source->Capabilities().SourceId != oldId, "reopened source receives a new connection identity");
         }
