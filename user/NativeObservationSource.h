@@ -8,21 +8,39 @@
 class NativeObservationSource final : public IObservationSource
 {
 public:
-    explicit NativeObservationSource(DeviceClient& device) : Device(device), Epoch(device.ObservationEpoch())
+    explicit NativeObservationSource(DeviceClient& device)
+        : NativeObservationSource(device, KNDBG_READ_OBSERVATION_KERNEL, 0, 0, 0) {}
+
+    NativeObservationSource(DeviceClient& device, uint32_t pid, uint64_t eprocess, uint64_t creation)
+        : NativeObservationSource(device, KNDBG_READ_OBSERVATION_PROCESS, pid, eprocess, creation) {}
+
+private:
+    NativeObservationSource(DeviceClient& device, uint32_t kind, uint32_t pid, uint64_t eprocess, uint64_t creation)
+        : Device(device), Epoch(device.ObservationEpoch()), Kind(kind), Pid(pid), Eprocess(eprocess), Creation(creation)
     {
         FILETIME created{}, exited{}, kernel{}, user{};
         if (Epoch != 0 && GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
         {
-            const uint64_t creation = (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+            const uint64_t collectorCreation = (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
             Caps.SourceId = L"native_kernel:" + std::to_wstring(GetCurrentProcessId()) + L":" +
-                std::to_wstring(creation) + L":" + std::to_wstring(Epoch);
+                std::to_wstring(collectorCreation) + L":" + std::to_wstring(Epoch);
         }
         Caps.Consistency = L"single_read";
         Caps.AddressSpace = device.AddressSpace();
-        Caps.KernelOnly = true;
+        Caps.KernelOnly = kind == KNDBG_READ_OBSERVATION_KERNEL;
+        Caps.UserOnly = kind == KNDBG_READ_OBSERVATION_PROCESS;
         Caps.MayChangeResidency = true;
+        if (Caps.UserOnly)
+        {
+            if (pid == 0 || eprocess == 0 || creation == 0) { Caps.SourceId.clear(); }
+            else if (!Caps.SourceId.empty())
+            {
+                Caps.SourceId += L":process:" + std::to_wstring(pid) + L":" + std::to_wstring(eprocess) + L":" + std::to_wstring(creation);
+            }
+        }
     }
 
+public:
     const ObservationSourceCapabilities& Capabilities() const override
     {
         return Caps;
@@ -32,35 +50,30 @@ protected:
     ObservationReadResult ReadSpans(const ObservationReadRequest& request) override
     {
         ObservationReadResult result;
-        ObservationReadSpan span;
-        span.Address = request.Address;
-        span.RequestedBytes = request.Length;
-        span.State = ObservationReadState::IdentityChanged;
-        if (SameConnection())
+        if (!SameConnection())
         {
-            std::vector<uint8_t> bytes;
-            const bool read = Device.ReadMemory(request.Address, request.Length, &bytes, nullptr);
-            if (SameConnection())
-            {
-                span.State = ObservationReadState::Failed;
-                if (read && !bytes.empty() && bytes.size() <= request.Length)
-                {
-                    span.RequestedBytes = static_cast<uint32_t>(bytes.size());
-                    span.State = ObservationReadState::Complete;
-                    span.Bytes = std::move(bytes);
-                    if (span.RequestedBytes < request.Length)
-                    {
-                        const auto copied = span.RequestedBytes;
-                        result.Spans.push_back(std::move(span));
-                        span = {};
-                        span.Address = request.Address + copied;
-                        span.RequestedBytes = request.Length - copied;
-                        span.State = ObservationReadState::Failed;
-                    }
-                }
-            }
+            result.State = ObservationReadState::IdentityChanged;
+            return result;
         }
-        result.Spans.push_back(std::move(span));
+        KNDBG_OBSERVATION_READ_REQUEST input{};
+        input.Size = sizeof(input);
+        input.Version = KNDBG_READ_OBSERVATION_VERSION;
+        input.Kind = Kind;
+        input.Flags = request.AllowResidencyChanges ? KNDBG_READ_OBSERVATION_ALLOW_RESIDENCY : 0;
+        input.ProcessId = Pid;
+        input.ExpectedEprocess = Eprocess;
+        input.ExpectedCreateTime = Creation;
+        input.Address = request.Address;
+        input.Length = request.Length;
+        input.SourceEpoch = Epoch;
+        result = NativeObservationReadResult(request.Address, request.Length, Device.ReadObservation(input));
+        if (!SameConnection())
+        {
+            result.Spans.clear();
+            result.State = ObservationReadState::IdentityChanged;
+            result.IdentityRevalidated = false;
+            result.ValidationReason = L"native_source_changed";
+        }
         return result;
     }
 
@@ -77,5 +90,9 @@ private:
 
     DeviceClient& Device;
     const uint64_t Epoch;
+    const uint32_t Kind;
+    const uint32_t Pid;
+    const uint64_t Eprocess;
+    const uint64_t Creation;
     ObservationSourceCapabilities Caps;
 };

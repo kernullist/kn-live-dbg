@@ -24,6 +24,7 @@ struct RuntimeCapabilityProbe
     bool NativeSessionPassed = false;
     uint64_t NativeSourceEpoch = 0;
     uint32_t NativeVirtualAddressBits = 0;
+    bool NativeReadObservationSupported = false;
     std::wstring NativeReason;
 };
 
@@ -160,6 +161,7 @@ inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& pro
         L",\"native_session_passed\":" + boolean(probe.NativeSessionPassed) +
         L",\"native_source_epoch\":" + std::to_wstring(probe.NativeSourceEpoch) +
         L",\"native_virtual_address_bits\":" + (probe.NativeContractPassed ? std::to_wstring(probe.NativeVirtualAddressBits) : L"null") +
+        L",\"native_read_observation_contract\":" + (probe.NativeContractPassed ? boolean(probe.NativeReadObservationSupported) : L"null") +
         L",\"native_reason\":" + mcpjson::Quote(probe.NativeReason) +
         L",\"native_raw_status_available\":false,\"probe_handles_closed\":true,"
         L"\"observer_actions\":[\"owned_process_handle_and_read\",\"existing_native_device_open_and_status\"],"

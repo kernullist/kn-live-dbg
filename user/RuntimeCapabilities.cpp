@@ -72,6 +72,7 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
             if (probe.NativeContractPassed)
             {
                 probe.NativeVirtualAddressBits = device.AddressSpace().VirtualAddressBits;
+                probe.NativeReadObservationSupported = device.HasReadObservationContract();
                 DriverSessionStatus status{};
                 probe.NativeSessionPassed = device.QuerySessionStatus(&status, &probe.NativeReason);
             }

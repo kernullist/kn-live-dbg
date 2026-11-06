@@ -252,6 +252,7 @@
     <ClInclude Include="ReadReceiptJson.h" />
     <ClInclude Include="BundleObservationSource.h" />
     <ClInclude Include="NativeObservationSource.h" />
+    <ClInclude Include="NativeReadObservation.h" />
     <ClInclude Include="ProcessObservationSource.h" />
     <ClInclude Include="SessionWritePolicy.h" />
     <ClInclude Include="CommandInput.h" />
@@ -361,6 +362,7 @@
     <ClInclude Include="WfpCalloutScanner.h" />
     <ClInclude Include="WnfScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
+    <ClInclude Include="..\shared\KnLiveDbgReadObservation.h" />
     <ClInclude Include="..\shared\KnLiveDbgPaging.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgVersion.h" />

@@ -2,6 +2,7 @@
 #include <wdmsec.h>
 #include <intrin.h>
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/KnLiveDbgReadObservation.h"
 #include "../shared/KnLiveDbgPaging.h"
 
 extern "C"
@@ -1532,7 +1533,8 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->DriverMajor = 0;
         response->DriverMinor = 6;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
-        response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER | KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED;
+        response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER | KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED |
+            KNDBG_VERSION_FLAG_READ_OBSERVATION;
         if (KnDbgIsLa57Active())
         {
             response->Flags |= KNDBG_VERSION_FLAG_LA57_ACTIVE;
@@ -2485,6 +2487,119 @@ static NTSTATUS KnDbgHandleReadProcessVirtual(
     }
 
     return KnDbgCompleteIrp(Irp, status, information);
+}
+
+// The outer status describes delivery of this versioned envelope. RawStatus
+// remains the original operation status, including failed/partial MmCopyMemory.
+static NTSTATUS KnDbgHandleReadObservation(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
+{
+    const ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
+    const ULONG outputLength = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+    if (Buffer == nullptr || inputLength != sizeof(KNDBG_OBSERVATION_READ_REQUEST))
+    {
+        return KnDbgCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    KNDBG_OBSERVATION_READ_REQUEST request = {};
+    RtlCopyMemory(&request, Buffer, sizeof(request));
+    if (!KnDbgObservationReadShapeValid(request))
+    {
+        return KnDbgCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    const ULONG header = FIELD_OFFSET(KNDBG_OBSERVATION_READ_RESPONSE, Data);
+    const ULONG required = header + request.Length; // Shape caps Length at 4 KiB.
+    if (outputLength < required)
+    {
+        return KnDbgCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+    }
+    RtlZeroMemory(Buffer, required);
+    auto* response = static_cast<KNDBG_OBSERVATION_READ_RESPONSE*>(Buffer);
+    response->Size = header;
+    response->Version = KNDBG_READ_OBSERVATION_VERSION;
+    response->DriverAbi = KNDBG_ABI_VERSION;
+    response->StatusDomain = KNDBG_STATUS_DOMAIN_NTSTATUS;
+    response->Request = request;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    SIZE_T copied = 0;
+    PEPROCESS process = nullptr;
+    do
+    {
+        if (KeGetCurrentIrql() > APC_LEVEL)
+        {
+            status = STATUS_INVALID_DEVICE_STATE;
+            break;
+        }
+        if (request.Kind != KNDBG_READ_OBSERVATION_PHYSICAL &&
+            (request.Flags & KNDBG_READ_OBSERVATION_ALLOW_RESIDENCY) == 0)
+        {
+            status = STATUS_ACCESS_DENIED;
+            response->ResultFlags = KNDBG_READ_OBSERVATION_POLICY_DENIED;
+            break;
+        }
+        if (request.Kind == KNDBG_READ_OBSERVATION_KERNEL && !KnDbgIsCanonicalSystemRange(request.Address, request.Length))
+        {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+        if (request.Kind == KNDBG_READ_OBSERVATION_PROCESS)
+        {
+            const auto highestUser = reinterpret_cast<ULONGLONG>(MmHighestUserAddress);
+            if (request.Address == 0 || request.Address > highestUser || request.Length - 1 > highestUser - request.Address)
+            {
+                status = STATUS_INVALID_ADDRESS;
+                break;
+            }
+            status = PsLookupProcessByProcessId(ULongToHandle(request.ProcessId), &process);
+            if (!NT_SUCCESS(status)) { break; }
+            if (request.ExpectedEprocess != reinterpret_cast<ULONGLONG>(process) ||
+                request.ExpectedCreateTime != static_cast<ULONGLONG>(PsGetProcessCreateTimeQuadPart(process)))
+            {
+                status = STATUS_NOT_FOUND;
+                response->ResultFlags = KNDBG_READ_OBSERVATION_IDENTITY_MISMATCH;
+                break;
+            }
+            // The reference binds the process object, not its virtual mappings.
+            response->ResultFlags |= KNDBG_READ_OBSERVATION_IDENTITY_VALIDATED;
+            if (PsGetProcessExitStatus(process) != STATUS_PENDING)
+            {
+                status = STATUS_PROCESS_IS_TERMINATING;
+                break;
+            }
+        }
+        KAPC_STATE apc = {};
+        BOOLEAN attached = FALSE;
+        __try
+        {
+            __try
+            {
+                if (process != nullptr)
+                {
+                    KeStackAttachProcess(reinterpret_cast<PRKPROCESS>(process), &apc);
+                    attached = TRUE;
+                }
+                response->ResultFlags |= KNDBG_READ_OBSERVATION_COPY_ATTEMPTED;
+                status = request.Kind == KNDBG_READ_OBSERVATION_PHYSICAL
+                    ? KnDbgReadPhysicalAddress(request.Address, response->Data, request.Length, &copied)
+                    : KnDbgReadVirtualAddress(request.Address, response->Data, request.Length, 0, &copied);
+            }
+            __finally
+            {
+                if (attached) { KeUnstackDetachProcess(&apc); }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            status = GetExceptionCode();
+            copied = 0; // An exceptional copy has no validated byte-count output.
+        }
+    } while (false);
+    if (process != nullptr) { ObDereferenceObject(process); }
+    if (copied > request.Length)
+    {
+        return KnDbgCompleteIrp(Irp, STATUS_DATA_ERROR, 0);
+    }
+    response->RawStatus = static_cast<KNDBG_UINT32>(status);
+    response->Transferred = static_cast<KNDBG_UINT32>(copied);
+    return KnDbgCompleteIrp(Irp, STATUS_SUCCESS, header + copied);
 }
 
 static NTSTATUS KnDbgHandleWriteVirtual(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID Buffer)
@@ -4042,6 +4157,9 @@ static NTSTATUS KnDbgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_KNDBG_READ_PROCESS_VIRTUAL:
         status = KnDbgHandleReadProcessVirtual(Irp, stack, buffer);
+        break;
+    case IOCTL_KNDBG_READ_OBSERVATION:
+        status = KnDbgHandleReadObservation(Irp, stack, buffer);
         break;
     case IOCTL_KNDBG_GET_PHYSICAL_RANGES:
         status = KnDbgHandleGetPhysicalRanges(Irp, stack, buffer);

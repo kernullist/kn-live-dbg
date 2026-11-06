@@ -23,6 +23,24 @@ controls do not establish this live host result.
 
 ## Native session policy
 
+Run `tools/validate-native-read.ps1 -Sanitize` for the production transport's
+versioned/legacy responses, request binding, raw NTSTATUS/Win32 separation,
+partial prefixes, count/status contradictions, malformed/truncated replies and
+refusal to retry an advertised extension through the legacy path. Its real
+`DeviceClient` check opens only NUL and verifies failed ABI qualification/close;
+this is not a driver read test.
+
+With an explicitly owned matching driver in an authorized native lab, additionally
+exercise kernel/process/physical control ranges, unavailable pages, a process
+exit and identity mismatch, source close/reopen and stop during a read. Check
+the new feature flag, raw NTSTATUS and byte count against the actual copy result,
+including zero-byte failures and observed partial copies. Reject malformed input,
+short output, wrong kind/identity and missing virtual residency consent. Keep
+old clients working against the new driver and test the explicit legacy result
+against a qualified old driver. Record final handle/service/driver cleanup and
+unresolved or unobserved branches; synthetic transport controls do not satisfy
+these native lifecycle gates.
+
 Current main changes native session defaults. In an authorized isolated lab with
 the matching EXE/SYS, additionally check a fresh `drvstatus` reports write-off,
 mutation requests are denied before `write on`, explicit on/off transitions agree

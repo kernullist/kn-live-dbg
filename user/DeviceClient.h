@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include "AddressSpaceDescriptor.h"
+#include "NativeReadObservation.h"
 #include "../shared/KnLiveDbgManagedCallbacks.h"
 
 struct PhysicalTranslationInfo
@@ -161,6 +162,8 @@ public:
     bool QueryVersion(std::wstring* error);
     AddressSpaceDescriptor AddressSpace() const;
     uint64_t ObservationEpoch() const;
+    bool HasReadObservationContract() const;
+    NativeReadObservation ReadObservation(KNDBG_OBSERVATION_READ_REQUEST request, std::wstring* error = nullptr);
     bool QuerySessionStatus(DriverSessionStatus* status, std::wstring* error);
     bool ResolveProcess(
         uint32_t processId,
@@ -289,6 +292,7 @@ private:
 
     HANDLE device_;
     std::atomic<uint32_t> pagingLevels_{0};
+    std::atomic<uint32_t> versionFlags_{0};
     std::atomic<uint64_t> observationEpoch_{0};
     HANDLE managedCallbackPort_ = INVALID_HANDLE_VALUE;
     std::mutex managedCallbackMutex_;

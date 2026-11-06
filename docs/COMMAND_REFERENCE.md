@@ -23,8 +23,11 @@ operation/receipt IDs, source/range provenance and shared budget denominators.
 `recording_complete` means every attempted read has a completed receipt, including
 failed reads; it does not mean the target was fully read or validated. It is
 private `kn.read_set.v1` evidence, and its caller-declared target labels are not
-an authenticated target identity. Native status and translation are separate,
-unfinished integration work.
+an authenticated target identity. `native_read_observation_contract` is null
+before successful ABI qualification, otherwise the advertised optional read
+feature flag. It does not qualify a native sample. Selected native sources use
+the versioned status transport; existing direct collectors and typed translation
+remain separate integration work.
 
 Saved KMON evidence can also be investigated without elevation, driver loading,
 or symbols: `KnLiveDbg.exe --offline !kmon evidence <directory> /json`,

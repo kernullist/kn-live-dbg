@@ -42,8 +42,11 @@ marks availability for its control range only; native connection checks are at
 most `partial`. Unsupported VTL1/VMI stays unsupported, other backends stay
 unprobed, and no result grants a validated OS/CPU/security-state combination.
 Handles close before publication; this is a timestamped observation, not a lease
-for subsequent commands. Native wrappers still lack a raw status DTO; the probe
-preserves their explanation without inventing NTSTATUS. Runtime reports contain
+for subsequent commands. The connection/status queries used by this probe do
+not expose raw NTSTATUS; it preserves their explanation without inventing one.
+`native_read_observation_contract` reports the optional read feature flag only
+after a valid version reply; it does not perform or validate a native read.
+Runtime reports contain
 identity/address evidence and are rejected by the public-content scanner.
 
 The owned read also publishes a `process_read_set` from the shared recorder
@@ -90,7 +93,55 @@ concurrent. Target/address-space labels are caller-declared, not independently
 qualified by the recorder. `kn.read_set.v1` is private observation JSON, not an
 authenticated or durable publication format. Its current production consumer is
 the owned-process capability probe. Image transactions, scanner/fallback migration,
-native raw status DTOs, typed translation and durable replay remain P02/P03 work.
+typed translation and durable replay remain P02/P03 work. Native read status
+transport is described below; existing direct `DeviceClient` collectors still
+require migration to the observation/recording path.
+
+## Native read status transport
+
+ABI 17 retains all existing IOCTLs and layouts. The optional
+`KNDBG_VERSION_FLAG_READ_OBSERVATION` advertises `IOCTL_KNDBG_READ_OBSERVATION`
+(function 0x818, buffered, read access). Version 1 accepts a fixed 64-byte request
+and returns a 96-byte header plus the transferred bytes, at most 4 KiB. Kernel
+virtual, identity-qualified process virtual and regular physical reads have
+separate kinds. Reserved fields, exact version/size, request echo and returned
+length are checked. The collector connection epoch is echoed for correlation;
+the driver does not authenticate that client-supplied epoch.
+
+Delivery success means the envelope arrived. Its NTSTATUS remains the original
+operation result; partial/failing copies retain their reported transferred count.
+Outer failures retain the raw Win32 transport error and an unknown copy count.
+The result distinguishes an unknown copy attempt from a known false flag.
+Explicit identity-mismatch and policy-denial flags remain `identity_changed`
+and `policy_denied`; neither can authorize an alternate-source fallback.
+Structurally bound but contradictory success/count pairs retain their raw status
+and count while withholding bytes from parsers. Valid partial prefixes remain
+sparse evidence and cannot enter an exact parser read.
+
+The WDM handler copies the buffered input before clearing its bounded output.
+It checks IRQL before lookup/attach/copy, references the expected process object,
+matches PID/EPROCESS/creation, and pairs attach/detach and reference/release on
+success, failure and exceptions. The device retains its SYSTEM/Administrators ACL
+and the new IOCTL requires read access. No mutation or MDL fallback is introduced.
+Virtual reads require explicit residency consent. The existing
+[`MmCopyMemory` contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-mmcopymemory)
+requires a nonpageable destination and IRQL at most APC_LEVEL, reports bytes copied
+on failure, and may make virtual memory resident. Physical reads use that routine's
+regular-memory behavior; no MMIO mapping fallback is added.
+[`METHOD_BUFFERED`](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/buffer-descriptions-for-i-o-control-codes)
+shares one kernel buffer between input and output. The process copy is kept within
+a short [`attach/detach` interval](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-kestackattachprocess).
+
+`DeviceClient` must first qualify the driver version. Close or a failed version
+query clears the optional contract. A qualified older driver uses the original
+IOCTL and explicitly marks raw NTSTATUS unavailable; a legacy failure does not
+invent transferred bytes. An advertised extension's failed or malformed reply
+does not trigger a legacy retry. `NativeObservationSource` uses this path and
+also supports a PID/EPROCESS/creation-bound process source. Existing direct
+read/fallback call sites are not automatically migrated. Object identity binding
+does not pin virtual mappings, establish a boot/VM identity, authenticate the
+kernel, or prove execution. Native driver load/lifecycle validation remains a
+separate gate from the transport's synthetic tests and driver build.
 
 ## Process cross-view qualification
 
@@ -258,13 +309,14 @@ Only complete reads can enter the existing byte-vector parser adapter. Gaps are
 never filled with zeroes. Cancellation is checked before and after a synchronous
 read; it does not interrupt an IOCTL already in progress.
 
-`NativeObservationSource` binds a kernel virtual-memory reader to a collector
+`NativeObservationSource` binds a kernel or qualified process virtual-memory reader to a collector
 process creation time and device-open epoch, checks the paging descriptor around
 each read, and preserves short reads. This detects connection replacement; it is
 not a kernel-object lifetime proof, a boot/VM identity or an atomic snapshot.
 The caller still owns the device and serializes its lifecycle with scan work.
-Original native status is marked unavailable because the existing DeviceClient
-API does not expose it. Pending-IRP parsing uses bounded chunks up to its existing
+Its optional versioned read transport retains raw NTSTATUS and transferred bytes;
+qualified older drivers explicitly retain the unavailable raw-status contract.
+Pending-IRP parsing uses bounded chunks up to its existing
 128 KiB total limit and retains its repeated-read comparison. The kernel virtual
 branches of execution-reference parsing use the same interface. Physical-page
 and user-process fallbacks retain their existing collectors.

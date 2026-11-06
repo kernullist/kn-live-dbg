@@ -7,6 +7,57 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Native read status transport checkpoint: 2026-11-07
+
+This P02 substep adds an optional ABI 17 read-observation envelope without
+changing the existing IOCTLs. The native observation source uses the advertised
+contract to retain original NTSTATUS, copy count and outer Win32 transport
+status. Qualified old drivers retain their legacy path with an explicitly
+unavailable NTSTATUS. Existing direct collectors and typed page-table receipts
+still require migration; this checkpoint does not complete P02.
+
+Release x64 EXE SHA-256:
+`53df0457247cd25e5da43636b0fc33cd24d0988c9b95bcd95b24613ee722c05f`.
+Release x64 driver SHA-256:
+`c1534013ffa8561f245579f860b85d3fcd38d5dabacdf0f53e195aff3bae2d3c`.
+ASan native-read harness SHA-256:
+`b45e59b884a4399f980d0aedbe20e8978146f35cc2c844b4ad12f7edbb23d22a`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+The build emitted C4744 on the unchanged `KmonHuntIndex::NextQueryEpoch` atomic
+field and C4244 on the unchanged byte-vector fill in `KernelMonitor.cpp`.
+
+`tools/validate-native-read.ps1 -Sanitize` passed 139 checks. An independent
+Python JSON oracle checked 14 status/source observations. The controlled
+responder exercises the production transport helper and decoder: all three
+read kinds, request/response bounds, identity and epoch binding, partial and
+failed copies, raw high-bit status values, legacy compatibility, contradictory
+status/count pairs and refusal to retry legacy IOCTLs after an advertised
+extension fails. The real `DeviceClient` checks open only `NUL`, reject its
+version query and verify that closing it clears qualification.
+
+Adversarial review found that process-identity mismatch could be flattened into
+an ordinary failure and authorize fallback. Explicit mismatch/policy flags and
+typed states now preserve those denials; recorder tests reject an explicit
+alternate-source retry. Review also corrected an unqualified source's contract
+label, unknown copy-attempt reporting and the direct converter's result state.
+The final reviewed scope had no additional actionable defects.
+
+The shared recorder passed 48 ASan checks and 13 operations/14 JSON snapshots;
+the owned process source passed 23 checks and six JSON cases. Evidence-bundle
+ASan passed 522 controls, with eight interrupted publications producing three
+valid and five absent final files; restart checks passed. Runtime policy passed
+22 controls. The final EXE passed the actual capability CLI checks, all 24
+contracts/261 routes, support-matrix drift check and full linked self-tests
+(timeline 28, MCP 102, console 558, commands 3,000, remote 66).
+
+No driver was loaded or service started. Real kernel/process/physical reads,
+process-exit overlap, close/reopen/stop overlap, old/new driver interoperability,
+Verifier, signing trust and OS/security-state regression remain separate native
+lab gates in the [manual checklist](MANUAL_TEST_CHECKLIST.md). Connection-epoch
+checks do not supply a lifetime lease: callers must still serialize the native
+source and `DeviceClient` lifecycle. The physical transport is not yet a typed
+translation source, and these controls do not establish MMIO, LA57 or VTL1 access.
+
 ## Ordered read recorder checkpoint: 2026-11-07
 
 The first P02 substep adds the shared recorder and operation-wide budgets to

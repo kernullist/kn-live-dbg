@@ -69,9 +69,20 @@ struct ObservationReadResult
     bool SideEffectsPossible = false;
     bool CancellationObserved = false;
     bool IdentityRevalidated = false;
-    // Current DeviceClient methods do not expose the original native status.
+    // Legacy DeviceClient reads do not expose the original NTSTATUS.
     std::wstring NativeStatusDomain = L"unavailable";
     uint32_t NativeStatus = 0;
+    bool TransferredBytesKnown = false;
+    uint32_t TransferredBytes = 0;
+    bool TransportAttempted = false;
+    bool TransportSucceeded = false;
+    uint32_t TransportStatus = 0;
+    bool BackendCopyAttemptKnown = false;
+    bool BackendCopyAttempted = false;
+    uint32_t NativeReadKind = 0;
+    uint32_t DriverAbi = 0;
+    uint64_t SourceEpoch = 0;
+    std::wstring BackendContract;
     std::wstring ValidationReason;
     std::wstring OperationId;
     uint64_t ReadReceiptId = 0;

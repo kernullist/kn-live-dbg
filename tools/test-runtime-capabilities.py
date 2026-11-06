@@ -38,6 +38,7 @@ def main():
     assert read_set["reads"][0]["read"] == sample and sample["read_receipt_id"] == "1"
     assert read_set["operation_id"] == sample["operation_id"] and read_set["execution_observed"] is False
     native_ready = probe["native_source_opened"] and probe["native_contract_passed"] and probe["native_session_passed"]
+    assert isinstance(probe["native_read_observation_contract"], bool) if probe["native_contract_passed"] else probe["native_read_observation_contract"] is None
     for capability in data["capabilities"]:
         assert capability["validation"] == "not_performed_for_target_environment"
         stages = capability["probe_stages"]

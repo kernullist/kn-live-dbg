@@ -558,6 +558,12 @@
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="NativeReadObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\shared\KnLiveDbgReadObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgPaging.h">
       <Filter>Header Files</Filter>
     </ClInclude>

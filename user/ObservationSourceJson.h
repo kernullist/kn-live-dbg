@@ -38,6 +38,15 @@ inline std::wstring ObservationReadJson(const ObservationSourceCapabilities& cap
         L",\"identity_revalidated\":" + (result.IdentityRevalidated ? L"true" : L"false") +
         L",\"native_status_domain\":" + mcpjson::Quote(result.NativeStatusDomain) +
         L",\"native_status\":" + (result.NativeStatusDomain == L"unavailable" ? std::wstring(L"null") : std::to_wstring(result.NativeStatus)) +
+        L",\"transferred_bytes\":" + (result.TransferredBytesKnown ? std::to_wstring(result.TransferredBytes) : std::wstring(L"null")) +
+        L",\"transport_status_domain\":" + mcpjson::Quote(result.TransportAttempted ? L"win32" : L"unavailable") +
+        L",\"transport_status\":" + (result.TransportAttempted ? std::to_wstring(result.TransportStatus) : std::wstring(L"null")) +
+        L",\"transport_succeeded\":" + (result.TransportAttempted ? (result.TransportSucceeded ? std::wstring(L"true") : std::wstring(L"false")) : std::wstring(L"null")) +
+        L",\"backend_copy_attempted\":" + (result.BackendCopyAttemptKnown ? (result.BackendCopyAttempted ? std::wstring(L"true") : std::wstring(L"false")) : std::wstring(L"null")) +
+        L",\"native_read_kind\":" + (result.NativeReadKind == 0 ? std::wstring(L"null") : std::to_wstring(result.NativeReadKind)) +
+        L",\"driver_abi\":" + (result.DriverAbi == 0 ? std::wstring(L"null") : std::to_wstring(result.DriverAbi)) +
+        L",\"source_epoch\":" + mcpjson::Quote(std::to_wstring(result.SourceEpoch)) +
+        L",\"backend_contract\":" + mcpjson::Quote(result.BackendContract) +
         L",\"validation_reason\":" + mcpjson::Quote(result.ValidationReason) +
         L",\"operation_id\":" + mcpjson::Quote(result.OperationId) +
         L",\"read_receipt_id\":" + mcpjson::Quote(std::to_wstring(result.ReadReceiptId)) +

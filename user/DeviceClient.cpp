@@ -88,6 +88,7 @@ void DeviceClient::Close()
 {
     observationEpoch_.store(0);
     pagingLevels_.store(0);
+    versionFlags_.store(0);
     // Keep the port and device close in the same critical section as control
     // requests. A concurrent status query must not reopen a lease between the
     // port close and the device becoming unavailable.
@@ -267,6 +268,7 @@ bool DeviceClient::QueryVersion(std::wstring* error)
 {
     bool ok = false;
     pagingLevels_.store(0);
+    versionFlags_.store(0);
 
     do
     {
@@ -296,6 +298,7 @@ bool DeviceClient::QueryVersion(std::wstring* error)
         }
 
         pagingLevels_.store((response.Flags & KNDBG_VERSION_FLAG_LA57_ACTIVE) != 0 ? 5u : 4u);
+        versionFlags_.store(response.Flags);
         ok = true;
     } while (false);
 
@@ -310,6 +313,40 @@ AddressSpaceDescriptor DeviceClient::AddressSpace() const
 uint64_t DeviceClient::ObservationEpoch() const
 {
     return observationEpoch_.load();
+}
+
+bool DeviceClient::HasReadObservationContract() const
+{
+    return (versionFlags_.load() & KNDBG_VERSION_FLAG_READ_OBSERVATION) != 0;
+}
+
+NativeReadObservation DeviceClient::ReadObservation(KNDBG_OBSERVATION_READ_REQUEST request, std::wstring* error)
+{
+    const auto epoch = ObservationEpoch();
+    const auto flags = versionFlags_.load();
+    if (epoch == 0 || request.SourceEpoch != epoch || (flags & KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED) == 0)
+    {
+        NativeReadObservation result;
+        result.Requested = request.Length;
+        result.SourceEpoch = request.SourceEpoch;
+        result.Kind = request.Kind;
+        result.Rejection = L"native_source_not_qualified";
+        if (error != nullptr) { *error = result.Rejection; }
+        return result;
+    }
+    auto result = ReadNativeObservation(request, (flags & KNDBG_VERSION_FLAG_READ_OBSERVATION) != 0,
+        [&](DWORD code, void* buffer, DWORD input, DWORD output, DWORD* returned, DWORD* status)
+        {
+            return Ioctl(code, buffer, input, output, returned, error, status);
+        });
+    if (epoch != ObservationEpoch())
+    {
+        result.Bytes.clear();
+        result.IdentityValidated = false;
+        result.Rejection = L"native_source_changed";
+    }
+    if (!result.Rejection.empty() && error != nullptr) { *error = result.Rejection; }
+    return result;
 }
 
 bool DeviceClient::QuerySessionStatus(DriverSessionStatus* status, std::wstring* error)
