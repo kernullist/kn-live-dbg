@@ -96,7 +96,12 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"queued\":" + std::to_wstring(EvidenceQueued.load()) + L",\"written\":" + std::to_wstring(EvidenceWritten.load()) +
         L",\"failed\":" + std::to_wstring(EvidenceFailed.load()) + L",\"dropped\":" + std::to_wstring(EvidenceDropped.load()) +
         L",\"pending\":" + std::to_wstring(CapturedEvidenceBundles.Size()) +
-        L",\"bytes\":" + std::to_wstring(EvidenceBytes.load()) + L",\"ledger_failed\":" + std::to_wstring(EvidenceLedgerFailed.load()) + L"}}";
+        L",\"bytes\":" + std::to_wstring(EvidenceBytes.load()) + L",\"ledger_failed\":" + std::to_wstring(EvidenceLedgerFailed.load()) + L"}," +
+        L"\"image_read_store\":{\"collection_id\":" + mcpjson::Quote(std::to_wstring(EvidenceCollectionEpoch.load())) +
+        L",\"queued\":" + std::to_wstring(ImageReadsQueued.load()) + L",\"written\":" + std::to_wstring(ImageReadsWritten.load()) +
+        L",\"failed\":" + std::to_wstring(ImageReadsFailed.load()) + L",\"dropped\":" + std::to_wstring(ImageReadsDropped.load()) +
+        L",\"pending\":" + std::to_wstring(CapturedImageReadSets.Size()) + L",\"bytes\":" + std::to_wstring(ImageReadsBytes.load()) +
+        L",\"ledger_failed\":" + std::to_wstring(ImageReadsLedgerFailed.load()) + L",\"verification_recipe_preserved\":false}}";
     if (cases != nullptr)
     {
         *cases = result.Cases;

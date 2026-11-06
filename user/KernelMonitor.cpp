@@ -1,5 +1,6 @@
 #include "KernelMonitor.h"
 #include "ProcessObservationSource.h"
+#include "NativeObservationSource.h"
 #include "PendingIrpReport.h"
 #include "KmonImportResolver.h"
 
@@ -19412,6 +19413,34 @@ void KernelMonitor::ScanUserModeHostility()
             bool imageReadContextValid = false;
             ProcessObservationSource processImageSource(processHandle, codeIdentity.ProcessId,
                 codeIdentity.CreateTime, device != nullptr && device->IsOpen() ? device->AddressSpace() : AddressSpaceDescriptor{});
+            auto unavailableCaps = processImageSource.Capabilities();
+            const auto imageTargetId = codeIdentity.BootId + L":process:" + std::to_wstring(codeIdentity.ProcessId) +
+                L":" + std::to_wstring(codeIdentity.CreateTime);
+            unavailableCaps.SourceId = L"unavailable_process_handle:" + imageTargetId;
+            UnavailableObservationSource unavailableImageSource(unavailableCaps);
+            std::unique_ptr<NativeObservationSource> nativeImageSource;
+            ObservationReadRouting imageRouting;
+            imageRouting.Primary = processImageSource.Capabilities().SourceId.empty() ?
+                static_cast<IObservationSource*>(&unavailableImageSource) : &processImageSource;
+            imageRouting.TargetId = imageTargetId;
+            imageRouting.AddressSpaceId = imageTargetId + L":user";
+            imageRouting.AllowFallback = imageRouting.AllowResidencyChanges = true;
+            imageRouting.Fallback = [&]() -> IObservationSource*
+            {
+                if (device == nullptr || symbols == nullptr || !device->IsOpen()) { return nullptr; }
+                if (!imageReadContextTried)
+                {
+                    imageReadContextTried = true;
+                    imageReadContextValid = ResolveObservationProcess(*device, *symbols, codeIdentity, &imageReadContext);
+                }
+                if (!imageReadContextValid) { return nullptr; }
+                if (nativeImageSource == nullptr)
+                {
+                    nativeImageSource = std::make_unique<NativeObservationSource>(*device, codeIdentity.ProcessId,
+                        imageReadContext.Eprocess, codeIdentity.CreateTime);
+                }
+                return nativeImageSource.get();
+            };
             const ObservationReader imageReader = [&](
                 uint64_t address, size_t size, std::vector<uint8_t>* bytes)
             {
@@ -19546,7 +19575,7 @@ void KernelMonitor::ScanUserModeHostility()
                 const bool compareBuiltinImageText = compareGameText && moduleLeaf == leaf;
                 if (compareGameText)
                 {
-                    ScanExecutableImage(modulePath, loadedModuleBase, codeIdentity, imageReader, 16);
+                    ScanExecutableImage(modulePath, loadedModuleBase, codeIdentity, imageReader, 16, &imageRouting);
                     ScanImagePermissionCandidates(modulePath, loadedModuleBase, codeIdentity, imageReader);
                     if (GameManifestActive && loadedModuleBase == exeRegion)
                     {

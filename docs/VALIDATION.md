@@ -7,6 +7,49 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## KMON original image read archive checkpoint: 2026-11-07
+
+This P02/P03 substep connects KMON's initial user/kernel image comparisons and
+background continuations to shared read operations. Failed primary reads,
+explicit handle/native fallback and the receipt selected by each parser call
+remain distinct. Changed/inconclusive slices publish bounded private `.knreads`
+archives with separate queue/store counters and final `.knreadledger` files.
+Cancellation/deadline checks also cover guard entry and completion. The archive
+does not retain the full reference, secondary-view inputs or normalization and
+cannot be replayed as an image recipe. Clean-only retention, complete background
+reference/recipe and sweep manifests, native lifecycle and full VS1 remain open.
+The P01–P16 design goal is not complete.
+
+Release x64 EXE SHA-256:
+`ce7f4e6e99670d74fe66121461f7e35b934cf50eb6237a2ec31819d4185cc411`.
+ASan read-routing harness SHA-256:
+`0e1afe76ab4d67d06133b7b92a60cf4bf44767fcb4b36da00c9e16976748272d`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration;
+the existing C4744 `KmonHuntIndex::NextQueryEpoch` warnings remain.
+
+`validate-read-routing.ps1 -Sanitize` passed 40 controls and an independent
+Python oracle over 31 operation snapshots. They cover partial-prefix retention
+without byte merging, fallback permission/source/descriptor binding, shared
+budgets, source changes, unavailable primary, factory failures, guard rejection,
+cancel/deadline before and during guards, parser capacity and abandoned reads.
+`validate-read-receipts.ps1 -Sanitize` passed 48 controls and 13-operation/
+14-snapshot JSON checks. `validate-native-read.ps1 -Sanitize` passed 139 controls
+and 14 JSON observations; the native transport is synthetic and the device
+qualification negative opens only NUL.
+
+`--self-test all` passed timeline 28, MCP 102, console 558, command registry
+3,000 and remote 66 checks. Its actual `ScanExecutableImage`/capture-writer
+integration passed 26 additional checks using owned synthetic PE bytes:
+modified/clean/unstable/unreadable comparisons, original header/page/confirmation
+receipts and selected bytes, publication after source/reference removal, payload
+hash, final ledger, queue pressure, session byte budget, filesystem failure,
+create-new collision and fixture cleanup. These are not OS-loaded image or
+native driver lifetime tests. The tests made no driver-load, service-start,
+Verifier, reboot or security-policy changes. Public-content regression checks
+passed 11 tests, including private archive/ledger extensions and renamed schemas.
+No additional defects were found in the reviewed implementation scope; the
+remaining architecture and native acceptance gates above remain unresolved.
+
 ## Handle-based live image transaction checkpoint: 2026-11-07
 
 This P03 substep adds `--verify-process-image` and `kn.image_recipe.v2`.

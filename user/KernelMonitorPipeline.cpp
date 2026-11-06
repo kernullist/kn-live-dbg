@@ -2,6 +2,7 @@
 #include "ContentHash.h"
 #include "McpJson.h"
 #include "EvidenceInvestigation.h"
+#include "ObservationReadRoutingJson.h"
 
 #include <algorithm>
 #include <chrono>
@@ -115,6 +116,13 @@ void KernelMonitor::ResetPipeline()
     CaptureTimings.Reset();
     CapturedPages.Reset();
     CapturedEvidenceBundles.Reset();
+    CapturedImageReadSets.Reset();
+    ImageReadsQueued.store(0);
+    ImageReadsWritten.store(0);
+    ImageReadsFailed.store(0);
+    ImageReadsDropped.store(0);
+    ImageReadsBytes.store(0);
+    ImageReadsLedgerFailed.store(0);
     EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
     EvidenceQueued.store(0);
     EvidenceWritten.store(0);
@@ -852,6 +860,95 @@ uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
     return id;
 }
 
+uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
+    const std::wstring& image, uint64_t imageBase)
+{
+    uint64_t estimate = reads.Attempts.Reads.size() * 1400ull;
+    for (const auto& receipt : reads.Attempts.Reads)
+    {
+        for (const auto& span : receipt.Result.Spans) { estimate += span.Bytes.size() * 2ull; }
+    }
+    if (estimate > EvidenceBundleMaxJsonBytes) { ImageReadsDropped.fetch_add(1); return 0; }
+    const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };
+    const auto payload = L"{\"image\":" + mcpjson::Quote(image) + L",\"image_base\":" + n(imageBase) +
+        L",\"boot_id\":" + mcpjson::Quote(identity.BootId) + L",\"pid\":" + n(identity.ProcessId) +
+        L",\"creation_time\":" + n(identity.CreateTime) + L",\"reads\":" + ObservationRoutedReadSetJson(reads) + L"}";
+    const auto bytes = mcpjson::WideToUtf8(payload);
+    ContentHash hash;
+    if (bytes.size() > EvidenceBundleMaxJsonBytes - 256 || !hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()))
+    {
+        ImageReadsDropped.fetch_add(1);
+        return 0;
+    }
+    const auto digest = hash.Finish();
+    if (digest.empty()) { ImageReadsDropped.fetch_add(1); return 0; }
+    CapturedImageReads item;
+    item.Id = NextCaptureId.fetch_add(1);
+    item.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
+    item.Identity = identity;
+    item.Json = L"{\"schema\":\"kn.image_reads.v1\",\"payload_sha256\":" + mcpjson::Quote(digest) + L",\"payload\":" + payload + L"}";
+    const auto id = item.Id;
+    if (!CapturedImageReadSets.Push(std::move(item))) { ImageReadsDropped.fetch_add(1); return 0; }
+    ImageReadsQueued.fetch_add(1);
+    return id;
+}
+
+void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcept
+{
+    bool written = false;
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-reads";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        const auto path = folder / (L"reads-" + reads.CollectionId + L"-" + std::to_wstring(reads.Id) + L".knreads");
+        const auto bytes = mcpjson::WideToUtf8(reads.Json).size();
+        std::wstring failure = ec ? L"read_set_directory_unavailable" : L"invalid_read_set_or_session_byte_budget";
+        if (!ec && !reads.Json.empty() && bytes <= EvidenceBundleMaxJsonBytes && bytes <= 128ull * 1024 * 1024 - ImageReadsBytes.load())
+        {
+            written = SaveObservationJson(path.wstring(), reads.Json, &failure);
+            if (written) { ImageReadsBytes.fetch_add(bytes); }
+        }
+        KmonEvent event;
+        event.Kind = L"coverage.image_reads";
+        event.ProcessId = reads.Identity.ProcessId;
+        event.Observation.Identity = reads.Identity;
+        event.Summary = written ? L"original image read attempts committed" : L"image read publication failed";
+        event.Evidence[L"read_set_id"] = std::to_wstring(reads.Id);
+        event.Evidence[L"collection_id"] = reads.CollectionId;
+        event.Evidence[L"read_set_path"] = written ? path.wstring() : L"";
+        event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
+        event.Evidence[L"failure"] = written ? L"" : failure;
+        event.Evidence[L"verification_recipe_preserved"] = L"false";
+        PipelineEvents.Push(std::move(event));
+    }
+    catch (...) {}
+    if (written) { ImageReadsWritten.fetch_add(1); }
+    else { ImageReadsFailed.fetch_add(1); }
+}
+
+void KernelMonitor::CloseImageReadCollection() noexcept
+{
+    try
+    {
+        std::wstring directory;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-reads";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        const auto id = std::to_wstring(EvidenceCollectionEpoch.load());
+        const auto json = L"{\"schema\":\"kn.image_read_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
+            L",\"queued\":" + std::to_wstring(ImageReadsQueued.load()) + L",\"written\":" + std::to_wstring(ImageReadsWritten.load()) +
+            L",\"failed\":" + std::to_wstring(ImageReadsFailed.load()) + L",\"dropped\":" + std::to_wstring(ImageReadsDropped.load()) +
+            L",\"pending\":" + std::to_wstring(CapturedImageReadSets.Size()) + L",\"bytes\":" + std::to_wstring(ImageReadsBytes.load()) + L"}";
+        if (!ec && SaveObservationJson((folder / (L"session-" + id + L".knreadledger")).wstring(), json, nullptr)) { return; }
+    }
+    catch (...) {}
+    ImageReadsLedgerFailed.fetch_add(1);
+}
+
 void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
 {
     bool written = false;
@@ -912,15 +1009,18 @@ void KernelMonitor::CloseEvidenceCollection() noexcept
 void KernelMonitor::CaptureWriterLoop()
 {
     CaptureWriterDone.store(false);
-    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0)
+    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0 || CapturedImageReadSets.Size() != 0)
     {
+        CapturedImageReads imageReads;
+        const bool haveImageReads = CapturedImageReadSets.Pop(&imageReads);
+        if (haveImageReads) { PersistImageReadSet(imageReads); }
         CapturedEvidence evidence;
         const bool haveEvidence = CapturedEvidenceBundles.Pop(&evidence);
         if (haveEvidence) { PersistEvidenceBundle(evidence); }
         CapturedPage page;
         if (!CapturedPages.Pop(&page))
         {
-            if (!haveEvidence) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+            if (!haveEvidence && !haveImageReads) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
             continue;
         }
         try
@@ -1035,6 +1135,7 @@ void KernelMonitor::CaptureWriterLoop()
             CaptureFailed.fetch_add(1);
         }
     }
+    CloseImageReadCollection();
     CloseEvidenceCollection();
     CaptureWriterDone.store(true);
 }
@@ -1136,6 +1237,13 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"evidence_bundles_pending"] = std::to_wstring(CapturedEvidenceBundles.Size());
         event.Evidence[L"evidence_bundle_bytes"] = std::to_wstring(EvidenceBytes.load());
         event.Evidence[L"evidence_ledger_failed"] = std::to_wstring(EvidenceLedgerFailed.load());
+        event.Evidence[L"image_read_sets_queued"] = std::to_wstring(ImageReadsQueued.load());
+        event.Evidence[L"image_read_sets_written"] = std::to_wstring(ImageReadsWritten.load());
+        event.Evidence[L"image_read_sets_failed"] = std::to_wstring(ImageReadsFailed.load());
+        event.Evidence[L"image_read_sets_dropped"] = std::to_wstring(ImageReadsDropped.load());
+        event.Evidence[L"image_read_sets_pending"] = std::to_wstring(CapturedImageReadSets.Size());
+        event.Evidence[L"image_read_set_bytes"] = std::to_wstring(ImageReadsBytes.load());
+        event.Evidence[L"image_read_ledger_failed"] = std::to_wstring(ImageReadsLedgerFailed.load());
         event.Evidence[L"capture_read_bytes"] = std::to_wstring(CaptureReadBytes.load());
         event.Evidence[L"capture_read_failed_bytes"] = std::to_wstring(CaptureReadFailedBytes.load());
         event.Evidence[L"capture_discardable_unreadable_bytes"] = std::to_wstring(CaptureDiscardableUnreadableBytes.load());
@@ -1315,6 +1423,7 @@ bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics)
 
 bool KmonPipelineSelfTest()
 {
+    if (!KmonImageReadIntegrationSelfTest()) { return false; }
     {
         KernelMonitor monitor;
         const auto process = GetCurrentProcess();

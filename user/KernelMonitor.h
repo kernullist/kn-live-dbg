@@ -7,6 +7,7 @@
 #include "ObservationWindows.h"
 #include "CodeTargetResolver.h"
 #include "ExecutableImageVerifier.h"
+#include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
 #include "AnalystSnapshot.h"
@@ -361,6 +362,7 @@ private:
     void InvalidateInlinePatchConfirmations() noexcept;
     bool ScanCallbackInlineTargets(const std::vector<KernelCallbackRecord>& records);
     friend bool KmonPipelineSelfTest();
+    friend bool KmonImageReadIntegrationSelfTest();
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     void WorkerLoop();
     void CollectorLoop();
@@ -440,7 +442,8 @@ private:
     // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
     void ScanKernelInlinePatches();
     CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
-        const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget);
+        const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
+        const ObservationReadRouting* routing = nullptr);
     void ScanKernelExecutableImages();
     void ContinueImageSweeps();
     void ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
@@ -601,6 +604,20 @@ private:
         EvidenceBundle Bundle;
     };
     uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
+    uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
+        const std::wstring& image, uint64_t imageBase);
+    struct CapturedImageReads
+    {
+        uint64_t Id = 0;
+        std::wstring CollectionId;
+        ObservationIdentity Identity;
+        std::wstring Json;
+    };
+    void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
+    void CloseImageReadCollection() noexcept;
+    KmonWorkQueue<CapturedImageReads> CapturedImageReadSets{8};
+    std::atomic<uint64_t> ImageReadsQueued{0}, ImageReadsWritten{0}, ImageReadsFailed{0}, ImageReadsDropped{0};
+    std::atomic<uint64_t> ImageReadsBytes{0}, ImageReadsLedgerFailed{0};
     void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
     void CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};
@@ -1429,4 +1446,5 @@ const wchar_t* KmonResidualSignalKindName(KmonResidualSignalKind kind);
 bool KernelMonitorMapperPoolSelfTest();
 
 bool KmonPipelineSelfTest();
+bool KmonImageReadIntegrationSelfTest();
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

@@ -211,6 +211,7 @@
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
     <ClCompile Include="ImageRecipeReadSet.cpp" />
+    <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
     <ClCompile Include="ImageVerificationRecipe.cpp" />
     <ClCompile Include="ImageProof.cpp" />
@@ -251,6 +252,8 @@
     <ClInclude Include="ObservationSource.h" />
     <ClInclude Include="ObservationSourceJson.h" />
     <ClInclude Include="RecordingObservationSource.h" />
+    <ClInclude Include="ObservationReadRouting.h" />
+    <ClInclude Include="ObservationReadRoutingJson.h" />
     <ClInclude Include="ReadReceiptJson.h" />
     <ClInclude Include="BundleObservationSource.h" />
     <ClInclude Include="NativeObservationSource.h" />

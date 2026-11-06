@@ -60,6 +60,24 @@ it does not replace these live kernel integration checks.
 
 ## Driver-free gates
 
+Run `tools/validate-read-routing.ps1 -Sanitize` for parser selection, retained
+failed/partial primary reads, explicit fallback, shared budgets, descriptor and
+source changes, guard rejection and cancellation/deadline during guards. Its
+Python oracle checks original JSON bytes and receipt links. `--self-test all`
+also drives actual KMON image comparisons with owned synthetic PE bytes:
+modified/clean/unstable/unreadable cases, original archive publication after
+source/reference removal, queue pressure, session byte limits, output collision,
+writer failure and final ledger/fixture cleanup. These are not native driver or
+real loaded-module tests, and `.knreads` is not a replayable image recipe.
+
+In the native lab, inspect changed and inconclusive initial/background image
+slices: match `read_operation_id` and `read_set_queued_id` to `coverage.image_reads`,
+then check the final `image-reads/*.knreadledger` after stop. Keep queue/size/I/O
+loss and ledger failure explicit. Verify handle/native receipt linkage and raw
+status with matching and legacy qualified driver contracts, including exit,
+identity replacement, mapping changes and cancellation. Record final host
+cleanup. Do not count a stored raw archive as retained reference/recipe replay.
+
 Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,
 sparse bytes, explicit fallback permission, shared budgets, metadata capacity,
 deadline/cancellation, observed concurrent completion and exception controls.

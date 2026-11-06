@@ -93,11 +93,41 @@ Operation bookkeeping is thread safe; that does not make an arbitrary adapter
 concurrent. Target/address-space labels are caller-declared, not independently
 qualified by the recorder. `kn.read_set.v1` is private observation JSON, not an
 authenticated or durable publication format. Production consumers include the
-owned-process capability probe and the optional dump read receipts below.
-Image transactions, scanner/fallback migration, native typed translation and
-durable replay remain P02/P03 work. Native read status
+owned-process capability probe, optional dump read receipts, the live image CLI
+and KMON image comparisons below. Other scanner/fallback migration, native typed
+translation and durable replay remain P02/P03 work. Native read status
 transport is described below; existing direct `DeviceClient` collectors still
 require migration to the observation/recording path.
+
+`ObservationReadRouter` binds each serialized parser request to its primary
+receipt and the receipt actually selected. An explicitly enabled fallback gets
+the same operation budget, range, address descriptor and user/kernel policy;
+it keeps its own source ID, consent and raw result. The parser receives only a
+complete single-source result. A rejected mapping/identity guard, cancellation
+or a deadline reached during a guard leaves the raw result intact and denies
+parser input. Source initialization and guard internals are not byte receipts;
+guard status does not establish an atomic mapping snapshot.
+
+KMON's initial user/kernel image comparisons and background image continuations
+use this router, including handle-to-native fallback. A slice shares limits of
+16 MiB requested bytes, 4,096 source calls/receipts, 65,536 spans and five seconds;
+the existing 25 ms sweep yield remains cooperative. Changed or inconclusive
+slices queue their original attempts and parser selections as `kn.image_reads.v1`
+under `image-reads/reads-<collection>-<id>.knreads`. The private payload has a
+SHA-256 integrity hash, not collector authentication. The writer uses create-new
+atomic publication, with an eight-item queue, 2 MiB per file and 128 MiB per
+session. Overflow is counted, never silently replaced by a fresh target read.
+`coverage.image_reads` reports publication; `coverage.pipeline` and the hunt
+JSON `image_read_store` report counts. A final `.knreadledger` records queued,
+written, failed, dropped and pending totals after producer/writer drain. Live
+snapshots are not final ledgers. These counters do not alter `.kncase` inventory.
+
+Clean-only slices are not selected for this archive. The archive does not retain
+the exact reference PE, local secondary-view reads or normalization and is not
+an executable verification recipe. Complete background reference/recipe and
+sweep-manifest publication, source-initialization receipts, other KMON reader
+paths and native lifecycle validation remain open. Single-source v2 recipe
+validation remains strict; routed fallback sets cannot be substituted into it.
 
 ## Typed translation receipts
 

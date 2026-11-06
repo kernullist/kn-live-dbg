@@ -111,6 +111,15 @@ or 1 on failure; extra arguments return 2. No driver is loaded. Runtime
 and urgency thresholds are not latency guarantees. See
 [capture scheduling](ARCHITECTURE.md#capture-scheduling-and-latency).
 
+Current-main KMON image comparisons preserve original read attempts for changed
+or inconclusive slices in private `image-reads/*.knreads` files. Finding/image
+coverage fields `read_operation_id` and `read_set_queued_id` link to publication
+events (`coverage.image_reads`); a queued ID alone does not mean the file was
+written. Hunt JSON `image_read_store` and `coverage.pipeline` report bounded
+queue/store loss. Inspect the final `.knreadledger` after stopping. These raw
+archives do not contain a complete reference/verification recipe and are not
+accepted by `replay-image`. See [read receipts](ARCHITECTURE.md#ordered-read-receipts-and-operation-budgets).
+
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
 DIA provider. Names are case-sensitive. It opens no live device and downloads no

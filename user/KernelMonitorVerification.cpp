@@ -4,6 +4,7 @@
 #include "ExecutableImagePermissions.h"
 #include "ExecutionSurfaceScanner.h"
 #include "NativeObservationSource.h"
+#include "ProcessObservationSource.h"
 
 #include <TlHelp32.h>
 #include <Psapi.h>
@@ -346,7 +347,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
 }
 
 CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint64_t base,
-    const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget)
+    const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
+    const ObservationReadRouting* routing)
 {
     auto work = FindImageWork(path, base, identity);
     if (work == nullptr)
@@ -356,7 +358,33 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     const uint64_t now = GetTickCount64();
     if (now < work->NextSweepDueMs) { return CodeOwnership::OwnedUnverified; }
     work->LastSweepMs = now;
-    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, reader, pageBudget, now, &work->Sweep, 25);
+    std::unique_ptr<ObservationReadRouter> router;
+    ObservationReader observedReader = reader;
+    std::wstring operationId;
+    if (routing != nullptr)
+    {
+        operationId = L"kmon-image:" + std::to_wstring(EvidenceCollectionEpoch.load()) + L":" +
+            std::to_wstring(NextCaptureId.fetch_add(1));
+        auto operation = std::make_shared<ObservationReadOperation>(operationId, routing->TargetId, routing->AddressSpaceId,
+            ObservationOperationBudget{16 * 1024 * 1024, 4096, 4096, 65536, 5000});
+        router = std::make_unique<ObservationReadRouter>(*routing, std::move(operation), &StopRequested);
+        observedReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+        {
+            return router->ReadExact(address, size, bytes);
+        };
+    }
+    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, 25);
+    uint64_t readSetId = 0;
+    std::wstring readPersistence = routing == nullptr ? L"unrecorded_reader" : L"not_selected_for_retention";
+    // Preserve the original attempt set for changed or inconclusive slices.
+    // This is not a verification recipe: exact reference/normalization
+    // retention remains a distinct transaction publication step.
+    if (router != nullptr && (pages.empty() || std::any_of(pages.begin(), pages.end(), [](const auto& page)
+        { return page.Ownership != CodeOwnership::OwnedVerified; })))
+    {
+        readSetId = QueueImageReadSet(router->Snapshot(), identity, path, base);
+        readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
+    }
     // Completed small images must not continually restart while larger images
     // still have an unvisited tail. Failed identities are retried, not trusted.
     work->NextSweepDueMs = work->Sweep.Coverage.TraversalComplete ? now + 30000 :
@@ -433,6 +461,10 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         event.Observation.Coverage = page.Coverage;
         event.Observation.MappingGeneration = generation;
         event.Evidence[L"image_base"] = std::to_wstring(base);
+        event.Evidence[L"read_operation_id"] = operationId;
+        event.Evidence[L"read_set_queued_id"] = std::to_wstring(readSetId);
+        event.Evidence[L"read_set_persistence"] = readPersistence;
+        event.Evidence[L"verification_recipe_preserved"] = L"false";
         event.Evidence[L"rva"] = std::to_wstring(page.Rva);
         event.Evidence[L"cycle"] = std::to_wstring(work->Sweep.Cycle);
         event.Evidence[L"function_override_compared_bytes"] = std::to_wstring(page.Rel32ValidatedBytes);
@@ -468,6 +500,9 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         coverage.Observation.Source = L"executable_page_sweep";
         coverage.Observation.Coverage = work->Sweep.Coverage;
         coverage.Evidence[L"cycle"] = std::to_wstring(work->Sweep.Cycle);
+        coverage.Evidence[L"read_operation_id"] = operationId;
+        coverage.Evidence[L"read_set_queued_id"] = std::to_wstring(readSetId);
+        coverage.Evidence[L"read_set_persistence"] = readPersistence;
         coverage.Evidence[L"cursor"] = std::to_wstring(work->Sweep.NextRange);
         coverage.Evidence[L"remaining_pages"] = std::to_wstring(work->Sweep.Ranges.size() - work->Sweep.NextRange);
         coverage.Evidence[L"last_completion_ms"] = std::to_wstring(work->Sweep.LastCompleteMs);
@@ -631,36 +666,51 @@ void KernelMonitor::ContinueImageSweeps()
         ProcessAddressContext current{};
         return ResolveObservationProcess(*device, *symbols, identity, &current);
     };
-    const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+    ProcessObservationSource processSource(process, pid, identity.CreateTime, device->AddressSpace());
+    NativeObservationSource kernelSource(*device);
+    auto unavailableCaps = processSource.Capabilities();
+    const auto targetId = identity.BootId + L":process:" + std::to_wstring(pid) + L":" + std::to_wstring(identity.CreateTime);
+    unavailableCaps.SourceId = L"unavailable_process_handle:" + targetId;
+    UnavailableObservationSource unavailableSource(unavailableCaps);
+    std::unique_ptr<NativeObservationSource> nativeSource;
+    ObservationReadRouting routing;
+    routing.TargetId = targetId;
+    routing.AddressSpaceId = targetId + (pid == 0 ? L":kernel" : L":user");
+    routing.Primary = pid == 0 ? static_cast<IObservationSource*>(&kernelSource) :
+        processSource.Capabilities().SourceId.empty() ? static_cast<IObservationSource*>(&unavailableSource) : &processSource;
+    routing.AllowResidencyChanges = true;
+    routing.AllowFallback = pid != 0;
+    routing.Fallback = [&]() -> IObservationSource*
     {
-        if (size == 0 || size > 4096 || address > UINT64_MAX - size || !sameProcess()) { return false; }
-        if (pid == 0)
+        if (!tried)
         {
-            return device->AddressSpace().KernelRange(address, size) && device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
+            tried = true;
+            resolved = ResolveObservationProcess(*device, *symbols, identity, &context);
         }
-        MEMORY_BASIC_INFORMATION before{}, after{};
-        const bool known = process != nullptr && VirtualQueryEx(process, reinterpret_cast<void*>(address),
+        if (!resolved) { return nullptr; }
+        if (nativeSource == nullptr) { nativeSource = std::make_unique<NativeObservationSource>(*device, pid, context.Eprocess, identity.CreateTime); }
+        return nativeSource.get();
+    };
+    MEMORY_BASIC_INFORMATION before{};
+    bool known = false;
+    routing.BeforeRead = [&](uint64_t address, size_t size)
+    {
+        if (!sameProcess()) { return false; }
+        if (pid == 0) { return device->AddressSpace().KernelRange(address, size); }
+        before = {};
+        known = process != nullptr && VirtualQueryEx(process, reinterpret_cast<void*>(address),
             &before, sizeof(before)) == sizeof(before);
         if (known && (before.State != MEM_COMMIT || before.Type != MEM_IMAGE ||
             reinterpret_cast<uint64_t>(before.AllocationBase) != base ||
             (before.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
             address < reinterpret_cast<uint64_t>(before.BaseAddress) || size > before.RegionSize ||
             address - reinterpret_cast<uint64_t>(before.BaseAddress) > before.RegionSize - size)) { return false; }
-        bytes->resize(size);
-        SIZE_T read = 0;
-        bool ok = process != nullptr && ReadProcessMemory(process, reinterpret_cast<void*>(address),
-            bytes->data(), size, &read) && read == size;
-        if (!ok)
-        {
-            if (!tried)
-            {
-                tried = true;
-                resolved = ResolveObservationProcess(*device, *symbols, identity, &context);
-            }
-            ok = resolved && device->ReadProcessVirtual(pid, context.Eprocess, identity.CreateTime,
-                address, static_cast<uint32_t>(size), bytes, nullptr);
-        }
-        return ok && sameProcess() && (!known ||
+        return true;
+    };
+    routing.AfterRead = [&](uint64_t address, size_t)
+    {
+        MEMORY_BASIC_INFORMATION after{};
+        return sameProcess() && (pid == 0 || !known ||
             (VirtualQueryEx(process, reinterpret_cast<void*>(address), &after, sizeof(after)) == sizeof(after) &&
                 before.BaseAddress == after.BaseAddress && before.AllocationBase == after.AllocationBase &&
                 before.RegionSize == after.RegionSize && before.State == after.State &&
@@ -669,7 +719,7 @@ void KernelMonitor::ContinueImageSweeps()
     // The verifier retains the 25ms bound. Coalesced publication permits a
     // larger page ceiling without one catalog insertion/event per clean page.
     const auto lastDiscovered = selected->LastUsedMs;
-    ScanExecutableImage(path, base, identity, reader, 1024);
+    ScanExecutableImage(path, base, identity, {}, 1024, &routing);
     // Continuation is not a new discovery. In particular, polling an exited
     // process must not keep its failed cache entries young indefinitely.
     selected->LastUsedMs = lastDiscovered;
@@ -773,7 +823,14 @@ void KernelMonitor::ScanKernelExecutableImages()
             return device->AddressSpace().KernelRange(address, size) && size <= 4096 &&
                 device->ReadMemory(address, static_cast<uint32_t>(size), bytes, nullptr);
         };
-        ScanExecutableImage(KmonNormalizeDriverPath(it->ImagePath), it->Base, ObserveProcessIdentity(0), reader, 16);
+        const auto identity = ObserveProcessIdentity(0);
+        NativeObservationSource source(*device);
+        ObservationReadRouting routing;
+        routing.Primary = &source;
+        routing.TargetId = identity.BootId + L":kernel";
+        routing.AddressSpaceId = routing.TargetId;
+        routing.AllowResidencyChanges = true;
+        ScanExecutableImage(KmonNormalizeDriverPath(it->ImagePath), it->Base, identity, reader, 16, &routing);
         ScanImagePermissionCandidates(KmonNormalizeDriverPath(it->ImagePath), it->Base, ObserveProcessIdentity(0), reader);
     }
 }

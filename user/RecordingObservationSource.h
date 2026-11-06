@@ -74,6 +74,12 @@ public:
 
     void Cancel() { Cancelled.store(true); }
 
+    bool DeadlineExceededOrCancelled() const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        return Cancelled.load() || Expired(Tick());
+    }
+
     bool MatchesTarget(const std::wstring& targetId, const std::wstring& addressSpaceId) const
     {
         std::lock_guard<std::mutex> lock(Mutex);
