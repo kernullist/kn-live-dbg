@@ -21,7 +21,8 @@ class PublicContentTests(unittest.TestCase):
                      "manifest.KNINDEX", "chunk.knchunk", "manifest.knindex.pending-123", "chunk.knchunk.pending-123",
                      "types.KNSCHEMA", "types.knschema.pending-123", "ref.knblob", "ref.knblob.pending-123",
                      "recipe.KNVERIFY", "recipe.knverify.pending-123", "capture.KNTRACE", "capture.kntrace.pending-123",
-                     "original.KNREADS", "original.knreads.pending-123", "session.KNREADLEDGER", "session.knreadledger.pending-123"):
+                     "original.KNREADS", "original.knreads.pending-123", "session.KNREADLEDGER", "session.knreadledger.pending-123",
+                     "slice.KNSLICE", "slice.knslice.pending-123"):
             with self.subTest(name=name):
                 self.assertTrue(AUDIT.inspect(name, b"empty"))
 
@@ -33,7 +34,8 @@ class PublicContentTests(unittest.TestCase):
     def test_renamed_evidence_stays_private(self):
         for schema in ("kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
                        "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
-                       "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_read_session.v1",
+                       "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
+                       "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                        "kn.translation_receipt.v1", "kn.dump_read.v1",
                        "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_proof.v1", "kn.capture_scheduling.v1",
                        "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",

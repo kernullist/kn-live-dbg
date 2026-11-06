@@ -1,6 +1,7 @@
 #include "KernelMonitor.h"
 #include "ObservationReadRoutingJson.h"
 #include "ContentHash.h"
+#include "ImageSliceRecipe.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -161,6 +162,10 @@ bool KmonImageReadIntegrationSelfTest()
         check(retained.HasReference && retained.Reference.Artifact != nullptr && retained.Reference.ContentRechecked &&
             retained.Reference.ContentStable && retained.Reference.Artifact->Bytes == disk &&
             retained.Reference.Artifact->Sha256 == ContentHash::Bytes(disk), "exact-reference-captured-and-rechecked-before-lease-release");
+        ImageSliceRecipe slice;
+        check(ParseImageSliceRecipe(retained.SliceJson, &slice) && slice.Slice.PageCount == 1 &&
+            slice.Policy == ImageSliceDirectPolicy && monitor.ImageSlicesQueued.load() == 1,
+            "actual-sweep-retains-original-routed-slice-recipe");
         const auto payload = Raw(retained.Json, L"payload");
         const auto routed = Raw(payload, L"reads");
         const auto attempts = Raw(routed, L"attempts");
@@ -222,7 +227,7 @@ bool KmonImageReadIntegrationSelfTest()
         const auto path = root / L"image-reads" / (L"reads-" + retained.CollectionId + L"-" + std::to_wstring(retained.Id) + L".knreads");
         std::wstring persisted;
         check(ReadAnalystSnapshot(path.wstring(), &persisted, nullptr) &&
-            Raw(Raw(persisted, L"payload"), L"reads") == routed && Text(persisted, L"schema") == L"kn.image_reads.v2" &&
+            Raw(Raw(persisted, L"payload"), L"reads") == routed && Text(persisted, L"schema") == L"kn.image_reads.v3" &&
             secondary.Calls.size() == calls && monitor.ImageReadsWritten.load() == 1 && monitor.ImageReadsFailed.load() == 0 &&
             monitor.ImageReadsLedgerFailed.load() == 0 && monitor.CapturedImageReadSets.Size() == 0 && monitor.CaptureWriterDone.load(),
             "shutdown-writer-persists-originals-after-source-disappearance");
@@ -231,6 +236,13 @@ bool KmonImageReadIntegrationSelfTest()
             monitor.ImageReferenceBlobsCreated.load() == 1 && monitor.ImageReferenceBytes.load() == disk.size() &&
             ContentHash::File((root / L"image-references" / (ContentHash::Bytes(disk) + L".knblob")).wstring()) == ContentHash::Bytes(disk),
             "writer-commits-exact-original-reference-before-referring-archive");
+        auto recipePath = path;
+        recipePath.replace_extension(L".knslice");
+        const auto replayed = ReplayImageRecipe(recipePath.wstring(), false, nullptr);
+        check(replayed.Status == L"replayed" && replayed.CurrentResult == slice.RecordedResult &&
+            !replayed.Proof.empty() && monitor.ImageSlicesWritten.load() == 1 && secondary.Calls.size() == calls,
+            "actual-kmon-slice-replays-after-target-and-original-reference-removal");
+        check(!Raw(Raw(persisted, L"payload"), L"slice_inputs").empty(), "raw-archive-retains-slice-inputs-separately-from-recipe");
         const auto payloadBytes = mcpjson::WideToUtf8(Raw(persisted, L"payload"));
         check(ContentHash::Bytes(std::vector<uint8_t>(payloadBytes.begin(), payloadBytes.end())) == Text(persisted, L"payload_sha256"),
             "payload-content-hash-matches-persisted-bytes");
@@ -241,6 +253,9 @@ bool KmonImageReadIntegrationSelfTest()
             Raw(ledger, L"reference_blobs_created") == L"1" && Raw(ledger, L"reference_blobs_failed") == L"0" &&
             Raw(ledger, L"reference_bytes") == std::to_wstring(disk.size()) && Raw(ledger, L"reference_reserved_bytes") == L"0",
             "final-image-read-ledger-balances");
+        check(Raw(ledger, L"slice_recipes_queued") == L"1" && Raw(ledger, L"slice_recipes_written") == L"1" &&
+            Raw(ledger, L"slice_recipes_failed") == L"0" && Raw(ledger, L"slice_recipes_unavailable") == L"0",
+            "final-slice-ledger-balances-publication-separately");
         monitor.DrainPipelineEvents(true);
         bool final = false;
         for (const auto& event : monitor.Ring)
@@ -257,7 +272,17 @@ bool KmonImageReadIntegrationSelfTest()
         KernelMonitor clean;
         clean.Options.LogDirectory = (root / L"clean").wstring();
         check(clean.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedVerified &&
-            clean.ImageReadsQueued.load() == 0, "clean-sweep-retention-policy-does-not-claim-recipe");
+            clean.ImageReadsQueued.load() == 1 && clean.ImageSlicesQueued.load() == 1, "clean-sweep-retains-original-matching-range-recipe");
+        clean.WriterStopping.store(true); clean.CaptureWriterLoop();
+        std::filesystem::path cleanRecipe;
+        size_t cleanRecipeCount = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(root / L"clean" / L"image-reads"))
+        {
+            if (entry.path().extension() == L".knslice") { cleanRecipe = entry.path(); ++cleanRecipeCount; }
+        }
+        const auto cleanReplay = ReplayImageRecipe(cleanRecipe.wstring(), false, nullptr);
+        check(cleanRecipeCount == 1 && cleanReplay.Status == L"replayed" && Text(cleanReplay.Proof, L"changed_bytes") == L"0" &&
+            Text(cleanReplay.Proof, L"compared_bytes") == L"4096", "clean-original-slice-publishes-and-replays-complete-matching-range");
         secondary.Bytes[0x1050] ^= 1; secondary.Unstable = true; secondary.PageReads = 0;
         KernelMonitor unstable;
         unstable.Options.LogDirectory = (root / L"unstable").wstring();
@@ -276,6 +301,51 @@ bool KmonImageReadIntegrationSelfTest()
         std::vector<uint8_t> bytes;
         check(router.ReadExact(Base, 32, &bytes), "publication-control-original-read");
         const auto set = router.Snapshot();
+        {
+            KernelMonitor incomplete;
+            incomplete.Options.LogDirectory = (root / L"incomplete-secondary").wstring();
+            ExecutableSliceTrace trace;
+            trace.Entered = trace.SecondaryNeeded = trace.SecondaryOpened = true;
+            trace.SecondaryViewBase = Base;
+            trace.SecondaryReads = set;
+            trace.SecondaryReads.UnrecordedParserCalls = 1; // Raw evidence remains useful even when replay is denied.
+            const auto id = incomplete.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference, L"", &trace);
+            incomplete.WriterStopping.store(true); incomplete.CaptureWriterLoop();
+            std::wstring archive;
+            const auto file = root / L"incomplete-secondary" / L"image-reads" /
+                (L"reads-" + std::to_wstring(incomplete.EvidenceCollectionEpoch.load()) + L"-" + std::to_wstring(id) + L".knreads");
+            check(ReadAnalystSnapshot(file.wstring(), &archive, nullptr) &&
+                Raw(Raw(Raw(archive, L"payload"), L"slice_inputs"), L"secondary_reads") == ObservationRoutedReadSetJson(trace.SecondaryReads) &&
+                incomplete.ImageSlicesUnavailable.load() == 1 && incomplete.ImageSlicesWritten.load() == 0,
+                "ineligible-secondary-inputs-still-survive-in-raw-archive");
+        }
+        for (unsigned mode = 0; mode < 3; ++mode)
+        {
+            KernelMonitor blocked;
+            const auto directory = root / (L"slice-failure-" + std::to_wstring(mode));
+            blocked.Options.LogDirectory = directory.wstring();
+            if (mode == 0) { blocked.ImageSliceBytes.store(128ull * 1024 * 1024); }
+            if (mode == 2) { blocked.ImageReferenceBytes.store(128ull * 1024 * 1024); }
+            const auto id = blocked.QueueImageReadSet(slice.TargetReads, identity, L"synthetic", Base,
+                &retained.Reference, retained.SliceJson, &slice.Slice);
+            const auto blockedSlicePath = directory / L"image-reads" /
+                (L"reads-" + std::to_wstring(blocked.EvidenceCollectionEpoch.load()) + L"-" + std::to_wstring(id) + L".knslice");
+            if (mode == 1)
+            {
+                std::filesystem::create_directories(blockedSlicePath.parent_path());
+                check(Write(blockedSlicePath, {0x7B, 0x7D}), "create-owned-slice-collision");
+            }
+            blocked.WriterStopping.store(true); blocked.CaptureWriterLoop();
+            check(blocked.ImageReadsWritten.load() == 1 && blocked.ImageSlicesQueued.load() == 1 &&
+                blocked.ImageSlicesWritten.load() == 0 && blocked.ImageSlicesFailed.load() == 1 &&
+                (mode == 1 ? ContentHash::File(blockedSlicePath.wstring()) == ContentHash::Bytes({0x7B, 0x7D}) : !std::filesystem::exists(blockedSlicePath)),
+                "slice-publication-failure-does-not-erase-raw-evidence-or-replace-existing-file");
+            std::wstring finalLedger;
+            check(ReadAnalystSnapshot((directory / L"image-reads" /
+                (L"session-" + std::to_wstring(blocked.EvidenceCollectionEpoch.load()) + L".knreadledger")).wstring(), &finalLedger, nullptr) &&
+                Raw(finalLedger, L"slice_recipes_failed") == L"1" && Raw(finalLedger, L"reference_reserved_bytes") == L"0",
+                "final-ledger-retains-slice-failure-and-releases-reference-reservation");
+        }
         KernelMonitor pressure;
         pressure.Options.LogDirectory = (root / L"pressure").wstring();
         for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }

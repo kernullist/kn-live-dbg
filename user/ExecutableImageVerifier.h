@@ -3,6 +3,7 @@
 #include "ExecutableImage.h"
 #include "ObservationModel.h"
 #include "ReferenceArtifact.h"
+#include "ObservationReadRouting.h"
 
 #include <functional>
 #include <map>
@@ -67,6 +68,24 @@ struct ExecutableSweepReference
     bool ContentStable = false;
 };
 
+// The executed schedule and auxiliary inputs of one slice, never a whole-sweep
+// atomic snapshot. Replay consumes this count instead of running a wall clock.
+struct ExecutableSliceTrace
+{
+    uint32_t StartRange = 0;
+    uint32_t PageCount = 0;
+    uint64_t PreviousRelocationBase = 0;
+    bool PreviousSecondary = false;
+    bool Entered = false;
+    bool SecondaryNeeded = false;
+    bool SecondaryOpened = false;
+    uint32_t SecondaryOpenError = 0;
+    uint64_t SecondaryViewBase = 0;
+    uint64_t RelocationBase = 0;
+    std::wstring RejectionReason;
+    ObservationRoutedReadSet SecondaryReads;
+};
+
 bool QualifyExecutableReference(
     const executable_image::DiskPeMetadata& metadata,
     uint64_t imageBase,
@@ -96,6 +115,14 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(
     uint64_t nowMs,
     ExecutableSweep* sweep,
     uint64_t budgetMs = 0,
-    ExecutableSweepReference* capturedReference = nullptr);
+    ExecutableSweepReference* capturedReference = nullptr,
+    ExecutableSliceTrace* trace = nullptr);
+
+// Uses an already retained reference and original parser inputs. It never maps
+// a fresh secondary view or consults a target process.
+std::vector<ExecutablePageResult> ReplayExecutableSlice(
+    const std::wstring& referencePath, const executable_image::DiskPeMetadata& metadata,
+    uint64_t imageBase, const ObservationReader& target, const ObservationReader& secondary,
+    const ExecutableSliceTrace& recorded, ExecutableSliceTrace* reproduced);
 
 bool ExecutableImageVerifierSelfTest();

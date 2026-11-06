@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "ImageSliceRecipe.h"
 #include "ContentHash.h"
 #include "KmonHuntingJson.h"
 #include "ExecutableImagePermissions.h"
@@ -374,17 +375,18 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         };
     }
     ExecutableSweepReference capturedReference;
+    ExecutableSliceTrace slice;
     const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, 25,
-        router == nullptr ? nullptr : &capturedReference);
+        router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice);
     uint64_t readSetId = 0;
     std::wstring readPersistence = routing == nullptr ? L"unrecorded_reader" : L"not_selected_for_retention";
-    // Preserve the original attempt set for changed or inconclusive slices.
-    // This is not a verification recipe: normalization, secondary-view inputs
-    // and slice-policy replay remain a distinct transaction publication step.
-    if (router != nullptr && (pages.empty() || std::any_of(pages.begin(), pages.end(), [](const auto& page)
-        { return page.Ownership != CodeOwnership::OwnedVerified; })))
+    // Retain clean ranges as well as changes and gaps from the original slice.
+    // Recipe eligibility is separate from raw-read/reference preservation.
+    if (router != nullptr)
     {
-        readSetId = QueueImageReadSet(router->Snapshot(), identity, path, base, &capturedReference);
+        const auto reads = router->Snapshot();
+        const auto recipe = CaptureImageSliceRecipeJson(work->Reference, base, capturedReference, slice, reads, pages);
+        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice);
         readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
     }
     // Completed small images must not continually restart while larger images

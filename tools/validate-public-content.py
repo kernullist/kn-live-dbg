@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -47,7 +47,7 @@ def path_rule(name: str) -> str | None:
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger")
+        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice")
     ):
         return "private-container-or-capture"
     return None
@@ -94,7 +94,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                 if isinstance(document, dict) and document.get("schema") in {
                     "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
-                    "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_read_session.v1",
+                    "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
+                    "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.translation_receipt.v1", "kn.dump_read.v1",
                     "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_proof.v1", "kn.capture_scheduling.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",

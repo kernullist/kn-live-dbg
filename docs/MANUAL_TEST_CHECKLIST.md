@@ -69,7 +69,18 @@ modified/clean/unstable/unreadable cases, original archive publication after
 source/reference removal, queue pressure, session byte limits, output collision,
 writer failure, exact reference publication/reuse, missing/corrupt references,
 queue reservation release and final ledger/fixture cleanup. These are not native
-driver or real loaded-module tests, and `.knreads` is not a replayable image recipe.
+driver or real loaded-module tests. Raw `.knreads` and executable `.knslice`
+publication have separate success/failure counters.
+
+Run `tools/validate-image-slice.ps1 -Sanitize` for original direct/secondary
+slice capture and replay. The script prints its private fixture directory; use
+`python tools/test-image-slice.py --exe x64/Release/KnLiveDbg.exe --fixtures <reported-directory> --cli`
+after building to exercise the actual offline command. The independent oracle
+checks hashes, receipt selection, relocation values and compared/changed/excluded/
+unreadable bytes. Targets are synthetic nonexecuting PE bytes; secondary reference
+reads use actual owned `SEC_IMAGE_NO_EXECUTE` views. The original target/reference
+are removed before replay. Include missing/corrupt blobs, order/fallback/identity
+contradictions, secondary-input tampering, output collision and recipe byte limits.
 
 Run `tools/validate-reference-blobs.ps1 -Sanitize` for exact-handle acquisition
 after source rename/path replacement, independent read position, write exclusion,
@@ -78,16 +89,19 @@ budget, forged hashes, corrupt existing blobs and owned-file cleanup. Its Python
 oracle independently hashes the expected bytes. An existing writable mapping is
 a lease-denial control, not a test of privileged mutation through an active lease.
 
-In the native lab, inspect changed and inconclusive initial/background image
+In the native lab, inspect clean, changed and inconclusive initial/background image
 slices: match `read_operation_id` and `read_set_queued_id` to `coverage.image_reads`,
-then check the final `image-reads/*.knreadledger` after stop. Check v2 reference
+then check the final `image-reads/*.knreadledger` after stop. Check v3 reference
 capture/recheck/persistence separately, verify the named `image-references` blob,
 and inspect reference created/reused/failed/missing counts and zero outstanding
 reservations after drain. Keep queue/size/I/O loss and ledger failure explicit.
 Verify handle/native receipt linkage and raw status with matching and legacy
 qualified driver contracts, including exit,
 identity replacement, mapping changes and cancellation. Record final host
-cleanup. Do not count stored reads plus a reference blob as slice-policy replay.
+cleanup. Replay the published `.knslice` after target exit/reference replacement;
+verify separate recipe publication counters and exact policy reproduction.
+Do not count raw reads plus a reference blob as successful slice replay or a
+replayed slice as full sweep-manifest/graph publication.
 
 Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,
 sparse bytes, explicit fallback permission, shared budgets, metadata capacity,

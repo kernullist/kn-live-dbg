@@ -275,16 +275,65 @@ namespace
             return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), bytes->data(), size, &count) && count == size;
         }
     };
+
+    class ReferenceImageSource final : public IObservationSource
+    {
+    public:
+        ReferenceImageSource(const ReferenceImageView& view, const std::wstring& referenceId) : View(view)
+        {
+            Caps.SourceId = L"reference_view:" + referenceId + L":" + std::to_wstring(view.Base());
+            Caps.Consistency = L"file_bound_sec_image_no_execute";
+            Caps.UserOnly = true;
+            Caps.MayChangeResidency = true;
+            SYSTEM_INFO info{};
+            GetNativeSystemInfo(&info);
+            Caps.AddressSpace.UserMaximum = reinterpret_cast<uint64_t>(info.lpMaximumApplicationAddress);
+        }
+        const ObservationSourceCapabilities& Capabilities() const override { return Caps; }
+    protected:
+        ObservationReadResult ReadSpans(const ObservationReadRequest& request) override
+        {
+            ObservationReadResult result;
+            result.BackendContract = L"file_bound_local_read_process_memory";
+            if (request.Address < View.Base() || request.Address - View.Base() >= View.Size ||
+                request.Length > View.Size - (request.Address - View.Base()))
+            {
+                result.State = ObservationReadState::PolicyDenied;
+                result.ValidationReason = L"outside_retained_reference_view";
+                return result;
+            }
+            ObservationReadSpan span{request.Address, request.Length, ObservationReadState::Failed, {}};
+            std::vector<uint8_t> bytes(request.Length);
+            SIZE_T received = 0;
+            const auto ok = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(request.Address),
+                bytes.data(), bytes.size(), &received);
+            result.NativeStatusDomain = L"win32";
+            result.NativeStatus = ok ? ERROR_SUCCESS : GetLastError();
+            result.BackendCopyAttemptKnown = result.BackendCopyAttempted = true;
+            result.TransferredBytesKnown = received <= request.Length;
+            result.TransferredBytes = result.TransferredBytesKnown ? static_cast<uint32_t>(received) : 0;
+            if (ok && received == request.Length)
+            {
+                span.State = ObservationReadState::Complete;
+                span.Bytes = std::move(bytes);
+            }
+            result.Spans.push_back(std::move(span));
+            return result;
+        }
+    private:
+        const ReferenceImageView& View;
+        ObservationSourceCapabilities Caps;
+    };
 }
 
 static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, uint32_t rva, uint32_t size, const ObservationReader& reader, HANDLE reference,
-    uint64_t relocationBase, const ReferenceImageView* referenceImage = nullptr)
+    uint64_t relocationBase, const ObservationReader* referenceReader = nullptr, uint64_t referenceViewBase = 0)
 {
     ExecutablePageResult result;
     result.Rva = rva;
     result.RelocationBase = relocationBase;
-    result.SecondaryImageView = referenceImage != nullptr;
+    result.SecondaryImageView = referenceReader != nullptr;
     result.Coverage.Attempted = true;
     result.Coverage.RequestedBytes = size;
     result.Coverage.Reason = L"reference_or_live_read_failed";
@@ -320,7 +369,7 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
         {
             break;
         }
-        if (referenceImage)
+        if (referenceReader)
         {
             // The local view comes from the already identity-checked handle,
             // with writes/deletes denied and no DLL initialization. Validate
@@ -335,7 +384,7 @@ static ExecutablePageResult CompareExecutableRangeWithFile(const std::wstring& p
             bool matched = true;
             for (; matched && it != metadata.BaseRelocations.end() && it->Rva < uint64_t(rva) + size; ++it)
             {
-                if (local.empty() && !referenceImage->Read(referenceImage->Base() + rva, size, &local))
+                if (local.empty() && !ReadExact(*referenceReader, referenceViewBase, rva, size, &local))
                 {
                     matched = false;
                     break;
@@ -509,11 +558,13 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
     return CompareExecutableRangeWithFile(path, metadata, imageBase, rva, size, reader, INVALID_HANDLE_VALUE, imageBase);
 }
 
-std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
+static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
-    uint64_t budgetMs, ExecutableSweepReference* capturedReference)
+    uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace,
+    const ExecutableSliceTrace* replay = nullptr, const ObservationReader& replaySecondary = {})
 {
     if (capturedReference != nullptr) { *capturedReference = {}; }
+    if (trace != nullptr) { *trace = {}; }
     const uint64_t started = GetTickCount64();
     std::vector<ExecutablePageResult> results;
     if (sweep == nullptr || sweep->Ranges.empty() || pageBudget == 0)
@@ -529,8 +580,16 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->Rel32ValidatedBytes = 0;
         ++sweep->Cycle;
     }
+    if (trace != nullptr)
+    {
+        trace->Entered = true;
+        trace->StartRange = static_cast<uint32_t>(sweep->NextRange);
+        trace->PreviousRelocationBase = sweep->RelocationBase;
+        trace->PreviousSecondary = sweep->SecondaryImageView;
+    }
     const auto reject = [&](const std::wstring& reason)
     {
+        if (trace != nullptr) { trace->RejectionReason = reason; }
         const uint64_t requested = sweep->Coverage.RequestedBytes;
         sweep->Coverage = {};
         sweep->Coverage.RequestedBytes = requested;
@@ -584,16 +643,59 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     sweep->Coverage.InventoryAvailable = true;
     ReferenceImageView localImage;
     const bool secondary = headerBase != metadata.ImageBase && headerBase != imageBase;
+    if (trace != nullptr) { trace->SecondaryNeeded = secondary; }
     uint64_t relocationBase = imageBase;
+    uint64_t localViewBase = 0;
+    std::unique_ptr<ReferenceImageSource> localSource;
+    std::unique_ptr<ObservationReadRouter> localRouter;
+    struct SaveSecondaryReads
+    {
+        const std::unique_ptr<ObservationReadRouter>& Router;
+        ExecutableSliceTrace* Trace;
+        ~SaveSecondaryReads() noexcept
+        {
+            if (Trace == nullptr || Router == nullptr) { return; }
+            try { Trace->SecondaryReads = Router->Snapshot(); }
+            catch (...) { Trace->SecondaryReads.UnrecordedParserCalls = UINT64_MAX; }
+        }
+    } saveSecondaryReads{localRouter, trace};
     const ObservationReader localReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
     {
+        if (replay != nullptr) { return replaySecondary && replaySecondary(address, size, bytes); }
+        if (localRouter != nullptr)
+        {
+            return localRouter->ReadExact(address, size, bytes);
+        }
         return localImage.Read(address, size, bytes);
     };
     if (secondary)
     {
+        const bool opened = replay != nullptr ? replay->SecondaryOpened : localImage.Open(reference, metadata.SizeOfImage);
+        const uint32_t openError = replay != nullptr ? replay->SecondaryOpenError : opened ? ERROR_SUCCESS : GetLastError();
+        localViewBase = replay != nullptr ? replay->SecondaryViewBase : localImage.Base();
+        if (trace != nullptr)
+        {
+            trace->SecondaryOpened = opened;
+            trace->SecondaryOpenError = openError;
+            trace->SecondaryViewBase = localViewBase;
+            if (replay == nullptr && opened)
+            {
+                const auto referenceId = capturedReference != nullptr && capturedReference->Artifact != nullptr ?
+                    capturedReference->Artifact->Sha256 : L"unretained";
+                localSource = std::make_unique<ReferenceImageSource>(localImage, referenceId);
+                ObservationReadRouting routing;
+                routing.Primary = localSource.get();
+                routing.TargetId = L"reference:" + referenceId;
+                routing.AddressSpaceId = localSource->Capabilities().SourceId;
+                routing.AllowResidencyChanges = true;
+                auto operation = std::make_shared<ObservationReadOperation>(L"secondary:" + std::to_wstring(GetTickCount64()),
+                    routing.TargetId, routing.AddressSpaceId, ObservationOperationBudget{4 * 1024 * 1024, 1024, 1024, 65536, 5000});
+                localRouter = std::make_unique<ObservationReadRouter>(routing, std::move(operation));
+            }
+        }
         uint64_t localBase = 0;
-        if (!localImage.Open(reference, metadata.SizeOfImage) ||
-            !ReadExecutableIdentity(metadata, localImage.Base(), localReader, nullptr, &localBase) ||
+        if (!opened ||
+            !ReadExecutableIdentity(metadata, localViewBase, localReader, nullptr, &localBase) ||
             localBase != headerBase || localBase == 0 || (localBase & 0xFFFF) != 0 ||
             localBase > UINT64_MAX - metadata.SizeOfImage)
         {
@@ -611,24 +713,27 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     }
     sweep->RelocationBase = relocationBase;
     sweep->SecondaryImageView = secondary;
-    const size_t end = sweep->NextRange + (std::min)(pageBudget, sweep->Ranges.size() - sweep->NextRange);
+    if (trace != nullptr) { trace->RelocationBase = relocationBase; }
+    const size_t end = sweep->NextRange + (std::min)(replay != nullptr ? size_t(replay->PageCount) : pageBudget,
+        sweep->Ranges.size() - sweep->NextRange);
     size_t publications = 0;
     bool publicationLimited = false;
     for (; sweep->NextRange < end; ++sweep->NextRange)
     {
-        if (publications >= 64)
+        if (replay == nullptr && publications >= 64)
         {
             publicationLimited = true;
             break;
         }
-        if (!results.empty() && budgetMs != 0 && GetTickCount64() - started >= budgetMs)
+        if (replay == nullptr && !results.empty() && budgetMs != 0 && GetTickCount64() - started >= budgetMs)
         {
             break;
         }
         const auto& range = sweep->Ranges[sweep->NextRange];
         auto page = CompareExecutableRangeWithFile(path, metadata, imageBase,
             static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader, reference,
-            relocationBase, secondary ? &localImage : nullptr);
+            relocationBase, secondary ? &localReader : nullptr, localViewBase);
+        if (trace != nullptr) { ++trace->PageCount; }
         const bool coalesces = !results.empty() && page.Ownership == CodeOwnership::OwnedVerified &&
             page.Rel32ValidatedBytes == 0 && results.back().Ownership == CodeOwnership::OwnedVerified &&
             results.back().Rel32ValidatedBytes == 0 && (page.Rva >> 16) == (results.back().Rva >> 16) &&
@@ -661,7 +766,7 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
     uint64_t finalHeaderBase = 0, finalLocalBase = 0;
     const bool sameImage = !hasComparedBytes ||
         (ReadExecutableIdentity(metadata, imageBase, reader, &reason, &finalHeaderBase) && finalHeaderBase == headerBase &&
-            (!secondary || (ReadExecutableIdentity(metadata, localImage.Base(), localReader, nullptr, &finalLocalBase) &&
+            (!secondary || (ReadExecutableIdentity(metadata, localViewBase, localReader, nullptr, &finalLocalBase) &&
                 finalLocalBase == relocationBase)));
     const bool retainedStable = finishReference();
     const bool sameReference = retainedStable && DiskFileIdentityMatches(reference, metadata) && DiskReferenceIdentityMatches(path, metadata);
@@ -710,6 +815,27 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& pat
         sweep->LastCompleteCoverage = sweep->Coverage;
     }
     return results;
+}
+
+std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
+    uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
+    uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace)
+{
+    return AdvanceExecutableSweepImpl(path, metadata, imageBase, reader, pageBudget, nowMs, sweep, budgetMs, capturedReference, trace);
+}
+
+std::vector<ExecutablePageResult> ReplayExecutableSlice(const std::wstring& path, const DiskPeMetadata& metadata,
+    uint64_t imageBase, const ObservationReader& target, const ObservationReader& secondary,
+    const ExecutableSliceTrace& recorded, ExecutableSliceTrace* reproduced)
+{
+    ExecutableSweep sweep;
+    if (!recorded.Entered || !sweep.Initialize(metadata) || recorded.StartRange >= sweep.Ranges.size() ||
+        recorded.PageCount > sweep.Ranges.size() - recorded.StartRange) { return {}; }
+    sweep.NextRange = recorded.StartRange;
+    sweep.RelocationBase = recorded.PreviousRelocationBase;
+    sweep.SecondaryImageView = recorded.PreviousSecondary;
+    return AdvanceExecutableSweepImpl(path, metadata, imageBase, target, 1, 0, &sweep, 0, nullptr,
+        reproduced, &recorded, secondary);
 }
 
 bool ExecutableImageVerifierSelfTest()

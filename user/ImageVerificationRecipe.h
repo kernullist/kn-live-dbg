@@ -48,9 +48,11 @@ struct ImageRecipeCaptureOptions
 
 struct ImageRecipeReplay
 {
+    std::wstring Schema = L"kn.image_replay.v1";
     std::wstring Status = L"unavailable";
     std::wstring Mode;
     std::wstring RecordedPolicy;
+    std::wstring CurrentPolicy = ImageRecipePolicy;
     std::wstring RecipeSha256;
     std::wstring CurrentResult;
     std::wstring RecordedResult;

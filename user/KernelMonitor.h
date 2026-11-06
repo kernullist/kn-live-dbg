@@ -605,7 +605,8 @@ private:
     };
     uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
-        const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr);
+        const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr,
+        const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr);
     struct ImageReferenceCharge
     {
         ImageReferenceCharge() = default;
@@ -622,9 +623,11 @@ private:
         ObservationIdentity Identity;
         std::wstring Payload;
         bool HasReference = false;
+        bool HasSliceInputs = false;
         ExecutableSweepReference Reference;
         std::shared_ptr<ImageReferenceCharge> ReferenceCharge;
         std::wstring Json;
+        std::wstring SliceJson;
     };
     void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
     void CloseImageReadCollection() noexcept;
@@ -634,6 +637,7 @@ private:
     std::atomic<uint64_t> ImageReadsBytes{0}, ImageReadsLedgerFailed{0};
     std::atomic<uint64_t> ImageReferenceBlobsCreated{0}, ImageReferenceBlobsReused{0}, ImageReferenceBlobsFailed{0};
     std::atomic<uint64_t> ImageReferenceBytes{0}, ImageReferencesMissing{0};
+    std::atomic<uint64_t> ImageSlicesQueued{0}, ImageSlicesWritten{0}, ImageSlicesFailed{0}, ImageSlicesUnavailable{0}, ImageSliceBytes{0};
     void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
     void CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};

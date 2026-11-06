@@ -111,18 +111,28 @@ or 1 on failure; extra arguments return 2. No driver is loaded. Runtime
 and urgency thresholds are not latency guarantees. See
 [capture scheduling](ARCHITECTURE.md#capture-scheduling-and-latency).
 
-Current-main KMON image comparisons preserve original read attempts for changed
-or inconclusive slices in private `image-reads/*.knreads` files. Finding/image
+Current-main KMON image comparisons preserve original read attempts for clean,
+changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication
 events (`coverage.image_reads`); a queued ID alone does not mean the file was
 written. Hunt JSON `image_read_store` and `coverage.pipeline` report bounded
-queue/store loss. Inspect the final `.knreadledger` after stopping. V2 archives
+queue/store loss. Inspect the final `.knreadledger` after stopping. V3 archives
 also report exact reference capture and separate publication status in the
 shared `image-references/*.knblob` store. A committed raw archive may still have
 a failed or missing reference; check both statuses and the reference counters.
-Normalization, secondary-view inputs and slice recipes remain incomplete, so
-these archives are not accepted by `replay-image`. See
-[read receipts](ARCHITECTURE.md#ordered-read-receipts-and-operation-budgets).
+V3 also retains original slice/secondary-view inputs. The raw archive itself is
+not accepted by `replay-image`. Eligible AMD64/PE64 slices publish a separate
+`.knslice`; check recipe publication status and counters independently.
+
+`KnLiveDbg.exe --offline !kmon replay-image ".\evidence\image-reads\reads-COLLECTION-ID.knslice" /json`
+replays the original direct or secondary policy from the recorded reads and
+shared reference blob. It returns `kn.image_slice_replay.v1` with the actual
+policy and an executed-range `kn.image_slice_proof.v1`. Exit 0 includes faithfully
+reproduced inconclusive results; it does not mean the whole image is clean.
+Missing or contradictory inputs return exit 1 without successful proof. `/current`
+is explicitly unavailable for slice recipes. Sweep manifests, graph associations
+and native loaded-image lifetime validation remain open. See
+[original slice replay](ARCHITECTURE.md#original-kmon-slice-replay).
 
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged

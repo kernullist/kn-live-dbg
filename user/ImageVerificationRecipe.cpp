@@ -4,6 +4,8 @@
 #include "ImageProof.h"
 #include "McpJson.h"
 #include "ReferenceArtifact.h"
+#include "ImageComparisonJson.h"
+#include "ImageSliceRecipe.h"
 #include <filesystem>
 
 namespace
@@ -55,7 +57,7 @@ namespace
             L",\"observed_hex\":" + mcpjson::Quote(Hex(p.Observed.data(), p.Observed.size())) + L"}";
     }
 
-    std::wstring Normalization(const executable_image::DiskPeMetadata& m, uint64_t base, uint32_t rva, uint32_t size)
+    std::wstring Normalization(const executable_image::DiskPeMetadata& m, uint64_t base, uint32_t rva, uint32_t size, bool secondary = false)
     {
         if (m.Sections.size() > 96)
         {
@@ -65,7 +67,7 @@ namespace
         {
             return count != 0 && uint64_t(start) < uint64_t(rva) + size && rva < uint64_t(start) + count;
         };
-        std::wstring json = L"{\"schema\":\"kn.image_normalization.direct.v1\",\"machine\":" + N(m.Machine) +
+        std::wstring json = L"{\"schema\":" + mcpjson::Quote(secondary ? L"kn.image_normalization.secondary.v1" : L"kn.image_normalization.direct.v1") + L",\"machine\":" + N(m.Machine) +
             L",\"optional_magic\":" + N(m.OptionalMagic) + L",\"image_size\":" + N(m.SizeOfImage) +
             L",\"headers_size\":" + N(m.SizeOfHeaders) + L",\"image_base\":" + N(m.ImageBase) + L",\"relocation_base\":" + N(base) +
             L",\"timestamp\":" + N(m.TimeDateStamp) + L",\"checksum\":" + N(m.CheckSum) + L",\"entrypoint\":" + N(m.EntryPointRva) +
@@ -73,7 +75,7 @@ namespace
             L",\"pdb_age\":" + N(m.PdbAge) + L",\"pdb_rva\":" + N(m.PdbRva) +
             L",\"relocations_present\":" + B(m.BaseRelocationTablePresent) + L",\"relocations_complete\":" + B(m.BaseRelocationTableComplete) +
             L",\"dynamic_present\":" + B(m.DynamicRelocationTablePresent) + L",\"dynamic_complete\":" + B(m.DynamicRelocationTableComplete) +
-            L",\"secondary_basis\":false,\"sections\":[";
+            L",\"secondary_basis\":" + B(secondary) + L",\"sections\":[";
         bool first = true;
         for (const auto& s : m.Sections)
         {
@@ -252,6 +254,17 @@ namespace
     }
 }
 
+std::wstring ImageComparisonResultJson(const ExecutablePageResult& result, bool qualified)
+{
+    return ResultJson(result, qualified);
+}
+
+std::wstring ImageComparisonNormalizationJson(const executable_image::DiskPeMetadata& metadata,
+    uint64_t base, uint32_t rva, uint32_t length, bool secondary)
+{
+    return Normalization(metadata, base, rva, length, secondary);
+}
+
 static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
     uint32_t rva, uint32_t length, const std::wstring& newDirectory, ImageVerificationRecipe* recipe,
     std::wstring* error, const std::atomic<bool>* cancellation, const ImageRecipeCaptureOptions* options)
@@ -405,6 +418,19 @@ bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& s
 
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error)
 {
+    auto extension = std::filesystem::path(directory).extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
+    if (extension == L".knslice")
+    {
+        if (!currentReanalysis) { return ReplayImageSliceRecipe(directory, error); }
+        ImageRecipeReplay unsupported;
+        unsupported.Schema = L"kn.image_slice_replay.v1";
+        unsupported.Mode = L"current_reanalysis";
+        unsupported.CurrentPolicy.clear();
+        unsupported.Status = L"slice_current_reanalysis_unavailable";
+        if (error != nullptr) { *error = L"slice recipes support original-policy replay only"; }
+        return unsupported;
+    }
     ImageRecipeReplay result;
     result.Mode = currentReanalysis ? L"current_reanalysis" : L"original_policy";
     ImageVerificationRecipe p;

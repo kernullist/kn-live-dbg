@@ -7,6 +7,63 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Original KMON slice replay checkpoint: 2026-11-07
+
+This P03 substep retains clean, changed and inconclusive original KMON slices.
+Raw `kn.image_reads.v3` includes the original secondary-view inputs even when
+recipe publication is unavailable. Eligible AMD64/PE64 slices publish direct
+`kn.image_slice.v1` or secondary `kn.image_slice.v2` recipes beside the archive.
+Offline replay consumes the original routed reads and retained reference,
+recomputes normalization/results and reports executed-range proof and coverage.
+It never substitutes a fresh target read or a newly mapped secondary view.
+Raw archives, recipes and reference blobs have separate publication counters.
+
+Release x64 EXE SHA-256:
+`eb3bfbff4c68de09bfd769b887161ff6e9dfa4a4e435ed6b88f3172374aafab1`.
+ASan slice harness SHA-256:
+`5f76facf3d29d4239f345384193e43e6e70f14514a9040ea1e3a82a40c4bda1c`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+Existing C4744 `NextQueryEpoch` alignment warnings remain; the preceding broader
+build also reported the existing C4244 conversion warnings.
+
+`validate-image-slice.ps1 -Sanitize` passed 127 controls and 369 independent
+Python checks across 11 cases. The final EXE passed 413 slice CLI/oracle checks.
+Cases cover clean/modified/unstable/unreadable inputs, rejected guards, final
+identity changes, continuation, ambiguous secondary basis and positive secondary
+comparisons. Synthetic targets use two executable pages, a DIR64 relocation and
+an explicit IAT exclusion. Secondary reference reads use actual owned
+`SEC_IMAGE_NO_EXECUTE` mappings; no fixture code is executed. Original targets
+and reference paths are removed before publication/replay. Independent checks
+verify hashes, selected receipts, relocation values, matching/differing ranges
+and byte denominators. Missing references, unlinked fallback, altered order,
+unsupported architecture and rehashed input/normalization/result contradictions
+cannot produce successful proof.
+
+`--self-test all` passed timeline 28, MCP 102, console 558, command registry
+3,000 and remote 66 checks. Its actual KMON comparison/writer integration passed
+49 controls, including clean/modified replay after source removal, incomplete
+secondary raw retention, independent recipe/reference byte limits, collisions,
+queue drain and final failure ledgers with zero reference reservations.
+`validate-image-recipe.ps1 -Sanitize` passed 92 compatibility controls and six
+interrupted publications per v1/v2 format (three valid, three absent each).
+The final EXE passed 101 existing recipe CLI and 168 live CLI checks; all three
+owned nonexecuting PE-buffer children exited. Public-content regressions passed
+11 checks, including renamed private slice inputs and proof formats.
+
+Review fixes preserve raw secondary inputs when recipe eligibility fails,
+distinguish slice replay schema/policy from single-page replay, and validate
+disjoint coverage accounting before issuing proof. Test discovery uses the
+published recipe path rather than assuming a capture ID. No additional defects
+were found in the reviewed implementation scope.
+
+These controls do not validate an OS-loaded target or native driver lifetime.
+No driver-load, service-start, Verifier, reboot or security-policy changes were
+made. A faithfully replayed inconclusive slice remains inconclusive; its proof
+does not establish whole-sweep completion, approved provenance, atomic mapping
+lifetime or execution. Sweep manifests/graph associations, source-initialization
+receipts, full-file reference caching/stage budgets, journal recovery/global
+retention and the full VS1/P01-P16 goal remain open.
+
 ## KMON exact reference retention checkpoint: 2026-11-07
 
 This P03/minimal-P06 substep pins the comparison reference before target reads,

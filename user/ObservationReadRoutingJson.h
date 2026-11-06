@@ -3,6 +3,9 @@
 #include "ObservationReadRouting.h"
 #include "ReadReceiptJson.h"
 
+bool ValidObservationRoutedReadSet(const ObservationRoutedReadSet& set);
+bool ParseObservationRoutedReadSet(const std::wstring& json, ObservationRoutedReadSet* set);
+
 inline std::wstring ObservationRoutedReadSetJson(const ObservationRoutedReadSet& set)
 {
     const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };

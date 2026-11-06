@@ -108,6 +108,11 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"reference_bytes\":" + std::to_wstring(ImageReferenceBytes.load()) +
         L",\"reference_reserved_bytes\":" + std::to_wstring(ImageReferenceReservedBytes->load()) +
         L",\"reference_captures_missing\":" + std::to_wstring(ImageReferencesMissing.load()) +
+        L",\"slice_recipes_queued\":" + std::to_wstring(ImageSlicesQueued.load()) +
+        L",\"slice_recipes_written\":" + std::to_wstring(ImageSlicesWritten.load()) +
+        L",\"slice_recipes_failed\":" + std::to_wstring(ImageSlicesFailed.load()) +
+        L",\"slice_recipes_unavailable\":" + std::to_wstring(ImageSlicesUnavailable.load()) +
+        L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) +
         L",\"verification_recipe_preserved\":false}}";
     if (cases != nullptr)
     {

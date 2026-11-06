@@ -1,5 +1,6 @@
 #include "ImageRecipeReadSet.h"
 #include "ReadReceiptJson.h"
+#include "ObservationReadSetParser.h"
 #include <limits>
 
 namespace
@@ -182,9 +183,10 @@ bool ValidImageRecipeReadSet(const ImageVerificationRecipe& p)
     return bytes == set.ChargedBytes && calls == set.ChargedSourceCalls && spans == set.StoredSpans;
 }
 
-bool ParseImageRecipeReadSet(const std::wstring& json, ImageVerificationRecipe* p)
+bool ParseObservationReadSet(const std::wstring& json, size_t maximumReceipts, ObservationReadSet* resultSet)
 {
-    auto& set = p->ReadSet;
+    if (resultSet == nullptr || maximumReceipts > 4096 || json.size() > 2 * 1024 * 1024 || !mcpjson::ValidateDocument(json)) { return false; }
+    ObservationReadSet set;
     std::wstring budget;
     std::vector<std::wstring> rows;
     if (!String(json, L"operation_id", &set.OperationId) || !String(json, L"target_id", &set.TargetId) ||
@@ -199,14 +201,14 @@ bool ParseImageRecipeReadSet(const std::wstring& json, ImageVerificationRecipe* 
         !Number(budget, L"maximum_receipts", &set.Budget.MaximumReceipts) ||
         !Number(budget, L"maximum_stored_spans", &set.Budget.MaximumStoredSpans) ||
         !Number(budget, L"maximum_elapsed_ms", &set.Budget.MaximumElapsedMs) ||
-        !Array(json, L"reads", ImageRecipeMaxReads, &rows)) { return false; }
+        !Array(json, L"reads", maximumReceipts, &rows)) { return false; }
     for (const auto& row : rows)
     {
         ObservationReadReceipt receipt;
         auto& q = receipt.Request;
         auto& s = receipt.Source;
         auto& a = s.AddressSpace;
-        std::wstring contract, shape, domain, result;
+        std::wstring contract, shape, domain, result, fallback;
         if (!Number(row, L"sequence", &receipt.Sequence) || !Boolean(row, L"completed", &receipt.Completed) ||
             !Boolean(row, L"abandoned", &receipt.Abandoned) || !Boolean(row, L"source_invoked", &receipt.SourceInvoked) ||
             !Boolean(row, L"deadline_exceeded", &receipt.DeadlineExceeded) || !String(row, L"admission_reason", &receipt.AdmissionReason) ||
@@ -220,11 +222,24 @@ bool ParseImageRecipeReadSet(const std::wstring& json, ImageVerificationRecipe* 
             !Number(shape, L"virtual_bits", &a.VirtualAddressBits) || !Number(shape, L"pointer_bytes", &a.PointerBytes) ||
             !Number(shape, L"physical_bits", &a.PhysicalAddressBits, true, true) || !Boolean(shape, L"legacy_assumed", &a.LegacyAssumed) ||
             !Number(shape, L"user_maximum", &a.UserMaximum) || !Number(shape, L"kernel_minimum", &a.KernelMinimum) ||
-            !Raw(row, L"read", &result) || !Result(result, &receipt.Result)) { return false; }
-        p->Reads.push_back({q.Address, q.Length, receipt.Result});
+            !Raw(row, L"fallback", &fallback) || !Raw(row, L"read", &result) || !Result(result, &receipt.Result)) { return false; }
+        if (fallback != L"null" && (!Number(fallback, L"from_receipt", &q.FallbackFromReceipt) ||
+            !String(fallback, L"reason", &q.FallbackReason) || !Boolean(fallback, L"permission_requested", &q.AllowFallback) ||
+            !Boolean(fallback, L"permitted", &receipt.FallbackPermitted))) { return false; }
         set.Reads.push_back(std::move(receipt));
     }
-    // Canonical regeneration also checks redundant counts, nullable fields,
-    // schema IDs, unknown fields, and unsupported fallback declarations.
-    return ValidImageRecipeReadSet(*p) && ObservationReadSetJson(set) == json;
+    if (ObservationReadSetJson(set) != json) { return false; }
+    *resultSet = std::move(set);
+    return true;
+}
+
+bool ParseImageRecipeReadSet(const std::wstring& json, ImageVerificationRecipe* p)
+{
+    if (!ParseObservationReadSet(json, ImageRecipeMaxReads, &p->ReadSet)) { return false; }
+    for (const auto& receipt : p->ReadSet.Reads)
+    {
+        p->Reads.push_back({receipt.Request.Address, receipt.Request.Length, receipt.Result});
+    }
+    // The v2 policy remains single-source and rejects all fallback declarations.
+    return ValidImageRecipeReadSet(*p);
 }

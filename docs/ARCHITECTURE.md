@@ -111,8 +111,8 @@ guard status does not establish an atomic mapping snapshot.
 KMON's initial user/kernel image comparisons and background image continuations
 use this router, including handle-to-native fallback. A slice shares limits of
 16 MiB requested bytes, 4,096 source calls/receipts, 65,536 spans and five seconds;
-the existing 25 ms sweep yield remains cooperative. Changed or inconclusive
-slices queue their original attempts and parser selections as `kn.image_reads.v2`
+the existing 25 ms sweep yield remains cooperative. Clean, changed and inconclusive
+slices queue their original attempts and parser selections as `kn.image_reads.v3`
 under `image-reads/reads-<collection>-<id>.knreads`. The private payload has a
 SHA-256 integrity hash, not collector authentication. The writer uses create-new
 atomic publication, with an eight-item queue, 2 MiB per file and 128 MiB per
@@ -142,12 +142,51 @@ the raw reads or imply replay readiness. Acquisition/rechecks and existing-blob
 verification still read full file contents per slice; caching and reference-stage
 latency budgets remain P09 work. The 25 ms yield is not an end-to-end deadline.
 
-Clean-only slices are not selected for this archive. Local secondary-view reads
-and normalization are not retained, so the archive is not an executable
-verification recipe. Complete background recipes and sweep-manifest publication,
-source-initialization receipts, other KMON reader paths, crash recovery/global
-retention and native lifecycle validation remain open. Single-source v2 recipe
-validation remains strict; routed fallback sets cannot be substituted into it.
+V3 raw archives also retain the executed slice schedule and original local
+secondary-view reads, including incomplete inputs that cannot form a recipe.
+Raw archive publication alone does not establish successful policy replay.
+Single-source v2 recipe validation remains strict; routed fallback sets cannot
+be substituted into it.
+
+## Original KMON slice replay
+
+Eligible AMD64/PE64 slices publish a separate `.knslice` beside the raw archive.
+`kn.image_slice.v1` records `kn.executable_slice.direct.v1`; `kn.image_slice.v2`
+records `kn.executable_slice.secondary.v1`. Both preserve the exact reference
+hash, original routed target reads, executed range schedule, previous relocation
+basis, per-range normalization and original typed results. Clean ranges are
+retained along with changed and inconclusive ranges.
+
+Secondary policy records the original owned `SEC_IMAGE_NO_EXECUTE` view's reads,
+mapping-open outcome and selected relocation basis. Those reads use a distinct
+source/address space with a 4 MiB, 1,024-call/receipt, 65,536-span, five-second
+budget, separate from the target's 16 MiB/4,096-call budget. They do not form an
+atomic snapshot with the target. Replay consumes recorded parser selections in
+their original order, including failed attempts and explicit fallback links. It
+does not read the live target, reopen the original reference path or create a
+new secondary image view. It executes the recorded range count rather than
+recreating the original cooperative wall-clock yield.
+
+The writer holds the verified reference blob lease through raw and recipe
+publication. Recipes have a separate 2 MiB/file and 128 MiB/session limit.
+Recipe queued/written/failed/unavailable counts and bytes remain separate from
+raw archives and reference blobs in publication events and final ledgers.
+Collisions are never overwritten. A raw archive can survive recipe failure.
+The hash provides integrity checking, not collector authentication.
+
+`!kmon replay-image <slice.knslice> /json` returns `kn.image_slice_replay.v1`.
+It verifies the retained blob and normalization, runs the shared comparison
+policy, requires exact receipt consumption and reproduces the recorded results.
+Its `kn.image_slice_proof.v1` reports matching/differing ranges and separate
+compared/excluded/unreadable byte totals for executed slice ranges. Even a
+successfully replayed inconclusive slice does not prove a match. Whole-sweep
+completion, approved reference provenance, atomic mapping lifetime and execution
+are not established. `/current` explicitly returns unavailable for slice recipes;
+existing v1/v2 single-range recipe behavior is unchanged.
+
+Sweep manifests and graph associations, source-initialization receipts, other
+KMON reader paths, crash recovery/global retention, reference caching and native
+lifecycle validation remain open. These slices do not complete VS1.
 
 ## Typed translation receipts
 
