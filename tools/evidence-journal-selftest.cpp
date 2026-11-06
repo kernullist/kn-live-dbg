@@ -1,5 +1,6 @@
 #include "../user/EvidenceJournal.h"
 #include "../user/EvidenceStore.h"
+#include "../user/EvidenceRetention.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
 #include "../user/McpJson.h"
@@ -210,6 +211,14 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--gc")
+        {
+            const std::wstring stage = argc == 6 ? argv[5] : L"";
+            const auto result = CollectEvidenceStore(argv[2], argv[3], std::wstring(argv[4]) == L"-" ? L"" : argv[4],
+                [&](const wchar_t* current) { Stage(stage, current); });
+            std::wcout << EvidenceGcResultJson(result) << '\n';
+            return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
+        }
         if (argc == 3 && std::wstring(argv[1]) == L"--store")
         {
             const auto result = InspectEvidenceStore(argv[2]);

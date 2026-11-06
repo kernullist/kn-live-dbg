@@ -57,6 +57,7 @@ public:
 private:
     friend EvidenceJournalRecovery RecoverEvidenceJournal(const std::wstring&, bool);
     friend EvidenceStoreInventory InspectEvidenceStore(const std::wstring&);
+    friend struct EvidenceStoreAccess;
     struct Impl;
     std::unique_ptr<Impl> Data;
 };

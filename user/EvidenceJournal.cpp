@@ -1,5 +1,6 @@
 #include "EvidenceJournal.h"
 #include "EvidenceStore.h"
+#include "EvidenceRetention.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -254,10 +255,11 @@ struct EvidenceJournal::Impl
         }
         return true;
     }
-    bool Read(const fs::path& path, uint64_t maximum, Handle* owner, std::wstring* digest, uint64_t* size, std::wstring* json = nullptr)
+    bool Read(const fs::path& path, uint64_t maximum, Handle* owner, std::wstring* digest, uint64_t* size, std::wstring* json = nullptr,
+        DWORD additionalAccess = 0)
     {
         if (!PinDirectory(path.parent_path(), false) || !Timely()) { return false; }
-        auto file = Own(CreateFileW(NativePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        auto file = Own(CreateFileW(NativePath(path).c_str(), GENERIC_READ | additionalAccess, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
         FILE_ATTRIBUTE_TAG_INFO attributes{};
         LARGE_INTEGER length{};
@@ -675,7 +677,16 @@ namespace
     }
 }
 
-EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
+struct EvidenceStoreAccess
+{
+    static EvidenceStoreInventory Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
+        const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action);
+    static EvidenceGcResult Collect(const std::wstring& root, const std::wstring& policyPath,
+        const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer);
+};
+
+EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
+    const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action)
 {
     EvidenceStoreInventory out;
     out.StartedTick = GetTickCount64();
@@ -815,7 +826,7 @@ EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
                 if (blob || json)
                 {
                     a.Verified = reader.Read(root / relative, blob ? MaxBlobBytes : MaxJsonBytes, &lease,
-                        &a.Artifact.Sha256, &a.Artifact.Bytes, json ? &text : nullptr);
+                        &a.Artifact.Sha256, &a.Artifact.Bytes, json ? &text : nullptr, deletionPaths.count(relative) ? DELETE : 0);
                     if (blob) { a.Artifact.Schema = L"raw.bytes"; }
                     else { mcpjson::GetString(text, L"schema", &a.Artifact.Schema); }
                     a.Verified = a.Verified && (blob || Id(MemberCollection(relative))) && MemberValid(a.Artifact, MemberCollection(relative));
@@ -857,9 +868,15 @@ EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
         if (!Digest(out.CatalogSha256) || !Digest(out.ArtifactsSha256)) { throw std::runtime_error("store report hashing failed"); }
         out.Status = out.MembershipComplete && out.ArtifactInventoryComplete ? L"verified" : L"partial";
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
+        if (action) { action(out, root, reader); }
     }
     catch (...) { out.Status = L"partial"; out.MembershipComplete = out.ArtifactInventoryComplete = false; out.Issue = L"store_inspection_exception"; }
     return finish();
+}
+
+EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
+{
+    return EvidenceStoreAccess::Inspect(artifactRoot, {}, {});
 }
 
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool includeArtifacts)
@@ -904,4 +921,354 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"collections\":" + collections + L"],\"artifacts\":" + artifacts +
         L"],\"deletion_authorized\":false,\"disk_allocation_established\":false,\"target_coverage_established\":false,"
         L"\"collector_authenticated\":false,\"power_loss_durability_established\":false}";
+}
+
+namespace
+{
+    constexpr uint64_t GcMaxBytes = 128ull * 1024 * 1024, GcMaxPolicyBytes = 128 * 1024;
+    constexpr size_t GcMaxFiles = 128;
+    uint64_t FileTimeValue(FILETIME time)
+    {
+        return (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    }
+    uint64_t CurrentFileTime()
+    {
+        FILETIME time{}; GetSystemTimeAsFileTime(&time); return FileTimeValue(time);
+    }
+    bool GcIdentity(HANDLE file, std::wstring* identity, uint64_t* lastWrite, bool directory = false)
+    {
+        BY_HANDLE_FILE_INFORMATION info{};
+        FILE_ID_INFO id{};
+        if (!GetFileInformationByHandle(file, &info) || !GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) ||
+            FileTimeValue(info.ftCreationTime) == 0 ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory ||
+            (!directory && (info.nNumberOfLinks != 1 || (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0))) { return false; }
+        std::wstring fileId;
+        bool nonzero = false;
+        constexpr wchar_t digits[] = L"0123456789abcdef";
+        for (const auto byte : id.FileId.Identifier)
+        {
+            nonzero |= byte != 0;
+            fileId += digits[byte >> 4]; fileId += digits[byte & 15];
+        }
+        if (!nonzero) { return false; }
+        *identity = std::to_wstring(id.VolumeSerialNumber) + L":" + fileId + L":" +
+            std::to_wstring(FileTimeValue(info.ftCreationTime));
+        *lastWrite = FileTimeValue(info.ftLastWriteTime);
+        return directory || *lastWrite != 0;
+    }
+    bool GcPolicyValid(const EvidenceGcPolicy& p)
+    {
+        if (!Text(p.Reason, 512) || p.MinimumAgeSeconds > 10ull * 366 * 86400 ||
+            p.ByteLimit == 0 || p.ByteLimit > GcMaxBytes || p.Members.empty() || p.Members.size() > GcMaxFiles) { return false; }
+        std::wstring previous;
+        uint64_t total = 0;
+        for (const auto& m : p.Members)
+        {
+            if (!MemberValid(m, MemberCollection(m.Path)) || m.Schema == L"kn.image_read_session.v1" ||
+                (m.Schema != L"raw.bytes" && !Id(MemberCollection(m.Path))) ||
+                (!previous.empty() && m.Path <= previous) || m.Bytes > p.ByteLimit - total) { return false; }
+            total += m.Bytes; previous = m.Path;
+        }
+        return true;
+    }
+    std::wstring GcOperationJson(const EvidenceGcResult& r, const EvidenceGcPolicy& p, uint64_t time, const std::wstring& catalog)
+    {
+        return Envelope(L"kn.evidence_gc_operation.v1", L"{\"operation_id\":" + mcpjson::Quote(r.OperationId) +
+            L",\"root_identity\":" + mcpjson::Quote(r.RootIdentity) + L",\"policy_sha256\":" + mcpjson::Quote(r.PolicySha256) +
+            L",\"created_filetime\":" + N(time) + L",\"initial_catalog_sha256\":" + mcpjson::Quote(catalog) +
+            L",\"policy\":" + EvidenceGcPolicyJson(p) + L"}");
+    }
+    std::wstring GcEntryJson(const EvidenceGcResult& r, const EvidenceGcEntry& e, size_t ordinal,
+        uint64_t time, const std::wstring& catalog, bool intent)
+    {
+        return Envelope(intent ? L"kn.evidence_gc_intent.v1" : L"kn.evidence_gc_receipt.v1",
+            L"{\"operation_sha256\":" + mcpjson::Quote(r.OperationSha256) + L",\"ordinal\":" + N(ordinal) +
+            L",\"artifact\":" + MemberJson(e.Artifact) + L",\"file_identity\":" + mcpjson::Quote(e.FileIdentity) +
+            L",\"last_write_filetime\":" + N(e.LastWriteTime) + L",\"observed_filetime\":" + N(time) +
+            L",\"catalog_sha256\":" + mcpjson::Quote(catalog) + L",\"state\":" + mcpjson::Quote(e.State) +
+            L",\"issue\":" + mcpjson::Quote(e.Issue) + L",\"intent_sha256\":" + mcpjson::Quote(e.IntentSha256) + L"}");
+    }
+    bool ParseGcEntry(const std::wstring& json, const EvidenceGcResult& operation, size_t ordinal, bool intent,
+        EvidenceGcEntry* entry)
+    {
+        std::wstring payload, catalog;
+        uint64_t time = 0;
+        if (!mcpjson::FindRawValue(json, L"payload", &payload) ||
+            !mcpjson::GetString(payload, L"file_identity", &entry->FileIdentity) || !Text(entry->FileIdentity, 100) ||
+            !Number(payload, L"last_write_filetime", &entry->LastWriteTime) ||
+            !Number(payload, L"observed_filetime", &time) || time == 0 ||
+            !mcpjson::GetString(payload, L"catalog_sha256", &catalog) || !Digest(catalog) ||
+            !mcpjson::GetString(payload, L"state", &entry->State) ||
+            !mcpjson::GetString(payload, L"issue", &entry->Issue) || !Text(entry->Issue, 256, true) ||
+            !mcpjson::GetString(payload, L"intent_sha256", &entry->IntentSha256)) { return false; }
+        if (intent)
+        {
+            if (entry->State != L"intent" || !entry->Issue.empty() || !entry->IntentSha256.empty()) { return false; }
+        }
+        else if (!Digest(entry->IntentSha256) || (entry->State != L"deleted_named_entry" && entry->State != L"delete_failed" &&
+            entry->State != L"absent_after_intent" && entry->State != L"delete_outcome_unknown")) { return false; }
+        return GcEntryJson(operation, *entry, ordinal, time, catalog, intent) == json;
+    }
+    struct GcFailure { std::wstring Issue; };
+}
+
+std::wstring EvidenceGcPolicyJson(const EvidenceGcPolicy& p)
+{
+    std::wstring members = L"[";
+    for (const auto& m : p.Members)
+    {
+        if (members.size() > 1) { members += L","; }
+        members += MemberJson(m);
+    }
+    return L"{\"schema\":\"kn.evidence_gc_policy.v1\",\"policy\":\"kn.gc_explicit_uncommitted.v1\",\"reason\":" +
+        mcpjson::Quote(p.Reason) + L",\"minimum_age_seconds\":" + N(p.MinimumAgeSeconds) + L",\"byte_limit\":" +
+        N(p.ByteLimit) + L",\"members\":" + members + L"]}";
+}
+
+bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy)
+{
+    EvidenceGcPolicy p;
+    std::vector<std::wstring> members;
+    if (policy == nullptr || json.size() > GcMaxPolicyBytes || !mcpjson::ValidateDocument(json) ||
+        !mcpjson::GetString(json, L"reason", &p.Reason) || !Number(json, L"minimum_age_seconds", &p.MinimumAgeSeconds) ||
+        !Number(json, L"byte_limit", &p.ByteLimit) || !Array(json, L"members", GcMaxFiles, &members)) { return false; }
+    for (const auto& row : members)
+    {
+        EvidenceJournalMember m;
+        if (!mcpjson::GetString(row, L"path", &m.Path) || !mcpjson::GetString(row, L"sha256", &m.Sha256) ||
+            !mcpjson::GetString(row, L"schema", &m.Schema) || !Number(row, L"bytes", &m.Bytes)) { return false; }
+        p.Members.push_back(std::move(m));
+    }
+    if (!GcPolicyValid(p) || EvidenceGcPolicyJson(p) != json) { return false; }
+    *policy = std::move(p);
+    return true;
+}
+
+EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const std::wstring& policyPath,
+    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer)
+{
+    EvidenceGcResult result;
+    result.OperationId = operationId; result.Apply = !operationId.empty();
+    try
+    {
+        if (result.Apply && !Id(operationId)) { result.Issue = L"invalid_gc_operation_id"; return result; }
+        if (!Text(policyPath, 30000)) { result.Issue = L"invalid_gc_policy_path"; return result; }
+        EvidenceJournal policyOwner;
+        auto& input = *policyOwner.Data;
+        Handle policyLease{nullptr, &CloseHandle};
+        std::wstring policyJson;
+        uint64_t policyBytes = 0;
+        if (!input.Read(fs::absolute(policyPath).lexically_normal(), GcMaxPolicyBytes, &policyLease,
+            &result.PolicySha256, &policyBytes, &policyJson)) { result.Issue = L"gc_policy_unavailable"; return result; }
+        EvidenceGcPolicy policy;
+        if (!ParseEvidenceGcPolicy(policyJson, &policy)) { result.Issue = L"invalid_gc_policy"; return result; }
+        std::set<std::wstring> deletionPaths;
+        for (const auto& member : policy.Members)
+        {
+            result.SelectedBytes += member.Bytes;
+            if (result.Apply) { deletionPaths.insert(member.Path); }
+        }
+        bool called = false;
+        const auto inventory = Inspect(root, deletionPaths, [&](const EvidenceStoreInventory& snapshot, const fs::path& absolute,
+            EvidenceJournal::Impl& reader)
+        {
+            called = true;
+            const auto stop = [](const wchar_t* issue) { throw GcFailure{issue}; };
+            const auto stage = [&](const wchar_t* name) { if (observer) { observer(name); } };
+            try
+            {
+                result.CatalogSha256 = snapshot.CatalogSha256; result.ArtifactsSha256 = snapshot.ArtifactsSha256;
+                result.ObservedFileTime = CurrentFileTime();
+                if (snapshot.Status != L"verified" || !snapshot.MembershipComplete || !snapshot.ArtifactInventoryComplete)
+                    { stop(L"gc_requires_complete_closed_store"); }
+                auto directory = Own(CreateFileW(NativePath(absolute).c_str(), FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+                uint64_t ignored = 0;
+                if (!directory || !GcIdentity(directory.get(), &result.RootIdentity, &ignored, true)) { stop(L"gc_root_identity_unavailable"); }
+                const auto operation = absolute / L"retention" / operationId;
+                const auto manifest = operation / L"operation.kngc";
+                const auto exists = [&](const fs::path& path)
+                {
+                    const auto attr = GetFileAttributesW(NativePath(path).c_str());
+                    if (attr != INVALID_FILE_ATTRIBUTES) { return true; }
+                    const auto error = GetLastError();
+                    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) { stop(L"gc_path_state_unavailable"); }
+                    return false;
+                };
+                const auto readJson = [&](const fs::path& path, std::wstring* json, std::wstring* hash)
+                {
+                    Handle lease{nullptr, &CloseHandle}; uint64_t size = 0;
+                    if (!reader.Read(path, MaxJsonBytes, &lease, hash, &size, json)) { stop(L"gc_audit_record_unavailable"); }
+                    reader.Files.emplace(L"@gc-" + path.wstring(), std::move(lease));
+                };
+                const auto publish = [&](const fs::path& path, const std::wstring& json, std::wstring* hash)
+                {
+                    if (!reader.Timely() || !SaveObservationJson(NativePath(path), json, nullptr)) { stop(L"gc_audit_publication_failed"); }
+                    std::wstring verified;
+                    readJson(path, &verified, hash);
+                    if (verified != json) { stop(L"gc_audit_verification_failed"); }
+                };
+                const bool resumed = result.Apply && exists(manifest);
+                if (resumed)
+                {
+                    std::wstring json, payload, catalog;
+                    uint64_t time = 0;
+                    readJson(manifest, &json, &result.OperationSha256);
+                    if (!mcpjson::FindRawValue(json, L"payload", &payload) || !Number(payload, L"created_filetime", &time) || time == 0 ||
+                        !mcpjson::GetString(payload, L"initial_catalog_sha256", &catalog) || !Digest(catalog) ||
+                        GcOperationJson(result, policy, time, catalog) != json) { stop(L"gc_operation_collision_or_policy_mismatch"); }
+                }
+                std::vector<bool> priorIntents;
+                bool denied = false;
+                for (size_t i = 0; i < policy.Members.size(); ++i)
+                {
+                    EvidenceGcEntry entry; entry.Artifact = policy.Members[i];
+                    const auto prefix = operation / std::to_wstring(i + 1);
+                    const auto intentPath = fs::path(prefix.wstring() + L".kngcintent");
+                    const auto receiptPath = fs::path(prefix.wstring() + L".kngcreceipt");
+                    const bool hasIntent = resumed && exists(intentPath);
+                    priorIntents.push_back(hasIntent);
+                    EvidenceGcEntry intent = entry;
+                    if (hasIntent)
+                    {
+                        std::wstring json, digest;
+                        readJson(intentPath, &json, &digest);
+                        if (!ParseGcEntry(json, result, i + 1, true, &intent)) { stop(L"gc_intent_invalid"); }
+                        intent.IntentSha256 = digest;
+                    }
+                    if (resumed && exists(receiptPath))
+                    {
+                        std::wstring json, digest;
+                        readJson(receiptPath, &json, &digest);
+                        if (!hasIntent || !ParseGcEntry(json, result, i + 1, false, &entry) ||
+                            entry.IntentSha256 != intent.IntentSha256 || entry.FileIdentity != intent.FileIdentity ||
+                            entry.LastWriteTime != intent.LastWriteTime) { stop(L"gc_receipt_invalid_or_unbound"); }
+                        entry.ReceiptSha256 = digest; entry.ReusedReceipt = true;
+                        result.Entries.push_back(std::move(entry));
+                        continue;
+                    }
+                    const auto found = std::find_if(snapshot.Artifacts.begin(), snapshot.Artifacts.end(),
+                        [&](const EvidenceStoreArtifact& row) { return row.Artifact.Path == entry.Artifact.Path; });
+                    const auto file = reader.Files.find(entry.Artifact.Path);
+                    entry.State = L"eligible";
+                    if (found == snapshot.Artifacts.end())
+                    {
+                        if (hasIntent && !exists(absolute / entry.Artifact.Path))
+                            { entry = intent; entry.State = L"absent_after_intent"; entry.Issue = L"deletion_actor_unknown"; }
+                        else { entry.State = L"denied"; entry.Issue = L"selected_file_missing"; }
+                    }
+                    else if (!found->Verified || found->Retention != L"uncommitted_requires_policy" || found->JournalReferences != 0)
+                        { entry.State = L"denied"; entry.Issue = L"selected_file_protected"; }
+                    else if (!Same(found->Artifact, entry.Artifact)) { entry.State = L"denied"; entry.Issue = L"selected_file_changed"; }
+                    else if (file == reader.Files.end() || !GcIdentity(file->second.get(), &entry.FileIdentity, &entry.LastWriteTime))
+                        { entry.State = L"denied"; entry.Issue = L"selected_identity_attributes_or_links_unavailable"; }
+                    else if (result.ObservedFileTime < entry.LastWriteTime ||
+                        (result.ObservedFileTime - entry.LastWriteTime) / 10000000 < policy.MinimumAgeSeconds)
+                        { entry.State = L"denied"; entry.Issue = L"selected_file_too_young_or_future"; }
+                    else if (hasIntent && (entry.FileIdentity != intent.FileIdentity || entry.LastWriteTime != intent.LastWriteTime))
+                        { entry.State = L"denied"; entry.Issue = L"replacement_after_intent_preserved"; }
+                    if (hasIntent) { entry.IntentSha256 = intent.IntentSha256; }
+                    denied |= entry.State == L"denied";
+                    result.Entries.push_back(std::move(entry));
+                }
+                stage(L"gc_preflight");
+                if (denied) { result.Status = L"denied"; result.Issue = L"gc_selection_not_eligible"; return; }
+                if (!result.Apply) { result.Status = L"planned"; return; }
+                if (!resumed)
+                {
+                    if (!reader.PinDirectory(operation, true)) { stop(L"gc_operation_directory_unavailable"); }
+                    // An interrupted manifest temporary is harmless; other unexplained records are not adopted.
+                    std::error_code ec; size_t pending = 0;
+                    for (fs::directory_iterator it(NativePath(operation), ec), end; !ec && it != end; it.increment(ec))
+                    {
+                        if (++pending > GcMaxFiles || it->path().filename().wstring().rfind(L"operation.kngc.pending-", 0) != 0)
+                            { stop(L"gc_operation_directory_collision"); }
+                    }
+                    if (ec) { stop(L"gc_operation_directory_unavailable"); }
+                    publish(manifest, GcOperationJson(result, policy, result.ObservedFileTime, result.CatalogSha256), &result.OperationSha256);
+                }
+                stage(L"gc_operation");
+                for (size_t i = 0; i < result.Entries.size(); ++i)
+                {
+                    auto& entry = result.Entries[i];
+                    if (entry.ReusedReceipt) { continue; }
+                    if (!reader.Timely()) { stop(L"gc_deadline_exhausted"); }
+                    const auto prefix = operation / std::to_wstring(i + 1);
+                    if (!priorIntents[i])
+                    {
+                        auto intent = entry; intent.State = L"intent"; intent.Issue.clear(); intent.IntentSha256.clear();
+                        publish(fs::path(prefix.wstring() + L".kngcintent"), GcEntryJson(result, intent, i + 1,
+                            result.ObservedFileTime, result.CatalogSha256, true), &entry.IntentSha256);
+                    }
+                    stage(L"gc_intent");
+                    if (entry.State == L"eligible")
+                    {
+                        if (!reader.Timely()) { stop(L"gc_deadline_exhausted_before_delete"); }
+                        auto file = reader.Files.find(entry.Artifact.Path);
+                        if (file == reader.Files.end()) { stop(L"gc_selected_lease_lost"); }
+                        FILE_DISPOSITION_INFO disposition{TRUE};
+                        if (!SetFileInformationByHandle(file->second.get(), FileDispositionInfo, &disposition, sizeof(disposition)))
+                        {
+                            entry.State = L"delete_failed"; entry.Issue = L"win32_" + std::to_wstring(GetLastError());
+                        }
+                        else
+                        {
+                            // Close the same verified DELETE-capable handle. Never reopen a path to delete it.
+                            file->second.reset(); reader.Files.erase(file);
+                            if (!exists(absolute / entry.Artifact.Path))
+                            {
+                                entry.State = L"deleted_named_entry"; entry.Issue.clear();
+                                ++result.DeletedThisCall; result.DeletedBytesThisCall += entry.Artifact.Bytes;
+                            }
+                            else { entry.State = L"delete_outcome_unknown"; entry.Issue = L"name_present_after_disposition"; }
+                        }
+                    }
+                    stage(L"gc_delete");
+                    publish(fs::path(prefix.wstring() + L".kngcreceipt"), GcEntryJson(result, entry, i + 1,
+                        CurrentFileTime(), result.CatalogSha256, false), &entry.ReceiptSha256);
+                    stage(L"gc_receipt");
+                }
+                result.Status = std::all_of(result.Entries.begin(), result.Entries.end(), [](const EvidenceGcEntry& entry)
+                    { return entry.State == L"deleted_named_entry"; }) ? L"completed" : L"completed_with_unresolved_outcomes";
+            }
+            catch (const GcFailure& failure) { result.Status = L"incomplete"; result.Issue = failure.Issue; }
+            catch (...) { result.Status = L"incomplete"; result.Issue = L"gc_execution_exception"; }
+        });
+        if (!called) { result.Issue = inventory.Issue.empty() ? L"gc_inventory_unavailable" : inventory.Issue; }
+    }
+    catch (...) { result.Status = L"incomplete"; result.Issue = L"gc_inspection_exception"; }
+    return result;
+}
+
+EvidenceGcResult CollectEvidenceStore(const std::wstring& root, const std::wstring& policyPath,
+    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer)
+{
+    return EvidenceStoreAccess::Collect(root, policyPath, operationId, observer);
+}
+
+std::wstring EvidenceGcResultJson(const EvidenceGcResult& r)
+{
+    std::wstring entries = L"[";
+    for (const auto& entry : r.Entries)
+    {
+        if (entries.size() > 1) { entries += L","; }
+        entries += L"{\"artifact\":" + MemberJson(entry.Artifact) + L",\"state\":" + mcpjson::Quote(entry.State) +
+            L",\"issue\":" + mcpjson::Quote(entry.Issue) + L",\"file_identity\":" + mcpjson::Quote(entry.FileIdentity) +
+            L",\"last_write_filetime\":" + N(entry.LastWriteTime) + L",\"intent_sha256\":" + mcpjson::Quote(entry.IntentSha256) +
+            L",\"receipt_sha256\":" + mcpjson::Quote(entry.ReceiptSha256) + L",\"reused_receipt\":" + B(entry.ReusedReceipt) + L"}";
+    }
+    return L"{\"schema\":\"kn.evidence_gc_result.v1\",\"status\":" + mcpjson::Quote(r.Status) + L",\"issue\":" +
+        mcpjson::Quote(r.Issue) + L",\"apply\":" + B(r.Apply) + L",\"operation_id\":" + mcpjson::Quote(r.OperationId) +
+        L",\"root_identity\":" + mcpjson::Quote(r.RootIdentity) + L",\"policy_sha256\":" + mcpjson::Quote(r.PolicySha256) +
+        L",\"operation_sha256\":" + mcpjson::Quote(r.OperationSha256) + L",\"preflight_catalog_sha256\":" + mcpjson::Quote(r.CatalogSha256) +
+        L",\"preflight_artifacts_sha256\":" + mcpjson::Quote(r.ArtifactsSha256) + L",\"observed_filetime\":" + N(r.ObservedFileTime) +
+        L",\"selected_bytes\":" + N(r.SelectedBytes) + L",\"deleted_this_call\":" + N(r.DeletedThisCall) +
+        L",\"deleted_named_bytes_this_call\":" + N(r.DeletedBytesThisCall) + L",\"entries\":" + entries +
+        L"],\"scope\":\"explicit_uncommitted_image_artifacts\",\"coordination\":\"participating_publishers\","
+        L"\"receipt_scope\":\"operation_history\",\"current_path_absence_established\":false,\"uncommitted_dependents_resolved\":false,"
+        L"\"deletion_authority_after_return\":false,\"disk_reclamation_established\":false,\"collector_authenticated\":false,"
+        L"\"power_loss_durability_established\":false}";
 }

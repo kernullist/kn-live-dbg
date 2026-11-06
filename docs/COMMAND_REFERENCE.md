@@ -64,6 +64,23 @@ after collection stops. Exit 0 means complete verified membership and artifact
 inventory, 1 means partial/unavailable, and 2 means invalid grammar. The returned
 report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
 
+`KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]`
+preflights an explicit policy by default. Prepare one with
+`python tools/new-evidence-gc-policy.py --inventory inventory.json --path image-reads/reads-123-4.knreads --reason "obsolete unpublished observation" --output policy.json`.
+The input must be the JSON from `store /artifacts`; when saving it in PowerShell,
+use `Set-Content -Encoding utf8`. The helper defaults to a 24-hour minimum file
+age and 128 MiB total named bytes. Repeat `--path` for explicit additional members.
+Review the generated policy and preflight result before using `/apply` with a
+canonical decimal operation ID of at most 20 digits. The same ID resumes that
+exact operation; it cannot select a new policy or another physical root.
+
+Exit 0 means planned or historically completed; exit 1 includes denied,
+incomplete and unresolved deletion outcomes; exit 2 means invalid grammar.
+`deleted_this_call` excludes old receipts and absence after an interrupted
+intent. Receipt reuse never deletes a later replacement. This command is
+offline-only and does not remove committed roots or failure ledgers. See
+[GC policy, audit and interruption semantics](ARCHITECTURE.md#explicit-uncommitted-artifact-gc).
+
 `KnLiveDbg.exe --offline !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
 returns a private `kn.evidence_graph.v1` fact graph for a retained `.kncase` bundle.
 The default root is its evidence node, depth is 2, record limit is 64 and

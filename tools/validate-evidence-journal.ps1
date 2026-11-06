@@ -27,4 +27,6 @@ if ($LASTEXITCODE -ne 0) { throw "Evidence journal controls failed: $LASTEXITCOD
 if ($LASTEXITCODE -ne 0) { throw "Evidence journal independent validation failed: $LASTEXITCODE; fixtures=$fixtures" }
 & python (Join-Path $PSScriptRoot 'test-evidence-store.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Evidence store independent validation failed: $LASTEXITCODE" }
+& python (Join-Path $PSScriptRoot 'test-evidence-gc.py') --exe $exe --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw "Evidence GC independent validation failed: $LASTEXITCODE" }
 Write-Output "[journal.validation] fixtures=$fixtures"

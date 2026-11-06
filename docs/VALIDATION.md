@@ -7,6 +7,71 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Explicit image-artifact GC checkpoint: 2026-11-07
+
+This P06 step adds offline `!kmon gc` preflight/apply/resume and a create-new
+policy helper. Explicit canonical policies bind exact uncommitted member bytes,
+reason, minimum age and byte ceiling. Current closed-root membership and all
+original/selected file leases remain held under the store barrier. A durable
+operation and per-file intent precede each handle-based deletion; separate
+receipts preserve success, failure and uncertain outcomes. Committed originals,
+references and failure ledgers cannot be selected. This does not retire committed
+roots or implement automatic retention priorities.
+
+Final Release EXE SHA-256:
+`686e3f0d7981e8d9f27c894a1c2e0fc5fc27a8ec05037dea555af0780b663877`.
+ASan journal/store/GC harness SHA-256:
+`4c87e5643693568d78884bfbf82afea921bb8ead365fae350ae3097faf35b5ae`.
+Release and ASan builds passed with VS 2022 Build Tools 17.14.60 / MSVC
+14.44.35207 and SDK/WDK 10.0.26100.0. Existing C4744 `NextQueryEpoch` alignment
+warnings remain; the initial broader rebuild also reproduced the existing C4244
+fill conversion warning in unchanged `KernelMonitor.cpp`.
+
+The final ASan validation passed **42 C++ controls**, **1,952 journal checks**,
+**476 store checks** and **892 independent GC checks**. The final EXE passed
+**898 GC CLI checks**, **1,952 journal CLI checks** and **492 store CLI checks**.
+The GC oracle creates, verifies and deletes only files beneath its own resolved
+fixture root. It independently recomputes canonical policy/operation/intent/
+receipt hashes and exact selected bytes, checks original committed files remain
+unchanged, and compares root/candidate identities with separate Win32
+`FileIdInfo` and creation-time queries. The observed fixture volume is NTFS;
+this is not a ReFS or filesystem compatibility matrix.
+
+Nine GC interruption cases observe an owned harness child's exact stage before
+termination/reaping. The final CLI resumes those recorded operations. They cover
+preflight, operation publication, intent, deletion before receipt, completed
+receipt, identical-byte replacement, corrupt intent, rehashed unbound receipt
+and copied operation/root identity. All owned children were reaped. Absence after
+intent remains actor-unknown; completed receipts are reused without deleting a
+later replacement. Denied/partial roots, committed references, failure-ledger
+policies, pending/unknown artifacts, policy/path/schema/byte errors, overflow,
+minimum age, future timestamps, read-only files, hard links and output collisions
+retain their explicit failure or preservation states. The policy helper is tested
+against actual store output, existing-output collisions and malformed completeness
+flags; six invalid CLI grammars return usage status without execution.
+
+Review changed file identity from the legacy 64-bit index to the full 128-bit
+identifier with volume and creation time, following the
+[Windows identity contract](ARCHITECTURE.md#explicit-uncommitted-artifact-gc).
+Unavailable identity/creation information is denied. A deadline check immediately
+before disposition also covers a delayed progress callback. The deadline remains
+cooperative, not an I/O cancellation or real-time guarantee.
+
+An isolated final `--self-test all` passed: timeline **28**, MCP **102**, KMON
+image **75**, console **558**, commands **3,000 / 261 routes**, remote **66**.
+Capability contracts passed **29 / 261 routes**, the generated support matrix
+matched, and the public-content classifier passed **11 tests**. GC capability
+availability remains `not_probed`; the live controller/MCP does not expose apply.
+
+No driver was loaded, service started, Verifier enabled, reboot performed or
+security policy changed. No real user evidence was cleaned. These tests establish
+bounded owned-file behavior and process-interruption recovery, not secure erasure,
+disk reclamation, authenticated storage or media/power-loss durability. Full
+uncommitted dependency-impact analysis, committed-root retirement, priority/privacy
+policies, large-store continuation and the full P01-P16 / VS1-VS4 gates remain
+open. The historical concurrent-load process-capture deadline failure remains
+unresolved separately; an isolated suite pass does not close it.
+
 ## Coordinated image-store inventory checkpoint: 2026-11-07
 
 This P06 step adds `!kmon store` for exact membership and dedup accounting across

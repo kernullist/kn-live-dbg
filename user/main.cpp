@@ -36,6 +36,7 @@
 #include "EvidenceInvestigation.h"
 #include "EvidenceInventory.h"
 #include "EvidenceJournal.h"
+#include "EvidenceRetention.h"
 #include "EvidenceGraph.h"
 #include "ImageSweepGraph.h"
 #include <filesystem>
@@ -23064,6 +23065,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
+    std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23401,7 +23403,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|evidence|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|evidence|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23620,6 +23622,36 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         }
         std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
+    }
+    if (action == L"gc")
+    {
+        bool valid = args.size() >= 4 && args.size() <= 7 && !args[2].empty() && !args[3].empty();
+        std::wstring operation;
+        std::set<std::wstring> seen;
+        for (size_t i = 4; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            valid = seen.insert(option).second;
+            if (option == L"/apply")
+            {
+                valid = valid && ++i < args.size();
+                if (valid)
+                {
+                    operation = args[i];
+                    valid = !operation.empty() && operation.size() <= 20 && operation.find_first_not_of(L"0123456789") == std::wstring::npos &&
+                        (operation.size() == 1 || operation.front() != L'0');
+                }
+            }
+            else { valid = valid && option == L"/json"; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]\n";
+            return 2;
+        }
+        const auto result = CollectEvidenceStore(args[2], args[3], operation);
+        std::wcout << EvidenceGcResultJson(result) << L"\n";
+        return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
     }
     if (action == L"store")
     {

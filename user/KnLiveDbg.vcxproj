@@ -242,6 +242,7 @@
     <ClInclude Include="EvidenceInventory.h" />
     <ClInclude Include="EvidenceJournal.h" />
     <ClInclude Include="EvidenceStore.h" />
+    <ClInclude Include="EvidenceRetention.h" />
     <ClInclude Include="EvidenceGraph.h" />
     <ClInclude Include="ExecutionSurfaceCore.h" />
     <ClInclude Include="ExecutionSurfaceScanner.h" />

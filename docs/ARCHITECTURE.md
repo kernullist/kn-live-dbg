@@ -340,8 +340,9 @@ roots is only `uncommitted_requires_policy`; unknown, pending, malformed or
 unreadable artifacts remain protected and make artifact inventory partial.
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
-`deletion_authorized:false`. Deletion, retention priorities, privacy controls
-and durable deletion receipts remain separate P06 work.
+`deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
+revalidates its own policy and leases. Committed-root retirement, retention
+priorities and privacy controls remain P06 work.
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
@@ -353,6 +354,67 @@ flags distinguish verified journal membership from an incomplete artifact scan.
 emitted/omitted row counts; the
 aggregate counters and complete captured-row digest remain available. Large-store
 continuation is still required; this bounded audit does not implement it.
+
+## Explicit uncommitted-artifact GC
+
+`--offline !kmon gc <root> <policy.json>` preflights a private
+`kn.evidence_gc_policy.v1` selection. `/apply <operation-id>` applies or resumes
+that exact policy. GC is available only through this offline CLI, not the live
+controller/MCP command route. `tools/new-evidence-gc-policy.py` creates a policy
+from explicitly selected `/artifacts` inventory rows; it performs no deletion,
+refuses protected/missing rows and never overwrites an existing policy. The
+collector independently revalidates the current store and original bytes.
+
+Policy `kn.gc_explicit_uncommitted.v1` binds a reason, minimum file age, total
+named-byte ceiling and sorted exact path/hash/size/schema members. Policies use
+canonical UTF-8 JSON and string-encoded unsigned integers; unknown fields or
+schemas are rejected. The helper emits this form. A policy is an operator
+selection, not a signature, priority inference or authentication credential.
+Bounds are 128 members, 128 KiB policy input and 128 MiB selected bytes, within
+the existing store budgets and cooperative deadline.
+
+Every captured collection must verify closed and the complete artifact scan
+must succeed. Only `uncommitted_requires_policy` members can be selected;
+committed originals/references, all failure ledgers, unknown artifacts and open
+or unresolved membership remain protected. All selections are preflighted before
+the first deletion. Exact files are held against writes/path replacement, and
+apply requests DELETE access on the selected unmatched files during verification.
+Read-only files, hard links, missing 128-bit file IDs/creation times, future mtimes and files
+younger than policy age are denied. Age uses the filesystem last-write timestamp;
+it does not establish acquisition time or trustworthy provenance.
+
+Under the exclusive store lease, GC publishes and verifies
+`retention/<operation-id>/operation.kngc`, then `<ordinal>.kngcintent` before each
+deletion. The operation binds the exact policy and physical root identity; each
+intent binds the selected member, volume/128-bit file ID/creation time, last-write time,
+catalog hash and observation time. It marks the same verified handle for
+deletion with `FileDispositionInfo`, closes it, observes the named path and
+publishes `<ordinal>.kngcreceipt`. Windows requires DELETE access for this
+[handle operation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle).
+GC requires `FileIdInfo`; the legacy 64-bit ID is
+[not guaranteed unique on ReFS](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information).
+No recursive/path-based cleanup is used. A receipt-publication failure cannot
+undo a deletion; the durable intent remains and the result is incomplete.
+
+Resumption verifies immutable operation/intent/receipt bytes and the current
+roots. A present original with the same file identity can resume; even an
+identical-byte replacement after an intent is preserved. An absent file after an
+intent but before a receipt becomes `absent_after_intent`, with deletion actor
+unknown. It is not counted as a newly confirmed deletion. Valid terminal receipts
+are reused without repeating the operation. `completed` describes the historical
+operation, not current path absence: a later replacement is retained. Failed or
+unknown outcomes remain explicit and are never silently retried by a completed
+receipt. Corrupt or colliding audit files are preserved and block continuation.
+
+Reports and receipts record selected named bytes and deletion reasons; they do
+not establish reclaimed disk blocks, secure erasure or power-loss durability.
+Uncommitted recipe dependencies are not resolved: explicit removal of an
+uncommitted reference can make another uncommitted artifact unusable. This scope
+is declared as `uncommitted_dependents_resolved:false`; committed dependencies
+stay protected by journal membership. Automatic priority allocation, retirement
+of committed roots, full dependency-impact analysis, privacy controls and
+large-store continuation remain required work. All policy/audit/report artifacts
+are private evidence; there is no automatic external upload.
 
 ## Replayed image sweep graph
 

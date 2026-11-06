@@ -61,6 +61,9 @@ def main():
     store = by_key[("evidence", "store", "local_files")]
     assert store["availability"] == "not_probed" and store["consistency"] == "coordinated_stopped_store"
     assert "participating_publishers" in store["requirements"] and "no_deletion_authority_or_disk_allocation" in store["limits"]
+    gc = by_key[("evidence", "gc", "local_files")]
+    assert gc["availability"] == "not_probed" and "durable_intent_before_delete" in gc["requirements"]
+    assert "committed_roots_and_failure_ledgers_protected" in gc["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]
