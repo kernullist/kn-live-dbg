@@ -3,6 +3,7 @@
 #include "DeviceClient.h"
 #include "ObservationSourceJson.h"
 #include "ProcessObservationSource.h"
+#include "ReadReceiptJson.h"
 
 #include <array>
 
@@ -32,12 +33,22 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
             request.Length = static_cast<uint32_t>(control.size());
             request.ByteBudget = control.size();
             request.AllowResidencyChanges = true;
-            const auto read = source.Read(request);
+            ObservationOperationBudget budget;
+            budget.MaximumBytes = control.size();
+            budget.MaximumSourceCalls = 1;
+            budget.MaximumReceipts = 2;
+            const auto operation = std::make_shared<ObservationReadOperation>(
+                L"capability_owned_read:" + source.Capabilities().SourceId + L":" + std::to_wstring(probe.StartedMs),
+                L"process:" + std::to_wstring(probe.ProcessId) + L":" + std::to_wstring(probe.ProcessCreateTime),
+                source.Capabilities().SourceId, budget);
+            RecordingObservationSource recording(source, operation);
+            const auto read = recording.Read(request);
             probe.ProcessReadAttempted = true;
             probe.ProcessReadPassed = read.State == ObservationReadState::Complete && read.IdentityRevalidated;
             probe.ProcessBytesMatched = probe.ProcessReadPassed && read.Spans.size() == 1 &&
                 read.Spans.front().Bytes == std::vector<uint8_t>(control.begin(), control.end());
             probe.ProcessReadJson = ObservationReadJson(source.Capabilities(), request, read);
+            probe.ProcessReadSetJson = ObservationReadSetJson(operation->Snapshot());
             probe.ProcessReason = probe.ProcessBytesMatched ? L"owned_control_bytes_match" : ObservationReadStateName(read.State);
         }
         else

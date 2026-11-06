@@ -38,6 +38,9 @@ inline std::wstring ObservationReadJson(const ObservationSourceCapabilities& cap
         L",\"identity_revalidated\":" + (result.IdentityRevalidated ? L"true" : L"false") +
         L",\"native_status_domain\":" + mcpjson::Quote(result.NativeStatusDomain) +
         L",\"native_status\":" + (result.NativeStatusDomain == L"unavailable" ? std::wstring(L"null") : std::to_wstring(result.NativeStatus)) +
+        L",\"validation_reason\":" + mcpjson::Quote(result.ValidationReason) +
+        L",\"operation_id\":" + mcpjson::Quote(result.OperationId) +
+        L",\"read_receipt_id\":" + mcpjson::Quote(std::to_wstring(result.ReadReceiptId)) +
         L",\"collector_authenticated\":false,\"spans\":[";
     for (const auto& span : result.Spans)
     {

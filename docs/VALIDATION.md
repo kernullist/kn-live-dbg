@@ -7,6 +7,55 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Ordered read recorder checkpoint: 2026-11-07
+
+The first P02 substep adds the shared recorder and operation-wide budgets to
+the actual owned-process capability probe. The recorded bytes come from that
+read, with no evidence-only reread. This does not complete P02: image/scanner
+migration, native raw status DTOs and typed translation are still open.
+
+Release x64 EXE SHA-256:
+`1202859ac3a3ca7a7aa8532d14183870da934be00ab3955f3dcf016d95d67dac`.
+ASan recorder harness SHA-256:
+`91f6b56c43255b851ca95e7a35a6ef10adc8665217246df4f67e06b14c38e636`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+The unchanged `KmonHuntIndex::NextQueryEpoch` atomic field still emitted C4744
+alignment warnings. Signing/deployment trust was not established.
+
+`validate-read-receipts.ps1 -Sanitize` passed 48 controls. Its independent Python
+oracle checked 13 operations and 14 snapshots, including a pending concurrent
+read. Controls cover original partial/error data, denial and cancellation,
+explicit fallback permission/source/range links, shared byte/call/span limits,
+receipt overflow, elapsed-time overrun, source replacement, malformed spans,
+exception unwinding and admission order differing from completion order. The
+concurrency test waits for observed source work before releasing the other actor.
+The owned Win32 control also compares direct API failure codes, closes the original
+caller handle and frees the source allocation before checking retained bytes.
+
+Review corrected three recording gaps: delegated empty denials lost their
+specific state, rejecting malformed/replaced-source bytes erased raw status, and
+pending/abandoned JSON lacked the requested range. It also added a separate sparse
+metadata budget; a byte limit alone did not bound span storage. The final reviewed
+scope had no additional actionable defects.
+
+Existing owned process-source ASan checks passed 23 controls and six JSON cases.
+Evidence-bundle ASan passed 522 synthetic controls, including the common source
+admission/parser regressions; eight interrupted publications produced three valid
+final files and five absent finals, with restart checks passing. The runtime
+policy harness passed 22 controls, and the actual CLI probe passed the read-set,
+Unicode/output-failure and matrix checks. All 24 compiled contracts/261 routes,
+the generated support matrix, 11 public-content scanner regressions and full
+linked self-tests passed (timeline 28, MCP 102, console 558, commands 3,000,
+remote 66).
+
+No driver was loaded. Native connection availability remained unavailable on
+this host. Native NTSTATUS recovery, process fallback, page-table receipts,
+protected-target access, real LA57, durable replay of this new JSON format and
+OS/security-state regression are not established by these controls. Target and
+address-space labels remain caller-declared. Budget charging counts delegated
+source requests, not physical I/O; elapsed time includes parser/queue delays but
+does not measure them separately. In-flight calls are not forcibly cancelled.
+
 ## Scoped runtime capability checkpoint: 2026-11-06
 
 The selected P04 probe and generated source/address matrix extend the compiled
@@ -46,7 +95,8 @@ probe's owned address shape is explicitly legacy LA48; active native width remai
 unknown without the driver response. Other backend/layout probes and authenticated
 environment regression evidence remain open P04 work. Runtime reports are private
 evidence, and connection handles close before output. Native raw error domains
-and operation-wide deadlines remain P02 work. Signing trust remains unvalidated.
+and operation-wide deadlines were outside this checkpoint; selected operation
+budgets are covered above. Signing trust remains unvalidated.
 
 ## Hidden-process scheduling checkpoint: 2026-11-06
 

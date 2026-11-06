@@ -18,6 +18,14 @@ UTF-8, including localized status text. Native calls have no hard timeout.
 Runtime probe JSON contains private process/address metadata and is not a public
 support certificate. See [generated address/backend contracts](SUPPORT_MATRIX.md).
 
+The probe's `process_read_set` contains the same read as `process_read`, with
+operation/receipt IDs, source/range provenance and shared budget denominators.
+`recording_complete` means every attempted read has a completed receipt, including
+failed reads; it does not mean the target was fully read or validated. It is
+private `kn.read_set.v1` evidence, and its caller-declared target labels are not
+an authenticated target identity. Native status and translation are separate,
+unfinished integration work.
+
 Saved KMON evidence can also be investigated without elevation, driver loading,
 or symbols: `KnLiveDbg.exe --offline !kmon evidence <directory> /json`,
 `--offline !kmon replay <file.kncase> /json`, or `--offline !kmon why <file.kncase>`.

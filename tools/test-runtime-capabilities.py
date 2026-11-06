@@ -31,6 +31,12 @@ def main():
     assert sample["native_status_domain"] == "win32" and sample["native_status"] == 0
     assert sample["requested_bytes"] == 32 and len(sample["spans"]) == 1
     assert bytes.fromhex(sample["spans"][0]["bytes_hex"]) == bytes(range(0x51, 0x71))
+    read_set = probe["process_read_set"]
+    assert read_set["schema"] == "kn.read_set.v1" and read_set["recording_complete"] is True
+    assert read_set["attempts"] == read_set["receipts_saved"] == read_set["charged_source_calls"] == "1"
+    assert read_set["charged_requested_bytes"] == read_set["stored_valid_bytes_with_repeats"] == "32"
+    assert read_set["reads"][0]["read"] == sample and sample["read_receipt_id"] == "1"
+    assert read_set["operation_id"] == sample["operation_id"] and read_set["execution_observed"] is False
     native_ready = probe["native_source_opened"] and probe["native_contract_passed"] and probe["native_session_passed"]
     for capability in data["capabilities"]:
         assert capability["validation"] == "not_performed_for_target_environment"

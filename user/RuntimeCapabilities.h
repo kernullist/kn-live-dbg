@@ -18,6 +18,7 @@ struct RuntimeCapabilityProbe
     bool ProcessBytesMatched = false;
     std::wstring ProcessReason;
     std::wstring ProcessReadJson = L"null";
+    std::wstring ProcessReadSetJson = L"null";
     bool NativeSourceOpened = false;
     bool NativeContractPassed = false;
     bool NativeSessionPassed = false;
@@ -152,6 +153,7 @@ inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& pro
         L",\"sample_bytes_matched\":" + boolean(probe.ProcessBytesMatched) +
         L",\"process_reason\":" + mcpjson::Quote(probe.ProcessReason) +
         L",\"process_read\":" + probe.ProcessReadJson +
+        L",\"process_read_set\":" + probe.ProcessReadSetJson +
         L",\"process_address_shape\":\"legacy_la48_probe_only_not_active_paging_detection\","
         L"\"native_source_opened\":" + boolean(probe.NativeSourceOpened) +
         L",\"native_contract_passed\":" + boolean(probe.NativeContractPassed) +

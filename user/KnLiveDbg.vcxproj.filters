@@ -649,6 +649,12 @@
     <ClInclude Include="ObservationModel.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="RecordingObservationSource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ReadReceiptJson.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ProcessObservationSource.h">
       <Filter>Header Files</Filter>
     </ClInclude>

@@ -33,6 +33,15 @@ it does not replace these live kernel integration checks.
 
 ## Driver-free gates
 
+Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,
+sparse bytes, explicit fallback permission, shared budgets, metadata capacity,
+deadline/cancellation, observed concurrent completion and exception controls.
+The owned Win32 control closes the original caller handle, retains readable
+prefixes across a later inaccessible page, compares the direct API error, and
+checks evidence after freeing the original allocation. Keep emitted JSON private.
+The runtime CLI test below verifies that the actual probe uses this recorder.
+These controls do not validate native IOCTL status or typed page-table receipts.
+
 For scoped runtime capabilities, build first, then run
 `tools/validate-runtime-capabilities.ps1 -Sanitize` and
 `python tools/test-runtime-capabilities.py --exe x64/Release/KnLiveDbg.exe --policy-exe .build/runtime-capabilities/Release-asan/runtime-capabilities-selftest.exe`.

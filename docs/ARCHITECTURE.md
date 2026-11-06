@@ -46,9 +46,51 @@ for subsequent commands. Native wrappers still lack a raw status DTO; the probe
 preserves their explanation without inventing NTSTATUS. Runtime reports contain
 identity/address evidence and are rejected by the public-content scanner.
 
+The owned read also publishes a `process_read_set` from the shared recorder
+described below. Its single receipt is the same observation as `process_read`;
+the probe does not reread the control range to construct evidence.
+
 `tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check`
 detects documentation drift without probing a target. Generation accepts only
 an unprobed compiled inventory and atomically replaces the Markdown output.
+
+## Ordered read receipts and operation budgets
+
+`RecordingObservationSource` wraps `IObservationSource` without changing the
+4 KiB admission or parser all-or-none contract. A scope begins before admission
+and completes for success, sparse reads and every returned admission failure.
+Receipt IDs reserve attempt order; concurrent completions may arrive in another
+order. Snapshots expose pending, abandoned and unrecorded attempts separately.
+Exceptions propagate and mark the reserved receipt abandoned. Failure to reserve
+recording capacity prevents source invocation and leaves an explicit gap count.
+
+All wrapped sources in one `ObservationReadOperation` share requested-byte,
+source-call, receipt-count, stored-span and elapsed-time limits. Failed delegated
+calls consume quota; fresh per-read budgets do not replenish it. Sparse metadata
+reserves its worst-case span count before delegation and refunds unused slots
+after completion. The elapsed interval includes time between reads, including
+parser and queue delays, but does not measure those costs separately. Cancellation
+and deadlines are cooperative: an in-flight synchronous call can overrun; its
+original bytes/status remain in evidence, later calls stop, and cancellation
+prevents parser consumption. These are source-call counts, not physical I/O counts.
+
+Each receipt retains the request, admitted source/address descriptor, validated
+sparse spans, raw status domain/code and source-validation reason. Malformed or
+identity-changed bytes are withheld while the original status remains available.
+An explicit fallback link must identify a completed failed/partial/unavailable
+read of the same range on another source, with a reason and permission. Cancelled,
+identity-changed, policy-denied and budget-deferred reads cannot authorize fallback.
+The next source still passes its own admission and residency consent. Receipts
+remain separate; their bytes are not combined into an atomic snapshot.
+
+The recorder owns shared operation state. Callers retain source objects and must
+serialize source close/replacement with use according to each adapter's contract.
+Operation bookkeeping is thread safe; that does not make an arbitrary adapter
+concurrent. Target/address-space labels are caller-declared, not independently
+qualified by the recorder. `kn.read_set.v1` is private observation JSON, not an
+authenticated or durable publication format. Its current production consumer is
+the owned-process capability probe. Image transactions, scanner/fallback migration,
+native raw status DTOs, typed translation and durable replay remain P02/P03 work.
 
 ## Process cross-view qualification
 

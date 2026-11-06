@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,10 @@ struct ObservationReadRequest
     uint64_t ByteBudget = 0;
     bool AllowResidencyChanges = false;
     const std::atomic<bool>* Cancellation = nullptr;
+    // A recorder interprets this explicit link; sources never initiate fallback.
+    uint64_t FallbackFromReceipt = 0;
+    std::wstring FallbackReason;
+    bool AllowFallback = false;
 };
 
 struct ObservationReadSpan
@@ -67,6 +72,19 @@ struct ObservationReadResult
     // Current DeviceClient methods do not expose the original native status.
     std::wstring NativeStatusDomain = L"unavailable";
     uint32_t NativeStatus = 0;
+    std::wstring ValidationReason;
+    std::wstring OperationId;
+    uint64_t ReadReceiptId = 0;
+};
+
+// Optional operation scope around the common admission path. Admission failures
+// also reach Complete, so parser rejection cannot erase their receipts.
+class ObservationReadScope
+{
+public:
+    virtual ~ObservationReadScope() = default;
+    virtual bool Admit(ObservationReadResult* result) = 0;
+    virtual void Complete(ObservationReadResult* result) = 0;
 };
 
 class IObservationSource
@@ -86,6 +104,7 @@ public:
         ObservationReadResult result;
         const auto caps = Capabilities();
         const uint64_t started = tick();
+        auto scope = BeginReadScope(request, caps);
         bool attempted = false;
         do
         {
@@ -119,17 +138,25 @@ public:
                 result.State = ObservationReadState::PolicyDenied;
                 break;
             }
+            if (scope != nullptr && !scope->Admit(&result))
+            {
+                break;
+            }
             attempted = true;
             result = ReadSpans(request);
             if (Capabilities().SourceId != caps.SourceId)
             {
-                result = {};
+                result.Spans.clear();
+                result.IdentityRevalidated = false;
+                result.ValidationReason = L"source_changed_during_read";
                 result.State = ObservationReadState::IdentityChanged;
                 break;
             }
             if (!ValidateSpans(request, &result))
             {
-                result = {};
+                result.Spans.clear();
+                result.IdentityRevalidated = false;
+                result.ValidationReason = L"malformed_source_spans";
                 result.State = ObservationReadState::Failed;
             }
         } while (false);
@@ -138,17 +165,33 @@ public:
         result.StartedTick = started;
         result.EndedTick = tick();
         result.SideEffectsPossible = attempted && caps.MayChangeResidency;
-        result.CancellationObserved = request.Cancellation != nullptr && request.Cancellation->load();
+        result.CancellationObserved = result.CancellationObserved ||
+            (request.Cancellation != nullptr && request.Cancellation->load());
+        if (scope != nullptr)
+        {
+            scope->Complete(&result);
+        }
         return result;
     }
 
 protected:
+    virtual std::unique_ptr<ObservationReadScope> BeginReadScope(
+        const ObservationReadRequest&, const ObservationSourceCapabilities&)
+    {
+        return {};
+    }
     virtual ObservationReadResult ReadSpans(const ObservationReadRequest& request) = 0;
 
 private:
     static bool ValidateSpans(const ObservationReadRequest& request, ObservationReadResult* result)
     {
-        if (result->Spans.empty() || result->Spans.size() > request.Length)
+        if (result->Spans.empty())
+        {
+            // A delegated admission failure has no byte spans. It cannot be
+            // promoted to complete/partial, but its original denial survives.
+            return result->State >= ObservationReadState::NotCaptured && result->State <= ObservationReadState::Cancelled;
+        }
+        if (result->Spans.size() > request.Length)
         {
             return false;
         }
