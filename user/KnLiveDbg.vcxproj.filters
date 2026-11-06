@@ -118,6 +118,12 @@
     <ClCompile Include="HiddenProcessPolicy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="HiddenProcessScheduler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HiddenProcessSchedulerTests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="HvPostureScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -379,6 +385,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HiddenProcessPolicy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="HiddenProcessScheduler.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionEvidenceJson.h">

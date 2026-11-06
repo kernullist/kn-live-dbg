@@ -191,6 +191,13 @@ HiddenProcessDecision QualifyHiddenProcess(uint32_t pid,
     result.Disposition = HiddenProcessDisposition::Unverified;
     result.Reason = L"comparison_unavailable";
     result.Notes = L"candidate has no lifetime-bracketed comparison";
+    if (q.SourceChanged || q.Cancelled)
+    {
+        result.Reason = q.SourceChanged ? L"source_changed" : L"qualification_cancelled";
+        result.Notes = q.SourceChanged ? L"source connection changed during qualification" :
+            L"candidate qualification was cancelled before completing its boundaries";
+        return result;
+    }
     if (q.BudgetExceeded)
     {
         result.Reason = L"qualification_budget";

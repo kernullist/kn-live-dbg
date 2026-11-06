@@ -1,4 +1,5 @@
 #include "../user/HiddenProcessReport.h"
+#include "../user/HiddenProcessScheduler.h"
 
 #include <iostream>
 #include <string>
@@ -6,14 +7,21 @@
 int wmain(int argc, wchar_t** argv)
 {
     uint32_t checks = 0;
-    if (!HiddenProcessPolicySelfTest(&checks))
+    uint32_t schedulerChecks = 0;
+    if (!HiddenProcessPolicySelfTest(&checks) || !HiddenProcessSchedulerSelfTest(&schedulerChecks))
     {
         std::wcerr << L"hidden-process policy controls failed\n";
         return 1;
     }
     if (argc == 1)
     {
-        std::wcout << L"hidden-process policy controls passed: " << checks << L"\n";
+        std::wcout << L"hidden-process policy controls passed: " << checks
+            << L"; scheduler controls: " << schedulerChecks << L"\n";
+        return 0;
+    }
+    if (argc == 2 && std::wstring(argv[1]) == L"--schedule-json")
+    {
+        std::wcout << BuildHiddenProcessSchedulingFixture() << L"\n";
         return 0;
     }
     if (argc != 2 || std::wstring(argv[1]) != L"--json")

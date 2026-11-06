@@ -26,6 +26,7 @@
 #include "WnfScanner.h"
 #include "KmonExecutablePages.h"
 #include "ProcessLayoutMonitor.h"
+#include "HiddenProcessScheduler.h"
 
 #include <array>
 #include <atomic>
@@ -540,6 +541,7 @@ private:
     std::thread Collector;
     std::thread LayoutWorker;
     ProcessLayoutMonitor LayoutMonitor;
+    HiddenProcessScheduler HiddenScheduler;
     bool LayoutAllProcesses = true;
     static constexpr size_t LayoutAdmissionLimit = 160;
     static constexpr size_t LayoutChangeReserve = 32;

@@ -128,6 +128,8 @@
     <ClCompile Include="HiddenProcessReport.cpp" />
     <ClCompile Include="HiddenProcessPolicyTests.cpp" />
     <ClCompile Include="HiddenProcessPolicy.cpp" />
+    <ClCompile Include="HiddenProcessScheduler.cpp" />
+    <ClCompile Include="HiddenProcessSchedulerTests.cpp" />
     <ClCompile Include="HiveScanner.cpp" />
     <ClCompile Include="HvPostureScanner.cpp" />
     <ClCompile Include="DumpAnalyzer.cpp" />
@@ -262,6 +264,7 @@
     <ClInclude Include="HiddenProcessScanner.h" />
     <ClInclude Include="HiddenProcessReport.h" />
     <ClInclude Include="HiddenProcessPolicy.h" />
+    <ClInclude Include="HiddenProcessScheduler.h" />
     <ClInclude Include="ExecutionEvidenceJson.h" />
     <ClInclude Include="ExecutionEvidence.h" />
     <ClInclude Include="ExecutionTrace.h" />

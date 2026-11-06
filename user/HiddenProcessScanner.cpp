@@ -489,8 +489,8 @@ namespace
     class DeviceProcessReader final : public HiddenProcessReader
     {
     public:
-        DeviceProcessReader(DeviceClient& device, uint32_t dtbOffset) :
-            Device(device), DtbOffset(dtbOffset)
+        DeviceProcessReader(DeviceClient& device, uint32_t dtbOffset, const std::atomic<bool>* cancelled) :
+            Device(device), DtbOffset(dtbOffset), Epoch(device.ObservationEpoch()), Cancelled(cancelled)
         {
         }
 
@@ -498,7 +498,7 @@ namespace
         {
             std::vector<uint8_t> data;
             if (Stopped() || value == nullptr || bytes == 0 || bytes > 8 ||
-                !Device.ReadMemory(address, bytes, &data, nullptr) || data.size() != bytes)
+                !Device.ReadMemory(address, bytes, &data, nullptr) || data.size() != bytes || Stopped())
             {
                 return false;
             }
@@ -512,7 +512,7 @@ namespace
             ProcessAddressContext context = {};
             if (Stopped() || eprocess == nullptr || DtbOffset == 0 ||
                 !Device.ResolveProcess(pid, DtbOffset, 0, &context, nullptr) ||
-                context.ProcessId != pid || context.Eprocess == 0)
+                context.ProcessId != pid || context.Eprocess == 0 || Stopped())
             {
                 return false;
             }
@@ -522,7 +522,8 @@ namespace
 
         bool Stopped() const override
         {
-            return Deadline != 0 && GetTickCount64() >= Deadline;
+            return (Cancelled != nullptr && Cancelled->load()) || Epoch == 0 ||
+                Device.ObservationEpoch() != Epoch || (Deadline != 0 && GetTickCount64() >= Deadline);
         }
 
         uint64_t Deadline = 0;
@@ -530,6 +531,72 @@ namespace
     private:
         DeviceClient& Device;
         uint32_t DtbOffset;
+        uint64_t Epoch;
+        const std::atomic<bool>* Cancelled;
+    };
+
+    class DeviceQualificationSource final : public HiddenProcessQualificationSource
+    {
+    public:
+        DeviceQualificationSource(DeviceClient& device, DeviceProcessReader& reader,
+            const AddressSpaceDescriptor& space, const HiddenProcessLayout& layout,
+            const std::atomic<bool>* cancelled) :
+            Device(device), Reader(reader), Space(space), Layout(layout), Cancellation(cancelled)
+        {
+        }
+
+        uint64_t NowMs() const override { return GetTickCount64(); }
+        uint64_t Epoch() const override { return Device.ObservationEpoch(); }
+        bool Cancelled() const override { return Cancellation != nullptr && Cancellation->load(); }
+
+        HiddenProcessLifetime ReadLifetime(uint32_t pid, uint64_t deadline) override
+        {
+            Reader.Deadline = deadline;
+            return ReadHiddenProcessLifetime(Reader, Space, Layout, pid);
+        }
+
+        HiddenProcessComparison Compare(uint64_t deadline) override
+        {
+            Reader.Deadline = deadline;
+            HiddenProcessComparison result;
+            result.StartedMs = NowMs();
+            result.Kernel = ReadHiddenProcessKernelView(Reader, Space, Layout);
+            if (!result.Kernel.Complete)
+            {
+                result.Warnings.push_back(L"comparison: " + result.Kernel.Reason);
+            }
+            UserInventory spi;
+            UserInventory toolhelp;
+            std::wstring warning;
+            result.SpiComplete = !Reader.Stopped() && CollectSystemProcessInformation(&spi, &warning);
+            if (!result.SpiComplete && !warning.empty())
+            {
+                result.Warnings.push_back(L"comparison: " + warning);
+            }
+            warning.clear();
+            result.ToolhelpComplete = !Reader.Stopped() && CollectToolhelpProcesses(&toolhelp, &warning);
+            if (!result.ToolhelpComplete && !warning.empty())
+            {
+                result.Warnings.push_back(L"comparison: " + warning);
+            }
+            for (const auto& item : spi.Images)
+            {
+                result.Spi.insert(item.first);
+            }
+            for (const auto& item : toolhelp.Images)
+            {
+                result.Toolhelp.insert(item.first);
+            }
+            result.FinishedMs = NowMs();
+            return result;
+        }
+
+    private:
+        DeviceClient& Device;
+        DeviceProcessReader& Reader;
+        const AddressSpaceDescriptor& Space;
+        const HiddenProcessLayout& Layout;
+        const std::atomic<bool>* Cancellation;
     };
 
     HiddenProcessField ResolveProcessField(SymbolEngine& symbols, const wchar_t* name)
@@ -599,8 +666,9 @@ namespace
     }
 }
 
-HiddenProcessScanner::HiddenProcessScanner(DeviceClient& device, SymbolEngine& symbols) :
-    device_(device), symbols_(symbols)
+HiddenProcessScanner::HiddenProcessScanner(DeviceClient& device, SymbolEngine& symbols,
+    HiddenProcessScheduler& scheduler, const std::atomic<bool>* cancelled) :
+    device_(device), symbols_(symbols), scheduler_(scheduler), cancelled_(cancelled)
 {
 }
 
@@ -643,7 +711,7 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result,
                 symbols_.FindField(L"nt!_EPROCESS", L"Pcb.DirectoryTableBase", &dtb, nullptr) ||
                 symbols_.FindField(L"nt!_EPROCESS", L"DirectoryTableBase", &dtb, nullptr)) &&
             !dtb.IsBitField && dtb.Length == 8 && dtb.Offset > 0 && dtb.Offset <= 0x4000;
-        DeviceProcessReader reader(device_, hasDtb ? dtb.Offset : 0);
+        DeviceProcessReader reader(device_, hasDtb ? dtb.Offset : 0, cancelled_);
         const auto addressSpace = device_.AddressSpace();
         if (!layout.CreateTime.Available || !layout.ExitTime.Available ||
             !layout.ActiveThreads.Available || !layout.Auxiliary.Available || !hasDtb ||
@@ -751,72 +819,10 @@ bool HiddenProcessScanner::Scan(HiddenProcessScanResult* result,
         result->CoverageComplete = result->InventoryComplete;
         // Discovery is only a PID-based hint. Bind fresh observations to a
         // sampled lifetime before drawing any absence conclusion.
-        constexpr size_t kMaxQualifiedCandidates = 128;
-        constexpr uint64_t kQualificationBudgetMs = 5000;
-        reader.Deadline = GetTickCount64() + kQualificationBudgetMs;
-        for (size_t i = 0; i < candidates.size(); ++i)
-        {
-            auto& q = candidates[i]->Qualification;
-            if (i >= kMaxQualifiedCandidates || reader.Stopped())
-            {
-                q.BudgetExceeded = true;
-                continue;
-            }
-            q.Attempted = true;
-            q.Before = ReadHiddenProcessLifetime(reader, addressSpace, layout, candidates[i]->ProcessId);
-        }
-
-        if (!candidates.empty() && !reader.Stopped())
-        {
-            result->ComparisonStartedMs = GetTickCount64();
-            const auto comparisonKernel = ReadHiddenProcessKernelView(reader, addressSpace, layout);
-            UserInventory comparisonSpi;
-            UserInventory comparisonToolhelp;
-            warning.clear();
-            const bool comparisonSpiOk = !reader.Stopped() && CollectSystemProcessInformation(&comparisonSpi, &warning);
-            if (!comparisonSpiOk && !warning.empty())
-            {
-                result->Warnings.push_back(L"comparison: " + warning);
-            }
-            warning.clear();
-            const bool comparisonToolhelpOk = !reader.Stopped() && CollectToolhelpProcesses(&comparisonToolhelp, &warning);
-            if (!comparisonToolhelpOk && !warning.empty())
-            {
-                result->Warnings.push_back(L"comparison: " + warning);
-            }
-            result->ComparisonFinishedMs = GetTickCount64();
-            if (!comparisonKernel.Complete)
-            {
-                result->Warnings.push_back(L"comparison: " + comparisonKernel.Reason);
-            }
-            for (auto* candidate : candidates)
-            {
-                auto& q = candidate->Qualification;
-                if (!q.Attempted)
-                {
-                    continue;
-                }
-                q.KernelComplete = comparisonKernel.Complete;
-                q.SpiComplete = comparisonSpiOk;
-                q.ToolhelpComplete = comparisonToolhelpOk;
-                const auto found = comparisonKernel.Entries.find(candidate->ProcessId);
-                q.Views.Kernel = found != comparisonKernel.Entries.end();
-                if (q.Views.Kernel)
-                {
-                    q.KernelIdentity = found->second;
-                }
-                q.Views.Spi = comparisonSpi.Images.count(candidate->ProcessId) != 0;
-                q.Views.Toolhelp = comparisonToolhelp.Images.count(candidate->ProcessId) != 0;
-                q.After = ReadHiddenProcessLifetime(reader, addressSpace, layout, candidate->ProcessId);
-                q.BudgetExceeded = reader.Stopped();
-            }
-        }
+        DeviceQualificationSource source(device_, reader, addressSpace, layout, cancelled_);
+        scheduler_.Qualify(source, candidates, *result);
         for (auto* candidate : candidates)
         {
-            if (reader.Stopped() && !candidate->Qualification.After.IdentityValid)
-            {
-                candidate->Qualification.BudgetExceeded = true;
-            }
             AddHiddenProcessDecision(*result, std::move(*candidate));
         }
         if (result->UnverifiedCount != 0)
@@ -844,5 +850,5 @@ bool HiddenProcessViewSelfTest()
         !ToolhelpProcessWalkComplete(20, true, ERROR_NO_MORE_FILES) &&
         !ToolhelpProcessWalkComplete(0, false, ERROR_NO_MORE_FILES) &&
         !ToolhelpProcessWalkComplete(kMaxProcesses, false, ERROR_NO_MORE_FILES) &&
-        HiddenProcessSpiParseSelfTest() && HiddenProcessPolicySelfTest();
+        HiddenProcessSpiParseSelfTest() && HiddenProcessPolicySelfTest() && HiddenProcessSchedulerSelfTest();
 }

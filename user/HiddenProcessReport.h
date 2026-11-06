@@ -26,6 +26,21 @@ struct HiddenProcessRecord
     HiddenProcessDecision Decision;
 };
 
+struct HiddenProcessScheduling
+{
+    uint64_t SourceEpoch = 0;
+    uint64_t StartedMs = 0;
+    uint64_t FinishedMs = 0;
+    uint64_t MaxServicedWaitMs = 0;
+    uint64_t MaxPendingWaitMs = 0;
+    uint32_t Candidates = 0;
+    uint32_t BatchLimit = 0;
+    uint32_t Selected = 0;
+    uint32_t Attempted = 0;
+    uint32_t Deferred = 0;
+    uint32_t CompletedBoundaries = 0;
+};
+
 struct HiddenProcessScanResult
 {
     std::vector<HiddenProcessRecord> Records;
@@ -46,6 +61,7 @@ struct HiddenProcessScanResult
     bool CoverageComplete = false;
     uint64_t ComparisonStartedMs = 0;
     uint64_t ComparisonFinishedMs = 0;
+    HiddenProcessScheduling Scheduling;
 };
 
 void AddHiddenProcessDecision(HiddenProcessScanResult& result, HiddenProcessRecord record);

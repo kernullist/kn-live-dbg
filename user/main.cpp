@@ -19589,8 +19589,11 @@ static void PrintHiddenProcHelp()
     std::wcout << L"owners, and CID discovery. SPI and Toolhelp share the process-list dependency.\n";
     std::wcout << L"Candidates require complete fresh inventories bracketed by matching PID,\n";
     std::wcout << L"EPROCESS, CreateTime and readable lifecycle fields. Missing reads, PID reuse\n";
-    std::wcout << L"and budget limits remain unverified records. Qualification is limited to 128\n";
-    std::wcout << L"candidates and a cooperative 5-second budget; in-flight calls are not interrupted.\n";
+    std::wcout << L"and budget limits remain unverified records. A session queue rotates up to 128\n";
+    std::wcout << L"candidates, reserving fresh comparison time within a cooperative 5-second budget.\n";
+    std::wcout << L"Repeated scans resume pending work; source replacement resets scheduling hints.\n";
+    std::wcout << L"Failed attempts rotate too; queue wait is not a successful revisit measurement.\n";
+    std::wcout << L"In-flight calls are not interrupted.\n";
     std::wcout << L"A sampled discrepancy does not establish deliberate hiding or actor identity.\n";
     std::wcout << L"\n";
     std::wcout << L"options:\n";
@@ -19643,7 +19646,8 @@ static void HandleHiddenProcCommand(
             break;
         }
 
-        HiddenProcessScanner scanner(device, symbols);
+        static HiddenProcessScheduler scheduler;
+        HiddenProcessScanner scanner(device, symbols, scheduler, &g_StopRequested);
         HiddenProcessScanResult result = {};
         std::wstring error;
         if (!scanner.Scan(&result, &error))
@@ -19714,6 +19718,9 @@ static void HandleHiddenProcCommand(
                    << L" unverified=" << result.UnverifiedCount
                    << L" reconciled=" << result.ReconciledCount
                    << L" ignored=" << result.IgnoredCount
+                   << L" attempted=" << result.Scheduling.Attempted
+                   << L" deferred=" << result.Scheduling.Deferred
+                   << L" max_pending_ms=" << result.Scheduling.MaxPendingWaitMs
                    << L" coverage=" << (result.CoverageComplete ? L"complete" : L"incomplete") << L"\n";
     } while (false);
 }

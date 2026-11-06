@@ -9966,7 +9966,7 @@ void KernelMonitor::ScanHiddenProcesses()
     }
     ClearEmittedKey(L"scan_failed:hidden:inventory");
 
-    HiddenProcessScanner scanner(*device, *symbols);
+    HiddenProcessScanner scanner(*device, *symbols, HiddenScheduler, &StopRequested);
     HiddenProcessScanResult result = {};
     std::wstring error;
     std::vector<uint32_t> extraPids;
@@ -10021,6 +10021,10 @@ void KernelMonitor::ScanHiddenProcesses()
         {
             notes = L"kernel, SPI, or Toolhelp inventory was incomplete";
         }
+        notes += L"; qualification_attempted=" + std::to_wstring(result.Scheduling.Attempted) +
+            L"/" + std::to_wstring(result.Scheduling.Candidates) +
+            L" deferred=" + std::to_wstring(result.Scheduling.Deferred) +
+            L" max_pending_ms=" + std::to_wstring(result.Scheduling.MaxPendingWaitMs);
         EmitUnique(
             L"process.hidden",
             L"scan_failed:hidden:coverage",

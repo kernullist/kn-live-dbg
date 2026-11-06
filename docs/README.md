@@ -37,6 +37,8 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 | [Remote design](REMOTE_OPERATOR_SESSION.md) | Framing, queue, disconnect and shutdown |
 | [Remaining work](FEATURE_PLAN.md) | Open work, separated from implemented features |
 | [Platform packages](FEATURE_PLAN.md#kernel-investigation-platform) | Adopted full-kernel architecture, capability contract and dependency order |
+| [Integration packages](FEATURE_PLAN.md#full-kernel-integration-design-2026-11-06) | P01-P16 acceptance, investigation paths and separate implementation/validation states |
+| [2026-11-06 design](KnLiveDbg_full_kernel_security_design_20261106_16c34da.md) | Original assessment at 16c34da, 22 domains, four investigation paths and 30 control families |
 
 ## Validation and releases
 

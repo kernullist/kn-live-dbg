@@ -5,6 +5,22 @@ configuration, Windows build, and test interval. [Validation status](VALIDATION.
 contains dated observations; it does not check off a new build or host.
 Preserve failed runs, partial coverage and cleanup errors.
 
+## Hidden-process fairness
+
+Run `tools/validate-hidden-process.ps1 -Sanitize` for the production batch
+orchestrator's fixed 257/1,025 candidates, priority churn, failed prefix,
+cost/deadline, cancellation, connection change and fresh-lifetime controls.
+Its Python oracle independently checks JSON scope and three-batch progress.
+After building, `--self-test all` includes the linked scheduler controls.
+
+In an authorized native lab, additionally repeat `!hiddenproc` and KMON scans
+against an owned candidate source. Verify attempted/deferred counts, maximum
+pending queue age, no stale before/after generations, source close/reopen and
+stop during acquisition. Separate queue service from successful qualification;
+failed reads must not count as successful revisits. Preserve slow API overruns,
+incomplete inventories and every unverified candidate. The owned driver-free
+controls do not establish this live host result.
+
 ## Native session policy
 
 Current main changes native session defaults. In an authorized isolated lab with

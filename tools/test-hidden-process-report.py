@@ -55,6 +55,43 @@ def main():
             assert q["before"]["state_transition"] is False and q["after"]["state_transition"] is False
         assert not (r["unverified"] and r["suspicious"])
     print("hidden-process JSON oracle passed: 7 retained dispositions and scoped requirements")
+    run = subprocess.run([str(args.exe.resolve()), "--schedule-json"], check=True,
+                         capture_output=True, text=True, timeout=30)
+    rounds = json.loads(run.stdout)
+    assert len(rounds) == 3
+    ever_visited = set()
+    for index, report in enumerate(rounds):
+        scheduling = report["scheduling"]
+        assert scheduling["policy"] == "fair-fresh-batch-v1"
+        assert scheduling["candidates"] == len(report["records"]) == 257
+        assert scheduling["attempted"] == scheduling["completed_boundaries"] == 128
+        assert scheduling["deferred"] == report["unverified"] == 129
+        assert scheduling["attempted"] + scheduling["deferred"] == scheduling["candidates"]
+        assert scheduling["source_epoch"] == 1
+        assert scheduling["success_revisit_measured"] is False
+        assert scheduling["wait_scope"] == "discovered_pid_scheduling_hint"
+        assert scheduling["started_ms"] <= report["comparison_started_ms"]
+        assert report["comparison_finished_ms"] <= scheduling["finished_ms"]
+        assert scheduling["max_serviced_wait_ms"] >= (5000 if index else 0)
+        visited = set()
+        for record in report["records"]:
+            q = record["qualification"]
+            assert not q["cancelled"] and not q["source_changed"]
+            if q["attempted"]:
+                visited.add(record["pid"])
+                assert q["stable_lifetime"] and record["suspicious"]
+                assert q["before"]["pid"] == q["after"]["pid"] == record["pid"]
+                assert q["before"]["create_time"] == q["after"]["create_time"]
+                assert q["before"]["eprocess"] == q["after"]["eprocess"]
+            else:
+                assert q["before"]["identity_valid"] is False
+                assert q["after"]["identity_valid"] is False
+                assert record["unverified"] and record["reason"] == "qualification_budget"
+        assert len(visited) == 128
+        assert len(ever_visited | visited) == min((index + 1) * 128, 257)
+        ever_visited |= visited
+    assert ever_visited == set(range(100, 357))
+    print("hidden-process scheduling JSON oracle passed: all 257 candidates, 3 fresh batches")
 
 
 if __name__ == "__main__":

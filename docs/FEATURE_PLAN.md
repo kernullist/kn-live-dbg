@@ -33,6 +33,47 @@ encrypted remote transport and independent corpus comparisons remain separate
 work packages below. A local fixture or replay pass does not establish those
 capabilities or a comparative detection rate.
 
+## Full-kernel integration design: 2026-11-06
+
+The [2026-11-06 design](KnLiveDbg_full_kernel_security_design_20261106_16c34da.md)
+is adopted against `16c34da`. Its P01-P16 packages extend W01-W15 below; they do
+not replace existing source, identity, recipe, graph or trace contracts. The
+design document is the original assessment, not a record of completed changes.
+The implementation must cover its D01-D22 domains and K01-K10/U01-U09 rules
+through the package dependencies and four investigation paths (VS1-VS4).
+
+| Package | Next implementation and acceptance | Implementation / integration | Validation / deployment |
+| --- | --- | --- | --- |
+| P01 Candidate fairness | Session-bound pending queue, reserved fresh comparison window, adaptive batch, failure/cancel denominators; 257/1,025 candidates and churn | Implemented in CLI and KMON | Owned ASan/JSON and full linked self-tests passed; live host/deployment unvalidated |
+| P02 Read and translation receipts | Ordered attempts/fallbacks, original error domains, operation-wide budgets, typed walk/permission receipts; parser remains all-or-none | Open | Sparse/status/root replacement controls required |
+| P03 Live verification transaction | Record the reads that decide a native image comparison; retain reference, exclusions, rechecks and policy; secondary-view recipes | Open | VS1 replay after target exit and reference replacement required |
+| P04 Runtime capability | Separate compiled, source opened, layout/read/semantic checks and scoped regression; generate address/backend docs from contracts | Open | Drift and denied/unavailable-source controls required |
+| P05 Artifact/schema broker | Isolate live layout consumers; bind target image, schema, required anchors and runtime invariants | Open | Wrong artifact, child failure and owned layout oracles required |
+| P06 Journal/index | Append-only publication, content storage, resumable index and global dedup/retention/closure; retain legacy adapters | Open | Interrupted writes and restart recovery required |
+| P07 Temporal graph | Join multiple publications only with target/source/lifetime/mapping/clock constraints; preserve immutable original facts | Open | Cross-VM, generation, ABA, late-arrival and unknown-bridge negatives required |
+| P08 Object/state claims | Versioned claim requirements for membership, ownership, registration and changes; seven ledgers, refutations and next observations | Open | Scanner adapters and raw evidence replay required |
+| P09 Pipeline scheduling | Discovery/qualification/reference/image/layout/capture/publication debt, quotas and per-stage latency | Open | Fixed/churning workload scope and maximum unobserved intervals required |
+| P10 Runtime/game lifetimes | TP work/timer/wait/I/O, WOW64, JIT and manifest object generation/secondary-vptr adapters | Open | Exact layout fixtures, cancellation/destruction and normal-runtime controls required |
+| P11 ETL/CPU samples | Actual producer context, loss, clock and code binding into normalized trace contracts | Open | Known owned execution and independent raw evidence validation required |
+| P12 Optional PT/VMI | Raw decoder/provider adapters, exact code versions, authenticity and supported environment gates | Open | Compatible lab validation of scoped X3/X4; unavailable hardware remains open |
+| P13 Wait/I/O/crash | Typed DbgEng, request lifecycle, concurrent wait cycles, alternatives and provenance-based diagnosis | Open | Address reuse, nonconcurrent cycles and independent replay/oracle required |
+| P14 Modes/transport | Offline/observe/collect/lab authority, observer actions, TLS/principal scopes, durable unknown-outcome operation journal | Open beyond existing write-off/volatile ledger | No silent downgrade/retry; restart, isolation and cleanup controls required |
+| P15 Evidence-checked AI | Typed bounded plans, evidence IDs, competing hypotheses, deterministic claim checks and offline egress policy | Open | Untrusted payload and unauthorized transmission/execution controls required |
+| P16 Independent evaluation | Artifact/ground-truth verification, collection runners, scope-matched comparisons and safety/overhead denominators | Open beyond existing imported-result evaluator | Owned/authorized/heldout results stay distinct; no comparative claim yet |
+
+Gate 0 connects P01/P04 and the baseline P14/P16 contracts. Gate 1 completes
+VS1 through P02 -> P03 -> P06. Gate 2 connects P05/P07/P08/P10/P13 for VS2/VS3.
+Gate 3 adds P11/P12 only where actual execution evidence is needed. Gate 4
+combines P09/P15/P16 with operational transport, retention and measured workloads.
+Every meaningful step is reviewed, corrected, validated and committed separately.
+
+Implementation, integration, validation and deployment readiness are independent
+states. A package stays open when its required adapter, raw evidence, compatible
+environment or independent truth is missing. Preserve T01-T30 failure, negative,
+interruption and compatibility controls from the design. Synthetic and owned
+user-mode checks never imply native driver, LA57, VTL1, hardware, game or corpus
+validation. Build/toolchain/binary-specific evidence belongs in [validation](VALIDATION.md).
+
 ## Open engineering work
 
 ## Kernel investigation platform

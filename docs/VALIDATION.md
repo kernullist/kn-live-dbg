@@ -7,6 +7,52 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Hidden-process scheduling checkpoint: 2026-11-06
+
+P01 of the [integration design](FEATURE_PLAN.md#full-kernel-integration-design-2026-11-06)
+uses the same qualification orchestrator in native CLI/KMON and owned controls.
+The pending queue lives beyond each scanner instance and resets on a changed
+device connection epoch. Only scheduling hints persist; every comparison requires
+fresh lifetime samples and fresh inventories in its own batch.
+
+Release x64 EXE SHA-256:
+`d084d488dcb63c7fabf0c696dd0328aa73b92ac5583cde00e46cd4c4f435db78`.
+ASan hidden-process harness SHA-256:
+`5114f1d31a3b6d9dfab3aaabfa8c8953d2cd902ce6c6d9ceb7b8f9227c32532e`.
+Build inputs were VS 2022 Build Tools, MSVC 14.44.35207 and SDK/WDK
+10.0.26100.0, Release x64 without a version bump.
+
+`tools/validate-hidden-process.ps1 -Sanitize` passed 226 existing policy controls
+and 1,367 scheduler controls. These execute the production batch selection and
+boundary orchestration with an owned source and deterministic clock: all 257 and
+1,025 fixed candidates receive service; continuous priority arrivals retain the
+old cohort's minimum share; failing prefixes rotate; cost adaptation leaves time
+for comparison/after reads. Cancellation, PID generation changes, zero budgets,
+source replacement and departed candidates preserve exact unverified scope.
+An independent Python JSON oracle checked seven original dispositions and all
+257 candidates over three fresh scheduled batches, including no stale samples
+on deferred records. These are synthetic acquisition controls, not 1,025 live
+hidden processes or a measured host latency SLO.
+
+The full `tools/build.ps1` solution build and `--self-test all` passed. The linked
+tests reported timeline 28, MCP 102, console 558, command checks 3,000 and remote
+protocol 66; startup/compiled capability validation also passed 24 contracts and
+261 routes. The build emitted C4744 alignment warnings for the unchanged
+`KmonHuntIndex::NextQueryEpoch` across existing translation units. Driver signing
+metadata was present, while the local trust query returned `UnknownError`;
+this checkpoint does not establish deployment trust or native load compatibility.
+
+Review corrected queue insertion rollback on allocation failure and preservation
+of the before-phase timeout reason. The final reviewed scope had no additional
+actionable defects. Working-tree and prospective-index public-content scans passed; raw evidence,
+private paths and credentials are excluded from publication inputs.
+
+No driver was loaded, no Driver Verifier or reboot was run, and native candidate
+churn, protected targets, live LA57 and multi-host workloads remain unvalidated.
+The scheduler does not interrupt an in-flight API, bound initial discovery, retain
+raw cross-view reads or measure successful lifetime revisit latency. These limits
+remain distinct from the implemented fairness and fresh-batch contract.
+
 ## Process-handle observation source checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

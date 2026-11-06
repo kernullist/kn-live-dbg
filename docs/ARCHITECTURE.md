@@ -45,9 +45,24 @@ SPI and Toolhelp share a process-list dependency and do not count as two
 independent proofs. Equality of sampled fields is not an atomic snapshot or an
 authentication of a potentially compromised kernel.
 
-At most 128 candidates enter confirmation per scan, in PID order, under a shared
-cooperative five-second budget. In-flight IOCTLs and API calls are not interrupted;
-discovery is outside that budget. Excess candidates stay in the result. The
+At most 128 candidates enter confirmation per scan under a cooperative
+five-second budget. CLI and KMON each retain a session scheduler across scanner
+instances, bound to the device connection epoch. Pending candidates rotate after
+each actual attempt, including failures; unattempted selections keep their place.
+At least three of four selection slots serve the oldest queue entries; new
+API-unlisted candidates may use the fourth. Departed candidates are pruned.
+The queue stores PID scheduling hints, never lifetime samples or identity proof.
+Every batch starts with fresh before/after state and fresh inventories.
+
+Recent inventory/lifetime costs reduce the batch size and reserve time for the
+comparison and after reads. The before phase has its own smaller deadline;
+in-flight IOCTLs and API calls are not interrupted, and discovery remains outside
+the qualification budget. Cancellation and source replacement leave unfinished
+candidates unverified; a source replacement invalidates all claims in that batch.
+The additive `scheduling` report retains candidates, selected/attempted/deferred
+counts, completed boundary attempts and maximum served/pending queue waits.
+These are queue service metrics, not successful lifetime revisit measurements or
+an achieved latency SLO. Excess candidates stay in the result. The
 additive `lifetime-cross-view-v2` policy in `kn-live-dbg.hidden-process.v1` separates
 discovery membership from qualification views, before/after samples and failure
 reasons. Unknown lifecycle values are null inside qualification; legacy scalar

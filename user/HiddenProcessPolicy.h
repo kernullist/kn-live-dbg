@@ -85,6 +85,8 @@ struct HiddenProcessQualification
     bool SpiComplete = false;
     bool ToolhelpComplete = false;
     bool BudgetExceeded = false;
+    bool Cancelled = false;
+    bool SourceChanged = false;
     HiddenProcessMembership Views;
     HiddenProcessKernelEntry KernelIdentity;
     HiddenProcessLifetime Before;

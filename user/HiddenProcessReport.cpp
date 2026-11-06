@@ -112,6 +112,15 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
     json << L",\"coverage_complete\":" << (result.CoverageComplete ? L"true" : L"false");
     json << L",\"comparison_started_ms\":" << result.ComparisonStartedMs;
     json << L",\"comparison_finished_ms\":" << result.ComparisonFinishedMs;
+    const auto& s = result.Scheduling;
+    json << L",\"scheduling\":{\"policy\":\"fair-fresh-batch-v1\",\"source_epoch\":" << s.SourceEpoch
+        << L",\"started_ms\":" << s.StartedMs << L",\"finished_ms\":" << s.FinishedMs
+        << L",\"candidates\":" << s.Candidates << L",\"batch_limit\":" << s.BatchLimit
+        << L",\"selected\":" << s.Selected << L",\"attempted\":" << s.Attempted
+        << L",\"deferred\":" << s.Deferred << L",\"completed_boundaries\":" << s.CompletedBoundaries
+        << L",\"max_serviced_wait_ms\":" << s.MaxServicedWaitMs
+        << L",\"max_pending_wait_ms\":" << s.MaxPendingWaitMs
+        << L",\"wait_scope\":\"discovered_pid_scheduling_hint\",\"success_revisit_measured\":false}";
     json << L",\"warnings\":[";
     bool first = true;
     for (const auto& warning : result.Warnings)
@@ -157,6 +166,8 @@ std::wstring BuildHiddenProcessJson(const HiddenProcessScanResult& result)
         json << L",\"reason\":\"" << record.Decision.Reason << L"\"";
         json << L",\"qualification\":{\"attempted\":" << (q.Attempted ? L"true" : L"false")
             << L",\"budget_exceeded\":" << (q.BudgetExceeded ? L"true" : L"false")
+            << L",\"cancelled\":" << (q.Cancelled ? L"true" : L"false")
+            << L",\"source_changed\":" << (q.SourceChanged ? L"true" : L"false")
             << L",\"stable_lifetime\":" << (record.Decision.StableLifetime ? L"true" : L"false")
             << L",\"kernel_complete\":" << (q.KernelComplete ? L"true" : L"false")
             << L",\"spi_complete\":" << (q.SpiComplete ? L"true" : L"false")

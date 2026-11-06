@@ -152,8 +152,12 @@ comparison completeness and `reason`; an unread lifecycle value is null there.
 discovery hints and are not an assertion about the confirmed lifetime.
 Legacy `suspicious` counts admitted sampled discrepancies, not proven hiding or
 actor attribution. SPI and Toolhelp have a shared process-list dependency.
-Confirmation covers at most 128 candidates with a cooperative five-second
-budget, excluding initial discovery. Remaining candidates stay unverified;
+Confirmation rotates a session-bound pending queue, attempting at most 128
+candidates per scan with a cooperative five-second budget, excluding initial
+discovery. The batch adapts to recent read costs and reserves fresh comparison
+time. Failed attempts rotate; cancellation and connection changes preserve
+unverified records. `scheduling` reports attempt/deferred counts and queue wait,
+which does not measure successful revisits. Remaining candidates stay unverified;
 zero suspicious records with incomplete coverage is not a clean bill of health.
 The report contains private process evidence and must not be committed.
 

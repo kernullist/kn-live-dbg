@@ -18,7 +18,7 @@ if ($Sanitize)
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\hidden-process-selftest.cpp', 'user\HiddenProcessPolicy.cpp', 'user\HiddenProcessPolicyTests.cpp', 'user\HiddenProcessReport.cpp')
+$sources = @('tools\hidden-process-selftest.cpp', 'user\HiddenProcessPolicy.cpp', 'user\HiddenProcessPolicyTests.cpp', 'user\HiddenProcessReport.cpp', 'user\HiddenProcessScheduler.cpp', 'user\HiddenProcessSchedulerTests.cpp')
 $quotedSources = ($sources | ForEach-Object { '"' + (Join-Path $repo $_) + '"' }) -join ' '
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}compiler.pdb" /link /INCREMENTAL:NO' -f $validationEnvironment.VcVarsPath, $flags, $quotedSources, $exe, ($output.Replace('\', '/') + '/')
 $batch = Join-Path $output 'compile.cmd'
