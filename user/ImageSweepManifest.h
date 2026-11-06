@@ -41,7 +41,9 @@ struct ImageSweepManifest
 std::wstring ImageSweepManifestJson(const ImageSweepManifest& manifest);
 bool ParseImageSweepManifest(const std::wstring& json, ImageSweepManifest* manifest);
 struct ImageRecipeReplay;
-ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error);
+struct ImageSweepReplayEvidence;
+ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
+    ImageSweepReplayEvidence* verifiedEvidence = nullptr, const std::wstring& expectedManifestSha256 = L"");
 
 // Writer-owned bounded metadata; queue losses remain visible as ordinal gaps.
 // No producer/writer shared mutable sweep state or original-file handles.

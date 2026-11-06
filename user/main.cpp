@@ -36,6 +36,8 @@
 #include "EvidenceInvestigation.h"
 #include "EvidenceInventory.h"
 #include "EvidenceGraph.h"
+#include "ImageSweepGraph.h"
+#include <filesystem>
 #include "LeftoverCommon.h"
 #include "MapperRemnantScanner.h"
 #include "OrphanKernelPageScanner.h"
@@ -23055,7 +23057,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
     std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples\n";
-    std::wcout << L"  !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
+    std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
@@ -23577,11 +23579,13 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         }
         if (!valid)
         {
-            std::wcerr << L"usage: !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
+            std::wcerr << L"usage: !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
             return 2;
         }
         EvidenceBundle bundle;
         EvidenceGraph graph;
+        ImageSweepGraph imageGraph;
+        const bool imageSweep = ToLower(std::filesystem::path(args[2]).extension().wstring()) == L".knsweep";
         EvidenceGraphPage page;
         std::wstring error, digest;
         try
@@ -23589,6 +23593,12 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
             if (g_StopRequested.load())
             {
                 page.Status = L"cancelled";
+            }
+            else if (imageSweep)
+            {
+                imageGraph = BuildImageSweepGraph(args[2]);
+                page = imageGraph.Facts.Status == L"materialized" ? QueryEvidenceGraph(imageGraph.Facts, query) : EvidenceGraphPage{};
+                if (imageGraph.Facts.Status != L"materialized") { page.Status = imageGraph.Facts.Status; }
             }
             else if (LoadEvidenceBundle(args[2], &bundle, &error, &digest))
             {
@@ -23605,7 +23615,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
             page = EvidenceGraphPage{};
             page.Status = L"materialization_failed";
         }
-        std::wcout << EvidenceGraphJson(graph, query, page) << L"\n";
+        std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
     }
     if (action == L"inventory")

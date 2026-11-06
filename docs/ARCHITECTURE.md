@@ -184,7 +184,7 @@ completion, approved reference provenance, atomic mapping lifetime and execution
 are not established. `/current` explicitly returns unavailable for slice recipes;
 existing v1/v2 single-range recipe behavior is unchanged.
 
-Graph associations, source-initialization receipts, other KMON reader paths,
+Cross-bundle graph associations, source-initialization receipts, other KMON reader paths,
 crash recovery/global retention, reference caching and native lifecycle validation
 remain open. These slices do not complete VS1.
 
@@ -231,9 +231,44 @@ an atomic lifetime. `/current` is explicitly unavailable for manifests.
 Replay admits up to 256 MiB of raw/recipe JSON inputs, matching their combined
 session limits. Slice replay still performs full reference verification per
 slice; shared physical storage does not provide an I/O cache or a latency bound.
-Global journal commits, restart/orphan recovery, retention and graph links remain
+Global journal commits, restart/orphan recovery, retention and cross-bundle joins remain
 separate work. Individual atomic file publication is not a multi-artifact
 transaction or a power-loss durability guarantee.
+
+## Replayed image sweep graph
+
+`!kmon graph <sweep.knsweep> /json` projects a successful original-policy replay
+as `kn.image_sweep_graph.v1`. It connects the sweep assessment, manifest, declared
+target context, exact reference artifact, slice recipes, published read archives,
+slice observations and executable-range comparisons. Every node and `derived_from`
+edge names a retained artifact digest, a JSON pointer where applicable, the
+original slice ordinal and observation interval. Binary references have no JSON
+pointer. These are provenance edges; no callback, dispatch, execution or writer
+relationship is inferred from an image difference.
+
+Range nodes report compared, changed, excluded and unreadable ranges and byte
+totals from newly recomputed comparisons. A failed original reference qualification
+cannot become a graph match. Missing slices remain unobserved in the sweep
+assessment. A missing raw archive has no retained-archive node, even when a recipe
+still contains enough original reads to replay; publication completion remains
+separate from comparison completion. Missing/corrupt declared artifacts or failed
+replay produce neither a materialized graph nor a successful assessment.
+
+Graph IDs bind the graph policy, exact manifest digest and recomputed proof.
+Even a shared reference digest does not merge target nodes across sweeps. The
+target identity remains collector-declared, and the monotonic interval describes
+observations, not a pinned mapping lifetime. The graph establishes neither
+approved distribution provenance nor collector authenticity.
+
+The existing bounded graph query handles both graph kinds. A sweep projection
+admits at most 256 nodes, 512 edges and 2 MiB of provenance/detail JSON, in addition
+to the replay input limits. Oversized projections fail explicitly; replay remains
+available separately. Cursors bind the graph, root, depth and record limit.
+`/budget-ms` covers materialized traversal only, not reference I/O or policy
+replay. Page/depth completion is unrelated to target or publication coverage.
+The legacy `.kncase` graph contract is unchanged. Qualified cross-bundle
+process/mapping/code-version joins and relationships to callback/dispatch evidence
+remain P07 work; P06 journal/recovery and native lifecycle gates remain open.
 
 ## Typed translation receipts
 

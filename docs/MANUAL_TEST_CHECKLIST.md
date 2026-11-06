@@ -89,6 +89,15 @@ head/terminal controls. Include direct and secondary policies, matching/changed/
 excluded bytes, contradictory target/range/time membership, missing/corrupt
 declared artifacts, metadata limits and manifest output collisions.
 
+Run `python tools/test-image-sweep-graph.py --exe x64/Release/KnLiveDbg.exe --fixtures <reported-directory> --cli`
+for original-policy graph materialization. Check exact artifact/JSON-pointer
+provenance and observation intervals, independently known changed/excluded ranges,
+unstable reads, lost raw publication, incomplete sweeps, deterministic IDs and
+fresh-process pagination. Changed query or evidence identity must reject old
+cursors; matching PID/VA/reference bytes across different boot/generation labels
+must not share graph nodes. Corrupt inputs and graph limits must fail without a
+partial successful graph. Retain the separate `.kncase` graph regression suite.
+
 Run `tools/validate-reference-blobs.ps1 -Sanitize` for exact-handle acquisition
 after source rename/path replacement, independent read position, write exclusion,
 snapshot survival after source removal, content-addressed reuse at zero new-byte
@@ -112,7 +121,7 @@ replayed slice as full sweep-manifest/graph publication. For `.knsweep` replay,
 check missing entries, unknown tail and complete executable comparison separately.
 After stop, reconcile started and terminal-observed sweep counts with manifest
 publication and metadata losses; an entirely dropped sweep has no manifest.
-Journal restart, graph associations and native lifetime validation remain
+Journal restart, cross-bundle graph associations and native lifetime validation remain
 independent gates.
 
 Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,

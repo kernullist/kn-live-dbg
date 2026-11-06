@@ -7,6 +7,64 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Replayed image sweep graph checkpoint: 2026-11-07
+
+This P03 substep extends the offline graph command to `.knsweep`. Successful
+original-policy replay supplies typed range comparisons; the graph connects the
+sweep assessment to manifest, reference, recipe, published raw archive and slice
+evidence. Each element retains an artifact digest, JSON pointer where applicable
+and original observation interval. Failed comparison, excluded bytes, unobserved
+ranges and raw publication loss remain separate.
+
+Release x64 EXE SHA-256:
+`5c86c9f84f0264feeae753ee384b6630a11493d631ed90a508324cc5a55e6a05`.
+ASan slice/sweep/graph harness SHA-256:
+`0f66faef0e0fe12ae233d9b991ddb08f48b33336f9236d59bb739f644caaf413`.
+The full Release solution built with the P01 VS/MSVC/SDK/WDK configuration.
+The existing C4744 `NextQueryEpoch` alignment warnings remain.
+
+The ASan harness passed 307 C++ controls, including typed replay admission bound
+to the expected manifest digest and clearing prior results on failure. Independent
+slice and sweep oracles passed 369 and 233 checks. The final EXE passed 1,414
+graph checks across eight sweep cases: matching, changed, excluded, missing first
+slice, unknown tail, actual secondary reference view, unstable comparison and lost
+raw archives. The oracle independently verifies provenance pointers, exact ranges
+and byte counts, intervals, graph identities, fresh-process pagination and cursor
+invalidation. Different boot/generation labels cannot share nodes even with the
+same PID, VA and reference bytes. Missing/corrupt files, a rehashed false verdict
+and an oversized projection produce no successful graph or assessment.
+
+The existing evidence ASan harness passed 522 controls; eight interrupted
+publications left three valid and five absent final files. The extracted graph
+traversal function is unchanged. The final EXE also passed 164 legacy graph,
+413 slice, 269 sweep, 101 legacy recipe and 168 live recipe CLI checks. All three
+owned live PE-buffer children exited. Capability checks covered 26 contracts and
+261 command routes without treating compiled support as target validation.
+Public-content regressions passed 11 checks, including renamed graph evidence.
+
+An isolated final `--self-test all` passed timeline 28, MCP 102, console 558,
+command registry 3,000 and remote 66 checks. KMON integration passed 64 controls,
+including changed-range and two-slice graphs from actual comparison/writer output
+after the original target and reference were removed. This isolated run does not
+resolve the concurrent host-load timeout observation in the earlier checkpoint.
+
+Review bound the graph's manifest preflight to replay before leaf I/O, retained
+original reference qualification separately from failed byte comparison, and
+made detail-budget failure discard the projection. The independent oracle found
+that the new unstable fixture initially matched and therefore never triggered
+the candidate confirmation read. The fixture now starts with a difference and
+changes during confirmation; the expected 4,096 failed bytes were retained.
+No additional defects were found in the reviewed implementation scope.
+
+Targets remain owned synthetic nonexecuting PE bytes, with actual local
+`SEC_IMAGE_NO_EXECUTE` reference views. No driver load, service start, Verifier,
+reboot or security-policy changes were made. Graph limits are 256 nodes, 512 edges
+and 2 MiB of details; traversal time budgets exclude replay and reference I/O.
+Cross-bundle mapping lifetimes and callback/dispatch joins, native loaded-image
+validation, approved-change policy, reference caching/stage budgets and P06
+journal/restart/global retention remain open. The full P01-P16 / VS1-VS4 goal
+remains active.
+
 ## Temporal image sweep checkpoint: 2026-11-07
 
 This P03 substep publishes bounded `kn.image_sweep.v1` manifests that bind the

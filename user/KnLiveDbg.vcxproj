@@ -153,6 +153,7 @@
     <ClCompile Include="EvidenceInvestigation.cpp" />
     <ClCompile Include="EvidenceInventory.cpp" />
     <ClCompile Include="EvidenceGraph.cpp" />
+    <ClCompile Include="EvidenceGraphQuery.cpp" />
     <ClCompile Include="EvidenceGraphJson.cpp" />
     <ClCompile Include="GameBuildManifest.cpp" />
     <ClCompile Include="GameBuildManifestGenerator.cpp" />
@@ -214,6 +215,7 @@
     <ClCompile Include="ImageSliceRecipe.cpp" />
     <ClCompile Include="ImageSweepManifest.cpp" />
     <ClCompile Include="ImageSweepReplay.cpp" />
+    <ClCompile Include="ImageSweepGraph.cpp" />
     <ClCompile Include="ObservationReadRoutingJson.cpp" />
     <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
@@ -369,6 +371,8 @@
     <ClInclude Include="ImageRecipeReadSet.h" />
     <ClInclude Include="ImageSliceRecipe.h" />
     <ClInclude Include="ImageSweepManifest.h" />
+    <ClInclude Include="ImageSweepReplayEvidence.h" />
+    <ClInclude Include="ImageSweepGraph.h" />
     <ClInclude Include="ImageComparisonJson.h" />
     <ClInclude Include="ObservationReadSetParser.h" />
     <ClInclude Include="BoundedObservationJson.h" />

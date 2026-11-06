@@ -1,4 +1,5 @@
 #include "ImageSweepManifest.h"
+#include "ImageSweepReplayEvidence.h"
 #include "ImageSliceRecipe.h"
 #include "ObservationReadRoutingJson.h"
 #include "BoundedObservationJson.h"
@@ -53,8 +54,11 @@ namespace
     }
 }
 
-ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error)
+ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
+    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256)
 {
+    if (verifiedEvidence != nullptr) { *verifiedEvidence = {}; }
+    ImageSweepReplayEvidence verified;
     ImageRecipeReplay result;
     result.Schema = L"kn.image_sweep_replay.v1";
     result.Mode = L"original_policy";
@@ -68,6 +72,10 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
     }
     const auto& s = manifest.Sweep;
     result.ManifestSha256 = Field(json, L"manifest_sha256");
+    if (!expectedManifestSha256.empty() && result.ManifestSha256 != expectedManifestSha256)
+    {
+        result.Status = L"manifest_identity_mismatch"; return result;
+    }
     result.RecordedPolicy = result.CurrentPolicy = L"kn.executable_sweep.temporal.v1";
     result.RecordedResult = Raw(json, L"payload");
     if (manifest.Inconsistent || manifest.Slices.empty()) { result.Status = L"sweep_membership_inconsistent_or_empty"; return result; }
@@ -135,7 +143,8 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         else { ++rawFailures; }
         // Reopening is bound by the returned digest, not by the pathname alone.
         // The shared reference exclusion lease remains held across every slice.
-        const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error);
+        ImageSweepReplayedSlice verifiedSlice;
+        const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error, verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr);
         uint64_t bytes = 0, equalOrDifferent = 0, skip = 0, fail = 0, differences = 0;
         bool sliceQualified = false;
         if (replay.Status != L"replayed" || replay.RecipeSha256 != row.RecipeSha256 ||
@@ -149,6 +158,13 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         }
         requested += bytes; compared += equalOrDifferent; excluded += skip; unreadable += fail; changed += differences;
         qualified &= sliceQualified;
+        if (verifiedEvidence != nullptr)
+        {
+            verifiedSlice.Publication = row;
+            verifiedSlice.Policy = p.Policy;
+            verifiedSlice.TargetReferenceQualified = sliceQualified;
+            verified.Slices.push_back(std::move(verifiedSlice));
+        }
         if (evidence.size() > 1) { evidence += L","; }
         evidence += L"{\"ordinal\":" + N(row.Ordinal) + L",\"read_set_id\":" + N(row.ReadSetId) +
             L",\"recipe_sha256\":" + mcpjson::Quote(row.RecipeSha256) + L",\"policy\":" + mcpjson::Quote(p.Policy) +
@@ -183,6 +199,13 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         L",\"recipe_evidence\":" + evidence + L"],\"unfulfilled_requirements\":[" + unmet + L"\"approved_reference_provenance\","
         L"\"atomic_mapping_lifetime\",\"execution_observation\"],\"atomic_snapshot\":false,\"collector_authenticated\":false,\"execution_observed\":false}";
     result.Status = L"replayed";
+    if (verifiedEvidence != nullptr)
+    {
+        verified.Manifest = std::move(manifest);
+        verified.ManifestSha256 = result.ManifestSha256;
+        verified.ReferenceSha256 = std::move(referenceHash);
+        *verifiedEvidence = std::move(verified);
+    }
     if (error != nullptr) { error->clear(); }
     return result;
 }

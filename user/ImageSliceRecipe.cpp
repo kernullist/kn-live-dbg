@@ -259,8 +259,10 @@ std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata&
     return ImageSliceRecipeJson(p);
 }
 
-ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error)
+ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
+    std::vector<ExecutablePageResult>* verifiedPages)
 {
+    if (verifiedPages != nullptr) { verifiedPages->clear(); }
     ImageRecipeReplay result;
     result.Schema = L"kn.image_slice_replay.v1";
     result.Mode = L"original_policy";
@@ -308,6 +310,7 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     }
     result.Proof = Proof(p, pages, result.RecipeSha256);
     if (result.Proof.empty()) { result.Status = L"comparison_accounting_failed"; return result; }
+    if (verifiedPages != nullptr) { *verifiedPages = pages; }
     result.Status = L"replayed";
     if (error != nullptr) { error->clear(); }
     return result;

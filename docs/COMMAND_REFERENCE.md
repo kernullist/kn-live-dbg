@@ -38,8 +38,8 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
-`KnLiveDbg.exe --offline !kmon graph <file.kncase> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
-returns a private `kn.evidence_graph.v1` fact graph over one retained bundle.
+`KnLiveDbg.exe --offline !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
+returns a private `kn.evidence_graph.v1` fact graph for a retained `.kncase` bundle.
 The default root is its evidence node, depth is 2, record limit is 64 and
 traversal budget is 1,000 ms. Edges retain their direction, while queries follow
 both directions. The record limit counts nodes and edges together; endpoints
@@ -50,6 +50,16 @@ JSON is returned with or without `/json`. Exit 0 means this query succeeded,
 including when the retained evidence has gaps; 1 means unavailable input,
 invalid cursor/node or deferred/cancelled traversal, and 2 means invalid grammar.
 See [retained fact graph](ARCHITECTURE.md#retained-fact-graph).
+
+For `.knsweep`, the same command first replays the original image policies and
+returns `kn.image_sweep_graph.v1`. Its assessment connects to exact manifest,
+reference, recipe, raw-archive and range-comparison evidence. Inspect the original
+intervals and compared/changed/excluded/unreadable bytes; successful pagination
+does not establish a complete sweep. It creates no execution, writer or
+cross-bundle lifetime edges. Missing/corrupt declared inputs yield exit 1 without
+a graph. Materialization is bounded to 256 nodes, 512 edges and 2 MiB of detail
+JSON; `/budget-ms` begins after replay. See
+[replayed image sweep graph](ARCHITECTURE.md#replayed-image-sweep-graph).
 
 `KnLiveDbg.exe --offline !kmon dump-read <file.dmp> <hex-address> <length> /json`
 reads 1..4,096 bytes through the shared observation source. Supported inputs are
@@ -130,8 +140,9 @@ shared reference blob. It returns `kn.image_slice_replay.v1` with the actual
 policy and an executed-range `kn.image_slice_proof.v1`. Exit 0 includes faithfully
 reproduced inconclusive results; it does not mean the whole image is clean.
 Missing or contradictory inputs return exit 1 without successful proof. `/current`
-is explicitly unavailable for slice recipes. Graph associations and native
-loaded-image lifetime validation remain open. See
+is explicitly unavailable for slice recipes. A containing `.knsweep` supports
+the graph command above; cross-bundle associations and native loaded-image
+lifetime validation remain open. See
 [original slice replay](ARCHITECTURE.md#original-kmon-slice-replay).
 
 `KnLiveDbg.exe --offline !kmon replay-image ".\evidence\image-sweeps\sweep-COLLECTION-ID.knsweep" /json`

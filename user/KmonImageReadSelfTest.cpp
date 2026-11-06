@@ -2,6 +2,7 @@
 #include "ObservationReadRoutingJson.h"
 #include "ContentHash.h"
 #include "ImageSliceRecipe.h"
+#include "ImageSweepGraph.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -249,6 +250,15 @@ bool KmonImageReadIntegrationSelfTest()
             Raw(sweepReplay.Proof, L"executable_ranges_match_retained_reference") == L"false" &&
             monitor.ImageSweepManifestsWritten.load() == 1 && monitor.ImageSweepManifestPending.load() == 0,
             "actual-kmon-manifest-binds-original-raw-reference-and-recipe");
+        const auto sweepGraph = BuildImageSweepGraph(sweepPath.wstring());
+        EvidenceGraphQuery graphQuery;
+        graphQuery.Depth = 8; graphQuery.Limit = 128;
+        const auto graphPage = QueryEvidenceGraph(sweepGraph.Facts, graphQuery);
+        check(sweepGraph.Facts.Status == L"materialized" && graphPage.Status == L"ok" &&
+            sweepGraph.Assessment == sweepReplay.Proof &&
+            std::count_if(graphPage.Nodes.begin(), graphPage.Nodes.end(), [](const auto& node)
+                { return node.Kind == L"executable_range_comparison" && node.State == L"changed_bytes_established"; }) == 1,
+            "actual-kmon-changed-range-graph-derives-from-replayed-originals");
         std::wstring sweepJson;
         ImageSweepManifest sweepManifest;
         check(ReadAnalystSnapshot(sweepPath.wstring(), &sweepJson, nullptr) && ParseImageSweepManifest(sweepJson, &sweepManifest),
@@ -367,6 +377,12 @@ bool KmonImageReadIntegrationSelfTest()
                 Text(multipleReplay.Proof, L"compared_bytes") == L"8192" &&
                 multiple.ImageReferenceBlobsCreated.load() == 1 && multiple.ImageReferenceBlobsReused.load() == 1,
                 "multi-slice-manifest-replays-complete-original-sweep-with-one-shared-reference");
+            const auto multipleGraph = BuildImageSweepGraph(manifest.wstring());
+            const auto multiplePage = QueryEvidenceGraph(multipleGraph.Facts, graphQuery);
+            check(multiplePage.Status == L"ok" && multipleGraph.Assessment == multipleReplay.Proof &&
+                std::count_if(multiplePage.Nodes.begin(), multiplePage.Nodes.end(), [](const auto& node)
+                    { return node.Kind == L"executable_range_comparison" && node.State == L"matches_retained_reference"; }) == 2,
+                "actual-kmon-multiple-slices-have-separate-qualified-range-graph-nodes");
         }
         Fixture(&secondary.Bytes);
         secondary.Bytes[0x1050] ^= 1; secondary.Unstable = true; secondary.PageReads = 0;

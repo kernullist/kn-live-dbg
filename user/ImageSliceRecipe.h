@@ -25,4 +25,6 @@ bool ParseImageSliceRecipe(const std::wstring& json, ImageSliceRecipe* recipe);
 std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata& metadata, uint64_t imageBase,
     const ExecutableSweepReference& reference, const ExecutableSliceTrace& slice,
     const ObservationRoutedReadSet& reads, const std::vector<ExecutablePageResult>& pages);
-ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error);
+// Optional typed results are populated only after all original inputs and results agree.
+ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
+    std::vector<ExecutablePageResult>* verifiedPages = nullptr);

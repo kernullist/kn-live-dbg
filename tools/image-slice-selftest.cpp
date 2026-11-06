@@ -1,5 +1,7 @@
 #include "../user/ImageSliceRecipe.h"
 #include "../user/ImageSweepManifest.h"
+#include "../user/ImageSweepGraph.h"
+#include "../user/ImageSweepReplayEvidence.h"
 #include "../user/ObservationReadRoutingJson.h"
 #include "../user/ContentHash.h"
 #include "../user/AnalystSnapshot.h"
@@ -117,13 +119,15 @@ namespace
 {
     void SweepTests(const std::filesystem::path& root)
     {
-        for (const auto scenario : {L"sweep_clean", L"sweep_modified", L"sweep_excluded", L"sweep_gap", L"sweep_interrupted", L"sweep_secondary"})
+        for (const auto scenario : {L"sweep_clean", L"sweep_modified", L"sweep_excluded", L"sweep_gap", L"sweep_interrupted", L"sweep_secondary",
+            L"sweep_unstable", L"sweep_raw_lost"})
         {
             const auto folder = root / scenario;
             std::filesystem::create_directories(folder / L"image-reads");
             std::filesystem::create_directories(folder / L"image-sweeps");
             const auto original = folder / L"original.exe";
             Source source(L"synthetic:sweep");
+            source.Unstable = std::wstring(scenario) == L"sweep_unstable";
             auto disk = Fixture(&source.Bytes);
             if (std::wstring(scenario) != L"sweep_excluded")
             {
@@ -133,7 +137,7 @@ namespace
                 Put(source.Bytes, offset, IMAGE_DATA_DIRECTORY{});
                 source.Bytes[0x1100] = disk[0x500]; // The removed exclusion must not leave a hidden fixture change.
             }
-            if (std::wstring(scenario) == L"sweep_modified") { source.Bytes[0x1050] ^= 1; }
+            if (std::wstring(scenario) == L"sweep_modified" || source.Unstable) { source.Bytes[0x1050] ^= 1; }
             Check(Write(original, disk), "sweep-owned-reference");
             std::unique_ptr<void, decltype(&CloseHandle)> section(nullptr, &CloseHandle);
             std::unique_ptr<void, decltype(&UnmapViewOfFile)> view(nullptr, &UnmapViewOfFile);
@@ -218,7 +222,15 @@ namespace
                 Check(SaveObservationJson((folder / L"image-reads" / (name + L".knslice")).wstring(), recipes[index], nullptr), "sweep-recipe-publication");
                 const auto raw = L"{\"schema\":\"kn.image_reads.v3\",\"payload_sha256\":" +
                     mcpjson::Quote(contexts[index].Slice.RawPayloadSha256) + L",\"payload\":" + rawPayloads[index] + L"}";
-                Check(SaveObservationJson((folder / L"image-reads" / (name + L".knreads")).wstring(), raw, nullptr), "sweep-raw-publication");
+                if (std::wstring(scenario) == L"sweep_raw_lost")
+                {
+                    contexts[index].Slice.RawWritten = false;
+                    contexts[index].Slice.RawPayloadSha256.clear();
+                }
+                else
+                {
+                    Check(SaveObservationJson((folder / L"image-reads" / (name + L".knreads")).wstring(), raw, nullptr), "sweep-raw-publication");
+                }
                 final = store.Observe(contexts[index]);
             }
             if (!final) { final = store.TakeIncomplete(); }
@@ -231,6 +243,14 @@ namespace
             const auto replay = ReplayImageRecipe(manifestPath.wstring(), false, nullptr);
             if (replay.Status != L"replayed") { std::wcerr << scenario << L": " << replay.Status << L"\n"; }
             Check(replay.Status == L"replayed" && !replay.Proof.empty(), "sweep-replay-after-original-source-removal");
+            ImageSweepReplayEvidence verified;
+            std::wstring expectedDigest;
+            mcpjson::GetString(json, L"manifest_sha256", &expectedDigest);
+            Check(ReplayImageSweepManifest(manifestPath.wstring(), nullptr, &verified, expectedDigest).Status == L"replayed" &&
+                verified.Slices.size() == final->Slices.size() && verified.ManifestSha256 == expectedDigest,
+                "typed-sweep-projection-binds-admitted-manifest-digest");
+            Check(ReplayImageSweepManifest(manifestPath.wstring(), nullptr, &verified, std::wstring(64, L'0')).Status == L"manifest_identity_mismatch" &&
+                verified.Slices.empty() && verified.ManifestSha256.empty(), "changed-manifest-is-denied-without-stale-typed-results");
             Check(ReplayImageRecipe(manifestPath.wstring(), true, nullptr).Status == L"sweep_current_reanalysis_unavailable", "sweep-current-policy-is-explicitly-unavailable");
             Check(!SaveObservationJson(manifestPath.wstring(), L"{}", nullptr), "sweep-collision-never-replaces-root");
             if (std::wstring(scenario) == L"sweep_clean")
@@ -274,6 +294,18 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 8 && std::wstring(argv[1]) == L"--graph")
+    {
+        EvidenceGraphQuery query;
+        query.Depth = static_cast<size_t>(std::stoull(argv[3]));
+        query.Limit = static_cast<size_t>(std::stoull(argv[4]));
+        query.Cursor = argv[5]; query.Node = argv[6]; query.TimeBudgetMs = std::stoull(argv[7]);
+        const auto graph = BuildImageSweepGraph(argv[2]);
+        auto page = graph.Facts.Status == L"materialized" ? QueryEvidenceGraph(graph.Facts, query) : EvidenceGraphPage{};
+        if (graph.Facts.Status != L"materialized") { page.Status = graph.Facts.Status; }
+        std::cout << mcpjson::WideToUtf8(ImageSweepGraphJson(graph, query, page)) << "\n";
+        return page.Status == L"ok" ? 0 : 1;
+    }
     if (argc == 3 && std::wstring(argv[1]) == L"--replay")
     {
         const auto replay = ReplayImageRecipe(argv[2], false, nullptr);
