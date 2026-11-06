@@ -231,9 +231,70 @@ an atomic lifetime. `/current` is explicitly unavailable for manifests.
 Replay admits up to 256 MiB of raw/recipe JSON inputs, matching their combined
 session limits. Slice replay still performs full reference verification per
 slice; shared physical storage does not provide an I/O cache or a latency bound.
-Global journal commits, restart/orphan recovery, retention and cross-bundle joins remain
-separate work. Individual atomic file publication is not a multi-artifact
-transaction or a power-loss durability guarantee.
+The [image collection journal](#image-collection-publication-journal) records
+collection membership separately from these files. Retention and cross-bundle
+joins remain separate work. Individual atomic file publication is not a
+multi-artifact transaction or a power-loss durability guarantee.
+
+## Image collection publication journal
+
+The KMON writer publishes original reference/read/recipe files, then a journal
+record under `collections/<collection-id>/journal-segments/`. A sweep root is
+committed only after every artifact it declares as published belongs to an earlier
+record. Finally, the writer publishes the read-session ledger and commits its
+closure record. The existing `persistence` and file counters describe individual
+files; `journal_read_batches_*`, `journal_sweeps_*` and final pipeline
+`image_journal_closed`/`image_journal_close_failed` describe collection publication.
+A read batch can retain a reference or recipe even when raw-file publication
+failed; consult both sets of counters. Closure does not imply complete target
+observation or successful comparison/replay.
+
+`session.knsession` (`kn.evidence_session.v1`) fixes the collection ID and
+`kn.image_collection_journal.v1` policy. Each create-new `.knjseg` record
+(`kn.evidence_journal_segment.v1`) binds its sequence, preceding **physical-file**
+SHA-256, transaction ID, members and prior dependencies. Members bind their exact
+physical bytes, lengths and original schemas. These hashes differ from canonical
+payload/recipe hashes. The writer pins verified files against writes/deletion,
+checks local directory components against reparse redirection, and owns an
+exclusive collection lock. An exact retry of a committed transaction is
+idempotent; conflicting IDs, paths and appends after closure are rejected.
+Journal I/O converts validated local paths to normalized extended paths, including
+backslash separators, so long temporary/index names do not depend on a system
+setting. See the [Windows path contract](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
+
+`!kmon journal <collection-directory> /json` locks the stopped collection and
+returns `kn.evidence_journal_recovery.v1`. It validates the session, consecutive
+segments, schemas, chain and exact original member files. Missing/corrupt input
+stops recovery before that transaction; later files are not included. Pending
+segments and unreferenced raw files remain uncommitted and are never deleted or
+automatically adopted. Recovery returns the verified prefix, explicit issue and
+whether a writer can resume at the next sequence. An absent terminal record is
+an unknown tail: the hash chain has no authenticated external anchor proving
+that a tail was not removed. Closure is accepted only for an entirely verified
+terminal sequence. A successful recovery establishes membership, not replay;
+the returned sweep paths can be passed to the existing replay/graph commands.
+
+Indexes are derived. The writer publishes a content-named `.knjindex` chunk after
+each journal record, and an immutable head after closure. `/index` reuses exact
+completed chunks and publishes missing chunks plus a head for the recovered
+prefix. A corrupt existing index is reported without replacement; it does not
+invalidate original journal membership. Restart revalidates the entire prefix
+and original files, so resumed publication is not an incremental I/O cache.
+Legacy `.kncase`, `.knverify` and `.knindex` readers remain unchanged.
+
+This version bounds recovery to 8,192 segments, 16,384 unique member paths,
+65,536 member/dependency references, 2 MiB per JSON record, 64 MiB per reference
+blob and 1 GiB of total file reads. Writer read accounting lasts for the open
+journal; recovery/index accounting lasts for that invocation. The 120-second
+deadline is checked between synchronous operations, not an I/O cancellation
+guarantee. Index reads share this budget. Logical reference bytes and unique
+content bytes cover only the verified collection prefix; they do not measure
+physical disk allocation, orphan volume or global cross-collection retention.
+GC, retention priorities, large-store continuation beyond these bounds and
+media/power-loss testing remain P06 work. Files are flushed before create-new
+rename; the observed-process-interruption tests do not establish power-loss
+durability or collector authenticity. All journal/index/recovery artifacts are
+private evidence.
 
 ## Replayed image sweep graph
 
@@ -268,7 +329,7 @@ available separately. Cursors bind the graph, root, depth and record limit.
 replay. Page/depth completion is unrelated to target or publication coverage.
 The legacy `.kncase` graph contract is unchanged. Qualified cross-bundle
 process/mapping/code-version joins and relationships to callback/dispatch evidence
-remain P07 work; P06 journal/recovery and native lifecycle gates remain open.
+remain P07 work; global P06 retention and native lifecycle gates remain open.
 
 ## Typed translation receipts
 

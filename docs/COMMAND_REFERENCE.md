@@ -38,6 +38,21 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
+`KnLiveDbg.exe --offline !kmon journal <collection-directory> [/index] [/json]`
+verifies a stopped `collections/<collection-id>` image collection and returns
+private `kn.evidence_journal_recovery.v1` JSON. It reports the committed prefix,
+closure/unknown tail, exact collection-scoped byte denominators and committed
+sweep paths. File presence alone does not establish membership. A live writer
+holds the exclusive collection lock, so recovery reports unavailable while it
+is active. `/index` resumes publication of derived chunks and an immutable head;
+original files are revalidated even if an index exists. Corrupt existing output
+is preserved and reported. No orphan deletion or new target acquisition occurs.
+Exit 0 means a verified prefix and, when requested, a ready index; the prefix can
+still have an unknown tail. Exit 1 means unavailable/incomplete recovery or index
+failure, and 2 means invalid grammar. Pass a returned sweep path relative to the
+artifact root to `replay-image` or `graph` for separate policy verification.
+See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
+
 `KnLiveDbg.exe --offline !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
 returns a private `kn.evidence_graph.v1` fact graph for a retained `.kncase` bundle.
 The default root is its evidence node, depth is 2, record limit is 64 and

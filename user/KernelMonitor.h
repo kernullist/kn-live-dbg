@@ -8,6 +8,7 @@
 #include "CodeTargetResolver.h"
 #include "ExecutableImageVerifier.h"
 #include "ImageSweepManifest.h"
+#include "EvidenceJournal.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
@@ -634,6 +635,12 @@ private:
     };
     void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
     void CloseImageReadCollection() noexcept;
+    EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction) noexcept;
+    std::unique_ptr<EvidenceJournal> ImageJournal; // Capture writer only; owns publication leases.
+    std::atomic<uint64_t> ImageJournalReadsCommitted{0}, ImageJournalReadsFailed{0};
+    std::atomic<uint64_t> ImageJournalSweepsCommitted{0}, ImageJournalSweepsFailed{0};
+    std::atomic<uint64_t> ImageJournalIndexFailed{0}, ImageJournalCloseFailed{0};
+    std::atomic<bool> ImageJournalClosed{false};
     void RecordImageSweepPublication(const CapturedImageReads& reads, bool rawWritten, bool recipeWritten,
         bool referenceWritten, const std::wstring& rawHash, const std::wstring& recipeHash) noexcept;
     void PersistImageSweepManifest(const ImageSweepManifest& manifest) noexcept;

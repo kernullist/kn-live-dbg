@@ -294,6 +294,15 @@ bool KmonImageReadIntegrationSelfTest()
         check(Raw(ledger, L"slice_recipes_queued") == L"1" && Raw(ledger, L"slice_recipes_written") == L"1" &&
             Raw(ledger, L"slice_recipes_failed") == L"0" && Raw(ledger, L"slice_recipes_unavailable") == L"0",
             "final-slice-ledger-balances-publication-separately");
+        const auto recovered = RecoverEvidenceJournal((root / L"collections" / retained.CollectionId).wstring(), true);
+        check(recovered.Status == L"verified_prefix" && recovered.Closed && !recovered.CanResume &&
+            recovered.CommittedSegments == 3 && recovered.UniquePaths == 5 && recovered.SweepPaths.size() == 1 &&
+            recovered.IndexStatus == L"ready" && monitor.ImageJournalClosed.load() && monitor.ImageJournalCloseFailed.load() == 0 &&
+            monitor.ImageJournalReadsCommitted.load() == 1 && monitor.ImageJournalSweepsCommitted.load() == 1 &&
+            Raw(ledger, L"journal_read_batches_committed") == L"1" && Raw(ledger, L"journal_sweeps_committed") == L"1",
+            "actual-kmon-original-files-and-closure-recover-from-committed-journal");
+        check(recovered.SweepPaths.size() == 1 && ReplayImageRecipe((root / recovered.SweepPaths.front()).wstring(), false, nullptr).Proof ==
+            sweepReplay.Proof, "recovered-collection-root-replays-original-comparison-after-source-removal");
         monitor.DrainPipelineEvents(true);
         bool final = false;
         for (const auto& event : monitor.Ring)
@@ -364,6 +373,16 @@ bool KmonImageReadIntegrationSelfTest()
                 Raw(partialLedger, L"sweeps_started") == L"1" && Raw(partialLedger, L"sweep_terminals_observed") == L"0" &&
                 Raw(partialLedger, L"sweep_manifests_written") == L"1" && Raw(partialLedger, L"reference_reserved_bytes") == L"0",
                 "stopped-incomplete-sweep-has-final-ledger-with-no-reference-reservation");
+            const auto partialCollection = RecoverEvidenceJournal((root / L"partial-sweep" / L"collections" /
+                std::to_wstring(partialSweep.EvidenceCollectionEpoch.load())).wstring());
+            check(partialCollection.Closed && partialCollection.CommittedSegments == 3 && partialCollection.SweepPaths.size() == 1 &&
+                Raw(partialReplay.Proof, L"whole_sweep_complete") == L"false",
+                "journal-closure-does-not-turn-incomplete-target-observation-into-complete-sweep");
+            const auto multiCollection = RecoverEvidenceJournal((root / L"multiple" / L"collections" /
+                std::to_wstring(multiple.EvidenceCollectionEpoch.load())).wstring());
+            check(multiCollection.Closed && multiCollection.CommittedSegments == 4 && multiCollection.UniquePaths == 7 &&
+                multiCollection.MemberReferences == 8 && multiCollection.LogicalBytes - multiCollection.UniqueContentBytes == twoDisk.size(),
+                "actual-multislice-journal-retains-reference-reuse-denominator");
             std::filesystem::path manifest;
             size_t manifests = 0;
             for (const auto& entry : std::filesystem::directory_iterator(root / L"multiple" / L"image-sweeps"))
@@ -420,6 +439,20 @@ bool KmonImageReadIntegrationSelfTest()
                 Raw(Raw(Raw(archive, L"payload"), L"slice_inputs"), L"secondary_reads") == ObservationRoutedReadSetJson(trace.SecondaryReads) &&
                 incomplete.ImageSlicesUnavailable.load() == 1 && incomplete.ImageSlicesWritten.load() == 0,
                 "ineligible-secondary-inputs-still-survive-in-raw-archive");
+        }
+        {
+            KernelMonitor blockedJournal;
+            const auto folder = root / L"journal-unavailable";
+            blockedJournal.Options.LogDirectory = folder.wstring();
+            std::filesystem::create_directories(folder);
+            check(Write(folder / L"collections", {0x78}), "owned-journal-directory-blocker");
+            blockedJournal.QueueImageReadSet(set, identity, L"synthetic", Base);
+            blockedJournal.WriterStopping.store(true); blockedJournal.CaptureWriterLoop();
+            check(blockedJournal.ImageReadsWritten.load() == 1 && blockedJournal.ImageReadsFailed.load() == 0 &&
+                blockedJournal.ImageReadsLedgerFailed.load() == 0 && blockedJournal.ImageJournalReadsCommitted.load() == 0 &&
+                blockedJournal.ImageJournalReadsFailed.load() == 1 && !blockedJournal.ImageJournalClosed.load() &&
+                blockedJournal.ImageJournalCloseFailed.load() == 1 && blockedJournal.ImageJournal == nullptr,
+                "original-file-publication-is-distinct-from-failed-collection-commit-and-closure");
         }
         for (unsigned mode = 0; mode < 3; ++mode)
         {

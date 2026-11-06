@@ -7,6 +7,66 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image collection journal and recovery checkpoint: 2026-11-07
+
+This bounded P06 step adds a collection journal to the original KMON image
+read/reference/recipe/sweep path. Exact physical file hashes and schemas precede
+hash-linked commits; dependent sweep roots require earlier committed members.
+The final read ledger has its own closure commit. File publication, collection
+commit, derived-index readiness and target observation coverage remain distinct.
+Recovery verifies the committed prefix and original files, excludes orphan and
+pending files, and resumes derived index publication from exact completed chunks.
+
+The final Release EXE SHA-256 is
+`14353ae1555af41f6d57d17a22b1d88baef468c39c9f26cc7cf98a32bf72ff52`.
+The ASan journal harness SHA-256 is
+`5c6f83208bacd4abd61fbb4026df1555def01ca262b06fc3431f58c5fb258c8a`.
+Builds used VS 2022 Build Tools 17.14.60 / MSVC 14.44.35207 and SDK/WDK
+10.0.26100.0. Existing C4744 `NextQueryEpoch` alignment warnings remain; the
+broader rebuild also reproduced C4244 in unchanged `KernelMonitor.cpp` fill code.
+
+`tools/validate-evidence-journal.ps1 -Sanitize` passed **35 C++ controls** and
+**1,952 independent Python checks**. The same Python oracle passed **1,952
+checks through the final EXE's offline CLI**. Each run interrupted ten owned
+children only after observing their exact publication-stage signal, reaped every
+child, recovered the expected prefix and checked restart at the next sequence.
+Controls cover raw-only orphans, missing/corrupt members and segments, rehashed
+schema/sequence/path violations, unknown tails, extra records after closure,
+writer exclusion, dependency admission, exact idempotent retries, collection
+dedup denominators, corrupt/partial indexes, directory junctions, NUL input,
+trailing separators and paths whose final index files exceed MAX_PATH.
+
+The first actual CLI oracle exposed a long temporary-index path failure. The
+journal now uses normalized local extended paths, including backslash separators;
+the first extended-path revision's separator regression was corrected before
+final validation. The original failing input rebuilt successfully without path
+shortening or host policy changes. Additional review fixes pin verified index
+chunks until head publication, prevent partial counter publication after an
+exception and withhold closed status when records follow a closure. A corrupt
+index remains a separate failure and is never silently replaced.
+
+The final EXE passed an isolated `--self-test all`: timeline **28**, MCP **102**,
+KMON image **70**, console **558**, commands **3,000 / 261 routes**, remote **66**.
+KMON controls recover and replay the original comparison after source/reference
+removal, retain incomplete sweep coverage inside a closed collection, account for
+reference reuse across actual scheduling slices, and distinguish successful raw
+files from a blocked journal/closure. Compatibility checks passed **1,414** sweep
+graph checks across eight cases, **164** legacy graph checks, **101** legacy image
+recipe checks, **27** capability contracts and **11** publication-classifier tests.
+Compiled journal support remains `not_probed` for target availability.
+
+These are owned storage fixtures and synthetic nonexecuting image observations.
+No driver was loaded, service started, Verifier enabled, reboot performed or
+security policy changed. Process termination does not establish media/power-loss
+durability. Recovery bounds and whole-prefix revalidation are documented in the
+[architecture](ARCHITECTURE.md#image-collection-publication-journal). Counts and
+dedup bytes cover one verified collection prefix, not global retention or disk
+allocation. Cross-collection retention/GC, large-store continuation, legacy
+inventory-build recovery, native loaded-image lifetime, approved-change policy
+and the full P01-P16 / VS1-VS4 gates remain open. The earlier load-sensitive
+process-capture deadline failure remains separate; isolated passes do not resolve
+or validate that concurrent-load timing condition.
+
 ## Replayed image sweep graph checkpoint: 2026-11-07
 
 This P03 substep extends the offline graph command to `.knsweep`. Successful

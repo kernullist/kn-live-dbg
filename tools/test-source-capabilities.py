@@ -55,6 +55,9 @@ def main():
     assert "cli_parser_process_containment" in schema["limits"] and "no_runtime_qualification" in schema["limits"]
     assert "other_symbol_paths_not_isolated" in schema["limits"] and "no_filesystem_or_network_sandbox" in schema["limits"]
     assert "exact_reference_blob" in by_key[("image", "replay_verification", "recipe")]["requirements"]
+    journal = by_key[("evidence", "journal", "local_files")]
+    assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
+    assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]

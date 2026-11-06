@@ -121,8 +121,17 @@ replayed slice as full sweep-manifest/graph publication. For `.knsweep` replay,
 check missing entries, unknown tail and complete executable comparison separately.
 After stop, reconcile started and terminal-observed sweep counts with manifest
 publication and metadata losses; an entirely dropped sweep has no manifest.
-Journal restart, cross-bundle graph associations and native lifetime validation remain
-independent gates.
+Run `tools/validate-evidence-journal.ps1 -Sanitize` for exact file/segment hashes,
+schema/dependency rejection, observed-stage process interruption, prefix recovery,
+restart append, collection-scoped dedup and resumable index publication. The
+Python oracle waits for the child to announce the exact stage before termination
+and reaps every child. This is a process-interruption test, not a power-loss test.
+After KMON stop, use `--offline !kmon journal <log-root>/collections/<id> /index /json`
+and reconcile raw-file, journal-commit and final closure counters separately.
+An orphan file must not enter recovered membership. Replay a returned sweep root
+after source removal, including an incomplete sweep in a closed collection.
+Global retention, cross-bundle graph associations and native lifetime validation
+remain independent gates.
 
 Run `tools/validate-read-receipts.ps1 -Sanitize` for ordered success/failure,
 sparse bytes, explicit fallback permission, shared budgets, metadata capacity,

@@ -189,6 +189,12 @@ python tools/test-capture-scheduling-cli.py --exe x64/Release/KnLiveDbg.exe
 
 `/budget-ms`는 이미 만들어진 그래프를 탐색하는 시간 예산으로 기본 1,000ms, 범위 0~5,000ms다. 0은 조회를 보류한다. 파일 읽기와 재구성은 파일 2MiB·구간 128개 상한으로 먼저 수행하며 이 시간 예산에 포함되지 않는다. `status=ok`와 종료 코드 0은 해당 조회 성공만 뜻한다. `gaps`, 원래 coverage, 캡처 중단·읽기 집합 완전성은 별도로 확인해야 한다. 실제 대상이 종료되어도 파일로 다시 조회할 수 있으며 드라이버는 로드하지 않는다.
 
+## 이미지 수집 저널 복구
+
+수집을 중지한 뒤 `--offline !kmon journal <로그 루트>/collections/<id> /index /json`으로 사건 게시 상태를 확인한다. `kn.evidence_journal_recovery.v1`은 연속된 커밋 기록과 실제 원본 파일의 해시·크기·스키마를 검증한 범위만 반환한다. 저널에 없는 파일과 임시 파일은 자동으로 사건에 포함하지 않는다. `/index`는 검증된 기록에서 파생 인덱스를 재구축하며, 이미 완성된 청크를 재사용하더라도 원본 검증은 다시 수행한다. 기존 인덱스가 손상됐으면 덮어쓰지 않고 실패를 보고한다.
+
+파일 게시 수, 저널 커밋 수, 종료 기록, 대상 관측 범위를 각각 확인한다. `closed:true`는 수집 기록이 종료됐다는 뜻이며 모든 이미지 바이트를 비교했다는 뜻이 아니다. 끝 기록이 없으면 `tail_unknown:true`이고, 중간 기록이나 원본 손상이 있으면 그 직전까지만 복구한다. 실행 중인 writer가 있으면 배타 잠금 때문에 복구를 진행하지 않는다. 반환된 sweep 경로를 로그 루트 기준으로 해석해 `replay-image` 또는 `graph`로 원래 정책을 별도 검증한다. 이 단계의 중복·바이트 분모는 해당 collection의 검증된 범위로 한정된다. 전역 보존·GC와 전원 장애 내구성은 [별도 미완료 범위](ARCHITECTURE.md#image-collection-publication-journal)다.
+
 ## 검증
 
 ```powershell

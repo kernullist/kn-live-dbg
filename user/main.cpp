@@ -35,6 +35,7 @@
 #include "AnalystSnapshot.h"
 #include "EvidenceInvestigation.h"
 #include "EvidenceInventory.h"
+#include "EvidenceJournal.h"
 #include "EvidenceGraph.h"
 #include "ImageSweepGraph.h"
 #include <filesystem>
@@ -23061,6 +23062,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
+    std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23617,6 +23619,25 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         }
         std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
+    }
+    if (action == L"journal")
+    {
+        bool rebuild = false, valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty();
+        std::set<std::wstring> seen;
+        for (size_t i = 3; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            valid = seen.insert(option).second && (option == L"/json" || option == L"/index");
+            if (option == L"/index") { rebuild = true; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon journal <collection-directory> [/index] [/json]\n";
+            return 2;
+        }
+        const auto result = RecoverEvidenceJournal(args[2], rebuild);
+        std::wcout << EvidenceJournalRecoveryJson(result) << L"\n";
+        return result.Status == L"verified_prefix" && (!rebuild || result.IndexStatus == L"ready") ? 0 : 1;
     }
     if (action == L"inventory")
     {
@@ -24557,7 +24578,7 @@ static void HandleKmonCommand(
         }
 
         if (action == L"dump-read" || action == L"verify-image" || action == L"replay-image" ||
-            action == L"inventory" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
+            action == L"inventory" || action == L"journal" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
             break;

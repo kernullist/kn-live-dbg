@@ -152,6 +152,7 @@
     <ClCompile Include="EvidenceBundle.cpp" />
     <ClCompile Include="EvidenceInvestigation.cpp" />
     <ClCompile Include="EvidenceInventory.cpp" />
+    <ClCompile Include="EvidenceJournal.cpp" />
     <ClCompile Include="EvidenceGraph.cpp" />
     <ClCompile Include="EvidenceGraphQuery.cpp" />
     <ClCompile Include="EvidenceGraphJson.cpp" />
@@ -239,6 +240,7 @@
     <ClInclude Include="EvidenceBundle.h" />
     <ClInclude Include="EvidenceInvestigation.h" />
     <ClInclude Include="EvidenceInventory.h" />
+    <ClInclude Include="EvidenceJournal.h" />
     <ClInclude Include="EvidenceGraph.h" />
     <ClInclude Include="ExecutionSurfaceCore.h" />
     <ClInclude Include="ExecutionSurfaceScanner.h" />
