@@ -1435,9 +1435,63 @@ it is never treated as a valid layout merely because it exists.
 Compressed/pointer stores, authenticated servers, proxy configuration, recursive
 SymSrv cache chains and automatic replacement of invalid entries are unsupported
 by this resolver. The child receives no search path or download request and runs
-inside the zero-capability AppContainer boundary above. Target image/anchor/invariant binding, propagation
-of these schema identities into every typed observation and full parser isolation
-remain open P05 requirements.
+inside the zero-capability AppContainer boundary above. The pending-IRP consumer
+now applies the bounded runtime binding below. Other typed consumers, approved
+build/layout validation records and full parser isolation remain open P05 work.
+
+### Pending IRP schema and runtime binding
+
+The live scanner retains the complete parent-accepted `_ETHREAD`, `_IRP` and
+`_IO_STACK_LOCATION` schema packages. All three must share the image/PDB/provider
+hashes, PDB GUID/age, machine, image size and provider version, and come from the
+same reported module base. Required field paths must have one unambiguous,
+non-bitfield storage location within their validated embedded/root bounds.
+Missing or ambiguous optional cancel/status/device/file fields remain unknown.
+
+Unavailable/cancelled native sources fail before symbol acquisition. Before
+reading objects, a fresh read-only image lease must match the schema's
+image hash and PE/PDB identity. The actual observation source then supplies the
+loaded PE headers and RSDS identity before and after the object scan. The same
+source contract and native connection epoch govern the reads. Existing IRP
+type/packet/stack/owner checks, reciprocal list checks, repeated packet reads and
+thread PID/TID/create-time rechecks still apply. Enabled completion references
+must be in the source descriptor's kernel address range.
+
+`qualified_observation` describes these recorded policy invariants only. It does
+not establish an approved Windows build, whole-image integrity, process creation
+identity, execution or an allocation lifetime. A final image/source/reference
+failure preserves decoded candidates and original reads but prevents their
+registration as observed completion targets. An initial identity failure stops
+object decoding. Equal repeated reads cannot exclude ABA replacement.
+
+One `kn.irp_capture.v1` artifact preserves the three canonical schemas, reference
+identity metadata, supplied thread inventory/cursor, results and ordered parser
+reads with their original statuses and bytes. It does not retain the image/PDB
+files or source-initialization activity. The read operation admits at most
+256 KiB, 2,048 source calls and 4,096 receipts over five seconds. Input inventory
+is capped at 16,384 threads; the existing per-scan object/walk limits still apply.
+Encoded capture size is capped at 16 MiB. Incomplete capture/operation state
+cannot qualify a result. The boot-tick report interval and the recorder's steady
+clock are identified separately.
+
+KMON request events reference the capture SHA-256. Four queued captures and one
+writer item are bounded separately; the writer has a 128 MiB session allowance.
+New `.knirp` files require an already initialized private evidence store in the
+configured log directory. The existing store policy determines ACL-only or EFS
+protection; there is no automatic initialization or encryption downgrade. The
+writer checks the actual new file handle before writing bytes, flushes and
+renames without replacement, and records publication success/failure separately
+from queue admission. A `.knirpledger` records final encoded-capture queue counts,
+bytes and pending work. A missing private policy causes a publication failure,
+not a silently successful capture. These formats and pending files are excluded
+from source publication even when a JSON artifact is renamed.
+
+These captures are not yet journal members and have no product offline replay
+command. Stopped-store inventory must continue treating them as unmanaged rather
+than inventing membership. Full typed-evidence replay/retention integration,
+approved build/schema change handling and real native-driver lifecycle evidence
+remain open. Owned DIA/offset/read-byte and writer controls are recorded in
+[validation](VALIDATION.md#pending-irp-runtime-binding-checkpoint-2026-11-07).
 
 ### Live symbol and type index broker
 

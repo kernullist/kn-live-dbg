@@ -6,7 +6,7 @@
 // Graph IDs are local to one observation. Address equality does not join
 // objects between reports or establish a referenced allocation lifetime.
 inline std::wstring PendingIrpObservationJson(const PendingIrpRequestObservation& request,
-    const PendingIrpScanResult& scan)
+    const PendingIrpScanResult& scan, bool includeCaptureLink = true)
 {
     const auto number = [](uint64_t value)
     {
@@ -34,6 +34,14 @@ inline std::wstring PendingIrpObservationJson(const PendingIrpRequestObservation
     out += L",\"virtual_address_bits\":" + std::to_wstring(scan.AddressSpace.VirtualAddressBits);
     out += L",\"address_format_assumed\":" + std::wstring(scan.AddressSpace.LegacyAssumed ? L"true" : L"false");
     out += L",\"layout_from_pdb\":" + std::wstring(scan.LayoutFromPdb ? L"true" : L"false");
+    out += L",\"validation_stage\":" + mcpjson::Quote(scan.RuntimeQualified ? L"qualified_observation" : L"decoded_candidate");
+    out += L",\"qualification_reason\":" + mcpjson::Quote(scan.QualificationReason);
+    out += L",\"qualification_scope\":\"recorded_policy_invariants_only\",\"build_approval\":\"not_established\"";
+    if (includeCaptureLink)
+    {
+        out += L",\"capture_sha256\":" + mcpjson::Quote(scan.Evidence ? scan.Evidence->Sha256 : L"");
+        out += L",\"capture_persistence\":\"consult_publication_event\"";
+    }
     out += L",\"coverage_scope\":" + mcpjson::Quote(scan.CoverageScope);
     out += L",\"pid\":" + std::to_wstring(request.Thread.ProcessId);
     out += L",\"tid\":" + std::to_wstring(request.Thread.ThreadId);

@@ -62,12 +62,14 @@ bool BrokeredTypeLayouts::Insert(uint64_t moduleBase, const std::wstring& qualif
     ULONG first = 0;
     if (!AllocateIds(embedded + 1, &first)) { return false; }
     std::map<Path, Node> pending;
+    const auto retained = std::make_shared<const TypeSchemaPackage>(schema);
     TypeLayoutInfo root;
     root.Name = qualifiedName;
     root.ModuleBase = moduleBase;
     root.TypeId = first;
     root.Size = schema.TypeBytes;
     root.SchemaPackageSha256 = digest;
+    root.SchemaPackage = retained;
     root.FieldsComplete = true;
     pending.emplace(Path{}, Node{first, 0, std::move(root)});
     ULONG next = first;
@@ -80,6 +82,7 @@ bool BrokeredTypeLayouts::Insert(uint64_t moduleBase, const std::wstring& qualif
         child.TypeId = ++next;
         child.Size = f.StorageBytes;
         child.SchemaPackageSha256 = digest;
+        child.SchemaPackage = retained;
         child.FieldsComplete = true;
         pending.emplace(f.Path, Node{next, f.Offset, std::move(child)});
     }

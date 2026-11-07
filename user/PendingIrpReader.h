@@ -190,6 +190,10 @@ namespace pending_irp
             {
                 continue;
             }
+            if (!space.KernelRange(record.CompletionRoutine, 1))
+            {
+                return false;
+            }
             record.ThreadObject = thread.ThreadObject;
             record.ThreadCreateTime = createTime;
             record.ProcessId = thread.ProcessId;

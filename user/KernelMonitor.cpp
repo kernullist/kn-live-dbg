@@ -24154,9 +24154,13 @@ void KernelMonitor::ScanKernelThreads()
     PendingIrpScanOptions irpOptions;
     irpOptions.Cursor = IrpCompletionCursor;
     irpOptions.ThreadInventoryComplete = walkComplete;
+    irpOptions.Cancellation = &StopRequested;
     PendingIrpScanResult irpResult;
     std::vector<KernelCallbackRecord> irpTargets;
-    if (irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored))
+    const bool irpScanned = irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored);
+    // Preserve identity rejections too; queue admission is not publication.
+    const bool irpCaptureQueued = QueueIrpCapture(irpResult.Evidence);
+    if (irpScanned)
     {
         IrpCompletionCursor = irpResult.NextCursor;
         for (const auto& request : irpResult.Requests)
@@ -24169,12 +24173,14 @@ void KernelMonitor::ScanKernelThreads()
             event.ProcessId = request.Thread.ProcessId;
             event.Summary = L"thread-linked IRP snapshot; final outcome is unknown";
             event.Evidence[L"irp_observation_json"] = PendingIrpObservationJson(request, irpResult);
+            event.Evidence[L"capture_admission"] = irpCaptureQueued ? L"queued" : L"unavailable_or_queue_full";
             event.Evidence[L"referenced_lifetime"] = L"false";
             event.Evidence[L"execution_observed"] = L"false";
             RecordEvent(std::move(event));
         }
         for (const PendingIrpCompletionRecord& record : irpResult.Records)
         {
+            if (!irpResult.RuntimeQualified || !record.StableObservation) { continue; }
             KernelCallbackRecord target;
             target.Kind = L"irp_completion_observed";
             target.Entry = record.Irp;

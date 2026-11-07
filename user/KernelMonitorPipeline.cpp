@@ -5,6 +5,8 @@
 #include "EvidenceInvestigation.h"
 #include "TemporalFactStore.h"
 #include "ObservationReadRoutingJson.h"
+#include "PendingIrpBinding.h"
+#include "EvidencePrivacy.h"
 
 #include <algorithm>
 #include <chrono>
@@ -146,6 +148,9 @@ void KernelMonitor::ResetPipeline()
     CaptureTimings.Reset();
     CapturedPages.Reset();
     CapturedEvidenceBundles.Reset();
+    CapturedIrps.Reset();
+    IrpCapturesQueued.store(0); IrpCapturesWritten.store(0); IrpCapturesFailed.store(0); IrpCapturesDropped.store(0);
+    IrpCaptureBytes.store(0); IrpCaptureLedgerFailed.store(0);
     CapturedImageReadSets.Reset();
     // Producers/writer have stopped; live hunt readers can still inspect the
     // previous session. Serialize the policy-state replacement with that path.
@@ -1346,6 +1351,91 @@ void KernelMonitor::CloseImageReadCollection() noexcept
     ImageStoreLease.reset();
 }
 
+bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact)
+{
+    if (!artifact) { return false; }
+    try
+    {
+        if (artifact->Bytes.empty() || artifact->Bytes.size() > PendingIrpEvidenceMaximumBytes || artifact->Sha256.size() != 64 ||
+            !CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact)}))
+        { IrpCapturesDropped.fetch_add(1); return false; }
+        IrpCapturesQueued.fetch_add(1);
+        return true;
+    }
+    catch (...) { IrpCapturesDropped.fetch_add(1); return false; }
+}
+
+void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
+{
+    bool written = false;
+    try
+    {
+        std::wstring directory, failure = L"irp_capture_session_byte_budget";
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        EvidencePrivacyGuard privacy;
+        EvidencePrivacyReport report;
+        EvidenceStoreLease lease;
+        std::wstring path;
+        // A new raw-data producer requires an already initialized private root.
+        // Publish directly in that pinned root; do not trust a pre-existing child directory.
+        if (directory.empty() || !privacy.Open(directory, false, &report)) { failure = L"private_store_required:" + report.Issue; }
+        else if (lease.Acquire(directory, false, &failure) && capture.Artifact &&
+            capture.Artifact->Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load())
+        {
+            const auto digest = ContentHash::Bytes(capture.Artifact->Bytes);
+            if (!digest.empty() && digest == capture.Artifact->Sha256)
+            {
+                path = (std::filesystem::path(directory) / (L"irp-" + capture.CollectionId + L"-" + digest + L".knirp")).wstring();
+                written = PublishReferenceArtifact(path, capture.Artifact->Bytes, &failure,
+                    [&](HANDLE file) { return privacy.CheckFile(file); });
+                if (written) { IrpCaptureBytes.fetch_add(capture.Artifact->Bytes.size()); }
+            }
+            else { failure = L"irp_capture_digest_mismatch"; }
+        }
+        KmonEvent event;
+        event.Kind = L"coverage.irp_capture";
+        event.Summary = written ? L"IRP schemas and original reads committed" : L"IRP capture publication failed";
+        event.Evidence[L"collection_id"] = capture.CollectionId;
+        event.Evidence[L"capture_sha256"] = capture.Artifact ? capture.Artifact->Sha256 : L"";
+        event.Evidence[L"capture_path"] = written ? path : L"";
+        event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
+        event.Evidence[L"failure"] = written ? L"" : failure;
+        event.Evidence[L"journal_membership"] = L"not_integrated";
+        if (!PipelineEvents.Push(std::move(event))) { CollectionLost.fetch_add(1); }
+    }
+    catch (...) {}
+    if (written) { IrpCapturesWritten.fetch_add(1); }
+    else { IrpCapturesFailed.fetch_add(1); }
+}
+
+void KernelMonitor::CloseIrpCollection() noexcept
+{
+    if (IrpCapturesQueued.load() == 0 && IrpCapturesDropped.load() == 0) { return; }
+    try
+    {
+        std::wstring directory, failure;
+        { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
+        EvidencePrivacyGuard privacy;
+        EvidencePrivacyReport report;
+        EvidenceStoreLease lease;
+        if (!directory.empty() && privacy.Open(directory, false, &report) && lease.Acquire(directory, false, &failure))
+        {
+            const auto id = std::to_wstring(EvidenceCollectionEpoch.load());
+            const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };
+            const auto json = L"{\"schema\":\"kn.irp_capture_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
+                L",\"queued\":" + n(IrpCapturesQueued.load()) + L",\"written\":" + n(IrpCapturesWritten.load()) +
+                L",\"failed\":" + n(IrpCapturesFailed.load()) + L",\"dropped\":" + n(IrpCapturesDropped.load()) +
+                L",\"bytes\":" + n(IrpCaptureBytes.load()) + L",\"pending\":" + n(CapturedIrps.Size()) + L",\"journal_membership\":false}";
+            const auto bytes = mcpjson::WideToUtf8(json);
+            if (PublishReferenceArtifact((std::filesystem::path(directory) / (L"irp-session-" + id + L".knirpledger")).wstring(),
+                std::vector<uint8_t>(bytes.begin(), bytes.end()), &failure,
+                [&](HANDLE file) { return privacy.CheckFile(file); })) { return; }
+        }
+    }
+    catch (...) {}
+    IrpCaptureLedgerFailed.fetch_add(1);
+}
+
 void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
 {
     bool written = false;
@@ -1406,7 +1496,7 @@ void KernelMonitor::CloseEvidenceCollection() noexcept
 void KernelMonitor::CaptureWriterLoop()
 {
     CaptureWriterDone.store(false);
-    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0 || CapturedImageReadSets.Size() != 0)
+    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0 || CapturedImageReadSets.Size() != 0 || CapturedIrps.Size() != 0)
     {
         CapturedImageReads imageReads;
         const bool haveImageReads = CapturedImageReadSets.Pop(&imageReads);
@@ -1414,10 +1504,13 @@ void KernelMonitor::CaptureWriterLoop()
         CapturedEvidence evidence;
         const bool haveEvidence = CapturedEvidenceBundles.Pop(&evidence);
         if (haveEvidence) { PersistEvidenceBundle(evidence); }
+        CapturedIrp irp;
+        const bool haveIrp = CapturedIrps.Pop(&irp);
+        if (haveIrp) { PersistIrpCapture(irp); }
         CapturedPage page;
         if (!CapturedPages.Pop(&page))
         {
-            if (!haveEvidence && !haveImageReads) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+            if (!haveEvidence && !haveImageReads && !haveIrp) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
             continue;
         }
         try
@@ -1535,6 +1628,7 @@ void KernelMonitor::CaptureWriterLoop()
     CloseImageSweepManifests();
     CloseImageReadCollection();
     CloseEvidenceCollection();
+    CloseIrpCollection();
     CaptureWriterDone.store(true);
 }
 
@@ -1635,6 +1729,13 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"evidence_bundles_pending"] = std::to_wstring(CapturedEvidenceBundles.Size());
         event.Evidence[L"evidence_bundle_bytes"] = std::to_wstring(EvidenceBytes.load());
         event.Evidence[L"evidence_ledger_failed"] = std::to_wstring(EvidenceLedgerFailed.load());
+        event.Evidence[L"irp_captures_queued"] = std::to_wstring(IrpCapturesQueued.load());
+        event.Evidence[L"irp_captures_written"] = std::to_wstring(IrpCapturesWritten.load());
+        event.Evidence[L"irp_captures_failed"] = std::to_wstring(IrpCapturesFailed.load());
+        event.Evidence[L"irp_captures_dropped"] = std::to_wstring(IrpCapturesDropped.load());
+        event.Evidence[L"irp_captures_pending"] = std::to_wstring(CapturedIrps.Size());
+        event.Evidence[L"irp_capture_bytes"] = std::to_wstring(IrpCaptureBytes.load());
+        event.Evidence[L"irp_capture_ledger_failed"] = std::to_wstring(IrpCaptureLedgerFailed.load());
         event.Evidence[L"image_read_sets_queued"] = std::to_wstring(ImageReadsQueued.load());
         event.Evidence[L"image_read_sets_written"] = std::to_wstring(ImageReadsWritten.load());
         event.Evidence[L"image_read_sets_failed"] = std::to_wstring(ImageReadsFailed.load());
@@ -1851,7 +1952,8 @@ bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
     {
-        KernelMonitor monitor;
+        const auto monitorOwner = std::make_unique<KernelMonitor>();
+        auto& monitor = *monitorOwner;
         const auto process = GetCurrentProcess();
         const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), process);
         if (!identity.HasCanonicalKey()) { return false; }
@@ -1948,7 +2050,8 @@ bool KmonPipelineSelfTest()
     {
         return false;
     }
-    KernelMonitor monitor;
+    const auto monitorOwner = std::make_unique<KernelMonitor>();
+    auto& monitor = *monitorOwner;
     monitor.Options.LogDirectory = unique;
     monitor.StartTickMs.store(GetTickCount64());
     void* allocation = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1960,6 +2063,45 @@ bool KmonPipelineSelfTest()
             if (allocation == nullptr)
             {
                 break;
+            }
+            {
+                // Exercise the actual writer and final ledger independently
+                // of a loaded driver. Plaintext is explicit for this owned test.
+                const auto privateRoot = std::wstring(unique) + L"\\irp-private";
+                const auto initialized = InitializeEvidencePrivateStore(privateRoot, false);
+                auto artifact = std::make_shared<PendingIrpEvidenceArtifact>();
+                const std::string fixture = "{\"schema\":\"kn.irp_capture.v1\",\"owned_writer_fixture\":true}";
+                artifact->Bytes.assign(fixture.begin(), fixture.end());
+                artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
+                const auto irpOwner = std::make_unique<KernelMonitor>();
+                auto& irp = *irpOwner;
+                irp.Options.LogDirectory = privateRoot;
+                const auto id = std::to_wstring(irp.EvidenceCollectionEpoch.load());
+                const bool queued = irp.QueueIrpCapture(artifact) && irp.QueueIrpCapture(artifact);
+                irp.WriterStopping.store(true);
+                irp.CaptureWriterLoop();
+                const auto path = std::filesystem::path(privateRoot) / (L"irp-" + id + L"-" + artifact->Sha256 + L".knirp");
+                const auto ledger = std::filesystem::path(privateRoot) / (L"irp-session-" + id + L".knirpledger");
+                const bool publication = initialized.Initialized && queued && irp.CapturedIrps.Size() == 0 &&
+                    irp.IrpCapturesWritten.load() == 1 && irp.IrpCapturesFailed.load() == 1 &&
+                    irp.IrpCaptureBytes.load() == artifact->Bytes.size() && irp.IrpCaptureLedgerFailed.load() == 0 &&
+                    ContentHash::File(path.wstring()) == artifact->Sha256 && std::filesystem::exists(ledger) &&
+                    InspectEvidencePrivacy(privateRoot, true).AuditComplete;
+                const auto pressureOwner = std::make_unique<KernelMonitor>();
+                auto& pressure = *pressureOwner;
+                for (size_t n = 0; n < 5; ++n) { pressure.QueueIrpCapture(artifact); }
+                const bool bounded = pressure.CapturedIrps.Size() == 4 && pressure.IrpCapturesQueued.load() == 4 &&
+                    pressure.IrpCapturesDropped.load() == 1;
+                const auto deniedOwner = std::make_unique<KernelMonitor>();
+                auto& denied = *deniedOwner;
+                denied.Options.LogDirectory = unique; // Existing directory without private policy.
+                denied.QueueIrpCapture(artifact);
+                denied.WriterStopping.store(true);
+                denied.CaptureWriterLoop();
+                const bool privateOnly = denied.IrpCapturesWritten.load() == 0 && denied.IrpCapturesFailed.load() == 1 &&
+                    denied.IrpCaptureBytes.load() == 0 && denied.CapturedIrps.Size() == 0 && denied.IrpCaptureLedgerFailed.load() == 1;
+                if (!publication || !bounded || !privateOnly)
+                { std::fprintf(stderr, "FAIL IRP private publication/collision/pressure/drain controls: %u %u %u\n", publication, bounded, privateOnly); break; }
             }
             std::vector<uint8_t> expected(4096, 0x53);
             std::memcpy(allocation, expected.data(), expected.size());
@@ -2526,11 +2668,13 @@ bool KmonPipelineSelfTest()
                 ReplayEvidence(recovered).ReferenceReached && ReplayEvidence(recovered).Gaps.empty();
             if (ok)
             {
-                KernelMonitor pressure;
+                const auto pressureOwner = std::make_unique<KernelMonitor>();
+                auto& pressure = *pressureOwner;
                 for (size_t i = 0; i < 65; ++i) { pressure.QueueEvidenceBundle(recovered); }
                 ok = pressure.EvidenceQueued.load() == 64 && pressure.EvidenceDropped.load() == 1 &&
                     pressure.CapturedEvidenceBundles.Size() == 64;
-                KernelMonitor exhausted;
+                const auto exhaustedOwner = std::make_unique<KernelMonitor>();
+                auto& exhausted = *exhaustedOwner;
                 exhausted.Options.LogDirectory = std::wstring(unique) + L"\\budget";
                 exhausted.EvidenceBytes.store(128ull * 1024 * 1024);
                 exhausted.QueueEvidenceBundle(recovered);
@@ -2597,7 +2741,8 @@ bool KmonPipelineSelfTest()
             // when stop is requested after admission. Guard protection must
             // survive; no kernel fallback is allowed for a known guard page.
             {
-                KernelMonitor unavailable;
+                const auto unavailableOwner = std::make_unique<KernelMonitor>();
+                auto& unavailable = *unavailableOwner;
                 const auto kernel = ObserveProcessIdentity(0);
                 ok = unavailable.QueueCapture(L"selftest_kernel_unavailable", 0xFFFF900000001000ull,
                     9 * 4096, kernel, ObservationFileTime(), nullptr) && ok;
@@ -2627,7 +2772,8 @@ bool KmonPipelineSelfTest()
                 std::memset(memory + 8192, 0x74, 4096);
                 DWORD old = 0;
                 const bool protectedPage = VirtualProtect(memory + 4096, 4096, protection, &old) != FALSE;
-                KernelMonitor holes;
+                const auto holesOwner = std::make_unique<KernelMonitor>();
+                auto& holes = *holesOwner;
                 const uint64_t start = reinterpret_cast<uint64_t>(memory) + 17;
                 ok = protectedPage && holes.QueueCapture(L"selftest_hole", start, 12288 - 17,
                     identity, ObservationFileTime(), nullptr) && ok;
@@ -2676,7 +2822,8 @@ bool KmonPipelineSelfTest()
             // shutdown starts with a full analysis queue. Real source eviction
             // must still be reported instead of disguised as successful drain.
             {
-                KernelMonitor bounded;
+                const auto boundedOwner = std::make_unique<KernelMonitor>();
+                auto& bounded = *boundedOwner;
                 for (size_t i = 0; i < 368; ++i) { bounded.PipelineEvents.Push(KmonEvent{}); }
                 ProcessLayoutNotice notice;
                 notice.Identity = identity;
@@ -2730,7 +2877,8 @@ bool KmonPipelineSelfTest()
                     raw.TimestampFileTime = ObservationFileTime() + index;
                 }
                 const auto added = upstream.IngestEvents(rawEvents);
-                KernelMonitor pressure;
+                const auto pressureOwner = std::make_unique<KernelMonitor>();
+                auto& pressure = *pressureOwner;
                 pressure.Options.LogDirectory = unique;
                 pressure.Timeline = &upstream;
                 bool preserved = added.Added == 3000;
@@ -2779,7 +2927,8 @@ bool KmonPipelineSelfTest()
                     raw.TaskName = L"selftest-unclassified";
                     upstream.Ring.push_back(std::move(raw));
                 }
-                KernelMonitor pressure;
+                const auto pressureOwner = std::make_unique<KernelMonitor>();
+                auto& pressure = *pressureOwner;
                 pressure.Options.LogDirectory = unique;
                 pressure.Ti = &upstream;
                 pressure.TiTraceGeneration = 7;

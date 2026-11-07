@@ -7,6 +7,86 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Pending IRP runtime binding checkpoint: 2026-11-07
+
+P05 now connects the live pending-IRP consumer's retained schemas to loaded
+PE/RSDS identity checks, object invariants and original ordered reads. KMON
+admits completion targets only after those checks and separately reports capture
+queue admission/publication. See the [bounded contract](ARCHITECTURE.md#pending-irp-schema-and-runtime-binding).
+Native IOCTL ABI and existing report fields remain compatible; the report adds
+qualification scope and capture references. Build approval remains explicitly
+`not_established`, and referenced lifetime/execution remain false.
+
+The owned fixture compiles its own `_ETHREAD`, `_IRP` and
+`_IO_STACK_LOCATION` PDB types, obtains them through the actual AppContainer
+broker, and maps an owned PE plus synthetic object bytes at declared kernel
+addresses. Release and ASan each passed **39 controls**. Independent Python
+`ctypes`/JSON/hash checks compared **32 fields and 29 original reads**, including
+owner generations, reciprocal links, packet/stack values and both RSDS reads.
+These are synthetic source observations, not native kernel reads.
+
+Controls cover mixed image/PDB/provider identities, required-field loss,
+ambiguous anonymous paths, missing optional cancellation, initial/final image
+failure, owner/source replacement, non-kernel completion addresses, original
+read failures, cancellation and the 2,048-call budget. Original candidate/read
+evidence survives a final binding failure. Private writer integration exercises
+actual file-handle admission before writing, immutable collision handling,
+four-entry queue pressure, rejection without a private policy and final drain
+counts. An output-admission exception leaves no owned pending file.
+
+Review found that equal packet reads could still admit a non-kernel completion
+pointer; the parser now rejects that reference. Final caller review also restored
+native availability/cancellation checks before schema acquisition. The first full
+linked run
+exhausted the default 1 MiB stack. CDB traced the nested pipeline/image-writer
+test into the journal reader's stack probe. Pipeline monitor fixtures now use
+scoped heap ownership; the final full run passed with the default stack size.
+The two interrupted synthetic fixtures were identified by their contents and
+removed by exact file/empty-directory cleanup. No additional actionable defects
+were found in the reviewed scope.
+
+Final Release EXE SHA-256:
+`4149d8090d352e01ec8f75866fe2d53dfe80caa99b6c2d026b217eb36c6220ab`.
+
+| Harness | SHA-256 |
+|---|---|
+| IRP binding, Release | `33f8ca2bbfce7869954f896d0fe52808dabefaac794a12efe154c3c20525e35b` |
+| IRP binding, ASan | `2db6a636dea15b05219457f6399574ea03bbb8efa0b2cda2353f1db5801330e5` |
+| Existing IRP parser, ASan | `980b60858a34732deaea5f4b7dd570de8ca7628766cb500705cb13f81109eb22` |
+| Image slice, ASan | `84fbc29b9aa7cb2713d15bc109b4479f2e9534dbc97ffc98046d74288258328f` |
+
+The existing IRP harness passed **32 controls** and its six-report oracle. The
+shared publication helper passed **307 image-slice controls**, followed by
+independent slice/sweep/graph oracles (**369/233/1,414**). The first script reached
+a missing Python launcher after the C++ pass; the bundled Python then completed
+all three oracles against the same executable and fixtures without rebuilding.
+The final isolated `--self-test all` passed timeline **28**, MCP **102**, KMON image
+**119**, console **564**, command **3,006 / 261 routes**, and remote **68** plus
+four connection-option checks. Compiled capabilities (**33 contracts**) and the
+generated support matrix passed. Publication-classifier tests passed **12**.
+
+The Release product also produced all three schemas from the retained kernel
+PE/PDB fixture: root sizes **1,944/208/72**, fields **866/85/190**, no reported gaps;
+the required consumer paths were present. This is a disk-artifact compatibility
+check, not validation of a loaded target. The earlier ASan real-kernel PDB
+512 MiB failure was not rerun or resolved here.
+
+Reproduction uses `tools/validate-irp-binding.ps1` with and without `-Sanitize`,
+`tools/validate-pending-irp.ps1 -Sanitize`, and
+`tools/validate-image-slice.ps1 -Sanitize`, with Python 3 on `PATH`. Validation ran
+on the same Windows/VS/SDK environment recorded below. Final checks found no
+test processes, parser profile directories/receipts/preparations, running known
+Kn drivers or interrupted owned fixture directories. BFE/MpsSvc/EFS states and
+firewall profiles were unchanged; **26 completed code-cache directories** remain
+intentionally. No driver was loaded and no reboot or service/policy change was
+performed.
+
+This closes the bounded IRP binding/capture implementation slice. It does not
+close P05, P06, P13 or the full P01-P16/VS1-VS4 goal. Exact build approval and
+schema-change gates, other typed consumers, native lifecycle/lifetime evidence,
+original image/PDB retention, source-initialization receipts and product offline
+IRP replay/journal/retention integration remain open.
+
 ## Parser AppContainer checkpoint: 2026-11-07
 
 P05 schema, layout and symbol-index workers now use a unique zero-capability

@@ -189,6 +189,7 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
     <ClCompile Include="KmonUserEvidence.cpp" />
     <ClCompile Include="PendingIrpScanner.cpp" />
+    <ClCompile Include="PendingIrpBinding.cpp" />
     <ClCompile Include="PendingIrpScannerTests.cpp" />
     <ClCompile Include="KmonTemporalEvidence.cpp" />
     <ClCompile Include="KmonPlatformEvidence.cpp" />
@@ -362,6 +363,7 @@
     <ClInclude Include="ThreatIntelSubscriber.h" />
     <ClInclude Include="KmonUserEvidence.h" />
     <ClInclude Include="PendingIrpScanner.h" />
+    <ClInclude Include="PendingIrpBinding.h" />
     <ClInclude Include="PendingIrpReader.h" />
     <ClInclude Include="PendingIrpReport.h" />
     <ClInclude Include="ScannerListWindow.h" />

@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include <Windows.h>
 #include <cstdint>
@@ -44,7 +45,8 @@ private:
 };
 
 // A failed or interrupted publication never exposes a valid final blob.
-bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error);
+bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error,
+    const std::function<bool(HANDLE)>& admitOutput = {});
 
 // Content-addressed create-new publication or exact-byte reuse. A returned lease
 // pins the verified blob until the caller commits the referring publication.

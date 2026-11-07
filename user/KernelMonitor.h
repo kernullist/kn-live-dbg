@@ -610,6 +610,18 @@ private:
         EvidenceBundle Bundle;
     };
     uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
+    struct CapturedIrp
+    {
+        std::wstring CollectionId;
+        std::shared_ptr<const PendingIrpEvidenceArtifact> Artifact;
+    };
+    bool QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact);
+    void PersistIrpCapture(const CapturedIrp& capture) noexcept;
+    void CloseIrpCollection() noexcept;
+    KmonWorkQueue<CapturedIrp> CapturedIrps{4}; // At most 4 * 16 MiB payloads.
+    std::atomic<uint64_t> IrpCapturesQueued{0}, IrpCapturesWritten{0}, IrpCapturesFailed{0}, IrpCapturesDropped{0};
+    std::atomic<uint64_t> IrpCaptureBytes{0};
+    std::atomic<uint64_t> IrpCaptureLedgerFailed{0};
     void BindEvidenceOrigin(EvidenceBundle& bundle, const std::wstring& captureId,
         uint64_t nativeEpochBefore, uint64_t nativeEpochAfter) const;
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,

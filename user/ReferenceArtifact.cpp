@@ -178,7 +178,8 @@ std::wstring ReferenceArtifact::FileIdentity() const
     return Content == nullptr ? L"" : Content->OriginalFileIdentity;
 }
 
-bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error)
+bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error,
+    const std::function<bool(HANDLE)>& admitOutput)
 {
     const auto absolute = LocalPath(path);
     if (error != nullptr)
@@ -192,7 +193,8 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
     static LONG serial = 0;
     const auto temporary = absolute + L".pending-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
         std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(InterlockedIncrement(&serial));
-    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE | (admitOutput ? READ_CONTROL | FILE_READ_ATTRIBUTES : 0),
+        0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
     {
         return false;
@@ -200,15 +202,22 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
     const std::unique_ptr<void, decltype(&CloseHandle)> owner(file, &CloseHandle);
     DWORD written = 0;
     bool ok = false;
-    if (GetFileType(file) == FILE_TYPE_DISK && WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
-        written == bytes.size() && FlushFileBuffers(file))
+    try
     {
-        std::vector<uint8_t> storage(offsetof(FILE_RENAME_INFO, FileName) + (absolute.size() + 1) * sizeof(wchar_t), 0);
-        auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-        rename->FileNameLength = static_cast<DWORD>(absolute.size() * sizeof(wchar_t));
-        std::memcpy(rename->FileName, absolute.data(), rename->FileNameLength);
-        ok = SetFileInformationByHandle(file, FileRenameInfo, rename, static_cast<DWORD>(storage.size())) != FALSE;
+        // Policy admission sees the actual CREATE_NEW handle before any raw
+        // bytes are written. Failure/exception disposes only this owned file.
+        if (GetFileType(file) == FILE_TYPE_DISK && (!admitOutput || admitOutput(file)) &&
+            WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+            written == bytes.size() && FlushFileBuffers(file))
+        {
+            std::vector<uint8_t> storage(offsetof(FILE_RENAME_INFO, FileName) + (absolute.size() + 1) * sizeof(wchar_t), 0);
+            auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+            rename->FileNameLength = static_cast<DWORD>(absolute.size() * sizeof(wchar_t));
+            std::memcpy(rename->FileName, absolute.data(), rename->FileNameLength);
+            ok = SetFileInformationByHandle(file, FileRenameInfo, rename, static_cast<DWORD>(storage.size())) != FALSE;
+        }
     }
+    catch (...) { ok = false; }
     if (!ok)
     {
         FILE_DISPOSITION_INFO remove{TRUE};

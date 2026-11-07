@@ -19,6 +19,10 @@
 *.knchunk.pending-*
 *.knschema
 *.knschema.pending-*
+*.knirp
+*.knirp.pending-*
+*.knirpledger
+*.knirpledger.pending-*
 *.knblob
 *.knblob.pending-*
 *.knverify

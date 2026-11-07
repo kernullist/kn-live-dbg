@@ -4,12 +4,22 @@
 #include "ScannerListWindow.h"
 
 #include <cstdint>
+#include <atomic>
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
 class DeviceClient;
 class SymbolEngine;
+
+// One bounded UTF-8 capture per scan; request events refer to its digest.
+// A digest identifies content, not an authenticated collector or object lifetime.
+struct PendingIrpEvidenceArtifact
+{
+    std::vector<uint8_t> Bytes;
+    std::wstring Sha256;
+};
 
 struct PendingIrpThreadInput
 {
@@ -54,6 +64,7 @@ struct PendingIrpScanOptions
     uint32_t MaxIrps = 64;
     uint32_t MaxWalkNodes = 4096;
     bool ThreadInventoryComplete = false;
+    const std::atomic<bool>* Cancellation = nullptr;
 };
 
 struct PendingIrpStackObservation
@@ -96,6 +107,9 @@ struct PendingIrpScanResult
     uint64_t ScanStartedTickMs = 0;
     uint64_t ScanFinishedTickMs = 0;
     bool LayoutFromPdb = false;
+    bool RuntimeQualified = false;
+    std::wstring QualificationReason = L"schema_runtime_not_checked";
+    std::shared_ptr<const PendingIrpEvidenceArtifact> Evidence;
     bool CoverageComplete = false;
     // Repeated equal reads cannot establish a referenced IRP lifetime or exclude ABA reuse.
     bool ReferencedLifetime = false;

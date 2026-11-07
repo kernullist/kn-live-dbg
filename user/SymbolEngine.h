@@ -21,6 +21,7 @@ constexpr DWORD KNDBG_SYMTAG_BASE_CLASS = 18;
 
 class BrokeredTypeLayouts;
 class BrokeredSymbolIndexes;
+struct TypeSchemaPackage;
 
 struct KernelModuleInfo
 {
@@ -61,6 +62,9 @@ struct TypeLayoutInfo
     uint32_t UnavailableFields = 0;
     bool UnavailableFieldCountKnown = true;
     std::wstring SchemaPackageSha256;
+    // Retain the complete parent-accepted root package, including identities,
+    // field paths and gaps. Embedded layouts share the same immutable package.
+    std::shared_ptr<const TypeSchemaPackage> SchemaPackage;
 };
 
 struct TypeMatchInfo
