@@ -13,6 +13,12 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_private_symbol_index(self):
+        for name in ("symbols.KNSYMIDX", "symbols.knsymidx.pending-1"):
+            self.assertTrue(AUDIT.inspect(name, b"empty"))
+        self.assertIn("private-symbol-index", {row["rule"] for row in AUDIT.inspect("renamed.bin", b"KNSYMIDX" + b"\0" * 248)})
+        self.assertEqual(AUDIT.inspect("sample.cpp", b'const char* magic = "KNSYMIDX";'), [])
+
     def test_private_files(self):
         for name in (".env", ".env.production", "sub/.env.backup", "signing.pfx",
                      "capture.DMP", "auth.json", "mcp-endpoint.json", "sub/id_ed25519",

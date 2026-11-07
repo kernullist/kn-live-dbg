@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knsymidx", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -47,7 +47,7 @@ def path_rule(name: str) -> str | None:
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
+        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knsymidx", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
     ):
         return "private-container-or-capture"
     return None
@@ -79,6 +79,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     bad_path = path_rule(name)
     if bad_path:
         add(bad_path)
+    if data.startswith(b"KNSYMIDX"):
+        add("private-symbol-index")
     private_symbols = Path(name).suffix.lower() == ".pdb"
     if private_symbols and not allow_private_symbols:
         add("private-symbol-file")

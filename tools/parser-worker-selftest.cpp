@@ -74,6 +74,12 @@ namespace
             Write("incomplete", 10);
             return 17;
         }
+        if (mode == L"large-index")
+        {
+            const std::string block(65536, 'i');
+            for (size_t i = 0; i < 48; ++i) { if (!Write(block.data(), block.size())) { return 96; } }
+            return 0;
+        }
         if (mode == L"flood")
         {
             const std::string block(8192, 'x');
@@ -254,6 +260,15 @@ int wmain(int argc, wchar_t** argv)
     request.OutputLimit = 1024;
     result = RunParserWorker(request);
     Check(result.Status == L"output_limit" && result.Output.empty(), "output flood terminates without partial DTO");
+    request.OutputLimit = 2 * 1024 * 1024;
+    request.Arguments = {L"--child", L"large-index"};
+    result = RunParserWorker(request);
+    Check(result.Status == L"output_limit" && result.Output.empty(), "schema default still rejects a large symbol frame");
+    request.OutputLimit = 32 * 1024 * 1024;
+    result = RunParserWorker(request);
+    Check(result.Status == L"exited" && result.Output == std::string(3 * 1024 * 1024, 'i'), "explicit symbol output budget carries a frame above two MiB");
+    request.OutputLimit += 1;
+    Check(RunParserWorker(request).Status == L"invalid_request", "symbol output ceiling rejects excessive allocation budget");
     request.OutputLimit = 2 * 1024 * 1024;
     request.Arguments = {L"--child", L"hang"};
     request.TimeoutMs = 100;

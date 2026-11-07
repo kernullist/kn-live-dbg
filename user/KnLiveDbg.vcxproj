@@ -215,6 +215,10 @@
     <ClCompile Include="TypeSchemaBroker.cpp" />
     <ClCompile Include="BrokeredTypeLayouts.cpp" />
     <ClCompile Include="SymbolArtifactResolver.cpp" />
+    <ClCompile Include="SymbolIndex.cpp" />
+    <ClCompile Include="SymbolIndexBroker.cpp" />
+    <ClCompile Include="SymbolIndexGenerator.cpp" />
+    <ClCompile Include="BrokeredSymbolIndexes.cpp" />
     <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
@@ -385,6 +389,10 @@
     <ClInclude Include="TypeSchemaBroker.h" />
     <ClInclude Include="BrokeredTypeLayouts.h" />
     <ClInclude Include="SymbolArtifactResolver.h" />
+    <ClInclude Include="SymbolIndex.h" />
+    <ClInclude Include="SymbolIndexBroker.h" />
+    <ClInclude Include="BrokeredSymbolIndexes.h" />
+    <ClInclude Include="DiaArtifactSession.h" />
     <ClInclude Include="SymbolArtifactCache.h" />
     <ClInclude Include="SchemaArtifact.h" />
     <ClInclude Include="SchemaReadStream.h" />

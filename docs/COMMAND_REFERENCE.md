@@ -290,8 +290,17 @@ field paths must be unique. Recursive layout follows embedded members only, up t
 the schema's eight-component bound. Unavailable parsing fails without an in-process
 fallback. `dt` prints the schema hash, unchecked runtime-invariant status and any
 incomplete field coverage. Opaque layout IDs expire when symbol/module state or
-the bounded cache changes. Symbol lookup and type enumeration still use their
-existing in-process providers. See [live layout scope and cache limits](ARCHITECTURE.md#live-type-layout-broker).
+the bounded cache changes. See [live layout scope and cache limits](ARCHITECTURE.md#live-type-layout-broker).
+
+Startup symbol preload, `x`, nearest-symbol lookup and wildcard `dt` now query
+bounded metadata produced by a restricted symbol-index worker. Exact decorated
+names disambiguate overloaded functions; a bare name searches previously indexed
+modules. Failed acquisitions remain cached until a symbol-path or module refresh.
+`x` and wildcard `dt` report result limits and unavailable modules. Verbose type
+lists label `providerTypeId` separately from opaque layout IDs and show the index
+hash and unchecked runtime-invariant status. MCP `symbol.search` adds size
+availability, index hashes and a coverage note; incomplete results set `truncated`.
+See [index scope and limits](ARCHITECTURE.md#live-symbol-and-type-index-broker).
 
 ## Session and memory
 

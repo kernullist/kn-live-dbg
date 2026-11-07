@@ -72,7 +72,7 @@ namespace
         }
         return result;
     }
-    bool Download(const std::wstring& url, HANDLE file, uint64_t started)
+    bool Download(const std::wstring& url, HANDLE file, uint64_t started, uint64_t timeoutMs)
     {
         if (url.size() > 16000) { return false; }
         URL_COMPONENTS parts{};
@@ -100,7 +100,7 @@ namespace
             !WinHttpSetOption(request.Value, WINHTTP_OPTION_REDIRECT_POLICY, &redirects, sizeof(redirects)) ||
             !WinHttpSetOption(request.Value, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS, &maximumRedirects, sizeof(maximumRedirects)) ||
             !WinHttpSetOption(request.Value, WINHTTP_OPTION_REJECT_USERPWD_IN_URL, &rejectCredentials, sizeof(rejectCredentials)) ||
-            GetTickCount64() - started >= 60000 ||
+            GetTickCount64() - started >= timeoutMs ||
             !WinHttpSendRequest(request.Value, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(request.Value, nullptr)) { return false; }
         DWORD status = 0, size = sizeof(status);
@@ -111,7 +111,7 @@ namespace
         for (;;)
         {
             DWORD received = 0, written = 0;
-            if (GetTickCount64() - started >= 60000 || !WinHttpReadData(request.Value, buffer.data(),
+            if (GetTickCount64() - started >= timeoutMs || !WinHttpReadData(request.Value, buffer.data(),
                 static_cast<DWORD>(buffer.size()), &received)) { return false; }
             if (received == 0) { return total != 0 && FlushFileBuffers(file); }
             if (received > MaximumPdbBytes - total || !WriteFile(file, buffer.data(), received, &written, nullptr) || written != received)
@@ -121,14 +121,12 @@ namespace
     }
 }
 
-bool ResolveBrokeredTypeSchema(const std::wstring& executable, const std::wstring& image,
-    uint32_t expectedImageSize, const std::wstring& symbolPath, const std::wstring& typeName,
-    TypeSchemaPackage* package, std::wstring* error)
+bool ResolveSymbolArtifacts(const std::wstring& executable, const std::wstring& image,
+    uint32_t expectedImageSize, const std::wstring& symbolPath, const SymbolArtifactConsumer& consume, std::wstring* error, uint64_t timeoutMs)
 {
-    if (package == nullptr) { return false; }
-    *package = {};
-    if (error != nullptr) { *error = L"brokered type layout unavailable: no matching approved local or HTTPS PDB"; }
-    if (symbolPath.size() > 30000 || symbolPath.find(L'\0') != std::wstring::npos || expectedImageSize == 0) { return false; }
+    if (error != nullptr) { *error = L"brokered symbol artifacts unavailable: no matching approved local or HTTPS PDB"; }
+    if (!consume || symbolPath.size() > 30000 || symbolPath.find(L'\0') != std::wstring::npos || expectedImageSize == 0 ||
+        timeoutMs == 0 || timeoutMs > 60000) { return false; }
     const auto started = GetTickCount64();
     SchemaArtifact imageFile;
     executable_image::DiskPeMetadata metadata;
@@ -156,17 +154,18 @@ bool ResolveBrokeredTypeSchema(const std::wstring& executable, const std::wstrin
         }
     }
     std::set<std::wstring> tried;
+    AcceptedSymbolArtifacts accepted;
     const auto parse = [&](const std::wstring& pdb) -> bool
     {
         const auto elapsed = GetTickCount64() - started;
-        if (elapsed >= 60000 || !tried.insert(Lower(pdb)).second) { return false; }
-        TypeSchemaPackage result;
+        if (elapsed >= timeoutMs || !tried.insert(Lower(pdb)).second) { return false; }
+        AcceptedSymbolArtifacts result;
         std::wstring parseError;
-        if (!GenerateBrokeredTypeSchema(executable, imageFile.Path, pdb, typeName, &result, &parseError, 60000 - elapsed, nullptr, true))
+        if (!consume(imageFile.Path, pdb, timeoutMs - elapsed, &result, &parseError))
         { if (error != nullptr) { *error = std::move(parseError); } return false; }
         if (result.ImageSha256 != imageFile.Sha256 || !imageFile.Unchanged())
         { if (error != nullptr) { *error = L"module image artifact changed during schema resolution"; } return false; }
-        *package = std::move(result);
+        accepted = std::move(result);
         return true;
     };
     for (const auto& root : roots)
@@ -185,7 +184,7 @@ bool ResolveBrokeredTypeSchema(const std::wstring& executable, const std::wstrin
     }
     for (const auto& root : roots)
     {
-        if (root.Server.empty() || GetTickCount64() - started >= 60000) { continue; }
+        if (root.Server.empty() || GetTickCount64() - started >= timeoutMs) { continue; }
         std::filesystem::path base;
         if (!symbol_artifacts::LocalRoot(root.Cache, &base)) { continue; }
         const auto directory = base / name / index;
@@ -200,14 +199,31 @@ bool ResolveBrokeredTypeSchema(const std::wstring& executable, const std::wstrin
         if (!temporary.Create(final.wstring() + L".pending-" + suffix)) { continue; }
         auto server = root.Server;
         while (!server.empty() && server.back() == L'/') { server.pop_back(); }
-        if (!Download(server + L"/" + UrlSegment(name) + L"/" + index + L"/" + UrlSegment(name), temporary.File, started)) { continue; }
+        if (!Download(server + L"/" + UrlSegment(name) + L"/" + index + L"/" + UrlSegment(name), temporary.File, started, timeoutMs)) { continue; }
         temporary.Close();
         SchemaArtifact approved;
         if (!approved.Open(temporary.Path, MaximumPdbBytes) || !temporary.Same(approved.Handle()) ||
             !parse(temporary.Path)) { continue; }
-        if (approved.Sha256 != package->PdbSha256 || !symbol_artifacts::Publish(approved, final)) { *package = {}; continue; }
+        if (approved.Sha256 != accepted.PdbSha256 || !symbol_artifacts::Publish(approved, final)) { continue; }
         if (error != nullptr) { error->clear(); }
         return true;
     }
     return false;
+}
+
+bool ResolveBrokeredTypeSchema(const std::wstring& executable, const std::wstring& image,
+    uint32_t expectedImageSize, const std::wstring& symbolPath, const std::wstring& typeName,
+    TypeSchemaPackage* package, std::wstring* error)
+{
+    if (package == nullptr) { return false; }
+    *package = {};
+    TypeSchemaPackage result;
+    const auto consume = [&](const std::wstring& approvedImage, const std::wstring& pdb, uint64_t timeout,
+        AcceptedSymbolArtifacts* accepted, std::wstring* issue)
+    {
+        if (!GenerateBrokeredTypeSchema(executable, approvedImage, pdb, typeName, &result, issue, timeout, nullptr, true)) { return false; }
+        *accepted = {result.ImageSha256, result.PdbSha256}; return true;
+    };
+    if (!ResolveSymbolArtifacts(executable, image, expectedImageSize, symbolPath, consume, error)) { return false; }
+    *package = std::move(result); return true;
 }

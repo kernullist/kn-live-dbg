@@ -3,6 +3,7 @@
 #include "../user/SymbolArtifactResolver.h"
 #include "../user/SymbolArtifactCache.h"
 #include "../user/TypeSchemaBroker.h"
+#include "../user/SymbolIndex.h"
 #include "../user/ExecutableImage.h"
 #include "../user/McpJson.h"
 #include "live-type-fixture.h"
@@ -15,15 +16,16 @@ struct SymbolEngineTestAccess
 {
     static void Module(SymbolEngine& engine, const KernelModuleInfo& module)
     {
-        std::lock_guard<std::recursive_mutex> lock(engine.dbghelpMutex_);
+        std::lock_guard<std::recursive_mutex> lock(engine.symbolMutex_);
         std::lock_guard<std::mutex> modulesLock(engine.modulesMutex_);
-        engine.typeLayouts_->Clear();
+        engine.ClearMetadata();
         engine.modules_ = {module};
     }
 };
 namespace
 {
     unsigned Passed = 0, Failed = 0;
+    HMODULE InitialDbghelp = nullptr;
     void Check(bool condition, const char* description)
     {
         if (condition) { ++Passed; }
@@ -188,8 +190,9 @@ namespace
         Check(!engine.GetTypeFields(L"fixture-a!Absent", &fields, &size, &error) && fields.empty() && size == 0, "failed field API clears stale results");
         Check(engine.GetTypeFields(L"fixture-a!PdbIdentityFixture", &fields, &size, &error) && size == sizeof(PdbIdentityFixture) && !fields.empty(),
             "field API compatibility");
-        IMAGEHLP_MODULEW64 module{}; module.SizeOfStruct = sizeof(module);
-        Check(!SymGetModuleInfoW64(GetCurrentProcess(), base, &module), "type APIs never registered fixture with parent DbgHelp");
+        // ASan itself preloads DbgHelp before main; production references to
+        // the parser APIs are checked separately by the Release import oracle.
+        Check(GetModuleHandleW(L"dbghelp.dll") == InitialDbghelp, "type APIs preserve initial parent DbgHelp state");
         Check(GetModuleHandleW(L"msdia140.dll") == nullptr, "type APIs never loaded DIA into parent");
         engine.SetSymbolPath(root.wstring());
         Check(!engine.GetTypeLayoutById(base, originalId, L"", &layout, &error), "symbol-path reset invalidates IDs");
@@ -269,6 +272,8 @@ namespace
 }
 int wmain(int argc, wchar_t** argv)
 {
+    InitialDbghelp = GetModuleHandleW(L"dbghelp.dll");
+    if (argc > 1 && std::wstring(argv[1]) == L"--symbol-index-worker") { return RunSymbolIndexWorkerCommand(argc, argv); }
     if (argc > 1 && (std::wstring(argv[1]) == L"--schema-worker" || std::wstring(argv[1]) == L"--schema-live-worker"))
     { return RunTypeSchemaWorkerCommand(argc, argv); }
     if (argc == 4 && std::wstring(argv[1]) == L"--fetch-kernel")

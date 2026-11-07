@@ -1815,6 +1815,7 @@ static void AddEnumeratedCallbackRoots(
                 continue;
             }
 
+            if (warnings != nullptr && !error.empty()) { warnings->push_back(mask + L": " + error); }
             for (const SymbolMatchInfo& match : matches)
             {
                 if (match.Address == 0)

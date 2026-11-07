@@ -15,6 +15,8 @@ struct ParserWorkerRequest
     // Caller retains the source leases until this synchronous call returns.
     std::vector<HANDLE> ReadOnlyFiles;
     uint64_t TimeoutMs = 60000;
+    // Schema requests retain the 2 MiB default. Full symbol indexes explicitly
+    // opt into a larger bounded frame, never more than 32 MiB.
     size_t OutputLimit = 2 * 1024 * 1024;
     const std::atomic<bool>* Cancellation = nullptr;
 };

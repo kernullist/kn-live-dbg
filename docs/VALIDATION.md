@@ -7,6 +7,87 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Symbol index broker checkpoint: 2026-11-07
+
+This P05/W04 step removes parent DbgHelp/DIA parsing from startup preload,
+name/address lookup and symbol/type enumeration. Restricted workers return
+bounded artifact-bound indexes; repeated queries use parent metadata caches.
+The prior four layout APIs retain their separate schema broker. Native IOCTL ABI
+and the existing bare symbol-name return format are unchanged. See the
+[index boundary](ARCHITECTURE.md#live-symbol-and-type-index-broker).
+
+Adversarial review fixed private function names being returned as full
+prototypes, unsafe display of linker control prefixes, ambiguous overload/address
+selection, loss of partial enumeration coverage and a full admission ledger
+blocking reacquisition of an evicted existing module. A separate legacy-provider
+comparison exposed missing enums, typedefs and six type names omitted by global
+DIA enumeration. Bounded symbol-table traversal now includes those names; typedef
+size lookup follows at most eight metadata aliases. No additional actionable
+defects were found in the reviewed scope.
+
+Final Release EXE SHA-256:
+`b6cd0b435cc5ffee792a37dbaa9dc9fecce53136c127cda858683c1be96b5a56`.
+
+| Harness | SHA-256 |
+|---|---|
+| Symbol index, ASan | `d440c05e86244fb77026b915893bdffc6c5545015881eccd7e6f5db710d0a53a` |
+| Symbol index, Release | `96888d609ec6b501a1cf019779ab603cb4c93c6b687e3986702c484aecd25aea` |
+| Live layouts, ASan | `3512b3af717aaeecb7593b16a9fb4d8fc9d768e4e7c16751e0f14b07d86d4dcb` |
+| Parser worker, ASan | `bd50cea9f4d21110677eb25767fc940a26f0d63ed4bd90bcda3012addae1d535` |
+| Schema broker, ASan | `67513e056d180d70c9640c2b74ad80b805a455d4921b23a9c422d2ac8bb5fe85` |
+
+Validation used Windows 11 Pro x64 `10.0.28000`, NTFS, VS 2022 Build Tools
+17.14.60, MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. The final Release build
+passed with the existing C4744 warnings. Sources and binaries were held fixed
+for applicable runs. The final linked self-test ran alone after builds and other
+oracles completed.
+
+| Check | Result and scope |
+|---|---|
+| `tools/validate-symbol-index.ps1`, with and without `-Sanitize` | 69 controls passed in each mode: actual worker/API integration, static/private/exported/overloaded names, compiler enum/typedef/UDT sizes, strict framing and artifact mismatch rejection, parent provider isolation, LRU/reset/failure behavior, synthetic admission-ledger pressure with real reacquisition, partial results and unavailable-module ambiguity |
+| `tools/symbol-index-oracle.py <fixture-directory>` | Independent PE/RSDS/hash/framing reader matched four PE exports and two private linker-MAP addresses. The separate owned-fixture DbgHelp oracle's 263 type names and 131 known name/size pairs were all present. Final fixture index contained 452 symbol rows and 298 type rows; seven raw linker control prefixes had escaped display names |
+| Real kernel PDB, Release harness | 56,077 symbol rows and 2,669 type rows; six startup-preload, qualified/nearest lookup, type-list, repeated-query and parent-DIA controls passed. Initial acquisition was 4,219 ms and 10,000 cached lookups were 3,496 microseconds in this run; these observations are not a latency SLO |
+| Actual Release executable workers | Two owned-fixture index controls, two kernel-artifact index controls and two layout controls passed, including mismatched-PDB rejection |
+| `tools/validate-live-type-layout.ps1 -Sanitize` | 112 existing API/layout/read/cache controls passed against the final engine |
+| `tools/validate-parser-worker.ps1 -Sanitize` | 22 controls passed, including explicit 3 MiB output, retained default 2 MiB rejection and rejection above the 32 MiB ceiling |
+| `tools/validate-schema-broker.ps1 -Sanitize` | 73 approved-handle, identity, protocol and containment controls passed; its exercised code remained unchanged by the later index-only type-discovery fixes |
+| Offline schema CLI | 79 controls passed; one file-symlink case skipped. This does not close that environment gate |
+| Compiled contracts and documentation | 33 capability contracts / 261 routes passed; generated support matrix matched |
+| Final `--self-test all` | Timeline 28, MCP 102, KMON image reads 119, console 564, command audit 3,006 over 261 routes, remote protocol 68 and four connection-argument checks passed |
+| Publication classifier | 12 tests passed, including renamed binary symbol indexes |
+
+The real artifact pair was Windows kernel `10.0.28000.3231`, image SHA-256
+`0e04b67c16f05f14e046a275097769a29ca88692ce3278eebc39ad476d922a76`,
+and the retained 12,136,448-byte PDB with GUID/age
+`29542158dc36b6d41d7f2dd8cb7ce68a` / `1`, SHA-256
+`c9521a2a2a98793e7165a053be53c3eb425d5379655b72146b24ab638fc5fa51`.
+The installed provider SHA-256 was
+`9c06a43a03b413fc885bf05faf7974b3bb8f8248507b3b51fda6d9376eb7768b`.
+These checks bind disk artifacts, not the currently loaded kernel image.
+
+**The ASan kernel-PDB run remains unavailable.** The final instrumented worker
+exited 1 with no accepted rows. A diagnostic copy reported `Failed to mmap`
+and peak process commit of 536,858,624 bytes against the unchanged 536,870,912-byte
+job limit. Earlier diagnostics also reported failure to commit ASan shadow memory
+at that limit. The job limit and sanitizer quarantine were not relaxed. The
+successful Release kernel run and owned-fixture ASan checks do not turn this into
+a passing ASan kernel test. MSVC ASan also preloaded DbgHelp before `main` in a
+minimal independent probe; the ordinary Release probe did not. Parent tests
+therefore compare initial DbgHelp state and require DIA to remain unloaded.
+The final Release import table contains no DbgHelp symbol-parser imports, and
+SymbolEngine source has no parent provider calls.
+
+This completes the bounded SymbolEngine parser migration, not P05 or the full
+integration design. Enforced worker egress denial, authenticated distribution,
+loaded-image/anchor/runtime-invariant/lifetime binding, propagation into every
+typed observation and isolation of other parser families remain open. Enumeration
+is bounded metadata discovery, not a complete runtime-object inventory. Only this
+host and artifact pair were exercised; the full Release program was not ASan-built.
+Existing privacy-initialization and process-capture timing observations below remain
+unresolved. No driver/service load, reboot or host security-policy change was
+performed. Final targeted checks found no task processes or KnLiveDbg drivers;
+EFS remained OS-managed Manual/Running.
+
 ## Live type layout broker checkpoint: 2026-11-07
 
 This P05/W04 step migrates `GetTypeLayout`, `GetTypeLayoutById`, `GetTypeFields`

@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -18,8 +19,8 @@ constexpr DWORD KNDBG_SYMTAG_BASE_TYPE = 16;
 constexpr DWORD KNDBG_SYMTAG_TYPEDEF = 17;
 constexpr DWORD KNDBG_SYMTAG_BASE_CLASS = 18;
 
-struct IDiaDataSource;
 class BrokeredTypeLayouts;
+class BrokeredSymbolIndexes;
 
 struct KernelModuleInfo
 {
@@ -69,6 +70,8 @@ struct TypeMatchInfo
     uint64_t ModuleBase;
     ULONG TypeId;
     ULONG64 Size;
+    bool SizeKnown = false;
+    std::wstring SymbolIndexSha256;
 };
 
 struct SymbolMatchInfo
@@ -76,6 +79,8 @@ struct SymbolMatchInfo
     uint64_t Address;
     uint32_t Size;
     std::wstring Name;
+    bool SizeKnown = false;
+    std::wstring SymbolIndexSha256;
 };
 
 class SymbolEngine
@@ -110,30 +115,24 @@ private:
     friend struct SymbolEngineTestAccess;
     bool EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error);
     std::wstring ResolveModuleImagePath(const KernelModuleInfo& module) const;
-    bool EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error);
-    bool EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error);
+    bool EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error, uint64_t timeoutMs = 60000);
+    bool ReadyModules(std::wstring* error);
+    void ClearMetadata();
     bool ShouldSearchTypeModule(const KernelModuleInfo& module, const std::wstring& moduleFilter) const;
-    bool ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error);
-    bool LoadDiaDataForModule(const KernelModuleInfo& module, IDiaDataSource* source, std::wstring* error);
-    bool EnumerateTypesWithDia(
-        const KernelModuleInfo& module,
-        const std::wstring& typeMask,
-        size_t limit,
-        std::vector<TypeMatchInfo>* matches,
-        bool* stoppedAtLimit,
-        std::wstring* error);
-
-    HANDLE process_;
     bool ready_;
     std::wstring symbolPath_;
     mutable std::mutex modulesMutex_;
-    // DbgHelp and DIA are single-threaded; the kmon worker resolves
-    // offsets while a hunt command runs on the engine thread, so every
-    // entry point that can reach Sym*/DIA takes this lock first. Lock
-    // order is always dbghelpMutex_ -> modulesMutex_.
-    mutable std::recursive_mutex dbghelpMutex_;
+    // Serialize broker requests and cache generations. Lock order is always
+    // symbolMutex_ -> modulesMutex_; the parent never invokes a PDB provider.
+    mutable std::recursive_mutex symbolMutex_;
     std::vector<KernelModuleInfo> modules_;
     // Broker-accepted artifact layouts, not runtime-object validation. Protected
-    // by dbghelpMutex_; IDs expire on eviction or symbol/module-state changes.
+    // by symbolMutex_; IDs expire on eviction or symbol/module-state changes.
     std::unique_ptr<BrokeredTypeLayouts> typeLayouts_;
+    std::unique_ptr<BrokeredSymbolIndexes> symbolIndexes_;
+    std::set<uint64_t> indexedModules_;
+    std::set<uint64_t> admittedModules_;
+    // Failed acquisitions are not retried per address in a scanner hot loop.
+    // SetSymbolPath/LoadKernelModules/Initialize starts a new generation.
+    std::map<uint64_t, std::wstring> indexFailures_;
 };

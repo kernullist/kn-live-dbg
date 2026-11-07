@@ -1,11 +1,9 @@
 #include "SymbolEngine.h"
 #include "BrokeredTypeLayouts.h"
+#include "BrokeredSymbolIndexes.h"
+#include "SymbolIndexBroker.h"
 #include "SymbolArtifactResolver.h"
-#include "PdbIdentity.h"
-#include "DiaTypeLayout.h"
-#include "ExecutableImage.h"
 
-#include <dia2.h>
 #include <winternl.h>
 
 #include <algorithm>
@@ -16,9 +14,6 @@
 #include <new>
 #include <sstream>
 
-#pragma comment(lib, "Dbghelp.lib")
-#pragma comment(lib, "diaguids.lib")
-#pragma comment(lib, "OleAut32.lib")
 
 typedef LONG NTSTATUS;
 
@@ -61,12 +56,7 @@ typedef NTSTATUS (NTAPI* NtQuerySystemInformationPtr)(
     ULONG SystemInformationLength,
     PULONG ReturnLength);
 
-typedef HRESULT (STDAPICALLTYPE* DllGetClassObjectPtr)(REFCLSID classId, REFIID interfaceId, LPVOID* object);
-
-static HMODULE g_DiaLocalModule = nullptr;
-static std::wstring g_DiaLocalModulePath;
-
-static std::wstring DbgHelpErrorText(const wchar_t* prefix, DWORD error)
+static std::wstring SystemErrorText(const wchar_t* prefix, DWORD error)
 {
     wchar_t buffer[512] = {};
     FormatMessageW(
@@ -117,70 +107,6 @@ static DWORD EnableModuleQueryPrivilege()
     }
     CloseHandle(token);
     return status;
-}
-
-static std::wstring LoadedModulePathText(const wchar_t* moduleName)
-{
-    std::wstring result = L"not-loaded";
-
-    do
-    {
-        if (moduleName == nullptr || moduleName[0] == L'\0')
-        {
-            break;
-        }
-
-        HMODULE module = GetModuleHandleW(moduleName);
-        if (module == nullptr)
-        {
-            break;
-        }
-
-        wchar_t path[MAX_PATH] = {};
-        DWORD length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
-        if (length == 0)
-        {
-            result = L"loaded-path-unavailable";
-            break;
-        }
-
-        if (length >= static_cast<DWORD>(std::size(path)))
-        {
-            result = L"loaded-path-truncated";
-            break;
-        }
-
-        result = path;
-    } while (false);
-
-    return result;
-}
-
-static std::wstring GetExecutableDirectory()
-{
-    std::wstring result;
-
-    do
-    {
-        wchar_t path[MAX_PATH] = {};
-        DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-        if (length == 0 || length >= static_cast<DWORD>(std::size(path)))
-        {
-            break;
-        }
-
-        result = path;
-        size_t slash = result.find_last_of(L"\\/");
-        if (slash == std::wstring::npos)
-        {
-            result.clear();
-            break;
-        }
-
-        result.resize(slash);
-    } while (false);
-
-    return result;
 }
 
 static std::wstring AsWide(const char* value)
@@ -249,7 +175,7 @@ static bool IsNtKernelImageName(const std::wstring& imageName)
     return result;
 }
 
-static std::wstring GetDbgHelpModuleName(const KernelModuleInfo& module)
+static std::wstring SymbolModuleName(const KernelModuleInfo& module)
 {
     std::wstring name = module.ImageName;
 
@@ -261,52 +187,6 @@ static std::wstring GetDbgHelpModuleName(const KernelModuleInfo& module)
             break;
         }
     } while (false);
-
-    return name;
-}
-
-static bool IsLoadedCodeViewSymbolType(SYM_TYPE type)
-{
-    return type == SymPdb || type == SymDia || type == SymCv;
-}
-
-static std::wstring SymbolTypeName(SYM_TYPE type)
-{
-    std::wstring name;
-
-    switch (type)
-    {
-    case SymNone:
-        name = L"SymNone";
-        break;
-    case SymCoff:
-        name = L"SymCoff";
-        break;
-    case SymCv:
-        name = L"SymCv";
-        break;
-    case SymPdb:
-        name = L"SymPdb";
-        break;
-    case SymExport:
-        name = L"SymExport";
-        break;
-    case SymDeferred:
-        name = L"SymDeferred";
-        break;
-    case SymSym:
-        name = L"SymSym";
-        break;
-    case SymDia:
-        name = L"SymDia";
-        break;
-    case SymVirtual:
-        name = L"SymVirtual";
-        break;
-    default:
-        name = L"SymUnknown";
-        break;
-    }
 
     return name;
 }
@@ -468,378 +348,6 @@ static bool TypeNameMatchesNoCase(const std::wstring& value, const std::wstring&
     return matches;
 }
 
-template <typename T>
-static void ReleaseCom(T*& value)
-{
-    if (value != nullptr)
-    {
-        value->Release();
-        value = nullptr;
-    }
-}
-
-static std::wstring HResultText(const wchar_t* prefix, HRESULT hr)
-{
-    std::wstringstream stream;
-    stream << prefix << L": 0x" << std::hex << static_cast<unsigned long>(hr);
-    return stream.str();
-}
-
-static bool CreateDiaDataSourceFromModule(HMODULE module, IDiaDataSource** source, std::wstring* error)
-{
-    bool ok = false;
-
-    do
-    {
-        if (source == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA data source output";
-            }
-            break;
-        }
-
-        *source = nullptr;
-
-        if (module == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA module handle";
-            }
-            break;
-        }
-
-        FARPROC proc = GetProcAddress(module, "DllGetClassObject");
-        if (proc == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"GetProcAddress DllGetClassObject failed", GetLastError());
-            }
-            break;
-        }
-
-        auto getClassObject = reinterpret_cast<DllGetClassObjectPtr>(proc);
-        IClassFactory* factory = nullptr;
-        HRESULT hr = getClassObject(CLSID_DiaSource, IID_IClassFactory, reinterpret_cast<void**>(&factory));
-        if (FAILED(hr) || factory == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"DllGetClassObject CLSID_DiaSource failed", hr);
-            }
-            ReleaseCom(factory);
-            break;
-        }
-
-        hr = factory->CreateInstance(nullptr, __uuidof(IDiaDataSource), reinterpret_cast<void**>(source));
-        ReleaseCom(factory);
-        if (FAILED(hr) || *source == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"IClassFactory::CreateInstance IDiaDataSource failed", hr);
-            }
-            ReleaseCom(*source);
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
-}
-
-static bool CreateDiaDataSource(IDiaDataSource** source, std::wstring* provider, std::wstring* error)
-{
-    bool ok = false;
-
-    do
-    {
-        if (source == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA data source output";
-            }
-            break;
-        }
-
-        *source = nullptr;
-        if (provider != nullptr)
-        {
-            provider->clear();
-        }
-
-        HRESULT hr = CoCreateInstance(
-            CLSID_DiaSource,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            __uuidof(IDiaDataSource),
-            reinterpret_cast<void**>(source));
-        if (SUCCEEDED(hr) && *source != nullptr)
-        {
-            if (provider != nullptr)
-            {
-                *provider = L"registered COM";
-            }
-            ok = true;
-            break;
-        }
-
-        ReleaseCom(*source);
-        std::wstring coCreateError = HResultText(L"CoCreateInstance CLSID_DiaSource failed", hr);
-
-        if (g_DiaLocalModule != nullptr)
-        {
-            std::wstring localError;
-            if (CreateDiaDataSourceFromModule(g_DiaLocalModule, source, &localError))
-            {
-                if (provider != nullptr)
-                {
-                    *provider = L"local " + g_DiaLocalModulePath;
-                }
-                ok = true;
-                break;
-            }
-
-            if (error != nullptr)
-            {
-                *error = coCreateError + L"; local DIA fallback failed: " + localError;
-            }
-            break;
-        }
-
-        std::wstring exeDir = GetExecutableDirectory();
-        if (exeDir.empty())
-        {
-            if (error != nullptr)
-            {
-                *error = coCreateError + L"; local DIA fallback failed: executable directory unavailable";
-            }
-            break;
-        }
-
-        const wchar_t* candidates[] =
-        {
-            L"msdia140.dll",
-            L"msdia150.dll"
-        };
-
-        std::wstring lastLocalError = L"no local msdia dll found";
-        for (const wchar_t* candidate : candidates)
-        {
-            std::wstring path = exeDir + L"\\" + candidate;
-            DWORD attributes = GetFileAttributesW(path.c_str());
-            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-            {
-                continue;
-            }
-
-            HMODULE module = LoadLibraryW(path.c_str());
-            if (module == nullptr)
-            {
-                lastLocalError = path + L": " + DbgHelpErrorText(L"LoadLibraryW DIA failed", GetLastError());
-                continue;
-            }
-
-            std::wstring createError;
-            if (!CreateDiaDataSourceFromModule(module, source, &createError))
-            {
-                lastLocalError = path + L": " + createError;
-                FreeLibrary(module);
-                continue;
-            }
-
-            g_DiaLocalModule = module;
-            g_DiaLocalModulePath = path;
-            if (provider != nullptr)
-            {
-                *provider = L"local " + path;
-            }
-            ok = true;
-            break;
-        }
-
-        if (!ok && error != nullptr)
-        {
-            *error = coCreateError + L"; local DIA fallback failed: " + lastLocalError;
-        }
-    } while (false);
-
-    return ok;
-}
-
-static std::wstring BstrToWide(BSTR value)
-{
-    std::wstring result;
-
-    if (value != nullptr)
-    {
-        result.assign(value, SysStringLen(value));
-    }
-
-    return result;
-}
-
-static std::wstring DiaSymbolName(IDiaSymbol* symbol)
-{
-    std::wstring name;
-    BSTR rawName = nullptr;
-
-    if (symbol != nullptr && SUCCEEDED(symbol->get_name(&rawName)))
-    {
-        name = BstrToWide(rawName);
-    }
-
-    if (rawName != nullptr)
-    {
-        SysFreeString(rawName);
-    }
-
-    return name;
-}
-
-static std::wstring GetLoadedPdbPath(HANDLE process, uint64_t moduleBase)
-{
-    std::wstring path;
-
-    do
-    {
-        if (moduleBase == 0)
-        {
-            break;
-        }
-
-        IMAGEHLP_MODULEW64 moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (!SymGetModuleInfoW64(process, moduleBase, &moduleInfo))
-        {
-            break;
-        }
-
-        if (moduleInfo.LoadedPdbName[0] != L'\0')
-        {
-            path = moduleInfo.LoadedPdbName;
-        }
-    } while (false);
-
-    return path;
-}
-
-typedef struct _KNDBG_FORCE_SYMBOL_LOAD_CONTEXT
-{
-    bool SeenSymbol;
-} KNDBG_FORCE_SYMBOL_LOAD_CONTEXT;
-
-static BOOL CALLBACK KnDbgForceSymbolLoadCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
-{
-    UNREFERENCED_PARAMETER(SymbolInfo);
-    UNREFERENCED_PARAMETER(SymbolSize);
-
-    auto context = reinterpret_cast<KNDBG_FORCE_SYMBOL_LOAD_CONTEXT*>(UserContext);
-    if (context != nullptr)
-    {
-        context->SeenSymbol = true;
-    }
-
-    return FALSE;
-}
-
-SymbolEngine::SymbolEngine() :
-    process_(GetCurrentProcess()),
-    ready_(false),
-    symbolPath_(L"SRV*https://msdl.microsoft.com/download/symbols"),
-    typeLayouts_(std::make_unique<BrokeredTypeLayouts>())
-{
-}
-
-SymbolEngine::~SymbolEngine()
-{
-    Shutdown();
-}
-
-bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* error)
-{
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
-    {
-        Shutdown();
-
-        symbolPath_ = symbolPath;
-        // Optional dt field filters are probed as symbols. A missing bare name
-        // must not download PDBs for every deferred module before it can fail.
-        // Qualified module!symbol requests still load their module on demand.
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES |
-            SYMOPT_EXACT_SYMBOLS | SYMOPT_NO_UNQUALIFIED_LOADS);
-
-        if (!SymInitializeW(process_, symbolPath_.c_str(), FALSE))
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymInitializeW failed", GetLastError());
-            }
-            break;
-        }
-
-        ready_ = true;
-        ok = true;
-    } while (false);
-
-    return ok;
-}
-
-void SymbolEngine::Shutdown()
-{
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_->Clear();
-    if (ready_)
-    {
-        SymCleanup(process_);
-        ready_ = false;
-    }
-
-    std::lock_guard<std::mutex> lock(modulesMutex_);
-    modules_.clear();
-}
-
-bool SymbolEngine::IsReady() const
-{
-    return ready_;
-}
-
-const std::wstring& SymbolEngine::SymbolPath() const
-{
-    return symbolPath_;
-}
-
-void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
-{
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_->Clear();
-    symbolPath_ = symbolPath;
-
-    if (ready_)
-    {
-        SymSetSearchPathW(process_, symbolPath_.c_str());
-    }
-}
-
-std::vector<KernelModuleInfo> SymbolEngine::Modules() const
-{
-    return CopyModules();
-}
-
-std::vector<KernelModuleInfo> SymbolEngine::CopyModules() const
-{
-    std::lock_guard<std::mutex> lock(modulesMutex_);
-    return modules_;
-}
-
 bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error)
 {
     bool ok = false;
@@ -863,7 +371,7 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
         {
             if (error != nullptr)
             {
-                *error = DbgHelpErrorText(L"GetModuleHandleW ntdll failed", GetLastError());
+                *error = SystemErrorText(L"GetModuleHandleW ntdll failed", GetLastError());
             }
             break;
         }
@@ -873,7 +381,7 @@ bool SymbolEngine::EnumKernelModules(std::vector<KernelModuleInfo>* modules, std
         {
             if (error != nullptr)
             {
-                *error = DbgHelpErrorText(L"GetProcAddress NtQuerySystemInformation failed", GetLastError());
+                *error = SystemErrorText(L"GetProcAddress NtQuerySystemInformation failed", GetLastError());
             }
             break;
         }
@@ -1009,1082 +517,256 @@ std::wstring SymbolEngine::ResolveModuleImagePath(const KernelModuleInfo& module
     return result;
 }
 
-bool SymbolEngine::EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error)
+SymbolEngine::SymbolEngine() : ready_(false), symbolPath_(L"SRV*https://msdl.microsoft.com/download/symbols"),
+    typeLayouts_(std::make_unique<BrokeredTypeLayouts>()), symbolIndexes_(std::make_unique<BrokeredSymbolIndexes>()) {}
+SymbolEngine::~SymbolEngine() { Shutdown(); }
+void SymbolEngine::ClearMetadata()
+{ typeLayouts_->Clear(); symbolIndexes_->Clear(); indexedModules_.clear(); admittedModules_.clear(); indexFailures_.clear(); }
+bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* error)
 {
-    bool ok = false;
-
-    do
-    {
-        if (module.Base == 0)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid module base";
-            }
-            break;
-        }
-
-        IMAGEHLP_MODULEW64 moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
-        {
-            if (moduleInfo.SymType != SymNone)
-            {
-                ok = true;
-                break;
-            }
-
-            typeLayouts_->Clear();
-            SymUnloadModule64(process_, module.Base);
-        }
-
-        std::wstring imagePath = ResolveModuleImagePath(module);
-        std::wstring moduleName = GetDbgHelpModuleName(module);
-
-        typeLayouts_->Clear();
-        SetLastError(ERROR_SUCCESS);
-        DWORD64 loaded = SymLoadModuleExW(
-            process_,
-            nullptr,
-            imagePath.empty() ? nullptr : imagePath.c_str(),
-            moduleName.empty() ? nullptr : moduleName.c_str(),
-            module.Base,
-            module.Size,
-            nullptr,
-            0);
-
-        DWORD lastError = GetLastError();
-        if (loaded == 0 && lastError != ERROR_SUCCESS)
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymLoadModuleExW failed", lastError);
-            }
-            break;
-        }
-
-        moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (!SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
-        {
-            lastError = GetLastError();
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymGetModuleInfoW64 failed", lastError);
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    Shutdown(); symbolPath_ = symbolPath; ready_ = true;
+    if (error != nullptr) { error->clear(); } return true;
 }
-
-bool SymbolEngine::EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error)
+void SymbolEngine::Shutdown()
 {
-    bool ok = false;
-
-    do
-    {
-        if (!EnsureModuleLoaded(module, error))
-        {
-            break;
-        }
-
-        IMAGEHLP_MODULEW64 moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo) &&
-            IsLoadedCodeViewSymbolType(moduleInfo.SymType))
-        {
-            ok = true;
-            break;
-        }
-
-        std::wstring reloadError;
-        if (ReloadModuleWithImmediateSymbols(module, &reloadError))
-        {
-            ok = true;
-            break;
-        }
-
-        KNDBG_FORCE_SYMBOL_LOAD_CONTEXT context = {};
-        SetLastError(ERROR_SUCCESS);
-        BOOL enumOk = SymEnumSymbolsW(process_, module.Base, L"*", KnDbgForceSymbolLoadCallback, &context);
-        DWORD lastError = GetLastError();
-
-        moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (SymGetModuleInfoW64(process_, module.Base, &moduleInfo) &&
-            IsLoadedCodeViewSymbolType(moduleInfo.SymType))
-        {
-            ok = true;
-            break;
-        }
-
-        if (error != nullptr)
-        {
-            std::wstringstream stream;
-            stream << L"CodeView/PDB symbols were not loaded for " << GetDbgHelpModuleName(module)
-                   << L" symType=" << static_cast<int>(moduleInfo.SymType)
-                   << L" (" << SymbolTypeName(moduleInfo.SymType) << L")";
-            if (moduleInfo.LoadedPdbName[0] != L'\0')
-            {
-                stream << L" pdb=" << moduleInfo.LoadedPdbName;
-            }
-            if (!reloadError.empty())
-            {
-                stream << L"; reload=" << reloadError;
-            }
-            if (!enumOk && lastError != ERROR_SUCCESS)
-            {
-                stream << L"; " << DbgHelpErrorText(L"SymEnumSymbolsW force load failed", lastError);
-            }
-            stream << L"; dbghelp=" << LoadedModulePathText(L"dbghelp.dll")
-                   << L"; symsrv=" << LoadedModulePathText(L"symsrv.dll");
-            *error = stream.str();
-        }
-    } while (false);
-
-    return ok;
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    ClearMetadata(); ready_ = false;
+    std::lock_guard<std::mutex> modulesLock(modulesMutex_); modules_.clear();
 }
-
-bool SymbolEngine::ShouldSearchTypeModule(const KernelModuleInfo& module, const std::wstring& moduleFilter) const
+bool SymbolEngine::IsReady() const
+{ std::lock_guard<std::recursive_mutex> lock(symbolMutex_); return ready_; }
+const std::wstring& SymbolEngine::SymbolPath() const { return symbolPath_; }
+void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
+{ std::lock_guard<std::recursive_mutex> lock(symbolMutex_); ClearMetadata(); symbolPath_ = symbolPath; }
+std::vector<KernelModuleInfo> SymbolEngine::Modules() const { return CopyModules(); }
+std::vector<KernelModuleInfo> SymbolEngine::CopyModules() const
+{ std::lock_guard<std::mutex> lock(modulesMutex_); return modules_; }
+bool SymbolEngine::ReadyModules(std::wstring* error)
 {
-    if (!moduleFilter.empty())
-    {
-        return ModuleNameMatches(module.ImageName, moduleFilter);
-    }
-    // Scanner fallbacks commonly retry an absent nt!type as a bare type.
-    // Do not turn that fallback into downloads for every deferred driver.
-    // Explicit module!type requests still load their requested module.
-    IMAGEHLP_MODULEW64 info = {};
-    info.SizeOfStruct = sizeof(info);
-    return SymGetModuleInfoW64(process_, module.Base, &info) &&
-        IsLoadedCodeViewSymbolType(info.SymType);
+    if (!ready_ && !Initialize(symbolPath_, error)) { return false; }
+    return !modules_.empty() || LoadKernelModules(error);
 }
-
-bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& module, std::wstring* error)
-{
-    bool ok = false;
-    DWORD originalOptions = SymGetOptions();
-    bool restoreOptions = false;
-
-    do
-    {
-        std::wstring imagePath = ResolveModuleImagePath(module);
-        if (imagePath.empty())
-        {
-            if (error != nullptr)
-            {
-                *error = L"Module image path is empty";
-            }
-            break;
-        }
-
-        DWORD immediateOptions = originalOptions & ~SYMOPT_DEFERRED_LOADS;
-        SymSetOptions(immediateOptions);
-        restoreOptions = true;
-
-        typeLayouts_->Clear();
-        SymUnloadModule64(process_, module.Base);
-
-        std::wstring moduleName = GetDbgHelpModuleName(module);
-        SetLastError(ERROR_SUCCESS);
-        DWORD64 loaded = SymLoadModuleExW(
-            process_,
-            nullptr,
-            imagePath.c_str(),
-            moduleName.empty() ? nullptr : moduleName.c_str(),
-            module.Base,
-            module.Size,
-            nullptr,
-            0);
-
-        DWORD lastError = GetLastError();
-        if (loaded == 0 && lastError != ERROR_SUCCESS)
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymLoadModuleExW immediate failed", lastError);
-            }
-            break;
-        }
-
-        IMAGEHLP_MODULEW64 moduleInfo = {};
-        moduleInfo.SizeOfStruct = sizeof(moduleInfo);
-        if (!SymGetModuleInfoW64(process_, module.Base, &moduleInfo))
-        {
-            lastError = GetLastError();
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymGetModuleInfoW64 immediate failed", lastError);
-            }
-            break;
-        }
-
-        if (!IsLoadedCodeViewSymbolType(moduleInfo.SymType))
-        {
-            if (error != nullptr)
-            {
-                std::wstringstream stream;
-                stream << L"immediate load symType=" << static_cast<int>(moduleInfo.SymType)
-                       << L" (" << SymbolTypeName(moduleInfo.SymType) << L")";
-                if (moduleInfo.LoadedPdbName[0] != L'\0')
-                {
-                    stream << L" pdb=" << moduleInfo.LoadedPdbName;
-                }
-                stream << L" image=" << imagePath;
-                *error = stream.str();
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    if (restoreOptions)
-    {
-        SymSetOptions(originalOptions);
-    }
-
-    return ok;
-}
-
 bool SymbolEngine::LoadKernelModules(std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_->Clear();
-    bool ok = false;
-
-    do
-    {
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        std::vector<KernelModuleInfo> modules;
-        if (!EnumKernelModules(&modules, error))
-        {
-            break;
-        }
-
-        for (const KernelModuleInfo& module : modules)
-        {
-            EnsureModuleLoaded(module, nullptr);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(modulesMutex_);
-            modules_ = std::move(modules);
-        }
-        ok = true;
-    } while (false);
-
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (!ready_ && !Initialize(symbolPath_, error)) { return false; }
+    ClearMetadata();
+    std::vector<KernelModuleInfo> discovered;
+    const bool ok = EnumKernelModules(&discovered, error);
+    std::lock_guard<std::mutex> modulesLock(modulesMutex_);
+    modules_ = std::move(discovered);
+    if (ok && error != nullptr) { error->clear(); }
     return ok;
 }
-
+bool SymbolEngine::EnsureModuleSymbolsLoaded(const KernelModuleInfo& module, std::wstring* error, uint64_t timeoutMs)
+{
+    if (error != nullptr) { error->clear(); }
+    if (symbolIndexes_->Contains(module.Base)) { return true; }
+    const auto failed = indexFailures_.find(module.Base);
+    if (failed != indexFailures_.end())
+    { if (error != nullptr) { *error = failed->second + L"; cached until symbol/module refresh"; } return false; }
+    if (module.Base == 0 || module.Size == 0 || module.Size > UINT64_MAX - module.Base || timeoutMs == 0 ||
+        (admittedModules_.count(module.Base) == 0 && admittedModules_.size() >= 512))
+    { if (error != nullptr) { *error = L"invalid module range or symbol generation budget exhausted"; } return false; }
+    std::wstring issue;
+    try
+    {
+        // An evicted entry already belongs to this generation. Reacquisition
+        // must not consume another identity slot or be blocked by a full ledger.
+        admittedModules_.insert(module.Base);
+        std::vector<wchar_t> path(32768);
+        const auto count = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        SymbolIndex index;
+        if (count != 0 && count < path.size() && ResolveBrokeredSymbolIndex(std::wstring(path.data(), count),
+            ResolveModuleImagePath(module), module.Size, symbolPath_, &index, &issue, timeoutMs))
+        {
+            if (symbolIndexes_->Insert(module.Base, std::move(index)))
+            { indexedModules_.insert(module.Base); return true; }
+            issue = L"symbol index exceeds retained metadata budget";
+        }
+    }
+    catch (const std::exception&) { issue = L"symbol index metadata allocation failed"; }
+    if (issue.empty()) { issue = L"isolated symbol index unavailable"; }
+    if (indexFailures_.size() < 512) { indexFailures_[module.Base] = issue; }
+    if (error != nullptr) { *error = issue; } return false;
+}
+bool SymbolEngine::ShouldSearchTypeModule(const KernelModuleInfo& module, const std::wstring& filter) const
+{
+    return filter.empty() ? IsNtKernelImageName(module.ImageName) || indexedModules_.count(module.Base) != 0 :
+        ModuleNameMatches(module.ImageName, filter);
+}
 bool SymbolEngine::PreloadKernelSymbols(size_t* loadedCount, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (loadedCount != nullptr) { *loadedCount = 0; }
+    if (!ReadyModules(error)) { return false; }
+    size_t loaded = 0;
+    std::wstring issue = L"kernel image was not found in the loaded module list";
+    for (const auto& module : modules_)
     {
-        if (loadedCount != nullptr)
-        {
-            *loadedCount = 0;
-        }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        if (modules_.empty())
-        {
-            if (!LoadKernelModules(error))
-            {
-                break;
-            }
-        }
-
-        bool sawKernelImage = false;
-        std::wstring lastError;
-        size_t localCount = 0;
-
-        for (const KernelModuleInfo& module : modules_)
-        {
-            if (!IsNtKernelImageName(module.ImageName))
-            {
-                continue;
-            }
-
-            sawKernelImage = true;
-            std::wstring localError;
-            if (!EnsureModuleSymbolsLoaded(module, &localError))
-            {
-                lastError = localError;
-                continue;
-            }
-
-            ++localCount;
-        }
-
-        if (!sawKernelImage)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Kernel image was not found in the loaded module list";
-            }
-            break;
-        }
-
-        if (localCount == 0)
-        {
-            if (error != nullptr)
-            {
-                *error = lastError.empty() ? L"Kernel symbols were not loaded" : lastError;
-            }
-            break;
-        }
-
-        if (loadedCount != nullptr)
-        {
-            *loadedCount = localCount;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+        if (IsNtKernelImageName(module.ImageName) && EnsureModuleSymbolsLoaded(module, &issue)) { ++loaded; }
+    }
+    if (loadedCount != nullptr) { *loadedCount = loaded; }
+    if (error != nullptr) { *error = loaded != 0 ? L"" : issue; } return loaded != 0;
 }
-
-bool SymbolEngine::LoadDiaDataForModule(const KernelModuleInfo& module, IDiaDataSource* source, std::wstring* error)
+namespace
 {
-    bool ok = false;
-
-    do
+    bool SplitSymbolQuery(const std::wstring& text, std::wstring* module, std::wstring* leaf, bool pattern)
     {
-        if (source == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA data source";
-            }
-            break;
-        }
-
-        IMAGEHLP_MODULEW64 loaded{};
-        loaded.SizeOfStruct = sizeof(loaded);
-        const bool hasLoaded = SymGetModuleInfoW64(process_, module.Base, &loaded) != FALSE;
-        if (hasLoaded && !symbol_identity::ModuleRecordMatches(loaded, module.Base, module.Size))
-        {
-            if (error != nullptr)
-            {
-                *error = L"DIA rejected unmatched module symbol identity";
-            }
-            break;
-        }
-        auto expected = symbol_identity::FromMatchedModule(loaded);
-        const auto imagePath = ResolveModuleImagePath(module);
-        executable_image::DiskPeMetadata image;
-        bool imageQualified = false;
-        if (!expected.Valid())
-        {
-            imageQualified = !imagePath.empty() && executable_image::ReadDiskPeMetadata(imagePath, &image, nullptr) &&
-                image.HasPdbIdentity && image.SizeOfImage == module.Size &&
-                (!hasLoaded || ((loaded.ImageSize == 0 || loaded.ImageSize == image.SizeOfImage) &&
-                    (loaded.TimeDateStamp == 0 || loaded.TimeDateStamp == image.TimeDateStamp) &&
-                    (loaded.CheckSum == 0 || loaded.CheckSum == image.CheckSum)));
-            if (!imageQualified)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"DIA expected PDB identity is unavailable or the image changed";
-                }
-                break;
-            }
-            expected.Guid = image.PdbGuid;
-            expected.Age = image.PdbAge;
-        }
-        if (!expected.Valid())
-        {
-            if (error != nullptr)
-            {
-                *error = L"DIA expected PDB signature or age is unavailable";
-            }
-            break;
-        }
-        const auto pdbPath = GetLoadedPdbPath(process_, module.Base);
-        HRESULT hr = E_FAIL;
-        if (!pdbPath.empty())
-        {
-            hr = symbol_identity::LoadMatchingPdb(source, pdbPath, expected);
-        }
-        else if (!imagePath.empty())
-        {
-            hr = source->loadDataForExe(imagePath.c_str(), symbolPath_.c_str(), nullptr);
-            if (hr == S_OK && !symbol_identity::VerifyDiaIdentity(source, expected))
-            {
-                hr = HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
-            }
-        }
-        if (hr != S_OK || (imageQualified && !executable_image::DiskReferenceIdentityMatches(imagePath, image)))
-        {
-            if (error != nullptr)
-            {
-                *error = hr == S_OK ? L"DIA image identity changed during symbol loading" :
-                    HResultText(L"DIA PDB identity validation failed", hr);
-            }
-            break;
-        }
-        ok = true;
-        if (error != nullptr)
-        {
-            error->clear();
-        }
-    } while (false);
-
-    return ok;
+        if (text.size() > 2048 || text.find(L'\0') != std::wstring::npos) { return false; }
+        const auto bang = text.find(L'!');
+        *module = bang == std::wstring::npos ? L"" : text.substr(0, bang);
+        *leaf = bang == std::wstring::npos ? text : text.substr(bang + 1);
+        if (pattern && leaf->empty()) { *leaf = L"*"; }
+        return !leaf->empty() && leaf->size() <= 1024 && leaf->find(L'!') == std::wstring::npos &&
+            (bang == std::wstring::npos || !module->empty());
+    }
+    uint64_t QueryRemaining(uint64_t started)
+    { const auto elapsed = GetTickCount64() - started; return elapsed < 60000 ? 60000 - elapsed : 0; }
 }
-
 bool SymbolEngine::ResolveSymbol(const std::wstring& name, uint64_t* address, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (address == nullptr) { if (error != nullptr) { *error = L"invalid symbol output"; } return false; }
+    *address = 0;
+    std::wstring filter, leaf;
+    if (!SplitSymbolQuery(name, &filter, &leaf, false))
+    { if (error != nullptr) { *error = L"invalid bounded symbol name"; } return false; }
+    if (!ReadyModules(error)) { return false; }
+    const auto started = GetTickCount64();
+    bool found = false, unavailable = false; uint64_t result = 0;
+    std::wstring issue = L"symbol not found in eligible modules";
+    for (const auto& module : modules_)
     {
-        if (address == nullptr)
+        // Bare field filters must never download every deferred module.
+        if (filter.empty() ? indexedModules_.count(module.Base) == 0 : !ModuleNameMatches(module.ImageName, filter)) { continue; }
+        if (!EnsureModuleSymbolsLoaded(module, &issue, QueryRemaining(started))) { unavailable = true; continue; }
+        const auto entry = symbolIndexes_->Find(module.Base);
+        uint32_t rva = 0; bool ambiguous = false;
+        if (entry && entry->Resolve(leaf, &rva, &ambiguous))
         {
-            if (error != nullptr)
-            {
-                *error = L"Invalid address output";
-            }
-            break;
+            const auto candidate = module.Base + rva;
+            if (found && result != candidate) { ambiguous = true; }
+            else { found = true; result = candidate; }
         }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        wchar_t buffer[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)] = {};
-        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(buffer);
-        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-        symbol->MaxNameLen = MAX_SYM_NAME;
-
-        if (!SymFromNameW(process_, name.c_str(), symbol))
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymFromNameW failed", GetLastError());
-            }
-            break;
-        }
-
-        *address = symbol->Address;
-        ok = true;
-    } while (false);
-
-    return ok;
+        if (ambiguous)
+        { if (error != nullptr) { *error = L"symbol name is ambiguous; use its module and exact linkage name"; } return false; }
+    }
+    if (!found || unavailable) { if (error != nullptr) { *error = issue; } return false; }
+    *address = result; if (error != nullptr) { error->clear(); } return true;
 }
-
 bool SymbolEngine::FindNearestSymbol(uint64_t address, std::wstring* name, uint64_t* displacement, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (name != nullptr) { name->clear(); } if (displacement != nullptr) { *displacement = 0; }
+    if (name == nullptr || displacement == nullptr)
+    { if (error != nullptr) { *error = L"invalid nearest-symbol output"; } return false; }
+    if (!ReadyModules(error)) { return false; }
+    const KernelModuleInfo* owner = nullptr;
+    for (const auto& module : modules_)
     {
-        if (name == nullptr || displacement == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid nearest-symbol output";
-            }
-            break;
-        }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        wchar_t buffer[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)] = {};
-        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(buffer);
-        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-        symbol->MaxNameLen = MAX_SYM_NAME;
-
-        DWORD64 localDisplacement = 0;
-        if (!SymFromAddrW(process_, address, &localDisplacement, symbol))
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"SymFromAddrW failed", GetLastError());
-            }
-            break;
-        }
-
-        *name = symbol->Name;
-        *displacement = localDisplacement;
-        ok = true;
-    } while (false);
-
-    return ok;
+        if (module.Size > UINT64_MAX - module.Base || address < module.Base || address - module.Base >= module.Size) { continue; }
+        if (owner != nullptr) { if (error != nullptr) { *error = L"overlapping module inventory"; } return false; }
+        owner = &module;
+    }
+    if (owner == nullptr) { if (error != nullptr) { *error = L"address is outside the module inventory"; } return false; }
+    if (!EnsureModuleSymbolsLoaded(*owner, error)) { return false; }
+    const auto entry = symbolIndexes_->Find(owner->Base);
+    const auto symbol = entry ? entry->Nearest(static_cast<uint32_t>(address - owner->Base)) : nullptr;
+    if (symbol == nullptr) { if (error != nullptr) { *error = L"no preceding image-relative symbol"; } return false; }
+    *name = symbol->Name;
+    *displacement = address - owner->Base - symbol->Rva;
+    if (error != nullptr) { error->clear(); } return true;
 }
-
-typedef struct _KNDBG_ENUM_SYMBOL_CONTEXT
-{
-    std::vector<SymbolMatchInfo>* Matches;
-    size_t Limit;
-} KNDBG_ENUM_SYMBOL_CONTEXT;
-
-static BOOL CALLBACK KnDbgEnumSymbolsCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
-{
-    BOOL keepGoing = TRUE;
-
-    do
-    {
-        auto context = reinterpret_cast<KNDBG_ENUM_SYMBOL_CONTEXT*>(UserContext);
-        if (context == nullptr || context->Matches == nullptr || SymbolInfo == nullptr)
-        {
-            keepGoing = FALSE;
-            break;
-        }
-
-        SymbolMatchInfo match = {};
-        match.Address = SymbolInfo->Address;
-        match.Size = SymbolSize;
-        match.Name = SymbolInfo->Name;
-        context->Matches->push_back(match);
-
-        if (context->Limit != 0 && context->Matches->size() >= context->Limit)
-        {
-            keepGoing = FALSE;
-        }
-    } while (false);
-
-    return keepGoing;
-}
-
-typedef struct _KNDBG_ENUM_TYPE_CONTEXT
-{
-    HANDLE Process;
-    std::vector<TypeMatchInfo>* Matches;
-    size_t Limit;
-    uint64_t ModuleBase;
-    std::wstring ModuleName;
-    std::wstring Mask;
-    bool StoppedAtLimit;
-} KNDBG_ENUM_TYPE_CONTEXT;
-
-static BOOL CALLBACK KnDbgEnumTypesCallback(PSYMBOL_INFOW SymbolInfo, ULONG SymbolSize, PVOID UserContext)
-{
-    BOOL keepGoing = TRUE;
-
-    do
-    {
-        auto context = reinterpret_cast<KNDBG_ENUM_TYPE_CONTEXT*>(UserContext);
-        if (context == nullptr || context->Matches == nullptr || SymbolInfo == nullptr)
-        {
-            keepGoing = FALSE;
-            break;
-        }
-
-        if (!TypeNameMatchesNoCase(SymbolInfo->Name, context->Mask))
-        {
-            break;
-        }
-
-        TypeMatchInfo match = {};
-        match.ModuleName = context->ModuleName;
-        match.Name = SymbolInfo->Name;
-        match.ModuleBase = SymbolInfo->ModBase != 0 ? SymbolInfo->ModBase : context->ModuleBase;
-        match.TypeId = SymbolInfo->TypeIndex;
-        match.Size = SymbolSize;
-
-        if (match.Size == 0 && context->Process != nullptr && match.ModuleBase != 0 && match.TypeId != 0)
-        {
-            SymGetTypeInfo(context->Process, match.ModuleBase, match.TypeId, TI_GET_LENGTH, &match.Size);
-        }
-
-        context->Matches->push_back(match);
-
-        if (context->Limit != 0 && context->Matches->size() >= context->Limit)
-        {
-            context->StoppedAtLimit = true;
-            keepGoing = FALSE;
-        }
-    } while (false);
-
-    return keepGoing;
-}
-
 bool SymbolEngine::EnumerateSymbols(const std::wstring& mask, size_t limit, std::vector<SymbolMatchInfo>* matches, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (matches == nullptr) { if (error != nullptr) { *error = L"invalid symbol output"; } return false; }
+    matches->clear(); std::wstring filter, pattern;
+    if (!SplitSymbolQuery(mask, &filter, &pattern, true))
+    { if (error != nullptr) { *error = L"invalid bounded symbol pattern"; } return false; }
+    if (!ReadyModules(error)) { return false; }
+    const auto started = GetTickCount64();
+    const auto maximum = limit == 0 ? SymbolIndexMaxRows : (std::min)(limit, SymbolIndexMaxRows);
+    size_t available = 0, unavailable = 0;
+    bool capped = false, exhausted = false;
+    size_t resultBytes = 0;
+    for (const auto& module : modules_)
     {
-        if (matches == nullptr)
+        if (!ModuleNameMatches(module.ImageName, filter)) { continue; }
+        if (QueryRemaining(started) == 0) { exhausted = true; break; }
+        if (!EnsureModuleSymbolsLoaded(module, nullptr, QueryRemaining(started))) { ++unavailable; continue; }
+        const auto entry = symbolIndexes_->Find(module.Base);
+        if (!entry) { ++unavailable; continue; } ++available;
+        for (const auto& row : entry->Index.Symbols)
         {
-            if (error != nullptr)
-            {
-                *error = L"Invalid symbol output";
-            }
-            break;
+            if (QueryRemaining(started) == 0) { exhausted = true; break; }
+            if (!WildcardMatchNoCase(row.Name, pattern) && !WildcardMatchNoCase(row.LinkageName, pattern)) { continue; }
+            const auto address = module.Base + row.Rva;
+            // Canonical rows sort by RVA then display name, so provider aliases
+            // for one name/address are adjacent within this module.
+            if (!matches->empty() && matches->back().Address == address && matches->back().Name == row.Name) { continue; }
+            const auto bytes = sizeof(SymbolMatchInfo) + (row.Name.size() + entry->Index.IndexSha256.size() + 2) * sizeof(wchar_t);
+            if (matches->size() == maximum || bytes > SymbolIndexMaxBytes - resultBytes) { capped = true; break; }
+            matches->push_back({address, static_cast<uint32_t>(row.Bytes), row.Name, row.SizeKnown, entry->Index.IndexSha256});
+            resultBytes += bytes;
         }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        std::wstring effectiveMask = mask.empty() ? L"*" : mask;
-        std::wstring moduleFilter;
-        std::wstring symbolMask = effectiveMask;
-        size_t bang = effectiveMask.find(L'!');
-        if (bang != std::wstring::npos)
-        {
-            moduleFilter = effectiveMask.substr(0, bang);
-            symbolMask = effectiveMask.substr(bang + 1);
-            if (symbolMask.empty())
-            {
-                symbolMask = L"*";
-            }
-        }
-
-        matches->clear();
-        KNDBG_ENUM_SYMBOL_CONTEXT context = {};
-        context.Matches = matches;
-        context.Limit = limit;
-
-        bool foundThroughModule = false;
-        DWORD lastError = ERROR_SUCCESS;
-        std::wstring lastDetail;
-
-        if (moduleFilter.empty())
-        {
-            if (!SymEnumSymbolsW(process_, 0, symbolMask.c_str(), KnDbgEnumSymbolsCallback, &context))
-            {
-                lastError = GetLastError();
-            }
-            else
-            {
-                foundThroughModule = true;
-            }
-        }
-
-        if (matches->empty() || !moduleFilter.empty())
-        {
-            for (const KernelModuleInfo& module : modules_)
-            {
-                if (!ModuleNameMatches(module.ImageName, moduleFilter))
-                {
-                    continue;
-                }
-
-                std::wstring loadError;
-                if (!EnsureModuleLoaded(module, &loadError))
-                {
-                    lastDetail = loadError;
-                    continue;
-                }
-
-                if (SymEnumSymbolsW(process_, module.Base, symbolMask.c_str(), KnDbgEnumSymbolsCallback, &context))
-                {
-                    foundThroughModule = true;
-                }
-                else
-                {
-                    lastError = GetLastError();
-                }
-
-                if (limit != 0 && matches->size() >= limit)
-                {
-                    break;
-                }
-            }
-        }
-
-        if (!foundThroughModule && matches->empty())
-        {
-            if (error != nullptr)
-            {
-                *error = lastDetail.empty() ? DbgHelpErrorText(L"SymEnumSymbolsW failed", lastError) : lastDetail;
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
-}
-
-bool SymbolEngine::EnumerateTypesWithDia(
-    const KernelModuleInfo& module,
-    const std::wstring& typeMask,
-    size_t limit,
-    std::vector<TypeMatchInfo>* matches,
-    bool* stoppedAtLimit,
-    std::wstring* error)
-{
-    bool ok = false;
-    bool coInitialized = false;
-
-    do
-    {
-        if (matches == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA type match output";
-            }
-            break;
-        }
-
-        if (stoppedAtLimit != nullptr)
-        {
-            *stoppedAtLimit = false;
-        }
-
-        if (limit != 0 && matches->size() >= limit)
-        {
-            if (stoppedAtLimit != nullptr)
-            {
-                *stoppedAtLimit = true;
-            }
-            ok = true;
-            break;
-        }
-
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(coHr))
-        {
-            coInitialized = true;
-        }
-        else if (coHr != RPC_E_CHANGED_MODE)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"CoInitializeEx failed", coHr);
-            }
-            break;
-        }
-
-        IDiaDataSource* source = nullptr;
-        IDiaSession* session = nullptr;
-        IDiaSymbol* global = nullptr;
-        IDiaEnumSymbols* udtEnum = nullptr;
-
-        std::wstring diaProvider;
-        std::wstring diaCreateError;
-        if (!CreateDiaDataSource(&source, &diaProvider, &diaCreateError))
-        {
-            if (error != nullptr)
-            {
-                *error = diaCreateError;
-            }
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        std::wstring diaLoadError;
-        if (!LoadDiaDataForModule(module, source, &diaLoadError))
-        {
-            if (error != nullptr)
-            {
-                *error = diaLoadError;
-            }
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        HRESULT hr = source->openSession(&session);
-        if (FAILED(hr))
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"IDiaDataSource::openSession failed", hr);
-            }
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        session->put_loadAddress(module.Base);
-
-        hr = session->get_globalScope(&global);
-        if (FAILED(hr) || global == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"IDiaSession::get_globalScope failed", hr);
-            }
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        hr = global->findChildren(SymTagUDT, nullptr, nsNone, &udtEnum);
-        if (FAILED(hr) || udtEnum == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"DIA findChildren UDT failed", hr);
-            }
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        std::wstring moduleName = GetDbgHelpModuleName(module);
-        while (true)
-        {
-            IDiaSymbol* udt = nullptr;
-            ULONG fetched = 0;
-            hr = udtEnum->Next(1, &udt, &fetched);
-            if (hr != S_OK || fetched == 0 || udt == nullptr)
-            {
-                ReleaseCom(udt);
-                if (FAILED(hr))
-                {
-                    if (error != nullptr)
-                    {
-                        *error = HResultText(L"DIA type enumeration failed", hr);
-                    }
-                    break;
-                }
-
-                ok = true;
-                break;
-            }
-
-            std::wstring name = DiaSymbolName(udt);
-            if (!name.empty() && TypeNameMatchesNoCase(name, typeMask))
-            {
-                TypeMatchInfo match = {};
-                match.ModuleName = moduleName;
-                match.Name = name;
-                match.ModuleBase = module.Base;
-
-                DWORD symIndexId = 0;
-                if (SUCCEEDED(udt->get_symIndexId(&symIndexId)))
-                {
-                    match.TypeId = symIndexId;
-                }
-
-                ULONGLONG length = 0;
-                if (SUCCEEDED(udt->get_length(&length)))
-                {
-                    match.Size = length;
-                }
-
-                matches->push_back(match);
-
-                if (limit != 0 && matches->size() >= limit)
-                {
-                    if (stoppedAtLimit != nullptr)
-                    {
-                        *stoppedAtLimit = true;
-                    }
-                    ReleaseCom(udt);
-                    ok = true;
-                    break;
-                }
-            }
-
-            ReleaseCom(udt);
-        }
-
-        ReleaseCom(udtEnum);
-        ReleaseCom(global);
-        ReleaseCom(session);
-        ReleaseCom(source);
-    } while (false);
-
-    if (coInitialized)
-    {
-        CoUninitialize();
+        if (capped || exhausted) { break; }
     }
-
-    return ok;
+    if (error != nullptr)
+    {
+        *error = unavailable != 0 ? L"symbol enumeration incomplete: unavailable modules=" + std::to_wstring(unavailable) : L"";
+        if (capped) { *error += L"; result limit reached"; }
+        if (exhausted) { *error += L"; query time budget exhausted"; }
+        if (available == 0 && error->empty()) { *error = L"no module matched symbol pattern"; }
+    }
+    return available != 0;
 }
-
 bool SymbolEngine::EnumerateTypes(const std::wstring& mask, size_t limit, std::vector<TypeMatchInfo>* matches, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
+    if (matches == nullptr) { if (error != nullptr) { *error = L"invalid type output"; } return false; }
+    matches->clear(); std::wstring filter, pattern;
+    if (!SplitSymbolQuery(mask, &filter, &pattern, true))
+    { if (error != nullptr) { *error = L"invalid bounded type pattern"; } return false; }
+    if (!ReadyModules(error)) { return false; }
+    const auto started = GetTickCount64();
+    const auto maximum = limit == 0 ? SymbolIndexMaxRows : (std::min)(limit, SymbolIndexMaxRows);
+    size_t available = 0, unavailable = 0, resultBytes = 0; bool capped = false, exhausted = false;
+    for (const auto& module : modules_)
     {
-        if (matches == nullptr)
+        if (!ShouldSearchTypeModule(module, filter)) { continue; }
+        if (QueryRemaining(started) == 0) { exhausted = true; break; }
+        if (!EnsureModuleSymbolsLoaded(module, nullptr, QueryRemaining(started))) { ++unavailable; continue; }
+        const auto entry = symbolIndexes_->Find(module.Base);
+        if (!entry) { ++unavailable; continue; } ++available;
+        for (const auto& row : entry->Index.Types)
         {
-            if (error != nullptr)
-            {
-                *error = L"Invalid type match output";
-            }
-            break;
+            if (QueryRemaining(started) == 0) { exhausted = true; break; }
+            if (!TypeNameMatchesNoCase(row.Name, pattern)) { continue; }
+            const auto bytes = sizeof(TypeMatchInfo) + (module.ImageName.size() + row.Name.size() + entry->Index.IndexSha256.size() + 3) * sizeof(wchar_t);
+            if (matches->size() == maximum || bytes > SymbolIndexMaxBytes - resultBytes) { capped = true; break; }
+            matches->push_back({SymbolModuleName(module), row.Name, module.Base, row.ProviderId, row.Bytes,
+                row.SizeKnown, entry->Index.IndexSha256});
+            resultBytes += bytes;
         }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        if (modules_.empty())
-        {
-            if (!LoadKernelModules(error))
-            {
-                break;
-            }
-        }
-
-        std::wstring effectiveMask = mask.empty() ? L"*" : mask;
-        std::wstring moduleFilter;
-        std::wstring typeMask = effectiveMask;
-        size_t bang = effectiveMask.find(L'!');
-        if (bang != std::wstring::npos)
-        {
-            moduleFilter = effectiveMask.substr(0, bang);
-            typeMask = effectiveMask.substr(bang + 1);
-            if (typeMask.empty())
-            {
-                typeMask = L"*";
-            }
-        }
-
-        matches->clear();
-        KNDBG_ENUM_TYPE_CONTEXT context = {};
-        context.Process = process_;
-        context.Matches = matches;
-        context.Limit = limit;
-        context.Mask = typeMask;
-
-        bool foundThroughModule = false;
-        bool matchedModule = false;
-        DWORD lastError = ERROR_SUCCESS;
-        std::wstring lastDetail;
-
-        for (const KernelModuleInfo& module : modules_)
-        {
-            if (!ShouldSearchTypeModule(module, moduleFilter))
-            {
-                continue;
-            }
-
-            matchedModule = true;
-            std::wstring loadError;
-            if (!EnsureModuleLoaded(module, &loadError))
-            {
-                lastDetail = loadError;
-                continue;
-            }
-
-            std::wstring symbolLoadError;
-            if (!EnsureModuleSymbolsLoaded(module, &symbolLoadError) && !symbolLoadError.empty())
-            {
-                lastDetail = symbolLoadError;
-            }
-
-            context.ModuleBase = module.Base;
-            context.ModuleName = GetDbgHelpModuleName(module);
-            context.StoppedAtLimit = false;
-
-            if (SymEnumTypesW(process_, module.Base, KnDbgEnumTypesCallback, &context))
-            {
-                foundThroughModule = true;
-            }
-            else if (context.StoppedAtLimit)
-            {
-                foundThroughModule = true;
-            }
-            else
-            {
-                lastError = GetLastError();
-                std::wstring diaError;
-                bool diaStoppedAtLimit = false;
-                context.StoppedAtLimit = false;
-                if (EnumerateTypesWithDia(module, typeMask, limit, matches, &diaStoppedAtLimit, &diaError))
-                {
-                    foundThroughModule = true;
-                    context.StoppedAtLimit = diaStoppedAtLimit;
-                }
-                else if (!diaError.empty())
-                {
-                    lastDetail = diaError;
-                }
-            }
-
-            if (limit != 0 && matches->size() >= limit)
-            {
-                break;
-            }
-        }
-
-        if (!matchedModule)
-        {
-            if (error != nullptr)
-            {
-                *error = L"No loaded module matched type pattern module: " + moduleFilter;
-            }
-            break;
-        }
-
-        if (!foundThroughModule && matches->empty())
-        {
-            if (error != nullptr)
-            {
-                *error = lastDetail.empty() ? DbgHelpErrorText(L"SymEnumTypesW failed", lastError) : lastDetail;
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+        if (capped || exhausted) { break; }
+    }
+    if (error != nullptr)
+    {
+        *error = unavailable != 0 ? L"type enumeration incomplete: unavailable modules=" + std::to_wstring(unavailable) : L"";
+        if (capped) { *error += L"; result limit reached"; }
+        if (exhausted) { *error += L"; query time budget exhausted"; }
+        if (available == 0 && error->empty()) { *error = L"no eligible module matched type pattern"; }
+    }
+    return available != 0;
 }
 
 bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName,
     TypeLayoutInfo* layout, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
     if (layout != nullptr) { *layout = {}; }
     if (!ready_ || !typeLayouts_->FindById(moduleBase, typeId, typeName, layout))
     {
@@ -2097,7 +779,7 @@ bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const st
 
 bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
     if (layout == nullptr) { if (error != nullptr) { *error = L"invalid type layout output"; } return false; }
     *layout = {};
     if (typeName.empty() || typeName.size() > 2048 || typeName.find(L'\0') != std::wstring::npos)
@@ -2147,7 +829,7 @@ bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* l
 
 bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeFieldInfo>* fields, ULONG64* typeSize, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
     if (typeSize != nullptr) { *typeSize = 0; }
     if (fields == nullptr) { if (error != nullptr) { *error = L"invalid field output"; } return false; }
     fields->clear();
@@ -2160,7 +842,7 @@ bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeF
 
 bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& fieldName, TypeFieldInfo* field, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    std::lock_guard<std::recursive_mutex> lock(symbolMutex_);
     if (field == nullptr) { if (error != nullptr) { *error = L"invalid field output"; } return false; }
     *field = {};
     if (error != nullptr) { *error = L"field path is invalid, unavailable or ambiguous"; }

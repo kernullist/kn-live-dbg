@@ -282,7 +282,7 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
     {
         if (request.Executable.empty() || request.Executable.size() > 30000 ||
             request.Executable.find(L'\0') != std::wstring::npos || request.TimeoutMs > 60000 ||
-            request.OutputLimit == 0 || request.OutputLimit > 2 * 1024 * 1024 || request.ReadOnlyFiles.size() > files.size())
+            request.OutputLimit == 0 || request.OutputLimit > 32 * 1024 * 1024 || request.ReadOnlyFiles.size() > files.size())
         {
             result.Status = L"invalid_request";
             break;

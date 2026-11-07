@@ -15,7 +15,7 @@ if ($Sanitize) {
 }
 $program = Join-Path $output 'live-type-layout-selftest.exe'
 $sources = @('tools\live-type-layout-selftest.cpp', 'user\SymbolEngine.cpp', 'user\BrokeredTypeLayouts.cpp',
-    'user\SymbolArtifactResolver.cpp', 'user\ExecutableImage.cpp', 'user\TypeSchema.cpp',
+    'user\SymbolArtifactResolver.cpp', 'user\BrokeredSymbolIndexes.cpp', 'user\SymbolIndex.cpp', 'user\SymbolIndexBroker.cpp', 'user\SymbolIndexGenerator.cpp', 'user\ExecutableImage.cpp', 'user\TypeSchema.cpp',
     'user\TypeSchemaGenerator.cpp', 'user\TypeSchemaBroker.cpp', 'user\TypeSchemaCommand.cpp',
     'user\ParserWorkerProcess.cpp', 'user\AnalystSnapshot.cpp', 'user\ReferenceArtifact.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }

@@ -963,7 +963,7 @@ changes after v0.0.36. For operator syntax use
 | `driver/Driver.cpp`, `shared/KnLiveDbgIoctl.h` | Administrators/SYSTEM device, exclusive controller, memory/page-table/CPU primitives, process operations, live callbacks and experimental I/O trace |
 | `user/DeviceClient.*`, `DriverService.*` | ABI-checked IOCTL client and owned SCM lifecycle |
 | `user/main.cpp`, `CommandRegistry.*`, `CommandInput.h`, `CompletionHints.h` | Local dispatch, syntax validation, help, completion, self-tests, execution-origin policy |
-| `user/SymbolEngine.*`, `NativeDisassembler.*`, `DbgEngBackend.*` | DbgHelp/DIA types and symbols, Zydis disassembly, optional DbgEng commands |
+| `user/SymbolEngine.*`, `NativeDisassembler.*`, `DbgEngBackend.*` | Brokered symbol/type metadata, Zydis disassembly, optional DbgEng commands |
 | `user/*Scanner.*`, `UserModeHunter.*` | Bounded native collectors and cross-view interpretation |
 | `KernelMonitor.*`, `KernelMonitorHunting.cpp`, `ProcessLayoutMonitor.*` | Continuous discovery, queues, capture, image traversal and evidence |
 | `KmonHunting.h`, `ObservationModel.h`, `ExecutableRegionCatalog.h`, `ExecutableImageVerifier.h` | Observation contracts, bounded case/region indexes, reference-byte verification |
@@ -1019,8 +1019,9 @@ Neither represents an atomic, fully paused machine snapshot.
 
 ## Engine, symbols, and transports
 
-The main engine owns DeviceClient and DbgHelp/DIA operations. Symbols are loaded
-from the EXE-local search path and cache. Missing fields or symbols must remain
+The main engine owns DeviceClient and serializes symbol metadata generations.
+Approved local image/PDB artifacts are parsed by restricted DIA workers; parent
+queries use verified bounded metadata. Missing fields or symbols must remain
 unsupported/partial; a guessed layout is not a stable Windows ABI.
 
 MCP and remote listeners own transport work and enqueue engine jobs. They have
@@ -1205,25 +1206,18 @@ See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFI
 
 ## PDB identity boundary
 
-For the remaining in-process DIA type-enumeration path, `SymbolEngine` binds the load to an expected PDB
-signature and age from matched DbgHelp module metadata. Unmatched PDB/DBG flags,
-different module bases and conflicting known image sizes are rejected. When that
-identity is unavailable, the existing PE reader extracts CodeView identity from
-the resolved image and checks the known size/timestamp/checksum constraints;
-the file identity is checked again after symbol loading.
-
-Direct PDB loads use Microsoft's
-[signature-and-age validation API](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiadatasource-loadandvalidatedatafrompdb?view=visualstudio),
-then independently compare the opened session's identity. Image-based DIA loads
-also receive the post-load comparison. A missing property is unavailable, not a
-zero-valued match. A rejected selected PDB does not become an unchecked fallback
-load on the same data-source object. The DbgHelp/DIA serialization lock remains
-in place. Concrete type-layout APIs use the broker described below.
+`SymbolEngine` obtains the expected GUID/age from the local image's bounded RSDS
+record and checks its size against the module inventory. The restricted worker
+opens DIA over approved read-only PDB handles and compares the opened global
+scope's GUID/age. A missing property is unavailable, not a zero-valued match.
+The parent compares image/PDB/provider content hashes and rechecks the held file
+objects before accepting either a layout package or a symbol index. Rejected
+artifacts do not trigger an in-process provider fallback.
 
 GUID/age matching prevents ordinary wrong-build and replaced-cache confusion;
 it is not a content hash, an approved distribution signature or collector
-authentication. Full loaded-image identity binding and isolation of the remaining
-symbol/enumeration consumers remain separate work.
+authentication. Full loaded-image identity binding and approved distribution
+remain separate work.
 `tools/validate-pdb-identity.ps1 -Sanitize` compiles two owned PE/PDB pairs and
 checks the actual DIA provider against matching, wrong-age, wrong-PDB and cache
 replacement controls without loading a driver or target image.
@@ -1235,7 +1229,7 @@ as private `kn.type_schema.v1` JSON, normally a `.knschema` file. The operation
 runs before controller construction and uses only the supplied local artifacts
 and the packaged DIA DLL. It performs no symbol download or live memory read.
 `--schema inspect <package>` checks and reconstructs the package without DIA.
-Live layout caching and the DbgHelp lock remain separate from package inspection.
+Live metadata caching and its serialization lock remain separate from package inspection.
 
 The package records PE/PDB/provider SHA-256, PE machine and image size, canonical
 PDB GUID (32 hexadecimal digits) and age, provider file version, root size and
@@ -1269,7 +1263,7 @@ remain fixed. `parser_isolated` is producer-reported provenance: new CLI exports
 record true, direct-library and legacy exports retain false. Inspecting a package
 does not authenticate this field or retroactively run its parser in isolation.
 Attaching package hashes to typed observations, supported-build fixture
-attestations and isolation of the remaining symbol/enumeration consumers remain open. Files and
+attestations and isolation of other untrusted parsers remain open. Files and
 renamed JSON packages are excluded by the sensitive-content gate.
 
 ### Schema parser process boundary
@@ -1288,7 +1282,7 @@ the parent publishes the package; timeout,
 crash, output overflow or setup failure cannot publish partial child output.
 There is no in-process fallback. Existing schema inspection remains a bounded
 JSON operation in the command process. Live layout APIs reuse this boundary as
-described below; symbol lookup and type enumeration still have separate paths.
+described below; symbol lookup and type enumeration use the bounded index worker.
 
 The broker passes three read-only file handles. The runner reopens each file
 object with an independent cursor and includes only those copies in the child
@@ -1326,7 +1320,8 @@ Windows 10 or later is required for atomic job assignment through
 The job allows one process, limits committed memory to 512 MiB and kills its
 worker when the final parent job handle closes. A suspended child is resumed
 only after creation with those restrictions. Parent supervision caps stdout and
-stderr together at 2 MiB, checks cancellation and enforces a 60-second elapsed
+stderr together at 2 MiB by default (symbol indexes explicitly allow 32 MiB),
+checks cancellation and enforces a 60-second elapsed
 budget once process creation returns. Failed cleanup is explicit; synchronous
 OS process creation/termination is not a hard real-time deadline. A large PDB
 can fail the memory budget even if it passes the input-file size limit. Existing
@@ -1336,7 +1331,7 @@ This boundary contains selected parser faults and resource use. It is not an
 AppContainer, a filesystem allowlist, an egress policy or authenticated parser
 attestation. The child retains some access under the same user, and artifact
 hashes/provider paths do not establish approved distribution. Network-denied
-execution, remaining SymbolEngine migration, runtime object/anchor binding and isolation
+execution, runtime object/anchor binding and isolation
 of all untrusted parsers remain open. No network lookup is requested by this
 schema path, but the token/job combination does not enforce a network deny rule.
 Parent artifact hashing has a cooperative 30-second limit per hash; the child
@@ -1363,7 +1358,7 @@ names, while bit width and storage size remain distinct.
 
 The cache retains at most 32 roots, 8 MiB of encoded packages and 32,768 layout
 nodes. IDs are process-unique opaque references, distinct from the native IDs
-displayed by the remaining type-enumeration path. Reset, symbol/module-state
+displayed by the index-based type-enumeration path. Reset, symbol/module-state
 changes, eviction or replacement invalidate IDs; an old ID cannot resolve to a
 new node. Nested nodes carry offsets relative to their own object. Schema hashes
 are retained on layouts and fields, and unavailable coverage is explicit, including
@@ -1396,10 +1391,58 @@ it is never treated as a valid layout merely because it exists.
 Compressed/pointer stores, authenticated servers, proxy configuration, recursive
 SymSrv cache chains and automatic replacement of invalid entries are unsupported
 by this resolver. The child receives no search path or download request, but still
-has no enforced egress rule. Startup symbol preloading, symbol lookup and type
-enumeration remain in process. Target image/anchor/invariant binding, propagation
+has no enforced egress rule. Target image/anchor/invariant binding, propagation
 of these schema identities into every typed observation and full parser isolation
 remain open P05 requirements.
+
+### Live symbol and type index broker
+
+Startup preloading, `ResolveSymbol`, `FindNearestSymbol`, `EnumerateSymbols` and
+`EnumerateTypes` now use an internal restricted worker. `Initialize` and module
+discovery do not invoke DbgHelp or DIA. A worker enumerates image-relative
+functions, data, labels, public aliases and thunks, plus class/struct/union, enum
+and typedef name/size metadata. Typedef size lookup can follow at most eight
+metadata aliases; an unavailable size remains explicitly unknown.
+Type discovery uses the [DIA symbol table](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiasession-getenumtables)
+so nested/local names omitted by global-scope enumeration remain available.
+Lexical locals, register locations and absolute constants are outside this
+index. Address enumeration follows the [DIA address-order contract](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiaenumsymbolsbyaddr);
+public enumeration preserves decorated aliases. Private function/data names
+retain their source scope, while public names use undecoration. Raw linkage
+names remain lookup keys; control characters are escaped in display names.
+
+The private `KNSYMIDX` version 1 frame has a 256-byte header containing three
+artifact SHA-256 values, RSDS GUID/age, image size, machine and row counts. All
+numbers are little-endian and strings are length-prefixed UTF-8. The parent
+requires canonical sorted unique rows, strict string round trips, known tags,
+explicit size availability, in-image RVAs/extents and exact frame consumption.
+It checks artifact identity against its own leases and computes the index digest.
+A matching digest identifies metadata; it does not attest provider semantics.
+The frame is capped at 32 MiB and 200,000 rows per symbol/type table. Traversal
+also has a cooperative 30-second budget and 64 MiB of accounted row data.
+Type discovery visits at most 3.2 million provider symbols across its symbol table.
+Bounds cause failure rather than silently publishing a truncated index.
+
+The parent retains at most 16 module indexes and 128 MiB of accounted vector/
+string capacity, excluding allocator overhead and temporary construction. Name
+orders support binary search; address order supports nearest-preceding lookup.
+Repeated address queries do not reopen a PDB or start another worker. Different
+addresses for one undecorated name are ambiguous; exact linkage names can select
+an overload. Unqualified lookup uses previously indexed modules, preserving the
+rule that a missing bare field filter cannot download every deferred PDB.
+The nearest preceding symbol does not prove that an address lies in its function.
+
+Initialization, symbol-path changes and module refresh invalidate metadata and
+failed acquisitions. Failure results are retained for that generation so scanner
+hot loops do not repeatedly launch a failing parser. At most 512 successful or
+failed module identities are admitted per generation. Enumeration shares a
+cooperative 60-second acquisition/query budget, caps returned rows at 200,000
+and accounted result data at 32 MiB, and reports unavailable modules and limits.
+The CLI and MCP symbol search expose incomplete coverage. Type enumeration's
+provider IDs are descriptive metadata, not the opaque IDs used for layout lookup.
+Cached metadata represents the accepted disk-artifact generation, not continuous
+revalidation or proof about a loaded target's bytes, object invariants or lifetime.
+`.knsymidx` files and renamed frames are rejected by the publication scanner.
 
 ## Capture scheduling and latency
 

@@ -77,6 +77,7 @@
 #include "PoolScanner.h"
 #include "SymbolEngine.h"
 #include "TypeSchema.h"
+#include "SymbolIndex.h"
 #include "ImageVerificationRecipe.h"
 #include "ProcessImageCapture.h"
 #include "UserModeHunter.h"
@@ -4687,12 +4688,14 @@ static void PrintDtTypeMatches(const DtRequest& request, const std::vector<TypeM
         }
 
         PrintColoredText(FormatTypeMatchName(match), KNDBG_COLOR_TITLE);
-        std::wcout << L" size=0x" << std::hex << match.Size << std::dec;
+        if (match.SizeKnown) { std::wcout << L" size=0x" << std::hex << match.Size << std::dec; }
+        else { std::wcout << L" size=unknown"; }
 
         if (request.Verbose)
         {
             std::wcout << L" moduleBase=0x" << std::hex << std::setw(16) << std::setfill(L'0') << match.ModuleBase
-                       << std::setfill(L' ') << L" typeId=" << std::dec << match.TypeId;
+                       << std::setfill(L' ') << L" providerTypeId=" << std::dec << match.TypeId
+                       << L" index=" << match.SymbolIndexSha256 << L" runtime_invariants=unchecked";
         }
 
         std::wcout << L"\n";
@@ -4914,6 +4917,7 @@ static void HandleDtCommand(
             }
 
             PrintDtTypeMatches(request, matches, typeMatchLimit);
+            if (!error.empty()) { std::wcout << L"type coverage: " << error << L"\n"; }
             break;
         }
 
@@ -43184,11 +43188,13 @@ static std::wstring BuildMcpProcessListJson(const std::vector<DmlProcessRecord>&
 }
 
 // Serialize wildcard symbol-search matches for MCP structuredContent.
-static std::wstring BuildMcpSymbolListJson(const std::vector<SymbolMatchInfo>& matches, bool truncated)
+static std::wstring BuildMcpSymbolListJson(const std::vector<SymbolMatchInfo>& matches, bool truncated, const std::wstring& coverageNote)
 {
     std::wstring out = L"{\"schema\":\"kn-live-dbg.symbol-list.v1\",\"count\":" + std::to_wstring(matches.size());
     out += L",\"truncated\":";
     out += truncated ? L"true" : L"false";
+    out += L",\"coverage_note\":" + mcpjson::Quote(coverageNote);
+    out += L",\"validation\":\"artifact_identity_and_bounds\",\"runtime_invariants\":\"unchecked\"";
     out += L",\"symbols\":[";
     for (size_t i = 0; i < matches.size(); ++i)
     {
@@ -43200,6 +43206,8 @@ static std::wstring BuildMcpSymbolListJson(const std::vector<SymbolMatchInfo>& m
         out += L"{\"address\":" + mcpjson::Quote(HexTextWidth(m.Address, 16, true));
         out += L",\"size\":" + std::to_wstring(m.Size);
         out += L",\"name\":" + mcpjson::Quote(m.Name);
+        out += L",\"size_known\":" + std::wstring(m.SizeKnown ? L"true" : L"false");
+        out += L",\"symbol_index_sha256\":" + mcpjson::Quote(m.SymbolIndexSha256);
         out += L"}";
     }
     out += L"]}";
@@ -45395,11 +45403,13 @@ static bool ExecuteAiCapabilitySymbolSearch(
         }
 
         std::vector<SymbolMatchInfo> matches;
-        if (!symbols.EnumerateSymbols(mask, limit, &matches, error))
+        std::wstring coverageNote;
+        if (!symbols.EnumerateSymbols(mask, limit, &matches, &coverageNote))
         {
+            if (error != nullptr) { *error = coverageNote; }
             break;
         }
-        bool truncated = (limit != 0 && matches.size() >= limit);
+        bool truncated = (limit != 0 && matches.size() >= limit) || !coverageNote.empty();
 
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": symbol.search\n";
@@ -45409,10 +45419,11 @@ static bool ExecuteAiCapabilitySymbolSearch(
             std::wcout << HexTextWidth(m.Address, 16, true) << L" " << m.Name << L"\n";
         }
         std::wcout << L"symbols=" << matches.size() << (truncated ? L" truncated=yes" : L"") << L"\n";
+        if (!coverageNote.empty()) { std::wcout << L"symbol coverage: " << coverageNote << L"\n"; }
 
         if (structuredJsonOut != nullptr)
         {
-            *structuredJsonOut = BuildMcpSymbolListJson(matches, truncated);
+            *structuredJsonOut = BuildMcpSymbolListJson(matches, truncated, coverageNote);
         }
         ok = true;
     } while (false);
@@ -50222,6 +50233,7 @@ static bool HandleCommand(
 
                 PrintColoredText(L"symbols", KNDBG_COLOR_TITLE);
                 std::wcout << L"=" << matches.size() << L"\n";
+                if (!error.empty()) { std::wcout << L"symbol coverage: " << error << L"\n"; }
             }
             else
             {
@@ -53786,6 +53798,10 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
     {
         return RunGameManifestCommand(argc, argv);
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--symbol-index-worker")
+    {
+        return RunSymbolIndexWorkerCommand(argc, argv);
     }
     if (argc >= 2 && (ToLower(argv[1]) == L"--schema-worker" || ToLower(argv[1]) == L"--schema-live-worker"))
     {
