@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import struct
 import uuid
+from collections import Counter
+from irp_claim_oracle import validate as validate_claims
 
 
 def main():
@@ -145,6 +147,15 @@ def main():
     assert hint["keys"] == [hashlib.sha256(encode(signature)).hexdigest()]
     print(f"IRP capture oracle passed: {fields_checked} fields, {len(receipts)} original reads, owner/list/stack/RSDS; sha256={hashlib.sha256(raw).hexdigest()}")
     print("IRP retention signature independently reconstructed from exact captured source/schema/request fields")
+    claim_counts = Counter()
+    captures = sorted(root.glob("case-*.knirp"))
+    for path in captures:
+        content = path.read_bytes()
+        report = json.loads(Path(str(path) + ".knclaims").read_bytes())
+        claim_counts.update(validate_claims(content, report,
+                                          reference_available=int(json.loads(content)["reference_captured_bytes"]) > 0))
+    assert set(claim_counts) == {"supported", "contradicted", "unfulfilled", "not_applicable"}
+    print(f"IRP claim oracle passed: {len(captures)} captures; statuses={dict(claim_counts)}; independent field truth, evidence pointers and address sweep")
 
 
 if __name__ == "__main__":

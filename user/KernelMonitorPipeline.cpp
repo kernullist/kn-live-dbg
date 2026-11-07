@@ -3424,6 +3424,30 @@ bool KmonPipelineSelfTest()
                 std::fprintf(stderr, "FAIL kmon event evidence classification\n");
             }
             ok = claims && ok;
+            const std::wstring irpClaimFixture = L"{\"schema\":\"kn.irp_claim_report.v1\",\"owned_routing_fixture\":true}";
+            KmonOptions unrelatedWatch;
+            unrelatedWatch.WatchPids = {0xfffffffe};
+            bool irpRouting = true;
+            for (const auto* kind : {L"io.request_observation", L"io.claim_assessment"})
+            {
+                KmonEvent event;
+                event.Kind = kind; event.ProcessId = 100;
+                event.Evidence[L"capture_sha256"] = std::wstring(64, L'a');
+                event.Evidence[L"irp_claims_json"] = irpClaimFixture;
+                irpRouting = irpRouting && KmonWatchMatches(event, unrelatedWatch);
+                monitor.RecordEvent(std::move(event));
+            }
+            const auto irpPublished = monitor.Recent(2, true);
+            irpRouting = irpRouting && irpPublished.size() == 2 && irpPublished[0].Kind == L"io.claim_assessment" &&
+                irpPublished[1].Kind == L"io.request_observation";
+            for (const auto& event : irpPublished)
+            {
+                irpRouting = irpRouting && event.Evidence.at(L"event_category") == L"observation" &&
+                    event.Evidence.at(L"display_suppressed") == L"true" && event.Evidence.at(L"maliciousness") == L"not_established" &&
+                    event.Evidence.at(L"irp_claims_json") == irpClaimFixture && event.Evidence.at(L"capture_sha256") == std::wstring(64, L'a');
+            }
+            if (!irpRouting) { std::fprintf(stderr, "FAIL IRP observation/claim retention and classification\n"); }
+            ok = irpRouting && ok;
             for (bool knownRange : {false, true})
             {
                 KmonEvent load;

@@ -7,6 +7,78 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## IRP object/state claim checkpoint: 2026-11-07
+
+This P08/P13 step adds the deterministic `kn.irp_claim_policy.v1` registry and
+an adapter for original bound IRP captures and canonical ordered-read replay.
+Reports distinguish supported, contradicted, unfulfilled and not-applicable
+claims, with original evidence references, unmet requirements, next-observation
+suggestions and seven separate ledgers. The
+[claim contract](ARCHITECTURE.md#irp-claim-policies) defines the bounded meanings.
+The existing `replay-irp` command exposes current-policy assessments separately
+from the original capture policy. Capture v1/v2 bytes and native ABI are unchanged.
+
+The final ASan binding harness passed **151 controls**. Independent capture
+checks passed **32 fields / 29 original reads** and reconstructed the retention
+state signature. The claim oracle checked **21 original captures**, including
+**25 supported / 31 contradicted / 34 unfulfilled / 65 not-applicable** emitted
+assessments. It derives expected results from the original packet/stack fields,
+checks the required policy definitions and resolves every evidence hash/JSON
+pointer. An independent boundary sweep verifies requested, accepted and
+failed-only address unions without counting repeated traffic as new coverage.
+These counts describe owned synthetic controls, not detection accuracy.
+
+Controls cover disabled completion flags, null completion targets, cancellation
+and status samples without lifecycle events, null versus unavailable device
+fields, empty inventories, missing retained images, source/image/owner changes,
+partial pages and a 64-stack report that reaches the output bound. Omitted
+assessments retain their exact denominator. Evaluator checks reject absent
+evidence, mixed captures, duplicate or unknown facts and duplicate requirements;
+an unqualified scope cannot yield a negative or not-applicable conclusion.
+The ASan replay runner passed **52 controls** and the final product passed
+**56 CLI controls**. Invalid or mutated captures expose no partial claim result.
+
+Review found a runtime integration defect: `io.request_observation` was emitted
+by the producer but had no retaining branch in `KmonWatchMatches`; the new claim
+event would also have been dropped and classified as a lead. Both now enter
+the ring/log as kernel observations independently of process-watch filters.
+Routine live printing remains suppressed. Actual `RecordEvent` controls verify
+retention, exact payload preservation, observation category and unchanged
+`maliciousness:not_established`. No additional actionable defects were found
+in the reviewed scope after the fix and affected rechecks.
+
+The final Release build and isolated `--self-test all` passed: timeline **28**,
+MCP **102**, KMON image integration **119**, console **564**, command audit
+**3,011 / 261 routes**, and remote **68** plus four connection-option controls.
+Capability checks passed **36 contracts / 261 routes**, the generated matrix
+matches the binary, and the expanded public-content classifier passed **12
+tests**. Target availability remains unprobed.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `eb03296e3b4086de813dc8967caf3b0164fc03361b0cfff8e32c3c5c5f4e6b23` |
+| IRP binding/claims/replay, ASan | `e5b12f882b45c6b117327d06d22ef92fd396dd73b5eff7a2fc474c93201c59b2` |
+
+Reproduce with `tools/validate-irp-binding.ps1 -Sanitize`; the runner preserves
+owned capture-time claim reports and runs both independent oracles. Its emitted
+fixture directory also supports `tools/test-irp-binding-capture.py <directory>`
+and `tools/test-irp-replay.py <product-exe> <directory> --product`. Run
+`KnLiveDbg.exe --self-test all` alone. This host uses the bundled Python runtime,
+Windows 11 Pro 10.0.28000, kernel 10.0.28000.3231, VS 17.14.60, MSVC 14.44.35207
+and SDK/WDK 10.0.26100.0. Existing C4744 link warnings remain. No driver was
+loaded, service/firewall policy changed or reboot performed. Final cleanup
+checks found no test process, parser profile/receipt/preparation or running
+task-driver residue; completed code caches and owned fixtures remain deliberately.
+
+The policy supports only captured recorded-state invariants. It does not prove
+an approved Windows build, IRP allocation lifetime, completion/cancellation,
+execution, device-driver ownership or authenticated collector identity. Original
+claim-report persistence and original-policy claim reproduction are not inferred
+from raw capture replay. Other scanner/image-change adapters, qualified
+cross-capture joins, lifecycle providers and native validation remain open,
+along with the earlier real-kernel PDB ASan resource failure. This does not
+complete P08/P13 or the full P01-P16/VS1-VS4 objective.
+
 ## IRP retention priority checkpoint: 2026-11-07
 
 This P06/P13 step separates first recorded IRP states, observation gaps and

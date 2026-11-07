@@ -14,7 +14,7 @@ if ($Sanitize) {
     Copy-Item -LiteralPath $environment.AsanRuntimePath -Destination $output
 }
 $program = Join-Path $output 'irp-binding-selftest.exe'
-$sources = @('tools\irp-binding-selftest.cpp', 'user\PendingIrpBinding.cpp', 'user\PendingIrpEvidence.cpp', 'user\BrokeredTypeLayouts.cpp',
+$sources = @('tools\irp-binding-selftest.cpp', 'user\PendingIrpBinding.cpp', 'user\PendingIrpEvidence.cpp', 'user\PendingIrpClaims.cpp', 'user\BrokeredTypeLayouts.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\TypeSchema.cpp',
     'user\TypeSchemaGenerator.cpp', 'user\TypeSchemaBroker.cpp', 'user\TypeSchemaCommand.cpp',
     'user\ParserWorkerProcess.cpp', 'user\AnalystSnapshot.cpp', 'user\ReferenceArtifact.cpp') |

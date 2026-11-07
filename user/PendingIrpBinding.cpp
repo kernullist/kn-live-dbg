@@ -1,4 +1,5 @@
 #include "PendingIrpBinding.h"
+#include "PendingIrpClaims.h"
 #include "PendingIrpEvidence.h"
 #include "ReferenceArtifact.h"
 #include "SchemaArtifact.h"
@@ -197,6 +198,11 @@ bool CaptureBoundPendingIrps(IObservationSource& source, const PendingIrpSchemaB
         result->RuntimeQualified = false;
         result->CoverageComplete = false;
         result->QualificationReason = L"irp_evidence_encoding_exceeded_bound_or_failed";
+    }
+    else
+    {
+        result->ClaimAssessmentJson = PendingIrpClaimAssessmentJson(binding, threads, options, *result, reads, context,
+            result->Evidence->Sha256, PendingIrpClaimMode::Capture, result->Evidence->Reference != nullptr);
     }
     if (error) { *error = result->RuntimeQualified ? L"" : result->QualificationReason; }
     // A failed final identity check preserves decoded candidates and reads;

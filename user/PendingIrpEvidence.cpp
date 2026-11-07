@@ -1,4 +1,5 @@
 #include "PendingIrpEvidence.h"
+#include "PendingIrpClaims.h"
 #include "PendingIrpReport.h"
 #include "SchemaArtifact.h"
 #include "ReferenceArtifact.h"
@@ -364,6 +365,8 @@ PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path)
         replay.SummaryMatched = true;
         replay.QualifiedObservation = result.RuntimeQualified && replay.ReferenceStatus == L"verified";
         replay.Status = L"replayed";
+        replay.ClaimAssessmentJson = PendingIrpClaimAssessmentJson(binding, threads, options, result, reads, context,
+            replay.CaptureSha256, PendingIrpClaimMode::Replay, replay.ReferenceStatus == L"verified");
         return replay;
     }
     catch (const std::exception&) { return fail(L"bounded_replay_failed"); }
@@ -379,7 +382,8 @@ std::wstring PendingIrpReplayJson(const PendingIrpReplay& replay)
         L",\"qualified_observation_reproduced\":" + B(replay.QualifiedObservation) +
         L",\"collector_authenticated\":false,\"external_final_state_authenticated\":false,\"pdb_file_verified\":false,"
         L"\"whole_image_integrity\":false,\"referenced_lifetime\":false,\"execution_observed\":false,\"atomic_snapshot\":false,"
-        L"\"build_approval\":\"not_established\",\"source_initialization_replayed\":false,\"result\":";
+        L"\"build_approval\":\"not_established\",\"source_initialization_replayed\":false,\"claim_assessment\":" +
+        (replay.SummaryMatched && !replay.ClaimAssessmentJson.empty() ? replay.ClaimAssessmentJson : L"null") + L",\"result\":";
     if (!replay.SummaryMatched) { return json + L"null}"; }
     json += L"{\"policy_runtime_qualified\":" + B(r.RuntimeQualified) + L",\"qualification_reason\":" + mcpjson::Quote(r.QualificationReason) +
         L",\"scope\":\"declared_inputs_and_ordered_original_reads\",\"threads_visited\":" + N(r.ThreadsVisited) +

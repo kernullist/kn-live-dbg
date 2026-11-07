@@ -23094,7 +23094,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
-    std::wcout << L"  !kmon replay-irp <capture.knirp> [/json]  ordered reads and schema/image/object invariants\n";
+    std::wcout << L"  !kmon replay-irp <capture.knirp> [/json]  ordered reads, schema/object invariants and scoped claims\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";

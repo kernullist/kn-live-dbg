@@ -842,8 +842,9 @@ PDB-resolved `Cancel`, `PendingReturned`, `IoStatus.Status`, device and file fie
 remain null when unavailable; offsets and pointer targets are not guessed.
 
 KMON emits `io.request_observation` with a private `kn.irp_observation.v1` report
-in `irp_observation_json`. The ordinary observation ring/log and watch filters
-apply; routine snapshots are suppressed from live console printing. Each report
+in `irp_observation_json`. These kernel observations enter the ordinary ring/log
+independently of process-watch filters; routine snapshots are suppressed from
+live console printing. Each report
 retains one request, up to 64 inspected stack locations, and a graph of its
 observed thread-list membership, stack locations and pointer references. Graph
 IDs are local to the enclosing event. A valid address shape does not validate a
@@ -1601,6 +1602,74 @@ identify their selected class. Final ledgers retain these denominators even
 after raw-file budgets are exhausted. Actual writer quota, reference-retry and
 concurrent admission checks are recorded in
 [validation](VALIDATION.md#irp-retention-priority-checkpoint-2026-11-07).
+
+#### IRP claim policies
+
+`kn.claim_registry.v1` supplies code-owned deterministic requirements for seven
+IRP claims under `kn.irp_claim_policy.v1`. The adapter consumes the bound
+collector's original result or a canonically matched ordered-read replay.
+Imported booleans alone are not inputs to the evaluator. The four outcomes are
+`supported`, `contradicted`, `unfulfilled` and `not_applicable`.
+
+| Claim | Supported scope or missing evidence |
+| --- | --- |
+| Thread-list membership observed | Captured reciprocal path and thread checks; no referenced allocation lifetime |
+| Packet owner matches thread observed | Typed `IRP.Tail.Overlay.Thread` equals the observed thread after the reader's checks |
+| Completion registration observed | Typed stack role, enabled control bits and a nonzero kernel target; disabled bits or a null target contradict this scoped registration |
+| Request completion observed | Unfulfilled without provider-bound request generation and a completion event/outcome |
+| Request cancellation observed | Unfulfilled without request generation and a cancel completion event/outcome; `Cancel` and `IoStatus` samples do not satisfy them |
+| Completion execution observed | Unfulfilled without request generation, an execution event and code-version binding |
+| Device-driver ownership observed | Unfulfilled without typed owner fields and referenced device/driver lifetimes; a pointer alone is insufficient |
+
+Every claim first requires original recorded reads, one stable declared source
+scope, exact schema/image binding and the reader's request invariants. Missing
+reference bytes or a failed final source/image check prevents both positive and
+negative qualification. Only within this qualified scope may the absence of an
+enabled completion reference, or an explicitly null device pointer, make the
+corresponding execution/ownership claim `not_applicable`. This says there is no
+applicable subject in that observation; it says nothing about earlier execution.
+Missing optional fields remain `unfulfilled` instead of becoming null pointers.
+
+Each result carries capture SHA-256 plus JSON pointers for supporting and
+contradicting facts, the unfulfilled requirements and a bounded next-observation
+suggestion. The evaluator rejects duplicate/unknown facts, missing evidence
+references and mixed-capture evidence. Suggestions identify their required
+collection mode and unresolved requirement; they do not authorize or execute
+an operation. A supported recorded-state claim never implies execution, a
+writer, maliciousness, host cleanliness, request lifetime or deadlock.
+
+`kn.irp_claim_report.v1` separates seven ledgers. Discovery preserves the supplied
+thread denominator, limits, cursor and unverified candidates. Address coverage
+uses unions of recorded parser-call ranges: requested bytes equal accepted
+bytes plus failed-only bytes. Repeated reads increase traffic without increasing
+that union. Unvisited addresses outside recorded calls remain unknown; no
+compared image bytes are claimed. Temporal coverage names the scan clock and
+interval without claiming continuous or atomic observation. Semantic,
+persistence, replay and trust ledgers distinguish layout checks, in-memory
+encoding, verified files, unchecked journal membership, current-policy analysis
+and unauthenticated collector declarations.
+
+Reports emit at most 128 claims and 128 Ki UTF-16 code units. They retain the
+exact possible/emitted/omitted denominator when the output bound is reached.
+`report_complete` refers only to this claim projection, separately from discovery
+coverage. A partial inventory can still support an admitted request's local
+claim. An empty or failed inventory never yields a whole-host clean claim.
+
+KMON retains `io.claim_assessment` and `io.request_observation` as kernel
+observations independently of process-watch filters; normal live printing is
+suppressed while the ring and log retain them. Unavailable assessments emit
+`coverage.irp_claims`. Capture-time reports remain derived event metadata outside
+the raw capture reservation. Existing `replay-irp` output adds `claim_assessment`
+only after canonical replay; invalid captures expose no partial claim result.
+Offline reports explicitly use `current_policy_on_replayed_observations` and
+do not claim to reproduce a separately preserved original claim policy.
+Capture v1/v2 bytes, request observation v1 and the native ABI remain unchanged.
+
+Other scanner adapters, image-change claims in the common registry,
+cross-capture qualified joins, request lifecycle providers and native build/
+lifetime validation remain open. The bounded IRP policy and publication-routing
+controls are recorded in
+[validation](VALIDATION.md#irp-objectstate-claim-checkpoint-2026-11-07).
 
 ### Live symbol and type index broker
 

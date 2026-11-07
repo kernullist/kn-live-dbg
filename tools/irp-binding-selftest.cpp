@@ -6,6 +6,8 @@
 #include "../user/ExecutableImageVerifier.h"
 #include "../user/ObservationReadRoutingJson.h"
 #include "../user/PendingIrpEvidence.h"
+#include "../user/PendingIrpClaims.h"
+#include "../user/ClaimPolicy.h"
 #include "irp-binding-fixture.h"
 #include <filesystem>
 #include <fstream>
@@ -111,6 +113,31 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc != 2) { return 2; }
     const std::filesystem::path root = argv[1];
+    {
+        using namespace claim_policy;
+        const Policy policy{L"owned_policy.v1", {{L"scope", L"qualify_scope", L"collect", true}, {L"condition", L"observe_condition", L"collect"}}};
+        const Evidence origin{std::wstring(64, L'a'), L"/owned"};
+        std::vector<Fact> facts{{L"scope", Observation::Met, origin}, {L"condition", Observation::Met, origin}};
+        Check(Evaluate(policy, facts).Status == State::Supported, "all required original facts support scoped claim");
+        facts[1].Value = Observation::Contrary;
+        Check(Evaluate(policy, facts).Status == State::Contradicted, "qualified contrary fact refutes condition");
+        facts[0].Value = Observation::Missing;
+        Check(Evaluate(policy, facts).Status == State::Unfulfilled && Evaluate(policy, facts, origin).Status == State::Unfulfilled,
+            "scope gap prevents negative and not-applicable upgrade");
+        facts[0].Value = Observation::Met;
+        Check(Evaluate(policy, facts, origin).Status == State::NotApplicable, "evidenced not-applicable subject stays distinct");
+        facts[1].Value = Observation::Met; facts[1].Origin = {};
+        Check(Evaluate(policy, facts).Status == State::Unfulfilled, "unsupported assertion without original evidence cannot pass");
+        facts[1].Origin = {std::wstring(64, L'b'), L"/owned"};
+        Check(Evaluate(policy, facts).Issue == L"mixed_capture_evidence", "equal subjects cannot join different captures");
+        facts[1].Origin = origin; facts.push_back(facts[1]);
+        Check(Evaluate(policy, facts).Issue == L"unknown_or_duplicate_fact", "duplicate facts cannot override original outcome");
+        facts.pop_back(); facts[1].RequirementId = L"foreign";
+        Check(Evaluate(policy, facts).Issue == L"unknown_or_duplicate_fact", "unknown requirement rejected");
+        auto duplicate = policy; duplicate.Requires.push_back(duplicate.Requires[0]);
+        Check(Evaluate(duplicate, {}).Issue == L"invalid_or_duplicate_requirement", "duplicate policy requirement rejected");
+        Check(Evaluate({}, {}).Status == State::Unfulfilled && !Evaluate({}, {}).Issue.empty(), "empty policy is not vacuous success");
+    }
     wchar_t own[32768]{}; GetModuleFileNameW(nullptr, own, 32768);
     PendingIrpSchemaBinding binding;
     binding.ImageBase = Image; binding.ImagePath = (root / L"fixture.exe").wstring();
@@ -153,8 +180,12 @@ int wmain(int argc, wchar_t** argv)
         {
             const auto path = (root / (L"case-" + std::to_wstring(++captureSequence) + L".knirp")).wstring();
             Check(PublishReferenceArtifact(path, result->Evidence->Bytes, &error), "negative and positive original capture preserved");
+            const auto claims = mcpjson::WideToUtf8(result->ClaimAssessmentJson);
+            Check(!claims.empty() && result->ClaimAssessmentJson.size() <= PendingIrpClaimMaximumCharacters &&
+                PublishReferenceArtifact(path + L".knclaims", std::vector<uint8_t>(claims.begin(), claims.end()), &error),
+                "bounded current-policy assessment retained independently of raw capture");
             const auto replay = ReplayPendingIrpCapture(path);
-            Check(replay.SummaryMatched && replay.Recomputed.RuntimeQualified == result->RuntimeQualified &&
+            Check(replay.SummaryMatched && !replay.ClaimAssessmentJson.empty() && replay.Recomputed.RuntimeQualified == result->RuntimeQualified &&
                 replay.Recomputed.Records.size() == result->Records.size(), "same parser reproduces saved capture including negative outcomes");
             if (!replay.SummaryMatched) { std::wcerr << L"[irp.replay] case=" << captureSequence << L" issue=" << replay.Issue << L'\n'; }
         }
@@ -380,6 +411,53 @@ int wmain(int argc, wchar_t** argv)
         Check(mcpjson::FindRawValue(Json(result), L"reads", &large) && large.size() > 2 * 1024 * 1024 &&
             !ParseObservationRoutedReadSet(large, &imported) && ParseObservationRoutedReadSet(large, &imported, PendingIrpEvidenceMaximumBytes),
             "large IRP import is explicit and leaves generic two MiB default intact");
+    }
+    for (unsigned variant = 0; variant < 6; ++variant)
+    {
+        auto memory = baseline; auto selected = binding;
+        auto& packet = memory.Regions[Irp];
+        if (variant == 0) { packet[sizeof(_IRP) + offsetof(_IO_STACK_LOCATION, Control)] = 0; }
+        if (variant == 1)
+        {
+            const uint64_t zero = 0;
+            memcpy(packet.data() + sizeof(_IRP) + offsetof(_IO_STACK_LOCATION, CompletionRoutine), &zero, sizeof(zero));
+        }
+        if (variant == 2)
+        {
+            packet[offsetof(_IRP, Cancel)] = 1;
+            const int32_t status = -1073741536;
+            memcpy(packet.data() + offsetof(_IRP, IoStatus), &status, sizeof(status));
+            const uint64_t device = 0xffff90000000b000ull;
+            memcpy(packet.data() + sizeof(_IRP) + offsetof(_IO_STACK_LOCATION, DeviceObject), &device, sizeof(device));
+        }
+        if (variant == 3)
+        {
+            auto schema = std::make_shared<TypeSchemaPackage>(*selected.Schemas[2]);
+            schema->Fields.erase(std::remove_if(schema->Fields.begin(), schema->Fields.end(),
+                [](const auto& f) { return f.Path.back() == L"DeviceObject"; }), schema->Fields.end());
+            selected.Schemas[2] = schema;
+        }
+        if (variant == 4)
+        {
+            const IrpFixtureLink empty{Thread + offsetof(_ETHREAD, IrpList), Thread + offsetof(_ETHREAD, IrpList)};
+            memcpy(memory.Regions[Thread].data() + offsetof(_ETHREAD, IrpList), &empty, sizeof(empty));
+        }
+        if (variant == 5)
+        {
+            packet.resize(sizeof(_IRP) + 64 * sizeof(_IO_STACK_LOCATION));
+            const auto bytes = static_cast<uint16_t>(packet.size());
+            memcpy(packet.data() + offsetof(_IRP, Size), &bytes, sizeof(bytes));
+            packet[offsetof(_IRP, StackCount)] = 64;
+        }
+        PendingIrpScanResult result;
+        Check(run(memory, selected, &result) && result.RuntimeQualified && !result.ClaimAssessmentJson.empty(),
+            "claim controls retain disabled null cancelled unknown empty and bounded-stack observations");
+        if (variant == 5)
+        {
+            std::wstring omitted;
+            Check(mcpjson::GetString(result.ClaimAssessmentJson, L"claims_omitted", &omitted) && omitted != L"0",
+                "claim report cap preserves exact omitted denominator");
+        }
     }
     std::cout << "[irp.binding] passed=" << Passed << " failed=" << Failed << '\n';
     return Failed == 0 ? 0 : 1;

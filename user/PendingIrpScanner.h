@@ -121,6 +121,7 @@ struct PendingIrpScanResult
     bool RuntimeQualified = false;
     std::wstring QualificationReason = L"schema_runtime_not_checked";
     std::shared_ptr<const PendingIrpEvidenceArtifact> Evidence;
+    std::wstring ClaimAssessmentJson; // Derived policy metadata; not part of capture bytes.
     bool CoverageComplete = false;
     // Repeated equal reads cannot establish a referenced IRP lifetime or exclude ABA reuse.
     bool ReferencedLifetime = false;

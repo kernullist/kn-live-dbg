@@ -205,6 +205,9 @@
     <ClCompile Include="PendingIrpScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="PendingIrpClaims.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PendingIrpScannerTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -484,6 +487,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PendingIrpScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ClaimPolicy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="PendingIrpClaims.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="IrpRetentionPolicy.h">

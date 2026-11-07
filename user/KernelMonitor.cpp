@@ -7891,7 +7891,9 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"thread.unbacked" ||
             event.Kind == L"thread.hidden" ||
             event.Kind == L"thread.dkom" ||
-            event.Kind == L"thread.scan")
+            event.Kind == L"thread.scan" ||
+            event.Kind == L"io.request_observation" ||
+            event.Kind == L"io.claim_assessment")
         {
             matched = true;
             break;
@@ -21243,7 +21245,7 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
-        event.Kind == L"io.request_observation" ||
+        event.Kind == L"io.request_observation" || event.Kind == L"io.claim_assessment" ||
         (event.Kind == L"coverage.layout" && (event.Task == L"complete" || event.Task == L"initial_observation")) ||
         event.Kind == L"coverage.page_candidates" ||
         event.Kind == L"coverage.image_permissions" ||
@@ -24160,6 +24162,21 @@ void KernelMonitor::ScanKernelThreads()
     const bool irpScanned = irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored);
     // Preserve identity rejections too; queue admission is not publication.
     const bool irpCaptureQueued = QueueIrpCapture(irpResult.Evidence);
+    {
+        KmonEvent assessment;
+        const bool available = !irpResult.ClaimAssessmentJson.empty();
+        assessment.Kind = available ? L"io.claim_assessment" : L"coverage.irp_claims";
+        assessment.Observation.Source = L"irp_snapshot";
+        assessment.Observation.DependencyGroup = L"native_thread_irp_list";
+        assessment.Observation.AddressSpace = irpResult.AddressSpace;
+        assessment.Summary = available ? L"IRP claims evaluated under recorded-state policy" : L"IRP claim assessment unavailable";
+        assessment.Evidence[L"assessment_status"] = available ? L"available" : L"unavailable";
+        assessment.Evidence[L"capture_sha256"] = irpResult.Evidence ? irpResult.Evidence->Sha256 : L"";
+        if (available) { assessment.Evidence[L"irp_claims_json"] = irpResult.ClaimAssessmentJson; }
+        else { assessment.Evidence[L"qualification_reason"] = irpResult.QualificationReason; }
+        assessment.Evidence[L"capture_admission"] = irpCaptureQueued ? L"queued" : L"unavailable_or_retention_denied";
+        RecordEvent(std::move(assessment));
+    }
     if (irpScanned)
     {
         IrpCompletionCursor = irpResult.NextCursor;

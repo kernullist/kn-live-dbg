@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from irp_claim_oracle import validate as validate_claims
 
 
 def main():
@@ -30,6 +31,10 @@ def main():
         if code:
             assert not result["qualified_observation_reproduced"] and not result["summary_matched"]
             assert result["result"] is None
+            assert result["claim_assessment"] is None
+        else:
+            validate_claims(path.read_bytes(), result["claim_assessment"], replay=True,
+                            reference_available=result["reference_status"] == "verified")
         checks += 1
         return result
 

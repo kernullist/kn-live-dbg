@@ -82,6 +82,9 @@ def main():
     irp_retention = by_key[("evidence", "retention_irp", "native")]
     assert "reference_and_journal_before_repeat_demotion" in irp_retention["requirements"]
     assert "unavailable_capture_denominator" in irp_retention["requirements"] and "4_slots_240MiB_reserved" in irp_retention["limits"]
+    irp_claims = by_key[("evidence", "claims_irp", "capture")]
+    assert "seven_ledgers" in irp_claims["requirements"] and "single_capture_evidence" in irp_claims["requirements"]
+    assert "omitted_denominator" in irp_claims["limits"] and irp_claims["availability"] == "not_probed"
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]

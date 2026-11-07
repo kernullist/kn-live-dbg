@@ -46,7 +46,7 @@ class PublicContentTests(unittest.TestCase):
                        "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
                        "kn.evidence_gc_policy.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
                     "kn.minimized_image_facts.v1", "kn.redaction_manifest.v1", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
-                       "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
+                       "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                        "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                        "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
                        "kn.translation_receipt.v1", "kn.dump_read.v1",
