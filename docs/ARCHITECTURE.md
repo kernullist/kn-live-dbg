@@ -839,8 +839,10 @@ final result; the [Windows IRP contract](https://learn.microsoft.com/en-us/windo
 does not allow the cancel flag alone to establish cancelled completion.
 Collector tick boundaries describe a non-atomic scan interval, not dispatch or
 completion latency. Enumeration coverage remains scoped to supplied ETHREADs.
-IRP allocation references, cross-observation joins, raw-read replay, dispatch/
-completion event providers, wait/lock graphs and deadlock diagnosis remain open.
+The [bound capture and offline replay](#pending-irp-schema-and-runtime-binding)
+preserve the original read evidence. IRP allocation references, cross-observation
+joins, dispatch/completion event providers, wait/lock graphs and deadlock
+diagnosis remain open.
 
 ## Imported execution samples
 
@@ -1464,34 +1466,62 @@ failure preserves decoded candidates and original reads but prevents their
 registration as observed completion targets. An initial identity failure stops
 object decoding. Equal repeated reads cannot exclude ABA replacement.
 
-One `kn.irp_capture.v1` artifact preserves the three canonical schemas, reference
+One `kn.irp_capture.v2` artifact preserves the three canonical schemas, reference
 identity metadata, supplied thread inventory/cursor, results and ordered parser
-reads with their original statuses and bytes. It does not retain the image/PDB
-files or source-initialization activity. The read operation admits at most
+reads with their original statuses and bytes. It also records the initial source
+contract, boot-tick interval, final cancellation/source-contract checks and the
+number of captured reference bytes. A bounded image snapshot comes from the same
+approved image handle. The PDB file and source-initialization activity are not
+retained. The read operation admits at most
 256 KiB, 2,048 source calls and 4,096 receipts over five seconds. Input inventory
 is capped at 16,384 threads; the existing per-scan object/walk limits still apply.
 Encoded capture size is capped at 16 MiB. Incomplete capture/operation state
 cannot qualify a result. The boot-tick report interval and the recorder's steady
 clock are identified separately.
 
-KMON request events reference the capture SHA-256. Four queued captures and one
-writer item are bounded separately; the writer has a 128 MiB session allowance.
+KMON request events reference the capture SHA-256. The four-slot queue and its
+writer share a 128 MiB byte reservation, charged until publication finishes.
+Each capture is at most 16 MiB and each image at most 64 MiB. This bounds queued
+and writing artifacts; the producer's current capture is separate. The writer
+has a combined 128 MiB session allowance for new capture and reference bytes.
 New `.knirp` files require an already initialized private evidence store in the
 configured log directory. The existing store policy determines ACL-only or EFS
 protection; there is no automatic initialization or encryption downgrade. The
 writer checks the actual new file handle before writing bytes, flushes and
 renames without replacement, and records publication success/failure separately
-from queue admission. A `.knirpledger` records final encoded-capture queue counts,
-bytes and pending work. A missing private policy causes a publication failure,
+from queue admission. An `irp-reference-<sha256>.knblob` in the same checked root
+is created without replacement or reused only after hash, size and privacy
+checks under a read-only lease. Reference failure does not erase the original
+capture; its publication event records the gap. A `.knirpledger` records final
+queue counts, bytes, pending reservations and reference creation/reuse/failures.
+A missing private policy causes a publication failure,
 not a silently successful capture. These formats and pending files are excluded
 from source publication even when a JSON artifact is renamed.
 
-These captures are not yet journal members and have no product offline replay
-command. Stopped-store inventory must continue treating them as unmanaged rather
-than inventing membership. Full typed-evidence replay/retention integration,
+`KnLiveDbg.exe --offline !kmon replay-irp <capture.knirp> /json` uses the same
+schema resolver, image-identity checks and IRP reader against the saved ordered
+calls. Every address, length, accepted/rejected result and final canonical
+capture must agree, including counters, graph, optional fields and pagination.
+The importer explicitly allows up to 16 MiB; existing generic read importers
+retain their 2 MiB default. Incomplete traces, forged summaries, unknown policies
+and unused or reordered calls cannot produce a matched replay.
+
+The fixed sibling reference name comes from the validated schema hash, never an
+imported pathname. Missing reference bytes allow a reported metadata replay but
+cannot reproduce `qualified_observation`. A present conflicting image rejects
+replay. Exact image/hash/PE/RSDS validation enables the bounded qualification;
+it authenticates neither the collector nor the declared external final state.
+The command does not open a live source, download symbols or reparse a PDB.
+Legacy v1 files remain intact and report their missing source/final-state inputs
+instead of inventing them. Request observation v1 and the native IOCTL ABI are
+unchanged.
+
+These captures and references are not yet journal members. The image-only
+stopped-store inventory does not account for them; its completeness is scoped
+to its image namespace. Typed journal membership and retention integration,
 approved build/schema change handling and real native-driver lifecycle evidence
 remain open. Owned DIA/offset/read-byte and writer controls are recorded in
-[validation](VALIDATION.md#pending-irp-runtime-binding-checkpoint-2026-11-07).
+[validation](VALIDATION.md#pending-irp-offline-replay-checkpoint-2026-11-07).
 
 ### Live symbol and type index broker
 

@@ -6,6 +6,7 @@
 #include "TemporalFactStore.h"
 #include "ObservationReadRoutingJson.h"
 #include "PendingIrpBinding.h"
+#include "SchemaArtifact.h"
 #include "EvidencePrivacy.h"
 
 #include <algorithm>
@@ -151,6 +152,8 @@ void KernelMonitor::ResetPipeline()
     CapturedIrps.Reset();
     IrpCapturesQueued.store(0); IrpCapturesWritten.store(0); IrpCapturesFailed.store(0); IrpCapturesDropped.store(0);
     IrpCaptureBytes.store(0); IrpCaptureLedgerFailed.store(0);
+    IrpCaptureReservedBytes.store(0); IrpReferenceBytes.store(0);
+    IrpReferencesCreated.store(0); IrpReferencesReused.store(0); IrpReferencesFailed.store(0);
     CapturedImageReadSets.Reset();
     // Producers/writer have stopped; live hunt readers can still inspect the
     // previous session. Serialize the policy-state replacement with that path.
@@ -1354,20 +1357,29 @@ void KernelMonitor::CloseImageReadCollection() noexcept
 bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact)
 {
     if (!artifact) { return false; }
+    uint64_t reservation = 0;
     try
     {
         if (artifact->Bytes.empty() || artifact->Bytes.size() > PendingIrpEvidenceMaximumBytes || artifact->Sha256.size() != 64 ||
-            !CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact)}))
+            (artifact->Reference && (artifact->Reference->Bytes.empty() || artifact->Reference->Bytes.size() > ReferenceArtifactMaxBytes)))
         { IrpCapturesDropped.fetch_add(1); return false; }
+        const uint64_t bytes = artifact->Bytes.size() + (artifact->Reference ? artifact->Reference->Bytes.size() : 0);
+        auto used = IrpCaptureReservedBytes.load();
+        do { if (bytes > 128ull * 1024 * 1024 - used) { IrpCapturesDropped.fetch_add(1); return false; } }
+        while (!IrpCaptureReservedBytes.compare_exchange_weak(used, used + bytes));
+        reservation = bytes;
+        if (!CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact), bytes}))
+        { IrpCaptureReservedBytes.fetch_sub(bytes); IrpCapturesDropped.fetch_add(1); return false; }
         IrpCapturesQueued.fetch_add(1);
         return true;
     }
-    catch (...) { IrpCapturesDropped.fetch_add(1); return false; }
+    catch (...) { if (reservation) { IrpCaptureReservedBytes.fetch_sub(reservation); } IrpCapturesDropped.fetch_add(1); return false; }
 }
 
 void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
 {
     bool written = false;
+    bool referenceSaved = false, referenceCreated = false;
     try
     {
         std::wstring directory, failure = L"irp_capture_session_byte_budget";
@@ -1375,16 +1387,51 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         EvidencePrivacyGuard privacy;
         EvidencePrivacyReport report;
         EvidenceStoreLease lease;
-        std::wstring path;
+        std::wstring path, referenceStatus = capture.Artifact && capture.Artifact->Reference ? L"not_attempted" : L"not_captured", referenceFailure;
+        auto referenceLease = std::make_unique<SchemaArtifact>();
         // A new raw-data producer requires an already initialized private root.
         // Publish directly in that pinned root; do not trust a pre-existing child directory.
         if (directory.empty() || !privacy.Open(directory, false, &report)) { failure = L"private_store_required:" + report.Issue; }
         else if (lease.Acquire(directory, false, &failure) && capture.Artifact &&
-            capture.Artifact->Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load())
+            capture.Artifact->Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load() - IrpReferenceBytes.load())
         {
             const auto digest = ContentHash::Bytes(capture.Artifact->Bytes);
             if (!digest.empty() && digest == capture.Artifact->Sha256)
             {
+                if (capture.Artifact->Reference)
+                {
+                    const auto& reference = *capture.Artifact->Reference;
+                    const auto referenceDigest = ContentHash::Bytes(reference.Bytes);
+                    bool saved = false, created = false;
+                    referenceStatus = L"failed";
+                    referenceFailure = L"reference_digest_mismatch";
+                    if (!referenceDigest.empty() && referenceDigest == reference.Sha256)
+                    {
+                        referenceFailure = L"reference_lease_or_privacy_mismatch";
+                        const auto referencePath = (std::filesystem::path(directory) / (L"irp-reference-" + referenceDigest + L".knblob")).wstring();
+                        if (!referenceLease->Open(referencePath, ReferenceArtifactMaxBytes))
+                        {
+                            referenceFailure = L"irp_reference_session_byte_budget";
+                            if (reference.Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load() - IrpReferenceBytes.load() - capture.Artifact->Bytes.size())
+                            {
+                                created = PublishReferenceArtifact(referencePath, reference.Bytes, &referenceFailure,
+                                    [&](HANDLE file) { return privacy.CheckFile(file); });
+                                // Count durable bytes even if a subsequent verification fails.
+                                if (created) { IrpReferenceBytes.fetch_add(reference.Bytes.size()); }
+                            }
+                            if (created)
+                            {
+                                referenceLease = std::make_unique<SchemaArtifact>();
+                                saved = referenceLease->Open(referencePath, ReferenceArtifactMaxBytes) && privacy.CheckFile(referenceLease->Handle()) &&
+                                    referenceLease->Sha256 == referenceDigest && referenceLease->Bytes() == reference.Bytes.size();
+                            }
+                        }
+                        else { saved = privacy.CheckFile(referenceLease->Handle()) && referenceLease->Sha256 == referenceDigest && referenceLease->Bytes() == reference.Bytes.size(); }
+                        if (saved) { referenceStatus = created ? L"created" : L"reused"; referenceFailure.clear(); }
+                        else if (referenceFailure.empty()) { referenceFailure = L"reference_lease_or_privacy_mismatch"; }
+                    }
+                    referenceSaved = saved; referenceCreated = created;
+                }
                 path = (std::filesystem::path(directory) / (L"irp-" + capture.CollectionId + L"-" + digest + L".knirp")).wstring();
                 written = PublishReferenceArtifact(path, capture.Artifact->Bytes, &failure,
                     [&](HANDLE file) { return privacy.CheckFile(file); });
@@ -1401,11 +1448,20 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
         event.Evidence[L"journal_membership"] = L"not_integrated";
+        event.Evidence[L"reference_persistence"] = referenceStatus;
+        event.Evidence[L"reference_failure"] = referenceFailure;
         if (!PipelineEvents.Push(std::move(event))) { CollectionLost.fetch_add(1); }
     }
     catch (...) {}
     if (written) { IrpCapturesWritten.fetch_add(1); }
     else { IrpCapturesFailed.fetch_add(1); }
+    if (capture.Artifact && capture.Artifact->Reference)
+    {
+        if (!referenceSaved) { IrpReferencesFailed.fetch_add(1); }
+        else if (referenceCreated) { IrpReferencesCreated.fetch_add(1); }
+        else { IrpReferencesReused.fetch_add(1); }
+    }
+    IrpCaptureReservedBytes.fetch_sub(capture.ReservedBytes);
 }
 
 void KernelMonitor::CloseIrpCollection() noexcept
@@ -1425,7 +1481,10 @@ void KernelMonitor::CloseIrpCollection() noexcept
             const auto json = L"{\"schema\":\"kn.irp_capture_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
                 L",\"queued\":" + n(IrpCapturesQueued.load()) + L",\"written\":" + n(IrpCapturesWritten.load()) +
                 L",\"failed\":" + n(IrpCapturesFailed.load()) + L",\"dropped\":" + n(IrpCapturesDropped.load()) +
-                L",\"bytes\":" + n(IrpCaptureBytes.load()) + L",\"pending\":" + n(CapturedIrps.Size()) + L",\"journal_membership\":false}";
+                L",\"bytes\":" + n(IrpCaptureBytes.load()) + L",\"pending\":" + n(CapturedIrps.Size()) +
+                L",\"reserved_bytes\":" + n(IrpCaptureReservedBytes.load()) + L",\"reference_bytes_created\":" + n(IrpReferenceBytes.load()) +
+                L",\"references_created\":" + n(IrpReferencesCreated.load()) + L",\"references_reused\":" + n(IrpReferencesReused.load()) +
+                L",\"references_failed\":" + n(IrpReferencesFailed.load()) + L",\"journal_membership\":false}";
             const auto bytes = mcpjson::WideToUtf8(json);
             if (PublishReferenceArtifact((std::filesystem::path(directory) / (L"irp-session-" + id + L".knirpledger")).wstring(),
                 std::vector<uint8_t>(bytes.begin(), bytes.end()), &failure,
@@ -1736,6 +1795,11 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"irp_captures_pending"] = std::to_wstring(CapturedIrps.Size());
         event.Evidence[L"irp_capture_bytes"] = std::to_wstring(IrpCaptureBytes.load());
         event.Evidence[L"irp_capture_ledger_failed"] = std::to_wstring(IrpCaptureLedgerFailed.load());
+        event.Evidence[L"irp_capture_reserved_bytes"] = std::to_wstring(IrpCaptureReservedBytes.load());
+        event.Evidence[L"irp_reference_bytes_created"] = std::to_wstring(IrpReferenceBytes.load());
+        event.Evidence[L"irp_references_created"] = std::to_wstring(IrpReferencesCreated.load());
+        event.Evidence[L"irp_references_reused"] = std::to_wstring(IrpReferencesReused.load());
+        event.Evidence[L"irp_references_failed"] = std::to_wstring(IrpReferencesFailed.load());
         event.Evidence[L"image_read_sets_queued"] = std::to_wstring(ImageReadsQueued.load());
         event.Evidence[L"image_read_sets_written"] = std::to_wstring(ImageReadsWritten.load());
         event.Evidence[L"image_read_sets_failed"] = std::to_wstring(ImageReadsFailed.load());
@@ -2073,6 +2137,10 @@ bool KmonPipelineSelfTest()
                 const std::string fixture = "{\"schema\":\"kn.irp_capture.v1\",\"owned_writer_fixture\":true}";
                 artifact->Bytes.assign(fixture.begin(), fixture.end());
                 artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
+                auto reference = std::make_shared<RetainedReferenceArtifact>();
+                reference->Bytes = {0x4d, 0x5a, 1, 2};
+                reference->Sha256 = ContentHash::Bytes(reference->Bytes);
+                artifact->Reference = reference;
                 const auto irpOwner = std::make_unique<KernelMonitor>();
                 auto& irp = *irpOwner;
                 irp.Options.LogDirectory = privateRoot;
@@ -2085,13 +2153,23 @@ bool KmonPipelineSelfTest()
                 const bool publication = initialized.Initialized && queued && irp.CapturedIrps.Size() == 0 &&
                     irp.IrpCapturesWritten.load() == 1 && irp.IrpCapturesFailed.load() == 1 &&
                     irp.IrpCaptureBytes.load() == artifact->Bytes.size() && irp.IrpCaptureLedgerFailed.load() == 0 &&
+                    irp.IrpCaptureReservedBytes.load() == 0 && irp.IrpReferencesCreated.load() == 1 && irp.IrpReferencesReused.load() == 1 &&
+                    irp.IrpReferenceBytes.load() == reference->Bytes.size() && irp.IrpReferencesFailed.load() == 0 &&
+                    ContentHash::File((std::filesystem::path(privateRoot) / (L"irp-reference-" + reference->Sha256 + L".knblob")).wstring()) == reference->Sha256 &&
                     ContentHash::File(path.wstring()) == artifact->Sha256 && std::filesystem::exists(ledger) &&
                     InspectEvidencePrivacy(privateRoot, true).AuditComplete;
                 const auto pressureOwner = std::make_unique<KernelMonitor>();
                 auto& pressure = *pressureOwner;
                 for (size_t n = 0; n < 5; ++n) { pressure.QueueIrpCapture(artifact); }
                 const bool bounded = pressure.CapturedIrps.Size() == 4 && pressure.IrpCapturesQueued.load() == 4 &&
-                    pressure.IrpCapturesDropped.load() == 1;
+                    pressure.IrpCapturesDropped.load() == 1 && pressure.IrpCaptureReservedBytes.load() == 4 * (artifact->Bytes.size() + reference->Bytes.size());
+                const auto weightedOwner = std::make_unique<KernelMonitor>();
+                auto large = std::make_shared<PendingIrpEvidenceArtifact>(*artifact);
+                auto largeReference = std::make_shared<RetainedReferenceArtifact>();
+                largeReference->Bytes.resize(ReferenceArtifactMaxBytes);
+                large->Reference = largeReference;
+                const bool weighted = weightedOwner->QueueIrpCapture(large) && !weightedOwner->QueueIrpCapture(large) &&
+                    weightedOwner->CapturedIrps.Size() == 1 && weightedOwner->IrpCaptureReservedBytes.load() == large->Bytes.size() + ReferenceArtifactMaxBytes;
                 const auto deniedOwner = std::make_unique<KernelMonitor>();
                 auto& denied = *deniedOwner;
                 denied.Options.LogDirectory = unique; // Existing directory without private policy.
@@ -2099,9 +2177,10 @@ bool KmonPipelineSelfTest()
                 denied.WriterStopping.store(true);
                 denied.CaptureWriterLoop();
                 const bool privateOnly = denied.IrpCapturesWritten.load() == 0 && denied.IrpCapturesFailed.load() == 1 &&
-                    denied.IrpCaptureBytes.load() == 0 && denied.CapturedIrps.Size() == 0 && denied.IrpCaptureLedgerFailed.load() == 1;
-                if (!publication || !bounded || !privateOnly)
-                { std::fprintf(stderr, "FAIL IRP private publication/collision/pressure/drain controls: %u %u %u\n", publication, bounded, privateOnly); break; }
+                    denied.IrpCaptureBytes.load() == 0 && denied.CapturedIrps.Size() == 0 && denied.IrpCaptureLedgerFailed.load() == 1 &&
+                    denied.IrpCaptureReservedBytes.load() == 0 && denied.IrpReferencesFailed.load() == 1;
+                if (!publication || !bounded || !weighted || !privateOnly)
+                { std::fprintf(stderr, "FAIL IRP private publication/collision/weighted pressure/drain controls: %u %u %u %u\n", publication, bounded, weighted, privateOnly); break; }
             }
             std::vector<uint8_t> expected(4096, 0x53);
             std::memcpy(allocation, expected.data(), expected.size());

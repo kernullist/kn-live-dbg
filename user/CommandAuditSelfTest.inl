@@ -485,6 +485,11 @@ static int RunCommandAuditSelfTest()
     check(!IsWriteLikeCommandLine(L"!kmon evidence x /pid 55 /json") &&
         !IsWriteLikeCommandLine(L"!kmon replay x.kncase /json") && !IsWriteLikeCommandLine(L"!kmon why x.kncase /json"),
         L"offline evidence inspection is read-only");
+    check(!IsWriteLikeCommandLine(L"!kmon replay-irp missing.knirp /json") &&
+        run(L"!kmon replay-irp missing.knirp /json").Output.find(L"kn.irp_replay.v1") != std::wstring::npos && !device.IsOpen(),
+        L"offline IRP replay is read-only and does not open a driver");
+    for (const auto& line : {L"!kmon replay-irp", L"!kmon replay-irp /json", L"!kmon replay-irp x /current", L"!kmon replay-irp x /json /json"})
+    { check(run(line).Error.find(L"usage") != std::wstring::npos, L"IRP replay rejects malformed arguments"); }
     check(IsWriteLikeCommandLine(L"!kmon inventory x new-output /json") &&
         !IsWriteLikeCommandLine(L"!kmon evidence x /inventory saved-index /json") &&
         !IsWriteLikeCommandLine(L"!kmon dump-read x.dmp 1000 16 /json"),

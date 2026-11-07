@@ -5,6 +5,7 @@
 #include "../user/SchemaArtifact.h"
 #include "../user/ExecutableImageVerifier.h"
 #include "../user/ObservationReadRoutingJson.h"
+#include "../user/PendingIrpEvidence.h"
 #include "irp-binding-fixture.h"
 #include <filesystem>
 #include <fstream>
@@ -102,6 +103,12 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
     if (argc >= 2 && std::wstring(argv[1]) == L"--schema-worker") { return RunTypeSchemaWorkerCommand(argc, argv); }
+    if (argc == 3 && std::wstring(argv[1]) == L"--replay-irp")
+    {
+        const auto replay = ReplayPendingIrpCapture(argv[2]);
+        std::wcout << PendingIrpReplayJson(replay) << L'\n';
+        return replay.SummaryMatched ? 0 : 1;
+    }
     if (argc != 2) { return 2; }
     const std::filesystem::path root = argv[1];
     wchar_t own[32768]{}; GetModuleFileNameW(nullptr, own, 32768);
@@ -137,9 +144,22 @@ int wmain(int argc, wchar_t** argv)
     Check(Initialize(baseline, binding.ImagePath, &metadata), "owned PE mapping and typed objects initialized");
     const std::vector<PendingIrpThreadInput> threads{{Thread, 100, 200}};
     PendingIrpScanOptions options; options.ThreadInventoryComplete = true;
+    uint32_t captureSequence = 0;
     const auto run = [&](Memory& memory, const PendingIrpSchemaBinding& selected, PendingIrpScanResult* result,
         const std::atomic<bool>* cancel = nullptr)
-    { return CaptureBoundPendingIrps(memory, selected, threads, options, result, &error, cancel); };
+    {
+        const auto captured = CaptureBoundPendingIrps(memory, selected, threads, options, result, &error, cancel);
+        if (result->Evidence)
+        {
+            const auto path = (root / (L"case-" + std::to_wstring(++captureSequence) + L".knirp")).wstring();
+            Check(PublishReferenceArtifact(path, result->Evidence->Bytes, &error), "negative and positive original capture preserved");
+            const auto replay = ReplayPendingIrpCapture(path);
+            Check(replay.SummaryMatched && replay.Recomputed.RuntimeQualified == result->RuntimeQualified &&
+                replay.Recomputed.Records.size() == result->Records.size(), "same parser reproduces saved capture including negative outcomes");
+            if (!replay.SummaryMatched) { std::wcerr << L"[irp.replay] case=" << captureSequence << L" issue=" << replay.Issue << L'\n'; }
+        }
+        return captured;
+    };
     PendingIrpScanResult good;
     Check(run(baseline, binding, &good) && good.RuntimeQualified && good.CoverageComplete && good.Records.size() == 1 &&
         good.Requests.size() == 1 && !good.ReferencedLifetime, "schema image owner list and IRP invariants qualify bounded observation");
@@ -157,6 +177,15 @@ int wmain(int argc, wchar_t** argv)
     if (good.Evidence)
     {
         Check(PublishReferenceArtifact((root / L"positive.knirp").wstring(), good.Evidence->Bytes, &error), "capture written create-new");
+        const auto missing = ReplayPendingIrpCapture((root / L"positive.knirp").wstring());
+        Check(missing.SummaryMatched && !missing.QualifiedObservation && missing.ReferenceStatus == L"missing_or_unreadable",
+            "metadata replay does not promote a missing reference image");
+        Check(good.Evidence->Reference && good.Evidence->Reference->Sha256 == binding.Schemas[0]->ImageSha256 &&
+            PublishReferenceArtifact((root / (L"irp-reference-" + good.Evidence->Reference->Sha256 + L".knblob")).wstring(),
+                good.Evidence->Reference->Bytes, &error), "exact leased image bytes retained for offline replay");
+        const auto verified = ReplayPendingIrpCapture((root / L"positive.knirp").wstring());
+        Check(verified.SummaryMatched && verified.QualifiedObservation && verified.ReferenceStatus == L"verified" &&
+            !verified.Recomputed.ReferencedLifetime, "saved image and ordered reads reproduce qualified observation without lifetime claim");
         Check(!PublishReferenceArtifact((root / L"positive.knirp").wstring(), std::vector<uint8_t>{1,2,3}, &error) &&
             ContentHash::File((root / L"positive.knirp").wstring()) == good.Evidence->Sha256, "collision leaves original capture intact");
         bool emptyAtAdmission = false;
@@ -259,6 +288,35 @@ int wmain(int argc, wchar_t** argv)
     }
     {
         auto memory = baseline;
+        constexpr uint64_t secondIrp = Irp + 0x4000;
+        memory.Regions[secondIrp] = memory.Regions[Irp];
+        auto* thread = reinterpret_cast<_ETHREAD*>(memory.Regions[Thread].data());
+        auto* first = reinterpret_cast<_IRP*>(memory.Regions[Irp].data());
+        auto* second = reinterpret_cast<_IRP*>(memory.Regions[secondIrp].data());
+        thread->IrpList.Blink = secondIrp + offsetof(_IRP, ThreadListEntry);
+        first->ThreadListEntry.Flink = thread->IrpList.Blink;
+        second->ThreadListEntry.Blink = Irp + offsetof(_IRP, ThreadListEntry);
+        second->Tail.Overlay.CurrentStackLocation = reinterpret_cast<void*>(secondIrp + sizeof(_IRP));
+        options.MaxIrps = 1;
+        PendingIrpScanResult page1, page2;
+        const bool firstPage = run(memory, binding, &page1);
+        options.Cursor = page1.NextCursor;
+        const bool secondPage = run(memory, binding, &page2);
+        Check(firstPage && secondPage && page1.Requests.size() == 1 && page2.Requests.size() == 1 &&
+            page1.Requests[0].Irp == Irp && page2.Requests[0].Irp == secondIrp && page1.NextCursor.IrpAddress == Irp &&
+            !page1.CoverageComplete && !page2.CoverageComplete, "nonzero continuation cursor replays distinct bounded pages");
+        options = {}; options.ThreadInventoryComplete = true;
+    }
+    {
+        auto memory = baseline;
+        std::atomic<bool> cancelled{false};
+        memory.Before = [&](const auto& q) { if (q.Address == Irp) { cancelled.store(true); } };
+        PendingIrpScanResult result;
+        Check(run(memory, binding, &result, &cancelled) && !result.RuntimeQualified && result.Requests.empty(),
+            "cancellation during a source read preserves the rejected complete receipt for replay");
+    }
+    {
+        auto memory = baseline;
         memory.Caps.MaximumReadBytes = 1;
         memory.Calls = 0;
         auto& packet = memory.Regions[Irp];
@@ -270,6 +328,11 @@ int wmain(int argc, wchar_t** argv)
         Check(run(memory, binding, &result) && !result.RuntimeQualified && !result.CoverageComplete &&
             result.Records.empty() && memory.Calls == 2048 && result.Evidence && Json(result).find(L"budget_deferred") != std::wstring::npos,
             "shared source-call budget bounds repeated object reads and retains denials");
+        std::wstring large;
+        ObservationRoutedReadSet imported;
+        Check(mcpjson::FindRawValue(Json(result), L"reads", &large) && large.size() > 2 * 1024 * 1024 &&
+            !ParseObservationRoutedReadSet(large, &imported) && ParseObservationRoutedReadSet(large, &imported, PendingIrpEvidenceMaximumBytes),
+            "large IRP import is explicit and leaves generic two MiB default intact");
     }
     std::cout << "[irp.binding] passed=" << Passed << " failed=" << Failed << '\n';
     return Failed == 0 ? 0 : 1;

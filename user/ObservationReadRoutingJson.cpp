@@ -115,15 +115,16 @@ bool ValidObservationRoutedReadSet(const ObservationRoutedReadSet& routed)
     return cursor == set.Reads.size();
 }
 
-bool ParseObservationRoutedReadSet(const std::wstring& json, ObservationRoutedReadSet* out)
+bool ParseObservationRoutedReadSet(const std::wstring& json, ObservationRoutedReadSet* out, size_t maximumCharacters)
 {
-    if (out == nullptr || json.size() > 2 * 1024 * 1024 || !mcpjson::ValidateDocument(json)) { return false; }
+    IndexedObject object;
+    if (out == nullptr || maximumCharacters > 16 * 1024 * 1024 || json.size() > maximumCharacters || !object.Parse(json)) { return false; }
     ObservationRoutedReadSet set;
     std::wstring attempts;
     std::vector<std::wstring> rows;
-    if (!Number(json, L"unrecorded_parser_calls", &set.UnrecordedParserCalls) ||
-        !mcpjson::FindRawValue(json, L"attempts", &attempts) || !ParseObservationReadSet(attempts, 4096, &set.Attempts) ||
-        !Array(json, L"parser_reads", 4096, &rows)) { return false; }
+    if (!Number(object.Metadata({L"attempts", L"parser_reads"}), L"unrecorded_parser_calls", &set.UnrecordedParserCalls) ||
+        !object.Raw(L"attempts", &attempts) || !ParseObservationReadSet(attempts, 4096, &set.Attempts, maximumCharacters) ||
+        !object.Rows(L"parser_reads", 4096, &rows)) { return false; }
     for (const auto& row : rows)
     {
         ObservationParserRead call;

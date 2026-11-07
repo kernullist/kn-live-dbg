@@ -1,5 +1,6 @@
 #include "PendingIrpBinding.h"
-#include "PendingIrpReport.h"
+#include "PendingIrpEvidence.h"
+#include "ReferenceArtifact.h"
 #include "SchemaArtifact.h"
 #include "ExecutableImageVerifier.h"
 #include "ObservationReadRoutingJson.h"
@@ -55,56 +56,7 @@ namespace
         return true;
     }
 
-    std::wstring CursorJson(const PendingIrpCursor& c)
-    {
-        return L"{\"thread\":" + N(c.ThreadObject) + L",\"created\":" + N(c.ThreadCreateTime) + L",\"irp\":" + N(c.IrpAddress) +
-            L",\"head\":" + N(c.List.Head) + L",\"entry\":" + N(c.List.Entry) + L",\"forward\":" + N(c.List.Forward) +
-            L",\"backward\":" + N(c.List.Backward) + L"}";
-    }
 
-    std::shared_ptr<const PendingIrpEvidenceArtifact> Evidence(const PendingIrpSchemaBinding& binding,
-        const executable_image::DiskPeMetadata& m, const std::vector<PendingIrpThreadInput>& threads,
-        const PendingIrpScanOptions& options, const PendingIrpScanResult& result, const ObservationRoutedReadSet& reads,
-        const std::wstring& before, const std::wstring& after, bool stable)
-    {
-        std::wstring json = L"{\"schema\":\"kn.irp_capture.v1\",\"policy\":\"schema-image-repeated-snapshot-v1\","
-            L"\"collector_authenticated\":false,\"reference_image_preserved\":false,\"pdb_file_preserved\":false,"
-            L"\"whole_image_integrity\":false,\"referenced_lifetime\":false,\"atomic_snapshot\":false,"
-            L"\"execution_observed\":false,\"source_initialization_recorded\":false,\"schemas\":[";
-        for (size_t i = 0; i < binding.Schemas.size(); ++i)
-        { if (i != 0) { json += L","; } json += TypeSchemaJson(*binding.Schemas[i]); }
-        json += L"],\"image_base\":" + N(binding.ImageBase) + L",\"reference_identity\":{\"image_base\":" + N(m.ImageBase) +
-            L",\"machine\":" + N(m.Machine) + L",\"optional_magic\":" + N(m.OptionalMagic) + L",\"image_size\":" + N(m.SizeOfImage) +
-            L",\"timestamp\":" + N(m.TimeDateStamp) + L",\"checksum\":" + N(m.CheckSum) + L",\"entry_point\":" + N(m.EntryPointRva) +
-            L",\"section_count\":" + N(m.Sections.size()) + L",\"pdb_rva\":" + N(m.PdbRva) + L",\"pdb_guid\":" + mcpjson::Quote(GuidText(m.PdbGuid)) +
-            L",\"pdb_age\":" + N(m.PdbAge) + L"},\"image_before\":" + mcpjson::Quote(before) + L",\"image_after\":" + mcpjson::Quote(after) +
-            L",\"reference_content_rechecked\":true,\"reference_content_stable\":" + B(stable) +
-            L",\"readset_complete\":" + B(ValidObservationRoutedReadSet(reads)) + L",\"runtime_qualified\":" + B(result.RuntimeQualified) +
-            L",\"qualification_reason\":" + mcpjson::Quote(result.QualificationReason) +
-            L",\"invariants\":[\"schema_artifact_identity_and_field_bounds\",\"loaded_pe_rsds_before_after\","
-            L"\"thread_pid_tid_create_time_before_after\",\"reciprocal_irp_list\",\"irp_type_size_owner_stack_ranges\","
-            L"\"equal_irp_reads\"],\"thread_inputs\":[";
-        for (size_t i = 0; i < threads.size(); ++i)
-        {
-            if (i != 0) { json += L","; }
-            json += L"{\"thread\":" + N(threads[i].ThreadObject) + L",\"pid\":" + N(threads[i].ProcessId) + L",\"tid\":" + N(threads[i].ThreadId) + L"}";
-        }
-        json += L"],\"options\":{\"max_threads\":" + N(options.MaxThreads) + L",\"max_irps\":" + N(options.MaxIrps) +
-            L",\"max_walk_nodes\":" + N(options.MaxWalkNodes) + L",\"inventory_complete\":" + B(options.ThreadInventoryComplete) +
-            L",\"cursor\":" + CursorJson(options.Cursor) + L"},\"next_cursor\":" + CursorJson(result.NextCursor) +
-            L",\"threads_visited\":" + N(result.ThreadsVisited) + L",\"irps_inspected\":" + N(result.IrpsInspected) +
-            L",\"walk_nodes\":" + N(result.WalkNodes) + L",\"unstable_observations\":" + N(result.UnstableObservations) +
-            L",\"enumeration_complete\":" + B(result.CoverageComplete) + L",\"requests\":[";
-        for (size_t i = 0; i < result.Requests.size(); ++i)
-        { if (i != 0) { json += L","; } json += PendingIrpObservationJson(result.Requests[i], result, false); }
-        json += L"],\"reads\":" + ObservationRoutedReadSetJson(reads) + L"}";
-        const auto utf8 = mcpjson::WideToUtf8(json);
-        if (utf8.empty() || utf8.size() > PendingIrpEvidenceMaximumBytes) { return {}; }
-        auto artifact = std::make_shared<PendingIrpEvidenceArtifact>();
-        artifact->Bytes.assign(utf8.begin(), utf8.end());
-        artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
-        return artifact->Sha256.empty() ? nullptr : artifact;
-    }
 }
 
 bool BuildPendingIrpLayout(const PendingIrpSchemaBinding& binding, pending_irp::IrpLayout* out, std::wstring* error)
@@ -182,6 +134,10 @@ bool CaptureBoundPendingIrps(IObservationSource& source, const PendingIrpSchemaB
         metadata.OptionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || metadata.Machine != schema.Machine ||
         metadata.SizeOfImage != schema.ImageSize || GuidText(metadata.PdbGuid) != schema.PdbGuid || metadata.PdbAge != schema.PdbAge)
     { return fail(L"schema_reference_image_identity_mismatch_or_unavailable"); }
+    ReferenceArtifact reference;
+    std::shared_ptr<const RetainedReferenceArtifact> retained;
+    if (reference.OpenHandle(image.Handle(), nullptr) && reference.Sha256() == schema.ImageSha256)
+    { retained = reference.Snapshot(); }
     static std::atomic<uint64_t> next{1};
     const auto id = L"irp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(next.fetch_add(1));
     ObservationOperationBudget budget;
@@ -213,14 +169,28 @@ bool CaptureBoundPendingIrps(IObservationSource& source, const PendingIrpSchemaB
     const bool last = first && QualifyExecutableReference(metadata, binding.ImageBase, read, &after);
     const bool stable = image.Unchanged();
     const auto reads = router.Snapshot();
+    PendingIrpCaptureContext context;
+    context.Source = caps;
+    context.ReferenceStable = stable;
+    context.FinalCancelled = cancellation != nullptr && cancellation->load();
+    context.FinalSourceSame = SameObservationSourceContract(caps, source.Capabilities());
+    context.ReferenceBytes = retained ? retained->Bytes.size() : 0;
     result->RuntimeQualified = first && last && stable && ValidObservationRoutedReadSet(reads) &&
         !reads.Attempts.Cancelled && !reads.Attempts.DeadlineExceeded &&
-        (cancellation == nullptr || !cancellation->load()) && SameObservationSourceContract(caps, source.Capabilities());
+        !context.FinalCancelled && context.FinalSourceSame;
     result->QualificationReason = !first ? before : !last ? after : !stable ? L"reference_image_changed" :
         result->RuntimeQualified ? L"schema_image_and_object_invariants_checked" : L"readset_incomplete_or_operation_interrupted";
     result->CoverageComplete = result->CoverageComplete && result->RuntimeQualified;
     result->ScanFinishedTickMs = GetTickCount64();
-    result->Evidence = Evidence(binding, metadata, threads, options, *result, reads, before, after, stable);
+    const auto utf8 = mcpjson::WideToUtf8(PendingIrpCaptureJson(binding, metadata, threads, options, *result, reads, before, after, context));
+    if (!utf8.empty() && utf8.size() <= PendingIrpEvidenceMaximumBytes)
+    {
+        auto artifact = std::make_shared<PendingIrpEvidenceArtifact>();
+        artifact->Bytes.assign(utf8.begin(), utf8.end());
+        artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
+        artifact->Reference = std::move(retained);
+        if (!artifact->Sha256.empty()) { result->Evidence = std::move(artifact); }
+    }
     if (!result->Evidence)
     {
         result->RuntimeQualified = false;

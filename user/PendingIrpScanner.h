@@ -12,6 +12,7 @@
 
 class DeviceClient;
 class SymbolEngine;
+struct RetainedReferenceArtifact;
 
 // One bounded UTF-8 capture per scan; request events refer to its digest.
 // A digest identifies content, not an authenticated collector or object lifetime.
@@ -19,6 +20,7 @@ struct PendingIrpEvidenceArtifact
 {
     std::vector<uint8_t> Bytes;
     std::wstring Sha256;
+    std::shared_ptr<const RetainedReferenceArtifact> Reference;
 };
 
 struct PendingIrpThreadInput

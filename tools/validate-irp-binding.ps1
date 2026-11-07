@@ -14,7 +14,7 @@ if ($Sanitize) {
     Copy-Item -LiteralPath $environment.AsanRuntimePath -Destination $output
 }
 $program = Join-Path $output 'irp-binding-selftest.exe'
-$sources = @('tools\irp-binding-selftest.cpp', 'user\PendingIrpBinding.cpp', 'user\BrokeredTypeLayouts.cpp',
+$sources = @('tools\irp-binding-selftest.cpp', 'user\PendingIrpBinding.cpp', 'user\PendingIrpEvidence.cpp', 'user\BrokeredTypeLayouts.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\TypeSchema.cpp',
     'user\TypeSchemaGenerator.cpp', 'user\TypeSchemaBroker.cpp', 'user\TypeSchemaCommand.cpp',
     'user\ParserWorkerProcess.cpp', 'user\AnalystSnapshot.cpp', 'user\ReferenceArtifact.cpp') |
@@ -35,4 +35,6 @@ if ($LASTEXITCODE -ne 0) { throw 'IRP binding compilation failed' }
 if ($LASTEXITCODE -ne 0) { throw 'IRP binding controls failed' }
 & python (Join-Path $PSScriptRoot 'test-irp-binding-capture.py') $output
 if ($LASTEXITCODE -ne 0) { throw 'Independent IRP capture oracle failed' }
+& python (Join-Path $PSScriptRoot 'test-irp-replay.py') $program $output
+if ($LASTEXITCODE -ne 0) { throw 'IRP replay mutation controls failed' }
 Write-Output "[irp.binding.validation] fixtures=$output"

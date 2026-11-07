@@ -27,6 +27,7 @@ backends are not implied by an x64 address width.
 | evidence / query | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
 | schema / export_type | local_pdb | implemented | not_an_address_reader | offline_artifacts |
 | evidence / replay | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
+| evidence / replay_irp | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | recorded_ordered_reads |
 | evidence / graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
 | evidence / graph | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_temporal_sweep |
 | evidence / temporal_graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_local_collector_scope |

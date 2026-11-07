@@ -7,6 +7,85 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Pending IRP offline replay checkpoint: 2026-11-07
+
+The next P05/P13 slice adds `kn.irp_capture.v2`, an exact retained image and
+`--offline !kmon replay-irp <capture.knirp> /json`. Replay rebuilds the layout
+from the three saved packages, consumes ordered original calls, reruns the
+image/object checks and compares the entire canonical capture. Its
+`qualified_observation_reproduced` field additionally requires the matching
+retained image. Missing images permit explicitly limited metadata replay;
+conflicting images, forged summaries and incomplete traces cannot qualify.
+The [architecture contract](ARCHITECTURE.md#pending-irp-schema-and-runtime-binding)
+describes the storage bounds and remaining claims.
+
+The final ASan IRP harness passed **75 controls**, the independent oracle checked
+**32 fields and 29 original reads**, and the ASan replay mutation runner passed
+**46 controls**. These include two IRPs continued through a nonzero cursor,
+mid-read cancellation, owner/source churn, missing optional state and a 3.8 MiB
+trace with 2,048 source calls. The generic importer's 2 MiB default remains
+enforced; only the bounded IRP path opts into the larger limit. Duplicate keys,
+unknown policy/fields, altered counters/graphs/acceptance flags, reordered or
+missing calls, schema corruption and reference collision/missing/restoration
+are covered. These are owned synthetic observations, not native kernel reads.
+
+Review found excessive repeated JSON validation in the large ASan case. The
+initial owned test process was stopped and the importer changed to index each
+bounded object once. Complete canonical comparisons and all rejection checks
+remain. The final mutation runner passed with its unchanged 60-second
+per-process timeout, including the large trace. This is not a latency guarantee
+for every 16 MiB capture or host. A subsequent integrated test exposed output
+bypassing the interactive transcript; the new command now uses the transcript
+stream interactively and the UTF-8 writer at the standalone offline entry.
+
+Common parser regression passed **307 image-slice ASan controls** plus the
+independent **369 slice / 233 sweep / 1,414 graph checks**. The legacy image
+recipe ASan suite passed **92 controls**; interrupted v1 and v2 publications
+each produced two valid complete recipes and four absent recipes across six
+termination points. Existing product image CLI checks passed **101 controls**.
+The public-content classifier passed **12 tests**, including renamed v2 captures
+and replay results. Capability inventory remains explicitly unprobed.
+
+The final Release product passed **50 IRP CLI controls** and an isolated
+`--self-test all`: timeline **28**, MCP **102**, KMON image integration **119**,
+console **564**, command audit **3,011 / 261 routes**, and remote **68** plus four
+connection-option controls. Actual writer tests cover reference creation/reuse,
+immutable capture collisions, four-entry and weighted-byte pressure, private
+store rejection, reservation refunds, final ledger and privacy audit. Review of
+the final changed scope found no additional actionable defects.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `11d4ba91e47debf09578ad12cea470a899121672940ad5c30b8bce52e252e6a3` |
+| IRP binding/replay, ASan | `4ef1b29d77aad6ccad686a46a854b95dc767342c62d17048c51102072849f6c5` |
+| Image slice, ASan | `d15ff113a8decf5b5c2c38d9388d1aa8b280ec7726c7c023ba7eaeca8ac8faeb` |
+| Image recipe, ASan | `53526f92c3f399a8622d4356d7add1052ee78316d0e37346059349f8f52b3116` |
+
+This used Windows 11 Pro 10.0.28000, kernel 10.0.28000.3231, VS 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Final checks found no remaining
+test processes, parser profile directories/receipts/preparations or running
+task drivers. Completed content-addressed code caches and private fixture
+artifacts are retained deliberately. No driver was loaded, service/policy
+changed or reboot performed; BFE/MpsSvc remained running/automatic, EFS
+running/manual and all firewall profiles enabled.
+
+Reproduction commands use `tools/validate-irp-binding.ps1 -Sanitize`,
+`tools/validate-image-slice.ps1 -Sanitize`,
+`tools/validate-image-recipe.ps1 -Sanitize`, and
+`tools/test-irp-replay.py <exe> <owned-fixture-directory> --product`.
+Use the bundled Python runtime on this host; the Windows Store `python` alias
+does not run these oracles. The fixture directory is emitted by the IRP script.
+
+The native IOCTL ABI and request observation v1 remain unchanged. Legacy
+capture v1 lacks the recorded source/final-state inputs and receives an explicit
+unavailable result. PDB files, source initialization, collector authentication,
+external final-state authentication, whole-image integrity, execution,
+referenced lifetimes and Windows-build approval are not established. Root IRP
+captures and images still lie outside the image journal/store inventory; typed
+journal membership and retention integration remain the next stage. Broader
+P05/P06/P13 and VS2/VS3 completion, native lifecycle evidence and the earlier
+real-kernel PDB ASan resource failure remain open.
+
 ## Pending IRP runtime binding checkpoint: 2026-11-07
 
 P05 now connects the live pending-IRP consumer's retained schemas to loaded

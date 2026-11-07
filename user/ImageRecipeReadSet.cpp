@@ -1,6 +1,7 @@
 #include "ImageRecipeReadSet.h"
 #include "ReadReceiptJson.h"
 #include "ObservationReadSetParser.h"
+#include "BoundedObservationJson.h"
 #include <limits>
 
 namespace
@@ -10,15 +11,22 @@ namespace
         return (empty || !text.empty()) && text.size() <= limit && text.find(L'\0') == std::wstring::npos &&
             mcpjson::SanitizeUtf16(text) == text;
     }
-    bool String(const std::wstring& json, const wchar_t* key, std::wstring* value)
+    using Object = bounded_observation_json::IndexedObject;
+    bool Raw(const Object& object, const wchar_t* key, std::wstring* value)
+    { return object.Raw(key, value); }
+    bool Raw(const Object& object, const wchar_t* key, Object* value)
     {
-        return mcpjson::GetString(json, key, value);
+        std::wstring raw;
+        return object.Raw(key, &raw) && value->Parse(raw);
     }
-    bool Raw(const std::wstring& json, const wchar_t* key, std::wstring* value)
+    bool String(const Object& object, const wchar_t* key, std::wstring* value)
     {
-        return mcpjson::FindRawValue(json, key, value);
+        std::wstring raw;
+        if (!object.Raw(key, &raw) || raw.empty() || raw.front() != L'"') { return false; }
+        *value = mcpjson::Unescape(raw);
+        return true;
     }
-    template<class T> bool Number(const std::wstring& json, const wchar_t* key, T* value,
+    template<class T> bool Number(const Object& json, const wchar_t* key, T* value,
         bool quoted = true, bool nullable = false, bool* known = nullptr)
     {
         std::wstring text;
@@ -37,7 +45,7 @@ namespace
         *value = static_cast<T>(number);
         return true;
     }
-    bool Boolean(const std::wstring& json, const wchar_t* key, bool* value, bool nullable = false, bool* known = nullptr)
+    bool Boolean(const Object& json, const wchar_t* key, bool* value, bool nullable = false, bool* known = nullptr)
     {
         std::wstring raw;
         if (!Raw(json, key, &raw)) { return false; }
@@ -47,27 +55,9 @@ namespace
         *value = raw == L"true";
         return true;
     }
-    bool Array(const std::wstring& object, const wchar_t* key, size_t limit, std::vector<std::wstring>* rows)
-    {
-        std::wstring raw;
-        if (!Raw(object, key, &raw) || raw.empty() || raw[0] != L'[') { return false; }
-        size_t pos = 1;
-        while (pos < raw.size() && raw[pos] != L']')
-        {
-            size_t end = 0;
-            if (rows->size() == limit || !mcpjson::ScanValue(raw, pos, &end)) { return false; }
-            rows->push_back(raw.substr(pos, end - pos));
-            pos = end;
-            if (pos < raw.size() && raw[pos] == L',')
-            {
-                ++pos;
-                if (pos == raw.size() || raw[pos] == L']') { return false; }
-            }
-            else { break; }
-        }
-        return pos + 1 == raw.size() && raw[pos] == L']';
-    }
-    bool State(const std::wstring& json, const wchar_t* key, ObservationReadState* value)
+    bool Array(const Object& object, const wchar_t* key, size_t limit, std::vector<std::wstring>* rows)
+    { return object.Rows(key, limit, rows); }
+    bool State(const Object& json, const wchar_t* key, ObservationReadState* value)
     {
         std::wstring name;
         if (!String(json, key, &name)) { return false; }
@@ -81,8 +71,10 @@ namespace
         }
         return false;
     }
-    bool Result(const std::wstring& json, ObservationReadResult* r)
+    bool Result(const std::wstring& encoded, ObservationReadResult* r)
     {
+        Object json;
+        if (!json.Parse(encoded)) { return false; }
         if (!State(json, L"status", &r->State) || !String(json, L"source_id", &r->SourceId) ||
             !String(json, L"consistency", &r->Consistency) || !String(json, L"clock_domain", &r->ClockDomain) ||
             !Number(json, L"started_tick", &r->StartedTick) || !Number(json, L"ended_tick", &r->EndedTick) ||
@@ -104,8 +96,10 @@ namespace
         std::vector<std::wstring> spans;
         if (!Array(json, L"spans", 4096, &spans)) { return false; }
         size_t total = 0;
-        for (const auto& row : spans)
+        for (const auto& spanJson : spans)
         {
+            Object row;
+            if (!row.Parse(spanJson)) { return false; }
             ObservationReadSpan span;
             std::wstring hex;
             if (!Number(row, L"address", &span.Address) || !Number(row, L"requested_bytes", &span.RequestedBytes, false) ||
@@ -183,32 +177,37 @@ bool ValidImageRecipeReadSet(const ImageVerificationRecipe& p)
     return bytes == set.ChargedBytes && calls == set.ChargedSourceCalls && spans == set.StoredSpans;
 }
 
-bool ParseObservationReadSet(const std::wstring& json, size_t maximumReceipts, ObservationReadSet* resultSet)
+bool ParseObservationReadSet(const std::wstring& json, size_t maximumReceipts, ObservationReadSet* resultSet, size_t maximumCharacters)
 {
-    if (resultSet == nullptr || maximumReceipts > 4096 || json.size() > 2 * 1024 * 1024 || !mcpjson::ValidateDocument(json)) { return false; }
+    bounded_observation_json::IndexedObject object;
+    if (resultSet == nullptr || maximumReceipts > 4096 || maximumCharacters > 16 * 1024 * 1024 ||
+        json.size() > maximumCharacters || !object.Parse(json)) { return false; }
     ObservationReadSet set;
-    std::wstring budget;
+    Object budget;
     std::vector<std::wstring> rows;
-    if (!String(json, L"operation_id", &set.OperationId) || !String(json, L"target_id", &set.TargetId) ||
-        !String(json, L"address_space_id", &set.AddressSpaceId) || !Number(json, L"started_tick", &set.StartedTick) ||
-        !Number(json, L"snapshot_tick", &set.SnapshotTick) || !Number(json, L"attempts", &set.TotalAttempts) ||
-        !Number(json, L"unrecorded_attempts", &set.UnrecordedAttempts) ||
-        !Number(json, L"charged_source_calls", &set.ChargedSourceCalls) || !Number(json, L"charged_requested_bytes", &set.ChargedBytes) ||
-        !Number(json, L"stored_spans", &set.StoredSpans) || !Number(json, L"reserved_span_slots", &set.ReservedSpanSlots) ||
-        !Boolean(json, L"cancelled", &set.Cancelled) || !Boolean(json, L"deadline_exceeded", &set.DeadlineExceeded) ||
-        !Raw(json, L"budget", &budget) || !Number(budget, L"maximum_bytes", &set.Budget.MaximumBytes) ||
+    if (!String(object, L"operation_id", &set.OperationId) || !String(object, L"target_id", &set.TargetId) ||
+        !String(object, L"address_space_id", &set.AddressSpaceId) || !Number(object, L"started_tick", &set.StartedTick) ||
+        !Number(object, L"snapshot_tick", &set.SnapshotTick) || !Number(object, L"attempts", &set.TotalAttempts) ||
+        !Number(object, L"unrecorded_attempts", &set.UnrecordedAttempts) ||
+        !Number(object, L"charged_source_calls", &set.ChargedSourceCalls) || !Number(object, L"charged_requested_bytes", &set.ChargedBytes) ||
+        !Number(object, L"stored_spans", &set.StoredSpans) || !Number(object, L"reserved_span_slots", &set.ReservedSpanSlots) ||
+        !Boolean(object, L"cancelled", &set.Cancelled) || !Boolean(object, L"deadline_exceeded", &set.DeadlineExceeded) ||
+        !Raw(object, L"budget", &budget) || !Number(budget, L"maximum_bytes", &set.Budget.MaximumBytes) ||
         !Number(budget, L"maximum_source_calls", &set.Budget.MaximumSourceCalls) ||
         !Number(budget, L"maximum_receipts", &set.Budget.MaximumReceipts) ||
         !Number(budget, L"maximum_stored_spans", &set.Budget.MaximumStoredSpans) ||
         !Number(budget, L"maximum_elapsed_ms", &set.Budget.MaximumElapsedMs) ||
-        !Array(json, L"reads", maximumReceipts, &rows)) { return false; }
-    for (const auto& row : rows)
+        !object.Rows(L"reads", maximumReceipts, &rows)) { return false; }
+    for (const auto& encoded : rows)
     {
+        Object row;
+        if (!row.Parse(encoded)) { return false; }
         ObservationReadReceipt receipt;
         auto& q = receipt.Request;
         auto& s = receipt.Source;
         auto& a = s.AddressSpace;
-        std::wstring contract, shape, domain, result, fallback;
+        Object contract, shape;
+        std::wstring domain, result, fallback;
         if (!Number(row, L"sequence", &receipt.Sequence) || !Boolean(row, L"completed", &receipt.Completed) ||
             !Boolean(row, L"abandoned", &receipt.Abandoned) || !Boolean(row, L"source_invoked", &receipt.SourceInvoked) ||
             !Boolean(row, L"deadline_exceeded", &receipt.DeadlineExceeded) || !String(row, L"admission_reason", &receipt.AdmissionReason) ||
@@ -223,9 +222,10 @@ bool ParseObservationReadSet(const std::wstring& json, size_t maximumReceipts, O
             !Number(shape, L"physical_bits", &a.PhysicalAddressBits, true, true) || !Boolean(shape, L"legacy_assumed", &a.LegacyAssumed) ||
             !Number(shape, L"user_maximum", &a.UserMaximum) || !Number(shape, L"kernel_minimum", &a.KernelMinimum) ||
             !Raw(row, L"fallback", &fallback) || !Raw(row, L"read", &result) || !Result(result, &receipt.Result)) { return false; }
-        if (fallback != L"null" && (!Number(fallback, L"from_receipt", &q.FallbackFromReceipt) ||
-            !String(fallback, L"reason", &q.FallbackReason) || !Boolean(fallback, L"permission_requested", &q.AllowFallback) ||
-            !Boolean(fallback, L"permitted", &receipt.FallbackPermitted))) { return false; }
+        Object fallbackObject;
+        if (fallback != L"null" && (!fallbackObject.Parse(fallback) || !Number(fallbackObject, L"from_receipt", &q.FallbackFromReceipt) ||
+            !String(fallbackObject, L"reason", &q.FallbackReason) || !Boolean(fallbackObject, L"permission_requested", &q.AllowFallback) ||
+            !Boolean(fallbackObject, L"permitted", &receipt.FallbackPermitted))) { return false; }
         set.Reads.push_back(std::move(receipt));
     }
     if (ObservationReadSetJson(set) != json) { return false; }

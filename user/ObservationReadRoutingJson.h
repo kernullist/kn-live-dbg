@@ -4,7 +4,8 @@
 #include "ReadReceiptJson.h"
 
 bool ValidObservationRoutedReadSet(const ObservationRoutedReadSet& set);
-bool ParseObservationRoutedReadSet(const std::wstring& json, ObservationRoutedReadSet* set);
+bool ParseObservationRoutedReadSet(const std::wstring& json, ObservationRoutedReadSet* set,
+    size_t maximumCharacters = 2 * 1024 * 1024);
 
 inline std::wstring ObservationRoutedReadSetJson(const ObservationRoutedReadSet& set)
 {

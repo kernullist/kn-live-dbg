@@ -14,7 +14,10 @@ def main():
     root = parser.parse_args().root
     raw = (root / "positive.knirp").read_bytes()
     capture = json.loads(raw)
-    assert capture["schema"] == "kn.irp_capture.v1"
+    assert capture["schema"] == "kn.irp_capture.v2"
+    assert int(capture["reference_captured_bytes"]) == (root / "fixture.exe").stat().st_size
+    assert capture["final_source_contract_same"] and not capture["final_cancelled"]
+    assert int(capture["scan_finished_tick_ms"]) >= int(capture["scan_started_tick_ms"])
     assert capture["runtime_qualified"] and capture["readset_complete"]
     assert capture["enumeration_complete"] and capture["reference_content_stable"]
     for flag in ("collector_authenticated", "reference_image_preserved", "pdb_file_preserved",
@@ -117,6 +120,7 @@ def main():
         observed = values(address, 8)
         assert observed and all(struct.unpack("<Q", value)[0] == expected for value in observed)
     base = int(capture["image_base"])
+    assert (root / f'irp-reference-{schemas[0]["image_sha256"]}.knblob').read_bytes() == (root / "fixture.exe").read_bytes()
     headers = values(base, 64)
     assert len(headers) == 2 and headers[0] == headers[1] and headers[0][:2] == b"MZ"
     pdb = values(base + int(capture["reference_identity"]["pdb_rva"]), 24)
