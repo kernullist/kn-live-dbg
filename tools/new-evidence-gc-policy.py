@@ -19,7 +19,7 @@ def main():
             raise ValueError("inventory too large")
         snapshot = json.loads(args.inventory.read_text(encoding="utf-8-sig"))
         if (snapshot["schema"] != "kn.evidence_store_inventory.v1" or snapshot["status"] != "verified" or
-                snapshot["scope"] != "image_collection_namespace" or snapshot["catalog_complete"] is not True or
+                snapshot["scope"] not in ("image_collection_namespace", "image_and_irp_collection_namespace") or snapshot["catalog_complete"] is not True or
                 snapshot["membership_complete"] is not True or snapshot["artifact_inventory_complete"] is not True or
                 snapshot["artifacts_included"] is not True):
             raise ValueError("a complete store inventory with artifact detail is required")

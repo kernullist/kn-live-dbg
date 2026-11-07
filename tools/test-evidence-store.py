@@ -49,7 +49,7 @@ def main():
         check(p.returncode == (0 if r["status"] == "verified" else 1), "exit status")
         for key in ("deletion_authorized", "disk_allocation_established", "target_coverage_established", "collector_authenticated", "power_loss_durability_established"):
             check(r[key] is False, f"no unsupported claim: {key}")
-        check(r["scope"] == "image_collection_namespace" and r["coordination"] == "participating_publishers", "explicit namespace and coordination")
+        check(r["scope"] == "image_and_irp_collection_namespace" and r["coordination"] == "participating_publishers", "explicit namespace and coordination")
         check(int(r["ended_tick"]) >= int(r["started_tick"]), "observation interval")
         if r["catalog_sha256"]:
             check(r["catalog_sha256"] == sha(encoded(r["collections"])), "root receipt hash")

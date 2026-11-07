@@ -92,7 +92,7 @@ def main():
         for key in ("deletion_authority_after_return", "disk_reclamation_established", "collector_authenticated", "power_loss_durability_established",
                     "current_path_absence_established", "uncommitted_dependents_resolved"):
             check(r[key] is False, f"bounded claim: {key}")
-        check(r["scope"] == "explicit_uncommitted_image_artifacts" and r["coordination"] == "participating_publishers", "explicit GC scope")
+        check(r["scope"] == "explicit_uncommitted_image_and_irp_artifacts" and r["coordination"] == "participating_publishers", "explicit GC scope")
         return r
 
     def case(name):

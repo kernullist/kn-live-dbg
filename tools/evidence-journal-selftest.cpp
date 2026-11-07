@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 namespace
@@ -82,6 +83,123 @@ namespace
         Check(SaveObservationJson((root / path).wstring(), json, nullptr), "publish-owned-closure-ledger");
         t.Members.push_back(EvidenceJournalJsonMember(path, json));
         return t;
+    }
+    EvidenceJournalTransaction Irp(const fs::path& root, const std::wstring& collection, const std::wstring& stage = L"",
+        size_t padding = 0)
+    {
+        EvidenceJournalTransaction t;
+        t.Kind = L"irp_capture";
+        auto blob = BlobMember();
+        blob.Path = L"irp-reference-" + blob.Sha256 + L".knblob";
+        if (!fs::exists(root / blob.Path)) { Check(Write(root / blob.Path, Blob), "publish-owned-irp-reference"); }
+        t.Members.push_back(blob);
+        Stage(stage, L"irp_reference");
+        const auto json = L"{\"schema\":\"kn.irp_capture.v2\",\"fixture\":\"membership_only_not_replay\",\"padding\":\"" +
+            std::wstring(padding, L'x') + L"\"}";
+        auto member = EvidenceJournalJsonMember(L"", json);
+        t.Id = member.Sha256;
+        member.Path = L"irp-" + collection + L"-" + t.Id + L".knirp";
+        if (!fs::exists(root / member.Path)) { Check(SaveObservationJson((root / member.Path).wstring(), json, nullptr), "publish-owned-irp-capture"); }
+        t.Members.push_back(member);
+        Stage(stage, L"irp_capture");
+        return t;
+    }
+    EvidenceJournalTransaction IrpLedger(const fs::path& root, const std::wstring& collection)
+    {
+        EvidenceJournalTransaction t;
+        t.Kind = L"irp_ledger"; t.Id = L"0";
+        const std::wstring json = L"{\"schema\":\"kn.irp_capture_session.v1\",\"fixture\":\"includes_failures\"}";
+        const auto path = L"irp-session-" + collection + L".knirpledger";
+        Check(SaveObservationJson((root / path).wstring(), json, nullptr), "publish-owned-irp-ledger");
+        t.Members.push_back(EvidenceJournalJsonMember(path, json));
+        return t;
+    }
+    int ProduceIrp(const fs::path& root, const std::wstring& collection, const std::wstring& stage)
+    {
+        EvidenceJournal journal;
+        std::wstring error;
+        if (!journal.Open(root.wstring(), collection, &error, EvidenceJournalPolicy::ImageAndIrpV2)) { return 1; }
+        Stage(stage, L"irp_session");
+        const auto capture = Irp(root, collection, stage);
+        Check(journal.Commit(capture).Committed, "commit-irp-capture-and-reference");
+        Stage(stage, L"irp_commit");
+        const auto ledger = IrpLedger(root, collection);
+        Stage(stage, L"irp_ledger_file");
+        Check(journal.Commit(ledger).Committed, "commit-irp-ledger");
+        Stage(stage, L"irp_ledger_commit");
+        auto closure = Closure(root, collection);
+        closure.Requires.push_back(ledger.Members[0].Path);
+        Stage(stage, L"irp_closure_file");
+        Check(journal.Commit(closure).Committed && journal.State().Closed, "close-after-irp-ledger");
+        Stage(stage, L"irp_closed");
+        return Failed ? 1 : 0;
+    }
+    void TypedTests(const fs::path& root)
+    {
+        fs::create_directories(root);
+        std::wstring error;
+        {
+            EvidenceJournal legacy;
+            Check(legacy.Open((root / L"legacy").wstring(), L"7", &error), "legacy-session-policy");
+            Check(!legacy.Commit(Irp(root / L"legacy", L"7")).Committed, "legacy-policy-rejects-irp-kind");
+        }
+        const auto typed = root / L"typed";
+        {
+            EvidenceJournal journal;
+            Check(journal.Open(typed.wstring(), L"7", &error, EvidenceJournalPolicy::ImageAndIrpV2), "typed-session-policy");
+            const auto capture = Irp(typed, L"7", L"", 2 * 1024 * 1024);
+            auto invalid = capture;
+            invalid.Members.pop_back();
+            Check(!journal.Commit(invalid).Committed, "irp-root-required");
+            invalid = capture; invalid.Id = std::wstring(64, L'0');
+            Check(!journal.Commit(invalid).Committed, "irp-id-is-exact-capture-hash");
+            invalid = capture; invalid.Members.back().Bytes = 16 * 1024 * 1024 + 1;
+            Check(!journal.Commit(invalid).Committed, "irp-specific-byte-limit");
+            invalid = capture; invalid.Members.back().Path = L"irp-8-" + invalid.Id + L".knirp";
+            Check(!journal.Commit(invalid).Committed, "irp-foreign-collection-rejected");
+            invalid = capture; invalid.Members.front() = BlobMember();
+            Check(!journal.Commit(invalid).Committed, "image-reference-in-irp-kind-rejected");
+            Check(journal.Commit(capture).Committed, "irp-over-two-MiB-within-typed-limit");
+            Check(journal.Commit(capture).AlreadyCommitted, "irp-idempotent-exact-transaction");
+            unsigned checkedFiles = 0;
+            Check(!journal.RestrictOutputs([&](HANDLE) { return ++checkedFiles == 1; }) && checkedFiles == 2,
+                "joining-private-journal-checks-existing-pinned-files");
+            Check(journal.RestrictOutputs([](HANDLE) { return true; }), "successful-output-admission-installed");
+            auto closure = Closure(typed);
+            Check(!journal.Commit(closure).Committed, "typed-closure-requires-irp-ledger");
+            auto ledger = IrpLedger(typed, L"7");
+            Check(journal.Commit(ledger).Committed, "irp-final-ledger-committed");
+            Check(!journal.Commit(Irp(typed, L"7")).Committed, "new-irp-after-ledger-rejected");
+            Check(!journal.Commit(closure).Committed, "closure-must-name-ledger-dependency");
+            closure.Requires.push_back(ledger.Members[0].Path);
+            Check(journal.Commit(closure).Committed, "typed-closure-with-ledger-dependency");
+        }
+        Check(RecoverEvidenceJournal((typed / L"collections/7").wstring(), true).Closed, "recover-typed-journal-and-index");
+        {
+            EvidenceJournal legacy;
+            Check(!legacy.Open(typed.wstring(), L"7", &error), "cannot-reopen-typed-session-as-legacy");
+        }
+        {
+            const auto admitted = root / L"admission";
+            EvidenceJournal journal;
+            unsigned calls = 0;
+            const auto emptyFile = [&](HANDLE file)
+            {
+                LARGE_INTEGER size{};
+                ++calls;
+                return GetFileSizeEx(file, &size) && size.QuadPart == 0;
+            };
+            Check(!journal.Open(admitted.wstring(), L"7", &error, EvidenceJournalPolicy::ImageAndIrpV2, emptyFile) &&
+                calls == 2 && error == L"session_missing_or_invalid", "admission-before-write-and-on-verified-read");
+        }
+        for (bool throws : {false, true})
+        {
+            const auto denied = root / (throws ? L"throw" : L"deny");
+            fs::create_directories(denied);
+            Check(!SaveObservationJson((denied / L"test.json").wstring(), L"{}", nullptr, [&](HANDLE)
+                { if (throws) { throw std::runtime_error("owned admission exception"); } return false; }) &&
+                fs::is_empty(denied), "failed-output-admission-leaves-no-pending-file");
+        }
     }
     int Produce(const fs::path& root, const std::wstring& stage, const std::wstring& collection = L"7", bool repeat = false)
     {
@@ -234,6 +352,7 @@ int wmain(int argc, wchar_t** argv)
             return 0;
         }
         if (argc == 4 && std::wstring(argv[1]) == L"--produce-collection") { return Produce(argv[2], L"", argv[3], true); }
+        if (argc == 5 && std::wstring(argv[1]) == L"--produce-irp") { return ProduceIrp(argv[2], argv[3], argv[4]); }
         if (argc >= 3 && std::wstring(argv[1]) == L"--recover")
         {
             const auto r = RecoverEvidenceJournal(argv[2], argc == 4 && std::wstring(argv[3]) == L"--index");
@@ -254,6 +373,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (argc != 2) { return 2; }
         Tests(argv[1]);
+        TypedTests(fs::path(argv[1]) / L"typed-controls");
         std::cout << "[journal.selftest] passed=" << Passed << " failed=" << Failed << '\n';
         return Failed ? 1 : 0;
     }

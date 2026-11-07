@@ -61,12 +61,15 @@ def main():
     journal = by_key[("evidence", "journal", "local_files")]
     assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
     assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
+    assert "legacy_image_v1_or_image_irp_v2_policy" in journal["requirements"] and "irp_ledger_before_closure" in journal["requirements"]
     store = by_key[("evidence", "store", "local_files")]
     assert store["availability"] == "not_probed" and store["consistency"] == "coordinated_stopped_store"
     assert "participating_publishers" in store["requirements"] and "no_deletion_authority_or_disk_allocation" in store["limits"]
+    assert "image_folders_and_reserved_irp_root_namespace" in store["limits"]
     gc = by_key[("evidence", "gc", "local_files")]
     assert gc["availability"] == "not_probed" and "durable_intent_before_delete" in gc["requirements"]
     assert "committed_roots_and_failure_ledgers_protected" in gc["limits"]
+    assert "uncommitted_image_and_irp_artifacts_only" in gc["limits"]
     retention = by_key[("evidence", "retention", "native")]
     privacy = by_key[("evidence", "privacy", "local_files")]
     disclosure = by_key[("evidence", "disclosure", "local_files")]

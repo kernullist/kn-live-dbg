@@ -603,7 +603,8 @@ bool SaveAnalystSnapshot(const std::wstring& path, const std::wstring& json, std
     return SaveObservationJson(path, json, error);
 }
 
-bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std::wstring* error)
+bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std::wstring* error,
+    const std::function<bool(HANDLE)>& admitOutput)
 {
     bool ok = false;
     std::wstring ignored;
@@ -632,26 +633,31 @@ bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std
         static LONG serial = 0;
         const auto temporary = absolute + L".pending-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
             std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(InterlockedIncrement(&serial));
-        HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE, 0, nullptr,
+        HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE | (admitOutput ? READ_CONTROL | FILE_READ_ATTRIBUTES : 0), 0, nullptr,
             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
             *error = L"cannot create snapshot temporary file: " + std::to_wstring(GetLastError());
             break;
         }
-        DWORD written = 0;
-        if (GetFileType(file) == FILE_TYPE_DISK && WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr) &&
-            written == utf8.size() && FlushFileBuffers(file))
+        try
         {
-            // KernelBase converts absolute DOS paths with a NUL-terminated helper.
-            const size_t bytes = offsetof(FILE_RENAME_INFO, FileName) + (absolute.size() + 1) * sizeof(wchar_t);
-            std::vector<uint8_t> storage(bytes, 0);
-            auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-            rename->ReplaceIfExists = FALSE;
-            rename->FileNameLength = static_cast<DWORD>(absolute.size() * sizeof(wchar_t));
-            std::memcpy(rename->FileName, absolute.data(), rename->FileNameLength);
-            ok = SetFileInformationByHandle(file, FileRenameInfo, rename, static_cast<DWORD>(bytes)) != FALSE;
+            DWORD written = 0;
+            if (GetFileType(file) == FILE_TYPE_DISK && (!admitOutput || admitOutput(file)) &&
+                WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr) &&
+                written == utf8.size() && FlushFileBuffers(file))
+            {
+                // KernelBase converts absolute DOS paths with a NUL-terminated helper.
+                const size_t bytes = offsetof(FILE_RENAME_INFO, FileName) + (absolute.size() + 1) * sizeof(wchar_t);
+                std::vector<uint8_t> storage(bytes, 0);
+                auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+                rename->ReplaceIfExists = FALSE;
+                rename->FileNameLength = static_cast<DWORD>(absolute.size() * sizeof(wchar_t));
+                std::memcpy(rename->FileName, absolute.data(), rename->FileNameLength);
+                ok = SetFileInformationByHandle(file, FileRenameInfo, rename, static_cast<DWORD>(bytes)) != FALSE;
+            }
         }
+        catch (...) { ok = false; }
         if (!ok)
         {
             *error = L"snapshot write/rename failed (existing files are preserved): " + std::to_wstring(GetLastError());

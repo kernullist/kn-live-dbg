@@ -7,6 +7,74 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## IRP journal and retention checkpoint: 2026-11-07
+
+This P06/P13 slice connects private IRP captures, retained references and the
+final failure ledger to `kn.image_irp_collection_journal.v2`. Legacy image v1
+sessions remain readable with their original policy. IRP transactions bind the
+capture's physical hash, collection path, schema and optional retained reference;
+the final collection closure requires the committed IRP ledger. Failed ledger
+publication leaves an open collection. Store inventory and explicit uncommitted
+GC now include the reserved IRP root namespace. Membership does not establish
+replay, source authenticity, request lifetime or execution. See the
+[journal contract](ARCHITECTURE.md#pending-irp-schema-and-runtime-binding).
+
+The final ASan journal harness passed **71 controls**. Independent checks passed
+**1,952 journal / 476 store / 892 GC / 400 IRP integration controls**. The journal
+and GC suites include respectively **10** and **9** observed interruption stages;
+the IRP suite adds **8** observed publication stages and **9** rehashed malformed
+transactions. It independently derives mixed legacy/typed collection hashes,
+reference multiplicity, global path/content byte counts and protected ledger
+classification. It also checks explicit orphan deletion, idempotent GC receipts,
+committed-file/ledger rejection, unknown root entries and recovery of the exact
+committed prefix. Synthetic membership fixtures do not assert valid IRP replay.
+
+The final Release product passed **400 IRP / 1,952 journal / 492 store / 898 GC
+CLI controls**. An isolated `--self-test all` passed: timeline **28**, MCP **102**,
+KMON image integration **119**, console **564**, command audit **3,011 / 261
+routes**, and remote **68** plus four connection-option controls. Actual writer
+checks use owned ACL-only roots and cover IRP-first publication, later IRP
+admission into an image journal, repeated reference reuse, ledger collision,
+private-policy rejection, immutable capture collision, bounded queue/byte
+reservations and final drain. A ledger collision preserves the existing file
+and prevents a closed collection result. Capability checks passed **34 entries /
+261 routes**; the generated matrix matches the binary and remains unprobed.
+The public-content classifier passed **12 tests**.
+
+The first new interruption oracle omitted image failure ledgers from its expected
+protected kinds; the implementation correctly protected them. The oracle now
+requires protection for both image and IRP ledgers. Review also removed repeated
+whole-journal ACL scans on every IRP capture: the existing-file admission happens
+once when IRP joins, with the recovery deadline, while each new input/output
+handle still passes the retained private-root check. Output admission occurs
+before bytes are written; denied or throwing admission leaves no owned pending
+file. Final review found no additional actionable defects in the changed scope.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `e99760f4dca76472b11806fd942bd0d9e0a3b23120c87422b675f8afac663c95` |
+| Journal/store/GC, ASan | `8223ed791e6f0dbe9b7a90046b29b2cfd0e3334f8b777b967c7f12f1030d0a02` |
+
+This used Windows 11 Pro 10.0.28000, kernel 10.0.28000.3231, VS 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. The build retained the existing C4744
+link warnings. No driver was loaded, service/firewall policy changed or reboot
+performed. Final cleanup checks found no test process, parser profile/receipt/
+preparation or running task-driver residue; completed code caches and owned
+fixture artifacts remain deliberately. EFS behavior uses the existing policy
+and actual-handle validator; the new integrated writer tests used ACL-only roots.
+
+Reproduce with `tools/validate-evidence-journal.ps1 -Sanitize`. Its emitted
+fixture directory can be used with `tools/test-evidence-journal.py --cli` and
+the product `--exe`, keeping the harness as `--producer`. Store/GC runners use
+the same options; `tools/test-irp-journal.py` uses `--product`. All require an
+owned `--fixtures` location and the bundled Python runtime on this host.
+
+The native ABI and existing v1 image journal bytes are unchanged. Committed-root
+retirement, IRP-specific priority partitions, other evidence families, large-store
+continuation, power-loss recovery, native request lifetime/build qualification
+and the prior real-kernel PDB ASan resource failure remain open. These checks do
+not complete P05/P06/P13 or VS2/VS3.
+
 ## Pending IRP offline replay checkpoint: 2026-11-07
 
 The next P05/P13 slice adds `kn.irp_capture.v2`, an exact retained image and
@@ -80,9 +148,9 @@ The native IOCTL ABI and request observation v1 remain unchanged. Legacy
 capture v1 lacks the recorded source/final-state inputs and receives an explicit
 unavailable result. PDB files, source initialization, collector authentication,
 external final-state authentication, whole-image integrity, execution,
-referenced lifetimes and Windows-build approval are not established. Root IRP
-captures and images still lie outside the image journal/store inventory; typed
-journal membership and retention integration remain the next stage. Broader
+referenced lifetimes and Windows-build approval are not established. At this
+checkpoint, root IRP captures and images lay outside the image journal/store
+inventory; the subsequent typed-journal checkpoint above extends that scope. Broader
 P05/P06/P13 and VS2/VS3 completion, native lifecycle evidence and the earlier
 real-kernel PDB ASan resource failure remain open.
 

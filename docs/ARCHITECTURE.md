@@ -299,8 +299,11 @@ multi-artifact transaction or a power-loss durability guarantee.
 The KMON writer publishes original reference/read/recipe files, then a journal
 record under `collections/<collection-id>/journal-segments/`. A sweep root is
 committed only after every artifact it declares as published belongs to an earlier
-record. Finally, the writer publishes the read-session ledger and commits its
-closure record. The existing `persistence` and file counters describe individual
+record. IRP captures and their retained references use `irp_capture` transactions;
+the final IRP ledger uses `irp_ledger`. When IRP work was admitted or dropped, the
+writer requires that ledger's commit before publishing the read-session closure
+with an explicit ledger dependency. A failed IRP ledger leaves the collection
+open. The existing `persistence` and file counters describe individual
 files; `journal_read_batches_*`, `journal_sweeps_*` and final pipeline
 `image_journal_closed`/`image_journal_close_failed` describe collection publication.
 A read batch can retain a reference or recipe even when raw-file publication
@@ -308,7 +311,10 @@ failed; consult both sets of counters. Closure does not imply complete target
 observation or successful comparison/replay.
 
 `session.knsession` (`kn.evidence_session.v1`) fixes the collection ID and
-`kn.image_collection_journal.v1` policy. Each create-new `.knjseg` record
+policy. Current KMON writers use `kn.image_irp_collection_journal.v2`; legacy
+`kn.image_collection_journal.v1` sessions remain readable and cannot accept IRP
+transaction kinds. A writer cannot reopen a session under a different policy.
+Each create-new `.knjseg` record
 (`kn.evidence_journal_segment.v1`) binds its sequence, preceding **physical-file**
 SHA-256, transaction ID, members and prior dependencies. Members bind their exact
 physical bytes, lengths and original schemas. These hashes differ from canonical
@@ -341,15 +347,18 @@ and original files, so resumed publication is not an incremental I/O cache.
 Legacy `.kncase`, `.knverify` and `.knindex` readers remain unchanged.
 
 This version bounds recovery to 8,192 segments, 16,384 unique member paths,
-65,536 member/dependency references, 2 MiB per JSON record, 64 MiB per reference
+65,536 member/dependency references, 2 MiB per JSON record except for explicitly
+typed IRP capture members (16 MiB), 64 MiB per reference
 blob and 1 GiB of total file reads. Writer read accounting lasts for the open
 journal; recovery/index accounting lasts for that invocation. The 120-second
 deadline is checked between synchronous operations, not an I/O cancellation
 guarantee. Index reads share this budget. Logical reference bytes and unique
 content bytes cover only the verified collection prefix; they do not measure
 physical disk allocation, orphan volume or global cross-collection retention.
-GC, retention priorities, large-store continuation beyond these bounds and
-media/power-loss testing remain P06 work. Files are flushed before create-new
+The stopped-store inventory and explicit uncommitted GC below cover image and
+IRP members. Committed-root retirement, remaining family priorities, large-store
+continuation beyond these bounds and media/power-loss testing remain P06 work.
+Files are flushed before create-new
 rename; the observed-process-interruption tests do not establish power-loss
 durability or collector authenticity. All journal/index/recovery artifacts are
 private evidence.
@@ -358,7 +367,11 @@ private evidence.
 
 `!kmon store <artifact-root> [/artifacts] /json` returns private
 `kn.evidence_store_inventory.v1` for the root's `collections`, `image-reads`,
-`image-references` and `image-sweeps` namespaces. Legacy `.kncase`/`.knverify`
+`image-references` and `image-sweeps` namespaces, plus reserved IRP files directly
+under the root. Scope is `image_and_irp_collection_namespace`. Root names starting
+with `irp-`, or using `.knirp`/`.knirpledger`, enter this inventory; malformed and
+pending entries remain protected. Unrelated root files are outside its scope.
+Legacy `.kncase`/`.knverify`
 and immutable `.knindex` stores retain their existing adapters and are excluded
 from these denominators. This command creates a zero-byte `store.knstorelock`
 in an existing local root if needed; it requires write access to that lock.
@@ -406,7 +419,8 @@ Local ACL/EFS admission is described under [private evidence roots](#private-evi
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
 Existing per-collection bounds remain; the separate unattributed-file reader is
-also limited to 1 GiB. The shared 120-second deadline is cooperative between
+also limited to 1 GiB. Root enumeration has a separate 65,536-entry cap, including
+entries outside the reserved IRP namespace. The shared 120-second deadline is cooperative between
 synchronous operations. Exhaustion yields partial/unavailable status; separate
 flags distinguish verified journal membership from an incomplete artifact scan.
 `/artifacts` uses a 16 Mi UTF-16 code-unit detail budget and reports
@@ -423,6 +437,10 @@ controller/MCP command route. `tools/new-evidence-gc-policy.py` creates a policy
 from explicitly selected `/artifacts` inventory rows; it performs no deletion,
 refuses protected/missing rows and never overwrites an existing policy. The
 collector independently revalidates the current store and original bytes.
+Its scope is `explicit_uncommitted_image_and_irp_artifacts`. Both image and IRP
+failure ledgers are rejected by policy validation even if uncommitted; all
+committed captures/references remain protected. Legacy image-only inventory
+reports are still accepted by the policy helper, which grants no deletion authority.
 
 Policy `kn.gc_explicit_uncommitted.v1` binds a reason, minimum file age, total
 named-byte ceiling and sorted exact path/hash/size/schema members. Policies use
@@ -1516,11 +1534,22 @@ Legacy v1 files remain intact and report their missing source/final-state inputs
 instead of inventing them. Request observation v1 and the native IOCTL ABI are
 unchanged.
 
-These captures and references are not yet journal members. The image-only
-stopped-store inventory does not account for them; its completeness is scoped
-to its image namespace. Typed journal membership and retention integration,
-approved build/schema change handling and real native-driver lifecycle evidence
-remain open. Owned DIA/offset/read-byte and writer controls are recorded in
+The writer commits each published v2 capture and any successfully retained
+reference to the typed journal. `irp_journal_captures_*` and
+`irp_journal_ledger_*` distinguish membership from file publication; a published
+file can remain uncommitted. The ledger's own `journal_membership:false` is a
+prepublication statement: membership comes from the external verified journal.
+IRP publication installs the private-root admission check on journal/index
+outputs before their first byte, and checks earlier pinned files when joining
+an existing image journal. Store inventory, exact-byte deduplication and explicit
+uncommitted GC cover these root files without upgrading their replay or source
+authenticity claims. Unknown tails and failure ledgers remain protected.
+
+Approved build/schema change handling, real native-driver lifecycle evidence,
+committed-root retirement and IRP-specific retention priorities remain open.
+Journal integration controls are recorded in
+[validation](VALIDATION.md#irp-journal-and-retention-checkpoint-2026-11-07).
+Owned DIA/offset/read-byte and replay controls are recorded in
 [validation](VALIDATION.md#pending-irp-offline-replay-checkpoint-2026-11-07).
 
 ### Live symbol and type index broker

@@ -48,7 +48,7 @@ struct EvidenceStoreInventory
     std::vector<EvidenceStoreArtifact> Artifacts;
 };
 
-// Exact counts for the captured image-store namespace under the participating
+// Exact counts for the image folders and reserved IRP root namespace under the participating
 // publisher barrier. The returned data releases all leases and NEVER grants
 // deletion authority. Unresolved roots protect all unattributed artifacts.
 EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot);

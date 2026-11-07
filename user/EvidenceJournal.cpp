@@ -18,6 +18,7 @@ namespace
     constexpr uint64_t MaxSegments = 8192, MaxPaths = 16384, MaxReferences = 65536;
     constexpr uint64_t MaxReadBytes = 1024ull * 1024 * 1024, MaxJsonBytes = 2 * 1024 * 1024;
     constexpr uint64_t MaxBlobBytes = 64 * 1024 * 1024, DeadlineMs = 120000;
+    constexpr uint64_t MaxIrpBytes = 16 * 1024 * 1024;
     constexpr uint64_t StoreMaxCollections = 1024, StoreMaxPaths = 65536, StoreMaxReferences = 262144;
     constexpr uint64_t StoreMaxReadBytes = 8ull * 1024 * 1024 * 1024;
     using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
@@ -56,12 +57,18 @@ namespace
         return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"payload_sha256\":" + mcpjson::Quote(Hash(payload)) +
             L",\"payload\":" + payload + L"}";
     }
-    std::wstring SessionJson(const std::wstring& id)
+    std::wstring SessionJson(const std::wstring& id, bool typed = false)
     {
         return Envelope(L"kn.evidence_session.v1", L"{\"collection_id\":" + mcpjson::Quote(id) +
-            L",\"policy\":\"kn.image_collection_journal.v1\",\"hash_basis\":\"exact_file_bytes\","
+            L",\"policy\":" + mcpjson::Quote(typed ? L"kn.image_irp_collection_journal.v2" : L"kn.image_collection_journal.v1") +
+            L",\"hash_basis\":\"exact_file_bytes\","
             L"\"collector_authenticated\":false,\"target_coverage_established\":false}");
     }
+    bool FailureLedger(const std::wstring& schema)
+    {
+        return schema == L"kn.image_read_session.v1" || schema == L"kn.irp_capture_session.v1";
+    }
+    bool IrpPath(const std::wstring& path) { return path.rfind(L"irp-", 0) == 0; }
     std::wstring MemberJson(const EvidenceJournalMember& m)
     {
         return L"{\"path\":" + mcpjson::Quote(m.Path) + L",\"sha256\":" + mcpjson::Quote(m.Sha256) +
@@ -76,7 +83,12 @@ namespace
         if (!Digest(m.Sha256) || m.Bytes == 0 || m.Path.size() > 180) { return false; }
         const auto reference = L"image-references/" + m.Sha256 + L".knblob";
         if (m.Path == reference) { return m.Schema == L"raw.bytes" && m.Bytes <= MaxBlobBytes; }
+        if (m.Path == L"irp-reference-" + m.Sha256 + L".knblob")
+            { return m.Schema == L"raw.bytes" && m.Bytes <= MaxBlobBytes; }
+        if (m.Path == L"irp-" + id + L"-" + m.Sha256 + L".knirp")
+            { return Id(id) && m.Bytes <= MaxIrpBytes && (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2"); }
         if (m.Bytes > MaxJsonBytes) { return false; }
+        if (m.Path == L"irp-session-" + id + L".knirpledger") { return Id(id) && m.Schema == L"kn.irp_capture_session.v1"; }
         if (m.Path == L"image-reads/session-" + id + L".knreadledger") { return m.Schema == L"kn.image_read_session.v1"; }
         const auto slash = m.Path.find(L'/');
         const auto dot = m.Path.rfind(L'.');
@@ -220,6 +232,8 @@ struct EvidenceJournal::Impl
     std::vector<Record> Records;
     uint64_t References = 0, Started = GetTickCount64();
     bool Writable = false, Healthy = false;
+    bool Typed = false;
+    std::function<bool(HANDLE)> AdmitOutput;
 
     bool Fail(const wchar_t* issue) { Result.Issue = issue; return false; }
     bool Timely() { return GetTickCount64() - Started <= DeadlineMs || Fail(L"deadline_exhausted"); }
@@ -268,6 +282,7 @@ struct EvidenceJournal::Impl
             (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
             !GetFileSizeEx(file.get(), &length) || length.QuadPart <= 0 || uint64_t(length.QuadPart) > maximum)
             { return Fail(L"file_missing_invalid_or_locked"); }
+        if (AdmitOutput && !AdmitOutput(file.get())) { return Fail(L"private_file_admission_failed"); }
         *size = uint64_t(length.QuadPart);
         if (*size > MaxReadBytes - Result.ReadBytes) { return Fail(L"read_budget_exhausted"); }
         if (SharedReadBytes != nullptr && *size > StoreMaxReadBytes - *SharedReadBytes) { return Fail(L"store_read_budget_exhausted"); }
@@ -300,7 +315,9 @@ struct EvidenceJournal::Impl
     }
     bool ValidateTransaction(const EvidenceJournalTransaction& t)
     {
-        if ((t.Kind != L"image_reads" && t.Kind != L"image_sweep" && t.Kind != L"closure") || !Id(t.Id) ||
+        const bool irp = Typed && t.Kind == L"irp_capture", irpLedger = Typed && t.Kind == L"irp_ledger";
+        if ((t.Kind != L"image_reads" && t.Kind != L"image_sweep" && t.Kind != L"closure" && !irp && !irpLedger) ||
+            (irp ? !Digest(t.Id) : !Id(t.Id)) ||
             t.Members.empty() || t.Members.size() > 8192 || t.Requires.size() > 8192 ||
             t.Members.size() + t.Requires.size() > MaxReferences - References) { return Fail(L"invalid_transaction_or_reference_budget"); }
         if (SharedReferences != nullptr && t.Members.size() + t.Requires.size() > StoreMaxReferences - *SharedReferences)
@@ -309,11 +326,34 @@ struct EvidenceJournal::Impl
                 t.Members[0].Path != L"image-reads/session-" + Result.CollectionId + L".knreadledger")) ||
             (t.Kind == L"image_sweep" && (t.Members.size() != 1 || t.Members[0].Path !=
                 L"image-sweeps/sweep-" + Result.CollectionId + L"-" + t.Id + L".knsweep"))) { return Fail(L"invalid_transaction_root"); }
+        const auto irpLedgerPath = L"irp-session-" + Result.CollectionId + L".knirpledger";
+        if (irp && (t.Members.size() > 2 || !t.Requires.empty() || Transactions.count(L"irp_ledger:0")))
+            { return Fail(L"invalid_irp_transaction_or_after_ledger"); }
+        if (irpLedger && (t.Id != L"0" || t.Members.size() != 1 || t.Members[0].Path != irpLedgerPath || !t.Requires.empty()))
+            { return Fail(L"invalid_irp_ledger_root"); }
+        if (Typed && t.Kind == L"closure")
+        {
+            const bool hasIrp = std::any_of(Records.begin(), Records.end(), [](const auto& r)
+                { return r.Transaction.Kind == L"irp_capture" || r.Transaction.Kind == L"irp_ledger"; });
+            if (hasIrp && (!Transactions.count(L"irp_ledger:0") ||
+                std::find(t.Requires.begin(), t.Requires.end(), irpLedgerPath) == t.Requires.end()))
+                { return Fail(L"irp_ledger_required_before_closure"); }
+        }
         std::wstring previous;
         size_t added = 0;
+        bool irpRoot = false;
         for (const auto& m : t.Members)
         {
             if (!MemberValid(m, Result.CollectionId) || (!previous.empty() && m.Path <= previous)) { return Fail(L"invalid_or_duplicate_member"); }
+            if ((!irp && !irpLedger && IrpPath(m.Path)) || (irpLedger && m.Schema != L"kn.irp_capture_session.v1"))
+                { return Fail(L"invalid_member_kind"); }
+            if (irp)
+            {
+                if (m.Path == L"irp-" + Result.CollectionId + L"-" + t.Id + L".knirp" && m.Sha256 == t.Id &&
+                    (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2")) { irpRoot = true; }
+                else if (m.Schema != L"raw.bytes" || m.Path != L"irp-reference-" + m.Sha256 + L".knblob")
+                    { return Fail(L"invalid_irp_transaction_member"); }
+            }
             if (t.Kind == L"image_reads" && m.Schema != L"raw.bytes" &&
                 m.Path != L"image-reads/reads-" + Result.CollectionId + L"-" + t.Id + L".knreads" &&
                 m.Path != L"image-reads/reads-" + Result.CollectionId + L"-" + t.Id + L".knslice") { return Fail(L"invalid_read_transaction_member"); }
@@ -324,6 +364,7 @@ struct EvidenceJournal::Impl
             if (content != ContentSizes.end() && content->second != m.Bytes) { return Fail(L"conflicting_content_size"); }
             previous = m.Path;
         }
+        if (irp && !irpRoot) { return Fail(L"irp_capture_root_required"); }
         if (added > MaxPaths - Members.size()) { return Fail(L"member_budget_exhausted"); }
         previous.clear();
         for (const auto& path : t.Requires)
@@ -414,15 +455,17 @@ struct EvidenceJournal::Impl
             (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
             { return Fail(L"collection_busy_or_lock_unavailable"); }
         const auto manifest = Collection / L"session.knsession";
-        const auto session = SessionJson(id);
+        const auto session = SessionJson(id, Typed);
         const auto attrs = GetFileAttributesW(NativePath(manifest).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES && create && GetLastError() == ERROR_FILE_NOT_FOUND &&
-            !SaveObservationJson(NativePath(manifest), session, nullptr)) { return Fail(L"session_publication_failed"); }
+            !SaveObservationJson(NativePath(manifest), session, nullptr, AdmitOutput)) { return Fail(L"session_publication_failed"); }
         Handle lease{nullptr, &CloseHandle};
         uint64_t bytes = 0;
         std::wstring json;
-        if (!Read(manifest, 4096, &lease, &Result.SessionSha256, &bytes, &json) || json != session)
+        if (!Read(manifest, 4096, &lease, &Result.SessionSha256, &bytes, &json) ||
+            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, true))))
             { return Fail(L"session_missing_or_invalid"); }
+        Typed = json == SessionJson(id, true);
         Files.emplace(L"@session", std::move(lease));
         Result.HeadSha256 = Result.SessionSha256;
         if (!PinDirectory(Collection / L"journal-segments", create)) { return false; }
@@ -468,7 +511,7 @@ struct EvidenceJournal::Impl
         if (Files.count(key)) { ++Result.IndexReused; return true; }
         const auto attr = GetFileAttributesW(NativePath(path).c_str());
         const bool exists = attr != INVALID_FILE_ATTRIBUTES;
-        if (!exists && (GetLastError() != ERROR_FILE_NOT_FOUND || !SaveObservationJson(NativePath(path), json, nullptr)))
+        if (!exists && (GetLastError() != ERROR_FILE_NOT_FOUND || !SaveObservationJson(NativePath(path), json, nullptr, AdmitOutput)))
             { return Fail(L"derived_index_publication_failed"); }
         Handle lease{nullptr, &CloseHandle};
         uint64_t size = 0;
@@ -511,14 +554,33 @@ EvidenceJournal::EvidenceJournal() : Data(std::make_unique<Impl>()) {}
 EvidenceJournal::~EvidenceJournal() = default;
 const EvidenceJournalRecovery& EvidenceJournal::State() const { return Data->Result; }
 
-bool EvidenceJournal::Open(const std::wstring& root, const std::wstring& id, std::wstring* error)
+bool EvidenceJournal::Open(const std::wstring& root, const std::wstring& id, std::wstring* error,
+    EvidenceJournalPolicy policy, std::function<bool(HANDLE)> admitOutput)
 {
     if (Data->Lock) { if (error) { *error = L"journal_already_open"; } return false; }
     bool ok = false;
-    try { ok = Data->Load(root, id, true); }
+    try
+    {
+        Data->Typed = policy == EvidenceJournalPolicy::ImageAndIrpV2;
+        Data->AdmitOutput = std::move(admitOutput);
+        ok = Data->Load(root, id, true);
+    }
     catch (...) { Data->Fail(L"journal_open_exception"); }
     if (error) { *error = Data->Result.Issue; }
     return ok;
+}
+
+bool EvidenceJournal::RestrictOutputs(std::function<bool(HANDLE)> admitOutput)
+{
+    try
+    {
+        Data->Started = GetTickCount64();
+        if (!Data->Healthy || !admitOutput || !admitOutput(Data->Lock.get())) { return false; }
+        for (const auto& file : Data->Files) { if (!Data->Timely() || !admitOutput(file.second.get())) { return false; } }
+        Data->AdmitOutput = std::move(admitOutput);
+        return true;
+    }
+    catch (...) { return false; }
 }
 
 EvidenceJournalCommit EvidenceJournal::Commit(EvidenceJournalTransaction t)
@@ -555,7 +617,7 @@ EvidenceJournalCommit EvidenceJournal::Commit(EvidenceJournalTransaction t)
         // verifies the record and supports an exact idempotent retry.
         d.Writable = d.Healthy = d.Result.CanResume = false;
         const auto path = d.Collection / L"journal-segments" / SequenceName(record.Sequence);
-        if (!SaveObservationJson(NativePath(path), json, nullptr))
+        if (!SaveObservationJson(NativePath(path), json, nullptr, d.AdmitOutput))
             { result.Issue = L"segment_publication_failed_reopen_required"; return result; }
         result.Sequence = record.Sequence;
         Handle lease{nullptr, &CloseHandle};
@@ -671,6 +733,8 @@ namespace
     std::wstring MemberCollection(const std::wstring& path)
     {
         const auto name = fs::path(path).filename().wstring();
+        if (path == name && name.rfind(L"irp-session-", 0) == 0 && fs::path(name).extension() == L".knirpledger")
+            { return name.substr(12, name.size() - 12 - 12); }
         const auto first = name.find(L'-');
         const auto last = name.find_first_of(L"-.", first == std::wstring::npos ? 0 : first + 1);
         return first != std::wstring::npos && last != std::wstring::npos ? name.substr(first + 1, last - first - 1) : L"";
@@ -767,7 +831,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                         EvidenceStoreArtifact a;
                         a.Artifact = member; a.Verified = true;
                         a.Retention = member.Schema == L"raw.bytes" ? L"committed_reference_protected" :
-                            member.Schema == L"kn.image_read_session.v1" ? L"failure_ledger_protected" : L"committed_original_protected";
+                            FailureLedger(member.Schema) ? L"failure_ledger_protected" : L"committed_original_protected";
                         found = artifacts.emplace(member.Path, std::move(a)).first;
                         out.UniquePathBytes += member.Bytes;
                         if (contentSizes.emplace(member.Sha256, member.Bytes).second) { out.UniqueContentBytes += member.Bytes; }
@@ -796,7 +860,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         reader.Started = out.StartedTick; reader.SharedReadBytes = &out.ReadBytes;
         bool physicalComplete = true;
         std::set<std::wstring> observed;
-        for (const auto& folder : {L"image-reads", L"image-references", L"image-sweeps"})
+        uint64_t rootEntries = 0;
+        for (const auto& folder : {L"image-reads", L"image-references", L"image-sweeps", L""})
         {
             const auto directory = root / folder;
             const auto attr = GetFileAttributesW(NativePath(directory).c_str());
@@ -805,10 +870,21 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             ec.clear();
             for (fs::directory_iterator it(NativePath(directory), ec), end; !ec && it != end; it.increment(ec))
             {
+                const auto name = LowerAscii(it->path().filename().wstring());
+                const bool irpRoot = *folder == 0;
+                if (irpRoot)
+                {
+                    if (++rootEntries > StoreMaxPaths || GetTickCount64() - out.StartedTick > DeadlineMs)
+                        { physicalComplete = false; out.Issue = L"store_root_enumeration_budget_exhausted"; break; }
+                    const auto ext = fs::path(name).extension().wstring();
+                    // Only the reserved IRP root namespace belongs to this inventory.
+                    // Unknown names and pending files inside it remain protected.
+                    if (!IrpPath(name) && ext != L".knirp" && ext != L".knirpledger") { continue; }
+                }
                 if (out.ObservedArtifactFiles == StoreMaxPaths || GetTickCount64() - out.StartedTick > DeadlineMs)
                     { physicalComplete = false; out.Issue = L"store_artifact_budget_exhausted"; break; }
                 ++out.ObservedArtifactFiles;
-                const auto relative = std::wstring(folder) + L"/" + LowerAscii(it->path().filename().wstring());
+                const auto relative = irpRoot ? name : std::wstring(folder) + L"/" + name;
                 if (!observed.insert(relative).second) { physicalComplete = false; ++out.UnmanagedEntries; continue; }
                 auto found = artifacts.find(relative);
                 if (found != artifacts.end()) { continue; } // Exact pinned file already checked through its journal.
@@ -817,15 +893,16 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 EvidenceStoreArtifact a;
                 a.Artifact.Path = relative;
                 const auto extension = fs::path(relative).extension().wstring();
-                const bool blob = extension == L".knblob" && std::wstring(folder) == L"image-references";
+                const bool blob = extension == L".knblob" && (std::wstring(folder) == L"image-references" || irpRoot);
                 const bool json = (std::wstring(folder) == L"image-reads" &&
                     (extension == L".knreads" || extension == L".knslice" || extension == L".knreadledger")) ||
-                    (std::wstring(folder) == L"image-sweeps" && extension == L".knsweep");
+                    (std::wstring(folder) == L"image-sweeps" && extension == L".knsweep") ||
+                    (irpRoot && (extension == L".knirp" || extension == L".knirpledger"));
                 Handle lease{nullptr, &CloseHandle};
                 std::wstring text;
                 if (blob || json)
                 {
-                    a.Verified = reader.Read(root / relative, blob ? MaxBlobBytes : MaxJsonBytes, &lease,
+                    a.Verified = reader.Read(root / relative, blob ? MaxBlobBytes : irpRoot && extension == L".knirp" ? MaxIrpBytes : MaxJsonBytes, &lease,
                         &a.Artifact.Sha256, &a.Artifact.Bytes, json ? &text : nullptr, deletionPaths.count(relative) ? DELETE : 0);
                     if (blob) { a.Artifact.Schema = L"raw.bytes"; }
                     else { mcpjson::GetString(text, L"schema", &a.Artifact.Schema); }
@@ -837,7 +914,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 if (!a.Verified) { ++out.UnverifiedArtifactFiles; physicalComplete = false; }
                 else { out.UnattributedBytes += a.Artifact.Bytes; }
                 a.Retention = !a.Verified ? L"unverified_artifact_protected" :
-                    a.Artifact.Schema == L"kn.image_read_session.v1" ? L"failure_ledger_protected" : out.MembershipComplete ?
+                    FailureLedger(a.Artifact.Schema) ? L"failure_ledger_protected" : out.MembershipComplete ?
                     L"uncommitted_requires_policy" : L"unresolved_membership_protected";
                 artifacts.emplace(relative, std::move(a));
             }
@@ -901,7 +978,7 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         }
     }
     return L"{\"schema\":\"kn.evidence_store_inventory.v1\",\"status\":" + mcpjson::Quote(r.Status) +
-        L",\"issue\":" + mcpjson::Quote(r.Issue) + L",\"scope\":\"image_collection_namespace\","
+        L",\"issue\":" + mcpjson::Quote(r.Issue) + L",\"scope\":\"image_and_irp_collection_namespace\","
         L"\"coordination\":\"participating_publishers\",\"retention_policy\":\"kn.retain_committed_and_unresolved.v1\","
         L"\"catalog_sha256\":" + mcpjson::Quote(r.CatalogSha256) + L",\"artifacts_sha256\":" + mcpjson::Quote(r.ArtifactsSha256) +
         L",\"started_tick\":" + N(r.StartedTick) + L",\"ended_tick\":" + N(r.EndedTick) +
@@ -966,7 +1043,7 @@ namespace
         uint64_t total = 0;
         for (const auto& m : p.Members)
         {
-            if (!MemberValid(m, MemberCollection(m.Path)) || m.Schema == L"kn.image_read_session.v1" ||
+            if (!MemberValid(m, MemberCollection(m.Path)) || FailureLedger(m.Schema) ||
                 (m.Schema != L"raw.bytes" && !Id(MemberCollection(m.Path))) ||
                 (!previous.empty() && m.Path <= previous) || m.Bytes > p.ByteLimit - total) { return false; }
             total += m.Bytes; previous = m.Path;
@@ -1267,7 +1344,7 @@ std::wstring EvidenceGcResultJson(const EvidenceGcResult& r)
         L",\"preflight_artifacts_sha256\":" + mcpjson::Quote(r.ArtifactsSha256) + L",\"observed_filetime\":" + N(r.ObservedFileTime) +
         L",\"selected_bytes\":" + N(r.SelectedBytes) + L",\"deleted_this_call\":" + N(r.DeletedThisCall) +
         L",\"deleted_named_bytes_this_call\":" + N(r.DeletedBytesThisCall) + L",\"entries\":" + entries +
-        L"],\"scope\":\"explicit_uncommitted_image_artifacts\",\"coordination\":\"participating_publishers\","
+        L"],\"scope\":\"explicit_uncommitted_image_and_irp_artifacts\",\"coordination\":\"participating_publishers\","
         L"\"receipt_scope\":\"operation_history\",\"current_path_absence_established\":false,\"uncommitted_dependents_resolved\":false,"
         L"\"deletion_authority_after_return\":false,\"disk_reclamation_established\":false,\"collector_authenticated\":false,"
         L"\"power_loss_durability_established\":false}";

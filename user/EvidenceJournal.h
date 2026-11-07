@@ -1,6 +1,8 @@
 #pragma once
 
+#include <Windows.h>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +42,7 @@ struct EvidenceJournalCommit
 };
 
 struct EvidenceStoreInventory;
+enum class EvidenceJournalPolicy { ImageV1, ImageAndIrpV2 };
 
 // One writer owns the collection lock and immutable-file leases. Recovery uses
 // the same lock: no live snapshot can be mistaken for a final committed prefix.
@@ -51,7 +54,12 @@ public:
     ~EvidenceJournal();
     EvidenceJournal(const EvidenceJournal&) = delete;
     EvidenceJournal& operator=(const EvidenceJournal&) = delete;
-    bool Open(const std::wstring& artifactRoot, const std::wstring& collectionId, std::wstring* error);
+    bool Open(const std::wstring& artifactRoot, const std::wstring& collectionId, std::wstring* error,
+        EvidenceJournalPolicy policy = EvidenceJournalPolicy::ImageV1,
+        std::function<bool(HANDLE)> admitOutput = {});
+    // A publisher may tighten admission after earlier image transactions. All
+    // currently pinned files must pass before the new admission is installed.
+    bool RestrictOutputs(std::function<bool(HANDLE)> admitOutput);
     EvidenceJournalCommit Commit(EvidenceJournalTransaction transaction);
     const EvidenceJournalRecovery& State() const;
 private:

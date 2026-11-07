@@ -625,6 +625,8 @@ private:
     std::atomic<uint64_t> IrpCaptureLedgerFailed{0};
     std::atomic<uint64_t> IrpCaptureReservedBytes{0}, IrpReferenceBytes{0};
     std::atomic<uint64_t> IrpReferencesCreated{0}, IrpReferencesReused{0}, IrpReferencesFailed{0};
+    std::atomic<uint64_t> IrpJournalCapturesCommitted{0}, IrpJournalCapturesFailed{0}, IrpJournalLedgerFailed{0};
+    std::atomic<bool> IrpJournalLedgerCommitted{false};
     void BindEvidenceOrigin(EvidenceBundle& bundle, const std::wstring& captureId,
         uint64_t nativeEpochBefore, uint64_t nativeEpochAfter) const;
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
@@ -648,8 +650,10 @@ private:
     };
     void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
     void CloseImageReadCollection() noexcept;
-    EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction) noexcept;
+    EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction,
+        std::function<bool(HANDLE)> admitOutput = {}) noexcept;
     std::unique_ptr<EvidenceJournal> ImageJournal; // Capture writer only; owns publication leases.
+    bool ImageJournalPrivate = false; // Existing files checked once when IRP joins the journal.
     std::unique_ptr<EvidenceStoreLease> ImageStoreLease; // Held before the first original file until closure.
     bool EnsureImageStoreLease(std::wstring* error) noexcept;
     std::atomic<uint64_t> ImageStoreAdmissionFailed{0};
