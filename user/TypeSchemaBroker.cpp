@@ -67,6 +67,7 @@ bool GenerateBrokeredTypeSchema(const std::wstring& executable, const std::wstri
     request.Executable = executable;
     request.Arguments = {allowTypeAliases ? L"--schema-live-worker" : L"--schema-worker", typeName};
     request.ReadOnlyFiles = {imageFile.Handle(), pdbFile.Handle(), providerFile.Handle()};
+    request.ProviderFileIndex = 2;
     request.TimeoutMs = workerTimeoutMs;
     request.Cancellation = cancellation;
     const auto worker = RunParserWorker(request);
@@ -75,7 +76,7 @@ bool GenerateBrokeredTypeSchema(const std::wstring& executable, const std::wstri
         if (error != nullptr)
         {
             *error = L"schema worker " + worker.Status + L"; error=" + std::to_wstring(worker.Error) +
-                L"; exit=" + std::to_wstring(worker.ExitCode);
+                L"; exit=" + std::to_wstring(worker.ExitCode) + L"; profile_hresult=" + std::to_wstring(static_cast<uint32_t>(worker.ProfileError));
         }
         return false;
     }

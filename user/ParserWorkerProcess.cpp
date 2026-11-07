@@ -1,4 +1,5 @@
 #include "ParserWorkerProcess.h"
+#include "ParserWorkerSandbox.h"
 #include <algorithm>
 #include <array>
 #include <objbase.h>
@@ -161,7 +162,7 @@ namespace
             (policy.Policy & TOKEN_MANDATORY_POLICY_NO_WRITE_UP) != 0;
     }
 
-    bool PrivateDesktop(const std::wstring& userSid, Desktop* desktop, std::wstring* fullName)
+    bool PrivateDesktop(const std::wstring& userSid, PSID appSid, Desktop* desktop, std::wstring* fullName)
     {
         GUID guid{};
         wchar_t unique[40]{}, station[256]{};
@@ -172,7 +173,10 @@ namespace
             return false;
         }
         const auto name = std::wstring(L"KnSchema-") + unique;
-        const auto sddl = L"D:P(A;;GA;;;" + userSid + L")(A;;GA;;;SY)S:(ML;;NW;;;LW)";
+        LocalMemory appText;
+        if (!ConvertSidToStringSidW(appSid, reinterpret_cast<LPWSTR*>(&appText.Value))) { return false; }
+        const auto sddl = L"D:P(A;;GA;;;" + userSid + L")(A;;GA;;;" + static_cast<const wchar_t*>(appText.Value) +
+            L")(A;;GA;;;SY)S:(ML;;NW;;;LW)";
         LocalMemory descriptor;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
             reinterpret_cast<PSECURITY_DESCRIPTOR*>(&descriptor.Value), nullptr))
@@ -210,26 +214,15 @@ namespace
     }
 }
 
-bool IsRestrictedParserWorker()
+static bool RestrictedTokenFacts(HANDLE token)
 {
-    Handle token;
     std::vector<uint8_t> label, privileges, groups;
     TOKEN_MANDATORY_POLICY policy{};
-    BOOL assigned = FALSE;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    wchar_t desktop[256]{};
     DWORD bytes = 0;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.Value) || !IsTokenRestricted(token.Value) ||
-        !TokenData(token.Value, TokenIntegrityLevel, &label) || !TokenData(token.Value, TokenPrivileges, &privileges) ||
-        !TokenData(token.Value, TokenGroups, &groups) ||
-        !GetTokenInformation(token.Value, TokenMandatoryPolicy, &policy, sizeof(policy), &bytes) ||
-        (policy.Policy & TOKEN_MANDATORY_POLICY_NO_WRITE_UP) == 0 ||
-        !IsProcessInJob(GetCurrentProcess(), nullptr, &assigned) || !assigned ||
-        !QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr) ||
-        (limits.BasicLimitInformation.LimitFlags & JobFlags) != JobFlags || limits.BasicLimitInformation.ActiveProcessLimit != 1 ||
-        limits.ProcessMemoryLimit > MemoryLimit || limits.ProcessMemoryLimit == 0 ||
-        !GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &bytes) ||
-        std::wstring(desktop).rfind(L"KnSchema-", 0) != 0)
+    if (!IsTokenRestricted(token) || !TokenData(token, TokenIntegrityLevel, &label) ||
+        !TokenData(token, TokenPrivileges, &privileges) || !TokenData(token, TokenGroups, &groups) ||
+        !GetTokenInformation(token, TokenMandatoryPolicy, &policy, sizeof(policy), &bytes) ||
+        (policy.Policy & TOKEN_MANDATORY_POLICY_NO_WRITE_UP) == 0)
     {
         return false;
     }
@@ -263,6 +256,21 @@ bool IsRestrictedParserWorker()
         *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1) <= SECURITY_MANDATORY_LOW_RID;
 }
 
+bool IsRestrictedParserWorker()
+{
+    Handle token; BOOL assigned = FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    wchar_t desktop[256]{}; DWORD bytes = 0;
+    return OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.Value) && RestrictedTokenFacts(token.Value) &&
+        parser_sandbox::TokenHasNoCapabilities(token.Value) &&
+        IsProcessInJob(GetCurrentProcess(), nullptr, &assigned) && assigned &&
+        QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr) &&
+        (limits.BasicLimitInformation.LimitFlags & JobFlags) == JobFlags && limits.BasicLimitInformation.ActiveProcessLimit == 1 &&
+        limits.ProcessMemoryLimit <= MemoryLimit && limits.ProcessMemoryLimit != 0 &&
+        GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &bytes) &&
+        std::wstring(desktop).rfind(L"KnSchema-", 0) == 0;
+}
+
 ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
 {
     ParserWorkerResult result;
@@ -273,6 +281,8 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
     std::array<Handle, 3> files;
     HANDLE jobs[1]{};
     Attributes attributes;
+    parser_sandbox::Runtime runtime;
+    parser_sandbox::Profile profile;
     Child child;
     const auto cancelled = [&]()
     {
@@ -282,7 +292,8 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
     {
         if (request.Executable.empty() || request.Executable.size() > 30000 ||
             request.Executable.find(L'\0') != std::wstring::npos || request.TimeoutMs > 60000 ||
-            request.OutputLimit == 0 || request.OutputLimit > 32 * 1024 * 1024 || request.ReadOnlyFiles.size() > files.size())
+            request.OutputLimit == 0 || request.OutputLimit > 32 * 1024 * 1024 || request.ReadOnlyFiles.size() > files.size() ||
+            (request.ProviderFileIndex != SIZE_MAX && request.ProviderFileIndex >= request.ReadOnlyFiles.size()))
         {
             result.Status = L"invalid_request";
             break;
@@ -327,8 +338,6 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
                 break;
             }
             inherited.push_back(files[i].Value);
-            command += L" " + std::to_wstring(reinterpret_cast<uintptr_t>(files[i].Value));
-            if (command.size() > 32766) { valid = false; }
         }
         if (!valid)
         {
@@ -342,8 +351,31 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
             result.Error = GetLastError();
             break;
         }
+        result.Status = L"runtime_configuration_failed";
+        if (!runtime.Prepare(request.Executable, request.ProviderFileIndex == SIZE_MAX ? INVALID_HANDLE_VALUE :
+            files[request.ProviderFileIndex].Value, userSid)) { result.Error = GetLastError(); break; }
+        if (request.ProviderFileIndex != SIZE_MAX)
+        {
+            const auto i = request.ProviderFileIndex;
+            HANDLE copy = nullptr;
+            if (!DuplicateHandle(GetCurrentProcess(), runtime.Provider, GetCurrentProcess(), &copy, GENERIC_READ, TRUE, 0))
+            { result.Error = GetLastError(); break; }
+            files[i].Reset(copy); inherited[i] = copy;
+        }
+        command = Quote(runtime.Executable);
+        for (const auto& arg : request.Arguments) { command += L" " + Quote(arg); }
+        for (size_t i = 0; i < request.ReadOnlyFiles.size(); ++i) { command += L" " + std::to_wstring(reinterpret_cast<uintptr_t>(files[i].Value)); }
+        if (command.size() > 32766) { result.Status = L"invalid_request"; break; }
+        if (cancelled() || GetTickCount64() - started >= request.TimeoutMs)
+        { result.Status = cancelled() ? L"cancelled" : L"timeout"; break; }
+        result.Status = L"sandbox_profile_failed";
+        const bool profileReady = profile.Create(userSid);
+        result.RecoveredProfileReceipts = profile.RecoveredCount;
+        if (!profileReady) { result.ProfileError = profile.Error; break; }
+        result.Status = L"network_configuration_failed";
+        if (!parser_sandbox::NetworkPolicyAllowsIsolation(profile.Sid)) { result.Error = GetLastError(); break; }
         result.Status = L"desktop_configuration_failed";
-        if (!PrivateDesktop(userSid, &desktop, &desktopName))
+        if (!PrivateDesktop(userSid, profile.Sid, &desktop, &desktopName))
         {
             result.Error = GetLastError();
             break;
@@ -375,14 +407,14 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
         }
         result.Status = L"attribute_configuration_failed";
         SIZE_T attributeBytes = 0;
-        InitializeProcThreadAttributeList(nullptr, 2, 0, &attributeBytes);
+        InitializeProcThreadAttributeList(nullptr, 3, 0, &attributeBytes);
         if (attributeBytes == 0 || attributeBytes > 65536)
         {
             break;
         }
         attributes.Storage.resize(attributeBytes);
         auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.Storage.data());
-        if (!InitializeProcThreadAttributeList(list, 2, 0, &attributeBytes))
+        if (!InitializeProcThreadAttributeList(list, 3, 0, &attributeBytes))
         {
             result.Error = GetLastError();
             break;
@@ -391,9 +423,11 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
         inherited.push_back(outputWrite.Value);
         inherited.push_back(input.Value);
         jobs[0] = job.Value;
+        SECURITY_CAPABILITIES capabilities{}; capabilities.AppContainerSid = profile.Sid;
         if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
             inherited.size() * sizeof(HANDLE), nullptr, nullptr) ||
-            !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs, sizeof(jobs), nullptr, nullptr))
+            !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs, sizeof(jobs), nullptr, nullptr) ||
+            !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &capabilities, sizeof(capabilities), nullptr, nullptr))
         {
             result.Error = GetLastError();
             break;
@@ -406,7 +440,8 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
             result.Status = L"environment_configuration_failed";
             break;
         }
-        std::wstring environment = L"SystemRoot=" + std::wstring(windows) + L'\0' + L"WINDIR=" + windows + L'\0' + L'\0';
+        std::wstring environment = L"LOCALAPPDATA=" + profile.Folder + L'\0' +
+            L"SystemRoot=" + std::wstring(windows) + L'\0' + L"WINDIR=" + windows + L'\0' + L'\0';
         STARTUPINFOEXW startup{};
         startup.StartupInfo.cb = sizeof(startup);
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -423,7 +458,7 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
             break;
         }
         result.Status = L"spawn_failed";
-        if (!CreateProcessAsUserW(token.Value, request.Executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+        if (!CreateProcessAsUserW(token.Value, runtime.Executable.c_str(), command.data(), nullptr, nullptr, TRUE,
             CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.data(), system, &startup.StartupInfo, &info))
         {
@@ -434,11 +469,23 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
         child.Thread.Reset(info.hThread);
         result.ProcessId = info.dwProcessId;
         outputWrite.Reset();
+        Handle childToken; BOOL assigned = FALSE;
+        result.Status = L"sandbox_token_failed";
+        if (!OpenProcessToken(child.Process.Value, TOKEN_QUERY, &childToken.Value)) { result.Error = GetLastError(); break; }
+        if (!RestrictedTokenFacts(childToken.Value)) { result.Error = ERROR_ACCESS_DENIED; break; }
+        if (!parser_sandbox::TokenHasNoCapabilities(childToken.Value, profile.Sid) ||
+            !IsProcessInJob(child.Process.Value, job.Value, &assigned)) { result.Error = GetLastError(); break; }
+        if (!assigned) { result.Error = ERROR_ACCESS_DENIED; break; }
+        if (!parser_sandbox::NetworkPolicyAllowsIsolation(profile.Sid)) { result.Error = GetLastError(); break; }
+        result.Status = L"sandbox_profile_cleanup_failed";
+        if (!profile.Remove()) { result.ProfileError = profile.Error; break; }
+        result.SandboxVerified = true;
         if (cancelled() || GetTickCount64() - started >= request.TimeoutMs)
         {
             result.Status = cancelled() ? L"cancelled" : L"timeout";
             break;
         }
+        result.Status = L"resume_failed";
         if (ResumeThread(child.Thread.Value) == MAXDWORD)
         {
             result.Error = GetLastError();
@@ -513,6 +560,7 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
             result.Status = L"cleanup_pending";
         }
     }
+    if (!profile.Remove()) { result.Status = L"sandbox_profile_cleanup_failed"; result.ProfileError = profile.Error; }
     if (result.Status != L"exited")
     {
         result.Output.clear();

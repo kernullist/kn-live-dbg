@@ -79,6 +79,13 @@ public:
                 (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
                 (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return false; }
         }
+        return PathNamesFile();
+    }
+
+    // The worker cannot inspect private ancestor directories. Its broker owns
+    // their no-delete pins; the worker still verifies the loader's pathname.
+    bool PathNamesFile() const
+    {
         HANDLE current = CreateFileW(Path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         FILE_ID_INFO identity{};

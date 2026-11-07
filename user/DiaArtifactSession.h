@@ -20,7 +20,7 @@ public:
     {
         if (!Image.OpenHandle(image, 512ull * 1024 * 1024, approved_file::Access::Duplicate) ||
             !Pdb.OpenHandle(pdb, 1024ull * 1024 * 1024, approved_file::Access::Duplicate) ||
-            !Provider.OpenHandle(provider, 64ull * 1024 * 1024, approved_file::Access::Duplicate) || !Provider.PinPath() ||
+            !Provider.OpenHandle(provider, 64ull * 1024 * 1024, approved_file::Access::Duplicate) || !Provider.PathNamesFile() ||
             !executable_image::ReadApprovedDiskPeIdentityHandle(Image.Handle(), &Metadata, nullptr) || !Metadata.HasPdbIdentity ||
             Metadata.Machine != IMAGE_FILE_MACHINE_AMD64) { return false; }
         const auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);

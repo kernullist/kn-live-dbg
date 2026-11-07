@@ -202,7 +202,7 @@ static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFil
     {
         return false;
     }
-    if (!providerFile.PinPath()) { return false; }
+    if (!(access == approved_file::Access::Duplicate ? providerFile.PathNamesFile() : providerFile.PinPath())) { return false; }
     executable_image::DiskPeMetadata metadata;
     const bool imageRead = access == approved_file::Access::Duplicate ?
         executable_image::ReadApprovedDiskPeIdentityHandle(imageFile.Handle(), &metadata, nullptr) :

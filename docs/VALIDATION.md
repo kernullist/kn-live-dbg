@@ -7,6 +7,82 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Parser AppContainer checkpoint: 2026-11-07
+
+P05 schema, layout and symbol-index workers now use a unique zero-capability
+AppContainer. The parent checks the actual suspended child's token, SID and job,
+requires running BFE/Windows Firewall services and no loopback exemption, and
+removes the native profile before resuming. Approved code is copied into a
+checked content-addressed runtime; image/PDB inputs retain their read-only handle
+boundary. See the [process boundary](ARCHITECTURE.md#schema-parser-process-boundary).
+Native IOCTL ABI and public schema/index formats are unchanged.
+
+Review found that interruption before worker entry could leave a native profile.
+Durable private receipts now precede profile creation, and later launches recover
+only proven-dead owners. Tests cover a completed profile, an interrupted receipt
+and a partial code copy, while preserving live owners. A corrupted published
+receipt rejects launch without deleting its profile; the owned byte is restored
+before recovery. Code-copy controls independently establish a distinct file ID
+and matching hash before testing altered bytes, extra DLLs and writable file or
+directory ACLs. The original executable remains unchanged.
+
+The network oracle checks delivery at owned parent listeners. UDP submission
+can report success even when no packet arrives, so `sendto` success is not used
+as a delivery result. IPv4/IPv6 TCP and UDP positive controls run before and after
+the worker attempts. Lifecycle controls require observed worker entry before
+timeout, cancellation or parent interruption. Final review also split process
+access attempts into individual rights and changed runtime creation to request
+write access alone; a denied combination cannot prove that each right is denied.
+No additional actionable defects were found in the reviewed scope.
+
+Final Release EXE SHA-256:
+`a91f77833e3da839f3c0deb1f22377a13a820061232d39375be86bf3311a0a0d`.
+
+| Harness | SHA-256 |
+|---|---|
+| Parser worker, Release | `7b427e5eed24b4775febbd9ca877b074e4fbd495653aadf2783d46a6beb806c5` |
+| Parser worker, ASan | `dd8073a37fdd6c24be73a11a2d1a921c99856400a5fbb81202fa41c781d798fe` |
+| Schema broker, ASan | `37b3309e30b28bf6707731261adea40f9684693014c17af26c05ee4166ec80f1` |
+| Symbol index, ASan | `93760bfce458c9c7ee026d32de1427639aec7db384b69db18cd5358d16a5a0f0` |
+| Live layouts, ASan | `2569a8bf716582170576dcc0cb79996c87bfd31bbf7f69326c14941a52b9af71` |
+
+Checks used Windows 11 Pro x64 `10.0.28000`, NTFS, VS 2022 Build Tools 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. The Release build passed with the
+existing C4744 link warnings. Product sources stayed fixed during the applicable
+checks; the final worker-only test strengthening did not change product code.
+The worker harnesses ran sequentially. **Run these harnesses without concurrent
+broker/product tests:** they deliberately corrupt owned recovery receipts and
+code copies before restoring them. The final full self-test ran alone after all
+builds and other executable tests finished.
+
+| Check | Result and scope |
+|---|---|
+| `tools/validate-parser-worker.ps1`, with and without `-Sanitize` | 65 controls passed per mode: actual token/identity, five allowed environment names including Windows-added profile-local TEMP/TMP, argument and handle inheritance, job/memory/output limits, observed timeout/cancellation/parent death, individual parent mutation and peer read/duplicate denial, create-only runtime write denial, owned loopback delivery, interrupted-owner recovery and code-copy integrity |
+| `tools/validate-schema-broker.ps1 -Sanitize` | 73 controls passed through the AppContainer worker |
+| `tools/validate-symbol-index.ps1 -Sanitize` | 69 controls passed |
+| Independent symbol-index oracle | Four PE exports, two private MAP addresses, 263 legacy type names and 131 known name/size pairs matched; 452 symbols and 298 types |
+| `tools/validate-live-type-layout.ps1 -Sanitize` | 112 controls passed |
+| Actual Release executable workers | Two owned symbol-index, two retained kernel-artifact symbol-index and two layout controls passed, including mismatched-PDB rejection |
+| Offline schema CLI | 79 controls passed; one file-symlink case remained skipped |
+| Capability/documentation contracts | 33 contracts / 261 routes passed; generated support matrix matched |
+| Final `--self-test all` | Timeline 28, MCP 102, KMON image reads 119, console 564, command audit 3,006 over 261 routes, remote 68 and four connection-argument checks passed |
+
+Final checks found no test processes, native profile directories, profile receipts
+or unfinished runtime preparations. Completed code-only cache directories remain
+for reuse by design. No driver/service load, reboot or firewall policy change was
+performed. BFE and MpsSvc remained running/automatic, EFS running/manual, and all
+three firewall profiles enabled. Original input and installed runtime ACLs were
+not changed.
+
+This is an ordinary AppContainer boundary, **not LPAC or a complete filesystem
+allowlist**. The network observations cover owned loopback TCP/UDP on this host;
+external routes and disabled or changing firewall policy were not exercised.
+The earlier ASan kernel-PDB failure at the 512 MiB process limit remains unresolved
+and was not rerun as an ASan kernel test here. Release disk-artifact success does
+not establish loaded-image identity, runtime invariants, object lifetime or
+approved distribution. Those P05 gates, the full design and the earlier
+privacy/process-capture observations remain open.
+
 ## Approved inherited file reads checkpoint: 2026-11-07
 
 This P05 prerequisite lets parser consumers read approved inherited file objects

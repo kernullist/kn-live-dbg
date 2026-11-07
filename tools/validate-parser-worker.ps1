@@ -5,7 +5,7 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'msvc-validation-environment.ps1')
 $environment = Get-MsvcValidationEnvironment -Sanitize:$Sanitize
 $variant = if ($Sanitize) { 'Release-asan' } else { 'Release' }
-$output = Join-Path $repo ('.build\parser-worker\' + $variant)
+$output = Join-Path $repo ('.build\parser-worker\' + $variant + '\run-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $flags = '/O2 /MD'
 if ($Sanitize) {
@@ -25,3 +25,4 @@ Set-Content -LiteralPath $batch -Value ($commands -join [Environment]::NewLine) 
 if ($LASTEXITCODE -ne 0) { throw 'Parser worker controls compilation failed' }
 & $program
 if ($LASTEXITCODE -ne 0) { throw 'Parser worker controls failed' }
+Write-Output "[parser.worker.validation] fixtures=$output"

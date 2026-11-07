@@ -39,10 +39,12 @@ bool GenerateBrokeredSymbolIndex(const std::wstring& executable, const std::wstr
     ParserWorkerRequest request;
     request.Executable = executable; request.Arguments = {L"--symbol-index-worker"}; request.TimeoutMs = timeoutMs;
     request.OutputLimit = SymbolIndexMaxBytes; request.ReadOnlyFiles = {imageFile.Handle(), pdbFile.Handle(), providerFile.Handle()};
+    request.ProviderFileIndex = 2;
     const auto worker = RunParserWorker(request);
     if (worker.Status != L"exited")
     {
-        if (error != nullptr) { *error = L"symbol worker " + worker.Status + L"; error=" + std::to_wstring(worker.Error) + L"; exit=" + std::to_wstring(worker.ExitCode); }
+        if (error != nullptr) { *error = L"symbol worker " + worker.Status + L"; error=" + std::to_wstring(worker.Error) +
+            L"; exit=" + std::to_wstring(worker.ExitCode) + L"; profile_hresult=" + std::to_wstring(static_cast<uint32_t>(worker.ProfileError)); }
         return false;
     }
     SymbolIndex result;

@@ -1306,32 +1306,63 @@ Overflowing seeks, writes and truncation fail. This follows the
 and Windows [explicit handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
 and [explicit-offset read semantics](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile).
 
-Windows loads the trusted installed provider DLL by pathname. Its lease also
-pins non-reparse ancestor directories against rename/delete and verifies the
-pathname's file ID before loading. This closes a pathname replacement gap while
-the original leased DLL still exists elsewhere. The installed executable and DLL
-remain trusted runtime inputs; their hashes do not attest provider authenticity.
+Windows loads the approved provider DLL by pathname from a code-only runtime
+under `%LOCALAPPDATA%\KnLiveDbgParserRuntime-v1`. The parent copies the trusted
+executable, approved DIA provider and, when present, its adjacent ASan runtime
+into a content-addressed directory. Its protected ACL grants the owner and SYSTEM
+full access and All Application Packages read/execute access. Every use checks
+the exact file list, owner/ACL, content hashes and non-reparse pathname pins.
+Unexpected DLLs, changed bytes and writable package grants make setup unavailable.
+Image/PDB inputs remain handle-only; their original ACLs are unchanged.
+The parent retains source and copy leases plus ancestor pins until child cleanup;
+the child verifies that the loader pathname still identifies its inherited provider.
+Completed code copies persist for reuse. Interrupted copies are recovered only
+after the creating process is proven dead, using checked handles and the exact
+known code filenames. The executable and DLL remain trusted runtime inputs;
+hashes do not attest provider authenticity or approved distribution.
 The public command and `kn.type_schema.v1` format remain compatible. Old packages
 can still be inspected, but their producer-reported identities are not converted
 into a fresh broker verification by inspection.
 
-The child receives a filtered primary token: administrator SID is deny-only,
+The child receives a filtered primary token and a unique zero-capability
+AppContainer identity: administrator SID is deny-only,
 privileges other than traverse are removed, integrity is low and the inherited
 no-write-up policy is checked. Its restricting SID list retains the current user,
 standard read-access groups and logon SID needed by the window station. A new
-private low-integrity desktop is created and released with the request. These
+private low-integrity desktop grants access to that AppContainer SID and is
+released with the request. These
 choices follow the Windows [restricted token contract](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken)
 and [mandatory integrity model](https://learn.microsoft.com/en-us/windows/win32/secauthz/mandatory-integrity-control).
-The initial environment contains only OS-derived SystemRoot/WINDIR. Handle
+The parent supplies only OS-derived SystemRoot/WINDIR and the profile's
+LOCALAPPDATA. Windows adds profile-local TEMP/TMP during AppContainer creation,
+as described in the [AppContainer launch contract](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer).
+Handle
 inheritance is limited to three approved read-only artifact copies, one output
 pipe and a NUL input handle; controller,
 token and credential environment handles/values are not forwarded.
+
+Before resuming the suspended child, the parent verifies its actual token,
+AppContainer SID, empty capability set and assignment to the exact job. It also
+requires running BFE and Windows Firewall services and checks that the SID has no
+[loopback exemption](https://learn.microsoft.com/en-us/windows/win32/api/networkisolation/nf-networkisolation-networkisolationgetappcontainerconfig).
+These checks only read policy; they create no firewall rules or exemptions.
+Setup fails closed. The parser has no network capability and cannot use the
+parent's artifact acquisition path.
+
+A private owner/SYSTEM receipt under `%LOCALAPPDATA%\KnLiveDbgParserProfiles-v1`
+is flushed and published before native profile creation. Its name includes the
+parent PID, process creation time and a random nonce. The profile and receipt are
+removed before the child resumes. On a later launch, recovery checks the receipt's
+owner, ACL, format and contents and requires authoritative owner exit or PID reuse;
+it preserves live or uncertain owners. Corrupt published receipts fail closed.
+Interrupted unpublished receipts are discarded without assuming a native profile
+exists. Profile failures retain the native HRESULT separately from Win32 errors.
 
 Windows 10 or later is required for atomic job assignment through
 [PROC_THREAD_ATTRIBUTE_JOB_LIST](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
 The job allows one process, limits committed memory to 512 MiB and kills its
 worker when the final parent job handle closes. A suspended child is resumed
-only after creation with those restrictions. Parent supervision caps stdout and
+only after these checks and profile cleanup. Parent supervision caps stdout and
 stderr together at 2 MiB by default (symbol indexes explicitly allow 32 MiB),
 checks cancellation and enforces a 60-second elapsed
 budget once process creation returns. Failed cleanup is explicit; synchronous
@@ -1339,13 +1370,14 @@ OS process creation/termination is not a hard real-time deadline. A large PDB
 can fail the memory budget even if it passes the input-file size limit. Existing
 host job or desktop restrictions can make setup unavailable.
 
-This boundary contains selected parser faults and resource use. It is not an
-AppContainer, a filesystem allowlist, an egress policy or authenticated parser
-attestation. The child retains some access under the same user, and artifact
-hashes/provider paths do not establish approved distribution. Network-denied
-execution, runtime object/anchor binding and isolation
-of all untrusted parsers remain open. No network lookup is requested by this
-schema path, but the token/job combination does not enforce a network deny rule.
+This boundary contains selected parser faults and resource use. It uses an
+ordinary AppContainer, not LPAC or an exhaustive filesystem allowlist: ordinary
+AppContainer access to shared system resources still applies. Its trust assumptions
+include Windows policy enforcement and the parent/runtime owner; it is not a
+defense against a hostile host administrator. The dated validation includes owned
+IPv4/IPv6 TCP/UDP loopback delivery controls, not an external-network or every-policy
+matrix. Runtime object/anchor binding, approved distribution, authenticated parser
+attestation and isolation of all untrusted parsers remain open.
 Parent artifact hashing has a cooperative 30-second limit per hash; the child
 timeout is not a hard deadline for the whole broker operation or synchronous I/O.
 
@@ -1402,8 +1434,8 @@ it is never treated as a valid layout merely because it exists.
 
 Compressed/pointer stores, authenticated servers, proxy configuration, recursive
 SymSrv cache chains and automatic replacement of invalid entries are unsupported
-by this resolver. The child receives no search path or download request, but still
-has no enforced egress rule. Target image/anchor/invariant binding, propagation
+by this resolver. The child receives no search path or download request and runs
+inside the zero-capability AppContainer boundary above. Target image/anchor/invariant binding, propagation
 of these schema identities into every typed observation and full parser isolation
 remain open P05 requirements.
 

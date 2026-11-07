@@ -398,6 +398,7 @@
     <ClInclude Include="ApprovedFileRead.h" />
     <ClInclude Include="SchemaReadStream.h" />
     <ClInclude Include="ParserWorkerProcess.h" />
+    <ClInclude Include="ParserWorkerSandbox.h" />
     <ClInclude Include="ReferenceArtifact.h" />
     <ClInclude Include="ImageVerificationRecipe.h" />
     <ClInclude Include="ImageRecipeReadSet.h" />
