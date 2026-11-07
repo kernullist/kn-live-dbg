@@ -989,8 +989,17 @@ namespace
         { L"/jsonl", L"!timeline export <path> /jsonl", L"explicit JSONL export (also the default)" },
     };
 
+    const CompletionHint kAiShareTokens[] =
+    {
+        { L"preview", L"ai share preview <private-package-root>", L"display and pin exact minimized facts without sending" },
+        { L"send", L"ai share send <review-id> confirm", L"approve one reviewed HTTP completion after private intent" },
+        { L"cancel", L"ai share cancel", L"revoke the pending disclosure review" },
+        { L"help", nullptr, L"minimized evidence disclosure usage" },
+    };
+
     const CompletionHint kAiRootTokens[] =
     {
+        { L"share", L"ai share preview <private-package-root> | send <review-id> confirm | cancel", L"review minimized image facts and approve one HTTP request" },
         { L"status", L"ai status", L"ready/blocked health and next setup step" },
         { L"help", L"ai help [subcommand]", L"AI usage" },
         { L"use", L"ai use <preset|model> [model]", L"pick a preset or cloud model and save .env" },
@@ -1013,8 +1022,8 @@ namespace
         { L"no", L"ai no", L"cancel a pending expensive local-tool plan" },
         { L"run", L"ai run [index|all]", L"execute planned read-only commands" },
         { L"write", L"ai write [index] [confirm]", L"preview or confirm a write-like plan step" },
-        { L"explain", L"ai explain <read-only-command...>", L"run a command and explain the output" },
-        { L"analyze", L"ai analyze <read-only-command...>", L"run a command and write an analysis report" },
+        { L"explain", L"ai explain <read-only-command...>", L"collect locally; raw output transfer is blocked" },
+        { L"analyze", L"ai analyze <read-only-command...>", L"collect locally; share supports reviewed image counts" },
         { L"annotate", L"ai annotate <u|uf> <addr>", L"annotate native disassembly" },
         { L"diagnose", L"ai diagnose <note>", L"diagnose a symbol/backend/type failure" },
         { L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"load a repeatable read-only plan" },
@@ -1710,6 +1719,7 @@ namespace
     const CompletionScopeTable kAiScopes[] =
     {
         SCOPE(L"", L"ai <goal> | ai chat <goal> | ai <subcommand> ...", L"intent router: local tools, playbooks, chat planner, and evidence analysis", kAiRootTokens),
+        SCOPE(L"share", L"ai share preview <root> | send <review-id> confirm | cancel", L"review minimized evidence and approve once", kAiShareTokens),
         SCOPE(L"config", L"ai config [status|provider|policy|model|test|...]", L"advanced provider setup", kAiConfigTokens),
         SCOPE(L"config-provider", L"ai config provider <name|off>", L"select the AI provider", kAiProviderNameTokens),
         SCOPE(L"config-policy", L"ai config policy <allow-remote|local-only|status>", L"allow or block HTTP providers", kAiPolicyTokens),
@@ -1723,7 +1733,7 @@ namespace
         SCOPE(L"chat", L"ai chat <goal> [/verbose]", L"natural-language catalog tool picker", kAiChatTokens),
         SCOPE(L"show", L"ai show [plan|pending|evidence]", L"loaded plan, pending tools, or last evidence", kAiShowTokens),
         SCOPE(L"leaf", L"ai <subcommand> [help]", L"subcommand help", kHelpOnlyTokens),
-        SCOPE(L"evidence", L"ai explain|analyze <read-only-command...>", L"run a command and explain or analyze the output", kAiEvidenceTokens),
+        SCOPE(L"evidence", L"ai explain|analyze <read-only-command...>", L"collect locally; raw output transfer is blocked", kAiEvidenceTokens),
         SCOPE(L"annotate", L"ai annotate <u|uf> <addr|symbol>", L"annotate native disassembly", kAiAnnotateTokens),
         SCOPE(L"write", L"ai write [index] [confirm]", L"preview or confirm a write-like plan step", kAiWriteTokens),
         SCOPE(L"run", L"ai run [index|all]", L"execute planned read-only commands", kAiRunTokens),
@@ -2227,7 +2237,11 @@ namespace
         }
         else if (command == L"ai")
         {
-            if (first == L"config")
+            if (first == L"share")
+            {
+                scope = second.empty() ? L"share" : L"leaf";
+            }
+            else if (first == L"config")
             {
                 if (second == L"provider")
                 {

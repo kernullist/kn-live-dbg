@@ -37,6 +37,7 @@
 #include "EvidenceInventory.h"
 #include "EvidenceJournal.h"
 #include "EvidencePrivacy.h"
+#include "EvidenceDisclosure.h"
 #include "EvidenceRetention.h"
 #include "EvidenceGraph.h"
 #include "ImageSweepGraph.h"
@@ -731,6 +732,7 @@ struct AiCommandProposal
 
 struct AiPlanState
 {
+    AiEvidenceReview PendingDisclosure;
     std::wstring Schema;
     std::wstring Title;
     std::wstring Summary;
@@ -779,6 +781,7 @@ static bool ByteRestoreCommandSelfTest();
 
 static void PreserveAiSessionSettings(AiPlanState& target, const AiPlanState& source)
 {
+    target.PendingDisclosure = source.PendingDisclosure;
     target.TranscriptPath = source.TranscriptPath;
     target.TranscriptEnabled = source.TranscriptEnabled;
     target.TranscriptMaxBytes = source.TranscriptMaxBytes;
@@ -23051,6 +23054,8 @@ static void PrintKmonHelp()
     std::wcout << L"                  same switch\n";
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
     std::wcout << L"  /private-log root  require initialized private root, audit before acquisition\n";
+    std::wcout << L"  --offline !kmon redact-image <recipe-directory|knslice|knsweep> <new-private-root> [/acl-only] [/json]\n";
+    std::wcout << L"  --offline !kmon disclosure <private-root> [/json]  inspect a minimized package; no transfer\n";
     std::wcout << L"  --offline !kmon init-store <new-root> [/acl-only] [/json]  require EFS by default\n";
     std::wcout << L"  --offline !kmon privacy <root> [/audit] [/json]  inspect OS protections\n";
     std::wcout << L"  /layout-ms N    memory layout rescan target, 1000..60000 ms (default 5000)\n";
@@ -23408,10 +23413,33 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|evidence|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
+    if (action == L"redact-image" || action == L"disclosure")
+    {
+        const size_t firstOption = action == L"redact-image" ? 4 : 3;
+        bool aclOnly = false, json = false, valid = args.size() >= firstOption;
+        for (size_t i = 2; valid && i < firstOption; ++i)
+            { valid = !args[i].empty() && args[i][0] != L'/'; }
+        for (size_t i = firstOption; valid && i < args.size(); ++i)
+        {
+            const auto flag = ToLower(args[i]);
+            if (flag == L"/json" && !json) { json = true; }
+            else if (flag == L"/acl-only" && action == L"redact-image" && !aclOnly) { aclOnly = true; }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: --offline !kmon redact-image <recipe-directory|knslice|knsweep> <new-private-root> [/acl-only] [/json]\n"
+                L"       --offline !kmon disclosure <private-root> [/json]\n";
+            return 2;
+        }
+        const auto package = action == L"redact-image" ? PrepareImageDisclosure(args[2], args[3], !aclOnly) : LoadEvidenceDisclosure(args[2]);
+        if (!WriteCapabilityJson(EvidenceDisclosurePackageJson(package))) { return 3; }
+        return package.Status == L"ready" ? 0 : 1;
+    }
     if (action == L"init-store" || action == L"privacy")
     {
         bool option = false, json = false, valid = args.size() >= 3 && !args[2].empty();
@@ -28022,15 +28050,14 @@ static void HandleUnassembleCommand(
     } while (false);
 }
 
-static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const SymbolEngine& symbols)
+static std::wstring BuildAiSystemPrompt(const DebuggerState& state, const SymbolEngine&)
 {
     std::wstringstream stream;
 
     stream << L"KnLiveDbg session context:\n";
     stream << L"- backend: " << BackendModeText(state.Backend) << L"\n";
     stream << L"- number base: " << state.NumberBase << L"\n";
-    stream << L"- symbol path: " << symbols.SymbolPath() << L"\n";
-    stream << L"- loaded kernel modules: " << symbols.Modules().size() << L"\n";
+    stream << L"- collected targets, symbol paths and last-session evidence are withheld\n";
     stream << L"- native write mode is off by default; explicit write on is required for lab mutations\n";
     stream << L"- native e* user VA writes use procctx or /process; kernel VA writes use System(pid 4)\n";
     stream << L"- address arguments support arithmetic such as nt!Symbol+20 or 0xfffff80000000000-10\n";
@@ -28628,6 +28655,7 @@ static void PrintAiHelp()
     std::wcout << L"  models       list/search cloud models; refresh fetches live OpenRouter IDs\n";
     std::wcout << L"  status       ready/blocked health and the next setup step\n";
     std::wcout << L"  test         smoke-check the selected provider/model\n";
+    std::wcout << L"  share        preview minimized image facts, then explicitly send once or cancel\n";
     std::wcout << L"  save         write the current provider/model to the EXE-dir .env\n";
     std::wcout << L"  config       advanced provider, policy, base URL, effort, or auth\n";
     std::wcout << L"  go           run a pending expensive local-tool plan\n";
@@ -28637,8 +28665,8 @@ static void PrintAiHelp()
     std::wcout << L"  plan         explicitly ask AI to produce executable command proposals\n";
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
-    std::wcout << L"  explain      explicitly run a read-only command and ask AI to explain the output\n";
-    std::wcout << L"  analyze      explicitly run a read-only command and ask AI for an analysis report\n";
+    std::wcout << L"  explain      run a read-only command locally; raw output transfer is blocked\n";
+    std::wcout << L"  analyze      run a read-only command locally; use share for minimized image facts\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
@@ -28678,7 +28706,8 @@ static void PrintAiHelp()
     std::wcout << L"  ai chat <goal> skips playbooks, process shortcuts, and command-recommendation plans.\n";
     std::wcout << L"  Exact read-only command lines after ai or ai chat still run as evidence.\n";
     std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
-    std::wcout << L"  After tools run, AI explains the captured output. Empty stderr is omitted so reports do not end with a stderr line.\n";
+    std::wcout << L"  Collected stdout/stderr is kept local. Use offline !kmon redact-image then ai share preview/send for minimized image facts.\n";
+    std::wcout << L"  Operator-authored prompts still go to the selected provider. private/local-only external CLI is not offline inference.\n";
     std::wcout << L"  Conceptual why/what after ai <goal> stay advisory.\n";
     std::wcout << L"  ai chat still tries catalog tools for why/what. dump-kernel and dump-live are not available through AI.\n";
     std::wcout << L"  ai plan remains an explicit command-proposal override. Default ai <goal> no longer auto-builds that plan.\n";
@@ -28704,6 +28733,13 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai status\n";
         std::wcout << L"  Show whether the selected preset/model is ready and what to do next.\n";
         std::wcout << L"  ai config status prints the verbose provider dump.\n";
+    }
+    else if (name == L"share")
+    {
+        std::wcout << L"ai share:\n  ai share preview <private-package-root>\n  ai share send <review-id> confirm\n  ai share cancel\n";
+        std::wcout << L"  Preview pins and displays exact minimized facts, system instructions and HTTP destination; it sends nothing.\n";
+        std::wcout << L"  Send requires a matching one-use review and committed private intent. No automatic retry or CLI evidence transfer.\n";
+        std::wcout << L"  Responses are advisory only. Raw captures, artifact identities and paths are withheld.\n";
     }
     else if (name == L"use")
     {
@@ -28809,8 +28845,8 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  Send a Korean or English request to the catalog tool planner.\n";
         std::wcout << L"  Local playbooks, process-field shortcuts, and command-recommendation plans are not used.\n";
         std::wcout << L"  Exact read-only command lines still run as evidence and are explained.\n";
-        std::wcout << L"  Cheap tools preview, run, then AI explains the captured output.\n";
-        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
+        std::wcout << L"  Cheap tools preview and run locally; captured output transfer requires a supported minimized package.\n";
+        std::wcout << L"  Collected stdout/stderr is not sent to the provider.\n";
         std::wcout << L"  hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
         std::wcout << L"  disable/enable and exact write-like lines still stage a write plan.\n";
         std::wcout << L"  dump-kernel and dump-live are not available through ai chat.\n";
@@ -28836,9 +28872,8 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai analyze <read-only-command...>\n";
         std::wcout << L"  ai analyze !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai analyze !callbacks [scope] /module <module>\n";
-        std::wcout << L"  Runs a read-only evidence command and asks AI for an analysis report.\n";
-        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
-        std::wcout << L"  Callback analysis remains available for compatibility.\n";
+        std::wcout << L"  Runs a read-only evidence command locally. Raw output transfer is blocked at the provider.\n";
+        std::wcout << L"  Use offline !kmon redact-image and ai share for reviewed image counts; other evidence adapters remain unavailable.\n";
     }
     else if (name == L"explain")
     {
@@ -28850,14 +28885,14 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai explain <u|uf> <address|symbol> [instruction-count]\n";
         std::wcout << L"  ai explain !module integrity all /summary\n";
         std::wcout << L"  ai explain !wnf data <state-name-hash|entry-address>\n";
-        std::wcout << L"  Runs a read-only evidence command and asks AI to explain fields, callbacks, or disassembly.\n";
-        std::wcout << L"  Empty command stderr is omitted from the explanation prompt and trailing empty-stderr echo is stripped.\n";
+        std::wcout << L"  Runs a read-only evidence command locally. Raw output transfer is blocked at the provider.\n";
+        std::wcout << L"  Use offline !kmon redact-image and ai share for reviewed image counts; other evidence adapters remain unavailable.\n";
     }
     else if (name == L"annotate")
     {
         std::wcout << L"ai annotate:\n";
         std::wcout << L"  ai annotate <u|uf> <address|symbol> [instruction-count]\n";
-        std::wcout << L"  Runs native disassembly and asks AI to annotate likely behavior.\n";
+        std::wcout << L"  Runs native disassembly locally. Raw output transfer is blocked; no minimized disassembly adapter is available.\n";
     }
     else if (name == L"diagnose")
     {
@@ -28987,7 +29022,7 @@ static bool IsAiSubcommandHelpRequest(const std::vector<std::wstring>& args, con
             break;
         }
 
-        if (IsAiPromptPayloadAction(action) || IsAiEvidenceNestedAction(action))
+        if (IsAiPromptPayloadAction(action) || IsAiEvidenceNestedAction(action) || action == L"share")
         {
             help = args.size() == 3 && IsHelpToken(args[2]);
             break;
@@ -30937,7 +30972,9 @@ static int RunConsoleSurfaceSelfTest()
                         aiHelp.find(L"ai chat") != std::wstring::npos &&
                         aiHelp.find(L"skips playbooks") != std::wstring::npos &&
                         aiHelp.find(L"dump-kernel and dump-live are not available") != std::wstring::npos &&
-                        aiHelp.find(L"Empty stderr is omitted") != std::wstring::npos &&
+                        aiHelp.find(L"Collected stdout/stderr is kept local") != std::wstring::npos &&
+                        aiHelp.find(L"ai share preview/send") != std::wstring::npos &&
+                        aiHelp.find(L"external CLI is not offline inference") != std::wstring::npos &&
                         aiHelp.find(L"ai \xC228\xC740 \xD504\xB85C\xC138\xC2A4") != std::wstring::npos &&
                         aiHelp.find(L"no longer auto-builds") != std::wstring::npos,
                     L"ai-help-covers-go-evidence-and-local-first");
@@ -30977,7 +31014,7 @@ static int RunConsoleSurfaceSelfTest()
                         chatHelp.find(L"evidence") != std::wstring::npos &&
                         chatHelp.find(L"write plan") != std::wstring::npos &&
                         chatHelp.find(L"dump-kernel") != std::wstring::npos &&
-                        chatHelp.find(L"Empty command stderr") != std::wstring::npos &&
+                        chatHelp.find(L"Collected stdout/stderr is not sent") != std::wstring::npos &&
                         chatHelp.find(L"ai chat object callbacks") != std::wstring::npos &&
                         chatHelp.find(L"ai use cloud") != std::wstring::npos,
                     L"ai-chat-subcommand-help");
@@ -37196,6 +37233,7 @@ static void HandleAiPlanRequest(
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
         request.Prompt = BuildAiPlanPrompt(prompt);
+        request.Origin = AiRequestOrigin::OperatorText;
 
         std::wcout << requestLabel << L": provider=" << ai.ProviderName()
                    << L" model=" << ai.Settings().Model
@@ -47762,28 +47800,6 @@ static std::wstring SerializeAiCapabilityPlan(const AiCapabilityPlan& plan)
     return stream.str();
 }
 
-static std::wstring BuildAiSessionHints(const AiPlanState& aiState)
-{
-    std::wstringstream stream;
-    if (aiState.LastPid != 0)
-    {
-        stream << L"last_pid=" << aiState.LastPid << L"\n";
-    }
-    if (!aiState.LastImage.empty())
-    {
-        stream << L"last_image=" << aiState.LastImage << L"\n";
-    }
-    if (!aiState.LastAddress.empty())
-    {
-        stream << L"last_address=" << aiState.LastAddress << L"\n";
-    }
-    if (!aiState.LastDumpPath.empty())
-    {
-        stream << L"last_dump=" << aiState.LastDumpPath << L"\n";
-    }
-    return stream.str();
-}
-
 static std::wstring ExtractAiGoalAddress(const std::wstring& query)
 {
     std::wstring address;
@@ -47955,7 +47971,7 @@ static void ExplainAiCapturedTools(
     RememberAiEvidence(aiState, summary.empty() ? query : summary, stdoutText);
     if (ToLower(ai.ProviderName()) == L"off")
     {
-        std::wcout << L"ai note: provider is off; raw tool output is above. type ai use cloud to enable explanations.\n";
+        std::wcout << L"ai note: raw tool output stays local; ai share accepts reviewed minimized image facts.\n";
         return;
     }
 
@@ -48311,7 +48327,8 @@ static AiCapabilityQueryResult TryHandleAiCapabilityQuery(
 
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
-        request.Prompt = BuildAiCapabilityPlannerPrompt(query, BuildAiSessionHints(aiState));
+        request.Prompt = BuildAiCapabilityPlannerPrompt(query, L"");
+        request.Origin = AiRequestOrigin::OperatorText;
 
         std::wcout << L"ai tool planner: provider=" << ai.ProviderName()
                    << L" model=" << ai.Settings().Model
@@ -48448,6 +48465,7 @@ static void HandleAiConfigTestCommand(const std::vector<std::wstring>& args, AiP
     {
         AiCompletionRequest request = {};
         request.System = L"You are a KnLiveDbg AI provider connectivity smoke test. Return exactly this marker and no other text: " + expectedMarker;
+        request.Origin = AiRequestOrigin::OperatorText;
         size_t promptIndex = 3;
         if (args.size() >= 2 && ToLower(args[1]) == L"test")
         {
@@ -48757,6 +48775,7 @@ static void HandleAiFreeFormCommand(
 
         bool verbose = false;
         StripAiGoalOptions(&query, &verbose);
+        const std::wstring operatorQuery = query;
         query = ApplyAiSessionContext(
             query,
             aiState.LastPid,
@@ -48779,7 +48798,7 @@ static void HandleAiFreeFormCommand(
         {
             std::wcout << L"ai auto: command recommendation request; building command plan\n";
             HandleAiPlanRequest(
-                query,
+                operatorQuery,
                 L"ai_auto_plan",
                 L"ai auto-plan request",
                 state,
@@ -48884,13 +48903,14 @@ static void HandleAiFreeFormCommand(
         {
             AiCompletionRequest request = {};
             request.System = BuildAiSystemPrompt(state, symbols);
-            request.Prompt = query;
+            request.Prompt = operatorQuery;
+            request.Origin = AiRequestOrigin::OperatorText;
             CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
             break;
         }
 
         AiCapabilityQueryResult capabilityResult = TryHandleAiCapabilityQuery(
-            query,
+            operatorQuery,
             verbose,
             state,
             device,
@@ -48907,13 +48927,14 @@ static void HandleAiFreeFormCommand(
         if (ToLower(ai.ProviderName()) == L"off")
         {
             std::wcout << L"ai provider is off. Local playbooks still run for known goals such as hidden processes or callbacks.\n";
-            std::wcout << L"type ai use cloud to enable tool planning and explanations.\n";
+            std::wcout << L"type ai use cloud to enable planning from operator text; collected output stays local.\n";
             break;
         }
 
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
-        request.Prompt = query;
+        request.Prompt = operatorQuery;
+        request.Origin = AiRequestOrigin::OperatorText;
         CompleteAndPrintAiRequest(L"ai_ask", request, ai, aiState);
     } while (false);
 }
@@ -48972,6 +48993,7 @@ static void HandleAiChatCommand(
 
         bool verbose = false;
         StripAiGoalOptions(&query, &verbose);
+        const std::wstring operatorQuery = query;
         query = ApplyAiSessionContext(
             query,
             aiState.LastPid,
@@ -49086,7 +49108,7 @@ static void HandleAiChatCommand(
         WriteAiTranscriptEvent(aiState, L"ai_chat", L"catalog tool planner", query);
 
         AiCapabilityQueryResult capabilityResult = TryHandleAiCapabilityQuery(
-            query,
+            operatorQuery,
             verbose,
             state,
             device,
@@ -49102,9 +49124,73 @@ static void HandleAiChatCommand(
 
         AiCompletionRequest request = {};
         request.System = BuildAiSystemPrompt(state, symbols);
-        request.Prompt = query;
+        request.Prompt = operatorQuery;
+        request.Origin = AiRequestOrigin::OperatorText;
         CompleteAndPrintAiRequest(L"ai_chat_ask", request, ai, aiState);
     } while (false);
+}
+
+static void HandleAiShareCommand(const std::vector<std::wstring>& args, AiProviderRuntime& ai, AiPlanState& aiState)
+{
+    if (g_RemoteOriginActive.load())
+    {
+        std::wcerr << L"ai share: evidence disclosure approval is console-local\n";
+        return;
+    }
+    if (args.size() == 3 && ToLower(args[2]) == L"cancel")
+    {
+        AiProviderRuntime::RevokeEvidenceReview(&aiState.PendingDisclosure);
+        std::wcout << L"ai share: pending review revoked\n";
+        return;
+    }
+    if (args.size() == 4 && ToLower(args[2]) == L"preview")
+    {
+        AiProviderRuntime::RevokeEvidenceReview(&aiState.PendingDisclosure);
+        const auto package = LoadEvidenceDisclosure(args[3]);
+        std::wstring error;
+        if (!ai.PrepareEvidenceReview(package, &aiState.PendingDisclosure, &error))
+        {
+            std::wcerr << L"ai share denied: " << (package.Status == L"ready" ? error : package.Issue) << L"\n";
+            return;
+        }
+        const auto& review = aiState.PendingDisclosure;
+        const auto preview = L"{\"schema\":\"kn.disclosure_review.v1\",\"review_id\":" + mcpjson::Quote(review.Id) +
+            L",\"destination\":" + review.Destination + L",\"system\":" + mcpjson::Quote(review.System) +
+            L",\"facts\":" + review.Facts + L",\"facts_sha256\":" + mcpjson::Quote(review.FactsSha256) +
+            L",\"manifest_sha256\":" + mcpjson::Quote(review.ManifestSha256) + L",\"transfer_authorized\":false}";
+        if (!WriteCapabilityJson(preview))
+        {
+            AiProviderRuntime::RevokeEvidenceReview(&aiState.PendingDisclosure);
+            std::wcerr << L"ai share: preview output failed; review revoked\n";
+            return;
+        }
+        std::wcout << L"No request sent. To approve this payload and destination once: ai share send " << review.Id << L" confirm\n";
+        return;
+    }
+    if (args.size() == 5 && ToLower(args[2]) == L"send" && ToLower(args[4]) == L"confirm")
+    {
+        // Remove the pending UI action before any dispatch. Failures need a new preview.
+        auto review = std::move(aiState.PendingDisclosure);
+        aiState.PendingDisclosure = {};
+        AiCompletionRequest request;
+        std::wstring error;
+        if (!ai.ApproveEvidenceReview(review, args[3], &request, &error))
+        {
+            AiProviderRuntime::RevokeEvidenceReview(&review);
+            std::wcerr << L"ai share denied before dispatch: " << error << L"\n";
+            return;
+        }
+        AiCompletionResponse response{};
+        const bool completed = ai.Complete(request, &response, &error);
+        AiProviderRuntime::RevokeEvidenceReview(&review);
+        std::wcout << L"ai share: " << response.DisclosureOutcome << L"; private result record=" <<
+            (response.DisclosureAuditRecorded ? L"committed" : L"unresolved") << L"; approval consumed\n";
+        if (!completed) { std::wcerr << L"ai share failed: " << mcpjson::Quote(error) << L"\n"; }
+        // Advisory text is never parsed as a plan or executed.
+        if (!response.Text.empty()) { WriteCapabilityJson(mcpjson::Quote(response.Text)); }
+        return;
+    }
+    std::wcerr << L"usage: ai share preview <private-package-root> | send <review-id> confirm | cancel\n";
 }
 
 static void HandleAiCommand(
@@ -49140,6 +49226,10 @@ static void HandleAiCommand(
         else if (action == L"status")
         {
             std::wcout << ai.HealthText();
+        }
+        else if (action == L"share")
+        {
+            HandleAiShareCommand(args, ai, aiState);
         }
         else if (action == L"use")
         {
@@ -49587,6 +49677,7 @@ static void HandleAiCommand(
             prompt << L"Operator note:\n";
             prompt << JoinArgs(args, 2) << L"\n";
             request.Prompt = prompt.str();
+            request.Origin = AiRequestOrigin::OperatorText;
             CompleteAndPrintAiRequest(L"ai_diagnose", request, ai, aiState);
         }
         else if (action == L"playbook")
@@ -49608,6 +49699,7 @@ static void HandleAiCommand(
             AiCompletionRequest request = {};
             request.System = BuildAiSystemPrompt(state, symbols);
             request.Prompt = JoinArgs(args, 2);
+            request.Origin = AiRequestOrigin::OperatorText;
 
             if (action == L"preview")
             {
@@ -49639,6 +49731,47 @@ static void HandleAiCommand(
             HandleAiFreeFormCommand(args, state, dbgeng, device, service, symbols, ai, aiState);
         }
     } while (false);
+}
+
+// Exercises the real console handlers without starting a controller. The only
+// permitted transport is an explicitly supplied owned loopback test listener.
+static int RunAiDisclosureHandlerSelfTest(const std::wstring& root, const std::wstring& portText)
+{
+    uint64_t port = 0;
+    if (portText.empty() || portText.find_first_not_of(L"0123456789") != std::wstring::npos ||
+        !ParseUnsigned(portText, 10, &port) || port == 0 || port > 65535) { return 2; }
+    AiProviderRuntime ai; std::wstring error;
+    if (!ai.SetProvider(L"openrouter", &error) || ai.Settings().ApiKey != L"sk-replace-me") { return 2; }
+    ai.SetRemotePolicy(L"allow-remote", &error);
+    ai.SetBaseUrl(L"http://127.0.0.1:" + std::to_wstring(port)); ai.SetModel(L"synthetic-model"); ai.SetReasoningEffort(L"");
+    const auto package = LoadEvidenceDisclosure(root);
+    if (package.Status != L"ready") { return 1; }
+    AiPlanState aiState{};
+    HandleAiShareCommand({L"ai", L"share", L"preview", root}, ai, aiState);
+    const auto id = aiState.PendingDisclosure.Id;
+    if (id.empty()) { return 1; }
+    HandleAiShareCommand({L"ai", L"share", L"send", id, L"confirm"}, ai, aiState);
+    if (!aiState.PendingDisclosure.Id.empty()) { return 1; }
+    std::wstring result;
+    if (!ReadAnalystSnapshot((std::filesystem::path(package.Root) / (L"transfer-" + id + L".knsendresult")).wstring(), &result, nullptr) ||
+        result.find(L"\"completion_received\"") == std::wstring::npos) { return 1; }
+    HandleAiShareCommand({L"ai", L"share", L"send", id, L"confirm"}, ai, aiState);
+    HandleAiShareCommand({L"ai", L"share", L"preview", root}, ai, aiState);
+    HandleAiShareCommand({L"ai", L"share", L"cancel"}, ai, aiState);
+    if (!aiState.PendingDisclosure.Id.empty()) { return 1; }
+    DebuggerState state{}; state.NumberBase = 16; state.Backend = DebuggerState::BackendMode::Native;
+    DeviceClient device; DriverService service(KNDBG_SERVICE_NAME, KNDBG_DISPLAY_NAME);
+    DbgEngBackend dbgeng; SymbolEngine symbols;
+    symbols.SetSymbolPath(L"C:\\synthetic-private-canary\\symbols");
+    aiState.LastPid = 424242; aiState.LastImage = L"synthetic-private-canary.exe";
+    aiState.LastAddress = L"0xffff800012340000"; aiState.LastDumpPath = L"C:\\synthetic-private-canary\\capture.dmp";
+    const std::wstring question = L"what is the meaning of this dump?";
+    HandleAiFreeFormCommand({L"ai", question}, state, dbgeng, device, service, symbols, ai, aiState);
+    HandleAiChatCommand({L"ai", L"chat", question}, state, dbgeng, device, service, symbols, ai, aiState);
+    ExplainAiCapturedTools(question, L"synthetic-private-canary", L"synthetic-private-canary stdout", L"synthetic-private-canary stderr",
+        state, symbols, ai, aiState);
+    std::wcout << L"[ai.disclosure.handlers] completed; independent loopback oracle must verify wire counts and absence of canaries\n";
+    return 0;
 }
 
 static bool HandleCommand(
@@ -53515,7 +53648,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|evidence|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";
@@ -53573,6 +53706,10 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--self-test")
     {
+        if (argc == 5 && ToLower(argv[2]) == L"ai-disclosure")
+        {
+            return RunAiDisclosureHandlerSelfTest(argv[3], argv[4]);
+        }
         if (argc == 3 && ToLower(argv[2]) == L"capture-scheduler")
         {
             std::wstring diagnostics;
@@ -53667,7 +53804,7 @@ int wmain(int argc, wchar_t** argv)
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
         return 2;
     }
 

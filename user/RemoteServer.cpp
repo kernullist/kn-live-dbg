@@ -1309,6 +1309,12 @@ bool IsRemoteDeniedCommandLine(const std::wstring& line, std::wstring* reason)
             set(L"log is console-local");
             break;
         }
+        if (canonical == L"ai" && args.size() >= 2)
+        {
+            auto action = args[1];
+            for (auto& c : action) { c = static_cast<wchar_t>(towlower(c)); }
+            if (action == L"share") { set(L"evidence disclosure approval is console-local"); break; }
+        }
         if (canonical == L".sympath+")
         {
             set(L"symbol path change denied");

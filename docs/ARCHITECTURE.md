@@ -203,7 +203,7 @@ the policy does not reserve physical disk space or guarantee crash-time closure.
 
 This policy applies to the routed image pipeline. Committed artifact protection
 continues to come from journal membership and the store's GC rules. Priority
-admission for other evidence families, cross-session retention, transfer/redaction
+admission for other evidence families, cross-session retention, other-family transfer/redaction
 privacy controls and committed-root retirement remain separate P06 requirements.
 
 ## Original KMON slice replay
@@ -400,7 +400,7 @@ unreadable artifacts remain protected and make artifact inventory partial.
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
 revalidates its own policy and leases. Committed-root retirement, cross-collection
-retention priorities and transfer/redaction controls remain P06 work.
+retention priorities and other-family transfer/redaction controls remain P06 work.
 Local ACL/EFS admission is described under [private evidence roots](#private-evidence-roots).
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
@@ -471,7 +471,7 @@ Uncommitted recipe dependencies are not resolved: explicit removal of an
 uncommitted reference can make another uncommitted artifact unusable. This scope
 is declared as `uncommitted_dependents_resolved:false`; committed dependencies
 stay protected by journal membership. Priority-based GC selection, retirement
-of committed roots, full dependency-impact analysis, transfer/redaction controls
+of committed roots, full dependency-impact analysis, other-family transfer/redaction controls
 and large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.
 
@@ -538,10 +538,71 @@ does not remove that concurrency limit. Parent directory permissions may also
 allow deletion: confidentiality does not establish availability. Ordinary exports,
 console logging and copies outside the private root need their own policy. This
 does not authenticate the collector, prove power-loss durability or authorize
-external transfer. Transfer minimization/approval, linked redaction derivatives,
-key recovery operations and broader P06 retention remain open. Reports and
+external transfer. The separate image disclosure path below implements a bounded
+minimization/approval workflow; other evidence families, key recovery operations
+and broader P06 retention remain open. Reports and
 `.knprivacy` files, including pending files, are private evidence; no automatic
 external upload is added.
+
+## Minimized image disclosure
+
+Offline `!kmon redact-image <recipe-directory|knslice|knsweep> <new-private-root>`
+replays the original policy before creating a derivative. The new root uses the
+private-root controls above: EFS is required unless `/acl-only` is explicit.
+`facts.knshare` contains canonical `kn.minimized_image_facts.v1` under
+`kn.image_counts_redaction.v1`. Its closed vocabulary includes only a random
+derivation ID, range/slice/sweep scope, byte denominators and fixed qualification
+limits. Paths, addresses, process/source identities, hashes, symbols, timestamps,
+raw bytes and source-controlled free text are omitted. Counts cover the recorded
+scope only; a zero-byte rejected slice remains unqualified with `changed_bytes`
+null. Null also preserves an unestablished direct-range comparison. Zero is not
+substituted for unknown. Retained references are not approved distributions, and
+no execution, maliciousness, atomic-state or collector-authenticity claim is made.
+
+The private `redaction.knredact` sidecar binds the exact original file hash,
+recipe/manifest semantic hash, fresh replay proof hash and derivative hash to the
+physical root and current principal. Originals are read under a lease and are
+never modified. Facts publish first and the manifest last through create-new,
+flushed files. A partial package cannot be reviewed for sending. Inspection can
+read a completed historical package without reacquiring a target or reopening
+the original; the linkage is not an authenticated collector signature.
+
+`ai share preview <root>` pins the audited root, facts and sidecar, and displays
+the exact facts, system instructions, HTTP endpoint/model and OAuth refresh
+endpoint when applicable. It sends nothing. `ai share send <review-id> confirm`
+requires the pending opaque review and unchanged settings/credentials, publishes
+a private `.knsend` intent, and consumes the approval before transport. A failed
+intent blocks dispatch. A `.knsendresult` records `not_dispatched`,
+`completion_received` or `outcome_unknown`; missing/colliding result records leave
+the intent unresolved. No automatic reapproval or application retry follows a
+failure. A new preview and confirmation are required. OAuth may refresh and retry
+one logical completion at the displayed endpoints; this is not an exactly-once
+HTTP delivery guarantee. Recipient processing, storage and deletion remain unknown.
+
+The endpoint must be HTTPS, except numeric loopback HTTP for owned tests. Redirects,
+implicit Windows authentication and automatic cookies are disabled using
+[WinHTTP request options](https://learn.microsoft.com/en-us/windows/win32/winhttp/option-flags#winhttp_option_disable_feature).
+OS proxy/DNS configuration and local administrators remain trusted. HTTP provider
+credentials are bound privately and never placed in preview or audit records.
+External CLI evidence transfer is rejected because that process's file access
+and egress are not confined. `local-only` also blocks reviewed HTTP disclosure.
+Approval is console-local: remote console commands and nested AI plans cannot
+invoke it, and no MCP approval tool is exposed.
+
+At the provider boundary, collected stdout/stderr and unclassified requests are
+denied for every provider, including CLI. Operator-authored questions and planning
+prompts remain explicit provider requests; automatic symbol paths, module counts,
+last-target hints and session-expanded addresses/dump paths are withheld from
+those requests. Local command interpretation can still use the session context.
+Model output from disclosure is advisory text and is never executed as a plan.
+Both response text and provider errors are escaped on display so terminal control
+characters remain data.
+This is not offline inference or a general egress sandbox for MCP, remote console,
+operator-pasted content, external tools or other evidence families. The owner,
+SYSTEM and administrators remain trusted; approval and hashes are not external
+authentication. All packages, previews and transfer records remain private,
+including renamed JSON and pending files. Approved recipient disclosure does not
+make an artifact safe for public publication.
 
 ## Replayed image sweep graph
 

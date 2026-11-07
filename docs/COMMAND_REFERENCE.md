@@ -64,6 +64,25 @@ them up. Administrator/recovery-agent access, owner changes, exports outside the
 root and external transfer/redaction require separate controls. See the
 [privacy scope and limits](ARCHITECTURE.md#private-evidence-roots).
 
+`KnLiveDbg.exe --offline !kmon redact-image <recipe-directory|knslice|knsweep>
+<new-private-root> [/acl-only] [/json]` replays a saved original and publishes
+minimized comparison counts plus a private original-hash linkage. A direct
+`recipe.knverify` path is also accepted. The default requires EFS; no target
+acquisition or AI provider request occurs. `--offline !kmon disclosure <root> [/json]` inspects
+the completed package. Both always emit private `kn.disclosure_package.v1` JSON:
+0 means ready, 1 denied/unavailable/incomplete, 2 invalid grammar and 3 output
+failure. Publication is create-new; an output failure does not undo it.
+
+In the local console, `ai share preview <root>` displays and pins the exact facts
+and HTTP destination without sending. `ai share send <review-id> confirm` approves
+that review once; `ai share cancel` revokes it. A private intent must commit before
+dispatch. Configuration/payload changes, partial packages and reused approvals
+are denied. Failed or uncertain transfers need a new review and explicit decision;
+they are not retried automatically. Raw captured output cannot be sent through
+`ai explain`/`analyze` or automatic tool explanations. Operator-authored prompts
+remain provider requests. See [minimized image disclosure](ARCHITECTURE.md#minimized-image-disclosure)
+and the [AI workflow](AI_ASSISTED_WORKFLOWS.md#review-minimized-image-evidence).
+
 `KnLiveDbg.exe --offline !kmon journal <collection-directory> [/index] [/json]`
 verifies a stopped `collections/<collection-id>` image collection and returns
 private `kn.evidence_journal_recovery.v1` JSON. It reports the committed prefix,

@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -47,7 +47,7 @@ def path_rule(name: str) -> str | None:
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy")
+        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knschema", ".knblob", ".knverify", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
     ):
         return "private-container-or-capture"
     return None
@@ -97,6 +97,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                     "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
                     "kn.evidence_gc_policy.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
+                    "kn.minimized_image_facts.v1", "kn.redaction_manifest.v1", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
                     "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",

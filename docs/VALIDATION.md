@@ -7,6 +7,90 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Minimized image disclosure checkpoint: 2026-11-07
+
+This bounded P06/P15 step adds offline `redact-image`/`disclosure` and console-local
+`ai share preview/send/cancel`. Original-policy replay produces closed-vocabulary
+image counts in an EFS-default private package with an original/proof/hash linkage.
+The provider requires an exact pending review and a committed private intent;
+approval is consumed once and unknown outcomes never authorize an automatic retry.
+Unclassified and captured raw output are denied, including external CLI requests.
+Operator prompts omit hidden symbol paths and session-expanded targets. See
+[minimized image disclosure](ARCHITECTURE.md#minimized-image-disclosure).
+The full P06/P15 and P01-P16 / VS1-VS4 goals remain open.
+
+The checked environment was Windows 11 Pro x64 **10.0.28000** on NTFS,
+VS 2022 Build Tools **17.14.60**, MSVC **14.44.35207**, SDK/WDK **10.0.26100.0**.
+The final Release build exited 0; the existing `NextQueryEpoch` C4744 link warnings
+remain. Final binary SHA-256 values:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Release `KnLiveDbg.exe` | `3ee7c73f2e6fc132b311e2e19d6910623d5ca92fdf0655ed38c5c28c7f4ec02b` |
+| ASan disclosure/provider harness | `8407294ad180461da1212bbc98485076a82982d2093d6324d6efde05b9a354be` |
+
+`tools/validate-evidence-disclosure.ps1 -Sanitize -ImageSliceFixtures <retained-slice-fixtures>
+-ImageRecipeFixtures <retained-recipe-fixtures> -Cli x64/Release/KnLiveDbg.exe`
+builds the core harness with `/W4 /WX /fsanitize=address` and runs the independent
+Python oracle. Source fixtures come from `validate-image-slice.ps1` and
+`validate-image-recipe.ps1`; this run reused their retained synthetic originals
+read-only. The final oracle was also run directly against the final EXE and the
+unchanged ASan harness. It passed **506 checks**, observed **14 loopback HTTP
+requests**, and ended with **0 owned child processes** and a closed listener.
+
+The final isolated `--self-test all` run exited 0: timeline **28**, MCP **102**,
+KMON image **119**, console **558**, command checks **3006** across **261** routes,
+and remote protocol **68** passed. The compiled-capability check passed **32**
+contracts / **261** routes, the regenerated support matrix matched the final EXE,
+and the public-content classifier's **11** tests passed. No additional actionable
+defects were found in the reviewed scope.
+
+The oracle checked exact original-file, semantic, fresh replay-proof and derivative
+hash links; count partitions for recipe/slice/sweep scopes; null versus zero;
+unchanged originals; EFS attributes; canonical field and bound rejection; malformed,
+copied, partial and unreplayable packages; no overwrite; immutable reviewed files
+and pinned roots. Three publication interruptions and one intent interruption were
+synchronized on observed work, without sleep-based ordering. A manifest-last
+package recovers only after the manifest is committed. An interrupted intent
+remains unresolved and cannot restore an in-memory approval after restart.
+
+Owned receivers verified exact reviewed facts/system/model, intent existence
+before receiving the body, and absence of raw output and hidden session canaries.
+Tests covered all three HTTP provider adapters with synthetic credentials, unknown
+and raw origins, explicit operator text, CLI rejection before process resolution,
+wrong/changed/revoked/reused approvals, configuration and credential changes,
+header-control injection, redirects, implicit-auth challenges, HTTP failure and
+post-send audit collision. The real EXE offline grammar, Unicode paths, output
+failure exit 3, and actual preview/send/cancel/chat handlers were exercised before
+controller startup. An actual provider-error response containing an ESC sequence
+reproduced raw terminal output; the final handler escapes it, records the unknown
+outcome and makes no automatic resend. Returned advice is never executed.
+
+The review also corrected rejected zero-range slices being omitted from disclosure
+and session-expanded PID/image/address/dump hints being classified as operator
+text. Zero-range slices now retain an unqualified empty scope and unknown change
+count. Local command interpretation retains its context, while provider requests
+use the original operator text. Help checks were updated for the changed behavior.
+
+Private evidence: `.build/p06-disclosure-error-escape-build.log`,
+`.build/p06-disclosure-final-asan.log`, `.build/p06-disclosure-final-handler.log`,
+`.build/p06-disclosure-complete-selftests.log`;
+the final owned fixtures are `disclosure-c1d09f34f4c84b4384cf2cb0cd651790` under
+`.build/evidence-disclosure/Release-asan`. Earlier core/CLI passes are superseded
+by the final handler oracle where applicable. Packages and receipts were retained;
+no real evidence was deleted or sent to an external service.
+
+This is core ASan and owned-loopback validation, not full-EXE ASan, real provider
+availability, production HTTPS/proxy configuration, OAuth refresh/retry, loaded
+driver/controller startup, other filesystems or power-loss testing. The owner,
+SYSTEM and administrators remain trusted. No driver or test service was explicitly
+loaded or started. Windows EFS remains OS-managed Manual/Running, as recorded in
+the prior privacy checkpoint. Its earlier unexplained initialization failure and
+the historical process-capture timing observation remain unresolved observations;
+these passing controls do not establish their root causes. General offline
+inference/child confinement, MCP/remote egress controls, other evidence adapters,
+key recovery and broader retention/native gates remain open.
+
 ## Private evidence root checkpoint: 2026-11-07
 
 This P06 step adds offline `init-store`/`privacy` and opt-in KMON `/private-log`.

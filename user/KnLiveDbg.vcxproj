@@ -154,6 +154,8 @@
     <ClCompile Include="EvidenceInventory.cpp" />
     <ClCompile Include="EvidenceJournal.cpp" />
     <ClCompile Include="EvidencePrivacy.cpp" />
+    <ClCompile Include="EvidenceDisclosure.cpp" />
+    <ClCompile Include="EvidenceDisclosureFacts.cpp" />
     <ClCompile Include="EvidenceGraph.cpp" />
     <ClCompile Include="EvidenceGraphQuery.cpp" />
     <ClCompile Include="EvidenceGraphJson.cpp" />
@@ -243,6 +245,7 @@
     <ClInclude Include="EvidenceInventory.h" />
     <ClInclude Include="EvidenceJournal.h" />
     <ClInclude Include="EvidencePrivacy.h" />
+    <ClInclude Include="EvidenceDisclosure.h" />
     <ClInclude Include="EvidenceStore.h" />
     <ClInclude Include="EvidenceRetention.h" />
     <ClInclude Include="ImageRetentionPolicy.h" />

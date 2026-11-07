@@ -66,6 +66,9 @@ def main():
     assert "committed_roots_and_failure_ledgers_protected" in gc["limits"]
     retention = by_key[("evidence", "retention", "native")]
     privacy = by_key[("evidence", "privacy", "local_files")]
+    disclosure = by_key[("evidence", "disclosure", "local_files")]
+    assert disclosure["availability"] == "not_probed" and disclosure["consistency"] == "reviewed_historical_image_counts"
+    assert "durable_intent_before_http" in disclosure["requirements"] and "no_raw_capture_transfer" in disclosure["limits"]
     assert privacy["availability"] == "not_probed" and privacy["consistency"] == "observed_os_access_controls"
     assert "efs_default" in privacy["requirements"] and "no_transfer_authority" in privacy["limits"]
     assert retention["availability"] == "not_probed" and retention["consistency"] == "recording_session_partitions"

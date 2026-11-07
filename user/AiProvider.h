@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,10 +37,24 @@ struct AiProviderSettings
     uint32_t TimeoutSeconds;
 };
 
+class AiDisclosureGrant;
+struct EvidenceDisclosurePackage;
+enum class AiRequestOrigin { Unreviewed, OperatorText, ReviewedEvidence };
+
 struct AiCompletionRequest
 {
     std::wstring System;
     std::wstring Prompt;
+    AiRequestOrigin Origin = AiRequestOrigin::Unreviewed;
+    std::shared_ptr<AiDisclosureGrant> Disclosure;
+};
+
+struct AiEvidenceReview
+{
+    std::wstring Id, Destination, System, Facts, FactsSha256, ManifestSha256;
+private:
+    friend class AiProviderRuntime;
+    std::shared_ptr<AiDisclosureGrant> Grant;
 };
 
 struct AiCompletionResponse
@@ -48,6 +63,8 @@ struct AiCompletionResponse
     std::wstring RawBody;
     uint32_t StatusCode;
     bool Truncated;
+    std::wstring DisclosureOutcome;
+    bool DisclosureAuditRecorded = false;
 };
 
 class AiProviderRuntime
@@ -79,6 +96,9 @@ public:
     bool RefreshCloudModels(std::wstring* error);
 
     bool Complete(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error);
+    bool PrepareEvidenceReview(const EvidenceDisclosurePackage& package, AiEvidenceReview* review, std::wstring* error) const;
+    bool ApproveEvidenceReview(const AiEvidenceReview& review, const std::wstring& confirmationId, AiCompletionRequest* request, std::wstring* error) const;
+    static void RevokeEvidenceReview(AiEvidenceReview* review);
 
     static std::vector<std::wstring> SupportedProviderNames();
     static bool NormalizeProviderName(const std::wstring& value, AiProviderKind* provider, std::wstring* normalized);
@@ -105,5 +125,7 @@ private:
 
     bool CompleteWithCodexCli(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error) const;
     bool CompleteWithOpenAICompatible(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error) const;
-    bool CompleteWithOpenAICodex(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error) const;
+    bool CompleteWithOpenAICodex(const AiCompletionRequest& request, AiCompletionResponse* response, std::wstring* error,
+        const AiDisclosureGrant* disclosure = nullptr) const;
+    bool DisclosureDestination(std::wstring* destination, std::wstring* binding, std::wstring* access, std::wstring* refresh, std::wstring* error) const;
 };

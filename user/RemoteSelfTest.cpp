@@ -354,6 +354,8 @@ int RunRemoteProtocolSelfTest()
     Check(&ctx, IsRemoteDeniedCommandLine(L"kd r", nullptr), L"deny-kd");
     Check(&ctx, IsRemoteDeniedCommandLine(L"mcp on", nullptr), L"deny-mcp");
     Check(&ctx, IsRemoteDeniedCommandLine(L"probe load", nullptr), L"deny-probe-load");
+    Check(&ctx, IsRemoteDeniedCommandLine(L"AI SHARE send 123 confirm", nullptr), L"deny-remote-evidence-approval");
+    Check(&ctx, IsRemoteDeniedCommandLine(L"ai share preview package", nullptr), L"deny-remote-evidence-review");
     Check(&ctx, !IsRemoteDeniedCommandLine(L"dt nt!_EPROCESS", nullptr), L"allow-dt");
     Check(&ctx, IsRemoteAddressOnlyEnter(L"eb ffff800000000000"), L"address-only-eb");
     Check(&ctx, IsRemoteAddressOnlyEnter(L"ef ffff800000000000"), L"address-only-ef");
