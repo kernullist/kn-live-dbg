@@ -244,6 +244,12 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if ((argc == 3 || (argc == 4 && std::wstring(argv[3]) == L"/current")) && std::wstring(argv[1]) == L"--report")
+    {
+        const auto replay = ReplayImageRecipe(argv[2], argc == 4, nullptr);
+        std::cout << mcpjson::WideToUtf8(ImageRecipeReplayJson(replay)) << "\n";
+        return replay.Status == L"replayed" || replay.Status == L"reanalyzed" ? 0 : 1;
+    }
     if (argc == 3 && std::wstring(argv[1]) == L"--replay")
     {
         std::wstring error;
@@ -428,11 +434,48 @@ int wmain(int argc, wchar_t** argv)
         changedProof.SupportingReadIndices.size() == 2,
         "confirmed difference claims contain absolute changed ranges while preserving exclusions");
     Check(mcpjson::ValidateDocument(ImageProofJson(modified, changedProof)), "proof ledger emits valid JSON");
+    const auto claimStatus = [&](const ImageVerificationRecipe& p, const ExecutablePageResult& result,
+        bool qualified, bool current, const wchar_t* match, const wchar_t* difference)
+    {
+        std::wstring digest, claims, status;
+        mcpjson::GetString(ImageRecipeJson(p), L"recipe_sha256", &digest);
+        const auto json = ImageClaimAssessmentJson(p, result, qualified, current, digest);
+        if (!mcpjson::ValidateDocument(json) || json.size() > ImageClaimMaximumCharacters ||
+            !mcpjson::FindRawValue(json, L"claims", &claims)) { return false; }
+        size_t end = 0;
+        if (!mcpjson::ScanValue(claims, 1, &end) || !mcpjson::GetString(claims.substr(1, end - 1), L"status", &status) ||
+            status != match) { return false; }
+        const auto start = end + 1;
+        return mcpjson::ScanValue(claims, start, &end) && mcpjson::GetString(claims.substr(start, end - start), L"status", &status) &&
+            status == difference && end + 1 == claims.size();
+    };
+    Check(claimStatus(original, cleanComparison, true, false, L"supported", L"contradicted") &&
+        claimStatus(modified, changedComparison, true, false, L"contradicted", L"supported"),
+        "common policies preserve scoped match and stable difference with counterexamples");
+    Check(claimStatus(original, cleanComparison, false, false, L"unfulfilled", L"unfulfilled"),
+        "unqualified mapped identity blocks both positive and negative common claims");
+    Check(ImageClaimAssessmentJson(original, cleanComparison, true, false, std::wstring(64, L'0')).empty(),
+        "claim adapter rejects a different original capture digest");
+    Source manyChanges = clean;
+    for (size_t i = 0x2000; i < 0x3000; i += 2) { manyChanges.Memory[i] ^= 1; }
+    ImageVerificationRecipe manyRecipe;
+    Check(capture(L"max-differences", manyChanges, 0x2000, &manyRecipe) &&
+        claimStatus(manyRecipe, compare(manyChanges, 0x2000), true, false, L"contradicted", L"supported"),
+        "all 2048 disjoint difference ranges fit the bounded common report");
+    Source observedChanged;
+    Fixture(&observedChanged);
+    observedChanged.Memory[0x1150] ^= 1;
+    ImageVerificationRecipe observedModified;
+    Check(CaptureObservedImageRecipe(image.wstring(), observedChanged, Source::Base, 0x1000, 4096,
+        (root / L"observed-modified").wstring(), observedOptions, &observedModified, &error),
+        "v2 stable difference retains original receipt references for common claims");
     auto invalidComparison = cleanComparison;
     invalidComparison.Coverage.Compared.push_back(invalidComparison.Coverage.Compared.front());
     invalidComparison.Coverage.ComparedBytes *= 2;
     Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
         "duplicate compared visits cannot inflate unique proof coverage");
+    Check(claimStatus(original, invalidComparison, true, false, L"unfulfilled", L"unfulfilled"),
+        "invalid address denominator cannot produce a common claim or refutation");
     invalidComparison = cleanComparison;
     invalidComparison.Coverage.Compared.front().Address += 4096;
     Check(!AssessImageProof(original, invalidComparison, true, false).InputConsistent,
@@ -473,6 +516,9 @@ int wmain(int argc, wchar_t** argv)
     Check(AssessImageProof(unknownPolicy, cleanComparison, true, false).Matches.Status == L"not_established" &&
         AssessImageProof(unknownPolicy, cleanComparison, true, true).Matches.Status == L"supported",
         "unknown original policy requires explicit current reanalysis before proving a claim");
+    Check(claimStatus(unknownPolicy, cleanComparison, true, false, L"unfulfilled", L"unfulfilled") &&
+        claimStatus(unknownPolicy, cleanComparison, true, true, L"supported", L"contradicted"),
+        "common claims do not substitute a current comparison without explicit selection");
     auto missingConfirmation = modified;
     const auto confirmation = std::find_if(missingConfirmation.Reads.begin(), missingConfirmation.Reads.end(), [](const auto& read)
     {
@@ -485,6 +531,14 @@ int wmain(int argc, wchar_t** argv)
     }
     Check(AssessImageProof(missingConfirmation, changedComparison, true, true).Differs.Status == L"not_established",
         "current reanalysis cannot invent a missing original confirmation read");
+    Check(claimStatus(missingConfirmation, changedComparison, true, true, L"unfulfilled", L"unfulfilled"),
+        "one retained difference read cannot confirm a stable changed-byte claim");
+    const auto noConfirmationDir = root / L"no-confirmation";
+    std::filesystem::create_directory(noConfirmationDir);
+    std::filesystem::copy_file(root / L"modified" / (modified.ReferenceSha256 + L".knblob"),
+        noConfirmationDir / (modified.ReferenceSha256 + L".knblob"));
+    Check(SaveObservationJson((noConfirmationDir / L"recipe.knverify").wstring(), ImageRecipeJson(missingConfirmation), &error),
+        "preserve missing confirmation as an explicit current-reanalysis fixture");
     auto wrongBytes = original;
     for (auto& read : wrongBytes.Reads)
     {

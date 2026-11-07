@@ -104,7 +104,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
                     "kn.translation_receipt.v1", "kn.dump_read.v1",
-                    "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_proof.v1", "kn.capture_scheduling.v1",
+                    "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.capture_scheduling.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
                     "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"

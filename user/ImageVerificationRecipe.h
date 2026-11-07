@@ -58,6 +58,7 @@ struct ImageRecipeReplay
     std::wstring CurrentResult;
     std::wstring RecordedResult;
     std::wstring Proof;
+    std::wstring ClaimAssessmentJson;
 };
 
 std::wstring ImageRecipeJson(const ImageVerificationRecipe& recipe);

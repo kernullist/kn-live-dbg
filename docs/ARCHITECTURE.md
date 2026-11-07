@@ -1874,6 +1874,54 @@ reanalysis; rereading the saved source cannot create another target observation.
 This is a selected image proof path. Generic cross-view, object-lifetime,
 deadlock, writer-attribution and live temporal policies remain separate work.
 
+### Common direct-image claim policies
+
+Successful direct recipe v1/v2 replay also returns `claim_assessment`, with schema
+`kn.image_claim_report.v1` and policy `kn.image_claim_policy.direct.v1`. The
+adapter uses the same code-owned `kn.claim_registry.v1` evaluator as the IRP
+adapter. It recomputes the existing typed image proof after reference verification,
+ordered replay or explicit current reanalysis. It never accepts a stored claim
+or ownership label as an observation. The original recipe, normalization and
+comparison-result bytes remain unchanged.
+
+`image_requested_range_matches_reference` requires the full requested range to
+match; a qualified stable difference contradicts it even if other bytes are
+excluded or unavailable. `image_compared_range_differs_reference` requires two
+recorded reads confirming the changed compared bytes; a qualified full-range
+match contradicts it. Missing identity, incompatible accounting, incomplete reads
+or missing confirmation leave the claim `unfulfilled`. Excluded/unread bytes
+are not `not_applicable` and do not establish a match or absence of changes.
+Both policies require the original recipe/reference, an explicitly selected
+implemented comparison policy, mapped identity, consistent typed comparison
+and completed comparison observations before a positive or negative result.
+
+Each report includes code-owned requirement definitions, support/refutation
+references containing the recipe payload SHA and JSON pointer, missing
+requirements, exact supported/counterexample address ranges and a bounded next
+observation suggestion. The suggestion executes nothing. V1 read pointers resolve
+under `/payload/reads`; v2 pointers resolve to original receipts under
+`/payload/read_set/reads`. All references belong to one recipe. This is not a
+cross-capture identity bridge or proof of authenticated collection.
+
+The seven ledgers retain the existing image proof's independent discovery,
+address, temporal, semantic, persistence, replay and trust meanings. Repeated
+read traffic is separate from unique requested comparison coverage. The replay
+ledger describes the comparison policy; `evaluation` explicitly identifies the
+current claim policy on replayed observations, and `original_claim_policy_reproduced`
+is false. `/current` also sets `recorded_normalization_reproduced=false` because
+the current verifier recomputes normalization from the retained reference.
+Claim-report persistence is not established and journal membership is not checked.
+
+There are exactly two claims, bounded to 256 Ki UTF-16 code units, with all
+difference ranges preserved for the at-most-4,096-byte direct recipe.
+`report_complete` refers only to this two-policy projection. Failed replay emits
+`claim_assessment=null`; slice and sweep replays also leave it null until their
+own adapters are implemented. Their existing proofs remain available. A scoped
+match/difference does not prove execution, writer, maliciousness, authorization,
+whole-image integrity or continuous observation. Original claim publication and
+reproduction, other object/image adapters and qualified cross-capture joins remain
+open parts of P08.
+
 ## Cross-bundle temporal candidates
 
 `TemporalFactStore` relates an explicit set of 2..32 retained `.kncase` files.

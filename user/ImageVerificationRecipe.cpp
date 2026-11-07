@@ -521,6 +521,8 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
     {
         result.Status = currentReanalysis ? L"reanalyzed" : L"replayed";
         result.Proof = ImageProofJson(p, AssessImageProof(p, comparison, referenceQualified, currentReanalysis));
+        result.ClaimAssessmentJson = ImageClaimAssessmentJson(p, comparison, referenceQualified,
+            currentReanalysis, result.RecipeSha256);
         if (error != nullptr)
         {
             error->clear();

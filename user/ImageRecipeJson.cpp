@@ -367,5 +367,6 @@ std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay)
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"rereads_are_recorded\":true,\"recorded_result\":" +
         (replay.RecordedResult.empty() ? L"null" : replay.RecordedResult) + L",\"result\":" +
         (replay.CurrentResult.empty() ? L"null" : replay.CurrentResult) +
-        L",\"proof\":" + (replay.Proof.empty() ? L"null" : replay.Proof) + L"}";
+        L",\"proof\":" + (replay.Proof.empty() ? L"null" : replay.Proof) +
+        L",\"claim_assessment\":" + (replay.ClaimAssessmentJson.empty() ? L"null" : replay.ClaimAssessmentJson) + L"}";
 }

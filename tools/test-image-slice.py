@@ -47,6 +47,8 @@ def main():
         data = json.loads(result.stdout)
         check(data["schema"] == "kn.image_slice_replay.v1", "slice envelope is distinct from single-page replay")
         check((data["status"] == "replayed") == success, "fresh replay state")
+        if args.cli:
+            check(data["claim_assessment"] is None, "direct claim adapter does not claim slice-policy coverage")
         return data
 
     for name, counts in EXPECTED.items():

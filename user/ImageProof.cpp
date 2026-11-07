@@ -1,5 +1,7 @@
 #include "ImageProof.h"
 #include "McpJson.h"
+#include "ClaimPolicy.h"
+#include <array>
 
 namespace
 {
@@ -316,4 +318,118 @@ std::wstring ImageProofJson(const ImageVerificationRecipe& recipe, const ImagePr
         L"\"approved_distribution\":false,\"security_domain\":\"unavailable\"}},\"claims\":[" + ClaimJson(proof.Matches) +
         L"," + ClaimJson(proof.Differs) + L"],\"not_proven\":[\"execution\",\"writer_identity\",\"maliciousness\","
         L"\"authorized_change\",\"whole_image_integrity\",\"continuous_target_observation\"]}";
+}
+
+std::wstring ImageClaimAssessmentJson(const ImageVerificationRecipe& recipe,
+    const ExecutablePageResult& comparison, bool referenceQualified, bool currentReanalysis,
+    const std::wstring& recipeSha256) noexcept
+{
+    using namespace claim_policy;
+    try
+    {
+        std::wstring digest;
+        const auto original = ImageRecipeJson(recipe);
+        if (original.empty() || !mcpjson::GetString(original, L"recipe_sha256", &digest) ||
+            digest != recipeSha256 || !Evidence{digest, L"/payload"}.Valid()) { return {}; }
+        // Recompute from the selected replay's typed result, never imported claims.
+        const auto proof = AssessImageProof(recipe, comparison, referenceQualified, currentReanalysis);
+        const std::vector<Requirement> gates = {
+            {L"retained_recipe_and_reference", L"recover_exact_recipe_and_content_addressed_reference", L"offline_replay", true},
+            {L"selected_comparison_policy", L"select_an_implemented_comparison_policy_explicitly", L"offline_replay", true},
+            {L"mapped_image_identity", L"capture_matching_mapped_identity_and_relocation_basis", L"collect", true},
+            {L"typed_comparison_consistent", L"recompute_unique_address_accounting_and_original_byte_agreement", L"offline_replay", true},
+            {L"completed_comparison_observations", L"capture_the_requested_comparison_without_lost_or_incomplete_observations", L"collect", true}};
+        std::array<Policy, 2> policies{{
+            {L"image_requested_range_matches_reference", gates},
+            {L"image_compared_range_differs_reference", gates}}};
+        policies[0].Requires.push_back({L"full_requested_range_match",
+            L"capture_missing_bytes_or_qualify_exact_normalization_exclusions", L"collect"});
+        policies[1].Requires.push_back({L"stable_difference_in_compared_range",
+            L"capture_qualified_difference_bytes_and_a_separate_confirmation_read", L"collect"});
+        const std::wstring reads = recipe.FormatVersion == 2 ? L"/payload/read_set/reads" : L"/payload/reads";
+        const auto fact = [&](const wchar_t* id, bool met, const std::wstring& pointer)
+        { return Fact{id, met ? Observation::Met : Observation::Missing, {digest, pointer}}; };
+        const auto& coverage = comparison.Coverage;
+        const std::vector<Fact> common = {
+            fact(L"retained_recipe_and_reference", true, L"/payload/reference_sha256"),
+            fact(L"selected_comparison_policy", currentReanalysis || recipe.Policy == ImageRecipePolicy, L"/payload"),
+            fact(L"mapped_image_identity", proof.ReferenceQualified, reads),
+            fact(L"typed_comparison_consistent", proof.InputConsistent, reads),
+            fact(L"completed_comparison_observations", coverage.Attempted && coverage.InventoryAvailable &&
+                coverage.TraversalComplete && coverage.LostEvents == 0, reads)};
+        const auto ref = [](const Evidence& evidence)
+        { return L"{\"capture_sha256\":" + mcpjson::Quote(evidence.Sha256) + L",\"json_pointer\":" + mcpjson::Quote(evidence.Pointer) + L"}"; };
+        const auto facts = [&](const std::vector<Fact>& values)
+        {
+            std::wstring json = L"[";
+            for (const auto& value : values)
+            {
+                if (json.size() > 1) { json += L","; }
+                json += L"{\"requirement\":" + mcpjson::Quote(value.RequirementId) + L",\"evidence\":" + ref(value.Origin) + L"}";
+            }
+            return json + L"]";
+        };
+        std::wstring definitions = L"[", claims = L"[", readRefs = L"[";
+        const bool matches = proof.Matches.Status == L"supported", differs = proof.Differs.Status == L"supported";
+        for (size_t i = 0; i < policies.size(); ++i)
+        {
+            const auto& policy = policies[i];
+            if (i) { definitions += L","; claims += L","; }
+            definitions += L"{\"claim\":" + mcpjson::Quote(policy.Id) + L",\"requirements\":[";
+            for (size_t j = 0; j < policy.Requires.size(); ++j)
+            {
+                const auto& requirement = policy.Requires[j];
+                if (j) { definitions += L","; }
+                definitions += L"{\"id\":" + mcpjson::Quote(requirement.Id) + L",\"gate\":" + B(requirement.Gate) +
+                    L",\"next_observation\":" + mcpjson::Quote(requirement.NextObservation) + L",\"mode\":" + mcpjson::Quote(requirement.Mode) + L"}";
+            }
+            definitions += L"]}";
+            const bool supported = i == 0 ? matches : differs, contradicted = i == 0 ? differs : matches;
+            auto input = common;
+            input.push_back({policy.Requires.back().Id, supported ? Observation::Met :
+                (contradicted ? Observation::Contrary : Observation::Missing), {digest, reads}});
+            const auto result = Evaluate(policy, input);
+            const std::vector<ObservationRange> full = {{recipe.ImageBase + recipe.Rva, recipe.Length}};
+            claims += L"{\"claim\":" + mcpjson::Quote(policy.Id) + L",\"status\":" + mcpjson::Quote(Name(result.Status)) +
+                L",\"issue\":" + mcpjson::Quote(result.Issue) + L",\"supports\":" + facts(result.Supports) +
+                L",\"contradicts\":" + facts(result.Contradicts) + L",\"supported_ranges\":" +
+                (result.Status == State::Supported ? Ranges(i == 0 ? full : proof.ChangedRanges) : L"[]") +
+                L",\"counterexample_ranges\":" + (result.Status == State::Contradicted ? Ranges(i == 0 ? proof.ChangedRanges : full) : L"[]") +
+                L",\"unfulfilled_requirements\":[";
+            for (size_t j = 0; j < result.Missing.size(); ++j)
+            { if (j) { claims += L","; } claims += mcpjson::Quote(result.Missing[j].Id); }
+            claims += L"],\"not_applicable_basis\":null,\"next_best_observation\":";
+            if (result.Status == State::Unfulfilled && !result.Missing.empty())
+            {
+                const auto& next = result.Missing.front();
+                claims += L"{\"resolves_requirement\":" + mcpjson::Quote(next.Id) + L",\"observation\":" + mcpjson::Quote(next.NextObservation) +
+                    L",\"mode\":" + mcpjson::Quote(next.Mode) + L",\"budget\":\"source_policy_bounded\",\"automatic_execution\":false,"
+                    L"\"remaining_unknown\":[\"execution\",\"writer_identity\",\"maliciousness\",\"continuous_target_observation\"]}";
+            }
+            else { claims += L"null"; }
+            claims += L"}";
+        }
+        for (const auto index : proof.SupportingReadIndices)
+        {
+            if (readRefs.size() > 1) { readRefs += L","; }
+            readRefs += ref({digest, reads + L"/" + std::to_wstring(index)});
+        }
+        // The seven dimensions come from this same freshly recomputed proof.
+        // Parsing a local serialization does not accept a stored proof as input.
+        std::wstring ledgers;
+        if (!mcpjson::FindRawValue(ImageProofJson(recipe, proof), L"ledgers", &ledgers)) { return {}; }
+        const auto report = L"{\"schema\":\"kn.image_claim_report.v1\",\"registry\":\"kn.claim_registry.v1\","
+            L"\"policy\":\"kn.image_claim_policy.direct.v1\",\"evaluation\":\"current_claim_policy_on_replayed_observations\","
+            L"\"original_claim_policy_reproduced\":false,\"recorded_normalization_reproduced\":" + B(!currentReanalysis) +
+            L",\"claim_report_persistence\":\"not_established\",\"journal_membership_checked\":false,"
+            L"\"capture_sha256\":" + mcpjson::Quote(digest) + L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) +
+            L",\"source_id\":" + mcpjson::Quote(recipe.SourceId) + L",\"source_identity_scope\":\"collector_declared\","
+            L"\"scope\":{\"image_base\":" + N(recipe.ImageBase) + L",\"rva\":" + N(recipe.Rva) + L",\"length\":" + N(recipe.Length) +
+            L"},\"claim_count\":\"2\",\"report_complete\":true,\"report_completeness_scope\":\"two_direct_range_policies_only\","
+            L"\"policies\":" + definitions + L"],\"claims\":" + claims + L"],\"supporting_read_refs\":" + readRefs +
+            L"],\"ledgers\":" + ledgers + L",\"not_proven\":[\"execution\",\"writer_identity\",\"maliciousness\","
+            L"\"authorized_change\",\"whole_image_integrity\",\"continuous_target_observation\",\"collector_authentication\"]}";
+        return report.size() <= ImageClaimMaximumCharacters ? report : L"";
+    }
+    catch (...) { return {}; }
 }

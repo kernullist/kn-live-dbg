@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tempfile
 
+from image_claim_oracle import check_report
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -29,7 +31,15 @@ def main():
         if exit_code == 2:
             check(not result.stdout.strip() and "usage:" in result.stderr, "invalid grammar produces no DTO")
             return None
-        return json.loads(result.stdout)
+        document = json.loads(result.stdout)
+        if arguments[0] == "replay-image":
+            if document["status"] in ("replayed", "reanalyzed"):
+                case = Path(arguments[1])
+                recipe = json.loads((case / "recipe.knverify").read_bytes())
+                check_report(recipe, (case / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes(), document)
+            else:
+                check(document["claim_assessment"] is None, "failed replay cannot expose a current claim report")
+        return document
 
     def encode(document):
         payload = json.dumps(document["payload"], ensure_ascii=False, separators=(",", ":"))

@@ -40,3 +40,11 @@ struct ImageProofAssessment
 ImageProofAssessment AssessImageProof(const ImageVerificationRecipe& recipe,
     const ExecutablePageResult& comparison, bool referenceQualified, bool currentReanalysis);
 std::wstring ImageProofJson(const ImageVerificationRecipe& recipe, const ImageProofAssessment& proof);
+
+// Derived current-policy claims, produced only after verified reference replay.
+// The digest binds the original recipe; this report never changes its bytes or
+// claims that the original capture recorded this newer claim policy.
+inline constexpr size_t ImageClaimMaximumCharacters = 256 * 1024;
+std::wstring ImageClaimAssessmentJson(const ImageVerificationRecipe& recipe,
+    const ExecutablePageResult& comparison, bool referenceQualified, bool currentReanalysis,
+    const std::wstring& recipeSha256) noexcept;

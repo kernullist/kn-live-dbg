@@ -7,6 +7,77 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Direct image claim checkpoint: 2026-11-07
+
+This P08 step connects direct image recipe v1/v2 replay to the common claim
+evaluator under `kn.image_claim_policy.direct.v1`. The two policies assess a
+complete requested-range match or a stable difference within compared bytes.
+Reports retain original SHA/JSON-pointer references, exact support/counterexample
+ranges, missing requirements, next-observation suggestions and seven ledgers.
+The [direct-image claim contract](ARCHITECTURE.md#common-direct-image-claim-policies)
+separates the current claim policy from original comparison replay or explicit
+current reanalysis. Original capture bytes and native ABI remain unchanged.
+
+The ASan recipe harness passed **103 controls**. The independent claim runner
+passed **34 replay controls**, with **13 supported / 13 contradicted / 30
+unfulfilled** assessments across accepted replays. These are test-case counts,
+not detection accuracy. The oracle reads the retained AMD64 PE sections and
+DIR64 relocations to reconstruct expected compared bytes independently, then
+checks original reads, confirmation, exact address partitions, every evidence
+pointer and all seven ledgers. It does not accept the emitted claim or legacy
+proof verdict as its oracle.
+
+Controls include clean and modified v1/v2 captures, 2,048 separate changed-byte
+ranges within the report bound, missing confirmation, sparse and unstable reads,
+wrong mapped identity, changed header bases, denied residency consent and zero
+acquisition budget. Rehashed unknown policies, substituted normalization, stored
+result replacement and injected claim/trust assertions cannot authorize an
+original-policy claim. Explicit current reanalysis recomputes its own comparison
+without asserting that the original normalization or claim policy was reproduced.
+V1 and v2 interruption checks each passed six cases: two complete publications
+replayed and four had no final recipe.
+
+The final product passed the same **34** claim replay controls and **122** offline
+CLI checks. The live handle-reader test passed **178 checks**, with **three owned
+child processes** and zero remaining children. Their nonexecuting PE buffers were
+read through the process handle; after process exit and removal of the original
+reference path, both replay modes passed the same claim oracle using retained
+inputs. This does not exercise native kernel reads or execution tracing.
+Slice compatibility passed **440 checks / 11 cases** and eight sweep envelopes
+preserved their original proofs with `claim_assessment=null`.
+
+The Release build and isolated `--self-test all` passed: timeline **28**, MCP
+**102**, KMON image integration **119**, console **564**, command audit **3,011 /
+261 routes**, and remote **68** plus four connection-option controls. Capability
+checks passed **36 contracts / 261 routes**, the generated support matrix matches
+the binary, and the public-content classifier passed **12 tests**. Target
+availability remains unprobed. Final review found no additional actionable
+defects in the reviewed scope.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `97a2fbe69c413362139cab440b91623787dbbadbe3939320c8474c5abd4be863` |
+| Direct recipe/claims, ASan | `efcfc350b09b46dc56270f43a9982befa7065784cabbaf6b0595125e5101a7f7` |
+
+Reproduce with `tools/validate-image-recipe.ps1 -Sanitize`; this now also requires
+Python and invokes `tools/test-image-claims.py` with its generated fixture
+directory. For the product, run that script with `--exe <product> --fixtures
+<directory> --product`, and run `tools/test-image-recipe-cli.py` and
+`tools/test-live-image-recipe.py` with the same `--exe` and `--fixtures` options.
+Run `KnLiveDbg.exe --self-test all` alone. This host uses the bundled Python
+runtime, Windows 11 Pro 10.0.28000, kernel 10.0.28000.3231, VS 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Existing C4744 link warnings remain.
+
+No driver was loaded, service/firewall policy changed or reboot performed.
+Final host checks found no test process, parser profile/receipt/preparation or
+running task-driver residue; completed code caches and owned fixtures remain.
+The policies do not establish execution, writer, maliciousness, authorized
+changes, whole-image integrity or continuous observation. Slice/sweep claim
+adapters, original claim publication/reproduction, qualified cross-capture joins,
+other object/lifecycle providers and native validation remain open. The earlier
+real-kernel PDB ASan resource failure is still unresolved. This does not complete
+P08 or the full P01-P16/VS1-VS4 objective, which remains active.
+
 ## IRP object/state claim checkpoint: 2026-11-07
 
 This P08/P13 step adds the deterministic `kn.irp_claim_policy.v1` registry and

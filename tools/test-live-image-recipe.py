@@ -14,6 +14,8 @@ import sys
 import tempfile
 import threading
 
+from image_claim_oracle import check_report
+
 
 def child(image, mode):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -102,7 +104,14 @@ def main():
         return json.loads(result.stdout)
 
     def replay(directory, current=False, code=0):
-        return run(["--offline", "!kmon", "replay-image", directory, *(["/current"] if current else []), "/json"], code)
+        result = run(["--offline", "!kmon", "replay-image", directory, *(["/current"] if current else []), "/json"], code)
+        if result["status"] in ("replayed", "reanalyzed"):
+            recipe = json.loads((directory / "recipe.knverify").read_bytes())
+            blob = (directory / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes()
+            check_report(recipe, blob, result)
+        else:
+            check(result["claim_assessment"] is None, "failed replay withholds current claims")
+        return result
 
     def encode(document):
         payload = json.dumps(document["payload"], ensure_ascii=False, separators=(",", ":"))

@@ -218,6 +218,15 @@ claims, unmet requirements, evidence references and separate coverage ledgers.
 Failed replay returns `proof=null`. A supported comparison claim proves neither
 execution nor maliciousness; see [image proof](ARCHITECTURE.md#claim-specific-image-proof).
 
+Direct v1/v2 replay also returns `claim_assessment` under
+`kn.image_claim_report.v1`: current versioned match/difference policies, exact
+original-read references, refutations, missing requirements and seven ledgers.
+`original_claim_policy_reproduced=false` separates this derived assessment from
+the reproduced comparison. `/current` recomputes comparison normalization and
+does not assert that the recorded normalization was reproduced. Failed replay
+and slice/sweep replay return `claim_assessment=null`. See
+[direct-image claim policies](ARCHITECTURE.md#common-direct-image-claim-policies).
+
 `KnLiveDbg.exe --self-test capture-scheduler` runs the capture worker using owned
 process memory and an absent kernel device. It emits JSON and exits 0 on success
 or 1 on failure; extra arguments return 2. No driver is loaded. Runtime

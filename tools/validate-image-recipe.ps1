@@ -44,6 +44,11 @@ if ($LASTEXITCODE -ne 0)
 {
     throw 'Image recipe controls failed'
 }
+& python (Join-Path $PSScriptRoot 'test-image-claims.py') --exe $program --fixtures $output
+if ($LASTEXITCODE -ne 0)
+{
+    throw 'Image claim original-evidence oracle failed'
+}
 foreach ($format in @('v1', 'v2'))
 {
     $published = 0
