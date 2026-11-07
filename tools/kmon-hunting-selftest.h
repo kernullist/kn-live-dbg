@@ -3,6 +3,7 @@
 #include "../user/KmonHuntingJson.h"
 #include "../user/ExecutableRegionCatalog.h"
 #include "kmon-page-coverage-selftest.h"
+#include "kmon-ordering-selftest.h"
 #include <iostream>
 
 inline KmonHuntReference HuntFixture(uint32_t pid, uint64_t now = 100)
@@ -328,5 +329,6 @@ inline bool KmonHuntingSelfTest()
         "JSON and claim boundary");
     std::cout << "[kmon.hunting] passed=" << passed << " failed=" << failed << " corpus=synthetic\n";
     const bool pagesPassed = KmonPageCoverageSelfTest();
-    return failed == 0 && pagesPassed;
+    const bool orderingPassed = KmonOrderingSelfTest();
+    return failed == 0 && pagesPassed && orderingPassed;
 }

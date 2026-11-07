@@ -27,7 +27,7 @@ if ($Sanitize)
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @($source, (Join-Path $repo 'user\ExecutableImage.cpp'), (Join-Path $repo 'user\ExecutableImageVerifier.cpp'), (Join-Path $repo 'user\CodeTargetResolver.cpp'), (Join-Path $repo 'user\GameBuildManifest.cpp'))
+$sources = @($source, (Join-Path $repo 'user\ExecutableImage.cpp'), (Join-Path $repo 'user\ExecutableImageVerifier.cpp'), (Join-Path $repo 'user\ReferenceArtifact.cpp'), (Join-Path $repo 'user\CodeTargetResolver.cpp'), (Join-Path $repo 'user\GameBuildManifest.cpp'))
 $quotedSourceList = foreach ($item in $sources)
 {
     '"' + $item + '"'

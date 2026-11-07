@@ -285,6 +285,31 @@ namespace
         const auto queryJson = KmonHuntQueryJson(initialPage, {}, 0, 0);
         Check(CompareAnalystSnapshots(queryJson, queryJson, &result, &error) && result.Unchanged == 256,
             "paged query snapshot retains compatible hunt schema");
+        auto orderingPressure = queryJson;
+        const auto deferredAt = orderingPressure.find(L"\"deferred\":0");
+        if (deferredAt != std::wstring::npos) { orderingPressure.replace(deferredAt, 12, L"\"deferred\":1"); }
+        Check(deferredAt != std::wstring::npos && CompareAnalystSnapshots(queryJson, orderingPressure, &result, &error) &&
+            result.CoverageChanged && result.Unchanged == 256, "ordering pressure remains coverage evidence in saved snapshots");
+        const auto orderingAt = queryJson.rfind(L",\"ordering\":");
+        const auto legacyQuery = queryJson.substr(0, orderingAt) + L"}";
+        Check(orderingAt != std::wstring::npos && CompareAnalystSnapshots(legacyQuery, queryJson, &result, &error) &&
+            result.CoverageChanged, "legacy query without ordering metadata remains readable with a distinct coverage scope");
+        for (const auto& change : std::vector<std::pair<std::wstring, std::wstring>>{
+            {L"\"state_capacity\":16384", L"\"state_capacity\":0"},
+            {L"\"retained_states\":300", L"\"retained_states\":16385"},
+            {L"\"cross_clock_conversion_established\":false", L"\"cross_clock_conversion_established\":true"},
+            {L"\"same_tick_order_established\":false", L"\"same_tick_order_established\":true"},
+            {L"\"source_loss_coverage_established\":false", L"\"source_loss_coverage_established\":true"},
+            {L"\"deferred\":0", L"\"deferred\":18446744073709551616"},
+            {L"\"untracked_transition_through_ms\":\"0\"", L"\"untracked_transition_through_ms\":\"101\""},
+            {L"single_collector_monotonic_ms", L"unqualified_provider_ticks"}})
+        {
+            auto invalid = queryJson;
+            const auto at = invalid.find(change.first);
+            if (at != std::wstring::npos) { invalid.replace(at, change.first.size(), change.second); }
+            Check(at != std::wstring::npos && !CompareAnalystSnapshots(invalid, queryJson, &result, &error),
+                "ordering metadata cannot invent clock, loss, capacity or pressure claims");
+        }
         Check(CompareAnalystSnapshots(queryJson, KmonHuntQueryJson(last, {}, 0, 0), &result, &error) &&
             result.CoverageChanged, "different query pages have different coverage");
         for (const auto& change : std::vector<std::pair<std::wstring, std::wstring>>{

@@ -2,10 +2,12 @@
 
 #include "ObservationModel.h"
 #include "KmonExecutablePages.h"
+#include "KmonHuntOrdering.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <deque>
+#include <cwchar>
 #include <random>
 
 struct KmonHuntReference
@@ -71,6 +73,8 @@ struct KmonHuntQueryPage
     size_t Matched = 0;
     size_t RetainedReferences = 0;
     size_t ReferenceCapacity = 0;
+    size_t OrderingStates = 0, OrderingCapacity = 0;
+    uint64_t OrderingExpired = 0, OrderingDeferred = 0, OrderingWatermarkMs = 0, OrderingPressureFloorMs = 0;
 
     size_t Omitted() const { return Status == L"ok" ? Matched - Offset - Cases.size() : 0; }
     bool Complete() const { return Status == L"ok" && Offset == 0 && Omitted() == 0; }
@@ -192,7 +196,8 @@ inline bool KmonChannelCandidate(uint64_t target, uint64_t slot, bool layoutVeri
 class KmonHuntIndex
 {
 public:
-    explicit KmonHuntIndex(size_t capacity = 512) : Capacity((std::max<size_t>)(1, (std::min<size_t>)(capacity, 512)))
+    explicit KmonHuntIndex(size_t capacity = 512, size_t orderingCapacity = 16384) :
+        Capacity((std::max<size_t>)(1, (std::min<size_t>)(capacity, 512))), Ordering(orderingCapacity)
     {
     }
 
@@ -220,6 +225,7 @@ public:
         reference.Context.ArrivalMonotonicMs = arrivalMs == 0 ?
             (std::max)(LastArrivalMs, context.MonotonicMs) : arrivalMs;
         LastArrivalMs = (std::max)(LastArrivalMs, reference.Context.ArrivalMonotonicMs);
+        Ordering.Advance(LastArrivalMs);
         std::wstring disposition;
         const uint64_t id = ObserveCurrent(reference, &disposition);
         KmonHuntReceipt recorded{reference, disposition, arrivalMs == 0};
@@ -247,7 +253,7 @@ private:
             return uint64_t{0};
         };
         if (context.MonotonicMs > context.ArrivalMonotonicMs) { return skip(L"future_event"); }
-        if (context.MonotonicMs < LastMs || context.ArrivalMonotonicMs - context.MonotonicMs > 30000)
+        if (context.ArrivalMonotonicMs - context.MonotonicMs > 30000)
         {
             return skip(L"historical_only");
         }
@@ -257,25 +263,32 @@ private:
             ++IdentityConflicts;
             return skip(L"identity_conflict");
         }
+        const auto order = Ordering.Observe(context, reference.Address, reference.Root, reference.Slot, reference.Role);
+        if (*order != L'\0')
+        {
+            if (std::wcscmp(order, L"identity_conflict") == 0) { ++IdentityConflicts; }
+            if (std::wcscmp(order, L"current_capacity") == 0)
+            {
+                // A fully observed transition whose guard could not be kept
+                // must not leave that process's previous rows called current.
+                References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& prior)
+                { return prior.Context.Identity.BootId == identity.BootId && prior.Context.Identity.ProcessId == identity.ProcessId; }),
+                    References.end());
+            }
+            return skip(order);
+        }
         reference.PageComparable = reference.PageComparable && context.MappingGeneration != 0 && KmonHuntHash(reference.PageSha256);
         if (!reference.PageComparable)
         {
             reference.PageSha256.clear();
         }
-        for (const auto& prior : References)
-        {
-            if (prior.Context.Identity.BootId == identity.BootId && prior.Context.Identity.ProcessId == identity.ProcessId &&
-                prior.Context.Identity.CreateTime > identity.CreateTime)
-            {
-                return skip(L"prior_process_instance");
-            }
-        }
-        LastMs = context.MonotonicMs;
         References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& prior)
         {
             const auto& old = prior.Context;
-            return LastMs - old.MonotonicMs > 30000 || old.Identity.BootId != identity.BootId ||
-                (old.Identity.ProcessId == identity.ProcessId && old.Identity.CreateTime != identity.CreateTime) ||
+            const auto now = Ordering.CurrentWatermark();
+            return (now >= old.MonotonicMs && now - old.MonotonicMs > 30000) ||
+                (old.Identity.BootId == identity.BootId && old.Identity.ProcessId == identity.ProcessId &&
+                    old.Identity.CreateTime != identity.CreateTime && identity.ProcessId != 0) ||
                 (old.Identity.SameInstance(identity) && (prior.Address & ~4095ull) == (reference.Address & ~4095ull) &&
                     old.MappingGeneration != 0 && context.MappingGeneration != 0 && old.MappingGeneration != context.MappingGeneration);
         }), References.end());
@@ -301,7 +314,7 @@ private:
                 {
                     return KmonPageRole(a.Role);
                 }
-                return a.Context.MonotonicMs < b.Context.MonotonicMs;
+                return a.Context.ArrivalSequence < b.Context.ArrivalSequence;
             });
             if (KmonPageRole(reference.Role) && !KmonPageRole(oldest->Role))
             {
@@ -348,6 +361,12 @@ public:
         page.Limit = options.Limit;
         page.RetainedReferences = References.size();
         page.ReferenceCapacity = Capacity;
+        page.OrderingStates = Ordering.Size();
+        page.OrderingCapacity = Ordering.Limit();
+        page.OrderingExpired = Ordering.Expired;
+        page.OrderingDeferred = Ordering.Deferred;
+        page.OrderingWatermarkMs = Ordering.CurrentWatermark();
+        page.OrderingPressureFloorMs = Ordering.PressureFloor();
         if (options.Limit == 0 || options.Limit > 256 || filter.Role.size() > 128 ||
             filter.Role.find(L'\0') != std::wstring::npos)
         {
@@ -468,14 +487,20 @@ public:
         return References.size();
     }
 
-    void Retire(const ObservationIdentity& identity, uint64_t root, uint64_t slot, const std::wstring& role)
+    void Retire(const ObservationIdentity& identity, uint64_t root, uint64_t slot, const std::wstring& role,
+        uint64_t observedMs = 0)
     {
         AdvanceRevision();
         const auto assertion = IdentityAssertions.find(identity.CanonicalKey());
         if (assertion != IdentityAssertions.end() && !assertion->second.CompatibleWith(identity)) { return; }
+        if (!identity.HasCanonicalKey() || identity.BootId.size() > 128 || role.empty() || role.size() > 64) { return; }
+        const auto tick = observedMs == 0 ? LastArrivalMs : observedMs;
+        LastArrivalMs = (std::max)(LastArrivalMs, tick);
+        Ordering.Advance(LastArrivalMs);
+        if (!Ordering.Retire(identity, root, slot, role, tick)) { return; }
         References.erase(std::remove_if(References.begin(), References.end(), [&](const auto& row)
         {
-            return row.Context.Identity.SameInstance(identity) && (slot != 0 || row.Root == root) &&
+            return row.Context.MonotonicMs <= tick && row.Context.Identity.SameInstance(identity) && (slot != 0 || row.Root == root) &&
                 row.Slot == slot && row.Role == role;
         }), References.end());
     }
@@ -489,7 +514,7 @@ private:
     uint64_t QueryEpoch = NextQueryEpoch.fetch_add(1);
     uint64_t Revision = 0;
     size_t Capacity;
-    uint64_t LastMs = 0;
+    KmonHuntOrdering Ordering;
     uint64_t LastArrivalMs = 0;
     uint64_t ArrivalSequence = 0;
     std::deque<KmonHuntReceipt> Receipts;

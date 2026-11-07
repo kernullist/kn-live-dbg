@@ -408,8 +408,28 @@ namespace
                     coverage.emplace(name, fields.at(name));
                 }
                 coverage.emplace(L"underlying_index_retention", Canonical(retention));
+                if (fields.count(L"ordering") != 0)
+                {
+                    Fields ordering;
+                    std::wstring policy, clock;
+                    uint64_t states = 0, stateCapacity = 0, expired = 0, deferred = 0, watermark = 0, floor = 0;
+                    bool crossClock = true, sameTick = true, sourceLoss = true;
+                    if (!Object(fields.at(L"ordering"), &ordering) || ordering.size() != 11 ||
+                        !Text(ordering, L"policy", &policy, 64) || policy != L"kn.local_entity_order.v1" ||
+                        !Text(ordering, L"clock_scope", &clock, 64) || clock != L"single_collector_monotonic_ms" ||
+                        !Boolean(ordering, L"cross_clock_conversion_established", &crossClock) || crossClock ||
+                        !Boolean(ordering, L"same_tick_order_established", &sameTick) || sameTick ||
+                        !Boolean(ordering, L"source_loss_coverage_established", &sourceLoss) || sourceLoss ||
+                        !Number(ordering, L"retained_states", &states) || !Number(ordering, L"state_capacity", &stateCapacity) ||
+                        stateCapacity == 0 || stateCapacity > 16384 || states > stateCapacity ||
+                        !Number(ordering, L"expired_states", &expired) || !Number(ordering, L"deferred", &deferred) ||
+                        !Number(ordering, L"arrival_watermark_ms", &watermark) ||
+                        !Number(ordering, L"untracked_transition_through_ms", &floor) || floor > watermark)
+                    { return false; }
+                    coverage.emplace(L"ordering", Canonical(ordering));
+                }
             }
-            else if (fields.count(L"query_status") != 0 || fields.count(L"page_offset") != 0 ||
+            else if (fields.count(L"ordering") != 0 || fields.count(L"query_status") != 0 || fields.count(L"page_offset") != 0 ||
                 fields.count(L"returned_case_count") != 0 || fields.count(L"next_cursor") != 0 ||
                 fields.count(L"matched_case_count") != 0 || fields.count(L"omitted_by_budget") != 0 ||
                 fields.count(L"complete_within_query_scope") != 0)

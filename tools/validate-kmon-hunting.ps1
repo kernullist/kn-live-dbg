@@ -28,7 +28,7 @@ if ($Sanitize)
 }
 $replay = Join-Path $output 'kmon-hunting-replay.exe'
 $fixture = Join-Path $output 'kmon-hunting-fixture.exe'
-$replaySources = @('tools\kmon-hunting-replay.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp') |
+$replaySources = @('tools\kmon-hunting-replay.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\ReferenceArtifact.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $commands = @(
     '@echo off',

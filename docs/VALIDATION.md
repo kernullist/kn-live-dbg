@@ -7,6 +7,92 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Local hunt ordering checkpoint: 2026-11-07
+
+This F07/P07 step removes the current hunt view's global latest-event gate.
+Independent delayed targets and paths can remain current within arrival freshness,
+while per-path, mapping-label and process-generation guards prevent rollback of
+retained state. The guards survive hot-row eviction and explicit retirement.
+Query JSON and saved analyst snapshots report their bounded capacity, deferrals
+and conservative transition floor. Receipt/bundle formats and the driver ABI are
+unchanged. See [local current-view ordering](ARCHITECTURE.md#local-current-view-ordering).
+
+The original defect was reproduced with PID 55 observed at tick 200 followed by
+independent PID 56 observed at 150 and arriving at 210: the second observation
+incorrectly became `historical_only`. Further review reproduced rejection of a
+new generation with a smaller creation FILETIME and retention of stale current
+rows when the new generation's guard could not be stored. The final rules use
+observed generation transitions, retire known previous generations even under
+guard pressure, and withdraw the affected process's current rows on that denial.
+Page zero no longer aliases a retirement marker. The expiry index also prepares
+allocating lookups before mutation and removes old entries by saved iterator.
+
+Final Release EXE SHA-256:
+`b701430a9c5b1c1ab4784733861d46ab2863b639efe9afeeece345b3bf9bab74`.
+Final ASan harness hashes:
+
+| Harness | SHA-256 |
+|---|---|
+| KMON core | `0afca301c5fb5fb88777ec375b527b6cec08a9fd455c14d6f0391666c70545f5` |
+| Analyst features | `1ed6d7c826132cefbaca81e2a4ed2b5ee0c0008353e9ece8a4d4677def150800` |
+| Hunting replay | `19c1f74aab074093ca2d88f56c37e94608d9c3de78689c8acee039437c909b78` |
+| Evidence bundle | `13868490d808d29c11511154a4f67dff4107bde4068a743db859455e016b23fb` |
+| Temporal facts | `23eee99be2aa5a591a7b6ff1ee17525add4b3e893b3b792fdb2354260e49a64b` |
+
+The final core ASan run passed 77 ordering checks, including all 24 permutations
+of four observations against independently specified current rows and exact
+original histories. Controls cover independent paths, source-label bypasses,
+slot retargeting, delayed retirement, eviction, unknown assertion bridges,
+backward-valued generation keys, capacity denial, recovery, page zero and
+`uint64` boundaries. Existing hunting 11,345, page 54, false-positive 49,
+capture scheduling 130 and execution-evidence 835 checks also passed, with ten
+independent execution JSON controls. The hunting runner repeated its shared
+controls and rejected eight malformed inputs; its four owned process fixtures
+(`clean`, `modified`, `text`, `jit`) passed. No external detector comparison ran.
+
+The analyst ASan runner passed 6,612 checks, including preserving ordering limits
+as snapshot coverage, legacy snapshots without that block, and rejection of false
+clock/loss/capacity claims. The legacy evidence runner passed 522 controls and its
+eight existing timed publication interruptions: three valid final files, five
+absent final files, successful restart. This is not synchronized v2 publication
+or power-loss validation. The temporal ASan oracle passed 147 checks including
+the final Release CLI and original v1/v2 bundle compatibility.
+
+```powershell
+.\tools\validate-kmon-core.ps1 -Sanitize
+.\tools\validate-analyst-features.ps1 -Sanitize
+.\tools\validate-kmon-hunting.ps1 -Sanitize
+.\tools\validate-evidence-bundle.ps1 -Sanitize
+.\tools\validate-temporal-facts.ps1 -Sanitize -Cli .\x64\Release\KnLiveDbg.exe
+.\x64\Release\KnLiveDbg.exe --self-test all
+```
+
+The final full suite ran after builds and standalone oracles had finished:
+timeline 28, MCP 102, KMON image-read 119, console 558, commands 3,006 across
+261 routes and remote 68 passed, plus four connection-argument controls. The
+KMON pipeline fixture read two owned pointer slots, observed distinct collector
+ticks, then delivered them in reverse capture order; both remained queryable.
+Capability checks passed for 33 contracts, the generated support matrix matched,
+and all 11 publication-classifier tests passed. Final targeted host readback found
+zero KnLiveDbg-family drivers and zero task processes. EFS remained OS-managed
+Manual/Running, as before the stage; no explicit driver load or service change ran.
+
+Local diagnostic logs are `.build/p07-ordering-transition-{core-asan,build,
+analyst-asan,hunting-asan,legacy-asan,temporal-asan,selftests}.log`. The initial
+core build exposed a missing `ReferenceArtifact.cpp` dependency in older core,
+hunting and analyst scripts; all three lists were repaired and the final runners
+completed. VS 2022 BuildTools 17.14.60 / MSVC 14.44.35207 / SDK and WDK
+10.0.26100.0 built on Windows 11 Pro x64 10.0.28000 / NTFS. Existing C4244 and
+C4744 warnings remain. Earlier 70-check binaries and logs are superseded here.
+
+This validates bounded local-clock reducer behavior and owned user-mode
+integration. The Release EXE is not ASan-instrumented. Generation-key reversal
+was synthetic; the host system clock was not changed. Foreign-clock adapters,
+CPU-specific loss, source-restart correspondence, loaded native-controller
+behavior, allocation-failure injection and general lifetime/temporal coverage
+remain unvalidated. The earlier privacy-initialization and process-capture timing
+observations remain unresolved. Full F07/P07 and P01-P16 / VS1-VS4 remain open.
+
 ## Local temporal candidate checkpoint: 2026-11-07
 
 This P07 step adds origin-bound `kmon.bundle.v2` captures and offline

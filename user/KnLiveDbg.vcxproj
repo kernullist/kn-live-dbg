@@ -312,6 +312,7 @@
     <ClInclude Include="CodeTargetResolver.h" />
     <ClInclude Include="ExecutableRegionCatalog.h" />
     <ClInclude Include="KmonHunting.h" />
+    <ClInclude Include="KmonHuntOrdering.h" />
     <ClInclude Include="KmonExecutablePages.h" />
     <ClInclude Include="UserExecutablePteWalker.h" />
     <ClInclude Include="ExecutableImagePermissions.h" />

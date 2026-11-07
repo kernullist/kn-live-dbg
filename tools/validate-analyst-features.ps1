@@ -27,7 +27,7 @@ if ($Sanitize)
 }
 $program = Join-Path $output 'analyst-features-selftest.exe'
 $sources = @('tools\analyst-features-selftest.cpp', 'user\ExecutionSurfaceScanner.cpp',
-    'user\AnalystSnapshot.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp') |
+    'user\AnalystSnapshot.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\ReferenceArtifact.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $commands = @(
     '@echo off',

@@ -1115,6 +1115,48 @@ Hunting also records up to 2,048 receipts with original event time, arrival time
 arrival sequence and current-view disposition. Delayed/conflicting receipts do
 not rewind the current view. This in-memory history reports eviction and is not
 itself a durable store; emitted receipt JSON remains subject to log collection loss.
+
+### Local current-view ordering
+
+`kn.local_entity_order.v1` admits an independent process or reference path even
+when its observation tick precedes another path's latest tick. The arrival
+watermark controls the 30-second freshness window; it is not a global minimum
+event time. All ticks admitted by this live reducer must use one collector's
+monotonic millisecond clock. Target boot IDs namespace identities, and producer
+names describe sources; neither supplies a conversion for foreign clocks.
+
+The reducer keeps up to 16,384 ordering guards separately from its 512 current
+references and 2,048 receipts. A pointer path is identified by process generation,
+slot and role; a slotless chain uses its root and role. Page guards constrain
+conflicting observed mapping-generation labels. They do not establish OS mapping
+lifetime. Guards retain known optional identity assertions, survive current-row
+eviction and retirement, and expire only when their protected ticks are outside
+the arrival freshness window. A late retirement cannot remove a newer reference.
+Creation FILETIME is a generation key, not an ordinal clock: a newly observed
+generation may have a smaller creation-time value. An observed transition retires
+the previously retained generations; a delayed old generation cannot revive them.
+A different generation cannot replace a later observation with an earlier event
+tick. These constraints remain bounded by retained guards, not the whole boot.
+
+When the guard table is full, a new key receives `current_capacity`; existing
+keys can refresh. An observation or retirement that cannot retain its own guard
+establishes a reported conservative tick floor. A denied observation withdraws
+that process's current rows; a denied generation transition still retires its
+known prior generations. This pressure fallback can defer independent observations
+at or below the floor. `!kmon cases /json` reports retained/expired states, capacity, deferrals,
+arrival watermark and that floor under `ordering`. Saved analyst snapshots retain
+and validate these limits as coverage evidence. Legacy snapshots without this
+block remain readable with a different coverage scope.
+
+Same-tick changes use arrival order for the bounded display and do not establish
+temporal precedence. Within a priority class, current rows are evicted by arrival
+sequence; page candidates still cannot evict execution references. Foreign-clock
+adapters, per-CPU loss watermarks, source restart correspondence and complete
+temporal coverage remain separate requirements. No receipt or bundle format,
+driver ABI, execution claim or cross-collector join authority changes here.
+
+### Durable hunt evidence
+
 `EvidenceBundle` provides the durable boundary:
 one private `.kncase` file contains a receipt, acquisition domain, original
 coverage, capture interval, and up to 128 sparse read spans of at most 4 KiB each.

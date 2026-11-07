@@ -106,6 +106,12 @@ inline std::wstring KmonHuntQueryJson(const KmonHuntQueryPage& page, const KmonH
     out += L",\"complete_within_query_scope\":" + std::wstring(page.Complete() ? L"true" : L"false");
     out += L",\"next_cursor\":" + (page.NextCursor.empty() ? L"null" : mcpjson::Quote(page.NextCursor));
     out += L",\"underlying_index_retention\":{\"reference_capacity\":" + std::to_wstring(page.ReferenceCapacity);
-    out += L",\"retained_references\":" + std::to_wstring(page.RetainedReferences) + L",\"freshness_ms\":30000}}";
+    out += L",\"retained_references\":" + std::to_wstring(page.RetainedReferences) + L",\"freshness_ms\":30000}";
+    out += L",\"ordering\":{\"policy\":\"kn.local_entity_order.v1\",\"clock_scope\":\"single_collector_monotonic_ms\",";
+    out += L"\"cross_clock_conversion_established\":false,\"same_tick_order_established\":false,\"source_loss_coverage_established\":false";
+    out += L",\"retained_states\":" + std::to_wstring(page.OrderingStates) + L",\"state_capacity\":" + std::to_wstring(page.OrderingCapacity);
+    out += L",\"expired_states\":" + std::to_wstring(page.OrderingExpired) + L",\"deferred\":" + std::to_wstring(page.OrderingDeferred);
+    out += L",\"arrival_watermark_ms\":" + mcpjson::Quote(std::to_wstring(page.OrderingWatermarkMs));
+    out += L",\"untracked_transition_through_ms\":" + mcpjson::Quote(std::to_wstring(page.OrderingPressureFloorMs)) + L"}}";
     return out;
 }

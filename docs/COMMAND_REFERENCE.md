@@ -422,6 +422,14 @@ No sample detection percentage follows from the fixture count.
 
 ## KMON
 
+`!kmon cases /json` includes an `ordering` block for the local current view:
+retained states and their capacity, expiry, deferrals, the arrival watermark and
+any conservative transition floor. Independently delayed paths can remain current
+within the 30-second window; older observations of the same path cannot roll it
+back. `current_capacity` can mean the ordering guard budget was exhausted as well
+as the current-reference budget. Saved snapshots preserve these limits. See
+[local ordering and clock restrictions](ARCHITECTURE.md#local-current-view-ordering).
+
 Routed image collection exposes its retention class in `coverage.image_reads`.
 The hunt JSON `image_read_store.retention`, pipeline `image_retention` evidence
 and final `.knreadledger` report separate first-difference, observation-gap and

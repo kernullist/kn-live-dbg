@@ -2457,6 +2457,7 @@ bool KmonPipelineSelfTest()
                 {ownedReference.Slot, 8, L"pointer_slot", L"valid", ownedSlot}};
             ownedEvidence.CaptureEndedMs = GetTickCount64();
             ownedEvidence.ReferenceConsistent = true;
+            const auto earlierOwnedReference = ownedReference;
             if (monitor.HuntIndex.Observe(ownedReference, GetTickCount64(), &ownedEvidence.Receipt) == 0) { break; }
             const auto firstCaptureId = NewEvidenceScope();
             monitor.BindEvidenceOrigin(ownedEvidence, firstCaptureId, 0, 0);
@@ -2482,6 +2483,24 @@ bool KmonPipelineSelfTest()
             if (!laterEvidence.Origin.Valid() || laterEvidence.Origin.CaptureId == firstCaptureId) { break; }
             const auto laterEvidenceId = monitor.QueueEvidenceBundle(std::move(laterEvidence));
             if (laterEvidenceId == 0) { break; }
+            // Observe two actual owned slots in capture order, then deliver
+            // their observations in reverse. Await the clock condition itself;
+            // elapsed sleeping is not evidence that the ticks are distinct.
+            const auto clockDeadline = GetTickCount64() + 250;
+            while (GetTickCount64() <= earlierOwnedReference.Context.MonotonicMs && GetTickCount64() < clockDeadline)
+            { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            const uint64_t otherPointer = ownedReference.Address;
+            if (!ReadProcessMemory(GetCurrentProcess(), &otherPointer, ownedSlot.data(), ownedSlot.size(), &slotRead) ||
+                slotRead != ownedSlot.size()) { break; }
+            auto laterOwnedReference = ownedReference;
+            laterOwnedReference.Slot = reinterpret_cast<uint64_t>(&otherPointer);
+            laterOwnedReference.Context.MonotonicMs = GetTickCount64();
+            laterOwnedReference.Context.Timestamp = ObservationFileTime();
+            if (laterOwnedReference.Context.MonotonicMs <= earlierOwnedReference.Context.MonotonicMs) { break; }
+            KmonHuntIndex reverseArrival;
+            if (reverseArrival.Observe(laterOwnedReference, GetTickCount64()) == 0 ||
+                reverseArrival.Observe(earlierOwnedReference, GetTickCount64()) == 0 ||
+                reverseArrival.Cases(GetTickCount64()).size() != 2) { break; }
             VirtualFree(allocation, 0, MEM_RELEASE);
             allocation = nullptr;
             monitor.CaptureStopping.store(true);

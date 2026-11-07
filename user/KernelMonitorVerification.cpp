@@ -975,7 +975,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         ExecutionReferenceKeys.erase(referenceKey);
         {
             std::lock_guard<std::mutex> lock(HuntMutex);
-            HuntIndex.Retire(work.Identity, work.Target, work.Slot, work.Role);
+            HuntIndex.Retire(work.Identity, work.Target, work.Slot, work.Role, captureStartedMs);
         }
         const uint64_t waited = GetTickCount64() - work.ObservedMs;
         ExecutionReferenceMaxWaitMs = (std::max)(ExecutionReferenceMaxWaitMs, waited);
