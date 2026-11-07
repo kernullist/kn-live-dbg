@@ -1,5 +1,6 @@
 #include "ParserWorkerProcess.h"
 #include <algorithm>
+#include <array>
 #include <objbase.h>
 #include <sddl.h>
 
@@ -268,7 +269,9 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
     const auto started = GetTickCount64();
     Handle job, token, input, outputRead, outputWrite;
     Desktop desktop;
-    HANDLE inherited[2]{}, jobs[1]{};
+    std::vector<HANDLE> inherited;
+    std::array<Handle, 3> files;
+    HANDLE jobs[1]{};
     Attributes attributes;
     Child child;
     const auto cancelled = [&]()
@@ -279,7 +282,7 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
     {
         if (request.Executable.empty() || request.Executable.size() > 30000 ||
             request.Executable.find(L'\0') != std::wstring::npos || request.TimeoutMs > 60000 ||
-            request.OutputLimit == 0 || request.OutputLimit > 2 * 1024 * 1024)
+            request.OutputLimit == 0 || request.OutputLimit > 2 * 1024 * 1024 || request.ReadOnlyFiles.size() > files.size())
         {
             result.Status = L"invalid_request";
             break;
@@ -304,6 +307,28 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
                 valid = false;
                 break;
             }
+        }
+        for (size_t i = 0; valid && i < request.ReadOnlyFiles.size(); ++i)
+        {
+            const auto source = request.ReadOnlyFiles[i];
+            if (source == nullptr || source == INVALID_HANDLE_VALUE || GetFileType(source) != FILE_TYPE_DISK)
+            {
+                valid = false;
+                break;
+            }
+            files[i].Reset(ReOpenFile(source, GENERIC_READ, FILE_SHARE_READ,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN));
+            FILE_ATTRIBUTE_TAG_INFO info{};
+            if (!files[i].Valid() || !GetFileInformationByHandleEx(files[i].Value, FileAttributeTagInfo, &info, sizeof(info)) ||
+                (info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+                !SetHandleInformation(files[i].Value, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+            {
+                valid = false;
+                break;
+            }
+            inherited.push_back(files[i].Value);
+            command += L" " + std::to_wstring(reinterpret_cast<uintptr_t>(files[i].Value));
+            if (command.size() > 32766) { valid = false; }
         }
         if (!valid)
         {
@@ -363,10 +388,11 @@ ParserWorkerResult RunParserWorker(const ParserWorkerRequest& request)
             break;
         }
         attributes.List = list;
-        inherited[0] = outputWrite.Value;
-        inherited[1] = input.Value;
+        inherited.push_back(outputWrite.Value);
+        inherited.push_back(input.Value);
         jobs[0] = job.Value;
-        if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr) ||
+        if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
+            inherited.size() * sizeof(HANDLE), nullptr, nullptr) ||
             !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs, sizeof(jobs), nullptr, nullptr))
         {
             result.Error = GetLastError();

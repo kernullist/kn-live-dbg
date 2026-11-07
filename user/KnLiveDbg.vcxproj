@@ -212,6 +212,7 @@
     <ClCompile Include="TypeSchema.cpp" />
     <ClCompile Include="TypeSchemaGenerator.cpp" />
     <ClCompile Include="TypeSchemaCommand.cpp" />
+    <ClCompile Include="TypeSchemaBroker.cpp" />
     <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
@@ -379,6 +380,9 @@
     <ClInclude Include="PdbIdentity.h" />
     <ClInclude Include="DiaTypeLayout.h" />
     <ClInclude Include="TypeSchema.h" />
+    <ClInclude Include="TypeSchemaBroker.h" />
+    <ClInclude Include="SchemaArtifact.h" />
+    <ClInclude Include="SchemaReadStream.h" />
     <ClInclude Include="ParserWorkerProcess.h" />
     <ClInclude Include="ReferenceArtifact.h" />
     <ClInclude Include="ImageVerificationRecipe.h" />

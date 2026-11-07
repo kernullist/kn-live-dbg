@@ -10,6 +10,10 @@ struct ParserWorkerRequest
 {
     std::wstring Executable;
     std::vector<std::wstring> Arguments;
+    // At most three approved regular files. The runner reopens each read-only,
+    // inherits only those copies, and appends their decimal handles to argv.
+    // Caller retains the source leases until this synchronous call returns.
+    std::vector<HANDLE> ReadOnlyFiles;
     uint64_t TimeoutMs = 60000;
     size_t OutputLimit = 2 * 1024 * 1024;
     const std::atomic<bool>* Cancellation = nullptr;

@@ -3,6 +3,7 @@ import argparse
 import copy
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,6 +52,15 @@ def main():
         check(not payload["trusted_distribution"] and not payload["runtime_invariants_checked"] and
               payload["parser_isolated"], "worker provenance does not upgrade artifact trust or runtime evidence")
         check(json.loads(run("inspect", output).stdout) == package, "fresh process reconstructs the same package")
+        unicode_root = root / "owned 한글 paths"
+        unicode_root.mkdir()
+        unicode_image, unicode_pdb = unicode_root / "image copy.exe", unicode_root / "symbols copy.pdb"
+        shutil.copyfile(image, unicode_image)
+        shutil.copyfile(pdb, unicode_pdb)
+        unicode_output = unicode_root / "배치 package.knschema"
+        check(json.loads(run("create", unicode_image, unicode_pdb, "PdbIdentityFixture", unicode_output).stdout) == package,
+              "brokered Unicode and space paths preserve exact artifact identity")
+        check(json.loads(run("inspect", unicode_output).stdout) == package, "Unicode publication remains readable")
         legacy = copy.deepcopy(package)
         legacy["payload"]["parser_isolated"] = False
         legacy_path = root / "legacy.knschema"
@@ -125,6 +135,10 @@ def main():
             symlink_skipped = 1
         else:
             run("inspect", link, success=False)
+            image_link = root / "input-image-link.exe"
+            image_link.symlink_to(image)
+            run("create", image_link, pdb, "PdbIdentityFixture", root / "linked-image.knschema", success=False)
+            check(not (root / "linked-image.knschema").exists(), "final reparse input cannot publish a schema")
         check(not list(root.glob("*.pending-*")), "normal failure paths leave no temporary publications")
     print(f"type schema CLI passed: {checks} checks, symlink_skipped={symlink_skipped}; no live target")
 

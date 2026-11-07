@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Windows.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -53,5 +54,7 @@ bool LoadTypeSchema(const std::wstring& path, TypeSchemaPackage* package, std::w
 bool SaveTypeSchema(const std::wstring& path, const TypeSchemaPackage& package, std::wstring* error);
 bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, const std::wstring& typeName,
     const std::wstring& provider, TypeSchemaPackage* package, std::wstring* error);
+bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, const std::wstring& typeName,
+    TypeSchemaPackage* package, std::wstring* error);
 int RunTypeSchemaCommand(int argc, wchar_t** argv);
 int RunTypeSchemaWorkerCommand(int argc, wchar_t** argv);

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 
 namespace executable_image
 {
@@ -1175,10 +1176,12 @@ namespace executable_image
         }
     }
 
-    bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error)
+    static bool ReadDiskPeMetadataImpl(const std::wstring& rawPath, HANDLE source, bool identityOnly,
+        DiskPeMetadata* metadata, std::wstring* error)
     {
         bool ok = false;
         HANDLE file = INVALID_HANDLE_VALUE;
+        std::unique_ptr<void, decltype(&CloseHandle)> owner(nullptr, &CloseHandle);
 
         do
         {
@@ -1192,16 +1195,17 @@ namespace executable_image
             }
 
             *metadata = {};
-            std::wstring path = NormalizeReferencePath(rawPath);
-            file = CreateFileW(
-                path.c_str(),
-                GENERIC_READ,
-                FILE_SHARE_READ,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL |
-                    FILE_FLAG_SEQUENTIAL_SCAN,
-                nullptr);
+            if (source != INVALID_HANDLE_VALUE)
+            {
+                file = ReOpenFile(source, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_SEQUENTIAL_SCAN);
+            }
+            else
+            {
+                const auto path = NormalizeReferencePath(rawPath);
+                file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            }
+            owner.reset(file == INVALID_HANDLE_VALUE ? nullptr : file);
             if (file == INVALID_HANDLE_VALUE)
             {
                 if (error != nullptr)
@@ -1635,6 +1639,14 @@ namespace executable_image
                 }
             }
 
+            if (identityOnly)
+            {
+                metadata->BaseRelocationTableComplete = false;
+                metadata->DynamicRelocationTableComplete = false;
+                ok = true;
+                break;
+            }
+
             if (managedRva != 0 &&
                 managedSize >= sizeof(IMAGE_COR20_HEADER) &&
                 static_cast<uint64_t>(managedRva) + managedSize <= metadata->SizeOfImage)
@@ -1698,12 +1710,34 @@ namespace executable_image
             ok = true;
         } while (false);
 
-        if (file != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(file);
-        }
-
         return ok;
+    }
+
+    bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error)
+    {
+        return ReadDiskPeMetadataImpl(rawPath, INVALID_HANDLE_VALUE, false, metadata, error);
+    }
+
+    bool ReadDiskPeMetadataHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error)
+    {
+        if (source == nullptr || source == INVALID_HANDLE_VALUE || GetFileType(source) != FILE_TYPE_DISK)
+        {
+            if (metadata != nullptr) { *metadata = {}; }
+            if (error != nullptr) { *error = L"invalid PE source handle"; }
+            return false;
+        }
+        return ReadDiskPeMetadataImpl(L"", source, false, metadata, error);
+    }
+
+    bool ReadDiskPeIdentityHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error)
+    {
+        if (source == nullptr || source == INVALID_HANDLE_VALUE || GetFileType(source) != FILE_TYPE_DISK)
+        {
+            if (metadata != nullptr) { *metadata = {}; }
+            if (error != nullptr) { *error = L"invalid PE identity source handle"; }
+            return false;
+        }
+        return ReadDiskPeMetadataImpl(L"", source, true, metadata, error);
     }
 
     bool DiskReferenceIdentityMatches(const std::wstring& rawPath, const DiskPeMetadata& metadata)

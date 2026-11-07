@@ -7,6 +7,71 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Schema artifact broker checkpoint: 2026-11-07
+
+This P05/W04 step binds offline schema creation to parent-owned artifact leases.
+The parent verifies returned image/PDB/provider hashes, PE machine/image size,
+RSDS GUID/age and requested type against its own inputs. The restricted child
+receives three read-only file handles; DIA reads a PDB stream rather than opening
+its supplied pathname. Provider loading pins its ancestor directories and file
+identity. The existing public CLI and `kn.type_schema.v1` format remain unchanged.
+See [schema parser boundaries](ARCHITECTURE.md#schema-parser-process-boundary).
+
+Review found that the previous parent accepted any internally consistent package
+with the requested type and `parser_isolated=true`, without comparing its artifact
+identities to the requested files. Actual hostile-worker controls now return
+canonical, checksum-valid mismatches and are rejected. Review also added provider
+directory pins and restricted the parent's PE decoder to bounded headers,
+sections and RSDS identity. Omitted relocation facts remain incomplete; the parent
+does not parse managed-image or relocation tables to obtain a schema identity.
+The shared PE reader now closes its file on C++ exception unwinding as well.
+No additional actionable defects were found in the reviewed scope.
+
+Final Release EXE SHA-256:
+`eb0e3c4d8d91518baf215b852c85ad3af789a8fac51356c6cb1c7fb142c2256e`.
+Final ASan harness hashes:
+
+| Harness | SHA-256 |
+|---|---|
+| Schema broker | `8f535567c0946f7dd945f770e3ee62c589b3c215fb662e74b736600c08e3062a` |
+| PDB identity | `9f8ccfebc2f14da28da2d1bd2b06be4d2bef3f6b2b3649409e2cc2fcf1f01c2b` |
+| Parser worker | `897b0060bb9a9024b8891be6eb44a3fbfea180eafb959e74565977553a700691` |
+| Shared KMON/PE core | `de6bee5c70c44b9cc5a712385ae3914f92d58d3851291e7ecba56ede3221cbc9` |
+
+Validation ran on Windows 11 Pro x64 `10.0.28000`, NTFS, using VS 2022 Build Tools
+17.14.60, MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Sources and binaries were
+frozen during each applicable run; the linked `--self-test all` ran after builds
+and other oracles had completed.
+
+| Check | Result and scope |
+|---|---|
+| `tools/validate-schema-broker.ps1 -Sanitize` | 73 controls passed: actual restricted worker, wrong artifact identities/type, unisolated/failed/flooding/hanging child, read-only handles, invalid handle allowlist, file bounds, provider directory pin, stream EOF/seek/overflow/clone concurrency, independent compiler `sizeof`/`offsetof` and owned `ReadProcessMemory` oracle |
+| `tools/validate-pdb-identity.ps1 -Sanitize` | 52 existing PDB/layout/package controls passed with stream loading and the identity-only PE path; wrong-build PDB, bitfields, nested paths, inherited gaps and depth limits remain covered |
+| `tools/validate-parser-worker.ps1 -Sanitize` | 19 controls passed, including crash/timeout/cancellation, memory/child-process limits, unrelated handle/environment exclusion and observed parent-death cleanup |
+| `tools/test-type-schema-cli.py` against the final Release EXE | 79 checks passed: independent Python artifact/package hashes, canonical output, fresh-process inspection, legacy unisolated packages, wrong PDB/type, collisions, malformed metadata and Unicode/space paths |
+| `tools/validate-kmon-core.ps1 -Sanitize` | Shared PE/relocation regressions passed; 835 execution, 130 scheduling, 11,345 hunting, 77 ordering, 54 page and 49 false-positive controls passed; independent execution JSON oracle passed 10 controls |
+| Final Release `--self-test all` | Timeline 28, MCP 102, KMON image/read 119, console 558, commands 3,006 across 261 routes, remote 68 and four connection-argument controls passed |
+| Contracts/publication | 33 compiled capability contracts and 261 routes passed; generated support matrix matched; the publication classifier's 11 controls passed |
+
+The CLI oracle reported `symlink_skipped=1`: this host did not permit creating
+the symlink fixture. Final-reparse rejection is implemented but that execution
+case remains unvalidated here. No policy was changed to enable it. Final targeted
+readbacks found no KnLiveDbg-family drivers or test processes. EFS remained the
+OS-managed Manual/Running service observed before testing; it was not stopped.
+No driver load, reboot, host clock or security-policy change was requested by
+these tests. Existing C4244/C4744 build warnings remain.
+
+This is the offline broker prerequisite, not completion of P05. Live SymbolEngine
+consumers, target image/object/anchor binding, supported-build attestations,
+runtime invariants and object lifetime remain open. The installed EXE/DLL are
+trusted runtime inputs; hashes do not authenticate distribution or attest a
+compromised parser's semantic output. The child has no enforced filesystem or
+network deny policy. Parent hashing and synchronous I/O are not covered by a
+whole-operation hard deadline. ASan covers the helper harnesses, not the complete
+Release EXE; allocator fault injection and other OS/filesystem environments were
+not validated. Earlier privacy initialization and process-capture timing
+observations remain unresolved and are not closed by these passing runs.
+
 ## Local hunt ordering checkpoint: 2026-11-07
 
 This F07/P07 step removes the current hunt view's global latest-event gate.

@@ -1253,9 +1253,9 @@ offset/size properties and uses `LocIsBitField` to distinguish units. Previously
 bitfield at bit zero. Actual compiler-generated PDB controls reproduce that case
 and compare the corrected offsets, storage and bit widths with C++ layout.
 
-Generation holds read-only, no-write/no-delete leases on local regular files,
-rejects final reparse points and device/stream paths, and rechecks identities and
-content after parsing. Limits are 512 MiB PE, 1 GiB PDB, 64 MiB provider, 8,192
+Generation holds read-only, no-write/no-delete leases on local fixed-drive regular
+files, rejects final reparse points and device/stream paths, and rechecks identities
+and content after parsing. Limits are 512 MiB PE, 1 GiB PDB, 64 MiB provider, 8,192
 direct DIA data members, 4,096 package fields/gaps, 16 MiB root/type extent and
 2 MiB serialized output. Hashing and recursive traversal check cooperative
 30-second budgets; an individual synchronous I/O or DIA call is not interruptible.
@@ -1275,14 +1275,39 @@ renamed JSON packages are excluded by the sensitive-content gate.
 ### Schema parser process boundary
 
 The public schema creation command now starts the same executable in an internal
-worker mode. Only that child loads the PE/PDB and DIA provider. The worker checks
-its token, private desktop and job limits before parsing. Parent-side success
-requires a zero child exit, strict bounded UTF-8/canonical package parsing and an
-exact requested type name. Only the parent publishes the package; timeout,
+worker mode. The artifact broker opens and hashes the image, PDB and adjacent
+installed DIA provider before starting it. The parent also uses the existing
+bounded PE decoder's identity-only path to obtain the expected machine, image
+size and RSDS GUID/age, stopping before managed-image and relocation tables;
+it does not load DIA or parse PDB types. The worker checks its token, private
+desktop and job limits before parsing. Parent-side success requires a zero child
+exit, strict bounded UTF-8/canonical package parsing, exact requested type and
+equality with the parent's image/PDB/provider hashes and PE identity. The parent
+rechecks all three original file objects before returning a usable package. Only
+the parent publishes the package; timeout,
 crash, output overflow or setup failure cannot publish partial child output.
 There is no in-process fallback. Existing schema inspection remains a bounded
 JSON operation in the command process, and other SymbolEngine consumers are
 unchanged.
+
+The broker passes three read-only file handles. The runner reopens each file
+object with an independent cursor and includes only those copies in the child
+handle list. PE decoding uses the approved image handle; DIA receives a bounded
+read-only `IStream` over the approved PDB handle, followed by a GUID/age check on
+the DIA global scope. It uses neither `loadDataForExe` nor a symbol-search path.
+Stream clones have independent cursors and serialize access to their shared
+handle. Out-of-range seeks, writes and truncation fail. This follows the
+[DIA stream input contract](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiadatasource-loaddatafromistream)
+and Windows [explicit handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+Windows loads the trusted installed provider DLL by pathname. Its lease also
+pins non-reparse ancestor directories against rename/delete and verifies the
+pathname's file ID before loading. This closes a pathname replacement gap while
+the original leased DLL still exists elsewhere. The installed executable and DLL
+remain trusted runtime inputs; their hashes do not attest provider authenticity.
+The public command and `kn.type_schema.v1` format remain compatible. Old packages
+can still be inspected, but their producer-reported identities are not converted
+into a fresh broker verification by inspection.
 
 The child receives a filtered primary token: administrator SID is deny-only,
 privileges other than traverse are removed, integrity is low and the inherited
@@ -1292,7 +1317,8 @@ private low-integrity desktop is created and released with the request. These
 choices follow the Windows [restricted token contract](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken)
 and [mandatory integrity model](https://learn.microsoft.com/en-us/windows/win32/secauthz/mandatory-integrity-control).
 The initial environment contains only OS-derived SystemRoot/WINDIR. Handle
-inheritance is limited to one output pipe and a NUL input handle; controller,
+inheritance is limited to three approved read-only artifact copies, one output
+pipe and a NUL input handle; controller,
 token and credential environment handles/values are not forwarded.
 
 Windows 10 or later is required for atomic job assignment through
@@ -1310,7 +1336,11 @@ This boundary contains selected parser faults and resource use. It is not an
 AppContainer, a filesystem allowlist, an egress policy or authenticated parser
 attestation. The child retains some access under the same user, and artifact
 hashes/provider paths do not establish approved distribution. Network-denied
-artifact brokering and isolation of all untrusted parsers remain open.
+execution, live SymbolEngine migration, runtime object/anchor binding and isolation
+of all untrusted parsers remain open. No network lookup is requested by this
+schema path, but the token/job combination does not enforce a network deny rule.
+Parent artifact hashing has a cooperative 30-second limit per hash; the child
+timeout is not a hard deadline for the whole broker operation or synchronous I/O.
 
 ## Capture scheduling and latency
 

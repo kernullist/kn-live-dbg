@@ -1,4 +1,6 @@
 #include "TypeSchema.h"
+#include "SchemaArtifact.h"
+#include "SchemaReadStream.h"
 #include "ContentHash.h"
 #include "DiaTypeLayout.h"
 #include "ExecutableImage.h"
@@ -16,108 +18,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
-    class ArtifactLease
-    {
-    public:
-        ~ArtifactLease()
-        {
-            if (File != INVALID_HANDLE_VALUE)
-            {
-                CloseHandle(File);
-            }
-        }
-        ArtifactLease() = default;
-        ArtifactLease(const ArtifactLease&) = delete;
-        ArtifactLease& operator=(const ArtifactLease&) = delete;
-
-        bool Open(const std::wstring& path, uint64_t maximum)
-        {
-            if (path.empty() || path.size() > 30000 || path.find(L'\0') != std::wstring::npos ||
-                path.rfind(L"\\\\", 0) == 0 || path.rfind(L"\\??\\", 0) == 0)
-            {
-                return false;
-            }
-            std::error_code ec;
-            const auto absolute = std::filesystem::absolute(path, ec).wstring();
-            if (ec || absolute.size() < 3 || absolute[1] != L':' || absolute.size() > 30000 ||
-                absolute.find(L':', 2) != std::wstring::npos)
-            {
-                return false;
-            }
-            File = CreateFileW(absolute.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-            FILE_ATTRIBUTE_TAG_INFO attributes{};
-            LARGE_INTEGER size{};
-            if (File == INVALID_HANDLE_VALUE || GetFileType(File) != FILE_TYPE_DISK ||
-                !GetFileInformationByHandleEx(File, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-                (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
-                !GetFileSizeEx(File, &size) || size.QuadPart <= 0 || static_cast<uint64_t>(size.QuadPart) > maximum ||
-                !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)))
-            {
-                return false;
-            }
-            std::vector<wchar_t> finalPath(32768);
-            const DWORD length = GetFinalPathNameByHandleW(File, finalPath.data(), static_cast<DWORD>(finalPath.size()), 0);
-            if (length == 0 || length >= finalPath.size())
-            {
-                return false;
-            }
-            Path.assign(finalPath.data(), length);
-            Size = static_cast<uint64_t>(size.QuadPart);
-            return Hash(&Sha256);
-        }
-
-        bool Unchanged()
-        {
-            HANDLE reopened = CreateFileW(Path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-            FILE_ID_INFO current{};
-            const bool same = reopened != INVALID_HANDLE_VALUE &&
-                GetFileInformationByHandleEx(reopened, FileIdInfo, &current, sizeof(current)) &&
-                std::memcmp(&current, &Identity, sizeof(current)) == 0;
-            if (reopened != INVALID_HANDLE_VALUE)
-            {
-                CloseHandle(reopened);
-            }
-            std::wstring after;
-            return same && Hash(&after) && after == Sha256;
-        }
-
-        std::wstring Path;
-        std::wstring Sha256;
-
-    private:
-        bool Hash(std::wstring* hash)
-        {
-            LARGE_INTEGER zero{}, currentSize{};
-            if (!SetFilePointerEx(File, zero, nullptr, FILE_BEGIN) || !GetFileSizeEx(File, &currentSize) ||
-                static_cast<uint64_t>(currentSize.QuadPart) != Size)
-            {
-                return false;
-            }
-            ContentHash digest;
-            std::vector<uint8_t> buffer(65536);
-            uint64_t remaining = Size;
-            const uint64_t deadline = GetTickCount64() + 30000;
-            while (remaining != 0)
-            {
-                DWORD received = 0;
-                const DWORD requested = static_cast<DWORD>((std::min)(remaining, static_cast<uint64_t>(buffer.size())));
-                if (GetTickCount64() >= deadline || !ReadFile(File, buffer.data(), requested, &received, nullptr) ||
-                    received != requested || !digest.Add(buffer.data(), received))
-                {
-                    return false;
-                }
-                remaining -= received;
-            }
-            *hash = digest.Finish();
-            return !hash->empty();
-        }
-        HANDLE File = INVALID_HANDLE_VALUE;
-        FILE_ID_INFO Identity{};
-        uint64_t Size = 0;
-    };
-
     class DiaProvider
     {
     public:
@@ -259,8 +159,8 @@ namespace
     }
 }
 
-bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, const std::wstring& typeName,
-    const std::wstring& providerPath, TypeSchemaPackage* package, std::wstring* error)
+static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFile, SchemaArtifact& providerFile,
+    const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error)
 {
     if (error != nullptr)
     {
@@ -271,23 +171,21 @@ bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, cons
     {
         return false;
     }
-    ArtifactLease imageFile, pdbFile, providerFile;
-    if (!imageFile.Open(image, 512 * 1024 * 1024) || !pdbFile.Open(pdb, 1024ull * 1024 * 1024) ||
-        !providerFile.Open(providerPath, 64 * 1024 * 1024))
-    {
-        return false;
-    }
+    if (!providerFile.PinPath()) { return false; }
     executable_image::DiskPeMetadata metadata;
-    if (!executable_image::ReadDiskPeMetadata(imageFile.Path, &metadata, nullptr) ||
+    if (!executable_image::ReadDiskPeIdentityHandle(imageFile.Handle(), &metadata, nullptr) ||
         metadata.Machine != IMAGE_FILE_MACHINE_AMD64 || !metadata.HasPdbIdentity)
     {
         return false;
     }
     DiaProvider provider;
+    ComPtr<IStream> pdbStream;
     ComPtr<IDiaSession> session;
     ComPtr<IDiaSymbol> global, type;
     if (!provider.Open(providerFile.Path) ||
-        symbol_identity::LoadMatchingPdb(provider.Source.Get(), pdbFile.Path, {metadata.PdbGuid, 0, metadata.PdbAge}) != S_OK ||
+        SchemaReadStream::Create(pdbFile.Handle(), &pdbStream) != S_OK ||
+        provider.Source->loadDataFromIStream(pdbStream.Get()) != S_OK ||
+        !symbol_identity::VerifyDiaIdentity(provider.Source.Get(), {metadata.PdbGuid, 0, metadata.PdbAge}) ||
         provider.Source->openSession(&session) != S_OK || !session || session->get_globalScope(&global) != S_OK || !global ||
         !FindUnique(global.Get(), SymTagUDT, typeName, &type))
     {
@@ -314,4 +212,34 @@ bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, cons
         error->clear();
     }
     return true;
+}
+
+bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, const std::wstring& typeName,
+    const std::wstring& providerPath, TypeSchemaPackage* package, std::wstring* error)
+{
+    if (package == nullptr) { return false; }
+    *package = {};
+    SchemaArtifact imageFile, pdbFile, providerFile;
+    if (!imageFile.Open(image, 512ull * 1024 * 1024) || !pdbFile.Open(pdb, 1024ull * 1024 * 1024) ||
+        !providerFile.Open(providerPath, 64ull * 1024 * 1024))
+    {
+        if (error != nullptr) { *error = L"schema artifact lease unavailable"; }
+        return false;
+    }
+    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error);
+}
+
+bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, const std::wstring& typeName,
+    TypeSchemaPackage* package, std::wstring* error)
+{
+    if (package == nullptr) { return false; }
+    *package = {};
+    SchemaArtifact imageFile, pdbFile, providerFile;
+    if (!imageFile.OpenHandle(image, 512ull * 1024 * 1024) || !pdbFile.OpenHandle(pdb, 1024ull * 1024 * 1024) ||
+        !providerFile.OpenHandle(provider, 64ull * 1024 * 1024))
+    {
+        if (error != nullptr) { *error = L"schema artifact handle unavailable"; }
+        return false;
+    }
+    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error);
 }

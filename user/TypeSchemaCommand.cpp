@@ -1,4 +1,5 @@
 #include "TypeSchema.h"
+#include "TypeSchemaBroker.h"
 #include "ParserWorkerProcess.h"
 #include "McpJson.h"
 #include <filesystem>
@@ -16,21 +17,32 @@ namespace
 
 int RunTypeSchemaWorkerCommand(int argc, wchar_t** argv)
 {
-    if (argc != 5 || !IsRestrictedParserWorker())
+    if (argc != 6 || !IsRestrictedParserWorker())
     {
         return 3;
     }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     try
     {
-        const auto executable = ExecutablePath();
-        if (executable.empty())
+        HANDLE files[3]{};
+        for (size_t i = 0; i < std::size(files); ++i)
         {
-            return 4;
+            const std::wstring text = argv[3 + i];
+            if (text.empty() || text.size() > 20 || text.find_first_not_of(L"0123456789") != std::wstring::npos)
+            {
+                return 4;
+            }
+            uint64_t value = 0;
+            for (const auto c : text)
+            {
+                if (value > (UINTPTR_MAX - (c - L'0')) / 10) { return 4; }
+                value = value * 10 + (c - L'0');
+            }
+            if (value == 0 || value == UINTPTR_MAX) { return 4; }
+            files[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
         }
-        const auto provider = std::filesystem::path(executable).parent_path() / L"msdia140.dll";
         TypeSchemaPackage package;
-        if (!GenerateTypeSchema(argv[2], argv[3], argv[4], provider.wstring(), &package, nullptr))
+        if (!GenerateTypeSchemaFromHandles(files[0], files[1], files[2], argv[2], &package, nullptr))
         {
             return 5;
         }
@@ -68,22 +80,8 @@ int RunTypeSchemaCommand(int argc, wchar_t** argv)
     {
         if (argc == 7 && std::wstring(argv[2]) == L"create")
         {
-            ParserWorkerRequest request;
-            request.Executable = ExecutablePath();
-            request.Arguments = {L"--schema-worker", std::filesystem::absolute(argv[3]).wstring(),
-                std::filesystem::absolute(argv[4]).wstring(), argv[5]};
-            const auto worker = RunParserWorker(request);
-            if (worker.Status == L"exited")
-            {
-                const auto json = mcpjson::Utf8ToWide(worker.Output);
-                success = mcpjson::WideToUtf8(json) == worker.Output && ParseTypeSchema(json, &package, &error) &&
-                    package.ParserIsolated && package.TypeName == argv[5] && SaveTypeSchema(argv[6], package, &error);
-            }
-            else
-            {
-                error = L"schema worker " + worker.Status + L"; error=" + std::to_wstring(worker.Error) +
-                    L"; exit=" + std::to_wstring(worker.ExitCode);
-            }
+            success = GenerateBrokeredTypeSchema(ExecutablePath(), argv[3], argv[4], argv[5], &package, &error) &&
+                SaveTypeSchema(argv[6], package, &error);
         }
         else if (argc == 4 && std::wstring(argv[2]) == L"inspect")
         {

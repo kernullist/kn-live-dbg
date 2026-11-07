@@ -137,6 +137,11 @@ namespace executable_image
         uint32_t loadConfigSize,
         bool pe64);
     bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error);
+    // Reopens the supplied file object with an independent cursor; never resolves a path.
+    bool ReadDiskPeMetadataHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error);
+    // Identity-only metadata: stops after bounded headers/sections/RSDS. Does
+    // not populate managed-image, base-relocation or dynamic-relocation facts.
+    bool ReadDiskPeIdentityHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error);
     bool DiskFileIdentityMatches(
         HANDLE file,
         const DiskPeMetadata& metadata);

@@ -263,9 +263,13 @@ interval. See [sweep manifests](ARCHITECTURE.md#temporal-image-sweep-manifests).
 `KnLiveDbg.exe --schema create <image> <pdb> <exact-type> <new-output>` exports a
 private `.knschema` package from a matching local AMD64 PE/PDB and the packaged
 DIA provider. Names are case-sensitive. It opens no live device and downloads no
-symbols. PE/PDB/DIA parsing runs in a child with a restricted low-integrity
+symbols. The parent leases and hashes the three artifacts, decodes the bounded
+PE identity, and checks the child's result against those exact inputs. The child
+reads PE/PDB through approved read-only handles and loads the installed DIA DLL
+with its pathname pinned. PDB type parsing runs with a restricted low-integrity
 token, private desktop, allowlisted handles/environment, 512 MiB commit limit,
-one-process job and 60-second parent timeout. Unsupported containment fails
+one-process job and 60-second child supervision budget. Parent file hashing has
+separate cooperative limits. Unsupported containment or identity mismatch fails
 without an in-process fallback. This is not a filesystem or network sandbox.
 `KnLiveDbg.exe --schema inspect <package>` verifies the stored checksum and
 bounded field relationships without loading DIA or requiring the original files.
