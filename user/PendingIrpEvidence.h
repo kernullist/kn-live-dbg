@@ -15,6 +15,11 @@ struct PendingIrpCaptureContext
     uint64_t ReferenceBytes = 0; // Zero means retention was unavailable.
 };
 
+// Stable recorded-state signatures exclude scan times, pagination and operation
+// IDs. They bind the source contract and all three exact schema packages.
+IrpRetentionRequest PendingIrpRetentionRequest(const PendingIrpSchemaBinding& binding,
+    const PendingIrpScanResult& result, const PendingIrpCaptureContext& context) noexcept;
+
 std::wstring PendingIrpCaptureJson(const PendingIrpSchemaBinding& binding,
     const executable_image::DiskPeMetadata& metadata, const std::vector<PendingIrpThreadInput>& threads,
     const PendingIrpScanOptions& options, const PendingIrpScanResult& result, const ObservationRoutedReadSet& reads,

@@ -152,14 +152,14 @@ void KernelMonitor::ResetPipeline()
     CapturedIrps.Reset();
     IrpCapturesQueued.store(0); IrpCapturesWritten.store(0); IrpCapturesFailed.store(0); IrpCapturesDropped.store(0);
     IrpCaptureBytes.store(0); IrpCaptureLedgerFailed.store(0);
-    IrpCaptureReservedBytes.store(0); IrpReferenceBytes.store(0);
+    IrpCapturesUnavailable.store(0); IrpReferenceBytes.store(0);
     IrpReferencesCreated.store(0); IrpReferencesReused.store(0); IrpReferencesFailed.store(0);
     IrpJournalCapturesCommitted.store(0); IrpJournalCapturesFailed.store(0); IrpJournalLedgerFailed.store(0);
     IrpJournalLedgerCommitted.store(false);
     CapturedImageReadSets.Reset();
     // Producers/writer have stopped; live hunt readers can still inspect the
     // previous session. Serialize the policy-state replacement with that path.
-    { std::lock_guard<std::mutex> lock(HuntMutex); ImageRetention = ImageRetentionPolicy{}; }
+    { std::lock_guard<std::mutex> lock(HuntMutex); ImageRetention = ImageRetentionPolicy{}; IrpRetention = IrpRetentionPolicy{}; }
     ImageReadsQueued.store(0);
     ImageReadsWritten.store(0);
     ImageReadsFailed.store(0);
@@ -1350,7 +1350,7 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             EvidenceJournalTransaction closure;
             closure.Kind = L"closure"; closure.Id = L"0";
             closure.Members.push_back(EvidenceJournalJsonMember(L"image-reads/" + name, json));
-            const bool irpActive = IrpCapturesQueued.load() != 0 || IrpCapturesDropped.load() != 0;
+            const bool irpActive = IrpCapturesQueued.load() != 0 || IrpCapturesDropped.load() != 0 || IrpCapturesUnavailable.load() != 0;
             if (irpActive) { closure.Requires.push_back(L"irp-session-" + id + L".knirpledger"); }
             EvidenceJournalCommit commit;
             if (!irpActive || IrpJournalLedgerCommitted.load()) { commit = JournalImageFiles(std::move(closure)); }
@@ -1370,24 +1370,23 @@ void KernelMonitor::CloseImageReadCollection() noexcept
 
 bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact)
 {
-    if (!artifact) { return false; }
-    uint64_t reservation = 0;
+    if (!artifact) { IrpCapturesUnavailable.fetch_add(1); IrpRetention.RecordUnavailable(); return false; }
+    bool acquired = false;
     try
     {
         if (artifact->Bytes.empty() || artifact->Bytes.size() > PendingIrpEvidenceMaximumBytes || artifact->Sha256.size() != 64 ||
+            artifact->Sha256.find_first_not_of(L"0123456789abcdef") != std::wstring::npos ||
             (artifact->Reference && (artifact->Reference->Bytes.empty() || artifact->Reference->Bytes.size() > ReferenceArtifactMaxBytes)))
-        { IrpCapturesDropped.fetch_add(1); return false; }
+        { IrpCapturesDropped.fetch_add(1); IrpRetention.RecordUnavailable(true); return false; }
         const uint64_t bytes = artifact->Bytes.size() + (artifact->Reference ? artifact->Reference->Bytes.size() : 0);
-        auto used = IrpCaptureReservedBytes.load();
-        do { if (bytes > 128ull * 1024 * 1024 - used) { IrpCapturesDropped.fetch_add(1); return false; } }
-        while (!IrpCaptureReservedBytes.compare_exchange_weak(used, used + bytes));
-        reservation = bytes;
-        if (!CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact), bytes}))
-        { IrpCaptureReservedBytes.fetch_sub(bytes); IrpCapturesDropped.fetch_add(1); return false; }
+        auto ticket = IrpRetention.Acquire(artifact->Retention, bytes);
+        acquired = true; // Acquire includes its own attempt/denial accounting.
+        if (!ticket || !CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact), std::move(ticket)}))
+        { IrpCapturesDropped.fetch_add(1); return false; }
         IrpCapturesQueued.fetch_add(1);
         return true;
     }
-    catch (...) { if (reservation) { IrpCaptureReservedBytes.fetch_sub(reservation); } IrpCapturesDropped.fetch_add(1); return false; }
+    catch (...) { if (!acquired) { IrpRetention.RecordUnavailable(true); } IrpCapturesDropped.fetch_add(1); return false; }
 }
 
 void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
@@ -1395,6 +1394,7 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
     bool written = false;
     bool referenceSaved = false, referenceCreated = false;
     EvidenceJournalCommit commit;
+    const auto lane = capture.Retention ? capture.Retention->Class() : IrpRetentionClass::ObservationGap;
     try
     {
         std::wstring directory, failure = L"irp_capture_session_byte_budget";
@@ -1407,8 +1407,8 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         // A new raw-data producer requires an already initialized private root.
         // Publish directly in that pinned root; do not trust a pre-existing child directory.
         if (directory.empty() || !privacy->Open(directory, false, &report)) { failure = L"private_store_required:" + report.Issue; }
-        else if (lease.Acquire(directory, false, &failure) && capture.Artifact &&
-            capture.Artifact->Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load() - IrpReferenceBytes.load())
+        else if (lease.Acquire(directory, false, &failure) && capture.Artifact && capture.Retention &&
+            capture.Artifact->Bytes.size() <= IrpRetention.Remaining(lane, IrpRetentionStream::Capture))
         {
             const auto digest = ContentHash::Bytes(capture.Artifact->Bytes);
             if (!digest.empty() && digest == capture.Artifact->Sha256)
@@ -1427,12 +1427,16 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
                         if (!referenceLease->Open(referencePath, ReferenceArtifactMaxBytes))
                         {
                             referenceFailure = L"irp_reference_session_byte_budget";
-                            if (reference.Bytes.size() <= 128ull * 1024 * 1024 - IrpCaptureBytes.load() - IrpReferenceBytes.load() - capture.Artifact->Bytes.size())
+                            if (reference.Bytes.size() <= IrpRetention.Remaining(lane, IrpRetentionStream::Reference))
                             {
                                 created = PublishReferenceArtifact(referencePath, reference.Bytes, &referenceFailure,
                                     [&](HANDLE file) { return privacy->CheckFile(file); });
                                 // Count durable bytes even if a subsequent verification fails.
-                                if (created) { IrpReferenceBytes.fetch_add(reference.Bytes.size()); }
+                                if (created)
+                                {
+                                    IrpReferenceBytes.fetch_add(reference.Bytes.size());
+                                    IrpRetention.Consume(lane, IrpRetentionStream::Reference, reference.Bytes.size());
+                                }
                             }
                             if (created)
                             {
@@ -1453,6 +1457,7 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
                 if (written)
                 {
                     IrpCaptureBytes.fetch_add(capture.Artifact->Bytes.size());
+                    IrpRetention.Consume(lane, IrpRetentionStream::Capture, capture.Artifact->Bytes.size());
                     EvidenceJournalTransaction transaction;
                     transaction.Kind = L"irp_capture"; transaction.Id = digest;
                     transaction.Members.push_back({std::filesystem::path(path).filename().wstring(), digest,
@@ -1480,6 +1485,7 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         event.Evidence[L"journal_membership"] = commit.Committed ? L"committed" : L"not_committed";
         event.Evidence[L"journal_failure"] = commit.Issue;
         event.Evidence[L"journal_indexed"] = commit.Indexed ? L"true" : L"false";
+        event.Evidence[L"retention"] = capture.Retention ? capture.Retention->Json() : L"{}";
         event.Evidence[L"reference_persistence"] = referenceStatus;
         event.Evidence[L"reference_failure"] = referenceFailure;
         if (!PipelineEvents.Push(std::move(event))) { CollectionLost.fetch_add(1); }
@@ -1495,12 +1501,12 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         else if (referenceCreated) { IrpReferencesCreated.fetch_add(1); }
         else { IrpReferencesReused.fetch_add(1); }
     }
-    IrpCaptureReservedBytes.fetch_sub(capture.ReservedBytes);
+    if (capture.Retention) { capture.Retention->Finish(written && commit.Committed && (!capture.Retention->HasState() || referenceSaved)); }
 }
 
 void KernelMonitor::CloseIrpCollection() noexcept
 {
-    if (IrpCapturesQueued.load() == 0 && IrpCapturesDropped.load() == 0) { return; }
+    if (IrpCapturesQueued.load() == 0 && IrpCapturesDropped.load() == 0 && IrpCapturesUnavailable.load() == 0) { return; }
     try
     {
         std::wstring directory, failure;
@@ -1515,8 +1521,9 @@ void KernelMonitor::CloseIrpCollection() noexcept
             const auto json = L"{\"schema\":\"kn.irp_capture_session.v1\",\"collection_id\":" + mcpjson::Quote(id) +
                 L",\"queued\":" + n(IrpCapturesQueued.load()) + L",\"written\":" + n(IrpCapturesWritten.load()) +
                 L",\"failed\":" + n(IrpCapturesFailed.load()) + L",\"dropped\":" + n(IrpCapturesDropped.load()) +
+                L",\"unavailable\":" + n(IrpCapturesUnavailable.load()) + L",\"retention\":" + IrpRetention.Json() +
                 L",\"bytes\":" + n(IrpCaptureBytes.load()) + L",\"pending\":" + n(CapturedIrps.Size()) +
-                L",\"reserved_bytes\":" + n(IrpCaptureReservedBytes.load()) + L",\"reference_bytes_created\":" + n(IrpReferenceBytes.load()) +
+                L",\"reserved_bytes\":" + n(IrpRetention.MemoryHeld()) + L",\"reference_bytes_created\":" + n(IrpReferenceBytes.load()) +
                 L",\"references_created\":" + n(IrpReferencesCreated.load()) + L",\"references_reused\":" + n(IrpReferencesReused.load()) +
                 L",\"references_failed\":" + n(IrpReferencesFailed.load()) +
                 L",\"journal_captures_committed\":" + n(IrpJournalCapturesCommitted.load()) +
@@ -1840,10 +1847,12 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"irp_captures_written"] = std::to_wstring(IrpCapturesWritten.load());
         event.Evidence[L"irp_captures_failed"] = std::to_wstring(IrpCapturesFailed.load());
         event.Evidence[L"irp_captures_dropped"] = std::to_wstring(IrpCapturesDropped.load());
+        event.Evidence[L"irp_captures_unavailable"] = std::to_wstring(IrpCapturesUnavailable.load());
+        event.Evidence[L"irp_retention"] = IrpRetention.Json();
         event.Evidence[L"irp_captures_pending"] = std::to_wstring(CapturedIrps.Size());
         event.Evidence[L"irp_capture_bytes"] = std::to_wstring(IrpCaptureBytes.load());
         event.Evidence[L"irp_capture_ledger_failed"] = std::to_wstring(IrpCaptureLedgerFailed.load());
-        event.Evidence[L"irp_capture_reserved_bytes"] = std::to_wstring(IrpCaptureReservedBytes.load());
+        event.Evidence[L"irp_capture_reserved_bytes"] = std::to_wstring(IrpRetention.MemoryHeld());
         event.Evidence[L"irp_reference_bytes_created"] = std::to_wstring(IrpReferenceBytes.load());
         event.Evidence[L"irp_references_created"] = std::to_wstring(IrpReferencesCreated.load());
         event.Evidence[L"irp_references_reused"] = std::to_wstring(IrpReferencesReused.load());
@@ -2189,6 +2198,7 @@ bool KmonPipelineSelfTest()
                 const std::string fixture = "{\"schema\":\"kn.irp_capture.v2\",\"owned_writer_fixture\":true}";
                 artifact->Bytes.assign(fixture.begin(), fixture.end());
                 artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
+                artifact->Retention = {{std::wstring(64, L'a')}, false, false};
                 auto reference = std::make_shared<RetainedReferenceArtifact>();
                 reference->Bytes = {0x4d, 0x5a, 1, 2};
                 reference->Sha256 = ContentHash::Bytes(reference->Bytes);
@@ -2207,7 +2217,7 @@ bool KmonPipelineSelfTest()
                 const bool publication = initialized.Initialized && queued && irp.CapturedIrps.Size() == 0 &&
                     irp.IrpCapturesWritten.load() == 1 && irp.IrpCapturesFailed.load() == 1 &&
                     irp.IrpCaptureBytes.load() == artifact->Bytes.size() && irp.IrpCaptureLedgerFailed.load() == 0 &&
-                    irp.IrpCaptureReservedBytes.load() == 0 && irp.IrpReferencesCreated.load() == 1 && irp.IrpReferencesReused.load() == 1 &&
+                    irp.IrpRetention.MemoryHeld() == 0 && irp.IrpReferencesCreated.load() == 1 && irp.IrpReferencesReused.load() == 1 &&
                     irp.IrpReferenceBytes.load() == reference->Bytes.size() && irp.IrpReferencesFailed.load() == 0 &&
                     ContentHash::File((std::filesystem::path(privateRoot) / (L"irp-reference-" + reference->Sha256 + L".knblob")).wstring()) == reference->Sha256 &&
                     ContentHash::File(path.wstring()) == artifact->Sha256 && std::filesystem::exists(ledger) &&
@@ -2233,6 +2243,7 @@ bool KmonPipelineSelfTest()
                 auto second = std::make_shared<PendingIrpEvidenceArtifact>(*artifact);
                 const std::string secondFixture = "{\"schema\":\"kn.irp_capture.v2\",\"owned_writer_fixture\":2}";
                 second->Bytes.assign(secondFixture.begin(), secondFixture.end()); second->Sha256 = ContentHash::Bytes(second->Bytes);
+                second->Retention.StateKeys = {std::wstring(64, L'b')};
                 joinedOk = joinedOk && joined.QueueIrpCapture(artifact) && joined.QueueIrpCapture(second);
                 joined.WriterStopping.store(true); joined.CaptureWriterLoop();
                 const auto joinedRecovery = RecoverEvidenceJournal((std::filesystem::path(joinedRoot) / L"collections" / joinedId).wstring());
@@ -2258,16 +2269,25 @@ bool KmonPipelineSelfTest()
                     ContentHash::File(collisionPath.wstring()) == collisionHash;
                 const auto pressureOwner = std::make_unique<KernelMonitor>();
                 auto& pressure = *pressureOwner;
-                for (size_t n = 0; n < 5; ++n) { pressure.QueueIrpCapture(artifact); }
-                const bool bounded = pressure.CapturedIrps.Size() == 4 && pressure.IrpCapturesQueued.load() == 4 &&
-                    pressure.IrpCapturesDropped.load() == 1 && pressure.IrpCaptureReservedBytes.load() == 4 * (artifact->Bytes.size() + reference->Bytes.size());
+                auto gap = std::make_shared<PendingIrpEvidenceArtifact>(*artifact);
+                gap->Retention = {};
+                const bool fill = pressure.QueueIrpCapture(artifact) && pressure.QueueIrpCapture(artifact) &&
+                    !pressure.QueueIrpCapture(artifact) && pressure.QueueIrpCapture(second) && pressure.QueueIrpCapture(gap);
+                const bool bounded = fill && pressure.CapturedIrps.Size() == 4 && pressure.IrpCapturesQueued.load() == 4 &&
+                    pressure.IrpCapturesDropped.load() == 1 && pressure.IrpRetention.MemoryHeld() ==
+                    3 * artifact->Bytes.size() + second->Bytes.size() + 4 * reference->Bytes.size();
                 const auto weightedOwner = std::make_unique<KernelMonitor>();
                 auto large = std::make_shared<PendingIrpEvidenceArtifact>(*artifact);
                 auto largeReference = std::make_shared<RetainedReferenceArtifact>();
                 largeReference->Bytes.resize(ReferenceArtifactMaxBytes);
                 large->Reference = largeReference;
-                const bool weighted = weightedOwner->QueueIrpCapture(large) && !weightedOwner->QueueIrpCapture(large) &&
-                    weightedOwner->CapturedIrps.Size() == 1 && weightedOwner->IrpCaptureReservedBytes.load() == large->Bytes.size() + ReferenceArtifactMaxBytes;
+                auto largeFirst = std::make_shared<PendingIrpEvidenceArtifact>(*large);
+                largeFirst->Retention.StateKeys = {std::wstring(64, L'b')};
+                auto largeGap = std::make_shared<PendingIrpEvidenceArtifact>(*large);
+                largeGap->Retention = {};
+                const bool weighted = weightedOwner->QueueIrpCapture(large) && !weightedOwner->QueueIrpCapture(largeFirst) &&
+                    weightedOwner->QueueIrpCapture(largeGap) && weightedOwner->QueueIrpCapture(large) &&
+                    weightedOwner->CapturedIrps.Size() == 3 && weightedOwner->IrpRetention.MemoryHeld() == 3 * (large->Bytes.size() + ReferenceArtifactMaxBytes);
                 const auto deniedOwner = std::make_unique<KernelMonitor>();
                 auto& denied = *deniedOwner;
                 denied.Options.LogDirectory = unique; // Existing directory without private policy.
@@ -2276,11 +2296,81 @@ bool KmonPipelineSelfTest()
                 denied.CaptureWriterLoop();
                 const bool privateOnly = denied.IrpCapturesWritten.load() == 0 && denied.IrpCapturesFailed.load() == 1 &&
                     denied.IrpCaptureBytes.load() == 0 && denied.CapturedIrps.Size() == 0 && denied.IrpCaptureLedgerFailed.load() == 1 &&
-                    denied.IrpCaptureReservedBytes.load() == 0 && denied.IrpReferencesFailed.load() == 1 &&
+                    denied.IrpRetention.MemoryHeld() == 0 && denied.IrpReferencesFailed.load() == 1 &&
                     !denied.IrpJournalLedgerCommitted.load() && denied.IrpJournalLedgerFailed.load() == 1 && !denied.ImageJournalClosed.load();
-                if (!publication || !joinedOk || !collisionOk || !bounded || !weighted || !privateOnly)
-                { std::fprintf(stderr, "FAIL IRP private publication/journal/ledger/pressure/drain controls: %u %u %u %u %u %u\n",
-                    publication, joinedOk, collisionOk, bounded, weighted, privateOnly); break; }
+                const auto missingRoot = std::wstring(unique) + L"\\irp-missing-capture";
+                const auto missingOwner = std::make_unique<KernelMonitor>();
+                auto& missing = *missingOwner;
+                missing.Options.LogDirectory = missingRoot;
+                bool missingOk = InitializeEvidencePrivateStore(missingRoot, false).Initialized && !missing.QueueIrpCapture({});
+                missing.WriterStopping.store(true); missing.CaptureWriterLoop();
+                const auto missingId = std::to_wstring(missing.EvidenceCollectionEpoch.load());
+                std::wstring missingJson;
+                missingOk = missingOk && missing.IrpCapturesUnavailable.load() == 1 && missing.IrpCapturesQueued.load() == 0 &&
+                    missing.IrpJournalLedgerCommitted.load() && missing.ImageJournalClosed.load() &&
+                    ReadAnalystSnapshot((std::filesystem::path(missingRoot) / (L"irp-session-" + missingId + L".knirpledger")).wstring(), &missingJson, nullptr) &&
+                    missingJson.find(L"\"unavailable\":\"1\"") != std::wstring::npos && missing.IrpRetention.MemoryHeld() == 0;
+                const auto quotaRoot = std::wstring(unique) + L"\\irp-priority-quota";
+                const auto quotaOwner = std::make_unique<KernelMonitor>();
+                auto& quota = *quotaOwner;
+                quota.Options.LogDirectory = quotaRoot;
+                auto limits = IrpRetentionPolicy::DefaultLimits();
+                limits[0].FileBytes = {1024, reference->Bytes.size()};
+                limits[1].FileBytes = {secondFixture.size(), reference->Bytes.size()};
+                limits[2].FileBytes = {secondFixture.size(), reference->Bytes.size()};
+                quota.IrpRetention = IrpRetentionPolicy(limits);
+                const auto quotaId = std::to_wstring(quota.EvidenceCollectionEpoch.load());
+                auto anotherReference = std::make_shared<RetainedReferenceArtifact>(*reference);
+                anotherReference->Bytes.back() = 3;
+                anotherReference->Sha256 = ContentHash::Bytes(anotherReference->Bytes);
+                const auto persist = [&](unsigned ordinal, IrpRetentionRequest hint,
+                    std::shared_ptr<const RetainedReferenceArtifact> retained, IrpRetentionClass expected, bool published)
+                {
+                    auto input = std::make_shared<PendingIrpEvidenceArtifact>();
+                    const auto bytes = "{\"schema\":\"kn.irp_capture.v2\",\"owned_writer_fixture\":" + std::to_string(ordinal) + "}";
+                    input->Bytes.assign(bytes.begin(), bytes.end()); input->Sha256 = ContentHash::Bytes(input->Bytes);
+                    input->Retention = std::move(hint); input->Reference = std::move(retained);
+                    if (!quota.QueueIrpCapture(input)) { return false; }
+                    KernelMonitor::CapturedIrp work;
+                    if (!quota.CapturedIrps.Pop(&work) || work.Retention->Class() != expected) { return false; }
+                    const auto before = quota.IrpCapturesWritten.load();
+                    quota.PersistIrpCapture(work);
+                    const auto output = std::filesystem::path(quotaRoot) / (L"irp-" + quotaId + L"-" + input->Sha256 + L".knirp");
+                    return quota.IrpCapturesWritten.load() == before + (published ? 1 : 0) &&
+                        (published ? ContentHash::File(output.wstring()) == input->Sha256 : !std::filesystem::exists(output));
+                };
+                using IrpClass = IrpRetentionClass;
+                // Exhaust the repeat partition, then retain a new state and gap.
+                // A missing reference must keep the new state's first priority.
+                // The gap partition supplies that reference; first-state retry
+                // can reuse it even when its own reference budget is exhausted.
+                bool quotaOk = InitializeEvidencePrivateStore(quotaRoot, false).Initialized &&
+                    persist(1, artifact->Retention, reference, IrpClass::FirstState, true) &&
+                    persist(2, artifact->Retention, reference, IrpClass::Routine, true) &&
+                    persist(3, artifact->Retention, reference, IrpClass::Routine, false) &&
+                    persist(4, second->Retention, anotherReference, IrpClass::FirstState, true) &&
+                    quota.IrpReferencesFailed.load() == 2 &&
+                    persist(5, {}, anotherReference, IrpClass::ObservationGap, true) &&
+                    persist(6, second->Retention, anotherReference, IrpClass::FirstState, true) &&
+                    persist(7, second->Retention, anotherReference, IrpClass::Routine, false);
+                quota.WriterStopping.store(true); quota.CaptureWriterLoop();
+                std::wstring quotaJson;
+                const auto quotaRecovery = RecoverEvidenceJournal((std::filesystem::path(quotaRoot) / L"collections" / quotaId).wstring());
+                quotaOk = quotaOk && quota.IrpCapturesQueued.load() == 7 && quota.IrpCapturesWritten.load() == 5 && quota.IrpCapturesFailed.load() == 2 &&
+                    quota.IrpCaptureBytes.load() == 5 * secondFixture.size() && quota.IrpReferenceBytes.load() == 2 * reference->Bytes.size() &&
+                    quota.IrpReferencesCreated.load() == 2 && quota.IrpReferencesReused.load() == 2 && quota.IrpReferencesFailed.load() == 3 &&
+                    quota.IrpJournalCapturesCommitted.load() == 5 && quota.IrpJournalCapturesFailed.load() == 2 &&
+                    quota.IrpRetention.Remaining(IrpClass::Routine, IrpRetentionStream::Capture) == 0 &&
+                    quota.IrpRetention.Remaining(IrpClass::ObservationGap, IrpRetentionStream::Capture) == 0 &&
+                    quota.IrpRetention.Remaining(IrpClass::FirstState, IrpRetentionStream::Capture) == 1024 - 3 * secondFixture.size() &&
+                    quota.IrpRetention.Remaining(IrpClass::FirstState, IrpRetentionStream::Reference) == 0 &&
+                    quota.IrpRetention.MemoryHeld() == 0 && quota.IrpJournalLedgerCommitted.load() && quota.ImageJournalClosed.load() &&
+                    quotaRecovery.Closed && quotaRecovery.CommittedSegments == 7 && quotaRecovery.UniquePaths == 9 &&
+                    ReadAnalystSnapshot((std::filesystem::path(quotaRoot) / (L"irp-session-" + quotaId + L".knirpledger")).wstring(), &quotaJson, nullptr) &&
+                    quotaJson.find(L"\"retention\":" + quota.IrpRetention.Json()) != std::wstring::npos;
+                if (!publication || !joinedOk || !collisionOk || !bounded || !weighted || !privateOnly || !missingOk || !quotaOk)
+                { std::fprintf(stderr, "FAIL IRP publication/journal/ledger/pressure/drain/missing/quotas: %u %u %u %u %u %u %u %u\n",
+                    publication, joinedOk, collisionOk, bounded, weighted, privateOnly, missingOk, quotaOk); break; }
             }
             std::vector<uint8_t> expected(4096, 0x53);
             std::memcpy(allocation, expected.data(), expected.size());

@@ -14,6 +14,14 @@ class DeviceClient;
 class SymbolEngine;
 struct RetainedReferenceArtifact;
 
+// Priority signatures of recorded state, never object identities or lifetime
+// joins. Derived from the same scan before publication; absent metadata is a gap.
+struct IrpRetentionRequest
+{
+    std::vector<std::wstring> StateKeys;
+    bool Gap = true, UnkeyedState = false;
+};
+
 // One bounded UTF-8 capture per scan; request events refer to its digest.
 // A digest identifies content, not an authenticated collector or object lifetime.
 struct PendingIrpEvidenceArtifact
@@ -21,6 +29,7 @@ struct PendingIrpEvidenceArtifact
     std::vector<uint8_t> Bytes;
     std::wstring Sha256;
     std::shared_ptr<const RetainedReferenceArtifact> Reference;
+    IrpRetentionRequest Retention;
 };
 
 struct PendingIrpThreadInput

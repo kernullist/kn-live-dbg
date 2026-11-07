@@ -486,6 +486,9 @@
     <ClInclude Include="PendingIrpScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="IrpRetentionPolicy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="PendingIrpReader.h">
       <Filter>Header Files</Filter>
     </ClInclude>

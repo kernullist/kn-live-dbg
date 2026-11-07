@@ -7,6 +7,77 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## IRP retention priority checkpoint: 2026-11-07
+
+This P06/P13 step separates first recorded IRP states, observation gaps and
+repeated/empty observations in the KMON queue and writer. Four shared in-flight
+slots have independent 80 MiB class budgets: 240 MiB total. Separate capture
+64/32/32 MiB and reference 64/64/64 MiB budgets allow at most 320 MiB of new raw
+files per session. These replace the previous combined 128 MiB allowances;
+producer artifacts and journal/event metadata are separate. No physical disk
+reservation is claimed. See the [priority contract](ARCHITECTURE.md#irp-retention-priority).
+
+The state signature binds the captured source contract, exact schema packages
+and typed request fields. It is a retention key, not an object-lifetime join or
+maliciousness verdict. A key becomes saved only after capture/reference/journal
+publication succeeds. Missing encoded captures now contribute to a protected
+final ledger even when no raw capture enters the queue. Legacy capture v1/v2
+bytes, replay policy and native ABI are unchanged.
+
+The ASan retention harness passed **28 controls** and an independent accounting
+oracle passed **101 checks**, including **9,000 attempts from nine concurrent
+threads**. Controls cover round-robin selection, writer-held reservations,
+separate maximum-size artifact capacity, failed-publication retry, pending and
+saved repeats, key bounds, abandoned tickets and final zero reservations.
+The ASan binding harness passed **101 controls**; the independent oracle checked
+**32 fields / 29 original reads** and reconstructed the signature directly from
+the saved source/schema/request data. Typed-field, source-epoch and schema
+changes produce new keys; time, pagination and coverage counters do not.
+Replay passed **46 harness controls** and **50 product CLI controls**, including
+original failure outcomes, modified inputs and command usage rejection.
+
+The final Release product passed an isolated `--self-test all`: timeline **28**,
+MCP **102**, KMON image integration **119**, console **564**, command audit
+**3,011 / 261 routes**, and remote **68** plus four connection-option controls.
+Actual KMON writer checks exhaust the repeat file budget, then retain first-state
+and gap captures. A first-state reference-budget failure leaves its state
+eligible for first priority; the gap class retains the reference, and the retry
+reuses it without charging new bytes. Only then does a later identical state
+use the repeat class. Final physical hashes, committed journal counts, reference
+creation/reuse/failures, embedded retention report and drained reservations agree.
+An unavailable-only session also publishes its failure ledger and closes through
+the journal. These writer controls use owned ACL-only roots without a driver.
+
+Capability checks passed **35 contracts / 261 routes** and the generated support
+matrix matches the binary, with target availability still unprobed. The expanded
+public-content classifier passed **12 tests**. Review covered ticket ownership,
+allocation rollback, concurrent admission, per-stream byte charging, missing
+capture accounting, reference reuse and post-publication retry. No additional
+actionable defects were found in the reviewed scope.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `4a6420cc19f3e5bd9d9fde10723a96477bf607f12a680ed152ac4898d89dda66` |
+| IRP retention, ASan | `4a61b1e3c20f9814ceaffff3cc927b843842d772f51d108254df4824c501ae2d` |
+| IRP binding/replay, ASan | `0e8c475a8911c6dab6d8e2b870fada92d39448cac122b5a6a86fbe65ebf8f0de` |
+
+Reproduce with `tools/validate-irp-retention.ps1 -Sanitize`,
+`tools/validate-irp-binding.ps1 -Sanitize`, and `KnLiveDbg.exe --self-test all`.
+Use the binding harness's emitted fixture directory for
+`tools/test-irp-replay.py <product-exe> <owned-fixture-directory> --product`.
+The bundled Python runtime is required on this host. Validation used Windows
+11 Pro 10.0.28000, kernel 10.0.28000.3231, VS 17.14.60, MSVC 14.44.35207 and
+SDK/WDK 10.0.26100.0. Existing C4744 link warnings remain. No driver was loaded,
+service/firewall policy changed or reboot performed. Final checks found no
+test process, parser profile/receipt/preparation or running task-driver residue;
+completed code caches and owned fixtures remain deliberately.
+
+These controls do not establish native request lifetime, address-reuse safety,
+approved Windows build coverage or full P05/P06/P13 and VS2/VS3 completion.
+Committed-root retirement, other-family priorities/redaction, large-store
+continuation, power-loss recovery and the earlier real-kernel PDB ASan resource
+failure remain open. The full P01-P16/VS1-VS4 objective remains active.
+
 ## IRP journal and retention checkpoint: 2026-11-07
 
 This P06/P13 slice connects private IRP captures, retained references and the
@@ -69,8 +140,9 @@ the product `--exe`, keeping the harness as `--producer`. Store/GC runners use
 the same options; `tools/test-irp-journal.py` uses `--product`. All require an
 owned `--fixtures` location and the bundled Python runtime on this host.
 
-The native ABI and existing v1 image journal bytes are unchanged. Committed-root
-retirement, IRP-specific priority partitions, other evidence families, large-store
+The native ABI and existing v1 image journal bytes are unchanged. At this
+checkpoint, committed-root retirement, IRP-specific priority partitions,
+other evidence families, large-store
 continuation, power-loss recovery, native request lifetime/build qualification
 and the prior real-kernel PDB ASan resource failure remain open. These checks do
 not complete P05/P06/P13 or VS2/VS3.

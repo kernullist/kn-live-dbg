@@ -12,6 +12,7 @@
 #include "EvidenceStore.h"
 #include "EvidencePrivacy.h"
 #include "ImageRetentionPolicy.h"
+#include "IrpRetentionPolicy.h"
 #include "ObservationReadRouting.h"
 #include "ExecutableRegionCatalog.h"
 #include "KmonHunting.h"
@@ -614,16 +615,18 @@ private:
     {
         std::wstring CollectionId;
         std::shared_ptr<const PendingIrpEvidenceArtifact> Artifact;
-        uint64_t ReservedBytes = 0;
+        std::shared_ptr<IrpRetentionPolicy::Ticket> Retention;
     };
     bool QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact);
     void PersistIrpCapture(const CapturedIrp& capture) noexcept;
     void CloseIrpCollection() noexcept;
-    KmonWorkQueue<CapturedIrp> CapturedIrps{4}; // Queue + writer share a 128 MiB reservation.
+    IrpRetentionQueue<CapturedIrp> CapturedIrps;
+    IrpRetentionPolicy IrpRetention;
     std::atomic<uint64_t> IrpCapturesQueued{0}, IrpCapturesWritten{0}, IrpCapturesFailed{0}, IrpCapturesDropped{0};
+    std::atomic<uint64_t> IrpCapturesUnavailable{0};
     std::atomic<uint64_t> IrpCaptureBytes{0};
     std::atomic<uint64_t> IrpCaptureLedgerFailed{0};
-    std::atomic<uint64_t> IrpCaptureReservedBytes{0}, IrpReferenceBytes{0};
+    std::atomic<uint64_t> IrpReferenceBytes{0};
     std::atomic<uint64_t> IrpReferencesCreated{0}, IrpReferencesReused{0}, IrpReferencesFailed{0};
     std::atomic<uint64_t> IrpJournalCapturesCommitted{0}, IrpJournalCapturesFailed{0}, IrpJournalLedgerFailed{0};
     std::atomic<bool> IrpJournalLedgerCommitted{false};

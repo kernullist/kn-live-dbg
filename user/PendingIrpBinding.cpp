@@ -189,6 +189,7 @@ bool CaptureBoundPendingIrps(IObservationSource& source, const PendingIrpSchemaB
         artifact->Bytes.assign(utf8.begin(), utf8.end());
         artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
         artifact->Reference = std::move(retained);
+        artifact->Retention = PendingIrpRetentionRequest(binding, *result, context);
         if (!artifact->Sha256.empty()) { result->Evidence = std::move(artifact); }
     }
     if (!result->Evidence)

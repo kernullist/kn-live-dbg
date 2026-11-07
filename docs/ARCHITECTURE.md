@@ -300,7 +300,8 @@ The KMON writer publishes original reference/read/recipe files, then a journal
 record under `collections/<collection-id>/journal-segments/`. A sweep root is
 committed only after every artifact it declares as published belongs to an earlier
 record. IRP captures and their retained references use `irp_capture` transactions;
-the final IRP ledger uses `irp_ledger`. When IRP work was admitted or dropped, the
+the final IRP ledger uses `irp_ledger`. When IRP work was admitted, dropped or
+unavailable before encoding, the
 writer requires that ledger's commit before publishing the read-session closure
 with an explicit ledger dependency. A failed IRP ledger leaves the collection
 open. The existing `persistence` and file counters describe individual
@@ -1497,11 +1498,12 @@ Encoded capture size is capped at 16 MiB. Incomplete capture/operation state
 cannot qualify a result. The boot-tick report interval and the recorder's steady
 clock are identified separately.
 
-KMON request events reference the capture SHA-256. The four-slot queue and its
-writer share a 128 MiB byte reservation, charged until publication finishes.
-Each capture is at most 16 MiB and each image at most 64 MiB. This bounds queued
-and writing artifacts; the producer's current capture is separate. The writer
-has a combined 128 MiB session allowance for new capture and reference bytes.
+KMON request events reference the capture SHA-256. The queue and its writer
+share four slots and a 240 MiB byte bound through the
+[IRP priority partitions](#irp-retention-priority). Each capture is at most
+16 MiB and each image at most 64 MiB. This bounds queued and writing artifacts;
+the producer's current capture is separate. Partitioned session allowances
+limit newly published capture/reference files to 320 MiB, excluding metadata.
 New `.knirp` files require an already initialized private evidence store in the
 configured log directory. The existing store policy determines ACL-only or EFS
 protection; there is no automatic initialization or encryption downgrade. The
@@ -1512,6 +1514,8 @@ is created without replacement or reused only after hash, size and privacy
 checks under a read-only lease. Reference failure does not erase the original
 capture; its publication event records the gap. A `.knirpledger` records final
 queue counts, bytes, pending reservations and reference creation/reuse/failures.
+It includes unavailable pre-encoding captures and per-class retention counters;
+these failures require a final ledger even when no raw capture was queued.
 A missing private policy causes a publication failure,
 not a silently successful capture. These formats and pending files are excluded
 from source publication even when a JSON artifact is renamed.
@@ -1546,11 +1550,57 @@ uncommitted GC cover these root files without upgrading their replay or source
 authenticity claims. Unknown tails and failure ledgers remain protected.
 
 Approved build/schema change handling, real native-driver lifecycle evidence,
-committed-root retirement and IRP-specific retention priorities remain open.
+committed-root retirement and cross-session retention remain open.
 Journal integration controls are recorded in
 [validation](VALIDATION.md#irp-journal-and-retention-checkpoint-2026-11-07).
 Owned DIA/offset/read-byte and replay controls are recorded in
 [validation](VALIDATION.md#pending-irp-offline-replay-checkpoint-2026-11-07).
+
+#### IRP retention priority
+
+`kn.irp_retention_partition.v1` separates `first_observed_state`,
+`observation_gap` and `repeat_or_empty`. They have respectively two, one and
+one queue/writer slots, with round-robin service across nonempty queues.
+Each class has an independent 80 MiB memory bound, enough for one maximum
+capture plus reference. A ticket holds both slot and bytes until its last
+owner releases it, including the writer's in-flight work. Classes cannot borrow
+each other's allowance. The earlier combined 128 MiB bound is replaced by this
+240 MiB bound so a maximum-size repeat cannot consume the first/gap reserves.
+
+New capture files have separate 64/32/32 MiB session budgets; references have
+64 MiB per class. Thus the maximum newly published raw data is 320 MiB per
+session. Already retained references cost zero after exact hash, size and
+privacy checks. Newly published bytes remain charged if a later check or
+journal commit fails. These limits do not reserve physical disk space or
+cover journal/index/event metadata, the producer's current artifact, or prior
+sessions. Missing encoded artifacts contribute to the unavailable denominator
+without competing for raw-file slots or bytes.
+
+Priority signatures come from the same captured result. They bind the exact
+source contract, image base, all three canonical schema packages, thread
+PID/TID/address/create-time, IRP address and typed packet/stack fields. Unknown
+optional fields remain distinct from zero/false. Scan times, operation IDs,
+cursor position and aggregate counts do not change the signature. Coverage
+gaps remain a separate flag. A signature identifies recorded state only:
+it does not prove object lifetime, exclude address reuse, or classify risk or
+maliciousness. First priority is not a high-risk verdict.
+
+An unseen state receives first priority. An identical pending state uses the
+repeat/gap class; it cannot occupy another first slot. The state becomes saved
+only after the capture and required reference belong to a committed journal
+batch. Failed publication remains eligible for first priority after its pending
+tickets drain. Up to 8,192 keys are tracked per recording session, with at most
+256 keys per capture. New keys denied at that bound are counted, never silently
+classified as repeats. Unkeyed states retain first priority; saved keys do not
+cross sessions.
+
+The final `kn.irp_retention.v1` report records attempts, admissions, resource/key
+denials, unavailable/invalid input, finished/complete/abandoned work, current and
+peak reservations, and physical file-byte charges by class. Publication events
+identify their selected class. Final ledgers retain these denominators even
+after raw-file budgets are exhausted. Actual writer quota, reference-retry and
+concurrent admission checks are recorded in
+[validation](VALIDATION.md#irp-retention-priority-checkpoint-2026-11-07).
 
 ### Live symbol and type index broker
 

@@ -5,6 +5,8 @@
 #include "ExecutableImageVerifier.h"
 #include "ObservationReadRoutingJson.h"
 #include "BoundedObservationJson.h"
+#include "ContentHash.h"
+#include <algorithm>
 #include <filesystem>
 
 using namespace bounded_observation_json;
@@ -35,6 +37,69 @@ namespace
             L",\"physical_bits\":" + N(a.PhysicalAddressBits) + L",\"legacy_assumed\":" + B(a.LegacyAssumed) +
             L",\"user_maximum\":" + N(a.UserMaximum) + L",\"kernel_minimum\":" + N(a.KernelMinimum) + L"}";
     }
+}
+
+IrpRetentionRequest PendingIrpRetentionRequest(const PendingIrpSchemaBinding& binding,
+    const PendingIrpScanResult& result, const PendingIrpCaptureContext& context) noexcept
+{
+    IrpRetentionRequest request;
+    if (!result.RuntimeQualified || !context.ReferenceStable || !context.FinalSourceSame || context.FinalCancelled ||
+        context.ReferenceBytes == 0 || context.ReferenceBytes > ReferenceArtifactMaxBytes) { return request; }
+    request.UnkeyedState = !result.Requests.empty();
+    try
+    {
+        if (!result.AddressSpace.Valid() || !context.Source.AddressSpace.Valid() || context.Source.SourceId.empty() ||
+            context.Source.SourceId.size() > 1024 || context.Source.AddressDomain != ObservationAddressDomain::Virtual ||
+            result.Requests.size() > 256) { return request; }
+        const auto add = [](ContentHash& hash, const std::wstring& json)
+        {
+            const auto bytes = mcpjson::WideToUtf8(json);
+            return !bytes.empty() && hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+        };
+        ContentHash scope;
+        if (!add(scope, L"{\"policy\":\"kn.irp_state_signature.v1\",\"source\":" + SourceJson(context.Source) +
+            L",\"image_base\":" + N(binding.ImageBase) + L",\"schemas\":[")) { return request; }
+        for (size_t i = 0; i < binding.Schemas.size(); ++i)
+        {
+            if (!binding.Schemas[i]) { return request; }
+            const auto json = TypeSchemaJson(*binding.Schemas[i]);
+            if (json.empty() || !add(scope, (i ? L"," : L"") + json)) { return request; }
+        }
+        if (!add(scope, L"]}")) { return request; }
+        const auto scopeDigest = scope.Finish();
+        if (scopeDigest.empty()) { return request; }
+        std::vector<std::wstring> keys;
+        for (const auto& observed : result.Requests)
+        {
+            if (observed.ThreadCreateTime == 0 || !result.AddressSpace.KernelRange(observed.Thread.ThreadObject, 1) ||
+                !result.AddressSpace.KernelRange(observed.Irp, 1) || observed.Stacks.size() > 64) { return request; }
+            const auto pointer = [](const std::optional<uint64_t>& value) { return value ? N(*value) : L"null"; };
+            const auto flag = [](const std::optional<bool>& value) { return value ? B(*value) : L"null"; };
+            std::wstring json = L"{\"scope_sha256\":" + mcpjson::Quote(scopeDigest) + L",\"thread\":" + N(observed.Thread.ThreadObject) +
+                L",\"pid\":" + N(observed.Thread.ProcessId) + L",\"tid\":" + N(observed.Thread.ThreadId) + L",\"created\":" + N(observed.ThreadCreateTime) +
+                L",\"irp\":" + N(observed.Irp) + L",\"stack_count\":" + N(observed.StackCount) + L",\"current_location\":" + N(observed.CurrentLocation) +
+                L",\"cancel\":" + flag(observed.CancelFlag) + L",\"pending_returned\":" + flag(observed.PendingReturned) +
+                L",\"io_status\":" + (observed.IoStatus ? mcpjson::Quote(std::to_wstring(*observed.IoStatus)) : L"null") + L",\"stacks\":[";
+            for (size_t i = 0; i < observed.Stacks.size(); ++i)
+            {
+                const auto& stack = observed.Stacks[i];
+                if (i) { json += L","; }
+                json += L"{\"index\":" + N(stack.Index) + L",\"address\":" + N(stack.Address) + L",\"major\":" + N(stack.MajorFunction) +
+                    L",\"minor\":" + N(stack.MinorFunction) + L",\"control\":" + N(stack.Control) + L",\"completion\":" + N(stack.CompletionRoutine) +
+                    L",\"context\":" + N(stack.Context) + L",\"device\":" + pointer(stack.DeviceObject) + L",\"file\":" + pointer(stack.FileObject) + L"}";
+            }
+            ContentHash hash;
+            if (!add(hash, json + L"]}")) { return request; }
+            const auto key = hash.Finish();
+            if (key.empty()) { return request; }
+            keys.push_back(key);
+        }
+        std::sort(keys.begin(), keys.end()); keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        request.StateKeys = std::move(keys); request.UnkeyedState = false;
+        request.Gap = !result.CoverageComplete || result.UnstableObservations != 0;
+    }
+    catch (...) {} // Preserve the capture with explicit unkeyed/gap admission.
+    return request;
 }
 
 std::wstring PendingIrpCaptureJson(const PendingIrpSchemaBinding& binding,

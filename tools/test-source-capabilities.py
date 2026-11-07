@@ -79,6 +79,9 @@ def main():
     assert "efs_default" in privacy["requirements"] and "no_transfer_authority" in privacy["limits"]
     assert retention["availability"] == "not_probed" and retention["consistency"] == "recording_session_partitions"
     assert "complete_journal_batch_before_repeat_demotion" in retention["requirements"] and "image_pipeline_only" in retention["limits"]
+    irp_retention = by_key[("evidence", "retention_irp", "native")]
+    assert "reference_and_journal_before_repeat_demotion" in irp_retention["requirements"]
+    assert "unavailable_capture_denominator" in irp_retention["requirements"] and "4_slots_240MiB_reserved" in irp_retention["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]

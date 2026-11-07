@@ -164,6 +164,53 @@ int wmain(int argc, wchar_t** argv)
     Check(run(baseline, binding, &good) && good.RuntimeQualified && good.CoverageComplete && good.Records.size() == 1 &&
         good.Requests.size() == 1 && !good.ReferencedLifetime, "schema image owner list and IRP invariants qualify bounded observation");
     if (!good.RuntimeQualified || good.Requests.empty() || !good.Evidence) { std::wcerr << error << '\n'; return 1; }
+    {
+        PendingIrpCaptureContext context;
+        context.Source = baseline.Capabilities(); context.ReferenceStable = context.FinalSourceSame = true;
+        context.ReferenceBytes = good.Evidence->Reference ? good.Evidence->Reference->Bytes.size() : 0;
+        const auto hint = PendingIrpRetentionRequest(binding, good, context);
+        Check(hint.StateKeys.size() == 1 && hint.StateKeys == good.Evidence->Retention.StateKeys && !hint.Gap && !hint.UnkeyedState,
+            "qualified capture carries original recorded-state retention signature");
+        auto later = good;
+        later.ScanStartedTickMs += 100; later.ScanFinishedTickMs += 100;
+        later.ThreadsVisited += 1; later.IrpsInspected += 1; later.WalkNodes += 1; later.NextCursor.IrpAddress += 16;
+        later.CoverageComplete = false;
+        const auto repeat = PendingIrpRetentionRequest(binding, later, context);
+        Check(repeat.StateKeys == hint.StateKeys && repeat.Gap, "scan time pagination and coverage do not invent new request state");
+        for (const auto& mutate : std::vector<std::function<void(PendingIrpRequestObservation&)>>{
+            [](auto& r) { ++r.Thread.ProcessId; }, [](auto& r) { ++r.Thread.ThreadId; }, [](auto& r) { r.Thread.ThreadObject += 16; },
+            [](auto& r) { ++r.ThreadCreateTime; }, [](auto& r) { r.Irp += 16; }, [](auto& r) { ++r.StackCount; },
+            [](auto& r) { ++r.CurrentLocation; }, [](auto& r) { r.CancelFlag = !r.CancelFlag.value_or(false); },
+            [](auto& r) { r.PendingReturned = !r.PendingReturned.value_or(false); }, [](auto& r) { r.IoStatus = -17; },
+            [](auto& r) { ++r.Stacks[0].Index; }, [](auto& r) { r.Stacks[0].Address += 16; }, [](auto& r) { ++r.Stacks[0].MajorFunction; },
+            [](auto& r) { ++r.Stacks[0].MinorFunction; }, [](auto& r) { ++r.Stacks[0].Control; },
+            [](auto& r) { r.Stacks[0].CompletionRoutine += 16; }, [](auto& r) { ++r.Stacks[0].Context; },
+            [](auto& r) { r.Stacks[0].DeviceObject.reset(); }, [](auto& r) { r.Stacks[0].FileObject = r.Stacks[0].FileObject.value_or(0) + 16; }})
+        {
+            auto changed = good; mutate(changed.Requests[0]);
+            const auto updated = PendingIrpRetentionRequest(binding, changed, context);
+            Check(updated.StateKeys.size() == 1 && updated.StateKeys != hint.StateKeys, "changed typed request field gets new retention signature");
+        }
+        auto sourceChanged = context; sourceChanged.Source.SourceId += L":new_epoch";
+        Check(PendingIrpRetentionRequest(binding, good, sourceChanged).StateKeys != hint.StateKeys, "source epoch scopes retention signatures");
+        auto schemaChanged = binding;
+        for (auto& schema : schemaChanged.Schemas)
+        {
+            auto next = std::make_shared<TypeSchemaPackage>(*schema); next->ProviderVersion += L".owned"; schema = next;
+        }
+        Check(PendingIrpRetentionRequest(schemaChanged, good, context).StateKeys != hint.StateKeys, "exact packages scope retention signatures");
+        auto noImage = context; noImage.ReferenceBytes = 0;
+        const auto missing = PendingIrpRetentionRequest(binding, good, noImage);
+        Check(missing.Gap && missing.StateKeys.empty(), "unretained reference stays in gap lane");
+        auto failed = good; failed.RuntimeQualified = false;
+        const auto unqualified = PendingIrpRetentionRequest(binding, failed, context);
+        Check(unqualified.Gap && unqualified.StateKeys.empty(), "unqualified candidates cannot become saved-state signatures");
+        std::wstring keys = L"{\"schema\":\"kn.irp_retention_keys.v1\",\"keys\":[";
+        for (size_t i = 0; i < hint.StateKeys.size(); ++i) { if (i) { keys += L","; } keys += mcpjson::Quote(hint.StateKeys[i]); }
+        const auto bytes = mcpjson::WideToUtf8(keys + L"],\"referenced_lifetime\":false}");
+        Check(PublishReferenceArtifact((root / L"positive-retention.json").wstring(), std::vector<uint8_t>(bytes.begin(), bytes.end()), &error),
+            "retention signature fixture retained for independent oracle");
+    }
     const auto json = Json(good);
     std::wstring raw;
     ObservationRoutedReadSet readset;

@@ -129,7 +129,22 @@ def main():
     assert struct.unpack("<I", pdb[0][20:])[0] == int(schemas[0]["pdb_age"])
     assert request["validation_stage"] == "qualified_observation" and request["build_approval"] == "not_established"
     assert request["process_create_time"] is None and not request["referenced_lifetime"]
+    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    scope = {"policy": "kn.irp_state_signature.v1", "source": capture["source_contract"],
+             "image_base": capture["image_base"], "schemas": capture["schemas"]}
+    signature = {"scope_sha256": hashlib.sha256(encode(scope)).hexdigest(), "thread": request["thread"],
+                 "pid": str(request["pid"]), "tid": str(request["tid"]), "created": request["thread_create_time"],
+                 "irp": request["irp"], "stack_count": str(request["stack_count"]), "current_location": str(request["current_location"]),
+                 "cancel": request["cancel_flag"], "pending_returned": request["pending_returned"],
+                 "io_status": str(request["io_status"]) if request["io_status"] is not None else None, "stacks": []}
+    for stack in request["stacks"]:
+        signature["stacks"].append({key: str(stack[key]) if stack[key] is not None else None for key in
+                                     ("index", "address", "major", "minor", "control", "completion", "context", "device", "file")})
+    hint = json.loads((root / "positive-retention.json").read_bytes())
+    assert hint["schema"] == "kn.irp_retention_keys.v1" and hint["referenced_lifetime"] is False
+    assert hint["keys"] == [hashlib.sha256(encode(signature)).hexdigest()]
     print(f"IRP capture oracle passed: {fields_checked} fields, {len(receipts)} original reads, owner/list/stack/RSDS; sha256={hashlib.sha256(raw).hexdigest()}")
+    print("IRP retention signature independently reconstructed from exact captured source/schema/request fields")
 
 
 if __name__ == "__main__":

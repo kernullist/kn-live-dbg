@@ -24173,7 +24173,7 @@ void KernelMonitor::ScanKernelThreads()
             event.ProcessId = request.Thread.ProcessId;
             event.Summary = L"thread-linked IRP snapshot; final outcome is unknown";
             event.Evidence[L"irp_observation_json"] = PendingIrpObservationJson(request, irpResult);
-            event.Evidence[L"capture_admission"] = irpCaptureQueued ? L"queued" : L"unavailable_or_queue_full";
+            event.Evidence[L"capture_admission"] = irpCaptureQueued ? L"queued" : L"unavailable_or_retention_denied";
             event.Evidence[L"referenced_lifetime"] = L"false";
             event.Evidence[L"execution_observed"] = L"false";
             RecordEvent(std::move(event));
