@@ -1,4 +1,6 @@
 #include "SymbolEngine.h"
+#include "BrokeredTypeLayouts.h"
+#include "SymbolArtifactResolver.h"
 #include "PdbIdentity.h"
 #include "DiaTypeLayout.h"
 #include "ExecutableImage.h"
@@ -466,165 +468,6 @@ static bool TypeNameMatchesNoCase(const std::wstring& value, const std::wstring&
     return matches;
 }
 
-static std::wstring GetTypeSymbolName(HANDLE process, DWORD64 moduleBase, ULONG typeId)
-{
-    std::wstring name;
-    WCHAR* rawName = nullptr;
-
-    if (SymGetTypeInfo(process, moduleBase, typeId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
-    {
-        name = rawName;
-        LocalFree(rawName);
-    }
-
-    return name;
-}
-
-static std::wstring BaseTypeName(DWORD baseType, ULONG64 length)
-{
-    std::wstring name;
-
-    switch (baseType)
-    {
-    case 0:
-        name = L"<no type>";
-        break;
-    case 1:
-        name = L"void";
-        break;
-    case 2:
-        name = L"char";
-        break;
-    case 3:
-        name = L"wchar_t";
-        break;
-    case 6:
-        name = length == 8 ? L"__int64" : (length == 2 ? L"short" : L"long");
-        break;
-    case 7:
-        name = length == 8 ? L"unsigned __int64" : (length == 2 ? L"unsigned short" : L"unsigned long");
-        break;
-    case 8:
-        name = length == 8 ? L"double" : L"float";
-        break;
-    case 10:
-        name = L"bool";
-        break;
-    case 13:
-        name = L"long";
-        break;
-    case 14:
-        name = L"unsigned long";
-        break;
-    case 31:
-        name = L"HRESULT";
-        break;
-    case 32:
-        name = L"char16_t";
-        break;
-    case 33:
-        name = L"char32_t";
-        break;
-    case 34:
-        name = L"char8_t";
-        break;
-    default:
-        name = L"<base>";
-        break;
-    }
-
-    return name;
-}
-
-static std::wstring DescribeType(HANDLE process, DWORD64 moduleBase, ULONG typeId, ULONG depth)
-{
-    std::wstring name;
-
-    do
-    {
-        if (typeId == 0)
-        {
-            break;
-        }
-
-        DWORD tag = 0;
-        SymGetTypeInfo(process, moduleBase, typeId, TI_GET_SYMTAG, &tag);
-
-        if (tag == KNDBG_SYMTAG_POINTER_TYPE)
-        {
-            ULONG childTypeId = 0;
-            if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
-            {
-                name = DescribeType(process, moduleBase, childTypeId, depth + 1);
-            }
-
-            if (name.empty())
-            {
-                name = L"void";
-            }
-
-            name += L" *";
-            break;
-        }
-
-        if (tag == KNDBG_SYMTAG_ARRAY_TYPE)
-        {
-            ULONG childTypeId = 0;
-            ULONG count = 0;
-            if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
-            {
-                name = DescribeType(process, moduleBase, childTypeId, depth + 1);
-            }
-
-            if (name.empty())
-            {
-                name = L"<array>";
-            }
-
-            if (SymGetTypeInfo(process, moduleBase, typeId, TI_GET_COUNT, &count))
-            {
-                std::wstringstream stream;
-                stream << name << L"[" << count << L"]";
-                name = stream.str();
-            }
-            else
-            {
-                name += L"[]";
-            }
-            break;
-        }
-
-        if (tag == KNDBG_SYMTAG_BASE_TYPE)
-        {
-            DWORD baseType = 0;
-            ULONG64 length = 0;
-            SymGetTypeInfo(process, moduleBase, typeId, TI_GET_BASETYPE, &baseType);
-            SymGetTypeInfo(process, moduleBase, typeId, TI_GET_LENGTH, &length);
-            name = BaseTypeName(baseType, length);
-            break;
-        }
-
-        name = GetTypeSymbolName(process, moduleBase, typeId);
-        if (!name.empty())
-        {
-            break;
-        }
-
-        ULONG childTypeId = 0;
-        if (depth < 8 && SymGetTypeInfo(process, moduleBase, typeId, TI_GET_TYPEID, &childTypeId))
-        {
-            name = DescribeType(process, moduleBase, childTypeId, depth + 1);
-        }
-    } while (false);
-
-    if (name.empty())
-    {
-        name = L"<unnamed>";
-    }
-
-    return name;
-}
-
 template <typename T>
 static void ReleaseCom(T*& value)
 {
@@ -859,91 +702,6 @@ static std::wstring DiaSymbolName(IDiaSymbol* symbol)
     return name;
 }
 
-static std::wstring DiaDescribeType(IDiaSymbol* type, ULONG depth)
-{
-    std::wstring name;
-
-    do
-    {
-        if (type == nullptr)
-        {
-            break;
-        }
-
-        DWORD tag = 0;
-        type->get_symTag(&tag);
-
-        if (tag == SymTagPointerType)
-        {
-            IDiaSymbol* child = nullptr;
-            if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
-            {
-                name = DiaDescribeType(child, depth + 1);
-            }
-            ReleaseCom(child);
-
-            if (name.empty())
-            {
-                name = L"void";
-            }
-            name += L"*";
-            break;
-        }
-
-        if (tag == SymTagArrayType)
-        {
-            IDiaSymbol* child = nullptr;
-            if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
-            {
-                name = DiaDescribeType(child, depth + 1);
-            }
-            ReleaseCom(child);
-
-            DWORD count = 0;
-            type->get_count(&count);
-            if (name.empty())
-            {
-                name = L"<array>";
-            }
-
-            std::wstringstream stream;
-            stream << name << L"[" << count << L"]";
-            name = stream.str();
-            break;
-        }
-
-        if (tag == SymTagBaseType)
-        {
-            DWORD baseType = 0;
-            ULONGLONG length = 0;
-            type->get_baseType(&baseType);
-            type->get_length(&length);
-            name = BaseTypeName(baseType, length);
-            break;
-        }
-
-        name = DiaSymbolName(type);
-        if (!name.empty())
-        {
-            break;
-        }
-
-        IDiaSymbol* child = nullptr;
-        if (depth < 8 && SUCCEEDED(type->get_type(&child)) && child != nullptr)
-        {
-            name = DiaDescribeType(child, depth + 1);
-        }
-        ReleaseCom(child);
-    } while (false);
-
-    if (name.empty())
-    {
-        name = L"<unknown>";
-    }
-
-    return name;
-}
-
 static std::wstring GetLoadedPdbPath(HANDLE process, uint64_t moduleBase)
 {
     std::wstring path;
@@ -993,7 +751,8 @@ static BOOL CALLBACK KnDbgForceSymbolLoadCallback(PSYMBOL_INFOW SymbolInfo, ULON
 SymbolEngine::SymbolEngine() :
     process_(GetCurrentProcess()),
     ready_(false),
-    symbolPath_(L"SRV*https://msdl.microsoft.com/download/symbols")
+    symbolPath_(L"SRV*https://msdl.microsoft.com/download/symbols"),
+    typeLayouts_(std::make_unique<BrokeredTypeLayouts>())
 {
 }
 
@@ -1037,7 +796,7 @@ bool SymbolEngine::Initialize(const std::wstring& symbolPath, std::wstring* erro
 void SymbolEngine::Shutdown()
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_.clear();
+    typeLayouts_->Clear();
     if (ready_)
     {
         SymCleanup(process_);
@@ -1061,7 +820,7 @@ const std::wstring& SymbolEngine::SymbolPath() const
 void SymbolEngine::SetSymbolPath(const std::wstring& symbolPath)
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_.clear();
+    typeLayouts_->Clear();
     symbolPath_ = symbolPath;
 
     if (ready_)
@@ -1275,14 +1034,14 @@ bool SymbolEngine::EnsureModuleLoaded(const KernelModuleInfo& module, std::wstri
                 break;
             }
 
-            typeLayouts_.clear();
+            typeLayouts_->Clear();
             SymUnloadModule64(process_, module.Base);
         }
 
         std::wstring imagePath = ResolveModuleImagePath(module);
         std::wstring moduleName = GetDbgHelpModuleName(module);
 
-        typeLayouts_.clear();
+        typeLayouts_->Clear();
         SetLastError(ERROR_SUCCESS);
         DWORD64 loaded = SymLoadModuleExW(
             process_,
@@ -1427,7 +1186,7 @@ bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& modu
         SymSetOptions(immediateOptions);
         restoreOptions = true;
 
-        typeLayouts_.clear();
+        typeLayouts_->Clear();
         SymUnloadModule64(process_, module.Base);
 
         std::wstring moduleName = GetDbgHelpModuleName(module);
@@ -1495,7 +1254,7 @@ bool SymbolEngine::ReloadModuleWithImmediateSymbols(const KernelModuleInfo& modu
 bool SymbolEngine::LoadKernelModules(std::wstring* error)
 {
     std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    typeLayouts_.clear();
+    typeLayouts_->Clear();
     bool ok = false;
 
     do
@@ -2322,902 +2081,141 @@ bool SymbolEngine::EnumerateTypes(const std::wstring& mask, size_t limit, std::v
     return ok;
 }
 
-bool SymbolEngine::GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t preferredModuleBase, TypeLayoutInfo* layout, std::wstring* error)
+bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName,
+    TypeLayoutInfo* layout, std::wstring* error)
 {
-    bool ok = false;
-    bool coInitialized = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    if (layout != nullptr) { *layout = {}; }
+    if (!ready_ || !typeLayouts_->FindById(moduleBase, typeId, typeName, layout))
     {
-        if (layout == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA layout output";
-            }
-            break;
-        }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        if (modules_.empty())
-        {
-            if (!LoadKernelModules(error))
-            {
-                break;
-            }
-        }
-
-        std::wstring lookupTypeName = typeName;
-        std::wstring moduleFilter;
-        size_t bang = typeName.find(L'!');
-        if (bang != std::wstring::npos)
-        {
-            moduleFilter = typeName.substr(0, bang);
-            lookupTypeName = typeName.substr(bang + 1);
-        }
-
-        if (lookupTypeName.empty())
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid DIA type name";
-            }
-            break;
-        }
-
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(coHr))
-        {
-            coInitialized = true;
-        }
-        else if (coHr != RPC_E_CHANGED_MODE)
-        {
-            if (error != nullptr)
-            {
-                *error = HResultText(L"CoInitializeEx failed", coHr);
-            }
-            break;
-        }
-
-        std::wstring lastError;
-        bool matchedModule = false;
-
-        for (const KernelModuleInfo& module : modules_)
-        {
-            if (preferredModuleBase != 0 && module.Base != preferredModuleBase)
-            {
-                continue;
-            }
-
-            if (!ShouldSearchTypeModule(module, moduleFilter))
-            {
-                continue;
-            }
-
-            matchedModule = true;
-            EnsureModuleLoaded(module, nullptr);
-
-            IDiaDataSource* source = nullptr;
-            IDiaSession* session = nullptr;
-            IDiaSymbol* global = nullptr;
-            IDiaEnumSymbols* udtEnum = nullptr;
-            IDiaSymbol* udt = nullptr;
-
-            std::wstring diaProvider;
-            std::wstring diaCreateError;
-            if (!CreateDiaDataSource(&source, &diaProvider, &diaCreateError))
-            {
-                lastError = diaCreateError;
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            std::wstring diaLoadError;
-            if (!LoadDiaDataForModule(module, source, &diaLoadError))
-            {
-                lastError = diaLoadError;
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            HRESULT hr = source->openSession(&session);
-            if (FAILED(hr))
-            {
-                lastError = HResultText(L"IDiaDataSource::openSession failed", hr);
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            session->put_loadAddress(module.Base);
-
-            hr = session->get_globalScope(&global);
-            if (FAILED(hr) || global == nullptr)
-            {
-                lastError = HResultText(L"IDiaSession::get_globalScope failed", hr);
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            hr = global->findChildren(SymTagUDT, nullptr, nsNone, &udtEnum);
-            if (FAILED(hr) || udtEnum == nullptr)
-            {
-                lastError = HResultText(L"DIA findChildren UDT failed", hr);
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            while (true)
-            {
-                ULONG fetched = 0;
-                hr = udtEnum->Next(1, &udt, &fetched);
-                if (hr != S_OK || fetched != 1 || udt == nullptr)
-                {
-                    ReleaseCom(udt);
-                    break;
-                }
-
-                std::wstring diaName = DiaSymbolName(udt);
-                if (TypeNameMatchesNoCase(diaName, lookupTypeName))
-                {
-                    break;
-                }
-
-                ReleaseCom(udt);
-            }
-
-            if (udt == nullptr)
-            {
-                std::wstringstream stream;
-                stream << L"DIA type not found: module=" << GetDbgHelpModuleName(module)
-                       << L" type=" << lookupTypeName;
-                std::wstring pdbPath = GetLoadedPdbPath(process_, module.Base);
-                if (!pdbPath.empty())
-                {
-                    stream << L" pdb=" << pdbPath;
-                }
-                stream << L" image=" << ResolveModuleImagePath(module);
-                lastError = stream.str();
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-
-            TypeLayoutInfo local;
-            if (!dia_layout::ReadLayout(udt, &local, DiaDescribeType))
-            {
-                lastError = L"DIA type members are unavailable, out of bounds, or exceed the layout limit";
-                ReleaseCom(udt);
-                ReleaseCom(udtEnum);
-                ReleaseCom(global);
-                ReleaseCom(session);
-                ReleaseCom(source);
-                continue;
-            }
-            local.Name = typeName;
-            local.ModuleBase = module.Base;
-            for (auto& field : local.Fields)
-            {
-                field.ModuleBase = module.Base;
-            }
-
-            std::sort(
-                local.Fields.begin(),
-                local.Fields.end(),
-                [](const TypeFieldInfo& left, const TypeFieldInfo& right)
-                {
-                    if (left.Offset != right.Offset)
-                    {
-                        return left.Offset < right.Offset;
-                    }
-
-                    return left.BitPosition < right.BitPosition;
-                });
-
-            *layout = local;
-            ok = true;
-
-            ReleaseCom(udt);
-            ReleaseCom(udtEnum);
-            ReleaseCom(global);
-            ReleaseCom(session);
-            ReleaseCom(source);
-            break;
-        }
-
-        if (!ok && error != nullptr)
-        {
-            if (!matchedModule)
-            {
-                std::wstringstream stream;
-                stream << L"DIA type lookup failed: no module matched";
-                if (!moduleFilter.empty())
-                {
-                    stream << L" filter=" << moduleFilter;
-                }
-                if (preferredModuleBase != 0)
-                {
-                    stream << L" base=0x" << std::hex << preferredModuleBase;
-                }
-                *error = stream.str();
-            }
-            else
-            {
-                *error = lastError.empty() ? L"DIA type lookup failed" : lastError;
-            }
-        }
-    } while (false);
-
-    if (coInitialized)
-    {
-        CoUninitialize();
+        if (error != nullptr) { *error = L"isolated type ID is unavailable or was invalidated; resolve its root again"; }
+        return false;
     }
-
-    return ok;
-}
-
-bool SymbolEngine::GetTypeLayoutById(uint64_t moduleBase, ULONG typeId, const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
-{
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
-    {
-        if (layout == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid type layout output";
-            }
-            break;
-        }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
-        if (moduleBase == 0 || typeId == 0)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid type identity";
-            }
-            break;
-        }
-
-        layout->Name = typeName.empty() ? DescribeType(process_, moduleBase, typeId, 0) : typeName;
-        layout->ModuleBase = moduleBase;
-        layout->TypeId = typeId;
-        layout->Size = 0;
-        layout->Fields.clear();
-        layout->FieldsComplete = false;
-        layout->UnavailableFields = 0;
-
-        // Nested field walks (ETHREAD UniqueThread, dotted EPROCESS paths) pass
-        // ChildTypeId values that are often pointers, arrays, or typedefs.
-        // TI_GET_CHILDRENCOUNT on those tags is undocumented; older dbghelp on
-        // Windows 10 has been observed to succeed with a garbage count, which
-        // turns the ChildId allocation below into bad_alloc / abort.
-        ULONG resolvedTypeId = typeId;
-        DWORD tag = 0;
-        bool haveTag = false;
-        for (ULONG aliasDepth = 0; aliasDepth < 8; ++aliasDepth)
-        {
-            if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_SYMTAG, &tag))
-            {
-                haveTag = false;
-                break;
-            }
-            haveTag = true;
-            if (tag != SymTagTypedef)
-            {
-                break;
-            }
-            ULONG nextTypeId = 0;
-            if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_TYPEID, &nextTypeId) ||
-                nextTypeId == 0 ||
-                nextTypeId == resolvedTypeId)
-            {
-                break;
-            }
-            resolvedTypeId = nextTypeId;
-        }
-        if (!haveTag)
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"TI_GET_SYMTAG failed", GetLastError());
-            }
-            break;
-        }
-        layout->TypeId = resolvedTypeId;
-        if (tag != SymTagUDT && tag != SymTagBaseClass)
-        {
-            // Pointer/array/enum/function TypeIds used to take TI_GET_CHILDRENCOUNT.
-            // Succeeding here with an empty field list made callers treat a
-            // pointer as a resolved UDT (dt dump, dotted FindField). Fail so
-            // the caller can skip the branch.
-            if (error != nullptr)
-            {
-                *error = L"type is not a UDT";
-            }
-            break;
-        }
-
-        constexpr ULONG kMaxTypeChildren = 8192;
-        ULONG childrenCount = 0;
-        if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_CHILDRENCOUNT, &childrenCount))
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"TI_GET_CHILDRENCOUNT failed", GetLastError());
-            }
-            break;
-        }
-
-        SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_GET_LENGTH, &layout->Size);
-
-        if (childrenCount == 0)
-        {
-            ok = true;
-            break;
-        }
-        if (childrenCount > kMaxTypeChildren)
-        {
-            if (error != nullptr)
-            {
-                *error = L"type child count exceeds layout safety cap";
-            }
-            break;
-        }
-
-        const size_t findChildrenSize =
-            FIELD_OFFSET(TI_FINDCHILDREN_PARAMS, ChildId) +
-            sizeof(ULONG) * static_cast<size_t>(childrenCount);
-        std::vector<uint8_t> findChildrenBuffer;
-        try
-        {
-            findChildrenBuffer.resize(findChildrenSize);
-            layout->Fields.reserve(childrenCount);
-        }
-        catch (const std::bad_alloc&)
-        {
-            if (error != nullptr)
-            {
-                *error = L"type child list is too large to materialize";
-            }
-            break;
-        }
-        auto findChildren = reinterpret_cast<TI_FINDCHILDREN_PARAMS*>(findChildrenBuffer.data());
-        findChildren->Count = childrenCount;
-        findChildren->Start = 0;
-
-        if (!SymGetTypeInfo(process_, moduleBase, resolvedTypeId, TI_FINDCHILDREN, findChildren))
-        {
-            if (error != nullptr)
-            {
-                *error = DbgHelpErrorText(L"TI_FINDCHILDREN failed", GetLastError());
-            }
-            break;
-        }
-
-        size_t skippedWithoutOffset = 0;
-        try
-        {
-            for (ULONG index = 0; index < childrenCount; ++index)
-            {
-                ULONG childId = findChildren->ChildId[index];
-                TypeFieldInfo field = {};
-                field.ModuleBase = moduleBase;
-                field.TypeId = childId;
-                field.ChildTypeId = 0;
-                field.Offset = 0;
-                field.Length = 0;
-                field.Tag = 0;
-                field.ChildTag = 0;
-                field.BaseType = 0;
-                field.IsBitField = false;
-                field.BitPosition = 0;
-
-                // Only data members and base classes participate in layout offsets.
-                // Nested types/functions without TI_GET_OFFSET used to be recorded
-                // as Offset=0 and silently corrupt every scanner that trusted them.
-                if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMTAG, &field.Tag))
-                {
-                    ++skippedWithoutOffset;
-                    continue;
-                }
-
-                if (field.Tag != SymTagData && field.Tag != SymTagBaseClass)
-                {
-                    continue;
-                }
-
-                WCHAR* rawName = nullptr;
-                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_SYMNAME, &rawName) && rawName != nullptr)
-                {
-                    field.Name = rawName;
-                    LocalFree(rawName);
-                }
-
-                if (field.Name.empty())
-                {
-                    continue;
-                }
-
-                if (!SymGetTypeInfo(process_, moduleBase, childId, TI_GET_OFFSET, &field.Offset))
-                {
-                    // Do not invent Offset=0 for named members when DbgHelp fails.
-                    // A true first member may still be 0 only when OFFSET succeeds.
-                    ++skippedWithoutOffset;
-                    continue;
-                }
-
-                SymGetTypeInfo(process_, moduleBase, childId, TI_GET_LENGTH, &field.Length);
-
-                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_BITPOSITION, &field.BitPosition))
-                {
-                    field.IsBitField = true;
-                }
-
-                if (SymGetTypeInfo(process_, moduleBase, childId, TI_GET_TYPEID, &field.ChildTypeId))
-                {
-                    // TI_GET_LENGTH on the data symbol is the bit width for a
-                    // bitfield.  The child type length is its storage size, so
-                    // overwriting the former turns one-bit flags into multi-bit
-                    // values and makes adjacent flags look set.  Keep this path
-                    // consistent with the DIA layout reader above.
-                    if (field.Length == 0 || !field.IsBitField)
-                    {
-                        SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_LENGTH, &field.Length);
-                    }
-                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_BASETYPE, &field.BaseType);
-                    SymGetTypeInfo(process_, moduleBase, field.ChildTypeId, TI_GET_SYMTAG, &field.ChildTag);
-                    field.TypeName = DescribeType(process_, moduleBase, field.ChildTypeId, 0);
-                }
-
-                if (field.TypeName.empty())
-                {
-                    field.TypeName = L"<unknown>";
-                }
-
-                layout->Fields.push_back(field);
-            }
-        }
-        catch (const std::bad_alloc&)
-        {
-            layout->Fields.clear();
-            if (error != nullptr)
-            {
-                *error = L"type child list is too large to materialize";
-            }
-            break;
-        }
-
-        if (layout->Fields.empty() && childrenCount != 0 && skippedWithoutOffset != 0)
-        {
-            if (error != nullptr)
-            {
-                *error = L"type has children but no members with a valid TI_GET_OFFSET";
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+    if (error != nullptr) { error->clear(); }
+    return true;
 }
 
 bool SymbolEngine::GetTypeLayout(const std::wstring& typeName, TypeLayoutInfo* layout, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    if (layout != nullptr && ready_)
+    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    if (layout == nullptr) { if (error != nullptr) { *error = L"invalid type layout output"; } return false; }
+    *layout = {};
+    if (typeName.empty() || typeName.size() > 2048 || typeName.find(L'\0') != std::wstring::npos)
+    { if (error != nullptr) { *error = L"invalid bounded type name"; } return false; }
+    try
     {
-        const auto cached = typeLayouts_.find(typeName);
-        if (cached != typeLayouts_.end())
-        {
-            *layout = cached->second;
-            return true;
-        }
-    }
-    bool ok = false;
-
-    do
-    {
-        if (layout == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid type layout output";
-            }
-            break;
-        }
-
-        if (!ready_)
-        {
-            if (!Initialize(symbolPath_, error))
-            {
-                break;
-            }
-        }
-
+        if (!ready_ && !Initialize(symbolPath_, error)) { return false; }
         if (modules_.empty())
         {
-            if (!LoadKernelModules(error))
-            {
-                break;
-            }
+            // Discovery for a type request does not register/load images in
+            // DbgHelp. The artifact resolver and restricted worker own this path.
+            std::vector<KernelModuleInfo> discovered;
+            if (!EnumKernelModules(&discovered, error)) { return false; }
+            std::lock_guard<std::mutex> modulesLock(modulesMutex_);
+            modules_ = std::move(discovered);
         }
-
-        ULONG typeId = 0;
-        DWORD64 moduleBase = 0;
-        std::vector<uint8_t> symbolBuffer(sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t));
-        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(symbolBuffer.data());
-        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-        symbol->MaxNameLen = MAX_SYM_NAME;
-
-        std::wstring lookupTypeName = typeName;
-        std::wstring moduleFilter;
-        size_t bang = typeName.find(L'!');
-        if (bang != std::wstring::npos)
+        const auto bang = typeName.find(L'!');
+        const auto moduleFilter = bang == std::wstring::npos ? L"" : typeName.substr(0, bang);
+        const auto leaf = bang == std::wstring::npos ? typeName : typeName.substr(bang + 1);
+        if (leaf.empty() || leaf.size() > 1024 || leaf.find(L'!') != std::wstring::npos)
+        { if (error != nullptr) { *error = L"invalid qualified type name"; } return false; }
+        std::vector<wchar_t> executable(32768);
+        const auto count = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        if (count == 0 || count >= executable.size()) { return false; }
+        std::wstring lastError = L"no module matched isolated type query";
+        for (const auto& module : modules_)
         {
-            moduleFilter = typeName.substr(0, bang);
-            lookupTypeName = typeName.substr(bang + 1);
+            if ((!moduleFilter.empty() && !ModuleNameMatches(module.ImageName, moduleFilter)) ||
+                (moduleFilter.empty() && !IsNtKernelImageName(module.ImageName) && !ShouldSearchTypeModule(module, L""))) { continue; }
+            if (typeLayouts_->Find(module.Base, typeName, layout))
+            { if (error != nullptr) { error->clear(); } return true; }
+            TypeSchemaPackage schema;
+            if (ResolveBrokeredTypeSchema(std::wstring(executable.data(), count), ResolveModuleImagePath(module),
+                module.Size, symbolPath_, leaf, &schema, &lastError) &&
+                typeLayouts_->Insert(module.Base, typeName, schema, layout, &lastError))
+            { if (error != nullptr) { error->clear(); } return true; }
         }
-
-        if (!moduleFilter.empty())
-        {
-            for (const KernelModuleInfo& module : modules_)
-            {
-                if (!ModuleNameMatches(module.ImageName, moduleFilter))
-                {
-                    continue;
-                }
-
-                EnsureModuleSymbolsLoaded(module, nullptr);
-
-                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
-                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-                symbol->MaxNameLen = MAX_SYM_NAME;
-
-                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
-                {
-                    typeId = symbol->TypeIndex;
-                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
-                    break;
-                }
-            }
-        }
-
-        if (typeId == 0)
-        {
-            std::vector<TypeMatchInfo> matches;
-            std::wstring enumError;
-            if (EnumerateTypes(typeName, 1, &matches, &enumError) && !matches.empty())
-            {
-                typeId = matches.front().TypeId;
-                moduleBase = matches.front().ModuleBase;
-            }
-        }
-
-        if (typeId == 0 && !SymGetTypeFromNameW(process_, 0, typeName.c_str(), symbol))
-        {
-            bool found = false;
-            for (const KernelModuleInfo& module : modules_)
-            {
-                if (!ShouldSearchTypeModule(module, moduleFilter))
-                {
-                    continue;
-                }
-
-                EnsureModuleSymbolsLoaded(module, nullptr);
-
-                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
-                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-                symbol->MaxNameLen = MAX_SYM_NAME;
-
-                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
-                {
-                    typeId = symbol->TypeIndex;
-                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-            {
-                std::wstring dbgHelpError = DbgHelpErrorText(L"SymGetTypeFromNameW failed", GetLastError());
-                std::wstring diaError;
-                if (GetTypeLayoutWithDia(typeName, 0, layout, &diaError))
-                {
-                    ok = true;
-                    break;
-                }
-
-                if (error != nullptr)
-                {
-                    *error = dbgHelpError + L"; DIA fallback failed: " + diaError;
-                }
-                break;
-            }
-        }
-        else
-        {
-            if (typeId == 0)
-            {
-                typeId = symbol->TypeIndex;
-                moduleBase = symbol->ModBase;
-            }
-        }
-
-        if (moduleBase == 0)
-        {
-            for (const KernelModuleInfo& module : modules_)
-            {
-                if (!ShouldSearchTypeModule(module, moduleFilter))
-                {
-                    continue;
-                }
-
-                EnsureModuleSymbolsLoaded(module, nullptr);
-
-                RtlZeroMemory(symbolBuffer.data(), symbolBuffer.size());
-                symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
-                symbol->MaxNameLen = MAX_SYM_NAME;
-
-                if (SymGetTypeFromNameW(process_, module.Base, lookupTypeName.c_str(), symbol))
-                {
-                    moduleBase = symbol->ModBase != 0 ? symbol->ModBase : module.Base;
-                    typeId = symbol->TypeIndex;
-                    break;
-                }
-            }
-        }
-
-        if (moduleBase == 0 && !modules_.empty())
-        {
-            moduleBase = modules_.front().Base;
-        }
-
-        if (!GetTypeLayoutById(moduleBase, typeId, typeName, layout, error))
-        {
-            std::wstring dbgHelpError = error != nullptr ? *error : L"DbgHelp type layout failed";
-            std::wstring diaError;
-            if (GetTypeLayoutWithDia(typeName, moduleBase, layout, &diaError))
-            {
-                ok = true;
-                break;
-            }
-
-            if (error != nullptr)
-            {
-                *error = dbgHelpError + L"; DIA fallback failed: " + diaError;
-            }
-            break;
-        }
-
-        ok = true;
-    } while (false);
-
-    if (ok && layout != nullptr && layout->ModuleBase != 0 &&
-        typeName.find(L'!') != std::wstring::npos)
-    {
-        // Bound retained metadata even for sessions inspecting many types.
-        if (typeLayouts_.size() >= 256)
-        {
-            typeLayouts_.clear();
-        }
-        typeLayouts_[typeName] = *layout;
+        if (error != nullptr) { *error = lastError; }
     }
-    return ok;
+    catch (const std::exception&)
+    {
+        *layout = {};
+        if (error != nullptr) { *error = L"isolated type layout failed while materializing bounded metadata"; }
+    }
+    return false;
 }
 
 bool SymbolEngine::GetTypeFields(const std::wstring& typeName, std::vector<TypeFieldInfo>* fields, ULONG64* typeSize, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
-    {
-        if (fields == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid field output";
-            }
-            break;
-        }
-
-        TypeLayoutInfo layout = {};
-        if (!GetTypeLayout(typeName, &layout, error))
-        {
-            break;
-        }
-
-        *fields = layout.Fields;
-        if (typeSize != nullptr)
-        {
-            *typeSize = layout.Size;
-        }
-
-        ok = true;
-    } while (false);
-
-    return ok;
+    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    if (typeSize != nullptr) { *typeSize = 0; }
+    if (fields == nullptr) { if (error != nullptr) { *error = L"invalid field output"; } return false; }
+    fields->clear();
+    TypeLayoutInfo layout;
+    if (!GetTypeLayout(typeName, &layout, error)) { return false; }
+    *fields = std::move(layout.Fields);
+    if (typeSize != nullptr) { *typeSize = layout.Size; }
+    return true;
 }
 
 bool SymbolEngine::FindField(const std::wstring& typeName, const std::wstring& fieldName, TypeFieldInfo* field, std::wstring* error)
 {
-    std::lock_guard<std::recursive_mutex> dbghelpLock(dbghelpMutex_);
-    bool ok = false;
-
-    do
+    std::lock_guard<std::recursive_mutex> lock(dbghelpMutex_);
+    if (field == nullptr) { if (error != nullptr) { *error = L"invalid field output"; } return false; }
+    *field = {};
+    if (error != nullptr) { *error = L"field path is invalid, unavailable or ambiguous"; }
+    if (fieldName.empty() || fieldName.size() > 8192 || fieldName.find(L'\0') != std::wstring::npos) { return false; }
+    std::vector<std::wstring> segments;
+    size_t begin = 0;
+    for (;;)
     {
-        if (field == nullptr)
+        const auto dot = fieldName.find(L'.', begin);
+        auto segment = fieldName.substr(begin, dot == std::wstring::npos ? dot : dot - begin);
+        if (segment.empty() || segment.size() > 1024 || segments.size() == TypeSchemaMaxDepth) { return false; }
+        segments.push_back(std::move(segment));
+        if (dot == std::wstring::npos) { break; }
+        begin = dot + 1;
+    }
+    // Preserve exact spelling first. Case-insensitive compatibility lookup is
+    // valid only when unique; never choose a field by enumeration order.
+    const auto find = [](const std::vector<TypeFieldInfo>& fields, const std::wstring& name) -> const TypeFieldInfo*
+    {
+        for (const auto& candidate : fields) { if (candidate.Name == name) { return &candidate; } }
+        const TypeFieldInfo* result = nullptr;
+        for (const auto& candidate : fields)
         {
-            if (error != nullptr)
-            {
-                *error = L"Invalid field output";
-            }
-            break;
+            if (_wcsicmp(candidate.Name.c_str(), name.c_str()) != 0) { continue; }
+            if (result != nullptr) { return nullptr; }
+            result = &candidate;
         }
-
-        // Split the field name on '.' so callers can resolve nested paths such
-        // as "Pcb.DirectoryTableBase" through embedded UDTs without manually
-        // chasing each level. A single segment keeps the original flat-lookup
-        // behavior. Pointer dereference paths are intentionally not supported;
-        // this resolves field offsets within a structure for "<base> + Offset"
-        // address math, so only embedded aggregate members are descended into.
-        std::vector<std::wstring> segments;
-        bool malformedPath = false;
-        size_t pathStart = 0;
-        while (pathStart <= fieldName.size())
+        return result;
+    };
+    TypeLayoutInfo layout;
+    if (!GetTypeLayout(typeName, &layout, error)) { return false; }
+    const auto rootSize = layout.Size;
+    uint64_t offset = 0;
+    TypeFieldInfo current;
+    for (size_t i = 0; i < segments.size(); ++i)
+    {
+        const auto member = find(layout.Fields, segments[i]);
+        if (member == nullptr || member->Offset > layout.Size || member->StorageLength > layout.Size - member->Offset ||
+            offset > rootSize || member->Offset > rootSize - offset) { break; }
+        current = *member;
+        offset += current.Offset;
+        if (offset > UINT32_MAX || current.StorageLength > rootSize - offset) { break; }
+        if (i + 1 == segments.size())
         {
-            size_t dot = fieldName.find(L'.', pathStart);
-            std::wstring segment = (dot == std::wstring::npos)
-                ? fieldName.substr(pathStart)
-                : fieldName.substr(pathStart, dot - pathStart);
-            if (segment.empty())
-            {
-                malformedPath = true;
-                break;
-            }
-            segments.push_back(segment);
-            if (dot == std::wstring::npos)
-            {
-                break;
-            }
-            pathStart = dot + 1;
+            current.Offset = static_cast<ULONG>(offset);
+            *field = std::move(current);
+            if (error != nullptr) { error->clear(); }
+            return true;
         }
-
-        if (malformedPath || segments.empty())
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid field path";
-            }
-            break;
-        }
-
-        auto findInFields = [](const std::vector<TypeFieldInfo>& fields, const std::wstring& name) -> const TypeFieldInfo*
-        {
-            for (const TypeFieldInfo& candidate : fields)
-            {
-                if (_wcsicmp(candidate.Name.c_str(), name.c_str()) == 0)
-                {
-                    return &candidate;
-                }
-            }
-            return nullptr;
-        };
-
-        // Resolve the first segment against the root type by name.
-        std::vector<TypeFieldInfo> rootFields;
-        if (!GetTypeFields(typeName, &rootFields, nullptr, error))
-        {
-            break;
-        }
-
-        const TypeFieldInfo* match = findInFields(rootFields, segments[0]);
-        if (match == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Field was not found";
-            }
-            break;
-        }
-
-        TypeFieldInfo current = *match;
-        ULONG cumulativeOffset = current.Offset;
-        bool pathOk = true;
-
-        // Descend through each remaining segment by enumerating the embedded
-        // aggregate type identified by the parent field's ChildTypeId.
-        for (size_t i = 1; i < segments.size(); ++i)
-        {
-            if (current.ChildTypeId == 0 || current.ModuleBase == 0)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"Field path segment is not an aggregate type";
-                }
-                pathOk = false;
-                break;
-            }
-
-            TypeLayoutInfo childLayout = {};
-            if (!GetTypeLayoutById(current.ModuleBase, current.ChildTypeId, current.TypeName, &childLayout, error))
-            {
-                pathOk = false;
-                break;
-            }
-
-            const TypeFieldInfo* childMatch = findInFields(childLayout.Fields, segments[i]);
-            if (childMatch == nullptr)
-            {
-                if (error != nullptr)
-                {
-                    *error = L"Field was not found";
-                }
-                pathOk = false;
-                break;
-            }
-
-            current = *childMatch;
-            cumulativeOffset += current.Offset;
-        }
-
-        if (!pathOk)
-        {
-            break;
-        }
-
-        // The leaf keeps its own type/length/bitfield metadata, but the offset
-        // is reported relative to the root type so callers can use
-        // <root-address> + field.Offset directly.
-        *field = current;
-        field->Offset = cumulativeOffset;
-        ok = true;
-    } while (false);
-
-    return ok;
+        if (current.ChildTypeId == 0 || !GetTypeLayoutById(current.ModuleBase, current.ChildTypeId, current.TypeName, &layout, error))
+        { break; }
+    }
+    if (error != nullptr) { *error = L"field path is unavailable or ambiguous; only bounded embedded members can be traversed"; }
+    return false;
 }
-
 std::optional<uint64_t> SymbolEngine::ParseAddressOrSymbol(const std::wstring& value, std::wstring* error)
 {
     std::optional<uint64_t> result;

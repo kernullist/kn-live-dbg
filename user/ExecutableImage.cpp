@@ -1630,6 +1630,7 @@ namespace executable_image
                             std::memcmp(codeview.data(), "RSDS", 4) == 0)
                         {
                             metadata->PdbRva = entry.AddressOfRawData;
+                            metadata->PdbRecordBytes = entry.SizeOfData;
                             std::memcpy(&metadata->PdbGuid, codeview.data() + 4, sizeof(GUID));
                             std::memcpy(&metadata->PdbAge, codeview.data() + 20, 4);
                             metadata->HasPdbIdentity = true;

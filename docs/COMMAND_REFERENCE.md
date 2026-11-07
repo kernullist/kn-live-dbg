@@ -283,6 +283,16 @@ pointers and arrays are retained as storage values. Gaps retain unsupported or
 unavailable layout portions. No runtime field values or kernel-object validity
 are claimed. See [schema contracts and limits](ARCHITECTURE.md#local-type-schema-packages).
 
+Live `dt`/`dtx` layout and scanner field lookups now use the same restricted schema
+worker, with parent acquisition from local roots or direct HTTPS SymStore paths.
+Exact names take priority; case/leading-underscore aliases and case-insensitive
+field paths must be unique. Recursive layout follows embedded members only, up to
+the schema's eight-component bound. Unavailable parsing fails without an in-process
+fallback. `dt` prints the schema hash, unchecked runtime-invariant status and any
+incomplete field coverage. Opaque layout IDs expire when symbol/module state or
+the bounded cache changes. Symbol lookup and type enumeration still use their
+existing in-process providers. See [live layout scope and cache limits](ARCHITECTURE.md#live-type-layout-broker).
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

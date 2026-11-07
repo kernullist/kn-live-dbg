@@ -29,7 +29,9 @@ bool AcceptTypeSchemaWorkerOutput(const std::string& output, const TypeSchemaBin
         parsed.ImageSha256 != expected.ImageSha256 || parsed.PdbSha256 != expected.PdbSha256 ||
         parsed.ProviderSha256 != expected.ProviderSha256 || parsed.PdbGuid != expected.PdbGuid ||
         parsed.PdbAge != expected.PdbAge || parsed.Machine != expected.Machine || parsed.ImageSize != expected.ImageSize ||
-        parsed.TypeName != expected.TypeName)
+        (parsed.TypeName != expected.TypeName && (!expected.AllowTypeAliases ||
+            NormalizeSchemaTypeAlias(expected.TypeName).empty() ||
+            NormalizeSchemaTypeAlias(parsed.TypeName) != NormalizeSchemaTypeAlias(expected.TypeName))))
     {
         return false;
     }
@@ -40,7 +42,7 @@ bool AcceptTypeSchemaWorkerOutput(const std::string& output, const TypeSchemaBin
 
 bool GenerateBrokeredTypeSchema(const std::wstring& executable, const std::wstring& image,
     const std::wstring& pdb, const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error,
-    uint64_t workerTimeoutMs, const std::atomic<bool>* cancellation)
+    uint64_t workerTimeoutMs, const std::atomic<bool>* cancellation, bool allowTypeAliases)
 {
     if (error != nullptr) { *error = L"schema broker requires stable local artifacts and the installed parser runtime"; }
     if (package == nullptr) { return false; }
@@ -60,9 +62,10 @@ bool GenerateBrokeredTypeSchema(const std::wstring& executable, const std::wstri
         !metadata.HasPdbIdentity || metadata.Machine != IMAGE_FILE_MACHINE_AMD64) { return false; }
     TypeSchemaBinding binding{imageFile.Sha256, pdbFile.Sha256, providerFile.Sha256, GuidText(metadata.PdbGuid),
         metadata.PdbAge, metadata.Machine, metadata.SizeOfImage, typeName};
+    binding.AllowTypeAliases = allowTypeAliases;
     ParserWorkerRequest request;
     request.Executable = executable;
-    request.Arguments = {L"--schema-worker", typeName};
+    request.Arguments = {allowTypeAliases ? L"--schema-live-worker" : L"--schema-worker", typeName};
     request.ReadOnlyFiles = {imageFile.Handle(), pdbFile.Handle(), providerFile.Handle()};
     request.TimeoutMs = workerTimeoutMs;
     request.Cancellation = cancellation;

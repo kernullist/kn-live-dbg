@@ -28,6 +28,47 @@ namespace dia_layout
         Unavailable
     };
 
+    inline std::wstring Describe(IDiaSymbol* type, ULONG depth)
+    {
+        if (type == nullptr || depth > 8) { return L"<unknown>"; }
+        DWORD tag = 0;
+        if (type->get_symTag(&tag) != S_OK) { return L"<unknown>"; }
+        if (tag == SymTagPointerType || tag == SymTagArrayType)
+        {
+            Microsoft::WRL::ComPtr<IDiaSymbol> child;
+            const auto childName = type->get_type(&child) == S_OK && child ? Describe(child.Get(), depth + 1) : L"<unknown>";
+            if (tag == SymTagPointerType) { return childName + L"*"; }
+            DWORD count = 0;
+            return childName + (type->get_count(&count) == S_OK ? L"[" + std::to_wstring(count) + L"]" : L"[?]");
+        }
+        if (tag == SymTagBaseType)
+        {
+            DWORD base = 0;
+            ULONGLONG bytes = 0;
+            if (type->get_baseType(&base) != S_OK || type->get_length(&bytes) != S_OK) { return L"<unknown>"; }
+            switch (base)
+            {
+            case 0: return L"<no type>";
+            case 1: return L"void";
+            case 2: return L"char";
+            case 3: return L"wchar_t";
+            case 6: return bytes == 8 ? L"__int64" : bytes == 4 ? L"int" : bytes == 2 ? L"short" : bytes == 1 ? L"char" : L"<integer>";
+            case 7: return bytes == 8 ? L"unsigned __int64" : bytes == 4 ? L"unsigned int" : bytes == 2 ? L"unsigned short" : bytes == 1 ? L"unsigned char" : L"<unsigned integer>";
+            case 8: return bytes == 8 ? L"double" : bytes == 4 ? L"float" : L"<floating>";
+            case 10: return L"bool";
+            case 13: return L"long";
+            case 14: return L"unsigned long";
+            case 31: return L"HRESULT";
+            case 32: return L"char16_t";
+            case 33: return L"char32_t";
+            case 34: return L"char8_t";
+            default: return L"<base>";
+            }
+        }
+        const auto name = Name(type);
+        return name.empty() ? L"<unnamed>" : name;
+    }
+
     // Length remains bits for bitfields and bytes for ordinary members.
     // StorageLength is always bytes and is never a substitute for bit width.
     inline MemberState ReadMember(IDiaSymbol* data, uint64_t parentBytes, TypeFieldInfo* output,

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -18,6 +19,7 @@ constexpr DWORD KNDBG_SYMTAG_TYPEDEF = 17;
 constexpr DWORD KNDBG_SYMTAG_BASE_CLASS = 18;
 
 struct IDiaDataSource;
+class BrokeredTypeLayouts;
 
 struct KernelModuleInfo
 {
@@ -42,6 +44,8 @@ struct TypeFieldInfo
     bool IsBitField = false;
     ULONG BitPosition = 0;
     ULONG64 StorageLength = 0;
+    // Present only for the isolated schema provider; not runtime-object proof.
+    std::wstring SchemaPackageSha256;
 };
 
 struct TypeLayoutInfo
@@ -54,6 +58,8 @@ struct TypeLayoutInfo
     // Data-member coverage only; providers without an explicit result leave it false.
     bool FieldsComplete = false;
     uint32_t UnavailableFields = 0;
+    bool UnavailableFieldCountKnown = true;
+    std::wstring SchemaPackageSha256;
 };
 
 struct TypeMatchInfo
@@ -101,6 +107,7 @@ public:
     std::optional<uint64_t> ParseAddressOrSymbol(const std::wstring& value, std::wstring* error);
 
 private:
+    friend struct SymbolEngineTestAccess;
     bool EnumKernelModules(std::vector<KernelModuleInfo>* modules, std::wstring* error);
     std::wstring ResolveModuleImagePath(const KernelModuleInfo& module) const;
     bool EnsureModuleLoaded(const KernelModuleInfo& module, std::wstring* error);
@@ -115,7 +122,6 @@ private:
         std::vector<TypeMatchInfo>* matches,
         bool* stoppedAtLimit,
         std::wstring* error);
-    bool GetTypeLayoutWithDia(const std::wstring& typeName, uint64_t preferredModuleBase, TypeLayoutInfo* layout, std::wstring* error);
 
     HANDLE process_;
     bool ready_;
@@ -127,7 +133,7 @@ private:
     // order is always dbghelpMutex_ -> modulesMutex_.
     mutable std::recursive_mutex dbghelpMutex_;
     std::vector<KernelModuleInfo> modules_;
-    // Successful qualified PDB layouts only. Protected by dbghelpMutex_ and
-    // invalidated whenever symbol/module state can change. Failures are retried.
-    std::map<std::wstring, TypeLayoutInfo> typeLayouts_;
+    // Broker-accepted artifact layouts, not runtime-object validation. Protected
+    // by dbghelpMutex_; IDs expire on eviction or symbol/module-state changes.
+    std::unique_ptr<BrokeredTypeLayouts> typeLayouts_;
 };

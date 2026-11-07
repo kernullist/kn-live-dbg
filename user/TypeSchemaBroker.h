@@ -13,6 +13,7 @@ struct TypeSchemaBinding
     uint64_t Machine = 0;
     uint64_t ImageSize = 0;
     std::wstring TypeName;
+    bool AllowTypeAliases = false;
 };
 
 // Validate untrusted child bytes against identities held independently by the
@@ -24,4 +25,4 @@ bool AcceptTypeSchemaWorkerOutput(const std::string& output, const TypeSchemaBin
 // Image/PDB are brokered local files; no symbol-search path is passed to DIA.
 bool GenerateBrokeredTypeSchema(const std::wstring& executable, const std::wstring& image,
     const std::wstring& pdb, const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error,
-    uint64_t workerTimeoutMs = 60000, const std::atomic<bool>* cancellation = nullptr);
+    uint64_t workerTimeoutMs = 60000, const std::atomic<bool>* cancellation = nullptr, bool allowTypeAliases = false);

@@ -99,11 +99,41 @@ namespace
         return true;
     }
 
+    bool FindType(IDiaSymbol* global, const std::wstring& name, bool aliases, IDiaSymbol** output)
+    {
+        if (FindUnique(global, SymTagUDT, name, output)) { return true; }
+        const auto normalized = NormalizeSchemaTypeAlias(name);
+        if (!aliases || normalized.empty() || name.find_first_of(L"*?") != std::wstring::npos) { return false; }
+        ComPtr<IDiaEnumSymbols> values;
+        if (global->findChildren(SymTagUDT, nullptr, nsNone, &values) != S_OK || !values) { return false; }
+        ComPtr<IDiaSymbol> match;
+        const auto started = GetTickCount64();
+        for (size_t i = 0; i < 200000 && GetTickCount64() - started < 30000; ++i)
+        {
+            ComPtr<IDiaSymbol> candidate;
+            ULONG fetched = 0;
+            const auto status = values->Next(1, &candidate, &fetched);
+            if (status == S_FALSE && fetched == 0)
+            {
+                if (!match) { return false; }
+                *output = match.Detach();
+                return true;
+            }
+            if (status != S_OK || fetched != 1 || !candidate) { return false; }
+            if (NormalizeSchemaTypeAlias(dia_layout::Name(candidate.Get())) == normalized)
+            {
+                if (match) { return false; }
+                match = std::move(candidate);
+            }
+        }
+        return false;
+    }
+
     bool Walk(IDiaSymbol* type, uint64_t offset, const std::vector<std::wstring>& path, TypeSchemaPackage* package,
         uint64_t deadline)
     {
         TypeLayoutInfo layout;
-        if (GetTickCount64() >= deadline || !dia_layout::ReadLayout(type, &layout))
+        if (GetTickCount64() >= deadline || !dia_layout::ReadLayout(type, &layout, dia_layout::Describe))
         {
             return false;
         }
@@ -160,7 +190,7 @@ namespace
 }
 
 static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFile, SchemaArtifact& providerFile,
-    const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error)
+    const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error, bool aliases = false)
 {
     if (error != nullptr)
     {
@@ -187,7 +217,7 @@ static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFil
         provider.Source->loadDataFromIStream(pdbStream.Get()) != S_OK ||
         !symbol_identity::VerifyDiaIdentity(provider.Source.Get(), {metadata.PdbGuid, 0, metadata.PdbAge}) ||
         provider.Source->openSession(&session) != S_OK || !session || session->get_globalScope(&global) != S_OK || !global ||
-        !FindUnique(global.Get(), SymTagUDT, typeName, &type))
+        !FindType(global.Get(), typeName, aliases, &type))
     {
         return false;
     }
@@ -200,7 +230,7 @@ static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFil
     p.Machine = metadata.Machine;
     p.ProviderSha256 = providerFile.Sha256;
     p.ProviderVersion = FileVersion(providerFile.Path);
-    p.TypeName = typeName;
+    p.TypeName = dia_layout::Name(type.Get());
     if (type->get_length(&p.TypeBytes) != S_OK || !Walk(type.Get(), 0, {}, &p, GetTickCount64() + 30000) ||
         !imageFile.Unchanged() || !pdbFile.Unchanged() || !providerFile.Unchanged() || !ValidateTypeSchema(p, nullptr))
     {
@@ -230,7 +260,7 @@ bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, cons
 }
 
 bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, const std::wstring& typeName,
-    TypeSchemaPackage* package, std::wstring* error)
+    TypeSchemaPackage* package, std::wstring* error, bool allowTypeAliases)
 {
     if (package == nullptr) { return false; }
     *package = {};
@@ -241,5 +271,5 @@ bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, co
         if (error != nullptr) { *error = L"schema artifact handle unavailable"; }
         return false;
     }
-    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error);
+    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error, allowTypeAliases);
 }

@@ -213,6 +213,8 @@
     <ClCompile Include="TypeSchemaGenerator.cpp" />
     <ClCompile Include="TypeSchemaCommand.cpp" />
     <ClCompile Include="TypeSchemaBroker.cpp" />
+    <ClCompile Include="BrokeredTypeLayouts.cpp" />
+    <ClCompile Include="SymbolArtifactResolver.cpp" />
     <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
@@ -381,6 +383,9 @@
     <ClInclude Include="DiaTypeLayout.h" />
     <ClInclude Include="TypeSchema.h" />
     <ClInclude Include="TypeSchemaBroker.h" />
+    <ClInclude Include="BrokeredTypeLayouts.h" />
+    <ClInclude Include="SymbolArtifactResolver.h" />
+    <ClInclude Include="SymbolArtifactCache.h" />
     <ClInclude Include="SchemaArtifact.h" />
     <ClInclude Include="SchemaReadStream.h" />
     <ClInclude Include="ParserWorkerProcess.h" />

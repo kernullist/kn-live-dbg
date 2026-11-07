@@ -7,6 +7,78 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Live type layout broker checkpoint: 2026-11-07
+
+This P05/W04 step migrates `GetTypeLayout`, `GetTypeLayoutById`, `GetTypeFields`
+and `FindField` to the artifact broker. PDB acquisition uses the local image's
+bounded RSDS identity and approved local/HTTPS search roots without parent PDB
+parsing. Restricted workers provide layouts; parent checks bind the result to
+the leased image/PDB/provider. Nested offsets, bit storage and coverage survive
+conversion into bounded, expiring opaque type IDs. No worker failure triggers an
+in-process layout fallback. See the [live layout boundary](ARCHITECTURE.md#live-type-layout-broker).
+
+Adversarial review fixed pre-probe network/device path exposure, the gap between
+temporary-file validation and cache publication, ambiguous case-folded field
+selection and stale result outputs. A native empty-directory reproducer showed
+that `FILE_READ_ATTRIBUTES` alone did not prevent rename; cache pins now include
+`FILE_LIST_DIRECTORY`. The regression tests that directory before any child file
+exists, separately from file-lease protection. Publication copies from the held
+verified lease into an exclusive create-new file, and temporary cleanup checks
+the original file ID. Review also prevented oversized bitfields from reaching a
+64-bit display shift and made unknown field coverage visible. No additional
+actionable defects were found in the reviewed scope.
+
+Final Release EXE SHA-256:
+`3312115f0938e202a0bba5283583d167366b18c81342639ce97fc551183d989f`.
+Final helper hashes:
+
+| ASan harness | SHA-256 |
+|---|---|
+| Live type layouts | `917f852bd1be969cbc63894dbbd4b8d23cca75cb9a5c9000ba200bfbb324ea7b` |
+| Schema broker | `53c0f538d08ebf601b64722c01e95d6eb4fddd10ae31acdca5540225da6b09dc` |
+| PDB identity | `6a62dd5f42cad205e78c315ffff0e26d7d8b8957dcd386339650299481c11a3e` |
+| Shared KMON/PE core | `366fab5da16e9e1ad7df67989ae1c1855061bc6c1e2b16275732708b651e3124` |
+
+Validation used Windows 11 Pro x64 `10.0.28000`, NTFS, VS 2022 Build Tools
+17.14.60, MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. The final Release build
+passed with the existing C4744 warnings. Sources/binaries were frozen during
+applicable runs, and the final linked self-test ran alone after builds and other
+oracles completed.
+
+| Check | Result and scope |
+|---|---|
+| `tools/validate-live-type-layout.ps1 -Sanitize` | 112 controls passed through the actual SymbolEngine APIs: compiler `sizeof`/`offsetof`, owned `ReadProcessMemory`, nested and bitfield semantics, unique/ambiguous aliases, pointer/array/depth/inheritance limits, cache eviction and nonreused IDs, concurrent lookup/reset, wrong PDB/module size, missing provider, cleared failure output, parent DIA remaining unloaded, cache collision/copy/cleanup and empty/reparse-directory pins |
+| Final Release worker integration | Two controls passed using the actual `KnLiveDbg.exe` live-worker dispatcher: a normalized type alias was accepted, and a mismatched PDB was rejected |
+| Direct HTTPS acquisition | A fresh cache received the 12,136,448-byte kernel PDB from the Microsoft public symbol server. An independent Python oracle checked canonical package hash, image/PDB hashes, SDK `_LIST_ENTRY` offsets and absence of pending files |
+| Real cached kernel PDB | Ten controls passed: `_LIST_ENTRY`, `_EPROCESS`, `_ETHREAD`, `_IRP`, `_IO_STACK_LOCATION`, `_DRIVER_OBJECT`, `_DEVICE_OBJECT`, SDK list layout, an embedded process field and no parent DIA load. These are artifact-layout checks, not kernel-object observations |
+| Existing schema/PDB regressions | 73 broker and 52 PDB identity/layout/package ASan controls passed. Final Release schema CLI passed 79 independent Python checks |
+| `tools/validate-kmon-core.ps1 -Sanitize` | Shared PE/relocation controls, 835 execution, 130 scheduling, 11,345 hunting, 77 ordering, 54 page, 49 false-positive controls and ten execution-JSON oracle checks passed |
+| Final Release `--self-test all` | Timeline 28, MCP 102, KMON image/read 119, console 564, commands 3,006 across 261 routes, remote 68 and four connection-argument controls passed. Console coverage includes oversized-bitfield rejection and unknown field-coverage display |
+| Contracts/publication | 33 compiled capability contracts and 261 routes passed; generated support matrix matched; publication classifier tests passed 11 controls |
+
+The real artifact pair was `ntoskrnl.exe` version `10.0.28000.3231`, image SHA-256
+`0e04b67c16f05f14e046a275097769a29ca88692ce3278eebc39ad476d922a76`, with PDB GUID
+`29542158dc36b6d41d7f2dd8cb7ce68a`, age 1 and SHA-256
+`c9521a2a2a98793e7165a053be53c3eb425d5379655b72146b24ab638fc5fa51`.
+The downloaded PDB remains a local validation artifact, not a published package.
+The separate CLI file-symlink fixture was skipped by host permissions; the cache
+directory-junction rejection case ran successfully. No security policy was
+changed to enable either test.
+
+This is a bounded live-layout migration, not completion of P05 or the full design.
+Startup symbol preloading, symbol resolution and type enumeration still parse in
+the parent. Enforced worker network denial, approved distribution, exact loaded
+target image binding, runtime object/anchor invariants, lifetime binding and
+propagation into every typed observation remain open. Helpers were ASan-built;
+the full Release program was not. Only this host/artifact pair was exercised;
+authenticated/proxy/compressed symbol stores, transport interruption, media/power
+failure and other filesystems were not validated. HTTPS acquisition and file
+hashing have cooperative limits, not a whole-operation hard deadline. Existing
+privacy-initialization and process-capture timing observations below remain
+unresolved. No driver/service load, reboot or host security-policy change was
+performed; final targeted cleanup checks found no task processes or KnLiveDbg
+drivers. EFS remained the OS-managed Manual/Running service.
+
 ## Schema artifact broker checkpoint: 2026-11-07
 
 This P05/W04 step binds offline schema creation to parent-owned artifact leases.

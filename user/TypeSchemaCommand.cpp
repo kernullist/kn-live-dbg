@@ -42,7 +42,8 @@ int RunTypeSchemaWorkerCommand(int argc, wchar_t** argv)
             files[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
         }
         TypeSchemaPackage package;
-        if (!GenerateTypeSchemaFromHandles(files[0], files[1], files[2], argv[2], &package, nullptr))
+        if (!GenerateTypeSchemaFromHandles(files[0], files[1], files[2], argv[2], &package, nullptr,
+            _wcsicmp(argv[1], L"--schema-live-worker") == 0))
         {
             return 5;
         }

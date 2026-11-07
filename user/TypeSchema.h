@@ -55,6 +55,7 @@ bool SaveTypeSchema(const std::wstring& path, const TypeSchemaPackage& package, 
 bool GenerateTypeSchema(const std::wstring& image, const std::wstring& pdb, const std::wstring& typeName,
     const std::wstring& provider, TypeSchemaPackage* package, std::wstring* error);
 bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, const std::wstring& typeName,
-    TypeSchemaPackage* package, std::wstring* error);
+    TypeSchemaPackage* package, std::wstring* error, bool allowTypeAliases = false);
+std::wstring NormalizeSchemaTypeAlias(const std::wstring& name);
 int RunTypeSchemaCommand(int argc, wchar_t** argv);
 int RunTypeSchemaWorkerCommand(int argc, wchar_t** argv);

@@ -5,6 +5,7 @@
 #include "SymbolEngine.h"
 #include <algorithm>
 #include <map>
+#include <cwctype>
 
 namespace
 {
@@ -156,6 +157,15 @@ namespace
         }
         return json + L"]}";
     }
+}
+
+std::wstring NormalizeSchemaTypeAlias(const std::wstring& name)
+{
+    const auto first = name.find_first_not_of(L'_');
+    if (first == std::wstring::npos) { return L""; }
+    std::wstring result = name.substr(first);
+    for (auto& c : result) { c = static_cast<wchar_t>(towlower(c)); }
+    return result;
 }
 
 std::wstring TypeSchemaExpansion(uint64_t symbolTag, size_t depth)

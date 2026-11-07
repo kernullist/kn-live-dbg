@@ -4736,6 +4736,11 @@ static void PrintFieldValue(
 
     if (field.IsBitField)
     {
+        if (field.BitPosition >= 64 || field.Length == 0 || field.Length > 64 - field.BitPosition)
+        {
+            std::wcout << L" <no scalar value>";
+            return;
+        }
         // DIA/DbgHelp store Length as a bit count for bitfields. Read the
         // containing integer that covers BitPosition..BitPosition+Length-1.
         const uint64_t bitEnd = static_cast<uint64_t>(field.BitPosition) + field.Length;
@@ -4808,6 +4813,11 @@ static void DumpTypeLayout(
             std::wcout << L" @ 0x" << std::hex << address;
     }
     std::wcout << L" size=0x" << std::hex << layout.Size << std::dec << L"\n";
+    if (!layout.FieldsComplete)
+    {
+        std::wcout << indentText << L"   <incomplete field coverage; unavailable="
+            << (layout.UnavailableFieldCountKnown ? std::to_wstring(layout.UnavailableFields) : L"unknown") << L">\n";
+    }
 
     for (const TypeFieldInfo& field : layout.Fields)
     {
@@ -4914,6 +4924,11 @@ static void HandleDtCommand(
             break;
         }
 
+        if (!layout.SchemaPackageSha256.empty())
+        {
+            std::wcout << L"schema=" << layout.SchemaPackageSha256
+                << L" validation=artifact_identity_and_bounds runtime_invariants=unchecked\n";
+        }
         DumpTypeLayout(device, state, symbols, layout, request, request.Address, 0, request.RecursionDepth);
     } while (false);
 }
@@ -29770,6 +29785,37 @@ static int RunConsoleSurfaceSelfTest()
 
     do
     {
+        {
+            DeviceClient unopened;
+            DebuggerState state{};
+            for (const auto& bits : {std::make_pair(64ul, 1ull), std::make_pair(63ul, 2ull),
+                std::make_pair(80ul, 3ull), std::make_pair(0ul, 65ull), std::make_pair(0ul, 0ull)})
+            {
+                TypeFieldInfo field;
+                field.IsBitField = true;
+                field.BitPosition = bits.first;
+                field.Length = bits.second;
+                field.StorageLength = 16;
+                std::wostringstream output;
+                auto* previous = std::wcout.rdbuf(output.rdbuf());
+                PrintFieldValue(unopened, state, field, 0);
+                std::wcout.rdbuf(previous);
+                CheckConsoleSurfaceSelfTest(&context, output.str() == L" <no scalar value>",
+                    L"dt-rejects-bitfield-outside-scalar-width-" + std::to_wstring(bits.first) + L"-" + std::to_wstring(bits.second));
+            }
+            TypeLayoutInfo layout;
+            layout.Name = L"Fixture";
+            layout.Size = 16;
+            layout.UnavailableFieldCountKnown = false;
+            SymbolEngine symbols;
+            DtRequest request{};
+            std::wostringstream output;
+            auto* previous = std::wcout.rdbuf(output.rdbuf());
+            DumpTypeLayout(unopened, state, symbols, layout, request, 0, 0, 0);
+            std::wcout.rdbuf(previous);
+            CheckConsoleSurfaceSelfTest(&context, output.str().find(L"incomplete field coverage; unavailable=unknown") != std::wstring::npos,
+                L"dt-retains-unknown-field-coverage");
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             HuntFirstCommandLineImage(L"\"C:\\Program Files\\Example\\example.exe\" --flag") ==
@@ -53741,7 +53787,7 @@ int wmain(int argc, wchar_t** argv)
     {
         return RunGameManifestCommand(argc, argv);
     }
-    if (argc >= 2 && ToLower(argv[1]) == L"--schema-worker")
+    if (argc >= 2 && (ToLower(argv[1]) == L"--schema-worker" || ToLower(argv[1]) == L"--schema-live-worker"))
     {
         return RunTypeSchemaWorkerCommand(argc, argv);
     }

@@ -1205,7 +1205,7 @@ See [coverage](KMON_DETECTION_COVERAGE.md), [verification](KMON_DETECTION_VERIFI
 
 ## PDB identity boundary
 
-Before DIA supplies type data, `SymbolEngine` binds the load to an expected PDB
+For the remaining in-process DIA type-enumeration path, `SymbolEngine` binds the load to an expected PDB
 signature and age from matched DbgHelp module metadata. Unmatched PDB/DBG flags,
 different module bases and conflicting known image sizes are rejected. When that
 identity is unavailable, the existing PE reader extracts CodeView identity from
@@ -1217,13 +1217,13 @@ Direct PDB loads use Microsoft's
 then independently compare the opened session's identity. Image-based DIA loads
 also receive the post-load comparison. A missing property is unavailable, not a
 zero-valued match. A rejected selected PDB does not become an unchecked fallback
-load on the same data-source object. Existing qualified layout caching and the
-DbgHelp/DIA serialization lock remain in place.
+load on the same data-source object. The DbgHelp/DIA serialization lock remains
+in place. Concrete type-layout APIs use the broker described below.
 
 GUID/age matching prevents ordinary wrong-build and replaced-cache confusion;
 it is not a content hash, an approved distribution signature or collector
-authentication. Full loaded-image identity binding, isolation of live symbol consumers
-and symbol acquisition deadlines remain separate work.
+authentication. Full loaded-image identity binding and isolation of the remaining
+symbol/enumeration consumers remain separate work.
 `tools/validate-pdb-identity.ps1 -Sanitize` compiles two owned PE/PDB pairs and
 checks the actual DIA provider against matching, wrong-age, wrong-PDB and cache
 replacement controls without loading a driver or target image.
@@ -1235,7 +1235,7 @@ as private `kn.type_schema.v1` JSON, normally a `.knschema` file. The operation
 runs before controller construction and uses only the supplied local artifacts
 and the packaged DIA DLL. It performs no symbol download or live memory read.
 `--schema inspect <package>` checks and reconstructs the package without DIA.
-Existing successful layout caches and the DbgHelp lock remain in use.
+Live layout caching and the DbgHelp lock remain separate from package inspection.
 
 The package records PE/PDB/provider SHA-256, PE machine and image size, canonical
 PDB GUID (32 hexadecimal digits) and age, provider file version, root size and
@@ -1247,7 +1247,7 @@ Base classes, unsupported field types and depth limits remain explicit gaps.
 Unavailable member properties create a gap on their containing path. Bounds
 cover each field's root and embedded parent; unions may intentionally overlap.
 
-`DiaTypeLayout` also serves the existing DIA fallback. It requires `S_OK` for
+`DiaTypeLayout` supplies the schema worker's member decoder. It requires `S_OK` for
 offset/size properties and uses `LocIsBitField` to distinguish units. Previously,
 `SUCCEEDED(get_bitPosition(...))` treated an unavailable `S_FALSE` property as a
 bitfield at bit zero. Actual compiler-generated PDB controls reproduce that case
@@ -1269,7 +1269,7 @@ remain fixed. `parser_isolated` is producer-reported provenance: new CLI exports
 record true, direct-library and legacy exports retain false. Inspecting a package
 does not authenticate this field or retroactively run its parser in isolation.
 Attaching package hashes to typed observations, supported-build fixture
-attestations and isolation of live symbol consumers remain open. Files and
+attestations and isolation of the remaining symbol/enumeration consumers remain open. Files and
 renamed JSON packages are excluded by the sensitive-content gate.
 
 ### Schema parser process boundary
@@ -1287,8 +1287,8 @@ rechecks all three original file objects before returning a usable package. Only
 the parent publishes the package; timeout,
 crash, output overflow or setup failure cannot publish partial child output.
 There is no in-process fallback. Existing schema inspection remains a bounded
-JSON operation in the command process, and other SymbolEngine consumers are
-unchanged.
+JSON operation in the command process. Live layout APIs reuse this boundary as
+described below; symbol lookup and type enumeration still have separate paths.
 
 The broker passes three read-only file handles. The runner reopens each file
 object with an independent cursor and includes only those copies in the child
@@ -1336,11 +1336,70 @@ This boundary contains selected parser faults and resource use. It is not an
 AppContainer, a filesystem allowlist, an egress policy or authenticated parser
 attestation. The child retains some access under the same user, and artifact
 hashes/provider paths do not establish approved distribution. Network-denied
-execution, live SymbolEngine migration, runtime object/anchor binding and isolation
+execution, remaining SymbolEngine migration, runtime object/anchor binding and isolation
 of all untrusted parsers remain open. No network lookup is requested by this
 schema path, but the token/job combination does not enforce a network deny rule.
 Parent artifact hashing has a cooperative 30-second limit per hash; the child
 timeout is not a hard deadline for the whole broker operation or synchronous I/O.
+
+### Live type layout broker
+
+`SymbolEngine::GetTypeLayout`, `GetTypeLayoutById`, `GetTypeFields` and `FindField`
+now consume broker-accepted schemas. A type request discovers module metadata
+without registering its image in DbgHelp. The resolver reads the local image's
+bounded RSDS record and uses only the PDB basename, GUID and age to find artifacts.
+It checks the module-reported image size; this is not a comparison with bytes read
+from the loaded target image. PDB type parsing runs in the restricted worker and
+cannot fall back to parent DbgHelp or DIA when unavailable.
+
+Exact type spelling takes priority. Live compatibility lookup can ignore case
+and leading underscores only when the bounded UDT search finds a unique match;
+the parent checks that the returned canonical type belongs to that alias. Offline
+`--schema create` retains exact spelling. `FindField` similarly prefers exact
+member spelling, rejects ambiguous case-folded matches and checks the cumulative
+offset against the root and each embedded extent. Pointers, arrays and depth-limit
+leaves are not traversed. Field descriptions retain ordinary base/pointer/array
+names, while bit width and storage size remain distinct.
+
+The cache retains at most 32 roots, 8 MiB of encoded packages and 32,768 layout
+nodes. IDs are process-unique opaque references, distinct from the native IDs
+displayed by the remaining type-enumeration path. Reset, symbol/module-state
+changes, eviction or replacement invalidate IDs; an old ID cannot resolve to a
+new node. Nested nodes carry offsets relative to their own object. Schema hashes
+are retained on layouts and fields, and unavailable coverage is explicit, including
+an unknown count when the package contains only a gap reason. `dt` prints the
+schema hash and `runtime_invariants=unchecked`, and shows incomplete field coverage.
+These facts do not qualify a runtime object, authorize a distribution or establish
+an allocation lifetime. Cached results represent the accepted artifact generation,
+not continuous revalidation of disk files or loaded target memory.
+
+The artifact resolver accepts local roots, `cache*<local-root>`,
+`srv*<local-root>`, and `srv*[<local-cache>*]https://<server>`. It probes flat
+files and SymStore GUID/hex-age paths. Local path spelling is checked before any
+filesystem probe; UNC, device, drive-relative, stream, reserved-name and Win32
+trailing-dot/space aliases are rejected. Cache ancestors are pinned and reparse
+directories are rejected. The SymStore index follows Microsoft's
+[symbol reader implementation](https://github.com/microsoft/perfview/blob/main/src/TraceEvent/Symbols/SymbolReader.cs).
+
+Downloads happen in the parent, through direct HTTPS with normal certificate
+validation, no proxy, cookies or implicit Windows authentication. URL userinfo is
+rejected and at most three HTTPS redirects are allowed. Transfers are capped at
+1 GiB with five-second I/O timeouts and a cooperative 60-second acquisition budget.
+The downloaded temporary file's original identity is checked, then its read-only
+lease stays held through parser validation and create-new cache copying. The
+destination is exclusive until flush/close; a copy failure marks that open object
+for deletion. A collision preserves the existing file. Temporary cleanup checks
+file identity and cannot remove a substituted file. A process/power interruption
+or an I/O failure can leave an incomplete cache entry, which must pass a later broker verification;
+it is never treated as a valid layout merely because it exists.
+
+Compressed/pointer stores, authenticated servers, proxy configuration, recursive
+SymSrv cache chains and automatic replacement of invalid entries are unsupported
+by this resolver. The child receives no search path or download request, but still
+has no enforced egress rule. Startup symbol preloading, symbol lookup and type
+enumeration remain in process. Target image/anchor/invariant binding, propagation
+of these schema identities into every typed observation and full parser isolation
+remain open P05 requirements.
 
 ## Capture scheduling and latency
 
