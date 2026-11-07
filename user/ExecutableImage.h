@@ -145,6 +145,9 @@ namespace executable_image
     // Identity-only metadata: stops after bounded headers/sections/RSDS. Does
     // not populate managed-image, base-relocation or dynamic-relocation facts.
     bool ReadDiskPeIdentityHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error);
+    // Approved inherited handle: do not reopen under the parser's reduced token.
+    // The shared file object's implicit cursor is not preserved; reads use offsets.
+    bool ReadApprovedDiskPeIdentityHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error);
     bool DiskFileIdentityMatches(
         HANDLE file,
         const DiskPeMetadata& metadata);

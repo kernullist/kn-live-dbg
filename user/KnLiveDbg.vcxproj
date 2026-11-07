@@ -395,6 +395,7 @@
     <ClInclude Include="DiaArtifactSession.h" />
     <ClInclude Include="SymbolArtifactCache.h" />
     <ClInclude Include="SchemaArtifact.h" />
+    <ClInclude Include="ApprovedFileRead.h" />
     <ClInclude Include="SchemaReadStream.h" />
     <ClInclude Include="ParserWorkerProcess.h" />
     <ClInclude Include="ReferenceArtifact.h" />

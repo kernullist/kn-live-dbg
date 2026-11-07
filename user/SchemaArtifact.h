@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ContentHash.h"
+#include "ApprovedFileRead.h"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -38,14 +39,14 @@ public:
         return Initialize(maximum);
     }
 
-    bool OpenHandle(HANDLE file, uint64_t maximum)
+    bool OpenHandle(HANDLE file, uint64_t maximum, approved_file::Access access = approved_file::Access::Reopen)
     {
         if (File != INVALID_HANDLE_VALUE || file == nullptr || file == INVALID_HANDLE_VALUE ||
             GetFileType(file) != FILE_TYPE_DISK)
         {
             return false;
         }
-        File = ReOpenFile(file, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+        File = approved_file::Open(file, access);
         return Initialize(maximum);
     }
 
@@ -126,8 +127,8 @@ private:
 
     bool Hash(std::wstring* hash)
     {
-        LARGE_INTEGER zero{}, currentSize{};
-        if (!SetFilePointerEx(File, zero, nullptr, FILE_BEGIN) || !GetFileSizeEx(File, &currentSize) ||
+        LARGE_INTEGER currentSize{};
+        if (!GetFileSizeEx(File, &currentSize) ||
             static_cast<uint64_t>(currentSize.QuadPart) != Size) { return false; }
         ContentHash digest;
         std::vector<uint8_t> buffer(65536);
@@ -137,7 +138,7 @@ private:
         {
             DWORD received = 0;
             const auto requested = static_cast<DWORD>((std::min)(remaining, static_cast<uint64_t>(buffer.size())));
-            if (GetTickCount64() - started >= 30000 || !ReadFile(File, buffer.data(), requested, &received, nullptr) ||
+            if (GetTickCount64() - started >= 30000 || !approved_file::ReadAt(File, Size - remaining, buffer.data(), requested, &received) ||
                 received != requested || !digest.Add(buffer.data(), received)) { return false; }
             remaining -= received;
         }

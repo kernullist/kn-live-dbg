@@ -1286,13 +1286,25 @@ described below; symbol lookup and type enumeration use the bounded index worker
 
 The broker passes three read-only file handles. The runner reopens each file
 object with an independent cursor and includes only those copies in the child
-handle list. PE decoding uses the approved image handle; DIA receives a bounded
+handle list. Inside the worker, readers duplicate those approved handles with
+read-only, non-inheritable access; they do not require a second pathname access
+check under the reduced token. The parent retains the original leases that deny
+writers and deletion. PE decoding uses the approved image handle; DIA receives a bounded
 read-only `IStream` over the approved PDB handle, followed by a GUID/age check on
 the DIA global scope. It uses neither `loadDataForExe` nor a symbol-search path.
 Stream clones have independent cursors and serialize access to their shared
-handle. Out-of-range seeks, writes and truncation fail. This follows the
+handle. Hashing, PE reads and stream reads use explicit byte offsets, so other
+duplicates changing the shared file object's implicit cursor cannot change the
+selected bytes. A private completion event also supports overlapped input handles;
+the read waits for completion before releasing its operation state. Its event
+suppresses [completion-port notification](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus)
+so a caller-owned port cannot receive the reader's temporary operation pointer. This remains
+synchronous I/O with cooperative outer budgets, not a hard cancellation deadline.
+Existing parent-facing APIs reopen by default and preserve the caller's cursor.
+Overflowing seeks, writes and truncation fail. This follows the
 [DIA stream input contract](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/idiadatasource-loaddatafromistream)
-and Windows [explicit handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+and Windows [explicit handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+and [explicit-offset read semantics](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile).
 
 Windows loads the trusted installed provider DLL by pathname. Its lease also
 pins non-reparse ancestor directories against rename/delete and verifies the

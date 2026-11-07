@@ -7,6 +7,73 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Approved inherited file reads checkpoint: 2026-11-07
+
+This P05 prerequisite lets parser consumers read approved inherited file objects
+when the child's token cannot reopen their path. Worker hash, PE identity and DIA
+stream readers now take read-only, non-inheritable duplicates and use explicit
+offsets. Default parent-facing APIs retain reopening and independent file cursors.
+The original parent leases still exclude writers and deletion; duplication does
+not itself approve an artifact or establish an immutable source. See the
+[parser handle boundary](ARCHITECTURE.md#schema-parser-process-boundary).
+
+The owned AppContainer reproducer returned access denied for both pathname open
+and handle reopen. The new duplicate path read the same approved bytes without
+granting access to the input file's path. Review also corrected the test's writer
+coordination: the initial Release test could finish before the cursor-changing
+thread ran again. The final test requires observed acknowledgements between read
+batches while the writer continues changing the implicit cursor. A further
+completion-port reproducer exposed notifications containing the reader's
+stack-owned `OVERLAPPED` pointer after return. The private event now suppresses
+those notifications; an ordinary-read positive control and the parent port check
+cover the correction. No additional actionable defects were found in the
+reviewed scope.
+
+Final Release EXE SHA-256:
+`00702d118471b8205d8b4ea5aa52d5cd06743b1c0d30353d8c4cfb147469e3c5`.
+
+| Harness | SHA-256 |
+|---|---|
+| Approved file, ASan | `e5802bbe6cdd88261afbc6356e00acace1053d25ee06a7cdce20cd68ed4406fc` |
+| Approved file, Release | `12c9af2f006aeb391f174a8d8fb7ae6d650de3aa73713c76b0fb185af0510397` |
+| Schema broker, ASan | `8cb71f5da8cb482b37e2c5f359353d8bd8e6a2773bbbe277a428a0e114f56718` |
+| Symbol index, ASan | `7c4b17d04f762a0bba4b7303e69de38ae9122b0b2fd91164a1fa4fe04fe56b63` |
+| Live layouts, ASan | `591cb88a399e8cd0182f8c851123dcce64f20643c475e6114f527c5831ad5736` |
+| KMON core, ASan | `c95c372fc4fdcd89addf3b1d6789f96d0319a7416bd1790718ad922ecb84f66c` |
+
+Checks used Windows 11 Pro x64 `10.0.28000`, NTFS, VS 2022 Build Tools 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Product sources stayed fixed during
+the applicable runs. The final Release build passed with existing C4744 link
+warnings. The preceding header rebuild also reported C4244 warnings in unchanged
+KernelMonitor code. The final full self-test ran
+alone after builds and other executable tests finished.
+
+| Check | Result and scope |
+|---|---|
+| `tools/validate-approved-file.ps1`, with and without `-Sanitize` | 35 controls passed per mode: 10 in each of two actual AppContainer children using synchronous/overlapped inherited files, plus 15 parent controls. Path/reopen denial, matching hashes and PE identity, read-only/non-inheritable duplicates, independent streams/clones under observed cursor changes, completion-port isolation, invalid handles, offset bounds and profile cleanup were checked |
+| `tools/validate-schema-broker.ps1 -Sanitize` | 73 controls passed, including default parent cursor preservation and the actual schema worker path |
+| `tools/validate-symbol-index.ps1 -Sanitize` | 69 controls passed through the updated worker readers |
+| Independent symbol-index oracle | Four PE exports, two private MAP addresses, 263 legacy type names and 131 known name/size pairs matched; final fixture contained 452 symbols and 298 types |
+| `tools/validate-live-type-layout.ps1 -Sanitize` | 112 controls passed |
+| KMON core, ASan | PE/relocation/coverage and owned handle controls passed, together with execution 835, scheduling 130, hunting 11,345, ordering 77, pages 54 and false-positive 49 controls; the 10-case JSON oracle passed |
+| Actual Release executable workers | Two owned symbol-index, two retained kernel-artifact symbol-index and two layout controls passed, including mismatched-PDB rejection |
+| Offline schema CLI | 79 controls passed; one file-symlink case remained skipped |
+| Capability/documentation contracts | 33 contracts / 261 routes passed; generated support matrix matched |
+| Final `--self-test all` | Timeline 28, MCP 102, KMON image reads 119, console 564, command audit 3,006 over 261 routes, remote 68 and four connection-argument checks passed |
+
+This validates the inherited-read prerequisite, **not a product AppContainer or
+network-deny boundary**. Runtime DLL access, profile/environment lifecycle,
+pre-resume token verification and network negative controls still need integration
+before that claim is available. Provider pathname pinning remains unchanged.
+The test grants read/execute access only to its fresh fixture's copied ASan DLL;
+input files and installed runtime ACLs are unchanged. Temporary test profiles were
+removed after the children exited. No driver/service load, reboot or firewall
+policy change was performed; final checks found no test processes or profiles.
+The earlier ASan kernel-PDB memory-limit failure remains unresolved and was not
+rerun as an ASan kernel test in this checkpoint. Release disk-artifact checks do
+not prove loaded-image identity, runtime invariants or object lifetime. The full
+P05/design goals and the earlier privacy/process-capture observations remain open.
+
 ## Symbol index broker checkpoint: 2026-11-07
 
 This P05/W04 step removes parent DbgHelp/DIA parsing from startup preload,

@@ -190,7 +190,8 @@ namespace
 }
 
 static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFile, SchemaArtifact& providerFile,
-    const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error, bool aliases = false)
+    const std::wstring& typeName, TypeSchemaPackage* package, std::wstring* error, bool aliases = false,
+    approved_file::Access access = approved_file::Access::Reopen)
 {
     if (error != nullptr)
     {
@@ -203,7 +204,10 @@ static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFil
     }
     if (!providerFile.PinPath()) { return false; }
     executable_image::DiskPeMetadata metadata;
-    if (!executable_image::ReadDiskPeIdentityHandle(imageFile.Handle(), &metadata, nullptr) ||
+    const bool imageRead = access == approved_file::Access::Duplicate ?
+        executable_image::ReadApprovedDiskPeIdentityHandle(imageFile.Handle(), &metadata, nullptr) :
+        executable_image::ReadDiskPeIdentityHandle(imageFile.Handle(), &metadata, nullptr);
+    if (!imageRead ||
         metadata.Machine != IMAGE_FILE_MACHINE_AMD64 || !metadata.HasPdbIdentity)
     {
         return false;
@@ -213,7 +217,7 @@ static bool GenerateFromLeases(SchemaArtifact& imageFile, SchemaArtifact& pdbFil
     ComPtr<IDiaSession> session;
     ComPtr<IDiaSymbol> global, type;
     if (!provider.Open(providerFile.Path) ||
-        SchemaReadStream::Create(pdbFile.Handle(), &pdbStream) != S_OK ||
+        SchemaReadStream::Create(pdbFile.Handle(), &pdbStream, access) != S_OK ||
         provider.Source->loadDataFromIStream(pdbStream.Get()) != S_OK ||
         !symbol_identity::VerifyDiaIdentity(provider.Source.Get(), {metadata.PdbGuid, 0, metadata.PdbAge}) ||
         provider.Source->openSession(&session) != S_OK || !session || session->get_globalScope(&global) != S_OK || !global ||
@@ -265,11 +269,12 @@ bool GenerateTypeSchemaFromHandles(HANDLE image, HANDLE pdb, HANDLE provider, co
     if (package == nullptr) { return false; }
     *package = {};
     SchemaArtifact imageFile, pdbFile, providerFile;
-    if (!imageFile.OpenHandle(image, 512ull * 1024 * 1024) || !pdbFile.OpenHandle(pdb, 1024ull * 1024 * 1024) ||
-        !providerFile.OpenHandle(provider, 64ull * 1024 * 1024))
+    if (!imageFile.OpenHandle(image, 512ull * 1024 * 1024, approved_file::Access::Duplicate) ||
+        !pdbFile.OpenHandle(pdb, 1024ull * 1024 * 1024, approved_file::Access::Duplicate) ||
+        !providerFile.OpenHandle(provider, 64ull * 1024 * 1024, approved_file::Access::Duplicate))
     {
         if (error != nullptr) { *error = L"schema artifact handle unavailable"; }
         return false;
     }
-    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error, allowTypeAliases);
+    return GenerateFromLeases(imageFile, pdbFile, providerFile, typeName, package, error, allowTypeAliases, approved_file::Access::Duplicate);
 }

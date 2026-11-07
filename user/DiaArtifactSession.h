@@ -18,9 +18,10 @@ public:
     }
     bool Open(HANDLE image, HANDLE pdb, HANDLE provider)
     {
-        if (!Image.OpenHandle(image, 512ull * 1024 * 1024) || !Pdb.OpenHandle(pdb, 1024ull * 1024 * 1024) ||
-            !Provider.OpenHandle(provider, 64ull * 1024 * 1024) || !Provider.PinPath() ||
-            !executable_image::ReadDiskPeIdentityHandle(Image.Handle(), &Metadata, nullptr) || !Metadata.HasPdbIdentity ||
+        if (!Image.OpenHandle(image, 512ull * 1024 * 1024, approved_file::Access::Duplicate) ||
+            !Pdb.OpenHandle(pdb, 1024ull * 1024 * 1024, approved_file::Access::Duplicate) ||
+            !Provider.OpenHandle(provider, 64ull * 1024 * 1024, approved_file::Access::Duplicate) || !Provider.PinPath() ||
+            !executable_image::ReadApprovedDiskPeIdentityHandle(Image.Handle(), &Metadata, nullptr) || !Metadata.HasPdbIdentity ||
             Metadata.Machine != IMAGE_FILE_MACHINE_AMD64) { return false; }
         const auto initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         Initialized = SUCCEEDED(initialized);
@@ -31,7 +32,7 @@ public:
         Microsoft::WRL::ComPtr<IClassFactory> creator;
         return factory != nullptr && factory(__uuidof(DiaSource), IID_PPV_ARGS(&creator)) == S_OK && creator &&
             creator->CreateInstance(nullptr, IID_PPV_ARGS(&Source)) == S_OK && Source &&
-            SchemaReadStream::Create(Pdb.Handle(), &Stream) == S_OK && Stream && Source->loadDataFromIStream(Stream.Get()) == S_OK &&
+            SchemaReadStream::Create(Pdb.Handle(), &Stream, approved_file::Access::Duplicate) == S_OK && Stream && Source->loadDataFromIStream(Stream.Get()) == S_OK &&
             symbol_identity::VerifyDiaIdentity(Source.Get(), {Metadata.PdbGuid, 0, Metadata.PdbAge}) &&
             Source->openSession(&Session) == S_OK && Session && Session->get_globalScope(&Global) == S_OK && Global;
     }

@@ -1,4 +1,5 @@
 #include "ExecutableImage.h"
+#include "ApprovedFileRead.h"
 
 #include <cstring>
 #include <limits>
@@ -61,16 +62,9 @@ namespace executable_image
                 break;
             }
 
-            LARGE_INTEGER distance = {};
-            distance.QuadPart = static_cast<LONGLONG>(offset);
-            if (!SetFilePointerEx(file, distance, nullptr, FILE_BEGIN))
-            {
-                break;
-            }
-
             bytes->assign(length, 0);
             DWORD read = 0;
-            if (!ReadFile(file, bytes->data(), length, &read, nullptr))
+            if (!approved_file::ReadAt(file, offset, bytes->data(), length, &read))
             {
                 break;
             }
@@ -1177,7 +1171,7 @@ namespace executable_image
     }
 
     static bool ReadDiskPeMetadataImpl(const std::wstring& rawPath, HANDLE source, bool identityOnly,
-        DiskPeMetadata* metadata, std::wstring* error)
+        DiskPeMetadata* metadata, std::wstring* error, approved_file::Access access = approved_file::Access::Reopen)
     {
         bool ok = false;
         HANDLE file = INVALID_HANDLE_VALUE;
@@ -1197,7 +1191,7 @@ namespace executable_image
             *metadata = {};
             if (source != INVALID_HANDLE_VALUE)
             {
-                file = ReOpenFile(source, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_SEQUENTIAL_SCAN);
+                file = approved_file::Open(source, access);
             }
             else
             {
@@ -1739,6 +1733,17 @@ namespace executable_image
             return false;
         }
         return ReadDiskPeMetadataImpl(L"", source, true, metadata, error);
+    }
+
+    bool ReadApprovedDiskPeIdentityHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error)
+    {
+        if (source == nullptr || source == INVALID_HANDLE_VALUE || GetFileType(source) != FILE_TYPE_DISK)
+        {
+            if (metadata != nullptr) { *metadata = {}; }
+            if (error != nullptr) { *error = L"invalid approved PE identity handle"; }
+            return false;
+        }
+        return ReadDiskPeMetadataImpl(L"", source, true, metadata, error, approved_file::Access::Duplicate);
     }
 
     bool DiskReferenceIdentityMatches(const std::wstring& rawPath, const DiskPeMetadata& metadata)

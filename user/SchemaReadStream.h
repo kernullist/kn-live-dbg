@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include "ApprovedFileRead.h"
 #include <objidl.h>
 #include <algorithm>
 #include <atomic>
@@ -19,14 +20,14 @@ class SchemaReadStream final : public IStream
         ~FileState() { if (File != INVALID_HANDLE_VALUE) { CloseHandle(File); } }
     };
 public:
-    static HRESULT Create(HANDLE file, IStream** output)
+    static HRESULT Create(HANDLE file, IStream** output, approved_file::Access access = approved_file::Access::Reopen)
     {
         if (output == nullptr) { return E_POINTER; }
         *output = nullptr;
         try
         {
             auto state = std::make_shared<FileState>();
-            state->File = ReOpenFile(file, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_SEQUENTIAL_SCAN);
+            state->File = approved_file::Open(file, access);
             LARGE_INTEGER size{};
             if (state->File == INVALID_HANDLE_VALUE || !GetFileSizeEx(state->File, &size) || size.QuadPart <= 0)
             {
@@ -62,10 +63,7 @@ public:
         const auto available = Position < State->Size ? State->Size - Position : 0;
         const auto count = static_cast<DWORD>((std::min)(available, static_cast<uint64_t>(bytes)));
         DWORD read = 0;
-        LARGE_INTEGER offset{};
-        offset.QuadPart = static_cast<LONGLONG>(Position);
-        if (count != 0 && (!SetFilePointerEx(State->File, offset, nullptr, FILE_BEGIN) ||
-            !ReadFile(State->File, buffer, count, &read, nullptr))) { return STG_E_READFAULT; }
+        if (count != 0 && !approved_file::ReadAt(State->File, Position, buffer, count, &read)) { return STG_E_READFAULT; }
         Position += read;
         if (received != nullptr) { *received = read; }
         return read == bytes ? S_OK : S_FALSE;
