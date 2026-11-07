@@ -8,6 +8,8 @@ import struct
 import subprocess
 import uuid
 
+from image_scope_claim_oracle import check_scope_report
+
 BASE = 0x180000000
 EXPECTED = {
     "clean": (8184, 8, 0, 0),
@@ -47,8 +49,12 @@ def main():
         data = json.loads(result.stdout)
         check(data["schema"] == "kn.image_slice_replay.v1", "slice envelope is distinct from single-page replay")
         check((data["status"] == "replayed") == success, "fresh replay state")
-        if args.cli:
-            check(data["claim_assessment"] is None, "direct claim adapter does not claim slice-policy coverage")
+        if success:
+            envelope = json.loads(path.read_bytes())
+            blob = path.parent.parent / "image-references" / (envelope["payload"]["reference_sha256"] + ".knblob")
+            check_scope_report(envelope, [envelope], [blob.read_bytes()], data)
+        else:
+            check(data["claim_assessment"] is None, "failed slice replay withholds current claims")
         return data
 
     for name, counts in EXPECTED.items():
@@ -82,6 +88,10 @@ def main():
         check(result["result"] == p["recorded_result"], "same-policy result matches original")
         check(result["current_policy"] == p["policy"] and result["recorded_policy"] == p["policy"], "reported policy matches replay engine")
         proof = result["proof"]
+        claim_states = [claim["status"] for claim in result["claim_assessment"]["claims"]]
+        expected_states = ["contradicted", "supported"] if name in {"modified", "secondary_modified"} else \
+            ["supported", "contradicted"] if name == "continuation" else ["unfulfilled", "unfulfilled"]
+        check(claim_states == expected_states, "scoped common claims preserve modified and unavailable controls")
         observed = tuple(int(proof[k]) for k in ("compared_bytes", "excluded_bytes", "unreadable_bytes", "changed_bytes"))
         check(observed == counts, "independent slice coverage denominators")
         check(sum(int(r["length"]) for r in proof["differs"]) == counts[3], "independent changed ranges")

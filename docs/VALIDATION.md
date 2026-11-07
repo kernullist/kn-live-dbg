@@ -7,6 +7,75 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Slice and sweep claim checkpoint: 2026-11-07
+
+This P08 step adds common claim adapters for original-policy image slice and
+sweep replay. The slice and sweep policy identifiers select their report
+variants under `kn.image_claim_report.v1`. Typed range partitions, original
+selected target receipts and exact manifest membership qualify the claims.
+The [scope claim contract](ARCHITECTURE.md#slice-and-sweep-claim-policies) describes
+the temporal scope, first stable difference witness and remaining limits.
+Original artifacts, existing proof output and native ABI remain unchanged.
+
+The ASan slice harness passed **423 C++ controls**. Independent Python oracles
+passed **385 slice checks / 11 cases**, **270 sweep checks / 11 cases** and
+**1,414 graph checks / 8 cases**. The claim oracle reconstructs AMD64 PE/DIR64
+expected bytes from the retained reference, resolves original accepted parser
+calls and distinct returned receipts, and checks the full range partition,
+membership links, exact witness and all seven ledgers. Retained prefixes from
+failed primary reads do not count as accepted target observations. Secondary-view inputs
+remain separately referenced and do not replace target confirmation reads.
+
+Additional controls preserve a stable changed range when the final slice is
+missing, an earlier manifest entry is missing, or a different page is unstable.
+The full-match claim is contradicted while the difference remains supported;
+missing membership requirements and failed/unvisited address partitions remain
+visible. Separate raw-archive publication loss remains explicit even when all
+original comparison inputs survive inside the recipes. Empty/rejected slices,
+loader exclusions, unconfirmed reads and changed identities cannot become full
+matches. Unit controls also reject altered comparison counters/bytes, foreign
+recipe digests and substituted child target namespaces/acquisition intervals.
+
+The final product passed **440 slice checks**, **312 sweep checks** and **1,414
+graph checks** on the same owned fixtures. Direct-image compatibility passed
+the existing **34 claim replay controls** and **122 CLI checks**. The updated
+disclosure harness compiled with ASan and passed **506 checks**, including the
+product's offline and real handler paths through an owned test endpoint;
+**14 requests** were observed and **zero child processes** remained. These are
+bounded controls, not native-platform coverage or a detection-accuracy estimate.
+
+The Release build and isolated `--self-test all` passed: timeline **28**, MCP
+**102**, KMON image integration **119**, console **564**, command audit **3,011 /
+261 routes**, and remote **68** plus four connection-option controls. Capability
+checks passed **36 contracts / 261 routes**, the generated support matrix matches
+the binary, and the public-content classifier passed **12 tests**. Target
+availability remains unprobed. Final review found no additional actionable
+defects in the reviewed scope.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `c28065e83ffa0c889b10f13552bf5bb391b533cffcce8b8473327f31973bab33` |
+| Slice/sweep/graph, ASan | `136ec01c7988c2e8174cd4e29fa5c74a3fb8327ea4977703605c1eb9d1425871` |
+| Disclosure compatibility, ASan | `bda8b936468dd3c1cb5f636da1756d39036afa203fa17bfac2d9959ac60c2158` |
+
+Reproduce with `tools/validate-image-slice.ps1 -Sanitize`; the runner emits unique
+binary and fixture directories, preserving previous run binaries. The three
+`test-image-slice.py`, `test-image-sweep.py` and `test-image-sweep-graph.py` scripts
+accept `--exe <product> --fixtures <directory> --cli` for product checks.
+`tools/validate-evidence-disclosure.ps1 -Sanitize` takes `-ImageSliceFixtures`,
+`-ImageRecipeFixtures` and optional `-Cli` paths. Run `KnLiveDbg.exe --self-test all`
+alone. The Windows 11 10.0.28000 / kernel 10.0.28000.3231 host, VS 17.14.60,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0 environment is unchanged from the
+direct-image checkpoint. Existing C4744 link warnings remain.
+
+Final cleanup found no test process, parser profile/receipt/preparation or
+running task-driver residue. Services, firewall settings and boot time match
+the baseline; no driver was loaded or reboot performed. Completed code caches
+and owned fixtures remain. Claim-report persistence, original claim-policy
+reproduction, generic cross-capture lifetime joins, other object adapters and
+native validation remain open. The earlier real-kernel PDB ASan resource failure
+is still unresolved. This does not complete P08 or the full P01-P16/VS1-VS4 goal.
+
 ## Direct image claim checkpoint: 2026-11-07
 
 This P08 step connects direct image recipe v1/v2 replay to the common claim

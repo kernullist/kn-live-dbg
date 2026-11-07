@@ -4,6 +4,7 @@
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
 #include "AnalystSnapshot.h"
+#include "ImageScopeClaims.h"
 #include <filesystem>
 
 using namespace bounded_observation_json;
@@ -260,9 +261,10 @@ std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata&
 }
 
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
-    std::vector<ExecutablePageResult>* verifiedPages)
+    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims)
 {
     if (verifiedPages != nullptr) { verifiedPages->clear(); }
+    if (verifiedClaims != nullptr) { *verifiedClaims = {}; }
     ImageRecipeReplay result;
     result.Schema = L"kn.image_slice_replay.v1";
     result.Mode = L"original_policy";
@@ -310,6 +312,9 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     }
     result.Proof = Proof(p, pages, result.RecipeSha256);
     if (result.Proof.empty()) { result.Status = L"comparison_accounting_failed"; return result; }
+    auto claims = AssessImageSliceClaims(p, pages, result.RecipeSha256);
+    result.ClaimAssessmentJson = ImageSliceClaimAssessmentJson(claims);
+    if (verifiedClaims != nullptr) { *verifiedClaims = std::move(claims); }
     if (verifiedPages != nullptr) { *verifiedPages = pages; }
     result.Status = L"replayed";
     if (error != nullptr) { error->clear(); }

@@ -1915,12 +1915,72 @@ Claim-report persistence is not established and journal membership is not checke
 There are exactly two claims, bounded to 256 Ki UTF-16 code units, with all
 difference ranges preserved for the at-most-4,096-byte direct recipe.
 `report_complete` refers only to this two-policy projection. Failed replay emits
-`claim_assessment=null`; slice and sweep replays also leave it null until their
-own adapters are implemented. Their existing proofs remain available. A scoped
+`claim_assessment=null`. Slice and sweep use the separate adapters described
+below; their existing proofs remain available. A scoped
 match/difference does not prove execution, writer, maliciousness, authorization,
 whole-image integrity or continuous observation. Original claim publication and
 reproduction, other object/image adapters and qualified cross-capture joins remain
 open parts of P08.
+
+### Slice and sweep claim policies
+
+Original-policy slice and sweep replay also emits `kn.image_claim_report.v1`,
+using `kn.image_claim_policy.slice.v1` or `kn.image_claim_policy.sweep.v1` with the
+common evaluator. Slice claims assess all executed requested ranges or the
+existence of a stable difference. Sweep claims assess the declared temporal
+schedule or a stable difference within one of its verified member recipes.
+Neither reports an atomic image snapshot. Unsupported `/current` comparison
+reanalysis still fails explicitly; current claim evaluation is a separate step.
+
+`AssessImageSliceClaims` consumes the freshly replayed typed pages and the exact
+recipe. It independently checks disjoint range classification, original expected
+and observed byte agreement, the recorded direct/secondary normalization basis,
+and original accepted parser calls. A difference witness requires two distinct
+returned receipts that agree on compared bytes. Failed primary prefixes and
+secondary reference reads cannot substitute for those target observations.
+The witness identifies the first stable changed range, both parser calls and
+their returned receipts, the normalization entry, and secondary inputs when used.
+Counts describe all stable difference bytes/ranges; the witness is an explicit
+selection, not a complete changed-range listing. The original recipe and legacy
+proof retain the full ranges.
+
+Sweep claims are evaluated only after replay checks the root manifest, each
+child recipe digest, exact reference, raw artifact when declared published,
+target/address-space labels, range membership and acquisition interval. Claim
+facts refer to this verified manifest membership; the witness links onward to
+the original child recipe. This bridge binds recorded artifacts under one
+declared collection. It does not authenticate the collector or establish a
+process/mapping lifetime. Substituting another child's digest, target namespace
+or interval prevents assessment.
+
+Complete matching requires nonempty complete membership, qualification of every
+range and a full comparison under each range's recorded policy. A stable local
+difference contradicts that match claim and supports the difference claim even
+when another slice is absent, the tail is unknown, or another page failed.
+Missing membership/qualification requirements remain visible beside the
+contradiction. Exclusions, an unconfirmed change and an empty/unattempted
+comparison stay unfulfilled; they are not not-applicable or evidence of a match.
+
+The address ledger keeps one exact compared/skipped/failed/unvisited partition
+per original slice, with its policy, relocation basis, range indices, interval
+and reference to replayed original ranges. It explicitly makes no combined
+coverage assertion across policies or times. Discovery separately records the
+scheduled and replayed range counts, missing entries and unvisited schedule
+bytes. Temporal coverage remains acquisition-only, without a known event-loss
+denominator or mapping lifetime. Persistence separates original target/secondary
+read traffic, stored bytes including repeated/failed attempts, and missing raw
+publications. A retained recipe can prove its compared bytes despite a missing
+separate raw archive; that loss still prevents the legacy whole-sweep publication
+claim. Journal membership and claim-report persistence are not inferred.
+
+Reports contain exactly two claim assessments and all original policy partitions,
+bounded to 2 Mi UTF-16 code units and at most 2,048 manifest members.
+`report_complete` describes that projection, not whole-image coverage or every
+possible difference witness. The remaining semantic, replay and trust ledgers
+retain unknown hotpatch epoch, original comparison versus current claim policy,
+and unauthenticated/undeclared approval limits. Invalid replay emits no claim
+report. Original claim publication/reproduction and other object/lifetime
+adapters remain separate P08 work.
 
 ## Cross-bundle temporal candidates
 

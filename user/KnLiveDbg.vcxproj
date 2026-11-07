@@ -228,6 +228,7 @@
     <ClCompile Include="ImageRecipeJson.cpp" />
     <ClCompile Include="ImageRecipeReadSet.cpp" />
     <ClCompile Include="ImageSliceRecipe.cpp" />
+    <ClCompile Include="ImageScopeClaims.cpp" />
     <ClCompile Include="ImageSweepManifest.cpp" />
     <ClCompile Include="ImageSweepReplay.cpp" />
     <ClCompile Include="ImageSweepGraph.cpp" />
@@ -419,6 +420,7 @@
     <ClInclude Include="BoundedObservationJson.h" />
     <ClInclude Include="ProcessImageCapture.h" />
     <ClInclude Include="ImageProof.h" />
+    <ClInclude Include="ImageScopeClaims.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />
     <ClInclude Include="WdFilterRuntimeScanner.h" />

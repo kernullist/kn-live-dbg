@@ -1,6 +1,7 @@
 #include "ImageSweepManifest.h"
 #include "ImageSweepReplayEvidence.h"
 #include "ImageSliceRecipe.h"
+#include "ImageScopeClaims.h"
 #include "ObservationReadRoutingJson.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -86,6 +87,7 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
     ReferenceArtifact reference;
     ExecutableSweep schedule;
     std::vector<bool> seen;
+    std::vector<ImageSliceClaimEvidence> claimSlices;
     std::set<uint64_t> readIds;
     for (const auto& row : manifest.Slices)
     {
@@ -144,7 +146,9 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         // Reopening is bound by the returned digest, not by the pathname alone.
         // The shared reference exclusion lease remains held across every slice.
         ImageSweepReplayedSlice verifiedSlice;
-        const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error, verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr);
+        ImageSliceClaimEvidence sliceClaims;
+        const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error,
+            verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr, &sliceClaims);
         uint64_t bytes = 0, equalOrDifferent = 0, skip = 0, fail = 0, differences = 0;
         bool sliceQualified = false;
         if (replay.Status != L"replayed" || replay.RecipeSha256 != row.RecipeSha256 ||
@@ -158,6 +162,7 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         }
         requested += bytes; compared += equalOrDifferent; excluded += skip; unreadable += fail; changed += differences;
         qualified &= sliceQualified;
+        claimSlices.push_back(std::move(sliceClaims));
         if (verifiedEvidence != nullptr)
         {
             verifiedSlice.Publication = row;
@@ -199,6 +204,7 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         L",\"recipe_evidence\":" + evidence + L"],\"unfulfilled_requirements\":[" + unmet + L"\"approved_reference_provenance\","
         L"\"atomic_mapping_lifetime\",\"execution_observation\"],\"atomic_snapshot\":false,\"collector_authenticated\":false,\"execution_observed\":false}";
     result.Status = L"replayed";
+    result.ClaimAssessmentJson = ImageSweepClaimAssessmentJson(manifest, result.ManifestSha256, claimSlices);
     if (verifiedEvidence != nullptr)
     {
         verified.Manifest = std::move(manifest);

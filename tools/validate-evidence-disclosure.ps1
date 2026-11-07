@@ -22,7 +22,7 @@ if ($Sanitize)
 $sources = @('tools\evidence-disclosure-selftest.cpp', 'user\EvidenceDisclosure.cpp', 'user\EvidenceDisclosureFacts.cpp',
     'user\EvidencePrivacy.cpp', 'user\AiProvider.cpp', 'user\AiModelCatalog.cpp',
     'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageVerificationRecipe.cpp',
-    'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
+    'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp') | ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}disclosure.pdb" /link /INCREMENTAL:NO winhttp.lib ws2_32.lib crypt32.lib shell32.lib' -f $validationEnvironment.VcVarsPath, $flags, ($sources -join ' '), $exe, ($output.Replace('\', '/') + '/')

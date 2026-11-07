@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import uuid
 
+from image_scope_claim_oracle import check_scope_report
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -34,6 +36,17 @@ def main():
         check((result["status"] == "replayed") == success, "replay status")
         if not success:
             check(result["proof"] is None, "contradictory or missing inputs have no proof")
+            check(result["claim_assessment"] is None, "failed sweep replay cannot authorize current claims")
+        else:
+            manifest = json.loads(path.read_bytes())
+            collection = manifest["payload"]["sweep"]["collection_id"]
+            folder = path.parent.parent
+            recipes, blobs = [], []
+            for member in manifest["payload"]["slices"]:
+                recipe = json.loads((folder / "image-reads" / f"reads-{collection}-{member['read_set_id']}.knslice").read_bytes())
+                recipes.append(recipe)
+                blobs.append((folder / "image-references" / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes())
+            check_scope_report(manifest, recipes, blobs, result)
         return result
 
     def envelope_hash(path, key):
@@ -93,6 +106,19 @@ def main():
             unavailable = replay(path, False, True)
             check(unavailable["status"] == "sweep_current_reanalysis_unavailable", "no silent current-policy alias")
 
+    for name, expected_states in {
+        "sweep_raw_lost": ["supported", "contradicted"],
+        "sweep_unstable": ["unfulfilled", "unfulfilled"],
+        "sweep_modified_interrupted": ["contradicted", "supported"],
+        "sweep_modified_gap": ["contradicted", "supported"],
+        "sweep_partial_modified": ["contradicted", "supported"],
+    }.items():
+        result = replay(root / name / "image-sweeps" / "sweep-7-1.knsweep")
+        check([claim["status"] for claim in result["claim_assessment"]["claims"]] == expected_states,
+              "local stable differences survive omitted slices, unknown tails and other failed comparisons")
+        if name == "sweep_raw_lost":
+            check(result["claim_assessment"]["ledgers"]["persistence"]["raw_publication_failures"] == "2" and
+                  not result["proof"]["whole_sweep_complete"], "retained recipe proof cannot hide raw publication loss")
     source = root / "sweep_clean"
     for mutation in ("schedule", "duplicate", "target", "missing_recipe", "missing_raw", "corrupt_reference",
                      "raw_identity", "contradictory_terminal", "contradictory_time", "inconsistent", "path_escape"):
@@ -137,7 +163,7 @@ def main():
         document["manifest_sha256"] = hashlib.sha256(payload.encode()).hexdigest()
         manifest.write_text(json.dumps(document, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         replay(manifest, False)
-    print(f"Image sweep oracle passed: {checks} checks; cases={len(expected)}; cli={args.cli}")
+    print(f"Image sweep oracle passed: {checks} checks; cases={len(expected) + 5}; cli={args.cli}")
 
 
 if __name__ == "__main__":

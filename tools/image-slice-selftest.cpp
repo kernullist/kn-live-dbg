@@ -2,6 +2,7 @@
 #include "../user/ImageSweepManifest.h"
 #include "../user/ImageSweepGraph.h"
 #include "../user/ImageSweepReplayEvidence.h"
+#include "../user/ImageScopeClaims.h"
 #include "../user/ObservationReadRoutingJson.h"
 #include "../user/ContentHash.h"
 #include "../user/AnalystSnapshot.h"
@@ -120,14 +121,14 @@ namespace
     void SweepTests(const std::filesystem::path& root)
     {
         for (const auto scenario : {L"sweep_clean", L"sweep_modified", L"sweep_excluded", L"sweep_gap", L"sweep_interrupted", L"sweep_secondary",
-            L"sweep_unstable", L"sweep_raw_lost"})
+            L"sweep_unstable", L"sweep_raw_lost", L"sweep_modified_interrupted", L"sweep_modified_gap", L"sweep_partial_modified"})
         {
             const auto folder = root / scenario;
             std::filesystem::create_directories(folder / L"image-reads");
             std::filesystem::create_directories(folder / L"image-sweeps");
             const auto original = folder / L"original.exe";
             Source source(L"synthetic:sweep");
-            source.Unstable = std::wstring(scenario) == L"sweep_unstable";
+            source.Unstable = std::wstring(scenario) == L"sweep_unstable" || std::wstring(scenario) == L"sweep_partial_modified";
             auto disk = Fixture(&source.Bytes);
             if (std::wstring(scenario) != L"sweep_excluded")
             {
@@ -137,7 +138,10 @@ namespace
                 Put(source.Bytes, offset, IMAGE_DATA_DIRECTORY{});
                 source.Bytes[0x1100] = disk[0x500]; // The removed exclusion must not leave a hidden fixture change.
             }
-            if (std::wstring(scenario) == L"sweep_modified" || source.Unstable) { source.Bytes[0x1050] ^= 1; }
+            if (std::wstring(scenario) == L"sweep_modified" || std::wstring(scenario) == L"sweep_modified_interrupted" || source.Unstable)
+            { source.Bytes[0x1050] ^= 1; }
+            if (std::wstring(scenario) == L"sweep_modified_gap" || std::wstring(scenario) == L"sweep_partial_modified")
+            { source.Bytes[0x2050] ^= 1; }
             Check(Write(original, disk), "sweep-owned-reference");
             std::unique_ptr<void, decltype(&CloseHandle)> section(nullptr, &CloseHandle);
             std::unique_ptr<void, decltype(&UnmapViewOfFile)> view(nullptr, &UnmapViewOfFile);
@@ -212,8 +216,8 @@ namespace
             std::optional<ImageSweepManifest> final;
             for (size_t index = 0; index < contexts.size(); ++index)
             {
-                if ((std::wstring(scenario) == L"sweep_gap" && index == 0) ||
-                    (std::wstring(scenario) == L"sweep_interrupted" && index == 1)) { continue; }
+                if (((std::wstring(scenario) == L"sweep_gap" || std::wstring(scenario) == L"sweep_modified_gap") && index == 0) ||
+                    ((std::wstring(scenario) == L"sweep_interrupted" || std::wstring(scenario) == L"sweep_modified_interrupted") && index == 1)) { continue; }
                 std::unique_ptr<ReferenceArtifact> lease;
                 bool created = false;
                 Check(PublishReferenceBlob((folder / L"image-references").wstring(), *references[index].Artifact, UINT64_MAX,
@@ -243,6 +247,8 @@ namespace
             const auto replay = ReplayImageRecipe(manifestPath.wstring(), false, nullptr);
             if (replay.Status != L"replayed") { std::wcerr << scenario << L": " << replay.Status << L"\n"; }
             Check(replay.Status == L"replayed" && !replay.Proof.empty(), "sweep-replay-after-original-source-removal");
+            Check(mcpjson::ValidateDocument(replay.ClaimAssessmentJson) &&
+                replay.ClaimAssessmentJson.size() <= ImageScopeClaimMaximumCharacters, "sweep-common-claims-preserve-bounded-policy-partitions");
             ImageSweepReplayEvidence verified;
             std::wstring expectedDigest;
             mcpjson::GetString(json, L"manifest_sha256", &expectedDigest);
@@ -255,6 +261,22 @@ namespace
             Check(!SaveObservationJson(manifestPath.wstring(), L"{}", nullptr), "sweep-collision-never-replaces-root");
             if (std::wstring(scenario) == L"sweep_clean")
             {
+                std::vector<ImageSliceClaimEvidence> claims;
+                for (const auto& row : parsed.Slices)
+                {
+                    ImageSliceClaimEvidence slice;
+                    const auto leaf = folder / L"image-reads" / (L"reads-7-" + std::to_wstring(row.ReadSetId) + L".knslice");
+                    Check(ReplayImageSliceRecipe(leaf.wstring(), nullptr, nullptr, &slice).Status == L"replayed" && slice.Valid,
+                        "claim-manifest-membership-starts-from-verified-child-replay");
+                    claims.push_back(std::move(slice));
+                }
+                Check(!ImageSweepClaimAssessmentJson(parsed, expectedDigest, claims).empty(), "verified-child-proofs-compose-in-explicit-manifest-scope");
+                auto wrongClaims = claims; wrongClaims.front().RecipeSha256.assign(64, L'0');
+                Check(ImageSweepClaimAssessmentJson(parsed, expectedDigest, wrongClaims).empty(), "claim-join-rejects-substituted-child-digest");
+                wrongClaims = claims; wrongClaims.front().TargetId += L":other";
+                Check(ImageSweepClaimAssessmentJson(parsed, expectedDigest, wrongClaims).empty(), "claim-join-rejects-other-target-namespace");
+                wrongClaims = claims; ++wrongClaims.front().StartedTick;
+                Check(ImageSweepClaimAssessmentJson(parsed, expectedDigest, wrongClaims).empty(), "claim-join-rejects-other-acquisition-interval");
                 auto altered = parsed;
                 altered.Slices.back().ReadSetId = altered.Slices.front().ReadSetId;
                 const auto duplicate = folder / L"image-sweeps" / L"duplicate.knsweep";
@@ -400,10 +422,31 @@ int wmain(int argc, wchar_t** argv)
             if (replay.Status != L"replayed") { std::wcerr << L"replay " << name << L": " << replay.Status << L"\n"; }
             Check(replay.Status == L"replayed" && replay.CurrentResult == parsed.RecordedResult && !replay.Proof.empty() && fallback.Calls == calls,
                 "same-policy-replay-without-target-or-original-reference");
+            const auto claims = AssessImageSliceClaims(parsed, pages, replay.RecipeSha256);
+            Check(claims.Valid && mcpjson::ValidateDocument(replay.ClaimAssessmentJson) &&
+                replay.ClaimAssessmentJson.size() <= ImageScopeClaimMaximumCharacters,
+                "slice-common-claims-bind-verified-original-replay");
+            const bool changed = scenario == L"modified" || scenario == L"secondary_modified";
+            Check((claims.FirstDifference.Size != 0) == changed &&
+                (!changed || (claims.WitnessParserReads.size() == 2 && claims.WitnessReceipts.size() == 2 &&
+                    claims.WitnessReceipts[0] != claims.WitnessReceipts[1])),
+                "stable-witness-needs-two-distinct-accepted-original-receipts");
+            Check(claims.FullMatch == (scenario == L"continuation"),
+                "excluded-unread-and-unqualified-slice-scope-cannot-be-a-full-match");
             Check(!SaveObservationJson(path.wstring(), L"{}", nullptr), "existing-slice-never-replaced");
             Check(ReplayImageRecipe(path.wstring(), true, nullptr).Status == L"slice_current_reanalysis_unavailable", "current-policy-mode-not-silently-substituted");
             if (scenario == L"modified")
             {
+                auto corruptPages = pages;
+                ++corruptPages[0].Coverage.ComparedBytes;
+                Check(!AssessImageSliceClaims(parsed, corruptPages, replay.RecipeSha256).Valid,
+                    "slice-claim-counter-tamper-fails-unique-range-accounting");
+                corruptPages = pages;
+                corruptPages[0].Observed[0x50] ^= 1;
+                Check(!AssessImageSliceClaims(parsed, corruptPages, replay.RecipeSha256).Valid,
+                    "slice-claim-bytes-must-agree-with-original-returned-receipt");
+                Check(!AssessImageSliceClaims(parsed, pages, std::wstring(64, L'0')).Valid,
+                    "slice-claim-cannot-bind-a-different-recipe-digest");
                 auto invalid = parsed;
                 invalid.TargetReads.ParserReads.front().ReturnedReceipt = invalid.TargetReads.ParserReads.front().PrimaryReceipt;
                 Check(ImageSliceRecipeJson(invalid).empty(), "partial-primary-cannot-replace-selected-fallback");

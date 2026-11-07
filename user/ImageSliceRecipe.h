@@ -26,5 +26,6 @@ std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata&
     const ExecutableSweepReference& reference, const ExecutableSliceTrace& slice,
     const ObservationRoutedReadSet& reads, const std::vector<ExecutablePageResult>& pages);
 // Optional typed results are populated only after all original inputs and results agree.
+struct ImageSliceClaimEvidence;
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
-    std::vector<ExecutablePageResult>* verifiedPages = nullptr);
+    std::vector<ExecutablePageResult>* verifiedPages = nullptr, ImageSliceClaimEvidence* verifiedClaims = nullptr);
