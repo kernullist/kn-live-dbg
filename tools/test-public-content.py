@@ -34,7 +34,7 @@ class PublicContentTests(unittest.TestCase):
         self.assertEqual(AUDIT.inspect("notes.md", b"sha256=" + b"a1" * 32), [])
 
     def test_renamed_evidence_stays_private(self):
-        for schema in ("kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
+        for schema in ("kmon.bundle.v1", "kmon.bundle.v2", "kmon.evidence.v1", "kmon.evidence.v2", "kn.temporal_facts.v1", "kmon.evidence_session.v1",
                        "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                        "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                        "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",

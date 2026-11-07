@@ -40,6 +40,7 @@
 #include "EvidenceDisclosure.h"
 #include "EvidenceRetention.h"
 #include "EvidenceGraph.h"
+#include "TemporalFactStore.h"
 #include "ImageSweepGraph.h"
 #include <filesystem>
 #include "LeftoverCommon.h"
@@ -23056,6 +23057,7 @@ static void PrintKmonHelp()
     std::wcout << L"  /private-log root  require initialized private root, audit before acquisition\n";
     std::wcout << L"  --offline !kmon redact-image <recipe-directory|knslice|knsweep> <new-private-root> [/acl-only] [/json]\n";
     std::wcout << L"  --offline !kmon disclosure <private-root> [/json]  inspect a minimized package; no transfer\n";
+    std::wcout << L"  --offline !kmon relate <2..32 file.kncase paths> [/gap-ms N] [/limit N] [/cursor token] [/budget-ms N] [/json]\n";
     std::wcout << L"  --offline !kmon init-store <new-root> [/acl-only] [/json]  require EFS by default\n";
     std::wcout << L"  --offline !kmon privacy <root> [/audit] [/json]  inspect OS protections\n";
     std::wcout << L"  /layout-ms N    memory layout rescan target, 1000..60000 ms (default 5000)\n";
@@ -23413,7 +23415,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23579,6 +23581,49 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         const auto result = source->Read(request);
         std::wcout << ObservationReadJson(source->Capabilities(), request, result) << L"\n";
         return result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1;
+    }
+    if (action == L"relate")
+    {
+        TemporalFactQuery query;
+        query.Cancellation = &g_StopRequested;
+        std::vector<std::wstring> paths;
+        std::set<std::wstring> seen;
+        bool valid = true, options = false;
+        for (size_t i = 2; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            if (!options && !option.empty() && option.front() != L'/')
+            {
+                paths.push_back(args[i]);
+                valid = paths.size() <= 32 && ToLower(std::filesystem::path(args[i]).extension().wstring()) == L".kncase";
+                continue;
+            }
+            options = true;
+            if (!seen.insert(option).second) { valid = false; }
+            else if (option == L"/json") { continue; }
+            else if (i + 1 < args.size() && (option == L"/cursor" || option == L"/limit" || option == L"/gap-ms" || option == L"/budget-ms"))
+            {
+                const auto& value = args[++i];
+                uint64_t number = 0;
+                if (option == L"/cursor") { query.Cursor = value; valid = !value.empty() && value.size() <= 180; }
+                else if (!ParseUnsigned(value, 10, &number)) { valid = false; }
+                else if (option == L"/limit") { valid = number >= 1 && number <= 128; query.Limit = static_cast<size_t>(number); }
+                else if (option == L"/gap-ms") { valid = number <= 300000; query.MaximumGapMs = number; }
+                else { valid = number <= 5000; query.TimeBudgetMs = number; }
+            }
+            else { valid = false; }
+        }
+        if (!valid || paths.size() < 2)
+        {
+            std::wcerr << L"usage: --offline !kmon relate <2..32 file.kncase paths> [/gap-ms 0..300000] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
+            return 2;
+        }
+        TemporalFactStore store;
+        TemporalFactPage page;
+        try { store = LoadTemporalFactStore(paths, &g_StopRequested); page = QueryTemporalFacts(store, query); }
+        catch (const std::exception&) { store = {}; page = {}; page.Status = L"operation_failed"; }
+        if (!WriteCapabilityJson(TemporalFactsJson(store, query, page))) { return 3; }
+        return page.Status == L"ok" ? 0 : 1;
     }
     if (action == L"graph")
     {
@@ -23856,7 +23901,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args)
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, replay-image, inventory, evidence, graph, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, replay-image, inventory, evidence, relate, graph, replay, or why\n";
     return 2;
 }
 
@@ -53648,7 +53693,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|replay-image|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";

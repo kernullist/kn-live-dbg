@@ -610,6 +610,8 @@ private:
         EvidenceBundle Bundle;
     };
     uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
+    void BindEvidenceOrigin(EvidenceBundle& bundle, const std::wstring& captureId,
+        uint64_t nativeEpochBefore, uint64_t nativeEpochAfter) const;
     uint64_t QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
         const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr,
         const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr,
@@ -658,6 +660,7 @@ private:
     void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
     void CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};
+    std::wstring EvidenceCollectorScope = NewEvidenceScope();
     KmonWorkQueue<CapturedEvidence> CapturedEvidenceBundles{64};
     std::atomic<uint64_t> EvidenceQueued{0};
     std::atomic<uint64_t> EvidenceWritten{0};

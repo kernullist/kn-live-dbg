@@ -1,6 +1,7 @@
 #pragma once
 
 #include "KmonHunting.h"
+#include "EvidenceOrigin.h"
 
 // One immutable receipt and its bounded read set. Files are local, private
 // captures; checksums establish consistency, not collector authenticity.
@@ -18,6 +19,7 @@ struct EvidenceBundle
     KmonHuntReceipt Receipt;
     std::wstring CollectionId;
     std::wstring Acquisition = L"unspecified";
+    EvidenceOrigin Origin;
     uint64_t CaptureStartedMs = 0;
     uint64_t CaptureEndedMs = 0;
     bool ReferenceConsistent = false;

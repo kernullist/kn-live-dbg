@@ -92,7 +92,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                         (document.get("target_probed") is not False or document.get("scope") == "runtime_probe" or "probe" in document)):
                     add("private-runtime-probe")
                 if isinstance(document, dict) and document.get("schema") in {
-                    "kmon.bundle.v1", "kmon.evidence.v1", "kmon.evidence_session.v1",
+                    "kmon.bundle.v1", "kmon.bundle.v2", "kmon.evidence.v1", "kmon.evidence.v2", "kn.temporal_facts.v1", "kmon.evidence_session.v1",
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                     "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                     "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",

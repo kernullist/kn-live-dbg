@@ -3,6 +3,7 @@
 #include "ContentHash.h"
 #include "McpJson.h"
 #include "EvidenceInvestigation.h"
+#include "TemporalFactStore.h"
 #include "ObservationReadRoutingJson.h"
 
 #include <algorithm>
@@ -181,6 +182,7 @@ void KernelMonitor::ResetPipeline()
     ImageSweepTerminalsObserved.store(0);
     ImageSweepMetadataFailures.store(0);
     EvidenceCollectionEpoch.store(KmonHuntQueryEpochSeed());
+    EvidenceCollectorScope = NewEvidenceScope();
     EvidenceQueued.store(0);
     EvidenceWritten.store(0);
     EvidenceFailed.store(0);
@@ -905,11 +907,24 @@ void KernelMonitor::CaptureLoop()
     CaptureWorkerDone.store(true);
 }
 
+void KernelMonitor::BindEvidenceOrigin(EvidenceBundle& bundle, const std::wstring& captureId,
+    uint64_t nativeEpochBefore, uint64_t nativeEpochAfter) const
+{
+    bundle.Origin = {};
+    const auto& boot = ObservationBootId();
+    if (nativeEpochBefore != nativeEpochAfter || boot != bundle.Receipt.Reference.Context.Identity.BootId ||
+        !EvidenceOrigin::Id(boot) || !EvidenceOrigin::Id(EvidenceCollectorScope) || !EvidenceOrigin::Id(captureId) ||
+        (bundle.Acquisition != L"local_user_reader" && nativeEpochBefore == 0)) { return; }
+    bundle.Origin = {EvidenceCollectorScope, captureId, boot, nativeEpochBefore};
+}
+
 uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
 {
     CapturedEvidence evidence;
     evidence.Id = NextCaptureId.fetch_add(1);
     bundle.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
+    // Requeued historical data cannot acquire a new local binding by admission.
+    if (bundle.Origin.CollectorScope != EvidenceCollectorScope) { bundle.Origin = {}; }
     evidence.Bundle = std::move(bundle);
     const uint64_t id = evidence.Id;
     if (!CapturedEvidenceBundles.Push(std::move(evidence))) { EvidenceDropped.fetch_add(1); return 0; }
@@ -2443,8 +2458,30 @@ bool KmonPipelineSelfTest()
             ownedEvidence.CaptureEndedMs = GetTickCount64();
             ownedEvidence.ReferenceConsistent = true;
             if (monitor.HuntIndex.Observe(ownedReference, GetTickCount64(), &ownedEvidence.Receipt) == 0) { break; }
+            const auto firstCaptureId = NewEvidenceScope();
+            monitor.BindEvidenceOrigin(ownedEvidence, firstCaptureId, 0, 0);
+            if (!ownedEvidence.Origin.Valid()) { break; }
+            auto changedConnection = ownedEvidence;
+            monitor.BindEvidenceOrigin(changedConnection, NewEvidenceScope(), 7, 8);
+            if (!changedConnection.Origin.Empty()) { break; }
             const uint64_t evidenceId = monitor.QueueEvidenceBundle(std::move(ownedEvidence));
             if (evidenceId == 0) { break; }
+            EvidenceBundle laterEvidence;
+            laterEvidence.Acquisition = L"local_user_reader";
+            laterEvidence.CaptureStartedMs = GetTickCount64();
+            if (!ReadProcessMemory(GetCurrentProcess(), allocation, ownedHead.data(), ownedHead.size(), &headRead) || headRead != ownedHead.size() ||
+                !ReadProcessMemory(GetCurrentProcess(), &pointer, ownedSlot.data(), ownedSlot.size(), &slotRead) || slotRead != ownedSlot.size()) { break; }
+            laterEvidence.Spans = {{ownedReference.Address, 32, L"target_head", L"valid", ownedHead},
+                {ownedReference.Slot, 8, L"pointer_slot", L"valid", ownedSlot}};
+            laterEvidence.CaptureEndedMs = GetTickCount64();
+            laterEvidence.ReferenceConsistent = true;
+            ownedReference.Context.MonotonicMs = laterEvidence.CaptureEndedMs;
+            ownedReference.Context.Timestamp = ObservationFileTime();
+            if (monitor.HuntIndex.Observe(ownedReference, GetTickCount64(), &laterEvidence.Receipt) == 0) { break; }
+            monitor.BindEvidenceOrigin(laterEvidence, NewEvidenceScope(), 0, 0);
+            if (!laterEvidence.Origin.Valid() || laterEvidence.Origin.CaptureId == firstCaptureId) { break; }
+            const auto laterEvidenceId = monitor.QueueEvidenceBundle(std::move(laterEvidence));
+            if (laterEvidenceId == 0) { break; }
             VirtualFree(allocation, 0, MEM_RELEASE);
             allocation = nullptr;
             monitor.CaptureStopping.store(true);
@@ -2459,8 +2496,14 @@ bool KmonPipelineSelfTest()
             std::wstring recoveryError;
             const auto evidencePath = std::wstring(unique) + L"\\cases\\case-" +
                 std::to_wstring(monitor.EvidenceCollectionEpoch.load()) + L"-" + std::to_wstring(evidenceId) + L".kncase";
-            ok = ok && monitor.EvidenceWritten.load() == 1 && monitor.EvidenceFailed.load() == 0 &&
+            const auto laterPath = std::wstring(unique) + L"\\cases\\case-" +
+                std::to_wstring(monitor.EvidenceCollectionEpoch.load()) + L"-" + std::to_wstring(laterEvidenceId) + L".kncase";
+            const auto temporal = LoadTemporalFactStore({evidencePath, laterPath});
+            const auto related = QueryTemporalFacts(temporal, {});
+            ok = ok && related.Status == L"ok" && related.TotalPairs == 1 && related.Supported == 1 &&
+                monitor.EvidenceWritten.load() == 2 && monitor.EvidenceFailed.load() == 0 &&
                 monitor.EvidenceLedgerFailed.load() == 0 && LoadEvidenceBundle(evidencePath, &recovered, &recoveryError) &&
+                recovered.Origin.Valid() && recovered.Origin.CollectorScope == monitor.EvidenceCollectorScope &&
                 ReplayEvidence(recovered).ReferenceReached && ReplayEvidence(recovered).Gaps.empty();
             if (ok)
             {

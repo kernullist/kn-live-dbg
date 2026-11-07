@@ -7,6 +7,87 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Local temporal candidate checkpoint: 2026-11-07
+
+This P07 step adds origin-bound `kmon.bundle.v2` captures and offline
+`!kmon relate` over explicit retained bundle membership. The versioned policy
+keeps original observations separate, preserves every pair's requirements and
+contradictions, and supports only local-collector temporal candidates. Legacy
+v1 remains readable without acquiring missing identity or clock assertions.
+See [cross-bundle temporal candidates](ARCHITECTURE.md#cross-bundle-temporal-candidates).
+Full P07 and P01-P16 / VS1-VS4 completion remains open.
+
+The checked host was Windows 11 Pro x64 **10.0.28000** on NTFS, with VS 2022
+Build Tools **17.14.60**, MSVC **14.44.35207** and SDK/WDK **10.0.26100.0**.
+The final Release build exited 0. Existing `NextQueryEpoch` C4744 link warnings
+remain; the initial broader build also retained the existing C4244 warning in
+`KernelMonitor.cpp`. Final SHA-256 values:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Release `KnLiveDbg.exe` | `60b1a39947b4ca50540a99bf94b571fab915ba8106d64a6a635fd4cd513ab388` |
+| ASan temporal harness | `a9ed0d8fedb86150def9a47c987f55df32207d9109b2f07d6790e06b1deeb168` |
+| ASan legacy evidence harness | `ef0b831a602db4a6f4fe36f076dfaec2dcb92493ba723f2d531a815cebc999c8` |
+
+`tools/validate-temporal-facts.ps1 -Sanitize -Cli x64/Release/KnLiveDbg.exe`
+compiled the core with `/W4 /WX /fsanitize=address` and passed **147** independent
+Python-oracle checks. They cover exact content/query identities, every pair and
+source reference, recorded capture order despite late arrival, overlapping
+intervals, gap boundaries, collector/boot/process-generation/native-epoch
+separation, known/unknown EPROCESS and session assertions, address contracts,
+legacy fallback, missing/corrupt/oversized/duplicate inputs, cancellation and
+pagination. The 32-input boundary produced exactly **496** distinct pairs;
+33 inputs were denied. The actual EXE covered grammar, Unicode paths, v1/v2
+single-bundle graph compatibility and broken-output exit 3. Original input bytes
+remained unchanged; no target acquisition was needed by the query.
+
+Adversarial review reproduced a v2 file with its address descriptor removed
+being accepted through the legacy fallback and producing a supported candidate.
+The final parser requires an original descriptor in v2; the negative oracle
+now denies that file. V1 fallback remains explicitly marked, and the report
+labels its decoded reference representation `normalized_legacy_compatible`.
+Invalid user-reader/kernel-origin combinations are also denied. Hash failure
+does not create a valid empty-content identity or a partially published relation.
+No additional actionable defects were found in the reviewed scope.
+
+The final `tools/validate-evidence-bundle.ps1 -Sanitize` run passed **522**
+existing evidence, inventory and graph controls. Its eight existing timed
+publication-interruption controls yielded **3** valid final files and **5**
+absent final files; fresh-process reconstruction passed. Those are legacy
+publication controls, not newly synchronized v2 crash or power-loss tests.
+`tools/test-evidence-graph-cli.py` passed **164** checks against the final EXE
+and those final fixtures.
+
+The isolated final `--self-test all` exited 0: timeline **28**, MCP **102**,
+KMON image **119**, console **558**, command checks **3006** across **261** routes,
+and remote protocol **68** passed. Its KMON pipeline fixture performed two actual
+owned `ReadProcessMemory` observations, bound and queued both, freed the source
+allocation, drained the writer, and required a supported candidate from the
+reloaded files. A changed native-epoch binding was denied. This exercises the
+user-mode publisher/helper path, not a loaded native driver. Compiled capability
+validation passed **33** contracts / **261** routes; the generated support matrix
+matched the final EXE, and all **11** public-content classifier tests passed.
+
+Private evidence: `.build/p07-temporal-address-contract-build.log`,
+`.build/p07-temporal-origin-gap-repro.log`, `.build/p07-temporal-final-asan.log`,
+`.build/p07-temporal-final-legacy-asan.log`, `.build/p07-temporal-final-selftests.log`.
+Final temporal fixtures are `run-15a1577268d145da9fbc5eaab584e0ca` under
+`.build/temporal-facts/Release-asan`; legacy fixtures are
+`run-adf436bf8c8b452cb1e1458adcbd6e0f` under `.build/evidence-bundle/Release-asan`.
+Earlier 97/141-check temporal runs and earlier EXE/full-suite results are
+superseded by these final observations. Retained synthetic originals remain
+private. Targeted host readbacks found zero task processes and zero KnLiveDbg
+driver instances. No driver or test service was explicitly loaded or started;
+Windows EFS remained OS-managed Manual/Running.
+
+This is core ASan and owned user-mode validation. Real cross-VM/provider
+correspondence, calibrated clock conversion, live reducer freshness, native
+driver lifetimes, other evidence families, persistent temporal indexing and
+mapping-lifetime/execution/write/causal relations remain open. Collector fields
+and hashes do not authenticate a collector or hostile evidence owner. The prior
+unexplained privacy initialization failure and process-capture timing observation
+also remain unresolved; these passes do not establish their causes.
+
 ## Minimized image disclosure checkpoint: 2026-11-07
 
 This bounded P06/P15 step adds offline `redact-image`/`disclosure` and console-local

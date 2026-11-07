@@ -126,6 +126,23 @@ intent. Receipt reuse never deletes a later replacement. This command is
 offline-only and does not remove committed roots or failure ledgers. See
 [GC policy, audit and interruption semantics](ARCHITECTURE.md#explicit-uncommitted-artifact-gc).
 
+`KnLiveDbg.exe --offline !kmon relate <2..32 file.kncase paths> [/gap-ms 0..300000]
+[/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]` evaluates temporal
+candidates across explicit retained observations. Defaults are a 30,000 ms
+recorded gap, 64 pair decisions and a 1,000 ms query budget. The separate input
+budget is 5 seconds / 64 MiB. No target acquisition or provider request occurs.
+
+Every pair retains its requirements and contradictions. `supported` requires
+matching recorded local-collector, process-generation, source and clock bounds;
+legacy or missing origin assertions remain unfulfilled. It does not establish
+mapping continuity, execution, writing or causality. All observations and source
+digests accompany each page. Continue with the same content membership, gap and
+limit; a zero query budget defers the query. Output is private
+`kn.temporal_facts.v1` JSON with or without `/json`. Exit 0 means the query ran,
+even when no pair is supported; 1 means invalid/unavailable input or cursor,
+cancellation or budget deferral; 2 invalid grammar; 3 output failure. This command
+is offline-only. See [cross-bundle temporal candidates](ARCHITECTURE.md#cross-bundle-temporal-candidates).
+
 `KnLiveDbg.exe --offline !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]`
 returns a private `kn.evidence_graph.v1` fact graph for a retained `.kncase` bundle.
 The default root is its evidence node, depth is 2, record limit is 64 and

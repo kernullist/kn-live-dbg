@@ -1424,6 +1424,73 @@ reanalysis; rereading the saved source cannot create another target observation.
 This is a selected image proof path. Generic cross-view, object-lifetime,
 deadlock, writer-attribution and live temporal policies remain separate work.
 
+## Cross-bundle temporal candidates
+
+`TemporalFactStore` relates an explicit set of 2..32 retained `.kncase` files.
+The versioned `kn.local_temporal_candidate.v1` policy keeps every observation
+separate and evaluates every pair as `supported`, `contradicted` or `unfulfilled`.
+A supported edge means the two recorded observations satisfy this target/clock
+policy and are close in that recorded scope. It does not mean they share an object or
+mapping lifetime, or that one caused the other.
+
+New KMON reference captures can publish `kmon.bundle.v2` / `kmon.evidence.v2`.
+Their original hashed payload includes a random collector namespace, collection
+ID, read-session ID, locally observed boot ID, native connection epoch and the
+`kn.local_collector_binding.v1` policy. The producer compares the native epoch
+before and after capture and requires the recorded target boot to match the
+local collector. Unavailable or changed binding inputs do not acquire a binding;
+the original evidence can still be retained in the legacy format. Requeuing a
+historical bundle through another monitor does not confer a new local binding.
+The read-session ID is a label, not an object reference or authentication key.
+
+The join requires matching collector/collection namespaces, target boot and
+process generation, native epoch, address contracts and recorded identity
+assertions. Known/unknown EPROCESS or session assertions do not match, so an
+unknown observation cannot bridge contradictory known observations. Different
+collectors, VMs or boots cannot join merely by reusing PID, VA, PFN or a boot-ID
+string. Cross-collector calibration and external provider namespaces require a
+separate correspondence policy; this policy does not accept an operator-supplied
+bridge. Collector-origin fields are unauthenticated retained assertions, not
+proof against a malicious collector or owner who forges a bundle.
+
+Capture begin/end, event FILETIME, event tick, arrival tick/sequence and unknown
+publication time remain distinct. The policy compares capture intervals in the
+recorded `GetTickCount64` domain only. Overlapping intervals stay unordered; late
+arrival never changes original event or capture times. Gap thresholds refer to
+recorded API ticks, not precise wall-clock intervals. The API's resolution is
+limited by the system timer; no FILETIME or external-clock conversion is inferred.
+See the [Windows clock contract](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64).
+No continuous observation, intermediate write, execution or causal relation is
+established. Equal mapping-generation labels, addresses, PFNs and page hashes are
+reported only as similarities, including when a join is denied.
+
+Legacy v1 files retain their existing parser and replay behavior. Missing origin
+metadata yields an unfulfilled join, never an inferred namespace. The report
+labels its decoded reference representation as `normalized_legacy_compatible`;
+legacy address assumptions remain marked separately from original source IDs.
+New v2 files require their exact canonical schema and an original address
+descriptor; the v1 missing-descriptor fallback cannot supply that requirement.
+Old readers can reject that new version
+rather than silently discarding its binding. The single-bundle graph below is
+unchanged. The temporal report does not rerun image comparison or invent raw
+reads, source authentication, mapping continuity or missing collection members.
+
+Input membership is bounded to 32 files / 64 MiB and read under a cooperative
+5-second loading budget. An invalid, missing or duplicate observation prevents
+publication of partial joins. Query traversal has a separate 0..5,000 ms budget,
+1..128 pair decisions per page and a maximum recorded gap of 0..300,000 ms.
+Individual synchronous file calls are not interruptible deadlines. All original
+observation nodes accompany each page so every relation resolves to its exact
+bundle payload and original field location. `ktf1` continuations bind immutable
+content membership, policy, gap threshold, limit and canonical pair offset;
+path spellings and arrival order do not define identity. Relation IDs also bind
+the query interpretation. These are consistency checks, not authorization.
+
+The report is private `kn.temporal_facts.v1`, including renamed JSON. Broader
+temporal graph storage, cross-collector receipts, image-sweep/object adapters,
+mapping-lifetime change claims, clock calibration and execution/I/O relations
+remain separate P07 requirements.
+
 ## Retained fact graph
 
 `EvidenceGraph` adapts one validated `.kncase` to evidence, recorded process or

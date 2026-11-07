@@ -25,6 +25,9 @@ def main():
     assert data["driver_abi"] == int(abi)
     keys = [(c["domain"], c["operation"], c["backend"]) for c in data["capabilities"]]
     assert len(set(keys)) == len(keys)
+    temporal = next(c for c in data["capabilities"] if (c["domain"], c["operation"], c["backend"]) == ("evidence", "temporal_graph", "bundle"))
+    assert temporal["consistency"] == "recorded_local_collector_scope" and "origin_bound_kncase_v2" in temporal["requirements"]
+    assert "no_cross_collector_bridge" in temporal["limits"] and temporal["availability"] == "not_probed"
     for capability in data["capabilities"]:
         assert capability["availability"] == "not_probed"
         assert capability["availability_scope"] == "none"

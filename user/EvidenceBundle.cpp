@@ -188,6 +188,11 @@ namespace
         const auto& r = b.Receipt.Reference;
         const auto& c = r.Context;
         const auto& coverage = c.Coverage;
+        if (!b.Origin.Empty() && (!b.Origin.Valid() || b.CollectionId.empty() ||
+            b.Origin.LocalBootId != c.Identity.BootId ||
+            (b.Acquisition != L"local_user_reader" && b.Acquisition != L"local_kernel_reader" && b.Acquisition != L"local_mixed_reader") ||
+            (b.Acquisition == L"local_user_reader" && c.Identity.ProcessId == 0) ||
+            (b.Acquisition != L"local_user_reader" && b.Origin.NativeEpoch == 0))) { return false; }
         const std::set<std::wstring> dispositions = {L"current", L"historical_only", L"identity_conflict", L"future_event",
             L"prior_process_instance", L"current_capacity"};
         const std::set<std::wstring> acquisitions = {L"local_user_reader", L"local_kernel_reader", L"local_mixed_reader", L"synthetic_fixture"};
@@ -227,7 +232,7 @@ namespace
     std::wstring Payload(const EvidenceBundle& b, bool includeAddressSpace)
     {
         const auto& c = b.Receipt.Reference.Context;
-        std::wstring out = L"{\"schema\":\"kmon.evidence.v1\",\"acquisition\":" + mcpjson::Quote(b.Acquisition) +
+        std::wstring out = L"{\"schema\":" + mcpjson::Quote(b.Origin.Empty() ? L"kmon.evidence.v1" : L"kmon.evidence.v2") + L",\"acquisition\":" + mcpjson::Quote(b.Acquisition) +
             L",\"capture_started_ms\":" + Decimal(b.CaptureStartedMs) + L",\"capture_ended_ms\":" + Decimal(b.CaptureEndedMs) +
             L",\"reference_consistent\":" + Bool(b.ReferenceConsistent) + L",\"capture_truncated\":" + Bool(b.CaptureTruncated) +
             L",\"read_set_complete\":" + Bool(EvidenceReadSetComplete(b)) + L",\"receipt\":" + KmonHuntReceiptJson(b.Receipt, includeAddressSpace) +
@@ -245,6 +250,14 @@ namespace
         }
         out += L"]";
         if (!b.CollectionId.empty()) { out += L",\"collection_id\":" + mcpjson::Quote(b.CollectionId); }
+        if (!b.Origin.Empty())
+        {
+            out += L",\"origin\":{\"policy\":\"kn.local_collector_binding.v1\",\"collector_scope\":" + mcpjson::Quote(b.Origin.CollectorScope) +
+                L",\"capture_id\":" + mcpjson::Quote(b.Origin.CaptureId) + L",\"local_boot_id\":" + mcpjson::Quote(b.Origin.LocalBootId) +
+                L",\"native_epoch\":" + Decimal(b.Origin.NativeEpoch) +
+                L",\"clock_domain\":\"win32_GetTickCount64_ms\",\"interval_semantics\":\"recorded_api_ticks\","
+                L"\"wall_clock_conversion\":null,\"collector_authenticated\":false,\"mapping_lifetime_bound\":false}";
+        }
         return out + L"}";
     }
     bool BundlePath(const std::wstring& path)
@@ -300,7 +313,8 @@ static std::wstring SerializeEvidenceBundle(const EvidenceBundle& bundle, bool i
     const auto payload = Payload(bundle, includeAddressSpace);
     const auto hash = Digest(payload);
     if (hash.size() != 64 || payload.size() > EvidenceBundleMaxJsonBytes) { return {}; }
-    return L"{\"schema\":\"kmon.bundle.v1\",\"payload_sha256\":" + mcpjson::Quote(hash) + L",\"payload\":" + payload + L"}";
+    return L"{\"schema\":" + mcpjson::Quote(bundle.Origin.Empty() ? L"kmon.bundle.v1" : L"kmon.bundle.v2") +
+        L",\"payload_sha256\":" + mcpjson::Quote(hash) + L",\"payload\":" + payload + L"}";
 }
 
 std::wstring EvidenceBundleJson(const EvidenceBundle& bundle)
@@ -315,7 +329,7 @@ bool ParseEvidenceBundle(const std::wstring& json, EvidenceBundle* bundle, std::
     *bundle = {};
     std::wstring schema, hash, payload, receipt, reference, coverage, array;
     if (json.size() > EvidenceBundleMaxJsonBytes || !mcpjson::ValidateDocument(json) ||
-        !mcpjson::GetString(json, L"schema", &schema) || schema != L"kmon.bundle.v1" ||
+        !mcpjson::GetString(json, L"schema", &schema) || (schema != L"kmon.bundle.v1" && schema != L"kmon.bundle.v2") ||
         !mcpjson::GetString(json, L"payload_sha256", &hash) || hash.size() != 64 ||
         !mcpjson::FindRawValue(json, L"payload", &payload) || Digest(payload) != hash) { return false; }
     EvidenceBundle parsed;
@@ -345,10 +359,22 @@ bool ParseEvidenceBundle(const std::wstring& json, EvidenceBundle* bundle, std::
     std::wstring collection;
     if (mcpjson::FindRawValue(payload, L"collection_id", &collection) &&
         (!mcpjson::GetString(payload, L"collection_id", &parsed.CollectionId) || parsed.CollectionId.empty())) { return false; }
+    if (schema == L"kmon.bundle.v2")
+    {
+        std::wstring origin;
+        if (!mcpjson::FindRawValue(payload, L"origin", &origin) ||
+            !mcpjson::GetString(origin, L"collector_scope", &parsed.Origin.CollectorScope) ||
+            !mcpjson::GetString(origin, L"capture_id", &parsed.Origin.CaptureId) ||
+            !mcpjson::GetString(origin, L"local_boot_id", &parsed.Origin.LocalBootId) ||
+            !Number(origin, L"native_epoch", &parsed.Origin.NativeEpoch) || !parsed.Origin.Valid()) { return false; }
+    }
     // New format: require the exact canonical form. This also validates every
     // derived checksum/count/closure claim and rejects unknown or aliased fields.
     std::wstring addressSpace;
     const bool hasAddressSpace = mcpjson::FindRawValue(reference, L"address_space", &addressSpace);
+    // Only legacy v1 may recover an absent descriptor as an explicit LA48
+    // assumption. A new origin binding must retain its original address contract.
+    if (schema == L"kmon.bundle.v2" && !hasAddressSpace) { return false; }
     if (!Valid(parsed) || SerializeEvidenceBundle(parsed, hasAddressSpace) != json) { return false; }
     *bundle = std::move(parsed);
     if (error != nullptr) { error->clear(); }

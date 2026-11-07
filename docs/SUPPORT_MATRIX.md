@@ -29,6 +29,7 @@ backends are not implied by an x64 address width.
 | evidence / replay | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
 | evidence / graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle |
 | evidence / graph | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_temporal_sweep |
+| evidence / temporal_graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_local_collector_scope |
 | evidence / journal | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | verified_committed_prefix |
 | evidence / store | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_stopped_store |
 | evidence / gc | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_explicit_policy |

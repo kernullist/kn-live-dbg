@@ -967,6 +967,8 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
     {
         auto work = std::move(ExecutionReferences.front());
         const uint64_t captureStartedMs = GetTickCount64();
+        const auto captureId = NewEvidenceScope();
+        const auto captureNativeEpoch = device->ObservationEpoch();
         ExecutionReferences.pop_front();
         ++ExecutionReferenceProcessed;
         const auto referenceKey = ReferenceKey(work.Target, work.Slot, work.Role, work.Identity);
@@ -1447,6 +1449,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
                     bundle.CaptureTruncated = evidenceTruncated;
                     bundle.Spans = confirmedReads;
                     bundle.Spans.push_back(evidencePages.at(pending.first));
+                    BindEvidenceOrigin(bundle, captureId, captureNativeEpoch, device->ObservationEpoch());
                     event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_bundle_queued_id"] =
                         std::to_wstring(QueueEvidenceBundle(std::move(bundle)));
                 }
