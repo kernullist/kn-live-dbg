@@ -5958,6 +5958,7 @@ namespace
         {
             return;
         }
+        const std::unique_ptr<void, decltype(&CloseHandle)> snapshotOwner(snapshot, &CloseHandle);
         THREADENTRY32 entry = {};
         entry.dwSize = sizeof(entry);
         BOOL more = Thread32First(snapshot, &entry);
@@ -5979,7 +5980,6 @@ namespace
                 inventory->Complete = GetLastError() == ERROR_NO_MORE_FILES;
             }
         }
-        CloseHandle(snapshot);
         for (auto& owner : inventory->ThreadIds)
         {
             std::vector<uint32_t>& tids = owner.second;
@@ -6021,6 +6021,7 @@ namespace
     {
         bool complete = false;
         HANDLE process = nullptr;
+        std::unique_ptr<void, decltype(&CloseHandle)> processOwner(nullptr, &CloseHandle);
         do
         {
             if (inventory == nullptr || starts == nullptr ||
@@ -6030,6 +6031,7 @@ namespace
             }
             starts->clear();
             process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+            processOwner.reset(process);
             if (process == nullptr || QueryProcessCreateTicks(process) != createTime ||
                 WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
             {
@@ -6069,6 +6071,7 @@ namespace
                     complete = false;
                     continue;
                 }
+                const std::unique_ptr<void, decltype(&CloseHandle)> threadOwner(thread, &CloseHandle);
                 PVOID address = nullptr;
                 ULONG returned = 0;
                 constexpr ULONG kThreadQuerySetWin32StartAddress = 9;
@@ -6091,7 +6094,6 @@ namespace
                 {
                     complete = false;
                 }
-                CloseHandle(thread);
             }
             if (QueryProcessCreateTicks(process) != createTime ||
                 WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
@@ -6100,10 +6102,6 @@ namespace
                 complete = false;
             }
         } while (false);
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
         return complete;
     }
 
@@ -8168,6 +8166,113 @@ struct KernelMonitor::UserInventoryWork : KmonUserInventory<KmonNativeUserInvent
           WatchPids(std::move(watches)), WatchNames(std::move(names)) {}
 };
 
+struct KernelMonitor::UserDeepWork
+{
+    KmonUserDeepScheduling Scheduling;
+    std::vector<KmonUserTarget> Targets;
+    KmonUserGenerationInventory Generations;
+    std::unordered_set<uint32_t> WatchPids, UrgentPids;
+    std::vector<std::wstring> WatchNames;
+    KmonUserThreadInventory Threads;
+    bool SnapshotCapped = false, DeepCapped = false, CursorCapacityLimited = false;
+    UserDeepWork(size_t count, uint64_t selected) : Scheduling(count, selected) {}
+    std::wstring Json(uint64_t now) const
+    {
+        auto json = Scheduling.Json(now); json.pop_back(); json += L",\"targets\":[";
+        for (size_t i = 0; i < Targets.size(); ++i)
+        {
+            if (i) { json += L","; }
+            json += L"{\"index\":" + mcpjson::Quote(std::to_wstring(i)) +
+                L",\"pid\":" + mcpjson::Quote(std::to_wstring(Targets[i].Pid)) +
+                L",\"inventory_generation\":" + mcpjson::Quote(std::to_wstring(Targets[i].CreateTime)) +
+                L",\"thread_query_quota\":" + mcpjson::Quote(std::to_wstring(Targets[i].ThreadQueryQuota)) + L"}";
+        }
+        return json + L"]}";
+    }
+};
+
+std::wstring KernelMonitor::UserDeepJson(uint64_t now) const
+{ return UserDeep ? UserDeep->Json(now) : LastUserDeep.empty() ? L"null" : LastUserDeep; }
+void KernelMonitor::CancelUserDeep()
+{
+    if (UserDeep)
+    {
+        UserDeep->Scheduling.Cancel();
+        LastUserDeep = UserDeep->Json(GetTickCount64());
+        UserDeep.reset();
+    }
+}
+void KernelMonitor::ResetUserDeep() { UserDeep.reset(); LastUserDeep.clear(); }
+
+bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* why)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[user.deep.native] FAIL %s\n", why); } return ok; };
+    const auto owner = std::make_unique<KernelMonitor>(); auto& monitor = *owner;
+    const auto pid = GetCurrentProcessId();
+    const auto created = QueryProcessCreateTicks(GetCurrentProcess());
+    check(created != 0, "owned current process has a native generation");
+    const auto seed = [&]()
+    {
+        monitor.StopRequested.store(false);
+        monitor.UserDeep = std::make_unique<KernelMonitor::UserDeepWork>(2, GetTickCount64());
+        for (uint64_t offset : {1ull, 2ull})
+        {
+            KmonUserTarget t; t.Pid = pid; t.CreateTime = created + offset;
+            monitor.UserDeep->Targets.push_back(t);
+            monitor.UserLayoutLeads[{pid, t.CreateTime}] = GetTickCount64();
+        }
+    };
+    seed();
+    DWORD before = 0, after = 0;
+    check(GetProcessHandleCount(GetCurrentProcess(), &before) != FALSE, "read owned process handle count");
+    const KmonDiscoveryStep step{KmonDiscoveryGroup::User, KmonDiscoveryPhase::UserHostility, false};
+    check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Continued && monitor.UserDeep &&
+        monitor.UserDeep->Scheduling.NextIndex() == 1, "actual dispatcher returns after one rejected-generation target");
+    const auto partial = monitor.UserDeepJson(GetTickCount64());
+    check(monitor.UserLayoutLeads.size() == 2 && !monitor.UserDeep->Threads.Attempted,
+        "generation rejection preserves both original leads and prevents thread inspection");
+    check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Returned && !monitor.UserDeep,
+        "second dispatch consumes the retained tail and releases cohort metadata");
+    const auto complete = monitor.UserDeepJson(GetTickCount64());
+    check(!monitor.UserInventory && monitor.UserHostilityScans.load() == 0 && monitor.UserLayoutLeads.size() == 2,
+        "pending deep cohort does not restart inventory or consume rejected leads");
+    check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before,
+        "rejected-generation process handles close before the next turn");
+
+    seed(); monitor.StopRequested.store(true);
+    check(monitor.ServiceUserDeep() == KmonDiscoveryDispatch::Cancelled && monitor.UserDeep->Scheduling.NextIndex() == 0,
+        "pre-entry stop retains every unattempted target");
+    const auto stopped = monitor.UserDeepJson(GetTickCount64());
+    monitor.ResetTemporalDetections();
+    check(!monitor.UserDeep && monitor.UserDeepJson(0) == L"null", "restart removes the prior cohort and diagnostics");
+    seed(); std::wstring error;
+    check(monitor.Stop(&error) && !monitor.UserDeep && monitor.UserDeepJson(0).find(L"\"cancelled\":true") != std::wstring::npos,
+        "actual Stop joins and releases pending cohort metadata with cancellation evidence");
+
+    KmonUserThreadInventory threads;
+    std::vector<KmonUserThreadStart> starts;
+    uint32_t afterTid = 0, quota = 2;
+    GetProcessHandleCount(GetCurrentProcess(), &before);
+    KmonCollectLiveUserThreadStarts(&threads, pid, created, &afterTid, &quota, &starts);
+    check(threads.Attempted && quota < 2, "owned native thread inventory and bounded queries ran");
+    check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before,
+        "native thread snapshot, process and thread handles close after bounded queries");
+    KmonUserThreadInventory rejected; quota = 2;
+    check(!KmonCollectLiveUserThreadStarts(&rejected, pid, created + 1, &afterTid, &quota, &starts) &&
+        !rejected.Attempted && quota == 2, "thread query rejects a changed process generation before snapshot");
+    check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before, "early thread-query rejection closes process handle");
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.user_deep_test.v1\",\"driver_loaded\":false,\"native_generation_rejection\":true,"
+            L"\"native_thread_queries\":true,\"full_target_inspection_validated\":false,\"passed\":" + std::wstring(failures ? L"false" : L"true") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"partial\":" + partial + L",\"complete\":" + complete + L",\"stopped\":" + stopped + L"}";
+    }
+    std::fprintf(stderr, "[user.deep.native] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
 std::wstring KernelMonitor::UserInventoryJson(uint64_t now) const
 { return UserInventory ? UserInventory->Json(now) : LastUserInventory.empty() ? L"null" : LastUserInventory; }
 void KernelMonitor::CancelUserInventory()
@@ -8851,6 +8956,7 @@ bool KernelMonitor::Start(
             Worker.join();
         }
         CancelUserInventory();
+        CancelUserDeep();
         ImageReferences->Join();
         ImageContents->Join();
         CaptureStopping.store(true);
@@ -8878,6 +8984,7 @@ void KernelMonitor::ResetTemporalDetections()
     // Start holds StateMutex and WatchMutex before publishing a new worker.
     DiscoveryScheduling.Reset();
     ResetUserInventory();
+    ResetUserDeep();
     DriverTamperBaselines.clear();
     UserVmWalkCursors.clear();
     UserThreadStartCursors.clear();
@@ -8974,6 +9081,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         worker.join();
     }
     CancelUserInventory(); // The worker no longer owns an open snapshot or a pending batch.
+    CancelUserDeep();
     ImageReferences->Join();
     ImageContents->Join();
     for (auto& item : ImageWork)
@@ -17290,6 +17398,7 @@ void KernelMonitor::ServiceWatchedReferences()
 KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
 {
     if (StopRequested.load()) { return KmonDiscoveryDispatch::Cancelled; }
+    if (UserDeep) { return ServiceUserDeep(); }
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
@@ -17461,36 +17570,87 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
     {
         return selected.at(left.Pid) < selected.at(right.Pid);
     });
-    constexpr uint32_t kMaxDeepScans = 8;
-    KmonUserThreadInventory userThreadInventory;
-    const bool scheduledCap = watchedUserPids.size() + priorityPids.size() + backgroundPids.size() > targets.size();
     KmonAssignUserThreadQueryQuotas(&targets, 1024);
-    uint32_t scanned = 0;
-    bool deepCapped = scheduledCap;
-    bool cursorCapacityLimited = false;
-    for (const KmonUserTarget& target : targets)
+    auto work = std::make_unique<UserDeepWork>(targets.size(), GetTickCount64());
+    work->SnapshotCapped = snapshotCapped;
+    work->DeepCapped = watchedUserPids.size() + priorityPids.size() + backgroundPids.size() > targets.size();
+    for (size_t i = 0; i < targets.size() && i < 2; ++i)
     {
-        if (StopRequested.load())
-        {
-            break;
-        }
-        if (scanned >= kMaxDeepScans)
-        {
-            deepCapped = true;
-            break;
-        }
-        ++scanned;
-        // Only eight targets can be selected. A sixteen-target interval never
-        // yielded, leaving admitted layout candidates to age through the pass.
-        if (scanned > 1)
-        {
-            ServicePendingAnalysis();
-            if (StopRequested.load())
-            {
-                break;
-            }
-        }
+        if (std::find(urgentPids.begin(), urgentPids.end(), targets[i].Pid) != urgentPids.end())
+        { work->UrgentPids.insert(targets[i].Pid); }
+    }
+    work->Targets = std::move(targets); work->Generations = std::move(userGenerations);
+    work->WatchPids = std::move(watchPids); work->WatchNames = std::move(watchNames);
+    UserDeep = std::move(work);
+    // Even the first target waits for a new discovery turn. Inventory service
+    // and selection cannot consume an unbounded first deep inspection as well.
+    return UserDeep->Scheduling.Complete() ? ServiceUserDeep() : KmonDiscoveryDispatch::Continued;
+}
 
+KmonDiscoveryDispatch KernelMonitor::ServiceUserDeep()
+{
+    if (!UserDeep) { return KmonDiscoveryDispatch::Returned; }
+    auto& work = *UserDeep;
+    const auto result = work.Scheduling.Run([]() { return GetTickCount64(); },
+        [&](size_t index) { return InspectUserTarget(work, index); },
+        [&]() { return StopRequested.load(); },
+        [&](size_t index, const char* message)
+        {
+            const auto pid = work.Targets.at(index).Pid;
+            EmitUnique(L"process.implant", L"scan_failed:userhostility:target_exception:" + std::to_wstring(pid),
+                L"", L"user", L"deep process inspection failed; remaining selected targets retained",
+                std::wstring(message, message + strlen(message)), pid);
+        });
+    if (!work.Scheduling.Complete()) { return result; }
+    LastUserDeep = work.Json(GetTickCount64());
+    if (!StopRequested.load() && work.CursorCapacityLimited)
+    {
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility:cursor_capacity",
+            std::wstring(),
+            L"user",
+            L"user-mode cursor retention reached its process limit",
+            L"state_limit=4096; an unobserved generation lost its continuation or a new continuation was deferred");
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:userhostility:cursor_capacity");
+    }
+    if (!StopRequested.load() && (work.SnapshotCapped || work.DeepCapped))
+    {
+        EmitUnique(
+            L"process.implant",
+            L"scan_failed:userhostility:truncated",
+            std::wstring(),
+            L"user",
+            L"user-mode hostility scan hit a process cap; extra hosts may be missed",
+            work.SnapshotCapped
+                ? L"inventory capped: snapshot=4096, watched=8192, suspects=12288; completeness unavailable"
+                : L"deep scan capped at 8; deferred hosts rotate across passes");
+    }
+    else if (!StopRequested.load())
+    {
+        ClearEmittedKey(L"scan_failed:userhostility:truncated");
+    }
+    UserDeep.reset();
+    return KmonDiscoveryDispatch::Returned;
+}
+
+KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t index)
+{
+    if (StopRequested.load()) { return KmonUserDeepResult::Cancelled; }
+    DeviceClient* device = nullptr;
+    SymbolEngine* symbols = nullptr;
+    { std::lock_guard<std::mutex> lock(StateMutex); device = Device; symbols = Symbols; }
+    const auto& target = work.Targets.at(index);
+    auto& userGenerations = work.Generations;
+    auto& watchPids = work.WatchPids;
+    auto& watchNames = work.WatchNames;
+    auto& userThreadInventory = work.Threads;
+    auto& cursorCapacityLimited = work.CursorCapacityLimited;
+    do
+    {
         const uint32_t pid = target.Pid;
         UserScanCursor.store(pid);
         uint64_t nextMemoryAnalysisMs = GetTickCount64() + 50;
@@ -17510,21 +17670,6 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
             return !StopRequested.load();
         };
         const auto scanKey = std::make_pair(pid, target.CreateTime);
-        const auto lead = UserLayoutLeads.find(scanKey);
-        if (lead != UserLayoutLeads.end())
-        {
-            KmonEvent scheduled;
-            scheduled.Kind = L"coverage.user_scheduling";
-            scheduled.ProcessId = pid;
-            scheduled.Observation.Identity.ProcessId = pid;
-            scheduled.Observation.Identity.CreateTime = target.CreateTime;
-            scheduled.Summary = L"layout execution lead selected for deep process inspection";
-            scheduled.Evidence[L"layout_lead_wait_ms"] = std::to_wstring(GetTickCount64() - lead->second);
-            scheduled.Evidence[L"layout_priority_slot"] = selected.at(pid) < 2 &&
-                std::find(urgentPids.begin(), urgentPids.end(), pid) != urgentPids.end() ? L"true" : L"false";
-            RecordEvent(std::move(scheduled));
-            UserLayoutLeads.erase(lead);
-        }
         UserLastScanMs[scanKey] = GetTickCount64();
         if (UserLastScanMs.size() > 4096)
         {
@@ -17557,7 +17702,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
         if (processHandle == nullptr && target.Suspect)
         {
             ScanConcealedUserProcess(pid, target.Eprocess, target.CreateTime, target.ImagePath);
-            continue;
+            return KmonUserDeepResult::Returned;
         }
         const uint64_t processCreateTime =
             QueryPidCreateTime(device, symbols, processHandle, pid);
@@ -17577,7 +17722,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
                     L" current_generation=" + HexU64(processCreateTime) +
                     L" pinned=" + std::to_wstring(processHandle != nullptr ? 1 : 0),
                 pid);
-            continue;
+            return KmonUserDeepResult::IdentityRejected;
         }
 
         // Unknown inventory identity cannot carry its old path into a new
@@ -17703,10 +17848,25 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
                     L"before_generation=" + HexU64(processCreateTime) +
                         L" after_generation=" + HexU64(afterModuleSnapshot),
                     pid);
-                continue;
+                return KmonUserDeepResult::IdentityRejected;
             }
             ClearEmittedKeyForPid(generationKey, pid);
             userGenerations[pid] = processCreateTime;
+            if (StopRequested.load()) { return KmonUserDeepResult::Cancelled; }
+            const auto lead = UserLayoutLeads.find(scanKey);
+            if (lead != UserLayoutLeads.end())
+            {
+                KmonEvent scheduled;
+                scheduled.Kind = L"coverage.user_scheduling";
+                scheduled.ProcessId = pid;
+                scheduled.Observation.Identity.ProcessId = pid;
+                scheduled.Observation.Identity.CreateTime = target.CreateTime;
+                scheduled.Summary = L"layout execution lead entered generation-qualified deep inspection";
+                scheduled.Evidence[L"layout_lead_wait_ms"] = std::to_wstring(GetTickCount64() - lead->second);
+                scheduled.Evidence[L"layout_priority_slot"] = work.UrgentPids.count(pid) != 0 ? L"true" : L"false";
+                RecordEvent(std::move(scheduled));
+                UserLayoutLeads.erase(lead);
+            }
             const bool moduleInventoryComplete = moduleWalkOk;
             const std::wstring moduleInventoryKey =
                 L"scan_failed:userhostility:modules:" + std::to_wstring(pid);
@@ -19844,39 +20004,8 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
                         pid);
                 }
             }
-    }
-
-    if (!StopRequested.load() && cursorCapacityLimited)
-    {
-        EmitUnique(
-            L"process.implant",
-            L"scan_failed:userhostility:cursor_capacity",
-            std::wstring(),
-            L"user",
-            L"user-mode cursor retention reached its process limit",
-            L"state_limit=4096; an unobserved generation lost its continuation or a new continuation was deferred");
-    }
-    else if (!StopRequested.load())
-    {
-        ClearEmittedKey(L"scan_failed:userhostility:cursor_capacity");
-    }
-    if (!StopRequested.load() && (snapshotCapped || deepCapped))
-    {
-        EmitUnique(
-            L"process.implant",
-            L"scan_failed:userhostility:truncated",
-            std::wstring(),
-            L"user",
-            L"user-mode hostility scan hit a process cap; extra hosts may be missed",
-            snapshotCapped
-                ? L"inventory capped: snapshot=4096, watched=8192, suspects=12288; completeness unavailable"
-                : L"deep scan capped at 8; deferred hosts rotate across passes");
-    }
-    else if (!StopRequested.load())
-    {
-        ClearEmittedKey(L"scan_failed:userhostility:truncated");
-    }
-    return KmonDiscoveryDispatch::Returned;
+    } while (false);
+    return StopRequested.load() ? KmonUserDeepResult::Cancelled : KmonUserDeepResult::Returned;
 }
 
 void KernelMonitor::EnableLoggingForPid(uint32_t pid)

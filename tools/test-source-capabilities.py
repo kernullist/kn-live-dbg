@@ -57,6 +57,8 @@ def main():
     assert "cycle_due_debt_not_target_success" in discovery["limits"]
     assert "continued_phase_once_per_turn" in discovery["limits"]
     assert "user_inventory_32_steps_25ms" in discovery["limits"]
+    assert "one_selected_deep_target_per_turn" in discovery["limits"]
+    assert "cohort_tail_survives_target_faults" in discovery["limits"]
     assert "stage_specific_live_source_gates" in analysis["requirements"]
     assert "nine_stage_persistent_rotation" in analysis["limits"]
     assert "cooperative_250ms_turn_100ms_maximum_slice" in analysis["limits"]

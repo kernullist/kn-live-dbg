@@ -7,6 +7,85 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Resumable deep process inspection checkpoint: 2026-11-18
+
+After inventory and priority selection, user-hostility inspection now retains
+the selected cohort and dispatches **one target per discovery turn**. The first
+target waits for a new turn as well. Original selection time, target identities,
+thread quotas and remaining work survive each return. Exceptions in a target
+or its failure reporter cannot discard the tail. Returned, identity-rejected,
+cancelled and faulted callbacks have separate counters and service samples;
+none establishes target-qualified success. See
+[resumable deep process inspections](ARCHITECTURE.md#resumable-deep-process-inspections).
+This completes that implementation slice and does not complete P09 or the full
+kernel-security design.
+
+Review also moved layout-lead consumption after the process generation fence
+following module enumeration. Rejected generations and earlier cancellation
+retain their leads. Thread snapshot/process/thread handles now use automatic
+cleanup on C++ exceptions. Stop, failed Start and restart release retained
+cohort metadata after worker ownership ends. The existing attempt/cooldown
+clock remains explicitly separate from successful target coverage.
+
+Validation used Windows **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- The `/W4 /WX` shared-core build passed **13 deep-cohort scenarios** plus
+  capacity/restart controls. The independent oracle passed **1,523 assertions**
+  for exact per-target outcomes, original selection debt, one callback per
+  turn, slow/faulting/rejected heads, failure-reporter exceptions, cancellation,
+  reentrancy, clock reversal and outcome-specific timing distributions.
+- The product passed **14 native controls / 25 independent assertions** using
+  the actual discovery dispatcher. Two selected targets with deliberately
+  wrong generations of the owned process are rejected in separate calls;
+  the tail, original identities and layout leads remain intact between calls.
+  Stop/restart and native thread snapshot/query paths leave the owned process's
+  handle count unchanged. This checks generation rejection and thread-query
+  ownership, not a complete successful deep inspection of a live target.
+- Existing core inventory/discovery oracles passed **14,211 / 70,151
+  assertions**, and the native inventory fixture passed **11 controls /
+  4 independent assertions**. The worker fixture passed **15 controls /
+  19 independent assertions**, including the separate native fixtures;
+  its absent-binding worker still dispatches no native discovery phase.
+  Product oracles passed **20 analysis / 968 image / 73 preparation /
+  50 reference / 85 publication / 16 layout / 23 capture assertions** and
+  **51 capability contracts / 261 command routes**. The support matrix matches
+  compiled contracts. Public-content regression passed **12 tests**, including
+  renamed UTF-8/UTF-16 private deep-cohort diagnostics.
+
+The final isolated `--self-test all` passed **28 timeline / 102 MCP /
+121 image-read / 319 image-scheduling / 39 preparation / 41 publication /
+21 layout / 15 analysis-integration / 15 discovery-integration /
+11 native inventory / 14 native deep-target / 564 console /
+3,043 command-route / 68 remote / 4 connect-option checks**.
+`owned_fixture_cleanup=passed` and the owned working directory was empty.
+The final fixture scope field explicitly separates the worker's binding gate
+from its nested native queries. Final review found no additional actionable
+defects in the reviewed scope.
+
+Final Release product SHA-256:
+`06c783ef1c815da34f40d3851a375b0cfc50b3a9fe8c34819633b7ee14a16f8e`.
+Shared KMON core harness SHA-256:
+`dbc9e8a12e5011bc9efd3ac7860998865556cc645535188e1aa3667f174e8e5f`.
+Existing C4244 conversion and C4744 alignment warnings remain. ASan remains
+blocked by the previously recorded host startup interception failure; no new
+ASan success is claimed.
+
+Read-only host checks at **04:24 KST** found the same boot time and no new
+reboot/BugCheck event, dump, task process, task driver, preparation/profile
+receipt or owned writer/preparation temporary residue. The 33 completed parser
+caches, BFE/mpssvc/EFS service states and firewall profiles match the preceding
+checkpoint. No task driver was loaded and no Verifier, reboot or security
+setting was changed during this stage.
+
+These runtime diagnostics do not prove successful per-target debt, full native
+inspection, individual native API latency, durable timing recovery or power
+loss safety. A returned discovery phase can contain recorded target faults or
+rejections. Native calls and within-target loops remain nonpreemptible. The
+ordered user-group tail waits for its selected cohort, and snapshot admission
+above the first 4,096 eligible targets is unchanged. Actual fixed/growing native
+workload SLOs and whole-source maximum unobserved intervals remain open.
+
 ## Resumable user inventory checkpoint: 2026-11-18
 
 The user-hostility inventory now resumes its owned Toolhelp snapshot, watched

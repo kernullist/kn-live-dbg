@@ -20,6 +20,7 @@
 #include "kmon-analysis-scheduling-selftest.h"
 #include "kmon-discovery-scheduling-selftest.h"
 #include "kmon-user-inventory-selftest.h"
+#include "kmon-user-deep-selftest.h"
 #include "execution-evidence-selftest.h"
 
 #include <iostream>
@@ -66,6 +67,12 @@ bool ArbitraryImageSelfTest()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--user-deep-json")
+    {
+        bool passed = false;
+        std::wcout << UserDeepFixturesJson(&passed) << L"\n";
+        return passed ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--user-inventory-json")
     {
         bool passed = false;
@@ -104,7 +111,8 @@ int main(int argc, char** argv)
     const bool pure = KmonHandleTrackingSelfTest() && ObservationModelSelfTest() && KmonHuntingPolicySelfTest() &&
         AddressSpaceSelfTest() && ObservationCoverageSelfTest() && SessionWritePolicySelfTest() &&
         KmonCaptureSchedulingSelfTest() && KmonReferenceSchedulingSelfTest() && KmonPublicationSchedulingSelfTest() &&
-        KmonAnalysisSchedulingSelfTest() && KmonDiscoverySchedulingSelfTest() && KmonUserInventorySelfTest() && ExecutionEvidenceSelfTest();
+        KmonAnalysisSchedulingSelfTest() && KmonDiscoverySchedulingSelfTest() && KmonUserInventorySelfTest() &&
+        KmonUserDeepSelfTest() && ExecutionEvidenceSelfTest();
     std::cout << "[kmon.core] handle ABI, rotation, lifecycle, channel controls: "
         << (pure ? "PASS" : "FAIL") << "\n";
     HANDLE file = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,

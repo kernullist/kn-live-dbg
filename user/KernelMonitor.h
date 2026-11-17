@@ -25,6 +25,7 @@
 #include "KmonPublicationScheduling.h"
 #include "KmonAnalysisScheduling.h"
 #include "KmonDiscoveryScheduling.h"
+#include "KmonUserDeepScheduling.h"
 #include "KmonLayoutScheduling.h"
 #include "ImageReferencePreparation.h"
 #include "GameBuildManifest.h"
@@ -383,6 +384,7 @@ private:
     friend bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
     friend struct KmonImageTestAccess;
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
@@ -475,6 +477,14 @@ private:
     std::wstring UserInventoryJson(uint64_t now) const;
     void CancelUserInventory();
     void ResetUserInventory();
+    struct UserDeepWork;
+    std::unique_ptr<UserDeepWork> UserDeep;
+    std::wstring LastUserDeep;
+    std::wstring UserDeepJson(uint64_t now) const;
+    void CancelUserDeep();
+    void ResetUserDeep();
+    KmonDiscoveryDispatch ServiceUserDeep();
+    KmonUserDeepResult InspectUserTarget(UserDeepWork& work, size_t index);
     void ScanKernelThreads();
     // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
     void ScanKernelInlinePatches();
@@ -1562,6 +1572,7 @@ bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

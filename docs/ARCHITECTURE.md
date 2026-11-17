@@ -1969,11 +1969,56 @@ The existing limits remain: 4,096 snapshot targets, up to 8,192 including extra
 watched PIDs, and 12,288 including suspects. A capped snapshot now closes at the
 first excess eligible row. It does not rotate admission beyond that snapshot
 prefix or prove fairness above the cap. Once ready, the existing priority
-selector chooses up to eight deep targets. Those deep inspections and other
-scanner-internal loops remain synchronous. The ordered user-group tail waits
-for this inventory and deep scan; independent discovery groups can proceed
-between inventory quanta. Neither measured host-workload SLOs nor whole-source
+selector chooses up to eight deep targets. Their inspection now resumes one
+target per discovery turn, as described below. Individual target internals and
+other scanner loops remain synchronous. The ordered user-group tail waits
+for this inventory and selected cohort; independent discovery groups can proceed
+between quanta. Neither measured host-workload SLOs nor whole-source
 maximum unobserved intervals follow from the bounded inventory policy.
+
+### Resumable deep process inspections
+
+After inventory and priority selection, `ScanUserModeHostility` retains the
+selected cohort, original generation inventory, watch inputs, urgent-slot
+assignment and per-target thread quotas. Selection returns before inspecting
+its first target. Each later call dispatches at most one selected target through
+`InspectUserTarget`, then yields to discovery and analysis. Native thread IDs
+are collected lazily and shared within this cohort; their existing process and
+thread identity/liveness fences still apply. A retained thread snapshot does
+not establish a fresh, complete view of the running process.
+
+`KmonUserDeepScheduling` records returned, identity-rejected, cancelled and
+faulted callbacks separately. A target exception advances only that target,
+preserving the remainder and the original selection clock. An exception in
+failure reporting cannot discard the remaining cohort. Stop before entry or
+during an otherwise returned inspection retains the unfinished target and tail.
+Stop after worker join, failed Start and restart release cohort metadata. Native
+process/module/thread handles and borrowed reference windows belong to the
+individual callback; they do not cross the return boundary. Thread enumeration
+and query handles also unwind on C++ exceptions.
+
+Layout leads are consumed only after process generation is checked again after
+module enumeration. A rejected generation or stop before that point preserves
+the lead. `UserLastScanMs` remains the existing attempt/cooldown clock; consuming
+a qualified lead, returning a callback and completing the selected cohort do
+not establish successful coverage of all target memory or rules. A returned
+discovery phase may contain explicitly recorded target faults or rejections.
+
+Private `coverage.pipeline.user_deep_scheduling_json`
+(`kn.user_deep_scheduling.v1`) describes the latest selected cohort: original
+selection time, remaining indices, PID/inventory-generation bindings, thread
+quotas, per-index attempts/outcomes, selection-to-first-dispatch samples,
+outcome-specific service times and calls exceeding 250 ms. Service includes
+callback cleanup and failure reporting. Cancellation and invalid clocks remain
+visible; invalid durations are excluded. Completed diagnostics freeze before
+cohort release. These clocks are neither successful-target debt nor a durable
+timing journal. Individual native calls and within-target loops can still block
+other work, and whole-source latency/SLO acceptance remains open.
+
+The discovery self-test's `worker_native_phases_dispatched` field describes
+only its worker with an absent device binding. Separate nested fixtures report
+actual inventory queries, dispatcher generation rejection and owned native
+thread queries; they do not validate a complete successful deep inspection.
 
 ## Layout collection and verification scheduling
 

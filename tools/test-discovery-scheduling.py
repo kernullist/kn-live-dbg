@@ -232,9 +232,10 @@ def deterministic(o, data):
 
 
 def integration(o, data):
-    o.check(data["schema"] == "kn.discovery_scheduler_test.v1" and data["passed"] is True and data["checks"] == 14,
+    o.check(data["schema"] == "kn.discovery_scheduler_test.v1" and data["passed"] is True and data["checks"] == 15,
             "actual worker controls passed")
-    o.check(data["driver_loaded"] is False and data["native_scans_executed"] is False, "binding-gate scope only")
+    o.check(data["driver_loaded"] is False and data["worker_native_phases_dispatched"] is False and
+            "native_scans_executed" not in data, "worker binding-gate scope is separate from the native fixtures")
     for key in ("pending", "stopped", "pipeline"):
         contract(o, data[key])
         o.check(all(p["attempts"] == "0" for p in data[key]["phases"]), "actual absent-binding gate prevents every native discovery dispatch")
