@@ -2,6 +2,7 @@
 #include "ImageVerificationRecipe.h"
 #include "ImageSliceRecipe.h"
 #include "ImageScopeClaimPublication.h"
+#include "ImageScopeReplayPaths.h"
 #include "ImageSweepReplayEvidence.h"
 #include "ReferenceArtifact.h"
 #include "BoundedObservationJson.h"
@@ -313,7 +314,7 @@ namespace
 
 ImageChangeAssessment AssessAuthorizedImageScopeChanges(const std::wstring& capture, const std::wstring& manifestPath,
     const std::wstring& policyPath, const std::wstring& policySha256, uint64_t evaluationTime,
-    const std::function<void(const wchar_t*)>& observer)
+    const std::function<void(const wchar_t*)>& observer, const ImageScopeReplayPaths* retainedInputs)
 {
     ImageChangeAssessment result;
     ReferenceArtifact root, manifestFile, policyFile;
@@ -353,8 +354,8 @@ ImageChangeAssessment AssessAuthorizedImageScopeChanges(const std::wstring& capt
         RequireScope(root.Open(capture, nullptr, ImageRecipeMaxBytes), L"scope_root_unavailable");
         auto extension = std::filesystem::path(root.Path()).extension().wstring();
         std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
-        RequireScope(extension == L".knslice" || extension == L".knsweep", L"scope_kind_unavailable");
-        const bool sweep = extension == L".knsweep";
+        RequireScope(retainedInputs || extension == L".knslice" || extension == L".knsweep", L"scope_kind_unavailable");
+        const bool sweep = retainedInputs ? retainedInputs->Sweep : extension == L".knsweep";
         scope = sweep ? L"temporal_sweep_ranges" : L"recorded_slice_ranges";
         const std::string rootUtf8(root.Bytes().begin(), root.Bytes().end());
         auto rootJson = mcpjson::Utf8ToWide(rootUtf8);
@@ -372,7 +373,7 @@ ImageChangeAssessment AssessAuthorizedImageScopeChanges(const std::wstring& capt
         if (sweep)
         {
             ImageSweepReplayEvidence evidence;
-            replay = ReplayImageSweepManifest(root.Path(), nullptr, &evidence);
+            replay = ReplayImageSweepManifest(root.Path(), nullptr, &evidence, L"", retainedInputs);
             RequireScope(replay.Status == L"replayed", L"original_scope_replay_unavailable");
             rootDigest = evidence.ManifestSha256; referenceHash = evidence.ReferenceSha256;
             expected = evidence.Manifest.Sweep.ExpectedBytes; sweepStarted = evidence.Manifest.Sweep.StartedFileTime;
@@ -391,7 +392,7 @@ ImageChangeAssessment AssessAuthorizedImageScopeChanges(const std::wstring& capt
         else
         {
             ScopeSlice slice;
-            replay = ReplayImageSliceRecipe(root.Path(), nullptr, &slice.Pages, nullptr, &slice.Context);
+            replay = ReplayImageSliceRecipe(root.Path(), nullptr, &slice.Pages, nullptr, &slice.Context, retainedInputs);
             RequireScope(replay.Status == L"replayed", L"original_scope_replay_unavailable");
             rootDigest = replay.RecipeSha256; referenceHash = slice.Context.ReferenceSha256;
             slice.Digest = rootDigest; slice.Policy = replay.RecordedPolicy; slice.Ordinal = 1;

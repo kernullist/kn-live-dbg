@@ -270,31 +270,41 @@ is relative to this caller-pinned policy; `issuer_signature_verified=false`
 remains explicit. Exit 0 means assessment completed, including unexplained or
 incomplete results; 1 means unavailable, 2 invalid grammar, and 3 stdout delivery
 failure. Interactive `!kmon` uses the same read-only route and transcript. The
-approval collection commands below retain direct inputs and assessments for
-later reproduction; they do not yet archive scoped approval results. See
+approval collection commands below retain direct and scoped inputs and
+assessments for later reproduction. See
 [approved image changes](ARCHITECTURE.md#approved-image-changes).
 
-`KnLiveDbg.exe --offline !kmon journal-image-approval <directory|managed.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> /json`
-archives one assessment and its four exact inputs into an `init-store` private
+`KnLiveDbg.exe --offline !kmon journal-image-approval <directory|managed.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> /json`
+archives one assessment and its exact inputs into an `init-store` private
 root. The policy digest is a separate trust input as for `assess-image`; the ID
-is 1..20 canonical decimal digits. The returned `kn.image_approval_collection.v1`
-uses `archived` only after the five-member transaction, dependent closure and
+is 1..20 canonical decimal digits. Direct results use
+`kn.image_approval_collection.v1`, scoped results
+`kn.image_scope_approval_collection.v1`. Both use `archived` only after the
+complete input transaction, dependent closure and
 indexes succeed. `committed`, `closed`, `indexed` and `historical_root_reused`
 distinguish partial outcomes and retries. `approval_path` and `capture_path` are
-relative to the private store.
+relative to the private store; `capture_path` applies to direct archives.
+Scoped results include logical input counts/bytes and unique input files/bytes.
+Their exact root, child recipes and declared raw archives use content-addressed
+`.knscopeblob` files and an explicit original-path catalog. A missing input
+cannot be recovered from an adjacent file with the old name.
 
 Retry with the same ID and exact inputs to finish an interrupted archive. A
 published assessment retains its original evaluation time and result, even if
 the policy has expired since publication. Changed input or a conflicting file is
 rejected without replacement. This is historical retention, not current approval.
-The command leaves source copies unchanged. Capture/assessment limits are 4 MiB,
-reference 64 MiB, and policy/manifest 64 KiB each. Exit codes are 0 archived,
+The command leaves source copies unchanged. Direct capture/assessment limits
+are 4 MiB; scoped inputs are at most 4,097 files, 2 MiB each and 256 MiB total,
+with an 8 MiB approval root. Reference is 64 MiB and policy/manifest 64 KiB each.
+Scoped assessment limits remain 2,048 slices, 16,384 pages and 4 MiB. A managed
+`.knscopeapproval` supplies retained inputs for retry or a new collection, with
+the separately supplied policy and manifest. Exit codes are 0 archived,
 1 incomplete/unavailable, 2 invalid grammar, 3 JSON delivery failure after any
 completed writes. Interactive `!kmon` treats this as a file-writing command.
 
-`KnLiveDbg.exe --offline !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> /json`
-reproduces the stored assessment from its exact managed capture, reference,
-policy and manifest at the recorded evaluation time. Supply the independently
+`KnLiveDbg.exe --offline !kmon replay-image-approval <assessment.knapprovalcase|assessment.knscopeapproval> <policy-sha256> /json`
+reproduces the stored assessment from its exact managed capture or scope input
+catalog, reference, policy and manifest at the recorded evaluation time. Supply the independently
 trusted digest again; the archive does not establish its own authority. Success
 requires exact original-report equality and returns `reproduced` with
 `original_assessment_reproduced=true`. Add `/current` to evaluate the retained
@@ -307,7 +317,8 @@ Use `journal <private-store>\collections\<id> /index /json` for that separate ch
 Exit codes are 0 reproduced/reanalyzed, 1 unavailable, 2 invalid grammar and
 3 JSON delivery failure. Both modes preserve comparison gaps and unexplained
 changes; success is not a clean-image or current-state claim. See
-[approved image collections](ARCHITECTURE.md#approved-image-collections).
+[approved image collections](ARCHITECTURE.md#approved-image-collections) and
+[scoped collections](ARCHITECTURE.md#scoped-approved-image-collections).
 
 `KnLiveDbg.exe --offline !kmon replay-image <directory|managed.kncapture> /json` reruns the recorded
 policy against either v1 or v2's retained artifact and ordered raw reads, including

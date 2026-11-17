@@ -7,6 +7,89 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Scoped approval collection checkpoint: 2026-11-17
+
+Scoped assessments now retain the exact original slice/sweep root, child
+recipes, declared raw archives, reference PE, caller policy and manifest.
+Content-addressed inputs and an explicit logical-path catalog preserve the
+original dependency closure without collisions between source collection names.
+The dedicated journal policy requires every declared input before closure;
+semantic replay separately requires the original assessment to reproduce at its
+recorded time. See [scoped collections](ARCHITECTURE.md#scoped-approved-image-collections)
+and the [command contract](COMMAND_REFERENCE.md).
+
+Release validation passed **1,712 harness / 1,723 product** scoped archive checks.
+An independent PE/returned-receipt oracle covered bare and original-claim roots,
+direct/secondary slices, continuation, unstable/unreadable ranges, partial and
+interrupted sweeps, raw-publication loss and a two-byte rule spanning slices.
+Original sources, policies and manifests could be removed before replay. Exact
+managed retries retained an expired historical assessment; explicit current-time
+evaluation rejected its expiry. Another collection could reuse the original
+inputs while evaluating its own separately supplied policy.
+
+Observed termination at **11 publication boundaries** retained only complete
+journal transactions. Retries preserved the first published assessment time and
+report, including a derived-index collision after commit. Controls also covered
+concurrent writers, full input/output leases, private ACL admission and default
+EFS, conflicting files, caller policy replacement, source-junction retargeting,
+catalog order/duplicates/schema/length/path mutations, missing dependencies and
+ambient files with original names. Rehashed missing/extra journal members were
+rejected. A rehashed false assessment could retain valid physical membership
+but failed semantic replay with `recorded_assessment_mismatch`. Explicit GC
+removed an eligible uncommitted CAS file while protecting committed inputs,
+assessment roots and final ledgers. All observed child processes were drained.
+No additional actionable defects were found in the reviewed scope.
+
+Affected slice/sweep compatibility passed **484 C++**, **385 slice**, **270
+sweep**, **1,414 graph**, **699 original-publication** and **868 scoped approval**
+checks. Direct recipe compatibility passed **120 C++**, **34 claim**, **59
+publication** and **448 approval** checks, plus v1/v2 interrupted publication.
+Journal regression passed **71 C++**, **1,952 journal**, **476 store**, **892 GC**
+and **400 IRP collection** checks. The final product passed **597 direct approval
+collection** controls with the prior producer, including expired historical
+report equality. The direct approval schema and assessment bytes remain unchanged.
+
+The product's isolated `--self-test all` passed: timeline **28**, MCP **102**,
+KMON image integration **121**, console **564**, command audit **3,043 / 261
+routes**, remote **68** and four connection-option controls. Capabilities passed
+**43 contracts / 261 routes**, the generated support matrix matched, and the
+public-content classifier passed **12 tests**, including the new private archive
+extensions and renamed JSON schemas.
+
+The product SHA-256 was
+`d4caced58781e9c2ac8403ecc78194415508befeb0257a3956ce8ec07c7aebf8`;
+the scope-archive harness was
+`50e9a3f8d9a7a273058201a366f01a2bd4a7651246bf4f12b0568210533a50c4`;
+the journal harness was
+`600ebae5385b3269d3ca1ab8687995531a1f08fcb64f19b0e5adb555db07ac96`;
+the slice harness was
+`a185ede739498cb15c84ae85296818b5ec288f2a85b2667dfadc4a49c6a19417`.
+Toolchain/host: MSVC 14.44.35207, SDK/WDK 10.0.26100.0, Windows
+10.0.28000.3501. Standalone builds passed `/W4 /WX`; existing product warnings
+remain. The updated-host ASan startup failure and earlier real-kernel-PDB ASan
+resource gate remain unresolved, without an unchanged retry or bypass.
+
+At **19:12 KST**, boot time remained **12:49**, with no new reboot/BugCheck
+events, task processes, loaded task drivers, parser receipts, preparation
+directories or AppContainer profiles. The 33 completed parser caches,
+BFE/mpssvc, enabled firewall profiles and Running/Manual EFS matched the stage
+baseline. The earlier EFS stop-denial limit remains unchanged.
+
+[validate-image-scope-approval-journal.ps1](../tools/validate-image-scope-approval-journal.ps1)
+runs the [archive oracle](../tools/test-image-scope-approval-journal.py). Supply
+`-ImageHarness` from `validate-image-recipe.ps1`, `-JournalHarness` from
+`validate-evidence-journal.ps1`, and `-ScopeFixtures` from a completed
+`validate-image-slice.ps1`. Add `-Product` for the offline CLI controls;
+`-Mode harness` or `-Mode product` selects one side. The recorded archive tests
+used the preceding checkpoint's retained scope fixtures to exercise expired
+historical policy windows. No task driver, Driver Verifier or reboot was used.
+
+This increment is not completion of VS1 or P01-P16. Signed distribution and
+revocation, native mapping/object lifetimes, cross-bundle associations, broader
+native corpora and media power-loss validation remain open. Policy, time and
+collector authentication, execution and atomic/current-state claims are not
+established by archived comparison or physical journal membership.
+
 ## Scoped approved image changes checkpoint: 2026-11-17
 
 `assess-image` now accepts original direct/secondary KMON slices and temporal

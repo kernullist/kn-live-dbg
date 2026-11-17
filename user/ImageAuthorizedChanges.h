@@ -20,6 +20,8 @@ ImageChangeAssessment AssessAuthorizedImageChanges(const std::wstring& capture,
 
 // Direct/secondary slices and temporal sweeps keep their original replay report
 // and per-observation scope. This does not change the direct assessment v1 format.
+struct ImageScopeReplayPaths;
 ImageChangeAssessment AssessAuthorizedImageScopeChanges(const std::wstring& capture,
     const std::wstring& manifest, const std::wstring& approvalPolicy, const std::wstring& policySha256,
-    uint64_t evaluationFileTime = 0, const std::function<void(const wchar_t*)>& observer = {});
+    uint64_t evaluationFileTime = 0, const std::function<void(const wchar_t*)>& observer = {},
+    const ImageScopeReplayPaths* retainedInputs = nullptr);

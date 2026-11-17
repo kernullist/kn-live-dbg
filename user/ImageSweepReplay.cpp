@@ -1,4 +1,5 @@
 #include "ImageSweepManifest.h"
+#include "ImageScopeReplayPaths.h"
 #include "ImageSweepReplayEvidence.h"
 #include "ImageSliceRecipe.h"
 #include "ImageScopeClaims.h"
@@ -57,7 +58,8 @@ namespace
 }
 
 static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std::filesystem::path& root, std::wstring* error,
-    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256)
+    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256,
+    const ImageScopeReplayPaths* retainedInputs = nullptr)
 {
     if (verifiedEvidence != nullptr) { *verifiedEvidence = {}; }
     ImageSweepReplayEvidence verified;
@@ -95,7 +97,7 @@ static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std
         if (!readIds.insert(row.ReadSetId).second) { result.Status = L"duplicate_slice_artifact"; return result; }
         if (!row.RecipeWritten || !row.ReferenceWritten) { result.Status = L"slice_recipe_not_published"; return result; }
         const auto name = L"reads-" + s.CollectionId + L"-" + std::to_wstring(row.ReadSetId);
-        const auto recipePath = root / L"image-reads" / (name + L".knslice");
+        const auto recipePath = ResolveImageScopeReplayPath(root, L"image-reads/" + name + L".knslice", retainedInputs);
         std::wstring recipeJson;
         ImageSliceRecipe p;
         ImageScopeClaimPublication slicePublication;
@@ -116,7 +118,7 @@ static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std
         {
             referenceHash = p.ReferenceSha256; referenceIdentity = p.OriginalFileIdentity;
             executable_image::DiskPeMetadata metadata;
-            if (!reference.Open((root / L"image-references" / (referenceHash + L".knblob")).wstring(), error) ||
+            if (!reference.Open(ResolveImageScopeReplayPath(root, L"image-references/" + referenceHash + L".knblob", retainedInputs).wstring(), error) ||
                 reference.Sha256() != referenceHash || !executable_image::ReadDiskPeMetadata(reference.Path(), &metadata, error) ||
                 metadata.Machine != IMAGE_FILE_MACHINE_AMD64 || metadata.OptionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
                 !schedule.Initialize(metadata) || schedule.Ranges.size() != s.TotalRanges ||
@@ -140,7 +142,7 @@ static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std
         if (row.RawWritten)
         {
             std::wstring raw;
-            if (!BoundedRead(root / L"image-reads" / (name + L".knreads"), consumed, &raw) || !RawMatches(raw, manifest, row, p))
+            if (!BoundedRead(ResolveImageScopeReplayPath(root, L"image-reads/" + name + L".knreads", retainedInputs), consumed, &raw) || !RawMatches(raw, manifest, row, p))
             {
                 result.Status = L"raw_artifact_missing_corrupt_or_mismatched"; return result;
             }
@@ -152,7 +154,7 @@ static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std
         ImageSliceClaimEvidence sliceClaims;
         const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error,
             verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr, &sliceClaims,
-            verifiedEvidence != nullptr ? &verifiedSlice.Context : nullptr);
+            verifiedEvidence != nullptr ? &verifiedSlice.Context : nullptr, retainedInputs);
         uint64_t bytes = 0, equalOrDifferent = 0, skip = 0, fail = 0, differences = 0;
         bool sliceQualified = false;
         if (replay.Status != L"replayed" || replay.RecipeSha256 != row.RecipeSha256 ||
@@ -234,7 +236,8 @@ std::wstring CaptureImageSweepClaimPublicationJson(const std::wstring& manifestJ
 }
 
 ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
-    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256)
+    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256,
+    const ImageScopeReplayPaths* retainedInputs)
 {
     if (verifiedEvidence) { *verifiedEvidence = {}; }
     std::wstring json;
@@ -245,5 +248,5 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         result.Status = L"manifest_unavailable_or_corrupt"; return result;
     }
     return EvaluateImageSweepManifest(std::move(json), std::filesystem::path(path).parent_path().parent_path(),
-        error, verifiedEvidence, expectedManifestSha256);
+        error, verifiedEvidence, expectedManifestSha256, retainedInputs);
 }

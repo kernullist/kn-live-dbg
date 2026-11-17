@@ -230,6 +230,7 @@
     <ClCompile Include="ImageCaptureCollection.cpp" />
     <ClCompile Include="ImageAuthorizedChanges.cpp" />
     <ClCompile Include="ImageApprovalCollection.cpp" />
+    <ClCompile Include="ImageScopeApprovalCollection.cpp" />
     <ClCompile Include="ImageRecipeReadSet.cpp" />
     <ClCompile Include="ImageSliceRecipe.cpp" />
     <ClCompile Include="ImageScopeClaims.cpp" />
@@ -429,6 +430,8 @@
     <ClInclude Include="ImageCaptureCollection.h" />
     <ClInclude Include="ImageAuthorizedChanges.h" />
     <ClInclude Include="ImageApprovalCollection.h" />
+    <ClInclude Include="ImageScopeApprovalCollection.h" />
+    <ClInclude Include="ImageScopeReplayPaths.h" />
     <ClInclude Include="EvidenceArtifactPublication.h" />
     <ClInclude Include="ImageScopeClaims.h" />
     <ClInclude Include="ImageScopeClaimPublication.h" />

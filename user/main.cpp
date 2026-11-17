@@ -39,6 +39,7 @@
 #include "ImageCaptureCollection.h"
 #include "ImageAuthorizedChanges.h"
 #include "ImageApprovalCollection.h"
+#include "ImageScopeApprovalCollection.h"
 #include "EvidencePrivacy.h"
 #include "EvidenceDisclosure.h"
 #include "EvidenceRetention.h"
@@ -23097,8 +23098,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
-    std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
-    std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> [/current] [/json]\n";
+    std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
+    std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase|assessment.knscopeapproval> <policy-sha256> [/current] [/json]\n";
     std::wcout << L"  !kmon assess-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
     std::wcout << L"  !kmon journal-image <case-directory> <private-store> <collection-id> [/json]\n";
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
@@ -23536,14 +23537,25 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
             args[7].size() <= 20 && args[7].find_first_not_of(L"0123456789") == std::wstring::npos && (args[7].size() == 1 || args[7][0] != L'0'); }
         if (!valid)
         {
-            std::wcerr << L"usage: !kmon journal-image-approval <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
+            std::wcerr << L"usage: !kmon journal-image-approval <directory|capture.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
             return 2;
         }
-        const auto result = JournalImageApproval(args[2], args[3], args[4], args[5], args[6], args[7]);
-        const auto json = ImageApprovalCollectionJson(result);
+        std::wstring json;
+        bool archived = false;
+        const auto extension = ToLower(std::filesystem::path(args[2]).extension().wstring());
+        if (extension == L".knslice" || extension == L".knsweep" || extension == L".knscopeapproval")
+        {
+            const auto result = JournalImageScopeApproval(args[2], args[3], args[4], args[5], args[6], args[7]);
+            json = ImageScopeApprovalCollectionJson(result); archived = result.Status == L"archived";
+        }
+        else
+        {
+            const auto result = JournalImageApproval(args[2], args[3], args[4], args[5], args[6], args[7]);
+            json = ImageApprovalCollectionJson(result); archived = result.Status == L"archived";
+        }
         if (directJsonOutput) { if (!WriteCapabilityJson(json)) { return 3; } }
         else { std::wcout << json << L"\n"; }
-        return result.Status == L"archived" ? 0 : 1;
+        return archived ? 0 : 1;
     }
     if (action == L"replay-image-approval")
     {
@@ -23558,10 +23570,11 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         }
         if (!valid)
         {
-            std::wcerr << L"usage: !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> [/current] [/json]\n";
+            std::wcerr << L"usage: !kmon replay-image-approval <assessment.knapprovalcase|assessment.knscopeapproval> <policy-sha256> [/current] [/json]\n";
             return 2;
         }
-        const auto result = ReplayImageApproval(args[2], args[3], current);
+        const auto result = ToLower(std::filesystem::path(args[2]).extension().wstring()) == L".knscopeapproval" ?
+            ReplayImageScopeApproval(args[2], args[3], current) : ReplayImageApproval(args[2], args[3], current);
         if (directJsonOutput) { if (!WriteCapabilityJson(result.Json)) { return 3; } }
         else { std::wcout << result.Json << L"\n"; }
         return result.Succeeded ? 0 : 1;

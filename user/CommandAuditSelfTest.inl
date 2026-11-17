@@ -505,6 +505,15 @@ static int RunCommandAuditSelfTest()
         L"approval replay stays read only and preserves its interactive transcript");
     check(run(approvalReplay + L" /current /json").Output.find(L"current_retained_policy") != std::wstring::npos && !device.IsOpen(),
         L"current approval reevaluation routes without a device");
+    for (const auto* path : {L"missing.knslice", L"missing.knsweep", L"missing.KNSCOPEAPPROVAL"})
+    {
+        const auto line = L"!kmon journal-image-approval " + std::wstring(path) + L" y z " + std::wstring(64, L'a') + L" store 7 /json";
+        check(IsWriteLikeCommandLine(line) && run(line).Output.find(L"kn.image_scope_approval_collection.v1") != std::wstring::npos && !device.IsOpen(),
+            L"scoped approval archival is write classified and preserves offline transcript");
+    }
+    const auto scopeReplay = L"!kmon replay-image-approval missing.KNSCOPEAPPROVAL " + std::wstring(64, L'a') + L" /current /json";
+    check(!IsWriteLikeCommandLine(scopeReplay) && run(scopeReplay).Output.find(L"kn.image_scope_approval_replay.v1") != std::wstring::npos && !device.IsOpen(),
+        L"scoped approval replay is read only and opens no driver");
     for (const auto& suffix : {L" /bad", L" /json /json", L" /current /current"})
     { check(run(approvalReplay + suffix).Error.find(L"usage") != std::wstring::npos, L"approval replay rejects malformed options"); }
     for (const auto& suffix : {L" /bad", L" /json /json", L" /current"})

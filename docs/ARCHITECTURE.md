@@ -2091,9 +2091,9 @@ The evaluator admits at most 2,048 slices and 16,384 pages; its output is at mos
 replay rather than returning a truncated successful assessment.
 
 This bounded policy path does not provision signed distribution trust, consult
-revocation services or join other cases. The approval collection below retains
-direct assessments only; durable scoped-approval archival remains pending.
-An updated policy requires its own explicit digest.
+revocation services or join other cases. The approval collections below retain
+direct and scoped assessments under separate journal policies. An updated
+policy requires its own explicit digest.
 
 ### Approved image collections
 
@@ -2154,6 +2154,64 @@ clock and the collector timestamp are unauthenticated. Neither membership nor
 replay establishes present approval, current live state, issuer signatures,
 execution, lifetime continuity, power-loss durability or disclosure authority.
 Approval publication, replay results and ledgers remain private evidence.
+
+### Scoped approved image collections
+
+The same commands accept `.knslice`, `.knsweep` and managed `.knscopeapproval`
+roots. Scope archival retains the exact root, every declared child recipe and
+each raw archive marked as published, including original claim wrappers. A
+missing required input makes archival unavailable. An original row with
+`raw_written=false` retains its publication-loss evidence without inventing a raw file.
+Comparison gaps and unexplained differences can be archived; archival success
+does not turn them into approved bytes.
+
+Original scope inputs use `image-scope-inputs/SHA.knscopeblob`, with the physical
+content hash as the key. A sorted catalog binds each original logical name to
+its hash, schema and byte length. This avoids filename collisions between
+different source collections and shares identical bytes across archives. The
+reference PE retains the existing `image-references/SHA.knblob` path; policy and
+manifest retain their shared approval paths. The catalog permits at most 4,097
+logical inputs, 2 MiB each and 256 MiB total. Reference, policy and manifest
+limits remain 64 MiB, 64 KiB and 64 KiB respectively. The assessment still has
+the 2,048-slice, 16,384-page and 4 MiB limits above.
+
+`image-approvals/scope-assessment-ID.knscopeapproval` is an at-most-8-MiB
+`kn.image_scope_approval_publication.v1` root. Its canonical payload records the
+collection ID, scope kind, original root/reference/policy/manifest hashes,
+catalog, evaluation time and complete assessment. Replay resolves original
+logical paths only through the retained catalog. A missing entry or CAS file
+never falls back to a nearby original filename. All source artifacts remain
+leased, and replay uses their concrete opened paths through publication.
+
+The dedicated `kn.approved_image_scope_collection_journal.v1` policy admits one
+`image_scope_approval` transaction containing every unique input CAS file, the
+reference, policy, manifest and assessment root. Its ID is the physical root
+hash. Membership verification requires exactly the catalog's declared member
+set; missing and extra committed members are rejected. Closure requires all
+those paths plus the final `scope-session-ID.knscopeledger` member under
+`image-approvals`. This `kn.image_scope_approval_session.v1` ledger separates
+logical input bytes from unique retained member bytes. Existing journal
+policies reject the new transaction kind. Recovery lists its root in
+`committed_approval_paths`; CAS sweep files are not standalone replay entry
+points in `committed_sweep_paths`.
+
+Private-store admission, directory pins, retained output leases, immutable
+retries, prefix recovery and explicit GC apply to this full closure. The fixed
+assessment path preserves its first evaluation time/report across interrupted
+and closed retries, including later policy expiry. A managed root can supply
+the original inputs for retry or a new collection after source removal; a new
+collection evaluates the separately supplied policy at its own evaluation time.
+Committed inputs and roots, final ledgers and uncertain membership remain
+protected from GC. Eligible uncommitted CAS files require exact-member policy.
+
+Scoped archive results use `kn.image_scope_approval_collection.v1`; replay uses
+`kn.image_scope_approval_replay.v1`. The caller must supply the policy digest
+again. Original replay requires exact assessment equality at the recorded time;
+`/current` reevaluates the retained policy at host time. Physical membership can
+verify even when a rehashed assessment lies, so semantic replay remains a
+separate check. Neither result proves atomic observation, authenticated time,
+issuer signatures, native lifetime continuity, current state or power-loss
+durability. The direct archive policy and historical report format are unchanged.
 
 ### Claim-specific image proof
 

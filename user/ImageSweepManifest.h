@@ -44,8 +44,10 @@ std::wstring CaptureImageSweepClaimPublicationJson(const std::wstring& manifestJ
     const std::wstring& artifactRoot, std::wstring* error);
 struct ImageRecipeReplay;
 struct ImageSweepReplayEvidence;
+struct ImageScopeReplayPaths;
 ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
-    ImageSweepReplayEvidence* verifiedEvidence = nullptr, const std::wstring& expectedManifestSha256 = L"");
+    ImageSweepReplayEvidence* verifiedEvidence = nullptr, const std::wstring& expectedManifestSha256 = L"",
+    const ImageScopeReplayPaths* retainedInputs = nullptr);
 
 // Writer-owned bounded metadata; queue losses remain visible as ordinal gaps.
 // No producer/writer shared mutable sweep state or original-file handles.

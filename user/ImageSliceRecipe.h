@@ -30,6 +30,7 @@ std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJso
     const std::wstring& referencePath, std::wstring* error);
 // Optional typed results are populated only after all original inputs and results agree.
 struct ImageSliceClaimEvidence;
+struct ImageScopeReplayPaths;
 struct ImageSliceReplayContext
 {
     std::wstring ReferenceSha256;
@@ -39,4 +40,4 @@ struct ImageSliceReplayContext
 };
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
     std::vector<ExecutablePageResult>* verifiedPages = nullptr, ImageSliceClaimEvidence* verifiedClaims = nullptr,
-    ImageSliceReplayContext* verifiedContext = nullptr);
+    ImageSliceReplayContext* verifiedContext = nullptr, const ImageScopeReplayPaths* retainedInputs = nullptr);

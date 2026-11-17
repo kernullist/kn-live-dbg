@@ -214,6 +214,9 @@
     <ClCompile Include="ImageApprovalCollection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ImageScopeApprovalCollection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ImageAuthorizedChanges.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -517,6 +520,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ImageApprovalCollection.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ImageScopeApprovalCollection.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ImageScopeReplayPaths.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="EvidenceArtifactPublication.h">

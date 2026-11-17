@@ -1,4 +1,5 @@
 #include "ImageSliceRecipe.h"
+#include "ImageScopeReplayPaths.h"
 #include "ImageComparisonJson.h"
 #include "ObservationReadRoutingJson.h"
 #include "BoundedObservationJson.h"
@@ -362,7 +363,7 @@ std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJso
 
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
     std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims,
-    ImageSliceReplayContext* verifiedContext)
+    ImageSliceReplayContext* verifiedContext, const ImageScopeReplayPaths* retainedInputs)
 {
     if (verifiedPages) { verifiedPages->clear(); }
     if (verifiedClaims) { *verifiedClaims = {}; }
@@ -377,7 +378,7 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     artifactJson = json;
     if (!UnwrapImageScopeClaimPublication(&artifactJson, &publication) || !ParseImageSliceRecipe(artifactJson, &recipe))
         { result.Status = L"recipe_unavailable_or_corrupt"; return result; }
-    const auto reference = std::filesystem::path(path).parent_path().parent_path() / L"image-references" /
-        (recipe.ReferenceSha256 + L".knblob");
+    const auto reference = ResolveImageScopeReplayPath(std::filesystem::path(path).parent_path().parent_path(),
+        L"image-references/" + recipe.ReferenceSha256 + L".knblob", retainedInputs);
     return EvaluateImageSliceRecipe(std::move(json), reference.wstring(), error, verifiedPages, verifiedClaims, verifiedContext);
 }
