@@ -135,7 +135,7 @@ bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
     return KmonLayoutQueue::Accepted(LayoutCandidates.Admit(std::move(candidate), GetTickCount64()));
 }
 
-void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before)
+void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before, uint64_t budgetMs)
 {
     const auto begin = GetTickCount64();
     if (LayoutLastServiceMs != 0 && begin >= LayoutLastServiceMs)
@@ -153,7 +153,7 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
     // is occupied. Never extend the candidate's original validity window.
     const bool pressure = LayoutCandidates.Size() >= (LayoutAdmissionLimit - LayoutChangeReserve) / 2;
     const size_t candidateBudget = pressure ? 64 : 16;
-    const uint64_t timeBudgetMs = pressure ? 100 : 25;
+    const uint64_t timeBudgetMs = (std::min)(budgetMs, uint64_t(pressure ? 100 : 25));
     const auto watches = SnapshotWatchPids();
     ProcessLayoutCandidate item;
     for (size_t count = 0; count < candidateBudget && (finalDrain || !StopRequested.load()) && GetTickCount64() - begin < timeBudgetMs &&

@@ -1012,8 +1012,16 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         if (deniedWriter != INVALID_HANDLE_VALUE) { CloseHandle(deniedWriter); }
         check(deniedWriter == INVALID_HANDLE_VALUE && deniedError == ERROR_SHARING_VIOLATION,
             "ready-content-lease-denies-source-mutation-until-consumed");
-        check(content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedVerified &&
+        const auto borrowedBefore = content.ImageTimings.Snapshot().BorrowedFirstPage;
+        const auto overrunBefore = content.ImageTimings.Snapshot().OverBudget;
+        // Model native setup already consuming the caller's allowance. The
+        // actual prepared comparison must still make its minimum page progress.
+        const auto expiredOrigin = GetTickCount64() - KmonImageTurnBudgetMs - 1;
+        check(content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing, false, 1, expiredOrigin) == CodeOwnership::OwnedVerified &&
             !contentRelease.load() && !source.Calls.empty(), "prepared-content-enables-actual-observation-beside-held-worker");
+        check(content.ImageTimings.Snapshot().BorrowedFirstPage == borrowedBefore + 1 &&
+            content.ImageTimings.Snapshot().OverBudget == overrunBefore + 1,
+            "expired-caller-allowance-preserves-minimum-progress-and-original-turn-clock");
         KernelMonitor::CapturedImageReads retained;
         check(content.CapturedImageReadSets.Pop(&retained) && retained.Reference.Artifact &&
             retained.Reference.Artifact->Bytes == contentDisk && retained.Reference.Artifact->Sha256 == ContentHash::Bytes(contentDisk) &&

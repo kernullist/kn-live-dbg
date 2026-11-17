@@ -23,6 +23,7 @@
 #include "KmonReferenceScheduling.h"
 #include "KmonImageScheduling.h"
 #include "KmonPublicationScheduling.h"
+#include "KmonAnalysisScheduling.h"
 #include "KmonLayoutScheduling.h"
 #include "ImageReferencePreparation.h"
 #include "GameBuildManifest.h"
@@ -378,6 +379,7 @@ private:
     friend bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
     friend struct KmonImageTestAccess;
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
@@ -388,15 +390,18 @@ private:
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti, const TiSequenceSnapshot* fence = nullptr);
     void LayoutLoop();
-    void DrainLayoutCandidates(bool finalDrain = false, const wchar_t* before = L"layout_drain");
+    void DrainLayoutCandidates(bool finalDrain = false, const wchar_t* before = L"layout_drain", uint64_t budgetMs = UINT64_MAX);
     bool QueueLayoutCandidate(ProcessLayoutCandidate candidate);
     bool QueueLayoutNotice(const ProcessLayoutNotice& notice);
     void ServicePendingAnalysis(const wchar_t* before = L"scanner_boundary");
+    std::array<KmonAnalysisPending, KmonAnalysisStages> AnalysisPending(uint64_t now) const;
+    KmonAnalysisScheduling AnalysisScheduling;
     void ServiceWatchedReferences();
     bool IsCurrentReferenceWatch(HANDLE process, const ObservationIdentity& identity) const;
     void CaptureLoop();
     void CaptureWriterLoop();
-    void DrainPipelineEvents(bool finalDrain = false);
+    void DrainPipelineEvents(bool finalDrain = false, uint64_t budgetMs = UINT64_MAX, bool includeRegions = true);
+    void DrainCapturedRegions(size_t maxCount, uint64_t budgetMs);
     void ResetPipeline();
     bool QueueCapture(const std::wstring& role, uint64_t address, uint64_t size,
         const ObservationIdentity& identity, uint64_t eventTimestamp, std::wstring* note,
@@ -404,8 +409,8 @@ private:
     uint64_t QueueCapturedBytes(const std::wstring& role, uint64_t address,
         const ObservationContext& context, const std::vector<uint8_t>& bytes);
 
-    void IngestThreatIntel();
-    void IngestLiveTimeline();
+    void IngestThreatIntel(size_t maxCount = 512, uint64_t budgetMs = UINT64_MAX);
+    void IngestLiveTimeline(size_t maxCount = 512, uint64_t budgetMs = UINT64_MAX);
     void NoteCredscanRead(const struct TiEventRecord& record);
     void NoteRegionObservation(const KmonRegionObservation& observation, const wchar_t* source);
     void NoteTiRegionEvent(const TiEventRecord& record, DeviceClient* device, SymbolEngine* symbols);
@@ -462,9 +467,10 @@ private:
     void ScanKernelInlinePatches();
     CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
-        const ObservationReadRouting* routing = nullptr, bool discovery = true);
+        const ObservationReadRouting* routing = nullptr, bool discovery = true, uint64_t budgetMs = KmonImageTurnBudgetMs,
+        uint64_t budgetStartedMs = UINT64_MAX);
     void ScanKernelExecutableImages();
-    void ContinueImageSweeps();
+    void ContinueImageSweeps(uint64_t budgetMs = KmonImageTurnBudgetMs);
     void ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader);
     void ScanGameObjectManifest(const std::wstring& path, uint64_t base,
@@ -1548,6 +1554,7 @@ bool KmonImageReadIntegrationSelfTest();
 bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

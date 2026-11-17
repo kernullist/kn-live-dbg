@@ -9265,7 +9265,6 @@ void KernelMonitor::WorkerLoop()
         }
         ScanExecutablePageCandidates();
         ServicePendingAnalysis(L"after_executable_page_candidates");
-        ScanExecutionReferences();
 
         AnalysisLastCompleteMs.store(GetTickCount64());
         if (GetTickCount64() - nowMs > 1000)
@@ -9651,8 +9650,9 @@ std::vector<TiEventRecord> KernelMonitor::CollectTiPage(TiSubscriber* ti, const 
     return std::move(snapshot.Records);
 }
 
-void KernelMonitor::IngestThreatIntel()
+void KernelMonitor::IngestThreatIntel(size_t maxCount, uint64_t budgetMs)
 {
+    const auto begin = GetTickCount64();
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
@@ -9660,9 +9660,9 @@ void KernelMonitor::IngestThreatIntel()
         device = Device;
         symbols = Symbols;
     }
-    std::vector<TiEventRecord> batch = CollectedTi.Drain(512);
     uint32_t activityEvents = 0;
-    for (const TiEventRecord& record : batch)
+    TiEventRecord record;
+    for (size_t count = 0; count < maxCount && GetTickCount64() - begin < budgetMs && CollectedTi.Pop(&record); ++count)
     {
         TiIngested.fetch_add(1);
         // Runs before classification: remote reads never classify, and the
@@ -9878,10 +9878,11 @@ void KernelMonitor::IngestThreatIntel()
     }
 }
 
-void KernelMonitor::IngestLiveTimeline()
+void KernelMonitor::IngestLiveTimeline(size_t maxCount, uint64_t budgetMs)
 {
-    std::vector<TimelineEvent> batch = CollectedLive.Drain(512);
-    for (const TimelineEvent& event : batch)
+    const auto begin = GetTickCount64();
+    TimelineEvent event;
+    for (size_t count = 0; count < maxCount && GetTickCount64() - begin < budgetMs && CollectedLive.Pop(&event); ++count)
     {
         if (ToLowerCopy(event.Source) != L"kernel-live")
         {

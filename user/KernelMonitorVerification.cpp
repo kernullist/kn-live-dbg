@@ -440,9 +440,9 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
 
 CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint64_t base,
     const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
-    const ObservationReadRouting* routing, bool discovery)
+    const ObservationReadRouting* routing, bool discovery, uint64_t budgetMs, uint64_t budgetStartedMs)
 {
-    const auto turnStarted = GetTickCount64();
+    const auto turnStarted = budgetStartedMs == UINT64_MAX ? GetTickCount64() : budgetStartedMs;
     ImageVerificationWork* admitted = nullptr;
     KmonImageAttemptOutcome outcome = KmonImageAttemptOutcome::Fault;
     ExecutableSweepTiming timing;
@@ -558,7 +558,7 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     };
     ExecutableSweepReference capturedReference;
     ExecutableSliceTrace slice;
-    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, KmonImageTurnBudgetMs,
+    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, (std::min)(budgetMs, KmonImageTurnBudgetMs),
         router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice, &timing, turnStarted, preparedContent.get());
     // The publication queue shares immutable bytes, never the source lease.
     preparedContent.reset();
@@ -944,12 +944,10 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     return nullptr;
 }
 
-void KernelMonitor::ContinueImageSweeps()
+void KernelMonitor::ContinueImageSweeps(uint64_t budgetMs)
 {
     const uint64_t now = GetTickCount64();
-    if (StopRequested.load() || now < NextImageSweepMs || ImageWork.empty() ||
-        LayoutCandidates.Size() >= 256 || ExecutionReferences.size() >= 256 ||
-        CollectedLive.Size() >= 1024 || CollectedTi.Size() >= 1024) { return; }
+    if (StopRequested.load() || budgetMs == 0 || now < NextImageSweepMs || ImageWork.empty()) { return; }
     NextImageSweepMs = now + 50;
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
@@ -1034,7 +1032,10 @@ void KernelMonitor::ContinueImageSweeps()
     // The cooperative budget includes reference lookup. Minimum first-page
     // progress and mandatory final fences can overrun; the timing report
     // preserves those overruns. Continuation never refreshes discovery age.
-    ScanExecutableImage(path, base, identity, {}, 1024, &routing, false);
+    // Keep the original budget origin and minimum first-page progress even if
+    // inventory/setup already exceeded the allowance. Skipping the verifier
+    // here could starve images whenever native setup is consistently slow.
+    ScanExecutableImage(path, base, identity, {}, 1024, &routing, false, budgetMs, now);
 }
 
 void KernelMonitor::ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,

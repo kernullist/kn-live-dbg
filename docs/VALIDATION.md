@@ -7,6 +7,78 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Shared analysis scheduling checkpoint: 2026-11-18
+
+Nine analysis stages now share a cooperative 250 ms turn, at most 100 ms per
+requested slice, and a cursor that survives budget exhaustion, exceptions and
+slow native calls. Persistent reference/event pressure no longer vetoes image
+continuation. Ingestion consumes one item at a time; pipeline events and captured
+regions have separate turns. Original target identity/content fences, per-item
+debt, source gates and explicit shutdown drains remain in place. See
+[shared analysis scheduling](ARCHITECTURE.md#shared-analysis-scheduling).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Private `kn.analysis_scheduling.v1` diagnostics distinguish backlog/dependency,
+dispatch/return/fault, service/gap distributions, ready-work deferrals and actual
+stage/turn overruns. Backlog age starts at the first scheduler observation of a
+continuous backlog. Counts describe service opportunities, not successful target
+observations or source-wide freshness. They are runtime diagnostics, not a
+durable timing journal. Native calls, individual handlers, final fences, bulk
+scanners outside safe boundaries and shutdown can exceed or bypass these normal
+cooperative allowances. No hard deadline or native workload SLO is claimed.
+
+Review preserved minimum image progress when native setup has already consumed
+the caller's allowance. Otherwise slow setup could repeatedly skip the verifier.
+An actual prepared comparison with an expired caller clock still reads its
+minimum page, preserves final reference fences and records the original overrun.
+Invalid clock order stops later stage dispatch without fabricating a duration;
+last-stage overruns are retained even when no further selection occurs.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier.
+The core harness built under `/W4 /WX` and passed **423 analysis checks**.
+The independent analysis oracle passed **6,722 assertions** across 12 synthetic
+fixed/growing, churn, blocked/rejoining, due-clock, slow/fault/stop/reentrant,
+clock-reversal, final-stage-overrun and depletion scenarios. It checks dispatch
+opportunities, remaining allowances, exact counters and independently computed
+histograms. These clocks do not represent measured native workload latency.
+
+The product's actual dispatcher passed **15 owned controls** and **20 independent
+assertions**: 1,600 live and 1,600 TI records, zero/count-limited allowances,
+remaining queue preservation, guard-preserving mapping qualification, unavailable
+source gates, actual coverage diagnostics, stop and reset. Product oracles also
+passed **968 image / 73 preparation / 50 reference / 85 publication / 16 layout /
+23 capture assertions**. Compiled capabilities passed **50 contracts / 261
+command routes** and the generated support matrix was refreshed.
+
+The final isolated `--self-test all` passed **28 timeline / 102 MCP /
+121 KMON image-read / 319 image-scheduling / 39 image-preparation /
+41 publication-writer / 21 layout-scheduler / 15 analysis-integration /
+564 console / 3,043 command-route / 68 remote / 4 connect-option checks**, with
+`owned_fixture_cleanup=passed`. The shared core also passed the existing capture,
+reference, publication, execution, hunting, page, ordering, false-positive and
+native image/handle controls, including independent **12,989 reference / 2,394
+publication / 10 execution assertions**. The public-content scanner regression
+passed **12 tests**, including renamed UTF-8/UTF-16 analysis diagnostics.
+Final review found no additional actionable defects in the reviewed scope.
+
+Final Release product SHA-256:
+`3ea9efd5144db495af1feb308a4efd9c95c566975b1354c11905b56bdec46b12`.
+Shared KMON core harness SHA-256:
+`65c5ac537b5811f7b80ac1dba492f5cb64485e6651c0535412b7f82b5bc2be0b`.
+Existing alignment warnings remain. ASan remains blocked by the previously
+recorded host startup interception failure; no new ASan success is claimed.
+Source-wide collection timing, persisted timing recovery, deeper dependency
+propagation, native API latency, workload-specific maximum unobserved intervals
+and durability under media/power loss remain open.
+
+At **02:52 KST**, boot time remained **12:49:00.5 KST on November 17**. No new
+reboot/BugCheck events, dump files, task processes/drivers or owned temporary
+writer/preparation fixtures remained after validation. The 33 completed parser
+caches, firewall profiles and BFE/mpssvc automatic-running and EFS manual-running
+service states matched the preceding collection-timing checkpoint.
+
 ## Collection publication timing checkpoint: 2026-11-18
 
 The capture writer now links known local acquisition windows to actual

@@ -1098,8 +1098,8 @@ bounded queues, identity checks, explicit loss accounting, and shutdown drain.
 Watched reference metadata has its own rotation between deep scans. Each visit
 qualifies the retained process handle against the current watch conditions;
 implicit child watches require the stored creation time. This avoids inheriting
-a stale watch when a PID is reused. Reference verification runs before and after
-event ingestion, with a larger bounded budget under queue pressure. IAT walks
+a stale watch when a PID is reused. Reference verification rotates with event
+ingestion under the shared analysis budget, retaining its pressure preference. IAT walks
 yield between descriptors/thunks so a long walk can service waiting work.
 
 TI and live-event collection limit each source read to available analysis queue
@@ -1805,8 +1805,59 @@ user memory, including guard/no-access pages, and an explicitly absent device.
 It verifies queue/service accounting, shutdown separation and preservation of
 the kernel quantum without loading a driver. The core ASan harness additionally
 checks percentile bounds, concurrency, fixed cohorts and sustained churn.
-Image and layout scheduling are described below; generic deadline/dependency
-propagation remains separate work.
+Shared analysis turns, image and layout scheduling are described below. Deadline
+propagation through other scanners and native calls remains separate work.
+
+## Shared analysis scheduling
+
+At safe scanner boundaries, the analysis thread rotates through nine stages:
+execution references, layout candidates, live events, TI events, I/O trace,
+pipeline events, captured regions, watched references and image continuations.
+The persistent cursor advances before invoking each stage, including a stage
+that throws or exceeds its allowance. A boundary has a shared 250 ms cooperative
+budget and dispatches each stage at most once. An allowance is at most 100 ms
+and never exceeds the remaining turn budget or the stage's requested slice.
+Existing smaller layout, ingestion and image budgets still apply. A later
+boundary resumes the cursor; sustained reference/event pressure no longer
+vetoes image continuation. Stage returns never renew successful target freshness.
+
+Readiness snapshots use queue counts, due clocks and cheap live-binding checks.
+Actual stages still qualify their sources, process instances and mapping/content
+fences. Image count means resident work, including work waiting for preparation
+or its own cooldown; I/O trace and watched-reference counts describe active
+service opportunities. They are not a count of verified or eligible targets.
+Snapshots are not atomic across queues. New work for an already visited stage
+waits for another boundary. Pipeline events and captured regions have separate
+turns. Ingestion pops only the next item being processed, so exhausted budgets
+leave remaining items in their original queue.
+
+Native calls, individual event handlers, module inventory, watched-reference
+visits, I/O trace batches and mandatory final fences cannot be preempted by this
+policy. They can overrun their allowance and the shared budget. Image setup
+shares the original comparison clock and retains minimum first-page progress
+even after slow preparation; otherwise consistently slow setup could prevent
+all image progress. Bulk discovery scanners outside these boundaries and
+explicit shutdown drains remain outside the normal shared-turn budget.
+
+`coverage.pipeline.analysis_scheduling_json` carries private
+`kn.analysis_scheduling.v1` diagnostics. It separates pending/dependency state,
+first-observed continuous backlog age, dispatch/return/fault counts, budget
+deferrals, actual overruns, active-stage time and service/dispatch-gap histograms.
+Pending/dependency fields reflect the last scheduler readiness observation,
+which can precede the active callback's queue changes.
+Turn service includes the last callback even when it exhausts the stage list;
+exhausted-turn counts mean the budget was reached at a later selection check.
+Budget deferrals count ready unvisited stages at that check. Percentiles are
+log2 bucket upper bounds. Invalid clock order halts the turn without wrapped
+durations. These are runtime stage diagnostics, not a durable timing journal,
+per-item acquisition times, native API latency or whole-source unobserved bounds.
+
+`--self-test analysis-scheduler` exercises the actual dispatcher and budgeted
+queues with owned guarded mapping metadata and an absent native binding.
+The standalone core and independent Python oracle cover fixed/growing arrivals,
+churn, blocked/rejoining stages, due clocks, slow calls, exceptions, stop,
+recursive entry, clock reversal and final-stage overruns. They establish the
+stated cooperative policy, not measured native workload SLOs or completion of P09.
 
 ## Layout collection and verification scheduling
 
@@ -2022,9 +2073,11 @@ borrow priority. That loan does not advance the ordinary process cursor. A
 permanently failing old image therefore cannot consume all ordinary service or
 the reserved bulk/tail turns. A failed reference becomes eligible for another
 lookup after a 30-second cooldown from preparation completion, even without rediscovery.
-Live continuations still require an available source and clear backpressure.
+Live continuations still require an available source and their due clock. The
+shared analysis rotation gives them turns under reference/event queue pressure.
 
-The 25 ms cooperative comparison budget starts before reference lookup. The
+The 25 ms cooperative comparison budget starts before reference lookup and,
+for continuations, includes source inventory and routing setup. The
 verifier preserves its cursor, allows at least one page after preparation, and
 always retains the final target/file identity and retained-content checks.
 Those synchronous calls, minimum progress and result handoff can exceed the

@@ -141,6 +141,7 @@ namespace
 
 void KernelMonitor::ResetPipeline()
 {
+    AnalysisScheduling.Reset();
     ImageReferences->Reset();
     ImageContents->Reset();
     {
@@ -280,32 +281,65 @@ void KernelMonitor::ResetPipeline()
     NextPipelineStatusMs = 0;
 }
 
+std::array<KmonAnalysisPending, KmonAnalysisStages> KernelMonitor::AnalysisPending(uint64_t now) const
+{
+    bool live = false, watches = false;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        live = Device != nullptr && Symbols != nullptr && Device->IsOpen();
+        watches = !Options.WatchPids.empty() || !Options.WatchNames.empty();
+    }
+    std::array<KmonAnalysisPending, KmonAnalysisStages> pending{};
+    const auto set = [&](KmonAnalysisStage stage, uint64_t count, uint64_t slice = 25,
+        bool needsLive = false, bool due = true)
+    {
+        auto& p = pending[static_cast<size_t>(stage)];
+        p.Count = count; p.SliceMs = slice;
+        p.Dependency = count == 0 ? KmonAnalysisDependency::Empty :
+            !due ? KmonAnalysisDependency::NotDue :
+            needsLive && !live ? KmonAnalysisDependency::LiveBindingAbsent : KmonAnalysisDependency::None;
+    };
+    // Readiness is cheap and advisory. Each dispatched stage still checks its
+    // real source/identity fences; module inventory must not run in this snapshot.
+    set(KmonAnalysisStage::References, ExecutionReferences.size(),
+        KmonReferenceDrainBudget(ExecutionReferences.size(), now, ExecutionReferences.OldestPendingMs()), true);
+    set(KmonAnalysisStage::Layout, LayoutCandidates.Size(), 100);
+    set(KmonAnalysisStage::Live, CollectedLive.Size());
+    set(KmonAnalysisStage::Ti, CollectedTi.Size());
+    set(KmonAnalysisStage::Iotrace, IotraceArmed() ? 1 : 0, 25, true);
+    set(KmonAnalysisStage::Events, PipelineEvents.Size() + (now >= NextPipelineStatusMs ? 1 : 0));
+    set(KmonAnalysisStage::Regions, CapturedRegions.Size());
+    set(KmonAnalysisStage::Watched, watches ? 1 : 0, 25, true, WatchedReferenceSchedule.Due(now));
+    set(KmonAnalysisStage::Images, ImageWork.size(), KmonImageTurnBudgetMs, true, now >= NextImageSweepMs);
+    return pending;
+}
+
 void KernelMonitor::ServicePendingAnalysis(const wchar_t* before)
 {
     if (ServicingAnalysis || StopRequested.load()) { return; }
     ServicingAnalysis = true;
     struct Reset { bool& Flag; ~Reset() { Flag = false; } } reset{ServicingAnalysis};
-    // All verifier/catalog state stays on the analysis thread. Yield at safe
-    // scan boundaries instead of waiting for an entire multi-scanner pass.
-    const auto serviceReferences = [this]()
-    {
-        if (!ExecutionReferences.empty())
+    // A persistent cursor gives every ready stage its next turn, including after
+    // a slow native call. Cooperative allowances cannot preempt native APIs or
+    // mandatory evidence fences. Original target debt remains in each stage.
+    AnalysisScheduling.Run([]() { return GetTickCount64(); },
+        [&]() { return AnalysisPending(GetTickCount64()); },
+        [&](KmonAnalysisStage stage, uint64_t allowance)
         {
-            ScanExecutionReferences(128, KmonReferenceDrainBudget(ExecutionReferences.size(),
-                GetTickCount64(), ExecutionReferences.OldestPendingMs()));
-        }
-    };
-    // Older work gets a bounded turn before ingestion can add another burst.
-    serviceReferences();
-    DrainLayoutCandidates(false, before);
-    IngestLiveTimeline();
-    IngestThreatIntel();
-    DrainIotraceEvents();
-    DrainPipelineEvents();
-    DrainLayoutCandidates(false, L"after_event_ingestion");
-    ServiceWatchedReferences();
-    serviceReferences();
-    ContinueImageSweeps();
+            switch (stage)
+            {
+            case KmonAnalysisStage::References: ScanExecutionReferences(128, allowance); break;
+            case KmonAnalysisStage::Layout: DrainLayoutCandidates(false, before, allowance); break;
+            case KmonAnalysisStage::Live: IngestLiveTimeline(512, allowance); break;
+            case KmonAnalysisStage::Ti: IngestThreatIntel(512, allowance); break;
+            case KmonAnalysisStage::Iotrace: DrainIotraceEvents(); break;
+            case KmonAnalysisStage::Events: DrainPipelineEvents(false, allowance, false); break;
+            case KmonAnalysisStage::Regions: DrainCapturedRegions(512, allowance); break;
+            case KmonAnalysisStage::Watched: ServiceWatchedReferences(); break;
+            case KmonAnalysisStage::Images: ContinueImageSweeps(allowance); break;
+            case KmonAnalysisStage::None: break;
+            }
+        }, [&]() { return StopRequested.load(); });
 }
 
 void KernelMonitor::CollectorLoop()
@@ -1956,16 +1990,25 @@ void KernelMonitor::CaptureWriterLoop()
     CaptureWriterDone.store(true);
 }
 
-void KernelMonitor::DrainPipelineEvents(bool finalDrain)
+void KernelMonitor::DrainCapturedRegions(size_t maxCount, uint64_t budgetMs)
 {
-    ApplyImageReferenceResults();
-    for (auto& observation : CapturedRegions.Drain(finalDrain ? 2048 : 512))
+    const auto begin = GetTickCount64();
+    ExecutableRegionObservation observation;
+    for (size_t count = 0; count < maxCount && GetTickCount64() - begin < budgetMs && CapturedRegions.Pop(&observation); ++count)
     {
         ObserveExecutableRegion(std::move(observation));
     }
-    for (auto& event : PipelineEvents.Drain(512))
+}
+
+void KernelMonitor::DrainPipelineEvents(bool finalDrain, uint64_t budgetMs, bool includeRegions)
+{
+    const auto begin = GetTickCount64();
+    ApplyImageReferenceResults();
+    if (includeRegions) { DrainCapturedRegions(finalDrain ? 2048 : 512, budgetMs); }
+    KmonEvent pending;
+    for (size_t count = 0; count < 512 && GetTickCount64() - begin < budgetMs && PipelineEvents.Pop(&pending); ++count)
     {
-        RecordEvent(std::move(event));
+        RecordEvent(std::move(pending));
     }
     const uint64_t now = GetTickCount64();
     if (finalDrain || now >= NextPipelineStatusMs)
@@ -1987,6 +2030,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"ti_analysis_peak"] = std::to_wstring(CollectedTi.Peak());
         event.Evidence[L"live_analysis_peak"] = std::to_wstring(CollectedLive.Peak());
         event.Evidence[L"analysis_pending"] = std::to_wstring(CollectedTi.Size() + CollectedLive.Size());
+        event.Evidence[L"analysis_scheduling_json"] = AnalysisScheduling.Json(now);
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
         const auto captureNow = GetTickCount64();
@@ -2409,6 +2453,107 @@ bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std:
     return passed;
 }
 
+bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* name)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[analysis.integration] FAIL %s\n", name); } return ok; };
+    const auto owner = std::make_unique<KernelMonitor>();
+    auto& monitor = *owner;
+    auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD));
+    const auto release = [](uint8_t* p) { if (p) { VirtualFree(p, 0, MEM_RELEASE); } };
+    const std::unique_ptr<uint8_t, decltype(release)> allocation(memory, release);
+    if (!check(memory != nullptr, "owned mapping allocated")) { return false; }
+    const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+    MEMORY_BASIC_INFORMATION mapping{};
+    check(VirtualQuery(memory, &mapping, sizeof(mapping)) == sizeof(mapping), "owned mapping queried");
+    ProcessLayoutCandidate candidate;
+    candidate.Identity = identity; candidate.Role = L"layout_periodic";
+    candidate.Region = {reinterpret_cast<uint64_t>(memory), 4096, reinterpret_cast<uint64_t>(mapping.AllocationBase),
+        mapping.State, mapping.Protect, mapping.AllocationProtect, mapping.Type};
+    candidate.ObservedAt = ObservationFileTime(); candidate.ObservedMs = GetTickCount64();
+    check(monitor.QueueLayoutCandidate(candidate), "owned layout admitted");
+    monitor.QueueExecutionReference(reinterpret_cast<uint64_t>(memory), 0, L"owned_binding_gate", identity);
+    monitor.ImageWork.try_emplace(L"synthetic:binding_gate");
+    monitor.Options.WatchPids = {identity.ProcessId};
+    for (unsigned i = 0; i < 1600; ++i)
+    {
+        TimelineEvent event; event.Source = L"owned_non_live_control";
+        monitor.CollectedLive.Push(std::move(event));
+        monitor.CollectedTi.Push({});
+    }
+    for (unsigned i = 0; i < 32; ++i)
+    {
+        KmonEvent event; event.Kind = L"coverage.owned_scheduler_control";
+        monitor.PipelineEvents.Push(std::move(event));
+    }
+    for (unsigned i = 0; i < 8; ++i)
+    {
+        ExecutableRegionObservation observation;
+        observation.Context.Identity = identity; observation.Context.Source = L"owned_scheduler_control";
+        observation.Range = {reinterpret_cast<uint64_t>(memory), 4096};
+        monitor.CapturedRegions.Push(std::move(observation));
+    }
+    monitor.NextPipelineStatusMs = UINT64_MAX;
+    monitor.IngestLiveTimeline(512, 0); monitor.IngestThreatIntel(512, 0);
+    monitor.DrainCapturedRegions(512, 0); monitor.DrainPipelineEvents(false, 0, false);
+    monitor.DrainLayoutCandidates(false, L"zero_allowance_control", 0);
+    check(monitor.CollectedLive.Size() == 1600 && monitor.CollectedTi.Size() == 1600 &&
+        monitor.CapturedRegions.Size() == 8 && monitor.PipelineEvents.Size() == 32 && monitor.LayoutCandidates.Size() == 1,
+        "zero allowance preserves each admitted queue");
+    monitor.IngestLiveTimeline(7); monitor.IngestThreatIntel(7); monitor.DrainCapturedRegions(3, UINT64_MAX);
+    check(monitor.CollectedLive.Size() == 1593 && monitor.CollectedTi.Size() == 1593 && monitor.CapturedRegions.Size() == 5 &&
+        monitor.TiIngested.load() == 7, "item limit preserves unpopped ingestion and region work");
+    const auto available = monitor.AnalysisPending(GetTickCount64());
+    check(available[0].Dependency == KmonAnalysisDependency::LiveBindingAbsent &&
+        available[7].Dependency == KmonAnalysisDependency::LiveBindingAbsent &&
+        available[8].Dependency == KmonAnalysisDependency::LiveBindingAbsent, "source-bound stages expose unavailable dependency");
+    check(available[1].Ready() && available[2].Ready() && available[3].Ready() && available[5].Ready() && available[6].Ready(),
+        "independent stages remain ready under event pressure");
+    monitor.NextPipelineStatusMs = 0;
+    const auto deadline = GetTickCount64() + 10000;
+    do
+    {
+        monitor.ServicePendingAnalysis(L"owned_scheduler_boundary");
+    } while ((monitor.CollectedLive.Size() || monitor.CollectedTi.Size() || monitor.LayoutCandidates.Size() ||
+        monitor.PipelineEvents.Size() || monitor.CapturedRegions.Size()) && GetTickCount64() < deadline);
+    const auto normal = monitor.AnalysisScheduling.Json(GetTickCount64());
+    check(monitor.CollectedLive.Size() == 0 && monitor.CollectedTi.Size() == 0 && monitor.CapturedRegions.Size() == 0 &&
+        monitor.PipelineEvents.Size() == 0 && monitor.LayoutCandidates.Size() == 0, "actual analysis boundaries drain ready queues");
+    check(monitor.TiIngested.load() == 1600 && monitor.CollectedTi.Loss() == 0 && monitor.CollectedLive.Loss() == 0 &&
+        monitor.CapturedRegions.Loss() == 0 && monitor.PipelineEvents.Loss() == 0, "ingestion and bounded interruption lose no admitted work");
+    check(monitor.LayoutCandidates.Snapshot().Qualified == 1 && monitor.ExecutionReferences.size() == 1 &&
+        monitor.ExecutionReferenceProcessed == 0 && monitor.ImageWork.size() == 1, "native mapping qualifies while source-bound work stays pending");
+    check(VirtualQuery(memory, &mapping, sizeof(mapping)) == sizeof(mapping) && (mapping.Protect & PAGE_GUARD) != 0 &&
+        monitor.PriorityCaptures.Size() == 0, "metadata service preserves guard without claiming byte capture");
+    std::wstring pipeline;
+    for (const auto& event : monitor.Ring)
+    {
+        const auto item = event.Evidence.find(L"analysis_scheduling_json");
+        if (event.Kind == L"coverage.pipeline" && item != event.Evidence.end()) { pipeline = item->second; }
+    }
+    check(!pipeline.empty() && mcpjson::ValidateDocument(pipeline), "coverage pipeline contains bounded scheduler diagnostics");
+    monitor.StopRequested.store(true);
+    monitor.CollectedLive.Push({});
+    const auto frozen = monitor.AnalysisScheduling.Json(0);
+    monitor.ServicePendingAnalysis(L"stopped_control");
+    check(monitor.CollectedLive.Size() == 1 && monitor.AnalysisScheduling.Json(0) == frozen, "stop excludes normal scheduler dispatch");
+    monitor.IngestLiveTimeline(); // Existing explicit shutdown drain still works.
+    check(monitor.CollectedLive.Size() == 0, "explicit shutdown ingestion remains available");
+    monitor.ImageWork.clear(); monitor.Options.WatchPids.clear();
+    monitor.ResetPipeline();
+    check(monitor.AnalysisScheduling.Json(0).find(L"\"turns\":\"0\"") != std::wstring::npos, "session reset clears scheduler history");
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.analysis_scheduler_test.v1\",\"driver_loaded\":false,\"native_byte_reads\":false,"
+            L"\"corpus\":\"owned_mapping_and_analysis_queues_with_unavailable_live_binding\",\"passed\":" +
+            std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
+            L",\"normal\":" + normal + L",\"pipeline\":" + (pipeline.empty() ? L"null" : pipeline) + L"}";
+    }
+    std::fprintf(stderr, "[analysis.integration] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
 bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
@@ -2416,6 +2561,7 @@ bool KmonPipelineSelfTest()
     if (!KmonImagePreparationIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonPublicationSchedulingIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonLayoutSchedulingIntegrationSelfTest(nullptr)) { return false; }
+    if (!KmonAnalysisSchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;
