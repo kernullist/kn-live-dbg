@@ -179,6 +179,22 @@ def main():
                       assessed["rules"][0]["state"] == ("authorized" if mode == "modified" else "not_applied"), "exact ASLR-independent non-fixup rule")
                 check(assessed["authorized_changed_bytes"] == ("1" if mode == "modified" else "0") and assessed["unexplained_changed_bytes"] == "0", "exact approved byte denominator")
                 check(assessed["replay"] == replayed and not assessed["issuer_signature_verified"] and not assessed["current_image_state_known"], "approval preserves original claims and does not imply signature or current state")
+                anchor = digest(policy_path.read_bytes())
+                approval = run(["--offline", "!kmon", "journal-image-approval", store / archived["capture_path"],
+                                change_path, policy_path, anchor, store, identifier + 100])
+                check(approval["closed"] and approval["indexed"] and not approval["current_approval_established"], "managed capture retains historical approval after target exit")
+                change_path.unlink()
+                policy_path.unlink()
+                historical = run(["--offline", "!kmon", "replay-image-approval", store / approval["approval_path"], anchor])
+                check(historical["status"] == "reproduced" and historical["original_assessment_reproduced"] and
+                      historical["assessment"] == historical["recorded_assessment"], "exact historical result survives original policy and manifest deletion")
+                check(historical["assessment"]["decision"] == assessed["decision"] and
+                      historical["assessment"]["authorized_changed_bytes"] == assessed["authorized_changed_bytes"], "retained approval preserves exact native byte result")
+                check_original_claim(document, historical["assessment"]["replay"])
+                check_report(recipe, raw, historical["assessment"]["replay"])
+                approved_membership = run(["--offline", "!kmon", "journal", store / "collections" / str(identifier + 100), "/index"])
+                check(approved_membership["closed"] and approved_membership["committed_approval_paths"] == [approval["approval_path"]] and
+                      approved_membership["unique_paths"] == "6" and not approved_membership["replay_established"], "five original approval members plus closure ledger")
                 disclosure_root = root / (mode + "-disclosure")
                 redacted = run(["--offline", "!kmon", "redact-image", store / archived["capture_path"], disclosure_root, "/acl-only"])
                 check(redacted["status"] == "ready", "managed capture supports original-policy count redaction")

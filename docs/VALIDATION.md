@@ -7,6 +7,99 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Approved image collection checkpoint: 2026-11-17
+
+Direct assessments now retain the exact capture, reference PE, caller-pinned
+policy, manifest and original assessment in one private journal transaction.
+Closure requires all five originals. `journal-image-approval` preserves the
+first published assessment time/result on exact retries; `replay-image-approval`
+requires the caller's policy digest again and distinguishes historical
+reproduction from explicit current-time evaluation of the retained policy.
+See [approved image collections](ARCHITECTURE.md#approved-image-collections) and
+the [command contract](COMMAND_REFERENCE.md).
+
+Final Release approval-collection validation passed **583 harness / 597 product**
+checks. An independent PE/read and physical journal oracle checked the five
+originals, hash chain, dependent closure, exact original-report reproduction,
+shared inputs, bare v1/v2 compatibility, logical byte counts and source removal.
+Nine observed writer termination boundaries recovered **0 / 0 / 0 / 0 / 0 / 0 / 1 / 1 / 2** committed
+segments; only the final boundary was closed. Retrying each prefix preserved any
+already published assessment and completed closure. Expired approval remained
+historically reproducible while current evaluation failed.
+
+Controls also covered wrong caller pins, oversized/held inputs, output directory
+and original-input leases, uninitialized stores, public-read ACEs on matching
+policy/manifest/assessment files, output/index collisions, different closed-input
+bindings, malformed roots, missing originals, old-policy rejection and rehashed
+invalid transactions/dependencies. Rehashing a forged report can preserve physical
+journal membership but cannot reproduce that report semantically. Inventory and
+explicit GC removed an eligible owned orphan policy while preserving committed
+originals and final ledgers. Product controls included default EFS, a complete
+private-root audit, CLI grammar and stdout-delivery failure. Review corrected the
+test's reference-PE retention expectation to the existing reference-specific
+class and ensured its stdout-failure child is cleaned up on timeout. It also
+fixed the archive result so a closed collection's commit/closure flags cannot
+be attributed to a different input rejected by that collection.
+An observed directory-junction switch exposed a second defect: the original
+capture was retained while assessment reopened the caller alias and evaluated a
+different capture. The writer and replay now use the opened capture's concrete
+path and verify recipe/original-claim hashes. The regression switches the junction
+only after source acquisition and requires the archived result to reproduce.
+
+Existing direct-collection compatibility passed **574 harness / 597 product**
+checks after sharing the immutable-file publication helper. The owned
+`LoadLibrary`/ASLR `MEM_IMAGE` control passed **73 checks** for clean and one-byte
+mutation cases. After observed target unload/exit and original DLL/case removal,
+it archived approval from the managed capture, removed the external policy and
+manifest, and reproduced the historical assessment from the private store. The
+independent oracle retained the exact original byte result and separate journal
+membership. No probe code was executed; this does not establish native lifetime
+or production hotpatch coverage.
+
+Recipe compatibility passed **120 C++**, **34 claim**, **59 publication** and
+**448 approval** controls, plus v1/v2 interrupted publication. Journal compatibility
+passed **71 C++**, **1,952 journal**, **476 store**, **892 GC** and **400 IRP** checks.
+The product's isolated `--self-test all` passed: timeline **28**, MCP **102**,
+KMON image integration **121**, console **564**, command audit **3,037 / 261
+routes**, remote **68** and four connection-option controls. Compiled capabilities
+passed **40 contracts / 261 routes**, generated support documentation matched,
+and the public-content classifier passed **12 tests**, including approval
+publications, ledgers and renamed result schemas. No additional actionable
+defects were found in the reviewed scope.
+
+The product SHA-256 was
+`9b458b9d6468f266430bd1734146f0b2054133f449a3d0f4262e86496d999b2a`;
+the image harness was
+`16adedcc2bc9a89e243ac0172df675666023e96367a97e55c10b9728b11fded5`;
+the journal harness was
+`3903fe0fc020016fbe9a1ecd32589302a7b355414858e04416e747f23be0d8bb`;
+the owned DLL was
+`694979d629483a1b65e261e96081bc0dbb62ed866ffe189704764c4a3dbb997a`.
+Toolchain/host: MSVC 14.44.35207, SDK/WDK 10.0.26100.0, Windows
+10.0.28000.3501. Existing product link warnings remain; standalone harnesses
+passed `/W4 /WX`. The updated-host ASan startup failure and prior real-kernel-PDB
+ASan resource gate remain open; no interceptor bypass or unchanged failing rerun
+was used.
+
+At 17:23 KST the boot time was unchanged, with no new reboot/BugCheck events or
+remaining task processes, loaded task drivers, parser profile receipts,
+preparation directories or AppContainer profiles. The 33 completed parser caches,
+BFE/mpssvc, enabled firewall profiles and Running/Manual EFS matched the stage
+baseline. The earlier EFS stop-denial limit remains unchanged.
+
+The [approval collection validator](../tools/validate-image-approval-journal.ps1)
+accepts `-ImageHarness`, `-JournalHarness` and `-Fixtures` from the Release
+recipe/journal validators, plus `-Product` for the built application. `-Mode
+harness` and `-Mode product` select either scope. The
+[direct collection validator](../tools/validate-image-capture-journal.ps1) also
+runs the extended [mapped-image test](../tools/test-mapped-image-journal.py).
+
+This P03/P06 increment is not completion of VS1 or P01-P16. Historical
+reproduction does not assert current approval, live state, authenticated clocks,
+collector identity, signatures or power-loss durability. Signed distribution
+provisioning/revocation, secondary/sweep approval, cross-bundle associations,
+native lifetimes, committed-root retirement and larger corpora remain open.
+
 ## Approved image changes checkpoint: 2026-11-17
 
 `assess-image` now checks exact authorized changes in direct recipes and managed

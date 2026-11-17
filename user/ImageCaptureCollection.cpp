@@ -5,47 +5,14 @@
 #include "EvidencePrivacy.h"
 #include "EvidenceStore.h"
 #include "BoundedObservationJson.h"
+#include "EvidenceArtifactPublication.h"
 #include <filesystem>
 
 using namespace bounded_observation_json;
+using namespace evidence_artifact_publication;
 namespace fs = std::filesystem;
 namespace
 {
-    using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
-    Handle PinFolder(const fs::path& path)
-    {
-        if (!CreateDirectoryW(path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-            { return Handle(nullptr, &CloseHandle); }
-        // Metadata-only handles do not enforce Windows share-access exclusion.
-        // Pin even an empty output directory before the first file is published.
-        const auto file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        Handle owner(file == INVALID_HANDLE_VALUE ? nullptr : file, &CloseHandle);
-        FILE_ATTRIBUTE_TAG_INFO attributes{};
-        if (!owner || !GetFileInformationByHandleEx(file, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-            !(attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-            { owner.reset(); }
-        return owner;
-    }
-    bool Retain(const fs::path& path, const std::vector<uint8_t>& bytes, const std::wstring& hash,
-        EvidencePrivacyGuard& privacy, std::unique_ptr<SchemaArtifact>* lease, bool* created)
-    {
-        const auto acquire = [&]()
-        {
-            auto file = std::make_unique<SchemaArtifact>();
-            if (!file->Open(path.wstring(), bytes.size()) || !privacy.CheckFile(file->Handle()) ||
-                file->Bytes() != bytes.size() || file->Sha256 != hash) { return false; }
-            *lease = std::move(file);
-            return true;
-        };
-        if (acquire()) { return true; }
-        const auto attributes = GetFileAttributesW(path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) { return false; }
-        *created = PublishReferenceArtifact(path.wstring(), bytes, nullptr,
-            [&](HANDLE file) { return privacy.CheckFile(file); });
-        // A simultaneous publisher may win CREATE_NEW, but cannot replace bytes.
-        return acquire();
-    }
     std::wstring Ledger(const ImageCaptureCollection& r)
     {
         return L"{\"schema\":" + mcpjson::Quote(DirectImageCollectionLedger) + L",\"collection_id\":" + mcpjson::Quote(r.CollectionId) +

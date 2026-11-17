@@ -3,6 +3,7 @@
 #include "../user/ImageClaimPublication.h"
 #include "../user/ImageCaptureCollection.h"
 #include "../user/ImageAuthorizedChanges.h"
+#include "../user/ImageApprovalCollection.h"
 #include "../user/EvidencePrivacy.h"
 #include "../user/ReferenceArtifact.h"
 #include "../user/AnalystSnapshot.h"
@@ -248,6 +249,26 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if ((argc == 9 || argc == 10) && std::wstring(argv[1]) == L"--archive-approval")
+    {
+        const auto report = JournalImageApproval(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], std::stoull(argv[8]), [&](const wchar_t* stage)
+        {
+            if (argc == 10 && std::wstring(argv[9]) == stage)
+            {
+                std::cout << "{\"stage\":" << mcpjson::WideToUtf8(mcpjson::Quote(stage)) << "}" << std::endl;
+                std::string line; std::getline(std::cin, line);
+                if (line != "continue") { ExitProcess(91); }
+            }
+        });
+        std::cout << mcpjson::WideToUtf8(ImageApprovalCollectionJson(report)) << "\n";
+        return report.Status == L"archived" ? 0 : 1;
+    }
+    if ((argc == 4 || (argc == 5 && std::wstring(argv[4]) == L"/current")) && std::wstring(argv[1]) == L"--replay-approval")
+    {
+        const auto report = ReplayImageApproval(argv[2], argv[3], argc == 5);
+        std::cout << mcpjson::WideToUtf8(report.Json) << "\n";
+        return report.Succeeded ? 0 : 1;
+    }
     if ((argc == 7 || argc == 8) && std::wstring(argv[1]) == L"--assess")
     {
         const auto report = AssessAuthorizedImageChanges(argv[2], argv[3], argv[4], argv[5], std::stoull(argv[6]), [&](const wchar_t* stage)

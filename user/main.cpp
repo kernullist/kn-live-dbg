@@ -38,6 +38,7 @@
 #include "EvidenceJournal.h"
 #include "ImageCaptureCollection.h"
 #include "ImageAuthorizedChanges.h"
+#include "ImageApprovalCollection.h"
 #include "EvidencePrivacy.h"
 #include "EvidenceDisclosure.h"
 #include "EvidenceRetention.h"
@@ -23096,6 +23097,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
+    std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
+    std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> [/current] [/json]\n";
     std::wcout << L"  !kmon assess-image <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
     std::wcout << L"  !kmon journal-image <case-directory> <private-store> <collection-id> [/json]\n";
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
@@ -23441,7 +23444,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|assess-image|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23521,6 +23524,44 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         if (directJsonOutput) { if (!WriteCapabilityJson(result.Json)) { return 3; } }
         else { std::wcout << result.Json << L"\n"; }
         return result.Assessed ? 0 : 1;
+    }
+    if (action == L"journal-image-approval")
+    {
+        bool valid = args.size() == 8 || (args.size() == 9 && ToLower(args[8]) == L"/json");
+        for (size_t i = 2; valid && i < 8; ++i) { valid = !args[i].empty() && args[i][0] != L'/'; }
+        if (valid) { valid = args[5].size() == 64 && args[5].find_first_not_of(L"0123456789abcdef") == std::wstring::npos &&
+            args[7].size() <= 20 && args[7].find_first_not_of(L"0123456789") == std::wstring::npos && (args[7].size() == 1 || args[7][0] != L'0'); }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon journal-image-approval <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
+            return 2;
+        }
+        const auto result = JournalImageApproval(args[2], args[3], args[4], args[5], args[6], args[7]);
+        const auto json = ImageApprovalCollectionJson(result);
+        if (directJsonOutput) { if (!WriteCapabilityJson(json)) { return 3; } }
+        else { std::wcout << json << L"\n"; }
+        return result.Status == L"archived" ? 0 : 1;
+    }
+    if (action == L"replay-image-approval")
+    {
+        bool current = false, jsonFlag = false, valid = args.size() >= 4 && args.size() <= 6 && !args[2].empty() && args[2][0] != L'/';
+        if (valid) { valid = args[3].size() == 64 && args[3].find_first_not_of(L"0123456789abcdef") == std::wstring::npos; }
+        for (size_t i = 4; valid && i < args.size(); ++i)
+        {
+            const auto flag = ToLower(args[i]);
+            if (flag == L"/current" && !current) { current = true; }
+            else if (flag == L"/json" && !jsonFlag) { jsonFlag = true; }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> [/current] [/json]\n";
+            return 2;
+        }
+        const auto result = ReplayImageApproval(args[2], args[3], current);
+        if (directJsonOutput) { if (!WriteCapabilityJson(result.Json)) { return 3; } }
+        else { std::wcout << result.Json << L"\n"; }
+        return result.Succeeded ? 0 : 1;
     }
     if (action == L"trace")
     {
@@ -23985,7 +24026,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, journal-image, assess-image, replay-image, replay-irp, inventory, evidence, relate, graph, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, journal-image, journal-image-approval, assess-image, replay-image-approval, replay-image, replay-irp, inventory, evidence, relate, graph, replay, or why\n";
     return 2;
 }
 
@@ -24815,7 +24856,7 @@ static void HandleKmonCommand(
             break;
         }
 
-        if (action == L"dump-read" || action == L"verify-image" || action == L"journal-image" || action == L"assess-image" || action == L"replay-image" || action == L"replay-irp" ||
+        if (action == L"dump-read" || action == L"verify-image" || action == L"journal-image" || action == L"assess-image" || action == L"journal-image-approval" || action == L"replay-image-approval" || action == L"replay-image" || action == L"replay-irp" ||
             action == L"inventory" || action == L"journal" || action == L"store" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
@@ -33175,7 +33216,7 @@ static bool IsWriteLikeCommandLine(const std::wstring& line)
         if (command == L"!kmon" && args.size() >= 2)
         {
             const auto action = ToLower(args[1]);
-            if (action == L"inventory" || action == L"journal-image")
+            if (action == L"inventory" || action == L"journal-image" || action == L"journal-image-approval")
             {
                 writeLike = true;
             }
@@ -53816,7 +53857,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|assess-image|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";

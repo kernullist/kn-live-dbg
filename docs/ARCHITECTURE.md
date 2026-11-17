@@ -2059,8 +2059,68 @@ private evidence and grant no disclosure authority.
 
 This bounded policy path does not provision signed distribution trust, consult
 revocation services, join other cases, or approve secondary slices and sweeps.
-Policy/manifest files must be retained separately for later reassessment; they
-are not yet journal members. An updated policy requires its own explicit digest.
+The approval collection below retains the exact policy and manifest for later
+reassessment. An updated policy requires its own explicit digest.
+
+### Approved image collections
+
+`!kmon journal-image-approval` archives one direct assessment into an initialized
+private store. It accepts a case directory or managed `.kncapture`, the manifest,
+the policy, a separate caller policy digest and a collection ID. Original direct
+replay and approval assessment must succeed before evidence publication; an
+assessment may still contain unexplained differences or incomplete comparison.
+Archival does not read a live target or change the source files' privacy.
+
+The dedicated `kn.approved_image_collection_journal.v1` policy admits exactly one
+`image_approval` transaction with five members:
+
+| Member | Store-relative path | Limit |
+| --- | --- | --- |
+| Exact capture/claim root | `image-captures/capture-ID-PHYSICALSHA.kncapture` | 4 MiB |
+| Exact reference PE | `image-references/SHA.knblob` | 64 MiB |
+| Caller-pinned policy bytes | `image-approvals/policy-SHA.knapproval` | 64 KiB |
+| Manifest bytes | `image-approvals/changes-SHA.knchange` | 64 KiB |
+| Original assessment | `image-approvals/assessment-ID.knapprovalcase` | 4 MiB |
+
+The canonical `kn.image_approval_publication.v1` root binds the four input hashes,
+collection ID, evaluation FILETIME and complete assessment. Its payload checksum
+and physical file hash are distinct; the latter is the transaction ID. The final
+`image-approvals/session-ID.knapprovalledger` (`kn.image_approval_session.v1`)
+counts one archived assessment and the five members' logical bytes. Closure
+requires all five previously committed paths. Existing journal policies keep
+their original encodings and reject approval transactions. Recovery adds
+`committed_approval_paths`; this is membership evidence, not semantic replay.
+
+Publication holds source read leases, the private-root guard, shared store
+barrier, collection lock, output directory pins and admitted output leases.
+Assessment uses the opened capture's concrete path and checks its recipe and
+original-claim hashes, so retargeting the caller's directory alias cannot switch
+the evaluated capture after acquisition.
+Shared input hashes permit reuse across collections. The assessment's fixed ID
+path preserves the first published evaluation time and result, including when
+interruption occurs before its journal commit. Exact retries reuse that result
+and verify it again at its original time; expiry since then does not replace it.
+A changed input, conflicting output or invalid original result fails without
+replacement. Index failure preserves a committed prefix and returns an incomplete
+archive. Inventory and explicit GC protect committed inputs, assessment roots,
+final ledgers and unresolved membership; only eligible uncommitted files may be
+removed under a separate exact-member GC policy.
+
+`!kmon replay-image-approval` requires the caller to supply the policy digest
+again. The stored digest cannot appoint its own trust. It resolves and pins the
+four exact input files, evaluates at the recorded time and requires byte-for-byte
+equality with the original assessment. The `kn.image_approval_replay.v1` result
+reports `reproduced` only after that equality check. `/current` instead evaluates
+the retained policy at the host's current time, keeps the recorded assessment
+separate, and reports `reanalyzed`; it does not fetch or select a newer policy.
+An expired policy can reproduce historically while current evaluation fails.
+
+The archive wrapper samples host time and supplies it explicitly to the
+assessment, so the stored report records `caller_supplied_time`. That historical
+clock and the collector timestamp are unauthenticated. Neither membership nor
+replay establishes present approval, current live state, issuer signatures,
+execution, lifetime continuity, power-loss durability or disclosure authority.
+Approval publication, replay results and ledgers remain private evidence.
 
 ### Claim-specific image proof
 

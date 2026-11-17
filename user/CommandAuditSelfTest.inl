@@ -497,6 +497,20 @@ static int RunCommandAuditSelfTest()
         run(L"!kmon journal-image missing-case missing-store 7 /json").Output.find(L"kn.image_capture_collection.v1") != std::wstring::npos && !device.IsOpen(),
         L"direct capture archival writes files without opening a driver");
     const std::wstring assess = L"!kmon assess-image x y z " + std::wstring(64, L'a');
+    const auto approvalArchive = L"!kmon journal-image-approval x y z " + std::wstring(64, L'a') + L" store 7";
+    const auto approvalReplay = L"!kmon replay-image-approval x " + std::wstring(64, L'a');
+    check(IsWriteLikeCommandLine(approvalArchive) && run(approvalArchive).Output.find(L"kn.image_approval_collection.v1") != std::wstring::npos && !device.IsOpen(),
+        L"approval collection archives offline and remains write classified");
+    check(!IsWriteLikeCommandLine(approvalReplay) && run(approvalReplay).Output.find(L"kn.image_approval_replay.v1") != std::wstring::npos && !device.IsOpen(),
+        L"approval replay stays read only and preserves its interactive transcript");
+    check(run(approvalReplay + L" /current /json").Output.find(L"current_retained_policy") != std::wstring::npos && !device.IsOpen(),
+        L"current approval reevaluation routes without a device");
+    for (const auto& suffix : {L" /bad", L" /json /json", L" /current /current"})
+    { check(run(approvalReplay + suffix).Error.find(L"usage") != std::wstring::npos, L"approval replay rejects malformed options"); }
+    for (const auto& suffix : {L" /bad", L" /json /json", L" /current"})
+    { check(run(approvalArchive + suffix).Error.find(L"usage") != std::wstring::npos, L"approval archival rejects malformed options"); }
+    for (const auto& line : {L"!kmon journal-image-approval x y z bad store 7", L"!kmon replay-image-approval x bad", L"!kmon replay-image-approval"})
+    { check(run(line).Error.find(L"usage") != std::wstring::npos, L"approval operations require an explicit external anchor"); }
     check(!IsWriteLikeCommandLine(assess) && run(assess + L" /json").Output.find(L"kn.image_change_assessment.v1") != std::wstring::npos && !device.IsOpen(),
         L"approved change assessment is read-only, captured in the transcript, and opens no driver");
     for (const auto& line : {L"!kmon assess-image", L"!kmon assess-image x y z bad", L"!kmon assess-image x y z /json"})
