@@ -473,6 +473,7 @@ private:
     KmonDiscoveryDispatch ScanUserModeHostility();
     struct UserInventoryWork;
     std::unique_ptr<UserInventoryWork> UserInventory;
+    KmonUserInventoryPosition UserAdmissionPosition;
     std::wstring LastUserInventory;
     std::wstring UserInventoryJson(uint64_t now) const;
     void CancelUserInventory();

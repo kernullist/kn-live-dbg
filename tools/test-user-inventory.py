@@ -35,7 +35,7 @@ def deterministic(data):
         complete = name not in ('stop', 'fault', 'clock')
         check(final['complete'] == complete and final['cancelled'] == (name in ('stop', 'clock')) and
               final['faulted'] == (name == 'fault') and final['invalid_clock'] == (name == 'clock'), f'{name}: final outcome')
-        check(final['walk_complete'] == (complete and name not in ('open_error', 'walk_error', 'cap')) and
+        check(final['walk_complete'] == (complete and name not in ('open_error', 'walk_error')) and
               final['capped'] == (name in ('cap', 'watch_cap', 'suspect_cap')), f'{name}: partial inventories cannot assert absence')
         check(scenario['opens'] == scenario['closes'] == (0 if name == 'open_error' else 1), 'native ownership balanced')
         check(scenario['fault'] == (name == 'fault'), 'fault provenance')
@@ -76,7 +76,8 @@ def deterministic(data):
             pids = [] if name in ('empty', 'open_error', 'watch_cap', 'suspect_cap') else [p for p in range(100, 4400 if name == 'cap' else 200) if p != 150]
             if name == 'walk_error':
                 pids = pids[:40]
-            pids = pids[:4096]
+            if name == 'cap':
+                pids = pids[:4095] + [pids[4096]]
             for pid in pids:
                 expected[pid] = [pid, 0 if pid == 160 else pid * 10, 0, False, '' if pid == 160 else 'owned.exe']
             if name in ('watch_suspect', 'open_error'):
@@ -87,7 +88,7 @@ def deterministic(data):
                     path = 'owned.exe' if pid == 165 else 'suspect.exe'
                     expected[pid] = [pid, generation, pid * 100, True, path]
             if name in ('watch_cap', 'suspect_cap'):
-                for pid in range(8000, 8000 + 8192):
+                for pid in [*range(8000, 8000 + 8191), 8000 + 8192]:
                     expected[pid] = [pid, pid * 10, 0, False, 'owned.exe']
             if name == 'suspect_cap':
                 for pid in range(30000, 30000 + 4096):
@@ -96,15 +97,32 @@ def deterministic(data):
         check(int(final['queries']) == scenario['queries'], 'actual resolver attempts accounted')
         if complete:
             expected_queries = len(expected) - (1 if name == 'watch_suspect' else 4096 if name == 'suspect_cap' else 0)
+            expected_queries += name in ('cap', 'watch_cap', 'suspect_cap')  # the displaced row was also resolved
             check(scenario['queries'] == expected_queries, 'no duplicate, excluded or suspect-only native query')
+        if name in ('cap', 'watch_cap', 'suspect_cap'):
+            ledger = final['admission_deferred']
+            events = {'cap': 204, 'watch_cap': 808, 'suspect_cap': 1012}[name]
+            check(int(ledger['events']) == events and len(ledger['scopes']) == 32 and
+                  int(ledger['unrepresented_events']) == events - 32, 'full-size overflow counts every capacity event')
+            displaced = [s for s in ledger['scopes'] if s['reason'] == 'reserved_slot_displacement']
+            pid = 4196 if name == 'cap' else 16191
+            check(len(displaced) == 1 and int(displaced[0]['pid']) == pid and
+                  int(displaced[0]['generation']) == 10 * pid, 'exact displaced generation survives sample saturation')
 
 
 def native(data):
-    check(data['schema'] == 'kn.user_inventory_test.v1' and data['passed'] and data['checks'] == 11, 'actual native ownership controls')
+    check(data['schema'] == 'kn.user_inventory_test.v1' and data['passed'] and data['checks'] == 13, 'actual native ownership controls')
     check(not data['driver_loaded'] and data['native_process_queries'] and not data['latency_slo_proven'], 'read-only native scope')
     state = data['complete']
-    check(state['complete'] and state['walk_complete'] and not state['capped'] and not state['cancelled'] and not state['faulted'], 'native source completion')
-    check(0 < int(state['queries']) == int(state['targets']) and 0 < int(state['max_steps']) <= 32, 'actual bounded native work')
+    check(state['complete'] and state['walk_complete'] and not state['cancelled'] and not state['faulted'] and
+          bool(int(state['reserved_pid'])) == state['capped'], 'native source completion and actual host capacity')
+    check(0 < int(state['targets']) <= int(state['queries']) <= int(state['targets']) + int(state['capped']) and
+          0 < int(state['max_steps']) <= 32, 'actual bounded native work')
+    small = data['one_slot']
+    check(small['walk_complete'] and small['capped'] and small['complete'] and small['targets'] == '1' and
+          0 < int(small['queries']) <= 2 < int(small['rows']), 'live Toolhelp tail read with one metadata slot')
+    check(4 < int(small['reserved_pid']) == int(small['lap_through_pid']) == int(small['reserved_through_pid']) and
+          int(small['admission_deferred']['events']) > 0, 'owned PID nominated in native bounded inventory')
 
 
 if __name__ == '__main__':

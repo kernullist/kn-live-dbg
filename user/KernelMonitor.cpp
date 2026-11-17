@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "KmonUserInventory.h"
 #include "ProcessObservationSource.h"
 #include "NativeObservationSource.h"
 #include "PendingIrpReport.h"
@@ -32,7 +33,6 @@
 #include "WfpCalloutScanner.h"
 #include "WnfScanner.h"
 #include "KmonUserEvidence.h"
-#include "KmonUserInventory.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "../shared/KnLiveDbgPaging.h"
@@ -8160,9 +8160,10 @@ struct KernelMonitor::UserInventoryWork : KmonUserInventory<KmonNativeUserInvent
     std::unordered_set<uint32_t> WatchPids;
     std::vector<std::wstring> WatchNames;
     UserInventoryWork(DeviceClient* device, SymbolEngine* symbols, std::unordered_set<uint32_t> watches,
-        std::vector<std::wstring> names, std::vector<KmonUserTarget> suspects, uint64_t started)
+        std::vector<std::wstring> names, std::vector<KmonUserTarget> suspects, uint64_t started,
+        KmonUserInventoryPosition previous = {})
         : KmonUserInventory(KmonNativeUserInventorySource(device, symbols),
-            std::vector<uint32_t>(watches.begin(), watches.end()), std::move(suspects), GetCurrentProcessId(), started),
+            std::vector<uint32_t>(watches.begin(), watches.end()), std::move(suspects), GetCurrentProcessId(), started, previous),
           WatchPids(std::move(watches)), WatchNames(std::move(names)) {}
 };
 
@@ -8174,11 +8175,16 @@ struct KernelMonitor::UserDeepWork
     std::unordered_set<uint32_t> WatchPids, UrgentPids;
     std::vector<std::wstring> WatchNames;
     KmonUserThreadInventory Threads;
+    KmonUserInventoryPosition Reservation;
+    bool ReservationEntered = false;
     bool SnapshotCapped = false, DeepCapped = false, CursorCapacityLimited = false;
     UserDeepWork(size_t count, uint64_t selected) : Scheduling(count, selected) {}
     std::wstring Json(uint64_t now) const
     {
-        auto json = Scheduling.Json(now); json.pop_back(); json += L",\"targets\":[";
+        auto json = Scheduling.Json(now); json.pop_back();
+        json += L",\"reserved_inventory_pid\":" + mcpjson::Quote(std::to_wstring(Reservation.AfterPid)) +
+            L",\"reserved_through_pid\":" + mcpjson::Quote(std::to_wstring(Reservation.ThroughPid)) +
+            L",\"reservation_entered\":" + (ReservationEntered ? L"true" : L"false") + L",\"targets\":[";
         for (size_t i = 0; i < Targets.size(); ++i)
         {
             if (i) { json += L","; }
@@ -8217,6 +8223,7 @@ bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
     {
         monitor.StopRequested.store(false);
         monitor.UserDeep = std::make_unique<KernelMonitor::UserDeepWork>(2, GetTickCount64());
+        monitor.UserDeep->Reservation = {pid, pid};
         for (uint64_t offset : {1ull, 2ull})
         {
             KmonUserTarget t; t.Pid = pid; t.CreateTime = created + offset;
@@ -8231,6 +8238,8 @@ bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
     check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Continued && monitor.UserDeep &&
         monitor.UserDeep->Scheduling.NextIndex() == 1, "actual dispatcher returns after one rejected-generation target");
     const auto partial = monitor.UserDeepJson(GetTickCount64());
+    check(monitor.UserAdmissionPosition.AfterPid == pid && monitor.UserAdmissionPosition.ThroughPid == pid &&
+        monitor.UserDeep->ReservationEntered, "reserved callback entry advances the lap even on identity rejection");
     check(monitor.UserLayoutLeads.size() == 2 && !monitor.UserDeep->Threads.Attempted,
         "generation rejection preserves both original leads and prevents thread inspection");
     check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Returned && !monitor.UserDeep,
@@ -8241,10 +8250,19 @@ bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
     check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before,
         "rejected-generation process handles close before the next turn");
 
+    seed();
+    monitor.UserDeep->Targets.front().Pid = 0; // OpenProcess rejects PID zero, keeping this control local.
+    monitor.UserAdmissionPosition = {5, pid};
+    check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Continued &&
+        monitor.UserAdmissionPosition.AfterPid == 5 && !monitor.UserDeep->ReservationEntered,
+        "an earlier callback cannot advance the reserved target's cursor");
+    monitor.ResetTemporalDetections();
     seed(); monitor.StopRequested.store(true);
     check(monitor.ServiceUserDeep() == KmonDiscoveryDispatch::Cancelled && monitor.UserDeep->Scheduling.NextIndex() == 0,
         "pre-entry stop retains every unattempted target");
     const auto stopped = monitor.UserDeepJson(GetTickCount64());
+    check(monitor.UserAdmissionPosition.AfterPid == 0 && !monitor.UserDeep->ReservationEntered,
+        "session reset clears the cursor and stop before entry leaves the reservation unspent");
     monitor.ResetTemporalDetections();
     check(!monitor.UserDeep && monitor.UserDeepJson(0) == L"null", "restart removes the prior cohort and diagnostics");
     seed(); std::wstring error;
@@ -8284,14 +8302,19 @@ void KernelMonitor::CancelUserInventory()
         UserInventory.reset();
     }
 }
-void KernelMonitor::ResetUserInventory() { UserInventory.reset(); LastUserInventory.clear(); }
+void KernelMonitor::ResetUserInventory()
+{
+    UserInventory.reset(); LastUserInventory.clear(); UserAdmissionPosition = {};
+}
 
 bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
 {
     unsigned checks = 0, failures = 0;
     const auto check = [&](bool ok, const char* why)
     { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[user.inventory.native] FAIL %s\n", why); } return ok; };
-    KmonUserInventory<KmonNativeUserInventorySource> inventory(KmonNativeUserInventorySource(nullptr, nullptr), {}, {}, 0, GetTickCount64());
+    const auto pid = GetCurrentProcessId();
+    KmonUserInventory<KmonNativeUserInventorySource> inventory(
+        KmonNativeUserInventorySource(nullptr, nullptr), {pid}, {}, 0, GetTickCount64());
     unsigned turns = 0;
     while (!inventory.Complete() && turns++ < 20000)
     {
@@ -8299,7 +8322,8 @@ bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
         if (result == KmonDiscoveryDispatch::Cancelled) { break; }
     }
     const auto complete = inventory.Json(GetTickCount64());
-    check(inventory.Complete() && !inventory.WalkIncomplete() && !inventory.Capped(), "actual Toolhelp inventory completed");
+    check(inventory.Complete() && !inventory.WalkIncomplete() && (inventory.Reservation().AfterPid != 0) == inventory.Capped(),
+        "actual Toolhelp inventory completed and capacity agreed with the reservation");
     check(inventory.SourceState().Snapshot == INVALID_HANDLE_VALUE, "completion closed native snapshot");
     const auto targets = inventory.Take();
     const auto self = std::find_if(targets.begin(), targets.end(), [](const KmonUserTarget& t) { return t.Pid == GetCurrentProcessId(); });
@@ -8311,6 +8335,20 @@ bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
         "current pinned path supersedes a stale snapshot name");
     check(!KmonUserSnapshotGenerationMatches(stale.CreateTime + 1, stale.CreateTime, stale.CreateTime, true),
         "existing deep-scan generation fence rejects replacement");
+
+    KmonUserInventory<KmonNativeUserInventorySource, 1, 2, 3> small(
+        KmonNativeUserInventorySource(nullptr, nullptr), {}, {}, 0, GetTickCount64(), {pid - 1, pid});
+    for (unsigned turn = 0; !small.Complete() && turn < 20000; ++turn)
+    {
+        if (small.Run([]() { return GetTickCount64(); }, []() { return false; }) == KmonDiscoveryDispatch::Cancelled) { break; }
+    }
+    const auto capped = small.Json(GetTickCount64());
+    check(small.Complete() && !small.WalkIncomplete() && small.Capped() && small.Reservation().AfterPid == pid,
+        "actual Toolhelp walk keeps the owned reservation with only one metadata slot");
+    const auto admitted = small.Take();
+    check(admitted.size() == 1 && admitted[0].Pid == pid &&
+        admitted[0].CreateTime == QueryProcessCreateTicks(GetCurrentProcess()) && !admitted[0].ImagePath.empty() &&
+        small.SourceState().Snapshot == INVALID_HANDLE_VALUE, "reserved native row has pinned identity and a closed snapshot");
 
     const auto owner = std::make_unique<KernelMonitor>(); auto& monitor = *owner;
     HANDLE retained = INVALID_HANDLE_VALUE;
@@ -8340,7 +8378,7 @@ bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
     {
         *diagnostics = L"{\"schema\":\"kn.user_inventory_test.v1\",\"driver_loaded\":false,\"native_process_queries\":true,"
             L"\"latency_slo_proven\":false,\"passed\":" + std::wstring(failures ? L"false" : L"true") +
-            L",\"checks\":" + std::to_wstring(checks) + L",\"complete\":" + complete + L"}";
+            L",\"checks\":" + std::to_wstring(checks) + L",\"complete\":" + complete + L",\"one_slot\":" + capped + L"}";
     }
     std::fprintf(stderr, "[user.inventory.native] checks=%u failed=%u\n", checks, failures);
     return failures == 0;
@@ -17429,7 +17467,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
             }
         }
         UserInventory = std::make_unique<UserInventoryWork>(device, symbols, std::move(watches),
-            std::move(names), std::move(suspects), started);
+            std::move(names), std::move(suspects), started, UserAdmissionPosition);
         UserHostilityScans.fetch_add(1);
     }
     KmonDiscoveryDispatch inventoryResult;
@@ -17447,6 +17485,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
     if (StopRequested.load()) { UserInventory->Cancel(); return KmonDiscoveryDispatch::Cancelled; }
     const bool walkIncomplete = UserInventory->WalkIncomplete(), snapshotCapped = UserInventory->Capped();
     const auto inventoryStarted = UserInventory->StartedMs();
+    const auto reservation = UserInventory->Reservation();
     LastUserInventory = UserInventory->Json(GetTickCount64());
     auto targets = UserInventory->Take();
     auto watchPids = std::move(UserInventory->WatchPids);
@@ -17556,7 +17595,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
         }
     }
     const auto schedule = KmonSelectUserPids(watchedUserPids, priorityPids, backgroundPids,
-        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor, urgentPids, &UrgentUserPidCursor);
+        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor, urgentPids, &UrgentUserPidCursor, reservation.AfterPid);
     std::map<uint32_t, size_t> selected;
     for (size_t index = 0; index < schedule.size(); ++index)
     {
@@ -17572,11 +17611,13 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
     });
     KmonAssignUserThreadQueryQuotas(&targets, 1024);
     auto work = std::make_unique<UserDeepWork>(targets.size(), GetTickCount64());
+    work->Reservation = reservation;
     work->SnapshotCapped = snapshotCapped;
     work->DeepCapped = watchedUserPids.size() + priorityPids.size() + backgroundPids.size() > targets.size();
     for (size_t i = 0; i < targets.size() && i < 2; ++i)
     {
-        if (std::find(urgentPids.begin(), urgentPids.end(), targets[i].Pid) != urgentPids.end())
+        if ((watchPids.count(targets[i].Pid) || NameEqualsWatch(targets[i].Leaf, watchNames)) &&
+            std::find(urgentPids.begin(), urgentPids.end(), targets[i].Pid) != urgentPids.end())
         { work->UrgentPids.insert(targets[i].Pid); }
     }
     work->Targets = std::move(targets); work->Generations = std::move(userGenerations);
@@ -17626,7 +17667,7 @@ KmonDiscoveryDispatch KernelMonitor::ServiceUserDeep()
             L"user",
             L"user-mode hostility scan hit a process cap; extra hosts may be missed",
             work.SnapshotCapped
-                ? L"inventory capped: snapshot=4096, watched=8192, suspects=12288; completeness unavailable"
+                ? L"metadata capped: snapshot=4096, watched=8192, suspects=12288; one rotating deep slot after a complete walk"
                 : L"deep scan capped at 8; deferred hosts rotate across passes");
     }
     else if (!StopRequested.load())
@@ -17644,6 +17685,11 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
     SymbolEngine* symbols = nullptr;
     { std::lock_guard<std::mutex> lock(StateMutex); device = Device; symbols = Symbols; }
     const auto& target = work.Targets.at(index);
+    if (work.Reservation.AfterPid && target.Pid == work.Reservation.AfterPid)
+    {
+        UserAdmissionPosition = work.Reservation;
+        work.ReservationEntered = true;
+    }
     auto& userGenerations = work.Generations;
     auto& watchPids = work.WatchPids;
     auto& watchNames = work.WatchNames;

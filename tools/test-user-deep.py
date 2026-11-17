@@ -119,7 +119,7 @@ def deterministic(data):
 
 
 def native(data):
-    check(data['schema'] == 'kn.user_deep_test.v1' and data['passed'] and data['checks'] == 14, 'actual dispatcher and native ownership controls')
+    check(data['schema'] == 'kn.user_deep_test.v1' and data['passed'] and data['checks'] == 17, 'actual dispatcher and native ownership controls')
     check(not data['driver_loaded'] and data['native_generation_rejection'] and data['native_thread_queries'] and
           not data['full_target_inspection_validated'], 'bounded native validation scope')
     for key in ('partial', 'complete', 'stopped'):
@@ -131,6 +131,8 @@ def native(data):
         check(state['returned'] == state['faults'] == state['cancellations'] == '0', 'native rejections cannot count as returned or successful targets')
         check(state['complete'] == (key == 'complete') and state['cancelled'] == (key == 'stopped'), 'actual lifecycle boundaries')
         check(state['pre_entry_stops'] == ('1' if key == 'stopped' else '0'), 'stop before native inspection')
+        check(state['reserved_inventory_pid'] == state['targets'][0]['pid'] == state['reserved_through_pid'] and
+              state['reservation_entered'] == (expected != 0), 'only entry into the reserved callback spends the lap position')
     check(data['partial']['selected_ms'] == data['complete']['selected_ms'], 'production cohort admission clock unchanged')
     targets = data['partial']['targets']
     check(targets == data['complete']['targets'] and len(targets) == 2 and [int(t['index']) for t in targets] == [0, 1] and

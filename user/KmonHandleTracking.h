@@ -146,7 +146,7 @@ inline KmonChannel ResolveKmonChannel(
 
 // Upper-bound rotation remains fair when watched PIDs are inserted or removed.
 inline std::vector<uint32_t> KmonNextPids(
-    std::vector<uint32_t> pids, size_t budget, uint32_t* lastPid)
+    std::vector<uint32_t> pids, size_t budget, uint32_t* lastPid, uint32_t reservedPid = 0)
 {
     std::vector<uint32_t> selected;
     if (lastPid != nullptr && !pids.empty())
@@ -164,7 +164,17 @@ inline std::vector<uint32_t> KmonNextPids(
         }
         if (!selected.empty())
         {
-            *lastPid = selected.back();
+            // A full inventory may nominate one PID outside the ordinary
+            // rotation. Charge it to this tier and advance the ordinary cursor
+            // only past PIDs that actually retained their slots.
+            if (reservedPid != 0 && std::binary_search(pids.begin(), pids.end(), reservedPid) &&
+                std::find(selected.begin(), selected.end(), reservedPid) == selected.end())
+            {
+                selected.pop_back();
+                if (!selected.empty()) { *lastPid = selected.back(); }
+                selected.push_back(reservedPid);
+            }
+            else { *lastPid = selected.back(); }
         }
     }
     return selected;
@@ -234,7 +244,8 @@ inline std::vector<uint32_t> KmonSelectUserPids(
     uint32_t* priorityCursor,
     uint32_t* backgroundCursor,
     const std::vector<uint32_t>& urgent = {},
-    uint32_t* urgentCursor = nullptr)
+    uint32_t* urgentCursor = nullptr,
+    uint32_t reservedPid = 0)
 {
     // Layout leads use at most half the watched quota. The remaining watches
     // and both other tiers keep independent rotation within eight targets.
@@ -243,16 +254,16 @@ inline std::vector<uint32_t> KmonSelectUserPids(
     {
         if (std::find(watched.begin(), watched.end(), pid) != watched.end()) { eligible.push_back(pid); }
     }
-    std::vector<uint32_t> selected = KmonNextPids(eligible, 2, urgentCursor);
+    std::vector<uint32_t> selected = KmonNextPids(eligible, 2, urgentCursor, reservedPid);
     std::vector<uint32_t> ordinary;
     for (const auto pid : watched)
     {
         if (std::find(selected.begin(), selected.end(), pid) == selected.end()) { ordinary.push_back(pid); }
     }
-    const auto watches = KmonNextPids(ordinary, 4 - selected.size(), watchedCursor);
+    const auto watches = KmonNextPids(ordinary, 4 - selected.size(), watchedCursor, reservedPid);
     selected.insert(selected.end(), watches.begin(), watches.end());
-    const auto otherPriority = KmonNextPids(priority, 6 - selected.size(), priorityCursor);
-    const auto otherBackground = KmonNextPids(background, 2, backgroundCursor);
+    const auto otherPriority = KmonNextPids(priority, 6 - selected.size(), priorityCursor, reservedPid);
+    const auto otherBackground = KmonNextPids(background, 2, backgroundCursor, reservedPid);
     selected.insert(selected.end(), otherPriority.begin(), otherPriority.end());
     selected.insert(selected.end(), otherBackground.begin(), otherBackground.end());
     // Preserve the previous per-tier workload even when a tier is empty.

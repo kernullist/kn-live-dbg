@@ -7,6 +7,52 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Deep inspection above process inventory capacity, 2026-11-18
+
+Current main reads the full process snapshot in bounded turns. On a complete
+capped inventory, one PID from the snapshot, watch or suspect inputs receives
+a deep slot within its existing priority quota. The first refused PID receives
+that opportunity immediately. Later laps keep their initial upper PID so that
+continued growth above it cannot postpone the return to lower PIDs. The cursor
+advances when the reserved inspection passes its stop check. See the
+[admission and inspection policy](ARCHITECTURE.md#deep-inspection-above-the-process-inventory-limits).
+
+On Windows **28000.3501**, the Release product and the `/W4 /WX` core harness
+passed the following checks.
+
+- The independent full-population model passed **37,107 assertions in 12
+  scenarios**. Fixed, growing and reordered populations ran for 96 inventories
+  each with scaled limits of 8/14/18. The model checks the reserved PID, lap
+  bound, eight-slot tier selection, ordinary cursors, PID reuse, partial walks,
+  cancellation and faults. A displaced native row retained its pinned identity
+  when a later watch or matching suspect admitted it.
+- The inventory oracle passed **19,537 assertions**, including the production
+  limits of **4,096 / 8,192 / 12,288**. It accounted for capacity events beyond
+  the 32 recorded scopes and identified the displaced PID and generation after
+  the sample filled. The existing deep and discovery core oracles passed
+  **1,523 / 70,151** assertions.
+- The product passed **13 native inventory / 17 deep dispatcher controls** and
+  **6 / 28 independent checks**. A real Toolhelp walk with a single metadata
+  slot returned the owned process with its pinned generation and image path.
+  A deliberately rejected process generation spent its reservation on entry.
+  An earlier callback and stop before entry preserved the previous position.
+  Worker, analysis, reference, compiled-capability and support-matrix checks
+  passed on the same binary.
+- The isolated `--self-test all` passed, including **3,043 command checks /
+  261 routes**. Its fixture cleanup passed and its working directory was empty.
+  Public-content regression passed **12 tests**.
+
+Release product SHA-256 `45f3af74edd5508835533bea488b3d0af0eaef72bd9d32ec71e10fa8f8ef7cea`. Core harness SHA-256 `20dd022a937f18422fcae4a1ec9e500c73e0a78a1d6076338ae482853d3d4c0f`.
+Read-only host checks at **05:59 KST** found the previous boot time, no new
+BugCheck or dump, and no running task driver or process. Service and firewall
+settings matched the starting record. The previously recorded ASan startup
+failure on this host still limits sanitizer coverage.
+
+The 96-inventory runs used synthetic populations. A native inspection start or
+generation rejection supplies an attempt time. Time to a successful observation
+for each process generation and a maximum unobserved interval on a measured
+host workload still require evidence. P09 remains open.
+
 ## Resumable deep process inspection checkpoint: 2026-11-18
 
 After inventory and priority selection, user-hostility inspection now retains

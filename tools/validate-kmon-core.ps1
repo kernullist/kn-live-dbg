@@ -76,6 +76,11 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "user inventory JSON oracle failed: $LASTEXITCODE"
 }
+& python (Join-Path $PSScriptRoot 'test-user-admission.py') --core-exe $exe
+if ($LASTEXITCODE -ne 0)
+{
+    throw "user inventory admission oracle failed: $LASTEXITCODE"
+}
 & python (Join-Path $PSScriptRoot 'test-discovery-scheduling.py') --core-exe $exe
 if ($LASTEXITCODE -ne 0)
 {

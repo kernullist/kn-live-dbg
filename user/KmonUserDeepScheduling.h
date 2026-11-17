@@ -4,6 +4,14 @@
 
 enum class KmonUserDeepResult { Returned, IdentityRejected, Cancelled };
 
+// The inventory proposes the next position. Only entry into its selected
+// deep inspection spends it; a PID position carries no process identity.
+struct KmonUserInventoryPosition
+{
+    uint32_t AfterPid = 0, ThroughPid = 0;
+    bool InCurrentLap(uint32_t pid) const { return pid > AfterPid && pid <= ThroughPid; }
+};
+
 // A fixed, selected cohort. One callback per turn; selection/attempt clocks
 // are not target-qualified observation success. Native calls are cooperative.
 class KmonUserDeepScheduling

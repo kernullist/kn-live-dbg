@@ -20,6 +20,7 @@
 #include "kmon-analysis-scheduling-selftest.h"
 #include "kmon-discovery-scheduling-selftest.h"
 #include "kmon-user-inventory-selftest.h"
+#include "kmon-user-admission-selftest.h"
 #include "kmon-user-deep-selftest.h"
 #include "execution-evidence-selftest.h"
 
@@ -67,6 +68,12 @@ bool ArbitraryImageSelfTest()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--user-admission-json")
+    {
+        bool passed = false;
+        std::wcout << KmonUserAdmissionFixturesJson(&passed) << L"\n";
+        return passed ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--user-deep-json")
     {
         bool passed = false;

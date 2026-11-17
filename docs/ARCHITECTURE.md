@@ -1965,16 +1965,47 @@ operation/query counts, step limit, completion/cap/cancellation/fault state,
 service samples and overruns. Completed diagnostics freeze before deep scanning;
 they are not a successful target revisit or a durable timing journal.
 
-The existing limits remain: 4,096 snapshot targets, up to 8,192 including extra
-watched PIDs, and 12,288 including suspects. A capped snapshot now closes at the
-first excess eligible row. It does not rotate admission beyond that snapshot
-prefix or prove fairness above the cap. Once ready, the existing priority
-selector chooses up to eight deep targets. Their inspection now resumes one
-target per discovery turn, as described below. Individual target internals and
-other scanner loops remain synchronous. The ordered user-group tail waits
-for this inventory and selected cohort; independent discovery groups can proceed
-between quanta. Neither measured host-workload SLOs nor whole-source
-maximum unobserved intervals follow from the bounded inventory policy.
+### Deep inspection above the process inventory limits
+
+The inventory keeps metadata for up to 4,096 snapshot targets, 8,192 including
+extra watched PIDs, and 12,288 including suspects. It reads the snapshot to its
+end in the same bounded turns. After the snapshot slots fill, it only needs the
+PID and a name hint from each subsequent row to choose a candidate. When the
+inputs can exceed a limit, it also ranks the eligible watch and suspect PIDs in
+bounded turns. A native end-of-snapshot and complete membership in retained
+metadata are separate facts. Absence-based pruning still requires both.
+
+On the first complete inventory that exceeds a limit, the first PID refused a
+slot gets a deep inspection slot in its own priority tier. Subsequent capped inventories
+choose the next eligible PID above the last reserved callback that actually
+started. The upper bound is the highest eligible PID observed when that lap
+began. When the interval is empty, selection returns to the smallest current
+PID and sets a new upper bound. New PIDs above a lap's bound wait for the next
+lap. New PIDs inside its remaining interval can participate. All three input
+sources share this rotation. A PID denotes a scheduling position. Each
+inspection still qualifies its process generation independently.
+
+If the reserved PID fell outside its source's retained metadata, it takes the
+last slot for that source. A later watch or matching suspect can recover the
+displaced row with its pinned identity. An older suspect generation cannot
+override that identity. The reservation costs one of the existing tier slots
+within the eight-target cohort. Up to two urgent watches, four watches total,
+six watches plus other priority targets, and two background targets retain
+their respective budgets. The ordinary cursor advances past the PIDs it
+actually selected. A partial or faulted walk cannot propose a new position.
+Stop before the reserved callback preserves the preceding position.
+
+Private inventory diagnostics report the previous and proposed lap positions.
+`admission_deferred` counts metadata-capacity encounters in this inventory,
+including displacements. Up to 32 scopes identify the input source, PID, known
+generation, reason, first and latest step clocks, and event count. The displaced
+row keeps a scope even when the sample is full. The unrepresented-event count
+covers the rest. Duplicate rows can generate repeated
+events, and a later input can admit a previously deferred PID. The deep-cohort
+diagnostic records whether the reserved inspection passed its stop check. The
+existing `oldest_age_ms` uses attempt times for interesting targets in retained
+metadata. Measuring time until a successful observation requires separate
+generation-qualified evidence.
 
 ### Resumable deep process inspections
 
