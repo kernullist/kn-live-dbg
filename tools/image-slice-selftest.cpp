@@ -1,4 +1,5 @@
 #include "../user/ImageSliceRecipe.h"
+#include "../user/ImageAuthorizedChanges.h"
 #include "../user/ImageSweepManifest.h"
 #include "../user/ImageSweepGraph.h"
 #include "../user/ImageSweepReplayEvidence.h"
@@ -122,7 +123,8 @@ namespace
     void SweepTests(const std::filesystem::path& root)
     {
         for (const auto scenario : {L"sweep_clean", L"sweep_modified", L"sweep_excluded", L"sweep_gap", L"sweep_interrupted", L"sweep_secondary",
-            L"sweep_unstable", L"sweep_raw_lost", L"sweep_modified_interrupted", L"sweep_modified_gap", L"sweep_partial_modified"})
+            L"sweep_unstable", L"sweep_raw_lost", L"sweep_modified_interrupted", L"sweep_modified_gap", L"sweep_partial_modified",
+            L"sweep_boundary_modified"})
         {
             const auto folder = root / scenario;
             std::filesystem::create_directories(folder / L"image-reads");
@@ -143,6 +145,8 @@ namespace
             { source.Bytes[0x1050] ^= 1; }
             if (std::wstring(scenario) == L"sweep_modified_gap" || std::wstring(scenario) == L"sweep_partial_modified")
             { source.Bytes[0x2050] ^= 1; }
+            if (std::wstring(scenario) == L"sweep_boundary_modified")
+            { source.Bytes[0x1fff] ^= 1; source.Bytes[0x2000] ^= 1; }
             Check(Write(original, disk), "sweep-owned-reference");
             std::unique_ptr<void, decltype(&CloseHandle)> section(nullptr, &CloseHandle);
             std::unique_ptr<void, decltype(&UnmapViewOfFile)> view(nullptr, &UnmapViewOfFile);
@@ -317,6 +321,18 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if ((argc == 7 || argc == 8) && std::wstring(argv[1]) == L"--assess-scope")
+    {
+        const auto report = AssessAuthorizedImageScopeChanges(argv[2], argv[3], argv[4], argv[5], std::stoull(argv[6]),
+            [&](const wchar_t* stage)
+            {
+                if (argc == 8 && (std::wstring(stage) == argv[7] || (std::wstring(argv[7]) == L"scope_path_cycle" &&
+                    (std::wstring(stage) == L"scope_root_leased" || std::wstring(stage) == L"scope_original_replayed"))))
+                { std::cerr << "leased:" << mcpjson::WideToUtf8(stage) << std::endl; std::string line; std::getline(std::cin, line); }
+            });
+        std::cout << mcpjson::WideToUtf8(report.Json) << "\n";
+        return report.Assessed ? 0 : 1;
+    }
     if (argc == 4 && std::wstring(argv[1]) == L"--publish")
     {
         const auto input = std::filesystem::path(argv[2]);
@@ -358,7 +374,7 @@ int wmain(int argc, wchar_t** argv)
     try
     {
         for (const auto& name : {L"clean", L"modified", L"unstable", L"unreadable", L"guard", L"identity", L"continuation",
-            L"secondary", L"secondary_verified", L"secondary_modified", L"secondary_unstable"})
+            L"secondary", L"secondary_verified", L"secondary_modified", L"secondary_unstable", L"boundary_modified"})
         {
             const auto folder = root / name;
             std::filesystem::create_directories(folder / L"image-reads");
@@ -394,6 +410,7 @@ int wmain(int argc, wchar_t** argv)
                 if (scenario == L"secondary_modified" || scenario == L"secondary_unstable") { fallback.Bytes[0x1050] ^= 1; }
             }
             if (scenario == L"modified" || scenario == L"unstable") { fallback.Bytes[0x1050] ^= 1; }
+            if (scenario == L"boundary_modified") { fallback.Bytes[0x1fff] ^= 1; fallback.Bytes[0x2000] ^= 1; }
             fallback.Unstable = scenario == L"unstable" || scenario == L"secondary_unstable";
             fallback.Unreadable = scenario == L"unreadable";
             fallback.ChangeHeader = scenario == L"identity";
@@ -443,13 +460,22 @@ int wmain(int argc, wchar_t** argv)
             Check(claims.Valid && mcpjson::ValidateDocument(replay.ClaimAssessmentJson) &&
                 replay.ClaimAssessmentJson.size() <= ImageScopeClaimMaximumCharacters,
                 "slice-common-claims-bind-verified-original-replay");
-            const bool changed = scenario == L"modified" || scenario == L"secondary_modified";
+            const bool changed = scenario == L"modified" || scenario == L"secondary_modified" || scenario == L"boundary_modified";
             Check((claims.FirstDifference.Size != 0) == changed &&
                 (!changed || (claims.WitnessParserReads.size() == 2 && claims.WitnessReceipts.size() == 2 &&
                     claims.WitnessReceipts[0] != claims.WitnessReceipts[1])),
                 "stable-witness-needs-two-distinct-accepted-original-receipts");
             Check(claims.FullMatch == (scenario == L"continuation"),
                 "excluded-unread-and-unqualified-slice-scope-cannot-be-a-full-match");
+            ImageSliceReplayContext verifiedContext;
+            std::vector<ExecutablePageResult> verifiedPages;
+            Check(ReplayImageSliceRecipe(path.wstring(), nullptr, &verifiedPages, nullptr, &verifiedContext).Status == L"replayed" &&
+                verifiedContext.Valid && verifiedContext.ReferenceSha256 == parsed.ReferenceSha256 &&
+                verifiedContext.CapturedFileTime == parsed.CapturedFileTime && verifiedContext.ImageBase == Base &&
+                verifiedPages.size() == pages.size(), "typed-slice-context-binds-original-replay");
+            Check(ReplayImageSliceRecipe((folder / L"missing.knslice").wstring(), nullptr, &verifiedPages, nullptr, &verifiedContext).Status != L"replayed" &&
+                !verifiedContext.Valid && verifiedContext.ReferenceSha256.empty() && verifiedContext.NormalizationRanges.empty() && verifiedPages.empty(),
+                "failed-slice-replay-clears-stale-context-and-pages");
             Check(!SaveObservationJson(path.wstring(), L"{}", nullptr), "existing-slice-never-replaced");
             Check(ReplayImageRecipe(path.wstring(), true, nullptr).Status == L"slice_current_reanalysis_unavailable", "current-policy-mode-not-silently-substituted");
             if (scenario == L"modified")

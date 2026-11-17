@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ImageSweepManifest.h"
+#include "ImageSliceRecipe.h"
 #include "ExecutableImageVerifier.h"
 
 struct ImageSweepReplayedSlice
@@ -9,6 +10,7 @@ struct ImageSweepReplayedSlice
     std::wstring Policy;
     bool TargetReferenceQualified = false;
     std::vector<ExecutablePageResult> Pages;
+    ImageSliceReplayContext Context;
 };
 
 // Projection of a successful replay, not a second acquisition or a stored verdict.

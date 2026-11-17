@@ -44,6 +44,7 @@ backends are not implied by an x64 address width.
 | evidence / retention_irp | native | implemented | collector_specific;extended_address_pipeline_unvalidated | recorded_state_session_partitions |
 | evidence / claims_irp | capture | implemented | collector_specific;extended_address_pipeline_unvalidated | current_policy_on_recorded_invariants |
 | image / assess_changes | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_direct_range |
+| image / assess_scope_changes | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_slice_or_temporal_sweep |
 | image / replay_verification | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |
 | image / capture_verification | process_handle | implemented | cli_legacy_la48_with_os_user_ceiling;user_only;pointer_bytes_8 | handle_bound_single_read |
 | proof / image_range | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |

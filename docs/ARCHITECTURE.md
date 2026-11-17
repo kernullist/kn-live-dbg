@@ -2012,7 +2012,8 @@ execution, lifetime continuity, complete capture coverage or approved changes.
 
 ### Approved image changes
 
-`!kmon assess-image` evaluates a direct case or managed `.kncapture` under a
+`!kmon assess-image` evaluates a direct case, managed `.kncapture`, KMON `.knslice`
+or temporal `.knsweep` under a
 separately supplied approval-policy SHA-256. `kn.image_approval_policy.v1` pins
 the exact image hash, manifest file hash and issuer identifier, with a policy
 epoch and validity window. `kn.authorized_image_changes.v1` repeats the image,
@@ -2057,10 +2058,42 @@ It proves neither current live state, execution, maliciousness, complete-image
 approval nor object lifetime. The assessment and its input artifacts remain
 private evidence and grant no disclosure authority.
 
+Slice and sweep inputs use `kn.image_scope_change_assessment.v1`; the direct
+assessment format stays unchanged. Their manifest pins the root's exact policy:
+`kn.executable_slice.direct.v1`, `kn.executable_slice.secondary.v1`, or
+`kn.executable_sweep.temporal.v1`. A temporal sweep can retain supported direct
+and secondary children; the original sweep replay validates each child's policy,
+reference, membership and recorded result before returning typed bytes. The
+approval evaluator derives normalization spans from that replay's verified PE
+metadata. It checks the opened root's recipe/manifest and original-claim hashes
+against the replay, as well as final file identity and contents. A parent-path
+replacement cannot bind another replay to the original root hash.
+
+A change may cross page or slice boundaries only when every byte was compared,
+the contributing target identities qualify and the exact assembled before/after
+hashes match. Each rule lists its recipe hash, ordinal, RVA, length and capture
+time per observed part. `spans_recipe_observations` makes a multi-recipe rule
+explicit. These are retained observations from separate acquisition intervals;
+`atomic_snapshot=false` applies even to an authorized range. Approval windows
+must cover evaluation and every declared child capture time, sweep start and row
+observation time. The timestamps remain unauthenticated.
+
+Rules outside retained ranges report `outside_observed_ranges`; holes and
+uncompared bytes report `not_fully_compared`. A good observed part may be approved
+while missing slices, unreadable ranges or extra differences remain explicit.
+The result separates scheduled bytes, observed requested bytes, compared bytes,
+authorized/unexplained changes, membership and comparison completeness. A single
+slice's denominator is its executed ranges; a sweep's is its original schedule.
+Zero executed pages never produce a complete comparison. Raw-publication loss
+remains in the unchanged original replay and is separate from byte comparison.
+The evaluator admits at most 2,048 slices and 16,384 pages; its output is at most
+4 MiB. A result over that limit is unavailable and explicitly omits the embedded
+replay rather than returning a truncated successful assessment.
+
 This bounded policy path does not provision signed distribution trust, consult
-revocation services, join other cases, or approve secondary slices and sweeps.
-The approval collection below retains the exact policy and manifest for later
-reassessment. An updated policy requires its own explicit digest.
+revocation services or join other cases. The approval collection below retains
+direct assessments only; durable scoped-approval archival remains pending.
+An updated policy requires its own explicit digest.
 
 ### Approved image collections
 

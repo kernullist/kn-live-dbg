@@ -7,6 +7,82 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Scoped approved image changes checkpoint: 2026-11-17
+
+`assess-image` now accepts original direct/secondary KMON slices and temporal
+sweeps under the caller's separate policy digest. The new
+`kn.image_scope_change_assessment.v1` preserves the original replay and records
+each approved range's contributing recipe, RVA and capture time. Comparison
+holes, missing slices, raw-publication loss and remaining differences stay
+visible. Cross-slice assembly does not establish an atomic snapshot. See
+[approved image changes](ARCHITECTURE.md#approved-image-changes) and the
+[command contract](COMMAND_REFERENCE.md).
+
+Release scoped-approval validation passed **868 harness / 815 product** checks.
+The independent oracle reconstructed expected PE bytes and bound observations
+to original returned receipts. Controls covered direct and actual local
+`SEC_IMAGE_NO_EXECUTE` secondary views, partial/unstable/unreadable observations,
+original claim publications, missing and interrupted sweeps, raw-publication
+loss, one-byte exceptions, two-byte page/slice seams, a 4,096-byte cross-slice
+rule, unexplained extra changes, normalization overlap, policy/scope/issuer/epoch
+mismatches, invalid UTF-8 and field sets, 128-entry limits, half-open validity
+windows and a future-dated later child. Unicode paths, input preservation,
+write-denying leases, CLI grammar and stdout failure were included.
+
+An observed junction-retarget control retained the originally opened modified
+capture and its exact approved byte. The root now also binds replayed semantic
+and original-claim hashes to the opened bytes. The ancestor-directory
+replacement control encountered a filesystem denial while the root lease was
+held; its replacement-and-restoration branch was not exercised on this host.
+Review kept per-range target qualification distinct from the aggregate slice
+identity flag, so a good retained part does not erase unrelated incomplete
+coverage. No additional actionable defects were found in the reviewed scope.
+
+The final slice validator passed **484 C++**, **385 slice**, **270 sweep**,
+**1,414 graph** and **699 original-publication** checks. Direct recipe
+compatibility passed **120 C++**, **34 claim**, **59 publication** and **448
+approval** checks, plus v1/v2 interrupted publication. The final product passed
+**597 approval-collection** controls using the prior committed image harness as
+producer, including exact reproduction and retry of its expired historical
+assessment. The direct v1 assessment function and JSON format remain unchanged.
+
+The product's isolated `--self-test all` passed: timeline **28**, MCP **102**,
+KMON image integration **121**, console **564**, command audit **3,039 / 261
+routes**, remote **68** and four connection-option controls. Capabilities passed
+**41 contracts / 261 routes**, the generated support matrix matched, and the
+public-content classifier passed **12 tests**, including renamed scoped reports.
+
+The product SHA-256 was
+`4d215c9f2ca27139e9b92447a9a679ff6433946775010757fd8d8970b266c982`;
+the final slice harness was
+`aab0b364434b66804966459c2c7d793d6b7b4737e634a0467449028c668a9a10`;
+the direct recipe compatibility harness was
+`f1a09c62b08070bb1e0439ca7ca9513fd042760daf1b15ade276e411d1d24ab8`.
+The prior producer hash is recorded in the next checkpoint. Toolchain/host:
+MSVC 14.44.35207, SDK/WDK 10.0.26100.0, Windows 10.0.28000.3501. Standalone
+harnesses passed `/W4 /WX`; existing product link warnings remain. The
+updated-host ASan startup failure and earlier real-kernel-PDB ASan resource gate
+remain unresolved, without an unchanged retry or interceptor bypass.
+
+At **18:09 KST**, boot time remained **12:49**, with no new reboot/BugCheck
+events, task processes, loaded task drivers, parser receipts, preparation
+directories or AppContainer profiles. The 33 completed parser caches,
+BFE/mpssvc, enabled firewall profiles and Running/Manual EFS matched the stage
+baseline. The earlier EFS stop-denial limit remains unchanged.
+
+[validate-image-slice.ps1](../tools/validate-image-slice.ps1) now runs the
+[scoped approval oracle](../tools/test-image-scope-authorized-changes.py) after
+the original-publication checks. To check a product, pass `--exe`, `--fixtures`
+from that completed validator and `--product` to the oracle. These are owned
+retained-input controls; no task driver, Driver Verifier or reboot was used.
+
+This increment is not completion of VS1 or P01-P16. Durable scoped-approval
+archival, signed distribution/revocation, native mapping/object lifetimes,
+cross-bundle associations and larger native corpora remain open. Approval does
+not authenticate timestamps, issuers or collectors and makes no execution or
+current-state claim. The existing direct approval journal does not yet archive
+these new scoped assessments.
+
 ## Approved image collection checkpoint: 2026-11-17
 
 Direct assessments now retain the exact capture, reference PE, caller-pinned

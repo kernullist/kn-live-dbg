@@ -151,7 +151,8 @@ static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std
         ImageSweepReplayedSlice verifiedSlice;
         ImageSliceClaimEvidence sliceClaims;
         const auto replay = ReplayImageSliceRecipe(recipePath.wstring(), error,
-            verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr, &sliceClaims);
+            verifiedEvidence != nullptr ? &verifiedSlice.Pages : nullptr, &sliceClaims,
+            verifiedEvidence != nullptr ? &verifiedSlice.Context : nullptr);
         uint64_t bytes = 0, equalOrDifferent = 0, skip = 0, fail = 0, differences = 0;
         bool sliceQualified = false;
         if (replay.Status != L"replayed" || replay.RecipeSha256 != row.RecipeSha256 ||

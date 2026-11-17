@@ -30,5 +30,13 @@ std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJso
     const std::wstring& referencePath, std::wstring* error);
 // Optional typed results are populated only after all original inputs and results agree.
 struct ImageSliceClaimEvidence;
+struct ImageSliceReplayContext
+{
+    std::wstring ReferenceSha256;
+    uint64_t ImageBase = 0, CapturedFileTime = 0;
+    bool Valid = false, IdentityQualified = false, TargetIdentityFencePassed = false;
+    std::vector<ObservationRange> NormalizationRanges; // RVA spans, from verified PE metadata.
+};
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
-    std::vector<ExecutablePageResult>* verifiedPages = nullptr, ImageSliceClaimEvidence* verifiedClaims = nullptr);
+    std::vector<ExecutablePageResult>* verifiedPages = nullptr, ImageSliceClaimEvidence* verifiedClaims = nullptr,
+    ImageSliceReplayContext* verifiedContext = nullptr);

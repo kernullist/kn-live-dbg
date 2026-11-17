@@ -513,6 +513,12 @@ static int RunCommandAuditSelfTest()
     { check(run(line).Error.find(L"usage") != std::wstring::npos, L"approval operations require an explicit external anchor"); }
     check(!IsWriteLikeCommandLine(assess) && run(assess + L" /json").Output.find(L"kn.image_change_assessment.v1") != std::wstring::npos && !device.IsOpen(),
         L"approved change assessment is read-only, captured in the transcript, and opens no driver");
+    for (const auto* path : {L"missing.knslice", L"missing.KNSWEEP"})
+    {
+        const auto line = L"!kmon assess-image " + std::wstring(path) + L" y z " + std::wstring(64, L'a') + L" /json";
+        check(!IsWriteLikeCommandLine(line) && run(line).Output.find(L"kn.image_scope_change_assessment.v1") != std::wstring::npos && !device.IsOpen(),
+            L"slice and sweep approval dispatch preserves interactive output and read-only classification");
+    }
     for (const auto& line : {L"!kmon assess-image", L"!kmon assess-image x y z bad", L"!kmon assess-image x y z /json"})
     { check(run(line).Error.find(L"usage") != std::wstring::npos, L"approved change assessment requires exact arguments and policy anchor"); }
     for (const auto& suffix : {L" /bad", L" /json /json", L" /current"})

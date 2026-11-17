@@ -227,13 +227,14 @@ driver. It preserves the source directory and does not encrypt that old copy.
 Root/reference limits are 4 MiB/64 MiB. See
 [direct capture collections](ARCHITECTURE.md#direct-image-capture-collections).
 
-`KnLiveDbg.exe --offline !kmon assess-image <directory|managed.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> /json`
+`KnLiveDbg.exe --offline !kmon assess-image <directory|managed.kncapture|slice.knslice|sweep.knsweep> <changes.knchange> <policy.knapproval> <policy-sha256> /json`
 evaluates authorized changes without new target reads or file writes. The final
 argument is the lower-case SHA-256 obtained through the analyst's approval
 process, separately from the evidence. Do not derive trust from a digest supplied
 by the capture itself. The policy pins the exact manifest bytes, reference image
-and issuer at the same epoch. Evaluation requires original direct replay and
-validity at both capture and current host time. There is no `/current` override.
+and issuer at the same epoch. Evaluation requires original replay and validity
+at capture and current host time. Scoped input also checks every declared sweep
+start and child observation time. There is no `/current` override.
 
 Both input files are UTF-8 JSON (no BOM), at most 64 KiB. Required fields are:
 
@@ -241,7 +242,7 @@ Both input files are UTF-8 JSON (no BOM), at most 64 KiB. Required fields are:
 | --- | --- |
 | `.knapproval` | `schema="kn.image_approval_policy.v1"`, `policy_id`, `policy_epoch`, `not_before_filetime`, `not_after_filetime`, `approvals` |
 | Each approval | `image_sha256`, `manifest_sha256`, `issuer` |
-| `.knchange` | `schema="kn.authorized_image_changes.v1"`, `image_sha256`, `issuer`, `policy_epoch`, `not_before_filetime`, `not_after_filetime`, `comparison_policy="kn.executable_page.direct.v1"`, `hash_basis="non_fixup_compared_bytes.v1"`, `changes` |
+| `.knchange` | `schema="kn.authorized_image_changes.v1"`, `image_sha256`, `issuer`, `policy_epoch`, `not_before_filetime`, `not_after_filetime`, `comparison_policy`, `hash_basis="non_fixup_compared_bytes.v1"`, `changes` |
 | Each change | `rva`, `length`, `before_sha256`, `after_sha256` |
 
 Numbers are decimal strings without leading zeros; time values are Windows
@@ -253,14 +254,24 @@ in the comparison; fixup and excluded spans cannot be exceptions in v1. Unknown
 or duplicate fields, ambiguous scopes and unsupported policies fail explicitly.
 The exact file digests include whitespace; changing formatting requires new pins.
 
+`comparison_policy` must match the original root: `kn.executable_page.direct.v1`
+for direct captures, `kn.executable_slice.direct.v1` or
+`kn.executable_slice.secondary.v1` for slices, and
+`kn.executable_sweep.temporal.v1` for sweeps. Scoped results use
+`kn.image_scope_change_assessment.v1` and list each rule's contributing recipe,
+RVA and capture time. Cross-slice assembly requires all bytes to qualify;
+it does not establish an atomic snapshot. Missing observations and unexplained
+changes remain separate. Limits are 2,048 slices, 16,384 pages and 4 MiB output;
+an oversized result is unavailable with `replay_output_included=false`.
+
 The result preserves the original replay and distinguishes authorized changes,
 unexplained changes, no observed change and incomplete comparison. `R-approved`
 is relative to this caller-pinned policy; `issuer_signature_verified=false`
 remains explicit. Exit 0 means assessment completed, including unexplained or
 incomplete results; 1 means unavailable, 2 invalid grammar, and 3 stdout delivery
 failure. Interactive `!kmon` uses the same read-only route and transcript. The
-approval collection commands below retain the two inputs and original assessment
-for later reproduction. See
+approval collection commands below retain direct inputs and assessments for
+later reproduction; they do not yet archive scoped approval results. See
 [approved image changes](ARCHITECTURE.md#approved-image-changes).
 
 `KnLiveDbg.exe --offline !kmon journal-image-approval <directory|managed.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> /json`

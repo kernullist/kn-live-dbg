@@ -262,10 +262,12 @@ std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata&
 }
 
 static ImageRecipeReplay EvaluateImageSliceRecipe(std::wstring json, const std::wstring& referencePath, std::wstring* error,
-    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims)
+    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims,
+    ImageSliceReplayContext* verifiedContext = nullptr)
 {
     if (verifiedPages != nullptr) { verifiedPages->clear(); }
     if (verifiedClaims != nullptr) { *verifiedClaims = {}; }
+    if (verifiedContext != nullptr) { *verifiedContext = {}; }
     ImageRecipeReplay result;
     result.Schema = L"kn.image_slice_replay.v1";
     result.Mode = L"original_policy";
@@ -317,6 +319,29 @@ static ImageRecipeReplay EvaluateImageSliceRecipe(std::wstring json, const std::
     result.ClaimAssessmentJson = ImageSliceClaimAssessmentJson(claims);
     result.Status = L"replayed";
     if (!ReproduceImageScopeClaim(publication, &result)) { return result; }
+    if (verifiedContext != nullptr)
+    {
+        ImageSliceReplayContext context;
+        context.ReferenceSha256 = p.ReferenceSha256; context.ImageBase = p.ImageBase;
+        context.CapturedFileTime = p.CapturedFileTime;
+        context.Valid = claims.Valid; context.IdentityQualified = claims.IdentityQualified;
+        context.TargetIdentityFencePassed = claims.Valid && p.Slice.RejectionReason.empty();
+        std::vector<ObservationRange> ranges;
+        for (const auto& page : pages) { ranges.push_back({page.Rva, page.Coverage.RequestedBytes}); }
+        std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.Address < b.Address; });
+        const auto add = [&](uint32_t rva, uint32_t length)
+        {
+            const auto found = std::lower_bound(ranges.begin(), ranges.end(), rva,
+                [](const auto& range, uint32_t start) { return range.Address + range.Size <= start; });
+            if (length && found != ranges.end() && found->Address < uint64_t(rva) + length)
+                { context.NormalizationRanges.push_back({rva, length}); }
+        };
+        for (const auto& range : metadata.BaseRelocations) { add(range.Rva, range.Width); }
+        for (const auto& range : metadata.LoaderMutableRanges) { add(range.Rva, range.Size); }
+        for (const auto& range : metadata.DynamicRelocationRanges) { add(range.Rva, range.Size); }
+        for (const auto& range : metadata.Rel32Overrides) { add(range.Rva, 4); }
+        *verifiedContext = std::move(context);
+    }
     if (verifiedClaims != nullptr) { *verifiedClaims = std::move(claims); }
     if (verifiedPages != nullptr) { *verifiedPages = pages; }
     if (error != nullptr) { error->clear(); }
@@ -336,10 +361,12 @@ std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJso
 }
 
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
-    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims)
+    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims,
+    ImageSliceReplayContext* verifiedContext)
 {
     if (verifiedPages) { verifiedPages->clear(); }
     if (verifiedClaims) { *verifiedClaims = {}; }
+    if (verifiedContext) { *verifiedContext = {}; }
     std::wstring json, artifactJson;
     ImageScopeClaimPublication publication;
     ImageSliceRecipe recipe;
@@ -352,5 +379,5 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
         { result.Status = L"recipe_unavailable_or_corrupt"; return result; }
     const auto reference = std::filesystem::path(path).parent_path().parent_path() / L"image-references" /
         (recipe.ReferenceSha256 + L".knblob");
-    return EvaluateImageSliceRecipe(std::move(json), reference.wstring(), error, verifiedPages, verifiedClaims);
+    return EvaluateImageSliceRecipe(std::move(json), reference.wstring(), error, verifiedPages, verifiedClaims, verifiedContext);
 }

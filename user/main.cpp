@@ -23099,7 +23099,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
     std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase> <policy-sha256> [/current] [/json]\n";
-    std::wcout << L"  !kmon assess-image <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
+    std::wcout << L"  !kmon assess-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
     std::wcout << L"  !kmon journal-image <case-directory> <private-store> <collection-id> [/json]\n";
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
     std::wcout << L"  !kmon replay-irp <capture.knirp> [/current] [/json]  original claim reproduction; /current evaluates current claims only\n";
@@ -23517,10 +23517,13 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         if (valid) { valid = args[5].size() == 64 && args[5].find_first_not_of(L"0123456789abcdef") == std::wstring::npos; }
         if (!valid)
         {
-            std::wcerr << L"usage: !kmon assess-image <directory|capture.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
+            std::wcerr << L"usage: !kmon assess-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> <changes.knchange> <policy.knapproval> <policy-sha256> [/json]\n";
             return 2;
         }
-        const auto result = AssessAuthorizedImageChanges(args[2], args[3], args[4], args[5]);
+        const auto extension = ToLower(std::filesystem::path(args[2]).extension().wstring());
+        const auto result = extension == L".knslice" || extension == L".knsweep" ?
+            AssessAuthorizedImageScopeChanges(args[2], args[3], args[4], args[5]) :
+            AssessAuthorizedImageChanges(args[2], args[3], args[4], args[5]);
         if (directJsonOutput) { if (!WriteCapabilityJson(result.Json)) { return 3; } }
         else { std::wcout << result.Json << L"\n"; }
         return result.Assessed ? 0 : 1;

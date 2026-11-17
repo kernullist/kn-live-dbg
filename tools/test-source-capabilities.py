@@ -61,6 +61,10 @@ def main():
     approval = by_key[("image", "assess_changes", "recipe")]
     assert approval["consistency"] == "recorded_direct_range" and "separate_policy_sha256_anchor" in approval["requirements"]
     assert "no_fixup_overlap" in approval["limits"] and "caller_policy_not_signature_authentication" in approval["limits"]
+    scope_approval = by_key[("image", "assess_scope_changes", "recipe")]
+    assert scope_approval["consistency"] == "recorded_slice_or_temporal_sweep"
+    assert "all_observation_and_evaluation_times" in scope_approval["requirements"] and "per_part_recipe_provenance" in scope_approval["requirements"]
+    assert "16384_pages_2048_slices" in scope_approval["limits"] and "no_fixup_overlap" in scope_approval["limits"]
     journal = by_key[("evidence", "journal", "local_files")]
     assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
     assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
