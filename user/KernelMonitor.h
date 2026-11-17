@@ -790,6 +790,11 @@ private:
         uint64_t PreparationFinishedMs = 0, PreparationSuccessMs = 0, PreparationSuccessEpisode = 0;
         bool PreparationFailed = false, PreparationCancelled = false;
         ImageReferencePreparation::Outcome PreparationOutcome = ImageReferencePreparation::Outcome::Cancelled;
+        uint64_t ContentPreparationId = 0, ContentQueuedMs = 0, ContentRetryAfterMs = 0;
+        uint64_t LastContentPreparationId = 0, ContentFinishedMs = 0, ContentSuccessMs = 0;
+        uint64_t ContentSuccessEpisode = 0, ContentExpired = 0;
+        bool ContentCancelled = false;
+        ImageReferencePreparation::Outcome ContentOutcome = ImageReferencePreparation::Outcome::Cancelled;
         uint64_t LastSweepMs = 0;
         uint64_t NextSweepDueMs = 0;
         uint64_t SweepSchedulingTurns = 0;
@@ -811,7 +816,9 @@ private:
         ImageVerificationWork** admitted = nullptr, bool discovery = true);
     std::wstring ImageSchedulingJson(uint64_t now) const;
     void ApplyImageReferenceResults();
+    void QueueImageReferenceContent(ImageVerificationWork& work);
     std::unique_ptr<ImageReferencePreparation> ImageReferences = std::make_unique<ImageReferencePreparation>();
+    std::unique_ptr<ImageReferencePreparation> ImageContents = std::make_unique<ImageReferencePreparation>(ImageReferencePreparation::Kind::Content);
     KmonImageTimings ImageTimings;
     uint64_t ImageWorkEvicted = 0, ImageDebtPriorityTurns = 0;
     std::array<std::array<uint64_t, 2>, 2> ImageOrdinaryTurns{};

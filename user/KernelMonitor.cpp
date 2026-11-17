@@ -8649,6 +8649,7 @@ bool KernelMonitor::Start(
                 try
                 {
                     ImageReferences->Start();
+                    ImageContents->Start();
                     CaptureWriter = std::thread(&KernelMonitor::CaptureWriterLoop, this);
                     CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, this);
                     Collector = std::thread(&KernelMonitor::CollectorLoop, this);
@@ -8659,6 +8660,7 @@ bool KernelMonitor::Start(
                 {
                     StopRequested.store(true);
                     ImageReferences->RequestStop();
+                    ImageContents->RequestStop();
                     CaptureStopping.store(true);
                     // The failure cleanup below joins every started producer
                     // before signalling the writer to close its collections.
@@ -8722,6 +8724,7 @@ bool KernelMonitor::Start(
     if (!ok && StopRequested.load())
     {
         ImageReferences->RequestStop();
+        ImageContents->RequestStop();
         if (LayoutWorker.joinable())
         {
             LayoutWorker.join();
@@ -8735,6 +8738,7 @@ bool KernelMonitor::Start(
             Worker.join();
         }
         ImageReferences->Join();
+        ImageContents->Join();
         CaptureStopping.store(true);
         if (CaptureWorker.joinable())
         {
@@ -8842,6 +8846,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         }
     }
     ImageReferences->RequestStop();
+    ImageContents->RequestStop();
     if (LayoutWorker.joinable())
     {
         LayoutWorker.join();
@@ -8855,10 +8860,13 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
         worker.join();
     }
     ImageReferences->Join();
+    ImageContents->Join();
     for (auto& item : ImageWork)
     {
         if (item.second.PreparationId != 0)
         { item.second.PreparationId = 0; item.second.PreparationCancelled = true; }
+        if (item.second.ContentPreparationId != 0)
+        { item.second.ContentPreparationId = 0; item.second.ContentCancelled = true; }
     }
 
     // Freeze the upstream tail now; backpressure can leave events there.

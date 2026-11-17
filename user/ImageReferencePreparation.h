@@ -12,6 +12,8 @@ class ImageReferencePreparation
 public:
     static constexpr size_t Capacity = 64, SubjectCapacity = 8, WorkerCount = 2, ResultSlots = 4;
     static constexpr uint64_t MaximumPreparedBytes = 128ull * 1024 * 1024;
+    static constexpr uint64_t ContentReadyLifetimeMs = 5000;
+    enum class Kind { Metadata, Content };
     enum class Admission { Queued, GlobalLimit, SubjectLimit, Stopping, Invalid };
     enum class Outcome { Prepared, Unavailable, NoExecutableRanges, StorageLimit, Cancelled, Fault };
     struct Request
@@ -24,6 +26,7 @@ public:
     {
         executable_image::DiskPeMetadata Reference;
         ExecutableSweep Sweep;
+        std::unique_ptr<ExecutableReferenceLease> Content;
     };
     struct Result
     {
@@ -37,12 +40,15 @@ public:
     using Loader = std::function<Outcome(const Request&, const std::atomic<bool>&, Prepared&, std::wstring&)>;
 
     explicit ImageReferencePreparation(Loader loader = {});
+    explicit ImageReferencePreparation(Kind kind, Loader loader = {});
     ~ImageReferencePreparation();
     ImageReferencePreparation(const ImageReferencePreparation&) = delete;
     ImageReferencePreparation& operator=(const ImageReferencePreparation&) = delete;
     void Start();
     Ticket Submit(Request work, uint64_t now = GetTickCount64());
-    std::unique_ptr<Result> Take();
+    std::unique_ptr<Result> Take(uint64_t id = 0);
+    bool Contains(uint64_t id);
+    bool IsReady(uint64_t id);
     void Disposition(const Result& result, bool applied, uint64_t now = GetTickCount64());
     void Abandon(uint64_t id);
     void RequestStop();
@@ -50,7 +56,8 @@ public:
     void Reset();
     std::wstring Json(uint64_t now = GetTickCount64()) const;
     static Outcome LoadNative(const Request&, const std::atomic<bool>&, Prepared&, std::wstring&);
-    static const wchar_t* OutcomeName(Outcome);
+    static Outcome LoadContent(const Request&, const std::atomic<bool>&, Prepared&, std::wstring&);
+    static const wchar_t* OutcomeName(Outcome, Kind kind = Kind::Metadata);
     static const wchar_t* AdmissionName(Admission);
 private:
     struct State;

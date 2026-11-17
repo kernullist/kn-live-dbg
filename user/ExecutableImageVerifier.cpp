@@ -558,11 +558,45 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
     return CompareExecutableRangeWithFile(path, metadata, imageBase, rva, size, reader, INVALID_HANDLE_VALUE, imageBase);
 }
 
+ExecutableReferenceLease::~ExecutableReferenceLease()
+{
+    if (File != INVALID_HANDLE_VALUE) { CloseHandle(File); }
+}
+
+bool ExecutableReferenceLease::Open(const std::wstring& path, const std::atomic<bool>& stop)
+{
+    if (File != INVALID_HANDLE_VALUE || stop.load()) { return false; }
+    RequestedPath = path;
+    File = CreateFileW(NormalizeReferencePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (File == INVALID_HANDLE_VALUE || stop.load()) { return false; }
+    // Retention is separately qualified. Oversized/unsupported retention must
+    // not silently remove the existing unretained comparison path.
+    Retained.OpenHandleCancelable(File, &Failure, stop);
+    return !stop.load();
+}
+
+void ExecutableReferenceLease::Capture(ExecutableSweepReference* output) const
+{
+    if (output == nullptr) { return; }
+    output->Artifact = Retained.Snapshot();
+    output->CaptureStatus = output->Artifact ? L"captured" : L"retention_unavailable";
+    output->Failure = Failure;
+}
+
+uint64_t ExecutableReferenceLease::RetainedBytes() const
+{
+    const auto value = Retained.Snapshot();
+    return sizeof(*this) + (RequestedPath.capacity() + Failure.capacity()) * sizeof(wchar_t) +
+        (value ? sizeof(*value) + value->Bytes.capacity() +
+            (value->OriginalPath.capacity() + value->OriginalFileIdentity.capacity() + value->Sha256.capacity()) * sizeof(wchar_t) : 0);
+}
+
 static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
     uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace,
     const ExecutableSliceTrace* replay = nullptr, const ObservationReader& replaySecondary = {},
-    ExecutableSweepTiming* timing = nullptr, uint64_t budgetStartedMs = 0)
+    ExecutableSweepTiming* timing = nullptr, uint64_t budgetStartedMs = 0, ExecutableReferenceLease* prepared = nullptr)
 {
     if (capturedReference != nullptr) { *capturedReference = {}; }
     if (trace != nullptr) { *trace = {}; }
@@ -629,10 +663,11 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
         sweep->Coverage.Reason = reason;
     };
     // Pin and qualify the exact reference object before any target read.
-    const auto reference = CreateFileW(NormalizeReferencePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    const auto reference = prepared != nullptr ? prepared->Handle() :
+        CreateFileW(NormalizeReferencePath(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
     const std::unique_ptr<void, decltype(&CloseHandle)> referenceOwner(
-        reference == INVALID_HANDLE_VALUE ? nullptr : reference, &CloseHandle);
+        prepared != nullptr || reference == INVALID_HANDLE_VALUE ? nullptr : reference, &CloseHandle);
     if (reference == INVALID_HANDLE_VALUE || !DiskFileIdentityMatches(reference, metadata))
     {
         if (capturedReference != nullptr) { capturedReference->CaptureStatus = L"reference_unavailable_or_changed"; }
@@ -642,7 +677,8 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
     ReferenceArtifact retained;
     if (capturedReference != nullptr)
     {
-        if (retained.OpenHandle(reference, &capturedReference->Failure))
+        if (prepared != nullptr) { prepared->Capture(capturedReference); }
+        else if (retained.OpenHandle(reference, &capturedReference->Failure))
         {
             capturedReference->Artifact = retained.Snapshot();
             capturedReference->CaptureStatus = L"captured";
@@ -654,7 +690,7 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
         timer.Next(3);
         if (capturedReference == nullptr || capturedReference->Artifact == nullptr) { return true; }
         capturedReference->ContentRechecked = true;
-        capturedReference->ContentStable = retained.Unchanged();
+        capturedReference->ContentStable = prepared != nullptr ? prepared->Unchanged() : retained.Unchanged();
         return capturedReference->ContentStable;
     };
     std::wstring reason;
@@ -854,10 +890,10 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
     uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace,
-    ExecutableSweepTiming* timing, uint64_t budgetStartedMs)
+    ExecutableSweepTiming* timing, uint64_t budgetStartedMs, ExecutableReferenceLease* prepared)
 {
     return AdvanceExecutableSweepImpl(path, metadata, imageBase, reader, pageBudget, nowMs, sweep, budgetMs,
-        capturedReference, trace, nullptr, {}, timing, budgetStartedMs);
+        capturedReference, trace, nullptr, {}, timing, budgetStartedMs, prepared);
 }
 
 std::vector<ExecutablePageResult> ReplayExecutableSlice(const std::wstring& path, const DiskPeMetadata& metadata,

@@ -2069,11 +2069,65 @@ The standalone harness also exercises admission/result bounds, loader faults,
 generation reuse, native parsing and a dispatch sequence checked by an independent
 Python model. Gates synchronize on observed work, not elapsed sleeps.
 
-Reference byte retention/hashing, alias and rescan identity opens, and final
-target/content fences remain synchronous. Both preparation workers can still
-wait inside native calls. Full asynchronous reference acquisition, generic stage
-budgets/dependencies, native workload SLOs and whole-source maximum unobserved
-intervals remain open.
+Recorded comparisons use the separate content preparation stage below. Alias
+and rescan identity opens, page reads and final target/content fences remain
+synchronous. Preparation workers can still wait inside native calls. Generic
+stage budgets/dependencies, native workload SLOs and whole-source maximum
+unobserved intervals remain open.
+
+## Asynchronous image reference content preparation
+
+Each recorded image comparison requests a source-file lease, original bytes and
+SHA-256 from two dedicated content workers. These workers are separate from the
+two metadata workers, so a backlog of ready file leases cannot occupy every
+metadata slot. Each pool admits 64 owners, at most 8 per process, and allows four
+running or ready results. A content result holds at most the existing 64 MiB
+reference snapshot; parser allocations and publication queues have separate
+ownership and limits. This is not a total process-memory bound.
+
+The analysis thread retains only a ticket while preparation is pending. It does
+not read the target or count that wait as a file failure. Admission attempts
+advance scheduler rotation without renewing original observation debt. A ready
+lease can be taken only by its exact ticket and matching process/work episode.
+The comparison uses that already-open file and snapshot, then closes the source
+handles before queueing immutable original evidence for publication. Source
+leases are never stored in the long-lived image cache. Unrecorded comparisons
+retain their existing behavior; they did not request whole-file retention.
+
+Ready results expire after a cooperative 5,000 ms retention period. Idle content
+dispatchers wake every 100 ms to discard expired results; admission/consumer
+checks also reclaim them. This is an expiry policy, not a guaranteed native
+handle-close deadline. A stale, expired or cancelled result cannot qualify a
+new work episode. Stop closes both pools, joins their running workers and clears
+active tickets. Cancellation preserves previous completed outcomes and success
+timestamps instead of turning removed shutdown tickets into expiry samples.
+
+The original final content re-read and file/target identity checks still run
+after comparison. Preparing a lease does not establish file trust, live bytes
+or successful retention: files that exceed the retention limit keep the existing
+explicitly unretained comparison path. Retention failure and file-open failure
+remain distinct. A failed content attempt receives a five-second retry cooldown
+and cannot renew a prior target success. The cancellation-aware retention reader
+checks between read/hash chunks and publishes no partial snapshot.
+
+`coverage.pipeline.image_content_preparation_json` uses the same private
+`kn.image_reference_preparation.v1` schema with `phase: content`. Its success
+scope is a prepared file lease, with separate retained-snapshot and unretained-
+lease counts. Metadata reports identify `phase: metadata`. Both retain their
+own queue, service, application, cancellation and shutdown populations. Image
+scheduling rows expose pending/last content tickets, original queue time,
+completion, successful episode, expiry count and cancellation separately.
+Their `content_preparation` object is null until admission, preserving the
+existing detail budget without filling unattempted scopes with empty fields.
+
+The preparation self-test observes another subject complete while a content
+worker is held, write exclusion while a native lease is ready, lease release
+before original bytes are published, failure after success, stale episodes and
+queued/running stop. The standalone harness also observes an unused lease expire
+and checks exact-ticket consumption and oversized unretained results. Reference
+blob controls compare multi-chunk hashes with an independent Python SHA-256.
+These controls do not establish native workload SLOs or close the remaining
+whole-pipeline timing and synchronous final-fence work.
 
 ## Execution reference scheduling
 

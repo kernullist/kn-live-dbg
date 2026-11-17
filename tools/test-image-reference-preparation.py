@@ -22,9 +22,10 @@ def run(exe, *arguments):
     return json.loads(result.stdout)
 
 
-def contract(check, report):
+def contract(check, report, content=False):
     check(report["schema"] == "kn.image_reference_preparation.v1" and
-          report["success_scope"] == "metadata_prepared_not_live_image_verified", "preparation cannot qualify live bytes")
+          report["success_scope"] == ("file_lease_prepared_not_live_image_verified" if content else "metadata_prepared_not_live_image_verified") and
+          report["phase"] == ("content" if content else "metadata"), "preparation cannot qualify live bytes")
     check(not report["hard_deadline_enforced"] and not report["native_io_cancellation_guaranteed"] and
           not report["shutdown_in_normal_samples"] and not report["hard_process_memory_bound"], "bounded cancellation and allocation claims")
     check(int(report["resident"]) == sum(int(report[k]) for k in ("running", "ready", "queued")) <= 64 and
@@ -67,6 +68,13 @@ def core(check, exe):
         contract(check, data[name])
     check(data["capacity"]["cancelled_queued"] == "62" and data["capacity"]["shutdown"]["cancelled"] == "2", "observed queue/worker shutdown overlap")
     check(data["native"]["normal"]["prepared"] == data["native"]["applied"] == "1", "owned file follows actual native parser")
+    for name in ("content", "expired"):
+        contract(check, data[name], content=True)
+    check(data["expired"]["expired_ready"] == "1" and data["expired"]["resident"] == "0" and
+          data["expired"]["ready_lifetime_ms"] == "5000", "unconsumed native lease expires and closes")
+    c = data["content"]["normal"]
+    check(c["prepared"] == "3" and c["retained_snapshots"] == "2" and c["unretained_leases"] == "1" and
+          data["content"]["applied"] == "2", "retention failure is distinct from file-lease preparation and application")
 
 
 def product(check, exe):
@@ -79,6 +87,15 @@ def product(check, exe):
     check(done["normal"]["prepared"] == "3" and done["normal"]["failed"] == "2" and done["stale_completions"] == "1", "failure and stale episode remain separate")
     check(data["before_stop"]["queued"] == "6" and data["before_stop"]["running"] == "2" and
           data["stopped"]["resident"] == "0" and data["stopped"]["shutdown"]["cancelled"] == "2", "actual Stop joins and accounts for all owners")
+    for name in ("content_pending", "content_completed", "content_before_stop", "content_stopped"):
+        contract(check, data[name], content=True)
+    check(data["content_pending"]["running"] == data["content_pending"]["ready"] == "1", "content ready beside held worker")
+    c = data["content_completed"]
+    check(c["normal"]["prepared"] == c["normal"]["retained_snapshots"] == "2" and c["normal"]["failed"] == "1" and
+          c["stale_completions"] == "1", "content success failure and stale application are distinct")
+    check(data["content_before_stop"]["queued"] == "6" and data["content_before_stop"]["running"] == "2" and
+          data["content_stopped"]["resident"] == "0" and data["content_stopped"]["shutdown"]["cancelled"] == "2",
+          "actual content Stop joins all in-flight owners")
     invalid = subprocess.run([str(exe.resolve()), "--self-test", "image-preparation", "extra"], capture_output=True, timeout=30)
     check(invalid.returncode == 2 and not invalid.stdout.strip(), "strict public CLI grammar")
     help_result = subprocess.run([str(exe.resolve()), "--help"], capture_output=True, timeout=30)

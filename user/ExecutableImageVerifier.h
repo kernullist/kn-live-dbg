@@ -69,6 +69,26 @@ struct ExecutableSweepReference
     bool ContentStable = false;
 };
 
+// A single comparison owns this lease. Preparation may happen on a dedicated
+// worker; ownership transfers without sharing its mutable file cursor. Ready
+// leases must be bounded and expired by the scheduler, never cached per image.
+class ExecutableReferenceLease
+{
+public:
+    ~ExecutableReferenceLease();
+    bool Open(const std::wstring& path, const std::atomic<bool>& stop);
+    HANDLE Handle() const { return File; }
+    const std::wstring& Path() const { return RequestedPath; }
+    void Capture(ExecutableSweepReference* output) const;
+    bool HasSnapshot() const { return Retained.Snapshot() != nullptr; }
+    bool Unchanged() { return Retained.Unchanged(); }
+    uint64_t RetainedBytes() const;
+private:
+    HANDLE File = INVALID_HANDLE_VALUE;
+    std::wstring RequestedPath, Failure;
+    ReferenceArtifact Retained;
+};
+
 // The executed schedule and auxiliary inputs of one slice, never a whole-sweep
 // atomic snapshot. Replay consumes this count instead of running a wall clock.
 struct ExecutableSliceTrace
@@ -133,7 +153,8 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(
     ExecutableSweepReference* capturedReference = nullptr,
     ExecutableSliceTrace* trace = nullptr,
     ExecutableSweepTiming* timing = nullptr,
-    uint64_t budgetStartedMs = 0);
+    uint64_t budgetStartedMs = 0,
+    ExecutableReferenceLease* prepared = nullptr);
 
 // Uses an already retained reference and original parser inputs. It never maps
 // a fresh secondary view or consults a target process.

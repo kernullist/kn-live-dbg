@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <atomic>
 
 #include <Windows.h>
 #include <cstdint>
@@ -29,6 +30,8 @@ public:
     // Reopen the exact file object with its own read pointer and a write/delete
     // exclusion lease. Never resolves the caller's old pathname to another file.
     bool OpenHandle(HANDLE file, std::wstring* error, size_t maximumBytes = ReferenceArtifactMaxBytes);
+    bool OpenHandleCancelable(HANDLE file, std::wstring* error, const std::atomic<bool>& stop,
+        size_t maximumBytes = ReferenceArtifactMaxBytes);
     bool Unchanged();
     // Shares immutable bytes only, not the source lease. Caller records its
     // final Unchanged fence separately before destroying the lease.
@@ -38,7 +41,8 @@ public:
     const std::vector<uint8_t>& Bytes() const;
     std::wstring FileIdentity() const;
 private:
-    bool Initialize(std::wstring* error, size_t maximumBytes);
+    bool Initialize(std::wstring* error, size_t maximumBytes, const std::atomic<bool>* stop = nullptr);
+    bool OpenHandleImpl(HANDLE file, std::wstring* error, size_t maximumBytes, const std::atomic<bool>* stop);
     HANDLE File = INVALID_HANDLE_VALUE;
     FILE_ID_INFO Identity{};
     std::shared_ptr<const RetainedReferenceArtifact> Content;

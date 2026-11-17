@@ -28,7 +28,19 @@ struct KmonImageTestAccess
         const ObservationIdentity& identity, const ObservationReader& reader, size_t pages,
         const ObservationReadRouting* routing = nullptr, bool discovery = true)
     {
-        Find(monitor, path, base, identity, nullptr, discovery);
+        const auto work = Find(monitor, path, base, identity, nullptr, discovery);
+        if (work != nullptr && routing != nullptr && GetTickCount64() >= work->NextSweepDueMs)
+        { PrepareContent(monitor, *work); }
         return monitor.ScanExecutableImage(path, base, identity, reader, pages, routing, false);
+    }
+    static void PrepareContent(KernelMonitor& monitor, KernelMonitor::ImageVerificationWork& work)
+    {
+        monitor.QueueImageReferenceContent(work);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (work.ContentPreparationId != 0 && !monitor.ImageContents->IsReady(work.ContentPreparationId) &&
+            monitor.ImageContents->Contains(work.ContentPreparationId) && std::chrono::steady_clock::now() < deadline)
+        { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+        if (work.ContentPreparationId != 0 && !monitor.ImageContents->IsReady(work.ContentPreparationId))
+        { throw std::runtime_error("image content preparation did not finish"); }
     }
 };

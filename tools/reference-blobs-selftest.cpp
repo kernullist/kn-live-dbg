@@ -120,9 +120,25 @@ int wmain(int argc, wchar_t** argv)
             Check(mapping != nullptr && !ready && leaseError == ERROR_SHARING_VIOLATION && captured.Snapshot() == nullptr,
                 "existing-writable-view-denies-stability-lease-before-capture");
         }
+        std::vector<uint8_t> multichunk(3 * 65536 + 17);
+        for (size_t i = 0; i < multichunk.size(); ++i) { multichunk[i] = static_cast<uint8_t>(i * 131 + 17); }
+        const auto multichunkPath = root / L"multichunk.bin";
+        Check(Write(multichunkPath, multichunk), "write-multi-chunk-retention-control");
+        std::wstring multichunkHash;
+        {
+            auto input = Owner(CreateFileW(multichunkPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, 0, nullptr));
+            std::atomic<bool> stop{false}; ReferenceArtifact retained, cancelled;
+            Check(input && retained.OpenHandleCancelable(input.get(), nullptr, stop) && retained.Bytes() == multichunk && retained.Unchanged(),
+                "cancel-capable-retention-preserves-every-chunk-and-final-tail");
+            multichunkHash = retained.Sha256(); stop.store(true);
+            Check(!cancelled.OpenHandleCancelable(input.get(), nullptr, stop) && !cancelled.Snapshot(),
+                "cancelled-retention-has-no-partial-snapshot");
+        }
         std::cout << "{\"original_sha256\":" << mcpjson::WideToUtf8(mcpjson::Quote(snapshot->Sha256)) <<
             ",\"retained_bytes\":" << snapshot->Bytes.size() << ",\"retained_byte\":" << unsigned(snapshot->Bytes[0]) <<
-            ",\"replacement_sha256\":" << mcpjson::WideToUtf8(mcpjson::Quote(ContentHash::Bytes(replacement))) << "}\n";
+            ",\"replacement_sha256\":" << mcpjson::WideToUtf8(mcpjson::Quote(ContentHash::Bytes(replacement))) <<
+            ",\"multichunk_sha256\":" << mcpjson::WideToUtf8(mcpjson::Quote(multichunkHash)) << "}\n";
     }
     catch (const std::exception&) { Check(false, "reference-store-fixture-exception"); }
     // Only this invocation's exclusively created absolute directory is removed.

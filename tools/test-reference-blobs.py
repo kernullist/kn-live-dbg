@@ -21,6 +21,7 @@ def main():
     assert result["replacement_sha256"] == hashlib.sha256(b"B" * 512).hexdigest()
     assert result["original_sha256"] != result["replacement_sha256"]
     assert result["retained_bytes"] == 512 and result["retained_byte"] == ord("Q")
+    assert result["multichunk_sha256"] == hashlib.sha256(bytes((i * 131 + 17) & 255 for i in range(3 * 65536 + 17))).hexdigest()
     assert not directory.exists(), "fixture directory survived"
     print("Reference blob JSON oracle passed: exact object, independent SHA-256, cleanup")
 

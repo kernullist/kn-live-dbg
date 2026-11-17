@@ -861,6 +861,7 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
     if (!DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { return false; }
     const std::filesystem::path root = std::filesystem::absolute(unique);
     std::wstring pending, beforeStop, stopped, completed;
+    std::wstring contentPending, contentCompleted, contentBeforeStop, contentStopped;
     try
     {
         Source source(L"synthetic:reference-preparation");
@@ -911,6 +912,7 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         check(monitor.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
             source.Calls.empty(), "changed-file-rejects-prepared-metadata-before-target-read");
         auto fast = KmonImageTestAccess::Find(monitor, fastPath, Base, fastIdentity);
+        if (fast != nullptr) { KmonImageTestAccess::PrepareContent(monitor, *fast); }
         check(fast != nullptr && monitor.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedVerified &&
             !source.Calls.empty() && !release.load() && !held.Loaded, "unrelated-observation-completes-while-first-preparation-held");
         if (fast == nullptr) { throw std::runtime_error("fast reference"); }
@@ -963,6 +965,105 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
             work.second.PreparationCancelled && !work.second.Scheduling.Successful; }
         stopping.FindImageWork(slowPath, Base, identity);
         check(tokensCleared && active.load() == 2, "stop-clears-owned-tokens-and-never-starts-new-preparation");
+
+        // Content has its own observed admission and source-handle lifetime.
+        auto contentDisk = Fixture(&source.Bytes);
+        source.Calls.clear();
+        check(Write(slowPath, contentDisk) && Write(fastPath, contentDisk), "owned-content-reference-files");
+        std::atomic<bool> contentEntered{false}, contentRelease{false};
+        const auto contentOwner = std::make_unique<KernelMonitor>();
+        auto& content = *contentOwner;
+        content.Options.LogDirectory = (root / L"content-output").wstring();
+        content.ImageContents = std::make_unique<ImageReferencePreparation>(ImageReferencePreparation::Kind::Content,
+            [&](const auto& request, const auto& cancel, auto& value, auto& error)
+        {
+            if (request.Path == slowPath)
+            { contentEntered.store(true); while (!contentRelease.load() && !cancel.load()) { std::this_thread::yield(); } }
+            return ImageReferencePreparation::LoadContent(request, cancel, value, error);
+        });
+        auto contentSlow = KmonImageTestAccess::Find(content, slowPath, Base, identity);
+        auto contentFast = KmonImageTestAccess::Find(content, fastPath, Base, fastIdentity);
+        if (!contentSlow || !contentFast) { throw std::runtime_error("content metadata"); }
+        check(content.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            wait([&] { return contentEntered.load(); }) && source.Calls.empty() && !contentSlow->Scheduling.Attempted,
+            "content-worker-held-without-blocking-analysis-or-starting-target-read");
+        const auto contentTicket = contentSlow->ContentPreparationId, contentQueued = contentSlow->ContentQueuedMs;
+        content.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing);
+        check(contentSlow->ContentPreparationId == contentTicket && contentSlow->ContentQueuedMs == contentQueued &&
+            Text(content.ImageContents->Json(), L"admitted") == L"1", "pending-content-keeps-original-ticket-and-clock");
+        content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        check(wait([&] { return content.ImageContents->IsReady(contentFast->ContentPreparationId); }), "other-content-subject-prepares-beside-held-worker");
+        contentPending = content.ImageContents->Json();
+        HANDLE deniedWriter = CreateFileW(fastPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        const auto deniedError = GetLastError();
+        if (deniedWriter != INVALID_HANDLE_VALUE) { CloseHandle(deniedWriter); }
+        check(deniedWriter == INVALID_HANDLE_VALUE && deniedError == ERROR_SHARING_VIOLATION,
+            "ready-content-lease-denies-source-mutation-until-consumed");
+        check(content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedVerified &&
+            !contentRelease.load() && !source.Calls.empty(), "prepared-content-enables-actual-observation-beside-held-worker");
+        KernelMonitor::CapturedImageReads retained;
+        check(content.CapturedImageReadSets.Pop(&retained) && retained.Reference.Artifact &&
+            retained.Reference.Artifact->Bytes == contentDisk && retained.Reference.Artifact->Sha256 == ContentHash::Bytes(contentDisk) &&
+            retained.Reference.ContentRechecked && retained.Reference.ContentStable,
+            "worker-prepared-original-bytes-and-final-content-fence-reach-publication-queue");
+        const auto contentSuccess = contentFast->ContentSuccessMs, targetSuccess = contentFast->Scheduling.LastSuccess;
+        check(DeleteFileW(fastPath.c_str()) != FALSE && retained.Reference.Artifact && retained.Reference.Artifact->Bytes == contentDisk,
+            "source-lease-released-before-publication-while-original-bytes-remain");
+        contentFast->NextSweepDueMs = 0; contentFast->LastReferenceCheckMs = GetTickCount64();
+        const auto callsBeforeContentFailure = source.Calls.size();
+        content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        check(wait([&] { return content.ImageContents->IsReady(contentFast->ContentPreparationId); }), "actual-content-open-failure-completes");
+        contentFast->LastReferenceCheckMs = GetTickCount64(); // Exercise content failure without the independent cache refresh.
+        content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        check(contentFast->ContentOutcome == ImageReferencePreparation::Outcome::Unavailable &&
+            contentFast->ContentSuccessMs == contentSuccess && contentFast->Scheduling.LastSuccess == targetSuccess &&
+            source.Calls.size() == callsBeforeContentFailure, "content-failure-cannot-renew-success-or-read-target");
+        ++contentSlow->RetentionEpisode;
+        contentRelease.store(true);
+        check(wait([&] { return content.ImageContents->IsReady(contentSlow->ContentPreparationId); }), "old-content-episode-ready");
+        content.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing);
+        check(Text(content.ImageContents->Json(), L"stale_completions") == L"1" && contentSlow->ContentSuccessMs == 0 &&
+            source.Calls.size() == callsBeforeContentFailure, "stale-content-lease-never-qualifies-new-episode");
+        contentCompleted = content.ImageContents->Json();
+
+        std::atomic<unsigned> contentActive{0};
+        const auto contentStopOwner = std::make_unique<KernelMonitor>();
+        auto& contentStop = *contentStopOwner;
+        contentStop.ImageContents = std::make_unique<ImageReferencePreparation>(ImageReferencePreparation::Kind::Content,
+            [&](const auto&, const auto& cancel, auto&, auto&)
+        { ++contentActive; while (!cancel.load()) { std::this_thread::yield(); } return ImageReferencePreparation::Outcome::Cancelled; });
+        for (unsigned i = 0; i < 8; ++i)
+        {
+            auto subject = identity; subject.ProcessId += i;
+            auto work = KmonImageTestAccess::Find(contentStop, slowPath, Base + i * 4096, subject);
+            if (!work) { throw std::runtime_error("stop metadata"); }
+            contentStop.QueueImageReferenceContent(*work);
+        }
+        check(wait([&] { return contentActive.load() == 2; }), "observed-content-workers-before-stop");
+        contentBeforeStop = contentStop.ImageContents->Json();
+        contentStop.StopRequested.store(true);
+        contentStop.ImageContents->RequestStop();
+        bool pendingCancellationPreserved = true;
+        for (auto& work : contentStop.ImageWork)
+        {
+            const auto ticket = work.second.ContentPreparationId;
+            contentStop.QueueImageReferenceContent(work.second);
+            pendingCancellationPreserved &= ticket != 0 && work.second.ContentPreparationId == ticket && work.second.ContentExpired == 0;
+        }
+        check(pendingCancellationPreserved && Text(contentBeforeStop, L"running") == L"2" &&
+            Text(contentBeforeStop, L"queued") == L"6" && contentStop.Stop(nullptr),
+            "actual-stop-closes-content-admission-and-joins-two-running-six-queued");
+        contentStopped = contentStop.ImageContents->Json();
+        bool contentTokensCleared = true;
+        for (auto& work : contentStop.ImageWork)
+        {
+            contentTokensCleared &= work.second.ContentPreparationId == 0 && work.second.ContentCancelled && work.second.ContentSuccessMs == 0;
+            contentStop.QueueImageReferenceContent(work.second);
+        }
+        check(contentTokensCleared && contentActive.load() == 2 && Text(contentStopped, L"resident") == L"0" &&
+            Text(contentStopped, L"cancelled_queued") == L"6" && Text(Raw(contentStopped, L"shutdown"), L"cancelled") == L"2",
+            "content-stop-leaves-no-owners-tickets-or-late-restart");
     }
     catch (...) { check(false, "fixture-exception"); }
     std::error_code cleanupError;
@@ -973,7 +1074,11 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         *diagnostics = L"{\"schema\":\"kn.image_preparation_test.v1\",\"passed\":" + std::wstring(failures == 0 ? L"true" : L"false") +
             L",\"checks\":" + std::to_wstring(checks) + L",\"driver_loaded\":false,\"corpus\":\"owned_reference_files_controlled_worker_gates_synthetic_target\","
             L"\"pending\":" + (pending.empty() ? L"null" : pending) + L",\"completed\":" + (completed.empty() ? L"null" : completed) +
-            L",\"before_stop\":" + (beforeStop.empty() ? L"null" : beforeStop) + L",\"stopped\":" + (stopped.empty() ? L"null" : stopped) + L"}";
+            L",\"before_stop\":" + (beforeStop.empty() ? L"null" : beforeStop) + L",\"stopped\":" + (stopped.empty() ? L"null" : stopped) +
+            L",\"content_pending\":" + (contentPending.empty() ? L"null" : contentPending) +
+            L",\"content_completed\":" + (contentCompleted.empty() ? L"null" : contentCompleted) +
+            L",\"content_before_stop\":" + (contentBeforeStop.empty() ? L"null" : contentBeforeStop) +
+            L",\"content_stopped\":" + (contentStopped.empty() ? L"null" : contentStopped) + L"}";
     }
     std::fprintf(stderr, "[image.preparation] checks=%u failed=%u\n", checks, failures);
     return failures == 0;
@@ -1054,12 +1159,15 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         check(work.RetentionEpisode != oldEpisode && work.Scheduling.LastGapFreeEpisode == oldEpisode &&
             work.Scheduling.FirstSeen == first.FirstSeen && work.Scheduling.Pending && work.Sweep.NextRange == 1,
             "new-reference-cannot-inherit-old-episode-completion");
+        KmonImageTestAccess::PrepareContent(monitor, work);
         monitor.StopRequested.store(true);
         const auto callsBeforeStop = source.Calls.size();
         const auto successBeforeStop = work.Scheduling.LastSuccess;
+        const auto contentSuccessBeforeStop = work.ContentSuccessMs, contentFinishedBeforeStop = work.ContentFinishedMs;
         KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Scheduling.LastGapFreeEpisode == oldEpisode && work.Scheduling.Pending &&
             work.Scheduling.LastSuccess == successBeforeStop && source.Calls.size() == callsBeforeStop &&
+            work.ContentCancelled && work.ContentSuccessMs == contentSuccessBeforeStop && work.ContentFinishedMs == contentFinishedBeforeStop &&
             monitor.ImageTimings.Snapshot(true).SuccessfulTurn.Samples == 0 && monitor.ImageTimings.Snapshot(true).FailedTurn.Samples == 1,
             "shutdown-cancellation-cannot-renew-success-or-call-target");
         cancelled = monitor.ImageSchedulingJson(GetTickCount64());

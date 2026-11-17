@@ -2,6 +2,7 @@
 #include "KmonFairRing.h"
 #include "KmonCaptureScheduling.h"
 #include <condition_variable>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -18,7 +19,7 @@ namespace
             p.Sweep.Ranges.capacity() * sizeof(ObservationRange);
         for (const auto& section : r.Sections) { bytes += section.Name.capacity() * sizeof(wchar_t); }
         for (const auto& range : r.Rel32Overrides) { bytes += range.Targets.capacity() * sizeof(uint32_t); }
-        return bytes;
+        return bytes + (p.Content ? p.Content->RetainedBytes() : 0);
     }
 }
 
@@ -33,6 +34,7 @@ struct ImageReferencePreparation::State
     struct Timing
     {
         uint64_t Attempts = 0, Prepared = 0, Failed = 0, Cancelled = 0;
+        uint64_t RetainedSnapshots = 0, UnretainedLeases = 0;
         KmonLatencyHistogram Queue, Service, PreparedService, FailedService, CancelledService, AdmissionToReady;
     };
     struct Deferred { Request Work; Admission Reason; uint64_t First = 0, Last = 0, Attempts = 0; };
@@ -47,11 +49,13 @@ struct ImageReferencePreparation::State
     std::array<std::thread, WorkerCount> Threads;
     std::array<Timing, 2> Timings;
     Loader Load;
+    Kind Mode = Kind::Metadata;
     bool Started = false, Closing = false;
     size_t Running = 0, Peak = 0;
     uint64_t NextId = 0, Admitted = 0, Refused = 0, Invalid = 0, Applied = 0, Stale = 0;
     uint64_t CancelledQueued = 0, DiscardedReady = 0, DeferredEvicted = 0, Abandoned = 0;
     uint64_t InvalidClocks = 0, CancelIoRequests = 0, CancelIoAccepted = 0, WorkerFaults = 0;
+    uint64_t ExpiredReady = 0;
     KmonLatencyHistogram ReadyToConsumer;
 
     void RemoveQueued(uint64_t id, const ObservationIdentity::Key& subject)
@@ -62,17 +66,29 @@ struct ImageReferencePreparation::State
         queue.erase(std::remove(queue.begin(), queue.end(), id), queue.end());
         if (queue.empty()) { Queues.erase(it); Order.Remove(subject); }
     }
+    void ExpireReady(uint64_t now)
+    {
+        if (Mode != Kind::Content) { return; }
+        for (auto it = Ready.begin(); it != Ready.end();)
+        {
+            const auto& result = *Entries.at(*it)->Output;
+            if (result.Finished > now || now - result.Finished < ContentReadyLifetimeMs) { ++it; continue; }
+            Entries.erase(*it); it = Ready.erase(it);
+            ++ExpiredReady; ++DiscardedReady;
+        }
+    }
 };
 
-ImageReferencePreparation::ImageReferencePreparation(Loader loader) : Data(std::make_unique<State>())
-{ Data->Load = loader ? std::move(loader) : LoadNative; }
+ImageReferencePreparation::ImageReferencePreparation(Loader loader) : ImageReferencePreparation(Kind::Metadata, std::move(loader)) {}
+ImageReferencePreparation::ImageReferencePreparation(Kind kind, Loader loader) : Data(std::make_unique<State>())
+{ Data->Mode = kind; Data->Load = loader ? std::move(loader) : kind == Kind::Content ? LoadContent : LoadNative; }
 ImageReferencePreparation::~ImageReferencePreparation() { RequestStop(); Join(); }
 
-const wchar_t* ImageReferencePreparation::OutcomeName(Outcome outcome)
+const wchar_t* ImageReferencePreparation::OutcomeName(Outcome outcome, Kind kind)
 {
     switch (outcome)
     {
-    case Outcome::Prepared: return L"prepared_metadata";
+    case Outcome::Prepared: return kind == Kind::Content ? L"prepared_content_lease" : L"prepared_metadata";
     case Outcome::Unavailable: return L"reference_unavailable";
     case Outcome::NoExecutableRanges: return L"no_supported_executable_ranges";
     case Outcome::StorageLimit: return L"prepared_storage_limit";
@@ -103,6 +119,16 @@ ImageReferencePreparation::Outcome ImageReferencePreparation::LoadNative(const R
     return stop.load() ? Outcome::Cancelled : Outcome::Prepared;
 }
 
+ImageReferencePreparation::Outcome ImageReferencePreparation::LoadContent(const Request& work,
+    const std::atomic<bool>& stop, Prepared& value, std::wstring& error)
+{
+    if (stop.load()) { return Outcome::Cancelled; }
+    value.Content = std::make_unique<ExecutableReferenceLease>();
+    if (!value.Content->Open(work.Path, stop))
+    { error = L"reference content lease unavailable"; return stop.load() ? Outcome::Cancelled : Outcome::Unavailable; }
+    return stop.load() ? Outcome::Cancelled : Outcome::Prepared;
+}
+
 void ImageReferencePreparation::Start()
 {
     auto& s = *Data;
@@ -129,6 +155,7 @@ ImageReferencePreparation::Ticket ImageReferencePreparation::Submit(Request work
     Start();
     auto& s = *Data;
     std::lock_guard<std::mutex> lock(s.Mutex);
+    s.ExpireReady(GetTickCount64());
     if (work.Key.empty() || work.Key.size() > 65536 || work.Path.empty() || work.Path.size() > 32768 ||
         work.Key.find(L'\0') != std::wstring::npos || work.Path.find(L'\0') != std::wstring::npos ||
         work.Identity.BootId.empty() || work.Identity.BootId.size() > 128 || work.Base == 0 || work.Episode == 0 ||
@@ -179,8 +206,15 @@ void ImageReferencePreparation::Run()
         std::shared_ptr<State::Entry> entry;
         {
             std::unique_lock<std::mutex> lock(s.Mutex);
-            s.Changed.wait(lock, [&] { return s.Closing || (!s.Queues.empty() && s.Ready.size() + s.Running < ResultSlots); });
+            const auto available = [&]
+            {
+                s.ExpireReady(GetTickCount64());
+                return s.Closing || (!s.Queues.empty() && s.Ready.size() + s.Running < ResultSlots);
+            };
+            if (s.Mode == Kind::Content) { s.Changed.wait_for(lock, std::chrono::milliseconds(100), available); }
+            else { s.Changed.wait(lock, available); }
             if (s.Closing) { return; }
+            if (s.Queues.empty() || s.Ready.size() + s.Running >= ResultSlots) { continue; }
             std::optional<ObservationIdentity::Key> oldest;
             uint64_t age = UINT64_MAX;
             if (s.Order.MayBorrow()) for (const auto& subject : s.Order.Keys())
@@ -220,6 +254,10 @@ void ImageReferencePreparation::Run()
             if (result.Status == Outcome::Prepared) { ++t.Prepared; }
             else if (result.Status == Outcome::Cancelled) { ++t.Cancelled; }
             else { ++t.Failed; }
+            if (result.Status == Outcome::Prepared && s.Mode == Kind::Content && result.Value->Content)
+            {
+                if (result.Value->Content->HasSnapshot()) { ++t.RetainedSnapshots; } else { ++t.UnretainedLeases; }
+            }
             if (result.Queued <= result.Started && result.Started <= result.Finished)
             { t.Queue.Add(result.Started - result.Queued); t.Service.Add(result.Finished - result.Started);
               (result.Status == Outcome::Prepared ? t.PreparedService : result.Status == Outcome::Cancelled ? t.CancelledService : t.FailedService).Add(result.Finished - result.Started);
@@ -242,16 +280,31 @@ void ImageReferencePreparation::Run()
     }
 }
 
-std::unique_ptr<ImageReferencePreparation::Result> ImageReferencePreparation::Take()
+std::unique_ptr<ImageReferencePreparation::Result> ImageReferencePreparation::Take(uint64_t requestedId)
 {
     auto& s = *Data;
     std::lock_guard<std::mutex> lock(s.Mutex);
-    if (s.Ready.empty()) { return {}; }
-    const auto id = s.Ready.front();
+    s.ExpireReady(GetTickCount64());
+    const auto ready = requestedId == 0 ? s.Ready.begin() : std::find(s.Ready.begin(), s.Ready.end(), requestedId);
+    if (ready == s.Ready.end()) { return {}; }
+    const auto id = *ready;
     auto output = std::move(s.Entries.at(id)->Output);
-    s.Ready.erase(s.Ready.begin()); s.Entries.erase(id);
+    s.Ready.erase(ready); s.Entries.erase(id);
     s.Changed.notify_all();
     return output;
+}
+bool ImageReferencePreparation::Contains(uint64_t id)
+{
+    auto& s = *Data; std::lock_guard<std::mutex> lock(s.Mutex);
+    s.ExpireReady(GetTickCount64());
+    return s.Entries.count(id) != 0;
+}
+bool ImageReferencePreparation::IsReady(uint64_t id)
+{
+    auto& s = *Data; std::lock_guard<std::mutex> lock(s.Mutex);
+    s.ExpireReady(GetTickCount64());
+    const auto found = s.Entries.find(id);
+    return found != s.Entries.end() && found->second->Ready;
 }
 void ImageReferencePreparation::Disposition(const Result& result, bool applied, uint64_t now)
 {
@@ -305,6 +358,7 @@ void ImageReferencePreparation::Reset()
 {
     RequestStop(); Join();
     auto replacement = std::make_unique<State>();
+    replacement->Mode = Data->Mode;
     replacement->Load = Data->Load;
     Data = std::move(replacement); // Owner has stopped all producers/readers.
 }
@@ -319,7 +373,8 @@ std::wstring ImageReferencePreparation::Json(uint64_t now) const
         L",\"p99_upper_ms\":" + n(histogram.UpperPercentile(99)) + L",\"max_ms\":" + n(histogram.MaximumMs) + L"}"; };
     const auto timing = [&](const State::Timing& t)
     { return L"{\"attempts\":" + n(t.Attempts) + L",\"prepared\":" + n(t.Prepared) + L",\"failed\":" + n(t.Failed) +
-        L",\"cancelled\":" + n(t.Cancelled) + L",\"queue_wait\":" + h(t.Queue) + L",\"service\":" + h(t.Service) +
+        L",\"cancelled\":" + n(t.Cancelled) + L",\"retained_snapshots\":" + n(t.RetainedSnapshots) +
+        L",\"unretained_leases\":" + n(t.UnretainedLeases) + L",\"queue_wait\":" + h(t.Queue) + L",\"service\":" + h(t.Service) +
         L",\"prepared_service\":" + h(t.PreparedService) + L",\"failed_service\":" + h(t.FailedService) + L",\"cancelled_service\":" + h(t.CancelledService) +
         L",\"admission_to_ready\":" + h(t.AdmissionToReady) + L"}"; };
     const auto scope = [&](const Request& w)
@@ -338,7 +393,7 @@ std::wstring ImageReferencePreparation::Json(uint64_t now) const
         auto row = scope(r.Work) + L",\"id\":" + n(r.Id) + L",\"queued_ms\":" + n(r.Queued) +
             L",\"age_ms\":" + (r.Queued <= now ? n(now - r.Queued) : L"null") + L",\"state\":" +
             mcpjson::Quote(e.Ready ? L"ready" : e.Running ? L"running" : L"queued") + L",\"outcome\":" +
-            (e.Ready ? mcpjson::Quote(OutcomeName(r.Status)) : L"null") + L"}";
+            (e.Ready ? mcpjson::Quote(OutcomeName(r.Status, s.Mode)) : L"null") + L"}";
         const auto needed = row.size() + (rows.empty() ? 0 : 1);
         if (needed > 65536 - characters) { continue; }
         characters += needed; ++count; if (!rows.empty()) { rows += L","; } rows += row;
@@ -351,7 +406,8 @@ std::wstring ImageReferencePreparation::Json(uint64_t now) const
         if (needed > 65536 - characters) { continue; }
         characters += needed; ++deferredCount; if (!deferred.empty()) { deferred += L","; } deferred += row;
     }
-    return L"{\"schema\":\"kn.image_reference_preparation.v1\",\"success_scope\":\"metadata_prepared_not_live_image_verified\","
+    return L"{\"schema\":\"kn.image_reference_preparation.v1\",\"phase\":" + mcpjson::Quote(s.Mode == Kind::Content ? L"content" : L"metadata") +
+        L",\"success_scope\":" + mcpjson::Quote(s.Mode == Kind::Content ? L"file_lease_prepared_not_live_image_verified" : L"metadata_prepared_not_live_image_verified") + L","
         L"\"clock_domain\":\"GetTickCount64_ms\",\"hard_deadline_enforced\":false,\"native_io_cancellation_guaranteed\":false,"
         L"\"shutdown_in_normal_samples\":false,\"policy\":\"subject_ring_bounded_oldest_loan.v1\",\"workers\":" + n(WorkerCount) +
         L",\"capacity\":" + n(Capacity) + L",\"subject_capacity\":" + n(SubjectCapacity) + L",\"result_slots\":" + n(ResultSlots) +
@@ -360,6 +416,7 @@ std::wstring ImageReferencePreparation::Json(uint64_t now) const
         L",\"admitted\":" + n(s.Admitted) + L",\"refused\":" + n(s.Refused) + L",\"invalid\":" + n(s.Invalid) +
         L",\"applied\":" + n(s.Applied) + L",\"stale_completions\":" + n(s.Stale) + L",\"cancelled_queued\":" + n(s.CancelledQueued) +
         L",\"discarded_ready\":" + n(s.DiscardedReady) + L",\"abandoned\":" + n(s.Abandoned) +
+        L",\"expired_ready\":" + n(s.ExpiredReady) + L",\"ready_lifetime_ms\":" + n(s.Mode == Kind::Content ? ContentReadyLifetimeMs : 0) +
         L",\"ready_retained_estimate_bytes\":" + n(retained) + L",\"per_result_estimate_limit\":" + n(MaximumPreparedBytes) +
         L",\"hard_process_memory_bound\":false,\"invalid_clocks\":" + n(s.InvalidClocks) + L",\"debt_loans\":" + n(s.Order.DebtLoans()) +
         L",\"cancel_io_requests\":" + n(s.CancelIoRequests) + L",\"cancel_io_accepted\":" + n(s.CancelIoAccepted) +

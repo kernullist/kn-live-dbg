@@ -142,6 +142,7 @@ namespace
 void KernelMonitor::ResetPipeline()
 {
     ImageReferences->Reset();
+    ImageContents->Reset();
     {
         std::lock_guard<std::mutex> lock(CapturesMutex);
         CandidateCaptures.clear();
@@ -2014,6 +2015,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"execution_references_peak"] = std::to_wstring(ExecutionReferencePeak);
         event.Evidence[L"reference_scheduling_json"] = ExecutionReferences.Json(GetTickCount64());
         event.Evidence[L"image_reference_preparation_json"] = ImageReferences->Json(now);
+        event.Evidence[L"image_content_preparation_json"] = ImageContents->Json(now);
         event.Evidence[L"reference_scan_cursors"] = std::to_wstring(ReferenceScanCursors.size());
         event.Evidence[L"reference_cursor_evicted"] = std::to_wstring(ReferenceCursorEvicted);
         event.Evidence[L"reference_scan_policy"] = L"rotating static sources: IAT/table 16, kernel tables 64; not complete path coverage";
@@ -2483,7 +2485,7 @@ bool KmonPipelineSelfTest()
     {
         return false;
     }
-    const auto monitorOwner = std::make_unique<KernelMonitor>();
+    auto monitorOwner = std::make_unique<KernelMonitor>();
     auto& monitor = *monitorOwner;
     monitor.Options.LogDirectory = unique;
     monitor.StartTickMs.store(GetTickCount64());
@@ -3634,6 +3636,7 @@ bool KmonPipelineSelfTest()
             // New controlled preparation phase after the shutdown assertions.
             monitor.StopRequested.store(false);
             monitor.ImageReferences->Reset();
+            monitor.ImageContents->Reset();
             auto work = KmonImageTestAccess::Find(monitor, referencePath, 0x140000000ull, identity);
             if (work == nullptr)
             {
@@ -3804,20 +3807,22 @@ bool KmonPipelineSelfTest()
         ok = false;
     }
     monitor.Stop(nullptr);
-    DeleteFileW(referencePath.c_str());
     if (allocation != nullptr)
     {
         VirtualFree(allocation, 0, MEM_RELEASE);
     }
-    for (const auto& path : monitor.SessionCapturePaths())
-    {
-        DeleteFileW(path.c_str());
-    }
-    for (const auto& path : monitor.SessionLogPaths())
-    {
-        DeleteFileW(path.c_str());
-    }
-    RemoveDirectoryW((std::wstring(unique) + L"\\captures").c_str());
-    RemoveDirectoryW(unique);
+    // This invocation exclusively created unique. Release journals/store leases
+    // before removing its full fixture tree; deleting only top-level logs left
+    // nested evidence behind while the self-test still reported success.
+    monitorOwner.reset();
+    std::error_code cleanupError;
+    const auto ownedRoot = std::filesystem::absolute(unique, cleanupError).lexically_normal();
+    const bool ownedPath = !cleanupError && ownedRoot.is_absolute() && ownedRoot.has_filename() &&
+        std::filesystem::equivalent(ownedRoot.parent_path(), std::filesystem::path(temporary), cleanupError) && !cleanupError;
+    if (ownedPath) { std::filesystem::remove_all(ownedRoot, cleanupError); }
+    std::error_code existsError;
+    const bool cleaned = ownedPath && !cleanupError && !std::filesystem::exists(ownedRoot, existsError) && !existsError;
+    std::fprintf(stderr, "[kmon.pipeline] owned_fixture_cleanup=%s\n", cleaned ? "passed" : "failed");
+    ok = cleaned && ok;
     return ok;
 }

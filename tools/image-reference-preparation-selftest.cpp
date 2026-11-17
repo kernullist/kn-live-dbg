@@ -1,5 +1,6 @@
 #include "../user/ImageReferencePreparation.h"
 #include "../user/McpJson.h"
+#include "../user/ContentHash.h"
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -35,7 +36,7 @@ int wmain(int argc, wchar_t** argv)
     unsigned checks = 0, failures = 0;
     const auto check = [&](bool ok, const char* name)
     { ++checks; if (!ok) { ++failures; std::cerr << "[reference.prepare] FAIL " << name << '\n'; } return ok; };
-    std::wstring capacity, resultBound, native, admissions, dispatch, fixed;
+    std::wstring capacity, resultBound, native, admissions, dispatch, fixed, content, expired;
     try
     {
         {
@@ -138,6 +139,61 @@ int wmain(int argc, wchar_t** argv)
                 "cancellation scope does not contaminate later ordinary parsing");
         }
         {
+            wchar_t executable[32768]{}, directory[MAX_PATH]{}, path[MAX_PATH]{};
+            if (!GetModuleFileNameW(nullptr, executable, 32768) || !GetTempPathW(MAX_PATH, directory) ||
+                !GetTempFileNameW(directory, L"knc", 0, path)) { throw std::runtime_error("owned content fixture"); }
+            struct Cleanup { const wchar_t* Path; ~Cleanup() { DeleteFileW(Path); } } cleanup{path};
+            if (!CopyFileW(executable, path, FALSE)) { throw std::runtime_error("owned executable copy"); }
+            const auto writable = [&]
+            {
+                const auto file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, 0, nullptr);
+                if (file == INVALID_HANDLE_VALUE) { return false; }
+                CloseHandle(file); return true;
+            };
+            Engine engine(Engine::Kind::Content);
+            auto work = Work(404, 0x140000000ull); work.Path = path;
+            const auto first = engine.Submit(work);
+            check(first.Status == Engine::Admission::Queued && Wait([&] { return engine.IsReady(first.Id); }), "native content ready");
+            check(!engine.Take(first.Id + 1) && engine.Contains(first.Id) && !writable(), "exact-ticket take preserves neighbor and source lease");
+            auto result = engine.Take(first.Id);
+            ExecutableSweepReference snapshot;
+            if (result && result->Value && result->Value->Content) { result->Value->Content->Capture(&snapshot); }
+            check(result && result->Status == Engine::Outcome::Prepared && snapshot.Artifact &&
+                snapshot.Artifact->Sha256 == ContentHash::Bytes(snapshot.Artifact->Bytes) && result->Value->Content->Unchanged(),
+                "content worker retains and hashes actual source with final fence");
+            if (result) { engine.Disposition(*result, true); }
+            result.reset();
+            check(writable() && snapshot.Artifact && !snapshot.Artifact->Bytes.empty(), "consumer release closes handles while immutable bytes survive");
+            {
+                const auto file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                const std::unique_ptr<void, decltype(&CloseHandle)> owner(file == INVALID_HANDLE_VALUE ? nullptr : file, &CloseHandle);
+                std::atomic<bool> cancel{true}; ReferenceArtifact cancelled, ordinary;
+                check(owner && !cancelled.OpenHandleCancelable(file, nullptr, cancel) && !cancelled.Snapshot() &&
+                    ordinary.OpenHandle(file, nullptr) && ordinary.Snapshot(), "cancelled retention publishes no partial bytes and ordinary retention stays available");
+            }
+            const auto aging = engine.Submit(work);
+            check(Wait([&] { return engine.IsReady(aging.Id); }) && !writable(), "unconsumed content owns bounded ready lease");
+            check(Wait(writable) && !engine.Contains(aging.Id), "idle dispatcher expiry closes file without consumer query or stop");
+            expired = engine.Json();
+            const auto large = CreateFileW(path, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            LARGE_INTEGER end{}; end.QuadPart = ReferenceArtifactMaxBytes + 1;
+            const bool enlarged = large != INVALID_HANDLE_VALUE && SetFilePointerEx(large, end, nullptr, FILE_BEGIN) && SetEndOfFile(large);
+            if (large != INVALID_HANDLE_VALUE) { CloseHandle(large); }
+            check(enlarged, "owned oversized reference control");
+            const auto oversize = engine.Submit(work);
+            check(Wait([&] { return engine.IsReady(oversize.Id); }), "oversized content attempt completes");
+            result = engine.Take(oversize.Id); snapshot = {};
+            if (result && result->Value && result->Value->Content) { result->Value->Content->Capture(&snapshot); }
+            check(result && result->Status == Engine::Outcome::Prepared && !snapshot.Artifact &&
+                snapshot.CaptureStatus == L"retention_unavailable", "oversized file preserves explicit unretained source lease");
+            if (result) { engine.Disposition(*result, true); }
+            result.reset(); content = engine.Json();
+            engine.RequestStop(); engine.Join(); engine.Reset();
+            check(Text(engine.Json(), L"phase") == L"content" && Text(engine.Json(), L"resident") == L"0", "content mode survives owner reset");
+            check(DeleteFileW(path) != FALSE, "all owned content handles released before fixture cleanup");
+        }
+        {
             Engine engine([](const auto&, const auto&, auto&, auto&) -> Engine::Outcome { throw std::runtime_error("controlled loader fault"); });
             auto work = Work(42, 0x1000);
             const auto original = engine.Submit(work);
@@ -157,7 +213,8 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"{\"schema\":\"kn.image_preparation_core.v1\",\"passed\":" << (failures == 0 ? L"true" : L"false") <<
             L",\"checks\":" << checks << L",\"initial_turns\":2,\"admissions\":[" << admissions << L"],\"dispatch\":[" << dispatch <<
             L"],\"fixed\":" << (fixed.empty() ? L"null" : fixed) << L",\"capacity\":" << (capacity.empty() ? L"null" : capacity) <<
-            L",\"result_bound\":" << (resultBound.empty() ? L"null" : resultBound) << L",\"native\":" << (native.empty() ? L"null" : native) << L"}\n";
+            L",\"result_bound\":" << (resultBound.empty() ? L"null" : resultBound) << L",\"native\":" << (native.empty() ? L"null" : native) <<
+            L",\"content\":" << (content.empty() ? L"null" : content) << L",\"expired\":" << (expired.empty() ? L"null" : expired) << L"}\n";
     }
     std::cerr << "[reference.prepare] checks=" << checks << " failed=" << failures << '\n';
     return failures == 0 ? 0 : 1;

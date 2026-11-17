@@ -7,6 +7,88 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image reference content preparation checkpoint: 2026-11-18
+
+Recorded image comparisons now prepare their exact-file lease, original bytes
+and hash on dedicated content workers, separately from metadata preparation.
+The consumer takes a matching ticket, keeps the original final content and
+identity fences, and releases source handles before publication. Unused ready
+leases expire cooperatively. See
+[reference content preparation](ARCHITECTURE.md#asynchronous-image-reference-content-preparation).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- The preparation harness built under `/W4 /WX`; its independent Python oracle
+  passed **74 assertions**. New controls cover exact-ticket consumption, native
+  file write exclusion, source-handle release while immutable bytes survive,
+  oversized unretained leases, cancellation and mode reset. Idle expiry is
+  observed through file write availability before querying the engine again.
+  Existing admission, dispatch, result-bound and shutdown controls also passed.
+- The actual `--self-test image-preparation` passed **36 checks** and its oracle
+  passed **73**. Content controls observe another subject's preparation and
+  target comparison beside a held worker, original bytes reaching the writer
+  queue after the final content fence, source deletion before publication,
+  native open failure after success, stale episodes and two-running/six-queued
+  shutdown. Metadata controls remain in the same suite.
+- Reference blob validation passed **26 native checks** and its independent
+  SHA-256/cleanup oracle, including three full read/hash chunks and a final tail.
+  Shared-verifier slice controls passed **484 native / 385 slice / 270 sweep /
+  1,414 graph / 699 scope-publication / 868 authorized-change checks**. The
+  retained-byte assertions were preserved. The harness did not exercise its
+  ancestor-switch control; no new claim is made for that race or journal mode.
+- Shared KMON core validation passed its image/relocation/coverage, routing,
+  scheduling and hunting checks under `/W4 /WX`, including **32,796 reference /
+  521 publication / 11,345 hunting checks** and independent **12,989 reference /
+  2,284 publication assertions**. Product image/reference/capture/publication/
+  layout oracles passed **968 / 50 / 23 / 43 / 16 assertions**.
+- The final isolated `--self-test all` passed **28 timeline / 102 MCP /
+  121 KMON image-read / 319 image-scheduling / 36 image-preparation /
+  30 publication-writer / 21 layout-scheduler / 564 console /
+  3,043 command-route / 68 remote / 4 connect-option checks**, and reported
+  successful owned pipeline-fixture cleanup. Compiled capabilities expose
+  **49 contracts / 261 routes**; the generated support matrix matched.
+
+Review fixed shutdown consumption that could rewrite a prior content success,
+and kept tickets removed during stop out of expiry accounting. An initial
+diagnostic expansion failed the existing 64-scope control; null content state
+before admission restored it without increasing the size limit or weakening
+assertions. The final host audit also found that an existing pipeline fixture
+removed only top-level files. It now destroys its monitor/store leases before
+removing its verified owned tree and fails if cleanup is incomplete. The
+pre-fix owned corpus was retained privately for inspection; subsequent validation
+removed its newly created temporary tree.
+
+Final review found no additional actionable defects in the reviewed scope.
+Final Release product SHA-256:
+`744461ec74634f830ace6e60d74e1872f45dcaf601343300107ad5a032ff6e98`.
+Preparation harness SHA-256:
+`47d77f5434a5642bd145fba711e2ed0d993c3a1c32571fc7cb70a3a215c798e3`.
+Reference blob harness SHA-256:
+`b67d77f10da1c4fbd1d38635cfc46fa7de8f79913d80c6e587f0f7686f596571`.
+Shared KMON core harness SHA-256:
+`d413d7bd0a0f0450d4f2e27ea9015aa8ed5b306aff3634155029e465faac1625`.
+Shared-verifier slice harness SHA-256:
+`6863c95bce1ce5062fe333b7b15211f1af47c4bb75f8c66f80d240d6aebbbf0d`.
+The product build retained existing fixture conversion/alignment warnings.
+ASan remains blocked by the previously recorded host startup interception
+failure; no new ASan success is claimed.
+
+At **01:38 KST**, boot time remained **12:49:00.5 KST on November 17**. No new
+reboot/BugCheck events or dump files appeared after the metadata checkpoint.
+No task process/driver, owned temporary preparation/writer fixture or parser
+preparation/profile residue remained. The 33 completed parser caches,
+BFE/mpssvc, firewall profiles and EFS running/manual baseline were unchanged.
+
+These results cover asynchronous content retention and per-comparison source
+ownership, not a measured workload SLO. Alias/cache opens, page reads and final
+file/content/target fences remain synchronous. Native calls and handle closure
+have no hard deadline; blocked native-I/O cancellation latency and native
+thread-creation exhaustion were not injected. Generic stage budgets/dependencies,
+whole-collection timing and whole-source maximum unobserved intervals remain open.
+
 ## Image reference metadata preparation checkpoint: 2026-11-18
 
 PE metadata parsing and executable sweep-range construction now run on two

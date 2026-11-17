@@ -120,6 +120,11 @@ def main():
     check(missing["pending_since_ms"] == missing["first_seen_ms"] and missing["last_successful_slice_ms"] is None and
           missing["first_parser_attempt_ms"] is None and missing["last_attempt_ms"] is not None, "failed metadata is attempted, not read or successful")
     check(data["bounded"]["details_omitted"] == "6", "long scope and capacity omissions explicit")
+    check(all(item["content_preparation"] is None for item in data["bounded"]["details"]),
+          "unattempted content has no invented completion and preserves exact-scope capacity")
+    check(cancelled["content_preparation"]["cancelled"] and row["content_preparation"]["active_id"] is None and
+          row["content_preparation"]["success_episode"] == row["retention_episode"],
+          "content cancellation and current successful preparation remain separate")
     for scenario in data["scenarios"]:
         model(check, scenario)
     invalid = subprocess.run([str(exe), "--self-test", "image-scheduler", "extra"], capture_output=True,

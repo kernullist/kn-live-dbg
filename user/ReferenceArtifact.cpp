@@ -32,8 +32,9 @@ namespace
         return text;
     }
 
-    bool Read(HANDLE file, std::vector<uint8_t>* bytes, size_t maximumBytes)
+    bool Read(HANDLE file, std::vector<uint8_t>* bytes, size_t maximumBytes, const std::atomic<bool>* stop = nullptr)
     {
+        if (stop != nullptr && stop->load()) { SetLastError(ERROR_OPERATION_ABORTED); return false; }
         LARGE_INTEGER size{}, zero{};
         if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
             static_cast<uint64_t>(size.QuadPart) > (std::min)(maximumBytes, ReferenceArtifactMaxBytes) ||
@@ -46,6 +47,8 @@ namespace
         const uint64_t started = GetTickCount64();
         while (offset < bytes->size())
         {
+            if (stop != nullptr && stop->load())
+            { bytes->clear(); SetLastError(ERROR_OPERATION_ABORTED); return false; }
             DWORD received = 0;
             const DWORD count = static_cast<DWORD>((std::min)(bytes->size() - offset, size_t{65536}));
             if (GetTickCount64() - started > 30000 || !ReadFile(file, bytes->data() + offset, count, &received, nullptr) ||
@@ -87,23 +90,34 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size
 
 bool ReferenceArtifact::OpenHandle(HANDLE file, std::wstring* error, size_t maximumBytes)
 {
+    return OpenHandleImpl(file, error, maximumBytes, nullptr);
+}
+
+bool ReferenceArtifact::OpenHandleCancelable(HANDLE file, std::wstring* error, const std::atomic<bool>& stop, size_t maximumBytes)
+{
+    return OpenHandleImpl(file, error, maximumBytes, &stop);
+}
+
+bool ReferenceArtifact::OpenHandleImpl(HANDLE file, std::wstring* error, size_t maximumBytes, const std::atomic<bool>* stop)
+{
     if (error != nullptr) { *error = L"reference handle must identify a stable local regular file within the byte limit"; }
+    if (stop != nullptr && stop->load()) { SetLastError(ERROR_OPERATION_ABORTED); return false; }
     if (File != INVALID_HANDLE_VALUE || file == nullptr || file == INVALID_HANDLE_VALUE || GetFileType(file) != FILE_TYPE_DISK)
     {
         return false;
     }
     File = ReOpenFile(file, GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
-    return Initialize(error, maximumBytes);
+    return Initialize(error, maximumBytes, stop);
 }
 
-bool ReferenceArtifact::Initialize(std::wstring* error, size_t maximumBytes)
+bool ReferenceArtifact::Initialize(std::wstring* error, size_t maximumBytes, const std::atomic<bool>* stop)
 {
     auto content = std::make_shared<RetainedReferenceArtifact>();
     FILE_ATTRIBUTE_TAG_INFO attributes{};
     if (File == INVALID_HANDLE_VALUE || GetFileType(File) != FILE_TYPE_DISK ||
         !GetFileInformationByHandleEx(File, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
         (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &content->Bytes, maximumBytes))
+        !GetFileInformationByHandleEx(File, FileIdInfo, &Identity, sizeof(Identity)) || !Read(File, &content->Bytes, maximumBytes, stop))
     {
         return false;
     }
@@ -120,7 +134,16 @@ bool ReferenceArtifact::Initialize(std::wstring* error, size_t maximumBytes)
         return false;
     }
     content->OriginalPath.erase(0, 4);
-    content->Sha256 = ContentHash::Bytes(content->Bytes);
+    ContentHash hash;
+    for (size_t offset = 0; offset < content->Bytes.size();)
+    {
+        if (stop != nullptr && stop->load()) { SetLastError(ERROR_OPERATION_ABORTED); return false; }
+        const auto count = (std::min)(content->Bytes.size() - offset, size_t{65536});
+        if (!hash.Add(content->Bytes.data() + offset, count)) { return false; }
+        offset += count;
+    }
+    content->Sha256 = hash.Finish();
+    if (stop != nullptr && stop->load()) { SetLastError(ERROR_OPERATION_ABORTED); return false; }
     if (content->Sha256.empty())
     {
         return false;

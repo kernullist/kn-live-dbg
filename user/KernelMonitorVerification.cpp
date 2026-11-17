@@ -257,6 +257,29 @@ void KernelMonitor::ApplyImageReferenceResults()
     }
 }
 
+void KernelMonitor::QueueImageReferenceContent(ImageVerificationWork& work)
+{
+    if (StopRequested.load()) { return; }
+    if (work.ContentPreparationId != 0 && !ImageContents->Contains(work.ContentPreparationId))
+    {
+        work.ContentPreparationId = 0;
+        if (StopRequested.load()) { work.ContentCancelled = true; } else { ++work.ContentExpired; }
+    }
+    if (work.ContentPreparationId != 0 || !work.Loaded || StopRequested.load() ||
+        GetTickCount64() < work.ContentRetryAfterMs) { return; }
+    ImageReferencePreparation::Request request;
+    request.Key = ImageKey(work.Path, work.Base, work.Identity); request.Path = work.Path; request.Identity = work.Identity;
+    request.Base = work.Base; request.Episode = work.RetentionEpisode; request.FirstSeen = work.Scheduling.FirstSeen;
+    const auto now = GetTickCount64();
+    work.LastSweepMs = now; // Rotate admission attempts without renewing observation debt.
+    const auto ticket = ImageContents->Submit(std::move(request), now);
+    if (ticket.Status == ImageReferencePreparation::Admission::Queued)
+    {
+        work.ContentPreparationId = work.LastContentPreparationId = ticket.Id;
+        work.ContentQueuedMs = now; work.ContentCancelled = false;
+    }
+}
+
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
     uint64_t base, const ObservationIdentity& identity, bool* referenceUnavailable, ImageVerificationWork** admitted, bool discovery)
 {
@@ -314,6 +337,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
                 {
                     RememberImageRescanDelay(old->second, now);
                     ImageReferences->Abandon(old->second.PreparationId);
+                    ImageContents->Abandon(old->second.ContentPreparationId);
                     old = ImageWork.erase(old);
                     ++ImageWorkEvicted;
                 }
@@ -381,6 +405,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.LayoutIdentityReported = false;
             work.LastAttemptMs = 0;
             ImageReferences->Abandon(work.PreparationId);
+            ImageContents->Abandon(work.ContentPreparationId);
+            work.ContentPreparationId = 0; work.ContentRetryAfterMs = 0;
             work.PreparationId = 0; work.ReferenceRetryAfterMs = 0; work.PreparationFailed = false;
             work.ManifestChecked = false;
             work.ManifestMatches = false;
@@ -448,6 +474,38 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     }
     const uint64_t now = GetTickCount64();
     if (now < work->NextSweepDueMs) { outcome = KmonImageAttemptOutcome::Deferred; return CodeOwnership::OwnedUnverified; }
+    std::unique_ptr<ExecutableReferenceLease> preparedContent;
+    if (routing != nullptr)
+    {
+        QueueImageReferenceContent(*work);
+        auto prepared = work->ContentPreparationId != 0 ? ImageContents->Take(work->ContentPreparationId) : nullptr;
+        if (!prepared)
+        { outcome = KmonImageAttemptOutcome::ReferencePending; return CodeOwnership::OwnedUnverified; }
+        const bool current = prepared->Work.Episode == work->RetentionEpisode && prepared->Work.Base == work->Base &&
+            prepared->Work.Path == work->Path && prepared->Work.Identity.SameCanonicalKey(work->Identity) &&
+            prepared->Work.Identity.Eprocess == work->Identity.Eprocess &&
+            prepared->Work.Identity.SessionKnown == work->Identity.SessionKnown &&
+            (!work->Identity.SessionKnown || prepared->Work.Identity.SessionId == work->Identity.SessionId);
+        const bool cancelled = StopRequested.load();
+        ImageContents->Disposition(*prepared, current && !cancelled);
+        work->ContentPreparationId = 0;
+        if (!current) { outcome = KmonImageAttemptOutcome::ReferencePending; return CodeOwnership::OwnedUnverified; }
+        if (cancelled) { work->ContentCancelled = true; }
+        else { work->ContentFinishedMs = prepared->Finished; work->ContentOutcome = prepared->Status; }
+        if (prepared->Status != ImageReferencePreparation::Outcome::Prepared || !prepared->Value || !prepared->Value->Content)
+        {
+            if (!cancelled) { work->ContentRetryAfterMs = prepared->Finished + 5000; }
+            before = work->Scheduling; attempted = work->Scheduling.Begin(now);
+            outcome = KmonImageAttemptOutcome::ReferenceUnavailable;
+            return CodeOwnership::OwnedUnverified;
+        }
+        preparedContent = std::move(prepared->Value->Content);
+        if (!cancelled)
+        {
+            work->ContentSuccessMs = prepared->Finished; work->ContentSuccessEpisode = work->RetentionEpisode;
+            work->ContentRetryAfterMs = 0;
+        }
+    }
     before = work->Scheduling;
     attempted = work->Scheduling.Begin(now);
     if (!attempted) { outcome = KmonImageAttemptOutcome::InvalidClock; return CodeOwnership::OwnedUnverified; }
@@ -501,7 +559,9 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     ExecutableSweepReference capturedReference;
     ExecutableSliceTrace slice;
     const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, KmonImageTurnBudgetMs,
-        router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice, &timing, turnStarted);
+        router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice, &timing, turnStarted, preparedContent.get());
+    // The publication queue shares immutable bytes, never the source lease.
+    preparedContent.reset();
     uint64_t readSetId = 0;
     std::wstring readPersistence = routing == nullptr ? L"unrecorded_reader" : L"not_selected_for_retention";
     // Retain clean ranges as well as changes and gaps from the original slice.
@@ -723,6 +783,16 @@ std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
         if (details == detailCapacity) { break; }
         const auto remaining = work->Loaded && work->Sweep.NextRange <= work->Sweep.Ranges.size() ?
             n(work->Sweep.Ranges.size() - work->Sweep.NextRange) : L"null";
+        const std::wstring content = work->LastContentPreparationId == 0 ? L"null" :
+            L"{\"active_id\":" + (work->ContentPreparationId == 0 ? L"null" : n(work->ContentPreparationId)) +
+            L",\"last_id\":" + n(work->LastContentPreparationId) + L",\"queued_ms\":" + n(work->ContentQueuedMs) +
+            L",\"finished_ms\":" + (work->ContentFinishedMs == 0 ? L"null" : n(work->ContentFinishedMs)) +
+            L",\"success_ms\":" + (work->ContentSuccessMs == 0 ? L"null" : n(work->ContentSuccessMs)) +
+            L",\"success_episode\":" + (work->ContentSuccessMs == 0 ? L"null" : n(work->ContentSuccessEpisode)) +
+            L",\"cancelled\":" + (work->ContentCancelled ? L"true" : L"false") +
+            L",\"expired\":" + n(work->ContentExpired) + L",\"retry_after_ms\":" + n(work->ContentRetryAfterMs) +
+            L",\"outcome\":" + (work->ContentFinishedMs == 0 ? L"null" :
+                mcpjson::Quote(ImageReferencePreparation::OutcomeName(work->ContentOutcome, ImageReferencePreparation::Kind::Content))) + L"}";
         const auto row = L"{\"boot_id\":" + mcpjson::Quote(work->Identity.BootId) + L",\"pid\":" + n(work->Identity.ProcessId) +
             L",\"create_time\":" + n(work->Identity.CreateTime) + L",\"base\":" + n(work->Base) + L",\"path\":" + mcpjson::Quote(work->Path) +
             L",\"retention_episode\":" + n(work->RetentionEpisode) + L",\"reference_loaded\":" + (work->Loaded ? L"true" : L"false") +
@@ -738,6 +808,7 @@ std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
             L",\"reference_last_success_episode\":" + (work->PreparationSuccessMs == 0 ? L"null" : n(work->PreparationSuccessEpisode)) +
             L",\"reference_last_outcome\":" + (work->PreparationFinishedMs == 0 ? L"null" :
                 mcpjson::Quote(ImageReferencePreparation::OutcomeName(work->PreparationOutcome))) +
+            L",\"content_preparation\":" + content +
             L",\"observation\":" + work->Scheduling.Json(now) + L"}";
         if (row.size() + (rows.empty() ? 0 : 1) > detailUnits - rows.size()) { continue; }
         if (!rows.empty()) { rows += L","; }
@@ -762,6 +833,7 @@ std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
 
 KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64_t now)
 {
+    if (StopRequested.load()) { return nullptr; }
     ApplyImageReferenceResults();
     std::set<uint32_t> watched;
     {
@@ -780,6 +852,12 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     {
         auto& work = item.second;
         if (now < work.NextSweepDueMs || work.PreparationId != 0 || (!work.Loaded && now < work.ReferenceRetryAfterMs)) { continue; }
+        if (work.ContentPreparationId != 0 && !ImageContents->Contains(work.ContentPreparationId))
+        {
+            work.ContentPreparationId = 0;
+            if (StopRequested.load()) { work.ContentCancelled = true; } else { ++work.ContentExpired; }
+        }
+        if (now < work.ContentRetryAfterMs || (work.ContentPreparationId != 0 && !ImageContents->IsReady(work.ContentPreparationId))) { continue; }
         const size_t group = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0 ? 0 : 1;
         const size_t phase = work.Sweep.LastCompleteMs == 0 && work.PriorTraversalMs == 0 ? 0 : 1;
         auto& candidate = eligible[group][phase][{work.Identity.ProcessId, work.Identity.CreateTime}];
