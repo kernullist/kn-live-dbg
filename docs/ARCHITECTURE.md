@@ -1837,7 +1837,8 @@ policy. They can overrun their allowance and the shared budget. Image setup
 shares the original comparison clock and retains minimum first-page progress
 even after slow preparation; otherwise consistently slow setup could prevent
 all image progress. Bulk discovery scanners outside these boundaries and
-explicit shutdown drains remain outside the normal shared-turn budget.
+explicit shutdown drains remain outside this analysis-turn budget. Discovery
+has its own resumable group policy described below.
 
 `coverage.pipeline.analysis_scheduling_json` carries private
 `kn.analysis_scheduling.v1` diagnostics. It separates pending/dependency state,
@@ -1858,6 +1859,75 @@ The standalone core and independent Python oracle cover fixed/growing arrivals,
 churn, blocked/rejoining stages, due clocks, slow calls, exceptions, stop,
 recursive entry, clock reversal and final-stage overruns. They establish the
 stated cooperative policy, not measured native workload SLOs or completion of P09.
+
+## Resumable discovery scheduling
+
+The analysis worker schedules 26 scanner phases in ten groups. It preserves
+each group's phase order and rotates eligible groups after each scanner, rather
+than running a whole mapper/user group before considering other due work.
+Readiness uses current local due clocks and cheap native-binding checks. The
+runtime subscription needs an open device; other groups also require the symbol
+binding. These checks do not qualify a loaded module, layout or target. Each
+scanner retains its existing source, identity and evidence checks.
+
+| Group | Ordered scanner phases |
+| --- | --- |
+| Runtime | Runtime provenance subscription |
+| Hidden | Process cross-view qualification |
+| Mapper | Remnants, pool images, unbacked driver objects, module inventory, image integrity, driver tamper, callbacks, callback lifecycle, platform evidence, input hooks, graphics dispatch, graphics references |
+| Kernel pages | CPU integrity, orphan mapped pages |
+| User | Stale-watch pruning, watch logging, process triage, handle tables, handle capabilities |
+| Inline | Kernel inline patches |
+| Threads | Kernel thread checks |
+| Channels | Communication surfaces |
+| Kernel images | Executable image discovery |
+| Page candidates | Admitted executable-page candidates |
+
+A discovery turn has a 250 ms cooperative budget that includes interleaved
+analysis service between scanners. It admits at most one dispatch cycle per
+group per turn. The worker first gives analysis its independent turn, then
+discovery a turn; 250 ms is therefore not a bound on the entire worker loop.
+Scanner-internal loops, nested analysis yields and native calls remain
+nonpreemptible and can overrun. The outer policy cannot provide a wall-clock
+revisit bound while a scanner itself remains blocked.
+
+Each group retains its phase cursor, original cycle due time and separate
+periodic/request clocks. Initial delay values and normal/watch interval values
+are retained; the next periodic due time starts at the last scanner's return.
+Actual cadence also includes waiting for other groups. Mapper events request both mapper and kernel-page
+service; user memory follow-ups retain the two-second initial-phase cooldown.
+Duplicate pending requests coalesce to their earliest due time. A request
+received after cycle start remains for a later cycle, so urgent arrivals cannot
+continually restart the current group's head or erase its unfinished tail.
+Periodic rescheduling cannot overwrite that retained request.
+
+Exceptions advance the failing scanner's phase and preserve later phases.
+Failed cycles have separate counters/distributions. Analysis and discovery
+boundaries handle exceptions independently, so a persistent analysis failure
+cannot prevent discovery from being called. The worker observes its existing
+50/200 ms idle delay after exceptions as well as returned turns. Stop observed
+after selection but before scanner entry returns an explicit cancellation:
+the selected phase and original cycle debt remain pending. Stop/reset does not
+claim those phases were observed. Reset occurs only after the worker joins.
+
+`coverage.pipeline.discovery_scheduling_json` carries private
+`kn.discovery_scheduling.v1` diagnostics: phase attempts, returns, faults,
+cancellations, actual service/gap distributions, partial cycles, due-to-first
+dispatch, due-to-cycle return/failure, queued requests and budget deferrals.
+An ordinary scanner return can itself mean unavailable, partial or rejected
+target evidence; it is not successful target freshness. Completed worker turns
+and completed dispatch cycles are not complete source sweeps. These clocks are
+runtime diagnostics, not a durable timing journal or individual native API
+latency. Clock reversal across turns cannot wrap a partial cycle's duration.
+
+`--self-test discovery-scheduler` runs the actual worker with an unopened device,
+owned requests, observed turn completion and joined cleanup. It verifies
+readiness, mapper/follow-up admission, cancellation and restart without executing
+native discovery scans. The core harness and independent oracle cover rotating
+groups, unfinished tails, flooding, binding churn, mid-cycle requests, repeated
+head faults, analysis-yield failure, stop/cancel and clock reversal. Loaded-native
+scanner workloads, finer scanner-internal continuation, successful per-target
+debt and measured SLOs remain separate acceptance work.
 
 ## Layout collection and verification scheduling
 

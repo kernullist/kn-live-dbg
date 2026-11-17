@@ -24,6 +24,7 @@
 #include "KmonImageScheduling.h"
 #include "KmonPublicationScheduling.h"
 #include "KmonAnalysisScheduling.h"
+#include "KmonDiscoveryScheduling.h"
 #include "KmonLayoutScheduling.h"
 #include "ImageReferencePreparation.h"
 #include "GameBuildManifest.h"
@@ -380,12 +381,17 @@ private:
     friend bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
     friend struct KmonImageTestAccess;
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     void WorkerLoop();
+    void ServiceDiscovery();
+    KmonDiscoveryDispatch DispatchDiscovery(KmonDiscoveryStep step);
+    std::array<KmonDiscoveryConfig, KmonDiscoveryGroups> DiscoveryConfig() const;
+    KmonDiscoveryScheduling DiscoveryScheduling;
     void CollectorLoop();
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
     std::vector<TiEventRecord> CollectTiPage(TiSubscriber* ti, const TiSequenceSnapshot* fence = nullptr);
@@ -870,8 +876,6 @@ private:
     std::atomic<uint64_t> KpageResumeAddress{0};
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> GraphicsSlotCursors;
     uint64_t KernelImageCursor = 0;
-    uint64_t NextImageScanTickMs = 0;
-    uint64_t NextChannelScanTickMs = 0;
     uint32_t ChannelScanCursor = 0;
     size_t WfpCalloutCursor = 0;
     mutable std::mutex HuntMutex;
@@ -1115,9 +1119,6 @@ private:
     std::atomic<uint64_t> MaxTiIngestGapMs{0};
     KmonRegionHistory RegionHistory;
     uint64_t LiveCursorEventId = 0;
-    uint64_t NextHiddenScanTickMs = 0;
-    uint64_t NextMapperScanTickMs = 0;
-    uint64_t NextKpageScanTickMs = 0;
     uint64_t KpageRegionOffset = 0;
     OrphanKernelPageContinuation KpageContinuation;
     uint64_t PoolPeEntryOffset = 0;
@@ -1140,7 +1141,6 @@ private:
     std::map<std::wstring, std::map<std::wstring, std::wstring>> EvidenceSurfaceBaselines;
     // (Root, region start) -> (last probed target address, last use tick). WatchMutex.
     std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>> MapperTargetCursors;
-    uint64_t NextUserScanTickMs = 0;
     // Exact process generation -> next VirtualQueryEx address. WatchMutex.
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> UserVmWalkCursors;
     // Exact process generation -> last attempted thread ID. WatchMutex.
@@ -1183,7 +1183,6 @@ private:
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> WatchedHandleAfter;
     // Stage 1: kernel-thread scan cadence and the two-scan confirmation that
     // keeps a thread-creation race from printing a hidden-thread verdict.
-    uint64_t NextThreadScanTickMs = 0;
     std::map<std::wstring, KmonRepeatObservation> ThreadHiddenStrikes;
     // Stage 1b: ETHREAD-list DKOM confirmation, keyed by pid because the
     // verdict compares a whole process thread list against its accounting.
@@ -1195,7 +1194,6 @@ private:
     // body both read them.
     static constexpr uint32_t kInlinePatchScanIntervalMs = 20000;
     static constexpr uint32_t kInlinePatchWatchScanIntervalMs = 10000;
-    uint64_t NextInlinePatchScanTickMs = 0;
     std::map<std::wstring, KmonRepeatObservation> InlinePatchStrikes;
     std::map<std::wstring, KmonRepeatObservation> CallbackRedirectStrikes;
     // Last completed batch address; resolved against the next live inventory.
@@ -1555,6 +1553,7 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

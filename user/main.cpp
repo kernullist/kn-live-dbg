@@ -53887,7 +53887,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
         std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
-        std::wcout << L"            connect-argv, capture-scheduler, reference-scheduler, image-scheduler, publication-scheduler, analysis-scheduler, layout-scheduler, image-preparation, irp-publication <owned.knirp>, all, platform-query, cloudfiles-query <path>,\n";
+        std::wcout << L"            connect-argv, capture-scheduler, reference-scheduler, image-scheduler, publication-scheduler, analysis-scheduler, discovery-scheduler, layout-scheduler, image-preparation, irp-publication <owned.knirp>, all, platform-query, cloudfiles-query <path>,\n";
         std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
         PrintHelp(argc >= 3 && ToLower(argv[2]) == L"all");
@@ -53950,6 +53950,13 @@ int wmain(int argc, wchar_t** argv)
         {
             std::wstring diagnostics;
             const bool passed = KmonAnalysisSchedulingIntegrationSelfTest(&diagnostics);
+            std::wcout << diagnostics << L"\n";
+            return passed ? 0 : 1;
+        }
+        if (argc == 3 && ToLower(argv[2]) == L"discovery-scheduler")
+        {
+            std::wstring diagnostics;
+            const bool passed = KmonDiscoverySchedulingIntegrationSelfTest(&diagnostics);
             std::wcout << diagnostics << L"\n";
             return passed ? 0 : 1;
         }
@@ -54082,7 +54089,7 @@ int wmain(int argc, wchar_t** argv)
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|reference-scheduler|image-scheduler|publication-scheduler|analysis-scheduler|layout-scheduler|image-preparation|irp-publication <owned.knirp>|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|reference-scheduler|image-scheduler|publication-scheduler|analysis-scheduler|discovery-scheduler|layout-scheduler|image-preparation|irp-publication <owned.knirp>|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
         return 2;
     }
 

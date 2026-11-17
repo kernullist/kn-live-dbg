@@ -142,6 +142,7 @@ namespace
 void KernelMonitor::ResetPipeline()
 {
     AnalysisScheduling.Reset();
+    DiscoveryScheduling.Reset();
     ImageReferences->Reset();
     ImageContents->Reset();
     {
@@ -2031,6 +2032,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain, uint64_t budgetMs, bool
         event.Evidence[L"live_analysis_peak"] = std::to_wstring(CollectedLive.Peak());
         event.Evidence[L"analysis_pending"] = std::to_wstring(CollectedTi.Size() + CollectedLive.Size());
         event.Evidence[L"analysis_scheduling_json"] = AnalysisScheduling.Json(now);
+        event.Evidence[L"discovery_scheduling_json"] = DiscoveryScheduling.Json(now);
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
         const auto captureNow = GetTickCount64();
@@ -2453,6 +2455,84 @@ bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std:
     return passed;
 }
 
+bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* why)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[discovery.integration] FAIL %s\n", why); } return ok; };
+    DeviceClient absent;
+    SymbolEngine symbols;
+    const auto owner = std::make_unique<KernelMonitor>();
+    auto& monitor = *owner;
+    monitor.Device = &absent; monitor.Symbols = &symbols;
+    monitor.Options.HiddenScanIntervalMs = 100;
+    monitor.Options.MapperScanIntervalMs = 100;
+    auto config = monitor.DiscoveryConfig();
+    check(std::none_of(config.begin(), config.end(), [](const KmonDiscoveryConfig& c) { return c.Enabled; }),
+        "unopened binding leaves every native discovery group unavailable");
+    check(config[1].IntervalMs == 5000 && config[2].IntervalMs == 8000 && config[8].IntervalMs == 500 && config[9].IntervalMs == 0,
+        "existing periodic fallback and image/page cadences retained");
+    const auto due = GetTickCount64() + 2000;
+    monitor.RegionFollowupPending = true; monitor.NextRegionFollowupTickMs = due;
+    monitor.ServiceDiscovery();
+    check(!monitor.RegionFollowupPending && monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::User),
+        "actual worker transfers follow-up ownership before clearing producer flag");
+    const auto pending = monitor.DiscoveryScheduling.Json(GetTickCount64());
+    check(pending.find(L"\"request_due_ms\":\"" + std::to_wstring(due) + L"\"") != std::wstring::npos,
+        "follow-up cooldown is retained as an explicit local due clock");
+    KmonEvent event; event.Driver = L"owned_discovery_scheduler_control.sys";
+    monitor.ArmMapperWatch(event);
+    check(monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Mapper) &&
+        monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::KernelPages) && monitor.MapperWatchArmedCount.load() == 1,
+        "actual mapper trigger retains both discovery requests");
+    config = monitor.DiscoveryConfig();
+    check(config[2].IntervalMs == 400 && config[3].IntervalMs == 1500 && config[6].IntervalMs == 10000,
+        "active mapper cadence remains independent of readiness");
+    monitor.AnalysisLastCompleteMs.store(0);
+    std::thread worker([&]() { monitor.WorkerLoop(); });
+    struct Join
+    {
+        std::atomic<bool>& Stop; std::thread& Worker;
+        ~Join() { Stop.store(true); if (Worker.joinable()) { Worker.join(); } }
+    } join{monitor.StopRequested, worker};
+    const auto deadline = GetTickCount64() + 10000;
+    while (monitor.AnalysisLastCompleteMs.load() == 0 && GetTickCount64() < deadline) { std::this_thread::yield(); }
+    check(monitor.AnalysisLastCompleteMs.load() != 0, "observe actual completed worker turn before stop");
+    monitor.StopRequested.store(true); worker.join();
+    const auto stopped = monitor.DiscoveryScheduling.Json(GetTickCount64());
+    check(!absent.IsOpen() && monitor.MapperWatchScans.load() == 0 && monitor.UserHostilityScans.load() == 0,
+        "source gate prevents native discovery scans while analysis still runs");
+    check(monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::User) &&
+        monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Mapper), "worker stop preserves unserved request debt");
+    std::wstring pipeline;
+    for (const auto& record : monitor.Ring)
+    {
+        const auto found = record.Evidence.find(L"discovery_scheduling_json");
+        if (record.Kind == L"coverage.pipeline" && found != record.Evidence.end()) { pipeline = found->second; }
+    }
+    check(!pipeline.empty() && mcpjson::ValidateDocument(pipeline), "actual analysis coverage includes discovery diagnostics");
+    const auto frozen = monitor.DiscoveryScheduling.Json(0);
+    monitor.ServiceDiscovery();
+    check(frozen == monitor.DiscoveryScheduling.Json(0), "stopped service cannot consume pending discovery");
+    const auto originalFollowup = monitor.NextRegionFollowupTickMs;
+    check(monitor.DispatchDiscovery({KmonDiscoveryGroup::User, KmonDiscoveryPhase::UserPrune, true}) == KmonDiscoveryDispatch::Cancelled &&
+        monitor.NextRegionFollowupTickMs == originalFollowup, "stop racing selection cancels before actual scanner setup");
+    monitor.ResetTemporalDetections();
+    check(!monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::User) &&
+        !monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Mapper), "session restart removes prior discovery requests");
+    monitor.Device = nullptr; monitor.Symbols = nullptr;
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.discovery_scheduler_test.v1\",\"driver_loaded\":false,\"native_scans_executed\":false,"
+            L"\"corpus\":\"actual_worker_with_absent_binding_and_owned_requests\",\"passed\":" +
+            std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
+            L",\"pending\":" + pending + L",\"stopped\":" + stopped + L",\"pipeline\":" +
+            (pipeline.empty() ? L"null" : pipeline) + L"}";
+    }
+    std::fprintf(stderr, "[discovery.integration] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
 bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics)
 {
     unsigned checks = 0, failures = 0;
@@ -2562,6 +2642,7 @@ bool KmonPipelineSelfTest()
     if (!KmonPublicationSchedulingIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonLayoutSchedulingIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonAnalysisSchedulingIntegrationSelfTest(nullptr)) { return false; }
+    if (!KmonDiscoverySchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;

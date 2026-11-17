@@ -7,6 +7,80 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Resumable discovery scheduling checkpoint: 2026-11-18
+
+The worker now rotates 26 scanner phases across ten discovery groups, preserving
+each group's order and unfinished cursor. It gives discovery a cooperative
+250 ms turn that includes interleaved analysis service, separately from the
+initial analysis turn. Periodic due clocks and coalesced urgent requests remain
+distinct. A request admitted during an active cycle survives completion, and a
+repeatedly failing scanner cannot indefinitely restart its group's head. See
+[resumable discovery scheduling](ARCHITECTURE.md#resumable-discovery-scheduling).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Review also isolated the initial analysis and discovery boundaries: a persistent
+analysis exception previously prevented discovery from being called. Both
+boundaries now run independently and retain the worker's idle delay after
+exceptions. Cancellation between selection and actual scanner entry retains the
+selected phase and its original cycle debt, instead of counting an unentered
+scanner as returned. Clock reversal across turns cannot wrap partial-cycle
+durations. Session reset clears the new state after worker join.
+
+Private `kn.discovery_scheduling.v1` runtime diagnostics separate phase
+attempts/returns/faults/cancellations, unfinished cycles, requests, due-to-first
+dispatch, due-to-cycle return/failure and actual overruns. These are scheduler
+clocks, not successful target revisits, native API latency or a durable timing
+journal. A scanner can return with unavailable or partial source evidence.
+Scanner-internal loops, nested analysis and native calls remain nonpreemptible;
+the policy does not enforce a hard deadline or a whole-worker 250 ms bound.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier.
+The core harness built under `/W4 /WX` and passed **369 discovery checks**.
+The independent discovery oracle passed **34,098 assertions** across 15 synthetic
+rotation/flood/churn/binding, mid-cycle request, repeated-head-fault, slow-call,
+analysis-yield-fault, stop/cancel, reentrant, clock-reversal, final-phase-overrun
+and depletion scenarios. It independently reconstructs group/phase queues,
+request retention, clocks, exact counters and ordered-sample histograms.
+
+The product's actual worker passed **13 controls** and **19 independent
+assertions** with an unopened device and owned mapper/user requests. The fixture
+observes an actual completed worker turn before requesting stop and joining;
+all 26 native discovery phases remain undispatched at the binding gate. The
+actual scanner entry also rejects a raced stop before setup. This validates the
+worker/gate boundary, not loaded-native scanner workloads or measured SLOs.
+Affected product oracles passed **20 analysis / 968 image / 73 preparation /
+50 reference / 85 publication / 16 layout / 23 capture assertions**.
+
+The final isolated `--self-test all` passed **28 timeline / 102 MCP /
+121 KMON image-read / 319 image-scheduling / 39 image-preparation /
+41 publication-writer / 21 layout-scheduler / 15 analysis-integration /
+13 discovery-integration / 564 console / 3,043 command-route / 68 remote /
+4 connect-option checks**, with `owned_fixture_cleanup=passed`.
+Existing shared-core controls passed, including independent **6,722 analysis /
+12,989 reference / 2,394 publication / 10 execution assertions**. Compiled
+capabilities passed **51 contracts / 261 command routes** and the support matrix
+was refreshed. The public-content scanner regression passed **12 tests**,
+including renamed UTF-8/UTF-16 discovery diagnostics.
+Final review found no additional actionable defects in the reviewed scope.
+
+Final Release product SHA-256:
+`3cd2acad15230eca6acb8846dd1d72cff7686e77965a93292b91adcb44da97f9`.
+Shared KMON core harness SHA-256:
+`ab4d24e6d8770cc54cf0f65097e424facec3c8909914b84d925b6851b37ac8b7`.
+Existing alignment warnings remain. ASan remains blocked by the previously
+recorded host startup interception failure; no new ASan success is claimed.
+Scanner-internal continuation, successful per-target debt, source-wide timing,
+persisted timing recovery, native workloads, maximum unobserved intervals and
+durability under media/power loss remain open.
+
+At **03:30 KST**, boot time remained **12:49:00.5 KST on November 17**. No new
+reboot/BugCheck events, dump files, task processes/drivers or owned temporary
+writer/preparation fixtures remained after validation. The 33 completed parser
+caches, firewall profiles and BFE/mpssvc automatic-running and EFS manual-running
+service states matched the preceding shared-analysis checkpoint.
+
 ## Shared analysis scheduling checkpoint: 2026-11-18
 
 Nine analysis stages now share a cooperative 250 ms turn, at most 100 ms per

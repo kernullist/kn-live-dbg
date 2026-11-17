@@ -8558,13 +8558,7 @@ bool KernelMonitor::Start(
                     LiveCursorEventId = nextLive - 1;
                 }
             }
-            NextHiddenScanTickMs = 0;
-            NextMapperScanTickMs = 0;
-            NextKpageScanTickMs = 0;
-            NextUserScanTickMs = 0;
             WatchedUserPidCursor = 0;
-            NextImageScanTickMs = 0;
-            NextChannelScanTickMs = 0;
             ChannelScanCursor = 0;
             WfpCalloutCursor = 0;
             UserThreadCursors.clear();
@@ -8762,6 +8756,7 @@ bool KernelMonitor::Start(
 void KernelMonitor::ResetTemporalDetections()
 {
     // Start holds StateMutex and WatchMutex before publishing a new worker.
+    DiscoveryScheduling.Reset();
     DriverTamperBaselines.clear();
     UserVmWalkCursors.clear();
     UserThreadStartCursors.clear();
@@ -8788,7 +8783,6 @@ void KernelMonitor::ResetTemporalDetections()
     ThreadHiddenStrikes.clear();
     ThreadListDkomStrikes.clear();
     ThreadScans.store(0);
-    NextThreadScanTickMs = 0;
     InlinePatchStrikes.clear();
     CallbackRedirectStrikes.clear();
     CallbackRedirectCursor = 0;
@@ -8814,7 +8808,6 @@ void KernelMonitor::ResetTemporalDetections()
     EvidenceSurfaceBaselines.clear();
     PoolPeEntryOffset = 0;
     MapperTargetCursors.clear();
-    NextInlinePatchScanTickMs = 0;
 }
 
 bool KmonWindowsModulePathLooksInbox(const std::wstring& path)
@@ -9049,258 +9042,111 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     return cleanupComplete;
 }
 
+std::array<KmonDiscoveryConfig, KmonDiscoveryGroups> KernelMonitor::DiscoveryConfig() const
+{
+    bool device = false, live = false;
+    uint64_t hidden = 5000, mapper = 8000;
+    {
+        std::lock_guard<std::mutex> lock(StateMutex);
+        device = Device != nullptr && Device->IsOpen();
+        live = device && Symbols != nullptr;
+        hidden = Options.HiddenScanIntervalMs >= 1000 ? Options.HiddenScanIntervalMs : 5000;
+        mapper = Options.MapperScanIntervalMs >= 1000 ? Options.MapperScanIntervalMs : 8000;
+    }
+    const bool watching = IsMapperWatchActive();
+    return {{{device, 2000}, {live, hidden}, {live, watching ? kMapperWatchIntervalMs : mapper},
+        {live, watching ? kMapperWatchKpageIntervalMs : kKpageScanIntervalMs}, {live, kUserScanIntervalMs},
+        {live, watching ? kInlinePatchWatchScanIntervalMs : kInlinePatchScanIntervalMs},
+        {live, watching ? kThreadWatchScanIntervalMs : kThreadScanIntervalMs}, {live, 5000}, {live, 500}, {live, 0}}};
+}
+
+void KernelMonitor::ServiceDiscovery()
+{
+    if (StopRequested.load()) { return; }
+    if (RegionFollowupPending)
+    {
+        // Transfer the request before clearing the producer flag. A request
+        // arriving during a partial user cycle survives that cycle's completion.
+        DiscoveryScheduling.Request(KmonDiscoveryGroup::User, (std::max)(GetTickCount64(), NextRegionFollowupTickMs));
+        RegionFollowupPending = false;
+    }
+    DiscoveryScheduling.Run([]() { return GetTickCount64(); }, [&]() { return DiscoveryConfig(); },
+        [&](KmonDiscoveryStep step) { return DispatchDiscovery(step); },
+        [&]() { ServicePendingAnalysis(L"discovery_boundary"); }, [&]() { return StopRequested.load(); });
+}
+
+KmonDiscoveryDispatch KernelMonitor::DispatchDiscovery(KmonDiscoveryStep step)
+{
+    if (StopRequested.load()) { return KmonDiscoveryDispatch::Cancelled; }
+    if (step.First && step.Group == KmonDiscoveryGroup::Mapper && IsMapperWatchActive()) { MapperWatchScans.fetch_add(1); }
+    if (step.First && step.Group == KmonDiscoveryGroup::User) { NextRegionFollowupTickMs = GetTickCount64() + 2000; }
+    switch (step.Phase)
+    {
+    case KmonDiscoveryPhase::Runtime:
+    {
+        bool realDevice = false;
+        { std::lock_guard<std::mutex> lock(StateMutex); realDevice = Device != nullptr && Device->IsOpen(); }
+        std::wstring error;
+        if (realDevice && !UserRuntimeTracker.Start(&error))
+        { EmitUnique(L"process.execution", L"scan_failed:runtime_provider", L"", L"runtime", L"runtime provenance subscription unavailable", error); }
+        else if (realDevice) { ClearEmittedKey(L"scan_failed:runtime_provider"); }
+        break;
+    }
+    case KmonDiscoveryPhase::Hidden: ScanHiddenProcesses(); break;
+    case KmonDiscoveryPhase::MapperRemnants: ScanMapperRemnants(); break;
+    case KmonDiscoveryPhase::PoolImages: ScanPoolMappedImages(); break;
+    case KmonDiscoveryPhase::UnbackedDrivers: ScanUnbackedDriverObjects(); break;
+    case KmonDiscoveryPhase::ModuleInventory: ScanModuleInventory(); break;
+    case KmonDiscoveryPhase::ImageIntegrity: ScanKernelImageIntegrity(); break;
+    case KmonDiscoveryPhase::DriverTamper: ScanDriverTamper(); break;
+    case KmonDiscoveryPhase::HookCallbacks: ScanHookCallbacks(); break;
+    case KmonDiscoveryPhase::CallbackLifecycle: ScanCallbackLifecycleSurfaces(); break;
+    case KmonDiscoveryPhase::PlatformEvidence: ScanPlatformEvidence(); break;
+    case KmonDiscoveryPhase::HookInput: ScanHookInput(); break;
+    case KmonDiscoveryPhase::GraphicsDispatch: ScanGraphicsDispatchTables(); break;
+    case KmonDiscoveryPhase::GraphicsReferences: ScanGraphicsReferences(); break;
+    case KmonDiscoveryPhase::CpuIntegrity: ScanCpuIntegrityHooks(); break;
+    case KmonDiscoveryPhase::OrphanPages: ScanOrphanMappedPages(); break;
+    case KmonDiscoveryPhase::UserPrune: PruneStalePromotedWatches(); break;
+    case KmonDiscoveryPhase::UserLogging: EnableLoggingForWatchTargets(); break;
+    case KmonDiscoveryPhase::UserHostility: ScanUserModeHostility(); break;
+    case KmonDiscoveryPhase::UserHandles: ScanWatchedHandleTables(); break;
+    case KmonDiscoveryPhase::UserCapabilities: ScanWatchedHandleCapabilities(); break;
+    case KmonDiscoveryPhase::Inline: ScanKernelInlinePatches(); break;
+    case KmonDiscoveryPhase::Threads: ScanKernelThreads(); break;
+    case KmonDiscoveryPhase::Channels: ScanCommunicationSurfaces(); break;
+    case KmonDiscoveryPhase::Images: ScanKernelExecutableImages(); break;
+    case KmonDiscoveryPhase::Pages: ScanExecutablePageCandidates(); break;
+    case KmonDiscoveryPhase::None: break;
+    }
+    return KmonDiscoveryDispatch::Returned;
+}
+
 void KernelMonitor::WorkerLoop()
 {
-    uint64_t nextRuntimeCheckMs = 0;
     while (!StopRequested.load())
     {
-        // One failing scan tick must never take the process down: this
-        // thread has no handler above it, so an escaping C++ exception
-        // would std::terminate the whole console. Log once (deduped) and
-        // let the next tick retry.
-        try
-        {
-            if (GetTickCount64() >= nextRuntimeCheckMs)
+        const auto begin = GetTickCount64();
+        const bool returned = KmonRunWorkerBoundaries([&]() { ServicePendingAnalysis(); }, [&]() { ServiceDiscovery(); },
+            [&](KmonWorkerBoundary boundary, const char* message)
             {
-                nextRuntimeCheckMs = GetTickCount64() + 2000;
-                std::wstring runtimeError;
-                bool realDevice = false;
-                {
-                    std::lock_guard<std::mutex> lock(StateMutex);
-                    realDevice = Device != nullptr && Device->IsOpen();
-                }
-                if (realDevice && !UserRuntimeTracker.Start(&runtimeError))
-                {
-                    EmitUnique(L"process.execution", L"scan_failed:runtime_provider", L"", L"runtime",
-                        L"runtime provenance subscription unavailable", runtimeError);
-                }
-                else if (realDevice)
-                {
-                    ClearEmittedKey(L"scan_failed:runtime_provider");
-                }
-            }
-            ServicePendingAnalysis();
-
-        const uint64_t nowMs = GetTickCount64();
-        const bool mapperWatch = IsMapperWatchActive();
-        uint32_t hiddenInterval = 5000;
-        uint32_t mapperInterval = 8000;
+                EmitUnique(L"process.implant", L"scan_failed:worker:exception", L"", L"user",
+                    L"kmon worker boundary failed; independent work continues on its saved cursor",
+                    std::wstring(boundary == KmonWorkerBoundary::Analysis ? L"analysis: " : L"discovery: ") +
+                        std::wstring(message, message + strlen(message)), 0);
+            });
+        if (returned)
         {
-            std::lock_guard<std::mutex> lock(StateMutex);
-            hiddenInterval = Options.HiddenScanIntervalMs;
-            mapperInterval = Options.MapperScanIntervalMs;
+            AnalysisLastCompleteMs.store(GetTickCount64());
+            if (GetTickCount64() - begin > 1000) { AnalysisBudgetExceeded.fetch_add(1); }
         }
-        if (hiddenInterval < 1000)
-        {
-            hiddenInterval = 5000;
-        }
-        if (mapperInterval < 1000)
-        {
-            mapperInterval = 8000;
-        }
-        const uint32_t idleMapperInterval = mapperInterval;
-
-        // First tick only schedules the scans. Walking PsActiveProcessHead
-        // plus mapper leftovers stalls TI ingest at the exact moment a
-        // short-lived drop is most likely to appear.
-        if (NextHiddenScanTickMs == 0)
-        {
-            NextHiddenScanTickMs = nowMs + 1000;
-        }
-        else if (nowMs >= NextHiddenScanTickMs)
-        {
-            ScanHiddenProcesses();
-            ServicePendingAnalysis(L"after_hidden_processes");
-            NextHiddenScanTickMs = GetTickCount64() + hiddenInterval;
-        }
-
-        if (NextMapperScanTickMs == 0)
-        {
-            NextMapperScanTickMs = nowMs + 1000;
-        }
-        else if (nowMs >= NextMapperScanTickMs)
-        {
-            if (mapperWatch)
-            {
-                MapperWatchScans.fetch_add(1);
-            }
-            ScanMapperRemnants();
-            ServicePendingAnalysis(L"after_mapper_remnants");
-            if (!StopRequested.load())
-            {
-                ScanPoolMappedImages();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                ScanUnbackedDriverObjects();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                // P0: the module inventory diff shares this mapper tick and
-                // reuses the snapshot the tick just refreshed, so it adds no
-                // extra module reload and no extra scan cadence.
-                ScanModuleInventory();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                // P1: re-check the load-time image baselines on the same tick
-                // so a self-patching driver is reported while it is resident.
-                // Bounded to a few drivers per pass with a 60s recheck floor.
-                ScanKernelImageIntegrity();
-                ServicePendingAnalysis(L"after_kernel_image_integrity");
-                ScanDriverTamper();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                ScanHookCallbacks();
-                ServicePendingAnalysis(L"after_hook_callbacks");
-                ScanCallbackLifecycleSurfaces();
-                ServicePendingAnalysis(L"after_callback_lifecycle");
-                ScanPlatformEvidence();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                ScanHookInput();
-            }
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                // Graphics dispatch tables follow the same mapper scan
-                // cadence; the DDI hooks the Berkan renderer placed were
-                // invisible to every other callback scan.
-                ScanGraphicsDispatchTables();
-                ServicePendingAnalysis(L"after_graphics_dispatch");
-                ScanGraphicsReferences();
-            }
-            ServicePendingAnalysis(L"after_graphics_references");
-            NextMapperScanTickMs = GetTickCount64() +
-                (IsMapperWatchActive() ? kMapperWatchIntervalMs : idleMapperInterval);
-        }
-
-        if (NextKpageScanTickMs == 0)
-        {
-            NextKpageScanTickMs = nowMs + 2000;
-        }
-        else if (nowMs >= NextKpageScanTickMs)
-        {
-            ScanCpuIntegrityHooks();
-            ServicePendingAnalysis();
-            if (!StopRequested.load())
-            {
-                ScanOrphanMappedPages();
-            }
-            ServicePendingAnalysis(L"after_orphan_mapped_pages");
-            NextKpageScanTickMs = GetTickCount64() +
-                (IsMapperWatchActive()
-                    ? kMapperWatchKpageIntervalMs
-                    : kKpageScanIntervalMs);
-        }
-
-        if (NextUserScanTickMs == 0)
-        {
-            NextUserScanTickMs = nowMs + 1500;
-        }
-        if (nowMs >= NextUserScanTickMs || (RegionFollowupPending && nowMs >= NextRegionFollowupTickMs))
-        {
-            RegionFollowupPending = false;
-            NextRegionFollowupTickMs = GetTickCount64() + 2000;
-            PruneStalePromotedWatches();
-            EnableLoggingForWatchTargets();
-            ScanUserModeHostility();
-            ServicePendingAnalysis(L"after_user_hostility");
-            if (!StopRequested.load())
-            {
-                ScanWatchedHandleTables();
-                ServicePendingAnalysis(L"after_watched_handle_tables");
-                ScanWatchedHandleCapabilities();
-            }
-            ServicePendingAnalysis();
-            NextUserScanTickMs = GetTickCount64() + kUserScanIntervalMs;
-        }
-
-        if (NextInlinePatchScanTickMs == 0)
-        {
-            NextInlinePatchScanTickMs = nowMs + 2000;
-        }
-        else if (nowMs >= NextInlinePatchScanTickMs)
-        {
-            ScanKernelInlinePatches();
-            ServicePendingAnalysis();
-            NextInlinePatchScanTickMs = GetTickCount64() +
-                (IsMapperWatchActive()
-                    ? kInlinePatchWatchScanIntervalMs
-                    : kInlinePatchScanIntervalMs);
-        }
-
-        if (NextThreadScanTickMs == 0)
-        {
-            NextThreadScanTickMs = nowMs + 2000;
-        }
-        else if (nowMs >= NextThreadScanTickMs)
-        {
-            ScanKernelThreads();
-            ServicePendingAnalysis();
-            NextThreadScanTickMs = GetTickCount64() +
-                (IsMapperWatchActive()
-                    ? kThreadWatchScanIntervalMs
-                    : kThreadScanIntervalMs);
-        }
-
-        if (!StopRequested.load() && nowMs >= NextChannelScanTickMs)
-        {
-            ScanCommunicationSurfaces();
-            NextChannelScanTickMs = GetTickCount64() + 5000;
-            ServicePendingAnalysis();
-        }
-        if (nowMs >= NextImageScanTickMs)
-        {
-            ScanKernelExecutableImages();
-            ServicePendingAnalysis(L"after_kernel_executable_images");
-            NextImageScanTickMs = GetTickCount64() + 500;
-        }
-        ScanExecutablePageCandidates();
-        ServicePendingAnalysis(L"after_executable_page_candidates");
-
-        AnalysisLastCompleteMs.store(GetTickCount64());
-        if (GetTickCount64() - nowMs > 1000)
-        {
-            AnalysisBudgetExceeded.fetch_add(1);
-        }
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(IsMapperWatchActive() ? 50 : 200));
-        }
-        catch (const std::exception& ex)
-        {
-            const char* rawWhat = ex.what();
-            const char* what = rawWhat != nullptr ? rawWhat : "";
-            EmitUnique(
-                L"process.implant",
-                L"scan_failed:worker:exception",
-                std::wstring(),
-                L"user",
-                L"kmon worker tick failed; the tick was skipped and the loop continues",
-                L"unhandled exception: " +
-                    std::wstring(what, what + strlen(what)),
-                0);
-        }
-        catch (...)
-        {
-            EmitUnique(
-                L"process.implant",
-                L"scan_failed:worker:exception",
-                std::wstring(),
-                L"user",
-                L"kmon worker tick failed; the tick was skipped and the loop continues",
-                L"unhandled exception (unknown type)",
-                0);
-        }
+        // Failed scanners advance their phase and still observe the worker's
+        // idle delay. A repeated exception must not become an immediate busy loop.
+        if (!StopRequested.load())
+        { std::this_thread::sleep_for(std::chrono::milliseconds(IsMapperWatchActive() ? 50 : 200)); }
     }
 }
+
 
 void KernelMonitor::NoteCredscanRead(const TiEventRecord& record)
 {
@@ -11343,8 +11189,8 @@ void KernelMonitor::ArmMapperWatch(const KmonEvent& event)
             emit = true;
         }
     }
-    NextMapperScanTickMs = 1;
-    NextKpageScanTickMs = 1;
+    DiscoveryScheduling.Request(KmonDiscoveryGroup::Mapper, nowMs);
+    DiscoveryScheduling.Request(KmonDiscoveryGroup::KernelPages, nowMs);
     // Force kpage on the next tick: the Berkan driver mapped its arena
     // within 8s of load and the 20s periodic missed the fresh mappings.
     // Hidden scan stays on its own cadence --- ActiveProcessLinks walks
@@ -24550,8 +24396,8 @@ bool KernelMonitorThreadSelfTest()
         restarted.UserThreadStartCursors[{4, 100}] = 1234;
         restarted.GraphicsDispatchCursors[L"old_driver"].NextRva = 0x1238;
         restarted.DriverTamperBaselines[L"old_driver"] = KmonDriverIdentitySnapshot{};
-        restarted.NextThreadScanTickMs = 999;
-        restarted.NextInlinePatchScanTickMs = 999;
+        restarted.DiscoveryScheduling.Request(KmonDiscoveryGroup::Threads, 999);
+        restarted.DiscoveryScheduling.Request(KmonDiscoveryGroup::Inline, 999);
         restarted.ResetTemporalDetections();
         if (!restarted.ThreadHiddenStrikes.empty() ||
             !restarted.ThreadListDkomStrikes.empty() ||
@@ -24572,8 +24418,8 @@ bool KernelMonitorThreadSelfTest()
             !restarted.UserThreadStartCursors.empty() ||
             !restarted.GraphicsDispatchCursors.empty() ||
             !restarted.DriverTamperBaselines.empty() ||
-            restarted.NextThreadScanTickMs != 0 ||
-            restarted.NextInlinePatchScanTickMs != 0)
+            restarted.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Threads) ||
+            restarted.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Inline))
         {
             break;
         }

@@ -346,6 +346,7 @@
     <ClInclude Include="KmonImageScheduling.h" />
     <ClInclude Include="KmonPublicationScheduling.h" />
     <ClInclude Include="KmonAnalysisScheduling.h" />
+    <ClInclude Include="KmonDiscoveryScheduling.h" />
     <ClInclude Include="KmonLayoutScheduling.h" />
     <ClInclude Include="KmonFairRing.h" />
     <ClInclude Include="ImageReferencePreparation.h" />

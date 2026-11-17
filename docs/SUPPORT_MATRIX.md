@@ -55,6 +55,7 @@ backends are not implied by an x64 address width.
 | scheduler / image_observation | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / publication | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / analysis | native | implemented | not_an_address_reader | collector_monotonic |
+| scheduler / discovery | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / layout | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / image_reference_preparation | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / image_content_preparation | native | implemented | not_an_address_reader | collector_monotonic |
