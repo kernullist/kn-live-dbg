@@ -1808,6 +1808,79 @@ checks percentile bounds, concurrency, fixed cohorts and sustained churn.
 Image observation scheduling is described below; layout scheduling and generic
 deadline/dependency propagation remain separate work.
 
+## Publication scheduling and completion timing
+
+The capture writer selects one admitted job at a time from image read sets,
+evidence bundles, IRP captures and byte pages. Three ordinary family turns are
+followed by a possible loan to the family with the oldest known queue time. A
+loan does not advance the ordinary cursor. With all four families continuously
+ready, each receives service within six dispatches. This is a dispatch bound,
+not a time bound: synchronous file, replay and journal work cannot be preempted.
+Image/IRP retention classes still rotate within their own queues and retain
+their existing slot, memory and file budgets. FIFO order inside each class is
+preserved. A snapshot sees each queue separately; it is not an atomic inventory
+of concurrent admission, dispatch and completion.
+
+The writer exits only after observing the producer-join signal and then taking
+a fresh empty queue snapshot. An empty dispatch snapshot taken before that
+signal cannot discard the last enqueue. Partial startup failures use the same
+producer-join-before-writer-stop order.
+
+Each admitted job carries its local queue timestamp. Actual capture, image,
+reference-bundle and IRP producers also pass a `GetTickCount64` acquisition
+window around their original acquisition/qualification work. These windows are
+collector observations, not individual native read API durations. The writer
+never reconstructs them from serialized receipts, wall clocks, the observation
+source's separate steady-clock domain, or the time that existing bytes were
+queued. Opaque or historical inputs keep an unknown acquisition origin while
+still contributing queue and service samples. Failed admission does not become
+a publication attempt.
+
+The publisher records primary artifact file API success and journal commit
+separately. For image/IRP jobs, the file milestone is the original read/capture
+root; reference blobs and recipes keep their existing separate counters. A
+failed job can therefore still have preserved dependency blobs.
+For byte pages, file success follows the existing write/flush/close path; for
+bundles it follows immutable file publication. Those two families have no
+per-job collection journal requirement. For image/IRP jobs, complete publication
+also requires the existing retention contract's journal and required reference/
+recipe members. A raw file surviving a failed journal commit is partial. A
+partial or failed job cannot enter complete-service samples. Complete describes
+publication of the required artifacts, not semantic qualification of their
+contents, a recorded claim's truth, journal indexing, final collection closure
+or storage survival under media/power loss.
+
+`coverage.pipeline.publication_scheduling_json` contains the private
+`kn.publication_scheduling.v1` report. Each family exposes admissions/rejections,
+pending count, oldest known queue age, missing/invalid clocks, outcomes and
+normal/shutdown histograms. Queue wait, complete/incomplete service, queue-to-file
+and queue-to-journal durations are separate. Known acquisition windows add
+start/end-to-file and start/end-to-journal distributions. Per-job receipts
+retain both acquisition endpoints; subtracting histogram quantiles cannot
+reconstruct an individual acquisition interval. Quantiles are log2 bucket
+upper bounds and maxima are exact samples.
+An active family and elapsed service/queue wait remain visible during a slow
+publication. Shutdown classification is fixed at dispatch; it does not change
+when a normal job finishes after a stop request.
+
+Each completed dispatch also queues `coverage.publication` with private
+`kn.publication_timing.v1` data linking the original job ID to acquisition,
+queue, service, file and journal timestamps. Existing raw files, recipes and
+their hashes are unchanged. Receipt-event loss is counted separately; losing
+that event cannot undo a file commit. Sweep manifests and final ledgers retain
+their original dependency order and remain outside the per-job completion
+contract. A job's service can include a triggered sweep manifest, while its
+file/journal milestones still describe that job's own artifacts.
+
+`--self-test publication-scheduler` runs the actual writer with owned files,
+native owned page/bundle reads and synthetic image/IRP inputs. It removes the
+original memory/reference before publication, observes completion before
+requesting writer stop, and checks failed shutdown and raw-file-only outcomes.
+The core picker tests and independent Python model exercise fixed, growing and
+cleared/reused queues. These checks do not establish native workload SLOs,
+complete source coverage, generic pipeline deadlines or whole-collection
+durability under power loss.
+
 ## Image observation scheduling
 
 Each resident image-work key records first/last discovery, pending time, last

@@ -8658,7 +8658,8 @@ bool KernelMonitor::Start(
                 {
                     StopRequested.store(true);
                     CaptureStopping.store(true);
-                    WriterStopping.store(true);
+                    // The failure cleanup below joins every started producer
+                    // before signalling the writer to close its collections.
                     Active.store(false);
                     LiveOutput.store(false);
                     {
@@ -24157,9 +24158,11 @@ void KernelMonitor::ScanKernelThreads()
     irpOptions.Cancellation = &StopRequested;
     PendingIrpScanResult irpResult;
     std::vector<KernelCallbackRecord> irpTargets;
+    const auto irpAcquisitionStarted = GetTickCount64();
     const bool irpScanned = irpScanner.Scan(irpThreads, irpOptions, &irpResult, &ignored);
+    const auto irpAcquisitionFinished = GetTickCount64();
     // Preserve identity rejections too; queue admission is not publication.
-    const bool irpCaptureQueued = QueueIrpCapture(irpResult.Evidence);
+    const bool irpCaptureQueued = QueueIrpCapture(irpResult.Evidence, {irpAcquisitionStarted, irpAcquisitionFinished, true});
     {
         KmonEvent assessment;
         const bool available = !irpResult.ClaimAssessmentJson.empty();

@@ -245,6 +245,12 @@ public:
         std::lock_guard<std::mutex> lock(Mutex);
         return Items[0].size() + Items[1].size() + Items[2].size();
     }
+    // Visitor is bounded/nonblocking and cannot retain references or reenter.
+    template<typename Visitor> void Inspect(Visitor visitor) const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        for (const auto& lane : Items) { for (const auto& item : lane) { visitor(item); } }
+    }
     void Reset()
     {
         std::lock_guard<std::mutex> lock(Mutex);

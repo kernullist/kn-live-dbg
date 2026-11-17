@@ -22,6 +22,7 @@
 #include "KmonCaptureScheduling.h"
 #include "KmonReferenceScheduling.h"
 #include "KmonImageScheduling.h"
+#include "KmonPublicationScheduling.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -373,6 +374,7 @@ private:
     friend bool KmonPipelineSelfTest();
     friend bool KmonImageReadIntegrationSelfTest();
     friend bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
@@ -610,21 +612,24 @@ private:
         ObservationContext Context;
         std::wstring Role;
         std::vector<uint8_t> Bytes;
+        KmonPublicationStamp Publication;
     };
     struct CapturedEvidence
     {
         uint64_t Id = 0;
         EvidenceBundle Bundle;
+        KmonPublicationStamp Publication;
     };
-    uint64_t QueueEvidenceBundle(EvidenceBundle bundle);
+    uint64_t QueueEvidenceBundle(EvidenceBundle bundle, KmonAcquisitionWindow acquisition = {});
     struct CapturedIrp
     {
         std::wstring CollectionId;
         std::shared_ptr<const PendingIrpEvidenceArtifact> Artifact;
         std::shared_ptr<IrpRetentionPolicy::Ticket> Retention;
+        KmonPublicationStamp Publication;
     };
-    bool QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact);
-    void PersistIrpCapture(const CapturedIrp& capture) noexcept;
+    bool QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact, KmonAcquisitionWindow acquisition = {});
+    KmonPublicationResult PersistIrpCapture(const CapturedIrp& capture) noexcept;
     void CloseIrpCollection() noexcept;
     IrpRetentionQueue<CapturedIrp> CapturedIrps;
     IrpRetentionPolicy IrpRetention;
@@ -643,7 +648,7 @@ private:
         const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference = nullptr,
         const std::wstring& sliceJson = L"", const ExecutableSliceTrace* slice = nullptr,
         const ImageSweepContext* sweep = nullptr, const std::vector<ExecutablePageResult>* pages = nullptr,
-        uint64_t retentionEpisode = 0);
+        uint64_t retentionEpisode = 0, KmonAcquisitionWindow acquisition = {});
     struct CapturedImageReads
     {
         uint64_t Id = 0;
@@ -657,8 +662,9 @@ private:
         std::wstring Json;
         std::wstring SliceJson;
         std::optional<ImageSweepContext> Sweep;
+        KmonPublicationStamp Publication;
     };
-    void PersistImageReadSet(const CapturedImageReads& reads) noexcept;
+    KmonPublicationResult PersistImageReadSet(const CapturedImageReads& reads) noexcept;
     void CloseImageReadCollection() noexcept;
     EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction,
         std::function<bool(HANDLE)> admitOutput = {}) noexcept;
@@ -688,7 +694,11 @@ private:
     std::atomic<uint64_t> ImageSlicesQueued{0}, ImageSlicesWritten{0}, ImageSlicesFailed{0}, ImageSlicesUnavailable{0}, ImageSliceBytes{0};
     std::atomic<uint64_t> ImageSliceClaimsWritten{0}, ImageSliceClaimsUnavailable{0};
     std::atomic<uint64_t> ImageSweepClaimsWritten{0}, ImageSweepClaimsUnavailable{0};
-    void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
+    KmonPublicationResult PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
+    KmonPublicationResult PersistCapturedPage(const CapturedPage& page) noexcept;
+    std::array<KmonPublicationPending, KmonPublicationFamilies> PublicationPending(uint64_t now) const;
+    bool PublicationDrainComplete() const;
+    KmonPublicationTimings PublicationTimings;
     void CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};
     std::wstring EvidenceCollectorScope = NewEvidenceScope();
@@ -1517,6 +1527,7 @@ bool KernelMonitorMapperPoolSelfTest();
 bool KmonPipelineSelfTest();
 bool KmonImageReadIntegrationSelfTest();
 bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);

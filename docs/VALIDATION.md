@@ -7,6 +7,70 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Publication scheduling checkpoint: 2026-11-17
+
+The writer now rotates image, evidence, IRP and byte-page families with bounded
+oldest-queue loans. It retains original acquisition windows and distinguishes
+queue/service time, primary file publication, journal commit, partial/failed
+outcomes and shutdown samples. See
+[publication scheduling](ARCHITECTURE.md#publication-scheduling-and-completion-timing).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- The core harness built and ran under `/W4 /WX`, including **521 publication
+  checks** for bounded loans, fairness, unknown/invalid clocks, outcome
+  separation, observed reader/writer overlap and reset. An independent Python
+  deque model passed **2,284 assertions** over fixed, growing and cleared/reused
+  queues. Existing core checks and execution/reference oracles passed. The
+  wrapper's Python lookup initially hit the Windows alias; its three oracles
+  then passed using the bundled interpreter explicitly, against the same binary.
+- The actual `--self-test publication-scheduler` writer passed **30 checks**;
+  its independent JSON/CLI oracle passed **43**. Owned native page/bundle reads
+  and synthetic image/IRP inputs exercised all four production queues after
+  original memory and the reference file were removed. A blocked journal left
+  the original file as partial; a page budget failure stayed in the failed
+  shutdown population. Completion was observed before normal writer stop.
+- Adversarial review fixed a stale empty dispatch snapshot that could miss a
+  final enqueue before the producer-stop signal. The writer now observes that
+  signal before taking its final empty-queue snapshot. Controls cover pre-join,
+  stale-empty and drained states. The partial-start failure path now joins
+  producers before stopping the writer; that ordering was traced in code,
+  without injecting native thread-creation exhaustion. Receipt ID formatting
+  also stays inside guarded diagnostic construction after publication.
+- Existing image scheduling passed **966 assertions**, reference scheduling
+  **50** and capture scheduling **23**. The isolated product `--self-test all`
+  passed **28 timeline / 102 MCP / 121 KMON image-read / 319 image-scheduling /
+  30 publication-writer / 564 console / 3,043 command-route / 68 remote /
+  4 connect-option checks**. Compiled capabilities exposed **46 contracts /
+  261 routes**, the generated support matrix matched, and the public-content
+  scanner's **12 tests** passed.
+
+Final review found no additional actionable defects in the reviewed scope.
+Release product SHA-256:
+`007f139b30f02ea859c1aea8f6532cf7ce101b2c0110946bc2e9ce751575f751`.
+Core harness SHA-256:
+`c1019d6fbfebfda68829043c1ec6f87f0e67a187bc04d60d253fd05c5cf422c4`.
+The product build retained existing fixture conversion/alignment warnings.
+ASan remains blocked by the previously recorded host startup interception
+failure; no new ASan success is claimed.
+
+At **22:33 KST**, boot time remained **12:49:00.5 KST**. No new
+reboot/BugCheck events or dump files appeared after the previous checkpoint.
+No task process/driver, owned writer fixture, or parser preparation/profile
+residue remained. The 33 completed parser caches, BFE/mpssvc, firewall profiles
+and EFS running/manual baseline were unchanged.
+
+These are collector acquisition-window and publication-API observations, not
+individual native read latency or media/power-loss guarantees. Image/IRP primary
+files and journal members remain distinct from final collection closure and
+semantic claim qualification. Layout scheduling, asynchronous reference
+preparation, generic pipeline budgets/dependencies, whole-collection timing,
+native workloads, measured SLOs and whole-source maximum unobserved intervals
+remain open.
+
 ## Image observation scheduling checkpoint: 2026-11-17
 
 Image work now preserves discovery/pending ages, separates attempted and

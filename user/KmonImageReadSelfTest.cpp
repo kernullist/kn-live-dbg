@@ -4,6 +4,7 @@
 #include "ImageSliceRecipe.h"
 #include "ImageScopeClaimPublication.h"
 #include "ImageSweepGraph.h"
+#include "EvidencePrivacy.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1068,5 +1069,157 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
             L",\"bounded\":" + bounded + L",\"scenarios\":[" + scenarios + L"]}";
     }
     std::fprintf(stderr, "[image.scheduler] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
+bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* name)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[publication.writer] FAIL %s\n", name); } return ok; };
+    wchar_t temporary[MAX_PATH]{}, unique[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temporary) || !GetTempFileNameW(temporary, L"knw", 0, unique)) { return false; }
+    if (!DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { return false; }
+    const std::filesystem::path root = std::filesystem::absolute(unique);
+    std::wstring normal = L"null", stopped = L"null", receipts;
+    try
+    {
+        const auto owner = std::make_unique<KernelMonitor>();
+        auto& monitor = *owner;
+        const auto store = root / L"private";
+        if (!check(InitializeEvidencePrivateStore(store.wstring(), false).Initialized, "owned-private-store")) { throw std::runtime_error("store"); }
+        monitor.Options.LogDirectory = store.wstring();
+        Source source(L"synthetic:publication-writer");
+        const auto disk = Fixture(&source.Bytes);
+        const auto reference = root / L"reference.exe";
+        if (!check(Write(reference, disk), "owned-reference")) { throw std::runtime_error("reference"); }
+        ObservationIdentity synthetic; synthetic.BootId = L"synthetic:writer:boot"; synthetic.ProcessId = 42; synthetic.CreateTime = 1;
+        ObservationReadRouting routing;
+        routing.Primary = &source; routing.TargetId = L"synthetic:42:1"; routing.AddressSpaceId = L"synthetic:42:1:user";
+        check(monitor.ScanExecutableImage(reference.wstring(), Base, synthetic, {}, 16, &routing) == CodeOwnership::OwnedVerified,
+            "actual-image-acquisition-queued");
+
+        auto* allocation = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        const auto release = [](uint8_t* memory) { if (memory) { VirtualFree(memory, 0, MEM_RELEASE); } };
+        std::unique_ptr<uint8_t, decltype(release)> memory(allocation, release);
+        if (allocation == nullptr) { throw std::runtime_error("memory"); }
+        std::fill(allocation, allocation + 4096, uint8_t{0x31});
+        const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+        check(monitor.QueueCapture(L"owned_writer_page", reinterpret_cast<uint64_t>(allocation), 4096, identity, 0, nullptr),
+            "actual-native-page-admitted");
+        monitor.CaptureStopping.store(true); monitor.CaptureLoop();
+        check(monitor.CapturedPages.Size() == 1 && monitor.CaptureReadBytes.load() == 4096, "actual-page-acquisition-finished");
+        ObservationContext context; context.Identity = identity;
+        check(monitor.QueueCapturedBytes(L"owned_historical_bytes", reinterpret_cast<uint64_t>(allocation), context, {0x31, 0x31}) != 0,
+            "opaque-existing-bytes-admitted-with-unknown-acquisition");
+
+        EvidenceBundle bundle;
+        bundle.Acquisition = L"local_user_reader";
+        bundle.CaptureStartedMs = GetTickCount64();
+        KmonHuntReference target;
+        target.Context.Identity = identity; target.Context.MonotonicMs = GetTickCount64();
+        target.Context.Timestamp = ObservationFileTime(); target.Context.Source = L"owned_writer_fixture";
+        target.Context.DependencyGroup = L"owned_fixture_memory"; target.Context.Ownership = CodeOwnership::UnownedExecutable;
+        target.Address = target.Root = reinterpret_cast<uint64_t>(allocation);
+        const auto pointer = target.Address; target.Slot = reinterpret_cast<uint64_t>(&pointer);
+        target.Role = L"manifest_vtable"; target.SlotStable = true;
+        std::vector<uint8_t> head(32), slot(8); SIZE_T headRead = 0, slotRead = 0;
+        check(ReadProcessMemory(GetCurrentProcess(), allocation, head.data(), head.size(), &headRead) && headRead == head.size() &&
+            ReadProcessMemory(GetCurrentProcess(), &pointer, slot.data(), slot.size(), &slotRead) && slotRead == slot.size(), "owned-native-bundle-inputs");
+        bundle.Spans = {{target.Address, 32, L"target_head", L"valid", head}, {target.Slot, 8, L"pointer_slot", L"valid", slot}};
+        bundle.CaptureEndedMs = GetTickCount64(); bundle.ReferenceConsistent = true;
+        check(monitor.HuntIndex.Observe(target, GetTickCount64(), &bundle.Receipt) != 0, "owned-bundle-receipt");
+        check(monitor.QueueEvidenceBundle(bundle, {bundle.CaptureStartedMs, bundle.CaptureEndedMs, true}) != 0, "live-bundle-acquisition-window");
+        auto artifact = std::make_shared<PendingIrpEvidenceArtifact>();
+        const std::string raw = "{\"schema\":\"kn.irp_capture.v2\",\"owned_writer_fixture\":true}";
+        artifact->Bytes.assign(raw.begin(), raw.end()); artifact->Sha256 = ContentHash::Bytes(artifact->Bytes);
+        // This is a serialization/publication control, not a live IRP read.
+        check(monitor.QueueIrpCapture(artifact), "synthetic-raw-irp-with-unknown-acquisition");
+        check(DeleteFileW(reference.c_str()) != FALSE, "reference-source-removed-before-writer");
+        memory.reset();
+        const auto before = monitor.PublicationPending(GetTickCount64());
+        check(before[0].Count == 1 && before[1].Count == 1 && before[2].Count == 1 && before[3].Count == 2,
+            "all-four-production-queues-ready-before-writer");
+        monitor.CaptureWriter = std::thread(&KernelMonitor::CaptureWriterLoop, &monitor);
+        const auto deadline = GetTickCount64() + 10000;
+        bool completed = false;
+        do
+        {
+            uint64_t attempts = 0;
+            for (size_t i = 0; i < 4; ++i) { attempts += monitor.PublicationTimings.Snapshot(static_cast<KmonPublicationFamily>(i)).Attempts; }
+            completed = attempts == 5;
+            if (!completed) { std::this_thread::yield(); }
+        } while (!completed && GetTickCount64() < deadline);
+        monitor.WriterStopping.store(true); monitor.CaptureWriter.join();
+        check(completed && monitor.CaptureWriterDone.load(), "writer-completion-observed-before-stop");
+        monitor.DrainPipelineEvents(true);
+        for (const auto& event : monitor.Ring)
+        {
+            const auto summary = event.Evidence.find(L"publication_scheduling_json");
+            if (summary != event.Evidence.end()) { normal = summary->second; }
+            const auto receipt = event.Evidence.find(L"publication_timing_json");
+            if (receipt != event.Evidence.end()) { if (!receipts.empty()) { receipts += L","; } receipts += receipt->second; }
+        }
+        check(normal != L"null" && Array(L"{\"rows\":[" + receipts + L"]}", L"rows").size() == 5,
+            "actual-writer-publishes-summary-and-per-job-times");
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const auto count = monitor.PublicationTimings.Snapshot(static_cast<KmonPublicationFamily>(i));
+            check(count.Attempts == (i == 3 ? 2u : 1u) && count.Complete == count.Attempts && count.Partial == 0 && count.Failed == 0 &&
+                count.Files == count.Attempts && count.Journals == (i == 0 || i == 2 ? 1u : 0u) && count.InvalidClocks == 0,
+                "family-specific-file-and-journal-completion");
+        }
+        check(monitor.PublicationTimings.Snapshot(KmonPublicationFamily::Page).UnknownAcquisition == 1 &&
+            monitor.PublicationTimings.Snapshot(KmonPublicationFamily::Irp).UnknownAcquisition == 1 && monitor.CapturedFiles.size() == 2,
+            "unknown-origins-remain-unknown-after-success");
+        for (const auto& file : monitor.CapturedFiles)
+        {
+            std::ifstream input(file, std::ios::binary);
+            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            check((bytes.size() == 4096 || bytes.size() == 2) && std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x31; }),
+                "durable-page-bytes-survive-original-memory-removal");
+        }
+
+        const auto failedOwner = std::make_unique<KernelMonitor>();
+        auto& failed = *failedOwner;
+        const auto failureStore = root / L"partial";
+        failed.StopRequested.store(true); // Partial startup has not joined producers yet.
+        const auto emptyBeforeShutdown = failed.PublicationPending(GetTickCount64());
+        check(std::all_of(emptyBeforeShutdown.begin(), emptyBeforeShutdown.end(), [](const auto& item) { return item.Count == 0; }) &&
+            !failed.PublicationDrainComplete(), "stop-request-before-producer-join-cannot-close-empty-writer");
+        std::filesystem::create_directories(failureStore);
+        check(Write(failureStore / L"collections", {0x78}), "block-journal-with-owned-file");
+        failed.Options.LogDirectory = failureStore.wstring();
+        auto operation = std::make_shared<ObservationReadOperation>(L"synthetic:writer-gap", routing.TargetId, routing.AddressSpaceId);
+        ObservationReadRouter router(routing, operation); std::vector<uint8_t> observed;
+        check(router.ReadExact(Base, 32, &observed) && failed.QueueImageReadSet(router.Snapshot(), synthetic, L"synthetic", Base) != 0,
+            "raw-image-queued-before-journal-failure");
+        failed.CapturedBytes = 256ull * 1024 * 1024;
+        check(failed.QueueCapturedBytes(L"owned_budget_failure", Base, context, {0x31}) != 0, "queue-page-before-budget-failure");
+        failed.WriterStopping.store(true);
+        check(!failed.PublicationDrainComplete(), "stale-empty-dispatch-snapshot-cannot-discard-final-enqueue");
+        failed.CaptureWriterLoop();
+        check(failed.PublicationDrainComplete(), "joined-producers-and-fresh-empty-queues-permit-close");
+        const auto partial = failed.PublicationTimings.Snapshot(KmonPublicationFamily::Image, true);
+        const auto rejected = failed.PublicationTimings.Snapshot(KmonPublicationFamily::Page, true);
+        check(partial.Attempts == 1 && partial.Partial == 1 && partial.Files == 1 && partial.Journals == 0 && partial.Complete == 0,
+            "raw-file-success-cannot-be-counted-as-journal-success");
+        check(rejected.Failed == 1 && rejected.Files == 0 && rejected.Complete == 0 &&
+            failed.PublicationTimings.Snapshot(KmonPublicationFamily::Page).Attempts == 0, "failed-shutdown-does-not-enter-normal-success");
+        stopped = failed.PublicationTimings.Json(failed.PublicationPending(GetTickCount64()), GetTickCount64());
+    }
+    catch (const std::exception&) { check(false, "owned-publication-fixture-exception"); }
+    std::error_code ec;
+    // Exclusively created absolute root. No caller-supplied path is removed.
+    std::filesystem::remove_all(root, ec);
+    check(!ec && !std::filesystem::exists(root), "owned-publications-and-fixtures-cleaned");
+    if (diagnostics != nullptr)
+    {
+        *diagnostics = L"{\"schema\":\"kn.publication_writer_test.v1\",\"driver_loaded\":false,"
+            L"\"corpus\":\"owned_files_native_page_and_bundle_synthetic_image_and_irp\",\"passed\":" +
+            std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
+            L",\"normal\":" + normal + L",\"shutdown\":" + stopped + L",\"receipts\":[" + receipts + L"]}";
+    }
+    std::fprintf(stderr, "[publication.writer] checks=%u failed=%u\n", checks, failures);
     return failures == 0;
 }

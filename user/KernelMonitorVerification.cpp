@@ -478,7 +478,8 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
         if (context.Slice.Terminal) { ImageSweepTerminalsObserved.fetch_add(1); }
         context.Slice.Reason = work->Sweep.Coverage.Reason;
         if (capturedReference.Artifact != nullptr) { context.Slice.ReferenceSha256 = capturedReference.Artifact->Sha256; }
-        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice, &context, &pages, work->RetentionEpisode);
+        readSetId = QueueImageReadSet(reads, identity, path, base, &capturedReference, recipe, &slice, &context, &pages,
+            work->RetentionEpisode, {turnStarted, timing.FinishedMs, true});
         readPersistence = readSetId == 0 ? L"not_queued" : L"queued";
     }
     // Completed small images must not continually restart while larger images
@@ -1581,7 +1582,7 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
                     bundle.Spans.push_back(evidencePages.at(pending.first));
                     BindEvidenceOrigin(bundle, captureId, captureNativeEpoch, device->ObservationEpoch());
                     event.Evidence[L"hop_" + std::to_wstring(pending.first) + L"_bundle_queued_id"] =
-                        std::to_wstring(QueueEvidenceBundle(std::move(bundle)));
+                        std::to_wstring(QueueEvidenceBundle(std::move(bundle), {captureStartedMs, captureEndedMs, true}));
                 }
                 if (reference.Id != 0)
                 {

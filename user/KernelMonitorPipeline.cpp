@@ -149,6 +149,7 @@ void KernelMonitor::ResetPipeline()
     PriorityCaptures.Reset();
     ContinuedCaptures.Reset();
     CaptureTimings.Reset();
+    PublicationTimings.Reset();
     CapturedPages.Reset();
     CapturedEvidenceBundles.Reset();
     CapturedIrps.Reset();
@@ -485,6 +486,7 @@ bool KernelMonitor::QueueCapture(const std::wstring& role, uint64_t address, uin
 uint64_t KernelMonitor::QueueCapturedBytes(const std::wstring& role, uint64_t address,
     const ObservationContext& context, const std::vector<uint8_t>& bytes)
 {
+    KmonPublicationAdmission admission{PublicationTimings, KmonPublicationFamily::Page};
     if (bytes.empty() || bytes.size() > 4096)
     {
         return 0;
@@ -499,11 +501,14 @@ uint64_t KernelMonitor::QueueCapturedBytes(const std::wstring& role, uint64_t ad
     page.Role = role;
     page.Bytes = bytes;
     const uint64_t id = page.Id;
+    // These bytes can be historical. Admission cannot establish acquisition time.
+    page.Publication = {{}, GetTickCount64(), true};
     if (!CapturedPages.Push(std::move(page)))
     {
         CaptureFailed.fetch_add(1);
         return 0;
     }
+    admission.Admitted = true;
     return id;
 }
 
@@ -826,7 +831,9 @@ void KernelMonitor::CaptureLoop()
                 page.Context.Coverage.ComparedBytes = count;
                 page.Context.Coverage.Reason = L"bytes_captured_not_integrity_verified";
                 page.Context.Identity = work.Identity;
+                page.Publication = {{page.Context.MonotonicMs, now, true}, GetTickCount64(), true};
                 success = CapturedPages.Push(std::move(page));
+                PublicationTimings.Admission(KmonPublicationFamily::Page, success);
                 if (success)
                 {
                     CaptureReadBytes.fetch_add(count);
@@ -936,8 +943,9 @@ void KernelMonitor::BindEvidenceOrigin(EvidenceBundle& bundle, const std::wstrin
     bundle.Origin = {EvidenceCollectorScope, captureId, boot, nativeEpochBefore};
 }
 
-uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
+uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle, KmonAcquisitionWindow acquisition)
 {
+    KmonPublicationAdmission admission{PublicationTimings, KmonPublicationFamily::Evidence};
     CapturedEvidence evidence;
     evidence.Id = NextCaptureId.fetch_add(1);
     bundle.CollectionId = std::to_wstring(EvidenceCollectionEpoch.load());
@@ -945,7 +953,9 @@ uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
     if (bundle.Origin.CollectorScope != EvidenceCollectorScope) { bundle.Origin = {}; }
     evidence.Bundle = std::move(bundle);
     const uint64_t id = evidence.Id;
+    evidence.Publication = {acquisition, GetTickCount64(), true};
     if (!CapturedEvidenceBundles.Push(std::move(evidence))) { EvidenceDropped.fetch_add(1); return 0; }
+    admission.Admitted = true;
     EvidenceQueued.fetch_add(1);
     return id;
 }
@@ -953,8 +963,9 @@ uint64_t KernelMonitor::QueueEvidenceBundle(EvidenceBundle bundle)
 uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads, const ObservationIdentity& identity,
     const std::wstring& image, uint64_t imageBase, const ExecutableSweepReference* reference, const std::wstring& sliceJson,
     const ExecutableSliceTrace* slice, const ImageSweepContext* sweep, const std::vector<ExecutablePageResult>* pages,
-    uint64_t retentionEpisode)
+    uint64_t retentionEpisode, KmonAcquisitionWindow acquisition)
 {
+    KmonPublicationAdmission admission{PublicationTimings, KmonPublicationFamily::Image};
     try
     {
         ImageRetentionRequest retention;
@@ -1032,7 +1043,9 @@ uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads,
         if (mcpjson::WideToUtf8(sliceJson).size() <= EvidenceBundleMaxJsonBytes) { item.SliceJson = sliceJson; }
         const bool hasSlice = !item.SliceJson.empty();
         const auto id = item.Id;
+        item.Publication = {acquisition, GetTickCount64(), true};
         if (!CapturedImageReadSets.Push(std::move(item))) { ImageReadsDropped.fetch_add(1); return 0; }
+        admission.Admitted = true;
         ImageReadsQueued.fetch_add(1);
         if (hasSlice) { ImageSlicesQueued.fetch_add(1); }
         else { ImageSlicesUnavailable.fetch_add(1); }
@@ -1041,8 +1054,9 @@ uint64_t KernelMonitor::QueueImageReadSet(const ObservationRoutedReadSet& reads,
     catch (...) { ImageReadsDropped.fetch_add(1); return 0; }
 }
 
-void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcept
+KmonPublicationResult KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcept
 {
+    KmonPublicationResult result;
     bool written = false;
     bool sliceWritten = false;
     bool sliceClaimWritten = false;
@@ -1106,6 +1120,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
             if (!json.empty() && finalBytes <= EvidenceBundleMaxJsonBytes && finalBytes <= ImageRetention.Remaining(lane, ImageRetentionStream::Reads))
             {
                 written = SaveObservationJson(path.wstring(), json, &failure);
+                if (written) { result.FilePublished = true; result.FileMs = GetTickCount64(); }
                 if (written)
                 {
                     ImageRetention.Consume(lane, ImageRetentionStream::Reads, finalBytes);
@@ -1174,12 +1189,15 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         else { ImageSliceClaimsUnavailable.fetch_add(1); }
     }
     const auto commit = JournalImageFiles(std::move(publication));
+    if (commit.Committed) { result.JournalCommitted = true; result.JournalMs = GetTickCount64(); }
     if (commit.Committed) { ImageJournalReadsCommitted.fetch_add(1); }
     else { ImageJournalReadsFailed.fetch_add(1); }
-    if (reads.Retention) { reads.Retention->Finish(commit.Committed && written &&
+    result.Complete = commit.Committed && written &&
         (!reads.HasReference || referenceWritten) && (!reads.HasSliceInputs || sliceWritten) &&
-        (!reads.Retention->HasDifference() || (referenceWritten && sliceWritten))); }
+        (reads.Retention && (!reads.Retention->HasDifference() || (referenceWritten && sliceWritten)));
+    if (reads.Retention) { reads.Retention->Finish(result.Complete); }
     RecordImageSweepPublication(reads, written, sliceWritten, referenceWritten, rawHash, recipeHash);
+    return result;
 }
 
 bool KernelMonitor::EnsureImageStoreLease(std::wstring* error) noexcept
@@ -1418,8 +1436,9 @@ void KernelMonitor::CloseImageReadCollection() noexcept
     ImageStoreLease.reset();
 }
 
-bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact)
+bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact, KmonAcquisitionWindow acquisition)
 {
+    KmonPublicationAdmission admission{PublicationTimings, KmonPublicationFamily::Irp};
     if (!artifact) { IrpCapturesUnavailable.fetch_add(1); IrpRetention.RecordUnavailable(); return false; }
     bool acquired = false;
     try
@@ -1431,16 +1450,19 @@ bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArti
         const uint64_t bytes = artifact->Bytes.size() + (artifact->Reference ? artifact->Reference->Bytes.size() : 0);
         auto ticket = IrpRetention.Acquire(artifact->Retention, bytes);
         acquired = true; // Acquire includes its own attempt/denial accounting.
-        if (!ticket || !CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact), std::move(ticket)}))
+        if (!ticket || !CapturedIrps.Push({std::to_wstring(EvidenceCollectionEpoch.load()), std::move(artifact), std::move(ticket),
+            {acquisition, GetTickCount64(), true}}))
         { IrpCapturesDropped.fetch_add(1); return false; }
+        admission.Admitted = true;
         IrpCapturesQueued.fetch_add(1);
         return true;
     }
     catch (...) { if (!acquired) { IrpRetention.RecordUnavailable(true); } IrpCapturesDropped.fetch_add(1); return false; }
 }
 
-void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
+KmonPublicationResult KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
 {
+    KmonPublicationResult result;
     bool written = false;
     bool claimWritten = false;
     bool referenceSaved = false, referenceCreated = false;
@@ -1522,6 +1544,7 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
                 path = (std::filesystem::path(directory) / (L"irp-" + capture.CollectionId + L"-" + physicalDigest + L".knirp")).wstring();
                 written = PublishReferenceArtifact(path, published, &failure,
                     [&](HANDLE file) { return privacy->CheckFile(file); });
+                if (written) { result.FilePublished = true; result.FileMs = GetTickCount64(); }
                 claimWritten = written && !publication.Bytes.empty();
                 if (written)
                 {
@@ -1538,6 +1561,7 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
                             reference.Sha256, L"raw.bytes", reference.Bytes.size()});
                     }
                     commit = JournalImageFiles(std::move(transaction), [privacy](HANDLE file) { return privacy->CheckFile(file); });
+                    if (commit.Committed) { result.JournalCommitted = true; result.JournalMs = GetTickCount64(); }
                 }
             }
             else { failure = L"irp_capture_digest_mismatch"; }
@@ -1577,7 +1601,9 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         else if (referenceCreated) { IrpReferencesCreated.fetch_add(1); }
         else { IrpReferencesReused.fetch_add(1); }
     }
-    if (capture.Retention) { capture.Retention->Finish(written && commit.Committed && (!capture.Retention->HasState() || referenceSaved)); }
+    result.Complete = written && commit.Committed && capture.Retention && (!capture.Retention->HasState() || referenceSaved);
+    if (capture.Retention) { capture.Retention->Finish(result.Complete); }
+    return result;
 }
 
 void KernelMonitor::CloseIrpCollection() noexcept
@@ -1627,8 +1653,9 @@ void KernelMonitor::CloseIrpCollection() noexcept
     IrpJournalLedgerFailed.fetch_add(1);
 }
 
-void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
+KmonPublicationResult KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
 {
+    KmonPublicationResult result;
     bool written = false;
     try
     {
@@ -1645,6 +1672,7 @@ void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noex
         if (!error && !json.empty() && bytes <= 128ull * 1024 * 1024 - EvidenceBytes.load())
         {
             written = SaveEvidenceBundle(path.wstring(), evidence.Bundle, &failure);
+            if (written) { result.FilePublished = result.Complete = true; result.FileMs = GetTickCount64(); }
             if (written) { EvidenceBytes.fetch_add(bytes); }
         }
         KmonEvent event;
@@ -1662,6 +1690,7 @@ void KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noex
     catch (...) {}
     if (written) { EvidenceWritten.fetch_add(1); }
     else { EvidenceFailed.fetch_add(1); }
+    return result;
 }
 
 void KernelMonitor::CloseEvidenceCollection() noexcept
@@ -1684,136 +1713,208 @@ void KernelMonitor::CloseEvidenceCollection() noexcept
     EvidenceLedgerFailed.fetch_add(1);
 }
 
+KmonPublicationResult KernelMonitor::PersistCapturedPage(const CapturedPage& page) noexcept
+{
+    KmonPublicationResult result;
+    try
+    {
+        std::wstring directory;
+        {
+            std::lock_guard<std::mutex> lock(StateMutex);
+            directory = Options.LogDirectory;
+        }
+        if (directory.empty())
+        {
+            wchar_t executable[32768] = {};
+            GetModuleFileNameW(nullptr, executable, 32768);
+            directory = std::filesystem::path(executable).parent_path().wstring();
+        }
+        directory += L"\\captures";
+        std::error_code ignored;
+        std::filesystem::create_directories(directory, ignored);
+        const std::wstring path = directory + L"\\capture-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(StartTickMs.load()) + L"-" + std::to_wstring(page.Id) + L"-" + std::to_wstring(page.Offset) + L".bin";
+        bool allowed = false;
+        {
+            std::lock_guard<std::mutex> lock(CapturesMutex);
+            allowed = CapturedBytes + page.Bytes.size() <= 256ull * 1024 * 1024;
+            if (allowed)
+            {
+                CapturedBytes += page.Bytes.size();
+            }
+        }
+        bool written = false;
+        if (allowed)
+        {
+            HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                DWORD count = 0;
+                written = WriteFile(file, page.Bytes.data(), static_cast<DWORD>(page.Bytes.size()), &count, nullptr) && count == page.Bytes.size();
+                if (written)
+                {
+                    written = FlushFileBuffers(file) != FALSE;
+                }
+                CloseHandle(file);
+                if (written) { result.FilePublished = result.Complete = true; result.FileMs = GetTickCount64(); }
+                if (!written)
+                {
+                    DeleteFileW(path.c_str());
+                }
+            }
+        }
+        if (allowed && !written)
+        {
+            std::lock_guard<std::mutex> lock(CapturesMutex);
+            CapturedBytes -= page.Bytes.size();
+        }
+        const std::wstring hash = ContentHash::Bytes(page.Bytes);
+        if (page.Role == L"modified_code" || (page.Context.Coverage.InventoryAvailable &&
+            (page.Role == L"kernel_exec_candidate" || page.Role == L"user_exec_candidate")))
+        {
+            ExecutableRegionObservation region;
+            region.Context = page.Context;
+            region.Context.Source = L"captured_bytes";
+            region.Context.DependencyGroup = L"memory_capture";
+            region.Range = {page.Address, page.Bytes.size()};
+            region.Executable = true;
+            region.ContentSha256 = hash;
+            region.ContentBytes = page.Bytes.size();
+            CapturedRegions.Push(std::move(region));
+        }
+        KmonEvent event;
+        event.Kind = L"coverage.capture";
+        event.ProcessId = page.Context.Identity.ProcessId;
+        event.Observation = page.Context;
+        event.Summary = written ? L"captured bytes persisted" : L"capture persistence failed or session byte budget exhausted";
+        event.Evidence[L"capture_id"] = std::to_wstring(page.Id);
+        event.Evidence[L"capture_role"] = page.Role;
+        event.Evidence[L"capture_path"] = written ? path : L"";
+        event.Evidence[L"capture_sha256"] = hash;
+        event.Evidence[L"capture_bytes"] = std::to_wstring(page.Bytes.size());
+        event.Evidence[L"requested_bytes"] = std::to_wstring(page.RequestedBytes);
+        event.Evidence[L"address"] = std::to_wstring(page.Address);
+        event.Evidence[L"chunk_offset"] = std::to_wstring(page.Offset);
+        event.Evidence[L"root_cr3"] = std::to_wstring(page.RootCr3);
+        event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(page.FirstDelayMs);
+        event.Evidence[L"request_age_at_read_start_ms"] = std::to_wstring(page.RequestAgeAtReadStartMs);
+        event.Evidence[L"page_read_duration_ms"] = std::to_wstring(page.ReadDurationMs);
+        event.Evidence[L"mapping_consistency"] = page.Context.PfnKnown ? L"pfn_checked_before_and_after" : L"unverified";
+        event.Evidence[L"persistence"] = written ? L"complete" : L"failed";
+        while (!StopRequested.load() && PipelineEvents.Size() >= 384)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        PipelineEvents.Push(std::move(event));
+        if (written)
+        {
+            std::lock_guard<std::mutex> lock(CapturesMutex);
+            const auto candidate = CandidateCaptures.find(page.Context.MappingGeneration);
+            if (candidate != CandidateCaptures.end() && page.Offset == 0)
+            {
+                candidate->second.Persisted = true;
+            }
+            if (CapturedFiles.size() < 65536)
+            {
+                CapturedFiles.push_back(path);
+            }
+        }
+        else
+        {
+            CaptureFailed.fetch_add(1);
+        }
+    }
+    catch (...)
+    {
+        CaptureFailed.fetch_add(1);
+    }
+    return result;
+}
+
+std::array<KmonPublicationPending, KmonPublicationFamilies> KernelMonitor::PublicationPending(uint64_t now) const
+{
+    std::array<KmonPublicationPending, KmonPublicationFamilies> pending{};
+    CapturedImageReadSets.Inspect([&](const auto& item) { pending[0].Add(item.Publication, now); });
+    CapturedEvidenceBundles.Inspect([&](const auto& item) { pending[1].Add(item.Publication, now); });
+    CapturedIrps.Inspect([&](const auto& item) { pending[2].Add(item.Publication, now); });
+    CapturedPages.Inspect([&](const auto& item) { pending[3].Add(item.Publication, now); });
+    return pending;
+}
+
+bool KernelMonitor::PublicationDrainComplete() const
+{
+    // Observe producer shutdown BEFORE checking the queues. The dispatch
+    // snapshot may predate the last producer's enqueue and join.
+    if (!WriterStopping.load()) { return false; }
+    const auto pending = PublicationPending(GetTickCount64());
+    return std::all_of(pending.begin(), pending.end(), [](const auto& item) { return item.Count == 0; });
+}
+
 void KernelMonitor::CaptureWriterLoop()
 {
     CaptureWriterDone.store(false);
-    while (!WriterStopping.load() || CapturedPages.Size() != 0 || CapturedEvidenceBundles.Size() != 0 || CapturedImageReadSets.Size() != 0 || CapturedIrps.Size() != 0)
+    KmonPublicationPicker picker;
+    for (;;)
     {
-        CapturedImageReads imageReads;
-        const bool haveImageReads = CapturedImageReadSets.Pop(&imageReads);
-        if (haveImageReads) { PersistImageReadSet(imageReads); }
-        CapturedEvidence evidence;
-        const bool haveEvidence = CapturedEvidenceBundles.Pop(&evidence);
-        if (haveEvidence) { PersistEvidenceBundle(evidence); }
-        CapturedIrp irp;
-        const bool haveIrp = CapturedIrps.Pop(&irp);
-        if (haveIrp) { PersistIrpCapture(irp); }
-        CapturedPage page;
-        if (!CapturedPages.Pop(&page))
+        const auto family = picker.Pick(PublicationPending(GetTickCount64()));
+        if (family == KmonPublicationFamily::None)
         {
-            if (!haveEvidence && !haveImageReads && !haveIrp) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+            if (PublicationDrainComplete()) { break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        try
+        const auto persist = [&](const auto& item, auto method, auto id, const ObservationIdentity& identity)
         {
-            std::wstring directory;
+            const auto started = GetTickCount64();
+            const bool shutdown = WriterStopping.load() || StopRequested.load();
+            PublicationTimings.Begin(family, item.Publication, started, shutdown, picker.DebtLoans());
+            const auto result = (this->*method)(item);
+            const auto ended = GetTickCount64();
+            PublicationTimings.Finish(family, item.Publication, started, ended, shutdown, result);
+            try
             {
-                std::lock_guard<std::mutex> lock(StateMutex);
-                directory = Options.LogDirectory;
+                const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };
+                const auto& stamp = item.Publication;
+                const auto& acquisition = stamp.Acquisition;
+                KmonEvent event;
+                event.Kind = L"coverage.publication"; event.ProcessId = identity.ProcessId;
+                event.Observation.Identity = identity;
+                event.Summary = result.Complete ? L"required publication completed" :
+                    result.FilePublished || result.JournalCommitted ? L"publication incomplete with preserved files or journal" : L"publication failed";
+                event.Evidence[L"publication_timing_json"] = L"{\"schema\":\"kn.publication_timing.v1\",\"family\":" +
+                    mcpjson::Quote(KmonPublicationFamilyName(static_cast<size_t>(family))) + L",\"id\":" + mcpjson::Quote(id()) +
+                    L",\"clock_domain\":\"GetTickCount64_ms\",\"queued_ms\":" + (stamp.QueuedKnown ? n(stamp.Queued) : L"null") +
+                    L",\"acquisition_start_ms\":" + (acquisition.Known ? n(acquisition.Started) : L"null") +
+                    L",\"acquisition_end_ms\":" + (acquisition.Known ? n(acquisition.Finished) : L"null") +
+                    L",\"service_start_ms\":" + n(started) + L",\"service_end_ms\":" + n(ended) +
+                    L",\"file_ms\":" + (result.FilePublished ? n(result.FileMs) : L"null") +
+                    L",\"journal_ms\":" + (result.JournalCommitted ? n(result.JournalMs) : L"null") +
+                    L",\"complete\":" + (result.Complete ? L"true" : L"false") + L",\"shutdown\":" + (shutdown ? L"true" : L"false") + L"}";
+                if (!PipelineEvents.Push(std::move(event))) { CollectionLost.fetch_add(1); }
             }
-            if (directory.empty())
-            {
-                wchar_t executable[32768] = {};
-                GetModuleFileNameW(nullptr, executable, 32768);
-                directory = std::filesystem::path(executable).parent_path().wstring();
-            }
-            directory += L"\\captures";
-            std::error_code ignored;
-            std::filesystem::create_directories(directory, ignored);
-            const std::wstring path = directory + L"\\capture-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                std::to_wstring(StartTickMs.load()) + L"-" + std::to_wstring(page.Id) + L"-" + std::to_wstring(page.Offset) + L".bin";
-            bool allowed = false;
-            {
-                std::lock_guard<std::mutex> lock(CapturesMutex);
-                allowed = CapturedBytes + page.Bytes.size() <= 256ull * 1024 * 1024;
-                if (allowed)
-                {
-                    CapturedBytes += page.Bytes.size();
-                }
-            }
-            bool written = false;
-            if (allowed)
-            {
-                HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (file != INVALID_HANDLE_VALUE)
-                {
-                    DWORD count = 0;
-                    written = WriteFile(file, page.Bytes.data(), static_cast<DWORD>(page.Bytes.size()), &count, nullptr) && count == page.Bytes.size();
-                    if (written)
-                    {
-                        written = FlushFileBuffers(file) != FALSE;
-                    }
-                    CloseHandle(file);
-                    if (!written)
-                    {
-                        DeleteFileW(path.c_str());
-                    }
-                }
-            }
-            if (allowed && !written)
-            {
-                std::lock_guard<std::mutex> lock(CapturesMutex);
-                CapturedBytes -= page.Bytes.size();
-            }
-            const std::wstring hash = ContentHash::Bytes(page.Bytes);
-            if (page.Role == L"modified_code" || (page.Context.Coverage.InventoryAvailable &&
-                (page.Role == L"kernel_exec_candidate" || page.Role == L"user_exec_candidate")))
-            {
-                ExecutableRegionObservation region;
-                region.Context = page.Context;
-                region.Context.Source = L"captured_bytes";
-                region.Context.DependencyGroup = L"memory_capture";
-                region.Range = {page.Address, page.Bytes.size()};
-                region.Executable = true;
-                region.ContentSha256 = hash;
-                region.ContentBytes = page.Bytes.size();
-                CapturedRegions.Push(std::move(region));
-            }
-            KmonEvent event;
-            event.Kind = L"coverage.capture";
-            event.ProcessId = page.Context.Identity.ProcessId;
-            event.Observation = page.Context;
-            event.Summary = written ? L"captured bytes persisted" : L"capture persistence failed or session byte budget exhausted";
-            event.Evidence[L"capture_id"] = std::to_wstring(page.Id);
-            event.Evidence[L"capture_role"] = page.Role;
-            event.Evidence[L"capture_path"] = written ? path : L"";
-            event.Evidence[L"capture_sha256"] = hash;
-            event.Evidence[L"capture_bytes"] = std::to_wstring(page.Bytes.size());
-            event.Evidence[L"requested_bytes"] = std::to_wstring(page.RequestedBytes);
-            event.Evidence[L"address"] = std::to_wstring(page.Address);
-            event.Evidence[L"chunk_offset"] = std::to_wstring(page.Offset);
-            event.Evidence[L"root_cr3"] = std::to_wstring(page.RootCr3);
-            event.Evidence[L"first_byte_delay_ms"] = std::to_wstring(page.FirstDelayMs);
-            event.Evidence[L"request_age_at_read_start_ms"] = std::to_wstring(page.RequestAgeAtReadStartMs);
-            event.Evidence[L"page_read_duration_ms"] = std::to_wstring(page.ReadDurationMs);
-            event.Evidence[L"mapping_consistency"] = page.Context.PfnKnown ? L"pfn_checked_before_and_after" : L"unverified";
-            event.Evidence[L"persistence"] = written ? L"complete" : L"failed";
-            while (!StopRequested.load() && PipelineEvents.Size() >= 384)
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-            PipelineEvents.Push(std::move(event));
-            if (written)
-            {
-                std::lock_guard<std::mutex> lock(CapturesMutex);
-                const auto candidate = CandidateCaptures.find(page.Context.MappingGeneration);
-                if (candidate != CandidateCaptures.end() && page.Offset == 0)
-                {
-                    candidate->second.Persisted = true;
-                }
-                if (CapturedFiles.size() < 65536)
-                {
-                    CapturedFiles.push_back(path);
-                }
-            }
-            else
-            {
-                CaptureFailed.fetch_add(1);
-            }
+            catch (...) { CollectionLost.fetch_add(1); }
+        };
+        if (family == KmonPublicationFamily::Image)
+        {
+            CapturedImageReads item;
+            if (CapturedImageReadSets.Pop(&item)) { persist(item, &KernelMonitor::PersistImageReadSet, [&] { return std::to_wstring(item.Id); }, item.Identity); }
         }
-        catch (...)
+        else if (family == KmonPublicationFamily::Evidence)
         {
-            CaptureFailed.fetch_add(1);
+            CapturedEvidence item;
+            if (CapturedEvidenceBundles.Pop(&item))
+            { persist(item, &KernelMonitor::PersistEvidenceBundle, [&] { return std::to_wstring(item.Id); }, item.Bundle.Receipt.Reference.Context.Identity); }
+        }
+        else if (family == KmonPublicationFamily::Irp)
+        {
+            CapturedIrp item;
+            if (CapturedIrps.Pop(&item)) { persist(item, &KernelMonitor::PersistIrpCapture, [&] { return item.Artifact ? item.Artifact->Sha256 : L""; }, {}); }
+        }
+        else
+        {
+            CapturedPage item;
+            if (CapturedPages.Pop(&item)) { persist(item, &KernelMonitor::PersistCapturedPage,
+                [&] { return std::to_wstring(item.Id) + L":" + std::to_wstring(item.Offset); }, item.Context.Identity); }
         }
     }
     CloseImageSweepManifests();
@@ -1995,6 +2096,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"shutdown_events_unanalyzed"] = std::to_wstring(ShutdownEventsUnanalyzed);
         event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
         event.Evidence[L"image_scheduling_json"] = ImageSchedulingJson(now);
+        event.Evidence[L"publication_scheduling_json"] = PublicationTimings.Json(PublicationPending(now), now);
         event.Evidence[L"image_work_capacity"] = std::to_wstring(ImageWorkCapacity);
         event.Evidence[L"image_watch_reserved_slots"] = std::to_wstring(ImageWatchReserve);
         event.Evidence[L"image_admission_deferred_attempts"] = std::to_wstring(ImageAdmissionDeferred);
@@ -2270,6 +2372,7 @@ bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
     if (!KmonImageSchedulingIntegrationSelfTest(nullptr)) { return false; }
+    if (!KmonPublicationSchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;

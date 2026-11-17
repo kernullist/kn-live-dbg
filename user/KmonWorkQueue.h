@@ -145,6 +145,14 @@ public:
         return timing;
     }
 
+    // Bounded inspection under the queue lock; the visitor must not block,
+    // retain references, mutate entries, or call back into this queue.
+    template<typename Visitor> void Inspect(Visitor visitor) const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        for (const auto& item : Items) { visitor(item); }
+    }
+
     // A sole producer can use this as a source read budget. Concurrent
     // consumers only increase the available room; zero must not mean unlimited.
     size_t Available() const

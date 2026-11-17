@@ -431,6 +431,16 @@ verifier-stage timing report overruns of the cooperative 25 ms budget, including
 minimum page progress and mandatory final checks. See
 [image observation scheduling](ARCHITECTURE.md#image-observation-scheduling).
 
+`KnLiveDbg.exe --self-test publication-scheduler` checks the production writer
+with owned files and page/bundle reads, synthetic image/IRP inputs, blocked
+journal publication and a page byte-budget failure. It emits JSON and returns
+0 on success, 1 on failure or 2 for extra arguments; no driver is loaded.
+`coverage.pipeline.publication_scheduling_json` reports family rotation, queue
+and service timing, explicit local acquisition windows, and separate physical
+file/journal outcomes. Per-job `coverage.publication` receipts link those clocks
+to the original job ID. Unknown historical acquisition times stay unknown. See
+[publication scheduling](ARCHITECTURE.md#publication-scheduling-and-completion-timing).
+
 Current-main KMON image comparisons preserve original read attempts for clean,
 changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication

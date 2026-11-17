@@ -56,3 +56,8 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "reference scheduling JSON oracle failed: $LASTEXITCODE"
 }
+& python (Join-Path $PSScriptRoot 'test-publication-scheduling.py') --core-exe $exe
+if ($LASTEXITCODE -ne 0)
+{
+    throw "publication scheduling JSON oracle failed: $LASTEXITCODE"
+}
