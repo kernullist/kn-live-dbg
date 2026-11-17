@@ -52,7 +52,7 @@ def contract(o, report):
 
 def deterministic(o, data):
     names = {"fixed", "flood", "churn", "blocked", "slow", "head_fault", "midcycle_request", "yield_fault", "stop",
-             "reentrant", "backward_between", "backward_inside", "last_phase_overrun", "depletion", "cancel"}
+             "reentrant", "backward_between", "backward_inside", "last_phase_overrun", "depletion", "cancel", "continued", "continued_slow"}
     o.check(data["schema"] == "kn.discovery_scheduler_fixtures.v1" and data["synthetic_clock"] is True and
             {s["name"] for s in data["scenarios"]} == names, "explicit complete synthetic corpus")
     for scenario in data["scenarios"]:
@@ -60,7 +60,7 @@ def deterministic(o, data):
         groups = [dict(due=None, request=None, next=0, active=False, fault=False, invalid=False, started=0, returned=0,
                        faulted=0, invalid_cycles=0, requests=0, coalesced=0, consumed=0, deferrals=0,
                        wait=[], service=[], failed=[], due_return=[], due_fault=[]) for _ in GROUPS]
-        phases = [dict(attempts=0, returned=0, faults=0, cancelled=0, overruns=0, last=None, last_return=None, service=[], failed=[], cancelled_service=[], gap=[])
+        phases = [dict(attempts=0, returned=0, faults=0, cancelled=0, continued=0, overruns=0, last=None, last_return=None, service=[], failed=[], cancelled_service=[], continued_service=[], gap=[])
                   for _ in PHASES]
         ring = deque(range(10))
         last_clock = None
@@ -125,11 +125,14 @@ def deterministic(o, data):
                 p["last"] = now
                 fault = call["fault"]
                 cancelled = call["cancelled"]
+                continued = call["continued"]
+                o.check(continued == (name in ("continued", "continued_slow") and phase == 18 and index < 30), "only injected continuation")
                 o.check(fault == (name == "head_fault" and phase == 2), "only injected scanner faults")
                 o.check(cancelled == (name == "cancel" and index == 0), "only injected pre-entry cancellation")
                 p["faults"] += fault
                 p["cancelled"] += cancelled
-                p["returned"] += not fault and not cancelled
+                p["continued"] += continued
+                p["returned"] += not fault and not cancelled and not continued
                 g["fault"] |= fault
                 end = call["end"]
                 if end < last_clock:
@@ -138,9 +141,9 @@ def deterministic(o, data):
                     g["invalid"] = True
                 else:
                     last_clock = end
-                    p["cancelled_service" if cancelled else "failed" if fault else "service"].append(end - now)
+                    p["continued_service" if continued else "cancelled_service" if cancelled else "failed" if fault else "service"].append(end - now)
                     p["overruns"] += end - now > 250 - (now - begin)
-                    if not fault and not cancelled:
+                    if not fault and not cancelled and not continued:
                         p["last_return"] = end
                 if cancelled:
                     g["next"] -= 1
@@ -148,6 +151,10 @@ def deterministic(o, data):
                     now = end
                     o.check(position == len(turn["trace"]) - 1 and g["active"], "cancelled entry preserves its pending phase and cycle debt")
                     break
+                if continued:
+                    g["next"] -= 1
+                    completed.add(group)
+                    o.check(g["active"], "continued phase keeps original cycle debt")
                 if g["next"] == COUNT[group]:
                     completed.add(group)
                     g.update(active=False, next=0, due=(end if valid else now) + interval)
@@ -208,10 +215,10 @@ def deterministic(o, data):
                                ("due_to_returned_cycle", "due_return"), ("due_to_faulted_cycle", "due_fault")):
                 o.histogram(actual[key], g[model])
         for actual, p in zip(final["phases"], phases):
-            o.check(all(int(actual[k]) == p[k] for k in ("attempts", "returned", "faults", "cancelled", "overruns")), "exact scanner outcomes")
+            o.check(all(int(actual[k]) == p[k] for k in ("attempts", "returned", "faults", "cancelled", "continued", "overruns")), "exact scanner outcomes")
             o.check(actual["last_attempt_ms"] == (str(p["last"]) if p["last"] is not None else None) and
                     actual["last_return_ms"] == (str(p["last_return"]) if p["last_return"] is not None else None), "return clocks exclude fault and invalid clock")
-            for key, model in (("service", "service"), ("failed_service", "failed"), ("cancelled_service", "cancelled_service"), ("attempt_gap", "gap")):
+            for key, model in (("service", "service"), ("failed_service", "failed"), ("cancelled_service", "cancelled_service"), ("continued_service", "continued_service"), ("attempt_gap", "gap")):
                 o.histogram(actual[key], p[model])
         if name == "midcycle_request":
             o.check(groups[2]["returned"] == 2 and groups[2]["consumed"] == 2 and groups[2]["request"] is None,
@@ -225,7 +232,7 @@ def deterministic(o, data):
 
 
 def integration(o, data):
-    o.check(data["schema"] == "kn.discovery_scheduler_test.v1" and data["passed"] is True and data["checks"] == 13,
+    o.check(data["schema"] == "kn.discovery_scheduler_test.v1" and data["passed"] is True and data["checks"] == 14,
             "actual worker controls passed")
     o.check(data["driver_loaded"] is False and data["native_scans_executed"] is False, "binding-gate scope only")
     for key in ("pending", "stopped", "pipeline"):

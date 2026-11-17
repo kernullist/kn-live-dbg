@@ -382,6 +382,7 @@ private:
     friend bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
     friend struct KmonImageTestAccess;
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
@@ -467,7 +468,13 @@ private:
     void ScanHookInput();
     void ScanCpuIntegrityHooks();
     void ScanHookDataPointers();
-    void ScanUserModeHostility();
+    KmonDiscoveryDispatch ScanUserModeHostility();
+    struct UserInventoryWork;
+    std::unique_ptr<UserInventoryWork> UserInventory;
+    std::wstring LastUserInventory;
+    std::wstring UserInventoryJson(uint64_t now) const;
+    void CancelUserInventory();
+    void ResetUserInventory();
     void ScanKernelThreads();
     // Stage 2: inline patches on hot ntoskrnl/win32k entry points.
     void ScanKernelInlinePatches();
@@ -1554,6 +1561,7 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonAnalysisSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

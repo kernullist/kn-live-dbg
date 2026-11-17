@@ -51,7 +51,7 @@ inline constexpr bool KmonDiscoveryInventoryValid()
 static_assert(KmonDiscoveryInventoryValid(), "Discovery group phases must be contiguous and nonoverlapping");
 struct KmonDiscoveryConfig { bool Enabled = false; uint64_t IntervalMs = 0; };
 struct KmonDiscoveryStep { KmonDiscoveryGroup Group; KmonDiscoveryPhase Phase; bool First; };
-enum class KmonDiscoveryDispatch { Returned, Cancelled };
+enum class KmonDiscoveryDispatch { Returned, Cancelled, Continued };
 
 // Analysis-thread owned. Reset only after joining that worker. A completed
 // dispatch cycle says nothing about successful target observation; scanners
@@ -170,22 +170,27 @@ public:
                 KmonDiscoveryDispatch result;
                 try { result = execute({static_cast<KmonDiscoveryGroup>(selected), static_cast<KmonDiscoveryPhase>(phase), firstPhase}); }
                 catch (...) { finish(true); throw; }
-                if (result == KmonDiscoveryDispatch::Cancelled)
+                if (result != KmonDiscoveryDispatch::Returned)
                 {
                     // Stop can race selection before the actual scanner entry.
                     // Retain that phase and its original cycle/request debt.
                     const auto end = sample();
-                    --g.NextPhase; ++p.Cancelled; ++s.Cancelled;
+                    --g.NextPhase;
+                    const bool continued = result == KmonDiscoveryDispatch::Continued;
+                    if (continued) { ++p.Continued; } else { ++p.Cancelled; ++s.Cancelled; }
                     s.Active = KmonDiscoveryPhase::None;
                     g.CycleInvalid = g.CycleInvalid || !valid;
                     if (valid)
                     {
-                        p.CancelledService.Add(end - now);
+                        (continued ? p.ContinuedService : p.CancelledService).Add(end - now);
                         p.Overruns += end - now > KmonDiscoveryTurnBudgetMs - (now - begin);
                     }
-                    return;
+                    if (!continued || !valid) { return; }
+                    // A cooperative scanner keeps its phase and original due
+                    // time, but cannot retry within this turn or block peers.
+                    completed[selected] = true;
                 }
-                finish(false);
+                else { finish(false); }
                 if (!valid) { return; }
                 try { yield(); }
                 catch (...) { ++s.YieldFaults; throw; }
@@ -228,10 +233,10 @@ public:
         {
             const auto& p = s.Phases[i]; if (i) { phases += L","; }
             phases += L"{\"phase\":" + mcpjson::Quote(KmonDiscoveryPhaseNames[i]) + L",\"attempts\":" + n(p.Attempts) +
-                L",\"returned\":" + n(p.Returned) + L",\"faults\":" + n(p.Faults) + L",\"cancelled\":" + n(p.Cancelled) + L",\"overruns\":" + n(p.Overruns) +
+                L",\"returned\":" + n(p.Returned) + L",\"faults\":" + n(p.Faults) + L",\"cancelled\":" + n(p.Cancelled) + L",\"continued\":" + n(p.Continued) + L",\"overruns\":" + n(p.Overruns) +
                 L",\"last_attempt_ms\":" + (p.Attempts ? n(p.LastAttempt) : L"null") +
                 L",\"last_return_ms\":" + (p.ReturnKnown ? n(p.LastReturn) : L"null") +
-                L",\"service\":" + h(p.Service) + L",\"failed_service\":" + h(p.FailedService) + L",\"cancelled_service\":" + h(p.CancelledService) +
+                L",\"service\":" + h(p.Service) + L",\"failed_service\":" + h(p.FailedService) + L",\"cancelled_service\":" + h(p.CancelledService) + L",\"continued_service\":" + h(p.ContinuedService) +
                 L",\"attempt_gap\":" + h(p.Gap) + L"}";
         }
         return L"{\"schema\":\"kn.discovery_scheduling.v1\",\"policy\":\"persistent_group_and_phase_rotation.v1\","
@@ -259,9 +264,9 @@ private:
     };
     struct Phase
     {
-        uint64_t Attempts = 0, Returned = 0, Faults = 0, Cancelled = 0, Overruns = 0, LastAttempt = 0, LastReturn = 0;
+        uint64_t Attempts = 0, Returned = 0, Faults = 0, Cancelled = 0, Continued = 0, Overruns = 0, LastAttempt = 0, LastReturn = 0;
         bool ReturnKnown = false;
-        KmonLatencyHistogram Service, FailedService, CancelledService, Gap;
+        KmonLatencyHistogram Service, FailedService, CancelledService, ContinuedService, Gap;
     };
     struct Data
     {

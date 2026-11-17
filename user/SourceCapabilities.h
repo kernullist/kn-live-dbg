@@ -134,7 +134,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"nine_stage_persistent_rotation;cooperative_250ms_turn_100ms_maximum_slice;one_dispatch_per_stage_per_turn;native_calls_and_final_fences_may_overrun;first_observed_continuous_backlog_not_target_freshness;shutdown_separate;no_measured_slo_or_whole_source_unobserved_bound"},
         {L"scheduler", L"discovery", L"native", L"implemented", L"collector_monotonic",
             L"analysis_worker;live_binding_readiness;original_scanner_target_fences;coverage_pipeline_event",
-            L"ten_group_26_phase_rotation;cooperative_250ms_includes_interleaved_analysis;preserved_group_phase_order;one_cycle_per_group_per_turn;midcycle_requests_retained;faults_advance_phase;cycle_due_debt_not_target_success;individual_scanners_not_preemptible;no_measured_native_slo"},
+            L"ten_group_26_phase_rotation;cooperative_250ms_includes_interleaved_analysis;preserved_group_phase_order;one_cycle_per_group_per_turn;midcycle_requests_retained;continued_phase_once_per_turn;user_inventory_32_steps_25ms;pinned_generation_path;inventory_caps_4096_8192_12288;faults_advance_phase;cycle_due_debt_not_target_success;individual_native_calls_not_preemptible;no_measured_native_slo"},
         {L"scheduler", L"layout", L"native", L"implemented", L"collector_monotonic",
             L"layout_collection_worker;analysis_thread_mapping_revalidation;qualified_process_identity;original_candidate_clock",
             L"process_ring_join_behind_waiters;bounded_oldest_loans;subject_and_class_quotas;original_pending_and_expiry_preserved;rediscovery_separate;bounded_deferred_scopes;mapping_not_byte_success;shutdown_separate;non_atomic_layout_not_mapping_lifetime_proof;no_measured_slo"},

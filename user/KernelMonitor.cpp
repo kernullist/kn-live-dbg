@@ -32,6 +32,7 @@
 #include "WfpCalloutScanner.h"
 #include "WnfScanner.h"
 #include "KmonUserEvidence.h"
+#include "KmonUserInventory.h"
 
 #include "../shared/KnLiveDbgIoctl.h"
 #include "../shared/KnLiveDbgPaging.h"
@@ -5761,19 +5762,6 @@ namespace
             (inventoryGeneration == 0 || inventoryGeneration == beforeSnapshot);
     }
 
-    struct KmonUserTarget
-    {
-        uint32_t Pid = 0;
-        uint64_t CreateTime = 0;
-        uint64_t Eprocess = 0;
-        uint32_t ThreadQueryQuota = 0;
-        std::wstring ImagePath;
-        std::wstring Leaf;
-        bool HighPriority = false;
-        bool Interesting = false;
-        bool Suspect = false;
-    };
-
     using KmonUserGenerationInventory = std::map<uint32_t, uint64_t>;
     constexpr size_t kMaxUserCursorGenerations = 4096;
 
@@ -8122,6 +8110,137 @@ bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event)
         event.Kind == L"driver.short_lived";
 }
 
+namespace
+{
+    struct KmonNativeUserInventorySource
+    {
+        DeviceClient* Device;
+        SymbolEngine* Symbols;
+        HANDLE Snapshot = INVALID_HANDLE_VALUE;
+        bool First = true;
+        KmonNativeUserInventorySource(DeviceClient* device, SymbolEngine* symbols) : Device(device), Symbols(symbols) {}
+        KmonNativeUserInventorySource(KmonNativeUserInventorySource&& other) noexcept
+            : Device(other.Device), Symbols(other.Symbols), Snapshot(std::exchange(other.Snapshot, INVALID_HANDLE_VALUE)), First(other.First) {}
+        ~KmonNativeUserInventorySource() { Close(); }
+        void Close() noexcept { if (Snapshot != INVALID_HANDLE_VALUE) { CloseHandle(Snapshot); Snapshot = INVALID_HANDLE_VALUE; } }
+        bool Open() { Close(); First = true; Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); return Snapshot != INVALID_HANDLE_VALUE; }
+        KmonUserInventoryRead Next(KmonUserTarget& target)
+        {
+            PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+            const bool ok = (First ? Process32FirstW(Snapshot, &entry) : Process32NextW(Snapshot, &entry)) != FALSE;
+            const auto error = ok ? ERROR_SUCCESS : GetLastError(); First = false;
+            if (!ok) { return error == ERROR_NO_MORE_FILES ? KmonUserInventoryRead::End : KmonUserInventoryRead::Error; }
+            target.Pid = entry.th32ProcessID;
+            target.Leaf = KmonBasenameLower(entry.szExeFile); // A scheduling hint, never a generation-bound path.
+            return KmonUserInventoryRead::Row;
+        }
+        void Resolve(KmonUserTarget& target)
+        {
+            const std::unique_ptr<void, decltype(&CloseHandle)> process(
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.Pid), &CloseHandle);
+            if (process)
+            {
+                target.CreateTime = QueryProcessCreateTicks(process.get());
+                if (target.CreateTime != 0)
+                {
+                    std::vector<wchar_t> path(32768, L'\0'); DWORD length = static_cast<DWORD>(path.size());
+                    if (QueryFullProcessImageNameW(process.get(), 0, path.data(), &length) && length != 0)
+                    { target.ImagePath.assign(path.data(), length); }
+                    // Keep the handle pinned across PID-based fallback reads.
+                    if (Device != nullptr && Symbols != nullptr)
+                    { EnrichProcessImagePath(Device, Symbols, target.Pid, &target.ImagePath); }
+                }
+            }
+            if (!target.ImagePath.empty()) { target.Leaf = KmonBasenameLower(target.ImagePath); }
+            target.HighPriority = KmonIsWindowsBuiltinLeaf(target.Leaf) || KmonClassifyDriverPath(target.ImagePath) == L"drop";
+        }
+    };
+}
+
+struct KernelMonitor::UserInventoryWork : KmonUserInventory<KmonNativeUserInventorySource>
+{
+    std::unordered_set<uint32_t> WatchPids;
+    std::vector<std::wstring> WatchNames;
+    UserInventoryWork(DeviceClient* device, SymbolEngine* symbols, std::unordered_set<uint32_t> watches,
+        std::vector<std::wstring> names, std::vector<KmonUserTarget> suspects, uint64_t started)
+        : KmonUserInventory(KmonNativeUserInventorySource(device, symbols),
+            std::vector<uint32_t>(watches.begin(), watches.end()), std::move(suspects), GetCurrentProcessId(), started),
+          WatchPids(std::move(watches)), WatchNames(std::move(names)) {}
+};
+
+std::wstring KernelMonitor::UserInventoryJson(uint64_t now) const
+{ return UserInventory ? UserInventory->Json(now) : LastUserInventory.empty() ? L"null" : LastUserInventory; }
+void KernelMonitor::CancelUserInventory()
+{
+    if (UserInventory)
+    {
+        UserInventory->Cancel();
+        LastUserInventory = UserInventory->Json(GetTickCount64());
+        UserInventory.reset();
+    }
+}
+void KernelMonitor::ResetUserInventory() { UserInventory.reset(); LastUserInventory.clear(); }
+
+bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* why)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[user.inventory.native] FAIL %s\n", why); } return ok; };
+    KmonUserInventory<KmonNativeUserInventorySource> inventory(KmonNativeUserInventorySource(nullptr, nullptr), {}, {}, 0, GetTickCount64());
+    unsigned turns = 0;
+    while (!inventory.Complete() && turns++ < 20000)
+    {
+        const auto result = inventory.Run([]() { return GetTickCount64(); }, []() { return false; });
+        if (result == KmonDiscoveryDispatch::Cancelled) { break; }
+    }
+    const auto complete = inventory.Json(GetTickCount64());
+    check(inventory.Complete() && !inventory.WalkIncomplete() && !inventory.Capped(), "actual Toolhelp inventory completed");
+    check(inventory.SourceState().Snapshot == INVALID_HANDLE_VALUE, "completion closed native snapshot");
+    const auto targets = inventory.Take();
+    const auto self = std::find_if(targets.begin(), targets.end(), [](const KmonUserTarget& t) { return t.Pid == GetCurrentProcessId(); });
+    check(self != targets.end() && self->CreateTime == QueryProcessCreateTicks(GetCurrentProcess()) && !self->ImagePath.empty(),
+        "owned process path and generation came from pinned native handle");
+    KmonUserTarget stale; stale.Pid = GetCurrentProcessId(); stale.Leaf = L"owned-stale-hint.exe";
+    KmonNativeUserInventorySource native(nullptr, nullptr); native.Resolve(stale);
+    check(stale.CreateTime != 0 && !stale.ImagePath.empty() && stale.Leaf != L"owned-stale-hint.exe",
+        "current pinned path supersedes a stale snapshot name");
+    check(!KmonUserSnapshotGenerationMatches(stale.CreateTime + 1, stale.CreateTime, stale.CreateTime, true),
+        "existing deep-scan generation fence rejects replacement");
+
+    const auto owner = std::make_unique<KernelMonitor>(); auto& monitor = *owner;
+    HANDLE retained = INVALID_HANDLE_VALUE;
+    const auto beginPending = [&]()
+    {
+        monitor.UserInventory = std::make_unique<KernelMonitor::UserInventoryWork>(nullptr, nullptr,
+            std::unordered_set<uint32_t>{}, std::vector<std::wstring>{}, std::vector<KmonUserTarget>{}, 0);
+        uint64_t clock = 0;
+        const auto result = monitor.UserInventory->Run([&]() { const auto now = clock; clock += 13; return now; }, []() { return false; });
+        retained = monitor.UserInventory->SourceState().Snapshot;
+        DWORD flags = 0;
+        check(result == KmonDiscoveryDispatch::Continued && retained != INVALID_HANDLE_VALUE && GetHandleInformation(retained, &flags),
+            "actual snapshot survives a forced cooperative boundary");
+    };
+    const auto closed = [&]()
+    { DWORD flags = 0; return !GetHandleInformation(retained, &flags) && GetLastError() == ERROR_INVALID_HANDLE; };
+    beginPending();
+    monitor.CancelUserInventory();
+    check(!monitor.UserInventory && closed() && monitor.LastUserInventory.find(L"\"cancelled\":true") != std::wstring::npos,
+        "post-join cancellation closes snapshot and retains partial diagnostic");
+    monitor.CancelUserInventory();
+    beginPending(); monitor.ResetTemporalDetections();
+    check(!monitor.UserInventory && closed() && monitor.UserInventoryJson(0) == L"null", "restart closes prior inventory and clears diagnostics");
+    beginPending();
+    std::wstring error; check(monitor.Stop(&error) && !monitor.UserInventory && closed(), "actual Stop disposes pending snapshot");
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.user_inventory_test.v1\",\"driver_loaded\":false,\"native_process_queries\":true,"
+            L"\"latency_slo_proven\":false,\"passed\":" + std::wstring(failures ? L"false" : L"true") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"complete\":" + complete + L"}";
+    }
+    std::fprintf(stderr, "[user.inventory.native] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
 KernelMonitor::KernelMonitor() { PublicationTimings.StartCollection(GetTickCount64()); }
 
 KernelMonitor::~KernelMonitor()
@@ -8731,6 +8850,7 @@ bool KernelMonitor::Start(
         {
             Worker.join();
         }
+        CancelUserInventory();
         ImageReferences->Join();
         ImageContents->Join();
         CaptureStopping.store(true);
@@ -8757,6 +8877,7 @@ void KernelMonitor::ResetTemporalDetections()
 {
     // Start holds StateMutex and WatchMutex before publishing a new worker.
     DiscoveryScheduling.Reset();
+    ResetUserInventory();
     DriverTamperBaselines.clear();
     UserVmWalkCursors.clear();
     UserThreadStartCursors.clear();
@@ -8852,6 +8973,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     {
         worker.join();
     }
+    CancelUserInventory(); // The worker no longer owns an open snapshot or a pending batch.
     ImageReferences->Join();
     ImageContents->Join();
     for (auto& item : ImageWork)
@@ -9109,7 +9231,7 @@ KmonDiscoveryDispatch KernelMonitor::DispatchDiscovery(KmonDiscoveryStep step)
     case KmonDiscoveryPhase::OrphanPages: ScanOrphanMappedPages(); break;
     case KmonDiscoveryPhase::UserPrune: PruneStalePromotedWatches(); break;
     case KmonDiscoveryPhase::UserLogging: EnableLoggingForWatchTargets(); break;
-    case KmonDiscoveryPhase::UserHostility: ScanUserModeHostility(); break;
+    case KmonDiscoveryPhase::UserHostility: return ScanUserModeHostility();
     case KmonDiscoveryPhase::UserHandles: ScanWatchedHandleTables(); break;
     case KmonDiscoveryPhase::UserCapabilities: ScanWatchedHandleCapabilities(); break;
     case KmonDiscoveryPhase::Inline: ScanKernelInlinePatches(); break;
@@ -17165,191 +17287,62 @@ void KernelMonitor::ServiceWatchedReferences()
     RecordEvent(std::move(visit));
 }
 
-void KernelMonitor::ScanUserModeHostility()
+KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
 {
+    if (StopRequested.load()) { return KmonDiscoveryDispatch::Cancelled; }
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
-        device = Device;
-        symbols = Symbols;
+        device = Device; symbols = Symbols;
     }
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    UserHostilityScans.fetch_add(1);
-
-    std::unordered_set<uint32_t> watchPids;
-    std::vector<std::wstring> watchNames;
-    std::vector<SuspectProcess> suspects;
+    if (!UserInventory)
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        watchPids = WatchPids;
-        watchNames = WatchNamesLower;
-        const uint64_t now = GetTickCount64();
-        for (auto it = SuspectProcesses.begin(); it != SuspectProcesses.end();)
+        const auto started = GetTickCount64();
+        std::unordered_set<uint32_t> watches;
+        std::vector<std::wstring> names;
+        std::vector<KmonUserTarget> suspects;
         {
-            if (now - it->second.LastObservedMs > 120000)
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            watches = WatchPids; names = WatchNamesLower;
+            for (auto it = SuspectProcesses.begin(); it != SuspectProcesses.end();)
             {
-                it = SuspectProcesses.erase(it);
-            }
-            else
-            {
-                suspects.push_back(it->second);
-                ++it;
-            }
-        }
-    }
-
-    std::vector<KmonUserTarget> targets;
-    const uint32_t selfPid = GetCurrentProcessId();
-    PROCESSENTRY32W entry = {};
-    entry.dwSize = sizeof(entry);
-    BOOL more = FALSE;
-    DWORD nextError = ERROR_SUCCESS;
-    bool snapshotCapped = false;
-    const bool firstOk = snap != INVALID_HANDLE_VALUE && Process32FirstW(snap, &entry) != FALSE;
-    if (firstOk)
-    {
-        more = TRUE;
-        do
-        {
-            const uint32_t pid = entry.th32ProcessID;
-            if (pid > 4 && pid != selfPid)
-            {
-                if (targets.size() >= 4096)
-                {
-                    snapshotCapped = true;
-                }
+                if (started >= it->second.LastObservedMs && started - it->second.LastObservedMs > 120000)
+                { it = SuspectProcesses.erase(it); }
                 else
                 {
-                KmonUserTarget target;
-                target.Pid = pid;
-                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                if (process != nullptr)
-                {
-                    target.CreateTime = QueryProcessCreateTicks(process);
-                    std::vector<wchar_t> pathBuf(32768, L'\0');
-                    DWORD pathLen = static_cast<DWORD>(pathBuf.size());
-                    if (QueryFullProcessImageNameW(process, 0, pathBuf.data(), &pathLen) && pathLen > 0)
-                    {
-                        target.ImagePath.assign(pathBuf.data(), pathLen);
-                    }
-                    CloseHandle(process);
-                }
-                if (target.ImagePath.empty())
-                {
-                    target.ImagePath = entry.szExeFile;
-                }
-                EnrichProcessImagePath(device, symbols, pid, &target.ImagePath);
-                target.Leaf = KmonBasenameLower(target.ImagePath);
-                const std::wstring pathClass = KmonClassifyDriverPath(target.ImagePath);
-                const bool watched =
-                    NameEqualsWatch(target.Leaf, watchNames) ||
-                    watchPids.count(pid) != 0;
-                target.HighPriority =
-                    KmonIsWindowsBuiltinLeaf(target.Leaf) ||
-                    watched ||
-                    pathClass == L"drop";
-                target.Interesting = true;
-                targets.push_back(std::move(target));
+                    const auto& source = it->second;
+                    KmonUserTarget target;
+                    target.Pid = source.Pid; target.CreateTime = source.CreateTime; target.Eprocess = source.Eprocess;
+                    target.ImagePath = source.Image; target.Leaf = KmonBasenameLower(source.Image);
+                    suspects.push_back(std::move(target)); ++it;
                 }
             }
-            entry.dwSize = sizeof(entry);
-            more = Process32NextW(snap, &entry);
-            if (!more)
-            {
-                nextError = GetLastError();
-            }
-        } while (more);
+        }
+        UserInventory = std::make_unique<UserInventoryWork>(device, symbols, std::move(watches),
+            std::move(names), std::move(suspects), started);
+        UserHostilityScans.fetch_add(1);
     }
-    if (snap != INVALID_HANDLE_VALUE)
+    KmonDiscoveryDispatch inventoryResult;
+    try
     {
-        CloseHandle(snap);
+        inventoryResult = UserInventory->Run([]() { return GetTickCount64(); }, [&]() { return StopRequested.load(); });
     }
-    const bool walkIncomplete =
-        !firstOk ||
-        nextError != ERROR_NO_MORE_FILES;
-
+    catch (...)
     {
-        std::unordered_set<uint32_t> have;
-        have.reserve(targets.size());
-        for (const KmonUserTarget& item : targets)
-        {
-            have.insert(item.Pid);
-        }
-        for (uint32_t pid : watchPids)
-        {
-            if (pid <= 4 || pid == selfPid || have.count(pid) != 0)
-            {
-                continue;
-            }
-            if (targets.size() >= 8192)
-            {
-                snapshotCapped = true;
-                break;
-            }
-            KmonUserTarget target;
-            target.Pid = pid;
-            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (process != nullptr)
-            {
-                target.CreateTime = QueryProcessCreateTicks(process);
-                std::vector<wchar_t> pathBuf(32768, L'\0');
-                DWORD pathLen = static_cast<DWORD>(pathBuf.size());
-                if (QueryFullProcessImageNameW(process, 0, pathBuf.data(), &pathLen) && pathLen > 0)
-                {
-                    target.ImagePath.assign(pathBuf.data(), pathLen);
-                }
-                CloseHandle(process);
-            }
-            EnrichProcessImagePath(device, symbols, pid, &target.ImagePath);
-            target.Leaf = KmonBasenameLower(target.ImagePath);
-            target.HighPriority = true;
-            target.Interesting = true;
-            targets.push_back(std::move(target));
-        }
-        for (const SuspectProcess& suspect : suspects)
-        {
-            if (suspect.Pid <= 4 || suspect.Pid == selfPid || suspect.CreateTime == 0)
-            {
-                continue;
-            }
-            auto existing = std::find_if(targets.begin(), targets.end(),
-                [&suspect](const KmonUserTarget& candidate)
-                {
-                    return candidate.Pid == suspect.Pid;
-                });
-            if (existing != targets.end())
-            {
-                if (existing->CreateTime != 0 && existing->CreateTime != suspect.CreateTime)
-                {
-                    continue;
-                }
-                existing->CreateTime = suspect.CreateTime;
-                existing->Eprocess = suspect.Eprocess;
-                existing->Suspect = true;
-                existing->HighPriority = true;
-                existing->Interesting = true;
-            }
-            else if (targets.size() < 12288)
-            {
-                KmonUserTarget target;
-                target.Pid = suspect.Pid;
-                target.Eprocess = suspect.Eprocess;
-                target.CreateTime = suspect.CreateTime;
-                target.ImagePath = suspect.Image;
-                target.Leaf = KmonBasenameLower(suspect.Image);
-                target.HighPriority = true;
-                target.Interesting = true;
-                target.Suspect = true;
-                targets.push_back(std::move(target));
-            }
-            else
-            {
-                snapshotCapped = true;
-            }
-        }
+        LastUserInventory = UserInventory->Json(GetTickCount64());
+        UserInventory.reset();
+        throw;
     }
+    if (inventoryResult != KmonDiscoveryDispatch::Returned) { return inventoryResult; }
+    if (StopRequested.load()) { UserInventory->Cancel(); return KmonDiscoveryDispatch::Cancelled; }
+    const bool walkIncomplete = UserInventory->WalkIncomplete(), snapshotCapped = UserInventory->Capped();
+    const auto inventoryStarted = UserInventory->StartedMs();
+    LastUserInventory = UserInventory->Json(GetTickCount64());
+    auto targets = UserInventory->Take();
+    auto watchPids = std::move(UserInventory->WatchPids);
+    auto watchNames = std::move(UserInventory->WatchNames);
+    UserInventory.reset();
 
     if (walkIncomplete)
     {
@@ -17362,7 +17355,7 @@ void KernelMonitor::ScanUserModeHostility()
             std::wstring());
         if (targets.empty())
         {
-            return;
+            return KmonDiscoveryDispatch::Returned;
         }
     }
     else
@@ -17395,11 +17388,11 @@ void KernelMonitor::ScanUserModeHostility()
         for (auto it = ImagePageCursors.begin(); it != ImagePageCursors.end();)
         {
             const auto generation = userGenerations.find(it->second.ProcessId);
-            const bool replaced = generation != userGenerations.end() && generation->second != 0 &&
-                generation->second != it->second.CreateTime;
+            const bool retired = KmonUserInventoryInvalidates(inventoryStarted, it->second.LastObservedMs,
+                it->second.CreateTime, generation != userGenerations.end(),
+                generation != userGenerations.end() ? generation->second : 0, inventoryComplete);
             if (it->second.ProcessId != 0 &&
-                (replaced || (inventoryComplete && generation == userGenerations.end()) ||
-                    now - it->second.LastObservedMs > 600000))
+                (retired || (now >= it->second.LastObservedMs && now - it->second.LastObservedMs > 600000)))
             {
                 it = ImagePageCursors.erase(it);
             }
@@ -17414,13 +17407,14 @@ void KernelMonitor::ScanUserModeHostility()
     std::vector<uint32_t> backgroundPids;
     const uint64_t schedulingNow = GetTickCount64();
     uint64_t oldest = 0;
-    for (const auto& target : targets)
+    for (auto& target : targets)
     {
         if (target.Interesting)
         {
             if (watchPids.count(target.Pid) != 0 || NameEqualsWatch(target.Leaf, watchNames))
             {
                 watchedUserPids.push_back(target.Pid);
+                target.HighPriority = true;
             }
             else
             {
@@ -17436,13 +17430,16 @@ void KernelMonitor::ScanUserModeHostility()
     for (auto it = UserLayoutLeads.begin(); it != UserLayoutLeads.end();)
     {
         const auto generation = userGenerations.find(it->first.first);
-        if (generation == userGenerations.end() || generation->second != it->first.second)
+        if (KmonUserInventoryInvalidates(inventoryStarted, it->second, it->first.second,
+                generation != userGenerations.end(), generation != userGenerations.end() ? generation->second : 0,
+                !walkIncomplete && !snapshotCapped))
         {
             it = UserLayoutLeads.erase(it);
         }
         else
         {
-            if (KmonUserLayoutLeadReady(it->first.first, it->first.second, schedulingNow, UserLastScanMs))
+            if (generation != userGenerations.end() && generation->second == it->first.second &&
+                KmonUserLayoutLeadReady(it->first.first, it->first.second, schedulingNow, UserLastScanMs))
             {
                 urgentPids.push_back(it->first.first);
             }
@@ -19872,13 +19869,14 @@ void KernelMonitor::ScanUserModeHostility()
             L"user",
             L"user-mode hostility scan hit a process cap; extra hosts may be missed",
             snapshotCapped
-                ? L"toolhelp snapshot capped at 4096"
-                : L"deep scan capped at 1024; deferred hosts rotate across passes");
+                ? L"inventory capped: snapshot=4096, watched=8192, suspects=12288; completeness unavailable"
+                : L"deep scan capped at 8; deferred hosts rotate across passes");
     }
     else if (!StopRequested.load())
     {
         ClearEmittedKey(L"scan_failed:userhostility:truncated");
     }
+    return KmonDiscoveryDispatch::Returned;
 }
 
 void KernelMonitor::EnableLoggingForPid(uint32_t pid)

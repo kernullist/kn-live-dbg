@@ -7,6 +7,78 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Resumable user inventory checkpoint: 2026-11-18
+
+The user-hostility inventory now resumes its owned Toolhelp snapshot, watched
+PID queries and suspect merges across discovery turns, with a cooperative
+**32-operation / 25 ms** allowance. `Continued` preserves the scanner phase and
+original cycle due time while allowing other discovery groups to proceed;
+continued service does not count as a returned scanner or completed cycle.
+See [resumable user process inventory](ARCHITECTURE.md#resumable-user-process-inventory).
+This completes the inventory slice and does not complete P09 or the full design.
+
+Review retained the deep generation fence, pinned generation/path queries to
+the same process handle, and prevented stale snapshot names from becoming
+generation-bound image paths. It also fixed deletion of layout leads/page state
+admitted while an older inventory was paused. Partial or unknown-generation
+inventory results cannot retire pending layout leads. Stop, failed Start,
+restart and exceptions close the retained snapshot. Truncation diagnostics now
+state the actual deep-scan limit of eight targets.
+
+On Windows **28000.3501**, MSVC **14.44.35207**, SDK/WDK **10.0.26100.0**:
+
+- The `/W4 /WX` shared-core build passed, including **14 inventory scenarios**,
+  **7 retirement controls** and the existing **369 discovery / 423 analysis /
+  32,796 reference / 521 publication / 130 capture / 835 execution** controls.
+- The independent inventory oracle passed **14,211 assertions** for exact
+  target/generation contents, duplicate/excluded rows, all three capacity
+  limits, fast/slow sources, partial walks, faults, cancellation, reversed
+  clocks, operation bounds and handle ownership. The discovery oracle passed
+  **70,151 assertions** across **17 scenarios**, including ordinary and
+  overrunning continuations, exact distributions, original debt and peer work.
+- The product passed **11 native inventory controls / 4 independent
+  assertions**, using actual Toolhelp snapshots and read-only process queries.
+  It verifies the current process's pinned path/generation, retained snapshot
+  validity, cancellation, restart and actual Stop cleanup. Forced boundary
+  clocks are synthetic; these controls do not establish a native latency SLO.
+- The actual worker fixture passed **14 controls / 19 independent assertions**,
+  including the separate native inventory fixture. Its absent-binding worker
+  still dispatches none of the 26 native discovery phases. Product oracles
+  passed **20 analysis / 968 image / 73 preparation / 50 reference /
+  85 publication / 16 layout / 23 capture assertions** and **51 capability
+  contracts / 261 command routes**. Public-content regression passed **12 tests**,
+  including renamed UTF-8/UTF-16 private inventory diagnostics.
+
+The isolated `--self-test all` passed **28 timeline / 102 MCP / 121 image-read /
+319 image-scheduling / 39 preparation / 41 publication / 21 layout /
+15 analysis-integration / 14 discovery-integration / 11 native inventory /
+564 console / 3,043 command-route / 68 remote / 4 connect-option checks**,
+with `owned_fixture_cleanup=passed` and an empty owned working directory.
+Final review found no additional actionable defects in the reviewed scope.
+
+Final Release product SHA-256:
+`21ef24ad75785f674cf0d90ec36f0a22c75df375b69898386e4cd83e38334f02`.
+Shared KMON core harness SHA-256:
+`852a7c899022ce517dcbfcf3792396f3790409356f454129d6fce711d63be1fb`.
+Existing C4244 conversion and C4744 alignment warnings remain. ASan remains
+blocked by the previously recorded host startup interception failure; no new
+ASan success is claimed.
+
+Read-only host checks at **03:59 KST** found the same boot time and no new
+reboot/BugCheck event, dump, task process, task driver, preparation/profile
+receipt or owned writer/preparation temporary residue. The 33 completed parser
+caches, BFE/mpssvc/EFS service states and firewall profiles match the preceding
+checkpoint. No task driver was loaded and no Verifier, reboot or security
+setting was changed during this stage.
+
+Private inventory and discovery clocks are runtime diagnostics, not proof of
+target-qualified success, individual native API latency, durable recovery or
+power loss safety. Native calls and input copying can overrun. The ordered user
+tail waits for inventory completion and up to eight synchronous deep scans.
+Snapshot admission still favors its first 4,096 eligible targets; fairness above
+that cap, finer deep-scan continuation, source-wide timing, fixed/growing native
+workload SLOs and maximum unobserved intervals remain open.
+
 ## Resumable discovery scheduling checkpoint: 2026-11-18
 
 The worker now rotates 26 scanner phases across ten discovery groups, preserving

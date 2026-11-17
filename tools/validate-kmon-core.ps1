@@ -66,6 +66,11 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "analysis scheduling JSON oracle failed: $LASTEXITCODE"
 }
+& python (Join-Path $PSScriptRoot 'test-user-inventory.py') --core-exe $exe
+if ($LASTEXITCODE -ne 0)
+{
+    throw "user inventory JSON oracle failed: $LASTEXITCODE"
+}
 & python (Join-Path $PSScriptRoot 'test-discovery-scheduling.py') --core-exe $exe
 if ($LASTEXITCODE -ne 0)
 {

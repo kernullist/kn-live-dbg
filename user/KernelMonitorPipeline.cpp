@@ -143,6 +143,7 @@ void KernelMonitor::ResetPipeline()
 {
     AnalysisScheduling.Reset();
     DiscoveryScheduling.Reset();
+    ResetUserInventory();
     ImageReferences->Reset();
     ImageContents->Reset();
     {
@@ -2033,6 +2034,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain, uint64_t budgetMs, bool
         event.Evidence[L"analysis_pending"] = std::to_wstring(CollectedTi.Size() + CollectedLive.Size());
         event.Evidence[L"analysis_scheduling_json"] = AnalysisScheduling.Json(now);
         event.Evidence[L"discovery_scheduling_json"] = DiscoveryScheduling.Json(now);
+        event.Evidence[L"user_inventory_json"] = UserInventoryJson(now);
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
         const auto captureNow = GetTickCount64();
@@ -2521,13 +2523,15 @@ bool KmonDiscoverySchedulingIntegrationSelfTest(std::wstring* diagnostics)
     check(!monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::User) &&
         !monitor.DiscoveryScheduling.HasRequest(KmonDiscoveryGroup::Mapper), "session restart removes prior discovery requests");
     monitor.Device = nullptr; monitor.Symbols = nullptr;
+    std::wstring inventory;
+    check(KmonUserInventoryIntegrationSelfTest(&inventory), "native inventory continuation, identity and cleanup controls");
     if (diagnostics)
     {
         *diagnostics = L"{\"schema\":\"kn.discovery_scheduler_test.v1\",\"driver_loaded\":false,\"native_scans_executed\":false,"
             L"\"corpus\":\"actual_worker_with_absent_binding_and_owned_requests\",\"passed\":" +
             std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
             L",\"pending\":" + pending + L",\"stopped\":" + stopped + L",\"pipeline\":" +
-            (pipeline.empty() ? L"null" : pipeline) + L"}";
+            (pipeline.empty() ? L"null" : pipeline) + L",\"user_inventory\":" + inventory + L"}";
     }
     std::fprintf(stderr, "[discovery.integration] checks=%u failed=%u\n", checks, failures);
     return failures == 0;

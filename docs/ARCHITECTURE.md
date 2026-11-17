@@ -1910,9 +1910,14 @@ after selection but before scanner entry returns an explicit cancellation:
 the selected phase and original cycle debt remain pending. Stop/reset does not
 claim those phases were observed. Reset occurs only after the worker joins.
 
+A scanner can also return `Continued`: its phase and original cycle due time
+remain pending, but that group cannot dispatch again in the same turn. Other
+groups and interleaved analysis can run. Continuations have separate service
+samples and counters; they do not count as returned phases or completed cycles.
+
 `coverage.pipeline.discovery_scheduling_json` carries private
 `kn.discovery_scheduling.v1` diagnostics: phase attempts, returns, faults,
-cancellations, actual service/gap distributions, partial cycles, due-to-first
+cancellations, continuations, actual service/gap distributions, partial cycles, due-to-first
 dispatch, due-to-cycle return/failure, queued requests and budget deferrals.
 An ordinary scanner return can itself mean unavailable, partial or rejected
 target evidence; it is not successful target freshness. Completed worker turns
@@ -1922,12 +1927,53 @@ latency. Clock reversal across turns cannot wrap a partial cycle's duration.
 
 `--self-test discovery-scheduler` runs the actual worker with an unopened device,
 owned requests, observed turn completion and joined cleanup. It verifies
-readiness, mapper/follow-up admission, cancellation and restart without executing
-native discovery scans. The core harness and independent oracle cover rotating
+readiness, mapper/follow-up admission, cancellation and restart without dispatching
+native discovery phases. Its separate user-inventory fixture performs real
+read-only Toolhelp/process queries and verifies snapshot ownership across
+continuation, cancellation, restart and Stop. The core harness and independent oracle cover rotating
 groups, unfinished tails, flooding, binding churn, mid-cycle requests, repeated
-head faults, analysis-yield failure, stop/cancel and clock reversal. Loaded-native
-scanner workloads, finer scanner-internal continuation, successful per-target
+head faults, analysis-yield failure, stop/cancel, continuation and clock reversal. Loaded-native
+scanner workloads, further scanner-internal continuation, successful per-target
 debt and measured SLOs remain separate acceptance work.
+
+### Resumable user process inventory
+
+`ScanUserModeHostility` retains a worker-owned Toolhelp snapshot and the watch /
+suspect input cohort across turns. Inventory work stops after 32 operations or
+a cooperative 25 ms allowance, checked between operations. One operation can
+read a row and resolve its process generation/path, merge a watch/suspect, or
+advance an inventory phase. Snapshot creation, native calls, allocation and
+initial input copying can overrun; this is not a hard deadline. No mutex or
+borrowed image-reference window crosses the continuation boundary.
+
+Each process query keeps a handle open through generation/path lookup and
+PID-based fallback reads. A snapshot name is only a scheduling hint; an unknown
+generation cannot inherit it as an image path. Suspect merges reject known
+generation disagreement. The existing deep-scan handle/generation fence runs
+again before target inspection. Snapshot creation failure, walk failure, caps,
+cancellation and faults retain distinct incomplete diagnostics. Completion,
+fault, stop after worker join, failed Start and restart close owned snapshots.
+
+Only a completed, uncapped inventory can establish absence for cursor pruning.
+An older inventory cannot retire layout leads or image-page state observed
+since it started, even when the PID's generation differs. Unknown generations
+and missing entries in partial inventories preserve pending layout leads.
+
+`coverage.pipeline.user_inventory_json` carries private `kn.user_inventory.v1`
+diagnostics for the latest inventory: original start/elapsed time, phase,
+operation/query counts, step limit, completion/cap/cancellation/fault state,
+service samples and overruns. Completed diagnostics freeze before deep scanning;
+they are not a successful target revisit or a durable timing journal.
+
+The existing limits remain: 4,096 snapshot targets, up to 8,192 including extra
+watched PIDs, and 12,288 including suspects. A capped snapshot now closes at the
+first excess eligible row. It does not rotate admission beyond that snapshot
+prefix or prove fairness above the cap. Once ready, the existing priority
+selector chooses up to eight deep targets. Those deep inspections and other
+scanner-internal loops remain synchronous. The ordered user-group tail waits
+for this inventory and deep scan; independent discovery groups can proceed
+between inventory quanta. Neither measured host-workload SLOs nor whole-source
+maximum unobserved intervals follow from the bounded inventory policy.
 
 ## Layout collection and verification scheduling
 

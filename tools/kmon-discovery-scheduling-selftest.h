@@ -7,7 +7,7 @@ inline std::wstring DiscoverySchedulingFixturesJson()
 {
     std::wstring scenarios;
     for (const std::wstring name : {L"fixed", L"flood", L"churn", L"blocked", L"slow", L"head_fault", L"midcycle_request",
-        L"yield_fault", L"stop", L"reentrant", L"backward_between", L"backward_inside", L"last_phase_overrun", L"depletion", L"cancel"})
+        L"yield_fault", L"stop", L"reentrant", L"backward_between", L"backward_inside", L"last_phase_overrun", L"depletion", L"cancel", L"continued", L"continued_slow"})
     {
         KmonDiscoveryScheduling scheduler;
         std::array<KmonDiscoveryConfig, KmonDiscoveryGroups> config{};
@@ -56,19 +56,20 @@ inline std::wstring DiscoverySchedulingFixturesJson()
                             [](KmonDiscoveryStep) -> KmonDiscoveryDispatch { throw std::runtime_error("recursive dispatch"); }, []() {}, []() { return false; });
                     }
                     const bool cancelled = name == L"cancel" && !special;
+                    const bool continued = (name == L"continued" || name == L"continued_slow") && phase == 18 && turn < 30;
                     if (cancelled) { special = true; }
                     else if (name == L"backward_inside" && !special) { --now; special = true; }
-                    else { now += (name == L"slow" && phase == 2) || (name == L"last_phase_overrun" && phase == 13) ? 350 :
-                        name == L"last_phase_overrun" ? 1 : name == L"depletion" ? 10 : 100; }
+                    else { now += (name == L"slow" && phase == 2) || (name == L"last_phase_overrun" && phase == 13) || (name == L"continued_slow" && continued) ? 350 :
+                        name == L"last_phase_overrun" ? 1 : (name == L"depletion" || name == L"continued" || name == L"continued_slow") ? 10 : 100; }
                     const bool fault = name == L"head_fault" && phase == 2;
                     if (!trace.empty()) { trace += L","; }
                     trace += L"{\"group\":" + std::to_wstring(group) + L",\"phase\":" + std::to_wstring(phase) +
                         L",\"first\":" + std::wstring(step.First ? L"true" : L"false") + L",\"begin\":" + std::to_wstring(started) +
                         L",\"end\":" + std::to_wstring(now) + L",\"fault\":" + (fault ? L"true" : L"false") +
-                        L",\"cancelled\":" + (cancelled ? L"true" : L"false") + L",\"requests\":[" + requests + L"]}";
+                        L",\"cancelled\":" + (cancelled ? L"true" : L"false") + L",\"continued\":" + (continued ? L"true" : L"false") + L",\"requests\":[" + requests + L"]}";
                     if (name == L"stop") { stopping = true; }
                     if (fault) { throw std::runtime_error("owned repeated head fault"); }
-                    return cancelled ? KmonDiscoveryDispatch::Cancelled : KmonDiscoveryDispatch::Returned;
+                    return cancelled ? KmonDiscoveryDispatch::Cancelled : continued ? KmonDiscoveryDispatch::Continued : KmonDiscoveryDispatch::Returned;
                 }, [&]()
                 {
                     if (name == L"yield_fault" && !special) { special = true; throw std::runtime_error("owned analysis yield fault"); }
