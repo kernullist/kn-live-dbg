@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <memory>
+#include <cstdio>
 
 std::wstring KernelMonitor::LayoutsJson(uint32_t pid, bool initial) const
 {
@@ -12,6 +13,8 @@ std::wstring KernelMonitor::LayoutsJson(uint32_t pid, bool initial) const
     json += L",\"verification_pending\":" + std::to_wstring(LayoutCandidates.Size());
     json += L",\"verification_dropped\":" + std::to_wstring(LayoutCandidates.Loss());
     json += L",\"verification_mapping_checked\":" + std::to_wstring(LayoutChecked.load());
+    json += L",\"collection_scheduling\":" + LayoutMonitor.SchedulingJson(GetTickCount64());
+    json += L",\"verification_scheduling\":" + LayoutCandidates.Json(GetTickCount64());
     json += L",\"verification_rejected\":" + std::to_wstring(LayoutRejected.load()) + L"}";
     return json;
 }
@@ -129,23 +132,7 @@ bool KernelMonitor::QueueLayoutNotice(const ProcessLayoutNotice& item)
 
 bool KernelMonitor::QueueLayoutCandidate(ProcessLayoutCandidate candidate)
 {
-    candidate.QueuedMs = GetTickCount64();
-    // Keep admitted work near the consumer instead of filling a 30-second
-    // stale backlog. The source retains a refused change or periodic cursor.
-    // Preserve the periodic admission window and add room for changed work, whose
-    // original observation deadline continues running while held at the source.
-    const size_t limit = candidate.Role == L"layout_change" ? LayoutAdmissionLimit :
-        LayoutAdmissionLimit - LayoutChangeReserve;
-    return LayoutCandidates.TryPushLatest(std::move(candidate), [](const auto& old, const auto& fresh)
-    {
-        const auto& a = old.Region;
-        const auto& b = fresh.Region;
-        return old.Identity.SameInstance(fresh.Identity) && old.ImageName == fresh.ImageName &&
-            (old.Role == L"layout_change") == (fresh.Role == L"layout_change") &&
-            a.Base == b.Base && a.Size == b.Size && a.AllocationBase == b.AllocationBase &&
-            a.State == b.State && a.Protect == b.Protect &&
-            a.AllocationProtect == b.AllocationProtect && a.Type == b.Type;
-    }, limit);
+    return KmonLayoutQueue::Accepted(LayoutCandidates.Admit(std::move(candidate), GetTickCount64()));
 }
 
 void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before)
@@ -173,6 +160,16 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
         LayoutCandidates.Pop(&item); ++count)
     {
         const uint64_t selectedMs = GetTickCount64();
+        struct Attempt
+        {
+            KmonLayoutQueue& Queue;
+            const ProcessLayoutCandidate& Item;
+            uint64_t Started;
+            bool Shutdown;
+            KmonLayoutOutcome Outcome = KmonLayoutOutcome::Fault;
+            std::optional<uint64_t> Qualified;
+            ~Attempt() { Queue.Finish(Item, Started, GetTickCount64(), Shutdown, Outcome, Qualified); }
+        } attempt{LayoutCandidates, item, selectedMs, finalDrain || StopRequested.load()};
         const uint64_t queueWait = item.QueuedMs != 0 && selectedMs >= item.QueuedMs ? selectedMs - item.QueuedMs : 0;
         const uint64_t sourceWait = item.QueuedMs >= item.ObservedMs ? item.QueuedMs - item.ObservedMs : 0;
         LayoutMaxQueueWaitMs.store((std::max)(LayoutMaxQueueWaitMs.load(), queueWait));
@@ -199,6 +196,7 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
             rejected.Observation.Coverage.Attempted = true;
             const uint64_t now = GetTickCount64();
             const bool expired = now < item.ObservedMs || now - item.ObservedMs > process_layout::MaxSweepMs;
+            attempt.Outcome = expired ? KmonLayoutOutcome::Expired : KmonLayoutOutcome::Rejected;
             if (expired) { LayoutExpired.fetch_add(1); }
             rejected.Observation.Coverage.Reason = expired ? L"candidate_expired" : L"process_or_mapping_changed_or_unavailable";
             rejected.Evidence[L"base"] = std::to_wstring(item.Region.Base);
@@ -207,10 +205,13 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
             rejected.Evidence[L"candidate_age_ms"] = std::to_wstring(now >= item.ObservedMs ? now - item.ObservedMs : 0);
             rejected.Evidence[L"queue_wait_ms"] = std::to_wstring(queueWait);
             rejected.Evidence[L"source_wait_ms"] = std::to_wstring(sourceWait);
+            rejected.Evidence[L"last_rediscovered_ms"] = std::to_wstring(item.LastObservedMs);
+            rejected.Evidence[L"rediscoveries"] = std::to_wstring(item.Rediscoveries);
             RecordEvent(std::move(rejected));
             continue;
         }
         LayoutChecked.fetch_add(1);
+        attempt.Qualified = GetTickCount64();
         const ObservationReader reader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
         {
             if (size == 0 || size > 4096 || address > UINT64_MAX - size || !current())
@@ -322,5 +323,96 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
             KmonRequestUserLayoutLead(pid, item.Identity.CreateTime, GetTickCount64(),
                 watched, UserLastScanMs, &UserLayoutLeads, item.Role == L"layout_change");
         }
+        attempt.Outcome = KmonLayoutOutcome::MappingCurrent;
     }
+}
+
+bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* name)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[layout.scheduler] FAIL %s\n", name); } return ok; };
+    const auto owner = std::make_unique<KernelMonitor>();
+    auto& monitor = *owner;
+    auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    const auto release = [](uint8_t* p) { if (p != nullptr) { VirtualFree(p, 0, MEM_RELEASE); } };
+    const std::unique_ptr<uint8_t, decltype(release)> allocation(memory, release);
+    if (!check(memory != nullptr, "owned-mapping-allocation")) { return false; }
+    DWORD old = 0;
+    check(VirtualProtect(memory + 2 * 4096, 4096, PAGE_READWRITE | PAGE_GUARD, &old) != FALSE, "owned-guard-metadata");
+    const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+    const uint64_t now = GetTickCount64();
+    check(now > process_layout::MaxSweepMs, "uptime-supports-expiration-control");
+    ProcessLayoutCandidate first, freshAfterExpired;
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        MEMORY_BASIC_INFORMATION mapping{};
+        check(VirtualQuery(memory + i * 4096, &mapping, sizeof(mapping)) == sizeof(mapping), "owned-mapping-query");
+        ProcessLayoutCandidate candidate;
+        candidate.Identity = identity; candidate.Role = L"layout_periodic";
+        candidate.Region = {reinterpret_cast<uint64_t>(memory + i * 4096), 4096, reinterpret_cast<uint64_t>(mapping.AllocationBase),
+            mapping.State, mapping.Protect, mapping.AllocationProtect, mapping.Type};
+        candidate.ObservedAt = ObservationFileTime(); candidate.ObservedMs = now;
+        if (i == 1) { candidate.ObservedMs = now > process_layout::MaxSweepMs ? now - process_layout::MaxSweepMs - 1 : 0; }
+        if (i == 3) { --candidate.Identity.CreateTime; }
+        check(monitor.QueueLayoutCandidate(candidate), "actual-layout-admission");
+        if (i == 0) { first = candidate; }
+        if (i == 1)
+        {
+            candidate.ObservedMs = now;
+            freshAfterExpired = candidate;
+            check(!monitor.QueueLayoutCandidate(candidate), "fresh-source-observation-held-behind-expired-original");
+        }
+    }
+    const auto pending = monitor.LayoutCandidates.Json(GetTickCount64());
+    monitor.DrainLayoutCandidates(false);
+    // A slow first turn may use the cooperative budget; finish only admitted work.
+    const auto deadline = GetTickCount64() + 10000;
+    while (monitor.LayoutCandidates.Size() != 0 && GetTickCount64() < deadline) { monitor.DrainLayoutCandidates(false); }
+    const auto normal = monitor.LayoutCandidates.Json(GetTickCount64());
+    const auto count = monitor.LayoutCandidates.Snapshot();
+    check(count.Attempts == 4 && count.Qualified == 2 && count.Outcomes[static_cast<size_t>(KmonLayoutOutcome::Expired)] == 1 &&
+        count.Outcomes[static_cast<size_t>(KmonLayoutOutcome::Rejected)] == 1 && count.InvalidClocks == 0,
+        "mapping-success-stale-identity-and-original-expiry-remain-distinct");
+    MEMORY_BASIC_INFORMATION guard{};
+    check(VirtualQuery(memory + 2 * 4096, &guard, sizeof(guard)) == sizeof(guard) && (guard.Protect & PAGE_GUARD) != 0,
+        "mapping-qualification-does-not-consume-guard");
+    check(monitor.PriorityCaptures.Size() == 0 && monitor.ContinuedCaptures.Size() == 0 && monitor.CapturedPages.Size() == 0,
+        "nonexecutable-mapping-success-does-not-claim-byte-capture");
+    check(monitor.QueueLayoutCandidate(freshAfterExpired), "retained-fresh-source-observation-retried");
+    monitor.DrainLayoutCandidates(false);
+    const auto retried = monitor.LayoutCandidates.Json(GetTickCount64());
+    check(monitor.LayoutCandidates.Snapshot().Attempts == 5 && monitor.LayoutCandidates.Snapshot().Qualified == 3,
+        "fresh-retry-gets-actual-mapping-qualification");
+    first.ObservedMs = GetTickCount64();
+    check(monitor.QueueLayoutCandidate(first), "new-observation-after-completed-work");
+    monitor.StopRequested.store(true);
+    monitor.DrainLayoutCandidates(true);
+    const auto stopped = monitor.LayoutCandidates.Json(GetTickCount64());
+    check(monitor.LayoutCandidates.Snapshot(true).Attempts == 1 && monitor.LayoutCandidates.Snapshot(true).Qualified == 1 &&
+        monitor.LayoutCandidates.Snapshot().Attempts == 5 && monitor.LayoutCandidates.Size() == 0,
+        "shutdown-qualification-is-separated-and-drained");
+    ProcessLayoutMonitor collector;
+    collector.Reset();
+    ProcessLayoutScope scope; scope.All = false; scope.Pids.insert(GetCurrentProcessId());
+    std::atomic<bool> stoppedCollection{false};
+    const auto collected = GetTickCount64() + 10000;
+    while (collector.Stats().Completed == 0 && GetTickCount64() < collected)
+    {
+        collector.Tick(scope, stoppedCollection, [](const ProcessLayoutNotice&) { return true; }, [](ProcessLayoutCandidate) { return true; });
+        std::this_thread::yield();
+    }
+    check(collector.Stats().Completed == 1, "owned-native-layout-sweep-completed");
+    check(VirtualQuery(memory + 2 * 4096, &guard, sizeof(guard)) == sizeof(guard) && (guard.Protect & PAGE_GUARD) != 0,
+        "native-collection-preserves-owned-guard");
+    const auto collection = collector.SchedulingJson(GetTickCount64());
+    if (diagnostics != nullptr)
+    {
+        *diagnostics = L"{\"schema\":\"kn.layout_scheduler_test.v1\",\"driver_loaded\":false,\"native_byte_reads\":false,"
+            L"\"corpus\":\"owned_native_mapping_metadata_guard_expiry_and_identity\",\"passed\":" +
+            std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
+            L",\"pending\":" + pending + L",\"normal\":" + normal + L",\"retry\":" + retried + L",\"shutdown\":" + stopped + L",\"collection\":" + collection + L"}";
+    }
+    std::fprintf(stderr, "[layout.scheduler] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
 }

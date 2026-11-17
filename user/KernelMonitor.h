@@ -23,6 +23,7 @@
 #include "KmonReferenceScheduling.h"
 #include "KmonImageScheduling.h"
 #include "KmonPublicationScheduling.h"
+#include "KmonLayoutScheduling.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -375,6 +376,7 @@ private:
     friend bool KmonImageReadIntegrationSelfTest();
     friend bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
@@ -561,9 +563,9 @@ private:
     ProcessLayoutMonitor LayoutMonitor;
     HiddenProcessScheduler HiddenScheduler;
     bool LayoutAllProcesses = true;
-    static constexpr size_t LayoutAdmissionLimit = 160;
-    static constexpr size_t LayoutChangeReserve = 32;
-    KmonWorkQueue<ProcessLayoutCandidate> LayoutCandidates{2048};
+    static constexpr size_t LayoutAdmissionLimit = KmonLayoutQueue::Capacity;
+    static constexpr size_t LayoutChangeReserve = KmonLayoutQueue::Capacity - KmonLayoutQueue::ClassCapacity;
+    KmonLayoutQueue LayoutCandidates;
     std::atomic<uint64_t> LayoutChecked{0};
     std::atomic<uint64_t> LayoutRejected{0};
     std::atomic<uint64_t> LayoutExpired{0};
@@ -1528,6 +1530,7 @@ bool KmonPipelineSelfTest();
 bool KmonImageReadIntegrationSelfTest();
 bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);

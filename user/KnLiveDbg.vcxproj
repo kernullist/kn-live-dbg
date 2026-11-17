@@ -146,6 +146,7 @@
     <ClCompile Include="KernelMonitorHunting.cpp" />
     <ClCompile Include="KernelMonitorPipeline.cpp" />
     <ClCompile Include="KernelMonitorLayout.cpp" />
+    <ClCompile Include="KmonLayoutScheduling.cpp" />
     <ClCompile Include="ProcessLayoutMonitor.cpp" />
     <ClCompile Include="ExecutionSurfaceScanner.cpp" />
     <ClCompile Include="AnalystSnapshot.cpp" />
@@ -343,6 +344,8 @@
     <ClInclude Include="KmonReferenceScheduling.h" />
     <ClInclude Include="KmonImageScheduling.h" />
     <ClInclude Include="KmonPublicationScheduling.h" />
+    <ClInclude Include="KmonLayoutScheduling.h" />
+    <ClInclude Include="KmonFairRing.h" />
     <ClInclude Include="ContentHash.h" />
     <ClInclude Include="GameBuildManifest.h" />
     <ClInclude Include="NativeHandleSnapshot.h" />

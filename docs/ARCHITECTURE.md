@@ -1805,8 +1805,76 @@ user memory, including guard/no-access pages, and an explicitly absent device.
 It verifies queue/service accounting, shutdown separation and preservation of
 the kernel quantum without loading a driver. The core ASan harness additionally
 checks percentile bounds, concurrency, fixed cohorts and sustained churn.
-Image observation scheduling is described below; layout scheduling and generic
-deadline/dependency propagation remain separate work.
+Image and layout scheduling are described below; generic deadline/dependency
+propagation remains separate work.
+
+## Layout collection and verification scheduling
+
+The layout worker maintains an explicit process ring. New discoveries join
+behind existing waiters instead of extending a PID-sorted scan's unfinished
+tail. Ordinary turns rotate the head; at most one turn in four may borrow the
+oldest eligible due or source-held work without advancing that ordinary head.
+Retirement removes membership, and a later rediscovery joins again. Failed
+collection preserves the original observation-due time and previous completed
+snapshot; its existing retry cooldown still applies. A completed sweep sets the
+next observation due time from its actual finish. First discovery is an
+inventory PID observation until the process instance is qualified.
+
+Collection keeps its existing 256-query/10 ms cooperative slice, 50 ms tick,
+30-second sweep window and bounded region/name storage. These budgets include
+synchronous work that cannot be forcibly preempted. Complete means a finished
+non-atomic `VirtualQueryEx` traversal, not clean code, an atomic inventory or
+proof that a mapping could not have been replaced between observations. The
+worker performs no shutdown sweeps; shutdown only flushes retained notices and
+changed candidates through the existing dependency order.
+
+The verification queue admits 160 candidates globally, 128 in either changed
+or periodic/initial class, 16 per process instance and 8 per instance/class.
+Each class therefore leaves 32 slots available to the other. Refused candidates
+remain with the producer's changed-range batch or periodic cursor. Admitted
+subjects rotate through a ring, their two classes rotate independently, and
+FIFO order is retained inside each class. A bounded oldest-head loan leaves the
+ordinary subject and class cursors intact. New subjects cannot join ahead of
+existing waiters. Existing per-sweep candidate budgets remain in force.
+
+A duplicate retains the original candidate, queue time and 30-second expiry.
+Last submitted observation time and rediscovery count are recorded separately;
+the count describes repeated submissions, not unseen mapping changes. Equality
+requires the same canonical process identity, optional EPROCESS/session
+assertion set, mapped name, range, attributes and candidate class. An unknown
+assertion cannot merge contradictory known identities. If the original is
+already expired, a newer observation stays at the source until that original
+has been accounted for, then receives its own admission and validation. In-flight
+originals likewise leave new source work pending.
+
+`coverage.pipeline.layout_collection_scheduling_json` carries private
+`kn.layout_collection_scheduling.v1` data: discovery/due/attempt/completed-sweep
+times, held callbacks, remaining cursor, successful/incomplete service and
+discovery/due-to-sweep distributions. It includes up to 64 exact resident scopes
+within a 65,536 UTF-16-character detail budget, plus up to 128 deferred discovery
+PIDs whose instance identity is explicitly unqualified. Omitted scopes and
+incomplete inventories remain visible. Failed attempts never renew a completed
+sweep timestamp.
+
+`layout_verification_scheduling_json` carries private
+`kn.layout_verification_scheduling.v1` data. It separates queue/source wait,
+admission/observation-to-mapping-qualification, complete/incomplete handler
+service and normal/shutdown outcomes. Qualification is recorded immediately
+after the native identity, age, mapping and mapped-name checks; a later handler
+fault remains a fault even if that mapping check succeeded. This success does
+not establish a byte read, image verification or mapping lifetime. Histograms
+use exact maxima and log2 quantile upper bounds. Resident history is limited to
+512 keys, with pending/in-flight keys pinned; deferred detail is limited to 64
+keys. Exact report rows and escaped text are bounded, with eviction and omission
+counts. Identical mapping reuse between observations remains unresolved.
+
+`--self-test layout-scheduler` exercises owned native mapping/guard/expiry and
+identity controls, an actual source sweep, fresh-source retry after original
+expiry, and a separate shutdown qualification. Core controls and an independent
+model exercise quotas, identity assertion conflicts, original clocks, observed
+concurrent reporting, bounded history, stable/growing/flooded/reused populations
+and source capacity deferral. They do not establish native workload SLOs,
+whole-source maximum unobserved intervals or generic pipeline deadlines.
 
 ## Publication scheduling and completion timing
 
@@ -1936,8 +2004,8 @@ exact maxima and log2 percentile upper bounds. Durability is outside this turn.
 with owned files and synthetic target bytes, plus controlled-time production
 selection for fixed, growing and delete/reuse cohorts. An independent Python
 model checks the latter sequence. These controls do not establish native-driver
-workload SLOs, all-source maximum unobserved intervals, layout scheduling,
-generic stage budgets/dependencies or durable publication latency.
+workload SLOs, all-source maximum unobserved intervals, generic stage
+budgets/dependencies or durable publication latency.
 
 ## Execution reference scheduling
 

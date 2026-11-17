@@ -441,6 +441,16 @@ file/journal outcomes. Per-job `coverage.publication` receipts link those clocks
 to the original job ID. Unknown historical acquisition times stay unknown. See
 [publication scheduling](ARCHITECTURE.md#publication-scheduling-and-completion-timing).
 
+`KnLiveDbg.exe --self-test layout-scheduler` checks an owned native layout sweep
+and mapping qualification, including a guard page, stale identity, original
+expiry, a fresh observation retained for retry, and shutdown separation. It
+emits JSON and returns 0 on success, 1 on failure or 2 for extra arguments;
+no driver is loaded. Mapping qualification does not mean bytes were captured or
+code verified. The private pipeline fields `layout_collection_scheduling_json`
+and `layout_verification_scheduling_json` expose original debt, bounded scopes,
+quota deferrals, collection/qualification latency and separate failure samples.
+See [layout scheduling](ARCHITECTURE.md#layout-collection-and-verification-scheduling).
+
 Current-main KMON image comparisons preserve original read attempts for clean,
 changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication

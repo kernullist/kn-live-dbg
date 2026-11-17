@@ -218,7 +218,9 @@ void ProcessLayoutMonitor::Reset(uint32_t intervalMs)
     Entries.clear();
     Counters = {};
     Counters.IntervalMs = (std::max)(1000u, (std::min)(intervalMs, 60000u));
-    CursorPid = 0;
+    ProcessOrder.Reset();
+    DiscoveryDeferred.clear();
+    Scheduling = std::make_unique<SchedulingStats>();
     NextInventoryMs = 0;
     RefreshRequested.store(false);
     SYSTEM_INFO system{};
@@ -278,6 +280,7 @@ void ProcessLayoutMonitor::Discover(const ProcessLayoutScope& scope, uint64_t no
                 if (it->second.PendingNotice || !it->second.PendingChanges.empty()) { ++it; continue; }
                 Counters.VerificationChangesAbandoned += it->second.PendingChanges.size();
                 ++Counters.Retired;
+                ProcessOrder.Remove(it->first);
                 it = Entries.erase(it);
             }
             else
@@ -296,14 +299,26 @@ void ProcessLayoutMonitor::Discover(const ProcessLayoutScope& scope, uint64_t no
         if (Entries.size() >= MaxProcesses)
         {
             ++Counters.ProcessCap;
+            const auto held = DiscoveryDeferred.find(item.first);
+            if (held != DiscoveryDeferred.end()) { held->second.second = now; }
+            else if (DiscoveryDeferred.size() < 128) { DiscoveryDeferred.emplace(item.first, std::make_pair(now, now)); }
             continue;
         }
         Entry entry;
         entry.Pid = item.first;
         entry.Name = item.second;
-        entry.FirstSeenMs = now;
-        Entries.emplace(item.first, std::move(entry));
+        const auto held = DiscoveryDeferred.find(item.first);
+        entry.FirstSeenMs = held == DiscoveryDeferred.end() ? now : held->second.first;
+        entry.ObservationDueMs = entry.FirstSeenMs;
+        ProcessOrder.Add(item.first);
+        try { Entries.emplace(item.first, std::move(entry)); }
+        catch (...) { ProcessOrder.Remove(item.first); throw; }
         ++Counters.Discovered;
+    }
+    for (auto it = DiscoveryDeferred.begin(); it != DiscoveryDeferred.end();)
+    {
+        if (Entries.count(it->first) != 0 || (complete && found.count(it->first) == 0)) { it = DiscoveryDeferred.erase(it); }
+        else { ++it; }
     }
 }
 
@@ -455,6 +470,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
         entry.History = {};
         entry.Pending.reset();
         entry.FirstSeenMs = begin;
+        entry.ObservationDueMs = begin;
         entry.VerificationCursor = 0;
         ++Counters.Retired;
         ++Counters.Discovered;
@@ -546,6 +562,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     entry.VerificationRowsRemaining = snapshot->Regions.size();
     entry.VerificationEmitted.clear();
     entry.NextScanMs = snapshot->FinishedMs + Counters.IntervalMs;
+    entry.ObservationDueMs = entry.NextScanMs;
     entry.Status = L"complete";
     ++Counters.Completed;
     const auto& delta = entry.History.LastDelta;
@@ -687,6 +704,24 @@ void ProcessLayoutMonitor::FlushNotices(const NoticeSink& notice)
     }
 }
 
+std::optional<uint32_t> ProcessLayoutMonitor::SelectProcess(uint64_t now)
+{
+    std::optional<uint32_t> oldest;
+    uint64_t age = UINT64_MAX;
+    if (ProcessOrder.MayBorrow()) for (const auto pid : ProcessOrder.Keys())
+    {
+        const auto& entry = Entries.at(pid);
+        uint64_t pending = entry.ObservationDueMs;
+        const bool due = now >= entry.NextScanMs;
+        if (entry.PendingNotice) { pending = (std::min)(pending, entry.PendingNotice->FinishedMs); }
+        if (!entry.PendingChanges.empty()) { pending = (std::min)(pending, entry.PendingChanges.front().ObservedMs); }
+        if (entry.PeriodicDeferred && entry.History.Current) { pending = (std::min)(pending, entry.History.Current->FinishedMs); }
+        if ((due || entry.PendingNotice || !entry.PendingChanges.empty() || entry.PeriodicDeferred) && pending <= now &&
+            (!oldest || pending < age)) { oldest = pid; age = pending; }
+    }
+    return ProcessOrder.Pick(oldest);
+}
+
 void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
     const NoticeSink& notice, const CandidateSink& candidate)
 {
@@ -699,16 +734,11 @@ void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atom
         NextInventoryMs = GetTickCount64() + 1000;
     }
     size_t visited = 0;
-    auto next = Entries.upper_bound(CursorPid);
     while (visited < Entries.size() && !stop.load() && GetTickCount64() - begin < 50)
     {
-        if (next == Entries.end())
-        {
-            next = Entries.begin();
-        }
-        auto& entry = next->second;
-        CursorPid = next->first;
-        ++next;
+        const auto selected = SelectProcess(GetTickCount64());
+        if (!selected) { break; }
+        auto& entry = Entries.at(*selected);
         ++visited;
         if (entry.PendingNotice)
         {
@@ -722,7 +752,34 @@ void ProcessLayoutMonitor::Tick(const ProcessLayoutScope& scope, const std::atom
         }
         if (GetTickCount64() >= entry.NextScanMs)
         {
-            Advance(entry, scope, stop, notice, candidate);
+            const auto started = GetTickCount64(), due = entry.ObservationDueMs, discovered = entry.FirstSeenMs;
+            const auto completed = Counters.Completed, failed = Counters.Failed;
+            ++Scheduling->Attempts;
+            try { Advance(entry, scope, stop, notice, candidate); }
+            catch (...)
+            {
+                ++Scheduling->Failed;
+                const auto ended = GetTickCount64();
+                if (ended >= started) { Scheduling->IncompleteService.Add(ended - started); }
+                else { ++Scheduling->InvalidClocks; }
+                throw;
+            }
+            const auto ended = GetTickCount64();
+            if (ended < started) { ++Scheduling->InvalidClocks; continue; }
+            if (ended - started > 10) { ++Scheduling->OverBudget; }
+            if (Counters.Completed != completed)
+            {
+                ++Scheduling->Completions; Scheduling->CompleteService.Add(ended - started);
+                const auto origin = discovered == entry.FirstSeenMs ? due : entry.FirstSeenMs;
+                const auto observed = entry.History.Current->FinishedMs;
+                if (origin <= observed) { Scheduling->DueToSweep.Add(observed - origin); } else { ++Scheduling->InvalidClocks; }
+                if (entry.History.Completed == 1 && entry.FirstSeenMs <= observed) { Scheduling->DiscoveryToFirstSweep.Add(observed - entry.FirstSeenMs); }
+            }
+            else
+            {
+                Scheduling->IncompleteService.Add(ended - started);
+                if (Counters.Failed != failed) { ++Scheduling->Failed; } else { ++Scheduling->Partial; }
+            }
         }
         else if (entry.PeriodicDeferred)
         {
@@ -762,6 +819,56 @@ ProcessLayoutStats ProcessLayoutMonitor::Stats() const
         stats.OldestAgeMs = (std::max)(stats.OldestAgeMs, now - (std::min)(now, last));
     }
     return stats;
+}
+
+std::wstring ProcessLayoutMonitor::SchedulingJson(uint64_t now) const
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };
+    const auto histogram = [&](const KmonLatencyHistogram& h)
+    { return L"{\"samples\":" + n(h.Samples) + L",\"p50_upper_ms\":" + n(h.UpperPercentile(50)) +
+        L",\"p95_upper_ms\":" + n(h.UpperPercentile(95)) + L",\"p99_upper_ms\":" + n(h.UpperPercentile(99)) + L",\"max_ms\":" + n(h.MaximumMs) + L"}"; };
+    size_t rows = 0;
+    uint64_t pending = 0, oldest = 0;
+    std::wstring entries, deferred;
+    for (const auto& item : Entries)
+    {
+        const auto& e = item.second;
+        const bool due = e.ObservationDueMs <= now;
+        pending += due;
+        if (due) { oldest = (std::max)(oldest, now - e.ObservationDueMs); }
+        if (rows >= 64) { continue; }
+        const auto row = L"{\"pid\":" + n(e.Pid) + L",\"boot_id\":" + mcpjson::Quote(e.Identity.BootId) +
+            L",\"create_time\":" + n(e.Identity.CreateTime) + L",\"first_seen_ms\":" + n(e.FirstSeenMs) +
+            L",\"pending_since_ms\":" + (due ? n(e.ObservationDueMs) : L"null") + L",\"next_attempt_due_ms\":" + n(e.NextScanMs) +
+            L",\"last_attempt_ms\":" + n(e.LastAttemptMs) + L",\"last_completed_sweep_ms\":" +
+            (e.History.Current ? n(e.History.Current->FinishedMs) : L"null") + L",\"status\":" + mcpjson::Quote(e.Status) +
+            L",\"pending_cursor\":" + (e.Pending ? n(e.Pending->Cursor) : L"null") + L",\"address_limit\":" + n(AddressLimit) +
+            L",\"changed_candidates_held\":" + n(e.PendingChanges.size()) + L",\"periodic_deferred\":" +
+            (e.PeriodicDeferred ? L"true" : L"false") + L",\"notice_held\":" + (e.PendingNotice ? L"true" : L"false") + L"}";
+        if (row.size() + (entries.empty() ? 0 : 1) > 65536 - entries.size()) { continue; }
+        if (!entries.empty()) { entries += L","; } entries += row; ++rows;
+    }
+    for (const auto& item : DiscoveryDeferred)
+    {
+        if (!deferred.empty()) { deferred += L","; }
+        deferred += L"{\"pid\":" + n(item.first) + L",\"identity_qualified\":false,\"first_deferred_ms\":" + n(item.second.first) +
+            L",\"last_deferred_ms\":" + n(item.second.second) + L",\"reason\":\"process_capacity\"}";
+    }
+    const auto& s = *Scheduling;
+    return L"{\"schema\":\"kn.layout_collection_scheduling.v1\",\"scope\":\"resident_process_inventory\","
+        L"\"clock_domain\":\"GetTickCount64_ms\",\"first_seen_scope\":\"inventory_pid_seen_before_instance_qualification\","
+        L"\"success_scope\":\"completed_non_atomic_layout_not_code_or_mapping_lifetime_proof\","
+        L"\"policy\":\"process_ring_bounded_oldest_loan.v1\",\"shutdown_observation_performed\":false,\"hard_deadline_enforced\":false,"
+        L"\"resident\":" + n(Entries.size()) + L",\"pending_observations\":" + n(pending) + L",\"oldest_pending_ms\":" + n(oldest) +
+        L",\"scope_rows_omitted\":" + n(Entries.size() - rows) + L",\"debt_loans\":" + n(ProcessOrder.DebtLoans()) +
+        L",\"attempts\":" + n(s.Attempts) + L",\"completed\":" + n(s.Completions) + L",\"partial\":" + n(s.Partial) + L",\"failed\":" + n(s.Failed) +
+        L",\"invalid_clocks\":" + n(s.InvalidClocks) + L",\"cooperative_10ms_overruns\":" + n(s.OverBudget) +
+        L",\"complete_service\":" + histogram(s.CompleteService) + L",\"incomplete_service\":" + histogram(s.IncompleteService) +
+        L",\"discovery_to_first_sweep\":" + histogram(s.DiscoveryToFirstSweep) + L",\"due_to_sweep\":" + histogram(s.DueToSweep) +
+        L",\"discovery_deferred_current_count\":" + n(Counters.ProcessCap) + L",\"discovery_deferred_resident\":" + n(DiscoveryDeferred.size()) +
+        L",\"discovery_scopes_omitted\":" + n(Counters.ProcessCap - (std::min<uint64_t>)(Counters.ProcessCap, DiscoveryDeferred.size())) +
+        L",\"inventory_complete\":" + (Counters.InventoryComplete ? L"true" : L"false") + L",\"records\":[" + entries + L"],\"discovery_deferred\":[" + deferred + L"]}";
 }
 
 std::wstring ProcessLayoutMonitor::Json(uint32_t pid, bool initial) const
@@ -976,6 +1083,44 @@ std::wstring ProcessLayoutMonitor::Text(uint32_t pid, bool initial) const
     return out.str();
 }
 
+std::wstring ProcessLayoutSchedulingFixturesJson()
+{
+    std::wstring scenarios;
+    for (unsigned scenario = 0; scenario < 3; ++scenario)
+    {
+        ProcessLayoutMonitor monitor;
+        std::wstring operations;
+        const auto emit = [&](const std::wstring& row) { if (!operations.empty()) { operations += L","; } operations += row; };
+        const auto add = [&](uint32_t pid, uint64_t due)
+        {
+            if (monitor.Entries.count(pid) != 0) { return; }
+            ProcessLayoutMonitor::Entry entry; entry.Pid = pid; entry.FirstSeenMs = entry.ObservationDueMs = due;
+            monitor.Entries.emplace(pid, std::move(entry)); monitor.ProcessOrder.Add(pid);
+            emit(L"{\"op\":\"add\",\"pid\":" + std::to_wstring(pid) + L",\"due\":" + std::to_wstring(due) + L"}");
+        };
+        for (uint32_t i = 0; i < 8; ++i) { add(100 + i, i * 10); }
+        for (uint32_t turn = 0; turn < 240; ++turn)
+        {
+            const uint64_t now = 1000 + turn;
+            if (scenario != 0 && monitor.Entries.size() < 64) { add(1000 + turn, now); }
+            if (scenario == 2 && turn % 3 == 0)
+            {
+                const auto pid = 100 + (turn / 3) % 8;
+                monitor.Entries.erase(pid); monitor.ProcessOrder.Remove(pid);
+                emit(L"{\"op\":\"remove\",\"pid\":" + std::to_wstring(pid) + L"}");
+                add(pid, now);
+            }
+            const auto selected = monitor.SelectProcess(now);
+            emit(L"{\"op\":\"select\",\"pid\":" + std::to_wstring(selected.value_or(0)) +
+                L",\"loans\":" + std::to_wstring(monitor.ProcessOrder.DebtLoans()) + L"}");
+        }
+        if (!scenarios.empty()) { scenarios += L","; }
+        scenarios += L"{\"name\":" + mcpjson::Quote(scenario == 0 ? L"fixed" : scenario == 1 ? L"growing" : L"delete_reuse") +
+            L",\"operations\":[" + operations + L"]}";
+    }
+    return L"[" + scenarios + L"]";
+}
+
 bool ProcessLayoutMonitorSelfTest()
 {
     ProcessLayoutMonitor monitor;
@@ -1001,6 +1146,44 @@ bool ProcessLayoutMonitorSelfTest()
     {
         return true;
     };
+    {
+        // Retained synthetic notices keep every slot occupied while a real,
+        // self-only inventory exercises capacity deferral without spawning
+        // thousands of native processes or discarding real source evidence.
+        ProcessLayoutMonitor capacity;
+        capacity.Reset();
+        for (uint32_t i = 0; i < MaxProcesses; ++i)
+        {
+            ProcessLayoutMonitor::Entry held;
+            held.Pid = UINT32_MAX - i; held.PendingNotice = ProcessLayoutNotice{};
+            capacity.ProcessOrder.Add(held.Pid);
+            capacity.Entries.emplace(held.Pid, std::move(held));
+        }
+        ProcessLayoutScope owned; owned.All = false; owned.Pids.insert(GetCurrentProcessId());
+        capacity.Discover(owned, 100);
+        capacity.Discover(owned, 200);
+        const auto refused = capacity.DiscoveryDeferred.find(GetCurrentProcessId());
+        if (!capacity.Counters.InventoryComplete || capacity.Counters.ProcessCap != 1 || refused == capacity.DiscoveryDeferred.end() ||
+            refused->second.first != 100 || refused->second.second != 200) { return false; }
+        const auto report = capacity.SchedulingJson(200);
+        if (!mcpjson::ValidateDocument(report) || report.find(L"\"scope_rows_omitted\":\"4032\"") == std::wstring::npos ||
+            report.find(L"\"reason\":\"process_capacity\"") == std::wstring::npos) { return false; }
+        const auto released = capacity.Entries.begin()->first;
+        capacity.Entries.erase(released); capacity.ProcessOrder.Remove(released);
+        capacity.Discover(owned, 300);
+        const auto admitted = capacity.Entries.find(GetCurrentProcessId());
+        if (admitted == capacity.Entries.end() || admitted->second.FirstSeenMs != 100 || admitted->second.ObservationDueMs != 100 ||
+            capacity.DiscoveryDeferred.count(GetCurrentProcessId()) != 0 || capacity.Counters.ProcessCap != 0) { return false; }
+        auto& held = admitted->second;
+        held.ObservationDueMs = 200;
+        auto previous = std::make_shared<process_layout::Snapshot>();
+        previous->FinishedMs = 150;
+        held.History.Current = previous;
+        held.Pending = std::make_shared<process_layout::Snapshot>();
+        capacity.Fail(held, L"controlled_unavailable", 0, notice);
+        if (held.FirstSeenMs != 100 || held.ObservationDueMs != 200 || held.History.Current->FinishedMs != 150 || held.Pending ||
+            held.NextScanMs <= 200 || capacity.Counters.Failed != 1) { return false; }
+    }
     {
         ProcessLayoutMonitor::Entry bounded;
         auto snapshot = std::make_shared<process_layout::Snapshot>();

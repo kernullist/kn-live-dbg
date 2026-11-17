@@ -4,6 +4,7 @@
 #include "../user/ExecutableImageVerifier.h"
 #include "../user/McpJson.h"
 #include "secondary-image-fixture.h"
+#include "kmon-layout-scheduling-selftest.h"
 
 #include <iostream>
 #include <random>
@@ -51,11 +52,18 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 2 && std::wstring(argv[1]) == L"--scheduling-json")
+    {
+        std::wcout << L"{\"schema\":\"kn.layout_scheduling_fixture.v1\",\"collection\":" << ProcessLayoutSchedulingFixturesJson() <<
+            L",\"verification\":" << LayoutQueueSchedulingFixturesJson() << L"}\n";
+        return 0;
+    }
     if (argc > 1 && std::wstring(argv[1]) == L"--layout-child")
     {
         Sleep(8000);
         return 0;
     }
+    if (!KmonLayoutSchedulingSelfTest()) { return 1; }
     using namespace process_layout;
     if (argc > 1)
     {

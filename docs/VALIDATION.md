@@ -7,6 +7,70 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Layout scheduling checkpoint: 2026-11-17
+
+Layout collection now rotates an explicit process ring with bounded oldest-work
+loans. Verification preserves the original observation, queue time and expiry,
+uses process/class quotas, and separates mapping qualification from byte reads
+and handler completion. See
+[layout scheduling](ARCHITECTURE.md#layout-collection-and-verification-scheduling).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- The layout harness built and ran under `/W4 /WX`: **1,017 scheduling checks**,
+  **105,120 layout-core checks** and **7,819 independent Python assertions**
+  passed. Fixed, growing, flooded and removed/reused populations exercise the
+  production selectors. The model verifies that later arrivals do not extend
+  existing waiters' bounds. Controls cover class/process limits, original
+  clocks, observed concurrent reporting, bounded history and escaped details.
+- A controlled 4,096-entry source population preserves the first deferred
+  discovery until a slot becomes available. A failed collection retains its
+  original due time and previous successful snapshot. This is a capacity
+  control, not a 4,096-process native workload result.
+- The actual `--self-test layout-scheduler` passed **21 checks** and its JSON/CLI
+  oracle passed **16**. Owned native mappings exercise guard preservation,
+  original expiry, stale identity, source-held fresh retry, normal/shutdown
+  separation and a completed layout sweep. Metadata qualification performs no
+  byte capture in these controls and does not consume the guard page.
+- Adversarial review fixed duplicate replacement that renewed original clocks,
+  and retained a newer source observation while its expired original awaits
+  accounting. Busy originals also refuse replacement. Exact optional identity
+  assertions prevent an unknown assertion from joining contradictory known
+  identities. Allocation failure rollback keeps queue membership consistent.
+- Existing image/reference/capture/publication scheduling oracles passed
+  **966 / 50 / 23 / 43 assertions**. Isolated `--self-test all` reported
+  **28 timeline / 102 MCP / 121 KMON image-read / 319 image-scheduling /
+  30 publication-writer / 21 layout-scheduler / 564 console / 3,043 command-route /
+  68 remote / 4 connect-option checks**, with no reported failures. Compiled
+  capabilities exposed **47 contracts / 261 routes**; the generated support
+  matrix matched. Public-content scanner tests passed **12**, and mapped-name
+  regression tests passed **8**.
+
+Final review found no additional actionable defects in the reviewed scope.
+Release product SHA-256:
+`e41e0e39d143a499699c1f30ac1dded079b53a7312baf7a075e4f81898df5706`.
+Layout harness SHA-256:
+`4d2caac93d679308f8510c95f37f6de1d4f9d09758839ec355b8973a01de0274`.
+The product build retained existing fixture conversion/alignment warnings.
+ASan remains blocked by the previously recorded host startup interception
+failure; no new ASan success is claimed.
+
+At **23:42 KST**, boot time remained **12:49:00.5 KST**. No new
+reboot/BugCheck events or dump files appeared after the publication checkpoint.
+No task process/driver, owned writer fixture, or parser preparation/profile
+residue remained. The 33 completed parser caches, BFE/mpssvc, firewall profiles
+and EFS running/manual baseline were unchanged.
+
+These results qualify completed non-atomic layout sweeps and mapping metadata,
+not mapping lifetimes, unseen identical reuse or code integrity. Cooperative
+slices can overrun inside synchronous native calls or callbacks. Asynchronous
+reference preparation, generic stage budgets/dependencies, whole-collection
+timing, native workload SLOs and whole-source maximum unobserved intervals remain
+open. No shutdown source sweep or full P09 completion is claimed.
+
 ## Publication scheduling checkpoint: 2026-11-17
 
 The writer now rotates image, evidence, IRP and byte-page families with bounded

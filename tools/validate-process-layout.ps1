@@ -26,8 +26,8 @@ if ($Sanitize)
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
 $program = Join-Path $output 'process-layout-selftest.exe'
-$sources = @('tools\process-layout-selftest.cpp', 'user\ProcessLayoutMonitor.cpp',
-    'user\AnalystSnapshot.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp') |
+$sources = @('tools\process-layout-selftest.cpp', 'user\ProcessLayoutMonitor.cpp', 'user\KmonLayoutScheduling.cpp',
+    'user\AnalystSnapshot.cpp', 'user\ExecutableImage.cpp', 'user\ExecutableImageVerifier.cpp', 'user\ReferenceArtifact.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $commands = @(
     '@echo off',
@@ -50,3 +50,5 @@ if ($LASTEXITCODE -ne 0)
     throw 'Layout harness validation failed'
 }
 Write-Output "[layout.validation] evidence=$evidence"
+& python (Join-Path $PSScriptRoot 'test-layout-scheduling.py') --core-exe $program
+if ($LASTEXITCODE -ne 0) { throw "Layout scheduling oracle failed: $LASTEXITCODE" }

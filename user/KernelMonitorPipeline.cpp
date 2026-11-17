@@ -1977,10 +1977,15 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"layout_notices_pending"] = std::to_wstring(layout.NoticesPending);
         event.Evidence[L"layout_notices_deferred"] = std::to_wstring(layout.NoticesDeferred);
         event.Evidence[L"layout_pending"] = std::to_wstring(LayoutCandidates.Size());
+        event.Evidence[L"layout_collection_scheduling_json"] = LayoutMonitor.SchedulingJson(now);
+        event.Evidence[L"layout_verification_scheduling_json"] = LayoutCandidates.Json(now);
         event.Evidence[L"layout_dropped"] = std::to_wstring(LayoutCandidates.Loss());
         event.Evidence[L"layout_peak"] = std::to_wstring(LayoutCandidates.Peak());
         event.Evidence[L"layout_admission_limit"] = std::to_wstring(LayoutAdmissionLimit);
         event.Evidence[L"layout_change_reserved_slots"] = std::to_wstring(LayoutChangeReserve);
+        event.Evidence[L"layout_periodic_reserved_slots"] = std::to_wstring(LayoutChangeReserve);
+        event.Evidence[L"layout_subject_limit"] = std::to_wstring(KmonLayoutQueue::SubjectCapacity);
+        event.Evidence[L"layout_subject_class_limit"] = std::to_wstring(KmonLayoutQueue::SubjectClassCapacity);
         event.Evidence[L"layout_coalesced"] = std::to_wstring(LayoutCandidates.Replacements());
         event.Evidence[L"layout_source_pending"] = std::to_wstring(layout.VerificationChangesPending);
         event.Evidence[L"layout_deferred"] = std::to_wstring(layout.VerificationDeferred);
@@ -2373,6 +2378,7 @@ bool KmonPipelineSelfTest()
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
     if (!KmonImageSchedulingIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonPublicationSchedulingIntegrationSelfTest(nullptr)) { return false; }
+    if (!KmonLayoutSchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;
@@ -2686,10 +2692,16 @@ bool KmonPipelineSelfTest()
                 bool admission = true;
                 ProcessLayoutCandidate queued;
                 queued.Identity = identity;
+                queued.Identity.BootId = L"synthetic:layout-admission";
+                queued.Identity.CreateTime = 1;
+                queued.Identity.Eprocess = 0;
+                queued.Region.Size = 4096;
                 queued.Role = L"layout_periodic";
-                queued.ObservedMs = 1;
+                const auto originalObserved = GetTickCount64() - 1;
+                queued.ObservedMs = originalObserved;
                 for (size_t index = 0; index < 128; ++index)
                 {
+                    queued.Identity.ProcessId = 0x10000 + static_cast<uint32_t>(index / 8);
                     queued.Region.Base = 0x10000 + index * 4096;
                     admission &= monitor.QueueLayoutCandidate(queued);
                 }
@@ -2698,23 +2710,31 @@ bool KmonPipelineSelfTest()
                 queued.Role = L"layout_change";
                 for (size_t index = 0; index < 32; ++index)
                 {
+                    queued.Identity.ProcessId = 0x10000 + static_cast<uint32_t>(index / 8);
                     queued.Region.Base = 0x100000 + index * 4096;
                     admission &= monitor.QueueLayoutCandidate(queued);
                 }
                 queued.Region.Base = 0x200000;
                 admission &= !monitor.QueueLayoutCandidate(queued);
                 queued.Role = L"layout_periodic";
+                queued.Identity.ProcessId = 0x10000;
                 queued.Region.Base = 0x10000;
-                queued.ObservedMs = 2; // A genuinely newer producer observation.
+                queued.ObservedMs = originalObserved + 1; // A genuinely newer producer observation.
                 admission &= monitor.QueueLayoutCandidate(queued);
-                auto retainedCandidates = monitor.LayoutCandidates.Drain(160);
+                std::vector<ProcessLayoutCandidate> retainedCandidates;
+                ProcessLayoutCandidate retainedCandidate;
+                while (monitor.LayoutCandidates.Pop(&retainedCandidate)) { retainedCandidates.push_back(retainedCandidate); }
                 admission &= retainedCandidates.size() == 160 && monitor.LayoutCandidates.Loss() == 0 &&
-                    monitor.LayoutCandidates.Replacements() == 1 && retainedCandidates.front().ObservedMs == 2;
-                for (size_t index = 1; index < retainedCandidates.size(); ++index)
+                    monitor.LayoutCandidates.Replacements() == 1;
+                size_t periodicCount = 0, changedCount = 0, rediscovered = 0;
+                for (const auto& retained : retainedCandidates)
                 {
-                    admission &= retainedCandidates[index].ObservedMs == 1 &&
-                        retainedCandidates[index].Role == (index < 128 ? L"layout_periodic" : L"layout_change");
+                    admission &= retained.ObservedMs == originalObserved;
+                    periodicCount += retained.Role == L"layout_periodic";
+                    changedCount += retained.Role == L"layout_change";
+                    rediscovered += retained.Region.Base == 0x10000 && retained.LastObservedMs == originalObserved + 1 && retained.Rediscoveries == 1;
                 }
+                admission &= periodicCount == 128 && changedCount == 32 && rediscovered == 1;
                 monitor.LayoutCandidates.Reset();
                 if (!admission) { break; }
             }

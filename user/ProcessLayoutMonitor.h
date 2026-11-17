@@ -2,6 +2,8 @@
 
 #include "ProcessLayoutCore.h"
 #include "ObservationWindows.h"
+#include "KmonCaptureScheduling.h"
+#include "KmonFairRing.h"
 
 #include <atomic>
 #include <deque>
@@ -82,6 +84,8 @@ struct ProcessLayoutCandidate
     uint64_t QueuedMs = 0;
     std::wstring Role;
     std::wstring ImageName;
+    // Local scheduling metadata; never used to renew ObservedMs or identity.
+    uint64_t SchedulingId = 0, LastObservedMs = 0, Rediscoveries = 0;
 };
 
 // Tick has a single caller. Readers copy immutable snapshots under Mutex.
@@ -98,6 +102,7 @@ public:
     ProcessLayoutStats Stats() const;
     std::wstring Json(uint32_t pid = 0, bool initial = false) const;
     std::wstring Text(uint32_t pid = 0, bool initial = false) const;
+    std::wstring SchedulingJson(uint64_t now) const;
     void NoteException();
     void RequestDiscovery();
     // Finish finite changed-range work without creating new periodic scans.
@@ -106,6 +111,7 @@ public:
 
 private:
     friend bool ProcessLayoutMonitorSelfTest();
+    friend std::wstring ProcessLayoutSchedulingFixturesJson();
     struct Entry
     {
         uint32_t Pid = 0;
@@ -114,6 +120,7 @@ private:
         process_layout::History History;
         std::shared_ptr<process_layout::Snapshot> Pending;
         uint64_t FirstSeenMs = 0;
+        uint64_t ObservationDueMs = 0;
         uint64_t NextScanMs = 0;
         uint64_t LastAttemptMs = 0;
         uint64_t VerificationCursor = 0;
@@ -129,6 +136,7 @@ private:
     };
 
     void Discover(const ProcessLayoutScope& scope, uint64_t now);
+    std::optional<uint32_t> SelectProcess(uint64_t now);
     void Advance(Entry& entry, const ProcessLayoutScope& scope, const std::atomic<bool>& stop,
         const NoticeSink& notice, const CandidateSink& candidate);
     void Fail(Entry& entry, const wchar_t* reason, uint32_t error, const NoticeSink& notice);
@@ -141,7 +149,14 @@ private:
     mutable std::mutex Mutex;
     std::map<uint32_t, Entry> Entries;
     ProcessLayoutStats Counters;
-    uint32_t CursorPid = 0;
+    KmonFairRing<uint32_t> ProcessOrder;
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> DiscoveryDeferred;
+    struct SchedulingStats
+    {
+        KmonLatencyHistogram CompleteService, IncompleteService, DiscoveryToFirstSweep, DueToSweep;
+        uint64_t Attempts = 0, Completions = 0, Partial = 0, Failed = 0, InvalidClocks = 0, OverBudget = 0;
+    };
+    std::unique_ptr<SchedulingStats> Scheduling = std::make_unique<SchedulingStats>();
     uint64_t NextInventoryMs = 0;
     uint64_t AddressLimit = 0;
     std::atomic<bool> RefreshRequested{false};
@@ -151,3 +166,4 @@ bool ProcessLayoutRegionMatches(const process_layout::Region& expected, const ME
 bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate& candidate);
 std::wstring ProcessLayoutReferencePath(const std::wstring& mappedName);
 bool ProcessLayoutMonitorSelfTest();
+std::wstring ProcessLayoutSchedulingFixturesJson();
