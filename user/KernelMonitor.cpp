@@ -8648,6 +8648,7 @@ bool KernelMonitor::Start(
             {
                 try
                 {
+                    ImageReferences->Start();
                     CaptureWriter = std::thread(&KernelMonitor::CaptureWriterLoop, this);
                     CaptureWorker = std::thread(&KernelMonitor::CaptureLoop, this);
                     Collector = std::thread(&KernelMonitor::CollectorLoop, this);
@@ -8657,6 +8658,7 @@ bool KernelMonitor::Start(
                 catch (...)
                 {
                     StopRequested.store(true);
+                    ImageReferences->RequestStop();
                     CaptureStopping.store(true);
                     // The failure cleanup below joins every started producer
                     // before signalling the writer to close its collections.
@@ -8719,6 +8721,7 @@ bool KernelMonitor::Start(
 
     if (!ok && StopRequested.load())
     {
+        ImageReferences->RequestStop();
         if (LayoutWorker.joinable())
         {
             LayoutWorker.join();
@@ -8731,6 +8734,7 @@ bool KernelMonitor::Start(
         {
             Worker.join();
         }
+        ImageReferences->Join();
         CaptureStopping.store(true);
         if (CaptureWorker.joinable())
         {
@@ -8837,6 +8841,7 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
             worker = std::move(Worker);
         }
     }
+    ImageReferences->RequestStop();
     if (LayoutWorker.joinable())
     {
         LayoutWorker.join();
@@ -8848,6 +8853,12 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     if (worker.joinable())
     {
         worker.join();
+    }
+    ImageReferences->Join();
+    for (auto& item : ImageWork)
+    {
+        if (item.second.PreparationId != 0)
+        { item.second.PreparationId = 0; item.second.PreparationCancelled = true; }
     }
 
     // Freeze the upstream tail now; backpressure can leave events there.

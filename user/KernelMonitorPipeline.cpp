@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "KmonImageTestSupport.h"
 #include "ImageSliceRecipe.h"
 #include "ContentHash.h"
 #include "McpJson.h"
@@ -140,6 +141,7 @@ namespace
 
 void KernelMonitor::ResetPipeline()
 {
+    ImageReferences->Reset();
     {
         std::lock_guard<std::mutex> lock(CapturesMutex);
         CandidateCaptures.clear();
@@ -1926,6 +1928,7 @@ void KernelMonitor::CaptureWriterLoop()
 
 void KernelMonitor::DrainPipelineEvents(bool finalDrain)
 {
+    ApplyImageReferenceResults();
     for (auto& observation : CapturedRegions.Drain(finalDrain ? 2048 : 512))
     {
         ObserveExecutableRegion(std::move(observation));
@@ -2010,6 +2013,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"execution_references_max_queue_wait_ms"] = std::to_wstring(ExecutionReferenceMaxWaitMs);
         event.Evidence[L"execution_references_peak"] = std::to_wstring(ExecutionReferencePeak);
         event.Evidence[L"reference_scheduling_json"] = ExecutionReferences.Json(GetTickCount64());
+        event.Evidence[L"image_reference_preparation_json"] = ImageReferences->Json(now);
         event.Evidence[L"reference_scan_cursors"] = std::to_wstring(ReferenceScanCursors.size());
         event.Evidence[L"reference_cursor_evicted"] = std::to_wstring(ReferenceCursorEvicted);
         event.Evidence[L"reference_scan_policy"] = L"rotating static sources: IAT/table 16, kernel tables 64; not complete path coverage";
@@ -2377,6 +2381,7 @@ bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
     if (!KmonImageSchedulingIntegrationSelfTest(nullptr)) { return false; }
+    if (!KmonImagePreparationIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonPublicationSchedulingIntegrationSelfTest(nullptr)) { return false; }
     if (!KmonLayoutSchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
@@ -2742,32 +2747,32 @@ bool KmonPipelineSelfTest()
             wchar_t selfPath[32768]{};
             GetModuleFileNameW(nullptr, selfPath, 32768);
             bool referenceUnavailable = true;
-            auto imageWork = monitor.FindImageWork(selfPath, selfBase, identity, &referenceUnavailable);
+            auto imageWork = KmonImageTestAccess::Find(monitor, selfPath, selfBase, identity, &referenceUnavailable);
             if (imageWork == nullptr || referenceUnavailable || imageWork->Sweep.Ranges.size() < 2) { break; }
             imageWork->Sweep.NextRange = 1;
             const std::wstring aliasPath = L"\\\\?\\" + std::wstring(selfPath);
-            if (monitor.FindImageWork(aliasPath, selfBase, identity) != imageWork ||
+            if (KmonImageTestAccess::Find(monitor, aliasPath, selfBase, identity) != imageWork ||
                 imageWork->Sweep.NextRange != 1 || monitor.ImageWork.size() != 1) { break; }
             auto reusedIdentity = identity;
             ++reusedIdentity.CreateTime;
-            if (monitor.FindImageWork(aliasPath, selfBase, reusedIdentity) == imageWork) { break; }
+            if (KmonImageTestAccess::Find(monitor, aliasPath, selfBase, reusedIdentity) == imageWork) { break; }
             wchar_t differentReference[32768]{};
             GetModuleFileNameW(GetModuleHandleW(L"ntdll.dll"), differentReference, 32768);
-            if (monitor.FindImageWork(differentReference, selfBase, identity) == imageWork ||
+            if (KmonImageTestAccess::Find(monitor, differentReference, selfBase, identity) == imageWork ||
                 monitor.ImageWork.size() != 3) { break; }
             monitor.ImageWork.clear();
             const auto missingReference = std::wstring(unique) + L"\\missing-reference.exe";
-            if (monitor.FindImageWork(missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
+            if (KmonImageTestAccess::Find(monitor, missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
                 !referenceUnavailable || monitor.ImageWork.size() != 1) { break; }
             referenceUnavailable = false;
-            if (monitor.FindImageWork(missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
+            if (KmonImageTestAccess::Find(monitor, missingReference, selfBase, identity, &referenceUnavailable) != nullptr ||
                 !referenceUnavailable) { break; }
-            if (monitor.FindImageWork(missingReference, 0, identity, &referenceUnavailable) != nullptr ||
+            if (KmonImageTestAccess::Find(monitor, missingReference, 0, identity, &referenceUnavailable) != nullptr ||
                 referenceUnavailable) { break; }
             monitor.ImageWork.clear();
             // Eviction must retain the normal 30-second rescan deadline, not
             // turn a completed image into permanently competing "initial" work.
-            auto completed = monitor.FindImageWork(selfPath, selfBase, identity);
+            auto completed = KmonImageTestAccess::Find(monitor, selfPath, selfBase, identity);
             if (completed == nullptr) { break; }
             completed->Sweep.Coverage.TraversalComplete = true;
             completed->Sweep.LastCompleteMs = GetTickCount64();
@@ -2776,7 +2781,7 @@ bool KmonPipelineSelfTest()
             if (monitor.ImageRescanDelays.size() != 1) { break; }
             monitor.ImageWork.clear();
             referenceUnavailable = true;
-            if (monitor.FindImageWork(aliasPath, selfBase, identity, &referenceUnavailable) != nullptr || referenceUnavailable ||
+            if (KmonImageTestAccess::Find(monitor, aliasPath, selfBase, identity, &referenceUnavailable) != nullptr || referenceUnavailable ||
                 !monitor.ImageWork.empty() || monitor.ImageRescanDelayHits != 1) { break; }
             // Process reuse, allocation reuse with a different file, and a
             // changed full file ID must not inherit the previous deadline.
@@ -2784,7 +2789,7 @@ bool KmonPipelineSelfTest()
                 monitor.ImageRescanDelayed(selfPath, selfBase + 4096, identity, GetTickCount64()) ||
                 monitor.ImageRescanDelayed(differentReference, selfBase, identity, GetTickCount64()) ||
                 !monitor.ImageRescanDelays.empty()) { break; }
-            completed = monitor.FindImageWork(selfPath, selfBase, identity);
+            completed = KmonImageTestAccess::Find(monitor, selfPath, selfBase, identity);
             if (completed == nullptr) { break; }
             completed->Sweep.Coverage.TraversalComplete = true;
             completed->Sweep.LastCompleteMs = GetTickCount64();
@@ -2796,7 +2801,7 @@ bool KmonPipelineSelfTest()
             monitor.RememberImageRescanDelay(*completed, GetTickCount64());
             monitor.ImageRescanDelays.begin()->second.DueMs = GetTickCount64() - 1;
             monitor.ImageWork.clear();
-            completed = monitor.FindImageWork(aliasPath, selfBase, identity);
+            completed = KmonImageTestAccess::Find(monitor, aliasPath, selfBase, identity);
             // An evicted repeat keeps only its scheduling class. It still has
             // to read every byte again, and cannot claim a completed cycle.
             if (completed == nullptr || completed->PriorTraversalMs == 0 ||
@@ -2816,7 +2821,7 @@ bool KmonPipelineSelfTest()
                 rememberedTraversal != traversed || history.DueMs != due ||
                 completed->Sweep.Coverage.ComparedBytes != 0 || completed->Sweep.CompletedCycles != 0) { break; }
             const ObservationReader unreadableRepeat = [](uint64_t, size_t, std::vector<uint8_t>*) { return false; };
-            if (monitor.ScanExecutableImage(aliasPath, selfBase, identity, unreadableRepeat, 1) != CodeOwnership::OwnedUnverified ||
+            if (KmonImageTestAccess::Scan(monitor, aliasPath, selfBase, identity, unreadableRepeat, 1) != CodeOwnership::OwnedUnverified ||
                 completed->Sweep.Coverage.ComparedBytes != 0 || completed->Sweep.CompletedCycles != 0) { break; }
             monitor.ImageRescanDelays.begin()->second.ExpiresMs = GetTickCount64() - 1;
             uint64_t expiredTraversal = 1;
@@ -2859,10 +2864,10 @@ bool KmonPipelineSelfTest()
             backgroundIdentity.ProcessId = 0;
             const auto backgroundSize = monitor.ImageWork.size();
             referenceUnavailable = true;
-            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity, &referenceUnavailable) != nullptr || referenceUnavailable ||
+            if (KmonImageTestAccess::Find(monitor, selfPath, selfBase, backgroundIdentity, &referenceUnavailable) != nullptr || referenceUnavailable ||
                 monitor.ImageWork.size() != backgroundSize || monitor.ImageAdmissionDeferred != 1 ||
                 monitor.ImageWatchAdmissionDeferred != 0) { break; }
-            auto admitted = monitor.FindImageWork(selfPath, selfBase, identity);
+            auto admitted = KmonImageTestAccess::Find(monitor, selfPath, selfBase, identity);
             if (admitted == nullptr || monitor.ImageWork.size() != backgroundSize + 1 ||
                 monitor.ImageWork.at(L"background-0").Sweep.NextRange != 1 ||
                 monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != backgroundSize + 1 || admissionWatched) { break; }
@@ -2875,13 +2880,13 @@ bool KmonPipelineSelfTest()
             }
             if (monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity ||
                 monitor.ImageWorkAdmissionLimit(0, &admissionWatched) != KernelMonitor::ImageWorkCapacity ||
-                monitor.FindImageWork(selfPath, selfBase + 4096, identity) != nullptr ||
+                KmonImageTestAccess::Find(monitor, selfPath, selfBase + 4096, identity) != nullptr ||
                 monitor.ImageAdmissionDeferred != 2 || monitor.ImageWatchAdmissionDeferred != 1 ||
                 monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity) { break; }
             // Reclaiming completed work still permits new background admission;
             // removing the watch restores the ordinary capacity immediately.
             monitor.ImageWork.at(L"background-0").Sweep.Coverage.TraversalComplete = true;
-            if (monitor.FindImageWork(selfPath, selfBase, backgroundIdentity) == nullptr ||
+            if (KmonImageTestAccess::Find(monitor, selfPath, selfBase, backgroundIdentity) == nullptr ||
                 monitor.ImageWork.count(L"background-0") != 0 ||
                 monitor.ImageWork.at(L"background-1").Sweep.NextRange != 1 ||
                 monitor.ImageWork.size() != KernelMonitor::ImageWorkCapacity) { break; }
@@ -3626,7 +3631,10 @@ bool KmonPipelineSelfTest()
                 ok = false;
                 break;
             }
-            auto work = monitor.FindImageWork(referencePath, 0x140000000ull, identity);
+            // New controlled preparation phase after the shutdown assertions.
+            monitor.StopRequested.store(false);
+            monitor.ImageReferences->Reset();
+            auto work = KmonImageTestAccess::Find(monitor, referencePath, 0x140000000ull, identity);
             if (work == nullptr)
             {
                 ok = false;
@@ -3643,7 +3651,7 @@ bool KmonPipelineSelfTest()
                 CloseHandle(append);
             }
             work->LastReferenceCheckMs = 0;
-            work = monitor.FindImageWork(referencePath, 0x140000000ull, identity);
+            work = KmonImageTestAccess::Find(monitor, referencePath, 0x140000000ull, identity);
             ok = ok && appended && work != nullptr && !work->ManifestChecked;
 
             // A queued image name must still describe the live allocation.

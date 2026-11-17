@@ -7,6 +7,73 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image reference metadata preparation checkpoint: 2026-11-18
+
+PE metadata parsing and executable sweep-range construction now run on two
+dedicated workers. Admission includes queued, running and ready work, with
+process quotas, fair dispatch and bounded completion slots. Results apply only
+to their original ticket, process identity and work episode. See
+[reference metadata preparation](ARCHITECTURE.md#asynchronous-image-reference-metadata-preparation).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- The preparation harness built under `/W4 /WX`; its independent Python oracle
+  passed **56 assertions**. Controls cover 64 admitted owners, per-process
+  limits, four completion slots, queued/ready abandonment, native metadata
+  parsing, cancellation scope, loader exceptions and process-generation reuse.
+  A deque model checks the observed fixed-cohort dispatch order. Shutdown begins
+  after observing two active workers and 62 queued jobs, then joins every owner.
+- The actual `--self-test image-preparation` passed **21 checks**; its JSON/CLI
+  oracle passed **38**. Owned files, explicit worker gates and synthetic target
+  bytes exercise progress beside a held worker, pending-path alias sharing,
+  replacement after readiness but before a target read, stale episode rejection
+  and failure after prior success. Actual monitor stop observes two running and
+  six queued requests, then leaves no resident work or active image tickets.
+- Review fixed duplicate pending preparation through different paths to the
+  same full file ID, retained original admission clocks, and kept cancellation
+  separate from the previous completed outcome and success. Allocation rollback
+  preserves existing subject queues; reporting reads mutable worker output only
+  after publication. Partial-start cleanup closes admission and joins started
+  threads; native thread-creation exhaustion was not injected.
+- Shared-parser layout validation passed **1,017 scheduling / 105,120 core /
+  7,819 independent-model checks**. Existing image/reference/capture/publication/
+  layout oracles passed **966 / 50 / 23 / 43 / 16 assertions**. The final isolated
+  `--self-test all` passed **28 timeline / 102 MCP / 121 KMON image-read /
+  319 image-scheduling / 21 image-preparation / 30 publication-writer /
+  21 layout-scheduler / 564 console / 3,043 command-route / 68 remote /
+  4 connect-option checks**. Compiled capabilities exposed **48 contracts /
+  261 routes**; the generated support matrix matched. Public-content scanner
+  tests passed **12**.
+
+Final review found no additional actionable defects in the reviewed scope.
+Release product SHA-256:
+`d8c9801997e0b1c660e0a48a3176ebb2c79682bab51d9022ce6e32f857168b5a`.
+Preparation harness SHA-256:
+`b1a45f43b1243692115b8e190f1ffb81306d1c435f2accedc7fd858730009128`.
+Shared-parser layout harness SHA-256:
+`2fd49bdb573f7b1f508f8e68b5bea89213ed50edaea7bb6d5bba8f4a348a4226`.
+The product build retained existing fixture conversion/alignment warnings.
+ASan remains blocked by the previously recorded host startup interception
+failure; no new ASan success is claimed.
+
+At **00:50 KST**, boot time remained **12:49:00.5 KST on November 17**. No new
+reboot/BugCheck events or dump files appeared after the layout checkpoint.
+No task process/driver, owned writer fixture, or parser preparation/profile
+residue remained. The 33 completed parser caches, BFE/mpssvc, firewall profiles
+and EFS running/manual baseline were unchanged.
+
+These results cover metadata preparation, not live byte qualification or
+whole-source fairness. Reference content retention/hashing, alias/rescan opens
+and final identity/content fences remain synchronous. The prepared-storage
+estimate excludes parser intermediates and allocator overhead. Native calls can
+still block both workers; cancellation requests have no hard completion bound.
+Full asynchronous reference acquisition, generic stage budgets/dependencies,
+whole-collection timing, native workload SLOs and maximum unobserved intervals
+remain open.
+
 ## Layout scheduling checkpoint: 2026-11-17
 
 Layout collection now rotates an explicit process ring with bounded oldest-work

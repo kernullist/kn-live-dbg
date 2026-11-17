@@ -6,7 +6,7 @@
 
 constexpr uint64_t KmonImageTurnBudgetMs = 25;
 
-enum class KmonImageAttemptOutcome { None, Observed, Gaps, ReferenceUnavailable, Deferred, NotAdmitted, Fault, InvalidClock, Count };
+enum class KmonImageAttemptOutcome { None, Observed, Gaps, ReferenceUnavailable, Deferred, NotAdmitted, Fault, InvalidClock, ReferencePending, Count };
 inline const wchar_t* KmonImageAttemptOutcomeName(KmonImageAttemptOutcome outcome)
 {
     switch (outcome)
@@ -15,6 +15,7 @@ inline const wchar_t* KmonImageAttemptOutcomeName(KmonImageAttemptOutcome outcom
     case KmonImageAttemptOutcome::Observed: return L"fully_compared_slice";
     case KmonImageAttemptOutcome::Gaps: return L"comparison_gaps";
     case KmonImageAttemptOutcome::ReferenceUnavailable: return L"reference_unavailable";
+    case KmonImageAttemptOutcome::ReferencePending: return L"reference_preparation_pending";
     case KmonImageAttemptOutcome::Deferred: return L"not_due";
     case KmonImageAttemptOutcome::NotAdmitted: return L"not_admitted";
     case KmonImageAttemptOutcome::InvalidClock: return L"invalid_clock";
@@ -91,7 +92,7 @@ class KmonImageTimings
 public:
     struct Samples
     {
-        KmonLatencyHistogram ReferenceLookup, SuccessfulTurn, FailedTurn, DeferredTurn;
+        KmonLatencyHistogram ReferenceLookup, SuccessfulTurn, FailedTurn, DeferredTurn, PreparationPendingTurn;
         KmonLatencyHistogram FirstParserAge, FirstExactReadAge, FirstTraversalAge, FirstGapFreeAge;
         std::array<KmonLatencyHistogram, 4> Stages;
         std::array<uint64_t, static_cast<size_t>(KmonImageAttemptOutcome::Count)> Outcomes{};
@@ -115,6 +116,7 @@ public:
             (timing.StagesEntered != 0 && (timing.StartedMs < started || timing.FinishedMs < timing.StartedMs || ended < timing.FinishedMs)))
         { ++stats.InvalidClocks; return; }
         (outcome == KmonImageAttemptOutcome::Observed ? stats.SuccessfulTurn :
+            outcome == KmonImageAttemptOutcome::ReferencePending ? stats.PreparationPendingTurn :
             outcome == KmonImageAttemptOutcome::Deferred ? stats.DeferredTurn : stats.FailedTurn).Add(ended - started);
         stats.OverBudget += ended - started > KmonImageTurnBudgetMs;
         stats.BorrowedFirstPage += timing.MinimumProgressOverBudget;
@@ -146,6 +148,7 @@ public:
         for (size_t i = 1; i < stats.Outcomes.size(); ++i)
         { if (!outcomes.empty()) { outcomes += L","; } outcomes += mcpjson::Quote(KmonImageAttemptOutcomeName(static_cast<KmonImageAttemptOutcome>(i))) + L":" + n(stats.Outcomes[i]); }
         return L"{\"outcomes\":{" + outcomes + L"},\"reference_lookup\":" + histogram(stats.ReferenceLookup) +
+            L",\"reference_pending_turn\":" + histogram(stats.PreparationPendingTurn) +
             L",\"successful_turn\":" + histogram(stats.SuccessfulTurn) + L",\"failed_turn\":" + histogram(stats.FailedTurn) +
             L",\"deferred_turn\":" + histogram(stats.DeferredTurn) +
             L",\"discovery_to_first_parser_attempt\":" + histogram(stats.FirstParserAge) + L",\"discovery_to_first_exact_read\":" + histogram(stats.FirstExactReadAge) +

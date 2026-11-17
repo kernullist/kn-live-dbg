@@ -111,7 +111,8 @@ def main():
         check(normal[name]["samples"] == "1", "one milestone per resident key: " + name)
     for name in ("reference_open_retention", "identity_secondary_qualification", "page_comparison", "final_identity_content_checks"):
         check(normal[name]["samples"] == "7", "seven entered verifier stages: " + name)
-    check(normal["reference_lookup"]["samples"] == "8" and normal["invalid_clocks"] == "0", "lookup includes deferred turns")
+    check(normal["reference_lookup"]["samples"] == "16" and normal["invalid_clocks"] == "0",
+          "each explicit preparation readiness check and actual observation performs a lookup")
     row = report["details"][0]
     check(row["observation"]["last_gap_free_episode"] == row["retention_episode"] and row["remaining_pages"] == "0",
           "replaced reference qualifies only its own completed episode")

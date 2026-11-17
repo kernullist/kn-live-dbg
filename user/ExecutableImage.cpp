@@ -8,6 +8,8 @@
 
 namespace executable_image
 {
+    // Scoped by ReadDiskPeMetadataCancelable only, never shared across workers.
+    static thread_local const std::atomic<bool>* MetadataStop = nullptr;
     constexpr uint64_t kPageSize = 0x1000;
     constexpr size_t kMaxBaseRelocationEntries = 8 * 1024 * 1024;
     constexpr uint32_t kMaxBaseRelocationTableBytes = 64u * 1024u * 1024u;
@@ -54,6 +56,8 @@ namespace executable_image
     bool ReadFileBytesAt(HANDLE file, uint64_t offset, uint32_t length, std::vector<uint8_t>* bytes)
     {
         bool ok = false;
+        if (MetadataStop != nullptr && MetadataStop->load())
+        { if (bytes != nullptr) { bytes->clear(); } SetLastError(ERROR_OPERATION_ABORTED); return false; }
 
         do
         {
@@ -1711,6 +1715,26 @@ namespace executable_image
     bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error)
     {
         return ReadDiskPeMetadataImpl(rawPath, INVALID_HANDLE_VALUE, false, metadata, error);
+    }
+
+    bool ReadDiskPeMetadataCancelable(const std::wstring& rawPath, DiskPeMetadata* metadata,
+        std::wstring* error, const std::atomic<bool>& stop)
+    {
+        struct Scope
+        {
+            const std::atomic<bool>* Previous = MetadataStop;
+            ~Scope() { MetadataStop = Previous; }
+        } scope;
+        MetadataStop = &stop;
+        const bool ok = !stop.load() && ReadDiskPeMetadataImpl(rawPath, INVALID_HANDLE_VALUE, false, metadata, error);
+        if (stop.load())
+        {
+            if (metadata != nullptr) { *metadata = {}; }
+            if (error != nullptr) { *error = L"reference preparation cancelled"; }
+            SetLastError(ERROR_OPERATION_ABORTED);
+            return false;
+        }
+        return ok;
     }
 
     bool ReadDiskPeMetadataHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error)

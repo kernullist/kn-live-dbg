@@ -1,4 +1,5 @@
 #include "KernelMonitor.h"
+#include "KmonImageTestSupport.h"
 #include "ObservationReadRoutingJson.h"
 #include "ContentHash.h"
 #include "ImageSliceRecipe.h"
@@ -158,7 +159,7 @@ bool KmonImageReadIntegrationSelfTest()
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;
         monitor.Options.LogDirectory = root.wstring();
-        const auto verdict = monitor.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing);
+        const auto verdict = KmonImageTestAccess::Scan(monitor, reference.wstring(), Base, identity, {}, 16, &routing);
         KernelMonitor::CapturedImageReads retained;
         if (!check(verdict == CodeOwnership::OwnedModified && monitor.CapturedImageReadSets.Pop(&retained),
             "actual-sweep-queues-original-modified-read-set")) { throw std::runtime_error("comparison failed"); }
@@ -311,7 +312,7 @@ bool KmonImageReadIntegrationSelfTest()
             check(Write(ownedReference, ownedDisk), "owned-private-reference");
             ObservationReadRouting route; route.Primary = &owned; route.TargetId = L"synthetic:privacy";
             route.AddressSpaceId = L"synthetic:privacy:user";
-            check(secure.ScanExecutableImage(ownedReference.wstring(), Base, identity, {}, 16, &route) == CodeOwnership::OwnedModified,
+            check(KmonImageTestAccess::Scan(secure, ownedReference.wstring(), Base, identity, {}, 16, &route) == CodeOwnership::OwnedModified,
                 "private-store-actual-image-comparison");
             check(DeleteFileW(ownedReference.c_str()) != FALSE, "private-original-source-removed-before-persistence");
             owned.Bytes.clear();
@@ -437,7 +438,7 @@ bool KmonImageReadIntegrationSelfTest()
         const auto cleanOwner = std::make_unique<KernelMonitor>();
         auto& clean = *cleanOwner;
         clean.Options.LogDirectory = (root / L"clean").wstring();
-        check(clean.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedVerified &&
+        check(KmonImageTestAccess::Scan(clean, reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedVerified &&
             clean.ImageReadsQueued.load() == 1 && clean.ImageSlicesQueued.load() == 1, "clean-sweep-retains-original-matching-range-recipe");
         clean.WriterStopping.store(true); clean.CaptureWriterLoop();
         std::filesystem::path cleanRecipe;
@@ -469,12 +470,12 @@ bool KmonImageReadIntegrationSelfTest()
             const auto multipleOwner = std::make_unique<KernelMonitor>();
             auto& multiple = *multipleOwner;
             multiple.Options.LogDirectory = (root / L"multiple").wstring();
-            const auto first = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
-            const auto second = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
+            const auto first = KmonImageTestAccess::Scan(multiple, twoPath.wstring(), Base, identity, {}, 1, &routing);
+            const auto second = KmonImageTestAccess::Scan(multiple, twoPath.wstring(), Base, identity, {}, 1, &routing);
             const auto partialSweepOwner = std::make_unique<KernelMonitor>();
             auto& partialSweep = *partialSweepOwner;
             partialSweep.Options.LogDirectory = (root / L"partial-sweep").wstring();
-            check(partialSweep.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            check(KmonImageTestAccess::Scan(partialSweep, twoPath.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
                 partialSweep.ImageReadsQueued.load() == 1, "stop-control-observes-one-original-slice");
             const auto partialId = partialSweep.ImageWork.empty() ? L"" : partialSweep.ImageWork.begin()->second.RecordingSweep.SweepId;
             check(first == CodeOwnership::OwnedUnverified && second == CodeOwnership::OwnedVerified &&
@@ -529,13 +530,13 @@ bool KmonImageReadIntegrationSelfTest()
         const auto unstableOwner = std::make_unique<KernelMonitor>();
         auto& unstable = *unstableOwner;
         unstable.Options.LogDirectory = (root / L"unstable").wstring();
-        check(unstable.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
+        check(KmonImageTestAccess::Scan(unstable, reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
             unstable.ImageReadsQueued.load() == 1, "unstable-page-keeps-inconclusive-originals");
         secondary.Unstable = false; secondary.Fail = true;
         const auto failedOwner = std::make_unique<KernelMonitor>();
         auto& failed = *failedOwner;
         failed.Options.LogDirectory = (root / L"failed").wstring();
-        check(failed.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
+        check(KmonImageTestAccess::Scan(failed, reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
             failed.ImageReadsQueued.load() == 1, "failed-identity-reads-are-retained");
 
         // Exercise the same publication queue with a small completed read set.
@@ -642,7 +643,7 @@ bool KmonImageReadIntegrationSelfTest()
         for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }
         check(pressure.ImageReadsQueued.load() == 2 && pressure.ImageReadsDropped.load() == 7 &&
             pressure.CapturedImageReadSets.Size() == 2, "queue-pressure-counts-rejected-original-set");
-        pressure.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing);
+        KmonImageTestAccess::Scan(pressure, reference.wstring(), Base, identity, {}, 16, &routing);
         check(pressure.ImageSweepsStarted.load() == 1 && pressure.ImageSweepTerminalsObserved.load() == 1 &&
             pressure.ImageReadsDropped.load() == 8, "entirely-dropped-sweep-remains-in-session-denominators");
         pressure.WriterStopping.store(true); pressure.CaptureWriterLoop();
@@ -674,7 +675,7 @@ bool KmonImageReadIntegrationSelfTest()
                     priority.ImageRetention.Remaining(ImageRetentionClass::Routine, stream)), "exhaust-only-routine-file-budget");
             }
             secondary.Bytes[0x1050] ^= 1;
-            check(priority.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedModified &&
+            check(KmonImageTestAccess::Scan(priority, reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedModified &&
                 priority.ImageReadsQueued.load() == 5 && priority.ImageReadsDropped.load() == 0,
                 "routine-and-gap-queue-pressure-cannot-consume-first-difference-reserve");
             priority.WriterStopping.store(true); priority.CaptureWriterLoop();
@@ -711,7 +712,7 @@ bool KmonImageReadIntegrationSelfTest()
                 if (attempt == 4) { ++target.CreateTime; }
                 if (attempt == 5) { repeated.ImageWork.clear(); }
                 for (auto& work : repeated.ImageWork) { work.second.NextSweepDueMs = 0; }
-                repeated.ScanExecutableImage(reference.wstring(), Base, target, {}, 16, &routing);
+                KmonImageTestAccess::Scan(repeated, reference.wstring(), Base, target, {}, 16, &routing);
                 KernelMonitor::CapturedImageReads item;
                 check(repeated.CapturedImageReadSets.Pop(&item) && item.Retention &&
                     item.Retention->Class == (attempt == 2 ? ImageRetentionClass::Routine : ImageRetentionClass::FirstDifference),
@@ -844,6 +845,140 @@ bool KmonImageReadIntegrationSelfTest()
     return failures == 0;
 }
 
+bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool ok, const char* name)
+    { ++checks; if (!ok) { ++failures; std::fprintf(stderr, "[image.preparation] FAIL %s\n", name); } return ok; };
+    const auto wait = [](const auto& ready)
+    {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!ready() && std::chrono::steady_clock::now() < end) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+        return ready();
+    };
+    wchar_t temporary[MAX_PATH]{}, unique[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temporary) || !GetTempFileNameW(temporary, L"knp", 0, unique)) { return false; }
+    if (!DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { return false; }
+    const std::filesystem::path root = std::filesystem::absolute(unique);
+    std::wstring pending, beforeStop, stopped, completed;
+    try
+    {
+        Source source(L"synthetic:reference-preparation");
+        auto disk = Fixture(&source.Bytes);
+        const auto slowPath = (root / L"held.exe").wstring(), fastPath = (root / L"fast.exe").wstring();
+        if (!check(Write(slowPath, disk) && Write(fastPath, disk), "owned-reference-files")) { throw std::runtime_error("fixture"); }
+        // Declare gates before owners: every exceptional exit joins the workers
+        // while their captures are still alive. Cancellation releases the gate.
+        std::atomic<bool> entered{false}, release{false};
+        const auto owner = std::make_unique<KernelMonitor>();
+        auto& monitor = *owner;
+        monitor.ImageReferences = std::make_unique<ImageReferencePreparation>([&](const auto& request, const auto& cancel, auto& value, auto& error)
+        {
+            if (request.Path == slowPath)
+            {
+                entered.store(true);
+                while (!release.load() && !cancel.load()) { std::this_thread::yield(); }
+            }
+            return ImageReferencePreparation::LoadNative(request, cancel, value, error);
+        });
+        ObservationIdentity identity; identity.BootId = L"synthetic:preparation"; identity.ProcessId = 42; identity.CreateTime = 1;
+        auto fastIdentity = identity; fastIdentity.ProcessId = 43;
+        ObservationReadRouting routing;
+        routing.Primary = &source; routing.TargetId = L"synthetic:preparation:43"; routing.AddressSpaceId = L"synthetic:preparation:user";
+        check(monitor.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            wait([&] { return entered.load(); }), "actual-preparation-returned-while-worker-held");
+        auto& held = monitor.ImageWork.begin()->second;
+        const auto originalId = held.PreparationId, queued = held.PreparationQueuedMs, seen = held.Scheduling.FirstSeen;
+        check(originalId != 0 && !held.Loaded && !held.PreparationFailed && source.Calls.empty() &&
+            !held.Scheduling.Attempted && !held.Scheduling.Successful, "pending-is-neither-file-failure-nor-target-read");
+        monitor.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing);
+        check(held.PreparationId == originalId && held.PreparationQueuedMs == queued && held.Scheduling.FirstSeen == seen,
+            "rediscovery-keeps-original-admission-and-no-duplicate-job");
+        const auto aliasPath = (root / L".\\held.exe").wstring();
+        monitor.ScanExecutableImage(aliasPath, Base, identity, {}, 1, &routing);
+        check(monitor.ImageWork.size() == 1 && held.PreparationId == originalId && held.PreparationQueuedMs == queued &&
+            Text(monitor.ImageReferences->Json(), L"admitted") == L"1" && source.Calls.empty(),
+            "full-file-identity-alias-shares-pending-job-without-qualifying-target");
+        monitor.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        check(wait([&] { return Text(monitor.ImageReferences->Json(), L"ready") == L"1"; }), "second-worker-prepares-other-subject");
+        pending = monitor.ImageReferences->Json();
+        // A ready result can become stale before the consumer reaches it.
+        // Change the actual file and synthetic target together, then require a
+        // new preparation episode before any target observation is admitted.
+        ++disk[0x80 + offsetof(IMAGE_NT_HEADERS64, FileHeader.TimeDateStamp)];
+        ++source.Bytes[0x80 + offsetof(IMAGE_NT_HEADERS64, FileHeader.TimeDateStamp)];
+        check(Write(fastPath, disk), "replace-reference-after-worker-ready");
+        check(monitor.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            source.Calls.empty(), "changed-file-rejects-prepared-metadata-before-target-read");
+        auto fast = KmonImageTestAccess::Find(monitor, fastPath, Base, fastIdentity);
+        check(fast != nullptr && monitor.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedVerified &&
+            !source.Calls.empty() && !release.load() && !held.Loaded, "unrelated-observation-completes-while-first-preparation-held");
+        if (fast == nullptr) { throw std::runtime_error("fast reference"); }
+        const auto priorPreparation = fast->PreparationSuccessMs, priorEpisode = fast->PreparationSuccessEpisode;
+        const auto priorRead = fast->Scheduling.LastSuccess;
+        check(DeleteFileW(fastPath.c_str()) != FALSE, "remove-prior-successful-reference");
+        fast->LastReferenceCheckMs = 0;
+        bool failedAgain = false;
+        check(KmonImageTestAccess::Find(monitor, fastPath, Base, fastIdentity, &failedAgain) == nullptr && failedAgain &&
+            fast->PreparationSuccessMs == priorPreparation && fast->PreparationSuccessEpisode == priorEpisode &&
+            fast->RetentionEpisode != priorEpisode && fast->Scheduling.LastSuccess == priorRead,
+            "later-preparation-failure-preserves-original-success-and-episode");
+        // Force the exact stale-completion race without cancelling it early.
+        ++held.RetentionEpisode; held.PreparationId = 0;
+        release.store(true);
+        check(wait([&] { return Text(monitor.ImageReferences->Json(), L"ready") == L"1"; }), "old-episode-completion-observed");
+        monitor.ApplyImageReferenceResults();
+        check(!held.Loaded && Text(monitor.ImageReferences->Json(), L"stale_completions") == L"1" && held.Scheduling.FirstSeen == seen,
+            "old-episode-result-cannot-overwrite-current-work");
+        const auto missing = (root / L"absent.exe").wstring();
+        bool unavailable = false;
+        check(KmonImageTestAccess::Find(monitor, missing, Base + 0x10000, identity, &unavailable) == nullptr && unavailable,
+            "actual-open-failure-remains-unavailable");
+        completed = monitor.ImageReferences->Json();
+        check(Text(Raw(completed, L"normal"), L"failed") == L"2" && Text(Raw(completed, L"normal"), L"prepared") == L"3",
+            "preparation-success-and-failure-counted-separately-from-application");
+
+        std::atomic<unsigned> active{0};
+        const auto stoppingOwner = std::make_unique<KernelMonitor>();
+        auto& stopping = *stoppingOwner;
+        stopping.ImageReferences = std::make_unique<ImageReferencePreparation>([&](const auto&, const auto& cancel, auto&, auto&)
+        {
+            active.fetch_add(1);
+            while (!cancel.load()) { std::this_thread::yield(); }
+            return ImageReferencePreparation::Outcome::Cancelled;
+        });
+        for (unsigned i = 0; i < 8; ++i)
+        { auto subject = identity; subject.ProcessId += i; stopping.FindImageWork(fastPath, Base + i * 4096, subject); }
+        check(wait([&] { return active.load() == 2; }), "two-inflight-workers-observed-before-stop");
+        beforeStop = stopping.ImageReferences->Json();
+        check(Text(beforeStop, L"queued") == L"6" && Text(beforeStop, L"running") == L"2", "owned-queued-and-inflight-overlap");
+        check(stopping.Stop(nullptr), "actual-monitor-stop-joins-preparation-workers");
+        stopped = stopping.ImageReferences->Json();
+        check(Text(stopped, L"resident") == L"0" && Text(stopped, L"running") == L"0" && Text(stopped, L"ready") == L"0" &&
+            Text(stopped, L"cancelled_queued") == L"6" && Text(Raw(stopped, L"shutdown"), L"cancelled") == L"2",
+            "queued-cancellation-and-inflight-shutdown-populations-close");
+        bool tokensCleared = true;
+        for (const auto& work : stopping.ImageWork)
+        { tokensCleared &= work.second.PreparationId == 0 && work.second.LastPreparationId != 0 &&
+            work.second.PreparationCancelled && !work.second.Scheduling.Successful; }
+        stopping.FindImageWork(slowPath, Base, identity);
+        check(tokensCleared && active.load() == 2, "stop-clears-owned-tokens-and-never-starts-new-preparation");
+    }
+    catch (...) { check(false, "fixture-exception"); }
+    std::error_code cleanupError;
+    std::filesystem::remove_all(root, cleanupError);
+    check(!cleanupError && !std::filesystem::exists(root), "owned-fixture-cleanup");
+    if (diagnostics != nullptr)
+    {
+        *diagnostics = L"{\"schema\":\"kn.image_preparation_test.v1\",\"passed\":" + std::wstring(failures == 0 ? L"true" : L"false") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"driver_loaded\":false,\"corpus\":\"owned_reference_files_controlled_worker_gates_synthetic_target\","
+            L"\"pending\":" + (pending.empty() ? L"null" : pending) + L",\"completed\":" + (completed.empty() ? L"null" : completed) +
+            L",\"before_stop\":" + (beforeStop.empty() ? L"null" : beforeStop) + L",\"stopped\":" + (stopped.empty() ? L"null" : stopped) + L"}";
+    }
+    std::fprintf(stderr, "[image.preparation] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
 bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
 {
     unsigned checks = 0, failures = 0;
@@ -886,27 +1021,27 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         const auto owner = std::make_unique<KernelMonitor>();
         auto& monitor = *owner;
         monitor.Options.LogDirectory = (root / L"capture").wstring();
-        check(monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified,
+        check(KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified,
             "first-slice-leaves-tail-unknown");
         auto& work = monitor.ImageWork.begin()->second;
         const auto first = work.Scheduling;
         check(first.Seen && first.Pending && first.Attempted && first.Successful && first.ParserAttempted && first.ExactRead &&
             !first.Traversed && !first.GapFree && work.Sweep.NextRange == 1, "successful-slice-is-not-successful-traversal");
-        check(monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false) == CodeOwnership::OwnedVerified,
+        check(KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false) == CodeOwnership::OwnedVerified,
             "continuation-completes-original-cursor");
         const auto complete = work.Scheduling;
         check(complete.GapFree && !complete.Pending && complete.FirstSeen == first.FirstSeen && complete.LastSeen == first.LastSeen &&
             complete.LastGapFreeEpisode == work.RetentionEpisode, "continuation-preserves-discovery-and-closes-qualified-debt");
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing);
         check(work.Scheduling.LastAttempt == complete.LastAttempt && work.Scheduling.FirstSeen == complete.FirstSeen &&
             !work.Scheduling.Pending && monitor.ImageTimings.Snapshot().DeferredTurn.Samples == 1, "rediscovery-does-not-renew-attempt-or-revisit");
         work.NextSweepDueMs = 0;
         source.FailAddress = Base + 0x1000;
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Scheduling.Pending && work.Scheduling.LastSuccess == complete.LastSuccess &&
             work.Scheduling.LastGapFree == complete.LastGapFree && work.Sweep.NextRange == 1, "failed-page-does-not-renew-success");
         source.FailAddress = 0;
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Sweep.Coverage.TraversalComplete && !work.Sweep.Coverage.Complete() && work.Scheduling.Pending &&
             work.Scheduling.LastGapFree == complete.LastGapFree, "traversed-with-gap-keeps-observation-debt");
         // Replacing the reference must preserve history but separate episodes.
@@ -915,14 +1050,14 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         load();
         check(Write(path, disk), "replace-owned-reference");
         work.LastReferenceCheckMs = 0; work.NextSweepDueMs = 0;
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.RetentionEpisode != oldEpisode && work.Scheduling.LastGapFreeEpisode == oldEpisode &&
             work.Scheduling.FirstSeen == first.FirstSeen && work.Scheduling.Pending && work.Sweep.NextRange == 1,
             "new-reference-cannot-inherit-old-episode-completion");
         monitor.StopRequested.store(true);
         const auto callsBeforeStop = source.Calls.size();
         const auto successBeforeStop = work.Scheduling.LastSuccess;
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Scheduling.LastGapFreeEpisode == oldEpisode && work.Scheduling.Pending &&
             work.Scheduling.LastSuccess == successBeforeStop && source.Calls.size() == callsBeforeStop &&
             monitor.ImageTimings.Snapshot(true).SuccessfulTurn.Samples == 0 && monitor.ImageTimings.Snapshot(true).FailedTurn.Samples == 1,
@@ -932,10 +1067,10 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         // cursor, so two newly acquired pages are required for this episode.
         monitor.StopRequested.store(false); work.NextSweepDueMs = 0;
         check(work.Sweep.NextRange == 0, "cancelled-identity-invalidates-partial-cursor");
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Sweep.NextRange == 1 && work.Scheduling.Pending && work.Scheduling.LastGapFreeEpisode == oldEpisode,
             "first-recovery-slice-is-not-complete");
-        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(monitor, path.wstring(), Base, identity, {}, 1, &routing, false);
         check(work.Scheduling.LastGapFreeEpisode == work.RetentionEpisode && !work.Scheduling.Pending,
             "new-episode-completes-only-after-entire-recovery-traversal");
         monitor.DrainPipelineEvents(true);
@@ -951,22 +1086,22 @@ bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         const auto missingOwner = std::make_unique<KernelMonitor>();
         auto& missing = *missingOwner;
         const auto missingPath = root / L"missing.exe";
-        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1);
+        KmonImageTestAccess::Scan(missing, missingPath.wstring(), Base, identity, {}, 1);
         auto& absent = missing.ImageWork.begin()->second;
         const auto failedAt = absent.LastAttemptMs;
         const auto pendingAt = absent.Scheduling.PendingSince;
         check(absent.Scheduling.Attempted && !absent.Scheduling.Successful && !absent.Scheduling.ParserAttempted &&
-            missing.SelectImageSweepWork(failedAt + 29999) == nullptr &&
-            missing.SelectImageSweepWork(failedAt + 30000) == &absent, "failed-reference-retries-after-cooldown-without-rediscovery");
-        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1);
+            missing.SelectImageSweepWork(absent.ReferenceRetryAfterMs - 1) == nullptr &&
+            missing.SelectImageSweepWork(absent.ReferenceRetryAfterMs) == &absent, "failed-reference-retries-after-cooldown-without-rediscovery");
+        KmonImageTestAccess::Scan(missing, missingPath.wstring(), Base, identity, {}, 1);
         check(absent.LastAttemptMs == failedAt && absent.Scheduling.PendingSince == pendingAt,
             "cooldown-rediscovery-keeps-old-pending-and-attempt");
         unavailable = missing.ImageSchedulingJson(GetTickCount64());
         check(Write(missingPath, disk), "reference-appears-after-initial-failure");
-        absent.LastAttemptMs = GetTickCount64() - 30000;
+        absent.ReferenceRetryAfterMs = 0;
         const auto discoveryBeforeRetry = absent.Scheduling.LastSeen;
         check(missing.SelectImageSweepWork(GetTickCount64()) == &absent, "recovered-reference-selected-without-rediscovery");
-        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1, &routing, false);
+        KmonImageTestAccess::Scan(missing, missingPath.wstring(), Base, identity, {}, 1, &routing, false);
         check(absent.Loaded && absent.Sweep.NextRange == 1 && absent.Scheduling.Successful &&
             absent.Scheduling.LastSeen == discoveryBeforeRetry && absent.Scheduling.PendingSince == pendingAt,
             "actual-retry-loads-and-advances-original-pending-work");
@@ -1096,7 +1231,7 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         ObservationIdentity synthetic; synthetic.BootId = L"synthetic:writer:boot"; synthetic.ProcessId = 42; synthetic.CreateTime = 1;
         ObservationReadRouting routing;
         routing.Primary = &source; routing.TargetId = L"synthetic:42:1"; routing.AddressSpaceId = L"synthetic:42:1:user";
-        check(monitor.ScanExecutableImage(reference.wstring(), Base, synthetic, {}, 16, &routing) == CodeOwnership::OwnedVerified,
+        check(KmonImageTestAccess::Scan(monitor, reference.wstring(), Base, synthetic, {}, 16, &routing) == CodeOwnership::OwnedVerified,
             "actual-image-acquisition-queued");
 
         auto* allocation = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));

@@ -1972,15 +1972,16 @@ large-image cursor progress and bounded-tail turns remain. On one in four
 borrow priority. That loan does not advance the ordinary process cursor. A
 permanently failing old image therefore cannot consume all ordinary service or
 the reserved bulk/tail turns. A failed reference becomes eligible for another
-lookup after the existing 30-second attempt cooldown, even without rediscovery.
+lookup after a 30-second cooldown from preparation completion, even without rediscovery.
 Live continuations still require an available source and clear backpressure.
 
 The 25 ms cooperative comparison budget starts before reference lookup. The
 verifier preserves its cursor, allows at least one page after preparation, and
 always retains the final target/file identity and retained-content checks.
 Those synchronous calls, minimum progress and result handoff can exceed the
-budget. The implementation reports that time; it does not enforce a hard
-deadline or asynchronously preempt reference preparation.
+budget. PE metadata and sweep-range preparation use the workers described below;
+native file identity, retained-content and target checks remain synchronous.
+Neither path enforces a hard deadline.
 
 `coverage.pipeline.image_scheduling_json` is a private `kn.image_scheduling.v1`
 JSON string. It exposes resident/loaded/pending/evicted counts, admission-deferred
@@ -1991,10 +1992,13 @@ and counted, never shortened into a different identity. An unavailable reference
 has unknown remaining pages. Deferred admission still requires source
 rediscovery; its sampled existing diagnostics are not a complete denominator.
 
-Lookup and whole-turn durations include synchronous preparation and result
-handoff. Verifier stages measure reference open/retention, identity/secondary
+Lookup and whole-turn durations include completion application and synchronous
+cache identity checks. Asynchronous metadata preparation has its own timing
+population. Verifier stages measure reference open/retention, identity/secondary
 qualification, page comparison, and final identity/content checks. Successful,
-failed and not-due turns are separated, as are normal and shutdown samples.
+failed, not-due and preparation-pending turns are separated, as are normal and
+shutdown samples. The legacy unavailable-lookup counter means no ready reference,
+including pending work and admission refusal; it is not a file-failure count.
 First parser attempt, exact read, traversal and gap-free traversal ages are
 counted once per resident key. A parser request can be rejected before a native
 read, so that milestone is not native API latency. Times use `GetTickCount64`,
@@ -2006,6 +2010,70 @@ selection for fixed, growing and delete/reuse cohorts. An independent Python
 model checks the latter sequence. These controls do not establish native-driver
 workload SLOs, all-source maximum unobserved intervals, generic stage
 budgets/dependencies or durable publication latency.
+
+## Asynchronous image reference metadata preparation
+
+The analysis worker submits PE metadata parsing and executable sweep-range
+construction to two dedicated workers. It keeps the original discovery time,
+queue ticket and work episode while preparation is pending. Rediscovery does
+not enqueue another copy or renew that age. Pending preparation is distinct from
+an attempted file failure and cannot produce a successful target observation.
+Different paths share a pending request only after the existing alias-open path
+compares their full volume/file IDs; that check does not qualify target bytes.
+An actual unavailable/unsupported/budget/fault outcome receives a 30-second
+retry cooldown from completion. The image debt and previous successful read
+remain intact.
+
+Admission includes queued, running and ready results: 64 total and 8 per
+canonical process instance. Subjects rotate through a ring, with FIFO jobs
+inside each subject and at most one oldest-head loan per four dispatches.
+New subjects join behind existing waiters. Four result slots include running
+jobs; an unconsumed completion backlog stops further parsing. Each prepared
+payload has a 128 MiB retained-storage estimate limit. Parser intermediates and
+allocator overhead remain outside that estimate, so it is not a process memory
+limit. Existing PE parser bounds also apply.
+
+Workers receive copied requests and never access the live image-work map or
+target readers. The analysis thread applies a result only when its ticket,
+work episode, path, base and exact process identity assertions still match.
+Eviction abandons the ticket; an obsolete completion is counted and discarded.
+A newly prepared reference still passes the native file identity check before
+a target read. Replacement between preparation and consumption starts a new
+episode. Preparation success is metadata availability, not file trust, a live
+mapping lifetime, a byte comparison or execution evidence.
+
+Stop closes admission before cancelling queued work and requesting cancellation
+on the dedicated worker threads. It then joins them before final pipeline
+reporting. A cancellation request is not completion and may not immediately
+interrupt a native operation; see Microsoft's
+[CancelSynchronousIo contract](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelsynchronousio).
+The parser checks its scoped cancellation flag between file reads and rejects
+partial metadata after cancellation. Ordinary parser calls retain their existing
+behavior. Partial worker startup also joins every thread that started.
+
+The private `coverage.pipeline.image_reference_preparation_json` field uses
+`kn.image_reference_preparation.v1`. It separates queue wait, preparation
+service, ready-to-consumer delay and admission-to-ready latency. Prepared,
+failed and cancelled service have distinct denominators, and shutdown attempts
+are separate from normal attempts. Current and deferred scopes are bounded to
+64 each, with a combined 65,536 UTF-16-unit detail budget and explicit omissions.
+Image scheduling rows retain the last preparation ticket, admission, attempt,
+completion, outcome and successful preparation episode. Cancellation never
+rewrites a previous completion or successful-read timestamp.
+
+`--self-test image-preparation` uses owned reference files, controlled worker
+gates and a synthetic target. It observes another subject complete while one
+worker is held, file replacement after readiness, stale episode rejection,
+failure after prior success, and actual monitor stop with queued/running overlap.
+The standalone harness also exercises admission/result bounds, loader faults,
+generation reuse, native parsing and a dispatch sequence checked by an independent
+Python model. Gates synchronize on observed work, not elapsed sleeps.
+
+Reference byte retention/hashing, alias and rescan identity opens, and final
+target/content fences remain synchronous. Both preparation workers can still
+wait inside native calls. Full asynchronous reference acquisition, generic stage
+budgets/dependencies, native workload SLOs and whole-source maximum unobserved
+intervals remain open.
 
 ## Execution reference scheduling
 

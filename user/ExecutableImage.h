@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -140,6 +141,10 @@ namespace executable_image
         uint32_t loadConfigSize,
         bool pe64);
     bool ReadDiskPeMetadata(const std::wstring& rawPath, DiskPeMetadata* metadata, std::wstring* error);
+    // Dedicated preparation worker: check cancellation between file reads and
+    // reject partial metadata after cancellation. Native calls remain cooperative.
+    bool ReadDiskPeMetadataCancelable(const std::wstring& rawPath, DiskPeMetadata* metadata,
+        std::wstring* error, const std::atomic<bool>& stop);
     // Reopens the supplied file object with an independent cursor; never resolves a path.
     bool ReadDiskPeMetadataHandle(HANDLE source, DiskPeMetadata* metadata, std::wstring* error);
     // Identity-only metadata: stops after bounded headers/sections/RSDS. Does

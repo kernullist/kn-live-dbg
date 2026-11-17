@@ -45,7 +45,7 @@ namespace
     }
 
     bool SameReferenceFile(HANDLE alias, const std::wstring& path,
-        const executable_image::DiskPeMetadata& reference)
+        const executable_image::DiskPeMetadata* reference)
     {
         // Use the full volume/file ID for aliasing (also on file systems with
         // 128-bit IDs), and the metadata stamp to reject a replaced reference.
@@ -54,8 +54,10 @@ namespace
         if (original == INVALID_HANDLE_VALUE) { return false; }
         const std::unique_ptr<void, decltype(&CloseHandle)> owner(original, &CloseHandle);
         FILE_ID_INFO a{}, b{};
-        return executable_image::DiskFileIdentityMatches(alias, reference) &&
-            executable_image::DiskFileIdentityMatches(original, reference) &&
+        // A pending job has no parsed metadata yet. Full file identity is
+        // enough to share that preparation request, never to qualify bytes.
+        return (reference == nullptr || (executable_image::DiskFileIdentityMatches(alias, *reference) &&
+            executable_image::DiskFileIdentityMatches(original, *reference))) &&
             GetFileInformationByHandleEx(alias, FileIdInfo, &a, sizeof(a)) &&
             GetFileInformationByHandleEx(original, FileIdInfo, &b, sizeof(b)) &&
             a.VolumeSerialNumber == b.VolumeSerialNumber &&
@@ -214,6 +216,47 @@ size_t KernelMonitor::ImageWorkAdmissionLimit(uint32_t pid, bool* watched)
     return ImageWorkCapacity - (ImageWatchReserve - occupied);
 }
 
+void KernelMonitor::ApplyImageReferenceResults()
+{
+    while (auto result = ImageReferences->Take())
+    {
+        const auto found = ImageWork.find(result->Work.Key);
+        const bool current = found != ImageWork.end() && found->second.RetentionEpisode == result->Work.Episode &&
+            found->second.PreparationId == result->Id && found->second.Base == result->Work.Base &&
+            found->second.Path == result->Work.Path && found->second.Identity.SameCanonicalKey(result->Work.Identity) &&
+            found->second.Identity.Eprocess == result->Work.Identity.Eprocess &&
+            found->second.Identity.SessionKnown == result->Work.Identity.SessionKnown &&
+            (!found->second.Identity.SessionKnown || found->second.Identity.SessionId == result->Work.Identity.SessionId);
+        ImageReferences->Disposition(*result, current && !StopRequested.load());
+        if (!current) { continue; }
+        auto& work = found->second;
+        work.PreparationId = 0;
+        if (StopRequested.load()) { work.PreparationCancelled = true; continue; }
+        work.PreparationOutcome = result->Status; work.PreparationCancelled = false;
+        work.LastAttemptMs = result->Started;
+        work.PreparationFinishedMs = result->Finished;
+        work.PreparationFailed = result->Status != ImageReferencePreparation::Outcome::Prepared;
+        if (!work.PreparationFailed && result->Value)
+        {
+            work.Reference = std::move(result->Value->Reference);
+            work.Sweep = std::move(result->Value->Sweep);
+            work.Loaded = true; work.LastReferenceCheckMs = 0; work.ReferenceRetryAfterMs = 0;
+            work.PreparationSuccessMs = result->Finished; work.PreparationSuccessEpisode = work.RetentionEpisode;
+        }
+        else
+        {
+            work.Loaded = false;
+            work.ReferenceRetryAfterMs = result->Finished + 30000;
+            const auto now = GetTickCount64();
+            if (work.Scheduling.Begin(now))
+            { work.Scheduling.Finish(now, KmonImageAttemptOutcome::ReferenceUnavailable, false, false, work.RetentionEpisode); }
+            EmitUnique(L"coverage.image", L"scan_failed:image:" + found->first, work.Path, L"image",
+                L"executable image reference unavailable", ImageReferencePreparation::OutcomeName(result->Status) +
+                    std::wstring(L": ") + result->Error, work.Identity.ProcessId);
+        }
+    }
+}
+
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
     uint64_t base, const ObservationIdentity& identity, bool* referenceUnavailable, ImageVerificationWork** admitted, bool discovery)
 {
@@ -225,6 +268,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
         KmonImageTimings& Stats; uint64_t Started; const bool& Ready; bool Shutdown;
         ~LookupTiming() { Stats.Lookup(Started, GetTickCount64(), Ready, Shutdown); }
     } lookupTiming{ImageTimings, lookupStarted, lookupReady, StopRequested.load()};
+    ApplyImageReferenceResults();
     if (referenceUnavailable != nullptr) { *referenceUnavailable = false; }
     if (base == 0 || path.empty() || (identity.ProcessId != 0 && identity.CreateTime == 0))
     {
@@ -241,14 +285,14 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
         HANDLE alias = INVALID_HANDLE_VALUE;
         for (auto candidate = ImageWork.begin(); candidate != ImageWork.end(); ++candidate)
         {
-            if (candidate->second.Base != base || !candidate->second.Loaded ||
+            if (candidate->second.Base != base || (!candidate->second.Loaded && candidate->second.PreparationId == 0) ||
                 !candidate->second.Identity.SameInstance(identity)) { continue; }
             if (alias == INVALID_HANDLE_VALUE)
             {
                 alias = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
                 if (alias == INVALID_HANDLE_VALUE) { break; }
             }
-            if (SameReferenceFile(alias, candidate->second.Path, candidate->second.Reference))
+            if (SameReferenceFile(alias, candidate->second.Path, candidate->second.Loaded ? &candidate->second.Reference : nullptr))
             {
                 it = candidate;
                 break;
@@ -269,6 +313,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
                 if (now - old->second.LastUsedMs > 300000 || old->second.Sweep.Coverage.TraversalComplete)
                 {
                     RememberImageRescanDelay(old->second, now);
+                    ImageReferences->Abandon(old->second.PreparationId);
                     old = ImageWork.erase(old);
                     ++ImageWorkEvicted;
                 }
@@ -335,6 +380,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.RetentionEpisode = NextCaptureId.fetch_add(1);
             work.LayoutIdentityReported = false;
             work.LastAttemptMs = 0;
+            ImageReferences->Abandon(work.PreparationId);
+            work.PreparationId = 0; work.ReferenceRetryAfterMs = 0; work.PreparationFailed = false;
             work.ManifestChecked = false;
             work.ManifestMatches = false;
             work.ObjectCursor = 0;
@@ -346,22 +393,21 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             work.PriorTraversalMs = 0;
         }
     }
-    if (!work.Loaded && (work.LastAttemptMs == 0 || now - work.LastAttemptMs >= 30000))
+    if (!work.Loaded && work.PreparationId == 0 && now >= work.ReferenceRetryAfterMs && !StopRequested.load())
     {
-        work.LastAttemptMs = now;
         work.LastSweepMs = now;
-        std::wstring error;
-        work.Loaded = executable_image::ReadDiskPeMetadata(path, &work.Reference, &error) &&
-            work.Sweep.Initialize(work.Reference);
-        if (!work.Loaded)
+        ImageReferencePreparation::Request request;
+        request.Key = it->first; request.Path = work.Path; request.Identity = work.Identity;
+        request.Base = work.Base; request.Episode = work.RetentionEpisode; request.FirstSeen = work.Scheduling.FirstSeen;
+        const auto ticket = ImageReferences->Submit(std::move(request), now);
+        if (ticket.Status == ImageReferencePreparation::Admission::Queued)
         {
-            if (work.Scheduling.Begin(now))
-            { work.Scheduling.Finish(GetTickCount64(), KmonImageAttemptOutcome::ReferenceUnavailable, false, false, work.RetentionEpisode); }
-            EmitUnique(L"coverage.image", L"scan_failed:image:" + key, path, L"image",
-                L"executable image reference unavailable", error, identity.ProcessId);
+            work.PreparationId = work.LastPreparationId = ticket.Id; work.PreparationQueuedMs = now;
+            work.PreparationFailed = work.PreparationCancelled = false;
         }
     }
-    if (referenceUnavailable != nullptr) { *referenceUnavailable = !work.Loaded; }
+    // Queueing/backpressure is not evidence that the file could not be parsed.
+    if (referenceUnavailable != nullptr) { *referenceUnavailable = work.PreparationFailed; }
     lookupReady = work.Loaded;
     return work.Loaded ? &work : nullptr;
 }
@@ -396,7 +442,8 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     auto work = FindImageWork(path, base, identity, nullptr, &admitted, discovery);
     if (work == nullptr)
     {
-        outcome = admitted == nullptr ? KmonImageAttemptOutcome::NotAdmitted : KmonImageAttemptOutcome::ReferenceUnavailable;
+        outcome = admitted == nullptr ? KmonImageAttemptOutcome::NotAdmitted :
+            admitted->PreparationFailed ? KmonImageAttemptOutcome::ReferenceUnavailable : KmonImageAttemptOutcome::ReferencePending;
         return CodeOwnership::OwnedUnverified;
     }
     const uint64_t now = GetTickCount64();
@@ -681,6 +728,16 @@ std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
             L",\"retention_episode\":" + n(work->RetentionEpisode) + L",\"reference_loaded\":" + (work->Loaded ? L"true" : L"false") +
             L",\"remaining_pages\":" + remaining + L",\"next_sweep_due_ms\":" + n(work->NextSweepDueMs) +
             L",\"reference_last_attempt_ms\":" + (work->LastAttemptMs == 0 ? L"null" : n(work->LastAttemptMs)) +
+            L",\"preparation_id\":" + (work->PreparationId == 0 ? L"null" : n(work->PreparationId)) +
+            L",\"last_preparation_id\":" + (work->LastPreparationId == 0 ? L"null" : n(work->LastPreparationId)) +
+            L",\"preparation_queued_ms\":" + (work->LastPreparationId == 0 ? L"null" : n(work->PreparationQueuedMs)) +
+            L",\"preparation_cancelled\":" + (work->PreparationCancelled ? L"true" : L"false") +
+            L",\"reference_retry_after_ms\":" + n(work->ReferenceRetryAfterMs) +
+            L",\"reference_last_finished_ms\":" + (work->PreparationFinishedMs == 0 ? L"null" : n(work->PreparationFinishedMs)) +
+            L",\"reference_last_success_ms\":" + (work->PreparationSuccessMs == 0 ? L"null" : n(work->PreparationSuccessMs)) +
+            L",\"reference_last_success_episode\":" + (work->PreparationSuccessMs == 0 ? L"null" : n(work->PreparationSuccessEpisode)) +
+            L",\"reference_last_outcome\":" + (work->PreparationFinishedMs == 0 ? L"null" :
+                mcpjson::Quote(ImageReferencePreparation::OutcomeName(work->PreparationOutcome))) +
             L",\"observation\":" + work->Scheduling.Json(now) + L"}";
         if (row.size() + (rows.empty() ? 0 : 1) > detailUnits - rows.size()) { continue; }
         if (!rows.empty()) { rows += L","; }
@@ -705,6 +762,7 @@ std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
 
 KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64_t now)
 {
+    ApplyImageReferenceResults();
     std::set<uint32_t> watched;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
@@ -721,8 +779,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     for (auto& item : ImageWork)
     {
         auto& work = item.second;
-        if (now < work.NextSweepDueMs || (!work.Loaded && work.LastAttemptMs != 0 &&
-            (now < work.LastAttemptMs || now - work.LastAttemptMs < 30000))) { continue; }
+        if (now < work.NextSweepDueMs || work.PreparationId != 0 || (!work.Loaded && now < work.ReferenceRetryAfterMs)) { continue; }
         const size_t group = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0 ? 0 : 1;
         const size_t phase = work.Sweep.LastCompleteMs == 0 && work.PriorTraversalMs == 0 ? 0 : 1;
         auto& candidate = eligible[group][phase][{work.Identity.ProcessId, work.Identity.CreateTime}];

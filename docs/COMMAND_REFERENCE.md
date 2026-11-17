@@ -451,6 +451,15 @@ and `layout_verification_scheduling_json` expose original debt, bounded scopes,
 quota deferrals, collection/qualification latency and separate failure samples.
 See [layout scheduling](ARCHITECTURE.md#layout-collection-and-verification-scheduling).
 
+`KnLiveDbg.exe --self-test image-preparation` exercises the asynchronous PE
+metadata workers with owned reference files and synthetic target bytes. It checks
+progress beside a held worker, replacement and stale results, failure after
+success, and queued/running shutdown. It emits JSON and returns 0 on success,
+1 on failure or 2 for extra arguments; no driver is loaded. The private pipeline
+field `image_reference_preparation_json` distinguishes preparation from actual
+image verification and reports bounded scopes, backpressure and timing. See
+[reference metadata preparation](ARCHITECTURE.md#asynchronous-image-reference-metadata-preparation).
+
 Current-main KMON image comparisons preserve original read attempts for clean,
 changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication

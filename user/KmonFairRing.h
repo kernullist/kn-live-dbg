@@ -28,6 +28,7 @@ public:
     bool LastWasLoan() const { return Loan; }
     bool MayBorrow() const { return Turns % 4 == 3; }
     uint64_t DebtLoans() const { return Loans; }
+    void ClearMembers() { Order.clear(); Loan = false; }
     void Reset() { *this = {}; }
 private:
     std::deque<Key> Order;

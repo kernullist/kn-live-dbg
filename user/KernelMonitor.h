@@ -24,6 +24,7 @@
 #include "KmonImageScheduling.h"
 #include "KmonPublicationScheduling.h"
 #include "KmonLayoutScheduling.h"
+#include "ImageReferencePreparation.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -377,6 +378,8 @@ private:
     friend bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
+    friend struct KmonImageTestAccess;
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
@@ -782,6 +785,11 @@ private:
         uint64_t LastAttemptMs = 0;
         uint64_t LastUsedMs = 0;
         uint64_t LastReferenceCheckMs = 0;
+        uint64_t PreparationId = 0, PreparationQueuedMs = 0, ReferenceRetryAfterMs = 0;
+        uint64_t LastPreparationId = 0;
+        uint64_t PreparationFinishedMs = 0, PreparationSuccessMs = 0, PreparationSuccessEpisode = 0;
+        bool PreparationFailed = false, PreparationCancelled = false;
+        ImageReferencePreparation::Outcome PreparationOutcome = ImageReferencePreparation::Outcome::Cancelled;
         uint64_t LastSweepMs = 0;
         uint64_t NextSweepDueMs = 0;
         uint64_t SweepSchedulingTurns = 0;
@@ -802,6 +810,8 @@ private:
         const ObservationIdentity& identity, bool* referenceUnavailable = nullptr,
         ImageVerificationWork** admitted = nullptr, bool discovery = true);
     std::wstring ImageSchedulingJson(uint64_t now) const;
+    void ApplyImageReferenceResults();
+    std::unique_ptr<ImageReferencePreparation> ImageReferences = std::make_unique<ImageReferencePreparation>();
     KmonImageTimings ImageTimings;
     uint64_t ImageWorkEvicted = 0, ImageDebtPriorityTurns = 0;
     std::array<std::array<uint64_t, 2>, 2> ImageOrdinaryTurns{};
@@ -1531,6 +1541,7 @@ bool KmonImageReadIntegrationSelfTest();
 bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
