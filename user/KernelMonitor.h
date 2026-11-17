@@ -21,6 +21,7 @@
 #include "KmonWorkQueue.h"
 #include "KmonCaptureScheduling.h"
 #include "KmonReferenceScheduling.h"
+#include "KmonImageScheduling.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -371,6 +372,7 @@ private:
     bool ScanCallbackInlineTargets(const std::vector<KernelCallbackRecord>& records);
     friend bool KmonPipelineSelfTest();
     friend bool KmonImageReadIntegrationSelfTest();
+    friend bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
@@ -453,7 +455,7 @@ private:
     void ScanKernelInlinePatches();
     CodeOwnership ScanExecutableImage(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
-        const ObservationReadRouting* routing = nullptr);
+        const ObservationReadRouting* routing = nullptr, bool discovery = true);
     void ScanKernelExecutableImages();
     void ContinueImageSweeps();
     void ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,
@@ -756,6 +758,7 @@ private:
 
     struct ImageVerificationWork
     {
+        KmonImageObservationDebt Scheduling;
         executable_image::DiskPeMetadata Reference;
         ExecutableSweep Sweep;
         ImageSweepIdentity RecordingSweep;
@@ -784,7 +787,12 @@ private:
         uint64_t PermissionCursor = 0;
     };
     ImageVerificationWork* FindImageWork(const std::wstring& path, uint64_t base,
-        const ObservationIdentity& identity, bool* referenceUnavailable = nullptr);
+        const ObservationIdentity& identity, bool* referenceUnavailable = nullptr,
+        ImageVerificationWork** admitted = nullptr, bool discovery = true);
+    std::wstring ImageSchedulingJson(uint64_t now) const;
+    KmonImageTimings ImageTimings;
+    uint64_t ImageWorkEvicted = 0, ImageDebtPriorityTurns = 0;
+    std::array<std::array<uint64_t, 2>, 2> ImageOrdinaryTurns{};
     GameBuildManifest GameManifest;
     bool GameManifestActive = false;
     std::map<std::wstring, ImageVerificationWork> ImageWork;
@@ -1508,6 +1516,7 @@ bool KernelMonitorMapperPoolSelfTest();
 
 bool KmonPipelineSelfTest();
 bool KmonImageReadIntegrationSelfTest();
+bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);

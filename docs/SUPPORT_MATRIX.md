@@ -52,6 +52,7 @@ backends are not implied by an x64 address width.
 | proof / image_range | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_reads |
 | scheduler / capture_timing | native | implemented | not_an_address_reader | collector_monotonic |
 | scheduler / reference_admission | native | implemented | not_an_address_reader | collector_monotonic |
+| scheduler / image_observation | native | implemented | not_an_address_reader | collector_monotonic |
 | process / cross_view | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | live_non_atomic |
 | debugger / execute | dbgeng | implemented | backend_defined;command_text_only | backend_defined |
 | io / interpose_dispatch | native | experimental | collector_specific;extended_address_pipeline_unvalidated | live_non_atomic |

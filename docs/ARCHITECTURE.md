@@ -1805,8 +1805,66 @@ user memory, including guard/no-access pages, and an explicitly absent device.
 It verifies queue/service accounting, shutdown separation and preservation of
 the kernel quantum without loading a driver. The core ASan harness additionally
 checks percentile bounds, concurrency, fixed cohorts and sustained churn.
-Image/layout scheduling and generic deadline/dependency propagation remain
-separate work. Execution-reference admission is described below.
+Image observation scheduling is described below; layout scheduling and generic
+deadline/dependency propagation remain separate work.
+
+## Image observation scheduling
+
+Each resident image-work key records first/last discovery, pending time, last
+attempt, last successfully compared slice, and first/last traversal. A traversal
+with gaps does not renew the separate last gap-free traversal. Observation debt
+uses that qualified traversal time, or first discovery if none has completed.
+A fully compared modified page is a successful observation; it does not mean
+the page is clean. Reference failure, read gaps and incidental rediscovery do
+not renew successful observation times. Continuations do not refresh discovery
+age, so polling an exited process cannot keep its cache entry young.
+
+Replacing a reference resets the comparison cursor and starts a new retention
+episode while preserving resident history. Successful-slice and gap-free times
+carry their episode IDs, so an older reference's completion remains historical.
+These entries describe a bounded cache, not continuous mapping lifetime or
+complete source inventory. Eviction drops that entry's debt history.
+
+The existing watched/background and first/repeat shares, process rotation,
+large-image cursor progress and bounded-tail turns remain. On one in four
+**ordinary** turns within the selected class, the oldest observation debt may
+borrow priority. That loan does not advance the ordinary process cursor. A
+permanently failing old image therefore cannot consume all ordinary service or
+the reserved bulk/tail turns. A failed reference becomes eligible for another
+lookup after the existing 30-second attempt cooldown, even without rediscovery.
+Live continuations still require an available source and clear backpressure.
+
+The 25 ms cooperative comparison budget starts before reference lookup. The
+verifier preserves its cursor, allows at least one page after preparation, and
+always retains the final target/file identity and retained-content checks.
+Those synchronous calls, minimum progress and result handoff can exceed the
+budget. The implementation reports that time; it does not enforce a hard
+deadline or asynchronously preempt reference preparation.
+
+`coverage.pipeline.image_scheduling_json` is a private `kn.image_scheduling.v1`
+JSON string. It exposes resident/loaded/pending/evicted counts, admission-deferred
+attempts, maximum resident debt, and oldest-debt scope details. Details contain
+exact boot/PID/create-time/base/path identities and are bounded to 64 rows and
+65,536 UTF-16 units for the serialized rows. A scope that cannot fit is omitted
+and counted, never shortened into a different identity. An unavailable reference
+has unknown remaining pages. Deferred admission still requires source
+rediscovery; its sampled existing diagnostics are not a complete denominator.
+
+Lookup and whole-turn durations include synchronous preparation and result
+handoff. Verifier stages measure reference open/retention, identity/secondary
+qualification, page comparison, and final identity/content checks. Successful,
+failed and not-due turns are separated, as are normal and shutdown samples.
+First parser attempt, exact read, traversal and gap-free traversal ages are
+counted once per resident key. A parser request can be rejected before a native
+read, so that milestone is not native API latency. Times use `GetTickCount64`,
+exact maxima and log2 percentile upper bounds. Durability is outside this turn.
+
+`--self-test image-scheduler` exercises production lookup/comparison/reporting
+with owned files and synthetic target bytes, plus controlled-time production
+selection for fixed, growing and delete/reuse cohorts. An independent Python
+model checks the latter sequence. These controls do not establish native-driver
+workload SLOs, all-source maximum unobserved intervals, layout scheduling,
+generic stage budgets/dependencies or durable publication latency.
 
 ## Execution reference scheduling
 

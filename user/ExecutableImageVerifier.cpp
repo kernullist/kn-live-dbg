@@ -561,11 +561,36 @@ ExecutablePageResult CompareExecutableRange(const std::wstring& path, const Disk
 static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
     uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace,
-    const ExecutableSliceTrace* replay = nullptr, const ObservationReader& replaySecondary = {})
+    const ExecutableSliceTrace* replay = nullptr, const ObservationReader& replaySecondary = {},
+    ExecutableSweepTiming* timing = nullptr, uint64_t budgetStartedMs = 0)
 {
     if (capturedReference != nullptr) { *capturedReference = {}; }
     if (trace != nullptr) { *trace = {}; }
     const uint64_t started = GetTickCount64();
+    if (timing != nullptr) { *timing = {}; timing->StartedMs = started; timing->InvalidBudgetClock = budgetStartedMs > started; }
+    const uint64_t budgetOrigin = budgetStartedMs != 0 && budgetStartedMs <= started ? budgetStartedMs : started;
+    struct StageTimer
+    {
+        ExecutableSweepTiming* Output;
+        uint64_t Since;
+        size_t Stage = 0;
+        void Next(size_t stage)
+        {
+            if (Output == nullptr || stage == Stage) { return; }
+            const auto now = GetTickCount64();
+            Output->StageMs[Stage] += now >= Since ? now - Since : 0;
+            Output->StagesEntered |= 1u << stage;
+            Since = now;
+            Stage = stage;
+        }
+        ~StageTimer()
+        {
+            if (Output == nullptr) { return; }
+            Output->FinishedMs = GetTickCount64();
+            Output->StageMs[Stage] += Output->FinishedMs >= Since ? Output->FinishedMs - Since : 0;
+        }
+    } timer{timing, started};
+    if (timing != nullptr) { timing->StagesEntered = 1; }
     std::vector<ExecutablePageResult> results;
     if (sweep == nullptr || sweep->Ranges.empty() || pageBudget == 0)
     {
@@ -626,6 +651,7 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
     }
     const auto finishReference = [&]()
     {
+        timer.Next(3);
         if (capturedReference == nullptr || capturedReference->Artifact == nullptr) { return true; }
         capturedReference->ContentRechecked = true;
         capturedReference->ContentStable = retained.Unchanged();
@@ -633,6 +659,7 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
     };
     std::wstring reason;
     uint64_t headerBase = 0;
+    timer.Next(1);
     if (!ReadExecutableIdentity(metadata, imageBase, reader, &reason, &headerBase))
     {
         reject(reason);
@@ -718,6 +745,7 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
         sweep->Ranges.size() - sweep->NextRange);
     size_t publications = 0;
     bool publicationLimited = false;
+    timer.Next(2);
     for (; sweep->NextRange < end; ++sweep->NextRange)
     {
         if (replay == nullptr && publications >= 64)
@@ -725,15 +753,20 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
             publicationLimited = true;
             break;
         }
-        if (replay == nullptr && !results.empty() && budgetMs != 0 && GetTickCount64() - started >= budgetMs)
+        if (replay == nullptr && budgetMs != 0 && GetTickCount64() - budgetOrigin >= budgetMs)
         {
-            break;
+            if (!results.empty()) { break; }
+            // Retain the minimum progress turn for large references. A hard
+            // stop here would repeatedly pay preparation without moving the
+            // cursor. The caller reports this borrowing and total overrun.
+            if (timing != nullptr) { timing->MinimumProgressOverBudget = true; }
         }
         const auto& range = sweep->Ranges[sweep->NextRange];
         auto page = CompareExecutableRangeWithFile(path, metadata, imageBase,
             static_cast<uint32_t>(range.Address), static_cast<uint32_t>(range.Size), reader, reference,
             relocationBase, secondary ? &localReader : nullptr, localViewBase);
         if (trace != nullptr) { ++trace->PageCount; }
+        if (timing != nullptr) { ++timing->Pages; }
         const bool coalesces = !results.empty() && page.Ownership == CodeOwnership::OwnedVerified &&
             page.Rel32ValidatedBytes == 0 && results.back().Ownership == CodeOwnership::OwnedVerified &&
             results.back().Rel32ValidatedBytes == 0 && (page.Rva >> 16) == (results.back().Rva >> 16) &&
@@ -764,6 +797,7 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
         return page.Coverage.ComparedBytes != 0;
     });
     uint64_t finalHeaderBase = 0, finalLocalBase = 0;
+    timer.Next(3);
     const bool sameImage = !hasComparedBytes ||
         (ReadExecutableIdentity(metadata, imageBase, reader, &reason, &finalHeaderBase) && finalHeaderBase == headerBase &&
             (!secondary || (ReadExecutableIdentity(metadata, localViewBase, localReader, nullptr, &finalLocalBase) &&
@@ -819,9 +853,11 @@ static std::vector<ExecutablePageResult> AdvanceExecutableSweepImpl(const std::w
 
 std::vector<ExecutablePageResult> AdvanceExecutableSweep(const std::wstring& path, const DiskPeMetadata& metadata,
     uint64_t imageBase, const ObservationReader& reader, size_t pageBudget, uint64_t nowMs, ExecutableSweep* sweep,
-    uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace)
+    uint64_t budgetMs, ExecutableSweepReference* capturedReference, ExecutableSliceTrace* trace,
+    ExecutableSweepTiming* timing, uint64_t budgetStartedMs)
 {
-    return AdvanceExecutableSweepImpl(path, metadata, imageBase, reader, pageBudget, nowMs, sweep, budgetMs, capturedReference, trace);
+    return AdvanceExecutableSweepImpl(path, metadata, imageBase, reader, pageBudget, nowMs, sweep, budgetMs,
+        capturedReference, trace, nullptr, {}, timing, budgetStartedMs);
 }
 
 std::vector<ExecutablePageResult> ReplayExecutableSlice(const std::wstring& path, const DiskPeMetadata& metadata,
@@ -984,6 +1020,21 @@ bool ExecutableImageVerifierSelfTest()
         AdvanceExecutableSweep(path, metadata, loadedBase, reader, 1, 12, &timed);
         if (timed.Coverage.TraversalComplete || timed.NextRange != 1 || timed.CompletedCycles != 1 ||
             !timed.LastCompleteCoverage.Complete() || timed.LastCompleteMs != 11) { break; }
+        ExecutableSweep prepared;
+        prepared.Initialize(metadata);
+        ExecutableSweepTiming preparedTiming;
+        ExecutableSweepReference retainedTiming;
+        const auto alreadySpent = GetTickCount64() - 1000;
+        const auto preparedFirst = AdvanceExecutableSweep(path, metadata, loadedBase, reader, 4, 20, &prepared,
+            25, &retainedTiming, nullptr, &preparedTiming, alreadySpent);
+        if (preparedFirst.size() != 1 || prepared.NextRange != 1 || !preparedTiming.MinimumProgressOverBudget ||
+            preparedTiming.InvalidBudgetClock || preparedTiming.Pages != 1 || preparedTiming.StagesEntered != 15 ||
+            preparedTiming.FinishedMs < preparedTiming.StartedMs || !retainedTiming.ContentRechecked || !retainedTiming.ContentStable) { break; }
+        const auto preparedTail = AdvanceExecutableSweep(path, metadata, loadedBase, reader, 4, 21, &prepared);
+        if (preparedTail.size() != 3 || !prepared.Coverage.Complete()) { break; }
+        AdvanceExecutableSweep(path, metadata, loadedBase, reader, 1, 22, &prepared, 25, nullptr, nullptr,
+            &preparedTiming, UINT64_MAX);
+        if (!preparedTiming.InvalidBudgetClock || preparedTiming.Pages != 1) { break; }
         bool reviewControls = true;
         const auto reviewCheck = [&](bool condition, const char* name)
         {

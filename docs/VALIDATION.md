@@ -7,6 +7,65 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image observation scheduling checkpoint: 2026-11-17
+
+Image work now preserves discovery/pending ages, separates attempted and
+successful slices from gap-free traversals, retries unavailable references after
+the existing cooldown, and grants bounded debt-priority turns within ordinary
+rotation. The cooperative 25 ms budget includes reference lookup; stage and
+whole-turn distributions retain minimum-progress and final-fence overruns.
+See [image observation scheduling](ARCHITECTURE.md#image-observation-scheduling).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- `tools/validate-kmon-core.ps1` passed under `/W4 /WX`, including new controls
+  for an already-spent preparation budget, minimum one-page progress, retained
+  content rechecks, cursor continuation and an invalid budget clock. Existing
+  reference/capture, execution, image, branch-chain and hunting controls passed.
+- `tools/test-image-scheduling.py --exe` passed **966 assertions** against the
+  production `--self-test image-scheduler` entry. Its independent model checked
+  actual selector sequences for fixed, growing and delete/reuse cohorts with a
+  permanently failing oldest entry. Owned file/synthetic target controls covered
+  partial progress, failed reads, reference replacement, discovery preservation,
+  cooldown/recovery, bounded exact scope details and invalid clocks.
+- An initial fixture incorrectly expected a stopped read to succeed. The
+  existing router correctly cancelled it. Final controls explicitly require no
+  target call or success renewal after cancellation, a reset partial cursor, and
+  two newly acquired pages before the replacement episode can complete. The
+  production cancellation gate was preserved.
+- Existing product reference scheduling passed **50 checks** and capture
+  scheduling passed **23**. The isolated final product `--self-test all` passed
+  **28 timeline / 102 MCP / 121 KMON image-read / 319 image-scheduling /
+  564 console / 3,043 command-route / 68 remote / 4 connect-option checks**.
+  Compiled capabilities exposed **45 contracts / 261 routes**; the generated
+  support matrix matched and the publication scanner's **12 tests** passed.
+
+Adversarial review also guarded fault/invalid-clock paths against inheriting a
+previous completed traversal, kept successful-slice and gap-free episode IDs
+separate, and bounded debt loans without advancing the ordinary process cursor.
+Timing histograms remain on the heap with a compile-time size bound. No further
+actionable defects were found in the reviewed scope.
+
+Final Release product SHA-256:
+`f6ed66694f5cb21e96181101a3035b4eea3bae41da0ceb71007a94501f005529`.
+Core harness SHA-256:
+`d268502371fe38ab9cde0f286d385c71bbf05a5c76991470618f86b0c9240e15`.
+The product build retained the existing C4244 fixture conversion and C4744
+alignment warnings. ASan remains blocked by the previously recorded startup
+interception failure on this host; no new ASan success is claimed.
+
+At **21:46 KST**, boot time remained **12:49:00.5 KST**. There were no new
+reboot/BugCheck events or dump files since the previous checkpoint, and no task
+process/driver or parser preparation/profile residue. The 33 completed parser
+caches, BFE/mpssvc, firewall profiles and EFS running/manual baseline were
+unchanged. Native-driver workloads, asynchronous reference preparation, generic
+pipeline budgets/dependencies, native first-read and durable publication latency,
+measured SLOs and whole-source maximum unobserved intervals remain open. Resident
+cache debt and successful comparisons do not establish those broader guarantees.
+
 ## Execution reference scheduling checkpoint: 2026-11-17
 
 The analysis queue now enforces subject/role admission quotas, rotates admitted

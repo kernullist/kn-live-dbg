@@ -240,6 +240,9 @@ void KernelMonitor::ResetPipeline()
     AnalysisLastCompleteMs.store(0);
     ImageRemainingPages.store(0);
     ImageLastCompleteMs.store(0);
+    ImageTimings.Reset();
+    ImageWorkEvicted = ImageDebtPriorityTurns = 0;
+    ImageOrdinaryTurns = {};
     ImageSweepProcessCursors[0] = {};
     ImageSweepProcessCursors[1] = {};
     ImageSweepGroupTurns = {};
@@ -1991,6 +1994,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"shutdown_events_processed"] = std::to_wstring(ShutdownEventsProcessed);
         event.Evidence[L"shutdown_events_unanalyzed"] = std::to_wstring(ShutdownEventsUnanalyzed);
         event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
+        event.Evidence[L"image_scheduling_json"] = ImageSchedulingJson(now);
         event.Evidence[L"image_work_capacity"] = std::to_wstring(ImageWorkCapacity);
         event.Evidence[L"image_watch_reserved_slots"] = std::to_wstring(ImageWatchReserve);
         event.Evidence[L"image_admission_deferred_attempts"] = std::to_wstring(ImageAdmissionDeferred);
@@ -2030,6 +2034,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
                 progress.Evidence[L"remaining_pages"] = std::to_wstring(work.Sweep.Ranges.size() - work.Sweep.NextRange);
                 progress.Evidence[L"last_completion_ms"] = std::to_wstring(work.Sweep.LastCompleteMs);
                 progress.Evidence[L"last_sweep_ms"] = std::to_wstring(work.LastSweepMs);
+                progress.Evidence[L"observation_debt_json"] = work.Scheduling.Json(now);
                 progress.Evidence[L"prior_traversal_ms"] = std::to_wstring(work.PriorTraversalMs);
                 progress.Evidence[L"scheduling_turns"] = std::to_wstring(work.SweepSchedulingTurns);
                 progress.Evidence[L"completion_priority_turns"] = std::to_wstring(work.CompletionPriorityTurns);
@@ -2264,6 +2269,7 @@ bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std:
 bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
+    if (!KmonImageSchedulingIntegrationSelfTest(nullptr)) { return false; }
     {
         const auto monitorOwner = std::make_unique<KernelMonitor>();
         auto& monitor = *monitorOwner;

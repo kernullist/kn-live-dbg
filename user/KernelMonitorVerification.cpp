@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <tuple>
 
 namespace
 {
@@ -214,8 +215,16 @@ size_t KernelMonitor::ImageWorkAdmissionLimit(uint32_t pid, bool* watched)
 }
 
 KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::wstring& path,
-    uint64_t base, const ObservationIdentity& identity, bool* referenceUnavailable)
+    uint64_t base, const ObservationIdentity& identity, bool* referenceUnavailable, ImageVerificationWork** admitted, bool discovery)
 {
+    if (admitted != nullptr) { *admitted = nullptr; }
+    const auto lookupStarted = GetTickCount64();
+    bool lookupReady = false;
+    struct LookupTiming
+    {
+        KmonImageTimings& Stats; uint64_t Started; const bool& Ready; bool Shutdown;
+        ~LookupTiming() { Stats.Lookup(Started, GetTickCount64(), Ready, Shutdown); }
+    } lookupTiming{ImageTimings, lookupStarted, lookupReady, StopRequested.load()};
     if (referenceUnavailable != nullptr) { *referenceUnavailable = false; }
     if (base == 0 || path.empty() || (identity.ProcessId != 0 && identity.CreateTime == 0))
     {
@@ -261,6 +270,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
                 {
                     RememberImageRescanDelay(old->second, now);
                     old = ImageWork.erase(old);
+                    ++ImageWorkEvicted;
                 }
                 else
                 {
@@ -305,7 +315,8 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
         it->second.PriorTraversalMs = priorTraversal;
     }
     auto& work = it->second;
-    work.LastUsedMs = now;
+    if (admitted != nullptr) { *admitted = &work; }
+    if (discovery || !work.Scheduling.Seen) { work.Scheduling.Discover(now); work.LastUsedMs = now; }
     if (work.Loaded && (work.LastReferenceCheckMs == 0 || now - work.LastReferenceCheckMs >= 1000))
     {
         work.LastReferenceCheckMs = now;
@@ -320,6 +331,7 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
             // A DLL can be unloaded and replaced at the same base/path. Never
             // let a failed cached reference disable verification indefinitely.
             work.Loaded = false;
+            if (!work.Scheduling.Pending) { work.Scheduling.Pending = true; work.Scheduling.PendingSince = now; }
             work.RetentionEpisode = NextCaptureId.fetch_add(1);
             work.LayoutIdentityReported = false;
             work.LastAttemptMs = 0;
@@ -337,30 +349,61 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::FindImageWork(const std::ws
     if (!work.Loaded && (work.LastAttemptMs == 0 || now - work.LastAttemptMs >= 30000))
     {
         work.LastAttemptMs = now;
+        work.LastSweepMs = now;
         std::wstring error;
         work.Loaded = executable_image::ReadDiskPeMetadata(path, &work.Reference, &error) &&
             work.Sweep.Initialize(work.Reference);
         if (!work.Loaded)
         {
+            if (work.Scheduling.Begin(now))
+            { work.Scheduling.Finish(GetTickCount64(), KmonImageAttemptOutcome::ReferenceUnavailable, false, false, work.RetentionEpisode); }
             EmitUnique(L"coverage.image", L"scan_failed:image:" + key, path, L"image",
                 L"executable image reference unavailable", error, identity.ProcessId);
         }
     }
     if (referenceUnavailable != nullptr) { *referenceUnavailable = !work.Loaded; }
+    lookupReady = work.Loaded;
     return work.Loaded ? &work : nullptr;
 }
 
 CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint64_t base,
     const ObservationIdentity& identity, const ObservationReader& reader, size_t pageBudget,
-    const ObservationReadRouting* routing)
+    const ObservationReadRouting* routing, bool discovery)
 {
-    auto work = FindImageWork(path, base, identity);
+    const auto turnStarted = GetTickCount64();
+    ImageVerificationWork* admitted = nullptr;
+    KmonImageAttemptOutcome outcome = KmonImageAttemptOutcome::Fault;
+    ExecutableSweepTiming timing;
+    KmonImageObservationDebt before;
+    bool attempted = false;
+    bool traversed = false, gapFree = false;
+    struct TurnTiming
+    {
+        KmonImageTimings& Stats; ImageVerificationWork*& Work; KmonImageObservationDebt& Before;
+        ExecutableSweepTiming& Timing; KmonImageAttemptOutcome& Outcome; bool& Attempted;
+        bool& Traversed; bool& GapFree; uint64_t Started; bool Shutdown;
+        ~TurnTiming()
+        {
+            const auto ended = GetTickCount64();
+            if (Work != nullptr && Attempted)
+            {
+                Work->Scheduling.Finish(ended, Outcome, Traversed, GapFree, Work->RetentionEpisode);
+                Stats.Milestones(Before, Work->Scheduling, Shutdown);
+            }
+            Stats.Turn(Started, ended, Timing, Outcome, Shutdown);
+        }
+    } turnTiming{ImageTimings, admitted, before, timing, outcome, attempted, traversed, gapFree, turnStarted, StopRequested.load()};
+    auto work = FindImageWork(path, base, identity, nullptr, &admitted, discovery);
     if (work == nullptr)
     {
+        outcome = admitted == nullptr ? KmonImageAttemptOutcome::NotAdmitted : KmonImageAttemptOutcome::ReferenceUnavailable;
         return CodeOwnership::OwnedUnverified;
     }
     const uint64_t now = GetTickCount64();
-    if (now < work->NextSweepDueMs) { return CodeOwnership::OwnedUnverified; }
+    if (now < work->NextSweepDueMs) { outcome = KmonImageAttemptOutcome::Deferred; return CodeOwnership::OwnedUnverified; }
+    before = work->Scheduling;
+    attempted = work->Scheduling.Begin(now);
+    if (!attempted) { outcome = KmonImageAttemptOutcome::InvalidClock; return CodeOwnership::OwnedUnverified; }
     work->LastSweepMs = now;
     FILETIME observedTime{};
     GetSystemTimeAsFileTime(&observedTime);
@@ -398,10 +441,20 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
             ImageSweepsStarted.fetch_add(1);
         }
     }
+    const auto read = observedReader;
+    observedReader = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
+    {
+        if (!work->Scheduling.ParserAttempted)
+        { work->Scheduling.FirstParserAttempt = GetTickCount64(); work->Scheduling.ParserAttempted = true; }
+        const bool ok = read && read(address, size, bytes) && bytes->size() == size;
+        if (ok && !work->Scheduling.ExactRead)
+        { work->Scheduling.FirstExactRead = GetTickCount64(); work->Scheduling.ExactRead = true; }
+        return ok;
+    };
     ExecutableSweepReference capturedReference;
     ExecutableSliceTrace slice;
-    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, 25,
-        router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice);
+    const auto pages = AdvanceExecutableSweep(path, work->Reference, base, observedReader, pageBudget, now, &work->Sweep, KmonImageTurnBudgetMs,
+        router == nullptr ? nullptr : &capturedReference, router == nullptr ? nullptr : &slice, &timing, turnStarted);
     uint64_t readSetId = 0;
     std::wstring readPersistence = routing == nullptr ? L"unrecorded_reader" : L"not_selected_for_retention";
     // Retain clean ranges as well as changes and gaps from the original slice.
@@ -581,7 +634,72 @@ CodeOwnership KernelMonitor::ScanExecutableImage(const std::wstring& path, uint6
     }
     ImageRemainingPages.store(remaining);
     ImageLastCompleteMs.store(lastComplete);
+    outcome = !pages.empty() && std::all_of(pages.begin(), pages.end(), [](const auto& page) { return page.Coverage.Complete(); }) ?
+        KmonImageAttemptOutcome::Observed : KmonImageAttemptOutcome::Gaps;
+    traversed = timing.Pages != 0 && work->Sweep.Coverage.TraversalComplete;
+    gapFree = traversed && work->Sweep.Coverage.Complete();
     return state;
+}
+
+std::wstring KernelMonitor::ImageSchedulingJson(uint64_t now) const
+{
+    const auto n = [](uint64_t value) { return mcpjson::Quote(std::to_wstring(value)); };
+    std::vector<const ImageVerificationWork*> ordered;
+    uint64_t pending = 0, loaded = 0, debt = 0, known = 0, invalid = 0;
+    for (const auto& item : ImageWork)
+    {
+        const auto& work = item.second;
+        ordered.push_back(&work);
+        pending += work.Scheduling.Pending;
+        loaded += work.Loaded;
+        if (work.Scheduling.Seen)
+        {
+            ++known;
+            if (work.Scheduling.DebtSince() <= now) { debt = (std::max)(debt, now - work.Scheduling.DebtSince()); }
+            else { ++invalid; }
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b)
+    {
+        if (a->Scheduling.Seen != b->Scheduling.Seen) { return a->Scheduling.Seen; }
+        return std::make_tuple(a->Scheduling.DebtSince(), a->LastSweepMs, a->Base) <
+            std::make_tuple(b->Scheduling.DebtSince(), b->LastSweepMs, b->Base);
+    });
+    // Exact scopes or explicit omissions. Never shorten a path into a different
+    // identity, and bound both the number and serialized UTF-16 size of rows.
+    constexpr size_t detailCapacity = 64, detailUnits = 65536;
+    size_t details = 0;
+    std::wstring rows;
+    for (const auto* work : ordered)
+    {
+        if (details == detailCapacity) { break; }
+        const auto remaining = work->Loaded && work->Sweep.NextRange <= work->Sweep.Ranges.size() ?
+            n(work->Sweep.Ranges.size() - work->Sweep.NextRange) : L"null";
+        const auto row = L"{\"boot_id\":" + mcpjson::Quote(work->Identity.BootId) + L",\"pid\":" + n(work->Identity.ProcessId) +
+            L",\"create_time\":" + n(work->Identity.CreateTime) + L",\"base\":" + n(work->Base) + L",\"path\":" + mcpjson::Quote(work->Path) +
+            L",\"retention_episode\":" + n(work->RetentionEpisode) + L",\"reference_loaded\":" + (work->Loaded ? L"true" : L"false") +
+            L",\"remaining_pages\":" + remaining + L",\"next_sweep_due_ms\":" + n(work->NextSweepDueMs) +
+            L",\"reference_last_attempt_ms\":" + (work->LastAttemptMs == 0 ? L"null" : n(work->LastAttemptMs)) +
+            L",\"observation\":" + work->Scheduling.Json(now) + L"}";
+        if (row.size() + (rows.empty() ? 0 : 1) > detailUnits - rows.size()) { continue; }
+        if (!rows.empty()) { rows += L","; }
+        rows += row;
+        ++details;
+    }
+    return L"{\"schema\":\"kn.image_scheduling.v1\",\"scope\":\"resident_image_work_entries\","
+        L"\"clock_domain\":\"GetTickCount64_ms\",\"policy\":\"bounded_debt_with_process_bulk_tail_rotation.v1\","
+        L"\"success_scope\":\"qualified_comparison_not_execution_or_durable_publication\","
+        L"\"debt_origin\":\"last_gap_free_traversal_or_first_discovery\",\"parser_attempt_is_native_read\":false,"
+        L"\"hard_deadline_enforced\":false,\"minimum_page_and_final_fences_may_overrun\":true,"
+        L"\"shutdown_in_normal_samples\":false,\"percentiles\":\"log2_bucket_upper_bounds\","
+        L"\"snapshot_ms\":" + n(now) + L",\"cooperative_turn_budget_ms\":" + n(KmonImageTurnBudgetMs) +
+        L",\"reference_retry_ms\":\"30000\",\"debt_priority_ordinary_stride\":\"4\",\"debt_priority_turns\":" + n(ImageDebtPriorityTurns) +
+        L",\"resident\":" + n(ImageWork.size()) + L",\"loaded\":" + n(loaded) + L",\"pending\":" + n(pending) +
+        L",\"debt_known\":" + n(known) + L",\"max_resident_observation_debt_ms\":" + n(debt) +
+        L",\"evicted\":" + n(ImageWorkEvicted) + L",\"deferred_admission_attempts\":" + n(ImageAdmissionDeferred) +
+        L",\"deferred_rediscovery_guaranteed\":false,\"detail_capacity\":" + n(detailCapacity) + L",\"detail_utf16_capacity\":" + n(detailUnits) +
+        L",\"details_omitted\":" + n(ImageWork.size() - details) + L",\"details\":[" + rows + L"],\"snapshot_invalid_clocks\":" + n(invalid) +
+        L",\"normal\":" + ImageTimings.Json() + L",\"shutdown\":" + ImageTimings.Json(true) + L"}";
 }
 
 KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64_t now)
@@ -596,27 +714,33 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
     // Per-process classification let repeat-only processes dilute every turn
     // of a DLL-rich process that still had unseen tails.
     std::map<std::pair<uint32_t, uint64_t>, ImageVerificationWork*> eligible[2][2];
+    ImageVerificationWork* oldest[2][2]{};
     ImageVerificationWork* bulk = nullptr;
     ImageVerificationWork* finishing = nullptr;
     for (auto& item : ImageWork)
     {
         auto& work = item.second;
-        if (!work.Loaded || now < work.NextSweepDueMs) { continue; }
+        if (now < work.NextSweepDueMs || (!work.Loaded && work.LastAttemptMs != 0 &&
+            (now < work.LastAttemptMs || now - work.LastAttemptMs < 30000))) { continue; }
         const size_t group = work.Identity.ProcessId != 0 && watched.count(work.Identity.ProcessId) != 0 ? 0 : 1;
         const size_t phase = work.Sweep.LastCompleteMs == 0 && work.PriorTraversalMs == 0 ? 0 : 1;
         auto& candidate = eligible[group][phase][{work.Identity.ProcessId, work.Identity.CreateTime}];
         if (candidate == nullptr || std::make_pair(work.LastSweepMs, work.Base) <
             std::make_pair(candidate->LastSweepMs, candidate->Base)) { candidate = &work; }
+        auto& debt = oldest[group][phase];
+        if (work.Scheduling.Seen && work.Scheduling.DebtSince() <= now && (debt == nullptr ||
+            std::make_tuple(work.Scheduling.DebtSince(), work.LastSweepMs, work.Base) <
+            std::make_tuple(debt->Scheduling.DebtSince(), debt->LastSweepMs, debt->Base))) { debt = &work; }
         // Incidental layout scans also update LastSweepMs. Equal turns did
         // not mean equal progress under the time budget, and a small incidental
         // read could postpone a large unvisited tail. Raise the lowest cursor
         // first; ordinary rotation still retries unavailable identities.
-        const bool bulkReady = !work.Sweep.Coverage.Attempted || work.Sweep.Coverage.InventoryAvailable;
+        const bool bulkReady = work.Loaded && (!work.Sweep.Coverage.Attempted || work.Sweep.Coverage.InventoryAvailable);
         if (group == 1 && phase == 0 && work.Sweep.Ranges.size() >= 4096 && bulkReady &&
             (bulk == nullptr || std::make_pair(work.Sweep.NextRange, work.LastSweepMs) <
                 std::make_pair(bulk->Sweep.NextRange, bulk->LastSweepMs))) { bulk = &work; }
-        const auto remaining = work.Sweep.Ranges.size() - work.Sweep.NextRange;
-        if (group == 1 && phase == 0 && remaining > 0 && remaining <= 1024 &&
+        const auto remaining = work.Sweep.NextRange <= work.Sweep.Ranges.size() ? work.Sweep.Ranges.size() - work.Sweep.NextRange : 0;
+        if (work.Loaded && group == 1 && phase == 0 && remaining > 0 && remaining <= 1024 &&
             (finishing == nullptr || std::make_pair(remaining, work.LastSweepMs) <
                 std::make_pair(finishing->Sweep.Ranges.size() - finishing->Sweep.NextRange, finishing->LastSweepMs)))
         { finishing = &work; }
@@ -662,11 +786,19 @@ KernelMonitor::ImageVerificationWork* KernelMonitor::SelectImageSweepWork(uint64
         }
         else
         {
-            auto& cursor = ImageSweepProcessCursors[group][phase];
-            auto next = candidates.upper_bound(cursor);
-            if (next == candidates.end()) { next = candidates.begin(); }
-            cursor = next->first;
-            selected = next->second;
+            // Debt can borrow one in four ordinary turns. Keep the ordinary
+            // process cursor unchanged on a borrowed turn so even a permanent
+            // failure cannot starve rotation, bulk progress, or bounded tails.
+            if (ImageOrdinaryTurns[group][phase]++ % 4 == 3 && oldest[group][phase] != nullptr)
+            { selected = oldest[group][phase]; ++ImageDebtPriorityTurns; }
+            else
+            {
+                auto& cursor = ImageSweepProcessCursors[group][phase];
+                auto next = candidates.upper_bound(cursor);
+                if (next == candidates.end()) { next = candidates.begin(); }
+                cursor = next->first;
+                selected = next->second;
+            }
         }
         if (scheduledGroup == 0 && scheduledPhase == 0 && group == 1 && phase == 0) { ++ImageBorrowedBackgroundTurns; }
         ++ImageSweepClassTurns[group][phase];
@@ -763,13 +895,10 @@ void KernelMonitor::ContinueImageSweeps()
                 before.RegionSize == after.RegionSize && before.State == after.State &&
                 before.Protect == after.Protect && before.Type == after.Type));
     };
-    // The verifier retains the 25ms bound. Coalesced publication permits a
-    // larger page ceiling without one catalog insertion/event per clean page.
-    const auto lastDiscovered = selected->LastUsedMs;
-    ScanExecutableImage(path, base, identity, {}, 1024, &routing);
-    // Continuation is not a new discovery. In particular, polling an exited
-    // process must not keep its failed cache entries young indefinitely.
-    selected->LastUsedMs = lastDiscovered;
+    // The cooperative budget includes reference lookup. Minimum first-page
+    // progress and mandatory final fences can overrun; the timing report
+    // preserves those overruns. Continuation never refreshes discovery age.
+    ScanExecutableImage(path, base, identity, {}, 1024, &routing, false);
 }
 
 void KernelMonitor::ScanImagePermissionCandidates(const std::wstring& path, uint64_t base,

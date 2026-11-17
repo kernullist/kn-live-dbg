@@ -6,6 +6,7 @@
 #include "ObservationReadRouting.h"
 
 #include <functional>
+#include <array>
 #include <map>
 
 using ObservationReader = std::function<bool(uint64_t, size_t, std::vector<uint8_t>*)>;
@@ -86,6 +87,20 @@ struct ExecutableSliceTrace
     ObservationRoutedReadSet SecondaryReads;
 };
 
+// Collector scheduling diagnostics, deliberately outside the replay recipe.
+// Final identity/content fences still run after a cooperative page budget.
+struct ExecutableSweepTiming
+{
+    uint64_t StartedMs = 0, FinishedMs = 0;
+    // Reference open/retention, identity/secondary qualification, comparison,
+    // and final identity/content checks respectively. No target wall clocks.
+    std::array<uint64_t, 4> StageMs{};
+    uint32_t StagesEntered = 0;
+    uint32_t Pages = 0;
+    bool MinimumProgressOverBudget = false;
+    bool InvalidBudgetClock = false;
+};
+
 bool QualifyExecutableReference(
     const executable_image::DiskPeMetadata& metadata,
     uint64_t imageBase,
@@ -116,7 +131,9 @@ std::vector<ExecutablePageResult> AdvanceExecutableSweep(
     ExecutableSweep* sweep,
     uint64_t budgetMs = 0,
     ExecutableSweepReference* capturedReference = nullptr,
-    ExecutableSliceTrace* trace = nullptr);
+    ExecutableSliceTrace* trace = nullptr,
+    ExecutableSweepTiming* timing = nullptr,
+    uint64_t budgetStartedMs = 0);
 
 // Uses an already retained reference and original parser inputs. It never maps
 // a fresh secondary view or consults a target process.

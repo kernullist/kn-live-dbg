@@ -421,6 +421,16 @@ failed checks do not count as successful revisits. See
 [execution reference scheduling](ARCHITECTURE.md#execution-reference-scheduling)
 for retention bounds and unmeasured latency limits.
 
+`KnLiveDbg.exe --self-test image-scheduler` checks production image lookup,
+comparison, cursor/debt accounting and scheduling with owned files, synthetic
+target bytes and controlled-time cohorts. It emits JSON and returns 0 on
+success, 1 on failure or 2 for extra arguments; no driver is loaded. The private
+`coverage.pipeline.image_scheduling_json` distinguishes successful slices,
+gap-free traversal, failed attempts and pending resident work. Whole-turn and
+verifier-stage timing report overruns of the cooperative 25 ms budget, including
+minimum page progress and mandatory final checks. See
+[image observation scheduling](ARCHITECTURE.md#image-observation-scheduling).
+
 Current-main KMON image comparisons preserve original read attempts for clean,
 changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication

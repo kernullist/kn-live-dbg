@@ -19,6 +19,7 @@ namespace
         std::vector<uint8_t> Bytes;
         std::vector<std::pair<uint64_t, uint32_t>> Calls;
         bool Partial = false, Fail = false, Unstable = false;
+        uint64_t FailAddress = 0;
         size_t PageReads = 0;
         explicit Source(const wchar_t* id)
         {
@@ -40,7 +41,7 @@ namespace
                 result.Spans = {{request.Address, 16, ObservationReadState::Complete, std::vector<uint8_t>(16, 0x41)},
                     {request.Address + 16, request.Length - 16, ObservationReadState::Failed, {}}};
             }
-            else if (!Fail && request.Address >= Base && request.Address - Base < Bytes.size() &&
+            else if (!Fail && request.Address != FailAddress && request.Address >= Base && request.Address - Base < Bytes.size() &&
                 request.Length <= Bytes.size() - (request.Address - Base))
             {
                 if (request.Address == Base + 0x1000 && ++PageReads == 2 && Unstable) { Bytes[0x1050] ^= 1; }
@@ -839,5 +840,233 @@ bool KmonImageReadIntegrationSelfTest()
     std::filesystem::remove_all(root, ec);
     check(!ec && !std::filesystem::exists(root), "owned-fixture-and-pending-files-cleaned");
     std::fprintf(stderr, "[kmon.image_reads] checks=%u failed=%u\n", checks, failures);
+    return failures == 0;
+}
+
+bool KmonImageSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool passed, const char* name)
+    {
+        ++checks;
+        if (!passed) { ++failures; std::fprintf(stderr, "[image.scheduler] FAIL %s\n", name); }
+        return passed;
+    };
+    wchar_t temporary[MAX_PATH]{}, unique[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temporary) || !GetTempFileNameW(temporary, L"kni", 0, unique)) { return false; }
+    if (!DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { return false; }
+    const std::filesystem::path root = std::filesystem::absolute(unique);
+    std::wstring pipeline = L"null", cancelled = L"null", unavailable = L"null", bounded = L"null", scenarios;
+    try
+    {
+        // Actual production lookup, cursor, comparison and pipeline publication,
+        // with owned reference files and a synthetic nonexecuting address space.
+        Source source(L"synthetic:image-scheduler");
+        auto disk = Fixture(&source.Bytes);
+        disk.resize(0x2400, 0x90);
+        uint32_t size = 0x3000;
+        std::memcpy(disk.data() + 0x80 + offsetof(IMAGE_NT_HEADERS64, OptionalHeader.SizeOfImage), &size, sizeof(size));
+        size = 0x2000;
+        const size_t section = 0x80 + sizeof(IMAGE_NT_HEADERS64);
+        std::memcpy(disk.data() + section + offsetof(IMAGE_SECTION_HEADER, Misc.VirtualSize), &size, sizeof(size));
+        std::memcpy(disk.data() + section + offsetof(IMAGE_SECTION_HEADER, SizeOfRawData), &size, sizeof(size));
+        const auto load = [&]()
+        {
+            source.Bytes.assign(0x3000, 0);
+            std::copy(disk.begin(), disk.begin() + 0x400, source.Bytes.begin());
+            std::copy(disk.begin() + 0x400, disk.end(), source.Bytes.begin() + 0x1000);
+        };
+        load();
+        const auto path = root / L"two-pages.exe";
+        if (!check(Write(path, disk), "owned-two-page-reference")) { throw std::runtime_error("fixture"); }
+        ObservationIdentity identity; identity.BootId = L"synthetic:image-scheduler:boot"; identity.ProcessId = 42; identity.CreateTime = 1;
+        ObservationReadRouting routing;
+        routing.Primary = &source; routing.TargetId = L"synthetic:42:1"; routing.AddressSpaceId = L"synthetic:42:1:user";
+        const auto owner = std::make_unique<KernelMonitor>();
+        auto& monitor = *owner;
+        monitor.Options.LogDirectory = (root / L"capture").wstring();
+        check(monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified,
+            "first-slice-leaves-tail-unknown");
+        auto& work = monitor.ImageWork.begin()->second;
+        const auto first = work.Scheduling;
+        check(first.Seen && first.Pending && first.Attempted && first.Successful && first.ParserAttempted && first.ExactRead &&
+            !first.Traversed && !first.GapFree && work.Sweep.NextRange == 1, "successful-slice-is-not-successful-traversal");
+        check(monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false) == CodeOwnership::OwnedVerified,
+            "continuation-completes-original-cursor");
+        const auto complete = work.Scheduling;
+        check(complete.GapFree && !complete.Pending && complete.FirstSeen == first.FirstSeen && complete.LastSeen == first.LastSeen &&
+            complete.LastGapFreeEpisode == work.RetentionEpisode, "continuation-preserves-discovery-and-closes-qualified-debt");
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing);
+        check(work.Scheduling.LastAttempt == complete.LastAttempt && work.Scheduling.FirstSeen == complete.FirstSeen &&
+            !work.Scheduling.Pending && monitor.ImageTimings.Snapshot().DeferredTurn.Samples == 1, "rediscovery-does-not-renew-attempt-or-revisit");
+        work.NextSweepDueMs = 0;
+        source.FailAddress = Base + 0x1000;
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.Scheduling.Pending && work.Scheduling.LastSuccess == complete.LastSuccess &&
+            work.Scheduling.LastGapFree == complete.LastGapFree && work.Sweep.NextRange == 1, "failed-page-does-not-renew-success");
+        source.FailAddress = 0;
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.Sweep.Coverage.TraversalComplete && !work.Sweep.Coverage.Complete() && work.Scheduling.Pending &&
+            work.Scheduling.LastGapFree == complete.LastGapFree, "traversed-with-gap-keeps-observation-debt");
+        // Replacing the reference must preserve history but separate episodes.
+        const auto oldEpisode = work.RetentionEpisode;
+        ++disk[0x80 + offsetof(IMAGE_NT_HEADERS64, FileHeader.TimeDateStamp)];
+        load();
+        check(Write(path, disk), "replace-owned-reference");
+        work.LastReferenceCheckMs = 0; work.NextSweepDueMs = 0;
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.RetentionEpisode != oldEpisode && work.Scheduling.LastGapFreeEpisode == oldEpisode &&
+            work.Scheduling.FirstSeen == first.FirstSeen && work.Scheduling.Pending && work.Sweep.NextRange == 1,
+            "new-reference-cannot-inherit-old-episode-completion");
+        monitor.StopRequested.store(true);
+        const auto callsBeforeStop = source.Calls.size();
+        const auto successBeforeStop = work.Scheduling.LastSuccess;
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.Scheduling.LastGapFreeEpisode == oldEpisode && work.Scheduling.Pending &&
+            work.Scheduling.LastSuccess == successBeforeStop && source.Calls.size() == callsBeforeStop &&
+            monitor.ImageTimings.Snapshot(true).SuccessfulTurn.Samples == 0 && monitor.ImageTimings.Snapshot(true).FailedTurn.Samples == 1,
+            "shutdown-cancellation-cannot-renew-success-or-call-target");
+        cancelled = monitor.ImageSchedulingJson(GetTickCount64());
+        // Controlled fixture restart: cancellation invalidated the partial
+        // cursor, so two newly acquired pages are required for this episode.
+        monitor.StopRequested.store(false); work.NextSweepDueMs = 0;
+        check(work.Sweep.NextRange == 0, "cancelled-identity-invalidates-partial-cursor");
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.Sweep.NextRange == 1 && work.Scheduling.Pending && work.Scheduling.LastGapFreeEpisode == oldEpisode,
+            "first-recovery-slice-is-not-complete");
+        monitor.ScanExecutableImage(path.wstring(), Base, identity, {}, 1, &routing, false);
+        check(work.Scheduling.LastGapFreeEpisode == work.RetentionEpisode && !work.Scheduling.Pending,
+            "new-episode-completes-only-after-entire-recovery-traversal");
+        monitor.DrainPipelineEvents(true);
+        for (const auto& event : monitor.Ring)
+        {
+            const auto found = event.Evidence.find(L"image_scheduling_json");
+            if (event.Kind == L"coverage.pipeline" && found != event.Evidence.end()) { pipeline = found->second; }
+        }
+        check(pipeline != L"null" && mcpjson::ValidateDocument(pipeline) &&
+            monitor.ImageTimings.Snapshot().FirstGapFreeAge.Samples == 1 &&
+            monitor.ImageTimings.Snapshot().FirstExactReadAge.Samples == 1, "pipeline-publishes-once-only-discovery-milestones");
+
+        const auto missingOwner = std::make_unique<KernelMonitor>();
+        auto& missing = *missingOwner;
+        const auto missingPath = root / L"missing.exe";
+        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1);
+        auto& absent = missing.ImageWork.begin()->second;
+        const auto failedAt = absent.LastAttemptMs;
+        const auto pendingAt = absent.Scheduling.PendingSince;
+        check(absent.Scheduling.Attempted && !absent.Scheduling.Successful && !absent.Scheduling.ParserAttempted &&
+            missing.SelectImageSweepWork(failedAt + 29999) == nullptr &&
+            missing.SelectImageSweepWork(failedAt + 30000) == &absent, "failed-reference-retries-after-cooldown-without-rediscovery");
+        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1);
+        check(absent.LastAttemptMs == failedAt && absent.Scheduling.PendingSince == pendingAt,
+            "cooldown-rediscovery-keeps-old-pending-and-attempt");
+        unavailable = missing.ImageSchedulingJson(GetTickCount64());
+        check(Write(missingPath, disk), "reference-appears-after-initial-failure");
+        absent.LastAttemptMs = GetTickCount64() - 30000;
+        const auto discoveryBeforeRetry = absent.Scheduling.LastSeen;
+        check(missing.SelectImageSweepWork(GetTickCount64()) == &absent, "recovered-reference-selected-without-rediscovery");
+        missing.ScanExecutableImage(missingPath.wstring(), Base, identity, {}, 1, &routing, false);
+        check(absent.Loaded && absent.Sweep.NextRange == 1 && absent.Scheduling.Successful &&
+            absent.Scheduling.LastSeen == discoveryBeforeRetry && absent.Scheduling.PendingSince == pendingAt,
+            "actual-retry-loads-and-advances-original-pending-work");
+
+        // Controlled time models exercise the production selector. Old failures
+        // remain old while successful observations renew their own debt origin.
+        for (unsigned scenario = 0; scenario < 3; ++scenario)
+        {
+            const auto scheduledOwner = std::make_unique<KernelMonitor>();
+            auto& scheduled = *scheduledOwner;
+            std::wstring operations;
+            const auto append = [&](const std::wstring& row) { if (!operations.empty()) { operations += L","; } operations += row; };
+            const auto put = [&](unsigned id, uint64_t generation, uint64_t now)
+            {
+                const auto key = std::to_wstring(id);
+                scheduled.ImageWork.erase(key);
+                KernelMonitor::ImageVerificationWork entry;
+                entry.Loaded = true; entry.Base = 0x10000 + id * 4096;
+                entry.Identity.BootId = L"synthetic:scheduling";
+                entry.Identity.ProcessId = 100 + id % 3; entry.Identity.CreateTime = generation;
+                entry.Path = L"synthetic-image-" + key;
+                entry.Sweep.LastCompleteMs = 1;
+                entry.Scheduling.Discover(now);
+                scheduled.WatchPids.insert(entry.Identity.ProcessId);
+                scheduled.ImageWork.emplace(key, std::move(entry));
+                append(L"{\"op\":\"put\",\"id\":" + key + L",\"generation\":" + std::to_wstring(generation) + L",\"now\":" + std::to_wstring(now) + L"}");
+            };
+            for (unsigned id = 0; id < 6; ++id) { put(id, 1, 100 + id); }
+            std::set<uint32_t> served;
+            for (unsigned turn = 0; turn < 96; ++turn)
+            {
+                const uint64_t now = 100000 + turn;
+                if (scenario == 1 && turn % 3 == 0) { put(6 + turn / 3, 1, now); }
+                if (scenario == 2 && turn % 5 == 0) { put(1 + (turn / 5) % 5, 2 + turn / 5, now); }
+                auto* selected = scheduled.SelectImageSweepWork(now);
+                if (!check(selected != nullptr, "nonempty-selector-makes-progress")) { break; }
+                const auto id = static_cast<unsigned>((selected->Base - 0x10000) / 4096);
+                served.insert(selected->Identity.ProcessId);
+                selected->LastSweepMs = now;
+                selected->Scheduling.Begin(now);
+                selected->Scheduling.Finish(now, id == 0 ? KmonImageAttemptOutcome::Gaps : KmonImageAttemptOutcome::Observed,
+                    id != 0, id != 0, 1);
+                append(L"{\"op\":\"select\",\"now\":" + std::to_wstring(now) + L",\"id\":" + std::to_wstring(id) + L"}");
+            }
+            check(served.size() == 3 && scheduled.ImageDebtPriorityTurns == 24 &&
+                !scheduled.ImageWork.at(L"0").Scheduling.Successful, "permanent-old-failure-cannot-consume-ordinary-rotation");
+            if (!scenarios.empty()) { scenarios += L","; }
+            scenarios += L"{\"name\":" + mcpjson::Quote(scenario == 0 ? L"fixed" : scenario == 1 ? L"growing" : L"delete_reuse") +
+                L",\"operations\":[" + operations + L"],\"report\":" + scheduled.ImageSchedulingJson(100096) + L"}";
+        }
+
+        const auto boundedOwner = std::make_unique<KernelMonitor>();
+        auto& limited = *boundedOwner;
+        for (unsigned i = 0; i < 70; ++i)
+        {
+            KernelMonitor::ImageVerificationWork entry;
+            entry.Identity = identity; entry.Base = 0x10000 + i * 4096;
+            entry.Path = i == 0 ? std::wstring(70000, L'x') : L"synthetic:bounded-" + std::to_wstring(i);
+            entry.Scheduling.Discover(10 + i);
+            limited.ImageWork.emplace(std::to_wstring(i), std::move(entry));
+        }
+        bounded = limited.ImageSchedulingJson(1000);
+        check(Array(bounded, L"details").size() == 64 && Text(bounded, L"details_omitted") == L"6" &&
+            Raw(bounded, L"details").size() <= 65538 && bounded.find(std::wstring(70000, L'x')) == std::wstring::npos,
+            "bounded-json-omits-exact-long-scope-with-denominator");
+        const auto invalid = limited.ImageSchedulingJson(0);
+        check(Text(invalid, L"snapshot_invalid_clocks") == L"70" && Text(invalid, L"max_resident_observation_debt_ms") == L"0",
+            "future-discovery-cannot-underflow-debt");
+
+        KmonImageObservationDebt history;
+        check(!history.Begin(0) && history.Discover(0) && history.Begin(1) &&
+            history.Finish(2, KmonImageAttemptOutcome::Gaps, true, false, 1) && history.Traversed && !history.Successful &&
+            !history.GapFree && history.Pending && history.DebtSince() == 0, "zero-clock-origin-and-gapped-traversal");
+        check(history.Discover(10) && !history.Discover(9) && !history.Begin(9) && history.Begin(11) &&
+            !history.Finish(10, KmonImageAttemptOutcome::Observed, true, true, 1) && !history.Successful,
+            "invalid-clock-cannot-create-success");
+        history.Finish(12, KmonImageAttemptOutcome::Observed, true, true, 1);
+        history.Begin(13); history.Finish(14, KmonImageAttemptOutcome::Fault, true, true, 2);
+        check(history.LastSuccess == 12 && history.LastTraversal == 12 && history.LastGapFree == 12 && history.Pending &&
+            history.LastGapFreeEpisode == 1, "fault-cannot-renew-prior-completed-sweep");
+        KmonImageTimings clocked;
+        ExecutableSweepTiming invalidTiming; invalidTiming.InvalidBudgetClock = true;
+        clocked.Turn(4, 5, invalidTiming, KmonImageAttemptOutcome::Gaps, false);
+        clocked.Lookup(6, 5, false, false);
+        check(clocked.Snapshot().InvalidClocks == 2 && clocked.Snapshot().FailedTurn.Samples == 0,
+            "invalid-clock-samples-excluded");
+        clocked.Reset();
+        check(clocked.Snapshot().InvalidClocks == 0, "new-session-resets-owned-histograms");
+    }
+    catch (const std::exception&) { check(false, "owned-fixture-exception"); }
+    std::error_code ec;
+    // Exclusively created absolute fixture root; never a supplied directory.
+    std::filesystem::remove_all(root, ec);
+    check(!ec && !std::filesystem::exists(root), "owned-fixture-cleanup");
+    if (diagnostics != nullptr)
+    {
+        *diagnostics = L"{\"schema\":\"kn.image_scheduler_test.v1\",\"corpus\":\"owned_files_synthetic_target_and_time\","
+            L"\"driver_loaded\":false,\"passed\":" + std::wstring(failures == 0 ? L"true" : L"false") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"pipeline\":" + pipeline + L",\"cancelled\":" + cancelled + L",\"unavailable\":" + unavailable +
+            L",\"bounded\":" + bounded + L",\"scenarios\":[" + scenarios + L"]}";
+    }
+    std::fprintf(stderr, "[image.scheduler] checks=%u failed=%u\n", checks, failures);
     return failures == 0;
 }
