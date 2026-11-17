@@ -7,6 +7,56 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process module observation debt, 2026-11-18
+
+Current main schedules overdue Toolhelp module observations by process
+generation. Successful observations require a complete module walk and a
+matching generation before and after the walk. The census, acquisition and
+retry rules are described in the [scheduler design](ARCHITECTURE.md#process-module-observation-debt).
+
+On Windows **28000.3501**, the Release product and the `/W4 /WX` core harness
+passed these checks.
+
+- An independent model passed **817 assertions** on pending work, first
+  observation, successful revisit, timing buckets, capacity loss and slot
+  selection. It checked the production 12,288-generation ceiling, conflicting
+  pins, PID reuse, access denial and cancellation. An unsupported generation
+  stayed out of the extra slot after a later failure or invalid clock. A
+  successful ordinary visit restored eligibility.
+- Each synthetic workload ran **80 inventories and 640 visits**, including
+  partial and capped inventories. All 16 offered slots in each run entered an
+  inspection within the existing priority quotas. The model independently
+  calculated the intervals below from acquisition times.
+
+| Synthetic workload | First observations | Successful revisit intervals | Longest successful revisit (ms) |
+| --- | ---: | ---: | ---: |
+| Fixed | 24 | 536 | 59,990 |
+| Growing | 92 | 481 | 170,000 |
+
+- The product passed **25 native deep-inspection controls** and **21
+  independent module-observation checks**. A real Toolhelp snapshot contained
+  the test process's executable under the pinned creation time. A second
+  acquisition produced one revisit. Mismatched inventory generations received
+  no success, and cancellation preserved the prior receipt. Exceptions before
+  and after acquisition produced
+  the expected source outcomes, and the process handle count returned to its
+  starting value.
+- Inventory admission, deep scheduling and discovery passed their existing
+  core checks. The Release binary passed the support-matrix check and isolated
+  `--self-test all`, including **3,043 command checks across 261 routes**.
+  The suite cleaned up its fixtures and left its working directory empty.
+  Public-content regression passed **12 tests**.
+
+Release product SHA-256 `b3fbcfda903509aa726a57425d8e5cdb0f92877e8cc6d022eb3ad71a26400c7b`. Core harness SHA-256 `8aefa91ae5910387cd5367a2385c584a4cbcb2a0dd907bcbb08a7f9fdef92fc5`.
+Read-only host checks at **07:05 KST** found the previous boot time, no new
+BugCheck or dump, and no running task driver or process. The service and
+firewall settings matched the baseline. The previously recorded ASan startup
+failure on this host still limits sanitizer coverage.
+
+The native test covers the owned process. The scheduling intervals above use
+a synthetic clock. P09 remains open for source-wide acquisition latency,
+durable timing and the maximum unobserved interval on a measured host workload.
+
 ## Deep inspection above process inventory capacity, 2026-11-18
 
 Current main reads the full process snapshot in bounded turns. On a complete

@@ -6,10 +6,10 @@
 struct KmonUserTarget
 {
     uint32_t Pid = 0;
-    uint64_t CreateTime = 0, Eprocess = 0;
+    uint64_t CreateTime = 0, Eprocess = 0, SuspectExpiresMs = 0;
     uint32_t ThreadQueryQuota = 0;
     std::wstring ImagePath, Leaf;
-    bool HighPriority = false, Interesting = false, Suspect = false;
+    bool HighPriority = false, Interesting = false, Suspect = false, PinnedGeneration = false;
 };
 enum class KmonUserInventoryRead { Row, End, Error };
 
@@ -333,6 +333,7 @@ private:
                 if (existing.CreateTime != 0 && existing.CreateTime != suspect.CreateTime) { return; }
                 if (existing.CreateTime == 0) { existing.ImagePath = suspect.ImagePath; existing.Leaf = suspect.Leaf; }
                 existing.CreateTime = suspect.CreateTime; existing.Eprocess = suspect.Eprocess;
+                existing.SuspectExpiresMs = suspect.SuspectExpiresMs;
                 existing.Suspect = existing.HighPriority = existing.Interesting = true;
             }
             else if (HasSlot(SuspectLimit, Input::Suspect, suspect.Pid, suspect.CreateTime))

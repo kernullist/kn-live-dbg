@@ -58,6 +58,7 @@ def main():
     assert "continued_phase_once_per_turn" in discovery["limits"]
     assert "user_inventory_32_steps_25ms" in discovery["limits"]
     assert "capped_inventory_rotating_deep_slot" in discovery["limits"] and "frozen_pid_lap" in discovery["limits"]
+    assert "generation_fenced_toolhelp_module_debt" in discovery["limits"]
     assert "one_selected_deep_target_per_turn" in discovery["limits"]
     assert "cohort_tail_survives_target_faults" in discovery["limits"]
     assert "stage_specific_live_source_gates" in analysis["requirements"]

@@ -2051,6 +2051,48 @@ only its worker with an absent device binding. Separate nested fixtures report
 actual inventory queries, dispatcher generation rejection and owned native
 thread queries; they do not validate a complete successful deep inspection.
 
+### Process module observation debt
+
+The user-hostility scheduler tracks Toolhelp module inventories by PID and
+process creation time for the current monitor session. Its `GetTickCount64`
+clock starts when an inventory or inspection first binds work to that
+generation. Rediscovery requests a new observation and preserves the earliest
+time that request has been pending. The latest attempt, successful acquisition
+and inventory sighting have separate timestamps.
+
+A successful acquisition requires a pinned process, a matching nonzero creation
+time before and after enumeration, and a nonempty walk with valid address
+ranges that ends with `ERROR_NO_MORE_FILES` within the 1,024-row limit.
+Cancellation, a partial walk, access denial, a conflicting generation or a
+source fault leaves the work pending. Once the source qualifies, a later
+inspection exception preserves the receipt. A PID with unknown creation time
+can earn its first receipt after a successful pin binds it to a generation.
+
+Every fourth complete, uncapped census may give one deep inspection slot to
+the generation that has waited longest since its last success or first
+admission. Ties favor the earliest unexpired suspect hint, then an unattempted
+or least recently attempted generation. The hint deadline comes from the
+existing suspect retention period. The process lifetime remains unknown.
+A failed visit has a 30-second cooldown for this slot. An explicitly unsupported
+generation can regain eligibility through a successful ordinary visit. The
+existing tier quotas still apply. Partial inventories use ordinary selection,
+and capped inventories retain their [population reservation](#deep-inspection-above-the-process-inventory-limits).
+
+Private `coverage.pipeline.user_module_debt_json`
+(`kn.user_module_observation_debt.v1`) reports up to 32 generation records,
+the omitted count, and outcomes for all attempts. It measures time from
+admission to first success, intervals between successful acquisitions of the
+same generation, and service time from inspection entry through qualification
+or failure. It records
+cancellation separately and excludes reversed clocks from duration samples.
+The session retains up to 12,288 generations. A pinned inventory replacement
+retires its predecessor, and complete absence retires a missing PID. Under
+capacity pressure the scheduler preserves current generations, records
+evictions or refused admission, and counts outcomes without a retained
+generation separately. Only retained generations contribute first-observation
+and revisit intervals. This source covers the module inventory. Other sources,
+durable timing and host-wide unobserved intervals require separate evidence.
+
 ## Layout collection and verification scheduling
 
 The layout worker maintains an explicit process ring. New discoveries join

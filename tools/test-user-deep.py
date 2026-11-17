@@ -119,7 +119,7 @@ def deterministic(data):
 
 
 def native(data):
-    check(data['schema'] == 'kn.user_deep_test.v1' and data['passed'] and data['checks'] == 17, 'actual dispatcher and native ownership controls')
+    check(data['schema'] == 'kn.user_deep_test.v1' and data['passed'] and data['checks'] == 25, 'actual dispatcher and native ownership controls')
     check(not data['driver_loaded'] and data['native_generation_rejection'] and data['native_thread_queries'] and
           not data['full_target_inspection_validated'], 'bounded native validation scope')
     for key in ('partial', 'complete', 'stopped'):

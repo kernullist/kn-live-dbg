@@ -1,5 +1,6 @@
 #include "KernelMonitor.h"
 #include "KmonUserInventory.h"
+#include "KmonUserModuleDebt.h"
 #include "ProcessObservationSource.h"
 #include "NativeObservationSource.h"
 #include "PendingIrpReport.h"
@@ -8110,6 +8111,75 @@ bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event)
 
 namespace
 {
+    struct KmonNativeModuleAttempt
+    {
+        KmonUserModuleDebt& Debt;
+        KmonUserModuleDebt::Attempt Visit;
+        KmonNativeModuleAttempt(KmonUserModuleDebt& debt, KmonUserModuleDebt::Key target, bool loan)
+            : Debt(debt), Visit(debt.Begin(target, GetTickCount64(), loan)) {}
+        ~KmonNativeModuleAttempt() { if (!Visit.Closed) { Fail(KmonModuleResult::Fault); } }
+        void Fail(KmonModuleResult reason, DWORD error = 0) { Debt.Fail(Visit, reason, GetTickCount64(), error); }
+    };
+
+    constexpr size_t kMaxToolhelpModuleRows = 1024;
+    struct KmonUserModuleView
+    {
+        uint64_t Base = 0, AfterGeneration = 0;
+        size_t Rows = 0;
+        DWORD Error = ERROR_SUCCESS;
+        bool Complete = false, Stable = false, Stopped = false;
+        std::vector<std::wstring> Paths;
+        std::vector<std::pair<uint64_t, uint32_t>> Ranges;
+    };
+
+    KmonUserModuleView KmonReadFencedUserModules(KmonNativeModuleAttempt& attempt,
+        const KmonUserTarget& target, uint64_t before, HANDLE process, DeviceClient* device, SymbolEngine* symbols,
+        const std::wstring& leaf, const std::atomic<bool>& stop)
+    {
+        KmonUserModuleView view;
+        view.Stopped = stop.load();
+        const HANDLE handle = view.Stopped ? INVALID_HANDLE_VALUE :
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, target.Pid);
+        if (handle == INVALID_HANDLE_VALUE) { view.Error = view.Stopped ? ERROR_CANCELLED : GetLastError(); }
+        else
+        {
+            const std::unique_ptr<void, decltype(&CloseHandle)> owner(handle, &CloseHandle);
+            MODULEENTRY32W row{}; row.dwSize = sizeof(row);
+            BOOL more = Module32FirstW(handle, &row);
+            bool rangesValid = true;
+            while (more)
+            {
+                if (stop.load()) { view.Stopped = true; view.Error = ERROR_CANCELLED; break; }
+                if (view.Rows == kMaxToolhelpModuleRows) { view.Error = ERROR_MORE_DATA; break; }
+                ++view.Rows;
+                const auto base = reinterpret_cast<uint64_t>(row.modBaseAddr);
+                if (!KmonUserModuleRangeValid(base, row.modBaseSize))
+                { rangesValid = false; view.Error = ERROR_INVALID_DATA; break; }
+                if (!view.Base && (KmonBasenameLower(row.szExePath) == leaf || KmonBasenameLower(row.szModule) == leaf))
+                { view.Base = base; }
+                view.Paths.emplace_back(row.szExePath);
+                view.Ranges.emplace_back(base, row.modBaseSize);
+                row.dwSize = sizeof(row);
+                more = Module32NextW(handle, &row);
+            }
+            if (!more) { view.Error = GetLastError(); }
+            view.Complete = KmonUserModuleWalkComplete(view.Rows, more != FALSE, rangesValid, view.Error);
+        }
+        view.AfterGeneration = QueryPidCreateTime(device, symbols, process, target.Pid);
+        view.Stable = KmonUserSnapshotGenerationMatches(target.CreateTime, before, view.AfterGeneration, process != nullptr);
+        view.Stopped = view.Stopped || stop.load();
+        if (!view.Stable)
+        {
+            attempt.Fail(view.AfterGeneration && before && process ? KmonModuleResult::GenerationChanged :
+                KmonModuleResult::IdentityUnavailable);
+        }
+        else
+        {
+            attempt.Debt.ConcludeWalk(attempt.Visit, view.AfterGeneration, view.Complete, view.Error, view.Stopped, GetTickCount64());
+        }
+        return view;
+    }
+
     struct KmonNativeUserInventorySource
     {
         DeviceClient* Device;
@@ -8141,6 +8211,7 @@ namespace
                 target.CreateTime = QueryProcessCreateTicks(process.get());
                 if (target.CreateTime != 0)
                 {
+                    target.PinnedGeneration = true;
                     std::vector<wchar_t> path(32768, L'\0'); DWORD length = static_cast<DWORD>(path.size());
                     if (QueryFullProcessImageNameW(process.get(), 0, path.data(), &length) && length != 0)
                     { target.ImagePath.assign(path.data(), length); }
@@ -8176,6 +8247,7 @@ struct KernelMonitor::UserDeepWork
     std::vector<std::wstring> WatchNames;
     KmonUserThreadInventory Threads;
     KmonUserInventoryPosition Reservation;
+    KmonUserModuleDebt::Key ModuleDebtLoan{};
     bool ReservationEntered = false;
     bool SnapshotCapped = false, DeepCapped = false, CursorCapacityLimited = false;
     UserDeepWork(size_t count, uint64_t selected) : Scheduling(count, selected) {}
@@ -8184,7 +8256,9 @@ struct KernelMonitor::UserDeepWork
         auto json = Scheduling.Json(now); json.pop_back();
         json += L",\"reserved_inventory_pid\":" + mcpjson::Quote(std::to_wstring(Reservation.AfterPid)) +
             L",\"reserved_through_pid\":" + mcpjson::Quote(std::to_wstring(Reservation.ThroughPid)) +
-            L",\"reservation_entered\":" + (ReservationEntered ? L"true" : L"false") + L",\"targets\":[";
+            L",\"reservation_entered\":" + (ReservationEntered ? L"true" : L"false") +
+            L",\"module_debt_loan_pid\":" + mcpjson::Quote(std::to_wstring(ModuleDebtLoan.first)) +
+            L",\"module_debt_loan_generation\":" + mcpjson::Quote(std::to_wstring(ModuleDebtLoan.second)) + L",\"targets\":[";
         for (size_t i = 0; i < Targets.size(); ++i)
         {
             if (i) { json += L","; }
@@ -8208,7 +8282,12 @@ void KernelMonitor::CancelUserDeep()
         UserDeep.reset();
     }
 }
-void KernelMonitor::ResetUserDeep() { UserDeep.reset(); LastUserDeep.clear(); }
+void KernelMonitor::ResetUserDeep()
+{
+    UserDeep.reset(); LastUserDeep.clear();
+    *UserModuleDebt = KmonUserModuleDebt{};
+}
+std::wstring KernelMonitor::UserModuleDebtJson(uint64_t now) const { return UserModuleDebt->Json(now); }
 
 bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
 {
@@ -8245,6 +8324,10 @@ bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
     check(monitor.DispatchDiscovery(step) == KmonDiscoveryDispatch::Returned && !monitor.UserDeep,
         "second dispatch consumes the retained tail and releases cohort metadata");
     const auto complete = monitor.UserDeepJson(GetTickCount64());
+    const auto rejectedModuleDebt = monitor.UserModuleDebtJson(GetTickCount64());
+    const auto* rejectedModule = monitor.UserModuleDebt->Find({pid, created + 1});
+    check(rejectedModule && rejectedModule->Pending && !rejectedModule->Successful &&
+        rejectedModule->Result == KmonModuleResult::GenerationChanged, "a rejected inventory generation keeps its observation debt");
     check(!monitor.UserInventory && monitor.UserHostilityScans.load() == 0 && monitor.UserLayoutLeads.size() == 2,
         "pending deep cohort does not restart inventory or consume rejected leads");
     check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before,
@@ -8281,11 +8364,61 @@ bool KmonUserDeepIntegrationSelfTest(std::wstring* diagnostics)
     check(!KmonCollectLiveUserThreadStarts(&rejected, pid, created + 1, &afterTid, &quota, &starts) &&
         !rejected.Attempted && quota == 2, "thread query rejects a changed process generation before snapshot");
     check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before, "early thread-query rejection closes process handle");
+    monitor.ResetTemporalDetections();
+    std::atomic<bool> stopModuleRead{false};
+    const auto readModules = [&](uint64_t expected, bool failAfterRead = false)
+    {
+        KmonUserTarget target; target.Pid = pid; target.CreateTime = expected;
+        KmonNativeModuleAttempt attempt(*monitor.UserModuleDebt, {pid, expected}, false);
+        const auto pinned = QueryPidCreateTime(nullptr, nullptr, GetCurrentProcess(), pid);
+        monitor.UserModuleDebt->Pin(attempt.Visit, pinned, GetTickCount64());
+        auto view = KmonReadFencedUserModules(attempt, target, pinned, GetCurrentProcess(), nullptr, nullptr, L"", stopModuleRead);
+        if (failAfterRead) { throw std::runtime_error("owned downstream interruption"); }
+        return view;
+    };
+    GetProcessHandleCount(GetCurrentProcess(), &before);
+    const auto firstView = readModules(0);
+    const auto exeBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+    check(firstView.Complete && firstView.Stable && firstView.AfterGeneration == created && firstView.Rows == firstView.Paths.size() &&
+        std::any_of(firstView.Ranges.begin(), firstView.Ranges.end(), [&](const auto& range) { return range.first == exeBase && range.second != 0; }),
+        "complete native module inventory contains the owned executable under its pinned generation");
+    const auto firstModuleDebt = monitor.UserModuleDebtJson(GetTickCount64());
+    check(!monitor.UserModuleDebt->Find({pid, 0}) && monitor.UserModuleDebt->Find({pid, created}) &&
+        monitor.UserModuleDebt->Find({pid, created})->Successful, "an initially unknown PID is credited only after binding");
+    const auto secondView = readModules(created);
+    const auto* receipt = monitor.UserModuleDebt->Find({pid, created});
+    check(secondView.Complete && secondView.Stable && receipt && !receipt->Pending &&
+        receipt->Result == KmonModuleResult::Observed, "second qualified acquisition closes the pending revisit");
+    const auto secondModuleDebt = monitor.UserModuleDebtJson(GetTickCount64());
+    const auto lastObserved = receipt ? receipt->LastSuccess : 0;
+    stopModuleRead.store(true);
+    const auto stoppedView = readModules(created);
+    check(stoppedView.Stopped && !stoppedView.Complete && receipt && receipt->Pending &&
+        receipt->Result == KmonModuleResult::Cancelled && receipt->LastSuccess == lastObserved,
+        "cancellation at the native source cannot refresh the last successful module walk");
+    const auto stoppedModuleDebt = monitor.UserModuleDebtJson(GetTickCount64());
+    try
+    {
+        KmonNativeModuleAttempt interrupted(*monitor.UserModuleDebt, {pid, created}, false);
+        throw std::runtime_error("owned module observation interruption");
+    }
+    catch (const std::runtime_error&) {}
+    check(receipt && receipt->Result == KmonModuleResult::Fault && receipt->LastSuccess == lastObserved,
+        "unwinding before module qualification records only a failed attempt");
+    stopModuleRead.store(false);
+    try { readModules(created, true); } catch (const std::runtime_error&) {}
+    check(receipt && !receipt->Pending && receipt->Result == KmonModuleResult::Observed,
+        "unwinding after a completed module acquisition preserves the source receipt");
+    const auto afterFaultModuleDebt = monitor.UserModuleDebtJson(GetTickCount64());
+    check(GetProcessHandleCount(GetCurrentProcess(), &after) && after == before, "native module walk and cancellation close their snapshot handles");
     if (diagnostics)
     {
         *diagnostics = L"{\"schema\":\"kn.user_deep_test.v1\",\"driver_loaded\":false,\"native_generation_rejection\":true,"
             L"\"native_thread_queries\":true,\"full_target_inspection_validated\":false,\"passed\":" + std::wstring(failures ? L"false" : L"true") +
-            L",\"checks\":" + std::to_wstring(checks) + L",\"partial\":" + partial + L",\"complete\":" + complete + L",\"stopped\":" + stopped + L"}";
+            L",\"checks\":" + std::to_wstring(checks) + L",\"partial\":" + partial + L",\"complete\":" + complete + L",\"stopped\":" + stopped +
+            L",\"module_rejected\":" + rejectedModuleDebt + L",\"module_first\":" + firstModuleDebt +
+            L",\"module_second\":" + secondModuleDebt + L",\"module_stopped\":" + stoppedModuleDebt +
+            L",\"module_after_fault\":" + afterFaultModuleDebt + L"}";
     }
     std::fprintf(stderr, "[user.deep.native] checks=%u failed=%u\n", checks, failures);
     return failures == 0;
@@ -8384,7 +8517,8 @@ bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)
     return failures == 0;
 }
 
-KernelMonitor::KernelMonitor() { PublicationTimings.StartCollection(GetTickCount64()); }
+KernelMonitor::KernelMonitor() : UserModuleDebt(std::make_unique<KmonUserModuleDebt>())
+{ PublicationTimings.StartCollection(GetTickCount64()); }
 
 KernelMonitor::~KernelMonitor()
 {
@@ -17454,13 +17588,16 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
             watches = WatchPids; names = WatchNamesLower;
             for (auto it = SuspectProcesses.begin(); it != SuspectProcesses.end();)
             {
-                if (started >= it->second.LastObservedMs && started - it->second.LastObservedMs > 120000)
+                constexpr uint64_t suspectRetentionMs = 120000;
+                if (started >= it->second.LastObservedMs && started - it->second.LastObservedMs > suspectRetentionMs)
                 { it = SuspectProcesses.erase(it); }
                 else
                 {
                     const auto& source = it->second;
                     KmonUserTarget target;
                     target.Pid = source.Pid; target.CreateTime = source.CreateTime; target.Eprocess = source.Eprocess;
+                    target.SuspectExpiresMs = source.LastObservedMs >= UINT64_MAX - suspectRetentionMs ?
+                        UINT64_MAX : source.LastObservedMs + suspectRetentionMs + 1;
                     target.ImagePath = source.Image; target.Leaf = KmonBasenameLower(source.Image);
                     suspects.push_back(std::move(target)); ++it;
                 }
@@ -17503,6 +17640,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
             std::wstring());
         if (targets.empty())
         {
+            UserModuleDebt->Refresh(targets, {}, false, GetTickCount64());
             return KmonDiscoveryDispatch::Returned;
         }
     }
@@ -17554,6 +17692,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
     std::vector<uint32_t> priorityPids;
     std::vector<uint32_t> backgroundPids;
     const uint64_t schedulingNow = GetTickCount64();
+    const auto moduleLoan = UserModuleDebt->Refresh(targets, userGenerations, !walkIncomplete && !snapshotCapped, schedulingNow);
     uint64_t oldest = 0;
     for (auto& target : targets)
     {
@@ -17595,7 +17734,8 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
         }
     }
     const auto schedule = KmonSelectUserPids(watchedUserPids, priorityPids, backgroundPids,
-        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor, urgentPids, &UrgentUserPidCursor, reservation.AfterPid);
+        &WatchedUserPidCursor, &HighPriorityPidCursor, &BackgroundPidCursor, urgentPids, &UrgentUserPidCursor,
+        reservation.AfterPid ? reservation.AfterPid : moduleLoan.first);
     std::map<uint32_t, size_t> selected;
     for (size_t index = 0; index < schedule.size(); ++index)
     {
@@ -17612,6 +17752,7 @@ KmonDiscoveryDispatch KernelMonitor::ScanUserModeHostility()
     KmonAssignUserThreadQueryQuotas(&targets, 1024);
     auto work = std::make_unique<UserDeepWork>(targets.size(), GetTickCount64());
     work->Reservation = reservation;
+    work->ModuleDebtLoan = moduleLoan;
     work->SnapshotCapped = snapshotCapped;
     work->DeepCapped = watchedUserPids.size() + priorityPids.size() + backgroundPids.size() > targets.size();
     for (size_t i = 0; i < targets.size() && i < 2; ++i)
@@ -17716,6 +17857,7 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
             return !StopRequested.load();
         };
         const auto scanKey = std::make_pair(pid, target.CreateTime);
+        KmonNativeModuleAttempt moduleAttempt(*UserModuleDebt, scanKey, work.ModuleDebtLoan.first && work.ModuleDebtLoan == scanKey);
         UserLastScanMs[scanKey] = GetTickCount64();
         if (UserLastScanMs.size() > 4096)
         {
@@ -17743,10 +17885,13 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
             // Kernel-only readers can obtain CreateTime from that same object.
             processHandle = OpenProcess(0, FALSE, pid);
         }
+        const DWORD openError = processHandle ? ERROR_SUCCESS : GetLastError();
         const std::unique_ptr<void, decltype(&CloseHandle)> processHandleOwner(
             processHandle, &CloseHandle);
         if (processHandle == nullptr && target.Suspect)
         {
+            moduleAttempt.Fail(openError == ERROR_ACCESS_DENIED ? KmonModuleResult::AccessDenied :
+                KmonModuleResult::IdentityUnavailable, openError);
             ScanConcealedUserProcess(pid, target.Eprocess, target.CreateTime, target.ImagePath);
             return KmonUserDeepResult::Returned;
         }
@@ -17760,6 +17905,9 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
                 processCreateTime,
                 processHandle != nullptr))
         {
+            const auto reason = openError == ERROR_ACCESS_DENIED ? KmonModuleResult::AccessDenied :
+                processHandle && processCreateTime ? KmonModuleResult::GenerationChanged : KmonModuleResult::IdentityUnavailable;
+            moduleAttempt.Fail(reason, openError);
             EmitUnique(
                 L"process.implant", generationKey, std::wstring(), L"user",
                 L"user-mode cross-view skipped; process generation is unavailable or changed pid=" +
@@ -17771,6 +17919,7 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
             return KmonUserDeepResult::IdentityRejected;
         }
 
+        UserModuleDebt->Pin(moduleAttempt.Visit, processCreateTime, GetTickCount64());
         // Unknown inventory identity cannot carry its old path into a new
         // process. Read the pinned object's path before using name-based rules.
         std::wstring imagePath = target.CreateTime != 0
@@ -17818,87 +17967,25 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
                 pid);
         }
 
-            uint64_t moduleBase = 0;
-            std::vector<std::wstring> modulePaths;
-            std::vector<std::pair<uint64_t, uint32_t>> moduleRanges;
-            HANDLE modSnap = CreateToolhelp32Snapshot(
-                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                pid);
-            size_t moduleCount = 0;
-            constexpr size_t kMaxModuleRows = 1024;
-            bool moduleWalkOk = false;
-            bool moduleRangesValid = true;
-            DWORD modError = modSnap == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-            if (modSnap != INVALID_HANDLE_VALUE)
-            {
-                const std::unique_ptr<void, decltype(&CloseHandle)> moduleSnapshotOwner(
-                    modSnap, &CloseHandle);
-                MODULEENTRY32W moduleEntry = {};
-                moduleEntry.dwSize = sizeof(moduleEntry);
-                BOOL moreMod = FALSE;
-                if (Module32FirstW(modSnap, &moduleEntry))
-                {
-                    moreMod = TRUE;
-                    do
-                    {
-                        if (moduleCount >= kMaxModuleRows)
-                        {
-                            modError = ERROR_MORE_DATA;
-                            break;
-                        }
-                        ++moduleCount;
-                        const uint64_t rangeBase = reinterpret_cast<uint64_t>(moduleEntry.modBaseAddr);
-                        if (!KmonUserModuleRangeValid(rangeBase, moduleEntry.modBaseSize))
-                        {
-                            moduleRangesValid = false;
-                            modError = ERROR_INVALID_DATA;
-                            break;
-                        }
-                        const std::wstring moduleLeaf = KmonBasenameLower(moduleEntry.szExePath);
-                        const bool isExe =
-                            moduleLeaf == leaf ||
-                            KmonBasenameLower(moduleEntry.szModule) == leaf;
-                        if (isExe && moduleBase == 0)
-                        {
-                            moduleBase = rangeBase;
-                        }
-                        modulePaths.push_back(moduleEntry.szExePath);
-                        moduleRanges.emplace_back(rangeBase, moduleEntry.modBaseSize);
-                        moduleEntry.dwSize = sizeof(moduleEntry);
-                        moreMod = Module32NextW(modSnap, &moduleEntry);
-                        if (!moreMod)
-                        {
-                            modError = GetLastError();
-                        }
-                    } while (moreMod);
-                    moduleWalkOk = KmonUserModuleWalkComplete(
-                        moduleCount, moreMod != FALSE, moduleRangesValid, modError);
-                }
-                else
-                {
-                    modError = GetLastError();
-                }
-            }
-            const uint64_t afterModuleSnapshot =
-                QueryPidCreateTime(device, symbols, processHandle, pid);
-            if (!KmonUserSnapshotGenerationMatches(
-                    target.CreateTime,
-                    processCreateTime,
-                    afterModuleSnapshot,
-                    processHandle != nullptr))
+            auto moduleView = KmonReadFencedUserModules(moduleAttempt, target, processCreateTime, processHandle,
+                device, symbols, leaf, StopRequested);
+            const auto moduleBase = moduleView.Base;
+            auto& modulePaths = moduleView.Paths;
+            auto& moduleRanges = moduleView.Ranges;
+            if (!moduleView.Stable)
             {
                 EmitUnique(
                     L"process.implant", generationKey, std::wstring(), L"user",
                     L"user-mode cross-view discarded; process generation changed or became unreadable pid=" +
                         std::to_wstring(pid),
                     L"before_generation=" + HexU64(processCreateTime) +
-                        L" after_generation=" + HexU64(afterModuleSnapshot),
+                        L" after_generation=" + HexU64(moduleView.AfterGeneration),
                     pid);
                 return KmonUserDeepResult::IdentityRejected;
             }
             ClearEmittedKeyForPid(generationKey, pid);
             userGenerations[pid] = processCreateTime;
-            if (StopRequested.load()) { return KmonUserDeepResult::Cancelled; }
+            if (moduleView.Stopped || StopRequested.load()) { return KmonUserDeepResult::Cancelled; }
             const auto lead = UserLayoutLeads.find(scanKey);
             if (lead != UserLayoutLeads.end())
             {
@@ -17913,7 +18000,7 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
                 RecordEvent(std::move(scheduled));
                 UserLayoutLeads.erase(lead);
             }
-            const bool moduleInventoryComplete = moduleWalkOk;
+            const bool moduleInventoryComplete = moduleView.Complete;
             const std::wstring moduleInventoryKey =
                 L"scan_failed:userhostility:modules:" + std::to_wstring(pid);
             if (!moduleInventoryComplete)
@@ -17922,8 +18009,8 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
                     L"process.implant", moduleInventoryKey, imagePath, L"user",
                     L"Toolhelp module inventory was incomplete pid=" +
                         std::to_wstring(pid) + L" " + leaf,
-                    L"rows=" + std::to_wstring(moduleCount) +
-                        L" error=" + std::to_wstring(modError) +
+                    L"rows=" + std::to_wstring(moduleView.Rows) +
+                        L" error=" + std::to_wstring(moduleView.Error) +
                         L" absence-based user-mode verdicts are unavailable",
                     pid);
             }
@@ -18067,7 +18154,7 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
             const bool vadGenerationMatches = hasKernelVadScan && kernelVad.Target.HasCreateTime &&
                 kernelVad.Target.CreateTime == QueryPidCreateTime(device, symbols, processHandle, pid);
             const auto imageCandidates = KmonCollectUserImageCandidates(
-                modulePaths, moduleRanges, vadGenerationMatches ? &kernelVad : nullptr, kMaxModuleRows);
+                modulePaths, moduleRanges, vadGenerationMatches ? &kernelVad : nullptr, kMaxToolhelpModuleRows);
             const auto& imagePaths = imageCandidates.Paths;
             const auto& imageRanges = imageCandidates.Ranges;
             const bool kernelModuleInventory = imageRanges.size() > moduleRanges.size();

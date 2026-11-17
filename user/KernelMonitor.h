@@ -272,6 +272,8 @@ enum class KmonModuleDiffKind
     Remap,
 };
 
+class KmonUserModuleDebt;
+
 class KernelMonitor
 {
 public:
@@ -480,6 +482,8 @@ private:
     void ResetUserInventory();
     struct UserDeepWork;
     std::unique_ptr<UserDeepWork> UserDeep;
+    std::unique_ptr<KmonUserModuleDebt> UserModuleDebt;
+    std::wstring UserModuleDebtJson(uint64_t now) const;
     std::wstring LastUserDeep;
     std::wstring UserDeepJson(uint64_t now) const;
     void CancelUserDeep();

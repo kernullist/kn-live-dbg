@@ -2037,6 +2037,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain, uint64_t budgetMs, bool
         event.Evidence[L"discovery_scheduling_json"] = DiscoveryScheduling.Json(now);
         event.Evidence[L"user_inventory_json"] = UserInventoryJson(now);
         event.Evidence[L"user_deep_scheduling_json"] = UserDeepJson(now);
+        event.Evidence[L"user_module_debt_json"] = UserModuleDebtJson(now);
         event.Evidence[L"capture_pending"] = std::to_wstring(PriorityCaptures.Size() + ContinuedCaptures.Size());
         event.Evidence[L"capture_queue_dropped"] = std::to_wstring(PriorityCaptures.Loss() + ContinuedCaptures.Loss());
         const auto captureNow = GetTickCount64();
