@@ -15,6 +15,32 @@ GATES = ("retained_recipe_and_reference", "selected_comparison_policy", "mapped_
 PROPERTIES = ("full_requested_range_match", "stable_difference_in_compared_range")
 
 
+def unpack_recipe(document):
+    return document["payload"]["recipe"] if document["schema"] == "kn.image_claim_publication.v1" else document
+
+
+def check_original_claim(document, replay):
+    original = replay["original_claim_replay"]
+    assert not original["collector_authenticated"] and not original["journal_membership_checked"]
+    if document["schema"] != "kn.image_claim_publication.v1":
+        assert original["status"] == "not_recorded" and not original["original_claim_policy_reproduced"]
+        assert not any(original[key] for key in ("publication_sha256", "recorded_assessment_sha256", "registry", "policy"))
+        return
+    assert set(document) == {"schema", "publication_sha256", "payload"}
+    assert set(document["payload"]) == {"recipe", "recorded_claim"}
+    canonical = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+    digest = hashlib.sha256(canonical(document["payload"])).hexdigest()
+    assert digest == document["publication_sha256"] == original["publication_sha256"]
+    report = document["payload"]["recorded_claim"]
+    assert original["recorded_assessment_sha256"] == hashlib.sha256(canonical(report)).hexdigest()
+    assert original["policy"] == report["policy"] and original["registry"] == report["registry"]
+    current = replay["mode"] == "current_reanalysis"
+    assert original["status"] == ("not_requested" if current else "reproduced")
+    assert original["original_claim_policy_reproduced"] == original["assessment_matches_current_report"] == (not current)
+    if not current:
+        assert replay["claim_assessment"] == report, "original evaluation is reproduced, not substituted"
+
+
 def normalized_pe(blob, image_base, rva, length):
     def unpack(fmt, offset):
         return struct.unpack_from("<" + fmt, blob, offset)[0]

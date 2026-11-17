@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 
-from image_claim_oracle import check_report
+from image_claim_oracle import check_report, check_original_claim, unpack_recipe
 
 
 def child(image, mode):
@@ -106,7 +106,9 @@ def main():
     def replay(directory, current=False, code=0):
         result = run(["--offline", "!kmon", "replay-image", directory, *(["/current"] if current else []), "/json"], code)
         if result["status"] in ("replayed", "reanalyzed"):
-            recipe = json.loads((directory / "recipe.knverify").read_bytes())
+            source = json.loads((directory / "recipe.knverify").read_bytes())
+            recipe = unpack_recipe(source)
+            check_original_claim(source, result)
             blob = (directory / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes()
             check_report(recipe, blob, result)
         else:
@@ -147,12 +149,15 @@ def main():
                 result = run(command)
                 manifest = directory / "recipe.knverify"
                 original = manifest.read_bytes()
-                recipe = json.loads(original)
+                publication = json.loads(original)
+                recipe = unpack_recipe(publication)
                 payload = recipe["payload"]
                 read_set = payload["read_set"]
                 reads = read_set["reads"]
-                check(recipe["schema"] == "kn.image_recipe.v2" and encode(copy.deepcopy(recipe)) == original,
+                check(recipe["schema"] == "kn.image_recipe.v2" and encode(copy.deepcopy(recipe)) == json.dumps(recipe, ensure_ascii=False, separators=(",", ":")).encode(),
                       "independent canonical digest matches v2")
+                check(publication["schema"] == "kn.image_claim_publication.v1" and result["original_claim_recorded"],
+                      "live capture atomically retains the original claim before successful return")
                 check(read_set["operation_id"] == result["operation_id"] and read_set["target_id"] ==
                       f'process:{identity["pid"]}:{identity["creation"]}', "original operation binds the requested process generation")
                 check(read_set["recording_complete"] and int(read_set["attempts"]) == len(reads) and

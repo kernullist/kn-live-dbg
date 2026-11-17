@@ -112,7 +112,7 @@ def main():
         manifest = json.loads((target / "redaction.knredact").read_bytes())
         check(manifest["source_file_sha256"] == original_hashes[original], "exact original-file hash link")
         original_json = json.loads(original.read_bytes())
-        check(manifest["source_semantic_sha256"] == original_json.get("recipe_sha256", original_json.get("manifest_sha256")), "semantic hash link")
+        check(manifest["source_semantic_sha256"] == original_json.get("publication_sha256", original_json.get("recipe_sha256", original_json.get("manifest_sha256"))), "semantic hash link")
         check(manifest["replay_proof_sha256"] == sha(canonical(proof).encode()), "fresh replay proof hash link")
         check(manifest["facts_sha256"] == sha((target / "facts.knshare").read_bytes()) == package["facts_sha256"], "exact facts hash")
         check(package["manifest_sha256"] == sha((target / "redaction.knredact").read_bytes()), "exact manifest hash")

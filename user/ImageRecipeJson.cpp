@@ -368,5 +368,12 @@ std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay)
         (replay.RecordedResult.empty() ? L"null" : replay.RecordedResult) + L",\"result\":" +
         (replay.CurrentResult.empty() ? L"null" : replay.CurrentResult) +
         L",\"proof\":" + (replay.Proof.empty() ? L"null" : replay.Proof) +
-        L",\"claim_assessment\":" + (replay.ClaimAssessmentJson.empty() ? L"null" : replay.ClaimAssessmentJson) + L"}";
+        L",\"claim_assessment\":" + (replay.ClaimAssessmentJson.empty() ? L"null" : replay.ClaimAssessmentJson) +
+        L",\"original_claim_replay\":{\"status\":" + mcpjson::Quote(replay.OriginalClaimStatus) +
+        L",\"publication_sha256\":" + mcpjson::Quote(replay.ClaimPublicationSha256) +
+        L",\"recorded_assessment_sha256\":" + mcpjson::Quote(replay.RecordedClaimSha256) +
+        L",\"registry\":" + mcpjson::Quote(replay.RecordedClaimRegistry) + L",\"policy\":" + mcpjson::Quote(replay.RecordedClaimPolicy) +
+        L",\"original_claim_policy_reproduced\":" + B(replay.OriginalClaimStatus == L"reproduced") +
+        L",\"assessment_matches_current_report\":" + B(replay.OriginalClaimStatus == L"reproduced") +
+        L",\"journal_membership_checked\":false,\"collector_authenticated\":false}}";
 }

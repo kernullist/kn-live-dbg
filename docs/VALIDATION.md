@@ -7,6 +7,79 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Original direct-image claim checkpoint: 2026-11-17
+
+New direct dump/process captures retain an unchanged v1/v2 recipe and the claim
+evaluated from its original reads in one `kn.image_claim_publication.v1` root.
+Offline original-policy replay recomputes the comparison and complete claim
+report, then requires equality with the retained evaluation. Legacy input remains
+`not_recorded`; `/current` reports `not_requested` for original claim replay.
+See the [publication contract](ARCHITECTURE.md#original-direct-image-claim-publication)
+for the two digest scopes, prepublication report fields and remaining limits.
+
+The final ASan harness passed **120 C++ controls**, **34 independent PE/read claim
+replays** and **59 publication controls**. The independent oracle checks both
+canonical payload hashes, original read/byte evidence, exact report equality and
+the distinction between original and current evaluation. Rehashed verdict,
+range, ledger and injected-claim changes fail original replay; unknown claim
+registry/policy versions require explicit current reanalysis. Foreign recipe or
+reference bindings, corrupt inner/outer hashes, missing/oversized reports,
+additional root fields, truncated roots and absent references fail explicitly.
+Legacy v1/v2 imports remain covered. Mutation cleanup restores the exact original
+publication bytes instead of replacing the root with a legacy recipe.
+
+Twelve sampled process interruptions left no final root (**zero committed,
+twelve absent**). Separate controls reject an abandoned pending root and partial
+final files. These samples do not establish power-loss durability or interruption
+at every publication instruction. Normal completed roots reproduce their claims.
+
+The Release product passed the same **34 claim** and **59 publication** controls,
+**123 offline CLI checks**, and **34 historical v1/v2 compatibility replays**.
+The live runner passed **181 checks** with three owned, nonexecuting PE-buffer
+children: clean, changed and unreadable ranges. Each child exited and released its
+mapping, then the original reference path was replaced/removed before replay.
+The recorded claims remained reproducible and **zero children** remained.
+This does not validate real loaded-image or native-driver mapping lifetimes.
+
+Product slice/sweep/graph compatibility passed **440 / 312 / 1,414 checks**.
+The rebuilt ASan disclosure harness passed **506 checks**, including the product's
+offline/HTTP handler paths, with **14 owned endpoint requests** and **zero child
+processes**. Redaction binds the entire new publication root and withholds facts
+when original-policy replay fails. The public-content classifier passed **12
+tests**, including the new private publication schema.
+
+The Release build and isolated `--self-test all` passed: timeline **28**, MCP
+**102**, KMON image integration **119**, console **564**, command audit **3,011 /
+261 routes**, and remote **68** plus four connection-option controls. Capability
+checks passed **36 contracts / 261 routes** and the generated support matrix
+matches the product. Final review found no additional actionable defects in the
+reviewed scope.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Release product | `865d80213de9b1025c72e110b6b45deaaf3447516af5b0ecd9804c2e728d2b50` |
+| Direct recipe/claim publication, ASan | `b66e0bb01909e31b3634f120874d5fa5863fac60e13ef330c50b3a681211032e` |
+| Disclosure compatibility, ASan | `a0f4e2e6f9813475ba070c44fe147959f05e4c6c2f24ef8042ce736d1543792e` |
+
+Reproduce with `tools/validate-image-recipe.ps1 -Sanitize`, which prints its unique
+binary/fixture directory. `test-image-claims.py` and
+`test-image-claim-publication.py` accept `--exe <product> --fixtures <directory>
+--product`; `test-image-recipe-cli.py` and `test-live-image-recipe.py` use the same
+arguments without `--product`. The host was Windows 11 10.0.28000 / kernel
+10.0.28000.3231 with MSBuild 17.14.60, MSVC 14.44.35207 and SDK/WDK 10.0.26100.0.
+Existing C4744 link warnings remain. Run the full self-test alone.
+
+Final checks found no task process or running task-driver residue. Boot time and
+firewall settings match this run's baseline. EFS changed from stopped to running
+during validation; service-stop attempts failed with Win32 5 under the current
+non-administrator token, and the service reports `NOT_STOPPABLE`. Its running
+state remains a cleanup limitation; service configuration was unchanged.
+
+Other adapters' original claim publication, collection-journal membership,
+qualified cross-capture lifetime joins and native validation remain open. The
+earlier real-kernel PDB ASan resource failure remains unresolved. This checkpoint
+does not complete P08, native VS1 validation or the full P01-P16/VS1-VS4 goal.
+
 ## Slice and sweep claim checkpoint: 2026-11-07
 
 This P08 step adds common claim adapters for original-policy image slice and

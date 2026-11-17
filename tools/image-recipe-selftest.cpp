@@ -1,5 +1,6 @@
 #include "../user/ImageVerificationRecipe.h"
 #include "../user/ImageProof.h"
+#include "../user/ImageClaimPublication.h"
 #include "../user/ReferenceArtifact.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
@@ -321,6 +322,16 @@ int wmain(int argc, wchar_t** argv)
         }
         const auto replay = ReplayImageRecipe(directory.wstring(), false, &error);
         Check(replay.Status == L"replayed" && replay.CurrentResult == p->RecordedResult, "ordered original-policy replay matches capture");
+        std::wstring publicationJson;
+        ImageClaimPublication publication;
+        Check(ReadAnalystSnapshot((directory / L"recipe.knverify").wstring(), &publicationJson, &error, ImageClaimPublicationMaxBytes) &&
+            ParseImageClaimPublication(publicationJson, &publication, &error) && publication.RecipeJson == ImageRecipeJson(*p) &&
+            publication.ReportJson == replay.ClaimAssessmentJson && replay.OriginalClaimStatus == L"reproduced" &&
+            replay.ClaimPublicationSha256 == publication.Sha256,
+            "atomic root binds original recipe and prepublication claim without a target reread");
+        Check(!ParseImageClaimPublication(publicationJson + L" ", &publication, nullptr) &&
+            !ParseImageClaimPublication(publicationJson.substr(0, publicationJson.size() - 1), &publication, nullptr),
+            "noncanonical or interrupted claim root is not a committed publication");
         return true;
     };
     ImageVerificationRecipe original;
@@ -637,6 +648,9 @@ int wmain(int argc, wchar_t** argv)
     invalid.Reads.front().Result.Spans.front().Address = invalid.Reads.front().Address;
     Check(ImageRecipeJson(invalid).empty(), "complete raw spans must belong to the declared address width");
     const auto directory = root / L"modified";
+    std::wstring originalPublication;
+    Check(ReadAnalystSnapshot((directory / L"recipe.knverify").wstring(), &originalPublication, &error, ImageClaimPublicationMaxBytes),
+        "retain the exact committed root before legacy mutation controls");
     Check(!CaptureImageRecipe(image.wstring(), clean, Source::Base, 0x1000, 4096, directory.wstring(), &loaded, &error),
         "capture refuses an existing directory");
     auto rewritten = modified;
@@ -662,7 +676,10 @@ int wmain(int argc, wchar_t** argv)
     WriteRecipe(directory, rewritten);
     Check(ReplayImageRecipe(directory.wstring(), false, &error).Status == L"recorded_result_mismatch",
         "stored verdict is independently recomputed rather than echoed");
-    WriteRecipe(directory, modified);
+    const auto originalPublicationBytes = mcpjson::WideToUtf8(originalPublication);
+    Write(directory / L"recipe.knverify", std::vector<uint8_t>(originalPublicationBytes.begin(), originalPublicationBytes.end()));
+    Check(ReplayImageRecipe(directory.wstring(), false, &error).OriginalClaimStatus == L"reproduced",
+        "mutation cleanup restores the original publication rather than a downgraded recipe");
     Write(image, std::vector<uint8_t>{0, 1, 2});
     Check(ReplayImageRecipe(directory.wstring(), false, &error).Status == L"replayed",
         "changing the original image path cannot change retained reference replay");

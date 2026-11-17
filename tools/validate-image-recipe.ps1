@@ -21,7 +21,7 @@ if ($Sanitize)
     Copy-Item -LiteralPath $environment.AsanRuntimePath -Destination $output -Force
 }
 $program = Join-Path $output 'image-recipe-selftest.exe'
-$sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp',
+$sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp',
     'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
@@ -48,6 +48,11 @@ if ($LASTEXITCODE -ne 0)
 if ($LASTEXITCODE -ne 0)
 {
     throw 'Image claim original-evidence oracle failed'
+}
+& python (Join-Path $PSScriptRoot 'test-image-claim-publication.py') --exe $program --fixtures $output
+if ($LASTEXITCODE -ne 0)
+{
+    throw 'Original image claim publication/replay controls failed'
 }
 foreach ($format in @('v1', 'v2'))
 {

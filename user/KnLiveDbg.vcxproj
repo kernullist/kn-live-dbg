@@ -226,6 +226,7 @@
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
+    <ClCompile Include="ImageClaimPublication.cpp" />
     <ClCompile Include="ImageRecipeReadSet.cpp" />
     <ClCompile Include="ImageSliceRecipe.cpp" />
     <ClCompile Include="ImageScopeClaims.cpp" />
@@ -420,6 +421,7 @@
     <ClInclude Include="BoundedObservationJson.h" />
     <ClInclude Include="ProcessImageCapture.h" />
     <ClInclude Include="ImageProof.h" />
+    <ClInclude Include="ImageClaimPublication.h" />
     <ClInclude Include="ImageScopeClaims.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />

@@ -21,7 +21,7 @@ if ($Sanitize)
 }
 $sources = @('tools\evidence-disclosure-selftest.cpp', 'user\EvidenceDisclosure.cpp', 'user\EvidenceDisclosureFacts.cpp',
     'user\EvidencePrivacy.cpp', 'user\AiProvider.cpp', 'user\AiModelCatalog.cpp',
-    'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageVerificationRecipe.cpp',
+    'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageVerificationRecipe.cpp',
     'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp') | ForEach-Object { '"' + (Join-Path $repo $_) + '"' }

@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 
-from image_claim_oracle import check_report
+from image_claim_oracle import check_report, check_original_claim, unpack_recipe
 
 
 def main():
@@ -35,7 +35,9 @@ def main():
         if arguments[0] == "replay-image":
             if document["status"] in ("replayed", "reanalyzed"):
                 case = Path(arguments[1])
-                recipe = json.loads((case / "recipe.knverify").read_bytes())
+                source = json.loads((case / "recipe.knverify").read_bytes())
+                recipe = unpack_recipe(source)
+                check_original_claim(source, document)
                 check_report(recipe, (case / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes(), document)
             else:
                 check(document["claim_assessment"] is None, "failed replay cannot expose a current claim report")
@@ -55,8 +57,10 @@ def main():
               "qualified full dump source can record a normalized comparison")
         manifest = case / "recipe.knverify"
         original = manifest.read_bytes()
-        recipe = json.loads(original)
-        check(encode(copy.deepcopy(recipe)).encode() == original, "independent Python canonical digest matches")
+        publication = json.loads(original)
+        recipe = unpack_recipe(publication)
+        check(encode(copy.deepcopy(recipe)) == json.dumps(recipe, ensure_ascii=False, separators=(",", ":")), "independent Python inner recipe digest matches")
+        check(publication["schema"] == "kn.image_claim_publication.v1", "new capture commits recipe and original claim together")
         blob = case / (recipe["payload"]["reference_sha256"] + ".knblob")
         artifact = blob.read_bytes()
         check(artifact == image.read_bytes() and hashlib.sha256(artifact).hexdigest() == result["reference_sha256"],
@@ -181,7 +185,7 @@ def main():
         sparse = root / "sparse"
         shutil.copytree(fixtures / "sparse", sparse)
         sparse_manifest = sparse / "recipe.knverify"
-        sparse_recipe = json.loads(sparse_manifest.read_bytes())
+        sparse_recipe = unpack_recipe(json.loads(sparse_manifest.read_bytes()))
         for field in ("source_id", "consistency"):
             changed = copy.deepcopy(sparse_recipe)
             partial = [read for read in changed["payload"]["reads"] if read["state"] == "partial"]

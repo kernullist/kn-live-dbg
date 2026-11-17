@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 
-from image_claim_oracle import check_report
+from image_claim_oracle import check_report, check_original_claim, unpack_recipe
 
 
 def main():
@@ -24,7 +24,8 @@ def main():
         nonlocal runs
         recipe_path = case / "recipe.knverify"
         before = recipe_path.read_bytes()
-        recipe = json.loads(before)
+        source = json.loads(before)
+        recipe = unpack_recipe(source)
         command = [str(args.exe.resolve())] + (["--offline", "!kmon", "replay-image"] if args.product else ["--report"])
         result = subprocess.run(command + [str(case.resolve())] + (["/current"] if current else []),
                                 capture_output=True, text=True, encoding="utf-8", timeout=60)
@@ -35,6 +36,7 @@ def main():
         if expected in ("replayed", "reanalyzed"):
             blob = (case / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes()
             states.update(check_report(recipe, blob, document))
+            check_original_claim(source, document)
         else:
             assert document["claim_assessment"] is None and document["proof"] is None
         runs += 1
@@ -53,7 +55,7 @@ def main():
         case = Path(temporary) / "case"
         shutil.copytree(args.fixtures / "modified", case)
         manifest = case / "recipe.knverify"
-        original = json.loads(manifest.read_bytes())
+        original = unpack_recipe(json.loads(manifest.read_bytes()))  # Preserve legacy mutation controls.
         for mutation in ("policy", "normalization", "recorded_result", "claim_injection"):
             document = copy.deepcopy(original)
             if mutation == "policy":

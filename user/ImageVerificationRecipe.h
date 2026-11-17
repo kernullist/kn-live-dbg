@@ -59,6 +59,8 @@ struct ImageRecipeReplay
     std::wstring RecordedResult;
     std::wstring Proof;
     std::wstring ClaimAssessmentJson;
+    std::wstring OriginalClaimStatus = L"not_recorded";
+    std::wstring ClaimPublicationSha256, RecordedClaimSha256, RecordedClaimRegistry, RecordedClaimPolicy;
 };
 
 std::wstring ImageRecipeJson(const ImageVerificationRecipe& recipe);

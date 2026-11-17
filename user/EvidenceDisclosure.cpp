@@ -1,6 +1,7 @@
 #include "EvidenceDisclosure.h"
 #include "EvidencePrivacy.h"
 #include "ImageVerificationRecipe.h"
+#include "ImageClaimPublication.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -49,7 +50,7 @@ namespace
     {
         if (!Hex(m.Id, 32) || !Hex(m.SourceFileSha, 64) || !Hex(m.SourceSemanticSha, 64) || !Hex(m.ProofSha, 64) || !Hex(m.FactsSha, 64) ||
             !Text(m.RootIdentity, 160) || !Text(m.Principal, 256) || !Text(m.SourcePath, 30000) || m.Created == 0 ||
-            (m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_slice.v1" &&
+            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_slice.v1" &&
                 m.SourceSchema != L"kn.image_slice.v2" && m.SourceSchema != L"kn.image_sweep.v1")) { return L""; }
         return L"{\"schema\":\"kn.redaction_manifest.v1\",\"policy\":\"kn.image_counts_redaction.v1\",\"redaction_id\":" + mcpjson::Quote(m.Id) +
             L",\"root_identity\":" + mcpjson::Quote(m.RootIdentity) + L",\"principal\":" + mcpjson::Quote(m.Principal) +
@@ -120,11 +121,14 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
             else { original /= L"recipe.knverify"; }
         }
         std::wstring originalJson, originalHash;
-        auto originalFile = Read(original, ImageRecipeMaxBytes, &originalJson, &originalHash);
+        auto originalFile = Read(original, ImageClaimPublicationMaxBytes, &originalJson, &originalHash);
         if (!originalFile) { return fail(L"disclosure_original_unavailable"); }
         const auto replay = ReplayImageRecipe(replayInput.wstring(), false, nullptr);
-        const auto semanticHash = Field(originalJson, extension == L".knsweep" ? L"manifest_sha256" : L"recipe_sha256");
-        if (!Hex(semanticHash, 64) || semanticHash != (extension == L".knsweep" ? replay.ManifestSha256 : replay.RecipeSha256))
+        const bool claimPublication = Field(originalJson, L"schema") == ImageClaimPublicationSchema;
+        const auto semanticHash = Field(originalJson, claimPublication ? L"publication_sha256" :
+            extension == L".knsweep" ? L"manifest_sha256" : L"recipe_sha256");
+        if (!Hex(semanticHash, 64) || semanticHash != (claimPublication ? replay.ClaimPublicationSha256 :
+            extension == L".knsweep" ? replay.ManifestSha256 : replay.RecipeSha256))
             { return fail(L"disclosure_original_replay_binding_failed"); }
         MinimizedImageFacts facts;
         if (!ProjectImageDisclosure(replay, NewDisclosureId(), &facts)) { return fail(L"disclosure_original_policy_replay_failed"); }

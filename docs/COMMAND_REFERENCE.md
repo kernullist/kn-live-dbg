@@ -190,6 +190,8 @@ new private directory. The dump must meet `dump-read` requirements. Base and RVA
 are hexadecimal. Supply locally trusted reference files; parsing is not isolated.
 The result's ownership and coverage determine the byte-comparison outcome;
 `status=recorded` means the case was published, including when reads are partial.
+New cases atomically retain the recipe and its original claim evaluation in
+`kn.image_claim_publication.v1`; `original_claim_recorded=true` confirms publication.
 
 `KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency`
 captures the same direct comparison from a live process into a v2 case. PID,
@@ -205,7 +207,8 @@ may still report an unverified or modified range. Exit 3 means stdout delivery
 failed; a case already published before that failure remains on disk.
 
 `KnLiveDbg.exe --offline !kmon replay-image <directory> /json` reruns the recorded
-policy against either v1 or v2's retained artifact and ordered raw reads. Add `/current` to
+policy against either v1 or v2's retained artifact and ordered raw reads, including
+recipes embedded in new claim publication roots. Add `/current` to
 perform current reanalysis instead; both policy identifiers and the original
 result remain visible. Missing/corrupt artifacts or unsupported original policy
 fail explicitly. Loader exclusions, partial reads and conflicting rereads cannot
@@ -226,6 +229,14 @@ the reproduced comparison. `/current` recomputes comparison normalization and
 does not assert that the recorded normalization was reproduced. Failed replay
 returns `claim_assessment=null`. See
 [direct-image claim policies](ARCHITECTURE.md#common-direct-image-claim-policies).
+
+New direct capture roots also return `original_claim_replay`. Its `reproduced`
+status requires the exact recorded registry/policy and complete report equality
+after independent replay. Unsupported recorded claim policies or altered reports
+fail original replay; `/current` instead reports `not_requested`. Legacy roots
+report `not_recorded`. The embedded claim report retains its prepublication
+fields; the separate outcome carries the later original-reproduction result and
+publication/report hashes. See [original claim publication](ARCHITECTURE.md#original-direct-image-claim-publication).
 
 Successful slice/sweep replay also returns current claim assessments under
 `kn.image_claim_policy.slice.v1` or `kn.image_claim_policy.sweep.v1`. They retain

@@ -16,7 +16,7 @@ if ($Sanitize)
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\image-slice-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp',
+$sources = @('tools\image-slice-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp',
     'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp',
     'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ImageSweepGraph.cpp', 'user\EvidenceGraphQuery.cpp',

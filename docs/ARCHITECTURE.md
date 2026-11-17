@@ -1765,7 +1765,8 @@ remain separate work.
 `--offline !kmon verify-image` now connects the dump observation source to the
 existing executable verifier and a private image case. Each case retains the
 complete reference PE as `<sha256>.knblob`, then atomically publishes
-`recipe.knverify` last. Original file identity/path and capture time remain
+`recipe.knverify` last. New captures use the claim publication root described
+below; legacy recipe roots remain readable. Original file identity/path and capture time remain
 provenance; replay opens only the retained content-addressed artifact. Both
 files are private local evidence, not public source inputs.
 
@@ -1823,7 +1824,8 @@ This path supports AMD64 direct mapping relocation bases and one range of
 1..4,096 bytes. A third header relocation base remains unqualified; the live
 sweep's independently qualified secondary image view is not silently reproduced
 by this recipe version. Limits are 64 MiB reference, 64 ordered reads and 128 KiB
-requested read bytes, with a 2 MiB recipe. File reads check a cooperative 30-second
+requested read bytes, with a 2 MiB inner recipe and a 4 MiB claim publication root.
+File reads check a cooperative 30-second
 budget; synchronous I/O and PE parsing have no hard cancellation deadline.
 Background KMON/native-fallback publication, secondary-view recipes, signed reference distribution
 and isolated parsing remain open. Existing `.kncase` replay still reports
@@ -1835,6 +1837,43 @@ valid final recipe; callers treat the missing final marker as incomplete. Case
 directories currently have explicit/manual retention and no automatic expiry or
 cross-case deduplication. Use locally trusted reference files until parser
 isolation is available.
+
+### Original direct-image claim publication
+
+New dump and process captures publish `kn.image_claim_publication.v1` in
+`recipe.knverify`. Its canonical payload contains the unchanged v1/v2 recipe
+envelope and `recorded_claim`, with a SHA-256 over both. The inner recipe retains
+its own observation digest, so claim evidence pointers resolve without a circular
+hash. The exact reference blob is still a separate content-addressed input.
+
+After collection, the writer replays only the retained reads against the pinned
+reference, verifies the recorded comparison and computes the claim report before
+publishing the final root. It makes no additional target acquisition. The root
+is flushed and renamed without replacement only after both recipe and claim are
+ready. Missing final roots, orphan blobs and `.pending-*` files do not constitute
+publication. This is the existing filesystem publication contract, not a claim
+of power-loss durability or journal membership.
+
+Offline replay validates the canonical root and inner recipe, then independently
+recomputes comparison and claims. `original_claim_replay.status=reproduced`
+requires the retained registry/policy to be implemented and the complete report
+to equal the stored report. It exposes the root and recorded-report hashes and
+sets `original_claim_policy_reproduced` and `assessment_matches_current_report`.
+An unavailable claim policy or any changed assessment fails original replay with
+`recorded_claim_policy_unavailable` or `recorded_claim_assessment_mismatch` and
+withholds proof/current-claim output. Stored assertions are never evaluator inputs.
+Future semantic changes require a new policy version and a retained old evaluator
+to continue reproducing that version.
+
+`/current` deliberately reports `not_requested` for original claim replay and
+evaluates the current policy separately. Bare v1/v2, slice and sweep recipes have
+`not_recorded`; they cannot acquire an original claim merely by being replayed.
+The frozen `recorded_claim` is the evaluation made immediately before publication:
+its conservative persistence and original-reproduction fields remain unchanged.
+The separate replay outcome carries the later reproduction result. Hashes bind
+local artifact contents without authenticating who collected or approved them.
+Original claim publication for other adapters and collection-journal integration
+remain open.
 
 ### Claim-specific image proof
 
@@ -1910,7 +1949,9 @@ ledger describes the comparison policy; `evaluation` explicitly identifies the
 current claim policy on replayed observations, and `original_claim_policy_reproduced`
 is false. `/current` also sets `recorded_normalization_reproduced=false` because
 the current verifier recomputes normalization from the retained reference.
-Claim-report persistence is not established and journal membership is not checked.
+Those fields describe this evaluation itself. For new direct capture roots,
+the separate `original_claim_replay` outcome verifies the preserved evaluation
+as described above; journal membership remains unchecked.
 
 There are exactly two claims, bounded to 256 Ki UTF-16 code units, with all
 difference ranges preserved for the at-most-4,096-byte direct recipe.
@@ -1918,9 +1959,9 @@ difference ranges preserved for the at-most-4,096-byte direct recipe.
 `claim_assessment=null`. Slice and sweep use the separate adapters described
 below; their existing proofs remain available. A scoped
 match/difference does not prove execution, writer, maliciousness, authorization,
-whole-image integrity or continuous observation. Original claim publication and
-reproduction, other object/image adapters and qualified cross-capture joins remain
-open parts of P08.
+whole-image integrity or continuous observation. Other object/image adapters,
+their original claim publication/reproduction and qualified cross-capture joins
+remain open parts of P08.
 
 ### Slice and sweep claim policies
 

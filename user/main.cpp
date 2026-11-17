@@ -23094,7 +23094,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
-    std::wcout << L"    Direct, slice and sweep replay add current claim policies, original read references and seven ledgers; each recorded policy/time scope stays separate.\n";
+    std::wcout << L"    New direct captures retain original claims; replay checks exact policy/report reproduction separately from /current. Legacy, slice and sweep claims remain current evaluations.\n";
     std::wcout << L"  !kmon replay-irp <capture.knirp> [/json]  ordered reads, schema/object invariants and scoped claims\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
@@ -23517,6 +23517,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         std::wcout << L"{\"schema\":\"kn.image_capture.v1\",\"status\":" << mcpjson::Quote(captured ? L"recorded" : L"failed")
             << L",\"reference_sha256\":" << mcpjson::Quote(recipe.ReferenceSha256) << L",\"source_id\":" << mcpjson::Quote(recipe.SourceId)
             << L",\"consistency\":" << mcpjson::Quote(recipe.SourceConsistency) << L",\"policy\":" << mcpjson::Quote(recipe.Policy)
+            << L",\"original_claim_recorded\":" << (captured ? L"true" : L"false")
             << L",\"collector_authenticated\":false,\"execution_observed\":false,\"error\":"
             << mcpjson::Quote(error) << L",\"result\":" << (captured ? recipe.RecordedResult : L"null") << L"}\n";
         return captured ? 0 : 1;

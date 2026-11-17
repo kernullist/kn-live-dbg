@@ -2,6 +2,7 @@
 #include "AnalystSnapshot.h"
 #include "ContentHash.h"
 #include "ImageProof.h"
+#include "ImageClaimPublication.h"
 #include "McpJson.h"
 #include "ReferenceArtifact.h"
 #include "ImageComparisonJson.h"
@@ -253,6 +254,68 @@ namespace
         *bytes = std::move(values);
         return true;
     }
+    ImageRecipeReplay EvaluateDirectImageRecipe(const ImageVerificationRecipe& p, const std::wstring& json,
+        ReferenceArtifact& artifact, const executable_image::DiskPeMetadata& metadata,
+        bool currentReanalysis, std::wstring* error)
+    {
+        ImageRecipeReplay result;
+        result.Mode = currentReanalysis ? L"current_reanalysis" : L"original_policy";
+        result.RecordedResult = p.RecordedResult; result.RecordedPolicy = p.Policy;
+        mcpjson::GetString(json, L"recipe_sha256", &result.RecipeSha256);
+        if (!currentReanalysis && p.Policy != ImageRecipePolicy)
+        { result.Status = L"original_policy_unavailable"; return result; }
+        if (!currentReanalysis && Normalization(metadata, p.ImageBase, p.Rva, p.Length) != p.Normalization)
+        {
+            result.Status = L"normalization_mismatch";
+            return result;
+        }
+        size_t cursor = 0;
+        bool mismatch = false;
+        const ObservationReader reader = [&](uint64_t address, size_t length, std::vector<uint8_t>* bytes)
+        {
+            bytes->clear();
+            if (currentReanalysis)
+            {
+                return ReanalysisRead(p, address, length, bytes);
+            }
+            if (cursor == p.Reads.size() || p.Reads[cursor].Address != address || p.Reads[cursor].Length != length)
+            {
+                mismatch = true;
+                return false;
+            }
+            return ExactBytes(p.Reads[cursor++], bytes);
+        };
+        ExecutablePageResult comparison;
+        bool referenceQualified = false;
+        result.CurrentResult = Execute(artifact, metadata, p, reader, &comparison, &referenceQualified);
+        if (!artifact.Unchanged())
+        {
+            result.CurrentResult.clear();
+            result.Status = L"reference_changed_during_replay";
+        }
+        else if (!currentReanalysis && (mismatch || cursor != p.Reads.size()))
+        {
+            result.CurrentResult.clear();
+            result.Status = L"recorded_read_set_mismatch";
+        }
+        else if (!currentReanalysis && result.CurrentResult != p.RecordedResult)
+        {
+            result.Status = L"recorded_result_mismatch";
+        }
+        else
+        {
+            result.Status = currentReanalysis ? L"reanalyzed" : L"replayed";
+            result.Proof = ImageProofJson(p, AssessImageProof(p, comparison, referenceQualified, currentReanalysis));
+            result.ClaimAssessmentJson = ImageClaimAssessmentJson(p, comparison, referenceQualified,
+                currentReanalysis, result.RecipeSha256);
+            if (error != nullptr)
+            {
+                error->clear();
+            }
+        }
+        return result;
+    }
+
 }
 
 std::wstring ImageComparisonResultJson(const ExecutablePageResult& result, bool qualified)
@@ -391,7 +454,12 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         return false;
     }
     const auto json = ImageRecipeJson(p);
-    if (json.empty() || !SaveObservationJson((directory / L"recipe.knverify").wstring(), json, error))
+    // Re-evaluate only the retained reads before publishing the final root.
+    // This performs no extra target read and binds the same observation digest.
+    const auto replay = json.empty() ? ImageRecipeReplay{} : EvaluateDirectImageRecipe(p, json, retained, metadata, false, error);
+    const auto publication = replay.Status == L"replayed" ? ImageClaimPublicationJson(json, replay.ClaimAssessmentJson) : L"";
+    if (publication.empty() || !retained.Unchanged() || !original.Unchanged() ||
+        !SaveObservationJson((directory / L"recipe.knverify").wstring(), publication, error))
     {
         return false;
     }
@@ -448,8 +516,17 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
     ImageVerificationRecipe p;
     std::wstring json;
     const auto root = std::filesystem::path(directory);
-    if (!ReadAnalystSnapshot((root / L"recipe.knverify").wstring(), &json, error, ImageRecipeMaxBytes, nullptr, true) ||
-        !ParseImageRecipe(json, &p, error))
+    ImageClaimPublication publication;
+    std::wstring schema;
+    bool loaded = ReadAnalystSnapshot((root / L"recipe.knverify").wstring(), &json, error, ImageClaimPublicationMaxBytes, nullptr, true);
+    if (loaded && mcpjson::GetString(json, L"schema", &schema) && schema == ImageClaimPublicationSchema)
+    {
+        result.OriginalClaimStatus = L"publication_unavailable_or_corrupt";
+        loaded = ParseImageClaimPublication(json, &publication, error);
+        if (loaded) { p = publication.Recipe; json = publication.RecipeJson; result.OriginalClaimStatus = L"not_attempted"; }
+    }
+    else if (loaded) { loaded = ParseImageRecipe(json, &p, error); }
+    if (!loaded)
     {
         result.Status = L"recipe_unavailable_or_corrupt";
         return result;
@@ -479,53 +556,33 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         result.Status = L"reference_parse_failed";
         return result;
     }
-    if (!currentReanalysis && Normalization(metadata, p.ImageBase, p.Rva, p.Length) != p.Normalization)
+    result = EvaluateDirectImageRecipe(p, json, artifact, metadata, currentReanalysis, error);
+    if (!publication.Sha256.empty())
     {
-        result.Status = L"normalization_mismatch";
-        return result;
-    }
-    size_t cursor = 0;
-    bool mismatch = false;
-    const ObservationReader reader = [&](uint64_t address, size_t length, std::vector<uint8_t>* bytes)
-    {
-        bytes->clear();
-        if (currentReanalysis)
+        result.ClaimPublicationSha256 = publication.Sha256;
+        result.RecordedClaimSha256 = publication.ReportSha256;
+        result.RecordedClaimRegistry = publication.Registry; result.RecordedClaimPolicy = publication.Policy;
+        result.OriginalClaimStatus = currentReanalysis ? L"not_requested" : L"not_attempted";
+        if (!currentReanalysis && result.Status == L"replayed")
         {
-            return ReanalysisRead(p, address, length, bytes);
-        }
-        if (cursor == p.Reads.size() || p.Reads[cursor].Address != address || p.Reads[cursor].Length != length)
-        {
-            mismatch = true;
-            return false;
-        }
-        return ExactBytes(p.Reads[cursor++], bytes);
-    };
-    ExecutablePageResult comparison;
-    bool referenceQualified = false;
-    result.CurrentResult = Execute(artifact, metadata, p, reader, &comparison, &referenceQualified);
-    if (!artifact.Unchanged())
-    {
-        result.CurrentResult.clear();
-        result.Status = L"reference_changed_during_replay";
-    }
-    else if (!currentReanalysis && (mismatch || cursor != p.Reads.size()))
-    {
-        result.CurrentResult.clear();
-        result.Status = L"recorded_read_set_mismatch";
-    }
-    else if (!currentReanalysis && result.CurrentResult != p.RecordedResult)
-    {
-        result.Status = L"recorded_result_mismatch";
-    }
-    else
-    {
-        result.Status = currentReanalysis ? L"reanalyzed" : L"replayed";
-        result.Proof = ImageProofJson(p, AssessImageProof(p, comparison, referenceQualified, currentReanalysis));
-        result.ClaimAssessmentJson = ImageClaimAssessmentJson(p, comparison, referenceQualified,
-            currentReanalysis, result.RecipeSha256);
-        if (error != nullptr)
-        {
-            error->clear();
+            // Dispatch only the exact retained code-owned policy. Future policy
+            // versions must keep their evaluator; current reanalysis is separate.
+            if (publication.Registry != L"kn.claim_registry.v1" || publication.Policy != L"kn.image_claim_policy.direct.v1")
+            {
+                result.OriginalClaimStatus = L"policy_unavailable";
+                result.Status = L"recorded_claim_policy_unavailable";
+            }
+            else if (result.ClaimAssessmentJson.empty() || result.ClaimAssessmentJson != publication.ReportJson)
+            {
+                result.OriginalClaimStatus = L"assessment_mismatch";
+                result.Status = L"recorded_claim_assessment_mismatch";
+            }
+            else { result.OriginalClaimStatus = L"reproduced"; }
+            if (result.Status != L"replayed")
+            {
+                result.Proof.clear(); result.ClaimAssessmentJson.clear();
+                if (error) { *error = L"the recorded claim policy or assessment could not be reproduced"; }
+            }
         }
     }
     return result;

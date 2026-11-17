@@ -84,6 +84,7 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
         L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) + L",\"source_id\":" + mcpjson::Quote(recipe.SourceId) +
         L",\"operation_id\":" + mcpjson::Quote(recipe.ReadSet.OperationId) + L",\"target_id\":" + mcpjson::Quote(recipe.ReadSet.TargetId) +
         L",\"policy\":" + mcpjson::Quote(recipe.Policy) + L",\"consistency\":" + mcpjson::Quote(recipe.SourceConsistency) +
+        L",\"original_claim_recorded\":" + (captured ? L"true" : L"false") +
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"residency_consent\":true,\"open_status\":" +
         std::to_wstring(openStatus) + L",\"error\":" + mcpjson::Quote(error) + L",\"result\":" +
         (captured ? recipe.RecordedResult : L"null") + L"}";
