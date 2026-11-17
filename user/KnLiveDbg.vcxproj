@@ -340,6 +340,7 @@
     <ClInclude Include="KmonHuntingJson.h" />
     <ClInclude Include="KmonWorkQueue.h" />
     <ClInclude Include="KmonCaptureScheduling.h" />
+    <ClInclude Include="KmonReferenceScheduling.h" />
     <ClInclude Include="ContentHash.h" />
     <ClInclude Include="GameBuildManifest.h" />
     <ClInclude Include="NativeHandleSnapshot.h" />

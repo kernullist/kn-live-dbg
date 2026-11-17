@@ -20,6 +20,7 @@
 #include "EvidenceBundle.h"
 #include "KmonWorkQueue.h"
 #include "KmonCaptureScheduling.h"
+#include "KmonReferenceScheduling.h"
 #include "GameBuildManifest.h"
 #include "SymbolEngine.h"
 #include "ThreatIntelSubscriber.h"
@@ -372,6 +373,7 @@ private:
     friend bool KmonImageReadIntegrationSelfTest();
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     void WorkerLoop();
     void CollectorLoop();
     void CollectLivePage(TimelineStore* timeline, uint64_t throughEventId = UINT64_MAX);
@@ -462,6 +464,7 @@ private:
         const ObservationIdentity& identity = {}, uint64_t observedAt = 0,
         const std::vector<ObservationAnchor>& anchors = {}, uint64_t expectedPeb = 0);
     void ScanExecutionReferences(size_t maxCount = 32, uint64_t budgetMs = 100, bool finalDrain = false);
+    void DrainExecutionReferences(DeviceClient* device, SymbolEngine* symbols, size_t maxCount, uint64_t budgetMs, bool finalDrain);
     static bool ResolveObservationProcess(DeviceClient& device, SymbolEngine& symbols,
         const ObservationIdentity& identity, ProcessAddressContext* context);
     void ScanExecutablePageCandidates();
@@ -834,20 +837,7 @@ private:
     uint64_t NextPageCoverageTickMs = 0;
     std::map<std::pair<uint32_t, uint64_t>, uint32_t> UserThreadCursors;
     std::map<std::pair<uint32_t, uint64_t>, std::pair<size_t, uint64_t>> UserCallbackCursors;
-    struct ExecutionReferenceWork
-    {
-        uint64_t Target = 0;
-        uint64_t Slot = 0;
-        uint64_t ObservedAt = 0;
-        uint64_t ObservedMs = 0;
-        ObservationIdentity Identity;
-        std::wstring Role;
-        std::vector<ObservationAnchor> Anchors;
-        uint64_t ExpectedPeb = 0;
-    };
-    std::deque<ExecutionReferenceWork> ExecutionReferences;
-    std::set<std::wstring> ExecutionReferenceKeys;
-    std::map<std::wstring, uint64_t> ExecutionReferenceLastChecked;
+    KmonReferenceQueue ExecutionReferences;
     uint64_t ExecutionReferenceDropped = 0;
     uint64_t ExecutionReferenceQueued = 0;
     uint64_t ExecutionReferenceProcessed = 0;
@@ -1520,3 +1510,4 @@ bool KmonPipelineSelfTest();
 bool KmonImageReadIntegrationSelfTest();
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);

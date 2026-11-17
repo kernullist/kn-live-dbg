@@ -284,7 +284,7 @@ void KernelMonitor::ServicePendingAnalysis(const wchar_t* before)
         if (!ExecutionReferences.empty())
         {
             ScanExecutionReferences(128, KmonReferenceDrainBudget(ExecutionReferences.size(),
-                GetTickCount64(), ExecutionReferences.front().ObservedMs));
+                GetTickCount64(), ExecutionReferences.OldestPendingMs()));
         }
     };
     // Older work gets a bounded turn before ingestion can add another burst.
@@ -1900,6 +1900,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"execution_references_expired"] = std::to_wstring(ExecutionReferenceExpired);
         event.Evidence[L"execution_references_max_queue_wait_ms"] = std::to_wstring(ExecutionReferenceMaxWaitMs);
         event.Evidence[L"execution_references_peak"] = std::to_wstring(ExecutionReferencePeak);
+        event.Evidence[L"reference_scheduling_json"] = ExecutionReferences.Json(GetTickCount64());
         event.Evidence[L"reference_scan_cursors"] = std::to_wstring(ReferenceScanCursors.size());
         event.Evidence[L"reference_cursor_evicted"] = std::to_wstring(ReferenceCursorEvicted);
         event.Evidence[L"reference_scan_policy"] = L"rotating static sources: IAT/table 16, kernel tables 64; not complete path coverage";

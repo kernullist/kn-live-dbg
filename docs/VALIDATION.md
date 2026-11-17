@@ -7,6 +7,65 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Execution reference scheduling checkpoint: 2026-11-17
+
+The analysis queue now enforces subject/role admission quotas, rotates admitted
+subjects and roles, and preserves original pending times and anchors on
+rediscovery. The private pipeline report separates attempts from successful
+static observations, retains bounded deferred scopes and resident debt, and
+separates normal/shutdown and successful/failed service timing. See
+[execution reference scheduling](ARCHITECTURE.md#execution-reference-scheduling).
+This completes that P09 implementation slice; it does not complete P09 or the
+full kernel-security design.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier:
+
+- `tools/validate-kmon-core.ps1` passed under `/W4 /WX`: the new reference checks
+  include pinned history through more than 16,384 completed keys, eviction,
+  invalid clocks, bounded anchors, original-work preservation and success/failure
+  timing. Its independent Python deque model passed **12,989 assertions** over
+  fixed, growing/flooded and full/expired/PID-reused cohorts. All four admission
+  limits, omitted deferred scopes and failed-success-revisit separation were
+  checked. Existing core, branch-chain, image, capture and hunting checks passed.
+- `tools/test-reference-scheduling.py --exe` passed **50 assertions** against
+  `--self-test reference-scheduler`. The actual production drain classified
+  owned readable, no-access, guard, slot/anchor mismatch, stale identity,
+  unavailable mapping and partial indirect-path cases. The absent live source
+  left work pending; shutdown samples stayed separate; a quiet role received its
+  second turn despite a flood. Guard protection remained set.
+- `tools/test-capture-scheduling-cli.py` passed **23 checks**. The isolated
+  product `--self-test all` passed **28 timeline / 102 MCP / 121 KMON image-read /
+  564 console / 3,043 command-route / 68 remote / 4 connect-option checks**.
+  Compiled capabilities exposed **44 contracts / 261 routes**, the generated
+  support matrix matched, and the publication scanner's **12 tests** passed.
+
+Adversarial validation found and corrected an unclassified early anchor failure
+and a failed exact reader retaining a resized buffer as apparent head bytes.
+Full-suite validation also exposed `0xc00000fd` in the nested image-read fixture
+path: added histogram storage enlarged already-large monitor stack frames.
+Local-symbol debugger evidence identified the path through image publication
+and path normalization. Histograms now use one scoped heap allocation, the queue
+has a compile-time stack-size bound, and the owned image-read monitor fixtures
+use scoped heap allocation. Final validation above includes these fixes. The
+two interrupted synthetic fixture roots were verified and cleaned.
+
+Final Release product SHA-256:
+`dde3390f511373d7f3631d587798b5883e88a0a788e5ab9999a45fc0e16cab00`.
+Core harness SHA-256:
+`c61d401a434f514f84362fa7211ba2f16fd4596070d76be81e20804718085be4`.
+The Release build retained the existing C4744 warning. Current-host ASan remains
+blocked by its previously recorded startup interception failure; no new ASan
+success is claimed.
+
+At **21:04 KST**, boot time remained **12:49:00.5 KST**, with no new reboot or
+BugCheck event since the preceding checkpoint, no task process/driver or parser
+preparation/profile residue, and 33 completed parser caches. BFE/mpssvc, firewall
+profiles and the EFS running/manual baseline were unchanged. Native-driver
+workloads, whole-source maximum unobserved intervals, other pipeline stages,
+durable publication latency and measured workload SLOs remain open. Resident
+history debt and dispatch fairness are not whole-pipeline coverage guarantees.
+
 ## Process mapping observation checkpoint: 2026-11-17
 
 The live process CLI now publishes v3 recipes with original `VirtualQueryEx`

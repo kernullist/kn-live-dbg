@@ -38,6 +38,11 @@ def main():
             "semantic_validation": "not_probed", "environment_regression": "not_performed"}
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
+    reference_scheduler = by_key[("scheduler", "reference_admission", "native")]
+    assert "confirmed_live_source_for_dispatch" in reference_scheduler["requirements"]
+    assert "admitted_subject_role_round_robin" in reference_scheduler["limits"]
+    assert "attempt_cooldown_not_success_revisit" in reference_scheduler["limits"]
+    assert "no_deferred_rediscovery_hard_deadline_or_measured_slo" in reference_scheduler["limits"]
     policy = by_key[("session", "mutation_gate", "native")]
     assert "default_write_denied_driver_flag" in policy["requirements"]
     assert "confirmed_session_status" in policy["requirements"]

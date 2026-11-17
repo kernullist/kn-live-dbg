@@ -11,6 +11,7 @@
 #include <Psapi.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 
 namespace
@@ -928,28 +929,18 @@ void KernelMonitor::QueueExecutionReference(uint64_t target, uint64_t slot,
     {
         actual.BootId = ObservationBootId();
     }
-    const auto key = ReferenceKey(target, slot, role, actual);
-    const auto last = ExecutionReferenceLastChecked.find(key);
-    if (last != ExecutionReferenceLastChecked.end() && GetTickCount64() - last->second < 10000)
-    {
-        return;
-    }
-    if (ExecutionReferenceKeys.count(key) != 0)
-    {
-        return;
-    }
-    if (ExecutionReferences.size() >= 1024)
+    const auto admitted = ExecutionReferences.Admit({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
+        GetTickCount64(), actual, role, anchors, expectedPeb});
+    if (admitted == KmonReferenceAdmission::Duplicate || admitted == KmonReferenceAdmission::Cooldown) { return; }
+    if (admitted != KmonReferenceAdmission::Queued)
     {
         ++ExecutionReferenceDropped;
         ++ExecutionReferenceQueueDropsByRole[role];
-        EmitUnique(L"coverage.references", L"scan_failed:references:queue_cap", L"", L"references",
-            L"execution reference queue is full", L"reference dropped; a later source sweep may rediscover it");
+        EmitUnique(L"coverage.references", L"scan_failed:references:admission:" + std::wstring(KmonReferenceAdmissionName(admitted)), L"", L"references",
+            L"execution reference admission deferred", L"bounded scope receipts in reference_scheduling_json; later rediscovery is not guaranteed");
         return;
     }
-    ExecutionReferenceKeys.insert(key);
     ++ExecutionReferenceQueued;
-    ExecutionReferences.push_back({target, slot, observedAt == 0 ? ObservationFileTime() : observedAt,
-        GetTickCount64(), actual, role, anchors, expectedPeb});
     ExecutionReferencePeak = (std::max)(ExecutionReferencePeak, ExecutionReferences.size());
 }
 
@@ -961,41 +952,47 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
     {
         return;
     }
+    DrainExecutionReferences(device, symbols, maxCount, budgetMs, finalDrain);
+}
+
+void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine* symbols,
+    size_t maxCount, uint64_t budgetMs, bool finalDrain)
+{
     const auto begin = GetTickCount64();
     for (size_t n = 0; n < maxCount && !ExecutionReferences.empty() && (finalDrain || !StopRequested.load()) &&
         GetTickCount64() - begin < budgetMs; ++n)
     {
-        auto work = std::move(ExecutionReferences.front());
+        auto work = ExecutionReferences.Pop();
         const uint64_t captureStartedMs = GetTickCount64();
+        KmonReferenceOutcome outcome = KmonReferenceOutcome::Fault;
+        struct Completion
+        {
+            KmonReferenceQueue& Queue;
+            const KmonExecutionReferenceWork& Work;
+            const uint64_t Started;
+            KmonReferenceOutcome& Outcome;
+            const bool Shutdown;
+            ~Completion() { Queue.Finish(Work, Started, GetTickCount64(), Outcome, Shutdown); }
+        } completion{ExecutionReferences, work, captureStartedMs, outcome, finalDrain};
         const auto captureId = NewEvidenceScope();
         const auto captureNativeEpoch = device->ObservationEpoch();
-        ExecutionReferences.pop_front();
         ++ExecutionReferenceProcessed;
         const auto referenceKey = ReferenceKey(work.Target, work.Slot, work.Role, work.Identity);
-        ExecutionReferenceKeys.erase(referenceKey);
         {
             std::lock_guard<std::mutex> lock(HuntMutex);
             HuntIndex.Retire(work.Identity, work.Target, work.Slot, work.Role, captureStartedMs);
         }
-        const uint64_t waited = GetTickCount64() - work.ObservedMs;
+        const uint64_t waited = captureStartedMs >= work.ObservedMs ? captureStartedMs - work.ObservedMs : 0;
         ExecutionReferenceMaxWaitMs = (std::max)(ExecutionReferenceMaxWaitMs, waited);
-        if (waited > 30000)
+        if (!ExecutionReferences.Start(work, captureStartedMs))
         {
+            outcome = captureStartedMs < work.ObservedMs ? KmonReferenceOutcome::InvalidClock : KmonReferenceOutcome::Expired;
             ++ExecutionReferenceDropped;
-            ++ExecutionReferenceExpired;
-            EmitUnique(L"coverage.references", L"scan_failed:references:expired", L"", L"references",
-                L"queued reference expired", L"reference older than 30 seconds was discarded", work.Identity.ProcessId);
+            ExecutionReferenceExpired += outcome == KmonReferenceOutcome::Expired;
+            EmitUnique(L"coverage.references", L"scan_failed:references:" + std::wstring(KmonReferenceOutcomeName(outcome)), L"", L"references",
+                L"queued reference could not start", KmonReferenceOutcomeName(outcome), work.Identity.ProcessId);
             continue;
         }
-        if (ExecutionReferenceLastChecked.size() >= 16384)
-        {
-            ExecutionReferenceLastChecked.erase(std::min_element(ExecutionReferenceLastChecked.begin(), ExecutionReferenceLastChecked.end(),
-                [](const auto& a, const auto& b)
-                {
-                    return a.second < b.second;
-                }));
-        }
-        ExecutionReferenceLastChecked[referenceKey] = GetTickCount64();
         const uint32_t pid = work.Identity.ProcessId;
         HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         if (pid != 0 && process == nullptr)
@@ -1026,6 +1023,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         };
         if (!sameProcess())
         {
+            outcome = KmonReferenceOutcome::IdentityUnavailable;
             EmitUnique(L"coverage.references", L"scan_failed:references:identity:" + std::to_wstring(pid),
                 L"", L"references", L"queued reference has stale or unknown process identity", L"", pid);
             continue;
@@ -1034,6 +1032,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         const bool pageCheck = KmonPageRole(work.Role) || work.Role == L"etw_stack_return";
         if (pid != 0 && !pageCheck && (process == nullptr || !IsWow64Process(process, &wow64) || wow64))
         {
+            outcome = KmonReferenceOutcome::ArchitectureUnavailable;
             EmitUnique(L"coverage.references", L"scan_failed:references:architecture:" + std::to_wstring(pid),
                 L"", L"references", L"static target decoding requires a confirmed native x64 process",
                 L"image page comparisons remain available; target architecture is unsupported or unknown", pid);
@@ -1068,6 +1067,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         PhysicalTranslationInfo candidateMapping = {};
         if (KmonPageRole(work.Role) && !executableMapping(work.Target, &candidateMapping))
         {
+            outcome = KmonReferenceOutcome::MappingUnavailable;
             EmitUnique(L"coverage.execution_path", L"page:unavailable:" + referenceKey, L"", work.Role,
                 L"candidate page is no longer executable or its mapping is unavailable", L"current mapping revalidation failed", pid);
             continue;
@@ -1138,6 +1138,7 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
         };
         if (!ObservationAnchorsMatch(work.Anchors, reader))
         {
+            outcome = KmonReferenceOutcome::Inconsistent;
             EmitUnique(L"coverage.references", L"reference:anchor_changed:" + referenceKey, L"", work.Role,
                 L"reference root or PE metadata changed before decoding", L"queued reference withheld", pid);
             continue;
@@ -1473,8 +1474,107 @@ void KernelMonitor::ScanExecutionReferences(size_t maxCount, uint64_t budgetMs, 
             event.Kind = L"coverage.executable_memory";
         }
         event.Evidence[L"physical_page_reader_used"] = physicalPageRead ? L"true" : L"false";
+        const bool allHeadsRead = !chain.Hops.empty() && std::all_of(chain.Hops.begin(), chain.Hops.end(),
+            [](const auto& hop) { return !hop.Bytes.empty(); });
+        const auto resolvedOutcome = chain.ReferenceChecked && !chain.ReferenceStable ? KmonReferenceOutcome::Inconsistent :
+            (!allHeadsRead || chain.Termination == L"unreadable" || chain.Termination == L"page_location_unreadable" ? KmonReferenceOutcome::ReadUnavailable :
+            (!referenceSnapshotValid ? KmonReferenceOutcome::Inconsistent :
+            ((pageCheck ? acceptedReferences != 0 : chain.Termination == L"no_supported_head_transfer") ?
+                KmonReferenceOutcome::Observed : KmonReferenceOutcome::Partial)));
+        event.Evidence[L"reference_scheduling_outcome"] = KmonReferenceOutcomeName(resolvedOutcome);
         RecordEvent(std::move(event));
+        outcome = resolvedOutcome;
     }
+}
+
+bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool value) { ++checks; if (!value) { ++failures; std::fprintf(stderr, "[reference.integration] failed %u\n", checks); } };
+    auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    const auto release = [](void* value) { if (value != nullptr) { VirtualFree(value, 0, MEM_RELEASE); } };
+    const std::unique_ptr<void, decltype(release)> owner(memory, release);
+    if (memory == nullptr) { if (diagnostics) { *diagnostics = L"{\"passed\":false,\"issue\":\"allocation_failed\"}"; } return false; }
+    std::memset(memory, 0x90, 4 * 4096);
+    memory[64] = 0xFF; memory[65] = 0xE0; // A register-indirect target remains partial.
+    const uint64_t base = reinterpret_cast<uint64_t>(memory);
+    const uint64_t other = base + 32;
+    std::memcpy(memory + 3 * 4096, &other, sizeof(other));
+    DWORD previous = 0;
+    check(VirtualProtect(memory + 4096, 4096, PAGE_NOACCESS, &previous) != FALSE);
+    check(VirtualProtect(memory + 2 * 4096, 4096, PAGE_READWRITE | PAGE_GUARD, &previous) != FALSE);
+    const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+    check(identity.HasCanonicalKey());
+    DeviceClient absent;
+    SymbolEngine symbols;
+    KernelMonitor monitor;
+    monitor.QueueExecutionReference(base, 0, L"owned_stable", identity);
+    monitor.QueueExecutionReference(base + 4096, 0, L"owned_unreadable", identity);
+    monitor.QueueExecutionReference(base + 2 * 4096, 0, L"owned_guard", identity);
+    monitor.QueueExecutionReference(base, 0, L"owned_anchor", identity, 0, {{base, {0x91}}});
+    monitor.QueueExecutionReference(base, base + 3 * 4096, L"iat", identity);
+    auto stale = identity; ++stale.CreateTime;
+    monitor.QueueExecutionReference(base, 0, L"owned_stale", stale);
+    monitor.QueueExecutionReference(base, 0, L"user_page_candidate", identity);
+    monitor.QueueExecutionReference(base + 64, 0, L"owned_partial", identity);
+    check(monitor.ExecutionReferences.size() == 8);
+    monitor.ScanExecutionReferences(32, 1000);
+    check(monitor.ExecutionReferences.size() == 8 && monitor.ExecutionReferenceProcessed == 0);
+    // Run the production drain with owned user memory and an unopened native
+    // backend. The public live-source gate above remains unchanged.
+    monitor.DrainExecutionReferences(&absent, &symbols, 32, 5000, false);
+    check(monitor.ExecutionReferences.empty() && monitor.ExecutionReferenceProcessed == 8);
+    const auto& normal = monitor.ExecutionReferences.Normal();
+    const auto count = [&](KmonReferenceOutcome outcome) { return normal.Outcomes[static_cast<size_t>(outcome)]; };
+    check(count(KmonReferenceOutcome::Observed) == 1 && count(KmonReferenceOutcome::ReadUnavailable) == 2 &&
+        count(KmonReferenceOutcome::Inconsistent) == 2 && count(KmonReferenceOutcome::IdentityUnavailable) == 1 &&
+        count(KmonReferenceOutcome::MappingUnavailable) == 1 && count(KmonReferenceOutcome::Partial) == 1);
+    check(normal.SuccessService.Samples == 1 && normal.FailedService.Samples == 7);
+    MEMORY_BASIC_INFORMATION guarded{};
+    check(VirtualQuery(memory + 2 * 4096, &guarded, sizeof(guarded)) == sizeof(guarded) && (guarded.Protect & PAGE_GUARD) != 0);
+    monitor.DrainPipelineEvents(true);
+    std::wstring pipeline;
+    bool failedHeadEmpty = false;
+    for (const auto& event : monitor.Ring)
+    {
+        if (event.Observation.Source == L"owned_unreadable")
+        {
+            const auto bytes = event.Evidence.find(L"hop_0_bytes_read");
+            failedHeadEmpty = bytes != event.Evidence.end() && bytes->second == L"0";
+        }
+        const auto found = event.Evidence.find(L"reference_scheduling_json");
+        if (event.Kind == L"coverage.pipeline" && found != event.Evidence.end()) { pipeline = found->second; }
+    }
+    check(!pipeline.empty() && failedHeadEmpty);
+
+    KernelMonitor draining;
+    draining.QueueExecutionReference(base, 0, L"owned_shutdown", identity);
+    draining.StopRequested.store(true);
+    draining.DrainExecutionReferences(&absent, &symbols, 32, 5000, false);
+    check(draining.ExecutionReferences.size() == 1);
+    draining.DrainExecutionReferences(&absent, &symbols, 32, 5000, true);
+    check(draining.ExecutionReferences.empty() && draining.ExecutionReferences.Normal().QueueWait.Samples == 0 &&
+        draining.ExecutionReferences.Shutdown().SuccessService.Samples == 1);
+
+    KernelMonitor flooding;
+    for (unsigned i = 0; i != 40; ++i) { flooding.QueueExecutionReference(base + i, 0, L"owned_flood", identity); }
+    flooding.QueueExecutionReference(base, 0, L"owned_quiet", identity);
+    check(flooding.ExecutionReferences.size() == 17 && flooding.ExecutionReferenceQueued == 17 && flooding.ExecutionReferenceDropped == 24);
+    flooding.QueueExecutionReference(base, 0, L"owned_flood", identity, 0, {{base, {0}}});
+    check(flooding.ExecutionReferenceQueued == 17);
+    flooding.DrainExecutionReferences(&absent, &symbols, 2, 5000, false);
+    KmonExecutionReferenceWork quiet; quiet.Identity = identity; quiet.Role = L"owned_quiet"; quiet.Target = base;
+    const auto* quietResult = flooding.ExecutionReferences.Find(quiet);
+    check(quietResult != nullptr && quietResult->HasSuccess && flooding.ExecutionReferences.size() == 15);
+    check(!absent.IsOpen());
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.reference_scheduler_test.v1\",\"passed\":" + std::wstring(failures == 0 ? L"true" : L"false") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"driver_loaded\":false,\"corpus\":\"owned_process_and_absent_device\",\"pipeline\":" +
+            (pipeline.empty() ? L"null" : pipeline) + L",\"shutdown\":" + draining.ExecutionReferences.Json(GetTickCount64()) +
+            L",\"admission\":" + flooding.ExecutionReferences.Json(GetTickCount64()) + L"}";
+    }
+    return failures == 0;
 }
 
 void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t base,

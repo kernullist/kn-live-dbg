@@ -411,6 +411,16 @@ or 1 on failure; extra arguments return 2. No driver is loaded. Runtime
 and urgency thresholds are not latency guarantees. See
 [capture scheduling](ARCHITECTURE.md#capture-scheduling-and-latency).
 
+`KnLiveDbg.exe --self-test reference-scheduler` checks execution-reference
+admission and the actual drain using owned user memory and an unopened native
+backend. It emits JSON and returns 0 on success, 1 on test failure or 2 for extra
+arguments. No driver is loaded. `coverage.pipeline.reference_scheduling_json`
+reports subject/role quotas, deferred scopes, resident observation debt and
+separate successful/failed and normal/shutdown timing. Attempt cooldowns and
+failed checks do not count as successful revisits. See
+[execution reference scheduling](ARCHITECTURE.md#execution-reference-scheduling)
+for retention bounds and unmeasured latency limits.
+
 Current-main KMON image comparisons preserve original read attempts for clean,
 changed and inconclusive slices in private `image-reads/*.knreads` files. Finding/image
 coverage fields `read_operation_id` and `read_set_queued_id` link to publication

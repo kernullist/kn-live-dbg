@@ -8586,8 +8586,6 @@ bool KernelMonitor::Start(
             UserImageCursors.clear();
             GraphicsSlotCursors.clear();
             ExecutionReferences.clear();
-            ExecutionReferenceKeys.clear();
-            ExecutionReferenceLastChecked.clear();
             ExecutionReferenceDropped = 0;
             ExecutionReferenceQueued = 0;
             ExecutionReferenceProcessed = 0;

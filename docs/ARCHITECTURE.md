@@ -1805,8 +1805,66 @@ user memory, including guard/no-access pages, and an explicitly absent device.
 It verifies queue/service accounting, shutdown separation and preservation of
 the kernel quantum without loading a driver. The core ASan harness additionally
 checks percentile bounds, concurrency, fixed cohorts and sustained churn.
-Image/reference/layout scheduling and generic deadline/dependency propagation
-remain separate work.
+Image/layout scheduling and generic deadline/dependency propagation remain
+separate work. Execution-reference admission is described below.
+
+## Execution reference scheduling
+
+The analysis thread admits execution references through a bounded queue:
+1,024 candidates globally, 64 per process instance, 16 per process instance and
+reference role, and 256 per role across instances. A subject is boot ID, PID and
+creation time; kernel references share one subject per boot. Optional EPROCESS
+or session assertions cannot create extra quota. A role is the producing
+scanner's declared reference kind, not an authenticated provider or a separate
+operating-system source. Existing scanner backpressure can stop discovery
+before this queue; its skipped candidates are outside these counters.
+
+Admitted subjects take turns, with roles taking turns within each subject and
+FIFO order within a subject/role. New subjects and roles join after those
+already waiting. A busy key's rediscovery increments a counter and last-seen
+time while preserving the original pending time, wall-clock observation,
+anchors, target and expected PEB. It does not claim to retain intermediate
+changes. Failed admission does not evict admitted candidates. Deferred work
+requires a later source rediscovery; that rediscovery is not guaranteed.
+
+`coverage.pipeline.reference_scheduling_json` contains a private
+`kn.reference_scheduling.v1` JSON string. It records exact deferred scope and
+reason for the first 128 distinct scope/reason pairs, coalesces repeated attempts
+for those pairs, and counts omitted attempts after that bound. These counts are
+admission attempts, not a complete distinct-target denominator. Up to 16,384
+admitted-key histories retain first/last discovery, pending time, last attempt,
+last successful check and last completed outcome. Completed histories may be
+evicted; pending/in-flight histories remain pinned. The report exposes resident
+and evicted counts, at most 64 scope details (oldest pending first), and omitted
+detail count. Maximum observation debt covers only resident admitted keys,
+using last success or first admission when no success exists. It cannot establish
+the maximum unobserved interval of all source candidates.
+
+The existing ten-second throttle is explicitly an **attempt cooldown**. Failed
+identity, architecture, mapping, read or consistency checks and partial paths do
+not advance last success. A successful bounded static check requires revalidated
+identity/anchors and either a stable supported head-chain ending without a
+recognized transfer, or an accepted page observation. It does not prove execution,
+complete control-flow coverage, verified file ownership or durable publication.
+Older-than-30-second work expires before qualification and does not advance last
+attempt or last success. Shutdown leaves any undrained work visible as pending;
+it does not count that work as successfully revisited.
+
+Queue waits include all completed dispatch outcomes. Successful and failed
+service distributions are separate; expiry and cancellation have no service
+sample. Normal and shutdown distributions are separate. Values use collector
+`GetTickCount64` milliseconds, exact maxima and log2-bucket percentile upper
+bounds. Invalid clock order is explicit. The drain's elapsed-time budget is
+cooperative between candidates; a synchronous call cannot be preempted. The
+limits are policy, not measured SLOs or a whole-pipeline budget.
+
+`--self-test reference-scheduler` exercises the actual admission/drain and pipeline
+report against owned user memory and an unopened native backend. It also checks
+that the live-source wrapper leaves work pending when its source is unavailable.
+An independent Python deque model checks fixed, growing, flooded, expired and
+PID-reused cohorts emitted by the C++ core harness. Native driver workloads,
+other pipeline stages, end-to-end durable latency and workload-specific maximum
+unobserved intervals remain open.
 
 ## Exact image reference replay
 

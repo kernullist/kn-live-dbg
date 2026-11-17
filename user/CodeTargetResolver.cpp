@@ -171,6 +171,9 @@ CodeTargetChain ResolveCodeTarget(uint64_t address, const ObservationReader& rea
         const size_t count = (std::min<uint64_t>)(32, 4096 - (address & 4095));
         if (!reader || !reader(address, count, &hop.Bytes) || hop.Bytes.size() != count)
         {
+            // This bool reader has no transferred-byte receipt. A resized or
+            // partial buffer from a failed exact read is not observed code.
+            hop.Bytes.clear();
             result.Hops.push_back(std::move(hop));
             result.Termination = L"unreadable";
             return result;
@@ -307,6 +310,16 @@ bool CodeTargetResolverSelfTest()
     memory.erase(0x1100);
     chain = ResolveCodeTarget(0x1000, reader, inspect);
     ok = ok && chain.Termination == L"unreadable";
+    const ObservationReader resizedFailure = [](uint64_t, size_t size, std::vector<uint8_t>* bytes)
+    { bytes->assign(size, 0x90); return false; };
+    const ObservationReader shortSuccess = [](uint64_t, size_t size, std::vector<uint8_t>* bytes)
+    { bytes->assign(size - 1, 0x90); return true; };
+    for (const auto& failed : {resizedFailure, shortSuccess})
+    {
+        const auto unavailable = ResolveCodeTarget(0x1000, failed, inspect);
+        ok = ok && unavailable.Termination == L"unreadable" && unavailable.Hops.size() == 1 &&
+            unavailable.Hops[0].Bytes.empty() && !unavailable.HasModifiedCode && !unavailable.HasUnownedExecutable;
+    }
     memory[0x1FFF] = {0xE9};
     chain = ResolveCodeTarget(0x1FFF, reader, inspect);
     ok = ok && chain.Termination == L"head_truncated_at_page_boundary";

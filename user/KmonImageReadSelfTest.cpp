@@ -153,7 +153,8 @@ bool KmonImageReadIntegrationSelfTest()
         routing.TargetId = L"synthetic:kmon:42:1";
         routing.AddressSpaceId = L"synthetic:kmon:42:1:user";
         routing.AllowFallback = true;
-        KernelMonitor monitor;
+        const auto monitorOwner = std::make_unique<KernelMonitor>();
+        auto& monitor = *monitorOwner;
         monitor.Options.LogDirectory = root.wstring();
         const auto verdict = monitor.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing);
         KernelMonitor::CapturedImageReads retained;
@@ -268,7 +269,8 @@ bool KmonImageReadIntegrationSelfTest()
             "actual-kmon-changed-range-graph-derives-from-replayed-originals");
         std::wstring sweepJson;
         {
-            KernelMonitor denied;
+            const auto deniedOwner = std::make_unique<KernelMonitor>();
+            auto& denied = *deniedOwner;
             denied.Options.PrivateLogRequired = true;
             denied.Options.LogDirectory = (root / L"missing-private-root").wstring();
             check(!denied.EnsureLogOpenLocked() && !std::filesystem::exists(denied.Options.LogDirectory),
@@ -286,7 +288,8 @@ bool KmonImageReadIntegrationSelfTest()
                 continue;
             }
             check(initialized.Status == L"ready", "private-root-initialized");
-            KernelMonitor secure;
+            const auto secureOwner = std::make_unique<KernelMonitor>();
+            auto& secure = *secureOwner;
             secure.Options.LogDirectory = folder.wstring(); secure.Options.PrivateLogRequired = true;
             check(secure.EnsureLogOpenLocked() && secure.LogPrivacy && secure.LogPrivacy->CheckFile(secure.LogHandle),
                 "actual-KMON-log-handle-satisfies-private-policy");
@@ -334,7 +337,8 @@ bool KmonImageReadIntegrationSelfTest()
             ParseImageSweepManifest(sweepJson, &sweepManifest),
             "actual-kmon-manifest-canonical-membership");
         {
-            KernelMonitor missing;
+            const auto missingOwner = std::make_unique<KernelMonitor>();
+            auto& missing = *missingOwner;
             const auto destination = root / L"claim-missing-children";
             missing.Options.LogDirectory = destination.wstring();
             missing.PersistImageSweepManifest(sweepManifest);
@@ -346,7 +350,8 @@ bool KmonImageReadIntegrationSelfTest()
                 ParseImageSweepManifest(legacy, &preserved), "missing-children-preserve-manifest-without-original-claim-or-collection-commit");
         }
         {
-            KernelMonitor bounded;
+            const auto boundedOwner = std::make_unique<KernelMonitor>();
+            auto& bounded = *boundedOwner;
             const auto destination = root / L"claim-recipe-budget";
             bounded.Options.LogDirectory = destination.wstring();
             const auto recipeBytes = mcpjson::WideToUtf8(retained.SliceJson).size();
@@ -364,7 +369,8 @@ bool KmonImageReadIntegrationSelfTest()
         }
         for (unsigned mode = 0; mode < 2; ++mode)
         {
-            KernelMonitor denied;
+            const auto deniedOwner = std::make_unique<KernelMonitor>();
+            auto& denied = *deniedOwner;
             const auto destination = root / (L"manifest-failure-" + std::to_wstring(mode));
             denied.Options.LogDirectory = destination.wstring();
             const auto manifestFile = destination / L"image-sweeps" / sweepPath.filename();
@@ -426,7 +432,8 @@ bool KmonImageReadIntegrationSelfTest()
         Fixture(&secondary.Bytes);
         check(Write(reference, disk), "restore-owned-reference");
         secondary.Calls.clear(); primary.Calls.clear(); secondary.PageReads = 0;
-        KernelMonitor clean;
+        const auto cleanOwner = std::make_unique<KernelMonitor>();
+        auto& clean = *cleanOwner;
         clean.Options.LogDirectory = (root / L"clean").wstring();
         check(clean.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedVerified &&
             clean.ImageReadsQueued.load() == 1 && clean.ImageSlicesQueued.load() == 1, "clean-sweep-retains-original-matching-range-recipe");
@@ -457,11 +464,13 @@ bool KmonImageReadIntegrationSelfTest()
             std::copy(twoDisk.begin(), twoDisk.begin() + 0x400, secondary.Bytes.begin());
             std::copy(twoDisk.begin() + 0x400, twoDisk.end(), secondary.Bytes.begin() + 0x1000);
             secondary.PageReads = 0;
-            KernelMonitor multiple;
+            const auto multipleOwner = std::make_unique<KernelMonitor>();
+            auto& multiple = *multipleOwner;
             multiple.Options.LogDirectory = (root / L"multiple").wstring();
             const auto first = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
             const auto second = multiple.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing);
-            KernelMonitor partialSweep;
+            const auto partialSweepOwner = std::make_unique<KernelMonitor>();
+            auto& partialSweep = *partialSweepOwner;
             partialSweep.Options.LogDirectory = (root / L"partial-sweep").wstring();
             check(partialSweep.ScanExecutableImage(twoPath.wstring(), Base, identity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
                 partialSweep.ImageReadsQueued.load() == 1, "stop-control-observes-one-original-slice");
@@ -515,12 +524,14 @@ bool KmonImageReadIntegrationSelfTest()
         }
         Fixture(&secondary.Bytes);
         secondary.Bytes[0x1050] ^= 1; secondary.Unstable = true; secondary.PageReads = 0;
-        KernelMonitor unstable;
+        const auto unstableOwner = std::make_unique<KernelMonitor>();
+        auto& unstable = *unstableOwner;
         unstable.Options.LogDirectory = (root / L"unstable").wstring();
         check(unstable.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
             unstable.ImageReadsQueued.load() == 1, "unstable-page-keeps-inconclusive-originals");
         secondary.Unstable = false; secondary.Fail = true;
-        KernelMonitor failed;
+        const auto failedOwner = std::make_unique<KernelMonitor>();
+        auto& failed = *failedOwner;
         failed.Options.LogDirectory = (root / L"failed").wstring();
         check(failed.ScanExecutableImage(reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedUnverified &&
             failed.ImageReadsQueued.load() == 1, "failed-identity-reads-are-retained");
@@ -533,7 +544,8 @@ bool KmonImageReadIntegrationSelfTest()
         check(router.ReadExact(Base, 32, &bytes), "publication-control-original-read");
         const auto set = router.Snapshot();
         {
-            KernelMonitor incomplete;
+            const auto incompleteOwner = std::make_unique<KernelMonitor>();
+            auto& incomplete = *incompleteOwner;
             incomplete.Options.LogDirectory = (root / L"incomplete-secondary").wstring();
             ExecutableSliceTrace trace;
             trace.Entered = trace.SecondaryNeeded = trace.SecondaryOpened = true;
@@ -551,7 +563,8 @@ bool KmonImageReadIntegrationSelfTest()
                 "ineligible-secondary-inputs-still-survive-in-raw-archive");
         }
         {
-            KernelMonitor blockedJournal;
+            const auto blockedJournalOwner = std::make_unique<KernelMonitor>();
+            auto& blockedJournal = *blockedJournalOwner;
             const auto folder = root / L"journal-unavailable";
             blockedJournal.Options.LogDirectory = folder.wstring();
             std::filesystem::create_directories(folder);
@@ -570,7 +583,8 @@ bool KmonImageReadIntegrationSelfTest()
             {
                 EvidenceStoreLease audit;
                 check(audit.Acquire(folder.wstring(), true, &issue, true), "owned-exclusive-store-barrier");
-                KernelMonitor blocked;
+                const auto blockedOwner = std::make_unique<KernelMonitor>();
+                auto& blocked = *blockedOwner;
                 blocked.Options.LogDirectory = folder.wstring();
                 blocked.QueueImageReadSet(set, identity, L"synthetic", Base);
                 blocked.WriterStopping.store(true); blocked.CaptureWriterLoop();
@@ -582,7 +596,8 @@ bool KmonImageReadIntegrationSelfTest()
                 check(blocked.ImageStoreAdmissionFailed.load() == 3 && blocked.ImageSweepManifestsFailed.load() == 1 &&
                     !std::filesystem::exists(folder / L"image-sweeps"), "store-barrier-also-precedes-sweep-publication");
             }
-            KernelMonitor resumed;
+            const auto resumedOwner = std::make_unique<KernelMonitor>();
+            auto& resumed = *resumedOwner;
             resumed.Options.LogDirectory = folder.wstring();
             resumed.QueueImageReadSet(set, identity, L"synthetic", Base);
             resumed.WriterStopping.store(true); resumed.CaptureWriterLoop();
@@ -593,7 +608,8 @@ bool KmonImageReadIntegrationSelfTest()
         }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
-            KernelMonitor blocked;
+            const auto blockedOwner = std::make_unique<KernelMonitor>();
+            auto& blocked = *blockedOwner;
             const auto directory = root / (L"slice-failure-" + std::to_wstring(mode));
             blocked.Options.LogDirectory = directory.wstring();
             if (mode == 0) { blocked.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Recipe, 32ull * 1024 * 1024); }
@@ -618,7 +634,8 @@ bool KmonImageReadIntegrationSelfTest()
                 Raw(finalLedger, L"slice_recipes_failed") == L"1" && Raw(finalLedger, L"reference_reserved_bytes") == L"0",
                 "final-ledger-retains-slice-failure-and-releases-reference-reservation");
         }
-        KernelMonitor pressure;
+        const auto pressureOwner = std::make_unique<KernelMonitor>();
+        auto& pressure = *pressureOwner;
         pressure.Options.LogDirectory = (root / L"pressure").wstring();
         for (unsigned i = 0; i < 9; ++i) { pressure.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference); }
         check(pressure.ImageReadsQueued.load() == 2 && pressure.ImageReadsDropped.load() == 7 &&
@@ -639,7 +656,8 @@ bool KmonImageReadIntegrationSelfTest()
             Raw(pressureLedger, L"sweep_manifests_written") == L"0" && Raw(pressureLedger, L"dropped") == L"8",
             "final-ledger-exposes-sweep-with-no-retained-slices");
         {
-            KernelMonitor priority;
+            const auto priorityOwner = std::make_unique<KernelMonitor>();
+            auto& priority = *priorityOwner;
             const auto folder = root / L"priority";
             priority.Options.LogDirectory = folder.wstring();
             priority.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference);
@@ -680,7 +698,8 @@ bool KmonImageReadIntegrationSelfTest()
             secondary.Bytes[0x1050] ^= 1;
         }
         {
-            KernelMonitor repeated;
+            const auto repeatedOwner = std::make_unique<KernelMonitor>();
+            auto& repeated = *repeatedOwner;
             repeated.Options.LogDirectory = (root / L"priority-retry").wstring();
             secondary.Bytes[0x1050] ^= 1;
             auto target = identity;
@@ -711,7 +730,8 @@ bool KmonImageReadIntegrationSelfTest()
             secondary.Bytes[0x1050] ^= 1; secondary.Bytes[0x1051] ^= 1;
         }
         {
-            KernelMonitor busy;
+            const auto busyOwner = std::make_unique<KernelMonitor>();
+            auto& busy = *busyOwner;
             const auto occupied = busy.ImageRetention.Acquire({}, 64ull * 1024 * 1024);
             check(busy.QueueImageReadSet(set, identity, L"synthetic", Base, &retained.Reference) == 0 &&
                 busy.ImageReadsDropped.load() == 1 && busy.CapturedImageReadSets.Size() == 0 &&
@@ -719,7 +739,8 @@ bool KmonImageReadIntegrationSelfTest()
         }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
-            KernelMonitor missing;
+            const auto missingOwner = std::make_unique<KernelMonitor>();
+            auto& missing = *missingOwner;
             const auto folder = root / (L"reference-failure-" + std::to_wstring(mode));
             missing.Options.LogDirectory = folder.wstring();
             auto capture = retained.Reference;
@@ -747,7 +768,8 @@ bool KmonImageReadIntegrationSelfTest()
         }
         for (unsigned mode = 0; mode < 3; ++mode)
         {
-            KernelMonitor rejected;
+            const auto rejectedOwner = std::make_unique<KernelMonitor>();
+            auto& rejected = *rejectedOwner;
             rejected.Options.LogDirectory = mode == 1 ? reference.wstring() : (root / (L"rejected-" + std::to_wstring(mode))).wstring();
             if (mode == 0) { rejected.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Reads, 32ull * 1024 * 1024); }
             rejected.QueueImageReadSet(set, identity, L"synthetic", Base);
@@ -781,11 +803,13 @@ bool KmonImageReadIntegrationSelfTest()
             }
             if (mode == 2) { check(ContentHash::File(collision.wstring()) == ContentHash::Bytes({0x51}), "existing-output-preserved"); }
         }
-        KernelMonitor oversized;
+        const auto oversizedOwner = std::make_unique<KernelMonitor>();
+        auto& oversized = *oversizedOwner;
         check(oversized.QueueImageReadSet(set, identity, std::wstring(EvidenceBundleMaxJsonBytes, L'x'), Base) == 0 &&
             oversized.ImageReadsDropped.load() == 1 && oversized.CapturedImageReadSets.Size() == 0, "oversize-archive-rejected-before-queue");
         {
-            KernelMonitor restarting;
+            const auto restartingOwner = std::make_unique<KernelMonitor>();
+            auto& restarting = *restartingOwner;
             std::atomic<bool> observed{false}, stopping{false}, valid{true};
             std::atomic<uint64_t> queries{0};
             std::thread reader([&]
