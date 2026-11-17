@@ -53,7 +53,8 @@ inline bool KmonPublicationSchedulingSelfTest()
     {
         while (!done.load())
         {
-            if (!mcpjson::ValidateDocument(timing.Json({}, 1000))) { valid.store(false); }
+            if (!mcpjson::ValidateDocument(timing.Json({}, 1000)) ||
+                !mcpjson::ValidateDocument(timing.CollectionJson(L"synthetic:overlap", 1000))) { valid.store(false); }
             readerReady.store(true);
             const auto attempts = timing.Snapshot(KmonPublicationFamily::Irp).Attempts;
             if (attempts > 0 && attempts < 200) { observedMiddle.store(true); }
@@ -124,5 +125,57 @@ inline std::wstring PublicationSchedulingFixturesJson()
         scenarios += L"{\"name\":" + mcpjson::Quote(scenario == 0 ? L"fixed" : scenario == 1 ? L"growing" : L"clear_reuse") +
             L",\"operations\":[" + operations + L"]}";
     }
-    return L"{\"schema\":\"kn.publication_picker_test.v1\",\"scenarios\":[" + scenarios + L"]}";
+    std::wstring collections;
+    for (const std::wstring name : {L"complete", L"partial_job", L"failed", L"unknown", L"rejected", L"pending", L"open", L"closing",
+        L"empty", L"invalid_acquisition", L"invalid_closure", L"late_admission", L"duplicate_closure", L"sweep_loss", L"irp_unavailable", L"optional_irp",
+        L"journal_only", L"failed_closure", L"auxiliary_only"})
+    {
+        KmonPublicationTimings timing;
+        timing.StartCollection(0);
+        if (name != L"empty")
+        {
+            timing.Admission(KmonPublicationFamily::Image, true);
+            if (name != L"pending")
+            {
+                KmonAcquisitionWindow origin{10, 20, true};
+                if (name == L"unknown") { origin = {}; }
+                if (name == L"invalid_acquisition") { origin = {25, 20, true}; }
+                const KmonPublicationStamp stamp{origin, 30, true};
+                timing.Begin(KmonPublicationFamily::Image, stamp, 32, false, 0);
+                timing.Finish(KmonPublicationFamily::Image, stamp, 32, 36, false,
+                    (name == L"failed" || name == L"auxiliary_only") ? KmonPublicationResult{} :
+                    name == L"journal_only" ? KmonPublicationResult{false, true, false, 0, 35} :
+                    name == L"partial_job" ? KmonPublicationResult{true, false, false, 33, 0} : KmonPublicationResult{true, true, true, 33, 35});
+                if (name == L"complete")
+                {
+                    // Dispatch order is not acquisition order, and tick zero is valid.
+                    timing.Admission(KmonPublicationFamily::Page, true);
+                    timing.Finish(KmonPublicationFamily::Page, {{0, 5, true}, 31, true}, 36, 38, true, {true, false, true, 37, 0});
+                }
+            }
+        }
+        if (name == L"rejected") { timing.Admission(KmonPublicationFamily::Image, false); }
+        if (name == L"closing") { timing.BeginClose(KmonCollectionClosePhase::SweepFlush, 40); }
+        else if (name != L"open")
+        {
+            for (size_t i = 0; i < KmonCollectionClosePhases; ++i)
+            {
+                const auto phase = static_cast<KmonCollectionClosePhase>(i);
+                const uint64_t start = 40 + 10 * i;
+                const bool required = name != L"optional_irp" || i != 2;
+                timing.BeginClose(phase, start, required);
+                auto result = KmonPublicationResult{i != 0, i >= 2, true, start + 2, start + 4};
+                if (!required || name == L"failed" || name == L"journal_only" || name == L"failed_closure" || name == L"auxiliary_only") { result = {}; }
+                if (name == L"invalid_closure" && i == 3) { result.JournalMs = start - 1; }
+                timing.FinishClose(phase, start + 6, result);
+            }
+            timing.FinishCollection(100, {name == L"sweep_loss" ? 1ull : 0ull, 0, name == L"irp_unavailable" ? 1ull : 0ull,
+                name == L"auxiliary_only" ? 1ull : 0ull});
+            if (name == L"late_admission") { timing.Admission(KmonPublicationFamily::Page, true); }
+            if (name == L"duplicate_closure") { timing.FinishCollection(200); }
+        }
+        if (!collections.empty()) { collections += L","; }
+        collections += L"{\"name\":" + mcpjson::Quote(name) + L",\"report\":" + timing.CollectionJson(L"synthetic:collection", 300) + L"}";
+    }
+    return L"{\"schema\":\"kn.publication_picker_test.v1\",\"scenarios\":[" + scenarios + L"],\"collections\":[" + collections + L"]}";
 }

@@ -8122,7 +8122,7 @@ bool KmonDriverUnloadArmsMapperWatch(const KmonEvent& event)
         event.Kind == L"driver.short_lived";
 }
 
-KernelMonitor::KernelMonitor() = default;
+KernelMonitor::KernelMonitor() { PublicationTimings.StartCollection(GetTickCount64()); }
 
 KernelMonitor::~KernelMonitor()
 {

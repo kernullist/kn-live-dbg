@@ -153,6 +153,7 @@ void KernelMonitor::ResetPipeline()
     ContinuedCaptures.Reset();
     CaptureTimings.Reset();
     PublicationTimings.Reset();
+    PublicationTimings.StartCollection(GetTickCount64());
     CapturedPages.Reset();
     CapturedEvidenceBundles.Reset();
     CapturedIrps.Reset();
@@ -1359,18 +1360,24 @@ void KernelMonitor::RecordImageSweepPublication(const CapturedImageReads& reads,
     catch (...) { ImageSweepMetadataFailures.fetch_add(1); }
 }
 
-void KernelMonitor::CloseImageSweepManifests() noexcept
+KmonPublicationResult KernelMonitor::CloseImageSweepManifests() noexcept
 {
+    KmonPublicationResult result;
+    const auto failures = ImageJournalSweepsFailed.load() + ImageSweepManifestsFailed.load() + ImageSweepMetadataFailures.load();
     try
     {
         while (auto incomplete = ImageSweepManifests.TakeIncomplete()) { PersistImageSweepManifest(*incomplete); }
         ImageSweepManifestPending.store(0);
     }
     catch (...) { ImageSweepMetadataFailures.fetch_add(1); }
+    result.Complete = ImageSweepManifestPending.load() == 0 &&
+        failures == ImageJournalSweepsFailed.load() + ImageSweepManifestsFailed.load() + ImageSweepMetadataFailures.load();
+    return result;
 }
 
-void KernelMonitor::CloseImageReadCollection() noexcept
+KmonPublicationResult KernelMonitor::CloseImageReadCollection() noexcept
 {
+    KmonPublicationResult result;
     try
     {
         std::wstring directory;
@@ -1418,6 +1425,7 @@ void KernelMonitor::CloseImageReadCollection() noexcept
         const auto name = L"session-" + id + L".knreadledger";
         if (admitted && !ec && SaveObservationJson((folder / name).wstring(), json, nullptr))
         {
+            result.FilePublished = true; result.FileMs = GetTickCount64();
             EvidenceJournalTransaction closure;
             closure.Kind = L"closure"; closure.Id = L"0";
             closure.Members.push_back(EvidenceJournalJsonMember(L"image-reads/" + name, json));
@@ -1426,10 +1434,11 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             EvidenceJournalCommit commit;
             if (!irpActive || IrpJournalLedgerCommitted.load()) { commit = JournalImageFiles(std::move(closure)); }
             ImageJournalClosed.store(commit.Committed);
+            if (commit.Committed) { result.JournalCommitted = result.Complete = true; result.JournalMs = GetTickCount64(); }
             if (!commit.Committed) { ImageJournalCloseFailed.fetch_add(1); }
             ImageJournal.reset(); ImageJournalPrivate = false;
             ImageStoreLease.reset();
-            return;
+            return result;
         }
     }
     catch (...) {}
@@ -1437,6 +1446,7 @@ void KernelMonitor::CloseImageReadCollection() noexcept
     ImageJournalCloseFailed.fetch_add(1);
     ImageJournal.reset(); ImageJournalPrivate = false;
     ImageStoreLease.reset();
+    return result;
 }
 
 bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact, KmonAcquisitionWindow acquisition)
@@ -1609,9 +1619,10 @@ KmonPublicationResult KernelMonitor::PersistIrpCapture(const CapturedIrp& captur
     return result;
 }
 
-void KernelMonitor::CloseIrpCollection() noexcept
+KmonPublicationResult KernelMonitor::CloseIrpCollection() noexcept
 {
-    if (IrpCapturesQueued.load() == 0 && IrpCapturesDropped.load() == 0 && IrpCapturesUnavailable.load() == 0) { return; }
+    KmonPublicationResult result;
+    if (IrpCapturesQueued.load() == 0 && IrpCapturesDropped.load() == 0 && IrpCapturesUnavailable.load() == 0) { return result; }
     try
     {
         std::wstring directory, failure;
@@ -1641,19 +1652,22 @@ void KernelMonitor::CloseIrpCollection() noexcept
                 std::vector<uint8_t>(bytes.begin(), bytes.end()), &failure,
                 [&](HANDLE file) { return privacy->CheckFile(file); }))
             {
+                result.FilePublished = true; result.FileMs = GetTickCount64();
                 EvidenceJournalTransaction transaction;
                 transaction.Kind = L"irp_ledger"; transaction.Id = L"0";
                 transaction.Members.push_back(EvidenceJournalJsonMember(name, json));
                 const auto commit = JournalImageFiles(std::move(transaction), [privacy](HANDLE file) { return privacy->CheckFile(file); });
                 IrpJournalLedgerCommitted.store(commit.Committed);
+                if (commit.Committed) { result.JournalCommitted = result.Complete = true; result.JournalMs = GetTickCount64(); }
                 if (!commit.Committed) { IrpJournalLedgerFailed.fetch_add(1); }
-                return;
+                return result;
             }
         }
     }
     catch (...) {}
     IrpCaptureLedgerFailed.fetch_add(1);
     IrpJournalLedgerFailed.fetch_add(1);
+    return result;
 }
 
 KmonPublicationResult KernelMonitor::PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept
@@ -1696,8 +1710,9 @@ KmonPublicationResult KernelMonitor::PersistEvidenceBundle(const CapturedEvidenc
     return result;
 }
 
-void KernelMonitor::CloseEvidenceCollection() noexcept
+KmonPublicationResult KernelMonitor::CloseEvidenceCollection() noexcept
 {
+    KmonPublicationResult result;
     try
     {
         std::wstring directory;
@@ -1710,10 +1725,12 @@ void KernelMonitor::CloseEvidenceCollection() noexcept
         const auto json = EvidenceSessionJson({collectionId, EvidenceQueued.load(), EvidenceWritten.load(),
             EvidenceFailed.load(), EvidenceDropped.load(), EvidenceBytes.load()});
         std::wstring failure;
-        if (!error && !json.empty() && SaveObservationJson((folder / (L"session-" + collectionId + L".knledger")).wstring(), json, &failure)) { return; }
+        if (!error && !json.empty() && SaveObservationJson((folder / (L"session-" + collectionId + L".knledger")).wstring(), json, &failure))
+        { result.FilePublished = result.Complete = true; result.FileMs = GetTickCount64(); return result; }
     }
     catch (...) {}
     EvidenceLedgerFailed.fetch_add(1);
+    return result;
 }
 
 KmonPublicationResult KernelMonitor::PersistCapturedPage(const CapturedPage& page) noexcept
@@ -1920,10 +1937,22 @@ void KernelMonitor::CaptureWriterLoop()
                 [&] { return std::to_wstring(item.Id) + L":" + std::to_wstring(item.Offset); }, item.Context.Identity); }
         }
     }
-    CloseImageSweepManifests();
-    CloseEvidenceCollection();
-    CloseIrpCollection();
-    CloseImageReadCollection();
+    const auto close = [&](KmonCollectionClosePhase phase, auto method, bool required = true)
+    {
+        PublicationTimings.BeginClose(phase, GetTickCount64(), required);
+        const auto result = (this->*method)();
+        PublicationTimings.FinishClose(phase, GetTickCount64(), result);
+    };
+    close(KmonCollectionClosePhase::SweepFlush, &KernelMonitor::CloseImageSweepManifests);
+    close(KmonCollectionClosePhase::EvidenceLedger, &KernelMonitor::CloseEvidenceCollection);
+    close(KmonCollectionClosePhase::IrpLedger, &KernelMonitor::CloseIrpCollection,
+        IrpCapturesQueued.load() != 0 || IrpCapturesDropped.load() != 0 || IrpCapturesUnavailable.load() != 0);
+    close(KmonCollectionClosePhase::ImageJournal, &KernelMonitor::CloseImageReadCollection);
+    PublicationTimings.FinishCollection(GetTickCount64(),
+        {ImageJournalSweepsFailed.load() + ImageSweepManifestsFailed.load(),
+            ImageSweepMetadataFailures.load() + ImageSweepManifestAdmissionDenied.load() + ImageSweepManifestEntryDrops.load(),
+            IrpCapturesUnavailable.load(), ImageReferenceBlobsCreated.load() + ImageReferenceBlobsReused.load() +
+            ImageSlicesWritten.load() + ImageSweepManifestsWritten.load() + IrpReferencesCreated.load() + IrpReferencesReused.load()});
     CaptureWriterDone.store(true);
 }
 
@@ -2108,6 +2137,7 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"image_work_items"] = std::to_wstring(ImageWork.size());
         event.Evidence[L"image_scheduling_json"] = ImageSchedulingJson(now);
         event.Evidence[L"publication_scheduling_json"] = PublicationTimings.Json(PublicationPending(now), now);
+        event.Evidence[L"collection_timing_json"] = PublicationTimings.CollectionJson(std::to_wstring(EvidenceCollectionEpoch.load()), now);
         event.Evidence[L"image_work_capacity"] = std::to_wstring(ImageWorkCapacity);
         event.Evidence[L"image_watch_reserved_slots"] = std::to_wstring(ImageWatchReserve);
         event.Evidence[L"image_admission_deferred_attempts"] = std::to_wstring(ImageAdmissionDeferred);

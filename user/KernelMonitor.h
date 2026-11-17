@@ -635,7 +635,7 @@ private:
     };
     bool QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArtifact> artifact, KmonAcquisitionWindow acquisition = {});
     KmonPublicationResult PersistIrpCapture(const CapturedIrp& capture) noexcept;
-    void CloseIrpCollection() noexcept;
+    KmonPublicationResult CloseIrpCollection() noexcept;
     IrpRetentionQueue<CapturedIrp> CapturedIrps;
     IrpRetentionPolicy IrpRetention;
     std::atomic<uint64_t> IrpCapturesQueued{0}, IrpCapturesWritten{0}, IrpCapturesFailed{0}, IrpCapturesDropped{0};
@@ -670,7 +670,7 @@ private:
         KmonPublicationStamp Publication;
     };
     KmonPublicationResult PersistImageReadSet(const CapturedImageReads& reads) noexcept;
-    void CloseImageReadCollection() noexcept;
+    KmonPublicationResult CloseImageReadCollection() noexcept;
     EvidenceJournalCommit JournalImageFiles(EvidenceJournalTransaction transaction,
         std::function<bool(HANDLE)> admitOutput = {}) noexcept;
     std::unique_ptr<EvidenceJournal> ImageJournal; // Capture writer only; owns publication leases.
@@ -685,7 +685,7 @@ private:
     void RecordImageSweepPublication(const CapturedImageReads& reads, bool rawWritten, bool recipeWritten,
         bool referenceWritten, const std::wstring& rawHash, const std::wstring& recipeHash) noexcept;
     void PersistImageSweepManifest(const ImageSweepManifest& manifest) noexcept;
-    void CloseImageSweepManifests() noexcept;
+    KmonPublicationResult CloseImageSweepManifests() noexcept;
     ImageSweepManifestStore ImageSweepManifests; // Capture writer only.
     std::atomic<uint64_t> ImageSweepManifestsWritten{0}, ImageSweepManifestsFailed{0}, ImageSweepManifestBytes{0};
     std::atomic<uint64_t> ImageSweepManifestPending{0}, ImageSweepManifestAdmissionDenied{0}, ImageSweepManifestEntryDrops{0};
@@ -704,7 +704,7 @@ private:
     std::array<KmonPublicationPending, KmonPublicationFamilies> PublicationPending(uint64_t now) const;
     bool PublicationDrainComplete() const;
     KmonPublicationTimings PublicationTimings;
-    void CloseEvidenceCollection() noexcept;
+    KmonPublicationResult CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};
     std::wstring EvidenceCollectorScope = NewEvidenceScope();
     KmonWorkQueue<CapturedEvidence> CapturedEvidenceBundles{64};

@@ -971,6 +971,7 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         source.Calls.clear();
         check(Write(slowPath, contentDisk) && Write(fastPath, contentDisk), "owned-content-reference-files");
         std::atomic<bool> contentEntered{false}, contentRelease{false};
+        std::atomic<unsigned> fastContentEntered{0}, fastContentReleased{0};
         const auto contentOwner = std::make_unique<KernelMonitor>();
         auto& content = *contentOwner;
         content.Options.LogDirectory = (root / L"content-output").wstring();
@@ -979,6 +980,11 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         {
             if (request.Path == slowPath)
             { contentEntered.store(true); while (!contentRelease.load() && !cancel.load()) { std::this_thread::yield(); } }
+            if (request.Path == fastPath)
+            {
+                const auto generation = fastContentEntered.fetch_add(1) + 1;
+                while (fastContentReleased.load() < generation && !cancel.load()) { std::this_thread::yield(); }
+            }
             return ImageReferencePreparation::LoadContent(request, cancel, value, error);
         });
         auto contentSlow = KmonImageTestAccess::Find(content, slowPath, Base, identity);
@@ -991,7 +997,13 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
         content.ScanExecutableImage(slowPath, Base, identity, {}, 1, &routing);
         check(contentSlow->ContentPreparationId == contentTicket && contentSlow->ContentQueuedMs == contentQueued &&
             Text(content.ImageContents->Json(), L"admitted") == L"1", "pending-content-keeps-original-ticket-and-clock");
-        content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        // A fast worker may otherwise complete and be consumed by this very
+        // Scan call, clearing the ticket before IsReady can observe it. Hold
+        // each native load until admission and the pending return are observed.
+        check(content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            wait([&] { return fastContentEntered.load() == 1; }) && contentFast->ContentPreparationId != 0,
+            "fast-content-admission-observed-before-native-load-release");
+        fastContentReleased.store(1);
         check(wait([&] { return content.ImageContents->IsReady(contentFast->ContentPreparationId); }), "other-content-subject-prepares-beside-held-worker");
         contentPending = content.ImageContents->Json();
         HANDLE deniedWriter = CreateFileW(fastPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1012,7 +1024,10 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics)
             "source-lease-released-before-publication-while-original-bytes-remain");
         contentFast->NextSweepDueMs = 0; contentFast->LastReferenceCheckMs = GetTickCount64();
         const auto callsBeforeContentFailure = source.Calls.size();
-        content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
+        check(content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing) == CodeOwnership::OwnedUnverified &&
+            wait([&] { return fastContentEntered.load() == 2; }) && contentFast->ContentPreparationId != 0,
+            "fast-content-failure-admission-observed-before-native-load-release");
+        fastContentReleased.store(2);
         check(wait([&] { return content.ImageContents->IsReady(contentFast->ContentPreparationId); }), "actual-content-open-failure-completes");
         contentFast->LastReferenceCheckMs = GetTickCount64(); // Exercise content failure without the independent cache refresh.
         content.ScanExecutableImage(fastPath, Base, fastIdentity, {}, 1, &routing);
@@ -1325,6 +1340,10 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
     if (!DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { return false; }
     const std::filesystem::path root = std::filesystem::absolute(unique);
     std::wstring normal = L"null", stopped = L"null", receipts;
+    std::wstring collection = L"null", failedCollection = L"null", openCollection = L"null", emptyCollection = L"null";
+    std::wstring closedWithFailure = L"null", noFilesCollection = L"null";
+    std::wstring auxiliaryCollection = L"null";
+    bool recoveredClosed = false;
     try
     {
         const auto owner = std::make_unique<KernelMonitor>();
@@ -1393,6 +1412,9 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
             completed = attempts == 5;
             if (!completed) { std::this_thread::yield(); }
         } while (!completed && GetTickCount64() < deadline);
+        openCollection = monitor.PublicationTimings.CollectionJson(std::to_wstring(monitor.EvidenceCollectionEpoch.load()), GetTickCount64());
+        check(openCollection.find(L"\"publication_outcome\":\"incomplete\"") != std::wstring::npos &&
+            openCollection.find(L"\"writer_end_ms\":null") != std::wstring::npos, "finished-jobs-are-not-a-closed-collection");
         monitor.WriterStopping.store(true); monitor.CaptureWriter.join();
         check(completed && monitor.CaptureWriterDone.load(), "writer-completion-observed-before-stop");
         monitor.DrainPipelineEvents(true);
@@ -1400,11 +1422,19 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         {
             const auto summary = event.Evidence.find(L"publication_scheduling_json");
             if (summary != event.Evidence.end()) { normal = summary->second; }
+            const auto closure = event.Evidence.find(L"collection_timing_json");
+            if (closure != event.Evidence.end()) { collection = closure->second; }
             const auto receipt = event.Evidence.find(L"publication_timing_json");
             if (receipt != event.Evidence.end()) { if (!receipts.empty()) { receipts += L","; } receipts += receipt->second; }
         }
         check(normal != L"null" && Array(L"{\"rows\":[" + receipts + L"]}", L"rows").size() == 5,
             "actual-writer-publishes-summary-and-per-job-times");
+        const auto recovery = RecoverEvidenceJournal((store / L"collections" / std::to_wstring(monitor.EvidenceCollectionEpoch.load())).wstring(), false);
+        recoveredClosed = recovery.Closed;
+        check(recoveredClosed && monitor.ImageJournalClosed.load() && monitor.IrpJournalLedgerCommitted.load() &&
+            collection.find(L"\"publication_outcome\":\"complete\"") != std::wstring::npos &&
+            collection.find(L"\"acquisition_to_successful_close_ms\":null") != std::wstring::npos,
+            "actual-closed-journal-does-not-invent-unknown-acquisition-times");
         for (size_t i = 0; i < 4; ++i)
         {
             const auto count = monitor.PublicationTimings.Snapshot(static_cast<KmonPublicationFamily>(i));
@@ -1450,6 +1480,64 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         check(rejected.Failed == 1 && rejected.Files == 0 && rejected.Complete == 0 &&
             failed.PublicationTimings.Snapshot(KmonPublicationFamily::Page).Attempts == 0, "failed-shutdown-does-not-enter-normal-success");
         stopped = failed.PublicationTimings.Json(failed.PublicationPending(GetTickCount64()), GetTickCount64());
+        failedCollection = failed.PublicationTimings.CollectionJson(std::to_wstring(failed.EvidenceCollectionEpoch.load()), GetTickCount64());
+        check(!failed.ImageJournalClosed.load() && failedCollection.find(L"\"publication_outcome\":\"partial\"") != std::wstring::npos,
+            "files-preserved-with-failed-journal-close-remain-partial");
+
+        const auto emptyOwner = std::make_unique<KernelMonitor>();
+        auto& empty = *emptyOwner;
+        empty.Options.LogDirectory = (root / L"empty").wstring();
+        std::filesystem::create_directories(empty.Options.LogDirectory);
+        empty.WriterStopping.store(true); empty.CaptureWriterLoop();
+        emptyCollection = empty.PublicationTimings.CollectionJson(std::to_wstring(empty.EvidenceCollectionEpoch.load()), GetTickCount64());
+        check(empty.ImageJournalClosed.load() && emptyCollection.find(L"\"publication_outcome\":\"empty\"") != std::wstring::npos &&
+            emptyCollection.find(L"\"acquisition_to_successful_close_ms\":null") != std::wstring::npos,
+            "empty-writer-has-closure-without-a-successful-acquisition-sample");
+
+        const auto gapOwner = std::make_unique<KernelMonitor>();
+        auto& gap = *gapOwner;
+        gap.Options.LogDirectory = (root / L"closed-gap").wstring();
+        std::filesystem::create_directories(gap.Options.LogDirectory);
+        gap.CapturedBytes = 256ull * 1024 * 1024;
+        check(gap.QueueCapturedBytes(L"owned_closed_gap", Base, context, {0x31}) != 0, "admit-job-before-failed-write-and-successful-close");
+        gap.WriterStopping.store(true); gap.CaptureWriterLoop();
+        closedWithFailure = gap.PublicationTimings.CollectionJson(std::to_wstring(gap.EvidenceCollectionEpoch.load()), GetTickCount64());
+        const auto gapRecovered = RecoverEvidenceJournal((std::filesystem::path(gap.Options.LogDirectory) / L"collections" /
+            std::to_wstring(gap.EvidenceCollectionEpoch.load())).wstring(), false);
+        check(gapRecovered.Closed && gap.CaptureFailed.load() == 1 &&
+            closedWithFailure.find(L"\"publication_outcome\":\"partial\"") != std::wstring::npos &&
+            closedWithFailure.find(L"\"closure_outcome\":\"complete\"") != std::wstring::npos, "recovered-closure-does-not-erase-failed-job");
+
+        const auto blockedOwner = std::make_unique<KernelMonitor>();
+        auto& blocked = *blockedOwner;
+        blocked.Options.LogDirectory = (root / L"blocked-directory").wstring();
+        check(Write(blocked.Options.LogDirectory, {0x78}) && blocked.QueueCapturedBytes(L"owned_failed", Base, context, {0x31}) != 0,
+            "owned-file-blocks-all-publication-directories");
+        blocked.WriterStopping.store(true); blocked.CaptureWriterLoop();
+        noFilesCollection = blocked.PublicationTimings.CollectionJson(std::to_wstring(blocked.EvidenceCollectionEpoch.load()), GetTickCount64());
+        check(!blocked.ImageJournalClosed.load() && noFilesCollection.find(L"\"publication_outcome\":\"failed\"") != std::wstring::npos,
+            "no-preserved-publication-is-a-failed-collection");
+
+        const auto auxiliaryOwner = std::make_unique<KernelMonitor>();
+        auto& auxiliary = *auxiliaryOwner;
+        const auto auxiliaryStore = root / L"auxiliary-only";
+        std::filesystem::create_directories(auxiliaryStore / L"image-reads");
+        auxiliary.Options.LogDirectory = auxiliaryStore.wstring();
+        check(Write(reference, disk) && KmonImageTestAccess::Scan(auxiliary, reference.wstring(), Base, synthetic, {}, 16, &routing) ==
+            CodeOwnership::OwnedVerified, "acquire-original-and-reference-before-selective-write-failures");
+        check(auxiliary.CapturedImageReadSets.Size() == 1 && Write(auxiliaryStore / L"collections", {0x78}) &&
+            Write(auxiliaryStore / L"cases", {0x78}), "owned-files-block-both-collection-ledger-locations");
+        auxiliary.CapturedImageReadSets.Inspect([&](const auto& item)
+        { std::filesystem::create_directories(auxiliaryStore / L"image-reads" / (L"reads-" + item.CollectionId + L"-" + std::to_wstring(item.Id) + L".knreads")); });
+        std::filesystem::create_directories(auxiliaryStore / L"image-reads" /
+            (L"session-" + std::to_wstring(auxiliary.EvidenceCollectionEpoch.load()) + L".knreadledger"));
+        auxiliary.WriterStopping.store(true); auxiliary.CaptureWriterLoop();
+        auxiliaryCollection = auxiliary.PublicationTimings.CollectionJson(std::to_wstring(auxiliary.EvidenceCollectionEpoch.load()), GetTickCount64());
+        check(auxiliary.ImageReferenceBlobsCreated.load() == 1 && auxiliary.ImageReadsWritten.load() == 0 &&
+            auxiliary.ImageJournalReadsCommitted.load() == 0 && !auxiliary.ImageJournalClosed.load() &&
+            auxiliaryCollection.find(L"\"publication_outcome\":\"partial\"") != std::wstring::npos &&
+            auxiliaryCollection.find(L"\"closure_outcome\":\"failed\"") != std::wstring::npos,
+            "reference-survives-original-and-ledger-failures-without-a-false-empty-failure");
     }
     catch (const std::exception&) { check(false, "owned-publication-fixture-exception"); }
     std::error_code ec;
@@ -1461,7 +1549,11 @@ bool KmonPublicationSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         *diagnostics = L"{\"schema\":\"kn.publication_writer_test.v1\",\"driver_loaded\":false,"
             L"\"corpus\":\"owned_files_native_page_and_bundle_synthetic_image_and_irp\",\"passed\":" +
             std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
-            L",\"normal\":" + normal + L",\"shutdown\":" + stopped + L",\"receipts\":[" + receipts + L"]}";
+            L",\"normal\":" + normal + L",\"shutdown\":" + stopped + L",\"receipts\":[" + receipts + L"],\"collection\":" + collection +
+            L",\"open_collection\":" + openCollection + L",\"failed_collection\":" + failedCollection + L",\"empty_collection\":" + emptyCollection +
+            L",\"closed_with_failure\":" + closedWithFailure + L",\"no_files_collection\":" + noFilesCollection +
+            L",\"auxiliary_collection\":" + auxiliaryCollection +
+            L",\"recovered_closed\":" + (recoveredClosed ? L"true" : L"false") + L"}";
     }
     std::fprintf(stderr, "[publication.writer] checks=%u failed=%u\n", checks, failures);
     return failures == 0;

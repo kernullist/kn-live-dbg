@@ -7,6 +7,71 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Collection publication timing checkpoint: 2026-11-18
+
+The capture writer now links known local acquisition windows to actual
+sweep-flush, evidence-ledger, IRP-ledger and image-journal closing operations.
+It distinguishes incomplete, empty, complete, partial and failed collections,
+without turning unknown origins or successful closure after failed work into
+successful acquisition latency. See
+[collection publication timing](ARCHITECTURE.md#collection-publication-timing).
+This completes that implementation slice; it does not complete P09 or the full
+kernel-security design.
+
+The private `kn.collection_timing.v1` report is a runtime diagnostic, not a new
+journal member. Original ledgers, journal recovery, file formats and hashes
+retain their contracts. Captured pages still have no collection ledger, and
+event loss or a crash can lose timing diagnostics. Source-wide observation
+coverage, other stage budgets/dependencies, measured native workload SLOs and
+durability under media/power loss remain open.
+
+Validation used Windows build **28000.3501**, MSVC **14.44.35207** and SDK/WDK
+**10.0.26100.0**, without loading a task driver or enabling Driver Verifier.
+The core harness built under `/W4 /WX`; the independent publication oracle
+passed **2,394 assertions**, including 19 collection scenarios. Controls cover
+unknown/invalid clocks, zero ticks, out-of-order acquisition, unprocessed or
+late admissions, rejection, optional IRP, auxiliary loss and duplicate closure.
+The shared suite also passed **521 publication / 32,796 reference / 130 capture /
+835 execution / 11,345 hunting checks**, native image/handle/relocation controls,
+and independent **12,989 reference / 10 execution assertions**.
+
+Review separated previous job artifacts from closing artifacts, so failed
+closure cannot become partial closure merely because an earlier file exists.
+Reference/recipe/sweep-only preservation now keeps the whole publication result
+partial even when primary files and all closing writes fail. A full-suite run
+also exposed a pre-existing preparation-test race: a fast result could be
+consumed in its first scan, leaving the test waiting on ticket zero. Per-load
+gates now require observed admission before releasing native work; the original
+lease, observation, failure and shutdown assertions remain intact.
+
+The final product's publication oracle passed **85 assertions** and the actual
+writer passed **41 checks**. Owned controls compare timing with offline journal
+recovery, observe completed jobs before writer stop, and exercise empty
+collections, successful closure after a failed page, file-only failed closure,
+no saved files, and reference-only preservation. The preparation oracle passed
+**73 assertions** after the synchronization fix.
+
+The final isolated `--self-test all` passed **28 timeline / 102 MCP /
+121 KMON image-read / 319 image-scheduling / 38 image-preparation /
+41 publication-writer / 21 layout-scheduler / 564 console /
+3,043 command-route / 68 remote / 4 connect-option checks**, with
+`owned_fixture_cleanup=passed`. The public-content scanner regression passed
+**12 tests**, including renamed UTF-8/UTF-16 collection diagnostics.
+Final review found no additional actionable defects in the reviewed scope.
+
+Final Release product SHA-256:
+`a3915ff6677b51824b4d2b5064bc1d96d65af1e86a89a5afe8f859a3e72cd588`.
+Shared KMON core harness SHA-256:
+`47af763b444adb4fea86d8df60cb37962ac7d0cf166ce2dd90005f2f33652ef5`.
+Existing alignment warnings remain. ASan remains blocked by the previously
+recorded host startup interception failure; no new ASan success is claimed.
+
+At **02:18 KST**, boot time remained **12:49:00.5 KST on November 17**. No new
+reboot/BugCheck events, dump files, task processes/drivers or owned temporary
+writer/preparation fixtures remained after validation. The 33 completed parser
+caches, firewall profiles and BFE/mpssvc automatic-running and EFS manual-running
+service states matched the preceding content-preparation checkpoint.
+
 ## Image reference content preparation checkpoint: 2026-11-18
 
 Recorded image comparisons now prepare their exact-file lease, original bytes

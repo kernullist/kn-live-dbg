@@ -29,6 +29,13 @@ struct KmonPublicationResult
     bool FilePublished = false, JournalCommitted = false, Complete = false;
     uint64_t FileMs = 0, JournalMs = 0;
 };
+enum class KmonCollectionClosePhase : size_t { SweepFlush, EvidenceLedger, IrpLedger, ImageJournal };
+constexpr size_t KmonCollectionClosePhases = 4;
+struct KmonCollectionTotals
+{
+    uint64_t SweepPublications = 0, SweepMetadata = 0, IrpUnavailable = 0;
+    uint64_t AuxiliaryPublications = 0; // Successful reference/recipe/sweep operations, including verified reuse; not unique files.
+};
 struct KmonPublicationPending
 {
     uint64_t Count = 0, OldestQueued = 0, UnknownQueued = 0, InvalidClocks = 0;
@@ -89,11 +96,19 @@ public:
         std::lock_guard<std::mutex> lock(Mutex);
         State = std::make_unique<Data>();
     }
+    void StartCollection(uint64_t now)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        auto& c = State->Collection;
+        if (c.StartKnown) { ++c.ProtocolErrors; return; }
+        c.Start = now; c.StartKnown = true;
+    }
     void Admission(KmonPublicationFamily family, bool admitted)
     {
         std::lock_guard<std::mutex> lock(Mutex);
         auto& count = admitted ? State->Admitted[static_cast<size_t>(family)] : State->Rejected[static_cast<size_t>(family)];
         ++count;
+        if (State->Collection.EndKnown) { ++State->Collection.ProtocolErrors; }
     }
     void Begin(KmonPublicationFamily family, const KmonPublicationStamp& stamp, uint64_t now, bool shutdown, uint64_t loans)
     {
@@ -113,12 +128,17 @@ public:
         counts.Files += result.FilePublished; counts.Journals += result.JournalCommitted;
         counts.UnknownQueued += !stamp.QueuedKnown; counts.UnknownAcquisition += !stamp.Acquisition.Known;
         State->Active = KmonPublicationFamily::None;
+        auto& collection = State->Collection;
+        if (collection.EndKnown) { ++collection.ProtocolErrors; }
         if (ended < started) { ++counts.InvalidClocks; return; }
+        if (!collection.WorkEndKnown || ended > collection.WorkEnd) { collection.WorkEnd = ended; collection.WorkEndKnown = true; }
         (result.Complete ? samples.CompleteService : samples.IncompleteService).Add(ended - started);
-        const bool queueValid = stamp.QueuedKnown && stamp.Queued <= started;
+        const bool queueValid = stamp.QueuedKnown && stamp.Queued <= started && (!collection.StartKnown || collection.Start <= stamp.Queued);
         const bool acquisitionValid = queueValid && stamp.Acquisition.Known && stamp.Acquisition.Started <= stamp.Acquisition.Finished &&
-            stamp.Acquisition.Finished <= stamp.Queued;
+            stamp.Acquisition.Finished <= stamp.Queued && (!collection.StartKnown || collection.Start <= stamp.Acquisition.Started);
         if ((stamp.QueuedKnown && !queueValid) || (stamp.Acquisition.Known && !acquisitionValid)) { ++counts.InvalidClocks; }
+        if (queueValid) { collection.Queue.Observe(stamp.Queued, stamp.Queued); }
+        if (acquisitionValid) { collection.Acquisition.Observe(stamp.Acquisition.Started, stamp.Acquisition.Finished); }
         if (queueValid) { samples.QueueWait.Add(started - stamp.Queued); }
         const auto milestone = [&](bool known, uint64_t tick, KmonLatencyHistogram& queue, KmonLatencyHistogram& lower, KmonLatencyHistogram& upper)
         {
@@ -130,6 +150,111 @@ public:
         milestone(result.FilePublished, result.FileMs, samples.QueueToFile, samples.AcquisitionEndToFile, samples.AcquisitionStartToFile);
         if (result.JournalCommitted && result.FilePublished && result.JournalMs < result.FileMs) { ++counts.InvalidClocks; }
         else { milestone(result.JournalCommitted, result.JournalMs, samples.QueueToJournal, samples.AcquisitionEndToJournal, samples.AcquisitionStartToJournal); }
+    }
+    // Only the writer calls these, after all producers have joined and their
+    // queues drained. Readers can observe an in-progress close without I/O locks.
+    void BeginClose(KmonCollectionClosePhase phase, uint64_t now, bool required = true)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        auto& c = State->Collection;
+        const auto index = static_cast<size_t>(phase);
+        if (index >= c.Close.size() || c.EndKnown || c.Close[index].StartedKnown)
+        { ++c.ProtocolErrors; return; }
+        auto& step = c.Close[index];
+        step.Started = now; step.StartedKnown = true; step.Required = required;
+        if ((index && (!c.Close[index - 1].EndedKnown || c.Close[index - 1].Ended > now)) ||
+            (c.StartKnown && now < c.Start) || (c.WorkEndKnown && c.WorkEnd > now)) { ++c.ProtocolErrors; }
+    }
+    void FinishClose(KmonCollectionClosePhase phase, uint64_t now, const KmonPublicationResult& result)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        auto& c = State->Collection;
+        const auto index = static_cast<size_t>(phase);
+        if (index >= c.Close.size() || c.EndKnown || !c.Close[index].StartedKnown || c.Close[index].EndedKnown)
+        { ++c.ProtocolErrors; return; }
+        auto& step = c.Close[index];
+        step.Ended = now; step.EndedKnown = true; step.Result = result;
+        const auto valid = [&](bool known, uint64_t tick) { return !known || (tick >= step.Started && tick <= now); };
+        if (now < step.Started || !valid(result.FilePublished, result.FileMs) || !valid(result.JournalCommitted, result.JournalMs) ||
+            (result.FilePublished && result.JournalCommitted && result.JournalMs < result.FileMs) ||
+            (!step.Required && (result.FilePublished || result.JournalCommitted)) ||
+            (step.Required && result.Complete && index != 0 && (!result.FilePublished || (index >= 2 && !result.JournalCommitted))))
+        { ++c.ProtocolErrors; }
+    }
+    void FinishCollection(uint64_t now, KmonCollectionTotals totals = {})
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        auto& c = State->Collection;
+        if (c.EndKnown) { ++c.ProtocolErrors; return; }
+        c.End = now; c.EndKnown = true; c.Totals = totals;
+        for (const auto& step : c.Close)
+        { if (!step.EndedKnown || step.Ended > now) { ++c.ProtocolErrors; } }
+        if (c.StartKnown && now < c.Start) { ++c.ProtocolErrors; }
+    }
+    std::wstring CollectionJson(const std::wstring& id, uint64_t now) const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        const auto& c = State->Collection;
+        const auto n = [](uint64_t v) { return mcpjson::Quote(std::to_wstring(v)); };
+        const auto b = [](bool v) { return v ? L"true" : L"false"; };
+        const auto tick = [&](bool known, uint64_t v) { return known ? n(v) : L"null"; };
+        const auto duration = [&](bool known, uint64_t first, uint64_t last) { return known && first <= last ? n(last - first) : L"null"; };
+        uint64_t admitted = 0, rejected = 0, attempts = 0, complete = 0, files = 0, journals = 0, invalid = 0, shutdown = 0;
+        for (size_t i = 0; i < KmonPublicationFamilies; ++i)
+        {
+            admitted += State->Admitted[i]; rejected += State->Rejected[i];
+            for (size_t j = 0; j < 2; ++j)
+            {
+                const auto& count = State->Families[i][j].Count;
+                attempts += count.Attempts; complete += count.Complete; files += count.Files; journals += count.Journals;
+                invalid += count.InvalidClocks; if (j) { shutdown += count.Attempts; }
+            }
+        }
+        std::wstring phases;
+        bool settled = true, closed = true, anyClosure = false, closureMaterial = false;
+        static const wchar_t* names[] = {L"sweep_flush", L"evidence_ledger", L"irp_ledger", L"image_journal"};
+        for (size_t i = 0; i < c.Close.size(); ++i)
+        {
+            const auto& s = c.Close[i]; const auto& r = s.Result;
+            settled &= s.EndedKnown; closed &= s.EndedKnown && (!s.Required || r.Complete);
+            anyClosure |= s.StartedKnown; closureMaterial |= r.FilePublished || r.JournalCommitted;
+            const auto outcome = !s.StartedKnown ? L"not_started" : !s.EndedKnown ? L"in_progress" : !s.Required ? L"not_applicable" :
+                r.Complete ? L"complete" : r.FilePublished || r.JournalCommitted ? L"partial" : L"failed";
+            if (i) { phases += L","; }
+            phases += L"{\"phase\":" + mcpjson::Quote(names[i]) + L",\"required\":" + b(s.Required) +
+                L",\"outcome\":" + mcpjson::Quote(outcome) + L",\"start_ms\":" + tick(s.StartedKnown, s.Started) +
+                L",\"end_ms\":" + tick(s.EndedKnown, s.Ended) + L",\"service_ms\":" + duration(s.StartedKnown && s.EndedKnown, s.Started, s.Ended) +
+                L",\"file_ms\":" + tick(r.FilePublished, r.FileMs) + L",\"journal_ms\":" + tick(r.JournalCommitted, r.JournalMs) + L"}";
+        }
+        const bool final = c.EndKnown && settled && State->Active == KmonPublicationFamily::None && admitted == attempts && c.ProtocolErrors == 0;
+        const bool ok = final && closed && complete == attempts && rejected == 0 &&
+            c.Totals.SweepPublications == 0 && c.Totals.SweepMetadata == 0 && c.Totals.IrpUnavailable == 0;
+        const bool anyMaterial = files != 0 || journals != 0 || closureMaterial || c.Totals.AuxiliaryPublications != 0;
+        const auto outcome = !final ? L"incomplete" : ok ? (attempts ? L"complete" : L"empty") : anyMaterial ? L"partial" : L"failed";
+        const bool allAcquired = attempts != 0 && c.Acquisition.Samples == attempts && admitted == attempts && invalid == 0;
+        const auto elapsedEnd = c.EndKnown ? c.End : now;
+        return L"{\"schema\":\"kn.collection_timing.v1\",\"collection_id\":" + mcpjson::Quote(id) +
+            L",\"scope\":\"capture_writer_session\",\"clock_domain\":\"GetTickCount64_ms\","
+            L"\"acquisition_scope\":\"processed_jobs_explicit_local_caller_windows\","
+            L"\"closure_scope\":\"existing_publication_api_success_not_media_power_loss_proof\","
+            L"\"timing_journal_member\":false,\"source_coverage_evaluated\":false,\"captured_page_ledger\":false,"
+            L"\"snapshot_atomic_with_producer_queues\":false,\"hard_deadline_enforced\":false,"
+            L"\"writer_finished\":" + b(c.EndKnown) + L",\"final\":" + b(final) + L",\"publication_outcome\":" + mcpjson::Quote(outcome) +
+            L",\"closure_outcome\":" + mcpjson::Quote(!anyClosure ? L"not_started" : !settled ? L"in_progress" : closed ? L"complete" : closureMaterial ? L"partial" : L"failed") +
+            L",\"start_ms\":" + tick(c.StartKnown, c.Start) + L",\"writer_end_ms\":" + tick(c.EndKnown, c.End) +
+            L",\"elapsed_ms\":" + duration(c.StartKnown, c.Start, elapsedEnd) + L",\"admitted\":" + n(admitted) +
+            L",\"rejected\":" + n(rejected) + L",\"attempts\":" + n(attempts) + L",\"complete_jobs\":" + n(complete) +
+            L",\"normal_attempts\":" + n(attempts - shutdown) + L",\"shutdown_attempts\":" + n(shutdown) +
+            L",\"known_acquisition_jobs\":" + n(c.Acquisition.Samples) + L",\"all_acquisitions_known\":" + b(allAcquired) +
+            L",\"first_known_acquisition_ms\":" + tick(c.Acquisition.Samples != 0, c.Acquisition.First) +
+            L",\"last_known_acquisition_ms\":" + tick(c.Acquisition.Samples != 0, c.Acquisition.Last) +
+            L",\"first_known_queue_ms\":" + tick(c.Queue.Samples != 0, c.Queue.First) +
+            L",\"known_subset_start_to_writer_end_ms\":" + duration(c.EndKnown && c.Acquisition.Samples != 0, c.Acquisition.First, c.End) +
+            L",\"acquisition_to_successful_close_ms\":" + duration(ok && allAcquired, c.Acquisition.First, c.End) +
+            L",\"invalid_clocks\":" + n(invalid) + L",\"protocol_errors\":" + n(c.ProtocolErrors) +
+            L",\"sweep_publication_failures\":" + n(c.Totals.SweepPublications) + L",\"sweep_metadata_gaps\":" + n(c.Totals.SweepMetadata) +
+            L",\"irp_unavailable\":" + n(c.Totals.IrpUnavailable) + L",\"auxiliary_publication_successes\":" + n(c.Totals.AuxiliaryPublications) +
+            L",\"phases\":[" + phases + L"]}";
     }
     Counts Snapshot(KmonPublicationFamily family, bool shutdown = false) const
     {
@@ -181,8 +306,33 @@ public:
             L",\"active_shutdown\":" + (active && State->ActiveShutdown ? L"true" : L"false") + L"}";
     }
 private:
+    struct Window
+    {
+        uint64_t First = 0, Last = 0, Samples = 0;
+        void Observe(uint64_t first, uint64_t last)
+        {
+            if (!Samples || first < First) { First = first; }
+            if (!Samples || last > Last) { Last = last; }
+            ++Samples;
+        }
+    };
+    struct CloseStep
+    {
+        uint64_t Started = 0, Ended = 0;
+        bool StartedKnown = false, EndedKnown = false, Required = true;
+        KmonPublicationResult Result;
+    };
+    struct CollectionData
+    {
+        uint64_t Start = 0, End = 0, WorkEnd = 0, ProtocolErrors = 0;
+        bool StartKnown = false, EndKnown = false, WorkEndKnown = false;
+        Window Queue, Acquisition;
+        std::array<CloseStep, KmonCollectionClosePhases> Close;
+        KmonCollectionTotals Totals;
+    };
     struct Data
     {
+        CollectionData Collection;
         std::array<std::array<Samples, 2>, KmonPublicationFamilies> Families;
         std::array<uint64_t, KmonPublicationFamilies> Admitted{}, Rejected{};
         KmonPublicationFamily Active = KmonPublicationFamily::None;

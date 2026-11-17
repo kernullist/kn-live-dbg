@@ -1949,6 +1949,55 @@ cleared/reused queues. These checks do not establish native workload SLOs,
 complete source coverage, generic pipeline deadlines or whole-collection
 durability under power loss.
 
+## Collection publication timing
+
+`coverage.pipeline.collection_timing_json` adds the private
+`kn.collection_timing.v1` report for one capture-writer session. It retains the
+session start, earliest and latest known acquisition endpoints, and the actual
+writer-finish time. The writer records each closing phase in dependency order:
+sweep-manifest flush, evidence-bundle ledger, optional IRP ledger, then the
+image-journal closure. File and journal timestamps are taken only after the
+existing publication APIs report success. A live report can expose a closing
+phase before it returns; no timing mutex is held across file I/O.
+
+`publication_outcome` is `incomplete` until the writer has drained all admitted
+jobs, finished its closing phases and reconciled admissions with attempts.
+It then distinguishes `empty`, `complete`, `partial` and `failed`. The separate
+`closure_outcome` describes the closing operations. Successful closure does
+not erase a failed or rejected job, unavailable IRP capture, failed sweep
+publication or lost sweep metadata. Normal and shutdown dispatch counts remain
+separate. Successful reference, recipe and sweep publication operations,
+including verified reference reuse, also preserve a partial outcome when
+primary files and closure fail. Their count is not a distinct-file count.
+This outcome concerns required publication, not successful reading of
+every target or the truth of a captured claim.
+
+Acquisition endpoints come exclusively from the local caller windows already
+attached to processed jobs. Dispatch order cannot replace an earlier endpoint.
+Historical bytes and absent or invalid clocks remain unknown; zero is a valid
+known tick. `known_subset_start_to_writer_end_ms` measures only that known subset.
+`acquisition_to_successful_close_ms` is present only for a complete, nonempty
+publication whose admitted jobs all have valid acquisition clocks. Empty,
+partial, failed and incomplete collections do not improve this success metric.
+Duplicate closure cannot renew the original finish time, and protocol errors
+prevent a final success classification.
+
+The report is a runtime diagnostic, not an additional journal member or a
+recoverable timing receipt. It can be lost with event logging or a crash;
+offline closure still requires the original ledgers and verified journal.
+Captured page files still have no collection ledger. Per-file formats, hashes
+and dependency requirements are unchanged. The report does not evaluate
+source-wide observation coverage, authenticate acquisition clocks, measure a
+native workload SLO or prove survival under media/power loss. Its producer-queue
+snapshot is not atomic; final accounting is meaningful after producer/writer
+join.
+
+The publication self-test compares post-join timing with actual journal
+recovery, exercises file-only failed closure and empty sessions, and observes
+completed jobs before requesting writer stop. The independent core oracle
+covers unknown/invalid clocks, out-of-order acquisition, unprocessed admissions,
+rejection, missing IRP, auxiliary losses and repeated closure.
+
 ## Image observation scheduling
 
 Each resident image-work key records first/last discovery, pending time, last
