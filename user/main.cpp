@@ -23095,7 +23095,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
-    std::wcout << L"  !kmon replay-irp <capture.knirp> [/json]  ordered reads, schema/object invariants and scoped claims\n";
+    std::wcout << L"  !kmon replay-irp <capture.knirp> [/current] [/json]  original claim reproduction; /current evaluates current claims only\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
@@ -23524,13 +23524,21 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
     }
     if (action == L"replay-irp")
     {
-        if (args.size() < 3 || args.size() > 4 || args[2].empty() || args[2][0] == L'/' ||
-            (args.size() == 4 && ToLower(args[3]) != L"/json"))
+        bool currentClaims = false, jsonFlag = false;
+        bool valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty() && args[2][0] != L'/';
+        for (size_t i = 3; i < args.size() && valid; ++i)
         {
-            std::wcerr << L"usage: !kmon replay-irp <capture.knirp> [/json]\n";
+            const auto flag = ToLower(args[i]);
+            if (flag == L"/current" && !currentClaims) { currentClaims = true; }
+            else if (flag == L"/json" && !jsonFlag) { jsonFlag = true; }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: !kmon replay-irp <capture.knirp> [/current] [/json]\n";
             return 2;
         }
-        const auto replay = ReplayPendingIrpCapture(args[2]);
+        const auto replay = ReplayPendingIrpCapture(args[2], currentClaims);
         const auto json = PendingIrpReplayJson(replay);
         if (directJsonOutput)
         {
@@ -53786,7 +53794,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
         std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
-        std::wcout << L"            connect-argv, capture-scheduler, all, platform-query, cloudfiles-query <path>,\n";
+        std::wcout << L"            connect-argv, capture-scheduler, irp-publication <owned.knirp>, all, platform-query, cloudfiles-query <path>,\n";
         std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
         PrintHelp(argc >= 3 && ToLower(argv[2]) == L"all");
@@ -53842,6 +53850,13 @@ int wmain(int argc, wchar_t** argv)
         {
             std::wstring diagnostics;
             const bool passed = KmonCaptureSchedulingIntegrationSelfTest(&diagnostics);
+            std::wcout << diagnostics << L"\n";
+            return passed ? 0 : 1;
+        }
+        if (argc == 4 && ToLower(argv[2]) == L"irp-publication")
+        {
+            std::wstring diagnostics;
+            const bool passed = KmonIrpPublicationIntegrationSelfTest(argv[3], &diagnostics);
             std::wcout << diagnostics << L"\n";
             return passed ? 0 : 1;
         }
@@ -53932,7 +53947,7 @@ int wmain(int argc, wchar_t** argv)
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|irp-publication <owned.knirp>|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
         return 2;
     }
 

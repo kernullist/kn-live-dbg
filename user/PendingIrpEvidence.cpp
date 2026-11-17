@@ -263,23 +263,24 @@ namespace
     };
 }
 
-PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path)
+static PendingIrpReplay ReplayOriginalIrpCapture(const std::wstring& json, const std::wstring& directory,
+    const std::wstring& digest, SchemaArtifact* capture, std::wstring* originalReport)
 {
     PendingIrpReplay replay;
-    const auto fail = [&](const wchar_t* issue) { replay.Issue = issue; replay.QualifiedObservation = false; return replay; };
+    replay.CaptureSha256 = replay.OriginalCaptureSha256 = digest;
+    const auto fail = [&](const wchar_t* issue)
+    {
+        replay.Status = L"unavailable"; replay.Issue = issue;
+        replay.SummaryMatched = replay.QualifiedObservation = false;
+        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {};
+        if (originalReport) { originalReport->clear(); }
+        return replay;
+    };
     try
     {
-        SchemaArtifact capture;
-        std::vector<uint8_t> bytes;
-        if (!capture.Open(path, PendingIrpEvidenceMaximumBytes) ||
-            !executable_image::ReadFileBytesAt(capture.Handle(), 0, static_cast<uint32_t>(capture.Bytes()), &bytes))
-        { return fail(L"capture_missing_or_unreadable"); }
-        replay.CaptureSha256 = capture.Sha256;
-        const std::string utf8(bytes.begin(), bytes.end());
-        const auto json = mcpjson::Utf8ToWide(utf8);
         std::wstring schema, source, identity, opts, cursor, rawReads;
         IndexedObject object;
-        if (mcpjson::WideToUtf8(json) != utf8 || !object.Parse(json))
+        if (!object.Parse(json))
         { return fail(L"invalid_capture_encoding"); }
         const auto metadataInputs = object.Metadata({L"schemas", L"thread_inputs", L"requests", L"reads"});
         if (!mcpjson::GetString(metadataInputs, L"schema", &schema)) { return fail(L"invalid_capture_metadata"); }
@@ -332,7 +333,7 @@ PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path)
         if (context.ReferenceBytes != 0)
         {
             // The document cannot choose a path or cause a symbol download.
-            const auto referencePath = std::filesystem::path(path).parent_path() /
+            const auto referencePath = std::filesystem::path(directory) /
                 (L"irp-reference-" + binding.Schemas[0]->ImageSha256 + L".knblob");
             executable_image::DiskPeMetadata actual;
             if (!reference.Open(referencePath.wstring(), ReferenceArtifactMaxBytes)) { replay.ReferenceStatus = L"missing_or_unreadable"; }
@@ -360,13 +361,132 @@ PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path)
         // fields, pagination, counters, invariant names, and every negative flag.
         if (PendingIrpCaptureJson(binding, metadata, threads, options, result, reads, before, after, context) != json)
         { return fail(L"recomputed_capture_differs"); }
-        if (!capture.Unchanged() || (replay.ReferenceStatus == L"verified" && !reference.Unchanged()))
+        if ((capture && !capture->Unchanged()) || (replay.ReferenceStatus == L"verified" && !reference.Unchanged()))
         { return fail(L"artifact_changed_during_replay"); }
         replay.SummaryMatched = true;
         replay.QualifiedObservation = result.RuntimeQualified && replay.ReferenceStatus == L"verified";
         replay.Status = L"replayed";
         replay.ClaimAssessmentJson = PendingIrpClaimAssessmentJson(binding, threads, options, result, reads, context,
             replay.CaptureSha256, PendingIrpClaimMode::Replay, replay.ReferenceStatus == L"verified");
+        if (originalReport && replay.ReferenceStatus != L"missing_or_unreadable")
+        {
+            *originalReport = PendingIrpClaimAssessmentJson(binding, threads, options, result, reads, context,
+                digest, PendingIrpClaimMode::Capture, replay.ReferenceStatus == L"verified");
+        }
+        return replay;
+    }
+    catch (const std::exception&) { return fail(L"bounded_replay_failed"); }
+}
+
+namespace
+{
+    std::wstring TextHash(const std::wstring& text)
+    {
+        const auto bytes = mcpjson::WideToUtf8(text);
+        ContentHash hash;
+        return hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : L"";
+    }
+    std::wstring ClaimPublicationJson(const std::wstring& capture, const std::wstring& report, std::wstring* digest)
+    {
+        const auto payload = L"{\"capture\":" + capture + L",\"recorded_claim\":" + report + L"}";
+        *digest = TextHash(payload);
+        return digest->empty() ? L"" : L"{\"schema\":" + mcpjson::Quote(PendingIrpClaimPublicationSchema) +
+            L",\"publication_sha256\":" + mcpjson::Quote(*digest) + L",\"payload\":" + payload + L"}";
+    }
+    bool DecodeCapture(const std::vector<uint8_t>& bytes, std::wstring* json)
+    {
+        if (bytes.empty() || bytes.size() > PendingIrpEvidenceMaximumBytes) { return false; }
+        const std::string utf8(bytes.begin(), bytes.end());
+        *json = mcpjson::Utf8ToWide(utf8);
+        return mcpjson::WideToUtf8(*json) == utf8;
+    }
+}
+
+PendingIrpClaimPublication BuildPendingIrpClaimPublication(const std::vector<uint8_t>& capture,
+    const std::wstring& directory, size_t maximumBytes)
+{
+    PendingIrpClaimPublication publication;
+    try
+    {
+        std::wstring json, report;
+        if (capture.size() > maximumBytes || !DecodeCapture(capture, &json))
+        { publication.Issue = L"capture_encoding_or_publication_budget"; return publication; }
+        const auto digest = ContentHash::Bytes(capture);
+        if (digest.empty()) { publication.Issue = L"capture_digest_unavailable"; return publication; }
+        const auto replay = ReplayOriginalIrpCapture(json, directory, digest, nullptr, &report);
+        if (!replay.SummaryMatched || report.empty())
+        {
+            publication.Issue = replay.Issue.empty() ? L"original_claim_inputs_unavailable" : replay.Issue;
+            return publication;
+        }
+        const auto encoded = mcpjson::WideToUtf8(ClaimPublicationJson(json, report, &publication.Sha256));
+        if (encoded.empty() || encoded.size() > (std::min)(maximumBytes, PendingIrpEvidenceMaximumBytes))
+        { publication.Sha256.clear(); publication.Issue = L"irp_claim_publication_byte_budget"; return publication; }
+        publication.ReportSha256 = TextHash(report);
+        if (publication.ReportSha256.empty())
+        { publication.Sha256.clear(); publication.Issue = L"claim_report_digest_unavailable"; return publication; }
+        publication.Bytes.assign(encoded.begin(), encoded.end());
+    }
+    catch (const std::exception&) { publication = {}; publication.Issue = L"bounded_claim_publication_failed"; }
+    return publication;
+}
+
+PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path, bool currentClaims)
+{
+    PendingIrpReplay replay;
+    const auto fail = [&](const wchar_t* issue)
+    {
+        replay.Status = L"unavailable"; replay.Issue = issue;
+        replay.SummaryMatched = replay.QualifiedObservation = false;
+        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {};
+        return replay;
+    };
+    try
+    {
+        SchemaArtifact capture;
+        std::vector<uint8_t> bytes;
+        if (!capture.Open(path, PendingIrpEvidenceMaximumBytes) ||
+            !executable_image::ReadFileBytesAt(capture.Handle(), 0, static_cast<uint32_t>(capture.Bytes()), &bytes))
+        { return fail(L"capture_missing_or_unreadable"); }
+        replay.CaptureSha256 = capture.Sha256;
+        std::wstring json, schema;
+        IndexedObject root;
+        if (!DecodeCapture(bytes, &json) || !root.Parse(json) || !root.Raw(L"schema", &schema))
+        { return fail(L"invalid_capture_encoding"); }
+        schema = mcpjson::Unescape(schema);
+        const auto directory = std::filesystem::path(path).parent_path().wstring();
+        if (schema != PendingIrpClaimPublicationSchema)
+        { return ReplayOriginalIrpCapture(json, directory, capture.Sha256, &capture, nullptr); }
+        replay.OriginalClaimStatus = L"invalid_publication";
+        std::wstring payload, raw, report, reportSchema, reportCapture;
+        IndexedObject inputs;
+        if (!root.Raw(L"payload", &payload) || !inputs.Parse(payload) || !inputs.Raw(L"capture", &raw) ||
+            !inputs.Raw(L"recorded_claim", &report) || report.size() > PendingIrpClaimMaximumCharacters ||
+            !mcpjson::GetString(report, L"schema", &reportSchema) || reportSchema != L"kn.irp_claim_report.v1" ||
+            !mcpjson::GetString(report, L"registry", &replay.RecordedClaimRegistry) || !Text(replay.RecordedClaimRegistry, 128) ||
+            !mcpjson::GetString(report, L"policy", &replay.RecordedClaimPolicy) || !Text(replay.RecordedClaimPolicy, 128) ||
+            !mcpjson::GetString(report, L"capture_sha256", &reportCapture) || reportCapture.size() != 64 || reportCapture != TextHash(raw) ||
+            ClaimPublicationJson(raw, report, &replay.ClaimPublicationSha256) != json)
+        { return fail(L"invalid_claim_publication"); }
+        replay.OriginalCaptureSha256 = reportCapture; replay.RecordedClaimSha256 = TextHash(report);
+        if (replay.RecordedClaimSha256.empty()) { return fail(L"claim_report_digest_unavailable"); }
+        replay.OriginalClaimStatus = currentClaims ? L"not_requested" : L"not_reproduced";
+        if (!currentClaims && (replay.RecordedClaimRegistry != L"kn.claim_registry.v1" ||
+            replay.RecordedClaimPolicy != L"kn.irp_claim_policy.v1"))
+        { replay.OriginalClaimStatus = L"policy_unavailable"; return fail(L"recorded_claim_policy_unavailable"); }
+        std::wstring originalReport;
+        auto evaluated = ReplayOriginalIrpCapture(raw, directory, reportCapture, &capture, currentClaims ? nullptr : &originalReport);
+        replay.ReferenceStatus = evaluated.ReferenceStatus;
+        if (!evaluated.SummaryMatched) { return fail(evaluated.Issue.c_str()); }
+        if (!currentClaims && originalReport.empty())
+        { replay.OriginalClaimStatus = L"inputs_unavailable"; return fail(L"original_claim_inputs_unavailable"); }
+        if (!currentClaims && originalReport != report)
+        { replay.OriginalClaimStatus = L"assessment_mismatch"; return fail(L"recorded_claim_assessment_mismatch"); }
+        replay.SummaryMatched = true; replay.QualifiedObservation = evaluated.QualifiedObservation;
+        replay.Status = L"replayed";
+        replay.Recomputed = std::move(evaluated.Recomputed);
+        replay.ClaimAssessmentJson = std::move(evaluated.ClaimAssessmentJson);
+        if (!currentClaims) { replay.OriginalClaimStatus = L"reproduced"; }
         return replay;
     }
     catch (const std::exception&) { return fail(L"bounded_replay_failed"); }
@@ -378,6 +498,13 @@ std::wstring PendingIrpReplayJson(const PendingIrpReplay& replay)
     // Do not expose partly recomputed requests as established results on failure.
     std::wstring json = L"{\"schema\":\"kn.irp_replay.v1\",\"policy\":\"schema-image-repeated-snapshot-v1\",\"status\":" +
         mcpjson::Quote(replay.Status) + L",\"issue\":" + mcpjson::Quote(replay.Issue) + L",\"capture_sha256\":" + mcpjson::Quote(replay.CaptureSha256) +
+        L",\"original_capture_sha256\":" + mcpjson::Quote(replay.OriginalCaptureSha256) +
+        L",\"original_claim_replay\":{\"status\":" + mcpjson::Quote(replay.OriginalClaimStatus) +
+        L",\"original_claim_policy_reproduced\":" + B(replay.OriginalClaimStatus == L"reproduced") +
+        L",\"journal_membership_checked\":false,\"collector_authenticated\":false" +
+        L",\"publication_sha256\":" + mcpjson::Quote(replay.ClaimPublicationSha256) +
+        L",\"recorded_report_sha256\":" + mcpjson::Quote(replay.RecordedClaimSha256) +
+        L",\"registry\":" + mcpjson::Quote(replay.RecordedClaimRegistry) + L",\"policy\":" + mcpjson::Quote(replay.RecordedClaimPolicy) + L"}" +
         L",\"summary_matched\":" + B(replay.SummaryMatched) + L",\"reference_status\":" + mcpjson::Quote(replay.ReferenceStatus) +
         L",\"qualified_observation_reproduced\":" + B(replay.QualifiedObservation) +
         L",\"collector_authenticated\":false,\"external_final_state_authenticated\":false,\"pdb_file_verified\":false,"

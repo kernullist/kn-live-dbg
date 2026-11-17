@@ -6,8 +6,10 @@
 #include "TemporalFactStore.h"
 #include "ObservationReadRoutingJson.h"
 #include "PendingIrpBinding.h"
+#include "PendingIrpEvidence.h"
 #include "SchemaArtifact.h"
 #include "EvidencePrivacy.h"
+#include "BoundedObservationJson.h"
 
 #include <algorithm>
 #include <chrono>
@@ -152,6 +154,7 @@ void KernelMonitor::ResetPipeline()
     CapturedIrps.Reset();
     IrpCapturesQueued.store(0); IrpCapturesWritten.store(0); IrpCapturesFailed.store(0); IrpCapturesDropped.store(0);
     IrpCaptureBytes.store(0); IrpCaptureLedgerFailed.store(0);
+    IrpClaimsWritten.store(0); IrpClaimsUnavailable.store(0);
     IrpCapturesUnavailable.store(0); IrpReferenceBytes.store(0);
     IrpReferencesCreated.store(0); IrpReferencesReused.store(0); IrpReferencesFailed.store(0);
     IrpJournalCapturesCommitted.store(0); IrpJournalCapturesFailed.store(0); IrpJournalLedgerFailed.store(0);
@@ -1209,7 +1212,7 @@ EvidenceJournalCommit KernelMonitor::JournalImageFiles(EvidenceJournalTransactio
             { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
             auto journal = std::make_unique<EvidenceJournal>();
             if (!journal->Open(directory.empty() ? L"." : directory, std::to_wstring(EvidenceCollectionEpoch.load()), &result.Issue,
-                EvidenceJournalPolicy::ImageClaimsAndIrpV3, admitOutput))
+                EvidenceJournalPolicy::ImageAndIrpClaimsV4, admitOutput))
                 { return result; }
             ImageJournal = std::move(journal);
             ImageJournalPrivate = bool(admitOutput);
@@ -1436,12 +1439,15 @@ bool KernelMonitor::QueueIrpCapture(std::shared_ptr<const PendingIrpEvidenceArti
 void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
 {
     bool written = false;
+    bool claimWritten = false;
     bool referenceSaved = false, referenceCreated = false;
     EvidenceJournalCommit commit;
     const auto lane = capture.Retention ? capture.Retention->Class() : IrpRetentionClass::ObservationGap;
     try
     {
         std::wstring directory, failure = L"irp_capture_session_byte_budget";
+        std::wstring physicalDigest, claimFailure = L"capture_not_published";
+        PendingIrpClaimPublication publication;
         { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
         const auto privacy = std::make_shared<EvidencePrivacyGuard>();
         EvidencePrivacyReport report;
@@ -1495,17 +1501,33 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
                     }
                     referenceSaved = saved; referenceCreated = created;
                 }
-                path = (std::filesystem::path(directory) / (L"irp-" + capture.CollectionId + L"-" + digest + L".knirp")).wstring();
-                written = PublishReferenceArtifact(path, capture.Artifact->Bytes, &failure,
+                if (!capture.Artifact->Reference || referenceSaved)
+                {
+                    publication = BuildPendingIrpClaimPublication(capture.Artifact->Bytes, directory,
+                        static_cast<size_t>((std::min)(IrpRetention.Remaining(lane, IrpRetentionStream::Capture),
+                            uint64_t(PendingIrpEvidenceMaximumBytes))));
+                    claimFailure = publication.Issue;
+                }
+                else { claimFailure = L"retained_reference_not_published"; }
+                if (!publication.Bytes.empty())
+                {
+                    physicalDigest = ContentHash::Bytes(publication.Bytes);
+                    if (physicalDigest.empty()) { publication = {}; claimFailure = L"claim_file_digest_unavailable"; }
+                }
+                const auto& published = publication.Bytes.empty() ? capture.Artifact->Bytes : publication.Bytes;
+                if (publication.Bytes.empty()) { physicalDigest = digest; }
+                path = (std::filesystem::path(directory) / (L"irp-" + capture.CollectionId + L"-" + physicalDigest + L".knirp")).wstring();
+                written = PublishReferenceArtifact(path, published, &failure,
                     [&](HANDLE file) { return privacy->CheckFile(file); });
+                claimWritten = written && !publication.Bytes.empty();
                 if (written)
                 {
-                    IrpCaptureBytes.fetch_add(capture.Artifact->Bytes.size());
-                    IrpRetention.Consume(lane, IrpRetentionStream::Capture, capture.Artifact->Bytes.size());
+                    IrpCaptureBytes.fetch_add(published.size());
+                    IrpRetention.Consume(lane, IrpRetentionStream::Capture, published.size());
                     EvidenceJournalTransaction transaction;
-                    transaction.Kind = L"irp_capture"; transaction.Id = digest;
-                    transaction.Members.push_back({std::filesystem::path(path).filename().wstring(), digest,
-                        L"kn.irp_capture.v2", capture.Artifact->Bytes.size()});
+                    transaction.Kind = L"irp_capture"; transaction.Id = physicalDigest;
+                    transaction.Members.push_back({std::filesystem::path(path).filename().wstring(), physicalDigest,
+                        publication.Bytes.empty() ? L"kn.irp_capture.v2" : PendingIrpClaimPublicationSchema, published.size()});
                     if (referenceSaved)
                     {
                         const auto& reference = *capture.Artifact->Reference;
@@ -1523,6 +1545,11 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
             written ? L"IRP capture published without collection commit" : L"IRP capture publication failed";
         event.Evidence[L"collection_id"] = capture.CollectionId;
         event.Evidence[L"capture_sha256"] = capture.Artifact ? capture.Artifact->Sha256 : L"";
+        event.Evidence[L"physical_capture_sha256"] = written ? physicalDigest : L"";
+        event.Evidence[L"original_claim_persistence"] = written && !publication.Bytes.empty() ? L"committed" : L"unavailable";
+        event.Evidence[L"original_claim_failure"] = written ? claimFailure : failure;
+        event.Evidence[L"claim_publication_sha256"] = written ? publication.Sha256 : L"";
+        event.Evidence[L"recorded_claim_sha256"] = written ? publication.ReportSha256 : L"";
         event.Evidence[L"capture_path"] = written ? path : L"";
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
@@ -1535,6 +1562,8 @@ void KernelMonitor::PersistIrpCapture(const CapturedIrp& capture) noexcept
         if (!PipelineEvents.Push(std::move(event))) { CollectionLost.fetch_add(1); }
     }
     catch (...) {}
+    if (claimWritten) { IrpClaimsWritten.fetch_add(1); }
+    else { IrpClaimsUnavailable.fetch_add(1); }
     if (written) { IrpCapturesWritten.fetch_add(1); }
     else { IrpCapturesFailed.fetch_add(1); }
     if (commit.Committed) { IrpJournalCapturesCommitted.fetch_add(1); }
@@ -1567,6 +1596,7 @@ void KernelMonitor::CloseIrpCollection() noexcept
                 L",\"failed\":" + n(IrpCapturesFailed.load()) + L",\"dropped\":" + n(IrpCapturesDropped.load()) +
                 L",\"unavailable\":" + n(IrpCapturesUnavailable.load()) + L",\"retention\":" + IrpRetention.Json() +
                 L",\"bytes\":" + n(IrpCaptureBytes.load()) + L",\"pending\":" + n(CapturedIrps.Size()) +
+                L",\"claims_written\":" + n(IrpClaimsWritten.load()) + L",\"claims_unavailable\":" + n(IrpClaimsUnavailable.load()) +
                 L",\"reserved_bytes\":" + n(IrpRetention.MemoryHeld()) + L",\"reference_bytes_created\":" + n(IrpReferenceBytes.load()) +
                 L",\"references_created\":" + n(IrpReferencesCreated.load()) + L",\"references_reused\":" + n(IrpReferencesReused.load()) +
                 L",\"references_failed\":" + n(IrpReferencesFailed.load()) +
@@ -1895,6 +1925,8 @@ void KernelMonitor::DrainPipelineEvents(bool finalDrain)
         event.Evidence[L"irp_retention"] = IrpRetention.Json();
         event.Evidence[L"irp_captures_pending"] = std::to_wstring(CapturedIrps.Size());
         event.Evidence[L"irp_capture_bytes"] = std::to_wstring(IrpCaptureBytes.load());
+        event.Evidence[L"irp_claims_written"] = std::to_wstring(IrpClaimsWritten.load());
+        event.Evidence[L"irp_claims_unavailable"] = std::to_wstring(IrpClaimsUnavailable.load());
         event.Evidence[L"irp_capture_ledger_failed"] = std::to_wstring(IrpCaptureLedgerFailed.load());
         event.Evidence[L"irp_capture_reserved_bytes"] = std::to_wstring(IrpRetention.MemoryHeld());
         event.Evidence[L"irp_reference_bytes_created"] = std::to_wstring(IrpReferenceBytes.load());
@@ -2117,6 +2149,117 @@ bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics)
     return ok;
 }
 
+bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics)
+{
+    unsigned checks = 0, failures = 0;
+    const auto check = [&](bool value)
+    {
+        ++checks;
+        if (!value) { ++failures; std::fprintf(stderr, "[kmon.irp_publication] failed_check=%u\n", checks); }
+        return value;
+    };
+    wchar_t temporary[MAX_PATH]{}, unique[MAX_PATH]{};
+    std::filesystem::path root;
+    bool created = false, cleaned = false;
+    try
+    {
+        auto artifact = std::make_shared<PendingIrpEvidenceArtifact>();
+        auto reference = std::make_shared<RetainedReferenceArtifact>();
+        {
+            SchemaArtifact input, image;
+            std::wstring schemaName;
+            std::vector<std::wstring> schemas;
+            bounded_observation_json::IndexedObject object;
+            TypeSchemaPackage schema;
+            if (!input.Open(capturePath, PendingIrpEvidenceMaximumBytes) ||
+                !executable_image::ReadFileBytesAt(input.Handle(), 0, static_cast<uint32_t>(input.Bytes()), &artifact->Bytes) ||
+                !object.Parse(mcpjson::Utf8ToWide(std::string(artifact->Bytes.begin(), artifact->Bytes.end()))) ||
+                !object.Raw(L"schema", &schemaName) || schemaName != L"\"kn.irp_capture.v2\"" ||
+                !object.Rows(L"schemas", 3, &schemas) || schemas.size() != 3 || !ParseTypeSchema(schemas[0], &schema, nullptr) ||
+                !ReplayPendingIrpCapture(capturePath).SummaryMatched) { throw std::runtime_error("invalid owned capture"); }
+            const auto sourceReference = std::filesystem::path(capturePath).parent_path() / (L"irp-reference-" + schema.ImageSha256 + L".knblob");
+            if (!image.Open(sourceReference.wstring(), ReferenceArtifactMaxBytes) || image.Sha256 != schema.ImageSha256 ||
+                !executable_image::ReadFileBytesAt(image.Handle(), 0, static_cast<uint32_t>(image.Bytes()), &reference->Bytes) ||
+                !input.Unchanged() || !image.Unchanged()) { throw std::runtime_error("owned reference unavailable"); }
+            artifact->Sha256 = input.Sha256; reference->Sha256 = image.Sha256;
+        }
+        artifact->Reference = reference;
+        artifact->Retention = {{artifact->Sha256}, false, false}; // Owned test priority key, not a request identity.
+        if (!GetTempPathW(MAX_PATH, temporary) || !GetTempFileNameW(temporary, L"kni", 0, unique) ||
+            !DeleteFileW(unique) || !CreateDirectoryW(unique, nullptr)) { throw std::runtime_error("owned root unavailable"); }
+        root = std::filesystem::absolute(unique); created = true;
+        for (unsigned mode = 0; mode < 3; ++mode)
+        {
+            const auto folder = root / std::to_wstring(mode);
+            if (!check(InitializeEvidencePrivateStore(folder.wstring(), false).Initialized)) { continue; }
+            const auto owner = std::make_unique<KernelMonitor>();
+            auto& monitor = *owner;
+            monitor.Options.LogDirectory = folder.wstring();
+            const auto id = std::to_wstring(monitor.EvidenceCollectionEpoch.load());
+            const auto lane = IrpRetentionClass::FirstState;
+            if (mode == 1)
+            {
+                const auto remaining = monitor.IrpRetention.Remaining(lane, IrpRetentionStream::Capture);
+                if (!check(remaining >= artifact->Bytes.size())) { continue; }
+                monitor.IrpRetention.Consume(lane, IrpRetentionStream::Capture, remaining - artifact->Bytes.size());
+            }
+            if (mode == 2)
+            {
+                monitor.IrpRetention.Consume(lane, IrpRetentionStream::Reference,
+                    monitor.IrpRetention.Remaining(lane, IrpRetentionStream::Reference));
+            }
+            if (!check(monitor.QueueIrpCapture(artifact))) { continue; }
+            monitor.WriterStopping.store(true); monitor.CaptureWriterLoop();
+            check(monitor.CapturedIrps.Size() == 0 && monitor.IrpRetention.MemoryHeld() == 0 &&
+                monitor.IrpCapturesWritten.load() == 1 && monitor.IrpCapturesFailed.load() == 0 &&
+                monitor.IrpClaimsWritten.load() == (mode == 0 ? 1u : 0u) && monitor.IrpClaimsUnavailable.load() == (mode == 0 ? 0u : 1u));
+            std::filesystem::path saved;
+            size_t roots = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(folder))
+            { if (entry.path().extension() == L".knirp") { saved = entry.path(); ++roots; } }
+            if (!check(roots == 1)) { continue; }
+            const auto replay = ReplayPendingIrpCapture(saved.wstring());
+            const auto physical = ContentHash::File(saved.wstring());
+            check(replay.SummaryMatched && replay.OriginalCaptureSha256 == artifact->Sha256 && replay.CaptureSha256 == physical &&
+                replay.OriginalClaimStatus == (mode == 0 ? L"reproduced" : L"not_recorded") &&
+                saved.filename() == L"irp-" + id + L"-" + physical + L".knirp");
+            check(monitor.IrpCaptureBytes.load() == std::filesystem::file_size(saved) &&
+                (mode == 0 ? physical != artifact->Sha256 : physical == artifact->Sha256));
+            check(monitor.IrpReferencesFailed.load() == (mode == 2 ? 1u : 0u) &&
+                monitor.IrpReferencesCreated.load() == (mode == 2 ? 0u : 1u));
+            check(replay.ReferenceStatus == (mode == 2 ? L"missing_or_unreadable" : L"verified") &&
+                (mode != 2 || !replay.QualifiedObservation));
+            const auto recovered = RecoverEvidenceJournal((folder / L"collections" / id).wstring());
+            check(recovered.Closed && recovered.CommittedSegments == 3 && monitor.IrpJournalCapturesCommitted.load() == 1 &&
+                monitor.IrpJournalLedgerCommitted.load() && monitor.ImageJournalClosed.load());
+            std::wstring ledger;
+            check(ReadAnalystSnapshot((folder / (L"irp-session-" + id + L".knirpledger")).wstring(), &ledger, nullptr) &&
+                ledger.find(L"\"claims_written\":\"" + std::wstring(mode == 0 ? L"1" : L"0") + L"\"") != std::wstring::npos &&
+                ledger.find(L"\"claims_unavailable\":\"" + std::wstring(mode == 0 ? L"0" : L"1") + L"\"") != std::wstring::npos);
+            check(InspectEvidenceStore(folder.wstring()).Status == L"verified" && InspectEvidencePrivacy(folder.wstring(), true).AuditComplete);
+        }
+    }
+    catch (const std::exception&) { check(false); }
+    std::error_code locationError;
+    if (created && root.filename().wstring().rfind(L"kni", 0) == 0 &&
+        std::filesystem::equivalent(root.parent_path(), std::filesystem::path(temporary), locationError) && !locationError)
+    {
+        std::error_code error;
+        // Only the absolute temporary directory exclusively created above.
+        std::filesystem::remove_all(root, error);
+        cleaned = !error && !std::filesystem::exists(root);
+    }
+    check(cleaned);
+    const bool passed = failures == 0;
+    if (diagnostics)
+    {
+        *diagnostics = L"{\"schema\":\"kn.irp_publication_test.v1\",\"passed\":" + std::wstring(passed ? L"true" : L"false") +
+            L",\"checks\":" + std::to_wstring(checks) + L",\"failed\":" + std::to_wstring(failures) +
+            L",\"driver_loaded\":false,\"owned_files_cleaned\":" + std::wstring(cleaned ? L"true" : L"false") + L"}";
+    }
+    return passed;
+}
+
 bool KmonPipelineSelfTest()
 {
     if (!KmonImageReadIntegrationSelfTest()) { return false; }
@@ -2261,6 +2404,7 @@ bool KmonPipelineSelfTest()
                 const bool publication = initialized.Initialized && queued && irp.CapturedIrps.Size() == 0 &&
                     irp.IrpCapturesWritten.load() == 1 && irp.IrpCapturesFailed.load() == 1 &&
                     irp.IrpCaptureBytes.load() == artifact->Bytes.size() && irp.IrpCaptureLedgerFailed.load() == 0 &&
+                    irp.IrpClaimsWritten.load() == 0 && irp.IrpClaimsUnavailable.load() == 2 &&
                     irp.IrpRetention.MemoryHeld() == 0 && irp.IrpReferencesCreated.load() == 1 && irp.IrpReferencesReused.load() == 1 &&
                     irp.IrpReferenceBytes.load() == reference->Bytes.size() && irp.IrpReferencesFailed.load() == 0 &&
                     ContentHash::File((std::filesystem::path(privateRoot) / (L"irp-reference-" + reference->Sha256 + L".knblob")).wstring()) == reference->Sha256 &&

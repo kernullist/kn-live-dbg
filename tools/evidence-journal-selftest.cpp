@@ -184,6 +184,44 @@ namespace
         Stage(stage, L"irp_closed");
         return Failed ? 1 : 0;
     }
+    int CommitPublishedIrp(const fs::path& root, const std::wstring& stage, const std::wstring& version)
+    {
+        const auto policy = version == L"4" ? EvidenceJournalPolicy::ImageAndIrpClaimsV4 :
+            version == L"3" ? EvidenceJournalPolicy::ImageClaimsAndIrpV3 :
+            version == L"2" ? EvidenceJournalPolicy::ImageAndIrpV2 : EvidenceJournalPolicy::ImageV1;
+        EvidenceJournal journal;
+        std::wstring error;
+        if (!journal.Open(root.wstring(), L"7", &error, policy)) { return 1; }
+        EvidenceJournalTransaction transaction;
+        transaction.Kind = L"irp_capture";
+        for (const auto& entry : fs::directory_iterator(root))
+        {
+            const auto name = entry.path().filename().wstring();
+            if (entry.path().extension() == L".knirp")
+            {
+                std::wstring json;
+                if (!ReadAnalystSnapshot(entry.path().wstring(), &json, nullptr, 16 * 1024 * 1024, nullptr, true)) { return 1; }
+                auto member = EvidenceJournalJsonMember(name, json);
+                transaction.Id = member.Sha256;
+                transaction.Members.push_back(std::move(member));
+            }
+            else if (name.rfind(L"irp-reference-", 0) == 0 && entry.path().extension() == L".knblob")
+            {
+                transaction.Members.push_back({name, ContentHash::File(entry.path().wstring()), L"raw.bytes", fs::file_size(entry.path())});
+            }
+        }
+        Stage(stage, L"irp_claim_files");
+        if (!journal.Commit(transaction).Committed) { return 1; }
+        Stage(stage, L"irp_claim_commit");
+        const auto ledger = IrpLedger(root, L"7");
+        if (!journal.Commit(ledger).Committed) { return 1; }
+        Stage(stage, L"irp_claim_ledger");
+        auto closure = Closure(root);
+        closure.Requires.push_back(ledger.Members[0].Path);
+        if (!journal.Commit(closure).Committed) { return 1; }
+        Stage(stage, L"irp_claim_closed");
+        return 0;
+    }
     void TypedTests(const fs::path& root)
     {
         fs::create_directories(root);
@@ -404,6 +442,7 @@ int wmain(int argc, wchar_t** argv)
         if (argc == 4 && std::wstring(argv[1]) == L"--produce-collection") { return Produce(argv[2], L"", argv[3], true); }
         if (argc == 5 && std::wstring(argv[1]) == L"--produce-irp") { return ProduceIrp(argv[2], argv[3], argv[4]); }
         if (argc == 5 && std::wstring(argv[1]) == L"--commit-published") { return CommitPublishedScopes(argv[2], argv[3], argv[4]); }
+        if (argc == 5 && std::wstring(argv[1]) == L"--commit-published-irp") { return CommitPublishedIrp(argv[2], argv[3], argv[4]); }
         if (argc >= 3 && std::wstring(argv[1]) == L"--recover")
         {
             const auto r = RecoverEvidenceJournal(argv[2], argc == 4 && std::wstring(argv[3]) == L"--index");

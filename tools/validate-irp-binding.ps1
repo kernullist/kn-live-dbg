@@ -37,4 +37,6 @@ if ($LASTEXITCODE -ne 0) { throw 'IRP binding controls failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Independent IRP capture oracle failed' }
 & python (Join-Path $PSScriptRoot 'test-irp-replay.py') $program $output
 if ($LASTEXITCODE -ne 0) { throw 'IRP replay mutation controls failed' }
+& python (Join-Path $PSScriptRoot 'test-irp-claim-publication.py') --exe $program --publisher $program --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw 'IRP claim publication controls failed' }
 Write-Output "[irp.binding.validation] fixtures=$output"

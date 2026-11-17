@@ -312,11 +312,12 @@ failed; consult both sets of counters. Closure does not imply complete target
 observation or successful comparison/replay.
 
 `session.knsession` (`kn.evidence_session.v1`) fixes the collection ID and
-policy. Current KMON writers use `kn.image_claim_irp_collection_journal.v3`, which
-admits original slice/sweep claim publications alongside existing image and IRP
-members. Image-only v1 and image/IRP v2 sessions remain readable and cannot admit
-the new publication schema; v1 also rejects IRP transaction kinds. A writer cannot
-reopen a session under a different policy.
+policy. Current KMON writers use `kn.image_irp_claim_collection_journal.v4`, which
+also admits `kn.irp_claim_publication.v1`. Image-only v1, image/IRP v2 and
+image-claim/IRP v3 sessions remain readable. V3 admits original slice/sweep claim
+publications but rejects the new IRP publication; v1/v2 reject both new forms,
+and v1 also rejects IRP transaction kinds. A writer cannot reopen a session under
+a different policy.
 Each create-new `.knjseg` record
 (`kn.evidence_journal_segment.v1`) binds its sequence, preceding **physical-file**
 SHA-256, transaction ID, members and prior dependencies. Members bind their exact
@@ -1532,17 +1533,17 @@ retain their 2 MiB default. Incomplete traces, forged summaries, unknown policie
 and unused or reordered calls cannot produce a matched replay.
 
 The fixed sibling reference name comes from the validated schema hash, never an
-imported pathname. Missing reference bytes allow a reported metadata replay but
-cannot reproduce `qualified_observation`. A present conflicting image rejects
-replay. Exact image/hash/PE/RSDS validation enables the bounded qualification;
+imported pathname. For a bare v2 capture, missing reference bytes allow a reported
+metadata replay but cannot reproduce `qualified_observation`. A present
+conflicting image rejects replay. Exact image/hash/PE/RSDS validation enables the bounded qualification;
 it authenticates neither the collector nor the declared external final state.
 The command does not open a live source, download symbols or reparse a PDB.
 Legacy v1 files remain intact and report their missing source/final-state inputs
 instead of inventing them. Request observation v1 and the native IOCTL ABI are
 unchanged.
 
-The writer commits each published v2 capture and any successfully retained
-reference to the typed journal. `irp_journal_captures_*` and
+The writer commits each published capture or claim publication and any successfully
+retained reference to the typed journal. `irp_journal_captures_*` and
 `irp_journal_ledger_*` distinguish membership from file publication; a published
 file can remain uncommitted. The ledger's own `journal_membership:false` is a
 prepublication statement: membership comes from the external verified journal.
@@ -1661,17 +1662,57 @@ KMON retains `io.claim_assessment` and `io.request_observation` as kernel
 observations independently of process-watch filters; normal live printing is
 suppressed while the ring and log retain them. Unavailable assessments emit
 `coverage.irp_claims`. Capture-time reports remain derived event metadata outside
-the raw capture reservation. Existing `replay-irp` output adds `claim_assessment`
-only after canonical replay; invalid captures expose no partial claim result.
-Offline reports explicitly use `current_policy_on_replayed_observations` and
-do not claim to reproduce a separately preserved original claim policy.
+the raw capture reservation. `replay-irp` output adds `claim_assessment` only after
+canonical replay; invalid captures expose no partial claim result. These offline
+reports use `current_policy_on_replayed_observations`; original report reproduction
+is a separate outcome described below.
 Capture v1/v2 bytes, request observation v1 and the native ABI remain unchanged.
 
-Other scanner adapters, image-change claims in the common registry,
-cross-capture qualified joins, request lifecycle providers and native build/
+#### Original IRP claim publication
+
+After preserving the fixed sibling reference, the KMON writer recomputes the
+capture from its retained ordered reads and evaluates its Capture-mode report.
+It writes one canonical `kn.irp_claim_publication.v1` root with `payload.capture`
+containing the unchanged v2 capture and `payload.recorded_claim` containing the
+frozen report. `publication_sha256` hashes the exact UTF-8 payload, without a
+circular self-reference. The whole publication shares the existing 16 MiB file
+limit and remaining per-class capture budget. It adds no queued report memory
+and performs no new target read, symbol lookup or PDB parse.
+
+If original inputs, report generation or the added byte budget are unavailable,
+the writer retains the bare capture and records `original_claim_failure`.
+`coverage.irp_capture` distinguishes `original_claim_persistence`, physical file
+hash, original capture hash, publication hash and report hash. Its existing
+`capture_sha256` continues to identify the raw observation used by request/claim
+events; `physical_capture_sha256` identifies the saved file. Final `.knirpledger`
+fields `claims_written` and `claims_unavailable` count publication outcomes,
+separately from journal membership. Durable byte accounting uses the whole saved
+file. Journal v4 binds this physical hash in the filename, transaction ID and
+member; a transaction still contains at most the publication and one reference.
+
+Default `replay-irp` first requires the recorded registry/policy, reconstructs
+the complete raw capture and regenerates the Capture-mode report. Only exact
+report equality gives `original_claim_replay.status: reproduced`. A missing
+reference that was used by the original report fails this reproduction. Unknown
+policies, changed reports or missing inputs expose no successful summary, current
+claim or request result. `/current` explicitly skips original claim reproduction
+and reports `not_requested`; it still requires canonical raw replay and reports
+unqualified current claims when the reference is missing. Legacy bare captures
+report `not_recorded` and retain their prior replay behavior.
+
+In replay JSON, `capture_sha256` is the physical file hash and
+`original_capture_sha256` is the embedded raw hash. Claim evidence pointers are
+relative to that original capture, not the publication envelope. The separate
+`original_claim_replay` includes publication/report hashes and recorded policy
+identity. It does not change the frozen report's prepublication persistence or
+replay statements. Reproduction neither authenticates the collector nor checks
+collection membership. Current `claim_assessment` remains a Replay-mode report;
+it is not compared directly to the intentionally different Capture-mode report.
+
+Other scanner adapters, cross-capture qualified joins, request lifecycle providers and native build/
 lifetime validation remain open. The bounded IRP policy and publication-routing
 controls are recorded in
-[validation](VALIDATION.md#irp-objectstate-claim-checkpoint-2026-11-07).
+[validation](VALIDATION.md#original-irp-claim-checkpoint-2026-11-17).
 
 ### Live symbol and type index broker
 
@@ -1905,7 +1946,7 @@ cover nonempty queued recipes; `slice_recipes_unavailable` separately counts
 inputs that were not recipe-eligible. Missing child evidence never creates an
 original sweep claim or a successful collection dependency.
 
-Journal v3 commits the exact physical publication bytes, including recorded
+Journal v3 and later commit the exact physical publication bytes, including recorded
 claims, and requires already committed child/reference paths before a sweep
 transaction. Recovery and store retention recognize the new sweep roots.
 Appending after closure, conflicting files, absent dependencies and reopening

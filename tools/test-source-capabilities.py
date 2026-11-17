@@ -61,7 +61,7 @@ def main():
     journal = by_key[("evidence", "journal", "local_files")]
     assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
     assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
-    assert "legacy_image_v1_or_image_irp_v2_policy" in journal["requirements"] and "irp_ledger_before_closure" in journal["requirements"]
+    assert "image_v1_image_irp_v2_image_claim_irp_v3_or_image_irp_claim_v4_policy" in journal["requirements"] and "irp_ledger_before_closure" in journal["requirements"]
     store = by_key[("evidence", "store", "local_files")]
     assert store["availability"] == "not_probed" and store["consistency"] == "coordinated_stopped_store"
     assert "participating_publishers" in store["requirements"] and "no_deletion_authority_or_disk_allocation" in store["limits"]
@@ -85,6 +85,11 @@ def main():
     irp_claims = by_key[("evidence", "claims_irp", "capture")]
     assert "seven_ledgers" in irp_claims["requirements"] and "single_capture_evidence" in irp_claims["requirements"]
     assert "omitted_denominator" in irp_claims["limits"] and irp_claims["availability"] == "not_probed"
+    assert "writer_original_claim_publication" in irp_claims["requirements"]
+    assert "raw_fallback_and_unavailable_counter" in irp_claims["limits"]
+    irp_replay = by_key[("evidence", "replay_irp", "local_files")]
+    assert "irp_claim_publication_v1" in irp_replay["requirements"]
+    assert "current_flag_skips_original_claim_reproduction" in irp_replay["limits"]
     assert "direct_mapping_basis" in by_key[("image", "capture_verification", "dump")]["limits"]
     live_image = by_key[("image", "capture_verification", "process_handle")]
     assert "explicit_residency_consent" in live_image["requirements"] and "no_native_fallback" in live_image["limits"]

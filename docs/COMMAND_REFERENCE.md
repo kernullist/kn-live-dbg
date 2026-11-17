@@ -252,9 +252,31 @@ requires exact recorded policy/report reproduction. Legacy or fallback files
 remain `not_recorded`; failed original replay withholds proof and claims. The
 2 MiB publication limit includes both the original artifact and report. Publication
 events and hunt/session `slice_claims_*` / `sweep_claims_*` counters expose claim
-storage failures separately from file and collection outcomes. Journal v3 binds
+storage failures separately from file and collection outcomes. Journal v3 and later bind
 the whole physical file, but replay alone does not check journal membership. See
 [slice/sweep publication](ARCHITECTURE.md#original-slice-and-sweep-claim-publication).
+
+`KnLiveDbg.exe --offline !kmon replay-irp <capture.knirp> [/current] [/json]`
+replays the original ordered IRP observations. New `kn.irp_claim_publication.v1`
+files also require exact original Capture-mode claim reproduction by default.
+Unknown claim policies, altered reports or missing original inputs return exit 1
+with no matched summary or derived requests/claims. `/current` evaluates current
+claims and explicitly leaves original claim reproduction `not_requested`; a
+missing reference can then yield bounded, unqualified observations. Bare v2
+captures retain their prior behavior and report original claims `not_recorded`.
+The JSON separates physical `capture_sha256`, `original_capture_sha256` and
+`original_claim_replay` from current `claim_assessment`. Evidence pointers use the
+original capture hash. Exit 0 can reproduce negative or inconclusive evidence;
+it does not establish execution, lifetime or collection membership. See the
+[IRP publication contract](ARCHITECTURE.md#original-irp-claim-publication).
+
+`KnLiveDbg.exe --self-test irp-publication <owned.knirp>` exercises the actual
+KMON writer using an existing raw v2 test capture and its fixed sibling reference.
+It covers original report publication, capture-budget fallback, unavailable
+reference retention, journal closure, counters and temporary-file cleanup. It
+does not load a driver. Use a fixture created by `tools/validate-irp-binding.ps1`;
+the input files remain unchanged. The command emits JSON and returns 0 on success,
+1 on test failure or 2 for invalid argument count.
 
 `KnLiveDbg.exe --self-test capture-scheduler` runs the capture worker using owned
 process memory and an absent kernel device. It emits JSON and exits 0 on success

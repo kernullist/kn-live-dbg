@@ -7,6 +7,87 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Original IRP claim checkpoint: 2026-11-17
+
+The KMON writer now preserves an unchanged v2 capture and its original
+Capture-mode claim report in `kn.irp_claim_publication.v1`. Default replay
+requires exact original report reproduction; `/current` explicitly requests
+current claims without asserting original claim reproduction. Journal v4 binds
+the whole physical publication. Bare captures, byte-budget fallbacks and missing
+reference outcomes remain explicit. See the
+[publication contract](ARCHITECTURE.md#original-irp-claim-publication).
+
+Release IRP validation passed **151 C++ controls**, an independent **32-field /
+29-read** capture oracle and claim truth/evidence-pointer checks across **21
+captures**. Legacy replay controls passed **53 harness / 57 product checks**.
+New publication checks passed **730 harness / 738 product checks**, including
+independent inner/outer hashes, exact equality with reports saved at capture
+time, current-policy field oracles, report/registry/policy mutations, missing
+references, duplicate keys, foreign or empty capture hashes, report limits,
+immutable collisions and the exact whole-publication budget boundary.
+Explicit current evaluation cannot bypass the publication envelope or raw
+capture validation.
+
+Observed writer termination at four publication boundaries recovered exactly
+**0 / 1 / 2 / 3** committed segments with the expected closure state. Independent
+physical hashes matched the journal chain; rehashed report substitution failed
+membership verification, and v1/v2/v3 policies rejected the new schema. These
+are sampled process-interruption controls, not power-loss or every-instruction
+coverage. The actual KMON writer also passed normal original-report publication,
+raw fallback when only the capture fits, and reference-retention budget failure.
+Its final ledgers, physical filenames, byte counts, membership and owned-file
+cleanup matched those outcomes. No target reads or driver load were required.
+
+Release journal compatibility passed **71 C++**, **1,952 journal**, **476 store**,
+**892 GC** and **400 IRP** checks. Capability validation passed **36 contracts /
+261 routes**, generated support documentation matched, and the public classifier
+passed **12 tests**, including the new private schema. Final review fixed empty
+digest handling before publication and updated the old `/current` rejection
+assertion to cover valid offline routing and duplicate-option rejection.
+The final Release build and isolated `--self-test all` passed: timeline **28**,
+MCP **102**, KMON image integration **121**, console **564**, command audit
+**3,012 / 261 routes**, and remote **68** plus four connection-option controls.
+The final product also passed the 738 publication checks. No additional
+actionable defects were found in the reviewed scope.
+
+**ASan execution is unresolved on the updated host.** Both IRP and journal ASan
+binaries stopped before their test bodies at `interception_win.cpp:193`. A
+separate minimal `puts`/`main` program exited 0 normally, while its ASan build
+exited 1 with the same interceptor error and no `main` output. No interception
+bypass was used: Microsoft documents that continuing past interception failure
+can miss reports for that function. See the
+[ASan runtime documentation](https://learn.microsoft.com/en-us/cpp/sanitizers/asan-runtime?view=msvc-170).
+This stage therefore has Release validation, not a successful ASan run. Earlier
+dated ASan evidence and the separate real-kernel PDB resource failure do not
+close this gap.
+
+Final host checks found unchanged boot time, zero new reboot/BugCheck events,
+and no task process, driver, parser-profile receipt, temporary preparation or
+AppContainer profile residue. The 33 completed code caches were retained, up
+from 31 at the fresh baseline. BFE, firewall service and profiles were unchanged.
+EFS changed from stopped/manual to running/manual during validation and remains
+there: it reports `CanStop:false`; the earlier stop attempt was denied with
+Win32 5 / `NOT_STOPPABLE`. No permission bypass or service configuration change
+was attempted. This is a remaining host-cleanup limitation.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Final Release product | `eb0f6bab5da2e2a48cfd0402dbae13b31681fa96b0b84cf469401e6a98d18654` |
+| IRP binding/publication, Release | `d2bc965f2644b51d7b901dd939f35b4b6ff12b0248c9077ae87a453590408b73` |
+| Journal/store, Release | `23e11362267f8984099cff87ac015f02fa415b4a45bb25636a7116cbe88757c9` |
+
+Reproduce with `tools/validate-irp-binding.ps1` and
+`tools/validate-evidence-journal.ps1`. Add journal interruption checks with
+`tools/test-irp-claim-publication.py --exe <irp-test> --publisher <irp-test>
+--fixtures <irp-fixtures> --journal-exe <journal-test>`; use `--exe <product>
+--product` for the product path, including the actual KMON writer self-test.
+Run the full self-test alone. The host was Windows 11 10.0.28000 / kernel
+10.0.28000.3501, MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Existing C4744
+warnings remain. The owned corpus does not establish native IRP lifetime,
+completion execution or broader build coverage. Other scanner adapters,
+direct-capture journal integration and qualified cross-capture lifetime joins
+remain open. This checkpoint does not complete P08 or P01-P16/VS1-VS4.
+
 ## Original slice/sweep claim checkpoint: 2026-11-17
 
 Eligible KMON slice/sweep files now retain an unchanged original artifact and

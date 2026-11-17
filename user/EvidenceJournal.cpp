@@ -5,6 +5,7 @@
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
 #include "ImageScopeClaimPublication.h"
+#include "PendingIrpEvidence.h"
 #include <algorithm>
 #include <filesystem>
 #include <map>
@@ -61,7 +62,8 @@ namespace
     std::wstring SessionJson(const std::wstring& id, unsigned version = 1)
     {
         return Envelope(L"kn.evidence_session.v1", L"{\"collection_id\":" + mcpjson::Quote(id) +
-            L",\"policy\":" + mcpjson::Quote(version == 3 ? L"kn.image_claim_irp_collection_journal.v3" :
+            L",\"policy\":" + mcpjson::Quote(version == 4 ? L"kn.image_irp_claim_collection_journal.v4" :
+                version == 3 ? L"kn.image_claim_irp_collection_journal.v3" :
                 version == 2 ? L"kn.image_irp_collection_journal.v2" : L"kn.image_collection_journal.v1") +
             L",\"hash_basis\":\"exact_file_bytes\","
             L"\"collector_authenticated\":false,\"target_coverage_established\":false}");
@@ -88,7 +90,8 @@ namespace
         if (m.Path == L"irp-reference-" + m.Sha256 + L".knblob")
             { return m.Schema == L"raw.bytes" && m.Bytes <= MaxBlobBytes; }
         if (m.Path == L"irp-" + id + L"-" + m.Sha256 + L".knirp")
-            { return Id(id) && m.Bytes <= MaxIrpBytes && (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2"); }
+            { return Id(id) && m.Bytes <= MaxIrpBytes && (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2" ||
+                m.Schema == PendingIrpClaimPublicationSchema); }
         if (m.Bytes > MaxJsonBytes) { return false; }
         if (m.Path == L"irp-session-" + id + L".knirpledger") { return Id(id) && m.Schema == L"kn.irp_capture_session.v1"; }
         if (m.Path == L"image-reads/session-" + id + L".knreadledger") { return m.Schema == L"kn.image_read_session.v1"; }
@@ -237,6 +240,7 @@ struct EvidenceJournal::Impl
     bool Writable = false, Healthy = false;
     bool Typed = false;
     bool Claims = false;
+    bool IrpClaims = false;
     std::function<bool(HANDLE)> AdmitOutput;
 
     bool Fail(const wchar_t* issue) { Result.Issue = issue; return false; }
@@ -350,12 +354,14 @@ struct EvidenceJournal::Impl
         {
             if (!MemberValid(m, Result.CollectionId) || (!previous.empty() && m.Path <= previous)) { return Fail(L"invalid_or_duplicate_member"); }
             if (!Claims && m.Schema == ImageScopeClaimPublicationSchema) { return Fail(L"claim_publication_requires_v3_policy"); }
+            if (!IrpClaims && m.Schema == PendingIrpClaimPublicationSchema) { return Fail(L"irp_claim_publication_requires_v4_policy"); }
             if ((!irp && !irpLedger && IrpPath(m.Path)) || (irpLedger && m.Schema != L"kn.irp_capture_session.v1"))
                 { return Fail(L"invalid_member_kind"); }
             if (irp)
             {
                 if (m.Path == L"irp-" + Result.CollectionId + L"-" + t.Id + L".knirp" && m.Sha256 == t.Id &&
-                    (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2")) { irpRoot = true; }
+                    (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2" ||
+                        m.Schema == PendingIrpClaimPublicationSchema)) { irpRoot = true; }
                 else if (m.Schema != L"raw.bytes" || m.Path != L"irp-reference-" + m.Sha256 + L".knblob")
                     { return Fail(L"invalid_irp_transaction_member"); }
             }
@@ -461,7 +467,7 @@ struct EvidenceJournal::Impl
             (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
             { return Fail(L"collection_busy_or_lock_unavailable"); }
         const auto manifest = Collection / L"session.knsession";
-        const auto session = SessionJson(id, Claims ? 3 : Typed ? 2 : 1);
+        const auto session = SessionJson(id, IrpClaims ? 4 : Claims ? 3 : Typed ? 2 : 1);
         const auto attrs = GetFileAttributesW(NativePath(manifest).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES && create && GetLastError() == ERROR_FILE_NOT_FOUND &&
             !SaveObservationJson(NativePath(manifest), session, nullptr, AdmitOutput)) { return Fail(L"session_publication_failed"); }
@@ -469,9 +475,11 @@ struct EvidenceJournal::Impl
         uint64_t bytes = 0;
         std::wstring json;
         if (!Read(manifest, 4096, &lease, &Result.SessionSha256, &bytes, &json) ||
-            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, 2) && json != SessionJson(id, 3))))
+            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, 2) &&
+                json != SessionJson(id, 3) && json != SessionJson(id, 4))))
             { return Fail(L"session_missing_or_invalid"); }
-        Claims = json == SessionJson(id, 3);
+        IrpClaims = json == SessionJson(id, 4);
+        Claims = IrpClaims || json == SessionJson(id, 3);
         Typed = Claims || json == SessionJson(id, 2);
         Files.emplace(L"@session", std::move(lease));
         Result.HeadSha256 = Result.SessionSha256;
@@ -568,7 +576,8 @@ bool EvidenceJournal::Open(const std::wstring& root, const std::wstring& id, std
     bool ok = false;
     try
     {
-        Data->Claims = policy == EvidenceJournalPolicy::ImageClaimsAndIrpV3;
+        Data->IrpClaims = policy == EvidenceJournalPolicy::ImageAndIrpClaimsV4;
+        Data->Claims = Data->IrpClaims || policy == EvidenceJournalPolicy::ImageClaimsAndIrpV3;
         Data->Typed = Data->Claims || policy == EvidenceJournalPolicy::ImageAndIrpV2;
         Data->AdmitOutput = std::move(admitOutput);
         ok = Data->Load(root, id, true);

@@ -370,6 +370,7 @@ private:
     bool ScanCallbackInlineTargets(const std::vector<KernelCallbackRecord>& records);
     friend bool KmonPipelineSelfTest();
     friend bool KmonImageReadIntegrationSelfTest();
+    friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     void WorkerLoop();
     void CollectorLoop();
@@ -625,6 +626,7 @@ private:
     std::atomic<uint64_t> IrpCapturesQueued{0}, IrpCapturesWritten{0}, IrpCapturesFailed{0}, IrpCapturesDropped{0};
     std::atomic<uint64_t> IrpCapturesUnavailable{0};
     std::atomic<uint64_t> IrpCaptureBytes{0};
+    std::atomic<uint64_t> IrpClaimsWritten{0}, IrpClaimsUnavailable{0};
     std::atomic<uint64_t> IrpCaptureLedgerFailed{0};
     std::atomic<uint64_t> IrpReferenceBytes{0};
     std::atomic<uint64_t> IrpReferencesCreated{0}, IrpReferencesReused{0}, IrpReferencesFailed{0};
@@ -1516,4 +1518,5 @@ bool KernelMonitorMapperPoolSelfTest();
 
 bool KmonPipelineSelfTest();
 bool KmonImageReadIntegrationSelfTest();
+bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);

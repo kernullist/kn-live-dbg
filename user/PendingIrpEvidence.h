@@ -28,6 +28,11 @@ std::wstring PendingIrpCaptureJson(const PendingIrpSchemaBinding& binding,
 struct PendingIrpReplay
 {
     std::wstring Status = L"unavailable", Issue, CaptureSha256;
+    // capture_sha256 always identifies the physical file; evidence pointers
+    // inside a publication address its unchanged original capture instead.
+    std::wstring OriginalCaptureSha256, ClaimPublicationSha256, RecordedClaimSha256;
+    std::wstring RecordedClaimRegistry, RecordedClaimPolicy;
+    std::wstring OriginalClaimStatus = L"not_recorded";
     std::wstring ReferenceStatus = L"not_checked";
     bool SummaryMatched = false;
     bool QualifiedObservation = false;
@@ -35,7 +40,20 @@ struct PendingIrpReplay
     PendingIrpScanResult Recomputed;
 };
 
+inline constexpr const wchar_t* PendingIrpClaimPublicationSchema = L"kn.irp_claim_publication.v1";
+struct PendingIrpClaimPublication
+{
+    std::vector<uint8_t> Bytes;
+    std::wstring Sha256, ReportSha256, Issue;
+};
+
+// The writer invokes this after publishing the retained reference. It evaluates
+// only the original bounded reads and fixed sibling reference, never a target.
+// Failure leaves Bytes empty so the caller can retain the legacy raw capture.
+PendingIrpClaimPublication BuildPendingIrpClaimPublication(const std::vector<uint8_t>& capture,
+    const std::wstring& artifactDirectory, size_t maximumBytes);
+
 // Opens only the bounded capture and its fixed content-addressed sibling image.
 // No live source, symbol lookup, PDB parser, or source initialization is used.
-PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path);
+PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path, bool currentClaims = false);
 std::wstring PendingIrpReplayJson(const PendingIrpReplay& replay);

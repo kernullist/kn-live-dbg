@@ -8,6 +8,7 @@
 #include "../user/PendingIrpEvidence.h"
 #include "../user/PendingIrpClaims.h"
 #include "../user/ClaimPolicy.h"
+#include "../user/ReferenceArtifact.h"
 #include "irp-binding-fixture.h"
 #include <filesystem>
 #include <fstream>
@@ -105,11 +106,25 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
     if (argc >= 2 && std::wstring(argv[1]) == L"--schema-worker") { return RunTypeSchemaWorkerCommand(argc, argv); }
-    if (argc == 3 && std::wstring(argv[1]) == L"--replay-irp")
+    if ((argc == 3 || (argc == 4 && std::wstring(argv[3]) == L"/current")) && std::wstring(argv[1]) == L"--replay-irp")
     {
-        const auto replay = ReplayPendingIrpCapture(argv[2]);
+        const auto replay = ReplayPendingIrpCapture(argv[2], argc == 4);
         std::wcout << PendingIrpReplayJson(replay) << L'\n';
         return replay.SummaryMatched ? 0 : 1;
+    }
+    if ((argc == 4 || argc == 5) && std::wstring(argv[1]) == L"--publish-irp")
+    {
+        SchemaArtifact input;
+        std::vector<uint8_t> bytes;
+        if (!input.Open(argv[2], PendingIrpEvidenceMaximumBytes) ||
+            !executable_image::ReadFileBytesAt(input.Handle(), 0, static_cast<uint32_t>(input.Bytes()), &bytes)) { return 1; }
+        const auto limit = argc == 5 ? static_cast<size_t>(std::stoull(argv[4])) : PendingIrpEvidenceMaximumBytes;
+        const auto publication = BuildPendingIrpClaimPublication(bytes, std::filesystem::path(argv[3]).parent_path().wstring(), limit);
+        std::wstring error;
+        const bool saved = input.Unchanged() && !publication.Bytes.empty() && PublishReferenceArtifact(argv[3], publication.Bytes, &error);
+        std::wcout << L"{\"published\":" << (saved ? L"true" : L"false") << L",\"issue\":"
+            << mcpjson::Quote(publication.Issue.empty() ? error : publication.Issue) << L"}\n";
+        return saved ? 0 : 1;
     }
     if (argc != 2) { return 2; }
     const std::filesystem::path root = argv[1];

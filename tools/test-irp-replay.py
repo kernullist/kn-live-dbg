@@ -20,9 +20,9 @@ def main():
     prefix = [str(args.executable.resolve())] + (["--offline", "!kmon", "replay-irp"] if args.product else ["--replay-irp"])
     checks = 0
 
-    def run(path, code=0):
+    def run(path, code=0, current=False):
         nonlocal checks
-        done = subprocess.run(prefix + [str(path)], capture_output=True, timeout=60, encoding="utf-8")
+        done = subprocess.run(prefix + [str(path)] + (["/current"] if current else []), capture_output=True, timeout=60, encoding="utf-8")
         assert done.returncode == code, (done.returncode, code, done.stderr[-1000:], done.stdout[-1000:])
         result = json.loads(done.stdout)
         assert result["schema"] == "kn.irp_replay.v1"
@@ -94,6 +94,7 @@ def main():
         assert run(path, 1)["reference_status"] == "mismatch"
         saved.write_bytes(content)
         assert run(path)["qualified_observation_reproduced"]
+        assert run(path, current=True)["original_claim_replay"]["status"] == "not_recorded"
         run(root / "missing.knirp", 1)
         # Replay each original outcome, including owner/source churn, failed
         # reads, cancellation, missing optional fields, and the >2 MiB trace.
@@ -101,7 +102,7 @@ def main():
             result = run(fixture)
             assert result["summary_matched"]
         if args.product:
-            for options in ([], ["/json"], [str(path), "/current"], [str(path), "/json", "/json"]):
+            for options in ([], ["/json"], [str(path), "/current", "/current"], [str(path), "/json", "/json"]):
                 done = subprocess.run(prefix + options, capture_output=True, timeout=60)
                 assert done.returncode == 2 and b"usage" in done.stderr
                 checks += 1
