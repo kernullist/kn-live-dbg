@@ -45,7 +45,7 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
     uint32_t openStatus = ERROR_SUCCESS;
     try
     {
-        std::unique_ptr<void, CloseHandleDeleter> process(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION,
+        std::unique_ptr<void, CloseHandleDeleter> process(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
             FALSE, static_cast<DWORD>(pid)));
         if (process == nullptr)
         {
@@ -71,6 +71,7 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
                 options.TargetId = L"process:" + std::to_wstring(pid) + L":" + std::to_wstring(creation);
                 options.AddressSpaceId = options.TargetId + L":user";
                 options.AllowResidencyChanges = true;
+                options.MappingObserver = &source;
                 captured = CaptureObservedImageRecipe(args[2], source, base, static_cast<uint32_t>(rva),
                     static_cast<uint32_t>(length), args[6], options, &recipe, &error, cancellation);
             }
@@ -80,7 +81,7 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
     {
         error = L"image capture could not materialize bounded artifacts";
     }
-    const auto json = L"{\"schema\":\"kn.image_capture.v2\",\"status\":" + mcpjson::Quote(captured ? L"recorded" : L"failed") +
+    const auto json = L"{\"schema\":\"kn.image_capture.v3\",\"status\":" + mcpjson::Quote(captured ? L"recorded" : L"failed") +
         L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) + L",\"source_id\":" + mcpjson::Quote(recipe.SourceId) +
         L",\"operation_id\":" + mcpjson::Quote(recipe.ReadSet.OperationId) + L",\"target_id\":" + mcpjson::Quote(recipe.ReadSet.TargetId) +
         L",\"policy\":" + mcpjson::Quote(recipe.Policy) + L",\"consistency\":" + mcpjson::Quote(recipe.SourceConsistency) +

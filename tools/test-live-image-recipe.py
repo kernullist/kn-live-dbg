@@ -154,8 +154,9 @@ def main():
                 payload = recipe["payload"]
                 read_set = payload["read_set"]
                 reads = read_set["reads"]
-                check(recipe["schema"] == "kn.image_recipe.v2" and encode(copy.deepcopy(recipe)) == json.dumps(recipe, ensure_ascii=False, separators=(",", ":")).encode(),
-                      "independent canonical digest matches v2")
+                check(recipe["schema"] == "kn.image_recipe.v3" and result["schema"] == "kn.image_capture.v3" and
+                      encode(copy.deepcopy(recipe)) == json.dumps(recipe, ensure_ascii=False, separators=(",", ":")).encode(),
+                      "independent canonical digest matches v3")
                 check(publication["schema"] == "kn.image_claim_publication.v1" and result["original_claim_recorded"],
                       "live capture atomically retains the original claim before successful return")
                 check(read_set["operation_id"] == result["operation_id"] and read_set["target_id"] ==

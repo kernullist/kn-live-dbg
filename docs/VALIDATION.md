@@ -7,6 +7,80 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process mapping observation checkpoint: 2026-11-17
+
+The live process CLI now publishes v3 recipes with original `VirtualQueryEx`
+observations before/after byte reads and at the end of acquisition. Conflicting
+or unavailable mapping evidence lowers comparison qualification, original
+claims and exact approved-change decisions. Original/current replay and direct
+private archives use the retained observations. V1/v2 results and claim policies
+remain unchanged. See [mapping observations](ARCHITECTURE.md#process-mapping-observations)
+and the [live command](COMMAND_REFERENCE.md).
+
+The Release `/W4 /WX` harness passed **103 native mapping controls**. Owned,
+nonexecuting buffers exercised protection changes, final rechecks, free/reserved
+regions, same-address private-to-section remapping, equal-attribute ABA, changes
+outside queried intersections, two-region reads, cancellation and process exit.
+Mutations ran synchronously at observed query boundaries. No scheduling delay
+was used to infer that a transition occurred. A retained handle preserved the
+exited process identity while its address-space query failed. A handle without
+either query right received native access denial and failed source identity
+admission. This host allowed limited-query handles; the controls do not assume
+that `PROCESS_QUERY_LIMITED_INFORMATION` always denies `VirtualQueryEx`.
+
+An independent Python oracle passed **526 harness / 526 product** checks over
+12 native cases. It recomputed queried intersections, native error/null fields,
+timing/order, coverage and conflict counts, claim requirements and original
+evidence pointers. Rehashed malformed mappings were rejected; valid failure,
+partial, cancellation and conflicting observations could not reproduce a stored
+success or authorize changed bytes. Original-policy, missing-requirement and
+wrong-pointer mutations were rejected. Bare v3 recipes and original claim roots
+retained exact query bytes through private collections, original input removal,
+historical approval replay and explicit current-policy evaluation.
+
+The final product passed **181 live capture** controls with three owned children
+and **77 LoadLibrary/MEM_IMAGE** controls with two children, including relocation,
+copy-on-write differences, archive and post-exit replay. All children exited.
+The DLL SHA-256 was `694979d629483a1b65e261e96081bc0dbb62ed866ffe189704764c4a3dbb997a`.
+Release disclosure checks passed **575 controls / 14 owned-loopback requests**,
+including v3 stable/conflicting/exited and bare-recipe inputs. Minimized output
+retained failed/unknown counts without publishing raw mapping records.
+
+Compatibility passed **121 C++ recipe**, **34 claim**, **59 publication** and
+**448 approval** controls plus v1/v2 interrupted publication. The final product
+also passed **59 publication/replay controls on the prior producer's artifacts**.
+Slice/sweep regression passed **484 C++**, **385 slice**, **270 sweep**, **1,414
+graph**, **699 original-publication** and **868 scoped approval** checks. The
+isolated product `--self-test all` passed timeline **28**, MCP **102**, KMON image
+integration **121**, console **564**, command audit **3,043 / 261 routes**, remote
+**68** and four connection-option controls. Capabilities passed **43 contracts /
+261 routes**, the support matrix matched, and public-content tests passed **12**.
+No additional actionable defects were found in the reviewed scope.
+
+Artifacts were built with MSVC **14.44.35207**, SDK/WDK **10.0.26100.0**, on
+Windows **10.0.28000.3501**. Product SHA-256:
+`1877b74b43b4522f7dfdf282cea210694b77773e016643725e5ed4d0209b97b2`.
+Recipe/native-mapping harness:
+`db8a459370ad7122064665b9120b760fef3687b1ad72711459a6f0d75c306b99`.
+Slice harness: `9d828aa09eecb2cb82b39b5d9fbd47dac069913413875fc58ae25ce4b11bd9dd`.
+Disclosure harness: `a711f060dba2c69e8185ca6a06685d41ce1c2f108031b354e5d0eb17711550be`.
+The product retained the existing C4744 link warning. The post-update ASan
+startup interception failure and earlier real-kernel-PDB resource gate remain
+open; these Release results do not renew earlier sanitizer evidence.
+
+At **20:11 KST**, the boot remained **12:49 KST**, with no new reboot/BugCheck
+events since the prior checkpoint, task processes/drivers, parser receipts,
+preparations or AppContainer profile residue. The 33 completed code caches and
+BFE/mpssvc/firewall/EFS state matched the prior baseline. No driver was loaded,
+Verifier enabled or reboot requested for this stage. The prior EFS stop denial
+remains recorded; no bypass was attempted.
+
+This is a bounded P03 step, **not completion of VS1**. Equal mapping queries do
+not exclude unobserved ABA, pin mapping lifetime or identify original/physical
+backing; `MEM_IMAGE` can remain reported after copy-on-write. Native kernel
+mapping/object providers, signed distribution provisioning, cross-bundle
+lifetime joins, other architectures and the remaining design packages stay open.
+
 ## Scoped approval collection checkpoint: 2026-11-17
 
 Scoped assessments now retain the exact original slice/sweep root, child

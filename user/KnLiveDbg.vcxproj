@@ -226,6 +226,7 @@
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
+    <ClCompile Include="ImageProcessMappings.cpp" />
     <ClCompile Include="ImageClaimPublication.cpp" />
     <ClCompile Include="ImageCaptureCollection.cpp" />
     <ClCompile Include="ImageAuthorizedChanges.cpp" />
@@ -299,6 +300,8 @@
     <ClInclude Include="TranslationReceiptJson.h" />
     <ClInclude Include="DumpReadObservationJson.h" />
     <ClInclude Include="ProcessObservationSource.h" />
+    <ClInclude Include="ProcessMappingObservation.h" />
+    <ClInclude Include="ImageProcessMappings.h" />
     <ClInclude Include="SessionWritePolicy.h" />
     <ClInclude Include="CommandInput.h" />
     <ClInclude Include="CommandAuditSelfTest.inl" />

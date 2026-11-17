@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import subprocess
 import threading
 import uuid
@@ -92,9 +93,19 @@ def main():
         candidate = args.slices / name / "image-sweeps" / "sweep-7-1.knsweep"
         if candidate.exists():
             sources.append(candidate.resolve())
-    for name in ("clean", "modified", "header-changed", "deadline-exceeded"):
+    for name in ("clean", "modified", "header-changed", "deadline-exceeded", "mapping-stable", "mapping-modified-conflict", "mapping-exited"):
         if (args.recipes / name / "recipe.knverify").exists():
             sources.append((args.recipes / name).resolve())
+    mapped = args.recipes / "mapping-stable" / "recipe.knverify"
+    if mapped.exists():
+        recipe = json.loads(mapped.read_bytes())["payload"]["recipe"]
+        check(recipe["schema"] == "kn.image_recipe.v3", "native mapping fixture format")
+        bare = root / "bare-mapping"
+        bare.mkdir()
+        (bare / "recipe.knverify").write_text(canonical(recipe), encoding="utf-8")
+        blob = recipe["payload"]["reference_sha256"] + ".knblob"
+        shutil.copyfile(mapped.parent / blob, bare / blob)
+        sources.append(bare)
     check(len(sources) >= 12, "required retained synthetic recipe/slice/sweep coverage")
     packages = []
     original_hashes = {}

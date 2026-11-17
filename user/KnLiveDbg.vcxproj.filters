@@ -22,6 +22,9 @@
     <ClCompile Include="AiCapabilityCatalog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ImageProcessMappings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="AnalystSnapshot.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -731,6 +734,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProcessObservationSource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessMappingObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ImageProcessMappings.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ObservationWindows.h">

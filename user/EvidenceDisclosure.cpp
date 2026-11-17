@@ -51,7 +51,7 @@ namespace
     {
         if (!Hex(m.Id, 32) || !Hex(m.SourceFileSha, 64) || !Hex(m.SourceSemanticSha, 64) || !Hex(m.ProofSha, 64) || !Hex(m.FactsSha, 64) ||
             !Text(m.RootIdentity, 160) || !Text(m.Principal, 256) || !Text(m.SourcePath, 30000) || m.Created == 0 ||
-            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != ImageScopeClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_slice.v1" &&
+            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != ImageScopeClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_recipe.v3" && m.SourceSchema != L"kn.image_slice.v1" &&
                 m.SourceSchema != L"kn.image_slice.v2" && m.SourceSchema != L"kn.image_sweep.v1")) { return L""; }
         return L"{\"schema\":\"kn.redaction_manifest.v1\",\"policy\":\"kn.image_counts_redaction.v1\",\"redaction_id\":" + mcpjson::Quote(m.Id) +
             L",\"root_identity\":" + mcpjson::Quote(m.RootIdentity) + L",\"principal\":" + mcpjson::Quote(m.Principal) +

@@ -17,7 +17,7 @@ if ($Sanitize)
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
 $sources = @('tools\image-slice-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageScopeClaimPublication.cpp',
-    'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageAuthorizedChanges.cpp',
+    'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageProcessMappings.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageAuthorizedChanges.cpp',
     'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ImageSweepGraph.cpp', 'user\EvidenceGraphQuery.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',

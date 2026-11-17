@@ -3,6 +3,7 @@
 #include "ExecutableImageVerifier.h"
 #include "ObservationSource.h"
 #include "RecordingObservationSource.h"
+#include "ProcessMappingObservation.h"
 
 constexpr size_t ImageRecipeMaxBytes = 2 * 1024 * 1024;
 constexpr size_t ImageRecipeMaxReads = 64;
@@ -36,6 +37,7 @@ struct ImageVerificationRecipe
     // v2 retains the original single-source operation. Reads is its validated
     // parser projection, never a second acquisition or an independent record.
     ObservationReadSet ReadSet;
+    ImageProcessMappings Mappings; // v3 only; snapshots do not establish mapping lifetime.
 };
 
 struct ImageRecipeCaptureOptions
@@ -43,6 +45,7 @@ struct ImageRecipeCaptureOptions
     std::wstring TargetId;
     std::wstring AddressSpaceId;
     bool AllowResidencyChanges = false;
+    IProcessMappingObserver* MappingObserver = nullptr;
     ObservationOperationBudget Budget{ImageRecipeReadBudget, ImageRecipeMaxReads, ImageRecipeMaxReads, 65536, 5000};
 };
 

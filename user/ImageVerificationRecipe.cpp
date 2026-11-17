@@ -8,7 +8,9 @@
 #include "ImageComparisonJson.h"
 #include "ImageSliceRecipe.h"
 #include "ImageSweepManifest.h"
+#include "ImageProcessMappings.h"
 #include <filesystem>
+#include <set>
 
 namespace
 {
@@ -57,6 +59,27 @@ namespace
             L",\"skipped\":" + Ranges(c.Skipped) + L",\"failed\":" + Ranges(c.Failed) + L",\"changes\":" + Ranges(p.Changes) +
             L",\"expected_hex\":" + mcpjson::Quote(Hex(p.Expected.data(), p.Expected.size())) +
             L",\"observed_hex\":" + mcpjson::Quote(Hex(p.Observed.data(), p.Observed.size())) + L"}";
+    }
+
+    std::wstring ResultWithMappings(const ImageVerificationRecipe& recipe, ExecutablePageResult* result, bool* qualified)
+    {
+        if (recipe.FormatVersion != 3) { return ResultJson(*result, *qualified); }
+        const auto mappings = AssessImageProcessMappings(recipe);
+        if (mappings.Status != L"consistent_observations")
+        {
+            *qualified = false;
+            result->Ownership = CodeOwnership::OwnedUnverified;
+            result->Changes.clear(); result->Rel32ValidatedBytes = 0;
+            result->Coverage = {};
+            result->Coverage.Attempted = true;
+            result->Coverage.RequestedBytes = recipe.Length;
+            result->Coverage.FailedBytes = recipe.Length;
+            result->Coverage.Failed.push_back({recipe.ImageBase + recipe.Rva, recipe.Length});
+            result->Coverage.Reason = mappings.Status == L"inconsistent_capture" ? L"image_mapping_conflict" : L"image_mapping_unavailable";
+        }
+        auto json = ResultJson(*result, *qualified);
+        json.pop_back();
+        return json + L",\"mapping\":" + ImageProcessMappingAssessmentJson(mappings) + L"}";
     }
 
     std::wstring Normalization(const executable_image::DiskPeMetadata& m, uint64_t base, uint32_t rva, uint32_t size, bool secondary = false)
@@ -150,7 +173,7 @@ namespace
 
     std::wstring Execute(const ReferenceArtifact& artifact, const executable_image::DiskPeMetadata& metadata,
         const ImageVerificationRecipe& recipe, const ObservationReader& reader,
-        ExecutablePageResult* comparison = nullptr, bool* referenceQualified = nullptr)
+        ExecutablePageResult* comparison = nullptr, bool* referenceQualified = nullptr, bool includeMappings = true)
     {
         ExecutablePageResult result;
         result.Rva = recipe.Rva;
@@ -179,7 +202,7 @@ namespace
             result.Coverage.Failed.push_back({recipe.ImageBase + recipe.Rva, recipe.Length});
             result.Coverage.Reason = reason;
         }
-        const auto json = ResultJson(result, qualified);
+        const auto json = includeMappings ? ResultWithMappings(recipe, &result, &qualified) : ResultJson(result, qualified);
         if (comparison != nullptr)
         {
             *comparison = std::move(result);
@@ -363,7 +386,8 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         };
         if (!text(options->TargetId) || !text(options->AddressSpaceId) || b.MaximumBytes > ImageRecipeReadBudget ||
             b.MaximumSourceCalls > ImageRecipeMaxReads || b.MaximumReceipts == 0 || b.MaximumReceipts > ImageRecipeMaxReads ||
-            b.MaximumStoredSpans > 65536 || b.MaximumElapsedMs == 0 || b.MaximumElapsedMs > 60000) { return false; }
+            b.MaximumStoredSpans > 65536 || b.MaximumElapsedMs == 0 || b.MaximumElapsedMs > 60000 ||
+            (options->MappingObserver && (!caps.UserOnly || caps.KernelOnly))) { return false; }
     }
     if (recipe == nullptr || imageBase == 0 || imageBase > UINT64_MAX - rva || imageBase + rva > UINT64_MAX - length ||
         length == 0 || length > 4096 || caps.AddressDomain != ObservationAddressDomain::Virtual ||
@@ -404,7 +428,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         return false;
     }
     ImageVerificationRecipe p;
-    p.FormatVersion = options == nullptr ? 1 : 2;
+    p.FormatVersion = options == nullptr ? 1 : options->MappingObserver ? 3 : 2;
     p.ReferenceSha256 = original.Sha256();
     p.OriginalReference = original.Path();
     p.OriginalFileIdentity = original.FileIdentity();
@@ -455,15 +479,34 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         ImageRecipeRead read;
         read.Address = address;
         read.Length = request.Length;
+        ImageReadMappings mappings;
+        if (p.FormatVersion == 3) { mappings.Before = options->MappingObserver->ObserveMapping(address, request.Length, cancellation); }
         read.Result = (recorded == nullptr ? source : *recorded).Read(request);
+        if (p.FormatVersion == 3)
+        {
+            mappings.After = options->MappingObserver->ObserveMapping(address, request.Length, cancellation);
+            p.Mappings.Reads.push_back(std::move(mappings));
+        }
         sourceChanged = sourceChanged || !SameObservationSourceContract(caps, source.Capabilities());
         exhausted = exhausted || read.Result.OperationDeadlineExceeded;
         remaining -= size;
         p.Reads.push_back(std::move(read));
         return !sourceChanged && ExactBytes(p.Reads.back(), bytes);
     };
-    p.RecordedResult = Execute(retained, metadata, p, recording);
+    ExecutablePageResult comparison;
+    bool qualified = false;
+    Execute(retained, metadata, p, recording, &comparison, &qualified, false);
+    if (p.FormatVersion == 3)
+    {
+        std::set<std::pair<uint64_t, uint32_t>> seen;
+        for (const auto& read : p.Reads)
+        {
+            if (seen.emplace(read.Address, read.Length).second)
+                { p.Mappings.Final.push_back(options->MappingObserver->ObserveMapping(read.Address, read.Length, cancellation)); }
+        }
+    }
     if (operation != nullptr) { p.ReadSet = operation->Snapshot(); }
+    p.RecordedResult = ResultWithMappings(p, &comparison, &qualified);
     if (exhausted || sourceChanged || !retained.Unchanged() || !original.Unchanged())
     {
         return false;
@@ -587,7 +630,8 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         {
             // Dispatch only the exact retained code-owned policy. Future policy
             // versions must keep their evaluator; current reanalysis is separate.
-            if (publication.Registry != L"kn.claim_registry.v1" || publication.Policy != L"kn.image_claim_policy.direct.v1")
+            const auto claimPolicy = p.FormatVersion == 3 ? L"kn.image_claim_policy.process_mapping.v1" : L"kn.image_claim_policy.direct.v1";
+            if (publication.Registry != L"kn.claim_registry.v1" || publication.Policy != claimPolicy)
             {
                 result.OriginalClaimStatus = L"policy_unavailable";
                 result.Status = L"recorded_claim_policy_unavailable";

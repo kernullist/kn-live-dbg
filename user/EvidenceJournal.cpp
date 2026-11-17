@@ -105,7 +105,7 @@ namespace
         if (m.Path == L"image-captures/capture-" + id + L"-" + m.Sha256 + L".kncapture")
         {
             return Id(id) && m.Bytes <= DirectImageCaptureMaxBytes && (m.Schema == L"kn.image_recipe.v1" ||
-                m.Schema == L"kn.image_recipe.v2" || m.Schema == L"kn.image_claim_publication.v1");
+                m.Schema == L"kn.image_recipe.v2" || m.Schema == L"kn.image_recipe.v3" || m.Schema == L"kn.image_claim_publication.v1");
         }
         if (m.Path == L"image-approvals/assessment-" + id + L".knapprovalcase")
             { return Id(id) && m.Schema == ImageApprovalPublicationSchema && m.Bytes <= ImageApprovalPublicationMaxBytes; }

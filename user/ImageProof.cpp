@@ -1,6 +1,7 @@
 #include "ImageProof.h"
 #include "McpJson.h"
 #include "ClaimPolicy.h"
+#include "ImageProcessMappings.h"
 #include <array>
 
 namespace
@@ -83,7 +84,8 @@ ImageProofAssessment AssessImageProof(const ImageVerificationRecipe& recipe,
     ImageProofAssessment proof;
     proof.Matches.Name = L"recorded_range_matches_reference_policy";
     proof.Differs.Name = L"recorded_range_differs_reference_policy";
-    proof.ReferenceQualified = referenceQualified;
+    proof.ReferenceQualified = referenceQualified && (recipe.FormatVersion != 3 ||
+        AssessImageProcessMappings(recipe).Status == L"consistent_observations");
     proof.CurrentReanalysis = currentReanalysis;
     // Reuse the bounded recipe admission contract, including sparse provenance.
     if (ImageRecipeJson(recipe).empty() || (!currentReanalysis && recipe.Policy != ImageRecipePolicy))
@@ -205,7 +207,7 @@ ImageProofAssessment AssessImageProof(const ImageVerificationRecipe& recipe,
     proof.InputConsistent = accounting && bytesAgree && (proof.ComparedBytes == 0 ||
         (!comparison.SecondaryImageView && comparison.RelocationBase == recipe.ImageBase &&
             !proof.SupportingReadIndices.empty()));
-    const bool compared = proof.InputConsistent && referenceQualified && coverage.Attempted &&
+    const bool compared = proof.InputConsistent && proof.ReferenceQualified && coverage.Attempted &&
         coverage.InventoryAvailable && coverage.TraversalComplete && coverage.LostEvents == 0;
     const bool matching = compared && coverage.CompleteFor({{start, length}}) &&
         comparison.Ownership == CodeOwnership::OwnedVerified && proof.ChangedRanges.empty() &&
@@ -215,7 +217,7 @@ ImageProofAssessment AssessImageProof(const ImageVerificationRecipe& recipe,
 
     for (auto* claim : {&proof.Matches, &proof.Differs})
     {
-        if (referenceQualified)
+        if (proof.ReferenceQualified)
         {
             claim->Supports.push_back(L"mapped_identity_qualified_by_selected_replay");
         }
@@ -333,12 +335,17 @@ std::wstring ImageClaimAssessmentJson(const ImageVerificationRecipe& recipe,
             digest != recipeSha256 || !Evidence{digest, L"/payload"}.Valid()) { return {}; }
         // Recompute from the selected replay's typed result, never imported claims.
         const auto proof = AssessImageProof(recipe, comparison, referenceQualified, currentReanalysis);
-        const std::vector<Requirement> gates = {
+        std::vector<Requirement> gates = {
             {L"retained_recipe_and_reference", L"recover_exact_recipe_and_content_addressed_reference", L"offline_replay", true},
             {L"selected_comparison_policy", L"select_an_implemented_comparison_policy_explicitly", L"offline_replay", true},
             {L"mapped_image_identity", L"capture_matching_mapped_identity_and_relocation_basis", L"collect", true},
             {L"typed_comparison_consistent", L"recompute_unique_address_accounting_and_original_byte_agreement", L"offline_replay", true},
             {L"completed_comparison_observations", L"capture_the_requested_comparison_without_lost_or_incomplete_observations", L"collect", true}};
+        if (recipe.FormatVersion == 3)
+        {
+            gates.push_back({L"observed_mapping_consistent",
+                L"capture_complete_before_after_and_final_mapping_queries_without_observed_conflict", L"collect", true});
+        }
         std::array<Policy, 2> policies{{
             {L"image_requested_range_matches_reference", gates},
             {L"image_compared_range_differs_reference", gates}}};
@@ -346,17 +353,22 @@ std::wstring ImageClaimAssessmentJson(const ImageVerificationRecipe& recipe,
             L"capture_missing_bytes_or_qualify_exact_normalization_exclusions", L"collect"});
         policies[1].Requires.push_back({L"stable_difference_in_compared_range",
             L"capture_qualified_difference_bytes_and_a_separate_confirmation_read", L"collect"});
-        const std::wstring reads = recipe.FormatVersion == 2 ? L"/payload/read_set/reads" : L"/payload/reads";
+        const std::wstring reads = recipe.FormatVersion >= 2 ? L"/payload/read_set/reads" : L"/payload/reads";
         const auto fact = [&](const wchar_t* id, bool met, const std::wstring& pointer)
         { return Fact{id, met ? Observation::Met : Observation::Missing, {digest, pointer}}; };
         const auto& coverage = comparison.Coverage;
-        const std::vector<Fact> common = {
+        std::vector<Fact> common = {
             fact(L"retained_recipe_and_reference", true, L"/payload/reference_sha256"),
             fact(L"selected_comparison_policy", currentReanalysis || recipe.Policy == ImageRecipePolicy, L"/payload"),
             fact(L"mapped_image_identity", proof.ReferenceQualified, reads),
             fact(L"typed_comparison_consistent", proof.InputConsistent, reads),
             fact(L"completed_comparison_observations", coverage.Attempted && coverage.InventoryAvailable &&
                 coverage.TraversalComplete && coverage.LostEvents == 0, reads)};
+        if (recipe.FormatVersion == 3)
+        {
+            common.push_back(fact(L"observed_mapping_consistent",
+                AssessImageProcessMappings(recipe).Status == L"consistent_observations", L"/payload/mapping_set"));
+        }
         const auto ref = [](const Evidence& evidence)
         { return L"{\"capture_sha256\":" + mcpjson::Quote(evidence.Sha256) + L",\"json_pointer\":" + mcpjson::Quote(evidence.Pointer) + L"}"; };
         const auto facts = [&](const std::vector<Fact>& values)
@@ -418,8 +430,9 @@ std::wstring ImageClaimAssessmentJson(const ImageVerificationRecipe& recipe,
         // Parsing a local serialization does not accept a stored proof as input.
         std::wstring ledgers;
         if (!mcpjson::FindRawValue(ImageProofJson(recipe, proof), L"ledgers", &ledgers)) { return {}; }
-        const auto report = L"{\"schema\":\"kn.image_claim_report.v1\",\"registry\":\"kn.claim_registry.v1\","
-            L"\"policy\":\"kn.image_claim_policy.direct.v1\",\"evaluation\":\"current_claim_policy_on_replayed_observations\","
+        const auto report = L"{\"schema\":\"kn.image_claim_report.v1\",\"registry\":\"kn.claim_registry.v1\",\"policy\":" +
+            mcpjson::Quote(recipe.FormatVersion == 3 ? L"kn.image_claim_policy.process_mapping.v1" : L"kn.image_claim_policy.direct.v1") +
+            L",\"evaluation\":\"current_claim_policy_on_replayed_observations\","
             L"\"original_claim_policy_reproduced\":false,\"recorded_normalization_reproduced\":" + B(!currentReanalysis) +
             L",\"claim_report_persistence\":\"not_established\",\"journal_membership_checked\":false,"
             L"\"capture_sha256\":" + mcpjson::Quote(digest) + L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) +

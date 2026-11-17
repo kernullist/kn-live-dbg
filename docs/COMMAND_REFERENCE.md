@@ -194,17 +194,28 @@ New cases atomically retain the recipe and its original claim evaluation in
 `kn.image_claim_publication.v1`; `original_claim_recorded=true` confirms publication.
 
 `KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency`
-captures the same direct comparison from a live process into a v2 case. PID,
+captures the same direct comparison from a live process into a v3 case. PID,
 creation FILETIME and length are decimal; base and RVA are hexadecimal. The
 supplied generation must match the opened handle, and the caller needs process
-read/query access. `--allow-residency` is required because reads can affect page
-residency. The command always emits `kn.image_capture.v2` JSON and opens no driver
+`PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` access. `--allow-residency` is required because reads can affect page
+residency. The command always emits `kn.image_capture.v3` JSON and opens no driver
 or symbols. It records the original ordered read receipts, consent and Win32
 status/copy counts. It supports one AMD64 direct-image range of 1..4,096 bytes,
 with a legacy LA48 assumption and the OS user ceiling recorded explicitly.
 It has no native fallback or background-monitor capture. Successful publication
 may still report an unverified or modified range. Exit 3 means stdout delivery
 failed; a case already published before that failure remains on disk.
+
+V3 also retains `VirtualQueryEx` calls before and after each read and a final
+query of each distinct read range. `result.mapping` separates consistent
+observations, unavailable queries and `inconsistent_capture`; conflicts or
+unavailable mapping fences leave the requested comparison bytes failed and
+withhold reference qualification and approved changes. Stable private/mapped
+buffers can still support byte comparisons; `native_image_mapping_observed`
+identifies actual `MEM_IMAGE` observations at the declared allocation base.
+Matching queries do not exclude unobserved unmap/remap, prove original backing
+or establish execution. Both original and `/current` replay use retained query
+records, including after target exit. Existing v1/v2 cases remain readable.
 
 `KnLiveDbg.exe --offline !kmon journal-image <case-directory> <private-store> <collection-id> /json`
 archives an existing direct recipe/claim publication and its exact reference into

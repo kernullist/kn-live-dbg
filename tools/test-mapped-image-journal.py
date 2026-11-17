@@ -138,6 +138,11 @@ def main():
                 check(differences == ([32] if mode == "modified" else []), "independent DIR64 normalization and exact owned mutation")
                 check(captured["result"]["ownership"] == ("owned_modified" if mode == "modified" else "owned_verified"), "real image bytes select positive and negative claims")
                 check(not captured["execution_observed"] and captured["original_claim_recorded"], "byte observation is not execution evidence")
+                mapping = captured["result"]["mapping"]
+                check(recipe["schema"] == "kn.image_recipe.v3" and mapping["status"] == "consistent_observations" and
+                      mapping["native_image_mapping_observed"], "before/after/final native queries retain actual MEM_IMAGE allocation")
+                check(not any(mapping[key] for key in ("original_backing_verified", "physical_identity_known", "aba_excluded", "mapping_lifetime_bound")),
+                      "MEM_IMAGE after copy-on-write does not prove sharing, backing or continuous mapping lifetime")
                 reads = payload["read_set"]["reads"]
                 check(payload["read_set"]["recording_complete"] and int(payload["read_set"]["attempts"]) == len(reads), "complete original receipt denominator")
                 matching = [r for r in reads if int(r["address"]) == identity["base"] + identity["rva"]]

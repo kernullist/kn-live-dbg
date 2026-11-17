@@ -16,6 +16,9 @@
 #include <fstream>
 #include <iostream>
 
+bool TestProcessImageMappings(const std::filesystem::path& root, const std::filesystem::path& image,
+    const std::vector<uint8_t>& initial);
+
 namespace
 {
     unsigned Passed = 0, Failed = 0;
@@ -250,6 +253,7 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 2 && std::wstring(argv[1]) == L"--mapping-exit") { return 0; }
     if ((argc == 9 || argc == 10) && std::wstring(argv[1]) == L"--archive-scope-approval")
     {
         const auto report = JournalImageScopeApproval(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], std::stoull(argv[8]),
@@ -785,6 +789,9 @@ int wmain(int argc, wchar_t** argv)
     Check(!PublishReferenceArtifact(blob.wstring(), disk, &error), "blob publication preserves an existing content path");
     Check(ReplayImageRecipe((root / L"absent").wstring(), false, &error).Status == L"recipe_unavailable_or_corrupt",
         "incomplete publication has no committed recipe");
+    Source mappingFixture;
+    Fixture(&mappingFixture);
+    Check(TestProcessImageMappings(root, image, mappingFixture.Memory), "native process mapping observations and replay");
     std::cout << "[image.recipe] passed=" << Passed << " failed=" << Failed << " corpus=synthetic\n";
     return Failed == 0 ? 0 : 1;
 }

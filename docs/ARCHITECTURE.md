@@ -1830,11 +1830,11 @@ separate coverage; excluded bytes cannot produce a fully verified result.
 Every retained byte span must belong to the declared address width, source and
 consistency model, including bytes inside a partially available read.
 
-`--verify-process-image` adds a handle-based live transaction in
-`kn.image_recipe.v2`. It uses a duplicated handle bound to the requested PID and
+`--verify-process-image` adds a handle-based live transaction, now written as
+`kn.image_recipe.v3`. It uses a duplicated handle bound to the requested PID and
 creation FILETIME, explicit residency consent and one shared operation budget.
 The actual qualifier, comparator and confirmation reads produce the saved
-`kn.read_set.v1`; there is no post-verdict acquisition for the recipe. Receipts
+`kn.read_set.v1`; byte receipts are not reconstructed from later reads. Receipts
 retain the full source contract, request, consent, original status and reported
 copy count, any native transport metadata, and operation/read identifiers.
 The recipe reader verifies counters, ordering, source consistency and parser
@@ -1842,14 +1842,58 @@ projection before replay. Pending, abandoned, missing, overrun, cross-source or
 fallback receipts cannot become an executable recipe under this single-source
 format. A recorded failed or denied read remains a failed or denied parser input.
 
-The live CLI requests only process read/query access and returns before driver,
+The live CLI requests `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` and returns before driver,
 service, symbol or monitor initialization. It uses the Win32 user-address ceiling
 with an explicitly assumed legacy LA48 shape; it does not infer CR4.LA57. The
 default acquisition budget is five seconds, 64 source calls/receipts and 128 KiB
 requested bytes; synchronous reads cannot be preempted. Reference opening,
-hashing and parsing precede that acquisition budget. Both v1 and v2 retain the
-same direct comparison policy and support post-exit replay. V1 remains readable;
+hashing and parsing precede that acquisition budget. V1, v2 and v3 retain the
+same direct byte comparison policy and support post-exit replay. V1 remains readable;
 its writer refuses new metadata that it cannot represent rather than dropping it.
+
+### Process mapping observations
+
+V3 adds `kn.process_image_mappings.v1` beside the unchanged v2 read-set format.
+The owned process handle supplies `VirtualQueryEx` observations immediately
+before and after each byte read, then once for every distinct address/length
+pair after comparison. All intervals use the collector's steady clock and must
+fit the operation snapshot/deadline. At most 64 byte reads produce 192 mapping
+observations and 384 native queries; query calls have their own retained count,
+separate from the read-set's charged byte-read calls. Each observation covers
+at most 4,096 bytes and two native regions. Cancellation, identity failure,
+query failure and malformed/partial results remain explicit.
+
+Every query retains its address, returned byte count, failure-only Win32 error,
+region extent, state and defined allocation/type/protection fields. Undefined
+fields are null: free regions have no allocation/type/protection, and reserved
+regions have no current protection. The canonical parser checks source identity,
+before/read/after ordering, complete final range coverage and bounded query
+progress. The evaluator compares state/type/allocation/protection only where
+the queried ranges overlap; unqueried neighboring extent changes are not conflicts.
+
+Observed identity or attribute conflicts produce `inconsistent_capture`;
+failed queries and uncommitted ranges produce `unavailable`. Either mapping
+fence withholds reference qualification, clears derived differences and places
+the requested comparison range in failed coverage while preserving original
+read bytes. V3 claims use `kn.image_claim_policy.process_mapping.v1` with an
+additional `observed_mapping_consistent` requirement pointing to the original
+`/payload/mapping_set`. Exact approved-change assessment and private archives
+use the same gated replay. V1/v2 retain their original schemas, results and
+`kn.image_claim_policy.direct.v1` evaluation without synthesized mapping facts.
+
+Stable `MEM_PRIVATE`/`MEM_MAPPED` buffers can support scoped byte comparisons.
+`native_image_mapping_observed` requires every successful queried region to be
+committed `MEM_IMAGE` at the declared image allocation base. It does not prove
+sharing or original backing: copy-on-write pages can still report `MEM_IMAGE`.
+Equal queries cannot exclude ABA or pin a mapping lifetime, and final queries
+are sequential observations rather than an atomic snapshot. Original and
+current replay evaluate retained records without querying a live process.
+The query contract is the native AMD64 48-byte structure; other query layouts
+and native kernel mapping-lifetime providers remain separate work.
+See Microsoft's [VirtualQueryEx contract](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex)
+and [defined memory-information fields](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-memory_basic_information).
+
+### Direct recipe replay
 
 Default `replay-image` uses the recorded policy only when this binary implements
 that version. It verifies the artifact hash, recomputes normalization, consumes
@@ -1889,7 +1933,7 @@ isolation is available.
 ### Original direct-image claim publication
 
 New dump and process captures publish `kn.image_claim_publication.v1` in
-`recipe.knverify`. Its canonical payload contains the unchanged v1/v2 recipe
+`recipe.knverify`. Its canonical payload contains the selected v1/v2/v3 recipe
 envelope and `recorded_claim`, with a SHA-256 over both. The inner recipe retains
 its own observation digest, so claim evidence pointers resolve without a circular
 hash. The exact reference blob is still a separate content-addressed input.
@@ -1914,14 +1958,14 @@ Future semantic changes require a new policy version and a retained old evaluato
 to continue reproducing that version.
 
 `/current` deliberately reports `not_requested` for original claim replay and
-evaluates the current policy separately. Bare v1/v2, slice and sweep recipes have
+evaluates the current policy separately. Bare v1/v2/v3, slice and sweep recipes have
 `not_recorded`; they cannot acquire an original claim merely by being replayed.
 The frozen `recorded_claim` is the evaluation made immediately before publication:
 its conservative persistence and original-reproduction fields remain unchanged.
 The separate replay outcome carries the later reproduction result. Hashes bind
 local artifact contents without authenticating who collected or approved them.
-Direct capture collection-journal integration remains open. KMON slice/sweep
-publication uses the collection contract described below.
+Direct capture and approval archives preserve this root under their dedicated
+collection policies. KMON slice/sweep publication uses the contract described below.
 
 ### Original slice and sweep claim publication
 

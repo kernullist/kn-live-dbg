@@ -7,6 +7,7 @@ This bounded test oracle is not a general PE parser or a source authenticator.
 import hashlib
 import json
 import struct
+from process_image_mapping_oracle import check_mappings
 
 
 CLAIMS = ("image_requested_range_matches_reference", "image_compared_range_differs_reference")
@@ -94,7 +95,9 @@ def check_report(recipe, blob, replay):
     assert digest == recipe["recipe_sha256"] == report["capture_sha256"] == replay["recipe_sha256"]
     assert hashlib.sha256(blob).hexdigest() == payload["reference_sha256"] == report["reference_sha256"]
     assert report["schema"] == "kn.image_claim_report.v1" and report["registry"] == "kn.claim_registry.v1"
-    assert report["policy"] == "kn.image_claim_policy.direct.v1"
+    v3 = recipe["schema"] == "kn.image_recipe.v3"
+    mapping_consistent = check_mappings(recipe, comparison) if v3 else True
+    assert report["policy"] == ("kn.image_claim_policy.process_mapping.v1" if v3 else "kn.image_claim_policy.direct.v1")
     assert report["evaluation"] == "current_claim_policy_on_replayed_observations"
     assert report["original_claim_policy_reproduced"] is False
     current = replay["mode"] == "current_reanalysis"
@@ -107,7 +110,7 @@ def check_report(recipe, blob, replay):
     assert len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode("utf-16-le")) // 2 <= 256 * 1024
     base, rva, size = (int(payload[key]) for key in ("image_base", "rva", "length"))
     start = base + rva
-    v2 = recipe["schema"] == "kn.image_recipe.v2"
+    v2 = recipe["schema"] in ("kn.image_recipe.v2", "kn.image_recipe.v3")
     path = "/payload/read_set/reads" if v2 else "/payload/reads"
     reads = payload["read_set"]["reads"] if v2 else payload["reads"]
 
@@ -171,6 +174,9 @@ def check_report(recipe, blob, replay):
     completed = comparison["attempted"] and comparison["inventory_available"] and comparison["traversal_complete"]
     gates = [True, current or payload["policy"] == "kn.executable_page.direct.v1",
              comparison["reference_qualified"], bool(consistent), completed]
+    gate_names = (*GATES, "observed_mapping_consistent") if v3 else GATES
+    if v3:
+        gates.append(mapping_consistent)
     match = all(gates) and counts["compared"] == size and not changed and supporters and comparison["ownership"] == "owned_verified"
     differs = all(gates) and changed and len(supporters) >= 2 and comparison["ownership"] == "owned_modified"
     expected_states = ("supported", "contradicted") if match else (("contradicted", "supported") if differs else ("unfulfilled", "unfulfilled"))
@@ -185,12 +191,12 @@ def check_report(recipe, blob, replay):
     for i, (definition, claim) in enumerate(zip(report["policies"], report["claims"])):
         assert definition["claim"] == claim["claim"] == CLAIMS[i]
         requirements = definition["requirements"]
-        assert [row["id"] for row in requirements] == list(GATES) + [PROPERTIES[i]]
-        assert [row["gate"] for row in requirements] == [True] * 5 + [False]
+        assert [row["id"] for row in requirements] == list(gate_names) + [PROPERTIES[i]]
+        assert [row["gate"] for row in requirements] == [True] * len(gates) + [False]
         assert all(row["next_observation"] and row["mode"] in ("offline_replay", "collect") for row in requirements)
         assert claim["status"] == expected_states[i]
-        supports = [name for name, met in zip(GATES, gates) if met]
-        missing = [name for name, met in zip(GATES, gates) if not met]
+        supports = [name for name, met in zip(gate_names, gates) if met]
+        missing = [name for name, met in zip(gate_names, gates) if not met]
         contradicts = []
         if expected_states[i] == "supported":
             supports.append(PROPERTIES[i])
@@ -204,7 +210,8 @@ def check_report(recipe, blob, replay):
         assert claim["issue"] == ("" if all(gates) else "observation_scope_unqualified")
         for fact in claim["supports"] + claim["contradicts"]:
             resolve(fact["evidence"])
-            pointer = {GATES[0]: "/payload/reference_sha256", GATES[1]: "/payload"}.get(fact["requirement"], path)
+            pointer = {GATES[0]: "/payload/reference_sha256", GATES[1]: "/payload",
+                       "observed_mapping_consistent": "/payload/mapping_set"}.get(fact["requirement"], path)
             assert fact["evidence"]["json_pointer"] == pointer
         assert claim["supported_ranges"] == ((full if i == 0 else changed_ranges) if expected_states[i] == "supported" else [])
         assert claim["counterexample_ranges"] == ((changed_ranges if i == 0 else full) if expected_states[i] == "contradicted" else [])

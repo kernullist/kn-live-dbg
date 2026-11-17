@@ -3,6 +3,7 @@
 #include "McpJson.h"
 #include "ObservationSourceJson.h"
 #include "ImageRecipeReadSet.h"
+#include "ImageProcessMappings.h"
 #include "ReadReceiptJson.h"
 #include <set>
 
@@ -126,9 +127,9 @@ namespace
     }
     bool Valid(const ImageVerificationRecipe& p)
     {
-        if ((p.FormatVersion != 1 && p.FormatVersion != 2) ||
+        if ((p.FormatVersion != 1 && p.FormatVersion != 2 && p.FormatVersion != 3) ||
             (p.FormatVersion == 1 && (!p.ReadSet.OperationId.empty() || !p.ReadSet.Reads.empty())) ||
-            (p.FormatVersion == 2 && !ValidImageRecipeReadSet(p)) ||
+            (p.FormatVersion >= 2 && !ValidImageRecipeReadSet(p)) || !ValidImageProcessMappings(p) ||
             !Text(p.Policy, 128) || p.ReferenceSha256.size() != 64 ||
             p.ReferenceSha256.find_first_not_of(L"0123456789abcdef") != std::wstring::npos ||
             !Text(p.OriginalReference, 30000) || !Text(p.OriginalFileIdentity, 128) ||
@@ -221,9 +222,10 @@ namespace
             L",\"image_base\":" + N(p.ImageBase) + L",\"rva\":" + N(p.Rva) + L",\"length\":" + N(p.Length) +
             L",\"collector_authenticated\":false,\"signer_approved\":false,\"hotpatch_epoch\":\"unavailable\","
             L"\"normalization\":" + p.Normalization + L",\"recorded_result\":" + p.RecordedResult;
-        if (p.FormatVersion == 2)
+        if (p.FormatVersion >= 2)
         {
-            return json + L",\"read_set\":" + ObservationReadSetJson(p.ReadSet) + L"}";
+            return json + L",\"read_set\":" + ObservationReadSetJson(p.ReadSet) +
+                (p.FormatVersion == 3 ? L",\"mapping_set\":" + ImageProcessMappingsJson(p.Mappings) : L"") + L"}";
         }
         json += L",\"reads\":[";
         bool first = true;
@@ -289,7 +291,8 @@ bool ParseImageRecipe(const std::wstring& json, ImageVerificationRecipe* recipe,
     uint64_t bits = 0, rva = 0, length = 0;
     std::vector<std::wstring> reads;
     if (recipe == nullptr || json.size() > ImageRecipeMaxBytes || !mcpjson::ValidateDocument(json) ||
-        !mcpjson::GetString(json, L"schema", &schema) || (schema != L"kn.image_recipe.v1" && schema != L"kn.image_recipe.v2") ||
+        !mcpjson::GetString(json, L"schema", &schema) ||
+        (schema != L"kn.image_recipe.v1" && schema != L"kn.image_recipe.v2" && schema != L"kn.image_recipe.v3") ||
         !mcpjson::FindRawValue(json, L"payload", &payload) || !mcpjson::GetString(payload, L"policy", &p.Policy) ||
         !mcpjson::GetString(payload, L"reference_sha256", &p.ReferenceSha256) ||
         !mcpjson::GetString(payload, L"original_reference", &p.OriginalReference) ||
@@ -306,11 +309,13 @@ bool ParseImageRecipe(const std::wstring& json, ImageVerificationRecipe* recipe,
     p.VirtualAddressBits = static_cast<uint32_t>(bits);
     p.Rva = static_cast<uint32_t>(rva);
     p.Length = static_cast<uint32_t>(length);
-    p.FormatVersion = schema == L"kn.image_recipe.v2" ? 2 : 1;
-    if (p.FormatVersion == 2)
+    p.FormatVersion = schema == L"kn.image_recipe.v3" ? 3 : schema == L"kn.image_recipe.v2" ? 2 : 1;
+    if (p.FormatVersion >= 2)
     {
         std::wstring set;
         if (!mcpjson::FindRawValue(payload, L"read_set", &set) || !ParseImageRecipeReadSet(set, &p)) { return false; }
+        if (p.FormatVersion == 3 && (!mcpjson::FindRawValue(payload, L"mapping_set", &set) || !ParseImageProcessMappings(set, &p.Mappings)))
+            { return false; }
     }
     else if (!Array(payload, L"reads", ImageRecipeMaxReads, &reads)) { return false; }
     for (const auto& row : reads)
