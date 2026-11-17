@@ -7,6 +7,54 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Owned Windows process module workloads, 2026-11-18
+
+On Windows **28000.3501**, an independent controller measured native Toolhelp
+module observations for two private jobs. Each workload ran 16 inventories
+with at least 25 ms between an admission and the next census. Child processes
+reported their readiness, creation time, executable base and exit. The observer
+used the shared module reader and scheduling code. A successful walk matched
+the child's executable base and generation and reached normal enumeration end.
+The [workload design](ARCHITECTURE.md#measuring-module-observation-intervals-on-windows)
+defines the cohort, clock and censoring boundaries.
+
+| Workload | Ready | Admitted | Observed at least once | Successful walks / attempts | Successful revisit intervals |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fixed | 12 | 12 | 12 | 128 / 128 | 116 |
+| Changing | 22 | 21 | 20 | 127 / 128 | 107 |
+
+| Workload | Ready to first P99 (ms) | Admission to first P99 (ms) | Revisit P99 / maximum (ms) | Longest interval including lifetime boundaries (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed | 3,718 | 63 | 156 / 156 | 3,718 |
+| Changing | 5,734 | 875 | 1,375 / 1,375 | 5,734 |
+
+The tables report one recorded run and use nearest-rank percentiles. Ready
+time includes the wait while the controller starts the rest of the cohort.
+The changing population included one exit before any census and one after
+selection but before the scheduled read. Both lifetimes contributed to the
+longest-interval calculation. Survivors contributed a right-censored tail
+up to the workload cutoff. Three previously observed processes exited during
+the changing workload and new processes joined. Each job had zero active
+processes after cleanup. When the controller was forcibly terminated with a
+cohort pending, an external supervisor confirmed termination of both the
+observer and target using their original process handles.
+
+The Release product's isolated `--self-test all` passed **3,043 command checks
+across 261 routes**, with fixture cleanup and an empty working directory.
+The `/W4 /WX` core suite passed the native workloads and the existing **817**
+module-debt assertions. Public-content regression passed **13 tests**,
+including renamed and partially written private workload transcripts.
+
+Release product SHA-256 `c0dbb5a25db3c60ce1281ae56b6732409ada3f43470f8ed67072a0ad8679cf7f`. Core harness SHA-256 `601809e7d96200681ab83dd5dc7fb5e084f9c4b73289b83e01abdc6a762bdb24`.
+Read-only host checks at **07:43 KST** found the previous boot time, no
+new BugCheck or dump, and no running task process or driver. Service and
+firewall state matched the baseline. The earlier ASan startup failure on this
+host still limits sanitizer coverage.
+
+P09 remains open for end-to-end discovery under host load, durable publication,
+other sources and workload-specific SLOs. The observer ran in the core harness
+with declared tiers and pacing. These measurements cover that workload.
+
 ## Process module observation debt, 2026-11-18
 
 Current main schedules overdue Toolhelp module observations by process

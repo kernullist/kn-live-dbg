@@ -22,6 +22,7 @@
 #include "kmon-user-inventory-selftest.h"
 #include "kmon-user-admission-selftest.h"
 #include "kmon-user-module-debt-selftest.h"
+#include "kmon-user-module-workload.h"
 #include "kmon-user-deep-selftest.h"
 #include "execution-evidence-selftest.h"
 
@@ -69,6 +70,10 @@ bool ArbitraryImageSelfTest()
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string(argv[1]) == "--owned-user-module-workload")
+    {
+        return user_module_workload::Run(argv[2]);
+    }
     if (argc == 2 && std::string(argv[1]) == "--user-module-debt-json")
     {
         std::wcout << KmonUserModuleDebtFixturesJson() << L"\n";

@@ -2093,6 +2093,42 @@ generation separately. Only retained generations contribute first-observation
 and revisit intervals. This source covers the module inventory. Other sources,
 durable timing and host-wide unobserved intervals require separate evidence.
 
+### Measuring module observation intervals on Windows
+
+The [owned workload runner](../tools/test-user-module-workload.py) starts
+Windows processes in a private job. Each process announces its own PID,
+creation time, executable base and ready clock. The controller confirms its
+identity using the process handle and confirms termination after the exit
+acknowledgement. A separate observer has query access to the job. It takes
+a kernel census of job members, reopens live generations, then uses the
+production inventory, tier selector, inspection scheduler, Toolhelp reader
+and observation ledger. The runner checks each acquired executable base
+against the value supplied by the child. An additional process outside the
+job stays alive throughout the measurement to check scope.
+
+The fixed and changing workloads each run 16 censuses, paced at least 25 ms
+from the preceding admission. The workload assigns tiers using
+`(PID / 4) % 3`. In the changing workload one child exits before the first
+census, another exits after selection and three observed children retire
+as new processes arrive. The controller records time from child readiness
+and first admission to the first successful acquisition, then each interval
+between successes. For each generation it also takes the longest interval
+including the initial wait and the tail through the exit acknowledgement or
+the workload cutoff. A child that exits before observation contributes its
+full measured ready-to-exit interval. Surviving processes have a right-censored
+tail. All clocks use `GetTickCount64`. The private trace contains generation
+identifiers and executable bases. The [dated measurements](VALIDATION.md#owned-windows-process-module-workloads-2026-11-18)
+publish aggregate intervals for these workloads.
+
+`tools/validate-kmon-core.ps1` builds the harness and runs the workload.
+To repeat the measurement with the same Release harness, run the following
+from the repository root. Add `--trace` to include the private per-process
+records on standard output.
+
+```powershell
+python tools/test-user-module-workload.py --core-exe .build/kmon-core/Release/kmon-core-Release.exe
+```
+
 ## Layout collection and verification scheduling
 
 The layout worker maintains an explicit process ring. New discoveries join
