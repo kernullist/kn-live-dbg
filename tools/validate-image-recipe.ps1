@@ -23,6 +23,7 @@ if ($Sanitize)
 $program = Join-Path $output 'image-recipe-selftest.exe'
 $sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageScopeClaimPublication.cpp',
     'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
+    'user\ImageCaptureCollection.cpp', 'user\EvidenceJournal.cpp', 'user\EvidencePrivacy.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
 {

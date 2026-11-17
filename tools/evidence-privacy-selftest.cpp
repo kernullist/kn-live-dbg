@@ -17,7 +17,8 @@ int wmain(int argc, wchar_t** argv)
         const std::wstring stage = argc < 5 ? L"" : argv[4];
         const auto result = InitializeEvidencePrivateStore(root, efs, [&](const wchar_t* observed)
         {
-            if (stage == observed)
+            if (stage == observed || (stage == L"rename-contention" &&
+                (std::wstring(observed) == L"private_policy_committed" || std::wstring(observed) == L"private_root_publication_blocked")))
             {
                 std::wcout << L"[privacy.stage] " << observed << std::endl;
                 std::string input;

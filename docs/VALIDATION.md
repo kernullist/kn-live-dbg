@@ -7,6 +7,99 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Direct image collection checkpoint: 2026-11-17
+
+Direct dump/process cases can now be archived into initialized private stores
+with `journal-image`, retaining the exact recipe/claim root and shared reference.
+The dedicated direct-image journal policy supports exact retries, dependent
+closure, managed `.kncapture` replay, inventory and conservative GC. Managed
+roots also support original-policy count redaction after the source case is
+removed. See [direct capture collections](ARCHITECTURE.md#direct-image-capture-collections).
+
+Final Release validation passed **574 harness / 597 product** direct-collection
+checks. Independent hashes and final ledgers cover original claims, bare v1/v2
+imports, shared-reference reuse, Unicode paths, source removal, malformed or
+forged claims, missing/corrupt references, privacy admission and immutable
+collisions. Six observed writer-termination boundaries recover **0 / 0 / 0 / 1 /
+1 / 2** committed segments, with closure only at the last boundary. Exact retries
+close each interrupted collection. Old journal v1-v4 policies reject direct
+members; rehashed invalid transactions/dependencies fail, and indexes cannot
+substitute for original membership. Open collections protect unattributed files;
+explicit GC removes only an eligible owned orphan and preserves committed roots
+and ledgers. Product controls also verify default EFS inheritance, complete
+private-root auditing, CLI grammar and stdout-delivery failure.
+
+An owned DLL with no entry point supplied a real `LoadLibrary` executable
+`MEM_IMAGE` mapping. A self-pointer in its unused probe bytes required DIR64
+relocation; reserving the preferred base forced actual relocation. The clean
+control and one-byte mutation control passed **49 checks**, including independent
+PE normalization, live handle identity/read receipts, original claim reproduction,
+private archival, observed child unload/exit, removal of the original DLL/case,
+managed replay and original-linked minimized counts. The mutation restored the
+page's protection before capture. This is byte-observation evidence; it does not
+establish execution or page sharing. Windows continues to report a modified
+copy-on-write image page as `MEM_IMAGE`; see
+[VirtualQuery](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualquery).
+
+Review corrected a premature `original_claim_recorded` flag on invalid input,
+an ineffective metadata-only pin for an empty output directory, and direct JSON
+output bypassing the interactive transcript. The regression controls exercise
+these boundaries. Product runs also exposed `private_store_publication_failed_5`
+during existing private-root initialization. A separate control reproduced that
+error by holding a read handle to the policy after its publication. The external
+process responsible for the original host occurrence was not identified.
+Initialization now uses a two-second retry budget for access-denied/sharing
+failures, holding the same root and parent pins, rechecking protection and never
+replacing a destination or relaxing permissions. Observed reader release permits
+publication; persistent contention preserves private staging and fails closed.
+Privacy validation passed **787 harness / 797 product** checks, including EFS,
+four interruption boundaries, late collisions and both contention outcomes.
+
+Direct image compatibility passed **120 C++**, **34 claim** and **59 publication**
+controls plus v1/v2 interrupted publication. Journal compatibility passed **71
+C++**, **1,952 journal**, **476 store**, **892 GC** and **400 IRP** checks. Compiled
+capabilities passed **37 contracts / 261 routes**, generated support documentation
+matched, and the public classifier passed **12 tests**. The final Release build
+and isolated `--self-test all` passed: timeline **28**, MCP **102**, KMON image
+integration **121**, console **564**, command audit **3,018 / 261 routes**, and
+remote **68** plus four connection-option controls. No additional actionable
+defects were found in the reviewed scope.
+
+The product SHA-256 was
+`e88d381a0277fb18bf578c31ecf00a57656b9834e554856d06ccd0f9fa6ab880`.
+The image harness was
+`3efb3d16a5a05735d385635cdb5e46e43d05d88fe40f679abe5cbee41a3f6507`;
+the journal harness was
+`d7c3f02ce8b90fca819da619ec7c4324f530fb11a27ed13f00bb74199a1d82a8`;
+the privacy harness was
+`73b5bbb093c75454486329f6006500926675fc6609f627dc288b016c05a917eb`.
+The owned DLL was
+`0fd5aea0ae3ce3619adc5e2d0b43c3911f972084f964162c4869379aeb6774bb`.
+These checks used MSVC 14.44.35207 and SDK/WDK 10.0.26100.0 on Windows
+10.0.28000.3501. The existing updated-host ASan startup failure remains unresolved;
+no interceptor bypass or unchanged failing ASan rerun was used. See the
+[IRP checkpoint](#original-irp-claim-checkpoint-2026-11-17) for its minimal control.
+The prior real-kernel-PDB ASan resource gate also remains open.
+
+At 15:43 KST, the boot time was unchanged and no new reboot/BugCheck events or
+task processes, drivers, parser profile receipts, preparation directories or
+AppContainer profiles remained. The 33 completed parser code caches were
+unchanged. BFE/mpssvc and firewall profiles remained enabled. EFS remained
+Running/Manual, matching this stage's baseline; the earlier stop-denial limitation
+was not bypassed or relabeled as restored.
+
+The [collection validator](../tools/validate-image-capture-journal.ps1) accepts
+`-ImageHarness`, `-JournalHarness` and `-Fixtures` from the Release recipe/journal
+validators, plus `-Product` for the built application and real mapped-image
+controls. `-Mode harness` and `-Mode product` run those scopes independently.
+The [privacy validator](../tools/validate-evidence-privacy.ps1) covers initialization
+and the observed contention controls.
+
+This stage does not complete VS1 or the wider P01-P16 design. Native mapping and
+object lifetime, approved changes, committed-root retirement, large-store
+continuation and physical media/power-loss behavior still require their own
+evidence. Original case directories retain their existing access controls.
+
 ## Original IRP claim checkpoint: 2026-11-17
 
 The KMON writer now preserves an unchanged v2 capture and its original

@@ -64,7 +64,7 @@ them up. Administrator/recovery-agent access, owner changes, exports outside the
 root and external transfer/redaction require separate controls. See the
 [privacy scope and limits](ARCHITECTURE.md#private-evidence-roots).
 
-`KnLiveDbg.exe --offline !kmon redact-image <recipe-directory|knslice|knsweep>
+`KnLiveDbg.exe --offline !kmon redact-image <recipe-directory|kncapture|knslice|knsweep>
 <new-private-root> [/acl-only] [/json]` replays a saved original and publishes
 minimized comparison counts plus a private original-hash linkage. A direct
 `recipe.knverify` path is also accepted. The default requires EFS; no target
@@ -186,7 +186,7 @@ or execution. The existing command without `/receipts` keeps its original schema
 
 `KnLiveDbg.exe --offline !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length> <new-directory> /json`
 captures one 1..4,096-byte executable comparison and its exact reference into a
-new private directory. The dump must meet `dump-read` requirements. Base and RVA
+new case directory using its parent's access controls. The dump must meet `dump-read` requirements. Base and RVA
 are hexadecimal. Supply locally trusted reference files; parsing is not isolated.
 The result's ownership and coverage determine the byte-comparison outcome;
 `status=recorded` means the case was published, including when reads are partial.
@@ -206,7 +206,28 @@ It has no native fallback or background-monitor capture. Successful publication
 may still report an unverified or modified range. Exit 3 means stdout delivery
 failed; a case already published before that failure remains on disk.
 
-`KnLiveDbg.exe --offline !kmon replay-image <directory> /json` reruns the recorded
+`KnLiveDbg.exe --offline !kmon journal-image <case-directory> <private-store> <collection-id> /json`
+archives an existing direct recipe/claim publication and its exact reference into
+a store initialized by `init-store`. The collection ID is a canonical decimal
+string of 1..20 digits. One collection holds one direct capture operation.
+The command returns `kn.image_capture_collection.v1`; `archived` requires the
+capture, closure and indexes to succeed. `capture_committed`, `closed`, `indexed`,
+`capture_created` and `reference_created` distinguish partial outcomes and reuse.
+The returned `capture_path` is relative to the private store. It is a managed
+`.kncapture` file that can be passed to `replay-image` after the source case is
+removed. `journal <private-store>\collections\<id> /index /json` separately verifies
+membership. Replay does not claim that this journal check occurred.
+
+Exact retries reuse the same files and transactions. Different committed input
+or a conflicting existing output is rejected; no original is replaced. Exit 0
+means archived, 1 means incomplete/unavailable, 2 means invalid arguments, and 3
+means JSON delivery failed after any already completed writes. The action also
+routes through interactive `!kmon` as a file-writing command without opening a
+driver. It preserves the source directory and does not encrypt that old copy.
+Root/reference limits are 4 MiB/64 MiB. See
+[direct capture collections](ARCHITECTURE.md#direct-image-capture-collections).
+
+`KnLiveDbg.exe --offline !kmon replay-image <directory|managed.kncapture> /json` reruns the recorded
 policy against either v1 or v2's retained artifact and ordered raw reads, including
 recipes embedded in new claim publication roots. Add `/current` to
 perform current reanalysis instead; both policy identifiers and the original

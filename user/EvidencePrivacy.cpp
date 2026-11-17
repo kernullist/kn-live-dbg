@@ -302,8 +302,25 @@ EvidencePrivacyReport InitializeEvidencePrivateStore(const std::wstring& root, b
         auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
         rename->FileNameLength = static_cast<DWORD>(targetName.size() * sizeof(wchar_t));
         std::memcpy(rename->FileName, targetName.data(), rename->FileNameLength);
-        if (!SetFileInformationByHandle(directory.get(), FileRenameInfo, rename, static_cast<DWORD>(size)))
-            { out.Issue = L"private_store_publication_failed_" + std::to_wstring(GetLastError()); return out; }
+        // A reader of the just-written policy can temporarily prevent a directory
+        // rename, even though the original directory handle has DELETE access.
+        // Keep the same object/ancestors and create-new destination semantics;
+        // never alter permissions, replace an existing target or retry forever.
+        const auto publicationDeadline = GetTickCount64() + 2000;
+        bool observedContention = false;
+        for (;;)
+        {
+            if (SetFileInformationByHandle(directory.get(), FileRenameInfo, rename, static_cast<DWORD>(size))) { break; }
+            const auto publicationError = GetLastError();
+            if ((publicationError != ERROR_ACCESS_DENIED && publicationError != ERROR_SHARING_VIOLATION) ||
+                GetTickCount64() >= publicationDeadline || GetFileAttributesW(targetName.c_str()) != INVALID_FILE_ATTRIBUTES)
+                { out.Issue = L"private_store_publication_failed_" + std::to_wstring(publicationError); return out; }
+            if (!Attributes(directory.get(), true, efs) || !PrivateAcl(directory.get(), out.OwnerSid, true))
+                { out.Issue = L"private_store_protection_changed_before_publication"; return out; }
+            if (!observedContention && observer) { observer(L"private_root_publication_blocked"); }
+            observedContention = true;
+            Sleep(25);
+        }
         out.TemporaryDirectory.clear(); out.RootAclVerified = true; out.AuditComplete = true;
         out.CheckedEntries = 1; out.Initialized = true; out.Status = L"ready";
         if (observer) { observer(L"private_root_published"); }

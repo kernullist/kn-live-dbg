@@ -493,6 +493,12 @@ static int RunCommandAuditSelfTest()
         L"IRP current claim evaluation routes offline without opening a device");
     for (const auto& line : {L"!kmon replay-irp", L"!kmon replay-irp /json", L"!kmon replay-irp x /current /current", L"!kmon replay-irp x /json /json"})
     { check(run(line).Error.find(L"usage") != std::wstring::npos, L"IRP replay rejects malformed arguments"); }
+    check(IsWriteLikeCommandLine(L"!kmon journal-image missing-case missing-store 7 /json") &&
+        run(L"!kmon journal-image missing-case missing-store 7 /json").Output.find(L"kn.image_capture_collection.v1") != std::wstring::npos && !device.IsOpen(),
+        L"direct capture archival writes files without opening a driver");
+    for (const auto& line : {L"!kmon journal-image", L"!kmon journal-image x y", L"!kmon journal-image x y 01",
+        L"!kmon journal-image x y 1 /json /json", L"!kmon journal-image x y 1 /bad"})
+    { check(run(line).Error.find(L"usage") != std::wstring::npos, L"direct capture archival rejects malformed arguments"); }
     check(IsWriteLikeCommandLine(L"!kmon inventory x new-output /json") &&
         !IsWriteLikeCommandLine(L"!kmon evidence x /inventory saved-index /json") &&
         !IsWriteLikeCommandLine(L"!kmon dump-read x.dmp 1000 16 /json"),

@@ -271,6 +271,48 @@ def main():
     check((collision / "sentinel").read_bytes() == b"owned collision" and not (collision / "store.knprivacy").exists(),
           "late destination is never replaced")
     check(len(set(sandbox.glob(".kn-private-*")) - before) == 1, "late collision preserves private staging")
+    for release in (True, False):
+        destination = sandbox / ("released-policy-reader" if release else "persistent-policy-reader")
+        before = set(sandbox.glob(".kn-private-*"))
+        actor = subprocess.Popen([str(producer), "init", str(destination), "acl", "rename-contention"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
+        observed = queue.Queue()
+        reader = threading.Thread(target=lambda: observed.put(actor.stdout.readline()), daemon=True)
+        reader.start()
+        lease = None
+        try:
+            check(observed.get(timeout=30).strip() == "[privacy.stage] private_policy_committed", "policy exists before reader contention")
+            temporary, = set(sandbox.glob(".kn-private-*")) - before
+            policy = temporary / "store.knprivacy"
+            lease = policy.open("rb")  # Denies DELETE sharing without modifying the original.
+            original = lease.read()
+            actor.stdin.write("continue\n")
+            actor.stdin.flush()
+            reader.join(timeout=2)
+            reader = threading.Thread(target=lambda: observed.put(actor.stdout.readline()), daemon=True)
+            reader.start()
+            check(observed.get(timeout=30).strip() == "[privacy.stage] private_root_publication_blocked", "actual failed rename precedes reader release")
+            if release:
+                lease.close()
+                lease = None
+            output, errors = actor.communicate("continue\n", timeout=10)
+            report = json.loads(output)
+            check(not errors and actor.returncode == (0 if release else 1), "bounded private-root publication result")
+            if release:
+                check(report["status"] == "ready" and (destination / "store.knprivacy").read_bytes() == original and not temporary.exists(),
+                      "same protected root publishes after observed reader release")
+                check(run("inspect", destination, True)["status"] == "ready", "retried publication preserves private policy")
+            else:
+                check(report["issue"] == "private_store_publication_failed_5" and not destination.exists() and policy.read_bytes() == original,
+                      "persistent contention fails closed and retains private staging")
+        finally:
+            if lease:
+                lease.close()
+            if actor.poll() is None:
+                actor.kill()
+                actor.communicate(timeout=10)
+            reader.join(timeout=2)
     for stage in ("private_root_created", "private_root_protected", "private_policy_committed", "private_root_published"):
         interrupted = sandbox / stage
         before = set(sandbox.glob(".kn-private-*"))

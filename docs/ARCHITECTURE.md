@@ -513,7 +513,12 @@ sibling, checks its owner/DACL
 and full 128-bit file ID, volume and creation time, enables EFS, then verifies
 the encrypted attribute. Only then does it publish `store.knprivacy` with
 `kn.evidence_private_store.v1`, the selected policy, principal and physical root
-identity. The directory is renamed by its held handle without replacement. A
+identity. The directory is renamed by its held handle without replacement.
+A reader of the newly written policy can temporarily prevent publication.
+Access-denied/sharing failures have a two-second retry budget with the same held
+directory and parent pins. Existing destinations stop the retry, and the root's ACL/encryption is
+rechecked. Persistent failure retains the private staging directory and returns
+the Win32 publication failure; permissions are never relaxed. A
 collision preserves both outputs; interruption can leave a private staging
 directory, whose path is reported on ordinary failure. There is no automatic
 recursive cleanup. Directory pins request data/list access as well as metadata
@@ -1958,8 +1963,52 @@ collector authentication, complete observation or power-loss durability.
 
 As with direct publications, stored reports keep their conservative prepublication
 persistence/reproduction fields. The separate replay outcome records later exact
-reproduction. Other adapters' original claims, direct-capture journal integration
-and qualified lifetime joins remain open.
+reproduction. Other adapters' original claims and qualified lifetime joins remain open.
+
+### Direct image capture collections
+
+`!kmon journal-image <case-directory> <private-store> <collection-id>` archives one
+existing direct capture into an initialized private store. It pins and validates
+the bounded original `recipe.knverify` and its hash-selected reference before
+publication. Bare v1/v2 recipes and `kn.image_claim_publication.v1` roots retain
+their exact physical bytes. The operation neither opens a target nor reparses
+PDBs. It does not move, delete or change the privacy of the original case.
+
+The dedicated `kn.direct_image_collection_journal.v1` policy admits one
+`image_capture` transaction and its dependent closure. Its immutable root is
+`image-captures/capture-ID-PHYSICALSHA.kncapture` (at most 4 MiB); its exact
+reference is `image-references/SHA.knblob` (at most 64 MiB). The capture transaction
+ID is the physical root hash and binds exactly these two members. Existing
+image/IRP journal v1-v4 encodings remain unchanged and reject this new family.
+
+Publication holds the shared store barrier, private-root guard, collection lock
+and admitted file handles. It retains the reference, retains the root, commits
+the capture, publishes `image-captures/session-ID.kncaptureledger`, and commits
+closure with both original paths as required dependencies. The ledger schema
+`kn.image_capture_session.v1` counts one archived capture and its logical referenced
+bytes; it does not reconstruct the original live attempt count or new disk usage.
+The separate `kn.image_capture_collection.v1` result reports this invocation's
+create/reuse, capture commit, closure and index outcomes.
+
+Exact retries reuse files and transactions, including a closed collection.
+Conflicting files or a different capture already committed to the collection
+fail without replacement. Interruption can leave uncommitted files, an open
+verified prefix or a closed collection; derived-index failure remains an incomplete
+archive result even when the original transaction committed. These boundaries
+do not establish power-loss durability. Recovery's `committed_direct_capture_paths`
+lists verified members, not semantically replayed claims. Store inventory and
+explicit GC recognize the new namespace; committed members, final ledgers and
+files protected by unresolved membership remain protected.
+
+`replay-image <managed.kncapture>` resolves the shared reference from the fixed
+parent store's `image-references` directory. Existing case-directory replay stays
+valid. Archival validates structure and physical hashes; original-policy replay
+independently evaluates the retained reads and reproduces the original claim.
+A structurally valid but false saved assessment can therefore be archived while
+failing replay. `redact-image` accepts managed roots only through the same
+original-policy replay and private original-hash linkage; archival alone does
+not authorize disclosure. Neither operation authenticates the collector or establishes
+execution, lifetime continuity, complete capture coverage or approved changes.
 
 ### Claim-specific image proof
 

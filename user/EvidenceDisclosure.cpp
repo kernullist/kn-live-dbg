@@ -116,7 +116,7 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
         const auto input = fs::absolute(source).lexically_normal();
         auto original = input, replayInput = input;
         const auto extension = Lower(input.extension().wstring());
-        if (extension != L".knslice" && extension != L".knsweep")
+        if (extension != L".knslice" && extension != L".knsweep" && extension != L".kncapture")
         {
             if (Lower(input.filename().wstring()) == L"recipe.knverify") { replayInput = input.parent_path(); }
             else { original /= L"recipe.knverify"; }

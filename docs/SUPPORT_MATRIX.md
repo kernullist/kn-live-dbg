@@ -33,6 +33,7 @@ backends are not implied by an x64 address width.
 | evidence / temporal_graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_local_collector_scope |
 | evidence / journal | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | verified_committed_prefix |
 | evidence / store | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_stopped_store |
+| evidence / journal_image | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | one_archived_capture |
 | evidence / gc | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_explicit_policy |
 | image / capture_verification | dump | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_dump |
 | evidence / privacy | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | observed_os_access_controls |

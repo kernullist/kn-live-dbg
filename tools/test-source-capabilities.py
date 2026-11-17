@@ -62,6 +62,10 @@ def main():
     assert journal["availability"] == "not_probed" and journal["consistency"] == "verified_committed_prefix"
     assert "exact_file_hashes" in journal["requirements"] and "no_gc_or_global_retention" in journal["limits"]
     assert "image_v1_image_irp_v2_image_claim_irp_v3_or_image_irp_claim_v4_policy" in journal["requirements"] and "irp_ledger_before_closure" in journal["requirements"]
+    assert "direct_image_collection_v1_policy" in journal["requirements"]
+    direct = by_key[("evidence", "journal_image", "local_files")]
+    assert direct["consistency"] == "one_archived_capture" and "initialized_private_store" in direct["requirements"]
+    assert "membership_separate_from_semantic_replay" in direct["limits"] and "one_capture_per_collection" in direct["limits"]
     store = by_key[("evidence", "store", "local_files")]
     assert store["availability"] == "not_probed" and store["consistency"] == "coordinated_stopped_store"
     assert "participating_publishers" in store["requirements"] and "no_deletion_authority_or_disk_allocation" in store["limits"]

@@ -1,6 +1,8 @@
 #include "../user/ImageVerificationRecipe.h"
 #include "../user/ImageProof.h"
 #include "../user/ImageClaimPublication.h"
+#include "../user/ImageCaptureCollection.h"
+#include "../user/EvidencePrivacy.h"
 #include "../user/ReferenceArtifact.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
@@ -245,6 +247,27 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 3 && std::wstring(argv[1]) == L"--init-store")
+    {
+        const auto result = InitializeEvidencePrivateStore(argv[2], false);
+        std::cout << mcpjson::WideToUtf8(EvidencePrivacyJson(result)) << "\n";
+        return result.Status == L"ready" ? 0 : 1;
+    }
+    if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--archive")
+    {
+        const auto result = JournalImageCapture(argv[2], argv[3], argv[4], [&](const wchar_t* stage)
+        {
+            if (argc == 6 && std::wstring(argv[5]) == stage)
+            {
+                std::wcout << L"[capture.stage] " << stage << std::endl;
+                std::string input;
+                std::getline(std::cin, input);
+                ExitProcess(91); // No continuation after an unexpected parent disconnect.
+            }
+        });
+        std::cout << mcpjson::WideToUtf8(ImageCaptureCollectionJson(result)) << "\n";
+        return result.Status == L"archived" ? 0 : 1;
+    }
     if ((argc == 3 || (argc == 4 && std::wstring(argv[3]) == L"/current")) && std::wstring(argv[1]) == L"--report")
     {
         const auto replay = ReplayImageRecipe(argv[2], argc == 4, nullptr);

@@ -518,7 +518,8 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
     const auto root = std::filesystem::path(directory);
     ImageClaimPublication publication;
     std::wstring schema;
-    bool loaded = ReadAnalystSnapshot((root / L"recipe.knverify").wstring(), &json, error, ImageClaimPublicationMaxBytes, nullptr, true);
+    const bool managed = extension == L".kncapture";
+    bool loaded = ReadAnalystSnapshot((managed ? root : root / L"recipe.knverify").wstring(), &json, error, ImageClaimPublicationMaxBytes, nullptr, true);
     if (loaded && mcpjson::GetString(json, L"schema", &schema) && schema == ImageClaimPublicationSchema)
     {
         result.OriginalClaimStatus = L"publication_unavailable_or_corrupt";
@@ -540,7 +541,8 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         return result;
     }
     ReferenceArtifact artifact;
-    if (!artifact.Open((root / (p.ReferenceSha256 + L".knblob")).wstring(), error))
+    const auto referenceRoot = managed ? root.parent_path().parent_path() / L"image-references" : root;
+    if (!artifact.Open((referenceRoot / (p.ReferenceSha256 + L".knblob")).wstring(), error))
     {
         result.Status = L"reference_missing_or_unreadable";
         return result;
