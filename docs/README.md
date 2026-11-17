@@ -43,8 +43,8 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 
 ## Validation and releases
 
-- [Corpus evaluation](BENCHMARK_CORPUS.md): bounded imported assessments, heldout
-  leakage checks, explicit failed/missing denominators and synthetic fixtures.
+- [Corpus evaluation](BENCHMARK_CORPUS.md) covers pinned Windows workload
+  replay, imported assessments, heldout leakage checks and failed or missing cases.
 - [Validation status](VALIDATION.md): separate release and development evidence,
   including the six-control reference and TI queue results, known gaps, and links
   to the original reports at v0.0.36. The dated observations are not refreshed by

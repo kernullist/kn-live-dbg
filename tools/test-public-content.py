@@ -53,11 +53,23 @@ class PublicContentTests(unittest.TestCase):
                        "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                        "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                        "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
-                       "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"):
+                       "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1",
+                       "kn.owned_module_benchmark.v1", "kn.owned_module_truth.v1", "kn.owned_module_evaluation.v1"):
             data = json.dumps({"schema": schema, "payload": {"bytes_hex": "c3"}})
             for encoding in ("utf-8", "utf-16"):
                 self.assertIn("private-evidence-bundle",
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
+
+    def test_private_benchmark_archive(self):
+        head = b"PK\x03\x04" + bytes(26)
+        self.assertEqual(AUDIT.path_rule("case.KNBENCH"), "private-container-or-capture")
+        self.assertEqual(AUDIT.path_rule(".knbench-interrupted.tmp"), "private-container-or-capture")
+        self.assertIn("private-benchmark-package", {f["rule"] for f in AUDIT.inspect("renamed.dat", head + b"owned-module-manifest.json")})
+        self.assertFalse(AUDIT.inspect("guide.zip", head + b"guide.txt"))
+        for kind in ("benchmark", "truth", "evaluation"):
+            truncated = "logged\n" + json.dumps({"schema": "kn.owned_module_" + kind + ".v1", "run_id": "interrupted"}, indent=2)[:-4]
+            for encoding in ("utf-8", "utf-16"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", truncated.encode(encoding))})
 
     def test_owned_module_workload_transcripts(self):
         schema = "kn.owned_module_workload.v1"

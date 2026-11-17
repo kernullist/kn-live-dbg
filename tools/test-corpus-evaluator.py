@@ -227,10 +227,16 @@ class CorpusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="kn-corpus-") as directory:
             path = Path(directory) / "input.json"
             for data in (b'{"x":1,"x":2}', b'{"x":NaN}', b'\xef\xbb\xbf{}', b'\xff',
-                         b'{} trailing', b'[' * 1500 + b'0' + b']' * 1500):
+                         b'{} trailing', b'1e500', b'[' * 1500 + b'0' + b']' * 1500):
                 path.write_bytes(data)
                 with self.assertRaises((ValueError, RecursionError)):
                     EVALUATOR.read_document(path)
+            depth = EVALUATOR.MAX_JSON_DEPTH
+            value = ('["\\]' * depth)
+            data = b'[' * depth + json.dumps(value).encode() + b']' * depth
+            self.assertIsInstance(EVALUATOR.decode_document(data), list)
+            with self.assertRaises(EVALUATOR.InvalidCorpus):
+                EVALUATOR.decode_document(b'[' + data + b']')
             data = b'{}' + b' ' * (EVALUATOR.MAX_BYTES - 2)
             path.write_bytes(data)
             self.assertEqual(EVALUATOR.read_document(path)[0], {})

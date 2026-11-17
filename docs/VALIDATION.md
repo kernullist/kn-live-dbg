@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Offline replay of owned Windows module acquisitions, 2026-11-18
+
+On Windows **28000.3501 x64**, a Release core observer recorded two owned
+process workloads. After all children and the observer exited, the offline
+evaluator opened the package using the pin returned at collection. It verified
+the executable and controller bytes, reconciled each readiness witness with
+its process handle and matched the two original observer streams to the
+controller's request windows.
+
+| Workload | In-scope generations | Admitted | Observed / all | Observed / observable | Unavailable | Missing | Successful walks / attempts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed | 12 | 12 | 12/12 | 12/12 | 0 | 0 | 128/128 |
+| Changing | 22 | 21 | 20/22 | 20/20 | 1 | 1 | 127/128 |
+
+The missing child exited before the first census. The unavailable child
+exited between selection and dispatch. Both appear in the end-to-end
+denominator. Each workload had one outside-job control, 16 censuses and zero
+active job members after cleanup. Separately pinned observer and target
+handles both signaled after abrupt controller termination. Repeated replay
+of the final package produced byte-identical output.
+
+The Release core validation passed, including the acquisition and replay
+gate. Eight replay tests covered altered package contents, file sharing,
+concurrent and interrupted writes, evidence ordering, generation fences,
+failed attempts, terminal per-generation records and CLI error handling.
+The original summary and private trace CLI modes also passed. The imported
+evaluator passed 13 tests and the publication checker passed 14. A synthetic change to one fixed generation's
+walks produced 11/12 end-to-end and 11/11 observable recall with one error.
+The pre-revision JSON parser accepted 1,500 nesting levels on this Python
+runtime. The shared decoder now enforces 128.
+
+Core harness SHA-256 `1edbcab7993b61ed23ecead1262c1a302da63c3d45f51d362ff5d926d7be7b46`.
+At **08:28 KST** the host retained its previous boot time, with zero new
+BugCheck or unexpected restart events, new dumps, running task processes,
+running task drivers or benchmark temporary files. The monitored services
+and firewall profiles matched the pre-run baseline.
+The recorded results cover one correlated owned development run. The
+[replay contract](BENCHMARK_CORPUS.md#replay-an-owned-windows-acquisition)
+defines the unit, evidence references and failure denominators. External
+sample provenance, heldout evaluation, overhead measurements and independent
+tool comparisons remain open under P16.
+
 ## Owned Windows process module workloads, 2026-11-18
 
 On Windows **28000.3501**, an independent controller measured native Toolhelp

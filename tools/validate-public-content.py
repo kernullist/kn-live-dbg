@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -46,7 +46,7 @@ def path_rule(name: str) -> str | None:
     base = path.name.lower()
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
-    if path.suffix.lower() in PRIVATE_EXTENSIONS or any(
+    if (base.startswith(".knbench-") and base.endswith(".tmp")) or path.suffix.lower() in PRIVATE_EXTENSIONS or any(
         extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
     ):
         return "private-container-or-capture"
@@ -79,6 +79,10 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     bad_path = path_rule(name)
     if bad_path:
         add(bad_path)
+    # A partially written or renamed acquisition still contains private executable and process evidence.
+    if data.startswith(b"PK\x03\x04") and data.startswith(b"owned-module-manifest.json", 30):
+        add("private-benchmark-package")
+        return findings
     if data.startswith(b"KNSYMIDX"):
         add("private-symbol-index")
     private_symbols = Path(name).suffix.lower() == ".pdb"
@@ -107,13 +111,18 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
-                    "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"
+                    "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1",
+                    "kn.owned_module_benchmark.v1", "kn.owned_module_truth.v1", "kn.owned_module_evaluation.v1"
                 }:
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):
                 pass
         # The workload emits one tagged object per reply. A transcript can
         # include multiple replies, a log banner or a partially written tail.
+        if not binary and "kn.owned_module_" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
+            partial = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.owned_module_(?:truth|benchmark|evaluation)\.v1"\s*,', text)
+            if partial:
+                add("private-evidence-bundle", text.count("\n", 0, partial.start()) + 1)
         if not binary and "kn.owned_module_workload.v1" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
             record = re.search(r'(?m)^[ \t]*\{[ \t]*"schema"[ \t]*:[ \t]*"kn\.owned_module_workload\.v1"[ \t]*,'
                                r'[ \t]*"(?:payload|passed)"[ \t]*:[ \t]*(?:\{|true\b|false\b)', text)

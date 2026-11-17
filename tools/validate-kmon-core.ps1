@@ -86,10 +86,10 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "user module observation debt oracle failed: $LASTEXITCODE"
 }
-& python (Join-Path $PSScriptRoot 'test-user-module-workload.py') --core-exe $exe
+& python (Join-Path $PSScriptRoot 'test-owned-module-benchmark.py') --core-exe $exe
 if ($LASTEXITCODE -ne 0)
 {
-    throw "owned native module workload failed: $LASTEXITCODE"
+    throw "owned native module workload or offline replay failed: $LASTEXITCODE"
 }
 & python (Join-Path $PSScriptRoot 'test-discovery-scheduling.py') --core-exe $exe
 if ($LASTEXITCODE -ne 0)

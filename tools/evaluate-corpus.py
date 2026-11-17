@@ -1,4 +1,4 @@
-"""Evaluate declared case-level outcomes without running collectors or target code."""
+"""Evaluate imported declarations or replay a pinned owned-process acquisition offline."""
 import argparse
 from collections import Counter, defaultdict
 import hashlib
@@ -11,6 +11,8 @@ import sys
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_CASES = 4096
+MAX_JSON_DEPTH = 128
+JSON_DELIMITERS = re.compile(rb'\\.|"|[\[\]{}]')
 LAYERS = {"synthetic", "owned_fixture", "authorized_sample", "independent_comparison"}
 OUTCOMES = ("positive", "negative", "abstain", "unavailable", "error", "missing")
 
@@ -51,15 +53,33 @@ def unique_object(pairs):
     return result
 
 
+def decode_document(raw):
+    depth = 0
+    in_string = False
+    for match in JSON_DELIMITERS.finditer(raw):
+        token = match[0]
+        if token == b'"':
+            in_string = not in_string
+        elif not in_string and token in (b'[', b'{'):
+            depth += 1
+            require(depth <= MAX_JSON_DEPTH, "JSON nesting exceeds limit")
+        elif not in_string and token in (b']', b'}'):
+            depth -= 1
+    def invalid_constant(_value):
+        raise InvalidCorpus("non-finite JSON constant")
+    def finite_float(value):
+        number = float(value)
+        require(math.isfinite(number), "non-finite JSON number")
+        return number
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                      parse_constant=invalid_constant, parse_float=finite_float)
+
+
 def read_document(path):
     with path.open("rb") as source:
         raw = source.read(MAX_BYTES + 1)
     require(len(raw) <= MAX_BYTES, "input exceeds 8 MiB")
-    # Reject nonstandard constants and preserve exact-byte corpus identity.
-    def invalid_constant(_value):
-        raise InvalidCorpus("non-finite JSON constant")
-    parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=invalid_constant)
-    return parsed, hashlib.sha256(raw).hexdigest()
+    return decode_document(raw), hashlib.sha256(raw).hexdigest()
 
 
 def validate_corpus(corpus):
@@ -216,15 +236,47 @@ def evaluate(corpus, corpus_hash, results, results_hash):
     }
 
 
+def evaluate_owned(path, pin):
+    from owned_module_benchmark import verified_run
+    manifest, scopes = verified_run(path, pin, decode_document)
+    for scope in scopes:
+        cases = [dict(id=row["id"], truth="positive", family="owned-main-module", independence_group=manifest["run_id"])
+                 for row in scope["cases"]]
+        assessments = {row["id"]: dict(outcome=row["outcome"], elapsed_us=int(row["elapsed_us"]))
+                       for row in scope["cases"] if row["outcome"] != "missing"}
+        metrics = summarize(cases, assessments)
+        metrics["uncertainty_reason"] = "correlated_processes_in_one_controlled_run"
+        scope.update(layer="owned_fixture", partition="development", task="acquire-owned-main-module",
+                     unit="entity", entity_kind="process_generation", metrics=metrics)
+    return dict(schema="kn.owned_module_evaluation.v1", assessment_basis="pinned_owned_acquisition_replay",
+                run_id=manifest["run_id"], package_sha256=pin, artifacts=manifest["artifacts"],
+                environment=manifest["environment"], clock=manifest["clock"], cadence_ms=manifest["cadence_ms"],
+                elapsed_basis="child_ready_to_first_qualified_observation_or_last_unsuccessful_dispatch",
+                artifacts_opened=True, truth_basis="child_acknowledgements_and_controller_handle_witnesses",
+                ground_truth_authenticated=False, acquisition_target_probed=True, target_probed=False,
+                owner_loss_witnesses_reconciled=True,
+                independent_detection_validation=False, overall_ranking=None, scopes=scopes)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", required=True, type=Path)
-    parser.add_argument("--results", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--corpus", type=Path)
+    source.add_argument("--owned-module-run", type=Path, help="private acquisition package from the native workload")
+    parser.add_argument("--results", type=Path)
+    parser.add_argument("--sha256", help="expected SHA-256 retained from workload acquisition")
     args = parser.parse_args()
+    if args.corpus and (args.results is None or args.sha256 is not None):
+        parser.error("--corpus requires --results and cannot use --sha256")
+    if args.owned_module_run and (args.sha256 is None or args.results is not None):
+        parser.error("--owned-module-run requires --sha256 and cannot use --results")
     try:
-        corpus, corpus_hash = read_document(args.corpus)
-        results, results_hash = read_document(args.results)
-        report = evaluate(corpus, corpus_hash, results, results_hash)
+        if args.owned_module_run:
+            report = evaluate_owned(args.owned_module_run, args.sha256)
+        else:
+            corpus, corpus_hash = read_document(args.corpus)
+            results, results_hash = read_document(args.results)
+            report = evaluate(corpus, corpus_hash, results, results_hash)
         raw = (json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode("utf-8")
         require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
     except (OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
