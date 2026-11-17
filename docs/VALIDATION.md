@@ -7,6 +7,76 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Approved image changes checkpoint: 2026-11-17
+
+`assess-image` now checks exact authorized changes in direct recipes and managed
+captures under a separately caller-pinned policy. The policy binds image and
+manifest hashes, issuer and epoch; both validity windows must cover capture and
+evaluation. Original replay, claims, differences and gaps remain unchanged.
+Approval applies to observed non-fixup spans with exact before/after hashes.
+See [approved image changes](ARCHITECTURE.md#approved-image-changes) and the
+[command contract](COMMAND_REFERENCE.md).
+
+Release approval validation passed **448 harness / 424 product** checks against
+original PE bytes and retained reads. Controls include exact approval, unchanged
+spans, extra unexplained differences, bad before/after hashes, fixup/exclusion
+overlap, gaps and unstable reads, bare v1/v2 inputs, forged original claims,
+policy/manifest/image/issuer/epoch substitution, validity boundaries, future
+capture timestamps, malformed/duplicate/overflow fields, 128/129-entry bounds,
+Unicode paths and issuers, observed input write-exclusion leases, CLI grammar
+and stdout failure. A forged retained reference matching the observed bytes
+successfully replays its compared local range but is rejected by the original
+approval policy. That control does not assert complete coverage or authenticated
+capture. Review also fixed truncated Unicode output in the new test harness;
+the final tests exercise UTF-8 output in both harness and product.
+
+The owned real `LoadLibrary`/ASLR `MEM_IMAGE` path passed **59 checks** for clean
+and one-byte-change cases. After child unload/exit and original DLL/case removal,
+managed replay and approval identify precisely the allowed byte, preserve the
+original replay, and retain separate journal membership and redaction results.
+No probe code was executed. This is an owned byte-observation control, not a
+production hotpatch corpus or lifetime validation.
+
+Affected recipe compatibility passed **120 C++**, **34 claim**, **59 publication**
+controls and v1/v2 interrupted publication. The final product's isolated
+`--self-test all` passed: timeline **28**, MCP **102**, KMON image integration
+**121**, console **564**, command audit **3,025 / 261 routes**, remote **68** and
+four connection-option controls. Compiled capability validation passed **38
+contracts / 261 routes** and the generated matrix matched. The public-content
+classifier passed **12 tests**, including the new private formats. No additional
+actionable defects were found in the reviewed scope.
+
+The product SHA-256 was
+`0046b47e7c1b9ca754ec7138adeb577e311b4a50ca5a00379d8eb5f22459f41d`;
+the image harness was
+`81bdc0a7a902fbb32d8a20ff5833a63bb41e5db61f53091e16aa2e01fc870373`.
+The unchanged owned DLL was
+`0fd5aea0ae3ce3619adc5e2d0b43c3911f972084f964162c4869379aeb6774bb`.
+Toolchain/host: MSVC 14.44.35207, SDK/WDK 10.0.26100.0, Windows
+10.0.28000.3501. Existing product link warnings remain; the standalone harness
+passed `/W4 /WX`. The updated-host ASan startup failure and prior real-kernel-PDB
+ASan resource gate remain open; no interceptor bypass or unchanged failing
+ASan rerun was used.
+
+The 16:17 KST cleanup snapshot found the same boot time, no new reboot/BugCheck
+events, and no task processes, loaded task drivers, parser profile receipts,
+preparation directories or AppContainer profiles. The 33 completed parser caches,
+BFE/mpssvc, enabled firewall profiles and Running/Manual EFS matched the stage
+baseline. The prior EFS stop-denial limit remains unchanged.
+
+[validate-image-recipe.ps1](../tools/validate-image-recipe.ps1) includes the
+[approval oracle](../tools/test-image-authorized-changes.py). To exercise the
+product against its resulting fixtures, run
+`python tools/test-image-authorized-changes.py --exe x64/Release/KnLiveDbg.exe --fixtures <fixture-directory> --product`.
+The [mapped-image test](../tools/test-mapped-image-journal.py), also called by the
+direct-collection validator, covers managed post-exit approval.
+
+This is a P03/VS1 increment, not completion of VS1 or P01-P16. Approval is relative
+to the caller-pinned policy; issuer signatures, collector timestamps and the host
+clock are not authenticated. Signed distribution provisioning/revocation,
+journaled approval inputs, secondary/sweep approval, cross-bundle associations,
+native lifetimes and broader hotpatch/instrumentation corpora remain open.
+
 ## Direct image collection checkpoint: 2026-11-17
 
 Direct dump/process cases can now be archived into initialized private stores

@@ -23,7 +23,7 @@ if ($Sanitize)
 $program = Join-Path $output 'image-recipe-selftest.exe'
 $sources = foreach ($source in @('tools\image-recipe-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageScopeClaimPublication.cpp',
     'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
-    'user\ImageCaptureCollection.cpp', 'user\EvidenceJournal.cpp', 'user\EvidencePrivacy.cpp',
+    'user\ImageCaptureCollection.cpp', 'user\ImageAuthorizedChanges.cpp', 'user\EvidenceJournal.cpp', 'user\EvidencePrivacy.cpp',
     'user\ObservationReadRoutingJson.cpp', 'user\ImageProof.cpp', 'user\ExecutableImage.cpp',
     'user\ExecutableImageVerifier.cpp', 'user\AnalystSnapshot.cpp'))
 {
@@ -54,6 +54,11 @@ if ($LASTEXITCODE -ne 0)
 if ($LASTEXITCODE -ne 0)
 {
     throw 'Original image claim publication/replay controls failed'
+}
+& python (Join-Path $PSScriptRoot 'test-image-authorized-changes.py') --exe $program --fixtures $output
+if ($LASTEXITCODE -ne 0)
+{
+    throw 'Pinned image approval and exact change controls failed'
 }
 foreach ($format in @('v1', 'v2'))
 {

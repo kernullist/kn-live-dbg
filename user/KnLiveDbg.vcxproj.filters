@@ -211,6 +211,9 @@
     <ClCompile Include="ImageClaimPublication.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ImageAuthorizedChanges.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ImageCaptureCollection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -508,6 +511,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ImageClaimPublication.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ImageAuthorizedChanges.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ImageCaptureCollection.h">

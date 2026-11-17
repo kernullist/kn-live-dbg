@@ -256,7 +256,7 @@ namespace
     }
     ImageRecipeReplay EvaluateDirectImageRecipe(const ImageVerificationRecipe& p, const std::wstring& json,
         ReferenceArtifact& artifact, const executable_image::DiskPeMetadata& metadata,
-        bool currentReanalysis, std::wstring* error)
+        bool currentReanalysis, std::wstring* error, DirectImageReplayEvidence* evidence = nullptr)
     {
         ImageRecipeReplay result;
         result.Mode = currentReanalysis ? L"current_reanalysis" : L"original_policy";
@@ -308,6 +308,21 @@ namespace
             result.Proof = ImageProofJson(p, AssessImageProof(p, comparison, referenceQualified, currentReanalysis));
             result.ClaimAssessmentJson = ImageClaimAssessmentJson(p, comparison, referenceQualified,
                 currentReanalysis, result.RecipeSha256);
+            if (evidence && !currentReanalysis)
+            {
+                evidence->Recipe = p;
+                evidence->Comparison = std::move(comparison);
+                evidence->ReferenceQualified = referenceQualified;
+                const auto add = [&](uint32_t rva, uint32_t size)
+                {
+                    if (size && uint64_t(rva) < uint64_t(p.Rva) + p.Length && p.Rva < uint64_t(rva) + size)
+                    { evidence->NormalizationRanges.push_back({rva, size}); }
+                };
+                for (const auto& r : metadata.BaseRelocations) { add(r.Rva, r.Width); }
+                for (const auto& r : metadata.LoaderMutableRanges) { add(r.Rva, r.Size); }
+                for (const auto& r : metadata.DynamicRelocationRanges) { add(r.Rva, r.Size); }
+                for (const auto& r : metadata.Rel32Overrides) { add(r.Rva, 4); }
+            }
             if (error != nullptr)
             {
                 error->clear();
@@ -485,8 +500,10 @@ bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& s
     return CaptureImageRecipeImpl(image, source, imageBase, rva, length, newDirectory, recipe, error, cancellation, &options);
 }
 
-ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error)
+ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
+    DirectImageReplayEvidence* evidence)
 {
+    if (evidence) { *evidence = {}; }
     auto extension = std::filesystem::path(directory).extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
     if (extension == L".knsweep")
@@ -558,7 +575,8 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         result.Status = L"reference_parse_failed";
         return result;
     }
-    result = EvaluateDirectImageRecipe(p, json, artifact, metadata, currentReanalysis, error);
+    DirectImageReplayEvidence evaluated;
+    result = EvaluateDirectImageRecipe(p, json, artifact, metadata, currentReanalysis, error, evidence ? &evaluated : nullptr);
     if (!publication.Sha256.empty())
     {
         result.ClaimPublicationSha256 = publication.Sha256;
@@ -587,5 +605,6 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
             }
         }
     }
+    if (evidence && !currentReanalysis && result.Status == L"replayed") { *evidence = std::move(evaluated); }
     return result;
 }

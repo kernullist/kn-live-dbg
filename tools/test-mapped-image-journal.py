@@ -157,6 +157,28 @@ def main():
                 check(replayed["status"] == "replayed" and replayed["recorded_result"] == captured["result"], "managed replay survives target exit and original artifacts removal")
                 check_original_claim(document, replayed)
                 check_report(recipe, raw, replayed)
+                # A separately pinned approval authorizes only the exact owned
+                # mutation, after unload and source removal. DIR64 at offset 0
+                # remains part of the original comparison, not the exception.
+                encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                digest = lambda value: hashlib.sha256(value).hexdigest()
+                change = {"schema": "kn.authorized_image_changes.v1", "image_sha256": digest(raw), "issuer": "owned-probe-build",
+                          "policy_epoch": "1", "not_before_filetime": "1", "not_after_filetime": "18446744073709551615",
+                          "comparison_policy": "kn.executable_page.direct.v1", "hash_basis": "non_fixup_compared_bytes.v1",
+                          "changes": [{"rva": str(identity["rva"] + 32), "length": "1", "before_sha256": digest(expected[32:33]),
+                                       "after_sha256": digest(bytes([expected[32] ^ 1]))}]}
+                change_path, policy_path = root / "change.knchange", root / "policy.knapproval"
+                change_path.write_bytes(encode(change))
+                policy = {"schema": "kn.image_approval_policy.v1", "policy_id": "owned-probe-approval", "policy_epoch": "1",
+                          "not_before_filetime": "1", "not_after_filetime": "18446744073709551615",
+                          "approvals": [{"image_sha256": digest(raw), "manifest_sha256": digest(change_path.read_bytes()), "issuer": change["issuer"]}]}
+                policy_path.write_bytes(encode(policy))
+                assessed = run(["--offline", "!kmon", "assess-image", store / archived["capture_path"], change_path, policy_path, digest(policy_path.read_bytes())])
+                check(assessed["reference_trust"] == "R-approved" and assessed["comparison_complete"], "approved reference is relative to a separate exact policy")
+                check(assessed["decision"] == ("all_observed_changes_authorized" if mode == "modified" else "no_observed_change") and
+                      assessed["rules"][0]["state"] == ("authorized" if mode == "modified" else "not_applied"), "exact ASLR-independent non-fixup rule")
+                check(assessed["authorized_changed_bytes"] == ("1" if mode == "modified" else "0") and assessed["unexplained_changed_bytes"] == "0", "exact approved byte denominator")
+                check(assessed["replay"] == replayed and not assessed["issuer_signature_verified"] and not assessed["current_image_state_known"], "approval preserves original claims and does not imply signature or current state")
                 disclosure_root = root / (mode + "-disclosure")
                 redacted = run(["--offline", "!kmon", "redact-image", store / archived["capture_path"], disclosure_root, "/acl-only"])
                 check(redacted["status"] == "ready", "managed capture supports original-policy count redaction")

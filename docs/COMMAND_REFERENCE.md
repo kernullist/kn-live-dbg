@@ -227,6 +227,42 @@ driver. It preserves the source directory and does not encrypt that old copy.
 Root/reference limits are 4 MiB/64 MiB. See
 [direct capture collections](ARCHITECTURE.md#direct-image-capture-collections).
 
+`KnLiveDbg.exe --offline !kmon assess-image <directory|managed.kncapture> <changes.knchange> <policy.knapproval> <policy-sha256> /json`
+evaluates authorized changes without new target reads or file writes. The final
+argument is the lower-case SHA-256 obtained through the analyst's approval
+process, separately from the evidence. Do not derive trust from a digest supplied
+by the capture itself. The policy pins the exact manifest bytes, reference image
+and issuer at the same epoch. Evaluation requires original direct replay and
+validity at both capture and current host time. There is no `/current` override.
+
+Both input files are UTF-8 JSON (no BOM), at most 64 KiB. Required fields are:
+
+| Document | Fields |
+| --- | --- |
+| `.knapproval` | `schema="kn.image_approval_policy.v1"`, `policy_id`, `policy_epoch`, `not_before_filetime`, `not_after_filetime`, `approvals` |
+| Each approval | `image_sha256`, `manifest_sha256`, `issuer` |
+| `.knchange` | `schema="kn.authorized_image_changes.v1"`, `image_sha256`, `issuer`, `policy_epoch`, `not_before_filetime`, `not_after_filetime`, `comparison_policy="kn.executable_page.direct.v1"`, `hash_basis="non_fixup_compared_bytes.v1"`, `changes` |
+| Each change | `rva`, `length`, `before_sha256`, `after_sha256` |
+
+Numbers are decimal strings without leading zeros; time values are Windows
+[FILETIME](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
+ticks (100 ns since 1601-01-01 UTC). Validity windows include the start and exclude the end. Arrays contain
+1..128 entries; changes are sorted and disjoint, with lengths 1..4,096. Hashes
+are 64 lower-case hex digits. Before/after hashes cover exactly that RVA span
+in the comparison; fixup and excluded spans cannot be exceptions in v1. Unknown
+or duplicate fields, ambiguous scopes and unsupported policies fail explicitly.
+The exact file digests include whitespace; changing formatting requires new pins.
+
+The result preserves the original replay and distinguishes authorized changes,
+unexplained changes, no observed change and incomplete comparison. `R-approved`
+is relative to this caller-pinned policy; `issuer_signature_verified=false`
+remains explicit. Exit 0 means assessment completed, including unexplained or
+incomplete results; 1 means unavailable, 2 invalid grammar, and 3 stdout delivery
+failure. Interactive `!kmon` uses the same read-only route and transcript. Keep
+the two policy inputs with the private evidence for reassessment; collection
+archival does not yet retain them. See
+[approved image changes](ARCHITECTURE.md#approved-image-changes).
+
 `KnLiveDbg.exe --offline !kmon replay-image <directory|managed.kncapture> /json` reruns the recorded
 policy against either v1 or v2's retained artifact and ordered raw reads, including
 recipes embedded in new claim publication roots. Add `/current` to

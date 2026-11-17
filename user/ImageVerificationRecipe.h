@@ -71,5 +71,15 @@ bool CaptureImageRecipe(const std::wstring& image, IObservationSource& source, u
 bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& source, uint64_t imageBase,
     uint32_t rva, uint32_t length, const std::wstring& newDirectory, const ImageRecipeCaptureOptions& options,
     ImageVerificationRecipe* recipe, std::wstring* error, const std::atomic<bool>* cancellation = nullptr);
-ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error);
+// Returned only after successful original direct replay, including original
+// claim reproduction. The bytes are from that same evaluated operation.
+struct DirectImageReplayEvidence
+{
+    ImageVerificationRecipe Recipe;
+    ExecutablePageResult Comparison;
+    std::vector<ObservationRange> NormalizationRanges; // RVA spans with fixups or exclusions.
+    bool ReferenceQualified = false;
+};
+ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
+    DirectImageReplayEvidence* evidence = nullptr);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay);

@@ -228,6 +228,7 @@
     <ClCompile Include="ImageRecipeJson.cpp" />
     <ClCompile Include="ImageClaimPublication.cpp" />
     <ClCompile Include="ImageCaptureCollection.cpp" />
+    <ClCompile Include="ImageAuthorizedChanges.cpp" />
     <ClCompile Include="ImageRecipeReadSet.cpp" />
     <ClCompile Include="ImageSliceRecipe.cpp" />
     <ClCompile Include="ImageScopeClaims.cpp" />
@@ -425,6 +426,7 @@
     <ClInclude Include="ImageProof.h" />
     <ClInclude Include="ImageClaimPublication.h" />
     <ClInclude Include="ImageCaptureCollection.h" />
+    <ClInclude Include="ImageAuthorizedChanges.h" />
     <ClInclude Include="ImageScopeClaims.h" />
     <ClInclude Include="ImageScopeClaimPublication.h" />
     <ClInclude Include="VbsScanner.h" />

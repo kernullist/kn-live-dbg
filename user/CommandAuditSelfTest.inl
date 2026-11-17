@@ -496,6 +496,13 @@ static int RunCommandAuditSelfTest()
     check(IsWriteLikeCommandLine(L"!kmon journal-image missing-case missing-store 7 /json") &&
         run(L"!kmon journal-image missing-case missing-store 7 /json").Output.find(L"kn.image_capture_collection.v1") != std::wstring::npos && !device.IsOpen(),
         L"direct capture archival writes files without opening a driver");
+    const std::wstring assess = L"!kmon assess-image x y z " + std::wstring(64, L'a');
+    check(!IsWriteLikeCommandLine(assess) && run(assess + L" /json").Output.find(L"kn.image_change_assessment.v1") != std::wstring::npos && !device.IsOpen(),
+        L"approved change assessment is read-only, captured in the transcript, and opens no driver");
+    for (const auto& line : {L"!kmon assess-image", L"!kmon assess-image x y z bad", L"!kmon assess-image x y z /json"})
+    { check(run(line).Error.find(L"usage") != std::wstring::npos, L"approved change assessment requires exact arguments and policy anchor"); }
+    for (const auto& suffix : {L" /bad", L" /json /json", L" /current"})
+    { check(run(assess + suffix).Error.find(L"usage") != std::wstring::npos, L"approved change assessment rejects unsupported options"); }
     for (const auto& line : {L"!kmon journal-image", L"!kmon journal-image x y", L"!kmon journal-image x y 01",
         L"!kmon journal-image x y 1 /json /json", L"!kmon journal-image x y 1 /bad"})
     { check(run(line).Error.find(L"usage") != std::wstring::npos, L"direct capture archival rejects malformed arguments"); }

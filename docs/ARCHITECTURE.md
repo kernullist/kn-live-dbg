@@ -2010,6 +2010,58 @@ original-policy replay and private original-hash linkage; archival alone does
 not authorize disclosure. Neither operation authenticates the collector or establishes
 execution, lifetime continuity, complete capture coverage or approved changes.
 
+### Approved image changes
+
+`!kmon assess-image` evaluates a direct case or managed `.kncapture` under a
+separately supplied approval-policy SHA-256. `kn.image_approval_policy.v1` pins
+the exact image hash, manifest file hash and issuer identifier, with a policy
+epoch and validity window. `kn.authorized_image_changes.v1` repeats the image,
+issuer and epoch and declares sorted, disjoint RVA spans with before/after
+SHA-256 hashes. Both documents are bounded to 64 KiB and 128 entries; each change
+span is 1..4,096 bytes. They are UTF-8 JSON with exact field sets, lower-case
+hashes and canonical decimal strings. Whitespace and object-field order do not
+affect parsing, but the policy and manifest pins bind their exact file bytes.
+
+The caller must obtain the policy digest through its approval process, separately
+from the capture and manifest. The manifest cannot appoint its own trusted
+issuer. The evaluator requires the supplied digest to match the policy, and
+that policy to name the manifest/image/issuer tuple at the same epoch. Both
+validity windows include their start and exclude their end. They must cover the
+recorded capture time and evaluation time; a capture dated after evaluation
+fails. CLI evaluation uses the host wall clock. Neither that clock nor the
+collector's capture timestamp is authenticated. API callers may supply an
+explicit evaluation time, recorded as `caller_supplied_time`.
+
+Successful original-policy replay, including any original claim reproduction,
+supplies the typed comparison from the same operation. Bare v1/v2 inputs keep
+their claim-not-recorded status. The evaluator verifies each span against
+replayed expected and observed bytes, requires full comparison of that span,
+and accounts for every observed changed byte separately. The v1 hash basis
+`non_fixup_compared_bytes.v1` rejects overlap with base relocations, loader or
+dynamic exclusions, and rel32 overrides. Accepted spans receive no load-base
+adjustment. Addresses introduced by a patch are not automatically normalized;
+their exact observed bytes must match the approved hash.
+Ranges outside this one capture remain `outside_capture`; missing or unstable
+reads cannot become approved changes. A before hash mismatch, unexpected after
+hash or additional difference stays unexplained. An exact original span reports
+`not_applied`. Incomplete comparison remains explicit even when every observed
+difference is authorized.
+
+`kn.image_change_assessment.v1` returns the unchanged original replay alongside
+rule outcomes, authorized/unexplained RVA spans, byte counts and completeness.
+`R-approved` means this exact reference is approved by the caller-pinned policy;
+it is not an assertion that a publisher signature was verified. A replaced local
+reference can match retained memory and still fail that policy. The result
+never changes the recipe, original ownership/difference report, or stored claim.
+It proves neither current live state, execution, maliciousness, complete-image
+approval nor object lifetime. The assessment and its input artifacts remain
+private evidence and grant no disclosure authority.
+
+This bounded policy path does not provision signed distribution trust, consult
+revocation services, join other cases, or approve secondary slices and sweeps.
+Policy/manifest files must be retained separately for later reassessment; they
+are not yet journal members. An updated policy requires its own explicit digest.
+
 ### Claim-specific image proof
 
 Successful `replay-image` adds a `kn.image_proof.v1` report generated from the
