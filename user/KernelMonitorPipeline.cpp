@@ -181,6 +181,8 @@ void KernelMonitor::ResetPipeline()
     ImageSlicesFailed.store(0);
     ImageSlicesUnavailable.store(0);
     ImageSliceBytes.store(0);
+    ImageSliceClaimsWritten.store(0); ImageSliceClaimsUnavailable.store(0);
+    ImageSweepClaimsWritten.store(0); ImageSweepClaimsUnavailable.store(0);
     ImageSweepManifests = {};
     ImageSweepManifestsWritten.store(0);
     ImageSweepManifestsFailed.store(0);
@@ -1037,6 +1039,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
 {
     bool written = false;
     bool sliceWritten = false;
+    bool sliceClaimWritten = false;
     bool referenceWritten = false;
     std::wstring rawHash, recipeHash;
     EvidenceJournalTransaction publication;
@@ -1060,6 +1063,7 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
             { failure = L"read_set_directory_unavailable"; }
         std::wstring referencePersistence = L"not_attempted", referenceFailure;
         std::wstring sliceFailure = L"reference_or_read_set_not_ready";
+        std::wstring claimFailure = L"slice_not_published";
         std::unique_ptr<ReferenceArtifact> referenceLease;
         if (admitted && !ec && reads.Retention && !reads.Json.empty() && bytes <= EvidenceBundleMaxJsonBytes &&
             bytes <= ImageRetention.Remaining(lane, ImageRetentionStream::Reads))
@@ -1105,16 +1109,27 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
             }
             if (!reads.SliceJson.empty() && referenceLease != nullptr)
             {
-                const auto sliceBytes = mcpjson::WideToUtf8(reads.SliceJson).size();
+                const auto recipeBudget = ImageRetention.Remaining(lane, ImageRetentionStream::Recipe);
+                // Do not replay retained inputs when even the original root cannot be published.
+                const auto claim = mcpjson::WideToUtf8(reads.SliceJson).size() <= recipeBudget ?
+                    CaptureImageSliceClaimPublicationJson(reads.SliceJson, referenceLease->Path(), &claimFailure) : L"";
+                bool claimReady = !claim.empty();
+                auto sliceJson = claimReady ? claim : reads.SliceJson;
+                if (claimReady && mcpjson::WideToUtf8(sliceJson).size() > ImageRetention.Remaining(lane, ImageRetentionStream::Recipe))
+                {
+                    sliceJson = reads.SliceJson; claimReady = false; claimFailure = L"claim_retention_class_byte_budget";
+                }
+                const auto sliceBytes = mcpjson::WideToUtf8(sliceJson).size();
                 sliceFailure = L"slice_retention_class_byte_budget";
                 if (sliceBytes <= EvidenceBundleMaxJsonBytes && sliceBytes <= ImageRetention.Remaining(lane, ImageRetentionStream::Recipe))
                 {
-                    sliceWritten = SaveObservationJson(slicePath.wstring(), reads.SliceJson, &sliceFailure);
+                    sliceWritten = SaveObservationJson(slicePath.wstring(), sliceJson, &sliceFailure);
+                    sliceClaimWritten = sliceWritten && claimReady;
                     if (sliceWritten)
                     {
                         ImageRetention.Consume(lane, ImageRetentionStream::Recipe, sliceBytes);
                         ImageSliceBytes.fetch_add(sliceBytes); mcpjson::GetString(reads.SliceJson, L"recipe_sha256", &recipeHash);
-                        publication.Members.push_back(EvidenceJournalJsonMember(L"image-reads/" + slicePath.filename().wstring(), reads.SliceJson));
+                        publication.Members.push_back(EvidenceJournalJsonMember(L"image-reads/" + slicePath.filename().wstring(), sliceJson));
                     }
                 }
             }
@@ -1134,6 +1149,8 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
         event.Evidence[L"failure"] = written ? L"" : failure;
         event.Evidence[L"store_admission_failure"] = admitted ? L"" : storeFailure;
         event.Evidence[L"verification_recipe_preserved"] = sliceWritten ? L"true" : L"false";
+        event.Evidence[L"original_claim_recorded"] = sliceClaimWritten ? L"true" : L"false";
+        event.Evidence[L"original_claim_failure"] = sliceClaimWritten ? L"" : !sliceWritten ? L"slice_not_published" : claimFailure;
         event.Evidence[L"slice_recipe_path"] = sliceWritten ? slicePath.wstring() : L"";
         event.Evidence[L"slice_recipe_failure"] = sliceWritten ? L"" : (reads.SliceJson.empty() ? L"original_inputs_not_recipe_eligible" : sliceFailure);
         event.Evidence[L"reference_persistence"] = referencePersistence;
@@ -1147,6 +1164,8 @@ void KernelMonitor::PersistImageReadSet(const CapturedImageReads& reads) noexcep
     {
         if (sliceWritten) { ImageSlicesWritten.fetch_add(1); }
         else { ImageSlicesFailed.fetch_add(1); }
+        if (sliceClaimWritten) { ImageSliceClaimsWritten.fetch_add(1); }
+        else { ImageSliceClaimsUnavailable.fetch_add(1); }
     }
     const auto commit = JournalImageFiles(std::move(publication));
     if (commit.Committed) { ImageJournalReadsCommitted.fetch_add(1); }
@@ -1190,7 +1209,7 @@ EvidenceJournalCommit KernelMonitor::JournalImageFiles(EvidenceJournalTransactio
             { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
             auto journal = std::make_unique<EvidenceJournal>();
             if (!journal->Open(directory.empty() ? L"." : directory, std::to_wstring(EvidenceCollectionEpoch.load()), &result.Issue,
-                EvidenceJournalPolicy::ImageAndIrpV2, admitOutput))
+                EvidenceJournalPolicy::ImageClaimsAndIrpV3, admitOutput))
                 { return result; }
             ImageJournal = std::move(journal);
             ImageJournalPrivate = bool(admitOutput);
@@ -1211,6 +1230,7 @@ EvidenceJournalCommit KernelMonitor::JournalImageFiles(EvidenceJournalTransactio
 void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest) noexcept
 {
     bool written = false;
+    bool claimWritten = false;
     EvidenceJournalCommit commit;
     try
     {
@@ -1218,8 +1238,8 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
         { std::lock_guard<std::mutex> lock(StateMutex); directory = Options.LogDirectory; }
         const auto folder = std::filesystem::path(directory.empty() ? L"." : directory) / L"image-sweeps";
         const auto path = folder / (L"sweep-" + manifest.Sweep.SweepId + L".knsweep");
-        const auto json = ImageSweepManifestJson(manifest);
-        const auto bytes = mcpjson::WideToUtf8(json).size();
+        const auto legacyJson = ImageSweepManifestJson(manifest);
+        auto json = legacyJson;
         std::wstring failure = L"invalid_manifest_or_session_byte_budget";
         std::error_code ec;
         std::wstring storeFailure;
@@ -1227,9 +1247,25 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
         if (!admitted) { failure = storeFailure; }
         if (admitted) { std::filesystem::create_directories(folder, ec); }
         const auto used = ImageSweepManifestBytes.load();
+        std::wstring claimFailure = L"manifest_not_published";
+        bool claimReady = false;
+        if (admitted && !ec && !legacyJson.empty() && used <= 128ull * 1024 * 1024 &&
+            mcpjson::WideToUtf8(legacyJson).size() <= 128ull * 1024 * 1024 - used)
+        {
+            const auto claim = CaptureImageSweepClaimPublicationJson(legacyJson,
+                std::filesystem::path(directory.empty() ? L"." : directory).wstring(), &claimFailure);
+            if (!claim.empty())
+            {
+                if (used <= 128ull * 1024 * 1024 && mcpjson::WideToUtf8(claim).size() <= 128ull * 1024 * 1024 - used)
+                    { json = claim; claimReady = true; }
+                else { claimFailure = L"claim_session_byte_budget"; }
+            }
+        }
+        const auto bytes = mcpjson::WideToUtf8(json).size();
         if (admitted && !ec && !json.empty() && used <= 128ull * 1024 * 1024 && bytes <= 128ull * 1024 * 1024 - used)
         {
             written = SaveObservationJson(path.wstring(), json, &failure);
+            claimWritten = written && claimReady;
             if (written)
             {
                 ImageSweepManifestBytes.fetch_add(bytes);
@@ -1258,6 +1294,8 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
             written ? L"image sweep file published without collection commit" : L"image sweep manifest publication failed";
         event.Evidence[L"image_sweep_id"] = manifest.Sweep.SweepId;
         event.Evidence[L"manifest_path"] = written ? path.wstring() : L"";
+        event.Evidence[L"original_claim_recorded"] = claimWritten ? L"true" : L"false";
+        event.Evidence[L"original_claim_failure"] = claimWritten ? L"" : !written ? L"manifest_not_published" : claimFailure;
         event.Evidence[L"persistence"] = written ? L"committed" : L"failed";
         event.Evidence[L"failure"] = written ? L"" : failure;
         event.Evidence[L"collection_commit"] = commit.Committed ? L"committed" : L"failed";
@@ -1269,6 +1307,8 @@ void KernelMonitor::PersistImageSweepManifest(const ImageSweepManifest& manifest
     catch (...) {}
     if (written) { ImageSweepManifestsWritten.fetch_add(1); }
     else { ImageSweepManifestsFailed.fetch_add(1); }
+    if (claimWritten) { ImageSweepClaimsWritten.fetch_add(1); }
+    else { ImageSweepClaimsUnavailable.fetch_add(1); }
     if (commit.Committed) { ImageJournalSweepsCommitted.fetch_add(1); }
     else { ImageJournalSweepsFailed.fetch_add(1); }
 }
@@ -1329,6 +1369,10 @@ void KernelMonitor::CloseImageReadCollection() noexcept
             L",\"slice_recipes_failed\":" + std::to_wstring(ImageSlicesFailed.load()) +
             L",\"slice_recipes_unavailable\":" + std::to_wstring(ImageSlicesUnavailable.load()) +
             L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) +
+            L",\"slice_claims_written\":" + std::to_wstring(ImageSliceClaimsWritten.load()) +
+            L",\"slice_claims_unavailable\":" + std::to_wstring(ImageSliceClaimsUnavailable.load()) +
+            L",\"sweep_claims_written\":" + std::to_wstring(ImageSweepClaimsWritten.load()) +
+            L",\"sweep_claims_unavailable\":" + std::to_wstring(ImageSweepClaimsUnavailable.load()) +
             L",\"sweep_manifests_written\":" + std::to_wstring(ImageSweepManifestsWritten.load()) +
             L",\"sweep_manifests_failed\":" + std::to_wstring(ImageSweepManifestsFailed.load()) +
             L",\"sweep_manifest_bytes\":" + std::to_wstring(ImageSweepManifestBytes.load()) +

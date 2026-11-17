@@ -2,6 +2,7 @@
 #include "EvidencePrivacy.h"
 #include "ImageVerificationRecipe.h"
 #include "ImageClaimPublication.h"
+#include "ImageScopeClaimPublication.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -50,7 +51,7 @@ namespace
     {
         if (!Hex(m.Id, 32) || !Hex(m.SourceFileSha, 64) || !Hex(m.SourceSemanticSha, 64) || !Hex(m.ProofSha, 64) || !Hex(m.FactsSha, 64) ||
             !Text(m.RootIdentity, 160) || !Text(m.Principal, 256) || !Text(m.SourcePath, 30000) || m.Created == 0 ||
-            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_slice.v1" &&
+            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != ImageScopeClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_slice.v1" &&
                 m.SourceSchema != L"kn.image_slice.v2" && m.SourceSchema != L"kn.image_sweep.v1")) { return L""; }
         return L"{\"schema\":\"kn.redaction_manifest.v1\",\"policy\":\"kn.image_counts_redaction.v1\",\"redaction_id\":" + mcpjson::Quote(m.Id) +
             L",\"root_identity\":" + mcpjson::Quote(m.RootIdentity) + L",\"principal\":" + mcpjson::Quote(m.Principal) +
@@ -124,7 +125,8 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
         auto originalFile = Read(original, ImageClaimPublicationMaxBytes, &originalJson, &originalHash);
         if (!originalFile) { return fail(L"disclosure_original_unavailable"); }
         const auto replay = ReplayImageRecipe(replayInput.wstring(), false, nullptr);
-        const bool claimPublication = Field(originalJson, L"schema") == ImageClaimPublicationSchema;
+        const bool claimPublication = Field(originalJson, L"schema") == ImageClaimPublicationSchema ||
+            Field(originalJson, L"schema") == ImageScopeClaimPublicationSchema;
         const auto semanticHash = Field(originalJson, claimPublication ? L"publication_sha256" :
             extension == L".knsweep" ? L"manifest_sha256" : L"recipe_sha256");
         if (!Hex(semanticHash, 64) || semanticHash != (claimPublication ? replay.ClaimPublicationSha256 :

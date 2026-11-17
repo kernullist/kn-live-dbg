@@ -679,6 +679,8 @@ private:
     std::atomic<uint64_t> ImageReferenceBlobsCreated{0}, ImageReferenceBlobsReused{0}, ImageReferenceBlobsFailed{0};
     std::atomic<uint64_t> ImageReferenceBytes{0}, ImageReferencesMissing{0};
     std::atomic<uint64_t> ImageSlicesQueued{0}, ImageSlicesWritten{0}, ImageSlicesFailed{0}, ImageSlicesUnavailable{0}, ImageSliceBytes{0};
+    std::atomic<uint64_t> ImageSliceClaimsWritten{0}, ImageSliceClaimsUnavailable{0};
+    std::atomic<uint64_t> ImageSweepClaimsWritten{0}, ImageSweepClaimsUnavailable{0};
     void PersistEvidenceBundle(const CapturedEvidence& evidence) noexcept;
     void CloseEvidenceCollection() noexcept;
     std::atomic<uint64_t> EvidenceCollectionEpoch{KmonHuntQueryEpochSeed()};

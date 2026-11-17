@@ -2,6 +2,7 @@
 #include "ObservationReadRoutingJson.h"
 #include "ContentHash.h"
 #include "ImageSliceRecipe.h"
+#include "ImageScopeClaimPublication.h"
 #include "ImageSweepGraph.h"
 #include <cstdio>
 #include <cstring>
@@ -243,11 +244,15 @@ bool KmonImageReadIntegrationSelfTest()
         recipePath.replace_extension(L".knslice");
         const auto replayed = ReplayImageRecipe(recipePath.wstring(), false, nullptr);
         check(replayed.Status == L"replayed" && replayed.CurrentResult == slice.RecordedResult &&
-            !replayed.Proof.empty() && monitor.ImageSlicesWritten.load() == 1 && secondary.Calls.size() == calls,
+            !replayed.Proof.empty() && replayed.OriginalClaimStatus == L"reproduced" &&
+            monitor.ImageSliceClaimsWritten.load() == 1 && monitor.ImageSliceClaimsUnavailable.load() == 0 &&
+            monitor.ImageSlicesWritten.load() == 1 && secondary.Calls.size() == calls,
             "actual-kmon-slice-replays-after-target-and-original-reference-removal");
         const auto sweepPath = root / L"image-sweeps" / (L"sweep-" + (retained.Sweep ? retained.Sweep->Sweep.SweepId : L"missing") + L".knsweep");
         const auto sweepReplay = ReplayImageRecipe(sweepPath.wstring(), false, nullptr);
         check(sweepReplay.Status == L"replayed" && Text(sweepReplay.Proof, L"changed_bytes") == L"1" &&
+            sweepReplay.OriginalClaimStatus == L"reproduced" && monitor.ImageSweepClaimsWritten.load() == 1 &&
+            monitor.ImageSweepClaimsUnavailable.load() == 0 &&
             Raw(sweepReplay.Proof, L"whole_sweep_complete") == L"true" &&
             Raw(sweepReplay.Proof, L"executable_ranges_match_retained_reference") == L"false" &&
             monitor.ImageSweepManifestsWritten.load() == 1 && monitor.ImageSweepManifestPending.load() == 0,
@@ -323,8 +328,40 @@ bool KmonImageReadIntegrationSelfTest()
             if (efs) { std::fprintf(stderr, "[kmon.privacy] efs=verified\n"); }
         }
         ImageSweepManifest sweepManifest;
-        check(ReadAnalystSnapshot(sweepPath.wstring(), &sweepJson, nullptr) && ParseImageSweepManifest(sweepJson, &sweepManifest),
+        ImageScopeClaimPublication sweepPublication;
+        check(ReadAnalystSnapshot(sweepPath.wstring(), &sweepJson, nullptr) &&
+            UnwrapImageScopeClaimPublication(&sweepJson, &sweepPublication) && !sweepPublication.Sha256.empty() &&
+            ParseImageSweepManifest(sweepJson, &sweepManifest),
             "actual-kmon-manifest-canonical-membership");
+        {
+            KernelMonitor missing;
+            const auto destination = root / L"claim-missing-children";
+            missing.Options.LogDirectory = destination.wstring();
+            missing.PersistImageSweepManifest(sweepManifest);
+            std::wstring legacy;
+            ImageSweepManifest preserved;
+            check(missing.ImageSweepManifestsWritten.load() == 1 && missing.ImageSweepClaimsWritten.load() == 0 &&
+                missing.ImageSweepClaimsUnavailable.load() == 1 && missing.ImageJournalSweepsFailed.load() == 1 &&
+                ReadAnalystSnapshot((destination / L"image-sweeps" / sweepPath.filename()).wstring(), &legacy, nullptr) &&
+                ParseImageSweepManifest(legacy, &preserved), "missing-children-preserve-manifest-without-original-claim-or-collection-commit");
+        }
+        {
+            KernelMonitor bounded;
+            const auto destination = root / L"claim-recipe-budget";
+            bounded.Options.LogDirectory = destination.wstring();
+            const auto recipeBytes = mcpjson::WideToUtf8(retained.SliceJson).size();
+            bounded.ImageRetention.Consume(ImageRetentionClass::Routine, ImageRetentionStream::Recipe, 32ull * 1024 * 1024 - recipeBytes);
+            const auto id = bounded.QueueImageReadSet(slice.TargetReads, identity, L"synthetic", Base,
+                &retained.Reference, retained.SliceJson, &slice.Slice);
+            bounded.WriterStopping.store(true); bounded.CaptureWriterLoop();
+            const auto file = destination / L"image-reads" / (L"reads-" + std::to_wstring(bounded.EvidenceCollectionEpoch.load()) +
+                L"-" + std::to_wstring(id) + L".knslice");
+            const auto replay = ReplayImageRecipe(file.wstring(), false, nullptr);
+            check(bounded.ImageSlicesWritten.load() == 1 && bounded.ImageSliceClaimsWritten.load() == 0 &&
+                bounded.ImageSliceClaimsUnavailable.load() == 1 && replay.Status == L"replayed" &&
+                replay.OriginalClaimStatus == L"not_recorded" && secondary.Calls.size() == calls,
+                "claim-budget-failure-preserves-original-recipe-without-new-target-reads");
+        }
         for (unsigned mode = 0; mode < 2; ++mode)
         {
             KernelMonitor denied;

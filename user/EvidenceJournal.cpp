@@ -4,6 +4,7 @@
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
+#include "ImageScopeClaimPublication.h"
 #include <algorithm>
 #include <filesystem>
 #include <map>
@@ -57,10 +58,11 @@ namespace
         return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"payload_sha256\":" + mcpjson::Quote(Hash(payload)) +
             L",\"payload\":" + payload + L"}";
     }
-    std::wstring SessionJson(const std::wstring& id, bool typed = false)
+    std::wstring SessionJson(const std::wstring& id, unsigned version = 1)
     {
         return Envelope(L"kn.evidence_session.v1", L"{\"collection_id\":" + mcpjson::Quote(id) +
-            L",\"policy\":" + mcpjson::Quote(typed ? L"kn.image_irp_collection_journal.v2" : L"kn.image_collection_journal.v1") +
+            L",\"policy\":" + mcpjson::Quote(version == 3 ? L"kn.image_claim_irp_collection_journal.v3" :
+                version == 2 ? L"kn.image_irp_collection_journal.v2" : L"kn.image_collection_journal.v1") +
             L",\"hash_basis\":\"exact_file_bytes\","
             L"\"collector_authenticated\":false,\"target_coverage_established\":false}");
     }
@@ -96,9 +98,10 @@ namespace
         const auto folder = m.Path.substr(0, slash), name = m.Path.substr(slash + 1, dot - slash - 1), ext = m.Path.substr(dot);
         const auto prefix = (folder == L"image-reads" ? L"reads-" : L"sweep-") + id + L"-";
         if (name.rfind(prefix, 0) != 0 || !Id(name.substr(prefix.size()))) { return false; }
-        if (folder == L"image-sweeps") { return ext == L".knsweep" && m.Schema == L"kn.image_sweep.v1"; }
+        if (folder == L"image-sweeps") { return ext == L".knsweep" &&
+            (m.Schema == L"kn.image_sweep.v1" || m.Schema == ImageScopeClaimPublicationSchema); }
         return folder == L"image-reads" && ((ext == L".knslice" &&
-            (m.Schema == L"kn.image_slice.v1" || m.Schema == L"kn.image_slice.v2")) || (ext == L".knreads" &&
+            (m.Schema == L"kn.image_slice.v1" || m.Schema == L"kn.image_slice.v2" || m.Schema == ImageScopeClaimPublicationSchema)) || (ext == L".knreads" &&
             (m.Schema == L"kn.image_reads.v1" || m.Schema == L"kn.image_reads.v2" || m.Schema == L"kn.image_reads.v3")));
     }
     struct Record
@@ -233,6 +236,7 @@ struct EvidenceJournal::Impl
     uint64_t References = 0, Started = GetTickCount64();
     bool Writable = false, Healthy = false;
     bool Typed = false;
+    bool Claims = false;
     std::function<bool(HANDLE)> AdmitOutput;
 
     bool Fail(const wchar_t* issue) { Result.Issue = issue; return false; }
@@ -345,6 +349,7 @@ struct EvidenceJournal::Impl
         for (const auto& m : t.Members)
         {
             if (!MemberValid(m, Result.CollectionId) || (!previous.empty() && m.Path <= previous)) { return Fail(L"invalid_or_duplicate_member"); }
+            if (!Claims && m.Schema == ImageScopeClaimPublicationSchema) { return Fail(L"claim_publication_requires_v3_policy"); }
             if ((!irp && !irpLedger && IrpPath(m.Path)) || (irpLedger && m.Schema != L"kn.irp_capture_session.v1"))
                 { return Fail(L"invalid_member_kind"); }
             if (irp)
@@ -423,7 +428,8 @@ struct EvidenceJournal::Impl
             ++accepted.MemberReferences; accepted.LogicalBytes += m.Bytes;
             if (ContentSizes.emplace(m.Sha256, m.Bytes).second) { accepted.UniqueContentBytes += m.Bytes; }
             Members.emplace(m.Path, m);
-            if (m.Schema == L"kn.image_sweep.v1") { accepted.SweepPaths.push_back(m.Path); }
+            if (m.Schema == L"kn.image_sweep.v1" || (m.Schema == ImageScopeClaimPublicationSchema &&
+                m.Path.rfind(L"image-sweeps/", 0) == 0)) { accepted.SweepPaths.push_back(m.Path); }
         }
         References += r.Transaction.Members.size() + r.Transaction.Requires.size();
         Transactions.emplace(r.Transaction.Kind + L":" + r.Transaction.Id, Records.size());
@@ -455,7 +461,7 @@ struct EvidenceJournal::Impl
             (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
             { return Fail(L"collection_busy_or_lock_unavailable"); }
         const auto manifest = Collection / L"session.knsession";
-        const auto session = SessionJson(id, Typed);
+        const auto session = SessionJson(id, Claims ? 3 : Typed ? 2 : 1);
         const auto attrs = GetFileAttributesW(NativePath(manifest).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES && create && GetLastError() == ERROR_FILE_NOT_FOUND &&
             !SaveObservationJson(NativePath(manifest), session, nullptr, AdmitOutput)) { return Fail(L"session_publication_failed"); }
@@ -463,9 +469,10 @@ struct EvidenceJournal::Impl
         uint64_t bytes = 0;
         std::wstring json;
         if (!Read(manifest, 4096, &lease, &Result.SessionSha256, &bytes, &json) ||
-            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, true))))
+            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, 2) && json != SessionJson(id, 3))))
             { return Fail(L"session_missing_or_invalid"); }
-        Typed = json == SessionJson(id, true);
+        Claims = json == SessionJson(id, 3);
+        Typed = Claims || json == SessionJson(id, 2);
         Files.emplace(L"@session", std::move(lease));
         Result.HeadSha256 = Result.SessionSha256;
         if (!PinDirectory(Collection / L"journal-segments", create)) { return false; }
@@ -561,7 +568,8 @@ bool EvidenceJournal::Open(const std::wstring& root, const std::wstring& id, std
     bool ok = false;
     try
     {
-        Data->Typed = policy == EvidenceJournalPolicy::ImageAndIrpV2;
+        Data->Claims = policy == EvidenceJournalPolicy::ImageClaimsAndIrpV3;
+        Data->Typed = Data->Claims || policy == EvidenceJournalPolicy::ImageAndIrpV2;
         Data->AdmitOutput = std::move(admitOutput);
         ok = Data->Load(root, id, true);
     }

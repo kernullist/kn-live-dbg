@@ -230,6 +230,7 @@
     <ClCompile Include="ImageRecipeReadSet.cpp" />
     <ClCompile Include="ImageSliceRecipe.cpp" />
     <ClCompile Include="ImageScopeClaims.cpp" />
+    <ClCompile Include="ImageScopeClaimPublication.cpp" />
     <ClCompile Include="ImageSweepManifest.cpp" />
     <ClCompile Include="ImageSweepReplay.cpp" />
     <ClCompile Include="ImageSweepGraph.cpp" />
@@ -423,6 +424,7 @@
     <ClInclude Include="ImageProof.h" />
     <ClInclude Include="ImageClaimPublication.h" />
     <ClInclude Include="ImageScopeClaims.h" />
+    <ClInclude Include="ImageScopeClaimPublication.h" />
     <ClInclude Include="VbsScanner.h" />
     <ClInclude Include="CodeIntegrityState.h" />
     <ClInclude Include="WdFilterRuntimeScanner.h" />

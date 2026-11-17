@@ -3,6 +3,7 @@
 #include "../user/ImageSweepGraph.h"
 #include "../user/ImageSweepReplayEvidence.h"
 #include "../user/ImageScopeClaims.h"
+#include "../user/ImageScopeClaimPublication.h"
 #include "../user/ObservationReadRoutingJson.h"
 #include "../user/ContentHash.h"
 #include "../user/AnalystSnapshot.h"
@@ -316,6 +317,22 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 4 && std::wstring(argv[1]) == L"--publish")
+    {
+        const auto input = std::filesystem::path(argv[2]);
+        const auto root = input.parent_path().parent_path();
+        std::wstring json, error, publication;
+        if (!ReadAnalystSnapshot(input.wstring(), &json, &error, ImageRecipeMaxBytes, nullptr, true)) { return 1; }
+        ImageSliceRecipe slice;
+        ImageSweepManifest sweep;
+        if (ParseImageSliceRecipe(json, &slice))
+            { publication = CaptureImageSliceClaimPublicationJson(json, (root / L"image-references" / (slice.ReferenceSha256 + L".knblob")).wstring(), &error); }
+        else if (ParseImageSweepManifest(json, &sweep))
+            { publication = CaptureImageSweepClaimPublicationJson(json, root.wstring(), &error); }
+        if (publication.empty() || !SaveObservationJson(argv[3], publication, &error))
+            { std::wcerr << error << L"\n"; return 1; }
+        return 0;
+    }
     if (argc == 8 && std::wstring(argv[1]) == L"--graph")
     {
         EvidenceGraphQuery query;

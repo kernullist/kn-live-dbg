@@ -16,7 +16,7 @@ if ($Sanitize)
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\image-slice-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp',
+$sources = @('tools\image-slice-selftest.cpp', 'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageScopeClaimPublication.cpp',
     'user\ImageVerificationRecipe.cpp', 'user\ImageRecipeReadSet.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp',
     'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
     'user\ImageSweepGraph.cpp', 'user\EvidenceGraphQuery.cpp',
@@ -36,4 +36,6 @@ if ($LASTEXITCODE -ne 0) { throw "Image slice independent validation failed: $LA
 if ($LASTEXITCODE -ne 0) { throw "Image sweep independent validation failed: $LASTEXITCODE; fixtures=$fixtures" }
 & python (Join-Path $PSScriptRoot 'test-image-sweep-graph.py') --exe $exe --fixtures $fixtures
 if ($LASTEXITCODE -ne 0) { throw "Image sweep graph validation failed: $LASTEXITCODE; fixtures=$fixtures" }
+& python (Join-Path $PSScriptRoot 'test-image-scope-publication.py') --exe $exe --publisher $exe --fixtures $fixtures
+if ($LASTEXITCODE -ne 0) { throw "Image scope original claim validation failed: $LASTEXITCODE; fixtures=$fixtures" }
 Write-Output "[image.slice.validation] exe=$exe fixtures=$fixtures"

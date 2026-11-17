@@ -25,6 +25,9 @@ bool ParseImageSliceRecipe(const std::wstring& json, ImageSliceRecipe* recipe);
 std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata& metadata, uint64_t imageBase,
     const ExecutableSweepReference& reference, const ExecutableSliceTrace& slice,
     const ObservationRoutedReadSet& reads, const std::vector<ExecutablePageResult>& pages);
+// Evaluate only retained reads against the published reference, before the final root write.
+std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJson,
+    const std::wstring& referencePath, std::wstring* error);
 // Optional typed results are populated only after all original inputs and results agree.
 struct ImageSliceClaimEvidence;
 ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,

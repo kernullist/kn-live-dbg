@@ -2,6 +2,7 @@
 #include "ImageSweepReplayEvidence.h"
 #include "ImageSliceRecipe.h"
 #include "ImageScopeClaims.h"
+#include "ImageScopeClaimPublication.h"
 #include "ObservationReadRoutingJson.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -55,7 +56,7 @@ namespace
     }
 }
 
-ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
+static ImageRecipeReplay EvaluateImageSweepManifest(std::wstring json, const std::filesystem::path& root, std::wstring* error,
     ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256)
 {
     if (verifiedEvidence != nullptr) { *verifiedEvidence = {}; }
@@ -65,13 +66,14 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
     result.Mode = L"original_policy";
     result.CurrentPolicy.clear();
     if (error != nullptr) { *error = L"sweep membership or retained original inputs could not be verified"; }
-    std::wstring json;
     ImageSweepManifest manifest;
-    if (!ReadAnalystSnapshot(path, &json, error, ImageRecipeMaxBytes, nullptr, true) || !ParseImageSweepManifest(json, &manifest))
+    ImageScopeClaimPublication publication;
+    if (!UnwrapImageScopeClaimPublication(&json, &publication) || !ParseImageSweepManifest(json, &manifest))
     {
         result.Status = L"manifest_unavailable_or_corrupt"; return result;
     }
     const auto& s = manifest.Sweep;
+    if (!publication.Sha256.empty()) { result.OriginalClaimStatus = L"not_attempted"; }
     result.ManifestSha256 = Field(json, L"manifest_sha256");
     if (!expectedManifestSha256.empty() && result.ManifestSha256 != expectedManifestSha256)
     {
@@ -80,7 +82,6 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
     result.RecordedPolicy = result.CurrentPolicy = L"kn.executable_sweep.temporal.v1";
     result.RecordedResult = Raw(json, L"payload");
     if (manifest.Inconsistent || manifest.Slices.empty()) { result.Status = L"sweep_membership_inconsistent_or_empty"; return result; }
-    const auto root = std::filesystem::path(path).parent_path().parent_path();
     uint64_t consumed = 0, requested = 0, compared = 0, excluded = 0, unreadable = 0, changed = 0, rawFailures = 0;
     bool qualified = true;
     std::wstring referenceHash, referenceIdentity, evidence = L"[";
@@ -97,7 +98,9 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         const auto recipePath = root / L"image-reads" / (name + L".knslice");
         std::wstring recipeJson;
         ImageSliceRecipe p;
-        if (!BoundedRead(recipePath, consumed, &recipeJson) || !ParseImageSliceRecipe(recipeJson, &p) ||
+        ImageScopeClaimPublication slicePublication;
+        if (!BoundedRead(recipePath, consumed, &recipeJson) || !UnwrapImageScopeClaimPublication(&recipeJson, &slicePublication) ||
+            !ParseImageSliceRecipe(recipeJson, &p) ||
             Field(recipeJson, L"recipe_sha256") != row.RecipeSha256)
         {
             result.Status = L"slice_artifact_missing_corrupt_or_budget"; return result;
@@ -152,6 +155,7 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         uint64_t bytes = 0, equalOrDifferent = 0, skip = 0, fail = 0, differences = 0;
         bool sliceQualified = false;
         if (replay.Status != L"replayed" || replay.RecipeSha256 != row.RecipeSha256 ||
+            replay.ClaimPublicationSha256 != slicePublication.Sha256 ||
             !Number(replay.Proof, L"requested_bytes", &bytes) || bytes != sliceBytes ||
             !Number(replay.Proof, L"compared_bytes", &equalOrDifferent) || !Number(replay.Proof, L"excluded_bytes", &skip) ||
             !Number(replay.Proof, L"unreadable_bytes", &fail) || !Number(replay.Proof, L"changed_bytes", &differences) ||
@@ -205,6 +209,7 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
         L"\"atomic_mapping_lifetime\",\"execution_observation\"],\"atomic_snapshot\":false,\"collector_authenticated\":false,\"execution_observed\":false}";
     result.Status = L"replayed";
     result.ClaimAssessmentJson = ImageSweepClaimAssessmentJson(manifest, result.ManifestSha256, claimSlices);
+    if (!ReproduceImageScopeClaim(publication, &result)) { return result; }
     if (verifiedEvidence != nullptr)
     {
         verified.Manifest = std::move(manifest);
@@ -214,4 +219,30 @@ ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstrin
     }
     if (error != nullptr) { error->clear(); }
     return result;
+}
+
+std::wstring CaptureImageSweepClaimPublicationJson(const std::wstring& manifestJson,
+    const std::wstring& artifactRoot, std::wstring* error)
+{
+    ImageSweepManifest manifest;
+    if (!ParseImageSweepManifest(manifestJson, &manifest)) { if (error) { *error = L"invalid_sweep_manifest"; } return {}; }
+    const auto replay = EvaluateImageSweepManifest(manifestJson, std::filesystem::path(artifactRoot), error, nullptr, L"");
+    const auto json = replay.Status == L"replayed" ? ImageScopeClaimPublicationJson(manifestJson, replay.ClaimAssessmentJson) : L"";
+    if (json.empty() && error) { *error = replay.Status == L"replayed" ? L"claim_report_invalid_or_byte_budget" : replay.Status; }
+    return json;
+}
+
+ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,
+    ImageSweepReplayEvidence* verifiedEvidence, const std::wstring& expectedManifestSha256)
+{
+    if (verifiedEvidence) { *verifiedEvidence = {}; }
+    std::wstring json;
+    if (!ReadAnalystSnapshot(path, &json, error, ImageRecipeMaxBytes, nullptr, true))
+    {
+        ImageRecipeReplay result;
+        result.Schema = L"kn.image_sweep_replay.v1"; result.Mode = L"original_policy"; result.CurrentPolicy.clear();
+        result.Status = L"manifest_unavailable_or_corrupt"; return result;
+    }
+    return EvaluateImageSweepManifest(std::move(json), std::filesystem::path(path).parent_path().parent_path(),
+        error, verifiedEvidence, expectedManifestSha256);
 }

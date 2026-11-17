@@ -40,6 +40,8 @@ struct ImageSweepManifest
 
 std::wstring ImageSweepManifestJson(const ImageSweepManifest& manifest);
 bool ParseImageSweepManifest(const std::wstring& json, ImageSweepManifest* manifest);
+std::wstring CaptureImageSweepClaimPublicationJson(const std::wstring& manifestJson,
+    const std::wstring& artifactRoot, std::wstring* error);
 struct ImageRecipeReplay;
 struct ImageSweepReplayEvidence;
 ImageRecipeReplay ReplayImageSweepManifest(const std::wstring& path, std::wstring* error,

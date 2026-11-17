@@ -114,6 +114,10 @@ std::wstring KernelMonitor::HuntCasesJson(const AnalystCaseFilter& filter, std::
         L",\"slice_recipes_failed\":" + std::to_wstring(ImageSlicesFailed.load()) +
         L",\"slice_recipes_unavailable\":" + std::to_wstring(ImageSlicesUnavailable.load()) +
         L",\"slice_recipe_bytes\":" + std::to_wstring(ImageSliceBytes.load()) +
+        L",\"slice_claims_written\":" + std::to_wstring(ImageSliceClaimsWritten.load()) +
+        L",\"slice_claims_unavailable\":" + std::to_wstring(ImageSliceClaimsUnavailable.load()) +
+        L",\"sweep_claims_written\":" + std::to_wstring(ImageSweepClaimsWritten.load()) +
+        L",\"sweep_claims_unavailable\":" + std::to_wstring(ImageSweepClaimsUnavailable.load()) +
         L",\"sweep_manifests_written\":" + std::to_wstring(ImageSweepManifestsWritten.load()) +
         L",\"sweep_manifests_failed\":" + std::to_wstring(ImageSweepManifestsFailed.load()) +
         L",\"sweep_manifest_pending\":" + std::to_wstring(ImageSweepManifestPending.load()) +

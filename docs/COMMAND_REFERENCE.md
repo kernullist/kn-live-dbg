@@ -246,6 +246,16 @@ missing or failed ranges; full matching requires the complete scoped evidence.
 Slice/sweep `/current` comparison reanalysis remains unsupported. See
 [slice and sweep claims](ARCHITECTURE.md#slice-and-sweep-claim-policies).
 
+Eligible new `.knslice`/`.knsweep` files also retain those evaluations in
+`kn.image_scope_claim_publication.v1`. `original_claim_replay.status=reproduced`
+requires exact recorded policy/report reproduction. Legacy or fallback files
+remain `not_recorded`; failed original replay withholds proof and claims. The
+2 MiB publication limit includes both the original artifact and report. Publication
+events and hunt/session `slice_claims_*` / `sweep_claims_*` counters expose claim
+storage failures separately from file and collection outcomes. Journal v3 binds
+the whole physical file, but replay alone does not check journal membership. See
+[slice/sweep publication](ARCHITECTURE.md#original-slice-and-sweep-claim-publication).
+
 `KnLiveDbg.exe --self-test capture-scheduler` runs the capture worker using owned
 process memory and an absent kernel device. It emits JSON and exits 0 on success
 or 1 on failure; extra arguments return 2. No driver is loaded. Runtime

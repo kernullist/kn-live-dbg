@@ -8,6 +8,8 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <map>
+#include <set>
 
 namespace fs = std::filesystem;
 namespace
@@ -103,6 +105,54 @@ namespace
         t.Members.push_back(member);
         Stage(stage, L"irp_capture");
         return t;
+    }
+    int CommitPublishedScopes(const fs::path& root, const std::wstring& stage, const std::wstring& version)
+    {
+        EvidenceJournal journal;
+        std::wstring error;
+        const auto policy = version == L"3" ? EvidenceJournalPolicy::ImageClaimsAndIrpV3 :
+            version == L"2" ? EvidenceJournalPolicy::ImageAndIrpV2 : EvidenceJournalPolicy::ImageV1;
+        if (!journal.Open(root.wstring(), L"7", &error, policy)) { return 1; }
+        Stage(stage, L"scope_files");
+        std::vector<EvidenceJournalMember> references;
+        for (const auto& entry : fs::directory_iterator(root / L"image-references"))
+        {
+            if (entry.path().extension() != L".knblob") { continue; }
+            references.push_back({L"image-references/" + entry.path().filename().wstring(), ContentHash::File(entry.path().wstring()),
+                L"raw.bytes", fs::file_size(entry.path())});
+        }
+        std::map<std::wstring, EvidenceJournalTransaction> batches;
+        std::set<std::wstring> dependencies;
+        for (const auto& entry : fs::directory_iterator(root / L"image-reads"))
+        {
+            const auto name = entry.path().stem().wstring(), ext = entry.path().extension().wstring();
+            if (name.rfind(L"reads-7-", 0) != 0 || (ext != L".knslice" && ext != L".knreads")) { continue; }
+            std::wstring json;
+            if (!ReadAnalystSnapshot(entry.path().wstring(), &json, nullptr, 2 * 1024 * 1024, nullptr, true)) { return 1; }
+            const auto id = name.substr(8);
+            auto& batch = batches[id]; batch.Kind = L"image_reads"; batch.Id = id;
+            batch.Members.push_back(EvidenceJournalJsonMember(L"image-reads/" + entry.path().filename().wstring(), json));
+        }
+        for (auto& item : batches)
+        {
+            auto& batch = item.second;
+            batch.Members.insert(batch.Members.end(), references.begin(), references.end());
+            if (!journal.Commit(batch).Committed) { return 1; }
+            for (const auto& member : batch.Members) { dependencies.insert(member.Path); }
+        }
+        Stage(stage, L"scope_reads");
+        std::wstring manifest;
+        const std::wstring path = L"image-sweeps/sweep-7-1.knsweep";
+        if (!ReadAnalystSnapshot((root / path).wstring(), &manifest, nullptr, 2 * 1024 * 1024, nullptr, true)) { return 1; }
+        EvidenceJournalTransaction sweep;
+        sweep.Kind = L"image_sweep"; sweep.Id = L"1";
+        sweep.Members.push_back(EvidenceJournalJsonMember(path, manifest));
+        sweep.Requires.assign(dependencies.begin(), dependencies.end());
+        if (!journal.Commit(sweep).Committed) { return 1; }
+        Stage(stage, L"scope_sweep");
+        if (!journal.Commit(Closure(root)).Committed) { return 1; }
+        Stage(stage, L"scope_closed");
+        return 0;
     }
     EvidenceJournalTransaction IrpLedger(const fs::path& root, const std::wstring& collection)
     {
@@ -353,6 +403,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (argc == 4 && std::wstring(argv[1]) == L"--produce-collection") { return Produce(argv[2], L"", argv[3], true); }
         if (argc == 5 && std::wstring(argv[1]) == L"--produce-irp") { return ProduceIrp(argv[2], argv[3], argv[4]); }
+        if (argc == 5 && std::wstring(argv[1]) == L"--commit-published") { return CommitPublishedScopes(argv[2], argv[3], argv[4]); }
         if (argc >= 3 && std::wstring(argv[1]) == L"--recover")
         {
             const auto r = RecoverEvidenceJournal(argv[2], argc == 4 && std::wstring(argv[3]) == L"--index");

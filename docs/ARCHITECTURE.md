@@ -312,9 +312,11 @@ failed; consult both sets of counters. Closure does not imply complete target
 observation or successful comparison/replay.
 
 `session.knsession` (`kn.evidence_session.v1`) fixes the collection ID and
-policy. Current KMON writers use `kn.image_irp_collection_journal.v2`; legacy
-`kn.image_collection_journal.v1` sessions remain readable and cannot accept IRP
-transaction kinds. A writer cannot reopen a session under a different policy.
+policy. Current KMON writers use `kn.image_claim_irp_collection_journal.v3`, which
+admits original slice/sweep claim publications alongside existing image and IRP
+members. Image-only v1 and image/IRP v2 sessions remain readable and cannot admit
+the new publication schema; v1 also rejects IRP transaction kinds. A writer cannot
+reopen a session under a different policy.
 Each create-new `.knjseg` record
 (`kn.evidence_journal_segment.v1`) binds its sequence, preceding **physical-file**
 SHA-256, transaction ID, members and prior dependencies. Members bind their exact
@@ -1872,8 +1874,51 @@ The frozen `recorded_claim` is the evaluation made immediately before publicatio
 its conservative persistence and original-reproduction fields remain unchanged.
 The separate replay outcome carries the later reproduction result. Hashes bind
 local artifact contents without authenticating who collected or approved them.
-Original claim publication for other adapters and collection-journal integration
-remain open.
+Direct capture collection-journal integration remains open. KMON slice/sweep
+publication uses the collection contract described below.
+
+### Original slice and sweep claim publication
+
+Eligible KMON `.knslice` and `.knsweep` files contain
+`kn.image_scope_claim_publication.v1`. Its payload binds an unchanged canonical
+`artifact` envelope and the complete `recorded_claim` under `publication_sha256`.
+Recipe/manifest digests and their evidence pointers still identify the embedded
+original artifact; the publication digest binds both artifact and claim. The
+whole UTF-8 file must fit the existing **2 MiB** file limit and retention budget.
+
+The writer evaluates the original recipe from retained target/secondary reads
+against the published reference, without another target read. Sweep evaluation
+replays its declared retained children and checks their publication identities
+across reopen. It then publishes one immutable root with the existing flushed,
+create-new rename path. Replay, bounded graphs and minimized disclosure accept
+the new root. Original replay requires a known recorded registry/policy and exact
+report equality; unsupported versions or altered assessments withhold proof.
+Slice/sweep `/current` remains unavailable.
+
+If original-claim evaluation or its additional byte budget is unavailable, the
+writer preserves the legacy recipe/manifest when its existing publication budget
+allows. `original_claim_recorded=false` and `original_claim_failure` identify this
+outcome in publication events. Hunt/session counters `slice_claims_written`,
+`slice_claims_unavailable`, `sweep_claims_written` and `sweep_claims_unavailable`
+separate these outcomes from comparison and file counters. Slice claim counters
+cover nonempty queued recipes; `slice_recipes_unavailable` separately counts
+inputs that were not recipe-eligible. Missing child evidence never creates an
+original sweep claim or a successful collection dependency.
+
+Journal v3 commits the exact physical publication bytes, including recorded
+claims, and requires already committed child/reference paths before a sweep
+transaction. Recovery and store retention recognize the new sweep roots.
+Appending after closure, conflicting files, absent dependencies and reopening
+under another journal policy remain rejected. A file saved before its journal
+transaction is an uncommitted artifact even if its claim reproduces. Accordingly,
+`original_claim_replay.journal_membership_checked` remains false: use separate
+journal recovery to establish collection membership. Neither operation proves
+collector authentication, complete observation or power-loss durability.
+
+As with direct publications, stored reports keep their conservative prepublication
+persistence/reproduction fields. The separate replay outcome records later exact
+reproduction. Other adapters' original claims, direct-capture journal integration
+and qualified lifetime joins remain open.
 
 ### Claim-specific image proof
 
@@ -2020,8 +2065,8 @@ bounded to 2 Mi UTF-16 code units and at most 2,048 manifest members.
 possible difference witness. The remaining semantic, replay and trust ledgers
 retain unknown hotpatch epoch, original comparison versus current claim policy,
 and unauthenticated/undeclared approval limits. Invalid replay emits no claim
-report. Original claim publication/reproduction and other object/lifetime
-adapters remain separate P08 work.
+report. Eligible original slice/sweep claims are retained and reproduced through
+the publication contract above; other object/lifetime adapters remain P08 work.
 
 ## Cross-bundle temporal candidates
 

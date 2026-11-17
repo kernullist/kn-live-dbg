@@ -7,6 +7,84 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Original slice/sweep claim checkpoint: 2026-11-17
+
+Eligible KMON slice/sweep files now retain an unchanged original artifact and
+its evaluated claim report in `kn.image_scope_claim_publication.v1`. Original
+replay requires the known recorded policy and exact report equality. Journal v3
+binds the physical publication and prior dependencies; reproducing a file alone
+does not establish collection membership. Legacy inputs and publication-budget
+fallbacks remain explicit `not_recorded` cases. See the
+[publication contract](ARCHITECTURE.md#original-slice-and-sweep-claim-publication).
+
+The ASan scope harness passed **423 C++ controls**, followed by **385 slice**,
+**270 sweep** and **1,414 graph** oracle checks. New original-publication checks
+passed **829 ASan / 669 Release checks across 22 cases**; the ASan count includes
+creation and collision checks. Both runs independently checked inner/outer
+hashes, PE/DIR64/read-receipt evidence, exact stored reports, legacy imports,
+changed claims/witnesses/ledgers, unknown registry/policy versions, foreign
+bindings, malformed/oversized/pending roots and missing references. An altered
+child claim also invalidated the parent replay.
+
+The new tests observed four publication boundaries before terminating the owned
+journal writer: files only, committed reads, committed sweep, and closure.
+Recovery reported exactly **0 / 2 / 3 / 4** committed segments with the expected
+closure state. Independent physical-file hashes and dependency order matched
+the verified prefix. Rehashed claim substitution failed journal recovery;
+legacy v1/v2 policies rejected the new publication schema. These are sampled
+process-interruption controls, not power-loss or every-instruction coverage.
+
+Journal/store compatibility passed **71 C++**, **1,952 journal**, **476 store**,
+**892 GC** and **400 IRP** ASan checks. Release compatibility passed **34 direct
+claim**, **59 direct publication**, **440 slice**, **312 sweep** and **1,414 graph**
+checks. Capability checks passed **36 contracts / 261 routes**, and generated
+support documentation matched. The rebuilt disclosure harness passed **506
+checks**, including new scope roots and product handlers, **14 owned endpoint
+requests** and **zero remaining children**. The public classifier passed **12
+tests**, including the new private schema.
+
+Final review fixed a persistence-budget path that replayed retained inputs even
+when the original root could no longer fit. The final Release build passed.
+KMON integration passed **121 checks**, including original claim reproduction
+after source/reference removal, no additional target reads, preservation of a
+legacy recipe when the claim exceeds its remaining budget, and a retained
+manifest with explicitly unavailable claims when child evidence is missing.
+The isolated final `--self-test all` also passed: timeline **28**, MCP **102**,
+console **564**, command audit **3,011 / 261 routes**, and remote **68** plus four
+connection-option controls. Final review found no additional actionable defects
+in the reviewed scope.
+Offline replay checks cover unchanged replay code across the final writer-budget
+fix; the final KMON/full-suite run checked that changed publication path.
+
+Final host checks found no task process/driver, parser-profile receipt, temporary
+preparation directory or AppContainer profile residue. The 31 completed code
+caches were retained. Boot time, services and firewall settings match this
+stage's baseline. EFS was already running/manual at that baseline; the previous
+stage's Win32 5 / `NOT_STOPPABLE` cleanup limitation remains, without another stop
+attempt or service configuration change. No driver was loaded by these tests.
+
+| Checked artifact | SHA-256 |
+| --- | --- |
+| Final Release product | `7df3d0c384338c34278af324f7136a4499850840c486e283363b8075d93436d8` |
+| Slice/sweep publication, ASan | `d1559aa9960a90d97fb75e7b467ce290eedce6e835e084235139f1a1d49e56e6` |
+| Journal/store, ASan | `a50624ce44abe718beaec2a1edab8cae185d634e59d9f9b7766a8eb224d6b79f` |
+| Disclosure, ASan | `7664594f05a3b22b3c0f7c655dcddf2cc667be9229c8e0f97e16f18795f32038` |
+
+Reproduce with `tools/validate-image-slice.ps1 -Sanitize` and
+`tools/validate-evidence-journal.ps1 -Sanitize`. The former creates a unique
+fixture directory with `scope-claim-publications`. To add the observed journal
+interruption checks, run `tools/test-image-scope-publication.py --exe <slice-test>
+--fixtures <slice-fixtures> --journal-exe <journal-test>` against that directory;
+use `--exe <product> --cli` for the Release replay/recovery paths. Run the full
+self-test alone. The host was Windows 11 10.0.28000 / kernel 10.0.28000.3231,
+MSVC 14.44.35207 and SDK/WDK 10.0.26100.0. Existing C4744 warnings remain.
+
+The owned/synthetic corpus does not establish native loaded-image or driver
+mapping lifetimes. Original IRP/other-adapter claims, direct-capture journal
+integration and qualified cross-capture lifetime joins remain open. The earlier
+real-kernel PDB ASan resource failure remains unresolved. This checkpoint does
+not complete P08, native VS1 or the full P01-P16/VS1-VS4 design.
+
 ## Original direct-image claim checkpoint: 2026-11-17
 
 New direct dump/process captures retain an unchanged v1/v2 recipe and the claim

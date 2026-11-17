@@ -1,6 +1,7 @@
 #include "ImageSweepGraph.h"
 #include "ImageSweepReplayEvidence.h"
 #include "ImageVerificationRecipe.h"
+#include "ImageScopeClaimPublication.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -61,7 +62,9 @@ ImageSweepGraph BuildImageSweepGraph(const std::wstring& path)
     // this exact digest too, so replacement cannot bypass this admission check.
     std::wstring json, expectedDigest;
     ImageSweepManifest manifest;
+    ImageScopeClaimPublication publication;
     if (!ReadAnalystSnapshot(path, &json, nullptr, ImageRecipeMaxBytes, nullptr, true) ||
+        !UnwrapImageScopeClaimPublication(&json, &publication) ||
         !ParseImageSweepManifest(json, &manifest) || !mcpjson::GetString(json, L"manifest_sha256", &expectedDigest))
     {
         return failure(L"manifest_unavailable_or_corrupt");
@@ -76,7 +79,8 @@ ImageSweepGraph BuildImageSweepGraph(const std::wstring& path)
     ImageSweepReplayEvidence verified;
     const auto replay = ReplayImageSweepManifest(path, nullptr, &verified, expectedDigest);
     if (replay.Status != L"replayed") { return failure(replay.Status); }
-    if (verified.ManifestSha256 != expectedDigest) { return failure(L"manifest_changed_during_graph_replay"); }
+    if (verified.ManifestSha256 != expectedDigest || replay.ClaimPublicationSha256 != publication.Sha256)
+        { return failure(L"manifest_changed_during_graph_replay"); }
     ImageSweepGraph result;
     auto& graph = result.Facts;
     graph.SourceDigest = verified.ManifestSha256;

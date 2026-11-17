@@ -5,6 +5,7 @@
 #include "ContentHash.h"
 #include "AnalystSnapshot.h"
 #include "ImageScopeClaims.h"
+#include "ImageScopeClaimPublication.h"
 #include <filesystem>
 
 using namespace bounded_observation_json;
@@ -260,7 +261,7 @@ std::wstring CaptureImageSliceRecipeJson(const executable_image::DiskPeMetadata&
     return ImageSliceRecipeJson(p);
 }
 
-ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
+static ImageRecipeReplay EvaluateImageSliceRecipe(std::wstring json, const std::wstring& referencePath, std::wstring* error,
     std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims)
 {
     if (verifiedPages != nullptr) { verifiedPages->clear(); }
@@ -270,9 +271,9 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     result.Mode = L"original_policy";
     result.CurrentPolicy.clear();
     if (error != nullptr) { *error = L"slice recipe or original inputs could not be verified"; }
-    std::wstring json;
     ImageSliceRecipe p;
-    if (!ReadAnalystSnapshot(path, &json, error, ImageRecipeMaxBytes, nullptr, true) || !ParseImageSliceRecipe(json, &p))
+    ImageScopeClaimPublication publication;
+    if (!UnwrapImageScopeClaimPublication(&json, &publication) || !ParseImageSliceRecipe(json, &p))
     {
         result.Status = L"recipe_unavailable_or_corrupt";
         return result;
@@ -281,9 +282,9 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     result.CurrentPolicy = p.Policy;
     result.RecordedResult = p.RecordedResult;
     mcpjson::GetString(json, L"recipe_sha256", &result.RecipeSha256);
-    const auto store = std::filesystem::path(path).parent_path().parent_path() / L"image-references";
+    if (!publication.Sha256.empty()) { result.OriginalClaimStatus = L"not_attempted"; }
     ReferenceArtifact artifact;
-    if (!artifact.Open((store / (p.ReferenceSha256 + L".knblob")).wstring(), error))
+    if (!artifact.Open(referencePath, error))
     {
         result.Status = L"reference_missing_or_unreadable";
         return result;
@@ -314,9 +315,42 @@ ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring*
     if (result.Proof.empty()) { result.Status = L"comparison_accounting_failed"; return result; }
     auto claims = AssessImageSliceClaims(p, pages, result.RecipeSha256);
     result.ClaimAssessmentJson = ImageSliceClaimAssessmentJson(claims);
+    result.Status = L"replayed";
+    if (!ReproduceImageScopeClaim(publication, &result)) { return result; }
     if (verifiedClaims != nullptr) { *verifiedClaims = std::move(claims); }
     if (verifiedPages != nullptr) { *verifiedPages = pages; }
-    result.Status = L"replayed";
     if (error != nullptr) { error->clear(); }
     return result;
+}
+
+std::wstring CaptureImageSliceClaimPublicationJson(const std::wstring& recipeJson,
+    const std::wstring& referencePath, std::wstring* error)
+{
+    // Capture accepts a canonical bare recipe, never an imported claim assertion.
+    ImageSliceRecipe recipe;
+    if (!ParseImageSliceRecipe(recipeJson, &recipe)) { if (error) { *error = L"invalid_slice_recipe"; } return {}; }
+    const auto replay = EvaluateImageSliceRecipe(recipeJson, referencePath, error, nullptr, nullptr);
+    const auto json = replay.Status == L"replayed" ? ImageScopeClaimPublicationJson(recipeJson, replay.ClaimAssessmentJson) : L"";
+    if (json.empty() && error) { *error = replay.Status == L"replayed" ? L"claim_report_invalid_or_byte_budget" : replay.Status; }
+    return json;
+}
+
+ImageRecipeReplay ReplayImageSliceRecipe(const std::wstring& path, std::wstring* error,
+    std::vector<ExecutablePageResult>* verifiedPages, ImageSliceClaimEvidence* verifiedClaims)
+{
+    if (verifiedPages) { verifiedPages->clear(); }
+    if (verifiedClaims) { *verifiedClaims = {}; }
+    std::wstring json, artifactJson;
+    ImageScopeClaimPublication publication;
+    ImageSliceRecipe recipe;
+    ImageRecipeReplay result;
+    result.Schema = L"kn.image_slice_replay.v1"; result.Mode = L"original_policy"; result.CurrentPolicy.clear();
+    if (!ReadAnalystSnapshot(path, &json, error, ImageRecipeMaxBytes, nullptr, true))
+        { result.Status = L"recipe_unavailable_or_corrupt"; return result; }
+    artifactJson = json;
+    if (!UnwrapImageScopeClaimPublication(&artifactJson, &publication) || !ParseImageSliceRecipe(artifactJson, &recipe))
+        { result.Status = L"recipe_unavailable_or_corrupt"; return result; }
+    const auto reference = std::filesystem::path(path).parent_path().parent_path() / L"image-references" /
+        (recipe.ReferenceSha256 + L".knblob");
+    return EvaluateImageSliceRecipe(std::move(json), reference.wstring(), error, verifiedPages, verifiedClaims);
 }
