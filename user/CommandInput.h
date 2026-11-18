@@ -104,6 +104,7 @@ namespace commandinput
         std::wstring Peer;
         bool AllowWrite = false;
         bool ObserveOnly = false;
+        std::wstring OperationJournalDirectory;
     };
 
     inline bool ParseListenerOptions(
@@ -132,6 +133,16 @@ namespace commandinput
             {
                 ok = !parsed.ObserveOnly;
                 parsed.ObserveOnly = true;
+            }
+            else if (!remote && arg == L"--journal")
+            {
+                ok = parsed.OperationJournalDirectory.empty() && index + 1 < args.size();
+                if (ok)
+                {
+                    parsed.OperationJournalDirectory = args[++index];
+                    ok = !parsed.OperationJournalDirectory.empty() && parsed.OperationJournalDirectory.front() != L'-' &&
+                        parsed.OperationJournalDirectory.find(L'\0') == std::wstring::npos;
+                }
             }
             else if (arg == L"--loopback")
             {
@@ -172,6 +183,7 @@ namespace commandinput
                 havePort = true;
             }
         }
+        if (!parsed.OperationJournalDirectory.empty() && !parsed.ObserveOnly) { ok = false; }
         if (parsed.ObserveOnly)
         {
             ok = ok && !parsed.AllowWrite;

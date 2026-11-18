@@ -115,6 +115,7 @@ struct McpServerConfig
     // process restarts. Clients send it as `Authorization: Bearer <password>`.
     std::wstring Password;
     bool ObserveOnly = false;
+    std::wstring OperationJournalDirectory;
 };
 
 class TimelineStore;
@@ -134,13 +135,15 @@ bool McpAuthorizationMatchesPassword(
     const std::string& authorization,
     const std::wstring& password);
 
-// Atomically writes an MCP secret-bearing file with a protected DACL granting
-// full access only to the current process user. The destination is replaced
-// only after the complete temporary file has been flushed.
+class EvidencePrivacyGuard;
+// Flush then replace a private MCP file. The default DACL grants the current
+// user access. A caller writing under its pinned private directory may instead
+// inherit that directory's ACL and verify the temporary file against its policy.
 bool WriteMcpSensitiveFile(
     const std::wstring& path,
     const std::string& bytes,
-    std::wstring* error);
+    std::wstring* error,
+    const EvidencePrivacyGuard* privateDirectory = nullptr);
 
 struct McpToolCatalogEntry
 {
@@ -206,6 +209,7 @@ public:
 
 private:
     friend int RunMcpToolCatalogSelfTest();
+    friend int RunMcpJournalFixture(const wchar_t*, uint16_t);
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     void StopLocked();
@@ -244,4 +248,5 @@ private:
     HANDLE jobReadyEvent_ = nullptr;
     size_t maxPending_ = 8;
     McpOperationLedger operations_;
+    std::unique_ptr<class McpOperationJournal> journal_;
 };

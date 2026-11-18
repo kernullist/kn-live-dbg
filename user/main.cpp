@@ -53105,7 +53105,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53213,6 +53213,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         config.BindAddress = options.BindAddress;
         config.AllowWrite = options.AllowWrite;
         config.ObserveOnly = options.ObserveOnly;
+        config.OperationJournalDirectory = options.OperationJournalDirectory;
         if (!ValidateMcpObservationConfig(config, &optionError))
         {
             std::wcerr << L"mcp start failed: " << optionError << L"\n";
@@ -53440,7 +53441,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }
@@ -53974,7 +53975,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --schema inspect <package>\n";
         std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
-        std::wcout << L"    suites: timeline, mcp-tools, mcp-http, mcp-observe, console, commands, remote-protocol,\n";
+        std::wcout << L"    suites: timeline, mcp-tools, mcp-http, mcp-observe, mcp-journal-fixture <directory> <port>, console, commands, remote-protocol,\n";
         std::wcout << L"            connect-argv, capture-scheduler, reference-scheduler, image-scheduler, publication-scheduler, analysis-scheduler, discovery-scheduler, layout-scheduler, image-preparation, irp-publication <owned.knirp>, all, platform-query, cloudfiles-query <path>,\n";
         std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
@@ -54097,6 +54098,11 @@ int wmain(int argc, wchar_t** argv)
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
         {
             return RunMcpToolCatalogSelfTest();
+        }
+        if (argc >= 3 && ToLower(argv[2]) == L"mcp-journal-fixture")
+        {
+            uint16_t port = 0;
+            return argc == 5 && commandinput::ParsePort(argv[4], &port) ? RunMcpJournalFixture(argv[3], port) : 2;
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
         {

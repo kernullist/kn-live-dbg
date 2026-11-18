@@ -919,6 +919,77 @@ static bool McpManifestMatches(const std::wstring& response, const wchar_t* list
     return names == expected;
 }
 
+// A separate process lets the test controller terminate this exact listener
+// after a real queue/dispatch boundary, without running the live debugger.
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port)
+{
+    McpServer server;
+    McpServerConfig config;
+    config.Port = port;
+    config.ObserveOnly = true;
+    config.BindAddress = L"127.0.0.1";
+    config.OperationJournalDirectory = directory;
+    config.AuditPath = config.OperationJournalDirectory + L"\\fixture-audit.jsonl";
+    std::wstring error, line;
+    if (!std::getline(std::wcin, config.Password) || !server.Start(config, &error))
+    {
+        std::wcout << L"unavailable" << std::endl;
+        return 1;
+    }
+    std::wcout << L"ready" << std::endl;
+    TimelineStore timeline(1);
+    std::shared_ptr<McpJob> job;
+    while (std::getline(std::wcin, line) && line != L"stop")
+    {
+        if (line == L"queued")
+        {
+            if (WaitForSingleObject(server.JobReadyEvent(), 15000) != WAIT_OBJECT_0) { return 2; }
+            std::lock_guard<std::mutex> lock(server.queueMutex_);
+            if (server.queue_.size() != 1) { return 2; }
+            std::wcout << L"queued " << server.queue_.front()->OperationId << std::endl;
+        }
+        else if (line == L"dispatch" && !job)
+        {
+            job = server.TryPopJob();
+            std::wcout << (job ? L"dispatched " + job->OperationId : L"refused") << std::endl;
+        }
+        else if (line == L"restart-held" && job)
+        {
+            std::promise<void> entered, release;
+            auto started = entered.get_future();
+            auto finish = release.get_future();
+            auto old = std::async(std::launch::async, [&]()
+            {
+                return server.DispatchJob(job, [&](const McpEngineRequest& req, TimelineScanBudget* scan)
+                {
+                    entered.set_value();
+                    finish.wait();
+                    return ReadMcpObservedTimeline(req, timeline, *scan);
+                });
+            });
+            const bool running = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+            server.Stop();
+            const bool restarted = server.Start(config, &error);
+            release.set_value();
+            const bool claimed = old.get();
+            job.reset();
+            std::wcout << (running && restarted && claimed ? L"restarted" : L"refused") << std::endl;
+        }
+        else if (line == L"return" && job)
+        {
+            const bool claimed = server.DispatchJob(job, [&](const McpEngineRequest& request, TimelineScanBudget* scan)
+            {
+                return ReadMcpObservedTimeline(request, timeline, *scan);
+            });
+            job.reset();
+            std::wcout << (claimed ? L"returned" : L"refused") << std::endl;
+        }
+        else { return 2; }
+    }
+    server.Stop();
+    return 0;
+}
+
 int RunMcpTransportSelfTest(bool observe)
 {
     SelfTestContext context;

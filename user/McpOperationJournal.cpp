@@ -1,0 +1,237 @@
+#include "McpOperationJournal.h"
+#include "McpServer.h"
+#include "ContentHash.h"
+#include "EvidencePrivacy.h"
+#include "EvidenceStore.h"
+#include <wincrypt.h>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <string_view>
+
+#pragma comment(lib, "crypt32.lib")
+
+namespace
+{
+    constexpr size_t MaxImage = 1024 * 1024;
+    constexpr char Header[] = "KnLiveDbg.observe.operations.1\n";
+    constexpr char Envelope[] = "KNMCPJ1"; // includes NUL, also recognized by the publication scanner
+    using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
+
+    std::string Hex(const uint8_t* bytes, size_t count)
+    {
+        std::string result;
+        for (size_t i = 0; i < count; ++i)
+        {
+            result += "0123456789abcdef"[bytes[i] >> 4];
+            result += "0123456789abcdef"[bytes[i] & 15];
+        }
+        return result;
+    }
+
+    std::string RandomHex(size_t count)
+    {
+        std::array<uint8_t, 32> bytes{};
+        if (count > bytes.size() || BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(count),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) { return {}; }
+        auto text = Hex(bytes.data(), count);
+        SecureZeroMemory(bytes.data(), bytes.size());
+        return text;
+    }
+
+    struct PrivateText
+    {
+        std::string Bytes;
+        ~PrivateText() { if (!Bytes.empty()) { SecureZeroMemory(Bytes.data(), Bytes.size()); } }
+    };
+
+    struct ProtectedBuffer
+    {
+        DATA_BLOB Value{};
+        ~ProtectedBuffer()
+        {
+            if (Value.pbData) { SecureZeroMemory(Value.pbData, Value.cbData); LocalFree(Value.pbData); }
+        }
+    };
+}
+
+struct McpOperationJournal::Impl
+{
+    EvidencePrivacyGuard Guard;
+    EvidenceStoreLease Lease;
+    std::wstring Path, Principal;
+    PrivateText Key;
+    std::array<uint8_t, 32> Entropy{};
+    using Row = std::pair<std::wstring, std::wstring>;
+    std::vector<Row> Rows; // admission order, including previous controller generations
+    bool Ready = false;
+
+    ~Impl() { SecureZeroMemory(Entropy.data(), Entropy.size()); }
+
+    DATA_BLOB Salt() { return {static_cast<DWORD>(Entropy.size()), Entropy.data()}; }
+    bool SetPrincipal()
+    {
+        ContentHash hash;
+        if (Key.Bytes.size() != 64 || Key.Bytes.find_first_not_of("0123456789abcdef") != std::string::npos ||
+            !hash.Add(reinterpret_cast<const uint8_t*>(Key.Bytes.data()), Key.Bytes.size())) { return false; }
+        Principal = hash.Finish().substr(0, 32);
+        return IsMcpOperationId(Principal);
+    }
+
+    bool Write(const std::vector<Row>& rows)
+    {
+        PrivateText clear;
+        clear.Bytes.reserve(sizeof(Header) + Key.Bytes.size() + rows.size() * 1600);
+        clear.Bytes.append(Header).append(Key.Bytes).push_back('\n');
+        for (const auto& row : rows)
+        {
+            const auto receipt = mcpjson::WideToUtf8(row.second);
+            if (receipt.empty() || receipt.size() > 4096) { return false; }
+            clear.Bytes.append(receipt).push_back('\n');
+        }
+        if (clear.Bytes.size() > MaxImage) { return false; }
+        DATA_BLOB in{static_cast<DWORD>(clear.Bytes.size()), reinterpret_cast<BYTE*>(clear.Bytes.data())};
+        auto salt = Salt();
+        ProtectedBuffer sealed;
+        if (!CryptProtectData(&in, nullptr, &salt, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &sealed.Value) ||
+            sealed.Value.cbData > MaxImage) { return false; }
+        std::string image(Envelope, sizeof(Envelope));
+        image.append(reinterpret_cast<const char*>(&sealed.Value.cbData), sizeof(DWORD));
+        image.append(reinterpret_cast<const char*>(sealed.Value.pbData), sealed.Value.cbData);
+        if (image.size() > MaxImage) { return false; }
+        return WriteMcpSensitiveFile(Path, image, nullptr, &Guard);
+    }
+
+    bool Read()
+    {
+        HANDLE raw = CreateFileW(Path.c_str(), GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        Handle file(raw == INVALID_HANDLE_VALUE ? nullptr : raw, &CloseHandle);
+        LARGE_INTEGER size{};
+        if (!file || !Guard.CheckFile(file.get()) || !GetFileSizeEx(file.get(), &size) ||
+            size.QuadPart <= 0 || size.QuadPart > MaxImage) { return false; }
+        std::vector<uint8_t> bytes(static_cast<size_t>(size.QuadPart));
+        DWORD read = 0;
+        if (!ReadFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) || read != bytes.size()) { return false; }
+        constexpr size_t prefix = sizeof(Envelope) + sizeof(DWORD);
+        if (read <= prefix || std::memcmp(bytes.data(), Envelope, sizeof(Envelope)) != 0) { return false; }
+        DWORD sealedBytes = 0;
+        std::memcpy(&sealedBytes, bytes.data() + sizeof(Envelope), sizeof(sealedBytes));
+        if (sealedBytes != read - prefix) { return false; }
+        DATA_BLOB in{sealedBytes, bytes.data() + prefix};
+        auto salt = Salt();
+        ProtectedBuffer clear;
+        if (!CryptUnprotectData(&in, nullptr, &salt, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &clear.Value) ||
+            clear.Value.cbData > MaxImage) { return false; }
+        const std::string_view image(reinterpret_cast<const char*>(clear.Value.pbData), clear.Value.cbData);
+        size_t pos = sizeof(Header) - 1;
+        if (image.substr(0, pos) != Header || image.size() < pos + 65 || image[pos + 64] != '\n') { return false; }
+        Key.Bytes = image.substr(pos, 64);
+        if (!SetPrincipal()) { return false; }
+        pos += 65;
+        while (pos < image.size())
+        {
+            const auto end = image.find('\n', pos);
+            if (end == image.npos || end - pos > 4096 || Rows.size() >= McpOperationLedger::Capacity) { return false; }
+            const auto text = mcpjson::Utf8ToWide(std::string(image.substr(pos, end - pos)));
+            std::wstring id, schema, journal, principal, recovered;
+            if (!mcpjson::ValidateDocument(text) || !mcpjson::GetString(text, L"schema", &schema) || schema != L"kn.mcp_operation.v1" ||
+                !mcpjson::GetString(text, L"operation_id", &id) || !IsMcpOperationId(id) ||
+                !mcpjson::FindRawValue(text, L"journal", &journal) || !mcpjson::GetString(journal, L"principal_id", &principal) ||
+                principal != Principal || !mcpjson::FindRawValue(journal, L"recovered", &recovered) || recovered != L"true" ||
+                std::any_of(Rows.begin(), Rows.end(), [&](const Row& row) { return row.first == id; })) { return false; }
+            Rows.emplace_back(std::move(id), text);
+            pos = end + 1;
+        }
+        return true;
+    }
+};
+
+McpOperationJournal::McpOperationJournal() : Data(std::make_unique<Impl>()) {}
+McpOperationJournal::~McpOperationJournal() = default;
+
+bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring& password, std::wstring* error)
+{
+    if (error) { *error = L"cannot open private operation journal with this credential"; }
+    if (Data->Ready || password.empty()) { return false; }
+    try
+    {
+        auto candidate = std::make_unique<Impl>();
+        EvidencePrivacyReport policy;
+        bool fresh = false;
+        if (!candidate->Guard.Open(directory, false, &policy))
+        {
+            fresh = InitializeEvidencePrivateStore(directory, false).Initialized;
+            if (!fresh || !candidate->Guard.Open(directory, false, &policy)) { return false; }
+        }
+        if (!candidate->Lease.Acquire(policy.RootPath, true, nullptr)) { return false; }
+        candidate->Path = L"\\\\?\\" + policy.RootPath + L"\\operations.knmcpjournal";
+        PrivateText binding;
+        binding.Bytes = mcpjson::WideToUtf8(L"KnLiveDbg.observe.journal.v1\n" + policy.RootIdentity + L"\n");
+        auto credential = mcpjson::WideToUtf8(password);
+        binding.Bytes.append(credential);
+        SecureZeroMemory(credential.data(), credential.size());
+        if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, reinterpret_cast<PUCHAR>(binding.Bytes.data()),
+            static_cast<ULONG>(binding.Bytes.size()), candidate->Entropy.data(), static_cast<ULONG>(candidate->Entropy.size())) < 0) { return false; }
+        if (fresh)
+        {
+            candidate->Key.Bytes = RandomHex(32);
+            if (!candidate->SetPrincipal() || !candidate->Write({})) { return false; }
+        }
+        else if (!candidate->Read()) { return false; }
+        candidate->Ready = true;
+        Data = std::move(candidate);
+        if (error) { error->clear(); }
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+std::optional<McpJournalIdentity> McpOperationJournal::Identify(const McpEngineRequest& request) const
+{
+    static const std::wstring generation = mcpjson::Utf8ToWide(RandomHex(16));
+    if (!Data->Ready || !IsMcpOperationId(generation)) { return std::nullopt; }
+    const auto frame = mcpjson::WideToUtf8((request.Kind == McpRequestKind::ToolCall ? L"tool\n" : L"resource\n") +
+        request.Name + L"\n" + request.ArgumentsJson);
+    std::array<uint8_t, 32> digest{};
+    if (frame.empty() || frame.size() > UINT32_MAX || BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,
+        reinterpret_cast<PUCHAR>(Data->Key.Bytes.data()), static_cast<ULONG>(Data->Key.Bytes.size()),
+        reinterpret_cast<PUCHAR>(const_cast<char*>(frame.data())), static_cast<ULONG>(frame.size()),
+        digest.data(), static_cast<ULONG>(digest.size())) < 0) { return std::nullopt; }
+    return McpJournalIdentity{Data->Principal, generation, mcpjson::Utf8ToWide(Hex(digest.data(), digest.size())), McpUtcFileTime()};
+}
+
+bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcept
+{
+    if (!Data->Ready) { return false; }
+    try
+    {
+        auto next = Data->Rows;
+        const auto at = std::find_if(next.begin(), next.end(), [&](const Impl::Row& row) { return row.first == operation.Id; });
+        const bool admission = !operation.Dispatched && !operation.Finished;
+        if (admission == (at == next.end()) && operation.Journal && operation.Journal->PrincipalId == Data->Principal)
+        {
+            auto receipt = McpOperationJson(operation, true);
+            if (admission)
+            {
+                if (next.size() == McpOperationLedger::Capacity) { next.erase(next.begin()); }
+                next.emplace_back(operation.Id, std::move(receipt));
+            }
+            else { at->second = std::move(receipt); }
+            if (Data->Write(next)) { Data->Rows.swap(next); return true; }
+        }
+    }
+    catch (...) {}
+    Data->Ready = false;
+    return false;
+}
+
+bool McpOperationJournal::Healthy() const { return Data->Ready; }
+
+bool McpOperationJournal::Lookup(const std::wstring& id, std::wstring* receipt) const
+{
+    const auto at = std::find_if(Data->Rows.begin(), Data->Rows.end(), [&](const Impl::Row& row) { return row.first == id; });
+    if (!Data->Ready || at == Data->Rows.end() || !receipt) { return false; }
+    *receipt = at->second;
+    return true;
+}

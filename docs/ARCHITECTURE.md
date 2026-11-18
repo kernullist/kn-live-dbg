@@ -1047,6 +1047,11 @@ clients of that listener. Queue admission, retained-event traversal and result
 publication draw from the same listener lifetime. Operation lookup stays on
 the control path when a quota is exhausted. [MCP observation quotas](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
+An optional private observe journal records admission and dispatch before the
+engine runs, and the engine return before the client receives a terminal
+receipt. Reopening the store restores metadata for lookup by operation ID.
+[Private operation recovery](MCP_SERVER_DESIGN.md#private-operation-recovery)
+
 Offline trace queries take their input from an inherited disk handle. The
 reader checks the granted read, attribute and synchronization rights and asks
 the I/O manager whether the device is remote before querying the filesystem.

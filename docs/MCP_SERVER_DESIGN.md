@@ -45,13 +45,60 @@ Timestamps are decimal-string collector boot ticks, not wall time or target time
 
 The ledger retains at most 256 metadata records, evicts the oldest finished
 record first, and rejects admission if every slot is active. It does not retain
-result payloads. Restart clears it; a new initialization on the same running
-server does not. Lookup uses the existing shared server password/session, with
+result payloads. By default, restart clears the ledger. Reinitializing a client
+on the running server preserves it. Lookup uses the shared server password/session, with
 no additional per-principal isolation. `not_retained` establishes no outcome.
 If the client disconnects before receiving an ID, this interface cannot recover
 that job by request ID. There is no automatic retry, idempotent resubmission,
-rollback, running-job cancellation, durable journal or standard MCP Tasks API.
+rollback, running-job cancellation or standard MCP Tasks API.
 The separate remote protocol has no operation lookup adapter yet.
+
+### Private operation recovery
+
+An operator can start `mcp on --observe --journal <directory>` on loopback.
+Choose a new directory under an existing local parent on first use. The
+controller creates and pins a private root with the operator's Windows ACL
+and takes its exclusive writer lease. For recovery, reopen that directory
+with the same Windows account and MCP password. A busy, missing, damaged
+or inaccessible journal in an existing root prevents listener startup.
+The option applies only to observe mode.
+
+Save the operation ID returned by the original call. After a fresh
+`initialize`, `operations.get` returns the last recorded state with
+`journal.recovered=true`. It spends no engine allowance. The journal
+retains the latest 256 admissions in admission order across listener and
+controller restarts. A new listener starts with its full query budget.
+
+| Last recorded phase | Recovered outcome |
+| --- | --- |
+| `admitted` | The request never obtained dispatch authorization. It recovers as `cancelled_before_execution` with zero scan and payload charges. The time of interruption stays unknown. |
+| `dispatch_authorized` | The handler could have run. Its return, effects and final charges remain unknown. |
+| `cancelled` or `engine_returned` | The receipt preserves the recorded cancellation, return or exception, together with the settled charges. |
+
+The controller flushes and replaces its encrypted metadata file before
+dispatch authorization and before reporting a recorded return. If a required
+write fails, the listener reports `journal_unavailable` and stops admitting
+work. Reopen the store to read the last committed phase. Recovery performs
+a lookup and never replays the original operation.
+
+The receipt includes an opaque ID for the journal's shared principal, a
+random generation for the controller process that owned the retained view,
+the approved observe scope and a keyed SHA-256 hash of the request kind,
+catalog name and UTF-8 argument object. The fields `admitted_utc`,
+`dispatched_utc` and `engine_returned_utc` use Windows FILETIME units.
+`effect_verified_utc` stays null. The ordinary request audit records the
+operation ID and state. The request fingerprint and principal and controller
+identifiers stay out of that log. The private journal contains recovery metadata only.
+The controller protects it with user-scoped DPAPI and binds decryption to
+the MCP password and the private directory identity. [Windows Data Protection API](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
+
+All authenticated clients of that observe listener share the journal principal.
+Keep the Windows account, private directory and password available for
+recovery. An operation ID lost before the caller receives it cannot be
+looked up by its JSON-RPC request ID. An operator who controls the store can
+remove it or restore an older valid copy. An interrupted file write can leave
+an encrypted temporary file, which recovery ignores. Journal writes run
+synchronously, so disk latency can delay dispatch and response publication.
 
 ## Transport and permissions
 
@@ -92,7 +139,8 @@ Read `observe_budget` in `kn://capabilities` or enter `mcp status` to see
 the limits, usage and remaining allowance. Every client of one observe listener
 shares the counters. Repeating `initialize`, changing the JSON-RPC ID or
 retrying a call keeps the same balance. An operator stop and fresh start opens
-a new allowance and a new operation ledger.
+a new allowance and a fresh in-memory ledger. An explicitly reopened private
+journal supplies historical operation receipts.
 
 | Meter | Limit for one listener | When it is charged |
 | --- | ---: | --- |

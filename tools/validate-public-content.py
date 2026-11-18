@@ -44,6 +44,8 @@ def path_rule(name: str) -> str | None:
     if any(p.lower() in PRIVATE_DIRECTORIES for p in path.parts[:-1]):
         return "local-state-directory"
     base = path.name.lower()
+    if base.endswith(".knmcpjournal") or ".knmcpjournal.tmp." in base:
+        return "private-operation-journal"
     if base.endswith((".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm", ".kncampaign", ".knruns")):
         return "private-container-or-capture"
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
@@ -87,6 +89,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         return findings
     if data.startswith(b"KNSYMIDX"):
         add("private-symbol-index")
+    if data.startswith(b"KNMCPJ1\0"):
+        add("private-operation-journal")
     private_symbols = Path(name).suffix.lower() == ".pdb"
     if private_symbols and not allow_private_symbols:
         add("private-symbol-file")

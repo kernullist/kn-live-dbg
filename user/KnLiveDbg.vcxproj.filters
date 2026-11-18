@@ -79,6 +79,9 @@
     <ClCompile Include="McpSelfTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="McpOperationJournal.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="RemoteFirewall.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -367,6 +370,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpOperation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="McpOperationJournal.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="McpSelfTest.h">

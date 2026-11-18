@@ -15,6 +15,8 @@
 #include "McpJson.h"
 #include "CommandInput.h"
 #include "TimelineStore.h"
+#include "EvidencePrivacy.h"
+#include "McpOperationJournal.h"
 
 #include <chrono>
 #include <algorithm>
@@ -784,6 +786,7 @@ namespace
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
+        if (!config.OperationJournalDirectory.empty()) { out += L",\"operation_journal\":\"bounded_private_journal\""; }
         out += L",\"tools\":";
         out += BuildToolsList(config);
         out += L"}";
@@ -1049,6 +1052,11 @@ bool IsMcpLoopbackBind(const std::wstring& bindAddress)
 
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error)
 {
+    if (!config.OperationJournalDirectory.empty() && !config.ObserveOnly)
+    {
+        if (error) { *error = L"--journal requires --observe"; }
+        return false;
+    }
     if (config.ObserveOnly && (config.AllowWrite || !IsMcpLoopbackBind(config.BindAddress)))
     {
         if (error != nullptr) { *error = L"--observe requires a loopback bind and excludes --allow-write"; }
@@ -1269,7 +1277,8 @@ void CollectMcpListenAddresses(std::vector<McpListenAddress>* addresses)
 bool WriteMcpSensitiveFile(
     const std::wstring& path,
     const std::string& bytes,
-    std::wstring* error)
+    std::wstring* error,
+    const EvidencePrivacyGuard* privateDirectory)
 {
     bool ok = false;
     HANDLE file = INVALID_HANDLE_VALUE;
@@ -1288,7 +1297,7 @@ bool WriteMcpSensitiveFile(
         }
 
         const size_t slash = path.find_last_of(L"\\/");
-        if (slash != std::wstring::npos)
+        if (!privateDirectory && slash != std::wstring::npos)
         {
             const std::wstring directory = path.substr(0, slash);
             if (!CreateDirectoryW(directory.c_str(), nullptr) &&
@@ -1303,7 +1312,7 @@ bool WriteMcpSensitiveFile(
             }
         }
 
-        if (!BuildCurrentUserSecurityDescriptor(&descriptor, error))
+        if (!privateDirectory && !BuildCurrentUserSecurityDescriptor(&descriptor, error))
         {
             break;
         }
@@ -1321,9 +1330,9 @@ bool WriteMcpSensitiveFile(
                 L"." + std::to_wstring(tick) + L"." + std::to_wstring(attempt);
             file = CreateFileW(
                 temporaryPath.c_str(),
-                GENERIC_WRITE,
+                GENERIC_WRITE | (privateDirectory ? READ_CONTROL | FILE_READ_ATTRIBUTES : 0),
                 0,
-                &attributes,
+                privateDirectory ? nullptr : &attributes,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_TEMPORARY,
                 nullptr);
@@ -1339,13 +1348,16 @@ bool WriteMcpSensitiveFile(
 
         if (file == INVALID_HANDLE_VALUE)
         {
+            const DWORD creationError = GetLastError();
+            temporaryPath.clear(); // CREATE_NEW did not give us ownership of this name.
             if (error != nullptr)
             {
                 *error = L"could not create protected MCP temporary file: " +
-                    std::to_wstring(GetLastError());
+                    std::to_wstring(creationError);
             }
             break;
         }
+        if (privateDirectory && !privateDirectory->CheckFile(file)) { break; }
 
         size_t offset = 0;
         while (offset < bytes.size())
@@ -1842,6 +1854,21 @@ HANDLE McpServer::JobReadyEvent() const
     return jobReadyEvent_;
 }
 
+static McpEngineResult McpJournalUnavailable(const std::wstring& admittedId = {})
+{
+    McpEngineResult result;
+    result.IsError = true;
+    result.OutcomeUnknown = !admittedId.empty();
+    result.Text = L"private operation journal unavailable";
+    result.StructuredJson = L"{\"status\":\"journal_unavailable\",\"automatic_retry\":false}";
+    if (!admittedId.empty())
+    {
+        result.OperationJson = L"{\"schema\":\"kn.mcp_operation.v1\",\"operation_id\":" + mcpjson::Quote(admittedId) +
+            L",\"state\":\"unknown_outcome\",\"journal_unavailable\":true,\"outcome_known\":false,\"automatic_retry\":false}";
+    }
+    return result;
+}
+
 std::shared_ptr<McpJob> McpServer::TryPopJob()
 {
     std::shared_ptr<McpJob> job;
@@ -1853,6 +1880,7 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
             queue_.pop_front();
             if (!operations_.Start(job->OperationId, GetTickCount64()))
             {
+                if (journal_ && !journal_->Healthy()) { job->ResultPromise.set_value(McpJournalUnavailable(job->OperationId)); }
                 job.reset();
             }
             else { job->ReadyToDispatch = true; }
@@ -1909,6 +1937,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
     }
     if (!operations_.Complete(job->OperationId, result.IsError, result.OutcomeUnknown, GetTickCount64(), cost))
     {
+        if (journal_ && !journal_->Healthy()) { job->ResultPromise.set_value(McpJournalUnavailable(job->OperationId)); }
         return;
     }
     job->ReadyToDispatch = false;
@@ -1923,6 +1952,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
 
 McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) const
 {
+    std::lock_guard<std::mutex> lock(queueMutex_);
     McpEngineResult result;
     McpOperationSnapshot snapshot;
     if (!IsMcpOperationId(operationId))
@@ -1930,8 +1960,13 @@ McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) cons
         result.IsError = true;
         result.Text = L"operation_id must be exactly 32 lowercase hexadecimal characters";
     }
+    else if (journal_ && !journal_->Healthy())
+    {
+        return McpJournalUnavailable();
+    }
     else if (!operations_.Get(operationId, &snapshot))
     {
+        if (journal_ && journal_->Lookup(operationId, &result.StructuredJson)) { return result; }
         result.IsError = true;
         result.Text = L"operation metadata is not retained; this does not establish an execution outcome";
         result.StructuredJson = L"{\"schema\":\"kn.mcp_operation.v1\",\"operation_id\":" + mcpjson::Quote(operationId) +
@@ -2057,6 +2092,7 @@ bool McpServer::DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineD
             scope.ObserveOnly = config_.ObserveOnly;
             scope.AllowWrite = config_.AllowWrite;
             if (stopRequested_.load()) { result = McpAuthorityError(ScopeName()); }
+            else if (journal_ && !journal_->Healthy()) { result = McpJournalUnavailable(job->OperationId); }
             else if (job->Observe)
             {
                 const auto limit = AvailableObserveWork(*job->Observe, job->Request);
@@ -2125,6 +2161,12 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
             else if (requestedEvents > usage.MaxRequestedEvents - usage.RequestedEvents) { limit = McpBudgetLimit::RequestedEvents; }
             if (limit != McpBudgetLimit::None) { *result = ObserveBudgetError(limit, L"admission"); return true; }
         }
+        std::optional<McpJournalIdentity> identity;
+        if (journal_)
+        {
+            identity = journal_->Identify(request);
+            if (!identity) { *result = McpJournalUnavailable(); return true; }
+        }
         job = std::make_shared<McpJob>(request, RandomHex(16));
         job->Owner = this;
         job->Generation = listenerGeneration_;
@@ -2134,9 +2176,10 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         try
         {
             const auto observeEvents = job->Observe ? std::optional<uint32_t>(requestedEvents) : std::nullopt;
-            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64(), observeEvents))
+            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64(), observeEvents, std::move(identity)))
             {
                 queue_.pop_back();
+                if (journal_ && !journal_->Healthy()) { *result = McpJournalUnavailable(); return true; }
                 return false;
             }
         }
@@ -2175,6 +2218,7 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
             {
                 operations_.WaitEnded(job->OperationId);
             }
+            if (journal_ && !journal_->Healthy()) { *result = McpJournalUnavailable(job->OperationId); return true; }
             result->IsError = true;
             result->OutcomeUnknown = !cancelled;
             result->Text = cancelled
@@ -2245,16 +2289,6 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         }
         tokenSource_ = L"password";
         config_.Password = token_;
-
-        // Ensure the audit directory exists. Audit logging is best-effort.
-        if (!config_.AuditPath.empty())
-        {
-            size_t slash = config_.AuditPath.find_last_of(L"\\/");
-            if (slash != std::wstring::npos)
-            {
-                CreateDirectoryW(config_.AuditPath.substr(0, slash).c_str(), nullptr);
-            }
-        }
 
         jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2391,6 +2425,17 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             break;
         }
 
+        if (!config_.OperationJournalDirectory.empty())
+        {
+            auto journal = std::make_unique<McpOperationJournal>();
+            if (!journal->Open(config_.OperationJournalDirectory, token_, error)) { break; }
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            journal_ = std::move(journal);
+            operations_.Reset([this](const McpOperationSnapshot& op) { return journal_->Persist(op); });
+        }
+        // Create the best-effort audit directory after establishing any private root.
+        const auto slash = config_.AuditPath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) { CreateDirectoryW(config_.AuditPath.substr(0, slash).c_str(), nullptr); }
         try
         {
             listener_ = std::thread(&McpServer::ListenerThreadMain, this);
@@ -2464,7 +2509,8 @@ void McpServer::StopLocked()
             result.Text = L"MCP server stopping";
             operations_.CancelQueued(job->OperationId, GetTickCount64());
             McpOperationSnapshot snapshot;
-            if (operations_.Get(job->OperationId, &snapshot))
+            if (journal_ && !journal_->Healthy()) { result = McpJournalUnavailable(job->OperationId); }
+            else if (operations_.Get(job->OperationId, &snapshot))
             {
                 result.OperationJson = McpOperationJson(snapshot);
             }
@@ -2475,6 +2521,11 @@ void McpServer::StopLocked()
             catch (...)
             {
             }
+        }
+        if (journal_)
+        {
+            operations_.Reset();
+            journal_.reset();
         }
     }
 
@@ -2615,7 +2666,16 @@ void McpServer::ListenerThreadMain()
         record += L",\"resultBytes\":" + std::to_wstring(resultBytes);
         if (!operation.empty())
         {
-            record += L",\"operation\":" + operation;
+            if (config_.OperationJournalDirectory.empty()) { record += L",\"operation\":" + operation; }
+            else
+            {
+                std::wstring id, state;
+                if (mcpjson::GetString(operation, L"operation_id", &id) && IsMcpOperationId(id) &&
+                    mcpjson::GetString(operation, L"state", &state))
+                {
+                    record += L",\"operation\":{\"operation_id\":" + mcpjson::Quote(id) + L",\"state\":" + mcpjson::Quote(state) + L"}";
+                }
+            }
         }
         if (!budgetDenial.empty()) { record += L",\"budget_denial\":" + budgetDenial; }
         record += L",\"writeArmed\":";

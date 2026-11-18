@@ -633,6 +633,12 @@ static int RunCommandAuditSelfTest()
         check(!commandinput::ParseListenerOptions(conflict, 0, false, 51766, &listen, &error), L"mcp observe option conflict");
     }
     check(!commandinput::ParseListenerOptions({ L"--observe" }, 0, true, 51766, &listen, &error), L"remote rejects mcp observe");
+    check(commandinput::ParseListenerOptions(Split(L"mcp on --observe --journal \"case operations\""), 2, false, 51766, &listen, &error) &&
+        listen.OperationJournalDirectory == L"case operations" && listen.BindAddress == L"127.0.0.1", L"mcp observe private journal");
+    check(!commandinput::ParseListenerOptions({ L"--journal", L"dir" }, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({ L"--observe", L"--journal" }, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({ L"--observe", L"--journal", L"a", L"--journal", L"b" }, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({ L"--journal", L"a" }, 0, true, 51766, &listen, &error), L"mcp journal requires an explicit observe directory");
 
     uint64_t number = 7;
     uint32_t major = 99;

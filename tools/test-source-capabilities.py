@@ -186,6 +186,7 @@ def main():
     assert "authenticated_loopback" in observe["requirements"] and "admission_and_dispatch_checks" in observe["requirements"]
     assert "64_events_per_query" in observe["limits"] and "shared_principal" in observe["limits"]
     assert "listener_budget_calls_requested_examined_events_and_payload_utf8_bytes" in observe["limits"]
+    assert "optional_private_operation_journal_256" in observe["limits"]
     assert operation["implementation"] == "implemented"
     assert "returned_operation_id" in operation["requirements"]
     assert "no_effect_verification_or_rollback" in operation["limits"]

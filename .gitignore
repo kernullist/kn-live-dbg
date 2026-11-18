@@ -12,6 +12,8 @@
 *.kncase
 *.kncase.pending-*
 *.knledger
+*.knmcpjournal
+*.knmcpjournal.tmp.*
 *.knledger.pending-*
 *.knindex
 *.knindex.pending-*

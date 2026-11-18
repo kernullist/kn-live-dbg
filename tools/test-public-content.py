@@ -13,6 +13,11 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_private_operation_journal(self):
+        for path in ("operations.KNMCPJOURNAL", "operations.knmcpjournal.tmp.1", "renamed.bin"):
+            self.assertIn("private-operation-journal", {r["rule"] for r in AUDIT.inspect(path, b"KNMCPJ1\0ciphertext")})
+        self.assertEqual(AUDIT.inspect("journal.cpp", b'const char* prefix = "KNMCPJ1";'), [])
+
     def test_private_symbol_index(self):
         for name in ("symbols.KNSYMIDX", "symbols.knsymidx.pending-1"):
             self.assertTrue(AUDIT.inspect(name, b"empty"))

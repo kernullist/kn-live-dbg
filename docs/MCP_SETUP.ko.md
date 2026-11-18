@@ -20,7 +20,7 @@ mcp on --loopback
 출력된 주소 중 클라이언트가 접근할 수 있는 IP를 선택한다.
 
 ```text
-mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -66,6 +66,11 @@ TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공�
 `observe_budget`에서 남은 요청 수, 이벤트 수와 결과 바이트를 확인한다.
 [조회 세션의 누적 한도](MCP_SERVER_DESIGN.ko.md#조회-세션의-누적-한도)
 
+재시작 뒤에도 작업을 조회하려면 기존 로컬 상위 폴더에서
+`mcp on --observe --journal "case operations"`로 시작한다. 처음에는 새
+디렉터리를 지정하고 반환된 작업 ID를 보관한다. 같은 Windows 계정과 MCP
+비밀번호로 같은 디렉터리를 다시 열면 된다. [작업 기록 복구](MCP_SERVER_DESIGN.ko.md#작업-기록-복구)
+
 기본 MCP 모드는 쓰기 도구를 노출하지 않고 엔진 진입 시 커널 write gate도 끈다.
 `mcp on --allow-write`는 typed 쓰기 도구와 gate를 활성화한다.
 `ti.subscribe start/stop`도 이 모드가 필요하다. 외부 콜백 포인터 변경은 여전히
@@ -91,7 +96,8 @@ MCP 취소 알림은 이미 실행 중인 작업을 취소하지 않는다.
 `operations.get`을 호출하면 원래 요청을 반복하지 않고 엔진의 후속 상태를 조회한다.
 도구 응답은 같은 메타데이터를 추가 텍스트로도 제공한다. 엔진이 실행 중이어도
 조회할 수 있지만 직렬 리스너의 현재 응답 대기가 먼저 끝나야 한다.
-기록은 최대 256개이며 종료된 오래된 기록부터 교체하고 서버 재시작 때 지운다.
+기본 메모리 기록은 최대 256개이며 종료된 오래된 기록부터 교체하고 서버 재시작 때 지운다.
+조회 저널을 지정하면 최근 승인 256건을 재시작 후에도 조회할 수 있다.
 `not_retained`는 성공/실패 판정이 아니다. 결과 본문, 부작용 검증, 롤백 또는
 반복 변경의 멱등성을 제공하지 않는다. 자세한 내용은
 [작업 상태 계약](MCP_SERVER_DESIGN.ko.md#실행-경계)을 참고한다.

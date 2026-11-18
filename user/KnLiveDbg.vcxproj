@@ -177,6 +177,7 @@
     <ClCompile Include="TokenPrivilegeScanner.cpp" />
     <ClCompile Include="McpServer.cpp" />
     <ClCompile Include="McpSelfTest.cpp" />
+    <ClCompile Include="McpOperationJournal.cpp" />
     <ClCompile Include="RemoteFirewall.cpp" />
     <ClCompile Include="RemoteServer.cpp" />
     <ClCompile Include="RemoteClient.cpp" />
@@ -370,6 +371,7 @@
     <ClInclude Include="McpServer.h" />
     <ClInclude Include="McpOperation.h" />
     <ClInclude Include="McpSelfTest.h" />
+    <ClInclude Include="McpOperationJournal.h" />
     <ClInclude Include="RemoteFirewall.h" />
     <ClInclude Include="RemoteProtocol.h" />
     <ClInclude Include="RemoteServer.h" />

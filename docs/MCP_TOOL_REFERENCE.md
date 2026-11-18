@@ -24,6 +24,11 @@ admitted request, use its operation ID to check the outcome and settled
 `observe_charge`. Pending scan and payload charges are `null`.
 [Listener budget and accounting](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
+When `kn://capabilities` reports `operation_journal=bounded_private_journal`,
+`operations.get` can also return a receipt from an earlier listener. Check
+`journal.recovered` and `journal.last_recorded_phase`. A dispatch without a
+recorded return has an unknown outcome. [Private operation recovery](MCP_SERVER_DESIGN.md#private-operation-recovery)
+
 Use `tools/list` on the running server for the active schema. `*` marks required
 arguments; arrays contain strings. Numeric values are strings where the schema
 says `string`. Unknown keys, wrong types, missing required values, and invalid

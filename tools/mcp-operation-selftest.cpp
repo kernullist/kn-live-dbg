@@ -1,6 +1,7 @@
 #include "../user/McpOperation.h"
 #include <atomic>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 
 namespace
@@ -103,6 +104,24 @@ int main()
     Check(fullOk && !ledger.Begin(Id(900), L"fixture.rejected", 2), "all-active-capacity-denies-new-work");
     Check(ledger.CancelQueued(Id(100), 3) && ledger.Begin(Id(900), L"fixture.new", 4) &&
         !ledger.Get(Id(100), &snapshot) && ledger.Get(Id(0), &snapshot), "only-finished-slot-can-be-reused");
+
+    bool failSave = true;
+    ledger.Reset([&](const McpOperationSnapshot&)
+    {
+        if (failSave) { throw std::runtime_error("owned storage failure"); }
+        return true;
+    });
+    Check(!ledger.Begin(Id(77), L"fixture.storage", 1) && !ledger.Get(Id(77), &snapshot), "unsaved-admission-is-removed");
+    failSave = false;
+    Check(ledger.Begin(Id(77), L"fixture.storage", 2), "failed-admission-did-not-reserve-id");
+    failSave = true;
+    Check(!ledger.CancelQueued(Id(77), 3) && !ledger.Start(Id(77), 4) && ledger.Get(Id(77), &snapshot) &&
+        snapshot.State == L"queued" && !snapshot.Finished && !snapshot.Dispatched, "unsaved-transitions-keep-queued-state");
+    failSave = false;
+    Check(ledger.Start(Id(77), 5), "saved-dispatch-is-visible");
+    failSave = true;
+    Check(!ledger.Complete(Id(77), false, false, 6) && ledger.Get(Id(77), &snapshot) && !snapshot.Finished &&
+        snapshot.State == L"running", "unsaved-completion-keeps-last-confirmed-phase");
 
     // Release both transitions together. Either ordering must preserve the
     // engine's final failure; waiter timeout cannot downgrade it afterwards.

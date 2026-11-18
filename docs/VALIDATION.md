@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Private MCP operation recovery, 2026-11-18
+
+The Windows **28000.3501 x64** Release executable had SHA-256
+`3df699bc09d9d071b5ccc097e299f82d0c438ac81eca9cccf4197758eaad90d2`.
+The process fixture ran the product's authenticated loopback HTTP listener,
+queue, journal and retained timeline reader. The test created private
+directories under its temporary directory and reopened them across processes.
+[Private operation recovery](MCP_SERVER_DESIGN.md#private-operation-recovery)
+
+| Boundary | Observed result |
+| --- | --- |
+| Abrupt controller exit | After the test observed admission, it terminated the controller. The reopened receipt reported cancellation before dispatch and zero scan and result charges. After a real 30-second HTTP wait and termination following dispatch authorization, lookup by the returned ID reported an unknown outcome with unsettled charges. |
+| Return and restart | Completed success and failure receipts survived process restart. A return that arrived after the HTTP timeout was visible in the next process with its original ID, times and charges. A separate handler finished after its listener was stopped and reopened in the same process. The old receipt stayed unknown and the new listener's allowance stayed full. |
+| Failed storage | A file handle prevented replacement of the journal during admission, dispatch and return. Each failure reached the client as `journal_unavailable`. The committed image stayed byte-identical. Reopening it recovered the last persisted phase. A second writer, wrong password, missing file, damaged file, hard-linked file and a sealed image copied into another private root all failed to open. |
+| Privacy | An independent Python reader decrypted the owned fixture through Windows DPAPI, inspected its metadata and reproduced the request HMAC. Neither the original filter nor the password was present in the decrypted records. The ordinary audit's operation object contained only ID and state. |
+| Retention | Three listener lifetimes admitted 257 successful operations. A fourth listener recovered the newest 256 by ID and reported the first as `not_retained`. Those lookups consumed zero engine admissions. The test checked that every fixture port stopped accepting connections and its temporary directory was removed. |
+
+The standalone Release ledger passed 40 checks, including storage exceptions
+at admission, cancellation, dispatch and completion. The Python oracle checked
+12 serialized records. MSVC AddressSanitizer stopped at
+`interception_win.cpp:193` before the ledger harness entered `main`.
+Instrumented execution remains unverified on this host. The product linker
+also emitted the existing C4744 warning for `KmonHuntIndex::NextQueryEpoch`.
+
+The full product self-test passed, including 3,050 command checks across
+261 registered commands. The MCP tool, observe HTTP, legacy HTTP and timeline
+suites passed 150, 98, 29 and 28 checks respectively. Restricted launch
+passed 70 CLI results. The capability inventory passed 53 contracts and its
+support matrix matched. From 11:31 to 12:09 KST the boot timestamp, monitored
+services and firewall profiles matched the baseline. There were zero new
+bugcheck or unexpected-restart events and zero new crash dumps. The final
+host check found no test processes, loaded project drivers, owned temporary
+fixtures or HTTP registrations on the regression port.
+
+These tests exercised controller termination on one Windows host.
+Physical power loss, hostile restoration of an older file,
+separate remote principals and live driver effects require other evidence.
+
 ## Cumulative MCP observe budgets, 2026-11-18
 
 On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256

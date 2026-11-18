@@ -22,7 +22,7 @@ For a separate lab client, `mcp on` binds all adapters; select a reachable targe
 IP from the startup output. The grammar is:
 
 ```text
-mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -73,6 +73,12 @@ Read `observe_budget` in `kn://capabilities` for the remaining calls, records
 and payload bytes. Reinitializing a client keeps the same budget.
 [Observe listener budget](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
+To keep operation receipts across restarts, enter
+`mcp on --observe --journal "case operations"` under an existing local parent.
+Use a new directory the first time. Keep the returned operation ID, then reopen
+the same directory with the same Windows account and listener password to query
+it after a restart. [Private operation recovery](MCP_SERVER_DESIGN.md#private-operation-recovery)
+
 Default MCP mode omits write tools and disarms the kernel write gate on engine
 entry. `mcp on --allow-write` exposes the typed write tools and enables the gate.
 `ti.subscribe start/stop` also requires that mode. It does not make unsupported
@@ -103,7 +109,8 @@ as an additional tool text item). Call `operations.get` with that string to
 query the engine's eventual state without repeating the original request.
 Lookup works while the engine is busy, subject to the serial listener finishing
 its current response wait. Only the newest retained metadata is available:
-256 records, finished records evicted first, cleared on server restart.
+256 records, finished records evicted first in memory. The default ledger
+clears on restart. An explicitly opened observe journal retains the last 256 admissions.
 `not_retained` does not imply success or failure. This API retains no result
 payload and does not prove target effects, provide rollback or make repeated
 mutations idempotent. See the [operation contract](MCP_SERVER_DESIGN.md#execution-boundary).
