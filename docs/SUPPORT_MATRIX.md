@@ -18,6 +18,7 @@ backends are not implied by an x64 address width.
 
 | Domain / operation | Backend | Implementation | Address contract | Consistency |
 | --- | --- | --- | --- | --- |
+| session / restricted_launch | local_cli | implemented | not_an_address_reader | one_shot |
 | session / mutation_gate | native | implemented | not_an_address_reader | per_handle |
 | memory / read_virtual | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | live_non_atomic |
 | memory / read_process | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | live_non_atomic |

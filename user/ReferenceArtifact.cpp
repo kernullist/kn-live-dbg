@@ -5,9 +5,22 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <winternl.h>
 
 namespace
 {
+    constexpr DWORD ResidentFileAccess = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+
+    template<typename Function>
+    Function NativeFileFunction(const char* name)
+    {
+        const auto entry = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name);
+        Function function = nullptr;
+        static_assert(sizeof(function) == sizeof(entry));
+        std::memcpy(&function, &entry, sizeof(function));
+        return function;
+    }
+
     std::wstring LocalPath(const std::wstring& path)
     {
         if (path.empty() || path.size() > 30000 || path.find(L'\0') != std::wstring::npos ||
@@ -19,6 +32,38 @@ namespace
         auto absolute = std::filesystem::absolute(path, error).wstring();
         return !error && absolute.size() > 3 && absolute.size() <= 30000 && absolute[1] == L':' &&
             absolute.find(L':', 2) == std::wstring::npos ? absolute : L"";
+    }
+
+    bool ResidentLocalDiskFile(HANDLE file)
+    {
+        if (file == nullptr || file == INVALID_HANDLE_VALUE) { return false; }
+        // Reopening under the process token must not upgrade an inherited
+        // metadata-only handle. Reject remote devices before filesystem queries.
+        const auto query = NativeFileFunction<decltype(&NtQueryObject)>("NtQueryObject");
+        PUBLIC_OBJECT_BASIC_INFORMATION access{};
+        if (!query || query(file, ObjectBasicInformation, &access, sizeof(access), nullptr) != 0 ||
+            (access.GrantedAccess & ResidentFileAccess) != ResidentFileAccess) { return false; }
+        using QueryFile = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+        const auto queryFile = NativeFileFunction<QueryFile>("NtQueryInformationFile");
+        constexpr ULONG fileIsRemoteDeviceInformation = 51; // WDK FILE_INFORMATION_CLASS, answered by the I/O manager.
+        IO_STATUS_BLOCK result{};
+        BOOLEAN remote = TRUE;
+        if (!queryFile || queryFile(file, &result, &remote, sizeof(remote), fileIsRemoteDeviceInformation) != 0 ||
+            result.Information != sizeof(remote) || remote || GetFileType(file) != FILE_TYPE_DISK) { return false; }
+        std::wstring path(32768, L'\0');
+        const DWORD size = GetFinalPathNameByHandleW(file, path.data(), static_cast<DWORD>(path.size()),
+            FILE_NAME_OPENED | VOLUME_NAME_GUID);
+        if (size == 0 || size >= path.size()) { return false; }
+        path.resize(size);
+        const auto volumeEnd = path.find(L"}\\");
+        if (path.rfind(L"\\\\?\\Volume{", 0) != 0 || volumeEnd == std::wstring::npos ||
+            volumeEnd + 2 >= path.size() || path.find(L':') != std::wstring::npos ||
+            GetDriveTypeW(path.substr(0, volumeEnd + 2).c_str()) != DRIVE_FIXED) { return false; }
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        constexpr DWORD excluded = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
+            FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+        return GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+            (tag.FileAttributes & excluded) == 0;
     }
 
     std::wstring Hex(const uint8_t* bytes, size_t size)
@@ -91,6 +136,25 @@ bool ReferenceArtifact::Open(const std::wstring& path, std::wstring* error, size
 bool ReferenceArtifact::OpenHandle(HANDLE file, std::wstring* error, size_t maximumBytes)
 {
     return OpenHandleImpl(file, error, maximumBytes, nullptr);
+}
+
+bool ReferenceArtifact::OpenResidentLocalHandle(HANDLE file, std::wstring* error, size_t maximumBytes)
+{
+    if (error != nullptr) { *error = L"standard input must be a resident regular file on a fixed local volume within the byte limit"; }
+    if (File != INVALID_HANDLE_VALUE || !ResidentLocalDiskFile(file)) { return false; }
+    // Empty relative name reopens the supplied object with its own cursor.
+    // The Win32 ReOpenFile flag set does not support no-recall.
+    const auto open = NativeFileFunction<decltype(&NtOpenFile)>("NtOpenFile");
+    UNICODE_STRING empty{};
+    OBJECT_ATTRIBUTES attributes{};
+    InitializeObjectAttributes(&attributes, &empty, 0, file, nullptr);
+    IO_STATUS_BLOCK result{};
+    HANDLE lease = nullptr;
+    if (!open || open(&lease, ResidentFileAccess, &attributes, &result, FILE_SHARE_READ,
+        FILE_OPEN_NO_RECALL | FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE |
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_SEQUENTIAL_ONLY) != 0) { return false; }
+    File = lease;
+    return ResidentLocalDiskFile(File) && Initialize(error, maximumBytes);
 }
 
 bool ReferenceArtifact::OpenHandleCancelable(HANDLE file, std::wstring* error, const std::atomic<bool>& stop, size_t maximumBytes)

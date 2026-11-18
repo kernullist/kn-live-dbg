@@ -1027,7 +1027,32 @@ automatically arming the REPL. A failed remote-console write-off stops that engi
 without publishing a false write-off status. Failure can leave the actual gate
 unknown; the error says so. These controls do not split observation from event
 collection, constrain every user-mode/DbgEng action, or provide protected remote
-transport. Four operating modes and narrower collection rights remain W14 work.
+transport.
+
+On current `main`, `wmain` resolves an explicit `--mode` before the generic CLI,
+worker, controller and transport entry points. A reserved selector anywhere
+else in the argument vector ends the request. The selected path has a closed
+operation list and returns directly. It has no dispatcher for command text,
+driver startup, collection, MCP or remote sessions. The boundary covers one
+process invocation. Principal scopes on an existing controller, kernel-side
+collection rights, protected transport and durable operation recovery remain
+P14 work.
+
+Offline trace queries take their input from an inherited disk handle. The
+reader checks the granted read, attribute and synchronization rights and asks
+the I/O manager whether the device is remote before querying the filesystem.
+It requires a fixed local volume and skips files marked offline, reparse or
+recall-on-access. It reopens the same file object with no-recall and an
+independent file pointer. The lease excludes writers and delete access. The
+reader repeats the checks before reading and hashing the bounded contents.
+It requests the opened name on a volume GUID path. Windows assigns these
+paths to local volumes. [Windows handle name contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+
+Observation adds a single explicitly consented read of the caller's own
+control range through a query/read handle. Its code path cannot open the
+native device. The capability response distinguishes a policy exclusion from
+a failed native connection and records which probe actions were attempted.
+See the [launch syntax and input requirements](COMMAND_REFERENCE.md#restricted-one-shot-launches).
 
 Virtual and physical reads use `MmCopyMemory`. Page-table translation supports
 four/five-level walks and effective permissions across parent entries.

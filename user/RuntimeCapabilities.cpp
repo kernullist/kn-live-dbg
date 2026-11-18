@@ -7,9 +7,10 @@
 
 #include <array>
 
-RuntimeCapabilityProbe ProbeRuntimeCapabilities()
+RuntimeCapabilityProbe ProbeOwnedProcessCapabilities()
 {
     RuntimeCapabilityProbe probe;
+    probe.NativeReason = L"outside_owned_process_scope";
     probe.StartedMs = GetTickCount64();
     probe.ProcessId = GetCurrentProcessId();
     FILETIME created{}, exited{}, kernel{}, user{};
@@ -23,7 +24,10 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
         {
             control[i] = static_cast<uint8_t>(0x51 + i);
         }
-        ProcessObservationSource source(GetCurrentProcess(), probe.ProcessId, probe.ProcessCreateTime, {});
+        probe.ProcessHandleAttempted = true;
+        const std::unique_ptr<void, decltype(&CloseHandle)> readOnly(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, probe.ProcessId), &CloseHandle);
+        ProcessObservationSource source(readOnly.get(), probe.ProcessId, probe.ProcessCreateTime, {});
         probe.ProcessSourceOpened = !source.Capabilities().SourceId.empty();
         if (probe.ProcessSourceOpened)
         {
@@ -62,10 +66,19 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
     {
         probe.ProcessReason = L"process_identity_query_failed_win32_" + std::to_wstring(GetLastError());
     }
+    probe.FinishedMs = GetTickCount64();
+    return probe;
+}
+
+RuntimeCapabilityProbe ProbeRuntimeCapabilities()
+{
+    auto probe = ProbeOwnedProcessCapabilities();
     {
         // Never create/start a service, load a driver, enable collection, switch
         // write mode, or acquire symbols. Another controller may deny this open.
         DeviceClient device;
+        probe.NativeProbeAttempted = true;
+        probe.NativeReason.clear();
         probe.NativeSourceOpened = device.Open(&probe.NativeReason);
         if (probe.NativeSourceOpened)
         {

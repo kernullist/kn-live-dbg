@@ -43,6 +43,8 @@ int main(int argc, char** argv)
     check(available(nullptr, L"native") == L"not_probed", "compiled native stays unprobed");
     check(available(nullptr, L"vmi", L"unsupported") == L"not_probed", "legacy compiled availability unchanged");
     RuntimeCapabilityProbe probe;
+    check(available(&probe, L"native") == L"blocked_by_policy", "unsolicited native probe cannot grant availability");
+    probe.NativeProbeAttempted = true;
     check(available(&probe, L"native") == L"unavailable", "failed open");
     probe.NativeSourceOpened = true;
     check(available(&probe, L"native") == L"unavailable", "open is not ABI validation");

@@ -112,6 +112,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -53826,6 +53827,71 @@ static void HandleRemoteCommand(
 
 #include "CommandAuditSelfTest.inl"
 
+static int WriteLaunchDecision(const std::wstring& mode, const wchar_t* reason, int code)
+{
+    std::wstring allowed = L"[]";
+    if (mode == L"offline" || mode == L"observe")
+    {
+        allowed = L"[\"--help\",\"--capabilities\",\"trace -\"";
+        if (mode == L"observe") { allowed += L",\"--capabilities --probe --allow-residency\""; }
+        allowed += L"]";
+    }
+    const auto status = code == 0 ? L"ready" : code == ERROR_ACCESS_DENIED ? L"blocked_by_policy" : L"invalid_request";
+    const auto json = L"{\"schema\":\"kn.launch_authority.v1\",\"mode\":" +
+        (mode.empty() ? L"null" : mcpjson::Quote(mode)) + L",\"status\":" + mcpjson::Quote(status) +
+        L",\"reason\":" + mcpjson::Quote(reason) + L",\"allowed_operations\":" + allowed + L"}";
+    return WriteCapabilityJson(json) ? code : 3;
+}
+
+static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
+{
+    // Legacy commands accept different option grammars. A misplaced selector
+    // must never be consumed as an ignored argument by one of those handlers.
+    bool selected = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (_wcsicmp(argv[i], L"--mode") == 0)
+        {
+            if (i != 1) { return WriteLaunchDecision({}, L"mode_must_appear_once_and_first", 2); }
+            selected = true;
+        }
+        else if (_wcsnicmp(argv[i], L"--mode=", 7) == 0)
+        {
+            return WriteLaunchDecision({}, L"mode_requires_a_separate_value", 2);
+        }
+    }
+    if (!selected) { return std::nullopt; }
+    if (argc < 3) { return WriteLaunchDecision({}, L"mode_required", 2); }
+    const auto mode = ToLower(argv[2]);
+    if (mode != L"offline" && mode != L"observe")
+    {
+        return WriteLaunchDecision({}, L"mode_unavailable", ERROR_ACCESS_DENIED);
+    }
+    if (argc < 4) { return WriteLaunchDecision(mode, L"operation_required", 2); }
+    const auto operation = ToLower(argv[3]);
+    if (argc == 4 && operation == L"--help") { return WriteLaunchDecision(mode, L"one_shot", 0); }
+    if (argc == 4 && operation == L"--capabilities")
+    {
+        return WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT))) ? 0 : 3;
+    }
+    if (operation == L"trace" && argc >= 5 && std::wstring(argv[4]) == L"-")
+    {
+        return RunExecutionTraceCommand(std::vector<std::wstring>(argv + 4, argv + argc),
+            &g_StopRequested, ExecutionTraceInput::LocalStandardInput);
+    }
+    if (mode == L"observe" && operation == L"--capabilities" && argc >= 5 && ToLower(argv[4]) == L"--probe")
+    {
+        if (argc != 6 || ToLower(argv[5]) != L"--allow-residency")
+        {
+            return WriteLaunchDecision(mode, L"owned_probe_requires_explicit_residency_consent", ERROR_ACCESS_DENIED);
+        }
+        const auto probe = ProbeOwnedProcessCapabilities();
+        if (!WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT), &probe))) { return 3; }
+        return probe.ProcessBytesMatched ? 0 : 1;
+    }
+    return WriteLaunchDecision(mode, L"operation_outside_mode", ERROR_ACCESS_DENIED);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     // Last-resort crash diagnostics for faults that escape every guard
@@ -53856,6 +53922,8 @@ int wmain(int argc, wchar_t** argv)
         std::abort();
     });
 
+    if (const auto code = RunRestrictedLaunch(argc, argv)) { return *code; }
+
     // Permanently install the tee buffer in front of std::wcout. Must
     // happen before any ScopedWideStreamCapture (i.e. before any
     // command is dispatched) so that "log enable" only needs to
@@ -53871,6 +53939,9 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"KnLiveDbg.exe command-line usage:\n";
         std::wcout << L"  KnLiveDbg.exe                         start the local controller (elevated)\n";
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
+        std::wcout << L"  KnLiveDbg.exe --mode offline|observe --help   list operations for a restricted one-shot launch\n";
+        std::wcout << L"    --capabilities | trace - [/limit N] [/cursor token] (redirect a local trace file to stdin)\n";
+        std::wcout << L"    observe also accepts --capabilities --probe --allow-residency (self only, 32 bytes)\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";

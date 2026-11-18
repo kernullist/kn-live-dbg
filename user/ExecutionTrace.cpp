@@ -539,7 +539,7 @@ std::wstring ExecutionTracePageJson(const ExecutionTrace& trace, size_t offset, 
     return out + L"],\"identity_time_format\":\"windows_filetime\",\"live_backend_opened\":false,\"raw_decoder_used\":false}";
 }
 
-int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation)
+int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation, ExecutionTraceInput input)
 {
     std::wstring error;
     std::wstring cursor;
@@ -547,7 +547,8 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
     bool seenLimit = false;
     bool seenCursor = false;
     bool seenJson = false;
-    bool arguments = !args.empty() && !args[0].empty();
+    const bool inherited = input == ExecutionTraceInput::LocalStandardInput;
+    bool arguments = !args.empty() && (inherited ? args[0] == L"-" : !args[0].empty());
     for (size_t i = 1; arguments && i < args.size(); ++i)
     {
         if (args[i] == L"/limit" && !seenLimit && i + 1 < args.size())
@@ -572,7 +573,8 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
     }
     if (!arguments)
     {
-        std::wcerr << L"usage: --offline !kmon trace <file> [/limit 1..128] [/cursor token] [/json]\n";
+        std::wcerr << (inherited ? L"usage: --mode offline|observe trace -" : L"usage: --offline !kmon trace <file>")
+            << L" [/limit 1..128] [/cursor token] [/json]\n";
         return 2;
     }
     try
@@ -583,7 +585,8 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
         {
             error = L"execution trace import cancelled";
         }
-        else if (file.Open(args[0], &error, ExecutionTraceMaxBytes))
+        else if (inherited ? file.OpenResidentLocalHandle(GetStdHandle(STD_INPUT_HANDLE), &error, ExecutionTraceMaxBytes) :
+            file.Open(args[0], &error, ExecutionTraceMaxBytes))
         {
             const auto& bytes = file.Bytes();
             const std::string utf8(bytes.begin(), bytes.end());

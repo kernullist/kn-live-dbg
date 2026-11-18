@@ -5,6 +5,44 @@ This guide describes workflows and output contracts. `help <command>` and
 available without elevation, a driver, or symbols. Tab completion uses the same
 command definitions in the local and remote consoles.
 
+## Restricted one-shot launches
+
+On current `main`, put `--mode offline` or `--mode observe` first. Each
+invocation runs one operation and exits before controller startup. Use
+`--mode offline --help` or `--mode observe --help` to list the operations
+available in that mode. Both accept `--capabilities` for the compiled
+inventory. That inventory describes the binary across all launch paths.
+
+Both modes can query one saved `kn.execution_trace.v1` file. Redirect a
+readable regular file on a fixed local volume to standard input. For example,
+in **cmd.exe**, using a saved trace named `saved trace.kntrace` in the working
+directory, run
+
+```bat
+KnLiveDbg.exe --mode offline trace - /limit 2 < "saved trace.kntrace"
+```
+
+The result carries the SHA-256 of the exact bytes read. To continue, pass
+`/cursor` with the returned token, the same limit and the same input file.
+The 2 MiB input limit also applies here. A pipe, device, metadata-only handle,
+conflicting writer, offline file or unqualified volume produces an unavailable
+result. The parser accepts only trace data. It never resolves paths from the
+record or opens a file named on the command line in these modes.
+
+`KnLiveDbg.exe --mode observe --capabilities --probe --allow-residency` reads
+one known 32-byte range in its own process. The consent flag allows the read
+to affect page residency. The report includes the process generation, the read
+receipt and the attempted observer actions. It marks native sources as outside
+the launch policy. The command exits 1 if it cannot confirm the expected bytes.
+
+A denied operation exits 5 with `blocked_by_policy`. Invalid selector syntax
+exits 2. A misplaced or repeated selector fails before other launch options
+can run. Controller sessions, capture, evidence-store writes, MCP and remote
+connections all require a separate launch. `collect` and `lab` are reserved
+and currently return `mode_unavailable`.
+
+## Capability reports and evidence commands
+
 `KnLiveDbg.exe --capabilities` prints selected compiled source contracts without
 opening a target. Add `--probe` to read a known 32-byte range in the command's own
 process and query an existing default native device's ABI/session. It never

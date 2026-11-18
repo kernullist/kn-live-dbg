@@ -30,6 +30,9 @@ public:
     // Reopen the exact file object with its own read pointer and a write/delete
     // exclusion lease. Never resolves the caller's old pathname to another file.
     bool OpenHandle(HANDLE file, std::wstring* error, size_t maximumBytes = ReferenceArtifactMaxBytes);
+    // Restricted offline input. Require a resident regular file on a fixed
+    // local volume before reopening it, and again under the read lease.
+    bool OpenResidentLocalHandle(HANDLE file, std::wstring* error, size_t maximumBytes);
     bool OpenHandleCancelable(HANDLE file, std::wstring* error, const std::atomic<bool>& stop,
         size_t maximumBytes = ReferenceArtifactMaxBytes);
     bool Unchanged();

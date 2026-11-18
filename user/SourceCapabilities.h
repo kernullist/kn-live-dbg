@@ -21,6 +21,9 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
 {
     static const std::vector<SourceCapability> capabilities =
     {
+        {L"session", L"restricted_launch", L"local_cli", L"implemented", L"one_shot",
+            L"leading_mode_selector;closed_operation_list;inherited_local_trace_file;self_probe_requires_residency_consent",
+            L"offline_or_observe_only;no_controller_collection_device_or_transport;other_processes_and_legacy_launch_outside_scope"},
         {L"session", L"mutation_gate", L"native", L"implemented", L"per_handle",
             L"default_write_denied_driver_flag;explicit_write_enable;confirmed_session_status",
             L"not_an_observe_collect_partition;read_side_effects_possible;administrator_not_a_trust_boundary"},
@@ -229,7 +232,7 @@ inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, co
             << L",\"availability_scope\":" << quote(probe == nullptr ? L"none" :
                 contractProbe == nullptr ? L"not_probed" :
                 std::wstring(capability.Backend) == L"process_handle" ? L"owned_control_range_only" :
-                std::wstring(capability.Backend) == L"native" ? L"connection_contract_only" : L"not_probed")
+                std::wstring(capability.Backend) == L"native" ? (probe->NativeProbeAttempted ? L"connection_contract_only" : L"launch_policy") : L"not_probed")
             << L",\"validation\":\"not_performed_for_target_environment\""
             << L",\"probe_stages\":" << CapabilityProbeStagesJson(capability.Backend, contractProbe)
             << L",\"address_contract\":" << quote(CapabilityAddressContract(capability.Domain, capability.Operation, capability.Backend))

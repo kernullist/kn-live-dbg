@@ -77,5 +77,6 @@ struct ExecutionTrace
 bool ParseExecutionTrace(const std::wstring& json, ExecutionTrace* trace, std::wstring* error,
     const std::atomic<bool>* cancellation = nullptr);
 std::wstring ExecutionTracePageJson(const ExecutionTrace& trace, size_t offset, size_t limit);
+enum class ExecutionTraceInput { NamedFile, LocalStandardInput };
 int RunExecutionTraceCommand(const std::vector<std::wstring>& args,
-    const std::atomic<bool>* cancellation = nullptr);
+    const std::atomic<bool>* cancellation = nullptr, ExecutionTraceInput input = ExecutionTraceInput::NamedFile);

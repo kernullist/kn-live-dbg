@@ -7,6 +7,36 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Restricted offline and observe launches, 2026-11-18
+
+On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256
+`55001e7a92e9668d4905fcf99d0cef9be373e0b4178858824954e2e382bb51d2`.
+The [launch regression](../tools/test-restricted-launch.py) checked 70 CLI
+results through that executable.
+
+| Boundary | Observed result |
+| --- | --- |
+| Dispatch before startup | Both modes refused the controller, collection, worker, mutation, MCP and remote requests tested. The two remote requests produced zero accepts at the loopback listener. The requested evidence store was absent. A misplaced selector returned a policy diagnostic before a legacy self-test could run. |
+| Saved trace | The documented cmd.exe invocation and the inherited-handle query reproduced the legacy page, SHA-256 and cursor. A changed page limit invalidated the cursor. Replacing the pathname after opening the file preserved the original input. The parent's file position stayed at byte 7. |
+| Input authority | A metadata-only handle, open writer, alternate stream, offline-marked file, NUL device and silent pipe were refused. A valid trace padded to exactly 2 MiB retained its digest. One extra byte made the same record unavailable. |
+| Observe consent | The reported PID matched the launched process. The receipt charged one call for the 32 expected bytes and recorded possible residency effects. The native probe remained unattempted. Omitting consent, adding another argument or requesting the same read in offline mode was denied. |
+
+The legacy trace oracle passed 93 controls. The standalone capability policy
+passed 29 checks and reference blobs passed 26 checks plus their SHA-256 oracle.
+The unprobed capability inventory reported 52 contracts and 261 command routes.
+Its generated support matrix matched the checked-in copy. The full product
+self-test passed, including 3,043 command checks across 261 registered routes.
+At 09:46 KST the boot time and monitored services and firewall profiles matched
+the 09:29 baseline. The system log showed no new bugcheck or unexpected restart.
+There were no new dump files or remaining task processes, loaded drivers or
+launch fixture directories in the checked locations.
+
+These results cover the selected one-shot CLI operations on this host.
+Kernel-side collection authority, authenticated remote sessions and durable
+operation recovery remain open. The run used local NTFS fixtures and loopback
+connection refusal. Deployment on network or cloud-backed storage and
+system-wide egress isolation require separate evidence.
+
 ## Registered Windows acquisition attempts, 2026-11-18
 
 On Windows **28000.3501 x64**, a pre-registered campaign reserved six slots.

@@ -13,6 +13,7 @@ struct RuntimeCapabilityProbe
     uint64_t FinishedMs = 0;
     uint32_t ProcessId = 0;
     uint64_t ProcessCreateTime = 0;
+    bool ProcessHandleAttempted = false;
     bool ProcessSourceOpened = false;
     bool ProcessReadAttempted = false;
     bool ProcessReadPassed = false;
@@ -20,6 +21,7 @@ struct RuntimeCapabilityProbe
     std::wstring ProcessReason;
     std::wstring ProcessReadJson = L"null";
     std::wstring ProcessReadSetJson = L"null";
+    bool NativeProbeAttempted = false;
     bool NativeSourceOpened = false;
     bool NativeContractPassed = false;
     bool NativeSessionPassed = false;
@@ -29,6 +31,7 @@ struct RuntimeCapabilityProbe
     std::wstring NativeReason;
 };
 
+RuntimeCapabilityProbe ProbeOwnedProcessCapabilities();
 RuntimeCapabilityProbe ProbeRuntimeCapabilities();
 
 inline bool CapabilityReadAccepted(const ObservationReadResult& read)
@@ -131,6 +134,7 @@ inline const wchar_t* CapabilityAvailability(const std::wstring& implementation,
     }
     if (backend == L"native")
     {
+        if (!probe->NativeProbeAttempted) { return L"blocked_by_policy"; }
         // Device/ABI/session checks do not qualify any layout, read or scanner.
         return probe->NativeSourceOpened && probe->NativeContractPassed && probe->NativeSessionPassed
             ? L"partial" : L"unavailable";
@@ -142,9 +146,9 @@ inline std::wstring CapabilityProbeStagesJson(const std::wstring& backend,
     const RuntimeCapabilityProbe* probe)
 {
     const bool process = probe != nullptr && backend == L"process_handle";
-    const bool native = probe != nullptr && backend == L"native";
+    const bool native = probe != nullptr && probe->NativeProbeAttempted && backend == L"native";
     const auto quote = mcpjson::Quote;
-    const wchar_t* source = process ? (probe->ProcessSourceOpened ? L"passed" : L"failed") :
+    const wchar_t* source = process && probe->ProcessHandleAttempted ? (probe->ProcessSourceOpened ? L"passed" : L"failed") :
         native ? (probe->NativeSourceOpened ? L"passed" : L"failed") : L"not_probed";
     const wchar_t* sample = process && probe->ProcessReadAttempted ?
         (probe->ProcessReadPassed ? L"passed" : L"failed") : L"not_probed";
@@ -156,18 +160,34 @@ inline std::wstring CapabilityProbeStagesJson(const std::wstring& backend,
 inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& probe)
 {
     const auto boolean = [](bool value) { return value ? L"true" : L"false"; };
-    return L"{\"scope\":\"owned_process_range_and_native_connection_only\","
+    std::wstring actions = L"[";
+    if (probe.ProcessReadAttempted) { actions += L"\"owned_process_handle_and_read\""; }
+    else if (probe.ProcessHandleAttempted) { actions += L"\"owned_process_handle_attempt\""; }
+    if (probe.NativeProbeAttempted)
+    {
+        if (actions.size() > 1) { actions += L","; }
+        if (probe.NativeContractPassed) { actions += L"\"existing_native_device_open_and_status\""; }
+        else if (probe.NativeSourceOpened) { actions += L"\"existing_native_device_open_and_version\""; }
+        else { actions += L"\"existing_native_device_open_attempt\""; }
+    }
+    actions += L"]";
+    return L"{\"scope\":" + mcpjson::Quote(probe.NativeProbeAttempted ?
+        L"owned_process_range_and_native_connection_only" : L"owned_process_range_only") + L","
         L"\"clock_domain\":\"collector_GetTickCount64\",\"started_ms\":" + std::to_wstring(probe.StartedMs) +
         L",\"finished_ms\":" + std::to_wstring(probe.FinishedMs) +
         L",\"process_id\":" + std::to_wstring(probe.ProcessId) +
         L",\"process_create_time\":" + mcpjson::Quote(std::to_wstring(probe.ProcessCreateTime)) +
+        L",\"process_handle_attempted\":" + boolean(probe.ProcessHandleAttempted) +
         L",\"process_source_opened\":" + boolean(probe.ProcessSourceOpened) +
+        L",\"process_read_attempted\":" + boolean(probe.ProcessReadAttempted) +
+        L",\"process_read_may_change_residency\":" + boolean(probe.ProcessReadAttempted) +
         L",\"sample_bytes_matched\":" + boolean(probe.ProcessBytesMatched) +
         L",\"process_reason\":" + mcpjson::Quote(probe.ProcessReason) +
         L",\"process_read\":" + probe.ProcessReadJson +
         L",\"process_read_set\":" + probe.ProcessReadSetJson +
         L",\"process_address_shape\":\"legacy_la48_probe_only_not_active_paging_detection\","
-        L"\"native_source_opened\":" + boolean(probe.NativeSourceOpened) +
+        L"\"native_probe_attempted\":" + boolean(probe.NativeProbeAttempted) +
+        L",\"native_source_opened\":" + boolean(probe.NativeSourceOpened) +
         L",\"native_contract_passed\":" + boolean(probe.NativeContractPassed) +
         L",\"native_session_passed\":" + boolean(probe.NativeSessionPassed) +
         L",\"native_source_epoch\":" + std::to_wstring(probe.NativeSourceEpoch) +
@@ -175,7 +195,7 @@ inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& pro
         L",\"native_read_observation_contract\":" + (probe.NativeContractPassed ? boolean(probe.NativeReadObservationSupported) : L"null") +
         L",\"native_reason\":" + mcpjson::Quote(probe.NativeReason) +
         L",\"native_raw_status_available\":false,\"probe_handles_closed\":true,"
-        L"\"observer_actions\":[\"owned_process_handle_and_read\",\"existing_native_device_open_and_status\"],"
+        L"\"observer_actions\":" + actions + L","
         L"\"driver_load_requested\":false,\"symbol_network_requested\":false,"
         L"\"mutation_requested\":false,\"validation\":\"not_performed_for_target_environment\"}";
 }

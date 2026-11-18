@@ -31,6 +31,7 @@ for their scope and remaining gaps.
 .\x64\Release\KnLiveDbg.exe --help all
 .\x64\Release\KnLiveDbg.exe --self-test all
 .\x64\Release\KnLiveDbg.exe --capabilities
+.\x64\Release\KnLiveDbg.exe --mode offline --help
 
 # Build from source with the installed SDK/WDK and signing configuration
 .\tools\build.ps1 -Configuration Release
