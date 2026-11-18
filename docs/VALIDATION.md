@@ -7,6 +7,49 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Live timeline callback control, 2026-11-18
+
+Windows build 28000.3501 produced the following x64 Release artifacts.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `KnLiveDbg.exe` | `5be46fc6139f3a469ed155fa6d22dff777b1290e844b151d0ac2a0a6798cef19` |
+| `KnLiveDbg.sys` (WDK) | `65909d3a7dd057cf64b4ab08c14d8b632915626803e6440af5993857a4e9b213` |
+
+The packaged controller and a user-mode fixture exercised the existing
+ABI 17 timeline start, stop and clear requests. The extended response
+records the driver's own callback registration state. Target process effects
+require independent measurement. [Interpreting a control result](TIMELINE_COMMAND_USAGE.md#inspect-live-callback-control-results)
+
+| Check | Observed result |
+| --- | --- |
+| Registration and cleanup | A scripted start made eight calls. Thread registration failed, then process removal failed during rollback. The exported row preserved both native errors, the call order, each pair of kernel timestamps supplied by the fixture, and the residual process registration. A later stop retried the remaining registration. |
+| In-flight delivery | A hosted callback announced entry and held completion. Stop disabled delivery before attempting removal. The removal waited for the held callback, then the test observed the final ownership mask reach zero. |
+| State transitions | A separate Release-hosted check exercised 1,179,648 combinations of initial state, requested action and scripted DDI results. It compared the fixture's owned registrations at each transition with the published flags and validated the resulting detailed response. The longest path used eight calls. |
+| Caller compatibility | The tests exercised a short buffer, missing acknowledgment, malformed or stale details, legacy acknowledgment, and device close and reopen. Automatic KMON rollback required a verified fresh start on the same device connection. Another live control submitted by the controller invalidated that authority. |
+| Windows I/O and CLI | A private local named pipe rejected the controller's clear request with Win32 error 1. Two invocations of `!timeline ingest observer` produced one event with that code and zero returned bytes. Reopening the same pipe path gave the client a new device epoch. A stop submitted with the old epoch produced no additional I/O or receipt. |
+
+Run `KnLiveDbg.exe --self-test callback-ownership` to exercise the packaged
+controller. Eight consecutive runs of the JSON check matched the scripted
+calls and native failure, and found each temporary directory empty.
+[JSON receipt check](../tools/test-timeline-callback-receipts.py)
+
+The command suite passed 3,081 checks across 261 commands. The console passed
+569 checks, and the compiled capability contract covered 53 sources.
+The standalone native-read regression passed 139 checks and its JSON test
+passed 14 observations. The MCP catalog, observe HTTP, legacy HTTP and
+timeline suites passed 154, 98, 29 and 28 checks respectively. Restricted
+launch checked 70 CLI results. The post-run inspection found zero new
+bugcheck or reboot events, crash dumps, resident test processes and test
+drivers during this validation window.
+
+The host ran without a loaded KnLiveDbg driver. Live process, thread and
+image notification delivery, last-handle cleanup and kernel unload under
+load still need a provisioned driver test host. Repeated removal failures
+can keep unload pending while the driver owns a registration. Both optional
+MSVC AddressSanitizer runs stopped during Windows interceptor initialization
+before the first test case.
+
 ## Separate MCP evidence and operation access, 2026-11-18
 
 Windows x64 build 28000.3501 ran Release binary SHA-256

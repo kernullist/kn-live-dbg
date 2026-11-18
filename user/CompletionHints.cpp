@@ -922,7 +922,7 @@ namespace
     const CompletionHint kTimelineIngestTokens[] =
     {
         { L"ti", L"!timeline ingest ti [recent|all] [/limit]", L"copy TI ring records into the timeline" },
-        { L"observer", L"!timeline ingest observer", L"copy the controller's retained TI control actions into the timeline" },
+        { L"observer", L"!timeline ingest observer", L"copy ETW and live callback control results into the timeline" },
         { L"snapshot", L"!timeline ingest snapshot [baseline|<path>]", L"ingest a snapshot as timeline events" },
         { L"help", nullptr, L"show ingest usage" },
     };

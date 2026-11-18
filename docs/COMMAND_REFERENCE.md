@@ -804,6 +804,13 @@ properties to return. [Windows ControlTraceW contract](https://learn.microsoft.c
 errors and a provider-free private Windows logger. It checks foreign-session
 survival, rollback, same-name replacement and the serialized timeline receipts.
 
+Live callback start, stop and ring clear use the same observer commands. A
+matching driver returns ordered callback calls, their raw NTSTATUS values and
+the remaining registrations, even when rollback fails. An older driver's
+acknowledgment is labeled separately. `KnLiveDbg.exe --self-test callback-ownership`
+exercises the control contract and uses an owned Windows pipe for the native
+transport rejection. [Live callback control results](TIMELINE_COMMAND_USAGE.md#inspect-live-callback-control-results)
+
 Use [timeline workflows](TIMELINE_COMMAND_USAGE.md) to ingest TI, live kernel
 events and snapshots, query evidence families, export JSONL, and reconcile
 same-boot baselines. Collection loss and capacity eviction constrain absence

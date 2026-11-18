@@ -29,6 +29,9 @@
     <ClInclude Include="..\shared\KnLiveDbgPaging.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\TimelineCallbackControl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgVersion.h">
       <Filter>Header Files</Filter>
     </ClInclude>

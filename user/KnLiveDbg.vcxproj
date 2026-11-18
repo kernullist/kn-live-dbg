@@ -205,6 +205,8 @@
     <ClCompile Include="TimelineModel.cpp" />
     <ClCompile Include="TimelineSelfTest.cpp" />
     <ClCompile Include="TimelineStore.cpp" />
+    <ClCompile Include="TimelineControlObservation.cpp" />
+    <ClCompile Include="TimelineCallbackSelfTest.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="SnapshotCollector.cpp" />
     <ClCompile Include="SnapshotDiff.cpp" />
@@ -413,6 +415,7 @@
     <ClInclude Include="TimelineModel.h" />
     <ClInclude Include="TimelineSelfTest.h" />
     <ClInclude Include="TimelineStore.h" />
+    <ClInclude Include="TimelineControlObservation.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SnapshotCollector.h" />
     <ClInclude Include="SnapshotDiff.h" />
@@ -466,6 +469,7 @@
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgReadObservation.h" />
     <ClInclude Include="..\shared\KnLiveDbgPaging.h" />
+    <ClInclude Include="..\shared\TimelineCallbackControl.h" />
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h" />
     <ClInclude Include="..\shared\KnLiveDbgVersion.h" />
     <ClInclude Include="..\third_party\zydis\amalgamated\Zydis.h" />

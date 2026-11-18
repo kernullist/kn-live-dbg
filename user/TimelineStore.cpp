@@ -2562,6 +2562,7 @@ void TimelineStore::Clear()
     EventKeys.clear();
     NextEventId = 1;
     TiObserverCursor = 0;
+    LiveObserverCursor = 0;
     DroppedEvents = 0;
     TiRecentCursorInitialized = false;
     TiRecentCursorSequence = 0;
@@ -2956,21 +2957,31 @@ TimelineIngestResult TimelineStore::IngestSnapshotDiff(
     return result;
 }
 
-TimelineIngestResult TimelineStore::IngestTiObserverActions(const TiObserverSnapshot& snapshot)
+template <typename Snapshot, typename Add>
+static TimelineIngestResult CopyObserverActions(const Snapshot& snapshot, uint64_t& cursor, const wchar_t* source, Add add)
 {
     TimelineIngestResult result{};
-    if (snapshot.Actions.empty()) { return result; }
-    std::lock_guard<std::mutex> lock(Mutex);
-    if (snapshot.Total <= TiObserverCursor) { return result; }
+    if (snapshot.Actions.empty() || snapshot.Total <= cursor) { return result; }
     const uint64_t first = snapshot.Actions.front().Sequence;
-    if (first > 1 && first - 1 > TiObserverCursor)
+    if (first > 1 && first - 1 > cursor)
     {
-        result.Warnings.push_back(std::to_wstring(first - 1 - TiObserverCursor) + L" TI observer actions evicted before ingest");
+        result.Warnings.push_back(std::to_wstring(first - 1 - cursor) + L" " + source + L" observer actions evicted before ingest");
     }
-    const uint64_t before = DroppedEvents;
     for (const auto& action : snapshot.Actions)
     {
-        if (action.Sequence <= TiObserverCursor) { continue; }
+        if (action.Sequence <= cursor) { continue; }
+        ++result.SourceRecords;
+        if (add(action)) { ++result.Added; }
+        cursor = action.Sequence;
+    }
+    return result;
+}
+
+TimelineIngestResult TimelineStore::IngestTiObserverActions(const TiObserverSnapshot& snapshot)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    const uint64_t before = DroppedEvents;
+    auto result = CopyObserverActions(snapshot, TiObserverCursor, L"TI", [&](const TiObserverAction& action) {
         TimelineEvent row;
         row.TimestampFileTime = action.ReturnedFileTime;
         row.Source = L"observer";
@@ -3002,10 +3013,70 @@ TimelineIngestResult TimelineStore::IngestTiObserverActions(const TiObserverSnap
             {L"returned_utc_filetime", std::to_wstring(action.ReturnedFileTime)}, {L"status_domain", L"win32"},
             {L"status", std::to_wstring(action.Status)}, {L"possible_observer_effect", effect}, {L"effect_verified", L"false"}};
         if (action.Request == TiObserverRequest::EnableProvider) { row.Evidence[L"provider"] = L"Microsoft-Windows-Threat-Intelligence"; }
-        ++result.SourceRecords;
-        if (AddEventLocked(std::move(row), nullptr, true)) { ++result.Added; }
-        TiObserverCursor = action.Sequence;
-    }
+        return AddEventLocked(std::move(row), nullptr, true);
+    });
+    result.Dropped = DroppedEvents - before;
+    return result;
+}
+
+TimelineIngestResult TimelineStore::IngestLiveObserverActions(const TimelineControlSnapshot& snapshot)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    const uint64_t before = DroppedEvents;
+    auto result = CopyObserverActions(snapshot, LiveObserverCursor, L"live callback", [&](const TimelineControlObservation& action) {
+        TimelineEvent row;
+        row.Source = L"observer";
+        row.Domain = L"observer_action";
+        row.Entity = L"driver:KnLiveDbg/timeline";
+        row.ProcessId = snapshot.ControllerPid;
+        row.TimestampFileTime = action.ReturnedUtc;
+        const wchar_t* effect = L"unknown";
+        switch (action.Request.Action)
+        {
+        case KNDBG_TIMELINE_CONTROL_START: row.Action = L"timeline.callbacks.start"; effect = L"initialize_or_reset_ring_and_register_callbacks"; break;
+        case KNDBG_TIMELINE_CONTROL_STOP: row.Action = L"timeline.callbacks.stop"; effect = L"stop_callback_delivery_and_unregister"; break;
+        case KNDBG_TIMELINE_CONTROL_CLEAR: row.Action = L"timeline.ring.clear"; effect = L"discard_queued_events"; break;
+        default: row.Action = L"timeline.control.unknown"; break;
+        }
+        const wchar_t* outcome = L"transport_failed";
+        if (action.Reply == TimelineControlReply::LegacyAck) { outcome = L"legacy_acknowledged"; }
+        if (action.Reply == TimelineControlReply::InvalidReply) { outcome = L"outcome_unconfirmed"; }
+        row.Evidence = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"},
+            {L"sequence", std::to_wstring(action.Sequence)}, {L"controller_create_time", std::to_wstring(snapshot.ControllerCreateTime)},
+            {L"device_epoch", std::to_wstring(action.DeviceEpoch)}, {L"requested_utc_filetime", std::to_wstring(action.RequestedUtc)},
+            {L"returned_utc_filetime", std::to_wstring(action.ReturnedUtc)}, {L"request_action", std::to_wstring(action.Request.Action)},
+            {L"requested_capacity", std::to_wstring(action.Request.Capacity)}, {L"returned_bytes", std::to_wstring(action.ReturnedBytes)},
+            {L"win32_status", std::to_wstring(action.Win32Status)}, {L"status_domain", L"win32"}, {L"status", std::to_wstring(action.Win32Status)},
+            {L"possible_observer_effect", effect}, {L"effect_verified", L"false"}};
+        if (action.RequestId) { row.Evidence[L"request_id"] = std::to_wstring(action.RequestId); }
+        if (action.Reply == TimelineControlReply::Detailed) { outcome = L"outcome_unconfirmed"; }
+        if (action.Reply == TimelineControlReply::Detailed && action.Request.Flags == KNDBG_TIMELINE_CONTROL_WANT_RECEIPT &&
+            ValidateTimelineControlReply(action))
+        {
+            const auto& receipt = action.Receipt;
+            outcome = receipt.OperationStatus == 0 ? L"succeeded" : L"failed";
+            row.Evidence[L"status_domain"] = L"ntstatus";
+            row.Evidence[L"status"] = HexU64(receipt.OperationStatus);
+            row.Evidence[L"callback_state_source"] = L"driver_control_receipt";
+            row.Evidence[L"before_flags"] = HexU64(receipt.BeforeFlags);
+            row.Evidence[L"after_flags"] = HexU64(receipt.AfterFlags);
+            row.Evidence[L"callback_calls"] = std::to_wstring(receipt.CallCount);
+            for (uint32_t i = 0; i < receipt.CallCount; ++i)
+            {
+                const auto& call = receipt.Calls[i];
+                const auto prefix = L"call." + std::to_wstring(i + 1) + L".";
+                row.Evidence[prefix + L"callback"] = call.CallbackFlag == timeline_callbacks::Process ? L"process" :
+                    (call.CallbackFlag == timeline_callbacks::Image ? L"image" : L"thread");
+                row.Evidence[prefix + L"request"] = call.Remove ? L"unregister" : L"register";
+                row.Evidence[prefix + L"ntstatus"] = HexU64(call.NtStatus);
+                row.Evidence[prefix + L"requested_utc_filetime"] = std::to_wstring(call.RequestedUtcFileTime);
+                row.Evidence[prefix + L"returned_utc_filetime"] = std::to_wstring(call.ReturnedUtcFileTime);
+            }
+        }
+        row.Evidence[L"outcome"] = outcome;
+        row.Summary = row.Action + L" " + outcome;
+        return AddEventLocked(std::move(row), nullptr, true);
+    });
     result.Dropped = DroppedEvents - before;
     return result;
 }

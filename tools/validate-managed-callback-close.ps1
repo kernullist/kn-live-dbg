@@ -6,7 +6,7 @@ $environment = Get-MsvcValidationEnvironment
 $output = Join-Path $repo '.build\managed-close-selftest'
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 $exe = Join-Path $output 'managed-callback-close-selftest.exe'
-$sources = @((Join-Path $PSScriptRoot 'managed-callback-close-selftest.cpp'), (Join-Path $repo 'user\DeviceClient.cpp'))
+$sources = @((Join-Path $PSScriptRoot 'managed-callback-close-selftest.cpp'), (Join-Path $repo 'user\DeviceClient.cpp'), (Join-Path $repo 'user\TimelineControlObservation.cpp'))
 $sourceArguments = ($sources | ForEach-Object { '"' + $_ + '"' }) -join ' '
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX /O2 /MD {1} /Fe:"{2}" /Fo:"{3}/" /link FltLib.lib /INCREMENTAL:NO' -f $environment.VcVarsPath, $sourceArguments, $exe, $output
 $batch = Join-Path $output 'compile.cmd'

@@ -271,6 +271,12 @@
     <ClCompile Include="TimelineStore.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TimelineControlObservation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimelineCallbackSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -591,6 +597,9 @@
     <ClInclude Include="TimelineStore.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="TimelineControlObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="PoolScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -649,6 +658,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgPaging.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\shared\TimelineCallbackControl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgProbeIoctl.h">

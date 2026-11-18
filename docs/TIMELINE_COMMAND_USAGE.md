@@ -159,6 +159,49 @@ still need cleanup. Use `!ti stop` to retry. Locally captured receipts carry
 `ingest_origin=local_controller`. An observer row submitted through generic
 event ingestion carries `ingest_origin=supplied_record`.
 
+### Inspect live callback control results
+
+After `!timeline live start`, `stop` or `clear`, use `!timeline ingest observer`
+and `!timeline query /source observer /domain observer_action`. The controller
+keeps the latest 64 live control requests in a separate queue with its own loss
+count. Dashboard refresh and `!timeline update` also copy the receipts.
+
+For a matching driver, each row contains the request ID, device-open epoch,
+Win32 transport result, operation NTSTATUS, and registration flags before and
+after the control. `call.1`, `call.2` and later fields retain each process,
+image or thread registration or removal in order, including its kernel UTC
+request and return times and any rollback calls. For
+example, a failed thread registration can leave a process callback registered
+if its rollback also fails. The row preserves both errors and the residual
+mask. A subsequent stop retries the remaining registrations.
+
+An explicit start prepares the event ring before callback registration.
+Preparing an existing ring clears queued events and resets its sequence and
+drop counters. This can already have happened when registration later fails.
+Use `!timeline live status` to inspect an existing collection.
+
+When KMON startup fails after enabling live collection, automatic rollback
+requires the detailed receipt for a fresh start on the same device-open epoch.
+If this controller submits another live timeline control first, the receipt
+expires for rollback. After a legacy acknowledgment, inspect
+`!timeline live status` before explicit cleanup.
+
+An older ABI 17 driver can return `legacy_acknowledged`. A malformed reply
+records `outcome_unconfirmed`. Callback masks and per-callback statuses are
+available only in a validated detailed reply. A transport failure preserves
+the Win32 code. The flags describe the driver's own registration state. Host
+request and return times bound the transaction. `effect_verified=false` means
+the controller did not measure the effect on a target process. Last-handle
+close and unload clean up inside the driver and have no returning controller
+transaction.
+
+For thread and image removal, Windows defines `STATUS_PROCEDURE_NOT_FOUND` as
+an absent registration. The receipt retains that raw code. An unresolved
+process removal retains its registration bit. If removal repeatedly fails at
+final unload, the driver waits between retries before releasing its code and
+ring. [Thread removal](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-psremovecreatethreadnotifyroutine)
+[Image removal](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-psremoveloadimagenotifyroutine)
+
 ## Scenario: Live Process/Thread/Image Tracking
 
 ```text

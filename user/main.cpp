@@ -21359,7 +21359,7 @@ static void PrintTimelineAdvancedHelp()
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
-    std::wcout << L"  !timeline ingest observer   copy retained TI controller requests and their native results\n";
+    std::wcout << L"  !timeline ingest observer   copy retained ETW and live callback control results\n";
     std::wcout << L"  !timeline targets ti <pid> [after <boot-id> <create-filetime>]  List retained TI header-process lifetimes.\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
@@ -21862,7 +21862,9 @@ static bool ControlTimelineLive(
     DeviceClient* device,
     uint32_t action,
     uint32_t capacity,
-    std::wstring* error)
+    std::wstring* error,
+    TimelineControlLease* acquired = nullptr,
+    const TimelineControlLease* expected = nullptr)
 {
     bool ok = false;
     std::lock_guard<std::mutex> lock(g_TimelineLiveIoMutex);
@@ -21877,7 +21879,7 @@ static bool ControlTimelineLive(
             }
             break;
         }
-        ok = device->ControlTimeline(action, capacity, error);
+        ok = device->ControlTimeline(action, capacity, error, acquired, expected);
     } while (false);
 
     return ok;
@@ -22731,13 +22733,31 @@ static void AddTimelineDashboardWarnings(
     }
 }
 
+static TimelineIngestResult IngestControllerActions(TimelineStore& store, bool printCounts = false)
+{
+    const auto ti = GetTiSubscriberInstance().ObserverActions();
+    const auto live = GetTimelineControlJournal().Snapshot();
+    auto result = store.IngestTiObserverActions(ti);
+    const auto callbacks = store.IngestLiveObserverActions(live);
+    result.SourceRecords += callbacks.SourceRecords;
+    result.Added += callbacks.Added;
+    result.Dropped += callbacks.Dropped;
+    result.Warnings.insert(result.Warnings.end(), callbacks.Warnings.begin(), callbacks.Warnings.end());
+    if (printCounts)
+    {
+        std::wcout << L"  TI control calls=" << ti.Total << L" retained=" << ti.Actions.size()
+                   << L"\n  Live callback control calls=" << live.Total << L" retained=" << live.Actions.size() << L"\n";
+    }
+    return result;
+}
+
 static void RefreshTimelineDashboardEvidence(
     DebuggerState& state,
     DeviceClient* device,
     std::vector<std::wstring>* warnings)
 {
     TiSubscriber& ti = GetTiSubscriberInstance();
-    const auto observer = state.Timeline.IngestTiObserverActions(ti.ObserverActions());
+    const auto observer = IngestControllerActions(state.Timeline);
     AddTimelineDashboardWarnings(warnings, observer.Warnings);
     TiSubscriberStats tiStats = ti.SnapshotStats();
     bool tiActive = ti.IsActive();
@@ -23010,9 +23030,10 @@ static void TryEnableTimelineTi(
     } while (false);
 }
 
-static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
+static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device, TimelineControlLease* acquired = nullptr)
 {
     bool active = false;
+    if (acquired) { *acquired = {}; }
 
     do
     {
@@ -23041,7 +23062,7 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device)
                 device,
                 KNDBG_TIMELINE_CONTROL_START,
                 static_cast<uint32_t>(KNDBG_TIMELINE_DEFAULT_CAPACITY),
-                &error))
+                &error, acquired))
         {
             std::wcerr << L"!timeline live on failed: " << error << L"\n";
             PrintTimelineLiveAccessDeniedHint(error);
@@ -24252,8 +24273,8 @@ static void HandleKmonCommand(
                 std::wcout << L"[kmon] TI ETW already active\n";
             }
 
-            const bool liveWasActive = TimelineLiveIsActive(&device, nullptr);
-            if (!TryEnableTimelineLive(state, &device))
+            TimelineControlLease liveStart;
+            if (!TryEnableTimelineLive(state, &device, &liveStart))
             {
                 if (startedTiHere)
                 {
@@ -24284,12 +24305,15 @@ static void HandleKmonCommand(
                     if (ti.Stop(&stopError)) { g_TiSubscriberForShutdown.store(nullptr); }
                     else { std::wcerr << L"TI cleanup: " << stopError << L"\n"; }
                 }
-                if (!liveWasActive)
+                if (liveStart.RequestId)
                 {
                     std::wstring liveError;
-                    ControlTimelineLive(&device, KNDBG_TIMELINE_CONTROL_STOP, 0, &liveError);
-                    StopTimelineAutoDrainWorker();
+                    if (ControlTimelineLive(&device, KNDBG_TIMELINE_CONTROL_STOP, 0, &liveError, nullptr, &liveStart))
+                    { StopTimelineAutoDrainWorker(); }
+                    else { std::wcerr << L"Live callback rollback: " << liveError << L"\n"; }
                 }
+                else if (liveStart.DeviceEpoch)
+                { std::wcerr << L"Live callback start ownership unconfirmed. Inspect '!timeline live status' before cleanup.\n"; }
                 std::wcerr << L"!kmon start failed: " << startError << L"\n";
                 break;
             }
@@ -25174,7 +25198,7 @@ static void HandleTimelineCommand(
                 update.Mode,
                 update.Limit);
             PrintTimelineIngestResult(L"ti", tiResult);
-            const auto observer = state.Timeline.IngestTiObserverActions(sub.ObserverActions());
+            const auto observer = IngestControllerActions(state.Timeline);
             if (observer.SourceRecords || !observer.Warnings.empty()) { PrintTimelineIngestResult(L"observer", observer); }
 
             if (state.HasSnapshotBaseline)
@@ -25559,10 +25583,7 @@ static void HandleTimelineCommand(
             if (source == L"observer")
             {
                 if (args.size() != 3) { std::wcerr << L"usage: !timeline ingest observer\n"; break; }
-                const auto actions = GetTiSubscriberInstance().ObserverActions();
-                auto result = state.Timeline.IngestTiObserverActions(actions);
-                PrintTimelineIngestResult(L"observer", result);
-                std::wcout << L"  TI control calls=" << actions.Total << L" retained=" << actions.Actions.size() << L"\n";
+                PrintTimelineIngestResult(L"observer", IngestControllerActions(state.Timeline, true));
                 break;
             }
             if (source == L"ti")
@@ -30900,6 +30921,7 @@ static int RunConsoleSurfaceSelfTest()
             ThreatIntelSubscriberSelfTest(),
             L"ti-consumer-lifecycle");
         CheckConsoleSurfaceSelfTest(&context, TiObserverOwnershipSelfTest(false), L"ti-session-ownership-and-observer-timeline");
+        CheckConsoleSurfaceSelfTest(&context, TimelineCallbackOwnershipSelfTest(false), L"live-callback-ownership-and-observer-timeline");
         {
             DebuggerState state{};
             DeviceClient unopened;
@@ -30918,7 +30940,8 @@ static int RunConsoleSurfaceSelfTest()
                 startError == L"TI start requires an open driver device" &&
                 stopError == L"TI subscriber has no owned trace resources" && statusError.empty() &&
                 output.str().find(L"trace_resources=none") != std::wstring::npos &&
-                output.str().find(L"TI control calls=0 retained=0") != std::wstring::npos,
+                output.str().find(L"TI control calls=0 retained=0") != std::wstring::npos &&
+                output.str().find(L"Live callback control calls=0 retained=0") != std::wstring::npos,
                 L"ti-command-rejection-and-idle-ingest");
         }
         CheckConsoleSurfaceSelfTest(
@@ -54270,6 +54293,18 @@ int wmain(int argc, wchar_t** argv)
         if (argc == 3 && ToLower(argv[2]) == L"ti-ownership")
         {
             return TiObserverOwnershipSelfTest(false) && TiObserverOwnershipSelfTest(true) ? 0 : 1;
+        }
+        if (argc == 3 && ToLower(argv[2]) == L"callback-ownership")
+        {
+            if (!TimelineCallbackOwnershipSelfTest(false) || !TimelineCallbackOwnershipSelfTest(true)) { return 1; }
+            DebuggerState state{};
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            const auto events = state.Timeline.AllEvents();
+            if (events.size() != 1 || events[0].Action != L"timeline.ring.clear" ||
+                events[0].Evidence.at(L"outcome") != L"transport_failed" || events[0].Evidence.count(L"callback_calls")) { return 1; }
+            std::wcout << L"[callback.native.receipt] " << TimelineEventToJson(events[0]) << L"\n";
+            return 0;
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
         {

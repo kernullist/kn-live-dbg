@@ -120,6 +120,8 @@ struct IotraceRecord
     uint32_t OutputLength = 0;
 };
 
+struct TimelineControlLease;
+
 class DeviceClient
 {
 public:
@@ -268,7 +270,9 @@ public:
     bool ControlTimeline(
         uint32_t action,
         uint32_t capacity,
-        std::wstring* error);
+        std::wstring* error,
+        TimelineControlLease* acquired = nullptr,
+        const TimelineControlLease* expected = nullptr);
 
     bool QueryTimelineStatus(
         TimelineLiveStatus* status,
@@ -281,6 +285,7 @@ public:
         std::wstring* error);
 
 private:
+    void CloseLocked();
     bool Ioctl(
         DWORD code,
         void* buffer,
@@ -288,7 +293,8 @@ private:
         DWORD outLength,
         DWORD* returned,
         std::wstring* error,
-        DWORD* deviceError = nullptr);
+        DWORD* deviceError = nullptr,
+        bool reportFailureBytes = false);
 
     HANDLE device_;
     std::atomic<uint32_t> pagingLevels_{0};

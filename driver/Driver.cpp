@@ -2,6 +2,7 @@
 #include <wdmsec.h>
 #include <intrin.h>
 #include "../shared/KnLiveDbgIoctl.h"
+#include "../shared/TimelineCallbackControl.h"
 #include "../shared/KnLiveDbgReadObservation.h"
 #include "../shared/KnLiveDbgPaging.h"
 
@@ -67,10 +68,7 @@ static BOOLEAN g_KnDbgOwnerClosing = FALSE;
 // Callback registration/removal requires PASSIVE_LEVEL; fast mutexes raise IRQL.
 static KMUTEX g_KnDbgTimelineControlLock;
 static KSPIN_LOCK g_KnDbgTimelineLock;
-static volatile LONG g_KnDbgTimelineEnabled = 0;
-static BOOLEAN g_KnDbgTimelineProcessRegistered = FALSE;
-static BOOLEAN g_KnDbgTimelineImageRegistered = FALSE;
-static BOOLEAN g_KnDbgTimelineThreadRegistered = FALSE;
+static volatile LONG g_KnDbgTimelineFlags = 0;
 static KNDBG_TIMELINE_EVENT_RECORD* g_KnDbgTimelineRing = nullptr;
 static ULONG g_KnDbgTimelineCapacity = 0;
 static ULONG g_KnDbgTimelineHead = 0;
@@ -445,7 +443,7 @@ static void KnDbgTimelinePushEvent(const KNDBG_TIMELINE_EVENT_RECORD* Event)
 {
     KIRQL oldIrql = PASSIVE_LEVEL;
 
-    if (Event == nullptr || InterlockedCompareExchange(&g_KnDbgTimelineEnabled, 0, 0) == 0)
+    if (Event == nullptr || !(InterlockedCompareExchange(&g_KnDbgTimelineFlags, 0, 0) & KNDBG_TIMELINE_STATUS_ACTIVE))
     {
         return;
     }
@@ -554,77 +552,48 @@ static NTSTATUS KnDbgTimelineEnsureRing(ULONG Capacity)
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
-static void KnDbgTimelineUnregisterCallbacks()
+static NTSTATUS KnDbgTimelineApplyCallbacks(bool start, KNDBG_TIMELINE_CONTROL_RECEIPT& receipt)
 {
-    InterlockedExchange(&g_KnDbgTimelineEnabled, 0);
-
-    if (g_KnDbgTimelineThreadRegistered != FALSE)
+    auto notify = [](KNDBG_UINT32 flag, bool remove) -> KNDBG_UINT32
     {
-        PsRemoveCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify);
-        g_KnDbgTimelineThreadRegistered = FALSE;
-    }
-    if (g_KnDbgTimelineProcessRegistered != FALSE)
-    {
-        PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, TRUE);
-        g_KnDbgTimelineProcessRegistered = FALSE;
-    }
-    if (g_KnDbgTimelineImageRegistered != FALSE)
-    {
-        PsRemoveLoadImageNotifyRoutine(KnDbgTimelineImageNotify);
-        g_KnDbgTimelineImageRegistered = FALSE;
-    }
+        if (flag == timeline_callbacks::Process)
+        {
+            return PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, remove ? TRUE : FALSE);
+        }
+        if (flag == timeline_callbacks::Image)
+        {
+            return remove ? PsRemoveLoadImageNotifyRoutine(KnDbgTimelineImageNotify) :
+                PsSetLoadImageNotifyRoutine(KnDbgTimelineImageNotify);
+        }
+        if (flag == timeline_callbacks::Thread)
+        {
+            return remove ? PsRemoveCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify) :
+                PsSetCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify);
+        }
+        return STATUS_INVALID_PARAMETER;
+    };
+    auto call = [&](KNDBG_UINT32 flag, bool remove, KNDBG_UINT64& requested, KNDBG_UINT64& returned) {
+        LARGE_INTEGER utc;
+        KeQuerySystemTimePrecise(&utc);
+        requested = utc.QuadPart;
+        const auto status = notify(flag, remove);
+        KeQuerySystemTimePrecise(&utc);
+        returned = utc.QuadPart;
+        return status;
+    };
+    auto publish = [](KNDBG_UINT32 flags) { InterlockedExchange(&g_KnDbgTimelineFlags, static_cast<LONG>(flags)); };
+    return static_cast<NTSTATUS>(start ? timeline_callbacks::Start(receipt, call, publish) :
+        timeline_callbacks::Stop(receipt, call, publish));
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
-static NTSTATUS KnDbgTimelineRegisterCallbacks()
+static NTSTATUS KnDbgTimelineStopOnRelease()
 {
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-
-    do
-    {
-        if (g_KnDbgTimelineProcessRegistered != FALSE &&
-            g_KnDbgTimelineImageRegistered != FALSE &&
-            g_KnDbgTimelineThreadRegistered != FALSE)
-        {
-            InterlockedExchange(&g_KnDbgTimelineEnabled, 1);
-            status = STATUS_SUCCESS;
-            break;
-        }
-
-        if (g_KnDbgTimelineProcessRegistered != FALSE ||
-            g_KnDbgTimelineImageRegistered != FALSE ||
-            g_KnDbgTimelineThreadRegistered != FALSE)
-        {
-            KnDbgTimelineUnregisterCallbacks();
-        }
-
-        status = PsSetCreateProcessNotifyRoutineEx(KnDbgTimelineProcessNotify, FALSE);
-        if (!NT_SUCCESS(status))
-        {
-            break;
-        }
-        g_KnDbgTimelineProcessRegistered = TRUE;
-
-        status = PsSetLoadImageNotifyRoutine(KnDbgTimelineImageNotify);
-        if (!NT_SUCCESS(status))
-        {
-            KnDbgTimelineUnregisterCallbacks();
-            break;
-        }
-        g_KnDbgTimelineImageRegistered = TRUE;
-
-        status = PsSetCreateThreadNotifyRoutine(KnDbgTimelineThreadNotify);
-        if (!NT_SUCCESS(status))
-        {
-            KnDbgTimelineUnregisterCallbacks();
-            break;
-        }
-        g_KnDbgTimelineThreadRegistered = TRUE;
-
-        InterlockedExchange(&g_KnDbgTimelineEnabled, 1);
-        status = STATUS_SUCCESS;
-    } while (false);
-
+    KeWaitForSingleObject(&g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
+    KNDBG_TIMELINE_CONTROL_RECEIPT receipt{};
+    receipt.AfterFlags = InterlockedCompareExchange(&g_KnDbgTimelineFlags, 0, 0);
+    const NTSTATUS status = KnDbgTimelineApplyCallbacks(false, receipt);
+    KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
     return status;
 }
 
@@ -1534,7 +1503,7 @@ static NTSTATUS KnDbgHandleGetVersion(PIRP Irp, PIO_STACK_LOCATION Stack, PVOID 
         response->DriverMinor = 6;
         response->MaxTransferSize = KNDBG_MAX_TRANSFER_SIZE;
         response->Flags = KNDBG_VERSION_FLAG_SINGLE_CONTROLLER | KNDBG_VERSION_FLAG_DEFAULT_WRITE_DENIED |
-            KNDBG_VERSION_FLAG_READ_OBSERVATION;
+            KNDBG_VERSION_FLAG_READ_OBSERVATION | KNDBG_VERSION_FLAG_TIMELINE_CONTROL_RECEIPT;
         if (KnDbgIsLa57Active())
         {
             response->Flags |= KNDBG_VERSION_FLAG_LA57_ACTIVE;
@@ -1600,51 +1569,32 @@ static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, P
             status = STATUS_INVALID_DEVICE_STATE;
             break;
         }
-        ULONG inputLength = Stack->Parameters.DeviceIoControl.InputBufferLength;
-        if (!KnDbgCheckInputHeader(Buffer, inputLength, sizeof(KNDBG_TIMELINE_CONTROL_REQUEST)))
-        {
-            status = STATUS_INVALID_PARAMETER;
-            break;
-        }
-        if (Stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(KNDBG_TIMELINE_CONTROL_REQUEST))
-        {
-            status = STATUS_BUFFER_TOO_SMALL;
-            break;
-        }
-
         PKNDBG_FILE_CONTEXT fileContext = reinterpret_cast<PKNDBG_FILE_CONTEXT>(Stack->FileObject->FsContext);
-        if (fileContext == nullptr || fileContext->WriteEnabled == FALSE)
-        {
-            status = STATUS_ACCESS_DENIED;
-            break;
-        }
-
-        KNDBG_TIMELINE_CONTROL_REQUEST request = {};
-        RtlCopyMemory(&request, Buffer, sizeof(request));
-        if (request.Acknowledge != KNDBG_WRITE_ACK_MAGIC)
-        {
-            status = STATUS_ACCESS_DENIED;
-            break;
-        }
-
+        KNDBG_TIMELINE_CONTROL_RECEIPT receipt{};
+        bool detailed = false;
+        status = static_cast<NTSTATUS>(timeline_callbacks::Prepare(Buffer, Stack->Parameters.DeviceIoControl.InputBufferLength,
+            Stack->Parameters.DeviceIoControl.OutputBufferLength, fileContext && fileContext->WriteEnabled, receipt, detailed));
+        if (!NT_SUCCESS(status)) { break; }
+        const auto& request = receipt.Request;
         status = KeWaitForSingleObject(
             &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
         if (status != STATUS_SUCCESS)
         {
             break;
         }
+        receipt.BeforeFlags = InterlockedCompareExchange(&g_KnDbgTimelineFlags, 0, 0);
+        receipt.AfterFlags = receipt.BeforeFlags;
         if (request.Action == KNDBG_TIMELINE_CONTROL_START)
         {
             status = KnDbgTimelineEnsureRing(request.Capacity);
             if (NT_SUCCESS(status))
             {
-                status = KnDbgTimelineRegisterCallbacks();
+                status = KnDbgTimelineApplyCallbacks(true, receipt);
             }
         }
         else if (request.Action == KNDBG_TIMELINE_CONTROL_STOP)
         {
-            KnDbgTimelineUnregisterCallbacks();
-            status = STATUS_SUCCESS;
+            status = KnDbgTimelineApplyCallbacks(false, receipt);
         }
         else if (request.Action == KNDBG_TIMELINE_CONTROL_CLEAR)
         {
@@ -1660,7 +1610,14 @@ static NTSTATUS KnDbgHandleTimelineControl(PIRP Irp, PIO_STACK_LOCATION Stack, P
         }
         KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
 
-        if (NT_SUCCESS(status))
+        if (detailed)
+        {
+            receipt.OperationStatus = static_cast<KNDBG_UINT32>(status);
+            RtlCopyMemory(Buffer, &receipt, sizeof(receipt));
+            information = sizeof(receipt);
+            status = STATUS_SUCCESS;
+        }
+        else if (NT_SUCCESS(status))
         {
             information = sizeof(KNDBG_TIMELINE_CONTROL_REQUEST);
         }
@@ -1695,22 +1652,7 @@ static NTSTATUS KnDbgHandleTimelineStatus(PIRP Irp, PIO_STACK_LOCATION Stack, PV
         response->NextSequence = g_KnDbgTimelineNextSequence;
         KeReleaseSpinLock(&g_KnDbgTimelineLock, oldIrql);
 
-        if (InterlockedCompareExchange(&g_KnDbgTimelineEnabled, 0, 0) != 0)
-        {
-            response->Flags |= KNDBG_TIMELINE_STATUS_ACTIVE;
-        }
-        if (g_KnDbgTimelineProcessRegistered != FALSE)
-        {
-            response->Flags |= KNDBG_TIMELINE_STATUS_PROCESS_CALLBACK;
-        }
-        if (g_KnDbgTimelineImageRegistered != FALSE)
-        {
-            response->Flags |= KNDBG_TIMELINE_STATUS_IMAGE_CALLBACK;
-        }
-        if (g_KnDbgTimelineThreadRegistered != FALSE)
-        {
-            response->Flags |= KNDBG_TIMELINE_STATUS_THREAD_CALLBACK;
-        }
+        response->Flags = InterlockedCompareExchange(&g_KnDbgTimelineFlags, 0, 0);
 
         information = sizeof(*response);
         status = STATUS_SUCCESS;
@@ -3544,10 +3486,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         g_KnDbgOwnerPid = 0;
         g_KnDbgOwnerOpenCount = 0;
         g_KnDbgOwnerClosing = FALSE;
-        g_KnDbgTimelineEnabled = 0;
-        g_KnDbgTimelineProcessRegistered = FALSE;
-        g_KnDbgTimelineImageRegistered = FALSE;
-        g_KnDbgTimelineThreadRegistered = FALSE;
+        g_KnDbgTimelineFlags = 0;
         g_KnDbgTimelineRing = nullptr;
         g_KnDbgTimelineCapacity = 0;
         g_KnDbgTimelineHead = 0;
@@ -3644,10 +3583,14 @@ static VOID KnDbgUnload(PDRIVER_OBJECT DriverObject)
         }
     }
 
-    KeWaitForSingleObject(
-        &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
-    KnDbgTimelineUnregisterCallbacks();
-    KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
+    // Unload cannot return while an OS callback may still point into this
+    // image. An unexpected removal error keeps just that registration for retry.
+    while (!NT_SUCCESS(KnDbgTimelineStopOnRelease()))
+    {
+        LARGE_INTEGER retryDelay;
+        retryDelay.QuadPart = -10000000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &retryDelay);
+    }
 
     if (g_KnDbgTimelineRing != nullptr)
     {
@@ -3719,10 +3662,12 @@ static NTSTATUS KnDbgCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 ExAcquireFastMutex(&g_KnDbgIotraceControlLock);
                 KnDbgIotraceDisarmLocked(TRUE);
                 ExReleaseFastMutex(&g_KnDbgIotraceControlLock);
-                KeWaitForSingleObject(
-                    &g_KnDbgTimelineControlLock, Executive, KernelMode, FALSE, nullptr);
-                KnDbgTimelineUnregisterCallbacks();
-                KeReleaseMutex(&g_KnDbgTimelineControlLock, FALSE);
+                const NTSTATUS removal = KnDbgTimelineStopOnRelease();
+                if (!NT_SUCCESS(removal))
+                {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                        "KnLiveDbg: timeline callback cleanup pending (NTSTATUS 0x%08X)\n", static_cast<ULONG>(removal)));
+                }
                 ExAcquireFastMutex(&g_KnDbgOwnerLock);
                 g_KnDbgOwnerPid = 0;
                 g_KnDbgOwnerClosing = FALSE;

@@ -1,4 +1,5 @@
 #include "DeviceClient.h"
+#include "TimelineControlObservation.h"
 #include "CommandInput.h"
 #include "NativeHandleSnapshot.h"
 #include "SessionWritePolicy.h"
@@ -43,11 +44,12 @@ bool DeviceClient::Open(std::wstring* error)
 
 bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
 {
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
     bool ok = false;
 
     do
     {
-        Close();
+        CloseLocked();
 
         if (userDeviceName.empty())
         {
@@ -86,13 +88,17 @@ bool DeviceClient::Open(const std::wstring& userDeviceName, std::wstring* error)
 
 void DeviceClient::Close()
 {
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    CloseLocked();
+}
+
+void DeviceClient::CloseLocked()
+{
     observationEpoch_.store(0);
     pagingLevels_.store(0);
     versionFlags_.store(0);
-    // Keep the port and device close in the same critical section as control
-    // requests. A concurrent status query must not reopen a lease between the
-    // port close and the device becoming unavailable.
-    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    // A control holds the same lock from connection identity lookup through
+    // completion. A replacement cannot inherit the old handle or capabilities.
     if (managedCallbackPort_ != INVALID_HANDLE_VALUE)
     {
         CloseHandle(managedCallbackPort_);
@@ -107,7 +113,7 @@ void DeviceClient::Close()
 
 bool DeviceClient::IsOpen() const
 {
-    return device_ != INVALID_HANDLE_VALUE;
+    return ObservationEpoch() != 0;
 }
 
 void DeviceClient::CloseManagedCallbacks()
@@ -214,7 +220,8 @@ bool DeviceClient::Ioctl(
     DWORD outLength,
     DWORD* returned,
     std::wstring* error,
-    DWORD* deviceError)
+    DWORD* deviceError,
+    bool reportFailureBytes)
 {
     bool ok = false;
 
@@ -242,6 +249,7 @@ bool DeviceClient::Ioctl(
         if (!DeviceIoControl(device_, code, buffer, inLength, buffer, outLength, &localReturned, nullptr))
         {
             const DWORD lastError = GetLastError();
+            if (reportFailureBytes && returned) { *returned = localReturned; }
             if (deviceError != nullptr)
             {
                 *deviceError = lastError;
@@ -266,6 +274,7 @@ bool DeviceClient::Ioctl(
 
 bool DeviceClient::QueryVersion(std::wstring* error)
 {
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
     bool ok = false;
     pagingLevels_.store(0);
     versionFlags_.store(0);
@@ -557,22 +566,21 @@ bool DeviceClient::ReadIdt(
 bool DeviceClient::ControlTimeline(
     uint32_t action,
     uint32_t capacity,
-    std::wstring* error)
+    std::wstring* error,
+    TimelineControlLease* acquired,
+    const TimelineControlLease* expected)
 {
-    KNDBG_TIMELINE_CONTROL_REQUEST request = {};
-    request.Size = sizeof(request);
-    request.Action = action;
-    request.Capacity = capacity;
-    request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
-
-    DWORD returned = 0;
-    return Ioctl(
-        IOCTL_KNDBG_TIMELINE_CONTROL,
-        &request,
-        sizeof(request),
-        sizeof(request),
-        &returned,
-        error);
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    if (!IsOpen())
+    {
+        if (acquired) { *acquired = {}; }
+        if (error) { *error = L"Device is not open"; }
+        return false;
+    }
+    auto send = [this](void* buffer, DWORD in, DWORD out, DWORD* returned, DWORD* win32, std::wstring* detail)
+    { return Ioctl(IOCTL_KNDBG_TIMELINE_CONTROL, buffer, in, out, returned, detail, win32, true); };
+    const bool detailed = (versionFlags_.load() & KNDBG_VERSION_FLAG_TIMELINE_CONTROL_RECEIPT) != 0;
+    return GetTimelineControlJournal().Submit(action, capacity, ObservationEpoch(), detailed, send, error, acquired, expected);
 }
 
 bool DeviceClient::QueryTimelineStatus(
