@@ -175,6 +175,14 @@ no ownership record.
 | `kmon_user_inventory` | Resolve the generation and image path for a PID admitted to KMON's user-process inventory. | Limited query (`0x1000`) |
 | `hunt_public_details` | Check the public image and session for a process in the hunt inventory. The handle stays open during the session lookup. | Limited query (`0x1000`) |
 | `hunt_package_identity` | Look up package metadata for a snapshot with a known creation time. | Limited query and synchronize (`0x101000`) |
+| `layout_collection` | Open the process for one slice of a layout sweep. A continuation carries the creation time from the unfinished sweep. | Query and VM read (`0x410`), then query only (`0x400`) if the first open fails |
+| `layout_verification` | Recheck a queued layout candidate against its original process and mapping. A candidate already past its 30-second window produces an expired scheduler outcome and zero handle calls. | Query and VM read (`0x410`) |
+
+If an explicit PID watch is withdrawn before the slice runs and there are no
+name watches, the collector reports `process_outside_scope` without opening
+the process. If a layout slice falls back to query-only access, the timeline
+keeps both open results. The close refers to the successful open. Windows permits
+region metadata queries with this access. [VirtualQueryEx access requirements](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex)
 
 An open can succeed for a process that has exited while another owner still
 holds a reference. The row reports that acquisition. Each collector applies

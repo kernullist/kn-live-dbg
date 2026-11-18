@@ -181,8 +181,7 @@ bool ProcessLayoutCandidateCurrent(HANDLE process, const ProcessLayoutCandidate&
     {
         MEMORY_BASIC_INFORMATION region{};
         const uint64_t now = GetTickCount64();
-        if (process == nullptr || candidate.Identity.ProcessId <= 4 || now < candidate.ObservedMs ||
-            now - candidate.ObservedMs > process_layout::MaxSweepMs ||
+        if (process == nullptr || candidate.Identity.ProcessId <= 4 || !candidate.WithinObservationWindow(now) ||
             !candidate.Identity.SameInstance(ObserveProcessIdentity(candidate.Identity.ProcessId, process)) || !Alive(process) ||
             VirtualQueryEx(process, reinterpret_cast<void*>(candidate.Region.Base), &region, sizeof(region)) != sizeof(region) ||
             !ProcessLayoutRegionMatches(candidate.Region, region))
@@ -445,18 +444,24 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     using namespace process_layout;
     const auto begin = GetTickCount64();
     entry.LastAttemptMs = begin;
-    Handle process{OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, entry.Pid)};
-    if (process.Value == nullptr)
+    // A PID-only watch can shrink between discovery and this turn. Name
+    // watches still need the pinned image name, which can change on PID reuse.
+    if (!scope.All && scope.Names.empty() && !scope.Pids.count(entry.Pid))
     {
-        process.Value = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, entry.Pid);
-    }
-    if (process.Value == nullptr)
-    {
-        Fail(entry, L"process_query_unavailable", GetLastError(), notice);
+        Fail(entry, L"process_outside_scope", 0, notice);
         return;
     }
-    const auto identity = ObserveProcessIdentity(entry.Pid, process.Value);
-    if (identity.CreateTime == 0 || identity.BootId.empty() || !Alive(process.Value))
+    // Discovery targets a PID. Only a continuation already has a generation.
+    ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::LayoutCollection, entry.Pid,
+        entry.Pending ? entry.Pending->Identity.CreateTime : 0);
+    if (!owner.Open(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ) && !owner.Open(PROCESS_QUERY_INFORMATION))
+    {
+        Fail(entry, L"process_query_unavailable", owner.Acquisition().Status, notice);
+        return;
+    }
+    const HANDLE process = owner.get();
+    const auto identity = ObserveProcessIdentity(entry.Pid, process);
+    if (identity.CreateTime == 0 || identity.BootId.empty() || !Alive(process))
     {
         Fail(entry, L"process_identity_unavailable_or_exited", 0, notice);
         return;
@@ -479,7 +484,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
     {
         wchar_t image[32768]{};
         DWORD length = 32768;
-        if (QueryFullProcessImageNameW(process.Value, 0, image, &length) && length != 0 && length < 32768)
+        if (QueryFullProcessImageNameW(process, 0, image, &length) && length != 0 && length < 32768)
         {
             const std::wstring path(image, length);
             entry.Name = path.substr(path.find_last_of(L"\\/") + 1);
@@ -515,7 +520,7 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
         !stop.load() && GetTickCount64() - begin < 10; ++queries)
     {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQueryEx(process.Value, reinterpret_cast<void*>(sweep.Cursor), &mbi, sizeof(mbi)) != sizeof(mbi))
+        if (VirtualQueryEx(process, reinterpret_cast<void*>(sweep.Cursor), &mbi, sizeof(mbi)) != sizeof(mbi))
         {
             Fail(entry, L"virtual_query_failed", GetLastError(), notice);
             return;
@@ -528,9 +533,9 @@ void ProcessLayoutMonitor::Advance(Entry& entry, const ProcessLayoutScope& scope
             return;
         }
         remainingRows -= sweep.Regions.size() - prior;
-        CollectImageName(sweep, row, process.Value, remainingNames, remainingNameCharacters);
+        CollectImageName(sweep, row, process, remainingNames, remainingNameCharacters);
     }
-    if (!entry.Identity.SameInstance(ObserveProcessIdentity(entry.Pid, process.Value)) || !Alive(process.Value))
+    if (!entry.Identity.SameInstance(ObserveProcessIdentity(entry.Pid, process)) || !Alive(process))
     {
         Fail(entry, L"process_changed_or_exited", 0, notice);
         return;
@@ -1123,6 +1128,10 @@ std::wstring ProcessLayoutSchedulingFixturesJson()
 
 bool ProcessLayoutMonitorSelfTest()
 {
+    ProcessLayoutCandidate timed;
+    timed.ObservedMs = UINT64_MAX - process_layout::MaxSweepMs - 1;
+    if (timed.WithinObservationWindow(timed.ObservedMs - 1) || !timed.WithinObservationWindow(timed.ObservedMs) ||
+        !timed.WithinObservationWindow(UINT64_MAX - 1) || timed.WithinObservationWindow(UINT64_MAX)) { return false; }
     ProcessLayoutMonitor monitor;
     monitor.Reset();
     ProcessLayoutMonitor::Entry entry;
@@ -1146,6 +1155,16 @@ bool ProcessLayoutMonitorSelfTest()
     {
         return true;
     };
+    {
+        ProcessLayoutScope withdrawn;
+        withdrawn.All = false;
+        ProcessLayoutMonitor::Entry prior;
+        prior.Pid = entry.Pid;
+        const auto before = ControllerProcessHandles().Snapshot().Total;
+        monitor.Advance(prior, withdrawn, stop, notice, candidate);
+        if (prior.Status != L"process_outside_scope" || prior.Identity.CreateTime || prior.Pending ||
+            ControllerProcessHandles().Snapshot().Total != before) { return false; }
+    }
     {
         // Retained synthetic notices keep every slot occupied while a real,
         // self-only inventory exercises capacity deferral without spawning

@@ -1,4 +1,5 @@
 #include "ProcessObservationSource.h"
+#include "ProcessLayoutMonitor.h"
 #include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 
@@ -172,6 +173,49 @@ bool ProcessHandleObserverSelfTest(bool emit)
 {
     if (!OwnershipAndErrors(emit) || !ConcurrentRetention()) { return false; }
     if (emit) { std::wcout << L"[handle.ownership] calls=10 acquired=4 successful_closes=3 fixture_cleanup=passed concurrent_calls=168 retained=64\n"; }
+    return true;
+}
+
+bool LayoutProcessHandleFixture()
+{
+    const auto release = [](void* page) { VirtualFree(page, 0, MEM_RELEASE); };
+    const std::unique_ptr<void, decltype(release)> guard(
+        VirtualAlloc(nullptr, 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD), release);
+    if (!guard) { return false; }
+    const auto command = [](const wchar_t* expected) {
+        std::wstring line;
+        return std::getline(std::wcin, line) && line == expected;
+    };
+    // Keep the page allocated while the parent samples each protection change.
+    std::wcout << L"[layout.guard] " << reinterpret_cast<uintptr_t>(guard.get()) << std::endl;
+    if (!command(L"collect")) { return false; }
+    ProcessLayoutMonitor monitor;
+    monitor.Reset();
+    ProcessLayoutScope self;
+    self.All = false;
+    self.Pids.insert(GetCurrentProcessId());
+    std::atomic<bool> stop{false};
+    TimelineStore timeline;
+    std::wstring status;
+    const auto deadline = GetTickCount64() + 10000;
+    while (status.empty() && GetTickCount64() < deadline)
+    {
+        monitor.Tick(self, stop, [&](const ProcessLayoutNotice& item) {
+            status = item.Status;
+            return true;
+        }, [](ProcessLayoutCandidate) { return true; });
+        if (!timeline.IngestProcessHandleActions(ControllerProcessHandles().Snapshot()).Warnings.empty()) { return false; }
+    }
+    const auto stats = monitor.Stats();
+    if (status.empty() || stats.Completed + stats.Failed != 1) { return false; }
+    std::wcout << L"[layout.collect] completed=" << stats.Completed << L" failed=" << stats.Failed
+        << L" rows=" << stats.StoredRows << L" status=" << status << std::endl;
+    DWORD previous = 0;
+    if (!command(L"clear") || !VirtualProtect(guard.get(), 1, PAGE_READWRITE, &previous) ||
+        previous != (PAGE_READWRITE | PAGE_GUARD)) { return false; }
+    std::wcout << L"[layout.control] cleared" << std::endl;
+    if (!command(L"finish")) { return false; }
+    for (const auto& row : timeline.AllEvents()) { std::wcout << L"[layout.handle] " << TimelineEventToJson(row) << L"\n"; }
     return true;
 }
 

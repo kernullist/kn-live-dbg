@@ -7,6 +7,52 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Layout collection and verification handles, 2026-11-19
+
+Windows x64 build 28000.3501 ran the Release controller with SHA-256
+`8129c33f10c6fc51f50e96285d632d7e9badcc9cd765adac537796ea2167232b`.
+The parent supervised a fresh controller for each case, independently tried
+both Windows access masks and compared the exported handle rows with the PID
+and creation time from its own handle to the child.
+[Layout handle sites](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
+| Access to the controller's own process | Observed collection |
+| --- | --- |
+| Query and VM read allowed | Two slices completed one sweep. Each opened the process with `0x410` and closed it. |
+| VM read denied | Both `0x410` opens returned Win32 error 5. Both `0x400` retries succeeded and closed. The sweep completed. |
+| Query denied | Both opens in the first slice returned Win32 error 5. The collector reported `process_query_unavailable` with zero stored regions or closes. |
+
+In each run the parent queried one private guard page before the sweep and
+after the collector returned. Its mapping, size and protection matched. The
+child then explicitly cleared the guard and the parent observed the change on
+the same page. These samples cover the guard flag on that page. The handle
+receipts retain `effect_verified=false`.
+
+The verification queue dispatched four candidates. Before the expiry fix,
+all four opened and closed the process. With the fix, two current mappings
+qualified, one creation-time mismatch was rejected after opening the process,
+and one expired candidate made zero handle calls. The standalone test passed
+an existing PID entry and an empty PID-only watch to the collector's next
+slice. It reported `process_outside_scope` with zero new handle calls.
+Boundary checks included the final valid millisecond, the next millisecond
+and a future observation.
+
+The Release standalone layout fixture passed 105,120 core checks and 1,017
+queue checks. The combined scheduling oracle passed 7,835 checks. The
+optional MSVC AddressSanitizer fixture compiled, but its Windows runtime
+stopped at `interception_win.cpp:193` before the test body. Instrumented
+execution and live driver delivery remain unverified.
+
+The same Release controller passed 3,081 command checks across 261 routes
+and 570 console checks. From 00:31 to 00:50 KST the host recorded no new
+reboot or bugcheck events or crash dumps. The post-run check found zero
+remaining test processes, running test drivers or fixture listeners.
+
+To reproduce the access and guard cases, run
+`python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`
+with 64-bit Python. The scheduling counts and serialized handle results also
+come from `KnLiveDbg.exe --self-test layout-scheduler`.
+
 ## Process metadata collector handles, 2026-11-19
 
 Windows x64 build 28000.3501 ran the Release controller with SHA-256

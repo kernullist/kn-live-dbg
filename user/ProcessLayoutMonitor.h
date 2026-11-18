@@ -86,6 +86,11 @@ struct ProcessLayoutCandidate
     std::wstring ImageName;
     // Local scheduling metadata; never used to renew ObservedMs or identity.
     uint64_t SchedulingId = 0, LastObservedMs = 0, Rediscoveries = 0;
+
+    bool WithinObservationWindow(uint64_t now) const
+    {
+        return now >= ObservedMs && now - ObservedMs <= process_layout::MaxSweepMs;
+    }
 };
 
 // Tick has a single caller. Readers copy immutable snapshots under Mutex.

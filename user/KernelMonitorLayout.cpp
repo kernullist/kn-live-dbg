@@ -1,5 +1,6 @@
 #include "KernelMonitor.h"
 #include "KmonHandleTracking.h"
+#include "TimelineStore.h"
 
 #include <chrono>
 #include <memory>
@@ -175,8 +176,12 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
         LayoutMaxQueueWaitMs.store((std::max)(LayoutMaxQueueWaitMs.load(), queueWait));
         LayoutMaxSourceWaitMs.store((std::max)(LayoutMaxSourceWaitMs.load(), sourceWait));
         const auto pid = item.Identity.ProcessId;
-        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        const std::unique_ptr<void, decltype(&CloseHandle)> handle(process, &CloseHandle);
+        ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::LayoutVerification, pid, item.Identity.CreateTime);
+        if (item.WithinObservationWindow(GetTickCount64()))
+        {
+            owner.Open(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+        }
+        const HANDLE process = owner.get();
         const auto current = [&]()
         {
             return ProcessLayoutCandidateCurrent(process, item);
@@ -195,7 +200,7 @@ void KernelMonitor::DrainLayoutCandidates(bool finalDrain, const wchar_t* before
             rejected.Observation.Source = item.Role;
             rejected.Observation.Coverage.Attempted = true;
             const uint64_t now = GetTickCount64();
-            const bool expired = now < item.ObservedMs || now - item.ObservedMs > process_layout::MaxSweepMs;
+            const bool expired = !item.WithinObservationWindow(now);
             attempt.Outcome = expired ? KmonLayoutOutcome::Expired : KmonLayoutOutcome::Rejected;
             if (expired) { LayoutExpired.fetch_add(1); }
             rejected.Observation.Coverage.Reason = expired ? L"candidate_expired" : L"process_or_mapping_changed_or_unavailable";
@@ -365,6 +370,7 @@ bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics)
         }
     }
     const auto pending = monitor.LayoutCandidates.Json(GetTickCount64());
+    const auto priorHandleSequence = ControllerProcessHandles().Snapshot().Total;
     monitor.DrainLayoutCandidates(false);
     // A slow first turn may use the cooperative budget; finish only admitted work.
     const auto deadline = GetTickCount64() + 10000;
@@ -374,6 +380,12 @@ bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics)
     check(count.Attempts == 4 && count.Qualified == 2 && count.Outcomes[static_cast<size_t>(KmonLayoutOutcome::Expired)] == 1 &&
         count.Outcomes[static_cast<size_t>(KmonLayoutOutcome::Rejected)] == 1 && count.InvalidClocks == 0,
         "mapping-success-stale-identity-and-original-expiry-remain-distinct");
+    auto normalHandles = ControllerProcessHandles().Snapshot();
+    auto& actions = normalHandles.Actions;
+    actions.erase(std::remove_if(actions.begin(), actions.end(), [&](const ProcessHandleAction& action) {
+        return action.Sequence <= priorHandleSequence || action.Site != ProcessHandleSite::LayoutVerification;
+    }), actions.end());
+    check(actions.size() == 6, "expired-original-skips-open-while-three-fresh-candidates-open-and-close");
     MEMORY_BASIC_INFORMATION guard{};
     check(VirtualQuery(memory + 2 * 4096, &guard, sizeof(guard)) == sizeof(guard) && (guard.Protect & PAGE_GUARD) != 0,
         "mapping-qualification-does-not-consume-guard");
@@ -408,10 +420,16 @@ bool KmonLayoutSchedulingIntegrationSelfTest(std::wstring* diagnostics)
     const auto collection = collector.SchedulingJson(GetTickCount64());
     if (diagnostics != nullptr)
     {
+        TimelineStore timeline;
+        timeline.IngestProcessHandleActions(normalHandles);
+        const auto events = timeline.AllEvents();
+        TimelineQueryOptions chronological;
+        chronological.NewestFirst = false;
         *diagnostics = L"{\"schema\":\"kn.layout_scheduler_test.v1\",\"driver_loaded\":false,\"native_byte_reads\":false,"
             L"\"corpus\":\"owned_native_mapping_metadata_guard_expiry_and_identity\",\"passed\":" +
             std::wstring(failures == 0 ? L"true" : L"false") + L",\"checks\":" + std::to_wstring(checks) +
-            L",\"pending\":" + pending + L",\"normal\":" + normal + L",\"retry\":" + retried + L",\"shutdown\":" + stopped + L",\"collection\":" + collection + L"}";
+            L",\"pending\":" + pending + L",\"normal\":" + normal + L",\"retry\":" + retried + L",\"shutdown\":" + stopped + L",\"collection\":" + collection +
+            L",\"verification_handle_timeline\":" + BuildTimelineEventsJson(events, chronological, events.size()) + L"}";
     }
     std::fprintf(stderr, "[layout.scheduler] checks=%u failed=%u\n", checks, failures);
     return failures == 0;

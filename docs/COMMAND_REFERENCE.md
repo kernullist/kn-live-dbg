@@ -490,10 +490,12 @@ to the original job ID. Unknown historical acquisition times stay unknown. See
 
 `KnLiveDbg.exe --self-test layout-scheduler` checks an owned native layout sweep
 and mapping qualification, including a guard page, stale identity, original
-expiry, a fresh observation retained for retry, and shutdown separation. It
-emits JSON and returns 0 on success, 1 on failure or 2 for extra arguments;
-no driver is loaded. Mapping qualification does not mean bytes were captured or
-code verified. The private pipeline fields `layout_collection_scheduling_json`
+expiry, a fresh observation retained for retry, and shutdown separation. Its
+JSON places the four initial outcomes in `normal.normal.outcomes` and their
+handle calls in `verification_handle_timeline.events`. It runs without a
+driver and returns 0 on success, 1 on failure or 2 for extra arguments.
+Mapping qualification checks the process identity and region metadata. The
+private pipeline fields `layout_collection_scheduling_json`
 and `layout_verification_scheduling_json` expose original debt, bounded scopes,
 quota deferrals, collection/qualification latency and separate failure samples.
 See [layout scheduling](ARCHITECTURE.md#layout-collection-and-verification-scheduling).

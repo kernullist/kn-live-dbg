@@ -3098,6 +3098,8 @@ static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
     case ProcessHandleSite::KmonUserInventory: return L"kmon_user_inventory";
     case ProcessHandleSite::HuntPublicDetails: return L"hunt_public_details";
     case ProcessHandleSite::HuntPackageIdentity: return L"hunt_package_identity";
+    case ProcessHandleSite::LayoutCollection: return L"layout_collection";
+    case ProcessHandleSite::LayoutVerification: return L"layout_verification";
     }
     return L"unknown";
 }

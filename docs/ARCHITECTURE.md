@@ -2188,7 +2188,10 @@ Retirement removes membership, and a later rediscovery joins again. Failed
 collection preserves the original observation-due time and previous completed
 snapshot; its existing retry cooldown still applies. A completed sweep sets the
 next observation due time from its actual finish. First discovery is an
-inventory PID observation until the process instance is qualified.
+inventory PID observation until the process instance is qualified. With a
+PID-only watch, the worker checks current membership before opening a process
+left over from the last inventory. Name watches recheck the pinned image name
+when the process generation changes.
 
 Collection keeps its existing 256-query/10 ms cooperative slice, 50 ms tick,
 30-second sweep window and bounded region/name storage. These budgets include
@@ -2208,6 +2211,10 @@ ordinary subject and class cursors intact. New subjects cannot join ahead of
 existing waiters. Existing per-sweep candidate budgets remain in force.
 
 A duplicate retains the original candidate, queue time and 30-second expiry.
+The verifier checks that window before opening the process and again when it
+validates the mapping. Candidates already expired at dispatch still count as
+attempts. The [observer timeline](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+records the handle calls made by both the collection and verification workers.
 Last submitted observation time and rediscovery count are recorded separately;
 the count describes repeated submissions, not unseen mapping changes. Equality
 requires the same canonical process identity, optional EPROCESS/session

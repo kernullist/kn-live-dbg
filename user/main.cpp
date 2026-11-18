@@ -54261,6 +54261,10 @@ int wmain(int argc, wchar_t** argv)
         {
             return TiObserverOwnershipSelfTest(false) && TiObserverOwnershipSelfTest(true) ? 0 : 1;
         }
+        if (argc == 3 && ToLower(argv[2]) == L"layout-handle-observer")
+        {
+            return LayoutProcessHandleFixture() ? 0 : 1;
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"collector-handle-observer")
         {
             if (argc != 4 && !(argc == 5 && ToLower(argv[4]) == L"retention")) { return 2; }

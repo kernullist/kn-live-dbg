@@ -1,6 +1,7 @@
 """Check the controller's process-handle timeline against its Windows process identity."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
 import json
@@ -57,6 +58,7 @@ def evidence(rows, calls, pid, created, first_sequence=1):
         assert (row["source"], row["domain"], row["entity"]) == ("observer", "observer_action", "process_handle:controller")
         assert (row["risk"], row["confidence"]) == ("info", "controller_reported")
         fields = row["evidence"]
+        assert row["summary"] == row["action"] + " " + fields["outcome"]
         assert fields["schema"] == "kn.observer_action.v1" and fields["ingest_origin"] == "local_controller"
         assert fields["actor"] == "controller" and fields["effect_verified"] == "false"
         assert fields["sequence"] == str(first_sequence + index - 1) and fields["controller_create_time"] == str(created)
@@ -142,6 +144,110 @@ def deny_child_access(child, mask):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
         release(descriptor)
+
+
+class MemoryBasicInformation(ctypes.Structure):
+    _fields_ = [("base", wintypes.LPVOID), ("allocation", wintypes.LPVOID),
+                ("allocation_protect", wintypes.DWORD), ("partition", wintypes.WORD),
+                ("size", ctypes.c_size_t), ("state", wintypes.DWORD),
+                ("protect", wintypes.DWORD), ("type", wintypes.DWORD)]
+
+
+def guard_mapping(handle, address):
+    if address > ctypes.c_size_t(-1).value:
+        raise ValueError("The supervisor needs a 64-bit Python to query this test page.")
+    query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQueryEx
+    query.argtypes = (wintypes.HANDLE, wintypes.LPCVOID, ctypes.POINTER(MemoryBasicInformation), ctypes.c_size_t)
+    query.restype = ctypes.c_size_t
+    row = MemoryBasicInformation()
+    if query(handle, address, ctypes.byref(row), ctypes.sizeof(row)) != ctypes.sizeof(row):
+        raise ctypes.WinError(ctypes.get_last_error())
+    assert row.base == row.allocation == address and row.state == 0x1000 and row.type == 0x20000
+    return (row.size, row.protect)
+
+
+def check_layout_collection(exe, directory, deny):
+    query, full = 0x400, 0x410
+    expected_status = {0: (0, 0), 0x10: (5, 0), query: (5, 5)}
+    with subprocess.Popen([exe, "--self-test", "layout-handle-observer"], cwd=directory, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8") as child, ThreadPoolExecutor(1) as reader:
+        def line():
+            return reader.submit(child.stdout.readline).result(timeout=30).strip()
+        def send(command):
+            child.stdin.write(command + "\n")
+            child.stdin.flush()
+        try:
+            ready = re.fullmatch(r"\[layout\.guard\] (\d+)", line())
+            assert ready, "missing owned guard mapping"
+            address = int(ready[1])
+            handle = int(child._handle)
+            created = creation_time(handle)
+            if deny:
+                deny_child_access(child, deny)
+            statuses = tuple(process_open_status(child.pid, mask) for mask in (full, query))
+            assert statuses == expected_status[deny]
+            before = guard_mapping(handle, address)
+            assert before[1] == 0x104
+            send("collect")
+            end = re.fullmatch(r"\[layout\.collect\] completed=(\d+) failed=(\d+) rows=(\d+) status=(\w+)", line())
+            assert end and guard_mapping(handle, address) == before
+            send("clear")
+            assert line() == "[layout.control] cleared"
+            assert guard_mapping(handle, address) == (before[0], 0x04)
+            output, errors = child.communicate("finish\n", timeout=30)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=15)
+        assert child.returncode == 0, errors[-400:]
+        pid = child.pid
+    completed, failed, stored = map(int, end.groups()[:3])
+    assert completed == int(0 in statuses) and failed == 1 - completed
+    assert (stored > 0) == bool(completed)
+    assert end[4] == ("initial_observation" if completed else "process_query_unavailable")
+    steps = [(full, statuses[0])]
+    if statuses[0]:
+        steps.append((query, statuses[1]))
+    calls = ["open"] * len(steps) + (["close"] if completed else [])
+    rows = [json.loads(s.removeprefix("[layout.handle] ")) for s in output.splitlines() if s.startswith("[layout.handle] ")]
+    turns, remainder = divmod(len(rows), len(calls))
+    assert turns > 0 and not remainder and (completed or turns == 1)
+    events = evidence(rows, calls * turns, pid, created)
+    for turn in range(turns):
+        batch = events[turn * len(calls):(turn + 1) * len(calls)]
+        for field in batch:
+            assert field["handle_site"] == "layout_collection" and field["requested_pid"] == str(pid)
+            assert field.get("requested_create_time") == (str(created) if turn else None)
+        for row, (mask, status) in zip(batch, steps):
+            assert row["requested_access"] == hex(mask) and row["status"] == str(status)
+            if status:
+                assert not {"acquisition_id", "observed_pid", "observed_create_time", "identity_win32_status"}.intersection(row)
+        if completed:
+            acquired, released = batch[-2:]
+            assert acquired["sequence"] == acquired["acquisition_id"] == released["acquisition_id"]
+            for row in (acquired, released):
+                assert row["status"] == row["identity_win32_status"] == "0" and row["observed_pid"] == str(pid)
+                assert row["observed_create_time"] == str(created) and row["identity_observed_at"] == "acquisition"
+    print(f"Layout collection: deny={deny:#x}, turns={turns}, calls={len(rows)}, guard retained and clear control observed.")
+
+
+def check_layout_verification(exe, directory):
+    output, pid, created = run_child(exe, ["--self-test", "layout-scheduler"], directory)
+    diagnostic = json.loads(output)
+    normal = diagnostic["normal"]["normal"]
+    assert diagnostic["passed"] and normal["attempts"] == "4" and normal["qualified_mappings"] == "2"
+    assert normal["outcomes"]["expired"] == normal["outcomes"]["mapping_or_identity_unavailable"] == "1"
+    timeline = diagnostic["verification_handle_timeline"]
+    assert timeline["count"] == timeline["totalStored"] == 6
+    rows = evidence(timeline["events"], ["open", "close"] * 3, pid, created)
+    assert sorted(int(row["requested_create_time"]) for row in rows[::2]) == [created - 1, created, created]
+    for opened, closed in zip(rows[::2], rows[1::2]):
+        assert opened["requested_access"] == "0x410" and opened["sequence"] == opened["acquisition_id"] == closed["acquisition_id"]
+        assert closed["requested_create_time"] == opened["requested_create_time"]
+        for row in (opened, closed):
+            assert row["handle_site"] == "layout_verification" and row["requested_pid"] == row["observed_pid"] == str(pid)
+            assert row["observed_create_time"] == str(created) and row["status"] == row["identity_win32_status"] == "0"
+    print("Verified 4 dispatched layout candidates, 3 opens and closes, 1 expired before open and 1 generation mismatch.")
 
 
 def collector_rows(output):
@@ -331,6 +437,9 @@ def main():
             check_denied_open(exe, args.policy_exe.resolve(strict=True), directory)
             print("Verified Windows access denial (5), one failed open, zero duplicates, reads or closes.")
         check_collectors(exe, directory, denied_cases=bool(args.policy_exe))
+        for deny in (0, 0x10, 0x400):
+            check_layout_collection(exe, directory, deny)
+        check_layout_verification(exe, directory)
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")
 
