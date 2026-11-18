@@ -41,11 +41,11 @@ def wire(port, authorization, session, method, params=None):
 
 
 class Listener:
-    def __init__(self, exe, root, password, grants=(), durable=True, target_ttl=None, access=()):
-        self.port = free_port()
+    def __init__(self, exe, root, password, grants=(), durable=True, target_ttl=None, access=(), tls=False, port=None):
+        self.port = free_port() if port is None else port
         self.password = password
         self.session = None
-        options = []
+        options = ["--tls"] if tls else []
         for grant in grants:
             options.extend(("--principal" if len(grant) == 2 else "--principal-target", *grant))
         for fingerprint, permission in access:

@@ -641,6 +641,12 @@ static int RunCommandAuditSelfTest()
         !commandinput::ParseListenerOptions({ L"--journal", L"a" }, 0, true, 51766, &listen, &error), L"mcp journal requires an explicit observe directory");
     const std::wstring fingerprint(64, L'a');
     const std::wstring secondFingerprint(64, L'b');
+    check(commandinput::ParseListenerOptions({L"--tls", L"--principal", fingerprint, L"ti", L"--observe"}, 0, false, 51766, &listen, &error) &&
+        listen.Tls && listen.BindAddress == L"127.0.0.1" &&
+        !commandinput::ParseListenerOptions({L"--tls", L"--observe"}, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({L"--tls", L"--tls", L"--observe", L"--principal", fingerprint, L"ti"}, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({L"--tls", L"--observe", L"--allow-write", L"--principal", fingerprint, L"ti"}, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({L"--tls"}, 0, true, 51767, &listen, &error), L"TLS requires scoped read access and a single MCP listener option");
     check(commandinput::ParseListenerOptions({L"--principal-access", secondFingerprint, L"operations", L"--observe",
         L"--principal", fingerprint, L"first", L"--principal", secondFingerprint, L"second",
         L"--principal-access", fingerprint, L"evidence"}, 0, false, 51766, &listen, &error) && listen.Principals.size() == 2 &&

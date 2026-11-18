@@ -898,6 +898,7 @@ if (Test-Path $vendorManifest)
 $toolScripts = @(
     "validate-public-content.py",
     "mcp-bridge.ps1",
+    "mcp-observe-tls.py",
     "update-byovd-intel.ps1",
     "run-hunt-clean-host.ps1",
     "owned-process-wait.ps1",

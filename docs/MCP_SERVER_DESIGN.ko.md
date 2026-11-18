@@ -97,7 +97,7 @@ DPAPI로 보호하며 디렉터리와 비밀번호에 연결한다. 요청 인�
 ## 출처별 조회 권한
 
 `mcp on --observe --principal <fingerprint> <source>`는 클라이언트의 bearer
-지문과 보관된 출처 하나를 연결한다. 루프백에서만 동작하며 `scope`는
+지문과 보관된 출처 하나를 연결한다. 기본 바인딩은 루프백이며 `scope`는
 `observe_source`다. 서버는 인증된 bearer로 세션과 조회 권한을 결정한다.
 클라이언트가 `initialize`를 다시 호출하면 자신의 세션 ID만 교체된다. 최대
 16개 주체를 설정할 수 있고, 각 누적 한도는 증거 조회가 허용된 주체끼리 균등하게 나눈다. 재접속 후에도
@@ -186,8 +186,21 @@ HTTP 전송부도 직렬화 후 다시 확인하므로 정산한 결과라도 �
 
 ## 전송과 권한
 
+`--observe --tls`는 출처 또는 프로세스 대상 권한이 하나 이상 있어야 시작된다.
+HTTP.sys에서 지정한 IPv4 주소와 포트의 인증서 및 구형 TLS 비활성화 설정을 확인한 뒤
+HTTPS 주소 하나를 등록한다. 인증 전 각 요청의 TLS 정보, 실제 로컬 주소와 포트,
+Host 및 MCP 경로를 확인하며 Origin 헤더가 있는 요청은 거절한다. 브리지는 TLS 1.2 이상에서
+인증서와 IP를 검증하고, 리디렉션과 평문 재시도를 거절한다. HTTPS 영수증은 전용 DPAPI
+도메인에 저장하며 승인 범위는 `https_observe_source` 또는 `https_observe_target`이다.
+루프백 저널은 기존 전송 방식에서 열 수 있다. [클라이언트 설정](MCP_SETUP.ko.md#보관-증거를-https로-조회하기)
+
+Python 3.10 이상으로 `tools/test-mcp-observe-tls.py --exe <KnLiveDbg.exe> --openssl <openssl.exe>`를
+실행하면 임시 CA를 사용한 브리지 검증, 제품 저널 복구와 인증서 바인딩 누락 검사를 수행한다.
+인증서를 설정한 루프백 포트에 `--native-port <포트> --ca-file <ca.pem>`을 지정하면 제품 리스너를
+직접 시작해 증거와 영수증을 조회하고 재시작 후 소유자의 영수증을 다시 확인한다.
+
 - HTTP `/mcp`, 기본 모든 인터페이스의 51766, 선택적 loopback/특정 bind.
-  TLS는 없다. MCP 프로토콜은 2025-06-18, 서버는 knlivedbg/0.1.0이다.
+  공유 비밀번호 세션은 평문 HTTP를 쓴다. MCP 프로토콜은 2025-06-18, 서버는 knlivedbg/0.1.0이다.
 - 세션 비밀번호 bearer 인증과 초기화 뒤 `Mcp-Session-Id`를 사용한다.
   비밀을 포함한 보조 파일은 현재 사용자 DACL과 원자적 교체를 사용한다.
 - 읽기 모드는 쓰기 도구를 숨기고 커널 gate도 끈다. `--allow-write`가 typed

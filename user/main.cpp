@@ -29684,14 +29684,14 @@ static std::wstring BuildAiEvidencePrompt(
     const std::wstring& commandLine,
     const CommandExecutionResult& result);
 static void StripTrailingEmptyStderrEcho(std::wstring* text);
-static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge);
+static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge, const std::wstring& url = {});
 static std::wstring BuildMcpClaudeCodeHttpServerJson(const std::wstring& url);
 static std::wstring BuildMcpCursorHttpJson(const std::wstring& url);
 static std::wstring BuildMcpCodexHttpToml(const std::wstring& url);
 static std::wstring BuildMcpCodexHttpPowerShellCommand(const std::wstring& url);
 static std::wstring BuildMcpGrokHttpToml(const std::wstring& url);
 static std::wstring BuildMcpGrokHttpPowerShellCommand(const std::wstring& url);
-static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath);
+static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath, const std::wstring& url = {});
 
 struct ConsoleSurfaceSelfTestContext
 {
@@ -30299,6 +30299,14 @@ static int RunConsoleSurfaceSelfTest()
                 loadEnv.find(L"invalid loopback URL") != std::wstring::npos &&
                 loadEnv.find(L"$e.password") != std::wstring::npos,
             L"mcp-load-env-exact-path-and-validation");
+        const std::wstring tlsUrl = L"https://192.0.2.10:51766/mcp/";
+        const auto tlsBridge = BuildMcpBridgeStdioJson(L"bridge.ps1", tlsUrl);
+        const auto tlsEnv = BuildMcpLoadEnvPowerShell(L"endpoint.json", tlsUrl);
+        CheckConsoleSurfaceSelfTest(&context, IsMcpTlsClientUrl(tlsUrl) && tlsBridge.find(L"\"-TlsEndpoint\"") != std::wstring::npos &&
+            tlsBridge.find(mcpjson::Quote(tlsUrl)) != std::wstring::npos && tlsEnv.find(L"'" + tlsUrl + L"'") != std::wstring::npos &&
+            !IsMcpTlsClientUrl(L"http://192.0.2.10:51766/mcp/") && !IsMcpTlsClientUrl(tlsUrl + L"?next") &&
+            !IsMcpTlsClientUrl(L"https://127.1:443/mcp/") && !IsMcpTlsClientUrl(L"https://127.0.0.1:0443/mcp/"),
+            L"mcp-scoped-https-setup-pins-canonical-endpoint");
 
         // Phase 2 quiet-surface root commands appear in registered completion.
         CheckCompletionCandidate(&context, {}, L"!hal", L"phase2-root-hal-completion");
@@ -52621,6 +52629,7 @@ static bool WriteMcpEndpointFile(
     json += L"  \"port\": " + std::to_wstring(port) + L",\n";
     json += L"  \"write\": " + std::wstring(allowWrite ? L"true" : L"false") + L",\n";
     json += L"  \"scope\": " + mcpjson::Quote(g_McpServer.ScopeName()) + L",\n";
+    json += L"  \"transport\": " + mcpjson::Quote(g_McpServer.UsesTls() ? L"https" : L"http") + L",\n";
     json += L"  \"remote_bind\": " + std::wstring(remoteBind ? L"true" : L"false") + L",\n";
     json += L"  \"bind\": " + mcpjson::Quote(bindAddress) + L",\n";
     json += L"  \"listen_ips\": " + listenJson + L",\n";
@@ -52743,7 +52752,7 @@ static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& wide
     return ok != 0 && written == utf8.size();
 }
 
-static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge)
+static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge, const std::wstring& url)
 {
     std::wstring json;
     json += L"{\n";
@@ -52755,7 +52764,9 @@ static std::wstring BuildMcpBridgeStdioJson(const std::wstring& bridge)
     json += L"        \"-ExecutionPolicy\",\n";
     json += L"        \"Bypass\",\n";
     json += L"        \"-File\",\n";
-    json += L"        \"" + JsonEscapePath(bridge) + L"\"\n";
+    json += L"        \"" + JsonEscapePath(bridge) + L"\"";
+    if (IsMcpTlsClientUrl(url)) { json += L",\n        \"-TlsEndpoint\",\n        " + mcpjson::Quote(url); }
+    json += L"\n";
     json += L"      ]\n";
     json += L"    }\n";
     json += L"  }\n";
@@ -52846,7 +52857,7 @@ static std::wstring BuildMcpGrokHttpPowerShellCommand(const std::wstring& url)
         L" --header 'Authorization: Bearer ${KNLIVEDBG_TOKEN}'";
 }
 
-static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath)
+static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath, const std::wstring& url)
 {
     std::wstring ps;
     ps += L"# Load KnLiveDbg MCP endpoint into the current PowerShell session.\n";
@@ -52855,15 +52866,22 @@ static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath)
     ps += L"$p = " + PowerShellSingleQuoted(endpointPath) + L"\n";
     ps += L"if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw \"missing $p -- run 'mcp on' first\" }\n";
     ps += L"$e = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json\n";
+    if (IsMcpTlsClientUrl(url))
+    {
+        ps += L"if ($e.transport -cne 'https' -or $e.url -cne " + PowerShellSingleQuoted(url) + L") { throw 'Scoped HTTPS endpoint changed' }\n";
+    }
     ps += L"$token = [string]$e.token\n";
     ps += L"if ([string]::IsNullOrWhiteSpace($token)) { $token = [string]$e.password }\n";
     ps += L"if ($e.token_source -eq 'principal') { $token = $env:KNLIVEDBG_TOKEN; if ($token -cnotmatch '\\A[0-9a-f]{64}\\z' -or !$token) { throw 'Set KNLIVEDBG_TOKEN to your assigned client bearer' } }\n";
     ps += L"$url = [string]$e.url\n";
     ps += L"if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 4) { throw \"invalid password in $p\" }\n";
     ps += L"$parsedUrl = $null\n";
-    ps += L"if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUrl) -or $parsedUrl.Scheme -ne 'http' -or -not $parsedUrl.IsLoopback) { throw \"invalid loopback URL in $p\" }\n";
+    ps += L"if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUrl)) { throw \"invalid endpoint URL in $p\" }\n";
+    ps += L"if ($e.transport -ceq 'https') {\n";
+    ps += L"  if ($e.token_source -cne 'principal' -or $e.write -ne $false -or $url -cne ('https://{0}:{1}/mcp/' -f $e.bind,$e.port) -or $parsedUrl.HostNameType -ne 'IPv4' -or $parsedUrl.Host -cne $e.bind -or $parsedUrl.Port -ne $e.port) { throw \"invalid scoped HTTPS endpoint in $p\" }\n";
+    ps += L"} elseif ($parsedUrl.Scheme -ne 'http' -or -not $parsedUrl.IsLoopback) { throw \"invalid loopback URL in $p\" }\n";
     ps += L"$env:KNLIVEDBG_TOKEN = $token\n";
-    ps += L"$env:KNLIVEDBG_MCP_URL = $parsedUrl.AbsoluteUri.TrimEnd('/')\n";
+    ps += L"$env:KNLIVEDBG_MCP_URL = if ($e.transport -ceq 'https') { $url } else { $parsedUrl.AbsoluteUri.TrimEnd('/') }\n";
     ps += L"$env:KNLIVEDBG_MCP_ENDPOINT = $p\n";
     ps += L"Write-Host (\"KNLIVEDBG_MCP_URL={0}\" -f $env:KNLIVEDBG_MCP_URL)\n";
     ps += L"Write-Host 'KNLIVEDBG_TOKEN set (value hidden)'\n";
@@ -52872,13 +52890,18 @@ static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath)
 
 static bool WriteMcpLoadEnvScript(
     const std::wstring& path,
-    const std::wstring& endpointPath)
+    const std::wstring& endpointPath,
+    const std::wstring& clientUrl)
 {
-    return WriteUtf8TextFile(path, BuildMcpLoadEnvPowerShell(endpointPath));
+    return WriteUtf8TextFile(path, BuildMcpLoadEnvPowerShell(endpointPath, clientUrl));
 }
 
 static std::wstring ResolveMcpClientSetupUrl()
 {
+    if (g_McpServer.IsRunning() && g_McpServer.UsesTls())
+    {
+        return L"https://" + g_McpServer.BindAddress() + L":" + std::to_wstring(g_McpServer.Port()) + L"/mcp/";
+    }
     const std::wstring fallback = L"http://127.0.0.1:51766/mcp";
     const std::wstring endpointPath = GetMcpEndpointPath();
     HANDLE file = CreateFileW(
@@ -52911,13 +52934,23 @@ static std::wstring ResolveMcpClientSetupUrl()
     bytes.resize(read);
     const std::wstring json = mcpjson::Utf8ToWide(bytes);
     std::wstring url;
+    std::wstring transport;
+    if (ExtractJsonStringValue(json, L"transport", &transport) && transport != L"http")
+    {
+        std::wstring clientUrl, source, write;
+        if (transport == L"https" && ExtractJsonStringValue(json, L"url", &url) && IsMcpTlsClientUrl(url) &&
+            ExtractJsonStringValue(json, L"client_url", &clientUrl) && url == clientUrl &&
+            ExtractJsonStringValue(json, L"token_source", &source) && source == L"principal" &&
+            ExtractJsonScalarValue(json, L"write", &write) && write == L"false") { return url; }
+        return {};
+    }
     if (ExtractJsonStringValue(json, L"client_url", &url) && !url.empty())
     {
-        return url;
+        return ToLower(url).rfind(L"https:", 0) == 0 ? std::wstring{} : url;
     }
     if (ExtractJsonStringValue(json, L"url", &url) && !url.empty())
     {
-        return url;
+        return ToLower(url).rfind(L"https:", 0) == 0 ? std::wstring{} : url;
     }
     return fallback;
 }
@@ -52965,13 +52998,13 @@ static bool WriteMcpClientSnippetFiles(
     };
 
     writeText(dir + L"\\claude-code-http.json", BuildMcpClaudeCodeHttpJson(clientUrl));
-    writeText(dir + L"\\claude-desktop-mcp.json", BuildMcpBridgeStdioJson(bridge));
+    writeText(dir + L"\\claude-desktop-mcp.json", BuildMcpBridgeStdioJson(bridge, clientUrl));
     writeText(dir + L"\\cursor-mcp.json", BuildMcpCursorHttpJson(clientUrl));
     writeText(dir + L"\\codex-config.toml.snippet", BuildMcpCodexHttpToml(clientUrl));
     writeText(dir + L"\\grok-config.toml.snippet", BuildMcpGrokHttpToml(clientUrl));
     writeText(dir + L"\\grok-http.toml.snippet", BuildMcpGrokHttpToml(clientUrl));
-    writeText(dir + L"\\legacy-stdio-mcp.json", BuildMcpBridgeStdioJson(bridge));
-    if (!WriteMcpLoadEnvScript(stateDir + L"\\mcp-load-env.ps1", endpointPath))
+    writeText(dir + L"\\legacy-stdio-mcp.json", BuildMcpBridgeStdioJson(bridge, clientUrl));
+    if (!WriteMcpLoadEnvScript(stateDir + L"\\mcp-load-env.ps1", endpointPath, clientUrl))
     {
         success = false;
         if (error != nullptr)
@@ -52996,23 +53029,22 @@ static bool WriteMcpClientSnippetFiles(
         dir + L"\\grok-http.powershell.txt",
         BuildMcpGrokHttpPowerShellCommand(clientUrl) + L"\n");
 
+    const std::wstring bridgeCommand = L"\"" + bridge + L"\"" +
+        (IsMcpTlsClientUrl(clientUrl) ? L" -TlsEndpoint " + clientUrl : L"") + L"\n";
     std::wstring claudeDesktopNote =
         L"REM Claude Desktop local MCP uses claude-desktop-mcp.json.\n"
         L"REM This bridge command is also a legacy fallback for older Claude Code builds.\n"
-        L"claude mcp add --transport stdio knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
-        bridge + L"\"\n";
+        L"claude mcp add --transport stdio knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File " + bridgeCommand;
     writeText(dir + L"\\claude-stdio.cmd.txt", claudeDesktopNote);
 
     std::wstring codexCmd =
         L"REM Legacy fallback only. Prefer codex-http.powershell.txt (native HTTP).\n"
-        L"codex mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
-        bridge + L"\"\n";
+        L"codex mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File " + bridgeCommand;
     writeText(dir + L"\\codex-stdio.cmd.txt", codexCmd);
 
     std::wstring grokCmd =
         L"REM Legacy fallback only. Prefer grok-http.powershell.txt (native HTTP).\n"
-        L"grok mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
-        bridge + L"\"\n";
+        L"grok mcp add knlivedbg -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File " + bridgeCommand;
     writeText(dir + L"\\grok-stdio.cmd.txt", grokCmd);
     return success;
 }
@@ -53025,6 +53057,7 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     const std::wstring clientsDir = stateDir + L"\\clients";
     const std::wstring loadEnvPath = stateDir + L"\\mcp-load-env.ps1";
     const std::wstring clientUrl = ResolveMcpClientSetupUrl();
+    if (clientUrl.empty()) { std::wcerr << L"Invalid scoped HTTPS endpoint descriptor.\n"; return; }
     const std::wstring f = ToLower(filter);
     const bool showAll = f.empty() || f == L"all" || f == L"help";
     const bool showClaudeCode = showAll || f == L"claude" || f == L"claude-code";
@@ -53053,9 +53086,12 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     std::wcout << L"MCP client setup (native Streamable HTTP preferred)\n";
     std::wcout << L"\n";
     std::wcout << L"How it works:\n";
-    std::wcout << L"  1. knkd> mcp on   prompts for a session password and listens on 0.0.0.0\n";
-    std::wcout << L"  2. Client needs only IP, port, and that password\n";
-    std::wcout << L"  3. Header: Authorization: Bearer <password>\n";
+    if (IsMcpTlsClientUrl(clientUrl))
+    {
+        std::wcout << L"  Use your assigned KNLIVEDBG_TOKEN, the HTTPS endpoint below and its trusted CA.\n";
+        std::wcout << L"  The scoped stdio bridge requires Python 3.8+ with SSL support.\n";
+    }
+    else { std::wcout << L"  Use the listener's credential with the endpoint below.\n"; }
     std::wcout << L"  Claude Desktop local MCP uses the stdio bridge because its remote\n";
     std::wcout << L"  connectors originate in Anthropic's cloud and cannot reach loopback.\n";
     std::wcout << L"\n";
@@ -53086,7 +53122,7 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     {
         std::wcout << L"=== Claude Desktop local MCP (stdio bridge) ===\n";
         std::wcout << L"  Merge this into %APPDATA%\\Claude\\claude_desktop_config.json:\n";
-        std::wcout << BuildMcpBridgeStdioJson(bridge);
+        std::wcout << BuildMcpBridgeStdioJson(bridge, clientUrl);
         std::wcout << L"  Fully restart Claude Desktop after editing.\n";
         std::wcout << L"  snippet: " << clientsDir << L"\\claude-desktop-mcp.json\n";
         std::wcout << L"\n";
@@ -53130,8 +53166,9 @@ static void PrintMcpClientSetupHelp(const std::wstring& filter)
     if (showLegacy)
     {
         std::wcout << L"=== Legacy stdio-only client fallback ===\n";
-        std::wcout << BuildMcpBridgeStdioJson(bridge);
-        std::wcout << L"  Requires Node.js/npx and pinned mcp-remote@0.1.38.\n";
+        std::wcout << BuildMcpBridgeStdioJson(bridge, clientUrl);
+        std::wcout << (IsMcpTlsClientUrl(clientUrl) ? L"  Requires Python 3.8+ with SSL support.\n" :
+            L"  Requires Node.js/npx and pinned mcp-remote@0.1.38.\n");
         std::wcout << L"  snippet: " << clientsDir << L"\\legacy-stdio-mcp.json\n";
         std::wcout << L"\n";
     }
@@ -53160,7 +53197,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe [--tls] [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53169,7 +53206,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         std::wcout << L"mcp on prompts for a session password (type it twice) and listens on 0.0.0.0.\n";
         std::wcout << L"Clients need IP + port + that password (Authorization: Bearer <password>).\n";
         std::wcout << L"--loopback keeps 127.0.0.1 only. --bind <ipv4> pins one address (avoid on multi-NIC).\n";
-        std::wcout << L"--observe restricts this session to loopback status and retained timeline queries.\n";
+        std::wcout << L"--observe uses loopback by default. Add --tls and a principal grant for retained reads on one HTTPS address.\n";
         return;
     }
 
@@ -53268,6 +53305,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         config.BindAddress = options.BindAddress;
         config.AllowWrite = options.AllowWrite;
         config.ObserveOnly = options.ObserveOnly;
+        config.Tls = options.Tls;
         config.OperationJournalDirectory = options.OperationJournalDirectory;
         config.Principals = std::move(options.Principals);
         config.TargetSessionSeconds = options.TargetSessionSeconds;
@@ -53277,7 +53315,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             return;
         }
 
-        config.BindAddress = NormalizeMcpBindAddress(config.BindAddress);
+        if (!config.Tls) { config.BindAddress = NormalizeMcpBindAddress(config.BindAddress); }
         if (!IsMcpWildcardBind(config.BindAddress) &&
             !IsMcpLoopbackBind(config.BindAddress) &&
             !IsMcpConcreteIpv4Bind(config.BindAddress))
@@ -53307,12 +53345,13 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
 
         const bool wildcardBound = g_McpServer.WildcardBound();
         const bool networkExposed = g_McpServer.IsNetworkExposed();
-        const std::wstring loopUrl =
-            L"http://127.0.0.1:" + std::to_wstring(g_McpServer.Port()) + L"/mcp";
+        const std::wstring clientUrl = (config.Tls ? L"https://" + config.BindAddress : std::wstring(L"http://127.0.0.1")) +
+            L":" + std::to_wstring(g_McpServer.Port()) + (config.Tls ? L"/mcp/" : L"/mcp");
 
         std::vector<McpListenAddress> listenAddresses;
-        CollectMcpListenAddresses(&listenAddresses);
         std::vector<std::wstring> listenIps;
+        if (config.Tls) { listenIps.push_back(config.BindAddress); }
+        else { CollectMcpListenAddresses(&listenAddresses); }
         std::wstring firstLanIp;
         for (const McpListenAddress& address : listenAddresses)
         {
@@ -53329,14 +53368,14 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             const std::wstring remoteHost = !firstLanIp.empty()
                 ? firstLanIp
                 : (wildcardBound ? L"<this-host-ip>" : g_McpServer.BindAddress());
-            remoteUrl = L"http://" + remoteHost + L":" +
+            remoteUrl = config.Tls ? clientUrl : L"http://" + remoteHost + L":" +
                 std::to_wstring(g_McpServer.Port()) + L"/mcp";
         }
 
         std::wstring endpointPath;
         std::wstring endpointError;
         if (!WriteMcpEndpointFile(
-                loopUrl,
+                clientUrl,
                 remoteUrl,
                 g_McpServer.Password(),
                 g_McpServer.TokenSource(),
@@ -53361,7 +53400,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         std::wstring snippetError;
         const bool snippetsWritten = WriteMcpClientSnippetFiles(
             ResolveMcpBridgeScriptPath(),
-            loopUrl,
+            clientUrl,
             &snippetError);
 
         const wchar_t* modeText = L"loopback";
@@ -53373,7 +53412,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         {
             modeText = L"selected addresses";
         }
-        std::wcout << L"MCP server started (" << modeText << L" Streamable HTTP).\n";
+        std::wcout << L"MCP server started (" << modeText << (config.Tls ? L" HTTPS).\n" : L" Streamable HTTP).\n");
         std::wcout << L"  scope    : " << g_McpServer.ScopeName() << L"\n";
         std::wcout << L"  listen   : " << g_McpServer.BindAddress() << L":"
                    << g_McpServer.Port() << L"\n";
@@ -53385,7 +53424,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         std::wcout << L"\n";
         if (scoped)
         {
-            std::wcout << L"  Clients use their own KNLIVEDBG_TOKEN with " << loopUrl << L"\n";
+            std::wcout << L"  Clients use their own KNLIVEDBG_TOKEN with " << clientUrl << L"\n";
         }
         else
         {
@@ -53412,7 +53451,11 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                 std::wcout << L"    " << host << L"\n";
             }
         }
-        if (wildcardBound || networkExposed)
+        if (config.Tls)
+        {
+            std::wcout << L"  HTTPS endpoint: " << clientUrl << L"\n";
+        }
+        else if (wildcardBound || networkExposed)
         {
             std::wcout << L"\n";
             std::wcout << L"  Addresses on this host (pick one the client can reach):\n";
@@ -53498,12 +53541,13 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         PrintMcpObserveBudget();
         std::wcout << L"  endpoint: " << GetMcpEndpointPath() << L"\n";
         std::wcout << L"  bridge  : " << ResolveMcpBridgeScriptPath() << L"\n";
-        std::wcout << (g_McpServer.TokenSource() == L"principal" ? L"  clients : loopback + assigned bearer\n" : L"  clients : IP + port + session password\n");
+        if (g_McpServer.UsesTls()) { std::wcout << L"  clients : HTTPS + assigned bearer\n"; }
+        else { std::wcout << (g_McpServer.TokenSource() == L"principal" ? L"  clients : loopback + assigned bearer\n" : L"  clients : IP + port + session password\n"); }
     }
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe [--tls] [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }
@@ -54161,6 +54205,10 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunMcpToolCatalogSelfTest();
         }
+        if (argc == 4 && ToLower(argv[2]) == L"mcp-journal-transport-fixture")
+        {
+            return RunMcpJournalTransportFixture(argv[3]);
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-journal-fixture")
         {
             if (argc < 5) { return 2; }
@@ -54169,7 +54217,7 @@ int wmain(int argc, wchar_t** argv)
             commandinput::ListenerOptions parsed;
             if (!commandinput::ParseListenerOptions(options, 0, false, 0, &parsed, nullptr) || !parsed.Port ||
                 !parsed.OperationJournalDirectory.empty()) { return 2; }
-            return RunMcpJournalFixture(argv[3], parsed.Port, parsed.Principals, parsed.TargetSessionSeconds);
+            return RunMcpJournalFixture(argv[3], parsed.Port, parsed.Principals, parsed.TargetSessionSeconds, parsed.Tls);
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
         {

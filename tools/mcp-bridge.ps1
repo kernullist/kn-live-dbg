@@ -14,6 +14,7 @@
 [CmdletBinding()]
 param(
     [string]$EndpointPath = "",
+    [string]$TlsEndpoint,
     [switch]$PreferRemote,
     [switch]$PrintEndpoint
 )
@@ -88,6 +89,31 @@ function Get-JsonStringProperty
     return [string]$prop.Value
 }
 
+function Start-ObserveTlsBridge([string]$Url)
+{
+    $uri = $null
+    if ($Url -cnotmatch '\Ahttps://([0-9.]+):([1-9][0-9]{0,4})/mcp/?\z' -or
+        -not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.HostNameType -ne 'IPv4' -or $uri.Host -cne $Matches[1] -or
+        [int]$Matches[2] -ne $uri.Port -or $uri.Host -match '^(0\.|22[4-9]\.|2[3-5][0-9]\.)' -or
+        ($uri.Host.StartsWith('127.') -and $uri.Host -ne '127.0.0.1'))
+    {
+        throw 'Expected a scoped HTTPS IPv4 endpoint with an explicit port and /mcp path.'
+    }
+    if ($PrintEndpoint) { Write-Output ("url={0}" -f $Url); return }
+    $client = Join-Path $PSScriptRoot 'mcp-observe-tls.py'
+    $python = Get-Command python.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    & $python.Source -I -B $client --endpoint $Url
+    exit $LASTEXITCODE
+}
+
+if ($PSBoundParameters.ContainsKey('TlsEndpoint'))
+{
+    if ($EndpointPath -or $PreferRemote) { throw '-TlsEndpoint selects exactly one endpoint.' }
+    Start-ObserveTlsBridge $TlsEndpoint
+    exit 0
+}
+
 $endpointPath = Resolve-EndpointPath -Explicit $EndpointPath
 if ([string]::IsNullOrWhiteSpace($endpointPath) -or -not (Test-Path -LiteralPath $endpointPath))
 {
@@ -122,6 +148,20 @@ $clientUrl = (Get-JsonStringProperty -Object $endpoint -Name "client_url").Trim(
 $tokenSource = (Get-JsonStringProperty -Object $endpoint -Name "token_source").Trim()
 $port = Get-JsonStringProperty -Object $endpoint -Name "port"
 $write = Get-JsonStringProperty -Object $endpoint -Name "write"
+$transport = Get-JsonStringProperty -Object $endpoint -Name "transport"
+if ($transport -ceq 'https')
+{
+    if ($tokenSource -cne 'principal' -or $endpoint.write -isnot [bool] -or $endpoint.write -ne $false -or
+        $loopUrl -cne ('https://{0}:{1}/mcp/' -f $endpoint.bind,$port) -or $clientUrl -cne $loopUrl -or
+        ($remoteUrl -and $remoteUrl -cne $loopUrl)) { throw 'Invalid scoped HTTPS descriptor.' }
+    Start-ObserveTlsBridge $loopUrl
+    exit 0
+}
+if ($transport -and $transport -cne 'http') { throw 'Unknown endpoint transport.' }
+if ($loopUrl -imatch '^https:' -or $remoteUrl -imatch '^https:' -or $clientUrl -imatch '^https:')
+{
+    throw 'HTTPS endpoints require an explicit scoped HTTPS descriptor or -TlsEndpoint.'
+}
 
 if ($tokenSource -eq 'principal')
 {

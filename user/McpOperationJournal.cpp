@@ -66,6 +66,7 @@ struct McpOperationJournal::Impl
     std::vector<Row> Rows; // admission order, including previous controller generations
     bool Ready = false;
     bool Scoped = false;
+    bool Tls = false;
 
     ~Impl() { SecureZeroMemory(Entropy.data(), Entropy.size()); }
 
@@ -167,11 +168,11 @@ struct McpOperationJournal::Impl
                 !mcpjson::FindRawValue(text, L"journal", &journal) || !mcpjson::GetString(journal, L"principal_id", &principal) ||
                 !(Scoped ? IsMcpOperationId(principal) : principal == Principal) ||
                 !mcpjson::GetString(journal, L"approved_scope", &scope) ||
-                (Scoped ? (scope != L"loopback_observe_source" && scope != L"loopback_observe_target") : scope != L"loopback_observe") ||
+                (Scoped ? (scope != McpScopedJournalName(Tls, false) && scope != McpScopedJournalName(Tls, true)) : scope != L"loopback_observe") ||
                 !mcpjson::FindRawValue(journal, L"recovered", &recovered) || recovered != L"true" ||
                 std::any_of(Rows.begin(), Rows.end(), [&](const Row& row) { return row.Id == id; })) { return false; }
             std::wstring controller, target;
-            const bool targetScoped = scope == L"loopback_observe_target";
+            const bool targetScoped = Scoped && scope == McpScopedJournalName(Tls, true);
             if (!mcpjson::GetString(journal, L"target_generation", &target) || !IsMcpOperationId(target) ||
                 mcpjson::FindRawValue(journal, L"controller_generation", &controller) != targetScoped ||
                 (targetScoped && (!mcpjson::GetString(journal, L"controller_generation", &controller) || !IsMcpOperationId(controller))))
@@ -192,14 +193,15 @@ struct McpOperationJournal::Impl
 McpOperationJournal::McpOperationJournal() : Data(std::make_unique<Impl>()) {}
 McpOperationJournal::~McpOperationJournal() = default;
 
-bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring& password, std::wstring* error, bool scoped)
+bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring& password, std::wstring* error, McpJournalMode mode)
 {
     if (error) { *error = L"cannot open private operation journal with this credential"; }
     if (Data->Ready || password.empty()) { return false; }
     try
     {
         auto candidate = std::make_unique<Impl>();
-        candidate->Scoped = scoped;
+        candidate->Scoped = mode != McpJournalMode::SharedLoopback;
+        candidate->Tls = mode == McpJournalMode::ScopedHttps;
         EvidencePrivacyReport policy;
         bool fresh = false;
         if (!candidate->Guard.Open(directory, false, &policy))
@@ -210,7 +212,8 @@ bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring
         if (!candidate->Lease.Acquire(policy.RootPath, true, nullptr)) { return false; }
         candidate->Path = L"\\\\?\\" + policy.RootPath + L"\\operations.knmcpjournal";
         PrivateText binding;
-        const std::wstring domain = scoped ? L"KnLiveDbg.observe.source.journal.v1\n" : L"KnLiveDbg.observe.journal.v1\n";
+        const std::wstring domain = candidate->Tls ? L"KnLiveDbg.observe.https.journal.v1\n" :
+            (candidate->Scoped ? L"KnLiveDbg.observe.source.journal.v1\n" : L"KnLiveDbg.observe.journal.v1\n");
         binding.Bytes = mcpjson::WideToUtf8(domain + policy.RootIdentity + L"\n");
         auto credential = mcpjson::WideToUtf8(password);
         binding.Bytes.append(credential);
@@ -242,6 +245,7 @@ std::optional<McpJournalIdentity> McpOperationJournal::Identify(const McpEngineR
     const auto digest = Data->Mac(Data->Scoped ? mcpjson::WideToUtf8(owner) + "\n" + frame : frame);
     if (digest.empty()) { return std::nullopt; }
     McpJournalIdentity identity{owner, generation, digest, McpUtcFileTime()};
+    identity.Tls = Data->Tls;
     if (Data->Scoped) { identity.ApprovedAccess = request.Grant.AccessName(); }
     if (request.Grant.Target)
     {
@@ -261,7 +265,7 @@ bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcep
         auto next = Data->Rows;
         const auto at = std::find_if(next.begin(), next.end(), [&](const Impl::Row& row) { return row.Id == operation.Id; });
         const bool admission = !operation.Dispatched && !operation.Finished;
-        if (admission == (at == next.end()) && operation.Journal &&
+        if (admission == (at == next.end()) && operation.Journal && operation.Journal->Tls == Data->Tls &&
             (Data->Scoped ? (!operation.OwnerFingerprint.empty() && IsMcpOperationId(operation.Journal->PrincipalId)) :
                 operation.OwnerFingerprint.empty() && operation.Journal->PrincipalId == Data->Principal) &&
             (admission || at->Owner == operation.Journal->PrincipalId))

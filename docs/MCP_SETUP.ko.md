@@ -52,9 +52,34 @@ Authorization: Bearer <session-password>
 서버를 재시작하면 URL·비밀번호·세션을 다시 확인한다. 클라이언트별 설정 형식은
 외부에서 바뀔 수 있으므로 오래된 설정 예제를 복제해 유지하지 않는다.
 
-이 전송은 비밀번호와 메모리를 포함한 **평문 HTTP**다. 격리된 lab 경로를 사용하고
+공유 비밀번호 리스너는 비밀번호와 메모리를 **평문 HTTP**로 전송한다. 격리된 lab 경로를 사용하고
 필요한 방화벽 규칙은 해당 클라이언트로 제한한다. 같은 PC에는 loopback이면 충분하다.
-TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공하지 않는다.
+
+### 보관 증거를 HTTPS로 조회하기
+
+서버의 IPv4 주소와 포트에 HTTP.sys 인증서를 바인딩하고 해당 바인딩의
+`disablelegacytls`를 활성화한다. 서버 인증서의 SAN에 같은 IP가 있어야 한다.
+`netsh http show sslcert ipport=<IPv4>:<포트>`로 확인할 수 있다. 인증서,
+URL 예약과 방화벽은 운영자가 관리한다. [Windows HTTP 서비스 설정](https://learn.microsoft.com/en-us/windows-server/networking/technologies/netsh/netsh-http)
+
+아래 문서용 주소를 실제 서버 주소로 바꾸고 클라이언트의 bearer 지문을 입력한다.
+
+```text
+mcp on 51766 --observe --tls --bind 192.0.2.10 --principal <지문> ti --principal-access <지문> evidence
+```
+
+클라이언트의 `KNLIVEDBG_TOKEN`에 배정된 bearer를 설정한다. Python 3.8 이상과
+SSL을 지원하는 환경에서 다음 명령을 stdio 브리지로 등록한다. 사설 CA는
+`KNLIVEDBG_TLS_CA`에 PEM 인증서 경로를 지정한다. 생략하면 기본 신뢰 저장소를 사용한다.
+
+```powershell
+& .\tools\mcp-bridge.ps1 -TlsEndpoint 'https://192.0.2.10:51766/mcp'
+```
+
+브리지는 서버 인증서와 IP 주소를 확인한 뒤에만 bearer를 전달하며 리디렉션을 거절한다.
+출처, 대상 세션, 조회 한도와 영수증 권한은 HTTPS에도 적용된다. 영수증을 보관하려면
+HTTPS 전용 `--journal` 디렉터리를 사용한다. 재시작 후 같은 전송 방식, Windows 계정,
+디렉터리, 잠금 해제 비밀번호와 주체 권한으로 다시 열 수 있다.
 
 ## 쓰기 권한
 

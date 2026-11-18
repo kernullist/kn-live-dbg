@@ -5,6 +5,7 @@
 
 struct McpEngineRequest;
 struct McpObserveGrant;
+enum class McpJournalMode { SharedLoopback, ScopedLoopback, ScopedHttps };
 
 // The server serializes access with its queue lock and holds the store lease
 // until the listener stops. Only recovery views of metadata enter the file.
@@ -13,7 +14,7 @@ class McpOperationJournal
 public:
     McpOperationJournal();
     ~McpOperationJournal();
-    bool Open(const std::wstring& directory, const std::wstring& password, std::wstring* error, bool scoped = false);
+    bool Open(const std::wstring& directory, const std::wstring& password, std::wstring* error, McpJournalMode mode);
     std::optional<McpJournalIdentity> Identify(const McpEngineRequest& request) const;
     bool Persist(const McpOperationSnapshot& operation) noexcept;
     bool Healthy() const;

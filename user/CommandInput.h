@@ -106,6 +106,7 @@ namespace commandinput
         std::wstring Peer;
         bool AllowWrite = false;
         bool ObserveOnly = false;
+        bool Tls = false;
         std::wstring OperationJournalDirectory;
         std::vector<McpObserveGrant> Principals;
         uint32_t TargetSessionSeconds = 300;
@@ -139,6 +140,11 @@ namespace commandinput
             {
                 ok = !parsed.ObserveOnly;
                 parsed.ObserveOnly = true;
+            }
+            else if (!remote && arg == L"--tls")
+            {
+                ok = !parsed.Tls;
+                parsed.Tls = true;
             }
             else if (!remote && (arg == L"--principal" || arg == L"--principal-target"))
             {
@@ -238,6 +244,7 @@ namespace commandinput
             at->Access = access;
         }
         if (!parsed.OperationJournalDirectory.empty() && !parsed.ObserveOnly) { ok = false; }
+        if (parsed.Tls && (!parsed.ObserveOnly || parsed.Principals.empty())) { ok = false; }
         if (!parsed.Principals.empty() && (!parsed.ObserveOnly || !ValidMcpObserveGrants(parsed.Principals))) { ok = false; }
         if (haveTargetTtl && std::none_of(parsed.Principals.begin(), parsed.Principals.end(),
             [](const auto& grant) { return grant.Target.has_value(); })) { ok = false; }

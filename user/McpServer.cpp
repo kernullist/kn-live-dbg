@@ -820,6 +820,7 @@ namespace
         std::wstring out = L"{\"server\":";
         out += mcpjson::Quote(kServerName);
         out += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config, grant));
+        if (config.Tls) { out += L",\"transport\":\"https\""; }
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
@@ -1116,6 +1117,31 @@ static const McpObserveGrant* AuthenticateObserveGrant(const std::string& author
     return nullptr;
 }
 
+static bool McpTlsAddress(const McpServerConfig& config, SOCKADDR_IN* address)
+{
+    if (!config.Port || config.BindAddress.find(L'\0') != std::wstring::npos ||
+        InetPtonW(AF_INET, config.BindAddress.c_str(), &address->sin_addr) != 1) { return false; }
+    wchar_t canonical[INET_ADDRSTRLEN]{};
+    const auto first = address->sin_addr.S_un.S_un_b.s_b1;
+    if (!InetNtopW(AF_INET, &address->sin_addr, canonical, INET_ADDRSTRLEN) || config.BindAddress != canonical ||
+        first == 0 || first >= 224 || (first == 127 && config.BindAddress != L"127.0.0.1")) { return false; }
+    address->sin_family = AF_INET;
+    address->sin_port = htons(config.Port);
+    return true;
+}
+
+bool IsMcpTlsClientUrl(const std::wstring& url)
+{
+    const size_t colon = url.find(L':', 8);
+    if (url.rfind(L"https://", 0) != 0 || colon == std::wstring::npos || url.size() < colon + 7 ||
+        url.compare(url.size() - 5, 5, L"/mcp/") != 0) { return false; }
+    McpServerConfig config;
+    config.BindAddress = url.substr(8, colon - 8);
+    const auto port = url.substr(colon + 1, url.size() - colon - 6);
+    SOCKADDR_IN address{};
+    return commandinput::ParsePort(port, &config.Port) && std::to_wstring(config.Port) == port && McpTlsAddress(config, &address);
+}
+
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error)
 {
     if (!config.TargetSessionSeconds || config.TargetSessionSeconds > 3600 || (config.TargetSessionSeconds != 300 &&
@@ -1134,7 +1160,13 @@ bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* e
         if (error) { *error = L"--journal requires --observe"; }
         return false;
     }
-    if (config.ObserveOnly && (config.AllowWrite || !IsMcpLoopbackBind(config.BindAddress)))
+    SOCKADDR_IN address{};
+    if (config.Tls && (!config.ObserveOnly || config.AllowWrite || config.Principals.empty() || !McpTlsAddress(config, &address)))
+    {
+        if (error) { *error = L"--tls requires --observe, an assigned principal and one canonical unicast IPv4 bind"; }
+        return false;
+    }
+    if (config.ObserveOnly && (config.AllowWrite || (!config.Tls && !IsMcpLoopbackBind(config.BindAddress))))
     {
         if (error != nullptr) { *error = L"--observe requires a loopback bind and excludes --allow-write"; }
         return false;
@@ -1153,6 +1185,56 @@ static bool IsMcpLoopbackAddress(const SOCKADDR* address)
         IN6_IS_ADDR_LOOPBACK(&reinterpret_cast<const SOCKADDR_IN6*>(address)->sin6_addr);
 }
 
+// Use only an exact administrator-provisioned IP:port record. Querying the
+// binding does not reserve a URL, install a key or change Schannel policy.
+static bool CheckMcpTlsBinding(const McpServerConfig& config, std::wstring* error)
+{
+    SOCKADDR_IN address{};
+    if (!McpTlsAddress(config, &address)) { return false; }
+    HTTP_SERVICE_CONFIG_SSL_QUERY query{};
+    query.QueryDesc = HttpServiceConfigQueryExact;
+    query.KeyDesc.pIpPort = reinterpret_cast<SOCKADDR*>(&address);
+    ULONG bytes = 0;
+    ULONG status = HttpQueryServiceConfiguration(nullptr, HttpServiceConfigSSLCertInfo, &query, sizeof(query),
+        nullptr, 0, &bytes, nullptr);
+    if (status == ERROR_INSUFFICIENT_BUFFER && bytes >= sizeof(HTTP_SERVICE_CONFIG_SSL_SET) && bytes <= 1024 * 1024)
+    {
+        std::vector<unsigned char> buffer(bytes);
+        status = HttpQueryServiceConfiguration(nullptr, HttpServiceConfigSSLCertInfo, &query, sizeof(query),
+            buffer.data(), bytes, &bytes, nullptr);
+        if (status == NO_ERROR)
+        {
+            const auto& record = *reinterpret_cast<const HTTP_SERVICE_CONFIG_SSL_SET*>(buffer.data());
+            const auto* key = reinterpret_cast<const SOCKADDR_IN*>(record.KeyDesc.pIpPort);
+            const auto& binding = record.ParamDesc;
+            if (key && key->sin_family == AF_INET && key->sin_port == address.sin_port &&
+                key->sin_addr.s_addr == address.sin_addr.s_addr && binding.pSslHash && binding.SslHashLength &&
+                (binding.DefaultFlags & HTTP_SERVICE_CONFIG_SSL_FLAG_DISABLE_LEGACY_TLS)) { return true; }
+            if (error) { *error = L"the selected HTTP.sys SSL binding requires a server certificate and disablelegacytls=enable"; }
+            return false;
+        }
+    }
+    if (error) { *error = L"exact HTTP.sys SSL certificate binding unavailable for " + config.BindAddress +
+        L":" + std::to_wstring(config.Port) + L" (status " + std::to_wstring(status) + L")"; }
+    return false;
+}
+
+static bool McpTlsRequestAllowed(const McpServerConfig& config, const HTTP_REQUEST& request)
+{
+    SOCKADDR_IN expected{};
+    const auto* local = request.Address.pLocalAddress;
+    if (!request.pSslInfo || !local || local->sa_family != AF_INET || !McpTlsAddress(config, &expected)) { return false; }
+    const auto* endpoint = reinterpret_cast<const SOCKADDR_IN*>(local);
+    if (expected.sin_port != endpoint->sin_port || expected.sin_addr.s_addr != endpoint->sin_addr.s_addr) { return false; }
+    const auto ip = mcpjson::WideToUtf8(config.BindAddress);
+    const auto host = KnownHeader(&request, HttpHeaderHost);
+    if (host != ip + ":" + std::to_string(config.Port) && !(config.Port == 443 && host == ip)) { return false; }
+    std::string origin;
+    if (UnknownHeader(&request, "origin", &origin) || !request.CookedUrl.pAbsPath || request.CookedUrl.QueryStringLength) { return false; }
+    const std::wstring path(request.CookedUrl.pAbsPath, request.CookedUrl.AbsPathLength / sizeof(wchar_t));
+    return path == L"/mcp/" || path == L"/mcp";
+}
+
 bool McpObserveAddressSelfTest()
 {
     SOCKADDR_IN v4{};
@@ -1167,6 +1249,67 @@ bool McpObserveAddressSelfTest()
     v6.sin6_addr.u.Byte[0] = 0x20;
     return !IsMcpLoopbackAddress(nullptr) && !IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v4)) &&
         !IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v6));
+}
+
+bool McpObserveTlsSelfTest()
+{
+    McpServerConfig config;
+    config.Tls = true;
+    config.ObserveOnly = true;
+    config.BindAddress = L"192.0.2.10";
+    if (ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    config.Principals.push_back({std::wstring(64, L'a'), L"fixture"});
+    if (!ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    for (const auto* address : {L"+", L"0.0.0.0", L"::1", L"localhost", L"192.0.2.010", L"224.0.0.1", L"127.1", L"192.0.2.10/extra"})
+    {
+        config.BindAddress = address;
+        if (ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    }
+    config.BindAddress = L"192.0.2.10";
+    config.AllowWrite = true;
+    if (ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    config.AllowWrite = false;
+    config.Tls = false;
+    if (ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    config.Tls = true;
+    config.ObserveOnly = false;
+    if (ValidateMcpObservationConfig(config, nullptr)) { return false; }
+    config.ObserveOnly = true;
+    SOCKADDR_IN local{};
+    HTTP_REQUEST request{};
+    HTTP_SSL_INFO tls{};
+    if (!McpTlsAddress(config, &local)) { return false; }
+    request.Address.pLocalAddress = reinterpret_cast<SOCKADDR*>(&local);
+    const std::string authority = "192.0.2.10:" + std::to_string(config.Port);
+    auto& host = request.Headers.KnownHeaders[HttpHeaderHost];
+    host.pRawValue = authority.c_str();
+    host.RawValueLength = static_cast<USHORT>(authority.size());
+    request.CookedUrl.pAbsPath = L"/mcp/";
+    request.CookedUrl.AbsPathLength = 5 * sizeof(wchar_t);
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    request.pSslInfo = &tls;
+    if (!McpTlsRequestAllowed(config, request)) { return false; }
+    HTTP_UNKNOWN_HEADER origin{};
+    origin.pName = "Origin";
+    origin.NameLength = 6;
+    request.Headers.pUnknownHeaders = &origin;
+    request.Headers.UnknownHeaderCount = 1;
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    request.Headers.UnknownHeaderCount = 0;
+    request.CookedUrl.QueryStringLength = sizeof(wchar_t);
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    request.CookedUrl.QueryStringLength = 0;
+    request.CookedUrl.pAbsPath = L"/mcpX";
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    request.CookedUrl.pAbsPath = L"/mcp/";
+    --host.RawValueLength;
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    ++host.RawValueLength;
+    local.sin_port = htons(config.Port + 1);
+    if (McpTlsRequestAllowed(config, request)) { return false; }
+    local.sin_port = htons(config.Port);
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return !McpTlsRequestAllowed(config, request);
 }
 
 bool IsMcpConcreteIpv4Bind(const std::wstring& bindAddress)
@@ -1924,7 +2067,7 @@ bool McpServer::AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstr
 
         const std::wstring formattedHost = FormatHttpSysHost(host);
         const std::wstring url =
-            L"http://" + formattedHost + L":" +
+            (config_.Tls ? L"https://" : L"http://") + formattedHost + L":" +
             std::to_wstring(config_.Port) + L"/mcp/";
         const ULONG status = HttpAddUrlToUrlGroup(
             reinterpret_cast<HTTP_URL_GROUP_ID>(urlGroup),
@@ -2463,7 +2606,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             }
             operations_.Reset();
         }
-        config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
+        if (!config_.Tls) { config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress); }
         sessionId_.clear();
         token_.clear();
         tokenSource_.clear();
@@ -2508,7 +2651,8 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             break;
         }
 
-        ULONG status = HttpInitialize(version, HTTP_INITIALIZE_SERVER, nullptr);
+        const ULONG initFlags = HTTP_INITIALIZE_SERVER | (config_.Tls ? HTTP_INITIALIZE_CONFIG : 0);
+        ULONG status = HttpInitialize(version, initFlags, nullptr);
         if (status != NO_ERROR)
         {
             if (error != nullptr)
@@ -2518,6 +2662,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             break;
         }
         httpInitialized_ = true;
+        if (config_.Tls && !CheckMcpTlsBinding(config_, error)) { break; }
 
         status = HttpCreateServerSession(version, &serverSession, 0);
         if (status != NO_ERROR)
@@ -2566,7 +2711,11 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
 
         bool prefixesOk = false;
         std::wstring prefixError;
-        if (IsMcpLoopbackBind(config_.BindAddress))
+        if (config_.Tls)
+        {
+            prefixesOk = AddUrlPrefix(urlGroupId_, config_.BindAddress, &prefixError);
+        }
+        else if (IsMcpLoopbackBind(config_.BindAddress))
         {
             prefixesOk = AddUrlPrefix(urlGroupId_, L"127.0.0.1", &prefixError);
             AddUrlPrefix(urlGroupId_, L"[::1]", nullptr);
@@ -2635,7 +2784,9 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         if (!config_.OperationJournalDirectory.empty())
         {
             auto journal = std::make_unique<McpOperationJournal>();
-            if (!journal->Open(config_.OperationJournalDirectory, config_.Password, error, scoped)) { break; }
+            const auto mode = config_.Tls ? McpJournalMode::ScopedHttps :
+                (scoped ? McpJournalMode::ScopedLoopback : McpJournalMode::SharedLoopback);
+            if (!journal->Open(config_.OperationJournalDirectory, config_.Password, error, mode)) { break; }
             if (scoped)
             {
                 SecureZeroMemory(config_.Password.data(), config_.Password.size() * sizeof(wchar_t));
@@ -2758,7 +2909,7 @@ void McpServer::StopLocked()
     }
     if (httpInitialized_)
     {
-        HttpTerminate(HTTP_INITIALIZE_SERVER, nullptr);
+        HttpTerminate(HTTP_INITIALIZE_SERVER | (config_.Tls ? HTTP_INITIALIZE_CONFIG : 0), nullptr);
         httpInitialized_ = false;
     }
     if (stopEvent_ != nullptr)
@@ -2870,6 +3021,7 @@ void McpServer::ListenerThreadMain()
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
         if (!config_.ObserveOnly) { record += L",\"session\":" + mcpjson::Quote(sessionId_); }
         record += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config_, grant));
+        if (config_.Tls) { record += L",\"transport\":\"https\""; }
         if (!grant.Fingerprint.empty()) { record += L",\"observe_access\":" + mcpjson::Quote(grant.AccessName()); }
         record += L",\"peerPort\":" + std::to_wstring(AuditPeerPort(request));
         record += L",\"method\":" + mcpjson::Quote(method);
@@ -2914,7 +3066,12 @@ void McpServer::ListenerThreadMain()
         HTTP_REQUEST_ID requestId = request->RequestId;
 
         // Transport-layer gating before any JSON-RPC work.
-        if (config_.ObserveOnly && (!IsMcpLoopbackAddress(request->Address.pRemoteAddress) ||
+        if (config_.Tls && !McpTlsRequestAllowed(config_, *request))
+        {
+            sendResponse(requestId, 403, "Forbidden", L"");
+            return;
+        }
+        if (config_.ObserveOnly && !config_.Tls && (!IsMcpLoopbackAddress(request->Address.pRemoteAddress) ||
             !IsMcpLoopbackAddress(request->Address.pLocalAddress)))
         {
             sendResponse(requestId, 403, "Forbidden", L"");
@@ -2942,14 +3099,14 @@ void McpServer::ListenerThreadMain()
         // Host; the session password plus Origin rejection remain the barrier
         // (non-browser MCP clients send no Origin).
         std::string host = KnownHeader(request, HttpHeaderHost);
-        if (!IsNetworkExposed() && !IsLoopbackHost(host))
+        if (!config_.Tls && !IsNetworkExposed() && !IsLoopbackHost(host))
         {
             sendResponse(requestId, 403, "Forbidden", L"");
             return;
         }
 
         std::string origin;
-        if (UnknownHeader(request, "origin", &origin) && !origin.empty() && !IsAllowedOrigin(origin))
+        if (!config_.Tls && UnknownHeader(request, "origin", &origin) && !origin.empty() && !IsAllowedOrigin(origin))
         {
             sendResponse(requestId, 403, "Forbidden", L"");
             return;

@@ -57,10 +57,10 @@ Client configuration formats can change; the live URL, bearer header and MCP
 handshake are the server contract. Old client-specific configuration examples
 are not maintained as a second copy of each client's documentation.
 
-The transport is cleartext HTTP, including credentials and returned memory.
+The shared-password listener uses cleartext HTTP, including credentials and returned memory.
 Use an isolated lab path and scope any required inbound firewall rule to the
-intended client. Loopback is sufficient for a same-machine client. MCP does not
-provide TLS, arbitrary shell execution, raw `kd`, or an arbitrary command tool.
+intended client. Loopback is sufficient for a same-machine client. For retained evidence
+across hosts, configure the scoped HTTPS listener below.
 
 ## Give each client one retained source
 
@@ -101,6 +101,36 @@ For recovery, add `--journal <directory>` and enter a separate operator unlock
 password. Reopen that directory in source-scoped mode with the same Windows
 account and unlock password. A client needs its original bearer and source
 grant to read its receipts. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
+
+### Connect a retained-evidence client over HTTPS
+
+Provision an HTTP.sys SSL certificate binding for the exact local IPv4 address and port.
+The certificate must cover that IP in its Subject Alternative Name. The client must trust
+the issuing CA. Check the binding with `netsh http show sslcert ipport=<ipv4>:<port>`
+and enable `disablelegacytls` on that binding. KnLiveDbg reads this configuration
+at startup. Certificate installation, URL permissions and inbound firewall access
+remain under the operator's control. [Windows HTTP service configuration](https://learn.microsoft.com/en-us/windows-server/networking/technologies/netsh/netsh-http)
+
+On the controller, select the address and the principal's existing evidence grant.
+This example uses a documentation address.
+
+```text
+mcp on 51766 --observe --tls --bind 192.0.2.10 --principal <fingerprint> ti --principal-access <fingerprint> evidence
+```
+
+On the client, set `KNLIVEDBG_TOKEN` to its assigned bearer. Launch the packaged
+stdio bridge with an explicit HTTPS URL. The bridge uses Python 3.8+ with SSL support.
+For a private CA, point `KNLIVEDBG_TLS_CA` at its PEM certificate. Otherwise the
+bridge uses the platform trust roots.
+
+```powershell
+& .\tools\mcp-bridge.ps1 -TlsEndpoint 'https://192.0.2.10:51766/mcp'
+```
+
+The bridge verifies the certificate and IP before sending the bearer. It refuses redirects.
+The target handle, source grant, query budget and receipt permissions also apply over HTTPS.
+Use a dedicated directory for `--journal`. Restart the listener with the same transport,
+directory, Windows user, journal unlock and principal grant to recover a receipt.
 
 ### Choose evidence or operation access
 

@@ -613,7 +613,8 @@ function Copy-McpBridgeScript
     $toolsDir = Join-Path $DestinationDir "tools"
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
     Copy-Item -LiteralPath $source -Destination (Join-Path $toolsDir "mcp-bridge.ps1") -Force
-    Write-Host "MCP: copied mcp-bridge.ps1"
+    Copy-Item -LiteralPath (Join-Path $repo "tools\mcp-observe-tls.py") -Destination $toolsDir -Force
+    Write-Host "MCP: copied stdio bridge and scoped HTTPS client"
 }
 
 $visualStudioInstallations = Get-VisualStudioInstallations

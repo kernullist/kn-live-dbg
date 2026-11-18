@@ -36,7 +36,14 @@ struct McpJournalIdentity
     uint64_t AdmittedUtc = 0, DispatchedUtc = 0, ReturnedUtc = 0;
     std::wstring ControllerGeneration{};
     std::wstring ApprovedAccess{}; // absent in shared-password and historical receipts
+    bool Tls = false;
 };
+
+inline const wchar_t* McpScopedJournalName(bool tls, bool target)
+{
+    if (tls) { return target ? L"https_observe_target" : L"https_observe_source"; }
+    return target ? L"loopback_observe_target" : L"loopback_observe_source";
+}
 
 inline uint64_t McpUtcFileTime()
 {
@@ -228,8 +235,8 @@ inline std::wstring McpOperationJson(const McpOperationSnapshot& operation, bool
     {
         const auto& j = *operation.Journal;
         const auto utc = [](uint64_t time) { return time ? mcpjson::Quote(std::to_wstring(time)) : std::wstring(L"null"); };
-        const wchar_t* scope = operation.OwnerFingerprint.empty() ? L"loopback_observe" : L"loopback_observe_source";
-        if (!j.ControllerGeneration.empty()) { scope = L"loopback_observe_target"; }
+        const wchar_t* scope = operation.OwnerFingerprint.empty() ? L"loopback_observe" :
+            McpScopedJournalName(j.Tls, !j.ControllerGeneration.empty());
         out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":" + mcpjson::Quote(scope);
         out += L",\"principal_id\":" + mcpjson::Quote(j.PrincipalId) + L",\"target_generation\":" + mcpjson::Quote(j.TargetGeneration);
         if (!j.ControllerGeneration.empty()) { out += L",\"controller_generation\":" + mcpjson::Quote(j.ControllerGeneration); }

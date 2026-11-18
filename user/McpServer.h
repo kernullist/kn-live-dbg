@@ -123,6 +123,7 @@ struct McpServerConfig
     // process restarts. Clients send it as `Authorization: Bearer <password>`.
     std::wstring Password;
     bool ObserveOnly = false;
+    bool Tls = false;
     std::wstring OperationJournalDirectory;
     std::vector<McpObserveGrant> Principals;
     uint32_t TargetSessionSeconds = 300;
@@ -130,6 +131,7 @@ struct McpServerConfig
 
 class TimelineStore;
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error);
+bool IsMcpTlsClientUrl(const std::wstring& url);
 McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline, TimelineScanBudget& scan);
 
 bool SanitizeMcpPassword(
@@ -166,6 +168,7 @@ std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
 bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
 bool McpRequestBodySelfTest();
 bool McpObserveAddressSelfTest();
+bool McpObserveTlsSelfTest();
 bool McpOperationWireSelfTest();
 bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error, bool targetBound = false);
 
@@ -179,7 +182,7 @@ public:
     McpServer& operator=(const McpServer&) = delete;
 
     // Starts the http.sys listener. Default bind is all interfaces
-    // (http://+:<port>/mcp/). Source-scoped observe requires loopback. Invalid
+    // (http://+:<port>/mcp/). Plaintext observe requires loopback. Invalid
     // credentials, policy or transport initialization fail startup.
     bool Start(const McpServerConfig& config, std::wstring* error);
 
@@ -194,6 +197,7 @@ public:
     bool IsRunning() const;
     bool AllowWrite() const;
     bool ObserveOnly() const { return config_.ObserveOnly; }
+    bool UsesTls() const { return config_.Tls; }
     const wchar_t* ScopeName() const;
     // True if name is an advertised non-read-only (write) tool. The kTools table
     // is the single source of truth for write-ness; the engine routes by this.
@@ -219,7 +223,7 @@ public:
 
 private:
     friend int RunMcpToolCatalogSelfTest();
-    friend int RunMcpJournalFixture(const wchar_t*, uint16_t, const std::vector<McpObserveGrant>&, uint32_t);
+    friend int RunMcpJournalFixture(const wchar_t*, uint16_t, const std::vector<McpObserveGrant>&, uint32_t, bool);
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     void StopLocked();

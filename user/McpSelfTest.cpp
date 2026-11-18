@@ -2,6 +2,7 @@
 
 #include "EtwScanner.h"
 #include "McpServer.h"
+#include "McpOperationJournal.h"
 #include "McpJson.h"
 #include "TimelineStore.h"
 
@@ -642,6 +643,7 @@ int RunMcpToolCatalogSelfTest()
             late.observeUsage_->AdmittedCalls == 1 && late.observeUsage_->PayloadBytes == 0,
             L"observe-running-timeout-settles-late-budget-denial-and-cost");
         Check(&context, McpObserveAddressSelfTest(), L"observe-connection-address-boundary");
+        Check(&context, McpObserveTlsSelfTest(), L"observe-tls-principal-certificate-transport-and-local-endpoint-boundary");
         McpEngineResult result;
         std::wstring nonBmp;
         for (int index = 0; index < 128; ++index) { nonBmp += L"\U0001f642"; }
@@ -942,12 +944,54 @@ static bool McpManifestMatches(const std::wstring& response, const wchar_t* list
 
 // A separate process lets the test controller terminate this exact listener
 // after a real queue/dispatch boundary, without running the live debugger.
-int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants, uint32_t targetSessionSeconds)
+int RunMcpJournalTransportFixture(const std::wstring& directory)
+{
+    std::wstring password;
+    if (!std::getline(std::wcin, password) || password.empty()) { return 1; }
+    const McpObserveGrant source{std::wstring(64, L'a'), L"ti"};
+    McpObserveGrant target = source;
+    target.Target = ObservationIdentity{std::wstring(32, L'1'), 22, 33};
+    const McpObserveGrant* grants[] = {&source, &target};
+    for (bool tls : {false, true})
+    {
+        const auto mode = tls ? McpJournalMode::ScopedHttps : McpJournalMode::ScopedLoopback;
+        const auto other = tls ? McpJournalMode::ScopedLoopback : McpJournalMode::ScopedHttps;
+        const auto root = directory + (tls ? L"\\https" : L"\\loopback");
+        if (GetFileAttributesW(root.c_str()) != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) { return 1; }
+        {
+            McpOperationJournal journal;
+            if (!journal.Open(root, password, nullptr, mode)) { return 1; }
+            for (const auto* grant : grants)
+            {
+                McpOperationSnapshot record;
+                record.Id = std::wstring(32, grant->Target ? L'a' : L'b');
+                record.Name = L"timeline.query";
+                record.OwnerFingerprint = grant->Fingerprint;
+                record.Journal = journal.Identify({McpRequestKind::ToolCall, record.Name, L"{}", *grant});
+                if (!record.Journal || !journal.Persist(record)) { return 1; }
+            }
+        }
+        McpOperationJournal recovered;
+        if (recovered.Open(root, password, nullptr, other) || !recovered.Open(root, password, nullptr, mode)) { return 1; }
+        for (const auto* grant : grants)
+        {
+            std::wstring receipt;
+            const std::wstring id(32, grant->Target ? L'a' : L'b');
+            if (!recovered.Lookup(id, *grant, &receipt) || receipt.find(McpScopedJournalName(tls, grant->Target.has_value())) == std::wstring::npos ||
+                recovered.Lookup(id, grant->Target ? source : target, &receipt)) { return 1; }
+        }
+    }
+    std::wcout << L"transport journal isolation and recovery passed" << std::endl;
+    return 0;
+}
+
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants, uint32_t targetSessionSeconds, bool tls)
 {
     McpServer server;
     McpServerConfig config;
     config.Port = port;
     config.ObserveOnly = true;
+    config.Tls = tls;
     config.BindAddress = L"127.0.0.1";
     config.Principals = grants;
     config.TargetSessionSeconds = targetSessionSeconds;
@@ -956,7 +1000,7 @@ int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vec
     std::wstring error, line;
     if (!std::getline(std::wcin, config.Password) || !server.Start(config, &error))
     {
-        std::wcout << L"unavailable" << std::endl;
+        std::wcout << (tls ? L"unavailable: " + error : L"unavailable") << std::endl;
         return 1;
     }
     if (!grants.empty() && (server.TokenSource() != L"principal" || !server.Password().empty() || !server.Token().empty())) { return 2; }

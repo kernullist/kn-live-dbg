@@ -104,13 +104,13 @@ synchronously, so disk latency can delay dispatch and response publication.
 
 ### Observe sessions on current main
 
-An operator can enter `mcp on --observe` in a running controller. HTTP.sys
-registers loopback prefixes. Before handling credentials or reading a body,
+An operator can enter `mcp on --observe` in a running controller. The default
+observe transport registers loopback prefixes. Before handling credentials or reading a body,
 the listener verifies both connection addresses are loopback. The host,
 origin, bearer password and initialized session checks still apply.
-The scope lasts until the listener stops. `mcp status`, the endpoint descriptor
-and `kn://capabilities` report `observe`, `observe_source`, `legacy_write_locked` or
-`legacy_write_enabled`.
+The scope lasts until the listener stops. `mcp status` and the endpoint descriptor
+report the listener scope. `kn://capabilities` reports the caller's scope, including
+`observe_target` for a grant tied to a process lifetime.
 
 | Shared observe interface | Accepted requests |
 | --- | --- |
@@ -132,6 +132,32 @@ the protocol session ID and result bodies. Timeline responses can contain the
 original event fields. All clients with the session credential share access to
 those fields. An operator can restrict clients to a source projection as described below. The separate
 one-shot CLI uses its own entry point and policy.
+
+### HTTPS for scoped observation
+
+`--observe --tls` requires at least one source or process-target grant. HTTP.sys
+registers one HTTPS prefix for the selected canonical unicast IPv4 address. The
+default is `127.0.0.1`. Startup checks the exact certificate binding and its
+legacy TLS disable flag before opening a journal or accepting application requests.
+The request handler checks HTTP.sys TLS metadata, the local address and port,
+the Host authority and the MCP path before bearer authentication. A browser
+Origin header is rejected. A TLS startup or handshake failure has no HTTP retry.
+
+The client bridge uses a fixed `/mcp/` POST over TLS 1.2 or later, with certificate
+and IP verification. It sends only MCP discovery, initialization, ping, the
+capabilities resource and the two retained-read tools. It ignores proxy settings
+and refuses redirects. Generated stdio registrations store the selected HTTPS URL.
+HTTPS journals use a distinct DPAPI entropy domain and record `https_observe_source`
+or `https_observe_target` at admission. A loopback journal requires its original
+transport to unlock, even with the same Windows user, password and source grant.
+[Client setup](MCP_SETUP.md#connect-a-retained-evidence-client-over-https)
+
+Run `tools/test-mcp-observe-tls.py --exe <KnLiveDbg.exe> --openssl <openssl.exe>`
+with Python 3.10+ for the temporary-CA bridge tests, native journal recovery and
+missing-binding check. To exercise a provisioned native listener, add
+`--native-port <port> --ca-file <ca.pem>` for an available `127.0.0.1` binding.
+That run opens the product listener, checks a retained query and receipt ownership,
+stops it and looks up the receipt after restart.
 
 ### Source-scoped observation
 
