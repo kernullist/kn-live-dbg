@@ -74,8 +74,8 @@ and `kn://capabilities` report `observe`, `legacy_write_locked` or
 The listener rejects out-of-scope requests before allocating an operation ID
 or signalling the queue. The engine repeats the check immediately before
 dispatch. Timeline and graph handlers read the retained store directly. Each
-selects up to 64 matching events, with a default of 50. Finding those matches
-can still require scanning the store. Session and driver status may query the
+selects up to 64 matching events, with a default of 50. Finding matches
+consumes the scan allowance below. Session and driver status may query the
 existing device or service. The existing write-off confirmation also runs on
 entry to the engine.
 
@@ -83,8 +83,49 @@ The request audit records the scope, decision and admitted operation metadata.
 In observe sessions it omits argument values, hidden or unknown identifiers,
 the protocol session ID and result bodies. Timeline responses can contain the
 original event fields. All clients with the session credential share access to
-those fields. Per-principal evidence filtering and cumulative budgets remain
-open. The separate one-shot CLI uses its own entry point and policy.
+those fields. Per-principal evidence filtering remains open. The separate
+one-shot CLI uses its own entry point and policy.
+
+### Observe listener budget
+
+Read `observe_budget` in `kn://capabilities` or enter `mcp status` to see
+the limits, usage and remaining allowance. Every client of one observe listener
+shares the counters. Repeating `initialize`, changing the JSON-RPC ID or
+retrying a call keeps the same balance. An operator stop and fresh start opens
+a new allowance and a new operation ledger.
+
+| Meter | Limit for one listener | When it is charged |
+| --- | ---: | --- |
+| `admitted_calls` | 128 | One for each engine tool call or resource read the queue accepts. |
+| `requested_events` | 1,024 | The requested limit for each admitted timeline or graph query, including the default 50. |
+| `examined_events` | 65,536 | One for each retained event visited by timeline status, timeline query or graph query. Each job can inspect up to 4,096 events. Nonmatches and graph lookahead count. |
+| `payload_utf8_bytes` | 1 MiB | The UTF-8 sizes of the engine's text and structured JSON, each counted once when a result passes publication. One result can contain up to 64 KiB. |
+
+Policy denials, busy queues and ledger admission failures spend no allowance.
+A cancelled queued request keeps its admission charges. A dispatched request
+can finish after its waiter times out. Its accepted result is charged once,
+including when the waiter has already left. Jobs carry their listener generation.
+A late completion from a retired listener cannot debit the new one.
+
+Budget denials report `budget_exhausted`, `dimension` and `stage`. Admission
+denials have no operation ID. If a scan reaches its limit before coverage is
+known, the engine withholds the partial page or histogram. An oversized result
+is also withheld. An admitted read carries an operation receipt. A resource error
+uses `error.data` for an admission denial and adds `budget_denial` to the
+operation data for an admitted job. The audit retains the typed reason.
+Discovery, `kn://capabilities` and `operations.get` remain available when the
+engine allowance is exhausted.
+
+Each observe receipt has an `observe_charge` field. The admission charges
+are available immediately. The examined count and payload bytes are `null`
+until the operation finishes. Queued cancellation settles both at zero.
+`operations.get` retains the settled amounts and the dimension and stage
+of a budget denial, including after the original HTTP wait ends.
+
+The meters cover engine admissions, retained-event visits and logical result
+data. Protocol framing, repeated JSON representations on the wire, control
+traffic, temporary allocations, elapsed CPU time and kernel or collector I/O
+have separate costs.
 
 ### Legacy sessions
 

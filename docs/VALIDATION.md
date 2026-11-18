@@ -7,6 +7,42 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Cumulative MCP observe budgets, 2026-11-18
+
+On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256
+`9bc72b570cba8b98e4f0ab3112c7f38c77d152a557eaad926326870494cd6c14`.
+The fixtures used retained events in memory and an authenticated HTTP.sys
+listener on loopback port 51768. [Observe listener budget](MCP_SERVER_DESIGN.md#observe-listener-budget)
+
+| Boundary | Observed result |
+| --- | --- |
+| Admission | Two concurrent requests asked for the last 64 event slots. One entered the queue. Cancelling it kept its admission charges and settled its scan and result costs at zero. Busy queues and a ledger full of unfinished jobs consumed no allowance. The fixture reached exactly 128 admitted calls. |
+| Retained-event scans | Timeline, graph and status queries against a 4,097-event store consumed exactly 65,536 visits. Nonmatches and graph lookahead counted. An incomplete query returned a typed denial and withheld its data, including when the last query had only 4,095 visits left of its 4,096 maximum. |
+| Result size | Multibyte UTF-8 fixtures exercised the 64 KiB result limit and the 1 MiB listener limit. An oversized result exposed no original payload and charged zero bytes. A subsequent result fitting the exact remaining balance succeeded. |
+| Timeout and lookup | A running request outlived a two-second wait. Its first receipt reported unknown costs. When its oversized result arrived, `operations.get` reported one examined event, zero result bytes and a publication denial. A separate HTTP request finished after its 30-second wait and charged its 16 result bytes once. |
+| Listener lifetime | A second `initialize` retained the first client's usage. At 1,024 requested event slots, the next timeline request received a denial before admission and earlier receipts remained readable. A job that finished after stop and restart left the new listener's four counters at zero. |
+
+The MCP tool, observe HTTP and legacy HTTP suites passed 150, 98 and 29
+checks respectively. The standalone Release operation ledger passed 35 checks,
+and the Python oracle verified 12 serialized records. The MSVC AddressSanitizer
+runtime stopped at `interception_win.cpp:193` before the ledger harness entered
+`main`. Sanitized ledger execution on this host remains unverified. The Release
+linker emitted the existing C4744 warning for `KmonHuntIndex::NextQueryEpoch`.
+
+The full product self-test passed, including 3,048 command checks across
+261 registered commands. The restricted-launch suite checked 70 CLI results
+and the timeline suite passed 28 checks. The capability inventory passed
+53 contracts across 261 command routes and matched the published support matrix.
+Between 10:41 and 11:17 KST, the boot timestamp, three monitored services and
+three firewall profiles matched the baseline. There were zero new bugcheck or
+unexpected-restart events and zero new crash dumps. The final check found zero
+listeners or HTTP registrations on port 51768, owned test processes, loaded
+project drivers or leftover fixture files in the checked locations.
+
+These checks cover listener accounting and retained queries. Live driver
+or service status, kernel collection costs, per-principal authorization and
+recovery of operation records across restarts require separate evidence.
+
 ## Loopback MCP observe sessions, 2026-11-18
 
 On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256

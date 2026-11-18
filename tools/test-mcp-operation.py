@@ -21,9 +21,10 @@ def main():
         (3, "failed", True, True, "50", "51", "60"),
         (4, "unknown_outcome", True, True, "70", "71", "80"),
     ]
-    assert len(rows) == len(expected)
+    assert len(rows) == len(expected) + 5
     for row, (identity, state, dispatched, finished, queued, started, ended) in zip(rows, expected):
         assert row["schema"] == "kn.mcp_operation.v1"
+        assert "observe_charge" not in row
         assert row["operation_id"] == f"{identity:032x}"
         assert row["state"] == state
         assert row["engine_dispatched"] is dispatched and row["operation_finished"] is finished
@@ -33,6 +34,19 @@ def main():
         assert row["retention"] == "bounded_server_lifetime"
         for field in ("result_payload_retained", "effects_verified", "rollback_performed", "automatic_retry"):
             assert row[field] is False
+    observed = [
+        (1001, "queued", 5, None, None, None),
+        (1001, "cancelled_before_execution", 5, 0, 0, None),
+        (1002, "unknown_outcome", 1, None, None, None),
+        (1002, "failed", 1, 42, 0, {"dimension": "payload_utf8_bytes", "stage": "publication"}),
+        (1003, "succeeded", 0, 0, 17, None),
+    ]
+    for row, (identity, state, requested, examined, payload, denial) in zip(rows[len(expected):], observed):
+        assert row["operation_id"] == f"{identity:032x}" and row["state"] == state
+        charge = {"admitted_calls": 1, "requested_events": requested, "examined_events": examined, "payload_utf8_bytes": payload}
+        if denial:
+            charge["budget_denial"] = denial
+        assert row["observe_charge"] == charge
     print(f"mcp operation JSON oracle: {len(rows)} state records passed")
 
 

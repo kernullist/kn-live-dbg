@@ -766,7 +766,7 @@ static int RunCommandAuditSelfTest()
     for (const auto& json : { LR"({"address":"0","function":{}})", LR"({"address":"0","count":"junk"})" })
     {
         McpEngineRequest request{ McpRequestKind::ToolCall, L"code.disasm", json };
-        check(DispatchMcpRequest(request, state, dbgeng, device, service, symbols, ai, aiState).IsError,
+        check(DispatchMcpRequest(request, nullptr, state, dbgeng, device, service, symbols, ai, aiState).IsError,
             L"MCP invalid disassembly options fail visibly");
     }
     for (const auto& line : { L"!ti save x y", L"!kmon save x y", L"!timeline clear extra",

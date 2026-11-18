@@ -4,6 +4,7 @@
 #include "ThreatIntelSubscriber.h"
 #include "TimelineModel.h"
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -12,6 +13,44 @@
 #include <vector>
 
 struct SnapshotDiffResult;
+
+// A retained query counts every predicate visit, including a nonmatch and a
+// graph lookahead. Concurrent queries can share a listener's remaining count.
+class TimelineScanBudget
+{
+public:
+    TimelineScanBudget(uint32_t maximum, std::atomic<uint32_t>& remaining)
+        : Maximum(maximum), Remaining(remaining) {}
+    TimelineScanBudget(const TimelineScanBudget&) = delete;
+    TimelineScanBudget& operator=(const TimelineScanBudget&) = delete;
+
+    bool Visit()
+    {
+        if (Examined < Maximum)
+        {
+            uint32_t available = Remaining.load(std::memory_order_relaxed);
+            while (available != 0)
+            {
+                if (Remaining.compare_exchange_weak(available, available - 1, std::memory_order_relaxed))
+                {
+                    ++Examined;
+                    return true;
+                }
+            }
+        }
+        Incomplete = true;
+        return false;
+    }
+    bool IsIncomplete() const { return Incomplete; }
+    uint32_t ExaminedCount() const { return Examined; }
+    bool ReachedLocalLimit() const { return Examined == Maximum; }
+
+private:
+    const uint32_t Maximum;
+    std::atomic<uint32_t>& Remaining;
+    uint32_t Examined = 0;
+    bool Incomplete = false;
+};
 
 class TimelineStore
 {
@@ -46,6 +85,7 @@ public:
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
+    std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored, TimelineScanBudget* budget) const;
     std::vector<TimelineEvent> AllEvents() const;
     // Chronological events with EventId > minExclusive. maxCount 0 = unlimited.
     std::vector<TimelineEvent> RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const;
@@ -53,11 +93,13 @@ public:
     // stale minExclusive would otherwise skip every new event forever.
     uint64_t PeekNextEventId() const;
     TimelineGraphResult BuildGraph(const TimelineGraphQueryOptions& options) const;
+    TimelineGraphResult BuildGraph(const TimelineGraphQueryOptions& options, TimelineScanBudget* budget) const;
     TimelineReconcileResult ReconcileSnapshot(
         const SnapshotDocument& document,
         const TimelineReconcileOptions& options) const;
     TimelineAnalysisResult AnalyzeLiveSignals(size_t limit) const;
     TimelineStats GetStats() const;
+    TimelineStats GetStats(TimelineScanBudget* budget) const;
     bool ExportJsonl(const std::wstring& path, std::wstring* error) const;
 
     // TI recent-mode cursor for callers that want to pull only unprocessed

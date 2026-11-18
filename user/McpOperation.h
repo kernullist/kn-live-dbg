@@ -3,6 +3,31 @@
 #include "McpJson.h"
 #include <map>
 #include <mutex>
+#include <optional>
+
+enum class McpBudgetLimit { None, Calls, RequestedEvents, ExaminedEvents, QueryExaminedEvents, PayloadBytes, ResultPayloadBytes };
+
+inline const wchar_t* McpBudgetDimension(McpBudgetLimit limit)
+{
+    switch (limit)
+    {
+    case McpBudgetLimit::Calls: return L"admitted_calls";
+    case McpBudgetLimit::RequestedEvents: return L"requested_events";
+    case McpBudgetLimit::ExaminedEvents: return L"examined_events";
+    case McpBudgetLimit::QueryExaminedEvents: return L"per_query_examined_events";
+    case McpBudgetLimit::PayloadBytes: return L"payload_utf8_bytes";
+    case McpBudgetLimit::ResultPayloadBytes: return L"per_result_payload_utf8_bytes";
+    default: return L"none";
+    }
+}
+
+struct McpObserveSettlement
+{
+    uint32_t ExaminedEvents = 0;
+    uint32_t PayloadBytes = 0;
+    McpBudgetLimit DeniedBy = McpBudgetLimit::None;
+    bool AtPublication = false;
+};
 
 struct McpOperationSnapshot
 {
@@ -15,6 +40,8 @@ struct McpOperationSnapshot
     uint64_t FinishedMs = 0;
     bool Dispatched = false;
     bool Finished = false;
+    std::optional<uint32_t> ObserveRequestedEvents;
+    McpObserveSettlement Settlement;
 };
 
 inline bool IsMcpOperationId(const std::wstring& id)
@@ -27,16 +54,17 @@ class McpOperationLedger
 public:
     static constexpr size_t Capacity = 256;
 
-    bool Begin(const std::wstring& id, const std::wstring& name, uint64_t now)
+    bool Begin(const std::wstring& id, const std::wstring& name, uint64_t now,
+        std::optional<uint32_t> observeRequestedEvents = std::nullopt)
     {
         std::lock_guard<std::mutex> lock(Mutex);
         if (!IsMcpOperationId(id) || name.empty() || name.size() > 512 || Records.count(id) != 0 || Order == UINT64_MAX)
         {
             return false;
         }
+        auto oldest = Records.end();
         if (Records.size() == Capacity)
         {
-            auto oldest = Records.end();
             for (auto at = Records.begin(); at != Records.end(); ++at)
             {
                 if (at->second.Finished && (oldest == Records.end() || at->second.Order < oldest->second.Order))
@@ -48,14 +76,16 @@ public:
             {
                 return false;
             }
-            Records.erase(oldest);
         }
         McpOperationSnapshot record;
         record.Id = id;
         record.Name = name;
-        record.Order = ++Order;
+        record.Order = Order + 1;
         record.QueuedMs = now;
+        record.ObserveRequestedEvents = observeRequestedEvents;
         Records.emplace(id, std::move(record));
+        if (oldest != Records.end()) { Records.erase(oldest); }
+        ++Order;
         return true;
     }
 
@@ -97,7 +127,7 @@ public:
         }
     }
 
-    bool Complete(const std::wstring& id, bool failed, bool unknown, uint64_t now)
+    bool Complete(const std::wstring& id, bool failed, bool unknown, uint64_t now, const McpObserveSettlement& settlement = {})
     {
         std::lock_guard<std::mutex> lock(Mutex);
         const auto at = Records.find(id);
@@ -106,6 +136,7 @@ public:
             return false;
         }
         at->second.State = unknown ? L"unknown_outcome" : failed ? L"failed" : L"succeeded";
+        at->second.Settlement = settlement;
         at->second.Finished = true;
         at->second.FinishedMs = now;
         return true;
@@ -147,6 +178,19 @@ inline std::wstring McpOperationJson(const McpOperationSnapshot& operation)
     out += L",\"started_tick_ms\":" + (operation.Dispatched ? mcpjson::Quote(std::to_wstring(operation.StartedMs)) : L"null");
     out += L",\"finished_tick_ms\":" + (operation.Finished ? mcpjson::Quote(std::to_wstring(operation.FinishedMs)) : L"null");
     out += L",\"clock\":\"collector_boot_tick_ms\",\"retention\":\"bounded_server_lifetime\",\"capacity\":256";
+    if (operation.ObserveRequestedEvents.has_value())
+    {
+        const auto& cost = operation.Settlement;
+        out += L",\"observe_charge\":{\"admitted_calls\":1,\"requested_events\":" + std::to_wstring(*operation.ObserveRequestedEvents);
+        out += L",\"examined_events\":" + (operation.Finished ? std::to_wstring(cost.ExaminedEvents) : L"null");
+        out += L",\"payload_utf8_bytes\":" + (operation.Finished ? std::to_wstring(cost.PayloadBytes) : L"null");
+        if (cost.DeniedBy != McpBudgetLimit::None)
+        {
+            out += L",\"budget_denial\":{\"dimension\":" + mcpjson::Quote(McpBudgetDimension(cost.DeniedBy)) +
+                L",\"stage\":" + mcpjson::Quote(cost.AtPublication ? L"publication" : L"dispatch") + L"}";
+        }
+        out += L"}";
+    }
     out += L",\"result_payload_retained\":false,\"effects_verified\":false,\"rollback_performed\":false,\"automatic_retry\":false}";
     return out;
 }

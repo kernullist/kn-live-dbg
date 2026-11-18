@@ -69,7 +69,9 @@ and status with a local client. The server selects loopback and checks the
 scope before admitting work. Confirm `scope=observe` in `mcp status` or read
 `kn://capabilities`. A client can call `timeline.query` with
 `{"limit":"10","order":"newest"}`. Changing scope requires stopping the listener.
-[Observe catalog and limits](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
+Read `observe_budget` in `kn://capabilities` for the remaining calls, records
+and payload bytes. Reinitializing a client keeps the same budget.
+[Observe listener budget](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
 Default MCP mode omits write tools and disarms the kernel write gate on engine
 entry. `mcp on --allow-write` exposes the typed write tools and enables the gate.

@@ -62,7 +62,9 @@ TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공�
 `mcp on --observe`를 입력한다. 루프백 주소가 자동 선택된다.
 `mcp status`의 `scope=observe` 또는 `kn://capabilities`에서 범위를 확인한다.
 최근 10건을 읽으려면 `timeline.query`에 `{"limit":"10","order":"newest"}`를 전달한다.
-권한을 바꾸려면 현재 리스너를 종료하고 새로 시작한다. [조회 세션 구조](MCP_SERVER_DESIGN.ko.md#실행-경계)
+권한을 바꾸려면 현재 리스너를 종료하고 새로 시작한다. `kn://capabilities`의
+`observe_budget`에서 남은 요청 수, 이벤트 수와 결과 바이트를 확인한다.
+[조회 세션의 누적 한도](MCP_SERVER_DESIGN.ko.md#조회-세션의-누적-한도)
 
 기본 MCP 모드는 쓰기 도구를 노출하지 않고 엔진 진입 시 커널 write gate도 끈다.
 `mcp on --allow-write`는 typed 쓰기 도구와 gate를 활성화한다.

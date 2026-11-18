@@ -18,6 +18,12 @@ argument object can occupy at most 4096 UTF-16 code units on the wire after
 UTF-8 decoding. Scope and argument denials create no operation ID.
 [Observe session contract](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
 
+Use `kn://capabilities` to check the shared observe allowance before a series
+of queries. `budget_exhausted` reports the affected meter and stage. For an
+admitted request, use its operation ID to check the outcome and settled
+`observe_charge`. Pending scan and payload charges are `null`.
+[Listener budget and accounting](MCP_SERVER_DESIGN.md#observe-listener-budget)
+
 Use `tools/list` on the running server for the active schema. `*` marks required
 arguments; arrays contain strings. Numeric values are strings where the schema
 says `string`. Unknown keys, wrong types, missing required values, and invalid

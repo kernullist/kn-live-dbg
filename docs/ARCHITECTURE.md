@@ -1043,7 +1043,9 @@ for its lifetime. Catalog discovery, queue admission and engine dispatch use
 the same allowlist. Retained timeline queries and status are available on
 authenticated loopback connections. Requests for collection, export and
 mutation are refused before operation allocation. The scope applies to all
-clients of that listener. [MCP observation session](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
+clients of that listener. Queue admission, retained-event traversal and result
+publication draw from the same listener lifetime. Operation lookup stays on
+the control path when a quota is exhausted. [MCP observation quotas](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
 Offline trace queries take their input from an inherited disk handle. The
 reader checks the granted read, attribute and synchronization rights and asks

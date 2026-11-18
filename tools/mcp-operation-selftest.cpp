@@ -62,6 +62,21 @@ int main()
         ledger.Complete(Id(4), true, true, 80), "exception-remains-unknown-after-engine-finished");
     Emit(ledger, 4);
 
+    McpOperationLedger observed;
+    Check(observed.Begin(Id(1001), L"fixture.query", 1, 5), "observe-requested-charge");
+    Emit(observed, 1001);
+    Check(observed.CancelQueued(Id(1001), 2), "observe-cancelled-charge");
+    Emit(observed, 1001);
+    Check(observed.Begin(Id(1002), L"fixture.late", 3, 1) && observed.Start(Id(1002), 4), "observe-late-charge");
+    observed.WaitEnded(Id(1002));
+    Emit(observed, 1002);
+    Check(observed.Complete(Id(1002), true, false, 5, { 42, 0, McpBudgetLimit::PayloadBytes, true }) &&
+        !observed.Complete(Id(1002), false, false, 6, { 0, 20 }), "observe-retains-first-settlement");
+    Emit(observed, 1002);
+    Check(observed.Begin(Id(1003), L"fixture.status", 7, 0) && observed.Start(Id(1003), 8) &&
+        observed.Complete(Id(1003), false, false, 9, { 0, 17 }), "observe-zero-requested-with-payload");
+    Emit(observed, 1003);
+
     // Keep an old running job while recycling every finished record. A
     // timeout must not make the old job eligible for eviction.
     Check(ledger.Begin(Id(5), L"fixture.active", 90) && ledger.Start(Id(5), 91), "retention-active-admitted");

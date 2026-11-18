@@ -2978,6 +2978,11 @@ std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& opti
 
 std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& options, uint64_t* totalStored) const
 {
+    return Query(options, totalStored, nullptr);
+}
+
+std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& options, uint64_t* totalStored, TimelineScanBudget* budget) const
+{
     std::vector<TimelineEvent> out;
     std::lock_guard<std::mutex> lock(Mutex);
     if (totalStored != nullptr) { *totalStored = Events.size(); }
@@ -3006,35 +3011,23 @@ std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& opti
         return matched;
     };
 
-    size_t limit = options.Limit;
-    if (options.NewestFirst)
+    auto collect = [&](auto begin, auto end)
     {
-        for (auto it = Events.rbegin(); it != Events.rend(); ++it)
+        for (auto it = begin; it != end; ++it)
         {
+            if (budget && !budget->Visit()) { break; }
             if (matches(*it))
             {
                 out.push_back(*it);
-                if (limit != 0 && out.size() >= limit)
+                if (options.Limit != 0 && out.size() >= options.Limit)
                 {
                     break;
                 }
             }
         }
-    }
-    else
-    {
-        for (const TimelineEvent& event : Events)
-        {
-            if (matches(event))
-            {
-                out.push_back(event);
-                if (limit != 0 && out.size() >= limit)
-                {
-                    break;
-                }
-            }
-        }
-    }
+    };
+    if (options.NewestFirst) { collect(Events.rbegin(), Events.rend()); }
+    else { collect(Events.begin(), Events.end()); }
 
     return out;
 }
@@ -3066,6 +3059,11 @@ std::vector<TimelineEvent> TimelineStore::AllEvents() const
 
 TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& options) const
 {
+    return BuildGraph(options, nullptr);
+}
+
+TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& options, TimelineScanBudget* budget) const
+{
     TimelineGraphResult result = {};
     result.Options = options;
     std::map<std::wstring, TimelineGraphNode> nodes;
@@ -3079,6 +3077,7 @@ TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& o
         {
             for (auto it = begin; it != end; ++it)
             {
+                if (budget && !budget->Visit()) { break; }
                 if (!TimelineEventMatchesGraphQuery(*it, options)) { continue; }
                 if (options.Limit != 0 && events.size() == options.Limit)
                 {
@@ -3092,6 +3091,7 @@ TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& o
         else { collect(Events.begin(), Events.end()); }
     }
     result.MatchedEvents = events.size();
+    if (budget && budget->IsIncomplete()) { return result; }
     for (const TimelineEvent& event : events)
     {
         AddTimelineGraphEvent(event, &nodes, &edges);
@@ -3600,6 +3600,11 @@ uint64_t TimelineStore::PeekNextEventId() const
 
 TimelineStats TimelineStore::GetStats() const
 {
+    return GetStats(nullptr);
+}
+
+TimelineStats TimelineStore::GetStats(TimelineScanBudget* budget) const
+{
     TimelineStats stats = {};
     std::lock_guard<std::mutex> lock(Mutex);
 
@@ -3609,6 +3614,7 @@ TimelineStats TimelineStore::GetStats() const
     stats.Dropped = DroppedEvents;
     for (const TimelineEvent& event : Events)
     {
+        if (budget && !budget->Visit()) { break; }
         ++stats.BySource[event.Source.empty() ? L"<unknown>" : event.Source];
         ++stats.ByDomain[event.Domain.empty() ? L"<unknown>" : event.Domain];
     }

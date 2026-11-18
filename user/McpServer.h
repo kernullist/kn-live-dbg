@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "McpOperation.h"
 
@@ -41,6 +42,21 @@ struct McpEngineRequest
     std::wstring ArgumentsJson;
 };
 
+struct McpObserveUsage
+{
+    static constexpr uint32_t MaxCalls = 128;
+    static constexpr uint32_t MaxRequestedEvents = 1024;
+    static constexpr uint32_t MaxExaminedEvents = 65536;
+    static constexpr uint32_t MaxQueryExaminedEvents = 4096;
+    static constexpr uint32_t MaxPayloadBytes = 1024 * 1024;
+    static constexpr uint32_t MaxResultPayloadBytes = 64 * 1024;
+
+    uint32_t AdmittedCalls = 0;
+    uint32_t RequestedEvents = 0;
+    uint32_t PayloadBytes = 0;
+    std::atomic<uint32_t> RemainingScan{MaxExaminedEvents};
+};
+
 // Result produced by the engine-thread dispatch. Text is the primary human/
 // model-readable content (already redacted by the engine). StructuredJson, if
 // non-empty, is a serialized JSON object surfaced as MCP structuredContent.
@@ -51,18 +67,28 @@ struct McpEngineResult
     std::wstring StructuredJson;
     bool OutcomeUnknown = false;
     std::wstring OperationJson;
+    McpBudgetLimit BudgetLimit = McpBudgetLimit::None;
 };
 
 struct McpJob
 {
-    McpEngineRequest Request;
-    std::wstring OperationId;
+    McpJob(const McpEngineRequest& request, std::wstring id) : Request(request), OperationId(std::move(id)) {}
+    const McpEngineRequest Request;
+    const std::wstring OperationId;
+
+private:
+    friend class McpServer;
+    const class McpServer* Owner = nullptr;
+    uint64_t Generation = 0;
+    std::shared_ptr<McpObserveUsage> Observe;
+    bool ReadyToDispatch = false;
     std::promise<McpEngineResult> ResultPromise;
 };
 
 // Invoked ON the engine thread for each dequeued job. Implemented in main.cpp
 // so it can reach the file-static capability/command/write machinery.
-using McpEngineDispatchFn = std::function<McpEngineResult(const McpEngineRequest&)>;
+class TimelineScanBudget;
+using McpEngineDispatchFn = std::function<McpEngineResult(const McpEngineRequest&, TimelineScanBudget*)>;
 
 struct McpListenAddress
 {
@@ -93,7 +119,7 @@ struct McpServerConfig
 
 class TimelineStore;
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error);
-McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline);
+McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline, TimelineScanBudget& scan);
 
 bool SanitizeMcpPassword(
     const std::wstring& raw,
@@ -171,19 +197,20 @@ public:
     std::wstring AuditPath() const;
 
     // Engine-thread interface. The engine waits on JobReadyEvent(), then drains
-    // pending jobs with TryPopJob() and publishes each via CompleteJob().
+    // pending jobs with TryPopJob(). DispatchJob claims and publishes the job once.
     HANDLE JobReadyEvent() const;
     std::shared_ptr<McpJob> TryPopJob();
-    void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result);
     McpEngineResult OperationStatus(const std::wstring& operationId) const;
-    McpEngineResult DispatchAuthorized(const McpEngineRequest& request, const McpEngineDispatchFn& dispatch) const;
+    std::wstring ObserveBudgetJson() const;
+    bool DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineDispatchFn& dispatch);
 
 private:
     friend int RunMcpToolCatalogSelfTest();
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     void StopLocked();
-    bool AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result) const;
+    void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result, uint32_t examinedEvents = 0);
+    bool AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result, uint32_t* requestedEvents = nullptr) const;
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);
     void AppendAuditLine(const std::wstring& line);
     bool AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstring* error);
@@ -210,7 +237,9 @@ private:
     std::mutex lifecycleMutex_;
 
     // Serialized job queue drained by the single engine thread.
-    std::mutex queueMutex_;
+    mutable std::mutex queueMutex_;
+    uint64_t listenerGeneration_ = 0;
+    std::shared_ptr<McpObserveUsage> observeUsage_;
     std::deque<std::shared_ptr<McpJob>> queue_;
     HANDLE jobReadyEvent_ = nullptr;
     size_t maxPending_ = 8;

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -370,6 +371,7 @@ int RunMcpToolCatalogSelfTest()
         std::vector<McpToolCatalogEntry> catalog = BuildMcpToolCatalogSnapshot();
         McpServer observer;
         observer.config_.ObserveOnly = true;
+        observer.observeUsage_ = std::make_shared<McpObserveUsage>();
         observer.config_.BindAddress = L"127.0.0.1";
         observer.jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         size_t dispatches = 0;
@@ -387,18 +389,21 @@ int RunMcpToolCatalogSelfTest()
             fixtures.push_back(event);
         }
         Check(&context, retained.IngestEvents(fixtures).Added == 70, L"observe-owned-events");
-        auto dispatch = [&](const McpEngineRequest& request)
+        auto dispatch = [&](const McpEngineRequest& request, TimelineScanBudget* scan)
         {
             ++dispatches;
-            return ReadMcpObservedTimeline(request, retained);
+            if (!scan) { return McpEngineResult{true, L"missing observe scan budget"}; }
+            return ReadMcpObservedTimeline(request, retained, *scan);
         };
         auto blockedBeforeAdmission = [&](const McpEngineRequest& request)
         {
             McpEngineResult admission;
             const bool responded = observer.EnqueueAndWait(request, 0, &admission);
-            const auto terminal = observer.DispatchAuthorized(request, dispatch);
+            McpEngineResult terminal;
+            const bool rejected = !observer.AuthorizeEngineRequest(request, &terminal) &&
+                !observer.DispatchJob(std::make_shared<McpJob>(request, L""), dispatch);
             return responded && admission.IsError && !admission.OutcomeUnknown && admission.OperationJson.empty() &&
-                terminal.IsError && terminal.StructuredJson == admission.StructuredJson && dispatches == 0 &&
+                rejected && terminal.IsError && terminal.StructuredJson == admission.StructuredJson && dispatches == 0 &&
                 !observer.TryPopJob() && WaitForSingleObject(observer.JobReadyEvent(), 0) == WAIT_TIMEOUT;
         };
         const std::set<std::wstring> engineTools{ L"timeline.status", L"timeline.query", L"graph.query", L"ti.subscribe" };
@@ -429,9 +434,21 @@ int RunMcpToolCatalogSelfTest()
         }
         Check(&context, blockedBeforeAdmission({ McpRequestKind::ToolCall, L"future.tool", L"{}" }) &&
             blockedBeforeAdmission({ McpRequestKind::ResourceRead, L"kn://session/info", L"{}" }), L"observe-unknown-or-mixed-kind");
+        const auto runJob = [&](McpServer& server, const McpEngineRequest& request, const McpEngineDispatchFn& handler)
+        {
+            McpEngineResult result;
+            auto waiter = std::async(std::launch::async, [&]() { return server.EnqueueAndWait(request, 5000, &result); });
+            if (WaitForSingleObject(server.JobReadyEvent(), 5000) == WAIT_OBJECT_0)
+            {
+                auto job = server.TryPopJob();
+                if (job) { server.DispatchJob(job, handler); }
+            }
+            if (!waiter.get()) { result.IsError = true; }
+            return result;
+        };
         const auto invoke = [&](const wchar_t* name, const wchar_t* args)
         {
-            return observer.DispatchAuthorized({ McpRequestKind::ToolCall, name, args }, dispatch).StructuredJson;
+            return runJob(observer, { McpRequestKind::ToolCall, name, args }, dispatch).StructuredJson;
         };
         const auto defaultQuery = invoke(L"timeline.query", L"{}");
         const auto oldest = invoke(L"timeline.query", LR"({"source":"fixture","domain":"test","pid":"7","limit":"1","order":"oldest"})");
@@ -444,6 +461,165 @@ int RunMcpToolCatalogSelfTest()
             noMatch.find(L"\"matchedEvents\":0,\"truncated\":false") != std::wstring::npos &&
             dispatches == 4 && retained.GetStats().Stored == 70 && retained.PeekNextEventId() == 71,
             L"observe-bounded-retained-query-and-graph");
+        Check(&context, observer.observeUsage_->AdmittedCalls == 4 && observer.observeUsage_->RequestedEvents == 116 &&
+            McpObserveUsage::MaxExaminedEvents - observer.observeUsage_->RemainingScan.load() == 186,
+            L"observe-admissions-predicates-and-graph-lookahead-charged-once");
+        const McpEngineRequest statusRequest{ McpRequestKind::ToolCall, L"timeline.status", L"{}" };
+        const auto exception = runJob(observer, statusRequest, [](const McpEngineRequest&, TimelineScanBudget* scan) -> McpEngineResult
+        {
+            scan->Visit();
+            throw std::runtime_error("private fixture error");
+        });
+        Check(&context, exception.OutcomeUnknown && exception.Text.find(L"private fixture error") == std::wstring::npos &&
+            exception.OperationJson.find(L"\"examined_events\":1,") != std::wstring::npos &&
+            exception.OperationJson.find(L"\"state\":\"unknown_outcome\"") != std::wstring::npos,
+            L"observe-exception-preserves-examined-work-without-private-detail");
+        Check(&context, !observer.DispatchJob(std::make_shared<McpJob>(statusRequest, L""), dispatch) &&
+            dispatches == 4, L"observe-cannot-dispatch-an-unadmitted-request");
+        auto initializeFixture = [](McpServer& server)
+        {
+            server.config_.ObserveOnly = true;
+            server.observeUsage_ = std::make_shared<McpObserveUsage>();
+            server.jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        };
+        McpServer admissions;
+        initializeFixture(admissions);
+        const McpEngineRequest fullPage{ McpRequestKind::ToolCall, L"timeline.query", LR"({"limit":"64"})" };
+        auto cancelAtAdmission = [&](const McpEngineRequest& request)
+        {
+            McpEngineResult result;
+            admissions.EnqueueAndWait(request, 0, &result);
+            return result;
+        };
+        admissions.maxPending_ = 0;
+        McpEngineResult busy;
+        Check(&context, !admissions.EnqueueAndWait(fullPage, 0, &busy) && admissions.observeUsage_->AdmittedCalls == 0,
+            L"observe-queue-busy-has-no-charge");
+        admissions.maxPending_ = 8;
+        McpServer ledgerFull;
+        initializeFixture(ledgerFull);
+        bool filled = true;
+        for (unsigned index = 0; index < McpOperationLedger::Capacity; ++index)
+        {
+            wchar_t id[33]{};
+            swprintf_s(id, L"%032x", index);
+            filled &= ledgerFull.operations_.Begin(id, L"fixture", 1);
+        }
+        Check(&context, filled && !ledgerFull.EnqueueAndWait(fullPage, 0, &busy) && busy.OperationJson.empty() &&
+            ledgerFull.observeUsage_->AdmittedCalls == 0 && ledgerFull.observeUsage_->RequestedEvents == 0 &&
+            WaitForSingleObject(ledgerFull.JobReadyEvent(), 0) == WAIT_TIMEOUT, L"observe-ledger-full-does-not-spend-admission");
+        bool cancelled = true;
+        for (unsigned index = 0; index < 15; ++index)
+        {
+            cancelled &= cancelAtAdmission(fullPage).OperationJson.find(L"cancelled_before_execution") != std::wstring::npos;
+        }
+        std::promise<void> begin;
+        auto start = begin.get_future().share();
+        auto contend = [&]() { start.wait(); return cancelAtAdmission(fullPage); };
+        auto left = std::async(std::launch::async, contend);
+        auto right = std::async(std::launch::async, contend);
+        begin.set_value();
+        const auto a = left.get(), b = right.get();
+        const auto& denied = a.OperationJson.empty() ? a : b;
+        Check(&context, cancelled && a.OperationJson.empty() != b.OperationJson.empty() &&
+            denied.IsError && denied.BudgetLimit == McpBudgetLimit::RequestedEvents &&
+            admissions.observeUsage_->AdmittedCalls == 16 && admissions.observeUsage_->RequestedEvents == 1024 &&
+            admissions.observeUsage_->RemainingScan == McpObserveUsage::MaxExaminedEvents && !admissions.TryPopJob(),
+            L"observe-concurrent-last-admission-and-queued-cancel-accounting");
+        for (unsigned index = 16; index < McpObserveUsage::MaxCalls; ++index) { cancelAtAdmission(statusRequest); }
+        const auto noCalls = cancelAtAdmission(statusRequest);
+        Check(&context, noCalls.BudgetLimit == McpBudgetLimit::Calls && noCalls.OperationJson.empty() &&
+            admissions.observeUsage_->AdmittedCalls == McpObserveUsage::MaxCalls, L"observe-exact-call-budget");
+
+        McpServer traversal;
+        initializeFixture(traversal);
+        TimelineStore large(4097);
+        std::vector<TimelineEvent> records(4097, fixtures.front());
+        for (size_t index = 0; index < records.size(); ++index) { records[index].TimestampFileTime = 1 + index; }
+        Check(&context, large.IngestEvents(records).Added == records.size(), L"observe-scan-quota-owned-corpus");
+        auto queryLarge = [&](const McpEngineRequest& req, TimelineScanBudget* scan)
+        {
+            return ReadMcpObservedTimeline(req, large, *scan);
+        };
+        bool bounded = !runJob(traversal, { McpRequestKind::ToolCall, L"timeline.query", LR"({"limit":"1"})" }, queryLarge).IsError;
+        const auto initialPayload = traversal.observeUsage_->PayloadBytes;
+        for (unsigned index = 0; index < 16; ++index)
+        {
+            const McpEngineRequest filtered{ McpRequestKind::ToolCall, index % 2 ? L"graph.query" : L"timeline.query",
+                LR"({"source":"absent","limit":"1"})" };
+            const auto result = runJob(traversal, index % 3 ? filtered : statusRequest, queryLarge);
+            bounded &= result.BudgetLimit == (index == 15 ? McpBudgetLimit::ExaminedEvents : McpBudgetLimit::QueryExaminedEvents) &&
+                result.OperationJson.find(L"\"state\":\"failed\"") != std::wstring::npos &&
+                result.OperationJson.find(index == 15 ? L"\"examined_events\":4095," : L"\"examined_events\":4096,") != std::wstring::npos &&
+                result.StructuredJson.find(L"\"stage\":\"dispatch\"") != std::wstring::npos &&
+                result.StructuredJson.find(L"absent") == std::wstring::npos;
+        }
+        McpEngineResult exhaustedScan;
+        Check(&context, bounded && traversal.EnqueueAndWait(statusRequest, 0, &exhaustedScan) &&
+            exhaustedScan.BudgetLimit == McpBudgetLimit::ExaminedEvents && exhaustedScan.OperationJson.empty() &&
+            traversal.observeUsage_->RemainingScan == 0 && traversal.observeUsage_->PayloadBytes == initialPayload,
+            L"observe-exhausted-scan-suppresses-partial-results-and-stops-further-timeline-admission");
+
+        McpServer payloads;
+        initializeFixture(payloads);
+        const McpEngineRequest tiStatus{ McpRequestKind::ToolCall, L"ti.subscribe", L"{}" };
+        auto publishText = [&](const std::wstring& text)
+        {
+            return runJob(payloads, tiStatus, [&](const McpEngineRequest&, TimelineScanBudget*)
+            {
+                McpEngineResult result;
+                result.Text = text;
+                return result;
+            });
+        };
+        const std::wstring page(McpObserveUsage::MaxResultPayloadBytes / 2, L'\u00e9');
+        const auto tooBig = publishText(page + L"x");
+        bool published = !publishText(L"\u20ac").IsError;
+        for (unsigned index = 0; index < 15; ++index) { published &= !publishText(page).IsError; }
+        const auto tooMuch = publishText(page);
+        published &= !publishText(std::wstring(McpObserveUsage::MaxResultPayloadBytes - 3, L'a')).IsError;
+        McpEngineResult noBytes;
+        Check(&context, published && tooBig.BudgetLimit == McpBudgetLimit::ResultPayloadBytes &&
+            tooMuch.BudgetLimit == McpBudgetLimit::PayloadBytes && tooMuch.Text.find(L'\u00e9') == std::wstring::npos &&
+            tooMuch.StructuredJson.find(L"\"stage\":\"publication\"") != std::wstring::npos &&
+            payloads.EnqueueAndWait(tiStatus, 0, &noBytes) && noBytes.BudgetLimit == McpBudgetLimit::PayloadBytes &&
+            noBytes.OperationJson.empty() && payloads.observeUsage_->PayloadBytes == McpObserveUsage::MaxPayloadBytes,
+            L"observe-exact-utf8-result-and-lifetime-publication-budget");
+
+        McpServer late;
+        initializeFixture(late);
+        McpEngineResult timedOut;
+        auto client = std::async(std::launch::async, [&]() { return late.EnqueueAndWait(statusRequest, 2000, &timedOut); });
+        const bool enqueued = WaitForSingleObject(late.JobReadyEvent(), 5000) == WAIT_OBJECT_0;
+        auto pendingJob = late.TryPopJob();
+        std::promise<void> entered, finish;
+        auto running = entered.get_future();
+        auto released = finish.get_future();
+        auto worker = std::async(std::launch::async, [&]()
+        {
+            return late.DispatchJob(pendingJob, [&](const McpEngineRequest&, TimelineScanBudget* scan)
+            {
+                scan->Visit();
+                entered.set_value();
+                const bool signalled = released.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+                McpEngineResult result;
+                result.IsError = !signalled;
+                result.Text.assign(McpObserveUsage::MaxResultPayloadBytes + 1, L'p');
+                return result;
+            });
+        });
+        const bool observed = running.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        const bool returned = client.get();
+        finish.set_value();
+        const bool finished = worker.get();
+        const auto settlement = late.OperationStatus(pendingJob ? pendingJob->OperationId : L"").StructuredJson;
+        Check(&context, enqueued && observed && returned && finished && timedOut.OutcomeUnknown &&
+            timedOut.OperationJson.find(L"\"examined_events\":null") != std::wstring::npos &&
+            settlement.find(L"\"state\":\"failed\"") != std::wstring::npos &&
+            settlement.find(L"\"examined_events\":1,\"payload_utf8_bytes\":0") != std::wstring::npos &&
+            settlement.find(L"\"dimension\":\"per_result_payload_utf8_bytes\",\"stage\":\"publication\"") != std::wstring::npos &&
+            late.observeUsage_->AdmittedCalls == 1 && late.observeUsage_->PayloadBytes == 0,
+            L"observe-running-timeout-settles-late-budget-denial-and-cost");
         Check(&context, McpObserveAddressSelfTest(), L"observe-connection-address-boundary");
         McpEngineResult result;
         std::wstring nonBmp;
@@ -907,11 +1083,8 @@ int RunMcpTransportSelfTest(bool observe)
             auto job = server.TryPopJob();
             if (!job) { return false; }
             TimelineStore timeline(1);
-            auto result = server.DispatchAuthorized(job->Request,
-                [&](const McpEngineRequest& req) { return ReadMcpObservedTimeline(req, timeline); });
-            const bool ok = !result.IsError && IsMcpOperationId(job->OperationId);
-            server.CompleteJob(job, std::move(result));
-            return ok;
+            return IsMcpOperationId(job->OperationId) && server.DispatchJob(job,
+                [&](const McpEngineRequest& req, TimelineScanBudget* scan) { return ReadMcpObservedTimeline(req, timeline, *scan); });
         });
         post(R"({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"timeline.query","arguments":{"source":"observe-audit-canary","limit":"1"}}})",
             200, L"kn-live-dbg.timeline.v1", L"http-observe-retained-query");
@@ -933,6 +1106,31 @@ int RunMcpTransportSelfTest(bool observe)
             L"kn://drivers/status", L"kn://ti/stats", L"kn://modules/kernel", L"kn://session/symbols", L"kn://snapshot/current",
             L"kn://audit/tail" }), L"http-legacy-complete-resource-catalog");
     }
+    const auto readWireBudget = [&]()
+    {
+        post(R"({"jsonrpc":"2.0","id":24,"method":"resources/read","params":{"uri":"kn://capabilities"}})",
+            200, L"kn.mcp_observe_budget.v1", L"http-observe-budget-resource");
+        std::wstring result, contents, text, budget;
+        if (mcpjson::FindRawValue(lastResponse, L"result", &result) &&
+            mcpjson::FindRawValue(result, L"contents", &contents) && contents.size() >= 2 &&
+            mcpjson::GetString(contents.substr(1, contents.size() - 2), L"text", &text))
+        {
+            mcpjson::FindRawValue(text, L"observe_budget", &budget);
+        }
+        return budget;
+    };
+    const auto used = [](const std::wstring& budget, const wchar_t* dimension)
+    {
+        std::wstring entry, count;
+        if (mcpjson::FindRawValue(budget, dimension, &entry)) { mcpjson::FindRawValue(entry, L"used", &count); }
+        return count;
+    };
+    if (observe)
+    {
+        const auto budget = readWireBudget();
+        Check(&context, used(budget, L"admitted_calls") == L"1" && used(budget, L"requested_events") == L"1" &&
+            used(budget, L"examined_events") == L"0", L"http-observe-denials-and-control-lookups-uncharged");
+    }
     std::promise<void> releaseEngine;
     auto release = releaseEngine.get_future();
     auto engine = std::async(std::launch::async, [&]()
@@ -942,14 +1140,16 @@ int RunMcpTransportSelfTest(bool observe)
             return false;
         }
         auto job = server.TryPopJob();
-        if (job == nullptr || release.wait_for(std::chrono::seconds(60)) != std::future_status::ready)
+        bool released = false;
+        auto handler = [&](const McpEngineRequest&, TimelineScanBudget*)
         {
-            return false;
-        }
-        McpEngineResult result;
-        result.StructuredJson = L"{\"fixture\":true}";
-        server.CompleteJob(job, result);
-        return true;
+            McpEngineResult completed;
+            released = release.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+            completed.IsError = !released;
+            completed.StructuredJson = L"{\"fixture\":true}";
+            return completed;
+        };
+        return job && server.DispatchJob(job, handler) && released && !server.DispatchJob(job, handler);
     });
     post(observe ? R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"timeline.status","arguments":{}}})" :
         R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"process.find","arguments":{}}})",
@@ -963,10 +1163,19 @@ int RunMcpTransportSelfTest(bool observe)
         mcpjson::FindRawValue(meta, L"knlivedbg/operation", &operation) &&
         mcpjson::GetString(operation, L"operation_id", &operationId) && IsMcpOperationId(operationId),
         L"http-timeout-carries-operation-id");
+    if (observe)
+    {
+        std::wstring charge;
+        Check(&context, mcpjson::FindRawValue(operation, L"observe_charge", &charge) &&
+            charge.find(L"\"examined_events\":null") != std::wstring::npos && charge.find(L"\"payload_utf8_bytes\":null") != std::wstring::npos,
+            L"http-observe-unsettled-costs-stay-unknown-after-timeout");
+    }
     const std::string query = mcpjson::WideToUtf8(L"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"operations.get\",\"arguments\":{\"operation_id\":" +
         mcpjson::Quote(operationId) + L"}}}");
     post(query, 200, L"\"state\":\"unknown_outcome\"", L"http-status-bypasses-blocked-engine");
     Check(&context, !server.TryPopJob(), L"http-status-does-not-enqueue-another-operation");
+    std::wstring waitingBudget;
+    if (observe) { waitingBudget = readWireBudget(); }
     releaseEngine.set_value();
     Check(&context, engine.get(), L"http-late-engine-completion");
     std::string finalQuery = query;
@@ -976,6 +1185,17 @@ int RunMcpTransportSelfTest(bool observe)
         finalQuery.replace(requestId, 6, "\"id\":5");
     }
     post(finalQuery, 200, L"\"state\":\"succeeded\"", L"http-late-completion-status");
+    if (observe)
+    {
+        Check(&context, lastResponse.find(L"\"payload_utf8_bytes\":16") != std::wstring::npos &&
+            lastResponse.find(L"\"examined_events\":0") != std::wstring::npos, L"http-observe-late-receipt-settles-payload");
+        const auto after = readWireBudget();
+        const auto beforeBytes = used(waitingBudget, L"payload_utf8_bytes");
+        Check(&context, used(waitingBudget, L"admitted_calls") == L"2" && used(after, L"admitted_calls") == L"2" &&
+            !beforeBytes.empty() && used(after, L"payload_utf8_bytes") == std::to_wstring(
+                wcstoul(beforeBytes.c_str(), nullptr, 10) + std::string("{\"fixture\":true}").size()),
+            L"http-observe-timeout-and-duplicate-completion-charge-once");
+    }
     post(R"({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"operations.get","arguments":{"operation_id":1}}})",
         200, L"\"isError\":true", L"http-operation-invalid-arguments");
     post(R"({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"operations.get","arguments":{"operation_id":"00000000000000000000000000000000"}}})",
@@ -993,12 +1213,14 @@ int RunMcpTransportSelfTest(bool observe)
             {
                 return false;
             }
-            McpEngineResult result;
-            result.IsError = variant != 0;
-            result.Text = L"synthetic resource";
-            result.StructuredJson = L"{\"fixture\":true}";
-            server.CompleteJob(job, result);
-            return true;
+            return server.DispatchJob(job, [&](const McpEngineRequest&, TimelineScanBudget*)
+            {
+                McpEngineResult result;
+                result.IsError = variant != 0;
+                result.Text = L"synthetic resource";
+                result.StructuredJson = L"{\"fixture\":true}";
+                return result;
+            });
         });
         const std::string body = "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(8 + variant) +
             ",\"method\":\"resources/read\",\"params\":{\"uri\":\"kn://session/info\"}}";
@@ -1020,6 +1242,97 @@ int RunMcpTransportSelfTest(bool observe)
         }
         Check(&context, metadataOk && mcpjson::GetString(operation, L"operation_id", &operationId) &&
             IsMcpOperationId(operationId), L"http-resource-operation-id-location");
+    }
+    if (observe)
+    {
+        bool completed = true;
+        auto oversized = std::async(std::launch::async, [&]()
+        {
+            if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0) { return false; }
+            return server.DispatchJob(server.TryPopJob(), [](const McpEngineRequest&, TimelineScanBudget*)
+            {
+                McpEngineResult result;
+                result.Text.assign(McpObserveUsage::MaxResultPayloadBytes, L'x');
+                result.StructuredJson = LR"({"observe-audit-canary":true})";
+                return result;
+            });
+        });
+        post(R"({"jsonrpc":"2.0","id":25,"method":"resources/read","params":{"uri":"kn://ti/stats"}})",
+            200, L"per_result_payload_utf8_bytes", L"http-observe-oversize-resource-withheld");
+        std::wstring errorEnvelope, data, deniedId, denial, stage;
+        Check(&context, oversized.get() && mcpjson::FindRawValue(lastResponse, L"error", &errorEnvelope) &&
+            mcpjson::FindRawValue(errorEnvelope, L"data", &data) && mcpjson::GetString(data, L"operation_id", &deniedId) &&
+            IsMcpOperationId(deniedId) && mcpjson::FindRawValue(data, L"budget_denial", &denial) &&
+            mcpjson::GetString(denial, L"stage", &stage) && stage == L"publication" &&
+            lastResponse.find(L"observe-audit-canary") == std::wstring::npos,
+            L"http-observe-resource-error-retains-receipt-and-typed-denial");
+        const std::string lookup = mcpjson::WideToUtf8(L"{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"operations.get\",\"arguments\":{\"operation_id\":" +
+            mcpjson::Quote(deniedId) + L"}}}");
+        post(lookup, 200, L"\"state\":\"failed\"", L"http-observe-denied-result-lookup");
+        Check(&context, lastResponse.find(L"\"dimension\":\"per_result_payload_utf8_bytes\"") != std::wstring::npos &&
+            lastResponse.find(L"\"stage\":\"publication\"") != std::wstring::npos && lastResponse.find(L"\"payload_utf8_bytes\":0") != std::wstring::npos,
+            L"http-observe-denial-cause-and-zero-publication-survive-lookup");
+        for (unsigned index = 0; index < 16; ++index)
+        {
+            const auto page = std::string(R"({"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"timeline.query","arguments":{"limit":")") +
+                (index == 15 ? "63" : "64") + R"("}}})";
+            auto reader = std::async(std::launch::async, [&]()
+            {
+                if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0) { return false; }
+                auto job = server.TryPopJob();
+                if (!job) { return false; }
+                TimelineStore store(1);
+                return server.DispatchJob(job, [&](const McpEngineRequest& request, TimelineScanBudget* scan)
+                {
+                    return ReadMcpObservedTimeline(request, store, *scan);
+                });
+            });
+            post(page, 200, L"\"state\":\"succeeded\"", L"http-observe-page-admission");
+            completed &= reader.get();
+        }
+        const auto full = readWireBudget();
+        const auto priorSession = sessionId;
+        post(R"({"jsonrpc":"2.0","id":27,"method":"initialize","params":{}})", 200, L"protocolVersion",
+            L"http-observe-repeat-client-initialize");
+        Check(&context, completed && used(full, L"requested_events") == L"1024" && sessionId != priorSession &&
+            readWireBudget() == full, L"http-observe-initialize-cannot-replenish-quota");
+        post(R"({"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"graph.query","arguments":{"limit":"1"}}})",
+            200, L"budget_exhausted", L"http-observe-exhausted-requests-denied");
+        Check(&context, lastResponse.find(L"\"dimension\":\"requested_events\"") != std::wstring::npos &&
+            lastResponse.find(L"operation_id") == std::wstring::npos &&
+            WaitForSingleObject(server.JobReadyEvent(), 0) == WAIT_TIMEOUT, L"http-observe-no-operation-after-quota");
+        post(finalQuery, 200, L"\"state\":\"succeeded\"", L"http-observe-outcome-lookup-after-quota");
+        Check(&context, readWireBudget() == full, L"http-observe-exhaustion-and-receipt-leave-budget-intact");
+        std::promise<void> finishOldJob;
+        auto finish = finishOldJob.get_future();
+        auto oldEngine = std::async(std::launch::async, [&]()
+        {
+            if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0) { return false; }
+            return server.DispatchJob(server.TryPopJob(), [&](const McpEngineRequest&, TimelineScanBudget* scan)
+            {
+                server.RequestStop();
+                McpEngineResult result;
+                result.IsError = !scan || finish.wait_for(std::chrono::seconds(30)) != std::future_status::ready || !scan->Visit();
+                result.Text = L"prior listener fixture";
+                return result;
+            });
+        });
+        post(R"({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"ti.subscribe","arguments":{}}})",
+            200, L"unknown_outcome", L"http-observe-stop-after-dispatch-retains-unknown-outcome");
+        server.Stop();
+        const bool restarted = server.Start(config, &error);
+        finishOldJob.set_value();
+        Check(&context, oldEngine.get(), L"http-observe-prior-listener-completion-observed");
+        Check(&context, restarted, L"http-observe-fresh-listener");
+        if (restarted)
+        {
+            post(R"({"jsonrpc":"2.0","id":29,"method":"initialize","params":{}})", 200, L"protocolVersion", L"http-observe-fresh-session");
+            const auto fresh = readWireBudget();
+            Check(&context, used(fresh, L"admitted_calls") == L"0" && used(fresh, L"requested_events") == L"0" &&
+                used(fresh, L"examined_events") == L"0" && used(fresh, L"payload_utf8_bytes") == L"0",
+                L"http-observe-new-listener-has-fresh-allowance");
+            post(finalQuery, 200, L"not_retained", L"http-observe-new-listener-has-fresh-ledger");
+        }
     }
     if (connection != nullptr)
     {
@@ -1044,6 +1357,8 @@ int RunMcpTransportSelfTest(bool observe)
         std::ifstream file(config.AuditPath.c_str(), std::ios::binary);
         std::string audit{ std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{} };
         Check(&context, !sessionId.empty() && audit.find("\"scope\":\"observe\"") != std::string::npos &&
+            audit.find("\"decision\":\"budget_exhausted\"") != std::string::npos &&
+            audit.find("\"stage\":\"admission\"") != std::string::npos && audit.find("\"stage\":\"publication\"") != std::string::npos &&
             audit.find("\"decision\":\"blocked_by_policy\"") != std::string::npos &&
             audit.find("\"decision\":\"invalid_arguments\"") != std::string::npos &&
             audit.find("observe-audit-canary") == std::string::npos && audit.find("\"args\":") == std::string::npos &&

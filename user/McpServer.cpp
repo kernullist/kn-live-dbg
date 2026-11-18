@@ -776,13 +776,14 @@ namespace
         return out;
     }
 
-    std::wstring BuildCapabilitiesResource(const McpServerConfig& config)
+    std::wstring BuildCapabilitiesResource(const McpServerConfig& config, const std::wstring& budget)
     {
         std::wstring out = L"{\"server\":";
         out += mcpjson::Quote(kServerName);
         out += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config));
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
+        if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
         out += L",\"tools\":";
         out += BuildToolsList(config);
         out += L"}";
@@ -1624,7 +1625,19 @@ static McpEngineResult McpAuthorityError(const wchar_t* scope, bool invalid = fa
     return result;
 }
 
-McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline)
+static McpEngineResult ObserveBudgetError(McpBudgetLimit limit, const wchar_t* stage)
+{
+    const wchar_t* dimension = McpBudgetDimension(limit);
+    McpEngineResult result;
+    result.IsError = true;
+    result.BudgetLimit = limit;
+    result.Text = std::wstring(L"observe budget exhausted: ") + dimension;
+    result.StructuredJson = L"{\"schema\":\"kn.mcp_observe_budget_denial.v1\",\"status\":\"budget_exhausted\",\"dimension\":" +
+        mcpjson::Quote(dimension) + L",\"stage\":" + mcpjson::Quote(stage) + L"}";
+    return result;
+}
+
+McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline, TimelineScanBudget& scan)
 {
     if (request.Kind != McpRequestKind::ToolCall ||
         (request.Name != L"timeline.status" && request.Name != L"timeline.query" && request.Name != L"graph.query"))
@@ -1641,19 +1654,26 @@ McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const T
     McpEngineResult result;
     if (request.Name == L"graph.query")
     {
-        result.StructuredJson = BuildTimelineGraphJson(timeline.BuildGraph(options));
+        const auto graph = timeline.BuildGraph(options, &scan);
+        if (!scan.IsIncomplete()) { result.StructuredJson = BuildTimelineGraphJson(graph); }
     }
     else if (request.Name == L"timeline.status")
     {
-        result.StructuredJson = BuildTimelineStatusJson(timeline.GetStats());
+        const auto stats = timeline.GetStats(&scan);
+        if (!scan.IsIncomplete()) { result.StructuredJson = BuildTimelineStatusJson(stats); }
     }
     else
     {
         TimelineQueryOptions query{ options.Source, options.Domain, options.HasProcessId, options.ProcessId,
             options.Limit, options.NewestFirst };
         uint64_t totalStored = 0;
-        const auto events = timeline.Query(query, &totalStored);
-        result.StructuredJson = BuildTimelineEventsJson(events, query, totalStored);
+        const auto events = timeline.Query(query, &totalStored, &scan);
+        if (!scan.IsIncomplete()) { result.StructuredJson = BuildTimelineEventsJson(events, query, totalStored); }
+    }
+    if (scan.IsIncomplete())
+    {
+        return ObserveBudgetError(scan.ReachedLocalLimit() ? McpBudgetLimit::QueryExaminedEvents :
+            McpBudgetLimit::ExaminedEvents, L"dispatch");
     }
     return result;
 }
@@ -1835,20 +1855,64 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
             {
                 job.reset();
             }
+            else { job->ReadyToDispatch = true; }
         }
     }
     return job;
 }
 
-void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result)
+static uint32_t ObservePayloadCost(const McpEngineResult& result)
+{
+    uint32_t bytes = 0;
+    constexpr uint32_t maximum = McpObserveUsage::MaxResultPayloadBytes;
+    for (const auto* part : { &result.Text, &result.StructuredJson })
+    {
+        if (part->empty()) { continue; }
+        if (part->size() > maximum - bytes) { return maximum + 1; }
+        const size_t encoded = mcpjson::WideToUtf8(*part).size();
+        if (encoded == 0 || encoded > maximum - bytes) { return maximum + 1; }
+        bytes += static_cast<uint32_t>(encoded);
+    }
+    return bytes;
+}
+
+void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result, uint32_t examinedEvents)
 {
     // Serialize publication with queue removal and admission/eviction. The
     // first engine completion wins, including after the waiter has timed out.
     std::lock_guard<std::mutex> lock(queueMutex_);
-    if (job == nullptr || !operations_.Complete(job->OperationId, result.IsError, result.OutcomeUnknown, GetTickCount64()))
+    if (!job || job->Owner != this || job->Generation != listenerGeneration_) { return; }
+    McpObserveSettlement cost;
+    if (job->Observe)
+    {
+        cost.ExaminedEvents = examinedEvents;
+        if (result.BudgetLimit != McpBudgetLimit::None)
+        {
+            result = ObserveBudgetError(result.BudgetLimit, L"dispatch");
+        }
+        else
+        {
+            cost.PayloadBytes = ObservePayloadCost(result);
+            McpBudgetLimit limit = McpBudgetLimit::None;
+            if (cost.PayloadBytes > McpObserveUsage::MaxResultPayloadBytes) { limit = McpBudgetLimit::ResultPayloadBytes; }
+            else if (cost.PayloadBytes > McpObserveUsage::MaxPayloadBytes - job->Observe->PayloadBytes) { limit = McpBudgetLimit::PayloadBytes; }
+            if (limit != McpBudgetLimit::None)
+            {
+                const bool unknown = result.OutcomeUnknown;
+                result = ObserveBudgetError(limit, L"publication");
+                result.OutcomeUnknown = unknown;
+                cost.PayloadBytes = 0;
+                cost.AtPublication = true;
+            }
+        }
+        cost.DeniedBy = result.BudgetLimit;
+    }
+    if (!operations_.Complete(job->OperationId, result.IsError, result.OutcomeUnknown, GetTickCount64(), cost))
     {
         return;
     }
+    job->ReadyToDispatch = false;
+    if (job->Observe) { job->Observe->PayloadBytes += cost.PayloadBytes; }
     McpOperationSnapshot snapshot;
     if (operations_.Get(job->OperationId, &snapshot))
     {
@@ -1885,68 +1949,154 @@ const wchar_t* McpServer::ScopeName() const
     return ScopeNameFor(config_);
 }
 
-bool McpServer::AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result) const
+static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const McpEngineRequest& request,
+    McpEngineResult* result, uint32_t* requestedEvents = nullptr)
 {
     if (request.Kind == McpRequestKind::ResourceRead)
     {
-        if (ResourceVisible(request.Name, config_) && request.Name != L"kn://capabilities" &&
+        if (ResourceVisible(request.Name, scope) && request.Name != L"kn://capabilities" &&
             request.ArgumentsJson.empty()) { return true; }
     }
     else if (request.Kind == McpRequestKind::ToolCall)
     {
         const auto* tool = FindTool(request.Name);
-        if (tool != nullptr && ToolVisible(*tool, config_) && request.Name != L"operations.get")
+        if (tool != nullptr && ToolVisible(*tool, scope) && request.Name != L"operations.get")
         {
             const auto& args = request.ArgumentsJson;
             std::wstring error;
-            if ((config_.ObserveOnly && args.size() > 4096) || !ValidateMcpToolArguments(request.Name, args, &error))
+            if ((scope.ObserveOnly && args.size() > 4096) || !ValidateMcpToolArguments(request.Name, args, &error))
             {
-                *result = McpAuthorityError(ScopeName(), true);
-                if (!config_.ObserveOnly) { result->Text = error; }
+                *result = McpAuthorityError(ScopeNameFor(scope), true);
+                if (!scope.ObserveOnly) { result->Text = error; }
                 return false;
             }
-            if (request.Name == L"ti.subscribe" && !AllowWrite())
+            if (request.Name == L"ti.subscribe" && (scope.ObserveOnly || !scope.AllowWrite))
             {
                 std::wstring action;
                 if (mcpjson::GetString(args, L"action", &action))
                 {
-                    if (!config_.ObserveOnly)
+                    if (!scope.ObserveOnly)
                     {
                         const auto visible = [](wchar_t ch) { return !std::iswspace(ch); };
                         const auto first = std::find_if(action.begin(), action.end(), visible);
                         const auto last = std::find_if(action.rbegin(), action.rend(), visible).base();
                         action = first < last ? std::wstring(first, last) : L"";
                     }
-                    const bool status = config_.ObserveOnly ? action == L"status" :
+                    const bool status = scope.ObserveOnly ? action == L"status" :
                         (action.empty() || (action.size() == 6 && _wcsicmp(action.c_str(), L"status") == 0));
                     if (!status)
                     {
-                        *result = McpAuthorityError(ScopeName());
+                        *result = McpAuthorityError(ScopeNameFor(scope));
                         return false;
                     }
                 }
             }
-            if (config_.ObserveOnly && (request.Name == L"timeline.query" || request.Name == L"graph.query"))
+            if (scope.ObserveOnly && (request.Name == L"timeline.query" || request.Name == L"graph.query"))
             {
                 TimelineGraphQueryOptions options;
                 if (!ParseObservedTimelineOptions(args, &options))
                 {
-                    *result = McpAuthorityError(ScopeName(), true);
+                    *result = McpAuthorityError(ScopeNameFor(scope), true);
                     return false;
                 }
+                if (requestedEvents) { *requestedEvents = static_cast<uint32_t>(options.Limit); }
             }
             return true;
         }
     }
-    *result = McpAuthorityError(ScopeName());
+    *result = McpAuthorityError(ScopeNameFor(scope));
     return false;
 }
 
-McpEngineResult McpServer::DispatchAuthorized(const McpEngineRequest& request, const McpEngineDispatchFn& dispatch) const
+bool McpServer::AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result, uint32_t* requestedEvents) const
+{
+    // Called by the listener. Start cannot replace its configuration before Stop joins it.
+    return ValidateEngineRequestForScope(config_, request, result, requestedEvents);
+}
+
+static McpBudgetLimit AvailableObserveWork(const McpObserveUsage& usage, const McpEngineRequest& request)
+{
+    if (usage.PayloadBytes == McpObserveUsage::MaxPayloadBytes) { return McpBudgetLimit::PayloadBytes; }
+    if (usage.RemainingScan.load(std::memory_order_relaxed) == 0 && request.Kind == McpRequestKind::ToolCall &&
+        (request.Name == L"timeline.query" || request.Name == L"timeline.status" || request.Name == L"graph.query"))
+    {
+        return McpBudgetLimit::ExaminedEvents;
+    }
+    return McpBudgetLimit::None;
+}
+
+std::wstring McpServer::ObserveBudgetJson() const
+{
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    if (!observeUsage_) { return {}; }
+    const auto& usage = *observeUsage_;
+    auto balance = [](uint32_t limit, uint32_t used)
+    {
+        return L"{\"limit\":" + std::to_wstring(limit) + L",\"used\":" + std::to_wstring(used) +
+            L",\"remaining\":" + std::to_wstring(limit - used) + L"}";
+    };
+    return L"{\"schema\":\"kn.mcp_observe_budget.v1\",\"lifetime\":\"listener\",\"admitted_calls\":" +
+        balance(usage.MaxCalls, usage.AdmittedCalls) + L",\"requested_events\":" + balance(usage.MaxRequestedEvents, usage.RequestedEvents) +
+        L",\"examined_events\":" + balance(usage.MaxExaminedEvents, usage.MaxExaminedEvents - usage.RemainingScan.load(std::memory_order_relaxed)) +
+        L",\"payload_utf8_bytes\":" + balance(usage.MaxPayloadBytes, usage.PayloadBytes) +
+        L",\"per_query_examined_events\":" + std::to_wstring(usage.MaxQueryExaminedEvents) +
+        L",\"per_result_payload_utf8_bytes\":" + std::to_wstring(usage.MaxResultPayloadBytes) + L"}";
+}
+
+bool McpServer::DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineDispatchFn& dispatch)
 {
     McpEngineResult result;
-    if (!AuthorizeEngineRequest(request, &result)) { return result; }
-    return dispatch(request);
+    McpServerConfig scope;
+    std::optional<TimelineScanBudget> scan;
+    try
+    {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!job || job->Owner != this || job->Generation != listenerGeneration_ || !job->ReadyToDispatch) { return false; }
+            job->ReadyToDispatch = false;
+            scope.ObserveOnly = config_.ObserveOnly;
+            scope.AllowWrite = config_.AllowWrite;
+            if (stopRequested_.load()) { result = McpAuthorityError(ScopeName()); }
+            else if (job->Observe)
+            {
+                const auto limit = AvailableObserveWork(*job->Observe, job->Request);
+                if (limit != McpBudgetLimit::None) { result = ObserveBudgetError(limit, L"dispatch"); }
+            }
+        }
+        if (!result.IsError && ValidateEngineRequestForScope(scope, job->Request, &result))
+        {
+            if (job->Observe)
+            {
+                scan.emplace(McpObserveUsage::MaxQueryExaminedEvents, job->Observe->RemainingScan);
+                result = dispatch(job->Request, &*scan);
+                if (scan->IsIncomplete())
+                {
+                    result = ObserveBudgetError(scan->ReachedLocalLimit() ? McpBudgetLimit::QueryExaminedEvents :
+                        McpBudgetLimit::ExaminedEvents, L"dispatch");
+                }
+            }
+            else { result = dispatch(job->Request, nullptr); }
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        result = {};
+        result.IsError = result.OutcomeUnknown = true;
+        result.Text = L"tool raised an unhandled exception";
+        if (job && !job->Observe && ex.what())
+        {
+            const char* detail = ex.what();
+            result.Text += L": " + std::wstring(detail, detail + strlen(detail));
+        }
+    }
+    catch (...)
+    {
+        result = {};
+        result.IsError = result.OutcomeUnknown = true;
+        result.Text = L"tool raised an unhandled exception (unknown type)";
+    }
+    CompleteJob(job, std::move(result), scan ? scan->ExaminedCount() : 0);
+    return true;
 }
 
 bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result)
@@ -1956,22 +2106,35 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         return false;
     }
     *result = McpEngineResult{};
-    if (!AuthorizeEngineRequest(request, result)) { return true; }
-    std::shared_ptr<McpJob> job = std::make_shared<McpJob>();
-    job->Request = request;
-    job->OperationId = RandomHex(16);
-    std::future<McpEngineResult> future = job->ResultPromise.get_future();
-
+    uint32_t requestedEvents = 0;
+    if (!AuthorizeEngineRequest(request, result, &requestedEvents)) { return true; }
+    std::shared_ptr<McpJob> job;
+    std::future<McpEngineResult> future;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
         if (stopRequested_.load() || queue_.size() >= maxPending_)
         {
             return false;
         }
+        if (config_.ObserveOnly)
+        {
+            if (!observeUsage_) { *result = McpAuthorityError(ScopeName()); return true; }
+            const auto& usage = *observeUsage_;
+            auto limit = AvailableObserveWork(usage, request);
+            if (usage.AdmittedCalls == usage.MaxCalls) { limit = McpBudgetLimit::Calls; }
+            else if (requestedEvents > usage.MaxRequestedEvents - usage.RequestedEvents) { limit = McpBudgetLimit::RequestedEvents; }
+            if (limit != McpBudgetLimit::None) { *result = ObserveBudgetError(limit, L"admission"); return true; }
+        }
+        job = std::make_shared<McpJob>(request, RandomHex(16));
+        job->Owner = this;
+        job->Generation = listenerGeneration_;
+        job->Observe = observeUsage_;
+        future = job->ResultPromise.get_future();
         queue_.push_back(job);
         try
         {
-            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64()))
+            const auto observeEvents = job->Observe ? std::optional<uint32_t>(requestedEvents) : std::nullopt;
+            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64(), observeEvents))
             {
                 queue_.pop_back();
                 return false;
@@ -1981,6 +2144,11 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         {
             queue_.pop_back();
             throw;
+        }
+        if (job->Observe)
+        {
+            ++job->Observe->AdmittedCalls;
+            job->Observe->RequestedEvents += requestedEvents;
         }
     }
     SetEvent(jobReadyEvent_);
@@ -2046,8 +2214,18 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         }
 
         if (!ValidateMcpObservationConfig(config, error)) { return false; }
-        config_ = config;
-        operations_.Reset();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (listenerGeneration_ == UINT64_MAX)
+            {
+                if (error) { *error = L"MCP listener generation exhausted"; }
+                return false;
+            }
+            ++listenerGeneration_;
+            config_ = config;
+            observeUsage_ = config.ObserveOnly ? std::make_shared<McpObserveUsage>() : nullptr;
+            operations_.Reset();
+        }
         config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
         sessionId_.clear();
         token_.clear();
@@ -2412,7 +2590,7 @@ void McpServer::ListenerThreadMain()
     // while the server runs (independent of the operator's `ai audit` setting).
     auto writeAudit = [&](const HTTP_REQUEST* request, const std::wstring& method, const std::wstring& name,
                           const std::wstring& args, const std::wstring& decision, bool isError, size_t resultBytes,
-                          const std::wstring& operation = L"")
+                          const std::wstring& operation = L"", const std::wstring& budgetDenial = L"")
     {
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
         if (!config_.ObserveOnly) { record += L",\"session\":" + mcpjson::Quote(sessionId_); }
@@ -2439,6 +2617,7 @@ void McpServer::ListenerThreadMain()
         {
             record += L",\"operation\":" + operation;
         }
+        if (!budgetDenial.empty()) { record += L",\"budget_denial\":" + budgetDenial; }
         record += L",\"writeArmed\":";
         record += config_.AllowWrite ? L"true" : L"false";
         record += L"}";
@@ -2660,12 +2839,14 @@ void McpServer::ListenerThreadMain()
                 else if (result.IsError)
                 {
                     decision = L"tool-error";
-                    if (result.OperationJson.empty()) { mcpjson::GetString(result.StructuredJson, L"status", &decision); }
+                    if (result.BudgetLimit != McpBudgetLimit::None) { decision = L"budget_exhausted"; }
+                    else if (result.OperationJson.empty()) { mcpjson::GetString(result.StructuredJson, L"status", &decision); }
                 }
             }
 
             writeAudit(request, L"tools/call", name, argsRaw, decision, result.IsError,
-                       result.Text.size() + result.StructuredJson.size(), result.OperationJson);
+                       result.Text.size() + result.StructuredJson.size(), result.OperationJson,
+                       result.BudgetLimit != McpBudgetLimit::None ? result.StructuredJson : L"");
             sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolResult(result)));
             return;
         }
@@ -2686,7 +2867,7 @@ void McpServer::ListenerThreadMain()
             if (uri == L"kn://capabilities")
             {
                 // Static manifest; served transport-side without an engine hop.
-                contentsText = BuildCapabilitiesResource(config_);
+                contentsText = BuildCapabilitiesResource(config_, ObserveBudgetJson());
             }
             else if (ResourceVisible(uri, config_))
             {
@@ -2702,9 +2883,17 @@ void McpServer::ListenerThreadMain()
                 }
                 if (result.IsError)
                 {
-                    writeAudit(request, L"resources/read", uri, L"", L"resource-error", true, 0, result.OperationJson);
+                    const bool exhausted = result.BudgetLimit != McpBudgetLimit::None;
+                    writeAudit(request, L"resources/read", uri, L"", exhausted ? L"budget_exhausted" : L"resource-error",
+                        true, 0, result.OperationJson, exhausted ? result.StructuredJson : L"");
                     std::wstring message = result.Text.empty() ? (L"unknown resource: " + uri) : result.Text;
-                    sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, message, result.OperationJson));
+                    std::wstring data = result.OperationJson;
+                    if (exhausted)
+                    {
+                        if (data.empty()) { data = result.StructuredJson; }
+                        else { data.insert(data.size() - 1, L",\"budget_denial\":" + result.StructuredJson); }
+                    }
+                    sendResponse(requestId, 200, "OK", RpcError(idRaw, exhausted ? -32001 : -32602, message, data));
                     return;
                 }
                 contentsText = result.StructuredJson.empty() ? result.Text : result.StructuredJson;

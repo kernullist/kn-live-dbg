@@ -51907,6 +51907,7 @@ static std::wstring BuildMcpAuditTailJson()
 
 static McpEngineResult DispatchMcpRequest(
     const McpEngineRequest& request,
+    TimelineScanBudget* observeScan,
     DebuggerState& state,
     DbgEngBackend& dbgeng,
     DeviceClient& device,
@@ -51917,6 +51918,12 @@ static McpEngineResult DispatchMcpRequest(
 {
     McpEngineResult result;
 
+    if (!observeScan && g_McpServer.ObserveOnly())
+    {
+        result.IsError = true;
+        result.Text = L"observe dispatch requires an admitted scan budget";
+        return result;
+    }
     if (request.Kind == McpRequestKind::ResourceRead)
     {
         if (request.Name == L"kn://session/info")
@@ -51983,7 +51990,7 @@ static McpEngineResult DispatchMcpRequest(
         return result;
     }
 
-    if (g_McpServer.ObserveOnly())
+    if (observeScan)
     {
         if (request.Name == L"ti.subscribe")
         {
@@ -51991,7 +51998,7 @@ static McpEngineResult DispatchMcpRequest(
             result.StructuredJson = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
             return result;
         }
-        return ReadMcpObservedTimeline(request, state.Timeline);
+        return ReadMcpObservedTimeline(request, state.Timeline, *observeScan);
     }
 
     // Tool call. Write-ness is decided by the kTools table (single source of
@@ -52358,39 +52365,18 @@ static void RunMcpEngineLoop(
             std::wcout << L"[mcp] running port=" << g_McpServer.Port()
                        << L" scope=" << g_McpServer.ScopeName()
                        << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off") << L"\n";
+            if (g_McpServer.ObserveOnly()) { std::wcout << g_McpServer.ObserveBudgetJson() << L"\n"; }
         }
 
         std::shared_ptr<McpJob> job;
         while ((job = g_McpServer.TryPopJob()) != nullptr)
         {
-            // The engine thread is the last handler above MCP tools; an
-            // escaping C++ exception would std::terminate the process.
-            McpEngineResult dispatchResult;
             try
             {
-                dispatchResult = g_McpServer.DispatchAuthorized(job->Request, [&](const McpEngineRequest& request)
+                g_McpServer.DispatchJob(job, [&](const McpEngineRequest& request, TimelineScanBudget* scan)
                 {
-                    return DispatchMcpRequest(request, state, dbgeng, device, service, symbols, ai, aiState);
+                    return DispatchMcpRequest(request, scan, state, dbgeng, device, service, symbols, ai, aiState);
                 });
-            }
-            catch (const std::exception& ex)
-            {
-                const char* rawWhat = ex.what();
-                const char* what = rawWhat != nullptr ? rawWhat : "";
-                dispatchResult.IsError = true;
-                dispatchResult.Text = L"tool raised an unhandled exception: " +
-                    std::wstring(what, what + strlen(what));
-                dispatchResult.OutcomeUnknown = true;
-            }
-            catch (...)
-            {
-                dispatchResult.IsError = true;
-                dispatchResult.Text = L"tool raised an unhandled exception (unknown type)";
-                dispatchResult.OutcomeUnknown = true;
-            }
-            try
-            {
-                g_McpServer.CompleteJob(job, std::move(dispatchResult));
             }
             catch (...)
             {
@@ -53446,6 +53432,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                    << L" wildcard=" << (g_McpServer.WildcardBound() ? L"on" : L"off")
                    << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off")
                    << L" auth=password\n";
+        if (g_McpServer.ObserveOnly()) { std::wcout << g_McpServer.ObserveBudgetJson() << L"\n"; }
         std::wcout << L"  endpoint: " << GetMcpEndpointPath() << L"\n";
         std::wcout << L"  bridge  : " << ResolveMcpBridgeScriptPath() << L"\n";
         std::wcout << L"  clients : IP + port + session password\n";
