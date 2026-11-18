@@ -132,6 +132,7 @@ public:
     bool Open(std::wstring* error);
     bool Open(const std::wstring& userDeviceName, std::wstring* error);
     void Close();
+    bool Close(DWORD& firstError);
     bool IsOpen() const;
 
     // The provider owns callbacks and rundown. Closing this client releases
@@ -289,7 +290,7 @@ public:
         std::wstring* error);
 
 private:
-    void CloseLocked();
+    bool CloseLocked(DWORD* firstError = nullptr);
     auto TimelineControlSender();
     bool ReadTimelineStatus(KNDBG_TIMELINE_STATUS_RESPONSE& response, std::wstring* error);
     bool Ioctl(

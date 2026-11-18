@@ -71,6 +71,7 @@
 #include "SnapshotPrinter.h"
 #include "ThreatIntelSubscriber.h"
 #include "TimelineDashboard.h"
+#include "ObservationWindows.h"
 #include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 #include "NmiScanner.h"
@@ -21359,7 +21360,7 @@ static void PrintTimelineAdvancedHelp()
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
-    std::wcout << L"  !timeline ingest observer   copy retained ETW and live callback control results\n";
+    std::wcout << L"  !timeline ingest observer   copy retained ETW, live callback and process handle results\n";
     std::wcout << L"  !timeline targets ti <pid> [after <boot-id> <create-filetime>]  List retained TI header-process lifetimes.\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
@@ -22737,16 +22738,20 @@ static TimelineIngestResult IngestControllerActions(TimelineStore& store, bool p
 {
     const auto ti = GetTiSubscriberInstance().ObserverActions();
     const auto live = GetTimelineControlJournal().Snapshot();
+    const auto handles = ControllerProcessHandles().Snapshot();
     auto result = store.IngestTiObserverActions(ti);
-    const auto callbacks = store.IngestLiveObserverActions(live);
-    result.SourceRecords += callbacks.SourceRecords;
-    result.Added += callbacks.Added;
-    result.Dropped += callbacks.Dropped;
-    result.Warnings.insert(result.Warnings.end(), callbacks.Warnings.begin(), callbacks.Warnings.end());
+    for (const auto& part : {store.IngestLiveObserverActions(live), store.IngestProcessHandleActions(handles)})
+    {
+        result.SourceRecords += part.SourceRecords;
+        result.Added += part.Added;
+        result.Dropped += part.Dropped;
+        result.Warnings.insert(result.Warnings.end(), part.Warnings.begin(), part.Warnings.end());
+    }
     if (printCounts)
     {
         std::wcout << L"  TI control calls=" << ti.Total << L" retained=" << ti.Actions.size()
-                   << L"\n  Live callback control calls=" << live.Total << L" retained=" << live.Actions.size() << L"\n";
+                   << L"\n  Live callback control calls=" << live.Total << L" retained=" << live.Actions.size()
+                   << L"\n  Process handle calls=" << handles.Total << L" retained=" << handles.Actions.size() << L"\n";
     }
     return result;
 }
@@ -30883,6 +30888,7 @@ static int RunConsoleSurfaceSelfTest()
             L"ti-consumer-lifecycle");
         CheckConsoleSurfaceSelfTest(&context, TiObserverOwnershipSelfTest(false), L"ti-session-ownership-and-observer-timeline");
         CheckConsoleSurfaceSelfTest(&context, TimelineCallbackOwnershipSelfTest(false), L"live-callback-ownership-and-observer-timeline");
+        CheckConsoleSurfaceSelfTest(&context, ProcessHandleObserverSelfTest(false), L"process-handle-observer-ownership-and-retention");
         {
             DebuggerState state{};
             DeviceClient unopened;
@@ -54254,6 +54260,23 @@ int wmain(int argc, wchar_t** argv)
         if (argc == 3 && ToLower(argv[2]) == L"ti-ownership")
         {
             return TiObserverOwnershipSelfTest(false) && TiObserverOwnershipSelfTest(true) ? 0 : 1;
+        }
+        if (argc == 3 && ToLower(argv[2]) == L"process-handle-observer")
+        {
+            if (!ProcessHandleObserverSelfTest(true)) { return 1; }
+            const DWORD pid = GetCurrentProcessId();
+            const auto borrowed = ObserveProcessIdentity(pid, GetCurrentProcess());
+            const auto noPid = ObserveProcessIdentity(0);
+            if (!borrowed.CreateTime || noPid.ProcessId || ControllerProcessHandles().Snapshot().Total) { return 1; }
+            const auto lookedUp = ObserveProcessIdentity(pid);
+            if (lookedUp.ProcessId != borrowed.ProcessId || lookedUp.CreateTime != borrowed.CreateTime) { return 1; }
+            DebuggerState state{};
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            const auto events = state.Timeline.AllEvents();
+            if (events.size() != 2 || events[0].Action != L"process.handle.open" || events[1].Action != L"process.handle.close") { return 1; }
+            for (const auto& row : events) { std::wcout << L"[handle.native.timeline] " << TimelineEventToJson(row) << L"\n"; }
+            return 0;
         }
         if (argc == 3 && ToLower(argv[2]) == L"callback-ownership")
         {

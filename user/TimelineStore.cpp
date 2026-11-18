@@ -1581,6 +1581,11 @@ namespace
         return values;
     }
 
+    bool TimelineIsObserverRow(const TimelineEvent& event)
+    {
+        return _wcsicmp(event.Source.c_str(), L"observer") == 0 || _wcsicmp(event.Domain.c_str(), L"observer_action") == 0;
+    }
+
     void EnrichTimelineEventProcessContext(
         TimelineEvent* event,
         const std::deque<TimelineEvent>& existingEvents)
@@ -1603,7 +1608,7 @@ namespace
 
             for (auto it = existingEvents.rbegin(); it != existingEvents.rend(); ++it)
             {
-                if (it->ProcessId != event->ProcessId)
+                if (it->ProcessId != event->ProcessId || TimelineIsObserverRow(*it))
                 {
                     continue;
                 }
@@ -2563,6 +2568,7 @@ void TimelineStore::Clear()
     NextEventId = 1;
     TiObserverCursor = 0;
     LiveObserverCursor = 0;
+    ProcessHandleCursor = 0;
     DroppedEvents = 0;
     TiRecentCursorInitialized = false;
     TiRecentCursorSequence = 0;
@@ -3081,6 +3087,62 @@ TimelineIngestResult TimelineStore::IngestLiveObserverActions(const TimelineCont
     return result;
 }
 
+TimelineIngestResult TimelineStore::IngestProcessHandleActions(const ProcessHandleSnapshot& snapshot)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    const auto before = DroppedEvents;
+    auto result = CopyObserverActions(snapshot, ProcessHandleCursor, L"process handle", [&](const ProcessHandleAction& item) {
+        TimelineEvent row;
+        row.Source = L"observer";
+        row.Domain = L"observer_action";
+        row.Entity = L"process_handle:controller";
+        row.ProcessId = snapshot.ControllerPid;
+        row.TimestampFileTime = item.ReturnedUtc;
+        const auto site = item.Site == ProcessHandleSite::SelfProbe ? L"owned_capability_probe" :
+            item.Site == ProcessHandleSite::IdentityLookup ? L"identity_lookup" : L"observation_source";
+        const auto outcome = item.Succeeded ? L"succeeded" : L"failed";
+        auto& fields = row.Evidence;
+        fields = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"}, {L"handle_site", site},
+            {L"sequence", std::to_wstring(item.Sequence)}, {L"controller_create_time", std::to_wstring(snapshot.ControllerCreateTime)},
+            {L"requested_pid", std::to_wstring(item.RequestedPid)}, {L"outcome", outcome}, {L"effect_verified", L"false"},
+            {L"status_domain", L"win32"}, {L"status", std::to_wstring(item.Status)},
+            {L"requested_utc_filetime", std::to_wstring(item.RequestedUtc)}, {L"returned_utc_filetime", std::to_wstring(item.ReturnedUtc)}};
+        if (item.RequestedCreation) { fields[L"requested_create_time"] = std::to_wstring(item.RequestedCreation); }
+        if (item.AcquisitionId) { fields[L"acquisition_id"] = std::to_wstring(item.AcquisitionId); }
+        if (item.ParentAcquisitionId) { fields[L"parent_acquisition_id"] = std::to_wstring(item.ParentAcquisitionId); }
+        if (item.AcquisitionId)
+        {
+            fields[L"identity_observed_at"] = L"acquisition";
+            fields[L"identity_win32_status"] = std::to_wstring(item.Bound.Error);
+            if (item.Bound.Pid) { fields[L"observed_pid"] = std::to_wstring(item.Bound.Pid); }
+            if (item.Bound.Created) { fields[L"observed_create_time"] = std::to_wstring(item.Bound.Created); }
+        }
+        switch (item.Call)
+        {
+        case ProcessHandleCall::Open:
+            row.Action = L"process.handle.open";
+            fields[L"possible_observer_effect"] = L"acquire_process_reference";
+            fields[L"requested_access"] = HexU64(item.DesiredAccess);
+            break;
+        case ProcessHandleCall::Duplicate:
+            row.Action = L"process.handle.duplicate";
+            fields[L"possible_observer_effect"] = L"acquire_duplicate_reference";
+            fields[L"access_mode"] = L"same_as_source";
+            fields[L"duplicate_options"] = HexU64(DUPLICATE_SAME_ACCESS);
+            break;
+        case ProcessHandleCall::Close:
+            row.Action = L"process.handle.close";
+            fields[L"possible_observer_effect"] = L"release_process_reference";
+            break;
+        }
+        if (item.Call != ProcessHandleCall::Close) { fields[L"inherit_handle"] = L"false"; }
+        row.Summary = row.Action + L" " + outcome;
+        return AddEventLocked(std::move(row), nullptr, true);
+    });
+    result.Dropped = DroppedEvents - before;
+    return result;
+}
+
 TimelineIngestResult TimelineStore::IngestEvents(
     const std::vector<TimelineEvent>& events)
 {
@@ -3325,11 +3387,16 @@ TimelineReconcileResult TimelineStore::ReconcileSnapshot(
 
     std::vector<TimelineEvent> events = AllEvents();
     result.TimelineEvents = events.size();
+    const bool observerOnly = _wcsicmp(options.Source.c_str(), L"observer") == 0 || _wcsicmp(options.Domain.c_str(), L"observer_action") == 0;
+    if (observerOnly)
+    {
+        result.Warnings.push_back(L"Observer actions describe the controller. Target snapshot comparison requires target events.");
+    }
     std::set<uint32_t> eventPids;
     std::set<std::wstring> eventImages;
     for (const TimelineEvent& event : events)
     {
-        if (!TimelineEventMatchesReconcile(event, options))
+        if (TimelineIsObserverRow(event) || !TimelineEventMatchesReconcile(event, options))
         {
             continue;
         }
@@ -3388,6 +3455,7 @@ TimelineReconcileResult TimelineStore::ReconcileSnapshot(
 
     for (const SnapshotRecord& record : document.Records)
     {
+        if (observerOnly) { break; }
         if (!options.Domain.empty() &&
             TimelineToLower(record.Domain) != TimelineToLower(options.Domain))
         {
@@ -3480,6 +3548,7 @@ TimelineAnalysisResult TimelineStore::AnalyzeLiveSignals(size_t limit) const
 
     for (const TimelineEvent& event : events)
     {
+        if (TimelineIsObserverRow(event)) { continue; }
         if (TimelineEventIsProcessCreate(event) && event.ProcessId != 0)
         {
             processCreates[event.ProcessId] = event;
@@ -3823,7 +3892,7 @@ bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentit
     }
     else
     {
-        if (_wcsicmp(event.Source.c_str(), L"observer") == 0 || _wcsicmp(event.Domain.c_str(), L"observer_action") == 0)
+        if (TimelineIsObserverRow(event))
         {
             // Evidence lookup accepts aliases and case variants. None of those
             // spellings can grant a supplied record local controller provenance.
@@ -3834,7 +3903,7 @@ bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentit
             }
             event.Evidence[L"ingest_origin"] = L"supplied_record";
         }
-        EnrichTimelineEventProcessContext(&event, Events);
+        else { EnrichTimelineEventProcessContext(&event, Events); }
         NormalizeTimelineEvent(&event);
     }
     auto key = TimelineEventKey(event);

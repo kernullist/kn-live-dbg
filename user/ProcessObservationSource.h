@@ -4,6 +4,7 @@
 #include <memory>
 #include "ObservationSource.h"
 #include "ProcessMappingObservation.h"
+#include "ProcessHandleObservation.h"
 
 // Byte reads are bound to an owned duplicate of one process object. This is
 // not an atomic process snapshot or a qualification of its object layouts.
@@ -11,7 +12,8 @@ class ProcessObservationSource final : public IObservationSource, public IProces
 {
 public:
     ProcessObservationSource(HANDLE process, uint32_t pid, uint64_t creation,
-        const AddressSpaceDescriptor& addressSpace) : Pid(pid), Creation(creation)
+        const AddressSpaceDescriptor& addressSpace, ProcessHandleJournal& journal = ControllerProcessHandles(),
+        uint64_t parentAcquisition = 0) : Process(journal, ProcessHandleSite::ObservationSource, pid, creation), Pid(pid), Creation(creation)
     {
         Caps.AddressSpace = addressSpace;
         Caps.Consistency = L"handle_bound_single_read";
@@ -23,14 +25,8 @@ public:
             {
                 break;
             }
-            HANDLE duplicate = nullptr;
-            if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &duplicate,
-                0, FALSE, DUPLICATE_SAME_ACCESS))
-            {
-                break;
-            }
-            Process.reset(duplicate);
-            if (!SameIdentity())
+            if (!Process.Duplicate(process, parentAcquisition) || Process.Acquisition().Bound.Pid != Pid ||
+                Process.Acquisition().Bound.Created != Creation)
             {
                 break;
             }
@@ -147,14 +143,6 @@ protected:
     }
 
 private:
-    struct CloseProcess
-    {
-        void operator()(void* handle) const
-        {
-            CloseHandle(handle);
-        }
-    };
-
     static uint64_t TimeValue(const FILETIME& time)
     {
         return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
@@ -165,11 +153,11 @@ private:
         FILETIME created{}, exited{}, kernel{}, user{};
         // Exit time is undefined for a live process. The retained handle pins
         // the object; matching identity does not assert current liveness.
-        return Process != nullptr && GetProcessId(Process.get()) == Pid &&
+        return Process.get() != nullptr && GetProcessId(Process.get()) == Pid &&
             GetProcessTimes(Process.get(), &created, &exited, &kernel, &user) && TimeValue(created) == Creation;
     }
 
-    std::unique_ptr<void, CloseProcess> Process;
+    ObservedProcessHandle Process;
     const uint32_t Pid;
     const uint64_t Creation;
     ObservationSourceCapabilities Caps;

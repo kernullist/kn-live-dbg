@@ -277,6 +277,9 @@
     <ClCompile Include="TimelineCallbackSelfTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ProcessHandleObserverSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PoolScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -598,6 +601,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TimelineControlObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessHandleObservation.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PoolScanner.h">

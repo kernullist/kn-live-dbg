@@ -32,7 +32,9 @@ record or opens a file named on the command line in these modes.
 `KnLiveDbg.exe --mode observe --capabilities --probe --allow-residency` reads
 one known 32-byte range in its own process. The consent flag allows the read
 to affect page residency. The report includes the process generation, the read
-receipt and the attempted observer actions. It marks native sources as outside
+receipt and a `process_handle_timeline` for this invocation. A successful sample
+records the open, the source's duplicate, and a close for each acquisition.
+It marks native sources as outside
 the launch policy. The command exits 1 if it cannot confirm the expected bytes.
 
 A denied operation exits 5 with `blocked_by_policy`. Invalid selector syntax
@@ -55,6 +57,13 @@ arguments exit 1 before any probe, and output failures exit 2. Redirected JSON i
 UTF-8, including localized status text. Native calls have no hard timeout.
 Runtime probe JSON contains private process/address metadata and is not a public
 support certificate. See [generated address/backend contracts](SUPPORT_MATRIX.md).
+
+`process_handles_acquired` and `process_handles_closed` count successful
+Windows calls during the self-probe. A failed close retains its acquisition
+ID and Win32 error in the timeline. `probe_handles_closed` requires equal
+counts and a successful close for any native device the probe opened.
+`native_close_succeeded` and `native_close_win32_status` are null when the
+probe had no native device to close. [Process handle evidence](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
 
 The probe's `process_read_set` contains the same read as `process_read`, with
 operation/receipt IDs, source/range provenance and shared budget denominators.

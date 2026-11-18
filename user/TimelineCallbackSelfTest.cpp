@@ -254,7 +254,8 @@ namespace
         std::wcout << L"[callback.activation.native] status_failed=1 start_receipts=0\n";
         if (client.ControlTimeline(KNDBG_TIMELINE_CONTROL_CLEAR, 0, &error))
         { std::wcerr << L"test pipe unexpectedly acknowledged timeline control\n"; return false; }
-        client.Close();
+        DWORD closeError = ERROR_INVALID_HANDLE;
+        if (!client.Close(closeError) || closeError != ERROR_SUCCESS) { return false; }
         const auto snap = journal.Snapshot();
         if (snap.Total != before + 1 || snap.Actions.empty()) { std::wcerr << L"test pipe control receipt missing\n"; return false; }
         const auto& row = snap.Actions.back();

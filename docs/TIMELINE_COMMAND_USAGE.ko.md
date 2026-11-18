@@ -149,6 +149,31 @@ PID와 프로세스 생성 시각, 세션 세대, 요청·반환 시각, Win32 �
 기록의 출처는 `ingest_origin=local_controller`다. 일반 이벤트 입력 경로로
 받은 관찰자 기록에는 `ingest_origin=supplied_record`가 붙는다.
 
+### 프로세스 핸들 열기와 닫기 확인
+
+`!timeline ingest observer`는 공용 프로세스 식별 경로와 관측 소스가 실행한
+최근 핸들 호출 64개도 복사한다. 대시보드 새로 고침과 `!timeline update`는
+같은 커서를 사용한다. 다시 실행하면 이후 호출만 들어온다. 복사 전에 밀려난
+호출이 있으면 그 개수를 표시한다. 호출자가 빌려준 핸들로 프로세스를 식별하면
+소유권 기록은 생기지 않는다.
+
+`/source observer /domain observer_action`으로 조회한 뒤
+`process.handle.open`, `process.handle.duplicate`, `process.handle.close`를
+확인한다. 각 행에는 컨트롤러 PID, 호출 경로, UTC 요청·반환 시각과 Win32
+결과가 담긴다. 비공개 증거에는 요청한 PID와 호출자가 제공한 생성 시각이
+들어간다. 핸들을 얻으면 ID가 생기고, 닫기에 실패해도 같은 ID로 오류를
+찾을 수 있다. 원본의 ID를 알고 복제한 경우에는 그 ID도 기록한다. 핸들에서
+PID와 생성 시각을 읽을 때 발생한 Windows 오류는 별도 필드에 남는다. 핸들의
+PID가 요청과 다르면 확인한 PID만 기록하고 생성 시각 조회는 건너뛴다.
+동시에 진행된 호출의 시퀀스는 기록 순서다. 실행 구간이 겹쳤는지는 각 호출의
+요청·반환 시각으로 확인한다.
+
+열기에는 요청한 접근 권한 마스크가 담긴다. 복제의 `access_mode=same_as_source`는
+원본 핸들의 권한을 이어받는 Windows 옵션을 기록한다. 스냅샷 대조와 라이브
+이상 분석은 대상 이벤트만 사용한다. 일회성 자체 읽기에 성공하면 이 호출 네
+건이 `process_handle_timeline.events`에 담긴다. 다른 수집기의 직접
+`OpenProcess` 호출은 별도 범위다. [Windows DuplicateHandle](https://learn.microsoft.com/ko-kr/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+
 ### 라이브 콜백 제어 결과 확인
 
 `!timeline live start`, `stop`, `clear` 실행 뒤 `!timeline ingest observer`와

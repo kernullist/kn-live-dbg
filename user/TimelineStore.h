@@ -3,6 +3,7 @@
 #include "SnapshotModel.h"
 #include "ThreatIntelSubscriber.h"
 #include "TimelineControlObservation.h"
+#include "ProcessHandleObservation.h"
 #include "TimelineModel.h"
 #include "ObservationModel.h"
 
@@ -98,6 +99,7 @@ public:
         const std::vector<TimelineEvent>& events);
     TimelineIngestResult IngestTiObserverActions(const TiObserverSnapshot& snapshot);
     TimelineIngestResult IngestLiveObserverActions(const TimelineControlSnapshot& snapshot);
+    TimelineIngestResult IngestProcessHandleActions(const ProcessHandleSnapshot& snapshot);
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
@@ -146,6 +148,7 @@ private:
     uint64_t NextEventId = 1;
     uint64_t TiObserverCursor = 0;
     uint64_t LiveObserverCursor = 0;
+    uint64_t ProcessHandleCursor = 0;
     uint64_t DroppedEvents = 0;
     bool TiRecentCursorInitialized = false;
     uint64_t TiRecentCursorSequence = 0; // last ingested ring Sequence

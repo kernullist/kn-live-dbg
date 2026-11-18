@@ -92,23 +92,33 @@ void DeviceClient::Close()
     CloseLocked();
 }
 
-void DeviceClient::CloseLocked()
+bool DeviceClient::Close(DWORD& firstError)
+{
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    return CloseLocked(&firstError);
+}
+
+bool DeviceClient::CloseLocked(DWORD* firstError)
 {
     observationEpoch_.store(0);
     pagingLevels_.store(0);
     versionFlags_.store(0);
     // A control holds the same lock from connection identity lookup through
     // completion. A replacement cannot inherit the old handle or capabilities.
-    if (managedCallbackPort_ != INVALID_HANDLE_VALUE)
+    bool closed = true;
+    if (firstError) { *firstError = ERROR_SUCCESS; }
+    for (HANDLE* owned : {&managedCallbackPort_, &device_})
     {
-        CloseHandle(managedCallbackPort_);
-        managedCallbackPort_ = INVALID_HANDLE_VALUE;
+        if (*owned == INVALID_HANDLE_VALUE) { continue; }
+        if (!CloseHandle(*owned))
+        {
+            const DWORD error = GetLastError();
+            if (closed && firstError) { *firstError = error; }
+            closed = false;
+        }
+        *owned = INVALID_HANDLE_VALUE;
     }
-    if (device_ != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(device_);
-        device_ = INVALID_HANDLE_VALUE;
-    }
+    return closed;
 }
 
 bool DeviceClient::IsOpen() const

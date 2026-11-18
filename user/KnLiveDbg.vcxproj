@@ -207,6 +207,7 @@
     <ClCompile Include="TimelineStore.cpp" />
     <ClCompile Include="TimelineControlObservation.cpp" />
     <ClCompile Include="TimelineCallbackSelfTest.cpp" />
+    <ClCompile Include="ProcessHandleObserverSelfTest.cpp" />
     <ClCompile Include="PoolScanner.cpp" />
     <ClCompile Include="SnapshotCollector.cpp" />
     <ClCompile Include="SnapshotDiff.cpp" />
@@ -416,6 +417,7 @@
     <ClInclude Include="TimelineSelfTest.h" />
     <ClInclude Include="TimelineStore.h" />
     <ClInclude Include="TimelineControlObservation.h" />
+    <ClInclude Include="ProcessHandleObservation.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SnapshotCollector.h" />
     <ClInclude Include="SnapshotDiff.h" />

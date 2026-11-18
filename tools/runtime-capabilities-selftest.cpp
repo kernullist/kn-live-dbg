@@ -1,10 +1,64 @@
 #include "../user/RuntimeCapabilities.h"
 
 #include <iostream>
+#include <sddl.h>
+#include <vector>
 
-int main(int argc, char** argv)
+#pragma comment(lib, "advapi32.lib")
+
+// The fixture applies its DACL only to the newly created controller process.
+// The parent reads its identity through the process-creation handle.
+static bool RunDeniedSelfProbe(const wchar_t* executable)
 {
-    if (argc == 2 && std::string(argv[1]) == "--unicode-json")
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --mode observe --capabilities --probe --allow-residency";
+    STARTUPINFOEXW startup{};
+    auto& io = startup.StartupInfo;
+    io.cb = sizeof(startup);
+    io.dwFlags = STARTF_USESTDHANDLES;
+    io.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    io.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    io.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE inherited[] = {io.hStdInput, io.hStdOutput, io.hStdError};
+    SIZE_T bytes = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+    if (!bytes) { return false; }
+    std::vector<BYTE> attributes(bytes);
+    startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &bytes)) { return false; }
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PROCESS_INFORMATION child{};
+    bool launched = false;
+    if (UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr) &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(D;;0x10;;;WD)(A;;GA;;;OW)", SDDL_REVISION_1, &descriptor, nullptr))
+    {
+        SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
+        launched = CreateProcessW(executable, command.data(), &security, nullptr, TRUE, CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+            nullptr, nullptr, &io, &child) != FALSE;
+        LocalFree(descriptor);
+    }
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
+    if (!launched) { return false; }
+    DWORD wait = WaitForSingleObject(child.hProcess, 30000);
+    if (wait != WAIT_OBJECT_0)
+    {
+        TerminateProcess(child.hProcess, 2);
+        WaitForSingleObject(child.hProcess, 5000);
+    }
+    DWORD exitCode = 0;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    bool observed = GetExitCodeProcess(child.hProcess, &exitCode) && GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user);
+    bool threadClosed = CloseHandle(child.hThread) != FALSE;
+    bool processClosed = CloseHandle(child.hProcess) != FALSE;
+    if (!observed || wait != WAIT_OBJECT_0 || !threadClosed || !processClosed) { return false; }
+    std::cerr << "child pid=" << child.dwProcessId << " created=" << ((uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime)
+              << " exit=" << exitCode << "\n";
+    return exitCode == 1;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc == 3 && std::wstring(argv[1]) == L"--deny-self-probe") { return RunDeniedSelfProbe(argv[2]) ? 0 : 2; }
+    if (argc == 2 && std::wstring(argv[1]) == L"--unicode-json")
     {
         RuntimeCapabilityProbe probe;
         probe.NativeReason = L"\ud55c\uae00 \U0001f512 \"quoted\"\n";
@@ -71,6 +125,19 @@ int main(int argc, char** argv)
     check(stages.find(L"\"environment_regression\":\"not_performed\"") != std::wstring::npos, "probe is not environment regression");
     probe.NativeReason = L"quote\" newline\n";
     const auto json = RuntimeCapabilityProbeJson(probe);
+    const auto reports = [&](const std::wstring& field) { return RuntimeCapabilityProbeJson(probe).find(field) != std::wstring::npos; };
+    check(reports(L"\"native_close_succeeded\":null") && reports(L"\"probe_handles_closed\":false"), "opened device needs a close result");
+    probe.NativeCloseAttempted = true;
+    probe.NativeCloseError = ERROR_ACCESS_DENIED;
+    check(reports(L"\"native_close_win32_status\":5") && reports(L"\"native_close_succeeded\":false") &&
+        reports(L"\"probe_handles_closed\":false"), "failed device close preserved");
+    probe.NativeCloseSucceeded = true;
+    probe.NativeCloseError = ERROR_SUCCESS;
+    probe.ProcessHandlesAcquired = 2;
+    probe.ProcessHandlesClosed = 1;
+    check(reports(L"\"probe_handles_closed\":false"), "unmatched process reference prevents closure claim");
+    probe.ProcessHandlesClosed = 2;
+    check(reports(L"\"native_close_win32_status\":0") && reports(L"\"probe_handles_closed\":true"), "all acquired references have successful closes");
     check(json.find(L"quote\\\" newline\\n") != std::wstring::npos, "status explanation escaped");
     check(json.find(L"\"native_raw_status_available\":false") != std::wstring::npos, "wrapper errors not invented NTSTATUS");
     check(std::wstring(CapabilityAddressContract(L"process", L"cross_view", L"native")).find(L"selected_paths_only") != std::wstring::npos,

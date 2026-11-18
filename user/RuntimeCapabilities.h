@@ -21,6 +21,8 @@ struct RuntimeCapabilityProbe
     std::wstring ProcessReason;
     std::wstring ProcessReadJson = L"null";
     std::wstring ProcessReadSetJson = L"null";
+    std::wstring ProcessHandleTimelineJson = L"null";
+    uint64_t ProcessHandlesAcquired = 0, ProcessHandlesClosed = 0;
     bool NativeProbeAttempted = false;
     bool NativeSourceOpened = false;
     bool NativeContractPassed = false;
@@ -28,6 +30,8 @@ struct RuntimeCapabilityProbe
     uint64_t NativeSourceEpoch = 0;
     uint32_t NativeVirtualAddressBits = 0;
     bool NativeReadObservationSupported = false;
+    bool NativeCloseAttempted = false, NativeCloseSucceeded = false;
+    DWORD NativeCloseError = ERROR_SUCCESS;
     std::wstring NativeReason;
 };
 
@@ -185,6 +189,9 @@ inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& pro
         L",\"process_reason\":" + mcpjson::Quote(probe.ProcessReason) +
         L",\"process_read\":" + probe.ProcessReadJson +
         L",\"process_read_set\":" + probe.ProcessReadSetJson +
+        L",\"process_handle_timeline\":" + probe.ProcessHandleTimelineJson +
+        L",\"process_handles_acquired\":" + std::to_wstring(probe.ProcessHandlesAcquired) +
+        L",\"process_handles_closed\":" + std::to_wstring(probe.ProcessHandlesClosed) +
         L",\"process_address_shape\":\"legacy_la48_probe_only_not_active_paging_detection\","
         L"\"native_probe_attempted\":" + boolean(probe.NativeProbeAttempted) +
         L",\"native_source_opened\":" + boolean(probe.NativeSourceOpened) +
@@ -194,7 +201,11 @@ inline std::wstring RuntimeCapabilityProbeJson(const RuntimeCapabilityProbe& pro
         L",\"native_virtual_address_bits\":" + (probe.NativeContractPassed ? std::to_wstring(probe.NativeVirtualAddressBits) : L"null") +
         L",\"native_read_observation_contract\":" + (probe.NativeContractPassed ? boolean(probe.NativeReadObservationSupported) : L"null") +
         L",\"native_reason\":" + mcpjson::Quote(probe.NativeReason) +
-        L",\"native_raw_status_available\":false,\"probe_handles_closed\":true,"
+        L",\"native_close_win32_status\":" + (probe.NativeCloseAttempted ? std::to_wstring(probe.NativeCloseError) : L"null") +
+        L",\"native_close_succeeded\":" + (probe.NativeCloseAttempted ? boolean(probe.NativeCloseSucceeded) : L"null") +
+        L",\"native_raw_status_available\":false,\"probe_handles_closed\":" +
+        boolean(probe.ProcessHandlesAcquired == probe.ProcessHandlesClosed && (!probe.NativeSourceOpened ||
+            (probe.NativeCloseAttempted && probe.NativeCloseSucceeded))) + L","
         L"\"observer_actions\":" + actions + L","
         L"\"driver_load_requested\":false,\"symbol_network_requested\":false,"
         L"\"mutation_requested\":false,\"validation\":\"not_performed_for_target_environment\"}";

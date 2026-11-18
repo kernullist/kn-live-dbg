@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ObservationModel.h"
+#include "ProcessHandleObservation.h"
 #include <Windows.h>
 #include <cstring>
 
@@ -43,24 +44,14 @@ inline ObservationIdentity ObserveProcessIdentity(uint32_t pid, HANDLE process =
     identity.ProcessId = pid;
     if (pid != 0)
     {
-        const bool close = process == nullptr;
-        if (close)
-        {
-            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        }
-        FILETIME create = {}, exit = {}, kernel = {}, user = {};
-        if (process != nullptr && GetProcessId(process) == pid &&
-            GetProcessTimes(process, &create, &exit, &kernel, &user))
-        {
-            identity.CreateTime = (static_cast<uint64_t>(create.dwHighDateTime) << 32) | create.dwLowDateTime;
-        }
+        ObservedProcessHandle owned(ControllerProcessHandles(), ProcessHandleSite::IdentityLookup, pid);
+        ProcessHandleIdentity bound;
+        if (process) { bound = ReadProcessHandleIdentity(process, pid); }
+        else if (owned.Open(PROCESS_QUERY_LIMITED_INFORMATION)) { bound = owned.Acquisition().Bound; }
+        if (bound.Pid == pid) { identity.CreateTime = bound.Created; }
         DWORD session = 0;
         identity.SessionKnown = identity.CreateTime != 0 && ProcessIdToSessionId(pid, &session) != FALSE;
         identity.SessionId = session;
-        if (close && process != nullptr)
-        {
-            CloseHandle(process);
-        }
     }
     return identity;
 }

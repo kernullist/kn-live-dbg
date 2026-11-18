@@ -159,6 +159,35 @@ still need cleanup. Use `!ti stop` to retry. Locally captured receipts carry
 `ingest_origin=local_controller`. An observer row submitted through generic
 event ingestion carries `ingest_origin=supplied_record`.
 
+### Inspect process handle ownership
+
+`!timeline ingest observer` also copies the last 64 calls made by the shared
+process identity lookup and the handle-backed observation source. Dashboard
+refresh and `!timeline update` use the same cursor. Repeating the ingest
+copies only later calls. If calls have already been evicted, the ingest
+reports how many it missed. Using a caller's borrowed identity handle creates
+no ownership record.
+
+Filter on `/source observer /domain observer_action` and look for
+`process.handle.open`, `process.handle.duplicate` and `process.handle.close`.
+Each row gives the controller PID, site, UTC request and return times, and
+Win32 result. The private evidence retains the requested PID and any supplied
+creation time. A successful acquisition gets an ID. The close refers to that
+ID even when it fails. A duplicate links to the original acquisition when the
+caller supplied that ID. A separate status records any Windows error from
+querying the identity. If the handle yields a different PID, the row keeps
+that PID and the controller skips the creation-time query.
+Overlapping calls receive sequence numbers as the journal records them. Use
+the request and return times to compare their intervals.
+
+The open carries its requested access mask. A duplicate records
+`access_mode=same_as_source`. Windows ignores the requested mask in this mode.
+The rows appear as controller activity during investigation. Snapshot
+reconciliation and live anomaly analysis use target events. The one-shot
+self-read exports its own four calls in `process_handle_timeline.events` on
+success. Other collectors that call `OpenProcess` directly have separate
+coverage. [Windows DuplicateHandle](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+
 ### Inspect live callback control results
 
 After `!timeline live start`, `stop` or `clear`, use `!timeline ingest observer`

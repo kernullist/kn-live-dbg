@@ -4,12 +4,14 @@
 #include "ObservationSourceJson.h"
 #include "ProcessObservationSource.h"
 #include "ReadReceiptJson.h"
+#include "TimelineStore.h"
 
 #include <array>
 
 RuntimeCapabilityProbe ProbeOwnedProcessCapabilities()
 {
     RuntimeCapabilityProbe probe;
+    ProcessHandleJournal handles;
     probe.NativeReason = L"outside_owned_process_scope";
     probe.StartedMs = GetTickCount64();
     probe.ProcessId = GetCurrentProcessId();
@@ -25,9 +27,9 @@ RuntimeCapabilityProbe ProbeOwnedProcessCapabilities()
             control[i] = static_cast<uint8_t>(0x51 + i);
         }
         probe.ProcessHandleAttempted = true;
-        const std::unique_ptr<void, decltype(&CloseHandle)> readOnly(
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, probe.ProcessId), &CloseHandle);
-        ProcessObservationSource source(readOnly.get(), probe.ProcessId, probe.ProcessCreateTime, {});
+        ObservedProcessHandle readOnly(handles, ProcessHandleSite::SelfProbe, probe.ProcessId, probe.ProcessCreateTime);
+        readOnly.Open(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ);
+        ProcessObservationSource source(readOnly.get(), probe.ProcessId, probe.ProcessCreateTime, {}, handles, readOnly.Acquisition().AcquisitionId);
         probe.ProcessSourceOpened = !source.Capabilities().SourceId.empty();
         if (probe.ProcessSourceOpened)
         {
@@ -66,6 +68,17 @@ RuntimeCapabilityProbe ProbeOwnedProcessCapabilities()
     {
         probe.ProcessReason = L"process_identity_query_failed_win32_" + std::to_wstring(GetLastError());
     }
+    const auto captured = handles.Snapshot();
+    probe.ProcessHandlesAcquired = captured.Acquired;
+    probe.ProcessHandlesClosed = captured.Closed;
+    TimelineStore timeline;
+    timeline.IngestProcessHandleActions(captured);
+    const auto events = timeline.AllEvents();
+    TimelineQueryOptions order;
+    order.Source = L"observer";
+    order.Domain = L"observer_action";
+    order.NewestFirst = false;
+    probe.ProcessHandleTimelineJson = BuildTimelineEventsJson(events, order, events.size());
     probe.FinishedMs = GetTickCount64();
     return probe;
 }
@@ -91,6 +104,8 @@ RuntimeCapabilityProbe ProbeRuntimeCapabilities()
                 DriverSessionStatus status{};
                 probe.NativeSessionPassed = device.QuerySessionStatus(&status, &probe.NativeReason);
             }
+            probe.NativeCloseAttempted = true;
+            probe.NativeCloseSucceeded = device.Close(probe.NativeCloseError);
         }
     }
     probe.FinishedMs = GetTickCount64();

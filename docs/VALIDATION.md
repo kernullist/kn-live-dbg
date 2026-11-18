@@ -7,6 +7,36 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process handle ownership, 2026-11-18
+
+Windows x64 build 28000.3501 ran the Release controller with SHA-256
+`8eb21accfd421df3938b180f16835fdf7682baaa442193a7d0d49a68641cee7f`.
+The checks exercised the restricted self-read, the shared identity lookup and
+the handle-backed source. [Reading the handle timeline](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
+| Check | Observed result |
+| --- | --- |
+| Consented self-read | The parent obtained the controller PID and creation time from its Windows process handle. Both matched the four timeline rows. The open requested `0x1010`, the duplicate inherited access, and the two successful closes identified their respective acquisitions. The read receipt contained the expected 32 bytes. |
+| Access denied | A separate launch gave the child process a security descriptor that denied memory-read opens. The child exited 1. The report contained one failed open with Win32 error 5 and the requested process identity. It recorded zero acquired handles, reads, duplicates or closes. |
+| Identity and close failures | A duplicate with the wrong requested creation time and a duplicate of an event object both failed to qualify as a process source. A different requested PID retained the observed PID and skipped its creation-time query. A disposable handle protected against close produced a failed close with the original acquisition ID. The test removed the protection and closed its handle. Borrowing a process handle for an identity lookup produced zero ownership rows. |
+| Overlap and retention | Four workers held four observed references at the same time. Across 168 calls, 84 acquisitions and 84 closes succeeded. Ingest retained the latest 64 rows and reported the preceding 104 as evicted. Repeating ingest added zero rows. |
+| Timeline interpretation | With an empty snapshot, controller rows produced zero missing-process findings. Adding a target process-create event produced one. A high-risk snapshot record with the controller PID still reported missing target evidence. Reimported rows carried `supplied_record`. A thread with the same PID inherited its image from the target process event even when an intervening observer row supplied another image. |
+
+The independent checker can be run with
+`python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`.
+To repeat the access-denied case with a standard Windows token, build the
+fixture with `tools/validate-runtime-capabilities.ps1` and add
+`--policy-exe .build/runtime-capabilities/Release/runtime-capabilities-selftest.exe`.
+The command suite passed 3,081 checks across 261 commands, the console suite
+passed 570 and the restricted launch suite passed 70. The process-source suite
+also checked Windows handle counts before and after successful and rejected
+sources. The managed callback close harness compiled. Post-run inspection
+found no new reboot or bugcheck events or crash dumps. It found zero running
+test drivers, test processes, fixture listeners or temporary test directories.
+Other collectors that
+open process handles directly, behavior with a loaded driver and independent
+measurement of effects on a target remain outside this validation.
+
 ## Automatic live timeline startup, 2026-11-18
 
 Windows x64 build 28000.3501 ran the Release controller with SHA-256
