@@ -255,6 +255,134 @@ def collector_rows(output):
     return [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
 
 
+def run_watch_maintenance(exe, directory, deny_query):
+    # A retained reference keeps the already-exited child's PID allocated for the liveness case.
+    with subprocess.Popen([sys.executable, "-I", "-B", "-c", "pass"], cwd=directory) as exited:
+        assert exited.wait(timeout=30) == 0
+        assert process_open_status(exited.pid, 0x1000) == 0
+        exited_created = creation_time(int(exited._handle))
+        current = _winapi.GetCurrentProcess()
+        reference = _winapi.DuplicateHandle(current, int(exited._handle), current, 0x1000, True, 0)
+        try:
+            startup = subprocess.STARTUPINFO()
+            startup.lpAttributeList = {"handle_list": [reference]}
+            with subprocess.Popen([exe, "--self-test", "watch-maintenance-observer", str(reference)],
+                                  cwd=directory, startupinfo=startup, close_fds=True, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8") as child:
+                try:
+                    created = creation_time(int(child._handle))
+                    deny_child_access(child, 0x200 | (0x1000 if deny_query else 0))
+                    assert process_open_status(child.pid, 0x200) == 5
+                    assert process_open_status(child.pid, 0x1000) == (5 if deny_query else 0)
+                    output, errors = child.communicate("check\n", timeout=90)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=15)
+                assert child.returncode == 0, errors[-800:]
+        finally:
+            _winapi.CloseHandle(reference)
+    return output, child.pid, created, exited.pid, exited_created
+
+
+def check_watch_maintenance(exe, directory, deny_query):
+    missing = 0xffffffff
+    assert process_open_status(missing, 0x1000) == 87
+    output, pid, created, exited, exited_created = run_watch_maintenance(exe, directory, deny_query)
+    rows = collector_rows(output)
+    fields = evidence(rows, [row["action"].rsplit(".", 1)[1] for row in rows], pid, created)
+    cases = {}
+    cursor = 0
+    for line in output.splitlines():
+        if not line.startswith("[watch.case] "):
+            continue
+        case = dict(item.split("=", 1) for item in line.removeprefix("[watch.case] ").split())
+        assert int(case["before"]) == cursor and case["name"] not in cases
+        end = int(case["after"])
+        batch = list(zip(rows[cursor:end], fields[cursor:end]))
+        cases[case["name"]] = (case, batch)
+        cursor = end
+    assert cursor == len(rows) and cursor < 64
+    case_count = len(cases)
+    assert f"source_records={cursor} added={cursor}" in output and "source_records=0 added=0" in output
+
+    def check(name, state, expected, calls, decision="none", target=pid, bound=created, enable="none"):
+        case, batch = cases.pop(name)
+        assert tuple(int(case[k]) for k in ("watched", "promoted", "enabled", "failed")) == state, (name, case)
+        assert case["enabled_count"] == case["enabled"] and case["decision"] == decision, (name, case)
+        assert case["enable_decision"] == enable
+        assert int(case["receipts"]) == int(decision != "none")
+        if decision != "none":
+            assert int(case["generation"]) == expected
+        assert case["outcome"] == ("unconfirmed" if decision == "control_attempted" else
+                                   "none" if decision == "none" else "not_attempted")
+        actual = [(r["action"].rsplit(".", 1)[1], f["handle_site"]) for r, f in batch]
+        assert actual == calls, (name, actual, calls)
+        active = {}
+        for (row, f), (action, site) in zip(batch, calls):
+            assert f["requested_pid"] == str(target), (name, f)
+            assert int(f.get("requested_create_time", 0)) == expected, (name, f)
+            status = 0
+            if action == "open":
+                assert int(f["requested_access"], 16) == (0x200 if site == "logging_control" else 0x1000)
+                if target == missing:
+                    status = 87
+                elif site == "logging_control" or (target == pid and deny_query):
+                    status = 5
+            assert int(f["status"]) == status, (name, f)
+            if status:
+                assert not {"acquisition_id", "observed_pid", "observed_create_time", "identity_win32_status"}.intersection(f)
+            else:
+                assert int(f["observed_pid"]) == target and int(f["observed_create_time"]) == bound
+                assert f["identity_win32_status"] == "0"
+                if action == "open":
+                    active[site] = f["sequence"]
+                    assert active[site] == f["acquisition_id"]
+                else:
+                    assert active.pop(site) == f["acquisition_id"]
+        assert not active
+        identity_ids = [int(f["acquisition_id"]) for row, f in batch if f["handle_site"] == "logging_identity" and
+                        row["action"] == "process.handle.open" and f["status"] == "0"]
+        assert int(case["acquisition"]) == (identity_ids[0] if identity_ids and decision != "none" else 0)
+
+    def query(site, denied=deny_query):
+        return [("open", site)] if denied else [("open", site), ("close", site)]
+
+    empty = (0, 0, 0, 0)
+    watch = "watch_maintenance"
+    guard = "logging_identity"
+    control = ("open", "logging_control")
+    check("unowned", empty, 0, [])
+    check("failed_only", empty, 0, [])
+    current = query(guard) if deny_query else [("open", guard), control, ("close", guard)]
+    release = "open_failed" if deny_query else "control_attempted"
+    check("withdrawn_current", empty, created, current, release)
+    check("explicit_overlap", (1, 0, 1, 0), created, query(watch))
+    check("mixed_logging", (1, 0, 1, int(deny_query)), created, query(watch))
+    check("missing_logging", (1, 0, 0, 0), 0, [("open", watch)], target=missing)
+    check("child_only", (1, 1, 0, 0), created, query(watch))
+    check("overlap_current", (1, 1, 1, 0), created, query(watch))
+    check("overlap_stale", (1, 1, 1, 0) if deny_query else empty, created + 1, query(watch),
+          "none" if deny_query else "generation_changed")
+    check("exited", (1, 0, 0, 0), exited_created, query(watch, False), target=exited, bound=exited_created)
+    for path in ("remove", "stop"):
+        state = (int(path == "stop"), 0, 0, 0)
+        check(path + "_unknown", state, 0, [], "unknown_generation")
+        check(path + "_current", state, created, current, release)
+        check(path + "_stale", state, created + 1, query(guard), "open_failed" if deny_query else "generation_changed")
+    check("promote", (1, 1, 0, 0), 0, query("watch_promotion"))
+    check("event_name", (1, 1, 0, 0), 0, [])
+    check("event_child", (2, 1, 0, 0), 0, [])
+    check("withdraw_during_event", empty, 0, [])
+    check("remove_stop", empty, created, current, release)
+    check("enable_current", (1, 1, 0, 1), created, current,
+          enable="open_failed" if deny_query else "none")
+    check("enable_stale", (1, 1, 0, 1), created + 1, query(guard), enable="open_failed" if deny_query else "generation_changed")
+    assert not cases
+    print(f"Watch maintenance: query_denied={deny_query}, {case_count} cases, {cursor} handle rows; "
+          "exited, missing, stale, unknown and unowned cases checked.")
+
+
 def check_verification_handles(exe, directory, deny):
     full, limited = 0x410, 0x1000
     with subprocess.Popen([exe, "--self-test", "verification-handle-observer"], cwd=directory, stdin=subprocess.PIPE,
@@ -531,6 +659,8 @@ def main():
         check_layout_verification(exe, directory)
         for deny in (0, 0x10, 0x1010):
             check_verification_handles(exe, directory, deny)
+        for deny_query in (False, True):
+            check_watch_maintenance(exe, directory, deny_query)
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")
 

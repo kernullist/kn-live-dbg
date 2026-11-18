@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Watched process identity and logging cleanup, 2026-11-19
+
+The Windows x64 Release controller had SHA-256
+`24fb0b9e49ea20ef3b08fa8d542d2e319c070d9fa57bd8b5e98e6f50778de94e`.
+A parent ran 23 watch cases per access configuration. It independently
+checked the child controller's creation time and Windows access results.
+The parent retained a query handle to a second, already-exited process.
+The control cases used only the controller itself, with set-information
+access denied and an unopened driver device.
+[Watch handle sites and cleanup evidence](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
+| Access to the controller | Timeline and KMON observations |
+| --- | --- |
+| Limited query allowed | 36 handle rows. Overlapping name, child and logging entries shared one open and close. The original generation qualified for a control attempt. Windows denied the control handle with error 5 and the cleanup event recorded `unconfirmed`. |
+| Limited query denied | 17 handle rows. The wildcard watch kept its uncertain entry. A requested release for a known generation reported `open_failed` and `not_attempted`. |
+
+Before the guard, pruning a watch with no successful logging request,
+including one with only a failed request, attempted a control open. A
+creation-time mismatch and shutdown with an unknown generation did the same.
+Windows denied each of those opens in the reproducer. On the final binary,
+all four cases made zero control opens. The exited process lost its promoted
+membership while its explicit PID watch remained. For a missing PID,
+Windows and the handle journal both reported error 87. A successful logging
+record for the current generation survived pruning when a failed record for
+the same PID named a different generation.
+
+In the event-withdrawal case, the test waited for the monitor to record a
+process-create event, withdrew the name watch, then let promotion continue.
+The PID stayed outside the watch. Two callers also started manual removal
+and shutdown at the same barrier. They consumed one earlier successful
+request and produced one cleanup receipt. Sixteen more disposable controllers
+repeated both overlap cases across the two access configurations. The fixture
+supplied the earlier logging records and synthetic create events. Actual target settings,
+driver acknowledgments and independent logging clients remain unverified.
+
+Run `python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`
+with 64-bit Python to reproduce the watch cases.
+
+The analysis and discovery scheduling oracles passed 6,742 and 70,170 checks
+with the Release controller and a freshly built standalone core. The controller
+passed 3,081 command checks across 261 routes and 570 console checks. From
+01:43 to 02:20 KST, the host recorded no new reboot or bugcheck events or
+crash dumps. The final check found zero remaining test processes, running test
+drivers or fixture listeners.
+
 ## Process handles during verification and capture, 2026-11-19
 
 The Windows x64 Release controller had SHA-256

@@ -393,6 +393,7 @@ private:
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
+    friend bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
     void WorkerLoop();
     void ServiceDiscovery();
     KmonDiscoveryDispatch DispatchDiscovery(KmonDiscoveryStep step);
@@ -578,6 +579,7 @@ private:
     void ArmMapperWatch(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
+    void ReleaseProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created, const wchar_t* priorRejection = nullptr);
     bool NoteWatchActivityTask(uint32_t pid, const std::wstring& task);
     void ScanWatchedHandleTables();
     void ScanWatchedHandleCapabilities();
@@ -1591,3 +1593,4 @@ bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std:
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
+bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);

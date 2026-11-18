@@ -54265,9 +54265,19 @@ int wmain(int argc, wchar_t** argv)
         {
             return LayoutProcessHandleFixture() ? 0 : 1;
         }
-        if (argc >= 3 && (ToLower(argv[2]) == L"collector-handle-observer" || ToLower(argv[2]) == L"verification-handle-observer"))
+        if (argc >= 3 && (ToLower(argv[2]) == L"collector-handle-observer" || ToLower(argv[2]) == L"verification-handle-observer" ||
+            ToLower(argv[2]) == L"watch-maintenance-observer"))
         {
-            if (ToLower(argv[2]) == L"verification-handle-observer")
+            if (ToLower(argv[2]) == L"watch-maintenance-observer")
+            {
+                uint64_t inherited = 0;
+                if (argc != 4 || !ParseUnsigned(argv[3], 10, &inherited) || !inherited || inherited >= UINTPTR_MAX) { return 2; }
+                std::wstring command, diagnostics;
+                if (!std::getline(std::wcin, command) || command != L"check" ||
+                    !KmonWatchMaintenanceSelfTest(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(inherited)), diagnostics)) { return 1; }
+                std::wcout << diagnostics;
+            }
+            else if (ToLower(argv[2]) == L"verification-handle-observer")
             {
                 if (argc != 3) { return 2; }
                 std::wstring command, diagnostics;

@@ -181,6 +181,22 @@ no ownership record.
 | `reference_verification` | Check the process named by a queued execution reference. | `0x410`, then `0x1000` on failure |
 | `page_capture` | Open the process for an ordinary user-mode page capture. | `0x410`, then `0x1000` on failure |
 | `diagnostic_identity` | Look up the current creation time for a PID-only diagnostic key when the PID is greater than 4. | Limited query (`0x1000`) |
+| `watch_maintenance` | Check a watched process during one pass over promoted watches and logging records. Entries for the same PID share one sample. | Limited query (`0x1000`) |
+| `watch_promotion` | Look up the process generation when adding a name-matched watch. | Limited query (`0x1000`) |
+| `logging_identity` | Hold the process identity while KMON attempts to change its logging or release a prior successful request. | Limited query (`0x1000`) |
+| `logging_control` | Request the existing user-mode control handle for that process generation. | Set information (`0x200`) |
+
+For watch cleanup, find the `coverage.logging` event in KMON's event log.
+`cleanup_decision` gives the reason for skipping a control or records
+`control_attempted`. Its `control_outcome` is `not_attempted`,
+`unconfirmed` or `success_reported`. A successful identity open has an
+`identity_acquisition_id` in the cleanup event when that open checked the
+release. The handle timeline shows the control open and its Win32 outcome
+separately. A returned success reports the backend's response. Confirmation
+of the final target settings requires separate evidence.
+If the controller cannot bind a generation before enabling logging,
+`enable_decision` in `coverage.logging` records the reason it skipped the
+control paths. Repeated failures for the same subject and reason share a diagnostic.
 
 Compare `requested_create_time` with `observed_create_time` on the open row.
 When both are present and differ, the image sweep skips the duplicate, reference

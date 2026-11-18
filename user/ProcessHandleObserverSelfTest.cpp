@@ -1,11 +1,14 @@
+#include "KernelMonitor.h"
 #include "ProcessObservationSource.h"
 #include "ProcessLayoutMonitor.h"
 #include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <iostream>
+#include <sstream>
 
 namespace
 {
@@ -252,4 +255,208 @@ bool CollectorProcessHandleFixture(uintptr_t inherited, bool retention)
     ReportKmonInventoryHandleFixture(identity.Pid, image, std::wcout);
     ReportHuntMetadataHandleFixture(identity.Pid, identity.Created, image, std::wcout);
     return true;
+}
+
+bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics)
+{
+    const DWORD pid = GetCurrentProcessId();
+    const auto self = ReadProcessHandleIdentity(GetCurrentProcess(), pid);
+    const auto exited = ReadProcessHandleIdentity(exitedProcess);
+    DWORD exitCode = 0;
+    if (!self.Created || !exited.Created || exited.Pid <= 4 || exited.Pid == pid ||
+        !GetExitCodeProcess(exitedProcess, &exitCode) || exitCode == STILL_ACTIVE) { return false; }
+    // All control cases target this controller. Require an independent Windows denial before seeding any ledger.
+    ProcessHandleJournal calibration;
+    ObservedProcessHandle denied(calibration, ProcessHandleSite::LoggingControl, pid);
+    if (denied.Open(PROCESS_SET_INFORMATION) || denied.Acquisition().Status != ERROR_ACCESS_DENIED) { return false; }
+
+    std::wostringstream result;
+    bool valid = true;
+    const auto run = [&](const wchar_t* name, auto exercise) {
+        KernelMonitor monitor;
+        const uint64_t before = ControllerProcessHandles().Snapshot().Total;
+        exercise(monitor);
+        std::wstring decision = L"none", outcome = L"none", enableDecision = L"none";
+        uint64_t decisionGeneration = 0, acquisition = 0;
+        size_t receipts = 0;
+        for (const auto& event : monitor.Ring)
+        {
+            const auto found = event.Evidence.find(L"cleanup_decision");
+            const auto enable = event.Evidence.find(L"enable_decision");
+            if (enable != event.Evidence.end()) { enableDecision = enable->second; }
+            if (found == event.Evidence.end() && enable == event.Evidence.end()) { continue; }
+            valid = valid && event.Observation.Identity.ProcessId == pid && event.Evidence.at(L"effect_verified") == L"false";
+            if (found != event.Evidence.end())
+            {
+                ++receipts;
+                decision = found->second;
+                outcome = event.Evidence.at(L"control_outcome");
+                decisionGeneration = event.Observation.Identity.CreateTime;
+                const auto id = event.Evidence.find(L"identity_acquisition_id");
+                if (id != event.Evidence.end()) { acquisition = std::stoull(id->second); }
+            }
+        }
+        result << L"[watch.case] name=" << name << L" before=" << before << L" after=" << ControllerProcessHandles().Snapshot().Total
+            << L" watched=" << monitor.WatchPids.size() << L" promoted=" << monitor.WatchPromotedPids.size()
+            << L" enabled=" << monitor.LoggingEnabledPids.size() << L" enabled_count=" << monitor.LoggingEnabledCount.load()
+            << L" failed=" << monitor.LoggingFailedPids.size() << L" decision=" << decision << L" receipts=" << receipts
+            << L" outcome=" << outcome << L" generation=" << decisionGeneration << L" acquisition=" << acquisition
+            << L" enable_decision=" << enableDecision << L"\n";
+        monitor.Active.store(false);
+        monitor.LoggingEnabledPids.clear(); // Artificial entries must not dispatch during the fixture destructor.
+        monitor.LoggingEnabledCount.store(0);
+    };
+    const auto promote = [&](KernelMonitor& monitor, uint64_t created) {
+        monitor.WatchPids.insert(pid);
+        monitor.WatchPromotedPids.insert(pid);
+        monitor.WatchPromotedCreated[pid] = created;
+    };
+    const auto priorEnable = [&](KernelMonitor& monitor, uint64_t created) {
+        monitor.LoggingEnabledPids[pid] = created;
+        monitor.LoggingEnabledCount.store(1);
+    };
+    run(L"unowned", [&](KernelMonitor& monitor) {
+        promote(monitor, self.Created);
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"failed_only", [&](KernelMonitor& monitor) {
+        promote(monitor, self.Created);
+        monitor.LoggingFailedPids[pid] = self.Created;
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"withdrawn_current", [&](KernelMonitor& monitor) {
+        promote(monitor, self.Created);
+        priorEnable(monitor, self.Created);
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"explicit_overlap", [&](KernelMonitor& monitor) {
+        promote(monitor, self.Created);
+        monitor.WatchExplicitPids.insert(pid);
+        priorEnable(monitor, self.Created);
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"mixed_logging", [&](KernelMonitor& monitor) {
+        monitor.WatchPids.insert(pid);
+        monitor.WatchExplicitPids.insert(pid);
+        priorEnable(monitor, self.Created);
+        monitor.LoggingFailedPids[pid] = self.Created + 1;
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"missing_logging", [&](KernelMonitor& monitor) {
+        constexpr uint32_t missing = UINT32_MAX;
+        monitor.WatchPids.insert(missing);
+        monitor.WatchExplicitPids.insert(missing);
+        monitor.LoggingFailedPids[missing] = 0;
+        monitor.PruneStalePromotedWatches();
+    });
+    run(L"child_only", [&](KernelMonitor& monitor) {
+        promote(monitor, self.Created);
+        monitor.WatchChildPids[pid] = pid;
+        monitor.PruneStalePromotedWatches();
+    });
+    for (bool stale : {false, true})
+    {
+        run(stale ? L"overlap_stale" : L"overlap_current", [&](KernelMonitor& monitor) {
+            monitor.WatchNamesLower.push_back(L"*");
+            promote(monitor, self.Created + stale);
+            monitor.WatchChildPids[pid] = pid;
+            priorEnable(monitor, self.Created + stale);
+            monitor.PruneStalePromotedWatches();
+        });
+    }
+    run(L"exited", [&](KernelMonitor& monitor) {
+        // An exited subject is only inspected. Its explicit watch is independent of its promoted entry.
+        monitor.WatchPids.insert(exited.Pid);
+        monitor.WatchExplicitPids.insert(exited.Pid);
+        monitor.WatchPromotedPids.insert(exited.Pid);
+        monitor.WatchPromotedCreated[exited.Pid] = exited.Created;
+        monitor.WatchNamesLower.push_back(L"*");
+        monitor.PruneStalePromotedWatches();
+    });
+    for (bool stop : {false, true})
+    {
+        for (const uint64_t generation : {uint64_t{0}, self.Created, self.Created + 1})
+        {
+            std::wstring name = stop ? L"stop_" : L"remove_";
+            name += !generation ? L"unknown" : generation == self.Created ? L"current" : L"stale";
+            run(name.c_str(), [&](KernelMonitor& monitor) {
+                monitor.WatchPids.insert(pid);
+                priorEnable(monitor, generation);
+                if (stop) { monitor.Stop(nullptr); }
+                else { monitor.RemoveWatchPid(pid); }
+            });
+        }
+    }
+    run(L"promote", [&](KernelMonitor& monitor) { monitor.PromoteNamedWatchPid(pid); });
+    const auto enqueueCreate = [&](KernelMonitor& monitor, uint32_t parent) {
+        TimelineEvent event;
+        event.Source = L"kernel-live";
+        event.Action = L"process-create";
+        event.Entity = L"owned-watch-fixture.exe";
+        event.ProcessId = pid;
+        event.Evidence[L"parent_pid"] = std::to_wstring(parent);
+        return monitor.CollectedLive.Push(std::move(event));
+    };
+    run(L"event_name", [&](KernelMonitor& monitor) {
+        monitor.WatchNamesLower.push_back(L"owned-watch-fixture.exe");
+        valid = enqueueCreate(monitor, 0) && valid;
+        monitor.IngestLiveTimeline(1, 5000);
+    });
+    run(L"event_child", [&](KernelMonitor& monitor) {
+        monitor.WatchPids.insert(exited.Pid);
+        valid = enqueueCreate(monitor, exited.Pid) && valid;
+        monitor.IngestLiveTimeline(1, 5000);
+        valid = valid && monitor.WatchChildPids.count(pid) && monitor.WatchChildPids.at(pid) == exited.Pid;
+    });
+    run(L"withdraw_during_event", [&](KernelMonitor& monitor) {
+        monitor.WatchNamesLower.push_back(L"owned-watch-fixture.exe");
+        valid = enqueueCreate(monitor, 0) && valid;
+        std::unique_lock<std::mutex> hold(monitor.LoggingControlMutex);
+        std::thread ingest([&] { monitor.IngestLiveTimeline(1, 5000); });
+        bool seen = false;
+        const auto deadline = GetTickCount64() + 5000;
+        while (!seen && GetTickCount64() < deadline)
+        {
+            {
+                std::lock_guard<std::mutex> watchLock(monitor.WatchMutex);
+                seen = monitor.RecentCreatePids.count(pid) != 0;
+                if (seen) { monitor.WatchNamesLower.clear(); }
+            }
+            if (!seen) { std::this_thread::yield(); }
+        }
+        hold.unlock();
+        ingest.join();
+        valid = valid && seen;
+    });
+    run(L"remove_stop", [&](KernelMonitor& monitor) {
+        monitor.WatchPids.insert(pid);
+        priorEnable(monitor, self.Created);
+        std::mutex mutex;
+        std::condition_variable ready;
+        size_t arrived = 0;
+        const auto start = [&] {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++arrived;
+            ready.notify_all();
+            ready.wait(lock, [&] { return arrived == 2; });
+        };
+        std::thread remove([&] { start(); monitor.RemoveWatchPid(pid); });
+        start();
+        monitor.Stop(nullptr);
+        remove.join();
+    });
+    for (bool stale : {false, true})
+    {
+        run(stale ? L"enable_stale" : L"enable_current", [&](KernelMonitor& monitor) {
+            promote(monitor, self.Created + stale);
+            monitor.LogHandle = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (monitor.LogHandle == INVALID_HANDLE_VALUE) { valid = false; return; }
+            monitor.Active.store(true);
+            monitor.EnableLoggingForPid(pid);
+            monitor.Active.store(false);
+        });
+    }
+    diagnostics = result.str();
+    return valid;
 }

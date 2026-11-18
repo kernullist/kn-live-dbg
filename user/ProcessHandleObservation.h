@@ -8,7 +8,8 @@
 enum class ProcessHandleSite
 {
     SelfProbe, IdentityLookup, ObservationSource, TiImageLookup, KmonUserInventory, HuntPublicDetails, HuntPackageIdentity,
-    LayoutCollection, LayoutVerification, ImageSweep, ReferenceVerification, PageCapture, DiagnosticIdentity
+    LayoutCollection, LayoutVerification, ImageSweep, ReferenceVerification, PageCapture, DiagnosticIdentity,
+    WatchMaintenance, WatchPromotion, LoggingIdentity, LoggingControl
 };
 enum class ProcessHandleCall { Open, Duplicate, Close };
 

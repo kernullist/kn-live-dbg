@@ -6684,13 +6684,10 @@ namespace
     typedef LONG NTSTATUS;
     typedef NTSTATUS(NTAPI* NtSetInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG);
 
-    bool TryEnableLoggingUsermode(
-        uint32_t pid,
-        uint32_t loggingFlags,
-        uint32_t* infoClass = nullptr)
+    bool TryEnableLoggingUsermode(uint32_t pid, uint32_t loggingFlags, uint32_t* infoClass, uint64_t created)
     {
         bool ok = false;
-        HANDLE process = nullptr;
+        ObservedProcessHandle control(ControllerProcessHandles(), ProcessHandleSite::LoggingControl, pid, created);
 
         do
         {
@@ -6698,11 +6695,11 @@ namespace
             {
                 *infoClass = 0;
             }
-            process = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
-            if (process == nullptr)
+            if (!control.Open(PROCESS_SET_INFORMATION))
             {
                 break;
             }
+            const HANDLE process = control.get();
 
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
             if (ntdll == nullptr)
@@ -6744,31 +6741,36 @@ namespace
             }
         } while (false);
 
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-
         return ok;
     }
 
-    void DisableProcessLogging(DeviceClient* device, uint32_t pid)
+    // Keep the identity handle until the caller has finished its PID-based operation.
+    const wchar_t* QualifyLoggingProcess(ObservedProcessHandle& pin)
     {
-        if (pid <= 4)
+        if (!pin.Open(PROCESS_QUERY_LIMITED_INFORMATION))
         {
-            return;
+            return pin.Acquisition().Status == ERROR_INVALID_PARAMETER ? L"process_gone" : L"open_failed";
         }
-        TryEnableLoggingUsermode(pid, 0);
+        if (pin.ConflictsWithRequestedIdentity()) { return L"generation_changed"; }
+        if (!pin.Acquisition().Bound.Created) { return L"identity_unavailable"; }
+        DWORD exitCode = 0;
+        if (!GetExitCodeProcess(pin.get(), &exitCode)) { return L"liveness_unavailable"; }
+        return exitCode == STILL_ACTIVE ? nullptr : L"process_exited";
+    }
+
+    bool DisableProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created)
+    {
+        const bool userReportedSuccess = TryEnableLoggingUsermode(pid, 0, nullptr, created);
         if (device == nullptr || !device->IsOpen())
         {
-            return;
+            return userReportedSuccess;
         }
         uint32_t applied = 0;
         uint32_t infoClass = 0;
         uint32_t ntStatus = 0;
         uint64_t eprocess = 0;
         std::wstring error;
-        device->SetProcessLogging(
+        const bool reply = device->SetProcessLogging(
             pid,
             0,
             &applied,
@@ -6777,6 +6779,7 @@ namespace
             &eprocess,
             &error,
             true);
+        return userReportedSuccess || (reply && !(ntStatus & 0x80000000u) && applied == 0);
     }
 
     bool CollectToolhelpPidsByName(
@@ -9318,21 +9321,16 @@ bool KernelMonitor::Stop(std::wstring* error, bool finalShutdown)
     UserRuntimeTracker.Stop();
     std::wstring cleanupError;
     const bool cleanupComplete = !IotraceArmed() || DisarmIotrace(&cleanupError);
-    std::vector<uint32_t> loggingPids;
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        for (const auto& entry : LoggingEnabledPids)
+        std::lock_guard<std::mutex> controlLock(LoggingControlMutex);
+        std::unordered_map<uint32_t, uint64_t> logging;
         {
-            loggingPids.push_back(entry.first);
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            logging.swap(LoggingEnabledPids);
+            LoggingFailedPids.clear();
+            LoggingEnabledCount.store(0);
         }
-        LoggingEnabledPids.clear();
-        LoggingFailedPids.clear();
-        LoggingEnabledCount.store(0);
-    }
-
-    for (uint32_t pid : loggingPids)
-    {
-        DisableProcessLogging(device, pid);
+        for (const auto& entry : logging) { ReleaseProcessLogging(device, entry.first, entry.second); }
     }
 
     if (finalShutdown && !cleanupComplete)
@@ -10076,29 +10074,13 @@ void KernelMonitor::IngestLiveTimeline(size_t maxCount, uint64_t budgetMs)
             }
             bool nameWatch = false;
             bool childWatch = false;
+            const auto matchWatch = [&] {
+                nameWatch = classified.ProcessId > 4 && NameEqualsWatch(base, WatchNamesLower);
+                childWatch = !nameWatch && classified.ProcessId > 4 && parentPid && WatchPids.count(parentPid);
+            };
             {
                 std::lock_guard<std::mutex> watchLock(WatchMutex);
-                nameWatch = NameEqualsWatch(base, WatchNamesLower) &&
-                    classified.ProcessId > 4;
-                if (nameWatch)
-                {
-                    WatchPromotedPids.insert(classified.ProcessId);
-                    WatchPids.insert(classified.ProcessId);
-                }
-                // Descendants of a watched loader inherit the watch so the
-                // 2nd stage gets hostility scans, VM logging, and the TI
-                // activity trail even after the parent exits.
-                childWatch =
-                    !nameWatch &&
-                    classified.ProcessId > 4 &&
-                    parentPid != 0 &&
-                    WatchPids.count(parentPid) != 0;
-                if (childWatch)
-                {
-                    WatchPromotedPids.insert(classified.ProcessId);
-                    WatchPids.insert(classified.ProcessId);
-                    WatchChildPids[classified.ProcessId] = parentPid;
-                }
+                matchWatch();
                 if (classified.ProcessId > 4)
                 {
                     RecentCreatePids[classified.ProcessId] = GetTickCount64();
@@ -10116,9 +10098,21 @@ void KernelMonitor::IngestLiveTimeline(size_t maxCount, uint64_t budgetMs)
                     }
                 }
             }
-            if ((nameWatch || childWatch) && classified.ProcessId > 4)
+            if (nameWatch || childWatch)
             {
-                EnableLoggingForPid(classified.ProcessId);
+                // Only a candidate waits for pruning. The watch can be withdrawn while the event waits.
+                {
+                    std::lock_guard<std::mutex> controlLock(LoggingControlMutex);
+                    std::lock_guard<std::mutex> watchLock(WatchMutex);
+                    matchWatch();
+                    if (nameWatch || childWatch)
+                    {
+                        WatchPromotedPids.insert(classified.ProcessId);
+                        WatchPids.insert(classified.ProcessId);
+                        if (childWatch) { WatchChildPids[classified.ProcessId] = parentPid; }
+                    }
+                }
+                if (nameWatch || childWatch) { EnableLoggingForPid(classified.ProcessId); }
             }
             if (childWatch)
             {
@@ -11714,6 +11708,11 @@ std::wstring KernelMonitor::MakeEmittedKey(const std::wstring& key, uint32_t pro
     return uniqueKey;
 }
 
+static std::wstring ObservationDiagnosticKey(const std::wstring& key, const ObservationIdentity& subject)
+{
+    return key + L":observation:" + subject.BootId + L":" + std::to_wstring(subject.ProcessId) + L":" + std::to_wstring(subject.CreateTime);
+}
+
 bool KernelMonitor::EmitUnique(
     const std::wstring& kind,
     const std::wstring& key,
@@ -11727,8 +11726,7 @@ bool KernelMonitor::EmitUnique(
     const uint32_t processId = subject.Pid;
     // Work items keep their original identity even when reporting a failure after PID reuse.
     const std::wstring uniqueKey = subject.Observation
-        ? key + L":observation:" + subject.Observation->BootId + L":" + std::to_wstring(processId) +
-            L":" + std::to_wstring(subject.Observation->CreateTime)
+        ? ObservationDiagnosticKey(key, *subject.Observation)
         : MakeEmittedKey(key, processId);
     bool claimed = false;
     {
@@ -20077,41 +20075,44 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
 
     DeviceClient* device = nullptr;
-    SymbolEngine* symbols = nullptr;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         device = Device;
-        symbols = Symbols;
     }
-
-    HANDLE query = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    const uint64_t created = QueryPidCreateTime(device, symbols, query, pid);
-    if (query != nullptr)
-    {
-        CloseHandle(query);
-    }
-
+    uint64_t expected = 0;
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
-        if (WatchPids.count(pid) == 0)
-        {
-            return;
-        }
+        if (!WatchPids.count(pid)) { return; }
+        const auto promoted = WatchPromotedCreated.find(pid);
+        if (!WatchExplicitPids.count(pid) && promoted != WatchPromotedCreated.end()) { expected = promoted->second; }
+    }
+    ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::LoggingIdentity, pid, expected);
+    const wchar_t* rejection = QualifyLoggingProcess(pin);
+    const bool qualified = rejection == nullptr;
+    const uint64_t created = qualified ? pin.Acquisition().Bound.Created : expected;
+    ObservationIdentity subject;
+    subject.BootId = ObservationBootId();
+    subject.ProcessId = pid;
+    subject.CreateTime = created;
+    {
+        std::lock_guard<std::mutex> watchLock(WatchMutex);
+        if (!WatchPids.count(pid) || StopRequested.load()) { return; }
+        const auto promoted = WatchPromotedCreated.find(pid);
+        if (qualified && !WatchExplicitPids.count(pid) && promoted != WatchPromotedCreated.end() &&
+            promoted->second && promoted->second != created) { return; }
         auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end() &&
-            created != 0 &&
-            it->second == created)
+        if (qualified && it != LoggingEnabledPids.end() && it->second == created)
         {
             return;
         }
     }
 
     uint32_t infoClass = 0;
-    bool enabled = TryEnableLoggingUsermode(
+    bool enabled = qualified && TryEnableLoggingUsermode(
         pid,
         KNDBG_PROCESS_LOG_DEFAULT,
-        &infoClass);
-    if (!enabled)
+        &infoClass, created);
+    if (qualified && !enabled)
     {
         if (device == nullptr)
         {
@@ -20154,11 +20155,11 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
             L"process logging fell back to ReadWriteVmLogging pid=" +
                 std::to_wstring(pid),
             L"AllocVM/ProtectVM/APC/MapView may be silent",
-            pid);
+            subject);
     }
-    else
+    else if (qualified)
     {
-        ClearEmittedKeyForPid(loggingPartialKey, pid);
+        ClearEmittedKey(ObservationDiagnosticKey(loggingPartialKey, subject));
     }
 
     if (enabled)
@@ -20182,14 +20183,53 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
     else
     {
-        std::lock_guard<std::mutex> watchLock(WatchMutex);
-        auto it = LoggingFailedPids.find(pid);
-        if (it == LoggingFailedPids.end() || it->second != created)
         {
-            LoggingFailedPids[pid] = created;
-            LoggingFailedCount.fetch_add(1);
+            std::lock_guard<std::mutex> watchLock(WatchMutex);
+            const auto it = LoggingFailedPids.find(pid);
+            if (it == LoggingFailedPids.end() || it->second != created)
+            {
+                LoggingFailedPids[pid] = created;
+                LoggingFailedCount.fetch_add(1);
+            }
+        }
+        if (rejection)
+        {
+            EmitUnique(L"coverage.logging", std::wstring(L"logging:enable_guard:") + rejection, L"", L"process_logging",
+                L"process logging request withheld", L"", subject, {{L"enable_decision", rejection}, {L"effect_verified", L"false"}});
         }
     }
+}
+
+void KernelMonitor::ReleaseProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created, const wchar_t* priorRejection)
+{
+    if (pid <= 4) { return; }
+    const wchar_t* decision = priorRejection;
+    const wchar_t* outcome = L"not_attempted";
+    uint64_t acquisition = 0;
+    {
+        ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::LoggingIdentity, pid, created);
+        if (!decision) { decision = created ? QualifyLoggingProcess(pin) : L"unknown_generation"; }
+        if (!decision)
+        {
+            decision = L"control_attempted";
+            outcome = DisableProcessLogging(device, pid, created) ? L"success_reported" : L"unconfirmed";
+        }
+        acquisition = pin.Acquisition().AcquisitionId;
+    }
+    KmonEvent event;
+    event.Kind = L"coverage.logging";
+    event.Task = L"cleanup";
+    event.ProcessId = pid;
+    event.Observation.Identity.BootId = ObservationBootId();
+    event.Observation.Identity.ProcessId = pid;
+    event.Observation.Identity.CreateTime = created;
+    event.Observation.Source = L"process_logging";
+    event.Summary = L"process logging cleanup";
+    event.Evidence[L"cleanup_decision"] = decision;
+    event.Evidence[L"control_outcome"] = outcome;
+    event.Evidence[L"effect_verified"] = L"false";
+    if (acquisition) { event.Evidence[L"identity_acquisition_id"] = std::to_wstring(acquisition); }
+    RecordEvent(std::move(event));
 }
 
 // Complete native snapshots drive lifecycle; channel reads have a resumable budget.
@@ -20858,254 +20898,145 @@ bool KernelMonitor::NoteWatchActivityTask(uint32_t pid, const std::wstring& task
     return record;
 }
 
+namespace
+{
+    struct WatchedProcessObservation
+    {
+        DWORD OpenStatus = ERROR_SUCCESS;
+        uint64_t Created = 0;
+        bool Exited = false;
+
+        const wchar_t* Rejection(uint64_t expected) const
+        {
+            if (expected && Created && expected != Created) { return L"generation_changed"; }
+            if (Exited) { return L"process_exited"; }
+            return OpenStatus == ERROR_INVALID_PARAMETER ? L"process_gone" : nullptr;
+        }
+    };
+
+    WatchedProcessObservation ObserveWatchedProcess(uint32_t pid, uint64_t expected, DeviceClient* device, SymbolEngine* symbols)
+    {
+        WatchedProcessObservation result;
+        ObservedProcessHandle handle(ControllerProcessHandles(), ProcessHandleSite::WatchMaintenance, pid, expected);
+        if (handle.Open(PROCESS_QUERY_LIMITED_INFORMATION))
+        {
+            result.Created = handle.Acquisition().Bound.Created;
+            DWORD code = 0;
+            result.Exited = GetExitCodeProcess(handle.get(), &code) && code != STILL_ACTIVE;
+        }
+        else { result.OpenStatus = handle.Acquisition().Status; }
+        if (expected && !result.Created && !result.Rejection(expected))
+        {
+            result.Created = QueryPidCreateTime(device, symbols, handle.get(), pid);
+        }
+        return result;
+    }
+}
+
 void KernelMonitor::PruneStalePromotedWatches()
 {
     std::lock_guard<std::mutex> loggingLock(LoggingControlMutex);
     std::vector<std::wstring> names;
     std::unordered_set<uint32_t> promoted;
-    std::vector<uint32_t> childPids;
+    std::unordered_map<uint32_t, uint32_t> children;
+    std::unordered_map<uint32_t, uint64_t> watchPins, loggingPins;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         names = WatchNamesLower;
         promoted = WatchPromotedPids;
-        childPids.reserve(WatchChildPids.size());
-        for (const auto& entry : WatchChildPids)
+        children = WatchChildPids;
+        watchPins = WatchPromotedCreated;
+        loggingPins = LoggingFailedPids;
+        for (const auto& entry : LoggingEnabledPids)
         {
-            childPids.push_back(entry.first);
+            auto [it, inserted] = loggingPins.insert(entry);
+            if (!inserted && entry.second) { it->second = entry.second; }
         }
     }
-    bool prunePromoted = false;
-    std::unordered_set<uint32_t> liveSet;
-    if (!promoted.empty())
-    {
-        bool hasWildcard = false;
-        for (const std::wstring& name : names)
-        {
-            if (WatchTokenIsWildcard(name))
-            {
-                hasWildcard = true;
-                break;
-            }
-        }
-
-        if (hasWildcard)
-        {
-            // /name * promotes every create. Keep promoted PIDs that are still
-            // alive instead of re-enumerating the whole system.
-            for (uint32_t pid : promoted)
-            {
-                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                if (process != nullptr)
-                {
-                    liveSet.insert(pid);
-                    CloseHandle(process);
-                    continue;
-                }
-                if (GetLastError() != ERROR_INVALID_PARAMETER)
-                {
-                    liveSet.insert(pid);
-                }
-            }
-            prunePromoted = true;
-        }
-        else
-        {
-            std::vector<uint32_t> live;
-            if (CollectToolhelpPidsByName(names, &live))
-            {
-                liveSet.insert(live.begin(), live.end());
-                prunePromoted = true;
-            }
-            else
-            {
-                for (uint32_t pid : promoted)
-                {
-                    HANDLE process = OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION,
-                        FALSE,
-                        pid);
-                    if (process != nullptr)
-                    {
-                        liveSet.insert(pid);
-                        CloseHandle(process);
-                        continue;
-                    }
-                    if (GetLastError() != ERROR_INVALID_PARAMETER)
-                    {
-                        liveSet.insert(pid);
-                    }
-                }
-                prunePromoted = true;
-            }
-        }
-    }
-
-    // Children carry a different image name than the watch, so name
-    // re-enumeration would drop them. Keep them on the wildcard-style
-    // liveness rule (the create-time pin below still applies).
-    for (uint32_t pid : childPids)
-    {
-        if (liveSet.count(pid) != 0)
-        {
-            continue;
-        }
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (process != nullptr)
-        {
-            liveSet.insert(pid);
-            CloseHandle(process);
-            continue;
-        }
-        if (GetLastError() != ERROR_INVALID_PARAMETER)
-        {
-            liveSet.insert(pid);
-        }
-    }
-
     DeviceClient* device = nullptr;
     SymbolEngine* symbols = nullptr;
     {
-        std::lock_guard<std::mutex> stateLock(StateMutex);
+        std::lock_guard<std::mutex> lock(StateMutex);
         device = Device;
         symbols = Symbols;
     }
-    std::unordered_map<uint32_t, uint64_t> promotedCreated;
+    const auto valueFor = [](const auto& values, uint32_t pid) -> uint64_t {
+        const auto found = values.find(pid);
+        return found == values.end() ? 0 : found->second;
+    };
+    // All bookkeeping for this pass shares the same sample. Control requests qualify their own held handle.
+    std::unordered_map<uint32_t, WatchedProcessObservation> samples;
+    const auto inspect = [&](uint32_t pid) -> const WatchedProcessObservation& {
+        auto [it, fresh] = samples.try_emplace(pid);
+        if (fresh)
+        {
+            const uint64_t watch = valueFor(watchPins, pid);
+            it->second = ObserveWatchedProcess(pid, watch ? watch : valueFor(loggingPins, pid), device, symbols);
+        }
+        return it->second;
+    };
+
+    std::vector<uint32_t> named;
+    const bool namesComplete = !promoted.empty() && std::none_of(names.begin(), names.end(), WatchTokenIsWildcard) &&
+        CollectToolhelpPidsByName(names, &named);
+    const std::unordered_set<uint32_t> namedPids(named.begin(), named.end());
+    for (const auto pid : promoted)
     {
+        const uint64_t expected = valueFor(watchPins, pid);
+        const bool checkLiveness = !namesComplete || children.count(pid) != 0;
+        if (checkLiveness || namedPids.count(pid))
+        {
+            if ((!checkLiveness && !expected) || !inspect(pid).Rejection(expected)) { continue; }
+        }
+
+        bool release = false;
+        uint64_t owned = 0;
+        {
+            std::lock_guard<std::mutex> lock(WatchMutex);
+            if (WatchNamesLower != names || valueFor(WatchPromotedCreated, pid) != expected ||
+                valueFor(WatchChildPids, pid) != valueFor(children, pid) || !WatchPromotedPids.erase(pid)) { continue; }
+            WatchPromotedCreated.erase(pid);
+            WatchChildPids.erase(pid);
+            WatchActivityTasks.erase(pid);
+            WatchKnownHandles.erase(pid);
+            WatchedHandleGenerations.erase(pid);
+            auto cursor = WatchedHandleAfter.lower_bound({pid, 0});
+            while (cursor != WatchedHandleAfter.end() && cursor->first.first == pid) { cursor = WatchedHandleAfter.erase(cursor); }
+            if (!WatchExplicitPids.count(pid))
+            {
+                WatchPids.erase(pid);
+                const auto found = LoggingEnabledPids.find(pid);
+                if (found != LoggingEnabledPids.end())
+                {
+                    release = true;
+                    owned = found->second;
+                    LoggingEnabledPids.erase(found);
+                    LoggingEnabledCount.store(LoggingEnabledPids.size());
+                }
+                LoggingFailedPids.erase(pid);
+                loggingPins.erase(pid);
+            }
+        }
+        if (release)
+        {
+            const auto sample = samples.find(pid);
+            ReleaseProcessLogging(device, pid, owned, sample == samples.end() ? nullptr : sample->second.Rejection(owned));
+        }
+    }
+
+    for (const auto& pending : loggingPins)
+    {
+        const uint32_t pid = pending.first;
+        const auto& sample = inspect(pid);
         std::lock_guard<std::mutex> lock(WatchMutex);
-        promotedCreated = WatchPromotedCreated;
-    }
-    for (uint32_t pid : promoted)
-    {
-        if (liveSet.count(pid) == 0)
+        const auto enabled = LoggingEnabledPids.find(pid);
+        if (enabled != LoggingEnabledPids.end() && sample.Rejection(enabled->second))
         {
-            continue;
+            LoggingEnabledPids.erase(enabled);
+            LoggingEnabledCount.store(LoggingEnabledPids.size());
         }
-        auto createdIt = promotedCreated.find(pid);
-        if (createdIt == promotedCreated.end() || createdIt->second == 0)
-        {
-            continue;
-        }
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-        if (created != 0 && created != createdIt->second)
-        {
-            liveSet.erase(pid);
-        }
-    }
-
-    std::vector<uint32_t> logging;
-    std::vector<uint32_t> droppedWatch;
-    {
-        std::lock_guard<std::mutex> lock(WatchMutex);
-        if (prunePromoted)
-        {
-            for (uint32_t pid : promoted)
-            {
-                if (liveSet.count(pid) != 0)
-                {
-                    continue;
-                }
-                if (WatchPromotedPids.erase(pid) == 0)
-                {
-                    continue;
-                }
-                WatchPromotedCreated.erase(pid);
-                WatchChildPids.erase(pid);
-                WatchActivityTasks.erase(pid);
-                WatchKnownHandles.erase(pid);
-                WatchedHandleGenerations.erase(pid);
-                auto handleCursor = WatchedHandleAfter.lower_bound({pid, 0});
-                while (handleCursor != WatchedHandleAfter.end() && handleCursor->first.first == pid)
-                {
-                    handleCursor = WatchedHandleAfter.erase(handleCursor);
-                }
-                if (WatchExplicitPids.count(pid) == 0)
-                {
-                    WatchPids.erase(pid);
-                    droppedWatch.push_back(pid);
-                    if (LoggingEnabledPids.erase(pid) != 0 &&
-                        LoggingEnabledCount.load() > 0)
-                    {
-                        LoggingEnabledCount.fetch_sub(1);
-                    }
-                    LoggingFailedPids.erase(pid);
-                }
-            }
-        }
-        std::unordered_set<uint32_t> ids;
-        ids.reserve(LoggingEnabledPids.size() + LoggingFailedPids.size());
-        for (const auto& entry : LoggingEnabledPids)
-        {
-            ids.insert(entry.first);
-        }
-        for (const auto& entry : LoggingFailedPids)
-        {
-            ids.insert(entry.first);
-        }
-        logging.assign(ids.begin(), ids.end());
-    }
-
-    for (uint32_t pid : droppedWatch)
-    {
-        DisableProcessLogging(device, pid);
-    }
-
-    for (uint32_t pid : logging)
-    {
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        const DWORD openError = (process == nullptr) ? GetLastError() : ERROR_SUCCESS;
-        const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-
-        std::lock_guard<std::mutex> lock(WatchMutex);
-        auto it = LoggingEnabledPids.find(pid);
-        if (it != LoggingEnabledPids.end())
-        {
-            if (created != 0)
-            {
-                if (it->second != 0 && created != it->second)
-                {
-                    LoggingEnabledPids.erase(it);
-                    if (LoggingEnabledCount.load() > 0)
-                    {
-                        LoggingEnabledCount.fetch_sub(1);
-                    }
-                }
-            }
-            else if (process == nullptr && openError == ERROR_INVALID_PARAMETER)
-            {
-                LoggingEnabledPids.erase(it);
-                if (LoggingEnabledCount.load() > 0)
-                {
-                    LoggingEnabledCount.fetch_sub(1);
-                }
-            }
-        }
-        auto failedIt = LoggingFailedPids.find(pid);
-        if (failedIt == LoggingFailedPids.end())
-        {
-            continue;
-        }
-        if (created != 0)
-        {
-            if (failedIt->second != 0 && created != failedIt->second)
-            {
-                LoggingFailedPids.erase(failedIt);
-            }
-            continue;
-        }
-        if (process != nullptr || openError != ERROR_INVALID_PARAMETER)
-        {
-            continue;
-        }
-        LoggingFailedPids.erase(failedIt);
+        const auto failed = LoggingFailedPids.find(pid);
+        if (failed != LoggingFailedPids.end() && sample.Rejection(failed->second)) { LoggingFailedPids.erase(failed); }
     }
 }
 
@@ -21122,13 +21053,14 @@ void KernelMonitor::PromoteNamedWatchPid(uint32_t pid)
         device = Device;
         symbols = Symbols;
     }
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
-    if (process != nullptr)
     {
-        CloseHandle(process);
-    }
-    {
+        std::lock_guard<std::mutex> controlLock(LoggingControlMutex);
+        ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::WatchPromotion, pid);
+        if (!pin.Open(PROCESS_QUERY_LIMITED_INFORMATION) && pin.Acquisition().Status == ERROR_INVALID_PARAMETER) { return; }
+        DWORD code = 0;
+        if (pin.get() && GetExitCodeProcess(pin.get(), &code) && code != STILL_ACTIVE) { return; }
+        uint64_t created = pin.Acquisition().Bound.Created;
+        if (!created) { created = QueryPidCreateTime(device, symbols, pin.get(), pid); }
         std::lock_guard<std::mutex> lock(WatchMutex);
         WatchPids.insert(pid);
         WatchPromotedPids.insert(pid);
@@ -21631,6 +21563,7 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
     std::lock_guard<std::mutex> loggingLock(LoggingControlMutex);
     bool removed = false;
     bool wasLogging = false;
+    uint64_t created = 0;
     {
         std::lock_guard<std::mutex> lock(WatchMutex);
         WatchExplicitPids.erase(pid);
@@ -21639,12 +21572,15 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
         WatchChildPids.erase(pid);
         WatchActivityTasks.erase(pid);
         removed = WatchPids.erase(pid) != 0;
-        wasLogging = LoggingEnabledPids.erase(pid) != 0;
-        LoggingFailedPids.erase(pid);
-        if (wasLogging && LoggingEnabledCount.load() > 0)
+        const auto enabled = LoggingEnabledPids.find(pid);
+        if (enabled != LoggingEnabledPids.end())
         {
-            LoggingEnabledCount.fetch_sub(1);
+            wasLogging = true;
+            created = enabled->second;
+            LoggingEnabledPids.erase(enabled);
+            LoggingEnabledCount.store(LoggingEnabledPids.size());
         }
+        LoggingFailedPids.erase(pid);
     }
     if (wasLogging)
     {
@@ -21653,7 +21589,7 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
             std::lock_guard<std::mutex> stateLock(StateMutex);
             device = Device;
         }
-        DisableProcessLogging(device, pid);
+        ReleaseProcessLogging(device, pid, created);
     }
     return removed;
 }

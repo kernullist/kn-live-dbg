@@ -3104,6 +3104,10 @@ static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
     case ProcessHandleSite::ReferenceVerification: return L"reference_verification";
     case ProcessHandleSite::PageCapture: return L"page_capture";
     case ProcessHandleSite::DiagnosticIdentity: return L"diagnostic_identity";
+    case ProcessHandleSite::WatchMaintenance: return L"watch_maintenance";
+    case ProcessHandleSite::WatchPromotion: return L"watch_promotion";
+    case ProcessHandleSite::LoggingIdentity: return L"logging_identity";
+    case ProcessHandleSite::LoggingControl: return L"logging_control";
     }
     return L"unknown";
 }

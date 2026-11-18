@@ -1943,6 +1943,19 @@ scanner retains its existing source, identity and evidence checks.
 | Kernel images | Executable image discovery |
 | Page candidates | Admitted executable-page candidates |
 
+The user discovery phase shares one process observation per PID across name
+watches, child watches and logging records during a pruning pass. A recorded
+creation-time mismatch, an invalid PID or a reported exit can retire a
+promoted entry. An access error alone leaves its status uncertain. Explicit PID
+watches retain their independent membership.
+
+KMON holds a limited-query handle for the subject when it attempts to change
+process logging. Pruning, manual removal and shutdown can request cleanup only
+for a generation with an earlier successful request in this controller.
+A known mismatch retires the local record. An unresolved identity produces
+a cleanup diagnostic. The handle pins the original process object through the
+existing control path. [Windows process ID lifetime](https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803)
+
 A discovery turn has a 250 ms cooperative budget that includes interleaved
 analysis service between scanners. It admits at most one dispatch cycle per
 group per turn. The worker first gives analysis its independent turn, then
