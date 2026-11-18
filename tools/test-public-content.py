@@ -66,10 +66,18 @@ class PublicContentTests(unittest.TestCase):
         self.assertEqual(AUDIT.path_rule(".knbench-interrupted.tmp"), "private-container-or-capture")
         self.assertIn("private-benchmark-package", {f["rule"] for f in AUDIT.inspect("renamed.dat", head + b"owned-module-manifest.json")})
         self.assertFalse(AUDIT.inspect("guide.zip", head + b"guide.txt"))
-        for kind in ("benchmark", "truth", "evaluation"):
+        for kind in ("benchmark", "truth", "evaluation", "plan", "campaign", "campaign_evaluation", "attempt", "attempt_receipt", "watch", "worker_failure"):
             truncated = "logged\n" + json.dumps({"schema": "kn.owned_module_" + kind + ".v1", "run_id": "interrupted"}, indent=2)[:-4]
             for encoding in ("utf-8", "utf-16"):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", truncated.encode(encoding))})
+
+    def test_campaign_database_and_recovery_files(self):
+        for name in ("state.KNCAMPAIGN", "renamed.knruns", "state.kncampaign-journal", "state.kncampaign-wal", "state.kncampaign-shm"):
+            self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
+        head = b"SQLite format 3\0" + bytes(52)
+        for raw in (head + b"KNMC", b"\0journal page" + b'{"schema":"kn.owned_module_attempt_receipt.v1",'):
+            self.assertIn("private-benchmark-campaign", {f["rule"] for f in AUDIT.inspect("renamed.db", raw)})
+        self.assertFalse(AUDIT.inspect("ordinary.db", head + bytes(4)))
 
     def test_owned_module_workload_transcripts(self):
         schema = "kn.owned_module_workload.v1"

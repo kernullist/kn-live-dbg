@@ -22,6 +22,10 @@ ERRORS = {"fault", "incomplete", "invalid_clock"}
 SOURCE_RESULTS = UNAVAILABLE | ERRORS | {"observed"}
 
 
+class PackagePinMismatch(ValueError):
+    pass
+
+
 def check(ok, message):
     if not ok:
         raise ValueError(message)
@@ -63,19 +67,13 @@ def encoded(value):
     return (json.dumps(value, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
 
 
-def write_bundle(destination, manifest, contents):
+def publish_new(destination, write):
     """Seal in the destination directory and publish without replacing an existing file."""
-    check(set(contents) == LIMITS.keys() - {MANIFEST}, "incomplete acquisition inputs")
-    manifest = dict(manifest, artifacts={name: sha(data) for name, data in contents.items()})
-    contents = {MANIFEST: encoded(manifest), **contents}
-    check(all(0 < len(data) <= LIMITS[name] for name, data in contents.items()), "artifact exceeds format bounds")
     temp = None
     try:
         with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".knbench-", suffix=".tmp", delete=False) as out:
             temp = Path(out.name)
-            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as archive:
-                for name in LIMITS:
-                    archive.writestr(name, contents[name])
+            write(out)
             out.flush()
             os.fsync(out.fileno())
             out.seek(0)
@@ -91,11 +89,24 @@ def write_bundle(destination, manifest, contents):
             temp.unlink(missing_ok=True)
 
 
+def write_bundle(destination, manifest, contents):
+    check(set(contents) == LIMITS.keys() - {MANIFEST}, "incomplete acquisition inputs")
+    manifest = dict(manifest, artifacts={name: sha(data) for name, data in contents.items()})
+    contents = {MANIFEST: encoded(manifest), **contents}
+    check(all(0 < len(data) <= LIMITS[name] for name, data in contents.items()), "artifact exceeds format bounds")
+    def write(out):
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name in LIMITS:
+                archive.writestr(name, contents[name])
+    return publish_new(destination, write)
+
+
 def read_bundle(path, expected, decode):
     check(isinstance(expected, str) and re.fullmatch("[0-9a-f]{64}", expected), "expected a lowercase SHA-256 pin")
     with path.open("rb") as stream:
         raw = stream.read(MAX_PACKAGE + 1)
-    check(len(raw) <= MAX_PACKAGE and sha(raw) == expected, "package size or SHA-256 mismatch")
+    if len(raw) > MAX_PACKAGE or sha(raw) != expected:
+        raise PackagePinMismatch("package size or SHA-256 mismatch")
     check(len(raw) >= 22 and raw.startswith(b"PK\x03\x04") and raw[30:30 + len(MANIFEST)] == MANIFEST.encode(),
           "invalid package header")
     # ZipFile eagerly materializes the central directory. Bound its byte count before opening it.

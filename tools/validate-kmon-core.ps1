@@ -91,6 +91,11 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "owned native module workload or offline replay failed: $LASTEXITCODE"
 }
+& python (Join-Path $PSScriptRoot 'test-owned-module-campaign.py') --core-exe $exe
+if ($LASTEXITCODE -ne 0)
+{
+    throw "owned acquisition campaign validation failed: $LASTEXITCODE"
+}
 & python (Join-Path $PSScriptRoot 'test-discovery-scheduling.py') --core-exe $exe
 if ($LASTEXITCODE -ne 0)
 {

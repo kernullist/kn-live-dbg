@@ -44,6 +44,8 @@ def path_rule(name: str) -> str | None:
     if any(p.lower() in PRIVATE_DIRECTORIES for p in path.parts[:-1]):
         return "local-state-directory"
     base = path.name.lower()
+    if base.endswith((".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm", ".kncampaign", ".knruns")):
+        return "private-container-or-capture"
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if (base.startswith(".knbench-") and base.endswith(".tmp")) or path.suffix.lower() in PRIVATE_EXTENSIONS or any(
@@ -89,6 +91,11 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if private_symbols and not allow_private_symbols:
         add("private-symbol-file")
     binary = b"\0" in data[:8192] and not data.startswith((b"\xff\xfe", b"\xfe\xff"))
+    if ((data.startswith(b"SQLite format 3\0") and data[68:72] == b"KNMC") or
+            (binary and any(marker in data for marker in (b'{"schema":"kn.owned_module_plan.v1",',
+                                                         b'{"schema":"kn.owned_module_attempt_receipt.v1",')))):
+        add("private-benchmark-campaign")
+        return findings
     for text in text_views(data):
         # Capture contents remain private even if the extension was changed.
         if text.lstrip().startswith("{"):
@@ -112,7 +119,10 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
                     "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1",
-                    "kn.owned_module_benchmark.v1", "kn.owned_module_truth.v1", "kn.owned_module_evaluation.v1"
+                    "kn.owned_module_benchmark.v1", "kn.owned_module_truth.v1", "kn.owned_module_evaluation.v1",
+                    "kn.owned_module_plan.v1", "kn.owned_module_campaign.v1", "kn.owned_module_campaign_evaluation.v1",
+                    "kn.owned_module_attempt.v1", "kn.owned_module_attempt_receipt.v1", "kn.owned_module_watch.v1",
+                    "kn.owned_module_worker_failure.v1"
                 }:
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):
@@ -120,7 +130,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # The workload emits one tagged object per reply. A transcript can
         # include multiple replies, a log banner or a partially written tail.
         if not binary and "kn.owned_module_" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
-            partial = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.owned_module_(?:truth|benchmark|evaluation)\.v1"\s*,', text)
+            partial = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.owned_module_(?:truth|benchmark|evaluation|'
+                                r'plan|campaign|campaign_evaluation|attempt|attempt_receipt|watch|worker_failure)\.v1"\s*,', text)
             if partial:
                 add("private-evidence-bundle", text.count("\n", 0, partial.start()) + 1)
         if not binary and "kn.owned_module_workload.v1" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):

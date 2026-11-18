@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -36,10 +37,12 @@ create_job = api('CreateJobObjectW', w.HANDLE, c.c_void_p, w.LPCWSTR)
 set_job = api('SetInformationJobObject', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD)
 query_job = api('QueryInformationJobObject', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p)
 assign_job = api('AssignProcessToJobObject', w.BOOL, w.HANDLE, w.HANDLE)
+terminate_job = api('TerminateJobObject', w.BOOL, w.HANDLE, w.UINT)
 close_handle = api('CloseHandle', w.BOOL, w.HANDLE)
 duplicate = api('DuplicateHandle', w.BOOL, w.HANDLE, w.HANDLE, w.HANDLE, c.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD)
 open_process = api('OpenProcess', w.HANDLE, w.DWORD, w.BOOL, w.DWORD)
 wait = api('WaitForSingleObject', w.DWORD, w.HANDLE, w.DWORD)
+process_exit = api('GetExitCodeProcess', w.BOOL, w.HANDLE, c.POINTER(w.DWORD))
 process_times = api('GetProcessTimes', w.BOOL, w.HANDLE, *(c.POINTER(w.FILETIME),) * 4)
 open_file = api('CreateFileW', w.HANDLE, w.LPCWSTR, w.DWORD, w.DWORD, c.c_void_p, w.DWORD, w.DWORD, w.HANDLE)
 file_info = api('GetFileInformationByHandleEx', w.BOOL, w.HANDLE, c.c_int, c.c_void_p, w.DWORD)
@@ -77,6 +80,10 @@ class Accounting(c.Structure):
     _fields_ = [('times', c.c_int64 * 4), ('faults', w.DWORD), ('total', w.DWORD), ('active', w.DWORD), ('terminated', w.DWORD)]
 
 
+class JobUsage(c.Structure):
+    _fields_ = [('basic', Accounting), ('io', c.c_uint64 * 6)]
+
+
 @contextmanager
 def leased_file(path):
     # Deny write/delete sharing while image names are resolved and the children run.
@@ -95,9 +102,9 @@ def leased_file(path):
 
 
 class BenchmarkCapture:
-    def __init__(self, stack, exe):
+    def __init__(self, stack, exe, ticket=None):
         from owned_module_benchmark import LIMITS
-        self.run_id = uuid.uuid4().hex
+        self.run_id = ticket or uuid.uuid4().hex
         self.parts, self.file_ids, self.worlds = {}, {}, []
         self.owner_loss = None
         for name, path in [('collector.bin', exe), ('target.bin', sys.executable), ('controller.py', __file__)]:
@@ -520,14 +527,249 @@ def interruption(exe, capture=None):
         return True
 
 
+def final_job_usage(job, end):
+    usage = JobUsage()
+    native(query_job(job, 8, c.byref(usage), c.sizeof(usage), None))
+    if usage.basic.active:
+        native(terminate_job(job, 1))
+        end["forced_cleanup"] = True
+        until = time.monotonic() + 10
+        while usage.basic.active and time.monotonic() < until:
+            time.sleep(0.02)
+            native(query_job(job, 8, c.byref(usage), c.sizeof(usage), None))
+    limits = ExtendedLimits()
+    peak_known = query_job(job, 9, c.byref(limits), c.sizeof(limits), None)
+    peak_error = None if peak_known else c.get_last_error()
+    return dict(total=usage.basic.total, active=usage.basic.active, user_100ns=str(usage.basic.times[0]),
+                kernel_100ns=str(usage.basic.times[1]), read_operations=str(usage.io[0]),
+                write_operations=str(usage.io[1]), other_operations=str(usage.io[2]),
+                read_bytes=str(usage.io[3]), written_bytes=str(usage.io[4]), other_bytes=str(usage.io[5]),
+                peak_job_bytes=str(limits.memory[3]) if peak_known else None, peak_error=peak_error)
+
+
+def wait_for_worker(worker, ticket, deadline):
+    grant = (ticket + '\n').encode('ascii')
+    while True:
+        try:
+            stdout, _ = worker.communicate(input=grant, timeout=max(0, deadline - tick()) / 1000)
+            return stdout
+        except subprocess.TimeoutExpired:
+            if tick() >= deadline:
+                raise
+            grant = None  # communicate resumes the original pipe operation.
+
+
+def finish_worker(worker, job, bound, end):
+    if worker.poll() is None:
+        if bound is not None:
+            end["forced_cleanup"] = True
+            try:
+                native(terminate_job(job, 1))
+            except OSError as exc:
+                end["error_code"] = exc.winerror
+                worker.kill()
+        else:
+            worker.kill()  # An ungranted worker cannot create descendants.
+        try:
+            worker.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            end["error_code"] = 258
+    if bound is not None:
+        code = worker.poll()
+        end["worker_exit"] = None if code is None else code & 0xffffffff
+        try:
+            end["job"] = final_job_usage(job, end)
+        except OSError as exc:
+            end["accounting_error"] = exc.winerror if exc.winerror is not None else 0
+
+
+def supervised_attempt(args):
+    import owned_module_campaign as campaign
+    from owned_module_benchmark import read_bundle
+
+    admission = dict(supervisor=[os.getpid(), str(creation(self_handle()))], tick_ms=tick())
+    plan, admission = campaign.admit(args.campaign, args.plan_sha256, args.slot, admission)
+    ticket = plan["tickets"][args.slot - 1]
+    destination = campaign.package_path(args.campaign, ticket)
+    end = dict(outcome="startup_error", worker_exit=None, worker_failure=None, package_sha256=None, error_code=None,
+               job=None, accounting_error=None, forced_cleanup=False)
+    bound = None
+    try:
+        with ExitStack() as stack:
+            inputs = {}
+            end["outcome"] = "input_unavailable"
+            for name, path in campaign.input_paths(args.core_exe).items():
+                stream, _ = stack.enter_context(leased_file(path))
+                inputs[name] = campaign.input_hash(stream, name)
+            if inputs != plan["inputs"]:
+                end["outcome"] = "input_mismatch"
+            else:
+                end["outcome"] = "startup_error"
+                if destination.exists():
+                    raise FileExistsError("registered output is already occupied")
+                argv = [sys.executable, str(Path(__file__).resolve()), "--campaign-worker", "--core-exe",
+                        str(args.core_exe.resolve()), "--benchmark-out", str(destination.resolve())]
+                with owned_job() as job:
+                    worker = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, close_fds=True,
+                                              creationflags=subprocess.DETACHED_PROCESS)
+                    stack.callback(worker._handle.Close)
+                    stack.callback(worker.stdout.close)
+                    stack.callback(worker.stdin.close)
+                    try:
+                        handle = int(worker._handle)
+                        native(assign_job(job, handle))
+                        witness = dict(worker=[native(peer_pid(handle)), str(creation(handle))], tick_ms=tick())
+                        bound = campaign.record(args.campaign, args.plan_sha256, args.slot, admission, "bound", witness)
+                        end["outcome"] = "worker_error"
+                        signal = wait_for_worker(worker, ticket, witness["tick_ms"] + plan["timeout_ms"])
+                        if worker.returncode == 3 and signal:
+                            end["outcome"] = "protocol_error"
+                            require(len(signal) <= 512, "oversized worker diagnostic")
+                            failure = json.loads(signal)
+                            campaign.check_worker_failure(failure, ticket)
+                            end.update(outcome="worker_error", worker_failure=failure)
+                        elif worker.returncode == 0 or (worker.returncode == 1 and signal):
+                            end["outcome"] = "protocol_error"
+                            require(re.fullmatch(rb"[0-9a-f]{64}\r?\n", signal), "invalid publication acknowledgement")
+                            pin = signal.strip().decode('ascii')
+                            end["outcome"] = "invalid_package"
+                            manifest, _ = read_bundle(destination, pin, json.loads)
+                            require(manifest["run_id"] == ticket and
+                                    all(manifest["artifacts"][k] == inputs[k] for k in campaign.IMAGES), "package differs from registered inputs")
+                            end.update(outcome="published", package_sha256=pin)
+                    except subprocess.TimeoutExpired:
+                        end["outcome"] = "timed_out"
+                    except KeyboardInterrupt:
+                        end["outcome"] = "interrupted"
+                    finally:
+                        finish_worker(worker, job, bound, end)
+    except KeyboardInterrupt:
+        if end["outcome"] == "published":
+            end["error_code"] = 995
+        else:
+            end["outcome"] = "interrupted"
+    except (OSError, ValueError, AssertionError) as exc:
+        end["error_code"] = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+    end["tick_ms"] = tick()
+    end = campaign.record(args.campaign, args.plan_sha256, args.slot, admission, "ended", end, bound)
+    row = dict(slot=args.slot, ticket=ticket, admitted=admission, bound=bound, ended=end, loss=None)
+    print(json.dumps(dict(schema="kn.owned_module_attempt.v1", **row)))
+    return 0 if campaign.passed(end) else 1
+
+
+def watch_owner(args):
+    import owned_module_campaign as campaign
+    snapshot = campaign.current_snapshot(args.campaign, args.plan_sha256)
+    seconds = 60 if args.watch_seconds is None else args.watch_seconds
+    if not 1 <= args.slot <= len(snapshot["attempts"]) or not 1 <= seconds <= 3600:
+        raise ValueError("invalid observation slot or timeout")
+    row = snapshot["attempts"][args.slot - 1]
+    if row["bound"] is None or row["ended"] is not None or row["loss"] is not None:
+        raise ValueError("watch requires a pending job-bound worker")
+    observation = dict(observer=[os.getpid(), str(creation(self_handle()))], before_ms=tick())
+    with ExitStack() as stack:
+        handles = {}
+        for name, key in (("supervisor", row["admitted"]["supervisor"]), ("worker", row["bound"]["worker"])):
+            handle = native(open_process(0x00101000, False, key[0]))
+            stack.callback(close_handle, handle)
+            pinned = [native(peer_pid(handle)), str(creation(handle))]
+            before = wait(handle, 0)
+            if pinned != key or before != 258:
+                raise ValueError("original live process unavailable for observation")
+            handles[name] = handle
+            observation[name] = dict(key=pinned, before=before)
+        print(json.dumps(dict(schema="kn.owned_module_watch.v1", status="armed", slot=args.slot)), flush=True)
+        deadline = tick() + seconds * 1000
+        for name, handle in handles.items():
+            after = wait(handle, max(deadline - tick(), 0))
+            if after == 258:
+                print(json.dumps(dict(schema="kn.owned_module_watch.v1", status="observation_timeout", slot=args.slot)))
+                return 1
+            if after != 0:
+                raise c.WinError(c.get_last_error())
+            code = w.DWORD()
+            native(process_exit(handle, c.byref(code)))
+            observation[name].update(after=after, exit_code=code.value)
+        observation["after_ms"] = tick()
+        receipt = campaign.record(args.campaign, args.plan_sha256, args.slot, row["admitted"], "loss", observation, row["bound"])
+    status = "owner_lost" if receipt is not None else "already_recorded"
+    print(json.dumps(dict(schema="kn.owned_module_watch.v1", status=status, slot=args.slot)))
+    return 0
+
+
+def run_workload(args, ticket):
+    phase = "inputs"
+    try:
+        exe = args.core_exe.resolve()
+        with ExitStack() as stack:
+            capture = BenchmarkCapture(stack, exe, ticket) if args.benchmark_out else None
+            worlds = []
+            for changing in (False, True):
+                phase = "changing" if changing else "fixed"
+                worlds.append(world(exe, changing, args.trace, capture))
+            phase = "interruption"
+            cleaned = interruption(exe, capture)
+            passed = all(w["passed"] for w in worlds) and cleaned
+            report = dict(schema=SCHEMA, passed=passed, clock="GetTickCount64_ms", interrupted_owner_cleanup=cleaned, worlds=worlds)
+            phase = "publication"
+            if capture is not None:
+                report["benchmark_sha256"] = capture.publish(args.benchmark_out)
+        print(report["benchmark_sha256"] if ticket else json.dumps(report))
+        return 0 if passed else 1
+    except (OSError, AssertionError, ValueError, KeyError, TypeError, IndexError, RuntimeError, queue.Empty, subprocess.TimeoutExpired) as exc:
+        if ticket is None:
+            raise
+        code = None
+        if isinstance(exc, OSError):
+            domain = "os"
+            if getattr(exc, "winerror", None) is not None:
+                domain, code = "win32", exc.winerror
+            elif exc.errno is not None:
+                domain, code = "errno", exc.errno
+        elif isinstance(exc, AssertionError):
+            domain = "assertion"
+        elif isinstance(exc, (queue.Empty, subprocess.TimeoutExpired)):
+            domain = "timeout"
+        else:
+            domain = "runtime" if isinstance(exc, RuntimeError) else "invalid_data"
+        print(json.dumps(dict(schema="kn.owned_module_worker_failure.v1", ticket=ticket, phase=phase, domain=domain, code=code)))
+        return 3
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--core-exe', type=Path)
     parser.add_argument('--trace', action='store_true', help='include private generation and acquisition evidence on stdout')
     parser.add_argument('--benchmark-out', type=Path, help='publish a new private replay package and return its SHA-256 pin')
+    parser.add_argument('--campaign', type=Path, help='run one pre-registered acquisition slot')
+    parser.add_argument('--slot', type=int)
+    parser.add_argument('--plan-sha256')
+    parser.add_argument('--watch-owner', action='store_true', help='observe a running supervisor and worker through pinned handles')
+    parser.add_argument('--watch-seconds', type=int)
+    parser.add_argument('--campaign-worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--interrupt-controller', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.watch_owner or any(x is not None for x in (args.campaign, args.slot, args.plan_sha256, args.watch_seconds)):
+        import sqlite3
+        if (not all(x is not None for x in (args.campaign, args.slot, args.plan_sha256)) or
+                (not args.watch_owner and (args.core_exe is None or args.watch_seconds is not None)) or
+                (args.watch_owner and args.core_exe is not None) or
+                args.trace or args.benchmark_out or args.campaign_worker or args.child or args.interrupt_controller):
+            parser.error('a registered campaign slot requires --core-exe for acquisition or --watch-owner for observation')
+        try:
+            sys.exit(watch_owner(args) if args.watch_owner else supervised_attempt(args))
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            print(f'campaign acquisition failed: {exc}', file=sys.stderr)
+            sys.exit(2)
+    ticket = None
+    if args.campaign_worker:
+        if not args.benchmark_out or not args.core_exe or args.trace or args.child or args.interrupt_controller:
+            parser.error('invalid supervised worker invocation')
+        grant = sys.stdin.buffer.readline(34)
+        if not re.fullmatch(rb'[0-9a-f]{32}\n', grant):
+            sys.exit(2)
+        ticket = grant[:-1].decode('ascii')
     if args.child:
         child()
     elif not args.core_exe:
@@ -535,16 +777,6 @@ if __name__ == '__main__':
     elif args.interrupt_controller:
         interrupted_controller(args.core_exe.resolve())
     else:
-        exe = args.core_exe.resolve()
-        with ExitStack() as stack:
-            if args.benchmark_out and args.benchmark_out.exists():
-                parser.error('benchmark destination already exists')
-            capture = BenchmarkCapture(stack, exe) if args.benchmark_out else None
-            worlds = [world(exe, changing, args.trace, capture) for changing in (False, True)]
-            cleaned = interruption(exe, capture)
-            passed = all(w['passed'] for w in worlds) and cleaned
-            report = dict(schema=SCHEMA, passed=passed, clock='GetTickCount64_ms', interrupted_owner_cleanup=cleaned, worlds=worlds)
-            if capture is not None:
-                report['benchmark_sha256'] = capture.publish(args.benchmark_out)
-            print(json.dumps(report))
-        sys.exit(0 if passed else 1)
+        if args.benchmark_out and args.benchmark_out.exists():
+            parser.error('benchmark destination already exists')
+        sys.exit(run_workload(args, ticket))

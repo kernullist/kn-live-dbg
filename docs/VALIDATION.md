@@ -7,6 +7,59 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Registered Windows acquisition attempts, 2026-11-18
+
+On Windows **28000.3501 x64**, a pre-registered campaign reserved six slots.
+The frozen snapshot contained five admissions, three job-bound workers and
+four terminal outcomes. One admission had an unknown outcome and one slot
+had never been admitted.
+
+| Outcome in the frozen registry | Slots | Verified packages |
+| --- | ---: | ---: |
+| Published and passed | 1 | 1 |
+| Executable unavailable before launch | 1 | 0 |
+| Executable content differed from the plan | 1 | 0 |
+| Supervisor and worker termination independently observed | 1 | 0 |
+| Admitted with no terminal receipt or independent witness | 1 | 0 |
+| Unadmitted | 1 | 0 |
+
+Success was **1/5 per admission** and **1/6 per planned slot**. Evidence
+survival was **1/1 acknowledged package**. That package reproduced 12/12
+fixed and 20/22 changing process generations. A copy of the same snapshot
+with its package missing still accounted for all six slots and five
+admissions. It reported **0/1** evidence survival and withheld process metrics.
+
+The successful run's job accounted for **42 processes**, with zero active
+at the final query. It recorded 6.84375 seconds of user CPU, 2.625 seconds of
+kernel CPU, 342,085,632 bytes of peak job memory, 99,298,082 bytes read and
+1,412,265 bytes written. Admission to the terminal receipt took 19,844 ms.
+These figures cover the assigned worker and descendants on this host.
+Collector-only cost and incremental overhead require paired measurements.
+
+The interruption controls waited for a live native observer and Python
+subject in the worker's tree. Both supervisor terminations released the
+pinned worker and descendants. The campaign credited owner loss only for
+the slot whose independent observer recorded both original process handles
+signaling. A separate 50 ms deadline terminated its job and recorded zero
+active processes. An invalid executable retained Win32 **193** in the fixed
+workload phase and the worker's OS exit code **3**.
+
+The Release core validation passed. Campaign checks exercised concurrent
+admission, a writer killed with an uncommitted SQLite transaction, frozen
+snapshots before and after interruption, a valid package from another ticket,
+and missing or altered evidence. Existing imported declarations, standalone
+package replay and private publication checks passed. The [campaign contract](BENCHMARK_CORPUS.md#register-and-evaluate-repeated-acquisitions)
+describes custody, outcome classification and measurement scope.
+
+Core harness SHA-256 `229430912cc9021a9a6d75c234ab2e204b96475472fe6b5f6c11eccd7d744a7e`.
+The **09:04 KST** host check found the same boot time as the pre-run baseline,
+zero new BugCheck or unexpected restart events, zero new dumps and zero
+remaining task processes or drivers. Monitored services and firewall profiles
+matched the baseline. The temporary publication files and SQLite recovery
+files had been cleaned up.
+P16 remains open for calibrated overhead, externally grounded heldout
+samples and independent tool comparisons.
+
 ## Offline replay of owned Windows module acquisitions, 2026-11-18
 
 On Windows **28000.3501 x64**, a Release core observer recorded two owned

@@ -258,20 +258,94 @@ def evaluate_owned(path, pin):
                 independent_detection_validation=False, overall_ranking=None, scopes=scopes)
 
 
+def evaluate_campaign(path, snapshot_pin, plan_pin):
+    import owned_module_campaign as campaign
+    from owned_module_benchmark import PackagePinMismatch
+    with path.open("rb") as stream:
+        raw = stream.read(campaign.MAX_SNAPSHOT + 1)
+    require(len(raw) <= campaign.MAX_SNAPSHOT and hashlib.sha256(raw).hexdigest() == campaign.digest(snapshot_pin),
+            "campaign snapshot size or SHA-256 mismatch")
+    plan, records = campaign.validate_snapshot(decode_document(raw), plan_pin)
+    states, evidence = Counter(), Counter()
+    admitted = assigned = reported = verified = passed = accounted = 0
+    rows = []
+    for row, state in records:
+        end = row["ended"]
+        states[state] += 1
+        admitted += row["admitted"] is not None
+        assigned += row["bound"] is not None
+        reported += end is not None or row["loss"] is not None
+        accounted += end is not None and end["job"] is not None
+        result = dict(**row, status=state, workloads=None, evidence_status="no_publication_receipt",
+                      admission_to_terminal_ms=None if end is None else end["tick_ms"] - row["admitted"]["tick_ms"])
+        run = None
+        if state == "published":
+            try:
+                run = evaluate_owned(campaign.package_path(path.parent, row["ticket"]), end["package_sha256"])
+            except FileNotFoundError:
+                result["evidence_status"] = "missing"
+            except OSError:
+                result["evidence_status"] = "unreadable"
+            except PackagePinMismatch:
+                result["evidence_status"] = "pin_mismatch"
+            except (ValueError, TypeError, RecursionError, OverflowError):
+                result["evidence_status"] = "invalid_records"
+        if run is not None:
+            require(run["run_id"] == row["ticket"] and all(run["artifacts"][k] == plan["inputs"][k] for k in campaign.IMAGES),
+                    "replayed acquisition differs from registered inputs or ticket")
+            gate = True
+            for scope in run["scopes"]:
+                changing = scope["workload"] == "changing"
+                misses = sorted(r["exit_boundary"] for r in scope["cases"] if r["outcome"] != "positive")
+                observed = scope["source_results"].get("observed", 0)
+                gate &= (misses == (["after_selection_before_dispatch", "before_first_census"] if changing else []) and
+                         observed > scope["metrics"]["true_positives"] and scope["attempts"] == observed + changing)
+            require((end["worker_exit"] == 0) == gate, "worker exit disagrees with replayed workload gate")
+            minimum_processes = 1 + 3 + sum(1 + s["out_of_scope_controls"] + s["metrics"]["cases"] for s in run["scopes"])
+            require(end["job"] is None or end["job"]["total"] >= minimum_processes, "job total omits a witnessed process")
+            result["workloads"] = run["scopes"]
+            result["evidence_status"] = "verified"
+            verified += 1
+            passed += campaign.passed(end)
+        evidence[result["evidence_status"]] += 1
+        rows.append(result)
+    return dict(schema="kn.owned_module_campaign_evaluation.v1", campaign_id=plan["campaign_id"],
+                snapshot_sha256=snapshot_pin, plan_sha256=plan_pin, inputs=plan["inputs"], timeout_ms=plan["timeout_ms"],
+                layer="owned_fixture", partition="development", unit="registered_acquisition_run",
+                clock="GetTickCount64_ms", resource_scope="assigned_windows_job_including_descendants",
+                declared_independence_groups=1, target_probed=False, independent_detection_validation=False,
+                overall_ranking=None, counts=dict(planned=len(rows), admitted=admitted, worker_bound=assigned,
+                                                  terminal=reported, unresolved=admitted-reported, unadmitted=len(rows)-admitted,
+                                                  published_packages=states["published"], verified_packages=verified,
+                                                  passed=passed, job_accounted=accounted,
+                                                  admitted_without_process_truth=admitted-verified),
+                outcomes={k: states[k] for k in ("unadmitted", "unresolved", "owner_lost", *campaign.OUTCOMES)},
+                evidence={k: evidence[k] for k in ("no_publication_receipt", "verified", "missing", "unreadable", "pin_mismatch", "invalid_records")},
+                evidence_survival_per_publication=ratio(verified, states["published"]),
+                verified_packages_per_admission=ratio(verified, admitted), success_per_admission=ratio(passed, admitted),
+                success_per_planned_run=ratio(passed, len(rows)), attempts=rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--corpus", type=Path)
     source.add_argument("--owned-module-run", type=Path, help="private acquisition package from the native workload")
+    source.add_argument("--owned-module-campaign", type=Path, help="frozen private campaign snapshot beside its packages")
     parser.add_argument("--results", type=Path)
     parser.add_argument("--sha256", help="expected SHA-256 retained from workload acquisition")
+    parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     args = parser.parse_args()
-    if args.corpus and (args.results is None or args.sha256 is not None):
-        parser.error("--corpus requires --results and cannot use --sha256")
-    if args.owned_module_run and (args.sha256 is None or args.results is not None):
-        parser.error("--owned-module-run requires --sha256 and cannot use --results")
+    if args.corpus and (args.results is None or args.sha256 is not None or args.plan_sha256 is not None):
+        parser.error("--corpus requires only --results")
+    if args.owned_module_run and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
+        parser.error("--owned-module-run requires only --sha256")
+    if args.owned_module_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
+        parser.error("--owned-module-campaign requires --sha256 and --plan-sha256")
     try:
-        if args.owned_module_run:
+        if args.owned_module_campaign:
+            report = evaluate_campaign(args.owned_module_campaign, args.sha256, args.plan_sha256)
+        elif args.owned_module_run:
             report = evaluate_owned(args.owned_module_run, args.sha256)
         else:
             corpus, corpus_hash = read_document(args.corpus)

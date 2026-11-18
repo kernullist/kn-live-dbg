@@ -68,13 +68,82 @@ the last failed dispatch. A generation with no attempt has unknown latency.
 separate fixed and changing scopes. SHA-256 ties replay to the caller's
 retained bytes. The controller supplies the lifetime witnesses. External
 authentication, heldout samples, comparative detection performance and host
-overhead remain open. Replay metrics cover completed acquisitions. Count
-startup and protocol failures using the runner's exit status and log. Keep
-those records alongside the independently held pin when counting attempted runs.
+overhead remain open. Standalone replay metrics cover completed acquisitions.
+Use a registered campaign to count attempts that end before package publication.
 
 The package, original transcripts, controller journal and evaluator report
 contain private investigation data. The public-content check recognizes the
 package header even when a file has been renamed.
+
+## Register and evaluate repeated acquisitions
+
+Register a new directory before the first Windows run. The plan fixes 1–32
+numbered slots, a distinct ticket for each slot, the worker deadline and the
+SHA-256 of the core, interpreter, controller, campaign and package-format
+scripts. Keep the returned plan pin separately. Each slot can be admitted once.
+
+```powershell
+$core = '.build/kmon-core/Release/kmon-core-Release.exe'
+$series = '.build/module-series'
+$plan = (python tools/owned_module_campaign.py create --directory $series --core-exe $core --attempts 2 --timeout-ms 180000 | ConvertFrom-Json).plan_sha256
+python tools/test-user-module-workload.py --campaign $series --slot 1 --plan-sha256 $plan --core-exe $core
+$snapshot = Join-Path $series 'first.knruns'
+$pin = (python tools/owned_module_campaign.py snapshot --directory $series --plan-sha256 $plan --out $snapshot | ConvertFrom-Json).snapshot_sha256
+python tools/evaluate-corpus.py --owned-module-campaign $snapshot --sha256 $pin --plan-sha256 $plan
+```
+
+This example leaves slot 2 unadmitted. It can be run later with a new snapshot
+filename. Each snapshot reads the complete roster and all transitions in one
+SQLite transaction. The snapshot and its acknowledged packages can be copied
+to another directory for offline replay with both pins. An earlier snapshot
+continues to describe the state at its own cutoff.
+
+| Recorded boundary | Evidence |
+| --- | --- |
+| Unadmitted | The original plan contains the ticket and the frozen registry has no admission |
+| Admitted | The supervisor commits the slot, its own process generation and its clock before checking the executable inputs |
+| Worker bound | Windows assigned the waiting worker to the supervisor's kill-on-close job. Its original PID and creation time are recorded before the supervisor grants it the ticket |
+| Supervisor terminal receipt | The receipt binds to the preceding transition and records the worker's OS exit, cleanup, resource accounting and any acknowledged package pin. Structured worker failures also retain their phase, error domain and available native code |
+| Observed owner loss | An independent observer pinned both original processes while live, saw both handles signal and recorded their exit codes while the slot still lacked a terminal receipt |
+| Unresolved | An admission lacks both a terminal receipt and an owner-loss witness. Its process-level truth and final job costs are unknown |
+
+For an independent owner-loss witness, run the following in a second console
+while the slot's worker is active. Use the same directory and original plan
+pin. The observer prints `armed` after opening and checking both live handles.
+If the supervisor records its result normally, the observer preserves it.
+An observation timeout keeps the last registered state.
+
+```powershell
+python tools/test-user-module-workload.py --campaign $series --slot 1 --plan-sha256 $plan --watch-owner --watch-seconds 180
+```
+
+The supervisor returns 0 for a published, passing workload with confirmed
+cleanup, 1 for a recorded unsuccessful terminal result and 2 for a rejected
+invocation or registry error. A crash can leave a durable admission without
+a terminal result. Snapshots account for every planned slot, including those
+still unadmitted. Starting another attempt requires a fresh slot.
+
+The report shows success per planned slot and per admission. Evidence survival
+uses verified packages over acknowledged publications. If an acknowledged
+package disappears, becomes unreadable, changes bytes or has invalid source
+records, the report keeps its slot and withholds process metrics. Contradictory
+plan, transition, ticket or replayed gate evidence fails the evaluation.
+Repeated acquisitions share one declared development group. The fixed and
+changing process denominators are available for each verified package.
+
+Job receipts include user/kernel CPU time in 100 ns units, transfer bytes,
+operation counts, peak job memory in bytes, total processes and the final
+active count. The scope includes the assigned worker and its descendants in
+the nested jobs. Peak-memory query failures retain their error and a null
+value. Admission-to-terminal elapsed time uses the supervisor's
+`GetTickCount64` clock. Calibrated collector overhead, host-wide effects
+and game latency require separate measurements. [Windows job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_and_io_accounting_information)
+and [peak job memory](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information).
+
+Keep the registry, its SQLite recovery files, snapshots, packages and
+reports private. The pins bind the operator's pre-registered plan and chosen
+snapshot. Third-party provenance and runs performed outside that registry
+remain outside this measurement.
 
 ## Run the synthetic example
 
