@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 #include "McpObserveGrant.h"
@@ -124,6 +125,7 @@ namespace commandinput
         bool haveBind = false;
         bool havePeer = false;
         bool haveTargetTtl = false;
+        std::map<std::wstring, McpObserveAccess> principalAccess;
         bool ok = output != nullptr;
         for (size_t index = first; ok && index < args.size(); ++index)
         {
@@ -155,6 +157,20 @@ namespace commandinput
                     }
                     parsed.Principals.push_back(std::move(grant));
                     index += values;
+                }
+            }
+            else if (!remote && arg == L"--principal-access")
+            {
+                ok = args.size() - index > 2 && principalAccess.size() < 16;
+                if (ok)
+                {
+                    const auto& fingerprint = args[++index];
+                    const auto& name = args[++index];
+                    McpObserveAccess access = McpObserveAccess::Both;
+                    if (name == L"evidence") { access = McpObserveAccess::Evidence; }
+                    else if (name == L"operations") { access = McpObserveAccess::Operations; }
+                    else if (name != L"both") { ok = false; }
+                    ok = ok && principalAccess.emplace(fingerprint, access).second;
                 }
             }
             else if (!remote && arg == L"--target-ttl")
@@ -213,6 +229,13 @@ namespace commandinput
                 ok = !havePort && ParsePort(arg, &parsed.Port);
                 havePort = true;
             }
+        }
+        for (const auto& [fingerprint, access] : principalAccess)
+        {
+            auto at = std::find_if(parsed.Principals.begin(), parsed.Principals.end(),
+                [&](const auto& grant) { return grant.Fingerprint == fingerprint; });
+            if (at == parsed.Principals.end()) { ok = false; break; }
+            at->Access = access;
         }
         if (!parsed.OperationJournalDirectory.empty() && !parsed.ObserveOnly) { ok = false; }
         if (!parsed.Principals.empty() && (!parsed.ObserveOnly || !ValidMcpObserveGrants(parsed.Principals))) { ok = false; }

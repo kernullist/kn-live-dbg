@@ -20,7 +20,7 @@ mcp on --loopback
 출력된 주소 중 클라이언트가 접근할 수 있는 IP를 선택한다.
 
 ```text
-mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -95,6 +95,20 @@ PowerShell 예제는 지문만 출력한다. 같은 클라이언트를 재시작
 사전 읽기·백업·검증·감사를 사용하지만 전체 transaction이나 복구를 보장하지 않는다.
 현재 main은 `off` 뒤 **write-off**를 요청하고 REPL로 복귀한다. 전환 실패 시
 상태 미확인으로 보고한다. 실험 변경에는 명시적으로 `write on`을 실행한다.
+
+### 증거 또는 작업 기록 허용하기
+
+`--principal`이나 `--principal-target`으로 등록한 지문에 `--principal-access`를 지정한다.
+아래 예시에서 첫 클라이언트는 보관된 TI 행을 조회한다. 두 번째 클라이언트는 운영자가 같은 암호로
+다시 연 저널에서 본인의 과거 작업 영수증을 ID로 읽을 수 있다.
+
+```text
+mcp on --observe --journal "case operations" --principal <reader-fingerprint> ti --principal <reviewer-fingerprint> ti --principal-access <reader-fingerprint> evidence --principal-access <reviewer-fingerprint> operations
+```
+
+클라이언트는 `kn://capabilities`의 `observe_access`에서 권한을 확인한다. 기본값 `both`는 두 도구를 허용한다.
+작업 전용 클라이언트에도 원래 출처가 필요하고, 대상이 지정된 경우 같은 프로세스 수명과 새 대상 핸들이 필요하다.
+운영자는 로컬 요청 감사 기록에서 작업 ID를 확인할 수 있다. [권한 모델](MCP_SERVER_DESIGN.ko.md#증거와-작업-기록의-조회-권한)
 
 ### 한 프로세스의 기록만 허용하기
 

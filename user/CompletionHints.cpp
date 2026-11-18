@@ -78,7 +78,7 @@ namespace
 
     const CompletionHint kMcpRootTokens[] =
     {
-        { L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]", L"start an authenticated MCP listener" },
+        { L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]", L"start an authenticated MCP listener" },
         { L"off", L"mcp off", L"stop the MCP server" },
         { L"status", L"mcp status", L"show listen address, password mode, and write-allow state" },
         { L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"print client config snippets" },
@@ -117,6 +117,7 @@ namespace
         { L"--principal", L"--principal <fingerprint> <source>", L"restrict one client to one exact retained source" },
         { L"--principal-target", L"--principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>", L"restrict one client to a retained TI header-process lifetime" },
         { L"--target-ttl", L"--target-ttl <seconds>", L"target handle lifetime in seconds (1 to 3600, default 300)" },
+        { L"--principal-access", L"--principal-access <fingerprint> <evidence|operations|both>", L"choose which retained data this client can read" },
         { L"--loopback", nullptr, L"listen on 127.0.0.1 only" },
         { L"--bind", L"--bind <addr>", L"0.0.0.0 (default, all adapters), loopback, or a specific IP" },
         { L"help", nullptr, L"show mcp on usage" },
@@ -1289,7 +1290,7 @@ namespace
     const CompletionScopeTable kMcpScopes[] =
     {
         SCOPE(L"", L"mcp on|off|status|client-setup|endpoint", L"native HTTP MCP server", kMcpRootTokens),
-        SCOPE(L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <ipv4>]", L"start the MCP server", kMcpOnTokens),
+        SCOPE(L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <ipv4>]", L"start the MCP server", kMcpOnTokens),
         SCOPE(L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
     };
 

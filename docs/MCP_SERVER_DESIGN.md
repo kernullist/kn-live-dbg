@@ -140,11 +140,11 @@ listener with scope `observe_source`. Each configured SHA-256 fingerprint
 authenticates one bearer and grants one exact retained source label. Each
 bearer has its own protocol session. Reinitializing it replaces only that
 session. The controller accepts up to 16 grants and divides each cumulative
-listener allowance equally among them, rounding down. Reinitialization
-preserves the grant's balance. Each client sees its balance in `kn://capabilities`.
+listener allowance equally among clients authorized to read evidence, rounding
+down. Reinitialization preserves the balance shown in `kn://capabilities`.
 
-The catalog contains `timeline.query`, `operations.get` and the capabilities
-resource. Admission and dispatch check the grant attached by the transport.
+By default the catalog contains `timeline.query`, `operations.get` and the
+capabilities resource. Admission and dispatch check the grant attached by the transport.
 The store indexes events by case-sensitive source. Traversal, `total_stored`
 and scan charges use the selected index, including after eviction or clear.
 `kn.mcp_source_timeline.v1` returns timestamp in FILETIME units, domain,
@@ -156,12 +156,36 @@ no proof of producer identity. Clients share retention capacity in the host stor
 
 A live receipt belongs to its admitted bearer. Durable owners are keyed
 hashes of the fingerprint and source under the private journal key. A
-reconfigured or revoked grant cannot recover the original owner's receipt.
+different fingerprint or source cannot recover the original owner's receipt.
 An unknown ID and another owner's ID yield the same `not_retained` response.
 Separate DPAPI entropy domains prevent a shared-password listener from
 opening a source-scoped journal and vice versa. The operator unlock password
 stays separate from client authentication. The 256-record retention limit
 applies to the whole journal. [Client provisioning](MCP_SETUP.md#give-each-client-one-retained-source)
+
+### Evidence and operation permissions
+
+`--principal-access <fingerprint> <evidence|operations|both>` sets the
+resources a configured bearer can read. Its position on the command line is
+independent of the source or target grant. A duplicate assignment or a
+fingerprint without a grant prevents listener startup. Existing grants
+default to `both`. The authenticated capabilities resource reports the
+effective `observe_access` and the same tool catalog as `tools/list`.
+
+| Access | Tool calls | Response and accounting |
+| --- | --- | --- |
+| `evidence` | `timeline.query` | Returns authorized rows and charges the caller's evidence budget. The wire envelope omits the operation ID, receipt text and operation metadata on success, timeout and journal failure. The operator's audit can still correlate admitted reads. |
+| `operations` | `operations.get` | Reads the caller's retained receipts by known operation ID. Discovery omits the evidence source label and budget. The lookup returns operation metadata and consumes no evidence allocation. |
+| `both` | Both tools | An admitted query can return its operation receipt, and the owner can look it up later. |
+
+The operator can reopen a private journal and give the same principal
+permission to inspect previous operations. Ownership still requires the
+original fingerprint, source and, for a target grant, process lifetime.
+The current permission governs lookup. On new scoped admissions,
+`journal.approved_access` records the permission at the time of the request.
+Historical scoped records without this field predate the option and were
+admitted under both permissions. Restarting a volatile listener starts an
+empty operation history. [Client configuration](MCP_SETUP.md#choose-evidence-or-operation-access)
 
 ### Process-lifetime observation
 
@@ -220,11 +244,12 @@ A late completion from a retired listener cannot debit the new one.
 Budget denials report `budget_exhausted`, `dimension` and `stage`. Admission
 denials have no operation ID. If a scan reaches its limit before coverage is
 known, the engine withholds the partial page or histogram. An oversized result
-is also withheld. An admitted read carries an operation receipt. A resource error
+is also withheld. An admitted read carries an operation receipt when the
+client has operation access. A resource error
 uses `error.data` for an admission denial and adds `budget_denial` to the
 operation data for an admitted job. The audit retains the typed reason.
-Discovery, `kn://capabilities` and `operations.get` remain available when the
-engine allowance is exhausted.
+Discovery and `kn://capabilities` remain available when the engine allowance
+is exhausted. Clients with operation access can still use `operations.get`.
 
 Each observe receipt has an `observe_charge` field. The admission charges
 are available immediately. The examined count and payload bytes are `null`

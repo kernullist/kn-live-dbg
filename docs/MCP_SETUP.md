@@ -22,7 +22,7 @@ For a separate lab client, `mcp on` binds all adapters; select a reachable targe
 IP from the startup output. The grammar is:
 
 ```text
-mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -91,7 +91,7 @@ Up to 16 distinct fingerprints can each receive one source. Labels start with
 an ASCII letter or digit and accept letters, digits, dots, underscores and
 hyphens up to 64 characters. Use labels from the retained timeline on this controller.
 
-Connect on loopback with the client's bearer. Read `evidence_source` and
+Connect on loopback with the client's bearer. For an evidence reader, read `evidence_source` and
 `observe_budget` from `kn://capabilities`, then call `timeline.query`.
 Omitting `source` selects the granted label. The local endpoint descriptor
 contains connection details and empty credential fields. The bridge and native
@@ -101,6 +101,23 @@ For recovery, add `--journal <directory>` and enter a separate operator unlock
 password. Reopen that directory in source-scoped mode with the same Windows
 account and unlock password. A client needs its original bearer and source
 grant to read its receipts. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
+
+### Choose evidence or operation access
+
+Configure each client's fingerprint with `--principal` or `--principal-target`.
+Add `--principal-access` for a client that should read only evidence or only
+operation receipts. For example, this configuration lets one client query
+retained TI rows. A returning second client can recover its own receipts by
+ID from a journal the operator reopens with the same unlock password.
+
+```text
+mcp on --observe --journal "case operations" --principal <reader-fingerprint> ti --principal <reviewer-fingerprint> ti --principal-access <reader-fingerprint> evidence --principal-access <reviewer-fingerprint> operations
+```
+
+Clients read `observe_access` in `kn://capabilities`. The default `both`
+permits both tools. A client with `operations` needs its original source and,
+where applicable, the same process-lifetime grant and a fresh target handle.
+The operator can find admitted IDs in the local request audit. [Permission details](MCP_SERVER_DESIGN.md#evidence-and-operation-permissions)
 
 ### Grant access to one process lifetime
 

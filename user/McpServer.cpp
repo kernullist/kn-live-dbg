@@ -629,11 +629,13 @@ namespace
         return config.AllowWrite ? L"legacy_write_enabled" : L"legacy_write_locked";
     }
 
-    bool ToolVisible(const McpToolDef& tool, const McpServerConfig& config)
+    bool ToolVisible(const McpToolDef& tool, const McpServerConfig& config, const McpObserveGrant& grant)
     {
         if (!config.Principals.empty())
         {
-            return tool.Observe && tool.ReadOnly && (wcscmp(tool.Name, L"timeline.query") == 0 || wcscmp(tool.Name, L"operations.get") == 0);
+            return !grant.Fingerprint.empty() && tool.Observe && tool.ReadOnly &&
+                ((grant.ReadsEvidence() && wcscmp(tool.Name, L"timeline.query") == 0) ||
+                 (grant.ReadsOperations() && wcscmp(tool.Name, L"operations.get") == 0));
         }
         return config.ObserveOnly ? (tool.Observe && tool.ReadOnly) : (tool.ReadOnly || config.AllowWrite);
     }
@@ -719,14 +721,14 @@ namespace
         return schema;
     }
 
-    std::wstring BuildToolsList(const McpServerConfig& config, bool targetBound = false)
+    std::wstring BuildToolsList(const McpServerConfig& config, const McpObserveGrant& grant)
     {
         std::wstring out = L"{\"tools\":[";
         bool first = true;
         for (size_t i = 0; i < kToolCount; ++i)
         {
             const McpToolDef& tool = kTools[i];
-            if (!ToolVisible(tool, config))
+            if (!ToolVisible(tool, config, grant))
             {
                 continue;
             }
@@ -741,7 +743,7 @@ namespace
             out += mcpjson::Quote(config.ObserveOnly && wcscmp(tool.Name, L"ti.subscribe") == 0
                 ? L"Read Threat-Intelligence subscription status and counters." : tool.Description);
             out += L",\"inputSchema\":";
-            out += BuildToolSchema(ScopedTool(tool, targetBound), config.ObserveOnly);
+            out += BuildToolSchema(ScopedTool(tool, grant.Target.has_value()), config.ObserveOnly);
             out += L",\"annotations\":{\"readOnlyHint\":";
             out += tool.ReadOnly ? L"true" : L"false";
             out += L",\"openWorldHint\":false";
@@ -821,15 +823,19 @@ namespace
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
-        if (!grant.Source.empty()) { out += L",\"evidence_source\":" + mcpjson::Quote(grant.Source); }
+        if (!grant.Source.empty())
+        {
+            if (grant.ReadsEvidence()) { out += L",\"evidence_source\":" + mcpjson::Quote(grant.Source); }
+            out += L",\"observe_access\":" + mcpjson::Quote(grant.AccessName());
+        }
         if (grant.Target)
         {
             out += L",\"target_session\":" + (targetSession.empty() ? L"null" : mcpjson::Quote(targetSession));
             out += L",\"target_session_ttl_seconds\":" + std::to_wstring(config.TargetSessionSeconds);
         }
-        if (!config.OperationJournalDirectory.empty()) { out += L",\"operation_journal\":\"bounded_private_journal\""; }
+        if (grant.ReadsOperations() && !config.OperationJournalDirectory.empty()) { out += L",\"operation_journal\":\"bounded_private_journal\""; }
         out += L",\"tools\":";
-        out += BuildToolsList(config, grant.Target.has_value());
+        out += BuildToolsList(config, grant);
         out += L"}";
         return out;
     }
@@ -910,7 +916,7 @@ namespace
                (data.empty() ? L"" : L",\"data\":" + data) + L"}}";
     }
 
-    std::wstring BuildToolResult(const McpEngineResult& result)
+    std::wstring BuildToolResult(const McpEngineResult& result, bool includeOperation)
     {
         // content[0].text MUST carry the exact data (serialized JSON when
         // structured, otherwise the captured text) so non-structured clients
@@ -925,12 +931,12 @@ namespace
             out += mcpjson::Quote(result.Text);
             out += L"}";
         }
-        if (!result.OperationJson.empty())
+        if (includeOperation && !result.OperationJson.empty())
         {
             out += L",{\"type\":\"text\",\"text\":" + mcpjson::Quote(result.OperationJson) + L"}";
         }
         out += L"]";
-        if (!result.OperationJson.empty())
+        if (includeOperation && !result.OperationJson.empty())
         {
             out += L",\"_meta\":{\"knlivedbg/operation\":" + result.OperationJson + L"}";
         }
@@ -956,13 +962,17 @@ bool McpOperationWireSelfTest()
     snapshot.Id = std::wstring(32, L'1');
     snapshot.Name = L"fixture.operation";
     result.OperationJson = McpOperationJson(snapshot);
-    const auto wire = BuildToolResult(result);
+    const auto wire = BuildToolResult(result, true);
+    const auto evidenceWire = BuildToolResult(result, false);
     std::wstring structured;
     std::wstring meta;
     std::wstring operation;
     std::wstring error;
     std::wstring data;
-    return mcpjson::IsObject(wire) &&
+    return mcpjson::IsObject(evidenceWire) && evidenceWire.find(snapshot.Id) == std::wstring::npos &&
+        !mcpjson::FindRawValue(evidenceWire, L"_meta", &meta) &&
+        mcpjson::FindRawValue(evidenceWire, L"structuredContent", &structured) && structured == result.StructuredJson &&
+        mcpjson::IsObject(wire) &&
         mcpjson::FindRawValue(wire, L"structuredContent", &structured) && structured == result.StructuredJson &&
         mcpjson::FindRawValue(wire, L"_meta", &meta) &&
         mcpjson::FindRawValue(meta, L"knlivedbg/operation", &operation) && operation == result.OperationJson &&
@@ -1734,7 +1744,7 @@ static McpEngineResult McpTargetSessionDenied()
 McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline, TimelineScanBudget& scan)
 {
     const wchar_t* scope = request.Grant.Target ? L"observe_target" : request.Grant.Source.empty() ? L"observe" : L"observe_source";
-    if (request.Kind != McpRequestKind::ToolCall ||
+    if (!request.Grant.ReadsEvidence() || request.Kind != McpRequestKind::ToolCall ||
         (request.Name != L"timeline.status" && request.Name != L"timeline.query" && request.Name != L"graph.query"))
     {
         return McpAuthorityError(scope);
@@ -2075,7 +2085,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
 
 static bool GrantAllowed(const McpServerConfig& config, const McpObserveGrant& grant)
 {
-    if (config.Principals.empty()) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target; }
+    if (config.Principals.empty()) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target && grant.Access == McpObserveAccess::Both; }
     return std::find(config.Principals.begin(), config.Principals.end(), grant) != config.Principals.end();
 }
 
@@ -2096,12 +2106,12 @@ McpEngineResult McpServer::OperationStatus(const std::wstring& operationId, cons
     std::lock_guard<std::mutex> lock(queueMutex_);
     McpEngineResult result;
     McpOperationSnapshot snapshot;
+    if (!GrantAllowed(config_, grant) || !grant.ReadsOperations()) { return McpAuthorityError(ScopeNameFor(config_, grant)); }
     if (!IsMcpOperationId(operationId))
     {
         result.IsError = true;
         result.Text = L"operation_id must be exactly 32 lowercase hexadecimal characters";
     }
-    else if (!GrantAllowed(config_, grant)) { return McpAuthorityError(ScopeNameFor(config_, grant)); }
     else if (!TargetSessionAllowedLocked(grant, targetSession)) { return McpTargetSessionDenied(); }
     else if (journal_ && !journal_->Healthy())
     {
@@ -2140,7 +2150,7 @@ static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const Mc
     else if (request.Kind == McpRequestKind::ToolCall)
     {
         const auto* tool = FindTool(request.Name);
-        if (tool != nullptr && ToolVisible(*tool, scope) && request.Name != L"operations.get")
+        if (tool != nullptr && ToolVisible(*tool, scope, request.Grant) && request.Name != L"operations.get")
         {
             const auto& args = request.ArgumentsJson;
             std::wstring error;
@@ -2445,9 +2455,11 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             observeUsage_ = config.ObserveOnly && config.Principals.empty() ? std::make_shared<McpObserveUsage>() : nullptr;
             principalUsage_.clear();
             targetLeases_.assign(config.Principals.size(), TargetLease{});
-            for (size_t i = 0; i < config.Principals.size(); ++i)
+            const auto readers = static_cast<uint32_t>(std::count_if(config.Principals.begin(), config.Principals.end(),
+                [](const auto& grant) { return grant.ReadsEvidence(); }));
+            for (const auto& grant : config.Principals)
             {
-                principalUsage_.push_back(std::make_shared<McpObserveUsage>(static_cast<uint32_t>(config.Principals.size())));
+                principalUsage_.push_back(grant.ReadsEvidence() ? std::make_shared<McpObserveUsage>(readers) : nullptr);
             }
             operations_.Reset();
         }
@@ -2824,7 +2836,7 @@ void McpServer::ListenerThreadMain()
             // before handing them to HTTP.sys, outside any audit or disk path.
             std::lock_guard<std::mutex> lock(queueMutex_);
             allowed = TargetSessionAllowedLocked(target->Grant, target->Handle);
-            if (!allowed) { body = mcpjson::WideToUtf8(RpcResult(target->Id, BuildToolResult(McpTargetSessionDenied()))); }
+            if (!allowed) { body = mcpjson::WideToUtf8(RpcResult(target->Id, BuildToolResult(McpTargetSessionDenied(), false))); }
         }
         HTTP_DATA_CHUNK chunk = {};
         if (!body.empty())
@@ -2858,11 +2870,12 @@ void McpServer::ListenerThreadMain()
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
         if (!config_.ObserveOnly) { record += L",\"session\":" + mcpjson::Quote(sessionId_); }
         record += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config_, grant));
+        if (!grant.Fingerprint.empty()) { record += L",\"observe_access\":" + mcpjson::Quote(grant.AccessName()); }
         record += L",\"peerPort\":" + std::to_wstring(AuditPeerPort(request));
         record += L",\"method\":" + mcpjson::Quote(method);
         const auto* tool = FindTool(name);
         if (!name.empty() && (!config_.ObserveOnly ||
-            (method == L"tools/call" && tool != nullptr && ToolVisible(*tool, config_)) ||
+            (method == L"tools/call" && tool != nullptr && ToolVisible(*tool, config_, grant)) ||
             (method == L"resources/read" && ResourceVisible(name, config_))))
         {
             record += L",\"tool\":" + mcpjson::Quote(name);
@@ -3057,7 +3070,7 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"tools/list")
         {
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_, grant.Target.has_value())));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_, grant)));
             return;
         }
 
@@ -3088,7 +3101,7 @@ void McpServer::ListenerThreadMain()
             std::wstring targetSession;
             if (grant.Target && argsRaw.size() <= 4096) { mcpjson::GetString(argsRaw, L"target_session", &targetSession); }
             std::wstring decision = L"ok";
-            if (config_.ObserveOnly && (tool == nullptr || !ToolVisible(*tool, config_)))
+            if (config_.ObserveOnly && (tool == nullptr || !ToolVisible(*tool, config_, grant)))
             {
                 result = McpAuthorityError(ScopeNameFor(config_, grant));
                 decision = L"blocked_by_policy";
@@ -3145,7 +3158,7 @@ void McpServer::ListenerThreadMain()
                     result.Text.size() + result.StructuredJson.size(), result.OperationJson,
                     result.BudgetLimit != McpBudgetLimit::None ? result.StructuredJson : L"");
             };
-            const auto reply = RpcResult(idRaw, BuildToolResult(result));
+            const auto reply = RpcResult(idRaw, BuildToolResult(result, grant.ReadsOperations()));
             if (grant.Target)
             {
                 const TargetReply target{grant, targetSession, idRaw};

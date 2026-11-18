@@ -640,6 +640,22 @@ static int RunCommandAuditSelfTest()
         !commandinput::ParseListenerOptions({ L"--observe", L"--journal", L"a", L"--journal", L"b" }, 0, false, 51766, &listen, &error) &&
         !commandinput::ParseListenerOptions({ L"--journal", L"a" }, 0, true, 51766, &listen, &error), L"mcp journal requires an explicit observe directory");
     const std::wstring fingerprint(64, L'a');
+    const std::wstring secondFingerprint(64, L'b');
+    check(commandinput::ParseListenerOptions({L"--principal-access", secondFingerprint, L"operations", L"--observe",
+        L"--principal", fingerprint, L"first", L"--principal", secondFingerprint, L"second",
+        L"--principal-access", fingerprint, L"evidence"}, 0, false, 51766, &listen, &error) && listen.Principals.size() == 2 &&
+        listen.Principals[0].ReadsEvidence() && !listen.Principals[0].ReadsOperations() &&
+        !listen.Principals[1].ReadsEvidence() && listen.Principals[1].ReadsOperations(),
+        L"principal access follows the named fingerprint in either option order");
+    for (const auto& suffix : std::vector<std::vector<std::wstring>>{
+        {L"--principal-access"}, {L"--principal-access", fingerprint}, {L"--principal-access", fingerprint, L"Evidence"},
+        {L"--principal-access", secondFingerprint, L"operations"},
+        {L"--principal-access", fingerprint, L"both", L"--principal-access", fingerprint, L"evidence"}})
+    {
+        std::vector<std::wstring> tokens{L"--observe", L"--principal", fingerprint, L"fixture"};
+        tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+        check(!commandinput::ParseListenerOptions(tokens, 0, false, 51766, &listen, &error), L"principal access rejects unbound or ambiguous assignment");
+    }
     check(commandinput::ParseListenerOptions({ L"--principal", fingerprint, L"Etw.File-1", L"--observe" }, 0, false, 51766, &listen, &error) &&
         listen.Principals.size() == 1 && listen.Principals.front().Source == L"Etw.File-1" && listen.BindAddress == L"127.0.0.1",
         L"mcp principal binds an exact source on observe loopback");

@@ -1053,9 +1053,10 @@ receipt. Reopening the store restores metadata for lookup by operation ID.
 [Private operation recovery](MCP_SERVER_DESIGN.md#private-operation-recovery)
 
 An observe listener can bind up to 16 bearer fingerprints to individual
-retained source labels. Each grant has its own protocol session and share of
-the listener budget. Source-indexed queries return selected row fields, and
-the grant controls live and recovered receipt access. A TI grant can further
+retained source labels. Each grant has its own protocol session. Evidence
+readers share the listener budget and receive projected rows. A separate
+permission allows lookup of the principal's live or recovered receipts.
+The local audit retains correlation IDs for evidence-only calls. A TI grant can further
 restrict queries to an event header process identified by boot ID, PID and
 creation time. Each tool call in that scope requires an expiring handle.
 Other producers and target roles still need authenticated identity evidence.

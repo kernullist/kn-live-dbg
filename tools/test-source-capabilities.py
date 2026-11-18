@@ -187,6 +187,7 @@ def main():
     assert "64_events_per_query" in observe["limits"] and "shared_principal" in observe["limits"]
     assert "optional_exact_source_grants_16" in observe["limits"] and "principal_scoped_sessions_budgets_and_receipts" in observe["limits"]
     assert "optional_ti_header_process_lifetime_with_expiring_target_session" in observe["limits"]
+    assert "independent_evidence_and_operation_access" in observe["limits"]
     assert "listener_budget_calls_requested_examined_events_and_payload_utf8_bytes" in observe["limits"]
     assert "optional_private_operation_journal_256" in observe["limits"]
     assert operation["implementation"] == "implemented"

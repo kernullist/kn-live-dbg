@@ -53160,7 +53160,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53503,7 +53503,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--principal-access <fingerprint> <evidence|operations|both>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }

@@ -85,7 +85,8 @@ struct McpOperationJournal::Impl
     }
     std::wstring Owner(const McpObserveGrant& grant) const
     {
-        if (!Scoped) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target ? Principal : L""; }
+        if (!Scoped) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target &&
+            grant.Access == McpObserveAccess::Both ? Principal : L""; }
         if (grant.Fingerprint.empty() || grant.Source.empty()) { return {}; }
         if (grant.Target)
         {
@@ -177,6 +178,10 @@ struct McpOperationJournal::Impl
             {
                 return false;
             }
+            std::wstring access;
+            if (mcpjson::FindRawValue(journal, L"approved_access", &access) &&
+                (!Scoped || !mcpjson::GetString(journal, L"approved_access", &access) ||
+                    (access != L"evidence" && access != L"both"))) { return false; }
             Rows.push_back({std::move(id), std::move(principal), text});
             pos = end + 1;
         }
@@ -229,20 +234,23 @@ bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring
 std::optional<McpJournalIdentity> McpOperationJournal::Identify(const McpEngineRequest& request) const
 {
     static const std::wstring generation = mcpjson::Utf8ToWide(RandomHex(16));
-    if (!Data->Ready || !IsMcpOperationId(generation)) { return std::nullopt; }
+    if (!Data->Ready || !IsMcpOperationId(generation) || !request.Grant.ReadsEvidence()) { return std::nullopt; }
     const auto frame = mcpjson::WideToUtf8((request.Kind == McpRequestKind::ToolCall ? L"tool\n" : L"resource\n") +
         request.Name + L"\n" + request.ArgumentsJson);
     const auto owner = Data->Owner(request.Grant);
     if (owner.empty() || frame.empty()) { return std::nullopt; }
     const auto digest = Data->Mac(Data->Scoped ? mcpjson::WideToUtf8(owner) + "\n" + frame : frame);
     if (digest.empty()) { return std::nullopt; }
+    McpJournalIdentity identity{owner, generation, digest, McpUtcFileTime()};
+    if (Data->Scoped) { identity.ApprovedAccess = request.Grant.AccessName(); }
     if (request.Grant.Target)
     {
         const auto target = Data->Mac(mcpjson::WideToUtf8(L"target.v1\n" + Impl::LifetimeFrame(*request.Grant.Target))).substr(0, 32);
         if (!IsMcpOperationId(target)) { return std::nullopt; }
-        return McpJournalIdentity{owner, target, digest, McpUtcFileTime(), 0, 0, generation};
+        identity.TargetGeneration = target;
+        identity.ControllerGeneration = generation;
     }
-    return McpJournalIdentity{owner, generation, digest, McpUtcFileTime()};
+    return identity;
 }
 
 bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcept
@@ -277,7 +285,7 @@ bool McpOperationJournal::Healthy() const { return Data->Ready; }
 
 bool McpOperationJournal::Lookup(const std::wstring& id, const McpObserveGrant& grant, std::wstring* receipt) const
 {
-    if (!Data->Ready || !receipt) { return false; }
+    if (!Data->Ready || !receipt || !grant.ReadsOperations()) { return false; }
     const auto owner = Data->Owner(grant);
     const auto at = std::find_if(Data->Rows.begin(), Data->Rows.end(),
         [&](const Impl::Row& row) { return row.Id == id && row.Owner == owner; });

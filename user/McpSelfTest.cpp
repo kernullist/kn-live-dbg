@@ -389,6 +389,27 @@ int RunMcpToolCatalogSelfTest()
             fixtures.push_back(event);
         }
         Check(&context, retained.IngestEvents(fixtures).Added == 70, L"observe-owned-events");
+        {
+            McpServer scoped;
+            scoped.config_.ObserveOnly = true;
+            const McpObserveGrant evidence{std::wstring(64, L'a'), L"fixture", {}, McpObserveAccess::Evidence};
+            const McpObserveGrant operations{std::wstring(64, L'b'), L"fixture", {}, McpObserveAccess::Operations};
+            scoped.config_.Principals = {evidence, operations};
+            McpEngineResult denial;
+            McpEngineRequest read{McpRequestKind::ToolCall, L"timeline.query", L"{}", operations};
+            std::atomic<uint32_t> balance{64};
+            TimelineScanBudget scan(64, balance);
+            Check(&context, !scoped.AuthorizeEngineRequest(read, &denial) && denial.IsError &&
+                ReadMcpObservedTimeline(read, retained, scan).IsError && scan.ExaminedCount() == 0,
+                L"operation access cannot reach the retained reader");
+            read.Grant.Access = McpObserveAccess::Both;
+            Check(&context, !scoped.AuthorizeEngineRequest(read, &denial), L"engine rejects a widened copy of a configured grant");
+            const std::wstring id(32, L'1');
+            Check(&context, scoped.operations_.Begin(id, L"timeline.query", 1, 1, {}, evidence.Fingerprint) &&
+                scoped.OperationStatus(id, evidence).IsError &&
+                scoped.OperationStatus(id, evidence).StructuredJson.find(id) == std::wstring::npos,
+                L"direct receipt lookup enforces evidence-only access before reading a known ID");
+        }
         auto dispatch = [&](const McpEngineRequest& request, TimelineScanBudget* scan)
         {
             ++dispatches;

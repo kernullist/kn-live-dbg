@@ -30,12 +30,18 @@ The query returns `kn.mcp_target_timeline.v1` for the authorized TI header
 process. An expired handle returns `target_session_unavailable`. Initialize
 again to renew it. [Process-lifetime observation](MCP_SERVER_DESIGN.md#process-lifetime-observation)
 
-With `scope=observe_source`, discovery lists `timeline.query`,
-`operations.get` and `kn://capabilities`. Read `evidence_source` for the exact
-case-sensitive label. `timeline.query` accepts an omitted, empty or matching source
+With `scope=observe_source`, discovery lists `kn://capabilities` and the
+tools allowed for the principal. Evidence readers see the exact case-sensitive
+label in `evidence_source`. `timeline.query` accepts an omitted, empty or matching source
 and returns `kn.mcp_source_timeline.v1`. Both the row count and scan cost
 refer to that source. The budget and receipt lookup belong to the
 authenticated client. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
+
+For source and target grants, `observe_access=evidence` exposes the query
+and returns the authorized rows without operation metadata.
+`observe_access=operations` exposes the receipt lookup by known ID.
+Both permissions include `kn://capabilities`. The default is `both`.
+[Evidence and operation permissions](MCP_SERVER_DESIGN.md#evidence-and-operation-permissions)
 
 When `kn://capabilities` reports `operation_journal=bounded_private_journal`,
 `operations.get` can also return a receipt from an earlier listener. Check

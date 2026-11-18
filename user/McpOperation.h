@@ -35,6 +35,7 @@ struct McpJournalIdentity
     std::wstring PrincipalId, TargetGeneration, RequestHmac;
     uint64_t AdmittedUtc = 0, DispatchedUtc = 0, ReturnedUtc = 0;
     std::wstring ControllerGeneration{};
+    std::wstring ApprovedAccess{}; // absent in shared-password and historical receipts
 };
 
 inline uint64_t McpUtcFileTime()
@@ -232,6 +233,7 @@ inline std::wstring McpOperationJson(const McpOperationSnapshot& operation, bool
         out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":" + mcpjson::Quote(scope);
         out += L",\"principal_id\":" + mcpjson::Quote(j.PrincipalId) + L",\"target_generation\":" + mcpjson::Quote(j.TargetGeneration);
         if (!j.ControllerGeneration.empty()) { out += L",\"controller_generation\":" + mcpjson::Quote(j.ControllerGeneration); }
+        if (!j.ApprovedAccess.empty()) { out += L",\"approved_access\":" + mcpjson::Quote(j.ApprovedAccess); }
         out += L",\"request_hmac_sha256\":" + mcpjson::Quote(j.RequestHmac) + L",\"utc_clock\":\"windows_filetime_100ns\"";
         out += L",\"admitted_utc\":" + utc(j.AdmittedUtc) + L",\"dispatched_utc\":" + utc(j.DispatchedUtc);
         out += L",\"engine_returned_utc\":" + utc(j.ReturnedUtc) + L",\"effect_verified_utc\":null,\"recovered\":";

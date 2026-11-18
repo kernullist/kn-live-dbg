@@ -41,13 +41,15 @@ def wire(port, authorization, session, method, params=None):
 
 
 class Listener:
-    def __init__(self, exe, root, password, grants=(), durable=True, target_ttl=None):
+    def __init__(self, exe, root, password, grants=(), durable=True, target_ttl=None, access=()):
         self.port = free_port()
         self.password = password
         self.session = None
         options = []
         for grant in grants:
             options.extend(("--principal" if len(grant) == 2 else "--principal-target", *grant))
+        for fingerprint, permission in access:
+            options.extend(("--principal-access", fingerprint, permission))
         if target_ttl is not None:
             options.extend(("--target-ttl", str(target_ttl)))
         self.proc = subprocess.Popen([exe, "--self-test", "mcp-journal-fixture", root if durable else "-", str(self.port), *options],
@@ -140,8 +142,8 @@ class Listener:
 
 
 @contextmanager
-def listener(exe, root, password, expected=True, grants=(), durable=True, target_ttl=None):
-    server = Listener(exe, root, password, grants, durable, target_ttl)
+def listener(exe, root, password, expected=True, grants=(), durable=True, target_ttl=None, access=()):
+    server = Listener(exe, root, password, grants, durable, target_ttl, access)
     try:
         marker = server.lines.get(timeout=30)
         assert marker == ("ready" if expected else "unavailable"), ("listener startup", marker)
@@ -694,21 +696,150 @@ def target_sessions(exe, folder, pool):
     print("target sessions: PID reuse, other boots, peer roles, import, expiry at three boundaries and exact durable ownership passed", flush=True)
 
 
+def resource_access(exe, folder, pool, previous=None):
+    root, unlock = folder / "resource-access", secrets.token_hex(32)
+    a, b, c = (secrets.token_hex(32) for _ in range(3))
+    fp, op_fp, both_fp = (hashlib.sha256(value.encode()).hexdigest() for value in (a, b, c))
+    grants = [(fp, "ti", "b" * 32, "73", "100"), (op_fp, "alpha"), (both_fp, "alpha")]
+    policy = [(op_fp, "operations"), (fp, "evidence")]
+
+    def begin(client, arguments):
+        pending = pool.submit(client.tool, "timeline.query", arguments)
+        checkpoint = client.server.cmd("queued")
+        assert checkpoint and re.fullmatch(r"queued [0-9a-f]{32}", checkpoint)
+        return checkpoint.split()[1], pending
+
+    def no_receipt(reply, identity):
+        encoded = json.dumps(reply)
+        assert "_meta" not in reply and identity not in encoded
+        assert "kn.mcp_operation.v1" not in encoded and "operation_id" not in encoded
+
+    def names(client):
+        catalog = client.call("tools/list")["result"]
+        assert catalog == client.caps()["tools"]
+        return {t["name"] for t in catalog["tools"]}
+
+    with listener(previous or exe, root, unlock, grants=grants) as old:
+        original = SourceClient(old, b)
+        _, prior = original.query(pool, {"limit": "2"})
+        if previous:
+            assert "approved_access" not in prior["journal"]
+    _, _, previous_rows = read_owned_journal(root, unlock, scoped=True)
+    assert len(previous_rows) == 1
+
+    with listener(exe, root, unlock, grants=grants, access=policy) as active:
+        evidence, receipts, both = TargetClient(active, a), SourceClient(active, b), SourceClient(active, c)
+        assert names(evidence) == {"timeline.query"} and names(receipts) == {"operations.get"}
+        assert names(both) == {"timeline.query", "operations.get"}
+        assert [client.caps()["observe_access"] for client in (evidence, receipts, both)] == ["evidence", "operations", "both"]
+        assert "operation_journal" not in evidence.caps() and "observe_budget" not in receipts.caps()
+        assert evidence.caps()["evidence_source"] == "ti" and "evidence_source" not in receipts.caps()
+        assert "alpha" not in json.dumps(receipts.caps())
+        assert receipts.caps()["operation_journal"] == "bounded_private_journal"
+        for client in (evidence, both):
+            assert client.caps()["observe_budget"]["admitted_calls"] == {"limit": 64, "used": 0, "remaining": 64}
+        assert receipts.lookup(prior["operation_id"]) == previous_rows[0]
+        blocked = receipts.tool("timeline.query", {"limit": "1"})
+        assert blocked["isError"] and blocked["structuredContent"]["status"] == "blocked_by_policy" and "_meta" not in blocked
+        assert "error" in receipts.call("resources/read", {"uri": "kn://ti/stats"})
+        assert "error" in evidence.call("resources/read", {"uri": "kn://audit/tail"})
+
+        args = {"limit": "4", "target_session": evidence.handle}
+        admitted, pending = begin(evidence, args)
+        assert active.cmd("dispatch") == "dispatched " + admitted and active.cmd("return") == "returned"
+        reply = pending.result(timeout=15)
+        no_receipt(reply, admitted)
+        rows = reply["structuredContent"]
+        assert not reply["isError"] and rows["schema"] == "kn.mcp_target_timeline.v1" and rows["total_stored"] == 2
+        assert json.loads(reply["content"][0]["text"]) == rows and len(reply["content"]) == 1
+        for identity in (admitted, prior["operation_id"], "bad"):
+            blocked = evidence.tool("operations.get", {"operation_id": identity, "target_session": evidence.handle})
+            assert blocked["isError"] and blocked["structuredContent"]["status"] == "blocked_by_policy"
+            no_receipt(blocked, identity)
+        assert receipts.lookup(admitted)["state"] == both.lookup(admitted)["state"] == "not_retained"
+        before = evidence.caps()["observe_budget"]
+        evidence.renew()
+        assert names(evidence) == {"timeline.query"} and evidence.caps()["observe_budget"] == before
+        _, other = both.query(pool, {"limit": "1"})
+        assert other["journal"]["approved_access"] == "both"
+
+        # Keep a dispatched, authorized read past the real HTTP deadline.
+        late, pending = begin(evidence, dict(args, target_session=evidence.handle))
+        assert active.cmd("dispatch") == "dispatched " + late
+        timed_out = pending.result(timeout=45)
+        assert timed_out["isError"] and "outcome unknown" in timed_out["content"][0]["text"]
+        no_receipt(timed_out, late)
+        assert active.cmd("return") == "returned"
+
+        # Refuse replacement of the private image at terminal settlement.
+        failed, pending = begin(evidence, dict(args, target_session=evidence.handle))
+        assert active.cmd("dispatch") == "dispatched " + failed
+        with (root / "operations.knmcpjournal").open("rb"):
+            assert active.cmd("return") == "returned"
+            failed_reply = pending.result(timeout=15)
+        assert failed_reply["isError"] and failed_reply["structuredContent"]["status"] == "journal_unavailable"
+        no_receipt(failed_reply, failed)
+        token = evidence.handle
+
+    audit = [json.loads(line) for line in (root / "fixture-audit.jsonl").read_text(encoding="utf-8-sig").splitlines()]
+    assert any(row.get("observe_access") == "evidence" and row.get("operation", {}).get("operation_id") == admitted for row in audit)
+    clear, _, rows = read_owned_journal(root, unlock, scoped=True)
+    admissions = {row["operation_id"]: row for row in rows}
+    assert admissions[prior["operation_id"]] == previous_rows[0]
+    for identity in (admitted, late, failed):
+        assert admissions[identity]["journal"]["approved_access"] == "evidence"
+    for secret in (a, b, c, fp, op_fp, both_fp, token):
+        assert secret.encode() not in clear and secret not in json.dumps(audit)
+
+    with listener(exe, root, unlock, grants=[grants[0]], access=[(fp, "operations")]) as reopened:
+        owner = TargetClient(reopened, a)
+        assert names(owner) == {"operations.get"} and "observe_budget" not in owner.caps()
+        assert "evidence_source" not in owner.caps() and grants[0][2] not in json.dumps(owner.caps())
+        for identity in (admitted, late):
+            row = recovered(owner, identity, "succeeded", "engine_returned")
+            assert row["journal"]["approved_access"] == "evidence" and "events" not in row
+        recovered(owner, failed, "unknown_outcome", "dispatch_authorized")
+        assert owner.lookup(other["operation_id"])["state"] == "not_retained"
+        foreign_handle = owner.tool("operations.get", {"operation_id": admitted, "target_session": token})
+        assert foreign_handle["structuredContent"]["status"] == "target_session_unavailable"
+        no_receipt(foreign_handle, admitted)
+    with listener(exe, root, unlock, grants=[(fp, "ti")], access=[(fp, "operations")]) as changed:
+        assert SourceClient(changed, a).lookup(admitted)["state"] == "not_retained"
+    with listener(exe, folder / "volatile-access", unlock, grants=[grants[1]], durable=False, access=[(op_fp, "operations")]) as volatile:
+        client = SourceClient(volatile, b)
+        assert client.lookup(prior["operation_id"])["state"] == "not_retained"
+        assert "observe_budget" not in client.caps() and "operation_journal" not in client.caps()
+    with listener(exe, folder / "volatile-access", unlock, grants=[grants[1]], durable=False, access=[(op_fp, "evidence")]) as volatile:
+        client = SourceClient(volatile, b)
+        assert names(client) == {"timeline.query"} and client.caps()["observe_budget"]["admitted_calls"]["limit"] == 128
+        identity, pending = begin(client, {"limit": "4"})
+        assert volatile.cmd("dispatch") == "dispatched " + identity and volatile.cmd("return") == "returned"
+        result = pending.result(timeout=15)
+        assert result["structuredContent"]["schema"] == "kn.mcp_source_timeline.v1" and result["structuredContent"]["returned"] == 2
+        no_receipt(result, identity)
+    print("resource access: independent evidence and operation reads, receipt suppression, private audit, recovery and quota isolation passed", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--principals-only", action="store_true")
     parser.add_argument("--targets-only", action="store_true")
+    parser.add_argument("--access-only", action="store_true")
+    parser.add_argument("--previous-exe", type=Path, help="pre-access release binary for historical journal compatibility")
     args = parser.parse_args()
     exe = args.exe.resolve(strict=True)
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="kn-mcp-journal-") as directory, ThreadPoolExecutor(max_workers=1) as pool:
         folder = Path(directory)
-        target_sessions(exe, folder, pool)
-        if not args.targets_only:
+        if args.access_only or not (args.principals_only or args.targets_only):
+            resource_access(exe, folder, pool, args.previous_exe.resolve(strict=True) if args.previous_exe else None)
+        if not args.access_only:
+            target_sessions(exe, folder, pool)
+        if not (args.access_only or args.targets_only):
             source_principals(exe, folder, pool, durable=False)
             source_principals(exe, folder, pool, durable=True)
-        if not args.principals_only and not args.targets_only:
+        if not (args.access_only or args.principals_only or args.targets_only):
             boundaries(exe, folder, pool)
             late_return(exe, folder, pool)
             retention(exe, folder, pool)

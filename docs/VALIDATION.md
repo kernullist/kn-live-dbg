@@ -7,6 +7,30 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Separate MCP evidence and operation access, 2026-11-18
+
+Windows x64 build 28000.3501 ran Release binary SHA-256
+`2a81097202345c1af0d50fb4b2f46abcdd8d53ca675271eaf5e0cbd3fe53107d`.
+The locally built Release executable for the preceding `main` commit,
+`eda1d46`, created a source-scoped receipt in a private journal. The new
+binary reopened that journal and ran the following checks through a loopback
+HTTP listener with synthetic retained rows.
+[Client setup](MCP_SETUP.md#choose-evidence-or-operation-access)
+
+| Check | Observed result |
+| --- | --- |
+| Three clients | The evidence-only client saw the timeline query, the operation-only client saw the receipt lookup, and the default client saw both. The two evidence readers received 64 calls each. The operation reader received no evidence allocation or source label. |
+| Query responses | Target and source evidence readers received the authorized rows. The test checked structured content, text entries and MCP metadata for receipt exposure. Success, a dispatched read past the real HTTP timeout, and a forced journal replacement failure all withheld the operation ID. |
+| Recovery | The operation reader recovered its complete pre-upgrade receipt. An independent DPAPI decryptor confirmed the historical record survived subsequent writes. When the operator later granted operation access to the original evidence reader, that client recovered its own completed and unknown-outcome records with a fresh target handle. Access checks rejected another owner, a changed target grant and the previous listener's handle. |
+| Local records | The audit retained its correlation ID. New scoped journal entries recorded the access at admission. The audit and decrypted journal checks searched for the original bearer values, fingerprints and target handle. |
+
+The full command suite passed 3,080 checks across 261 commands. The standalone
+Release ledger passed 40 checks and the independent JSON oracle passed 12 state
+records. The optional MSVC AddressSanitizer runtime stopped in Windows
+interceptor initialization before the ledger checks. The integration fixture
+used the existing controller's retained store and exercised volatile and
+private-journal listeners on loopback.
+
 ## Expiring TI process-lifetime grants, 2026-11-18
 
 Windows x64 build 28000.3501 ran Release binary SHA-256
