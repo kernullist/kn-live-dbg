@@ -22,7 +22,7 @@ For a separate lab client, `mcp on` binds all adapters; select a reachable targe
 IP from the startup output. The grammar is:
 
 ```text
-mcp on [port] [--allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -64,6 +64,13 @@ provide TLS, arbitrary shell execution, raw `kd`, or an arbitrary command tool.
 
 ## Write policy
 
+On current main, enter `mcp on --observe` to share retained timeline queries
+and status with a local client. The server selects loopback and checks the
+scope before admitting work. Confirm `scope=observe` in `mcp status` or read
+`kn://capabilities`. A client can call `timeline.query` with
+`{"limit":"10","order":"newest"}`. Changing scope requires stopping the listener.
+[Observe catalog and limits](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
+
 Default MCP mode omits write tools and disarms the kernel write gate on engine
 entry. `mcp on --allow-write` exposes the typed write tools and enables the gate.
 `ti.subscribe start/stop` also requires that mode. It does not make unsupported
@@ -101,14 +108,16 @@ mutations idempotent. See the [operation contract](MCP_SERVER_DESIGN.md#executio
 
 The automatic request audit is independent of `ai audit` and is written under
 `<exe-dir>\.kn-live-dbg\mcp-audit-<port>.jsonl`. It records decisions, results and
-bounded argument text. It is separate from the write-audit tail resource.
+bounded argument text in legacy sessions. Observe audit entries contain
+decision and operation metadata and omit argument values and protocol session IDs.
 
 ## Verify and troubleshoot
 
 1. Confirm the correct current URL/password and network path. HTTP 401 indicates
    authentication failure; a new start needs a new session.
 2. Initialize the protocol and retain `Mcp-Session-Id` for subsequent requests.
-3. Read `kn://session/info` and `kn://session/symbols`, then call a simple read
+3. In observe scope, read `kn://capabilities` and call `timeline.status`.
+   In legacy scope, read `kn://session/info` and `kn://session/symbols`, then call a simple read
    such as `process.find`. Missing driver/symbol coverage is not a healthy empty scan.
 4. Check `writes-disabled`, argument-validation errors, queue/outcome messages
    and the audit separately. Do not fix a read failure by automatically enabling writes.

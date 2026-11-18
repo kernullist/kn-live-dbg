@@ -7,6 +7,27 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Loopback MCP observe sessions, 2026-11-18
+
+On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256
+`acb7cace985c0c3fcc96061353eb742a2487be5b0ae9711a932437e7229331fc`.
+The HTTP fixtures used an authenticated HTTP.sys listener and a WinHTTP
+client on loopback port 51768. [Observe session contract](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
+
+| Boundary | Observed result |
+| --- | --- |
+| Discovery and authorization | `--self-test mcp-observe` passed 55 checks. Discovery returned five tools, four resources and an empty prompt list. Requests for capture, export, collection control, unknown names and over-budget queries produced no queue work. The scope survived a repeated start and a stop request before the listener joined. |
+| Retained reads | The loopback client received a timeline result and a completed operation receipt. In a separate 70-event store, `mcp-tools` checked default count, oldest/newest selection, filters, graph truncation and the 64-event limit. The event count and next ID stayed stable. The suite passed 139 checks. |
+| Audit and transport | A stale session ID was refused. The request audit retained the policy decision and omitted the test argument marker, bearer password and protocol session ID. The legacy HTTP suite passed 29 checks, including its 68-tool and eight-resource discovery contracts. |
+| Operation ledger | The standalone Release harness passed 25 checks. A Python oracle verified seven serialized states. The MSVC AddressSanitizer runtime stopped during interceptor initialization before the harness entered its tests. Sanitized execution on this host remains unverified. |
+| Regression and cleanup | `--self-test all` passed, including 3,048 command checks across 261 registered commands. The restricted-launch regression checked 70 CLI results. After the tests, port 51768 had zero listeners and HTTP registrations. The owned fixture directories and audit files were gone. The boot timestamp and firewall profile settings matched the baseline. There were zero new bugcheck or unexpected-restart events and zero new crash dumps. |
+
+The HTTP fixtures supplied synthetic engine jobs and used the real retained
+timeline reader. Live driver and service status, per-principal isolation,
+protected remote transport and cumulative collection budgets require separate
+evidence. The Release linker also emitted the existing C4744 alignment warning
+for `KmonHuntIndex::NextQueryEpoch`.
+
 ## Restricted offline and observe launches, 2026-11-18
 
 On Windows **28000.3501 x64**, the Release `KnLiveDbg.exe` had SHA-256

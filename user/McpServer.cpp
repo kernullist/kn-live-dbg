@@ -13,11 +13,14 @@
 
 #include "McpServer.h"
 #include "McpJson.h"
+#include "CommandInput.h"
+#include "TimelineStore.h"
 
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -165,6 +168,7 @@ namespace
         bool ReadOnly;
         const McpToolArg* Args;
         size_t ArgCount;
+        bool Observe = false;
     };
 
     // Read-only tools: a strict projection of the in-tool AI capability catalog
@@ -256,7 +260,7 @@ namespace
 
     const McpToolDef kTools[] =
     {
-        { L"operations.get", L"Read retained engine outcome metadata after a response timeout; never retries or cancels execution.", true, MCP_ARG_TABLE(kArgsOperationGet) },
+        { L"operations.get", L"Read retained engine outcome metadata after a response timeout; never retries or cancels execution.", true, MCP_ARG_TABLE(kArgsOperationGet), true },
         { L"process.find", L"Find live processes by image name, PID, or EPROCESS address.", true, MCP_ARG_TABLE(kArgsProcessFind) },
         { L"process.describe", L"Describe an _EPROCESS (PID, DTB, PEB, threads, parent).", true, MCP_ARG_TABLE(kArgsProcessDescribe) },
         { L"type.describe", L"Dump a kernel structure (dt) at an address or for a process.", true, MCP_ARG_TABLE(kArgsTypeDescribe) },
@@ -309,10 +313,10 @@ namespace
         { L"hunt.run", L"Whole-system user-mode anomaly hunt (injection, VAD/PTE, threads, APC, driver/WFP/TI).", true, MCP_ARG_TABLE(kArgsHuntRun) },
         { L"snapshot.capture", L"Capture a same-boot evidence baseline in memory (read kn://snapshot/current; no disk writes).", true, MCP_ARG_TABLE(kArgsSnapshotCapture) },
         { L"snapshot.show", L"Show the current snapshot baseline or a snapshot JSON file; returns summary text plus structured JSON.", true, MCP_ARG_TABLE(kArgsSnapshotShow) },
-        { L"timeline.status", L"Report the in-memory evidence timeline store status and counters.", true, nullptr, 0 },
-        { L"timeline.query", L"Query the in-memory evidence timeline by source/domain/PID/limit.", true, MCP_ARG_TABLE(kArgsTimelineQuery) },
+        { L"timeline.status", L"Report the in-memory evidence timeline store status and counters.", true, nullptr, 0, true },
+        { L"timeline.query", L"Query the in-memory evidence timeline by source/domain/PID/limit.", true, MCP_ARG_TABLE(kArgsTimelineQuery), true },
         { L"timeline.export", L"Return in-memory timeline events as JSONL text without writing to disk.", true, MCP_ARG_TABLE(kArgsTimelineQuery) },
-        { L"graph.query", L"Derive a process/image/domain/source evidence graph from in-memory timeline events.", true, MCP_ARG_TABLE(kArgsGraphQuery) },
+        { L"graph.query", L"Derive a process/image/domain/source evidence graph from in-memory timeline events.", true, MCP_ARG_TABLE(kArgsGraphQuery), true },
         { L"timeline.reconcile", L"Compare ingested timeline evidence with a snapshot baseline or JSON file.", true, MCP_ARG_TABLE(kArgsTimelineReconcile) },
 
         { L"memory.read_virtual", L"Read bytes at a kernel/user virtual address (db/dq); returns hex with an unreadable-byte mask. width=1|2|4|8.", true, MCP_ARG_TABLE(kArgsMemoryReadVirtual) },
@@ -324,7 +328,7 @@ namespace
         { L"memory.compare", L"Compare two virtual ranges and report mismatch offsets (c); for inline-hook/patch detection (text).", true, MCP_ARG_TABLE(kArgsMemoryCompare) },
         { L"code.disasm", L"Disassemble instructions at an address or function (u/uf) (text).", true, MCP_ARG_TABLE(kArgsCodeDisasm) },
         { L"symbol.search", L"Enumerate symbols by wildcard (x module!mask) to resolve names to addresses.", true, MCP_ARG_TABLE(kArgsSymbolSearch) },
-        { L"ti.subscribe", L"Control the Threat-Intelligence ETW subscription (action=start|stop|status); start/stop need --allow-write.", true, MCP_ARG_TABLE(kArgsTiSubscribe) },
+        { L"ti.subscribe", L"Control the Threat-Intelligence ETW subscription (action=start|stop|status); start/stop need --allow-write.", true, MCP_ARG_TABLE(kArgsTiSubscribe), true },
         { L"snapshot.diff", L"Diff the in-memory baseline against a fresh live capture, or two snapshot files (!diff) (text).", true, MCP_ARG_TABLE(kArgsSnapshotDiff) },
 
         { L"memory.write_virtual", L"[WRITE] Write bytes to a kernel virtual address (e*).", false, MCP_ARG_TABLE(kArgsWriteVirtual) },
@@ -614,7 +618,18 @@ namespace
         return IsLoopbackHost(authority);
     }
 
-    std::wstring BuildToolSchema(const McpToolDef& tool)
+    const wchar_t* ScopeNameFor(const McpServerConfig& config)
+    {
+        if (config.ObserveOnly) { return L"observe"; }
+        return config.AllowWrite ? L"legacy_write_enabled" : L"legacy_write_locked";
+    }
+
+    bool ToolVisible(const McpToolDef& tool, const McpServerConfig& config)
+    {
+        return config.ObserveOnly ? (tool.Observe && tool.ReadOnly) : (tool.ReadOnly || config.AllowWrite);
+    }
+
+    std::wstring BuildToolSchema(const McpToolDef& tool, bool observe)
     {
         std::wstring schema = L"{\"type\":\"object\",\"properties\":{";
         std::wstring required;
@@ -637,6 +652,16 @@ namespace
             {
                 schema += L":{\"type\":";
                 schema += mcpjson::Quote(arg.Type);
+                if (observe)
+                {
+                    const std::wstring key(arg.Name);
+                    if (key == L"action") { schema += LR"(,"enum":["status"])"; }
+                    else if (key == L"order") { schema += LR"(,"enum":["newest","oldest"])"; }
+                    else if (key == L"limit") { schema += LR"(,"pattern":"^([1-9]|[1-5][0-9]|6[0-4])$","default":"50")"; }
+                    else if (key == L"pid") { schema += LR"(,"pattern":"^(0|[1-9][0-9]{0,9})$","description":"Decimal PID up to 4294967295")"; }
+                    else if (key == L"operation_id") { schema += LR"(,"pattern":"^[0-9a-f]{32}$")"; }
+                    else { schema += LR"(,"maxLength":128,"pattern":"^[^\\u0000-\\u001f\\u007f]*$")"; }
+                }
                 schema += L"}";
             }
             if (arg.Required)
@@ -659,14 +684,14 @@ namespace
         return schema;
     }
 
-    std::wstring BuildToolsList(bool allowWrite)
+    std::wstring BuildToolsList(const McpServerConfig& config)
     {
         std::wstring out = L"{\"tools\":[";
         bool first = true;
         for (size_t i = 0; i < kToolCount; ++i)
         {
             const McpToolDef& tool = kTools[i];
-            if (!tool.ReadOnly && !allowWrite)
+            if (!ToolVisible(tool, config))
             {
                 continue;
             }
@@ -678,9 +703,10 @@ namespace
             out += L"{\"name\":";
             out += mcpjson::Quote(tool.Name);
             out += L",\"description\":";
-            out += mcpjson::Quote(tool.Description);
+            out += mcpjson::Quote(config.ObserveOnly && wcscmp(tool.Name, L"ti.subscribe") == 0
+                ? L"Read Threat-Intelligence subscription status and counters." : tool.Description);
             out += L",\"inputSchema\":";
-            out += BuildToolSchema(tool);
+            out += BuildToolSchema(tool, config.ObserveOnly);
             out += L",\"annotations\":{\"readOnlyHint\":";
             out += tool.ReadOnly ? L"true" : L"false";
             out += L",\"openWorldHint\":false";
@@ -706,29 +732,59 @@ namespace
         return nullptr;
     }
 
-    std::wstring BuildResourcesList()
+    struct McpResourceDef
+    {
+        const wchar_t* Uri;
+        const wchar_t* Name;
+        const wchar_t* Description;
+        bool Observe;
+    };
+
+    const McpResourceDef kResources[] = {
+        { L"kn://session/info", L"session-info", L"Driver session, ABI, ownership, write-arm state.", true },
+        { L"kn://capabilities", L"capabilities", L"Enabled MCP tools and their argument schemas.", true },
+        { L"kn://modules/kernel", L"kernel-modules", L"Loaded kernel module list (name/base/size) -- the name->address map.", false },
+        { L"kn://drivers/status", L"drivers-status", L"Driver service state plus single-controller session ownership.", true },
+        { L"kn://session/symbols", L"symbols", L"Symbol search path, loaded module count, and engine ready state.", false },
+        { L"kn://ti/stats", L"ti-stats", L"Threat-Intelligence ETW ring statistics and active state.", true },
+        { L"kn://snapshot/current", L"snapshot-baseline", L"Current in-memory snapshot baseline (kn-live-dbg.snapshot.v1), if captured.", false },
+        { L"kn://audit/tail", L"audit-tail", L"Last 50 write-audit JSONL entries (when audit is enabled).", false }
+    };
+
+    bool ResourceVisible(const std::wstring& uri, const McpServerConfig& config)
+    {
+        for (const auto& resource : kResources)
+        {
+            if (uri == resource.Uri) { return !config.ObserveOnly || resource.Observe; }
+        }
+        return false;
+    }
+
+    std::wstring BuildResourcesList(const McpServerConfig& config)
     {
         std::wstring out = L"{\"resources\":[";
-        out += L"{\"uri\":\"kn://session/info\",\"name\":\"session-info\",\"description\":\"Driver session, ABI, ownership, write-arm state.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://capabilities\",\"name\":\"capabilities\",\"description\":\"Enabled MCP tools and their argument schemas.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://modules/kernel\",\"name\":\"kernel-modules\",\"description\":\"Loaded kernel module list (name/base/size) -- the name->address map.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://drivers/status\",\"name\":\"drivers-status\",\"description\":\"Driver service state plus single-controller session ownership.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://session/symbols\",\"name\":\"symbols\",\"description\":\"Symbol search path, loaded module count, and engine ready state.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://ti/stats\",\"name\":\"ti-stats\",\"description\":\"Threat-Intelligence ETW ring statistics and active state.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://snapshot/current\",\"name\":\"snapshot-baseline\",\"description\":\"Current in-memory snapshot baseline (kn-live-dbg.snapshot.v1), if captured.\",\"mimeType\":\"application/json\"},";
-        out += L"{\"uri\":\"kn://audit/tail\",\"name\":\"audit-tail\",\"description\":\"Last 50 write-audit JSONL entries (when audit is enabled).\",\"mimeType\":\"application/json\"}";
+        bool first = true;
+        for (const auto& resource : kResources)
+        {
+            if (config.ObserveOnly && !resource.Observe) { continue; }
+            if (!first) { out += L","; }
+            first = false;
+            out += L"{\"uri\":" + mcpjson::Quote(resource.Uri) + L",\"name\":" + mcpjson::Quote(resource.Name) +
+                L",\"description\":" + mcpjson::Quote(resource.Description) + L",\"mimeType\":\"application/json\"}";
+        }
         out += L"]}";
         return out;
     }
 
-    std::wstring BuildCapabilitiesResource(bool allowWrite)
+    std::wstring BuildCapabilitiesResource(const McpServerConfig& config)
     {
         std::wstring out = L"{\"server\":";
         out += mcpjson::Quote(kServerName);
+        out += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config));
         out += L",\"writeEnabled\":";
-        out += allowWrite ? L"true" : L"false";
+        out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         out += L",\"tools\":";
-        out += BuildToolsList(allowWrite);
+        out += BuildToolsList(config);
         out += L"}";
         return out;
     }
@@ -982,11 +1038,49 @@ bool IsMcpWildcardBind(const std::wstring& bindAddress)
 bool IsMcpLoopbackBind(const std::wstring& bindAddress)
 {
     const std::wstring value = TrimCopy(bindAddress);
+    if (value.find(L'\0') != std::wstring::npos) { return false; }
     return _wcsicmp(value.c_str(), L"loopback") == 0 ||
            _wcsicmp(value.c_str(), L"localhost") == 0 ||
            _wcsicmp(value.c_str(), L"127.0.0.1") == 0 ||
            _wcsicmp(value.c_str(), L"::1") == 0 ||
            _wcsicmp(value.c_str(), L"[::1]") == 0;
+}
+
+bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error)
+{
+    if (config.ObserveOnly && (config.AllowWrite || !IsMcpLoopbackBind(config.BindAddress)))
+    {
+        if (error != nullptr) { *error = L"--observe requires a loopback bind and excludes --allow-write"; }
+        return false;
+    }
+    return true;
+}
+
+static bool IsMcpLoopbackAddress(const SOCKADDR* address)
+{
+    if (address == nullptr) { return false; }
+    if (address->sa_family == AF_INET)
+    {
+        return (ntohl(reinterpret_cast<const SOCKADDR_IN*>(address)->sin_addr.s_addr) >> 24) == 127;
+    }
+    return address->sa_family == AF_INET6 &&
+        IN6_IS_ADDR_LOOPBACK(&reinterpret_cast<const SOCKADDR_IN6*>(address)->sin6_addr);
+}
+
+bool McpObserveAddressSelfTest()
+{
+    SOCKADDR_IN v4{};
+    v4.sin_family = AF_INET;
+    v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    SOCKADDR_IN6 v6{};
+    v6.sin6_family = AF_INET6;
+    v6.sin6_addr = in6addr_loopback;
+    if (!IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v4)) ||
+        !IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v6))) { return false; }
+    v4.sin_addr.s_addr = htonl(0xc0000201u);
+    v6.sin6_addr.u.Byte[0] = 0x20;
+    return !IsMcpLoopbackAddress(nullptr) && !IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v4)) &&
+        !IsMcpLoopbackAddress(reinterpret_cast<const SOCKADDR*>(&v6));
 }
 
 bool IsMcpConcreteIpv4Bind(const std::wstring& bindAddress)
@@ -1478,6 +1572,92 @@ bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json
     return true;
 }
 
+// The observe path consumes typed filters directly in the retained store.
+// A missing limit always selects a finite window, including for graph queries.
+static bool ParseObservedTimelineOptions(const std::wstring& args, TimelineGraphQueryOptions* options)
+{
+    options->Limit = 50;
+    mcpjson::GetString(args, L"source", &options->Source);
+    mcpjson::GetString(args, L"domain", &options->Domain);
+    mcpjson::GetString(args, L"image", &options->Image);
+    for (const auto* filter : { &options->Source, &options->Domain, &options->Image })
+    {
+        // Unescape has normalized UTF-16. JSON Schema maxLength counts scalar values.
+        const auto scalars = std::count_if(filter->begin(), filter->end(),
+            [](wchar_t ch) { return ch < 0xdc00 || ch > 0xdfff; });
+        if (scalars > 128 || std::any_of(filter->begin(), filter->end(),
+            [](wchar_t ch) { return ch < 0x20 || ch == 0x7f; }))
+        {
+            return false;
+        }
+    }
+    std::wstring value;
+    uint64_t number = 0;
+    if (mcpjson::GetString(args, L"pid", &value))
+    {
+        if (!commandinput::ParseDigits(value, 10, &number) || number > UINT32_MAX ||
+            value != std::to_wstring(number)) { return false; }
+        options->HasProcessId = true;
+        options->ProcessId = static_cast<uint32_t>(number);
+    }
+    if (mcpjson::GetString(args, L"limit", &value))
+    {
+        if (!commandinput::ParseDigits(value, 10, &number) || number == 0 || number > 64 ||
+            value != std::to_wstring(number)) { return false; }
+        options->Limit = static_cast<size_t>(number);
+    }
+    if (mcpjson::GetString(args, L"order", &value))
+    {
+        if (value != L"oldest" && value != L"newest") { return false; }
+        options->NewestFirst = value == L"newest";
+    }
+    return true;
+}
+
+static McpEngineResult McpAuthorityError(const wchar_t* scope, bool invalid = false)
+{
+    McpEngineResult result;
+    result.IsError = true;
+    result.Text = invalid ? L"invalid arguments for this MCP session" : L"request blocked by MCP session policy";
+    result.StructuredJson = L"{\"schema\":\"kn.mcp_authority.v1\",\"scope\":" + mcpjson::Quote(scope) +
+        L",\"status\":" + mcpjson::Quote(invalid ? L"invalid_arguments" : L"blocked_by_policy") + L"}";
+    return result;
+}
+
+McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline)
+{
+    if (request.Kind != McpRequestKind::ToolCall ||
+        (request.Name != L"timeline.status" && request.Name != L"timeline.query" && request.Name != L"graph.query"))
+    {
+        return McpAuthorityError(L"observe");
+    }
+    TimelineGraphQueryOptions options;
+    if (request.ArgumentsJson.size() > 4096 ||
+        !ValidateMcpToolArguments(request.Name, request.ArgumentsJson, nullptr) ||
+        !ParseObservedTimelineOptions(request.ArgumentsJson, &options))
+    {
+        return McpAuthorityError(L"observe", true);
+    }
+    McpEngineResult result;
+    if (request.Name == L"graph.query")
+    {
+        result.StructuredJson = BuildTimelineGraphJson(timeline.BuildGraph(options));
+    }
+    else if (request.Name == L"timeline.status")
+    {
+        result.StructuredJson = BuildTimelineStatusJson(timeline.GetStats());
+    }
+    else
+    {
+        TimelineQueryOptions query{ options.Source, options.Domain, options.HasProcessId, options.ProcessId,
+            options.Limit, options.NewestFirst };
+        uint64_t totalStored = 0;
+        const auto events = timeline.Query(query, &totalStored);
+        result.StructuredJson = BuildTimelineEventsJson(events, query, totalStored);
+    }
+    return result;
+}
+
 McpServer::McpServer()
 {
 }
@@ -1494,7 +1674,7 @@ bool McpServer::IsRunning() const
 
 bool McpServer::AllowWrite() const
 {
-    return config_.AllowWrite;
+    return !config_.ObserveOnly && config_.AllowWrite;
 }
 
 bool McpServer::IsWriteTool(const std::wstring& name) const
@@ -1700,6 +1880,75 @@ McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) cons
     return result;
 }
 
+const wchar_t* McpServer::ScopeName() const
+{
+    return ScopeNameFor(config_);
+}
+
+bool McpServer::AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result) const
+{
+    if (request.Kind == McpRequestKind::ResourceRead)
+    {
+        if (ResourceVisible(request.Name, config_) && request.Name != L"kn://capabilities" &&
+            request.ArgumentsJson.empty()) { return true; }
+    }
+    else if (request.Kind == McpRequestKind::ToolCall)
+    {
+        const auto* tool = FindTool(request.Name);
+        if (tool != nullptr && ToolVisible(*tool, config_) && request.Name != L"operations.get")
+        {
+            const auto& args = request.ArgumentsJson;
+            std::wstring error;
+            if ((config_.ObserveOnly && args.size() > 4096) || !ValidateMcpToolArguments(request.Name, args, &error))
+            {
+                *result = McpAuthorityError(ScopeName(), true);
+                if (!config_.ObserveOnly) { result->Text = error; }
+                return false;
+            }
+            if (request.Name == L"ti.subscribe" && !AllowWrite())
+            {
+                std::wstring action;
+                if (mcpjson::GetString(args, L"action", &action))
+                {
+                    if (!config_.ObserveOnly)
+                    {
+                        const auto visible = [](wchar_t ch) { return !std::iswspace(ch); };
+                        const auto first = std::find_if(action.begin(), action.end(), visible);
+                        const auto last = std::find_if(action.rbegin(), action.rend(), visible).base();
+                        action = first < last ? std::wstring(first, last) : L"";
+                    }
+                    const bool status = config_.ObserveOnly ? action == L"status" :
+                        (action.empty() || (action.size() == 6 && _wcsicmp(action.c_str(), L"status") == 0));
+                    if (!status)
+                    {
+                        *result = McpAuthorityError(ScopeName());
+                        return false;
+                    }
+                }
+            }
+            if (config_.ObserveOnly && (request.Name == L"timeline.query" || request.Name == L"graph.query"))
+            {
+                TimelineGraphQueryOptions options;
+                if (!ParseObservedTimelineOptions(args, &options))
+                {
+                    *result = McpAuthorityError(ScopeName(), true);
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    *result = McpAuthorityError(ScopeName());
+    return false;
+}
+
+McpEngineResult McpServer::DispatchAuthorized(const McpEngineRequest& request, const McpEngineDispatchFn& dispatch) const
+{
+    McpEngineResult result;
+    if (!AuthorizeEngineRequest(request, &result)) { return result; }
+    return dispatch(request);
+}
+
 bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result)
 {
     if (result == nullptr)
@@ -1707,6 +1956,7 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         return false;
     }
     *result = McpEngineResult{};
+    if (!AuthorizeEngineRequest(request, result)) { return true; }
     std::shared_ptr<McpJob> job = std::make_shared<McpJob>();
     job->Request = request;
     job->OperationId = RandomHex(16);
@@ -1778,6 +2028,7 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
 
 bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
 {
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
     bool ok = false;
     HTTPAPI_VERSION version = HTTPAPI_VERSION_2;
     HTTP_SERVER_SESSION_ID serverSession = 0;
@@ -1785,15 +2036,16 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
 
     do
     {
-        if (running_.load())
+        if (running_.load() || listener_.joinable())
         {
             if (error != nullptr)
             {
-                *error = L"MCP server is already running";
+                *error = L"MCP listener must finish stopping before another start";
             }
-            break;
+            return false;
         }
 
+        if (!ValidateMcpObservationConfig(config, error)) { return false; }
         config_ = config;
         operations_.Reset();
         config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
@@ -1978,7 +2230,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
 
     if (!ok)
     {
-        Stop();
+        StopLocked();
     }
 
     return ok;
@@ -1986,6 +2238,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
 
 void McpServer::RequestStop()
 {
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
     stopRequested_.store(true);
     running_.store(false);
     if (stopEvent_ != nullptr)
@@ -1996,8 +2249,12 @@ void McpServer::RequestStop()
 
 void McpServer::Stop()
 {
-    std::lock_guard<std::mutex> lock(stopMutex_);
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    StopLocked();
+}
 
+void McpServer::StopLocked()
+{
     stopRequested_.store(true);
     if (stopEvent_ != nullptr)
     {
@@ -2103,7 +2360,8 @@ void McpServer::ListenerThreadMain()
 
     // Sends an HTTP response with a JSON (or empty) body. ANSI strings are kept
     // local so they outlive the synchronous HttpSendHttpResponse call.
-    auto sendResponse = [&](HTTP_REQUEST_ID requestId, USHORT statusCode, const char* reason, const std::wstring& bodyWide)
+    auto sendResponse = [&](HTTP_REQUEST_ID requestId, USHORT statusCode, const char* reason, const std::wstring& bodyWide,
+                            bool initialized = false)
     {
         std::string body = mcpjson::WideToUtf8(bodyWide);
         std::string sessionAnsi = mcpjson::WideToUtf8(sessionId_);
@@ -2118,7 +2376,7 @@ void McpServer::ListenerThreadMain()
         response.Headers.KnownHeaders[HttpHeaderContentType].RawValueLength = static_cast<USHORT>(strlen(contentType));
 
         HTTP_UNKNOWN_HEADER unknownHeaders[1] = {};
-        if (!sessionAnsi.empty())
+        if (!sessionAnsi.empty() && (!config_.ObserveOnly || initialized))
         {
             unknownHeaders[0].pName = "Mcp-Session-Id";
             unknownHeaders[0].NameLength = static_cast<USHORT>(strlen("Mcp-Session-Id"));
@@ -2157,14 +2415,18 @@ void McpServer::ListenerThreadMain()
                           const std::wstring& operation = L"")
     {
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
-        record += L",\"session\":" + mcpjson::Quote(sessionId_);
+        if (!config_.ObserveOnly) { record += L",\"session\":" + mcpjson::Quote(sessionId_); }
+        record += L",\"scope\":" + mcpjson::Quote(ScopeName());
         record += L",\"peerPort\":" + std::to_wstring(AuditPeerPort(request));
         record += L",\"method\":" + mcpjson::Quote(method);
-        if (!name.empty())
+        const auto* tool = FindTool(name);
+        if (!name.empty() && (!config_.ObserveOnly ||
+            (method == L"tools/call" && tool != nullptr && ToolVisible(*tool, config_)) ||
+            (method == L"resources/read" && ResourceVisible(name, config_))))
         {
             record += L",\"tool\":" + mcpjson::Quote(name);
         }
-        if (!args.empty())
+        if (!args.empty() && !config_.ObserveOnly)
         {
             std::wstring trimmedArgs = args.size() > 512 ? (args.substr(0, 512) + L"...(truncated)") : args;
             record += L",\"args\":" + mcpjson::Quote(trimmedArgs);
@@ -2188,6 +2450,12 @@ void McpServer::ListenerThreadMain()
         HTTP_REQUEST_ID requestId = request->RequestId;
 
         // Transport-layer gating before any JSON-RPC work.
+        if (config_.ObserveOnly && (!IsMcpLoopbackAddress(request->Address.pRemoteAddress) ||
+            !IsMcpLoopbackAddress(request->Address.pLocalAddress)))
+        {
+            sendResponse(requestId, 403, "Forbidden", L"");
+            return;
+        }
         if (request->Verb != HttpVerbPOST)
         {
             sendResponse(requestId, 405, "Method Not Allowed", L"");
@@ -2293,7 +2561,7 @@ void McpServer::ListenerThreadMain()
                 L",\"serverInfo\":{\"name\":" + mcpjson::Quote(kServerName) +
                 L",\"version\":" + mcpjson::Quote(kServerVersion) + L"}}";
             writeAudit(request, L"initialize", L"", L"", L"session-open", false, 0);
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, result));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, result), true);
             return;
         }
 
@@ -2319,7 +2587,7 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"tools/list")
         {
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_.AllowWrite)));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_)));
             return;
         }
 
@@ -2339,7 +2607,7 @@ void McpServer::ListenerThreadMain()
             }
 
             const McpToolDef* tool = FindTool(name);
-            if (tool == nullptr)
+            if (tool == nullptr && !config_.ObserveOnly)
             {
                 writeAudit(request, L"tools/call", name, argsRaw, L"unknown-tool", true, 0);
                 sendResponse(requestId, 200, "OK", RpcError(idRaw, -32601, L"unknown tool: " + name));
@@ -2348,7 +2616,12 @@ void McpServer::ListenerThreadMain()
 
             McpEngineResult result;
             std::wstring decision = L"ok";
-            if (!tool->ReadOnly && !config_.AllowWrite)
+            if (config_.ObserveOnly && (tool == nullptr || !ToolVisible(*tool, config_)))
+            {
+                result = McpAuthorityError(ScopeName());
+                decision = L"blocked_by_policy";
+            }
+            else if (tool != nullptr && !tool->ReadOnly && !config_.AllowWrite)
             {
                 result.IsError = true;
                 result.Text = L"writes are disabled; start the MCP server with --allow-write (lab mode)";
@@ -2360,11 +2633,11 @@ void McpServer::ListenerThreadMain()
                 // This lookup must never queue behind that same operation.
                 std::wstring error;
                 std::wstring operationId;
-                if (!ValidateMcpToolArguments(name, argsRaw, &error) ||
+                if ((config_.ObserveOnly && argsRaw.size() > 4096) || !ValidateMcpToolArguments(name, argsRaw, &error) ||
                     !mcpjson::GetString(argsRaw, L"operation_id", &operationId))
                 {
-                    result.IsError = true;
-                    result.Text = error.empty() ? L"operation_id is required" : error;
+                    result = McpAuthorityError(ScopeName(), true);
+                    if (!config_.ObserveOnly) { result.Text = error.empty() ? L"operation_id is required" : error; }
                 }
                 else
                 {
@@ -2387,6 +2660,7 @@ void McpServer::ListenerThreadMain()
                 else if (result.IsError)
                 {
                     decision = L"tool-error";
+                    if (result.OperationJson.empty()) { mcpjson::GetString(result.StructuredJson, L"status", &decision); }
                 }
             }
 
@@ -2398,7 +2672,7 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"resources/list")
         {
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildResourcesList()));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildResourcesList(config_)));
             return;
         }
 
@@ -2412,12 +2686,10 @@ void McpServer::ListenerThreadMain()
             if (uri == L"kn://capabilities")
             {
                 // Static manifest; served transport-side without an engine hop.
-                contentsText = BuildCapabilitiesResource(config_.AllowWrite);
+                contentsText = BuildCapabilitiesResource(config_);
             }
-            else if (uri.rfind(L"kn://", 0) == 0)
+            else if (ResourceVisible(uri, config_))
             {
-                // All other kn:// resources read live state; the engine thread
-                // (DispatchMcpRequest) validates the URI and builds the JSON.
                 McpEngineRequest engineRequest;
                 engineRequest.Kind = McpRequestKind::ResourceRead;
                 engineRequest.Name = uri;
@@ -2440,8 +2712,9 @@ void McpServer::ListenerThreadMain()
             }
             else
             {
-                writeAudit(request, L"resources/read", uri, L"", L"unknown-resource", true, 0);
-                sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, L"unknown resource: " + uri));
+                writeAudit(request, L"resources/read", uri, L"", config_.ObserveOnly ? L"blocked_by_policy" : L"unknown-resource", true, 0);
+                sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602,
+                    config_.ObserveOnly ? L"request blocked by MCP session policy" : L"unknown resource: " + uri));
                 return;
             }
 
@@ -2459,12 +2732,18 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"prompts/list")
         {
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildPromptsList()));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, config_.ObserveOnly ? L"{\"prompts\":[]}" : BuildPromptsList()));
             return;
         }
 
         if (method == L"prompts/get")
         {
+            if (config_.ObserveOnly)
+            {
+                writeAudit(request, L"prompts/get", L"", L"", L"blocked_by_policy", true, 0);
+                sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, L"request blocked by MCP session policy"));
+                return;
+            }
             std::wstring name;
             mcpjson::GetString(params, L"name", &name);
             std::wstring argsRaw;

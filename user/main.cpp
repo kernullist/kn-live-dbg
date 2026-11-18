@@ -51983,6 +51983,17 @@ static McpEngineResult DispatchMcpRequest(
         return result;
     }
 
+    if (g_McpServer.ObserveOnly())
+    {
+        if (request.Name == L"ti.subscribe")
+        {
+            TiSubscriber& ti = GetTiSubscriberInstance();
+            result.StructuredJson = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
+            return result;
+        }
+        return ReadMcpObservedTimeline(request, state.Timeline);
+    }
+
     // Tool call. Write-ness is decided by the kTools table (single source of
     // truth) via the server, not a parallel hardcoded list.
     const std::wstring& tool = request.Name;
@@ -52307,6 +52318,7 @@ static void RunMcpEngineLoop(
 
     std::wcout << L"[mcp] engine active: " << g_McpServer.BindAddress()
                << L":" << g_McpServer.Port()
+               << L" scope=" << g_McpServer.ScopeName()
                << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off")
                << L"  -- type 'off' then Enter to stop\n";
 
@@ -52344,6 +52356,7 @@ static void RunMcpEngineLoop(
         if (statusRequested.exchange(false))
         {
             std::wcout << L"[mcp] running port=" << g_McpServer.Port()
+                       << L" scope=" << g_McpServer.ScopeName()
                        << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off") << L"\n";
         }
 
@@ -52355,8 +52368,10 @@ static void RunMcpEngineLoop(
             McpEngineResult dispatchResult;
             try
             {
-                dispatchResult = DispatchMcpRequest(
-                    job->Request, state, dbgeng, device, service, symbols, ai, aiState);
+                dispatchResult = g_McpServer.DispatchAuthorized(job->Request, [&](const McpEngineRequest& request)
+                {
+                    return DispatchMcpRequest(request, state, dbgeng, device, service, symbols, ai, aiState);
+                });
             }
             catch (const std::exception& ex)
             {
@@ -52565,6 +52580,7 @@ static bool WriteMcpEndpointFile(
     json += L"  \"token_source\": " + mcpjson::Quote(tokenSource) + L",\n";
     json += L"  \"port\": " + std::to_wstring(port) + L",\n";
     json += L"  \"write\": " + std::wstring(allowWrite ? L"true" : L"false") + L",\n";
+    json += L"  \"scope\": " + mcpjson::Quote(g_McpServer.ScopeName()) + L",\n";
     json += L"  \"remote_bind\": " + std::wstring(remoteBind ? L"true" : L"false") + L",\n";
     json += L"  \"bind\": " + mcpjson::Quote(bindAddress) + L",\n";
     json += L"  \"listen_ips\": " + listenJson + L",\n";
@@ -53103,7 +53119,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53112,6 +53128,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         std::wcout << L"mcp on prompts for a session password (type it twice) and listens on 0.0.0.0.\n";
         std::wcout << L"Clients need IP + port + that password (Authorization: Bearer <password>).\n";
         std::wcout << L"--loopback keeps 127.0.0.1 only. --bind <ipv4> pins one address (avoid on multi-NIC).\n";
+        std::wcout << L"--observe restricts this session to loopback status and retained timeline queries.\n";
         return;
     }
 
@@ -53152,6 +53169,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             std::wstring tokenSource;
             std::wstring port;
             std::wstring write;
+            std::wstring scope;
             if (!ExtractJsonStringValue(wide, L"url", &url) ||
                 !ExtractJsonStringValue(wide, L"token_source", &tokenSource) ||
                 !ExtractJsonScalarValue(wide, L"port", &port) ||
@@ -53163,6 +53181,10 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             {
                 ExtractJsonStringValue(wide, L"remote_url", &remoteUrl);
                 ExtractJsonStringValue(wide, L"client_url", &clientUrl);
+                if (ExtractJsonStringValue(wide, L"scope", &scope))
+                {
+                    std::wcout << L"  scope       : " << scope << L"\n";
+                }
                 std::wcout << L"  url         : " << url << L"\n";
                 if (!remoteUrl.empty())
                 {
@@ -53204,6 +53226,12 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         config.Port = options.Port;
         config.BindAddress = options.BindAddress;
         config.AllowWrite = options.AllowWrite;
+        config.ObserveOnly = options.ObserveOnly;
+        if (!ValidateMcpObservationConfig(config, &optionError))
+        {
+            std::wcerr << L"mcp start failed: " << optionError << L"\n";
+            return;
+        }
 
         config.BindAddress = NormalizeMcpBindAddress(config.BindAddress);
         if (!IsMcpWildcardBind(config.BindAddress) &&
@@ -53301,6 +53329,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
             modeText = L"selected addresses";
         }
         std::wcout << L"MCP server started (" << modeText << L" Streamable HTTP).\n";
+        std::wcout << L"  scope    : " << g_McpServer.ScopeName() << L"\n";
         std::wcout << L"  listen   : " << g_McpServer.BindAddress() << L":"
                    << g_McpServer.Port() << L"\n";
         std::wcout << L"  port     : " << g_McpServer.Port() << L"\n";
@@ -53412,6 +53441,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (g_McpServer.IsRunning())
     {
         std::wcout << L"MCP server: running port=" << g_McpServer.Port()
+                   << L" scope=" << g_McpServer.ScopeName()
                    << L" bind=" << g_McpServer.BindAddress()
                    << L" wildcard=" << (g_McpServer.WildcardBound() ? L"on" : L"off")
                    << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off")
@@ -53423,7 +53453,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }
@@ -53957,7 +53987,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --schema inspect <package>\n";
         std::wcout << L"    local offline type metadata; no live target, network symbols, or runtime qualification\n";
         std::wcout << L"  KnLiveDbg.exe --self-test <suite>\n";
-        std::wcout << L"    suites: timeline, mcp-tools, mcp-http, console, commands, remote-protocol,\n";
+        std::wcout << L"    suites: timeline, mcp-tools, mcp-http, mcp-observe, console, commands, remote-protocol,\n";
         std::wcout << L"            connect-argv, capture-scheduler, reference-scheduler, image-scheduler, publication-scheduler, analysis-scheduler, discovery-scheduler, layout-scheduler, image-preparation, irp-publication <owned.knirp>, all, platform-query, cloudfiles-query <path>,\n";
         std::wcout << L"            minifilter-attachments-query\n";
         std::wcout << L"  Internal relaunch: --cloak-resume <session> | --cloak-cleanup <session>\n\n";
@@ -54085,6 +54115,10 @@ int wmain(int argc, wchar_t** argv)
         {
             return RunMcpTransportSelfTest();
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"mcp-observe")
+        {
+            return RunMcpTransportSelfTest(true);
+        }
         if (argc >= 3 && ToLower(argv[2]) == L"remote-protocol")
         {
             return RunRemoteProtocolSelfTest();
@@ -54160,7 +54194,7 @@ int wmain(int argc, wchar_t** argv)
                 remoteExit == 0 && connectExit == 0) ? 0 : 1;
         }
 
-        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|console|commands|capture-scheduler|reference-scheduler|image-scheduler|publication-scheduler|analysis-scheduler|discovery-scheduler|layout-scheduler|image-preparation|irp-publication <owned.knirp>|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --self-test timeline|mcp-tools|mcp-http|mcp-observe|console|commands|capture-scheduler|reference-scheduler|image-scheduler|publication-scheduler|analysis-scheduler|discovery-scheduler|layout-scheduler|image-preparation|irp-publication <owned.knirp>|platform-query|cloudfiles-query <path>|minifilter-attachments-query|remote-protocol|connect-argv|ai-disclosure <private-package> <owned-loopback-port>|all\n";
         return 2;
     }
 

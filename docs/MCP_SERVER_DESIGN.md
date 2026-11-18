@@ -55,6 +55,39 @@ The separate remote protocol has no operation lookup adapter yet.
 
 ## Transport and permissions
 
+### Observe sessions on current main
+
+An operator can enter `mcp on --observe` in a running controller. HTTP.sys
+registers loopback prefixes. Before handling credentials or reading a body,
+the listener verifies both connection addresses are loopback. The host,
+origin, bearer password and initialized session checks still apply.
+The scope lasts until the listener stops. `mcp status`, the endpoint descriptor
+and `kn://capabilities` report `observe`, `legacy_write_locked` or
+`legacy_write_enabled`.
+
+| Observe interface | Accepted requests |
+| --- | --- |
+| Tools | `operations.get`, `timeline.status`, `timeline.query`, `graph.query` and `ti.subscribe` with no action or the exact string `status` |
+| Resources | `kn://capabilities`, `kn://session/info`, `kn://drivers/status` and `kn://ti/stats` |
+| Prompts | Empty list |
+
+The listener rejects out-of-scope requests before allocating an operation ID
+or signalling the queue. The engine repeats the check immediately before
+dispatch. Timeline and graph handlers read the retained store directly. Each
+selects up to 64 matching events, with a default of 50. Finding those matches
+can still require scanning the store. Session and driver status may query the
+existing device or service. The existing write-off confirmation also runs on
+entry to the engine.
+
+The request audit records the scope, decision and admitted operation metadata.
+In observe sessions it omits argument values, hidden or unknown identifiers,
+the protocol session ID and result bodies. Timeline responses can contain the
+original event fields. All clients with the session credential share access to
+those fields. Per-principal evidence filtering and cumulative budgets remain
+open. The separate one-shot CLI uses its own entry point and policy.
+
+### Legacy sessions
+
 - HTTP `/mcp`, default all-interface port 51766, optional loopback/concrete bind.
   No TLS. MCP protocol 2025-06-18; server identity knlivedbg/0.1.0.
 - Session password as a bearer credential, followed by `Mcp-Session-Id` after
@@ -78,7 +111,7 @@ decoded keys, invalid UTF-8 and nesting beyond 64. Envelopes and argument schema
 are validated before dispatch; numeric values remain strings where advertised.
 
 Transport errors and tool-result errors are distinct. Some tools return
-structured content, others text. Eight resources and seven prompts supplement
+structured content, others text. In legacy sessions eight resources and seven prompts supplement
 the tool catalog. The automatic request audit is separate from write auditing.
 
 Uniform pagination/output schemas, SSE progress, per-write elicitation, and
@@ -90,6 +123,8 @@ those as current guarantees. The outstanding work is in [FEATURE_PLAN.md](FEATUR
 `--self-test mcp-tools` checks catalog/validation/dispatch contracts without
 loading a driver. `tools/validate-mcp-operation.ps1 -Sanitize` checks ledger
 retention and timeout/completion races with an independent JSON oracle.
+`--self-test mcp-observe` checks the restricted catalog and admission decisions
+over loopback, executes a retained query and inspects the resulting audit.
 `--self-test mcp-http` separately exercises the loopback
 transport and requires HTTP.sys registration rights. Run network fixtures
 sequentially; the synthetic operation test deliberately waits for the 30-second

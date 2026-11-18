@@ -1038,6 +1038,13 @@ process invocation. Principal scopes on an existing controller, kernel-side
 collection rights, protected transport and durable operation recovery remain
 P14 work.
 
+Inside an existing controller, `mcp on --observe` fixes the listener's scope
+for its lifetime. Catalog discovery, queue admission and engine dispatch use
+the same allowlist. Retained timeline queries and status are available on
+authenticated loopback connections. Requests for collection, export and
+mutation are refused before operation allocation. The scope applies to all
+clients of that listener. [MCP observation session](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
+
 Offline trace queries take their input from an inherited disk handle. The
 reader checks the granted read, attribute and synchronization rights and asks
 the I/O manager whether the device is remote before querying the filesystem.

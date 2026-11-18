@@ -103,6 +103,7 @@ namespace commandinput
         std::wstring BindAddress = L"0.0.0.0";
         std::wstring Peer;
         bool AllowWrite = false;
+        bool ObserveOnly = false;
     };
 
     inline bool ParseListenerOptions(
@@ -126,6 +127,11 @@ namespace commandinput
             {
                 ok = !parsed.AllowWrite;
                 parsed.AllowWrite = true;
+            }
+            else if (!remote && arg == L"--observe")
+            {
+                ok = !parsed.ObserveOnly;
+                parsed.ObserveOnly = true;
             }
             else if (arg == L"--loopback")
             {
@@ -165,6 +171,11 @@ namespace commandinput
                 ok = !havePort && ParsePort(arg, &parsed.Port);
                 havePort = true;
             }
+        }
+        if (parsed.ObserveOnly)
+        {
+            ok = ok && !parsed.AllowWrite;
+            if (!haveBind) { parsed.BindAddress = L"127.0.0.1"; }
         }
         if (ok)
         {

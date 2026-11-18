@@ -181,6 +181,10 @@ def main():
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
+    observe = by_key[("session", "observe_scope", "mcp")]
+    assert observe["consistency"] == "listener_lifetime"
+    assert "authenticated_loopback" in observe["requirements"] and "admission_and_dispatch_checks" in observe["requirements"]
+    assert "64_events_per_query" in observe["limits"] and "shared_principal" in observe["limits"]
     assert operation["implementation"] == "implemented"
     assert "returned_operation_id" in operation["requirements"]
     assert "no_effect_verification_or_rollback" in operation["limits"]

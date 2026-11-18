@@ -2973,8 +2973,14 @@ TimelineIngestResult TimelineStore::IngestEvents(
 
 std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& options) const
 {
+    return Query(options, nullptr);
+}
+
+std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& options, uint64_t* totalStored) const
+{
     std::vector<TimelineEvent> out;
     std::lock_guard<std::mutex> lock(Mutex);
+    if (totalStored != nullptr) { *totalStored = Events.size(); }
 
     auto matches = [&options](const TimelineEvent& event) -> bool
     {
@@ -3068,48 +3074,27 @@ TimelineGraphResult TimelineStore::BuildGraph(const TimelineGraphQueryOptions& o
 
     {
         std::lock_guard<std::mutex> lock(Mutex);
-        events.assign(Events.begin(), Events.end());
+        result.TotalEvents = Events.size();
+        auto collect = [&](auto begin, auto end)
+        {
+            for (auto it = begin; it != end; ++it)
+            {
+                if (!TimelineEventMatchesGraphQuery(*it, options)) { continue; }
+                if (options.Limit != 0 && events.size() == options.Limit)
+                {
+                    result.Truncated = true;
+                    break;
+                }
+                events.push_back(*it);
+            }
+        };
+        if (options.NewestFirst) { collect(Events.rbegin(), Events.rend()); }
+        else { collect(Events.begin(), Events.end()); }
     }
-    result.TotalEvents = events.size();
-
-    auto handleEvent = [&result, &nodes, &edges, &options](const TimelineEvent& event) -> bool
+    result.MatchedEvents = events.size();
+    for (const TimelineEvent& event : events)
     {
-        bool keepGoing = true;
-        if (TimelineEventMatchesGraphQuery(event, options))
-        {
-            if (options.Limit != 0 && result.MatchedEvents >= options.Limit)
-            {
-                result.Truncated = true;
-                keepGoing = false;
-            }
-            else
-            {
-                AddTimelineGraphEvent(event, &nodes, &edges);
-                ++result.MatchedEvents;
-            }
-        }
-        return keepGoing;
-    };
-
-    if (options.NewestFirst)
-    {
-        for (auto it = events.rbegin(); it != events.rend(); ++it)
-        {
-            if (!handleEvent(*it))
-            {
-                break;
-            }
-        }
-    }
-    else
-    {
-        for (const TimelineEvent& event : events)
-        {
-            if (!handleEvent(event))
-            {
-                break;
-            }
-        }
+        AddTimelineGraphEvent(event, &nodes, &edges);
     }
 
     for (const auto& item : nodes)

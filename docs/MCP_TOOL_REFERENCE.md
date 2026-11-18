@@ -1,10 +1,22 @@
 # MCP tool reference
 
-Source: [McpServer.cpp](../user/McpServer.cpp), current main. The catalog has
-**68 tools in read-only mode** and **12 additional write tools**.
+The legacy catalog on current main has **68 tools with writes locked** and
+**12 additional write tools**. [Catalog source](../user/McpServer.cpp)
 `ti.subscribe` is listed in read-only mode, but its `start`/`stop` actions require
 write permission. Read-only describes target mutation policy; it does not mean
 no in-memory state, resource use, or audit output.
+
+`mcp on --observe` exposes **five tools** on loopback. Use `operations.get`
+for a retained operation, `timeline.status` for store counters and
+`ti.subscribe` with `{}` or `{"action":"status"}` for subscription counters.
+`timeline.query` and `graph.query` read the existing store. The optional
+`limit` is a decimal string from `"1"` through `"64"` and defaults to `"50"`.
+`pid` is canonical decimal up to `4294967295`, and `order` accepts `newest`
+or `oldest`. The `source`, `domain` and graph-only `image` filters each accept
+up to 128 Unicode characters, excluding C0 controls and DEL. An observe tool
+argument object can occupy at most 4096 UTF-16 code units on the wire after
+UTF-8 decoding. Scope and argument denials create no operation ID.
+[Observe session contract](MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
 
 Use `tools/list` on the running server for the active schema. `*` marks required
 arguments; arrays contain strings. Numeric values are strings where the schema

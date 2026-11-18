@@ -9,6 +9,25 @@
 
 ## 실행 경계
 
+현재 `main`에서 운영자가 실행 중인 컨트롤러에 `mcp on --observe`를 입력하면
+루프백 전용 조회 세션이 열린다. 리스너는 인증과 본문 처리 전에 실제 연결의
+양쪽 IP 주소를 확인한다. `mcp status`, endpoint 파일, `kn://capabilities`에서
+`observe`, `legacy_write_locked`, `legacy_write_enabled` 중 현재 범위를 확인할 수 있다.
+
+| 조회 세션 | 허용 범위 |
+| --- | --- |
+| 도구 | `operations.get`, `timeline.status`, `timeline.query`, `graph.query`, `ti.subscribe`의 기본 동작 또는 `status` |
+| 리소스 | `kn://capabilities`, `kn://session/info`, `kn://drivers/status`, `kn://ti/stats` |
+| 프롬프트 | 빈 목록 |
+
+범위를 벗어난 요청은 큐에 들어가기 전에 거부하므로 작업 ID가 생기지 않는다.
+엔진은 실행 직전에도 같은 권한을 검사한다. 타임라인과 그래프는 보관된 이벤트를
+직접 조회하며 기본 50건, 최대 64건을 선택한다. 일치 여부를 확인하려면 전체
+저장소를 훑을 수 있다. 드라이버 상태는 기존 장치와 서비스에 질의할 수 있다.
+조회 세션의 감사 로그에는 요청 인자·미허용 식별자·프로토콜 세션 ID·응답 본문을
+기록하지 않는다. 조회 결과에는 보관된 이벤트의 원본 필드가 포함될 수 있다.
+이 권한은 리스너를 종료할 때까지 같은 자격 증명을 쓰는 클라이언트에 공통 적용된다.
+
 ```text
 HTTP 요청 -> 본문 크기 / 인증 / 세션 / JSON 검사
           -> typed 인자 검사 -> FIFO -> 메인 엔진
@@ -71,7 +90,7 @@ envelope와 도구 인자를 dispatch 전에 검사하며, schema가 string으�
 숫자는 문자열로 전달한다.
 
 전송 오류와 도구 결과 오류를 구분한다. 일부 도구는 structured content,
-일부는 텍스트를 반환한다. 리소스 8개와 프롬프트 7개가 있다.
+일부는 텍스트를 반환한다. 기존 모드는 리소스 8개와 프롬프트 7개를 제공한다.
 자동 요청 감사와 쓰기 감사는 별개다.
 
 통일된 pagination/output schema, SSE 진행, 개별 쓰기 elicitation,
@@ -82,5 +101,6 @@ envelope와 도구 인자를 dispatch 전에 검사하며, schema가 string으�
 
 `--self-test mcp-tools`는 드라이버 없이 목록·인자·dispatch 계약을 검사한다.
 별도 `--self-test mcp-http`는 loopback 전송을 검사하며 HTTP.sys 등록 권한이 필요하다.
+`--self-test mcp-observe`는 같은 포트에서 조회 범위, 실행 전 거부, 타임라인 응답과 감사 기록을 확인한다.
 네트워크 fixture는 순차 실행한다. 실제 커널 동작·쓰기 검증·정리는
 [수동 체크리스트](MANUAL_TEST_CHECKLIST.md)에서 따로 확인한다.

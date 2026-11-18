@@ -20,7 +20,7 @@ mcp on --loopback
 출력된 주소 중 클라이언트가 접근할 수 있는 IP를 선택한다.
 
 ```text
-mcp on [port] [--allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -58,6 +58,12 @@ TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공�
 
 ## 쓰기 권한
 
+현재 `main`에서 보관 중인 타임라인과 상태만 로컬 클라이언트에 제공하려면
+`mcp on --observe`를 입력한다. 루프백 주소가 자동 선택된다.
+`mcp status`의 `scope=observe` 또는 `kn://capabilities`에서 범위를 확인한다.
+최근 10건을 읽으려면 `timeline.query`에 `{"limit":"10","order":"newest"}`를 전달한다.
+권한을 바꾸려면 현재 리스너를 종료하고 새로 시작한다. [조회 세션 구조](MCP_SERVER_DESIGN.ko.md#실행-경계)
+
 기본 MCP 모드는 쓰기 도구를 노출하지 않고 엔진 진입 시 커널 write gate도 끈다.
 `mcp on --allow-write`는 typed 쓰기 도구와 gate를 활성화한다.
 `ti.subscribe start/stop`도 이 모드가 필요하다. 외부 콜백 포인터 변경은 여전히
@@ -90,14 +96,16 @@ MCP 취소 알림은 이미 실행 중인 작업을 취소하지 않는다.
 
 자동 요청 감사는 `ai audit`과 별개로
 `<exe-dir>\.kn-live-dbg\mcp-audit-<port>.jsonl`에 저장한다.
-판정·결과·길이가 제한된 인자 기록을 보존하며 write-audit tail 리소스와는 별도다.
+기존 모드는 판정·결과·길이가 제한된 인자를 기록한다. 조회 세션은 판정과
+작업 메타데이터를 남기고 인자 값과 프로토콜 세션 ID는 기록에서 제외한다.
 
 ## 확인과 문제 해결
 
 1. 현재 URL·비밀번호·네트워크 경로를 확인한다. HTTP 401은 인증 오류이며
    새 서버 세션에서는 새 비밀번호가 필요하다.
 2. 초기화 후 `Mcp-Session-Id`를 후속 요청에 유지한다.
-3. `kn://session/info`, `kn://session/symbols`, `process.find` 등으로 확인한다.
+3. 조회 세션은 `kn://capabilities`와 `timeline.status`로 확인한다.
+   기존 모드는 `kn://session/info`, `kn://session/symbols`, `process.find` 등으로 확인한다.
    드라이버·심벌 공백을 정상적인 빈 검사로 처리하지 않는다.
 4. 쓰기 차단·인자 검증·큐·불확실한 결과와 감사 로그를 구분한다.
    읽기 실패 때문에 자동으로 쓰기 권한을 켜지 않는다.

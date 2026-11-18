@@ -3,11 +3,13 @@
 #include "EtwScanner.h"
 #include "McpServer.h"
 #include "McpJson.h"
+#include "TimelineStore.h"
 
 #include <Aclapi.h>
 #include <winhttp.h>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -296,7 +298,8 @@ int RunMcpToolCatalogSelfTest()
         McpServer queueServer;
         queueServer.jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         Check(&context, queueServer.jobReadyEvent_ != nullptr, L"queue-test-event");
-        McpEngineRequest queueRequest{ McpRequestKind::ToolCall, L"memory.write_virtual", L"{}" };
+        queueServer.config_.AllowWrite = true;
+        McpEngineRequest queueRequest{ McpRequestKind::ToolCall, L"ti.clear", L"{}" };
         McpEngineResult queueResult;
         Check(&context, queueServer.EnqueueAndWait(queueRequest, 0, &queueResult) && queueResult.IsError &&
             queueResult.Text.find(L"cancelled before execution") != std::wstring::npos && !queueServer.TryPopJob(),
@@ -365,6 +368,115 @@ int RunMcpToolCatalogSelfTest()
             operationState == L"cancelled_before_execution", L"stop-retains-queued-cancellation");
 
         std::vector<McpToolCatalogEntry> catalog = BuildMcpToolCatalogSnapshot();
+        McpServer observer;
+        observer.config_.ObserveOnly = true;
+        observer.config_.BindAddress = L"127.0.0.1";
+        observer.jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        size_t dispatches = 0;
+        TimelineStore retained(80);
+        std::vector<TimelineEvent> fixtures;
+        for (unsigned index = 1; index <= 70; ++index)
+        {
+            TimelineEvent event;
+            event.TimestampFileTime = index;
+            event.Source = L"fixture";
+            event.Domain = L"test";
+            event.Action = L"sample";
+            event.Entity = std::to_wstring(index);
+            event.ProcessId = 7;
+            fixtures.push_back(event);
+        }
+        Check(&context, retained.IngestEvents(fixtures).Added == 70, L"observe-owned-events");
+        auto dispatch = [&](const McpEngineRequest& request)
+        {
+            ++dispatches;
+            return ReadMcpObservedTimeline(request, retained);
+        };
+        auto blockedBeforeAdmission = [&](const McpEngineRequest& request)
+        {
+            McpEngineResult admission;
+            const bool responded = observer.EnqueueAndWait(request, 0, &admission);
+            const auto terminal = observer.DispatchAuthorized(request, dispatch);
+            return responded && admission.IsError && !admission.OutcomeUnknown && admission.OperationJson.empty() &&
+                terminal.IsError && terminal.StructuredJson == admission.StructuredJson && dispatches == 0 &&
+                !observer.TryPopJob() && WaitForSingleObject(observer.JobReadyEvent(), 0) == WAIT_TIMEOUT;
+        };
+        const std::set<std::wstring> engineTools{ L"timeline.status", L"timeline.query", L"graph.query", L"ti.subscribe" };
+        bool closed = observer.jobReadyEvent_ != nullptr;
+        for (const auto& entry : catalog)
+        {
+            if (!engineTools.count(entry.Name))
+            {
+                closed &= blockedBeforeAdmission({ McpRequestKind::ToolCall, entry.Name, L"{}" });
+            }
+        }
+        Check(&context, closed, L"observe-catalog-denials-before-queue-and-dispatch");
+        for (const auto& uri : { L"kn://snapshot/current", L"kn://audit/tail", L"kn://modules/kernel",
+            L"kn://session/symbols", L"kn://capabilities", L"kn://new" })
+        {
+            Check(&context, blockedBeforeAdmission({ McpRequestKind::ResourceRead, uri, L"" }), L"observe-resource-denial");
+        }
+        for (const auto& args : { LR"({"action":"start"})", LR"({"action":"stop"})", LR"({"action":"STATUS"})",
+            LR"({"action":"status\u0000start"})", LR"({"act\u0069on":"status","action":"stop"})" })
+        {
+            Check(&context, blockedBeforeAdmission({ McpRequestKind::ToolCall, L"ti.subscribe", args }), L"observe-action-denial");
+        }
+        for (const auto& args : std::vector<std::wstring>{ LR"({"limit":"0"})", LR"({"limit":"65"})", LR"({"limit":"01"})",
+            LR"({"limit":32})", LR"({"pid":"4294967296"})", LR"({"order":"other"})", LR"({"domain":"a\u0000b"})",
+            LR"({"path":"unused"})", L"{\"source\":\"" + std::wstring(129, L'x') + L"\"}", std::wstring(4095, L' ') + L"{}" })
+        {
+            Check(&context, blockedBeforeAdmission({ McpRequestKind::ToolCall, L"timeline.query", args }), L"observe-invalid-filter");
+        }
+        Check(&context, blockedBeforeAdmission({ McpRequestKind::ToolCall, L"future.tool", L"{}" }) &&
+            blockedBeforeAdmission({ McpRequestKind::ResourceRead, L"kn://session/info", L"{}" }), L"observe-unknown-or-mixed-kind");
+        const auto invoke = [&](const wchar_t* name, const wchar_t* args)
+        {
+            return observer.DispatchAuthorized({ McpRequestKind::ToolCall, name, args }, dispatch).StructuredJson;
+        };
+        const auto defaultQuery = invoke(L"timeline.query", L"{}");
+        const auto oldest = invoke(L"timeline.query", LR"({"source":"fixture","domain":"test","pid":"7","limit":"1","order":"oldest"})");
+        const auto graph = invoke(L"graph.query", LR"({"limit":"64","pid":"7"})");
+        const auto noMatch = invoke(L"graph.query", LR"({"pid":"4294967295","limit":"1"})");
+        Check(&context, defaultQuery.find(L"\"count\":50,") != std::wstring::npos &&
+            defaultQuery.find(L"\"eventId\":70,") != std::wstring::npos &&
+            oldest.find(L"\"count\":1,") != std::wstring::npos && oldest.find(L"\"eventId\":1,") != std::wstring::npos &&
+            graph.find(L"\"matchedEvents\":64,\"truncated\":true") != std::wstring::npos &&
+            noMatch.find(L"\"matchedEvents\":0,\"truncated\":false") != std::wstring::npos &&
+            dispatches == 4 && retained.GetStats().Stored == 70 && retained.PeekNextEventId() == 71,
+            L"observe-bounded-retained-query-and-graph");
+        Check(&context, McpObserveAddressSelfTest(), L"observe-connection-address-boundary");
+        McpEngineResult result;
+        std::wstring nonBmp;
+        for (int index = 0; index < 128; ++index) { nonBmp += L"\U0001f642"; }
+        auto filterAllowed = [&](const std::wstring& text)
+        {
+            return observer.AuthorizeEngineRequest(
+                { McpRequestKind::ToolCall, L"graph.query", L"{\"image\":" + mcpjson::Quote(text) + L"}" }, &result);
+        };
+        Check(&context, filterAllowed(nonBmp) && !filterAllowed(nonBmp + L"x"), L"observe-filter-budget-counts-unicode-scalars");
+        for (const auto& uri : { L"kn://session/info", L"kn://drivers/status", L"kn://ti/stats" })
+        {
+            Check(&context, observer.AuthorizeEngineRequest({ McpRequestKind::ResourceRead, uri, L"" }, &result),
+                L"observe-permitted-status-resource");
+        }
+        Check(&context, observer.AuthorizeEngineRequest({ McpRequestKind::ToolCall, L"ti.subscribe", L"{}" }, &result) &&
+            observer.AuthorizeEngineRequest({ McpRequestKind::ToolCall, L"ti.subscribe", LR"({"action":"status"})" }, &result),
+            L"observe-status-actions");
+        McpServerConfig incompatible = observer.config_;
+        incompatible.AllowWrite = true;
+        Check(&context, !observer.Start(incompatible, nullptr) && !observer.AllowWrite() &&
+            !observer.IsRunning() && observer.JobReadyEvent() != nullptr, L"observe-write-conflict-refused-before-setup");
+        McpServer legacy;
+        Check(&context, legacy.AuthorizeEngineRequest({ McpRequestKind::ToolCall, L"ti.subscribe", LR"({"action":"\fSTATUS\u000b"})" }, &result)
+            && !legacy.AuthorizeEngineRequest({ McpRequestKind::ToolCall, L"ti.subscribe", LR"({"action":"stop"})" }, &result)
+            && result.IsError && result.OperationJson.empty(), L"legacy-status-normalization-and-prequeue-lifecycle-denial");
+        for (const auto& bind : std::vector<std::wstring>{ L"0.0.0.0", L"+", L"192.0.2.1", std::wstring(L"127.0.0.1\0x", 11) })
+        {
+            McpServerConfig invalid = observer.config_;
+            invalid.BindAddress = bind;
+            Check(&context, !observer.Start(invalid, nullptr) && !observer.IsRunning() &&
+                observer.BindAddress() == L"127.0.0.1" && observer.JobReadyEvent() != nullptr, L"observe-refuses-bind-before-setup");
+        }
         Check(&context, !catalog.empty(), L"catalog-not-empty");
         Check(&context, McpRequestBodySelfTest(), L"http-body-bounds-eof-and-read-failure");
         Check(&context, McpOperationWireSelfTest(), L"operation-wire-preserves-payload-and-exposes-metadata");
@@ -609,7 +721,29 @@ int RunMcpToolCatalogSelfTest()
     return exitCode;
 }
 
-int RunMcpTransportSelfTest()
+static bool McpManifestMatches(const std::wstring& response, const wchar_t* list, const wchar_t* field,
+                               const std::set<std::wstring>& expected)
+{
+    std::wstring result, items;
+    if (!mcpjson::FindRawValue(response, L"result", &result) || !mcpjson::FindRawValue(result, list, &items) ||
+        items.empty() || items.front() != L'[') { return false; }
+    std::set<std::wstring> names;
+    size_t pos = 1;
+    mcpjson::SkipWhitespace(items, &pos);
+    while (pos < items.size() && items[pos] != L']')
+    {
+        std::wstring name;
+        size_t end = pos;
+        if (!mcpjson::ScanValue(items, pos, &end) || !mcpjson::GetString(items.substr(pos, end - pos), field, &name) ||
+            !names.insert(name).second) { return false; }
+        pos = end;
+        mcpjson::SkipWhitespace(items, &pos);
+        if (pos < items.size() && items[pos] == L',') { ++pos; mcpjson::SkipWhitespace(items, &pos); }
+    }
+    return names == expected;
+}
+
+int RunMcpTransportSelfTest(bool observe)
 {
     SelfTestContext context;
     McpServer server;
@@ -617,10 +751,19 @@ int RunMcpTransportSelfTest()
     config.Port = 51768;
     config.BindAddress = L"127.0.0.1";
     config.Password = L"kn-command-selftest";
+    config.ObserveOnly = observe;
+    if (observe)
+    {
+        wchar_t directory[MAX_PATH] = {}, path[MAX_PATH] = {};
+        const DWORD length = GetTempPathW(MAX_PATH, directory);
+        if (!length || length >= MAX_PATH || !GetTempFileNameW(directory, L"mco", 0, path)) { return 1; }
+        config.AuditPath = path;
+    }
     std::wstring error;
     if (!server.Start(config, &error))
     {
         std::wcerr << L"[mcp.http.selftest] listener failed: " << error << L"\n";
+        if (observe) { DeleteFileW(config.AuditPath.c_str()); }
         return 1;
     }
     HINTERNET session = WinHttpOpen(L"KnLiveDbg command self-test", WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -715,6 +858,81 @@ int RunMcpTransportSelfTest()
     post(R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}})", 200,
         L"protocolVersion", L"http-operation-initialize");
     Check(&context, !sessionId.empty(), L"http-session-header-retained");
+    if (observe)
+    {
+        const auto originalSession = sessionId;
+        McpServerConfig conflict = config;
+        conflict.ObserveOnly = false;
+        conflict.AllowWrite = true;
+        Check(&context, !server.Start(conflict, &error) && server.IsRunning() && server.ObserveOnly() &&
+            !server.AllowWrite() && !server.IsNetworkExposed(), L"http-observe-ceiling-survives-repeated-start");
+        sessionId = L"stale-test-id";
+        post(R"({"jsonrpc":"2.0","id":11,"method":"tools/list"})", 200, L"invalid or missing", L"http-observe-stale-session");
+        Check(&context, sessionId == L"stale-test-id", L"http-observe-denial-withholds-session-header");
+        sessionId = originalSession;
+        post(R"({"jsonrpc":"2.0","id":12,"method":"tools/list"})", 200, L"operations.get", L"http-observe-tools-list");
+        Check(&context, McpManifestMatches(lastResponse, L"tools", L"name", { L"operations.get", L"timeline.status",
+            L"timeline.query", L"graph.query", L"ti.subscribe" }) && lastResponse.find(L"\"enum\":[\"status\"]") != std::wstring::npos,
+            L"http-observe-exact-tools-and-status-schema");
+        post(R"({"jsonrpc":"2.0","id":13,"method":"resources/list"})", 200, L"kn://capabilities", L"http-observe-resources-list");
+        Check(&context, McpManifestMatches(lastResponse, L"resources", L"uri", { L"kn://capabilities", L"kn://session/info",
+            L"kn://drivers/status", L"kn://ti/stats" }), L"http-observe-exact-resources");
+        post(R"({"jsonrpc":"2.0","id":14,"method":"resources/read","params":{"uri":"kn://capabilities"}})",
+            200, LR"(\"scope\":\"observe\")", L"http-observe-capabilities");
+        Check(&context, lastResponse.find(L"snapshot.capture") == std::wstring::npos &&
+            lastResponse.find(L"knlivedbg/operation") == std::wstring::npos, L"http-observe-capabilities-served-inline");
+        post(R"({"jsonrpc":"2.0","id":15,"method":"prompts/list"})", 200, L"\"prompts\":[]", L"http-observe-empty-prompts");
+        post(R"({"jsonrpc":"2.0","id":16,"method":"prompts/get","params":{"name":"observe-audit-canary"}})",
+            200, L"blocked by MCP session policy", L"http-observe-prompts-closed");
+        for (const auto& tool : { "snapshot.capture", "timeline.export", "timeline.reconcile", "snapshot.diff",
+            "observe-audit-canary" })
+        {
+            const auto body = std::string(R"({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":")") +
+                tool + R"(","arguments":{"path":"observe-audit-canary"}}})";
+            post(body, 200, L"blocked_by_policy", L"http-observe-tool-policy-denial");
+            Check(&context, lastResponse.find(L"operation_id") == std::wstring::npos &&
+                lastResponse.find(L"observe-audit-canary") == std::wstring::npos, L"http-observe-denial-has-no-ledger-entry-or-input");
+        }
+        post(R"({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"ti.subscribe","arguments":{"action":"start"}}})",
+            200, L"blocked_by_policy", L"http-observe-mixed-tool-denied");
+        post(R"({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"graph.query","arguments":{"limit":"65"}}})",
+            200, L"invalid_arguments", L"http-observe-query-budget-enforced");
+        post(R"({"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"kn://observe-audit-canary"}})",
+            200, L"blocked by MCP session policy", L"http-observe-resource-denied");
+        Check(&context, !server.TryPopJob() && WaitForSingleObject(server.JobReadyEvent(), 0) == WAIT_TIMEOUT,
+            L"http-observe-no-work-signalled-by-denials");
+        auto retainedRead = std::async(std::launch::async, [&]()
+        {
+            if (WaitForSingleObject(server.JobReadyEvent(), 5000) != WAIT_OBJECT_0) { return false; }
+            auto job = server.TryPopJob();
+            if (!job) { return false; }
+            TimelineStore timeline(1);
+            auto result = server.DispatchAuthorized(job->Request,
+                [&](const McpEngineRequest& req) { return ReadMcpObservedTimeline(req, timeline); });
+            const bool ok = !result.IsError && IsMcpOperationId(job->OperationId);
+            server.CompleteJob(job, std::move(result));
+            return ok;
+        });
+        post(R"({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"timeline.query","arguments":{"source":"observe-audit-canary","limit":"1"}}})",
+            200, L"kn-live-dbg.timeline.v1", L"http-observe-retained-query");
+        Check(&context, retainedRead.get() && lastResponse.find(L"\"state\":\"succeeded\"") != std::wstring::npos,
+            L"http-observe-allowed-operation-receipt");
+    }
+    else
+    {
+        std::set<std::wstring> expected;
+        for (const auto& tool : BuildMcpToolCatalogSnapshot())
+        {
+            if (tool.ReadOnly) { expected.insert(tool.Name); }
+        }
+        post(R"({"jsonrpc":"2.0","id":22,"method":"tools/list"})", 200, L"snapshot.capture", L"http-legacy-tools-list");
+        Check(&context, expected.size() == 68 && McpManifestMatches(lastResponse, L"tools", L"name", expected),
+            L"http-legacy-complete-write-locked-catalog");
+        post(R"({"jsonrpc":"2.0","id":23,"method":"resources/list"})", 200, L"kn://snapshot/current", L"http-legacy-resources-list");
+        Check(&context, McpManifestMatches(lastResponse, L"resources", L"uri", { L"kn://capabilities", L"kn://session/info",
+            L"kn://drivers/status", L"kn://ti/stats", L"kn://modules/kernel", L"kn://session/symbols", L"kn://snapshot/current",
+            L"kn://audit/tail" }), L"http-legacy-complete-resource-catalog");
+    }
     std::promise<void> releaseEngine;
     auto release = releaseEngine.get_future();
     auto engine = std::async(std::launch::async, [&]()
@@ -733,7 +951,8 @@ int RunMcpTransportSelfTest()
         server.CompleteJob(job, result);
         return true;
     });
-    post(R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"process.find","arguments":{}}})",
+    post(observe ? R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"timeline.status","arguments":{}}})" :
+        R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"process.find","arguments":{}}})",
         200, L"unknown_outcome", L"http-dispatched-operation-times-out");
     std::wstring rpcResult;
     std::wstring meta;
@@ -810,7 +1029,30 @@ int RunMcpTransportSelfTest()
     {
         WinHttpCloseHandle(session);
     }
+    if (observe)
+    {
+        server.RequestStop();
+        McpServerConfig next = config;
+        next.ObserveOnly = false;
+        next.AllowWrite = true;
+        Check(&context, !server.Start(next, &error) && server.ObserveOnly() && !server.AllowWrite(),
+            L"http-observe-scope-pinned-until-listener-joined");
+    }
     server.Stop();
-    std::wcout << L"[mcp.http.selftest] passed=" << context.Passed << L" failed=" << context.Failed << L"\n";
+    if (observe)
+    {
+        std::ifstream file(config.AuditPath.c_str(), std::ios::binary);
+        std::string audit{ std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{} };
+        Check(&context, !sessionId.empty() && audit.find("\"scope\":\"observe\"") != std::string::npos &&
+            audit.find("\"decision\":\"blocked_by_policy\"") != std::string::npos &&
+            audit.find("\"decision\":\"invalid_arguments\"") != std::string::npos &&
+            audit.find("observe-audit-canary") == std::string::npos && audit.find("\"args\":") == std::string::npos &&
+            audit.find(mcpjson::WideToUtf8(sessionId)) == std::string::npos &&
+            audit.find(mcpjson::WideToUtf8(config.Password)) == std::string::npos, L"http-observe-audit-metadata-only");
+        file.close();
+        Check(&context, DeleteFileW(config.AuditPath.c_str()) != FALSE, L"http-observe-owned-audit-removed");
+    }
+    std::wcout << (observe ? L"[mcp.observe.selftest]" : L"[mcp.http.selftest]") <<
+        L" passed=" << context.Passed << L" failed=" << context.Failed << L"\n";
     return context.Failed == 0 ? 0 : 1;
 }

@@ -1,4 +1,4 @@
 #pragma once
 
 int RunMcpToolCatalogSelfTest();
-int RunMcpTransportSelfTest();
+int RunMcpTransportSelfTest(bool observe = false);

@@ -187,9 +187,10 @@ AddressSanitizer applies to the standalone harnesses, not every command run by
 the normal EXE. The hunting validator's PE-sieve comparison is separate and
 requires `-PeSieve <path>`; omission is not a successful external comparison.
 
-`--self-test mcp-http` is separate and needs HTTP.sys registration rights.
-Run network fixtures sequentially: remote loopback uses 51767 and HTTP self-test
-uses 51768. These test modes do not create external listeners/firewall rules.
+`--self-test mcp-http` and `--self-test mcp-observe` need HTTP.sys registration
+rights. Run them sequentially. Both use loopback port 51768 and the remote
+loopback fixture uses 51767. The observe suite checks denied requests leave
+the queue idle, runs a retained query and inspects its temporary audit.
 Source validators require their toolchain; the package does not imply every
 source-only harness is present.
 

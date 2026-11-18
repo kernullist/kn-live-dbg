@@ -76,9 +76,11 @@ dispatch-interposition path with unresolved publication/unload lifetime limits;
 the cooperative fixture tests do not establish its safety.
 
 MCP and the human remote console use separate, mutually exclusive listeners.
-Both transports are cleartext lab interfaces. MCP starts read-only; the human
-remote session follows the local write policy. AI provider configuration does
-not change these transport or kernel permissions.
+Both transports use cleartext HTTP or TCP. MCP starts with writes locked.
+On current `main`, `mcp on --observe` limits a local client to status and
+retained timeline queries. The human remote session follows the local write
+policy. AI provider configuration is independent of these permissions.
+[MCP session scopes](docs/MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
 
 ## Documentation
 

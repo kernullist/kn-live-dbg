@@ -45,6 +45,7 @@ public:
         const std::vector<TimelineEvent>& events);
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
+    std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
     std::vector<TimelineEvent> AllEvents() const;
     // Chronological events with EventId > minExclusive. maxCount 0 = unlimited.
     std::vector<TimelineEvent> RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const;

@@ -625,6 +625,14 @@ static int RunCommandAuditSelfTest()
     check(commandinput::ParseListenerOptions({ L"--allow-write", L"--bind=127.0.0.1" },
         0, false, 51766, &listen, &error) && listen.Port == 51766 && listen.AllowWrite,
         L"mcp listener valid options");
+    check(commandinput::ParseListenerOptions({ L"--observe" }, 0, false, 51766, &listen, &error) &&
+        listen.ObserveOnly && !listen.AllowWrite && listen.BindAddress == L"127.0.0.1", L"mcp observe defaults to loopback");
+    for (const auto& conflict : std::vector<std::vector<std::wstring>>{
+        { L"--observe", L"--allow-write" }, { L"--allow-write", L"--observe" }, { L"--observe", L"--observe" } })
+    {
+        check(!commandinput::ParseListenerOptions(conflict, 0, false, 51766, &listen, &error), L"mcp observe option conflict");
+    }
+    check(!commandinput::ParseListenerOptions({ L"--observe" }, 0, true, 51766, &listen, &error), L"remote rejects mcp observe");
 
     uint64_t number = 7;
     uint32_t major = 99;

@@ -88,7 +88,12 @@ struct McpServerConfig
     // Session password set when the operator enables MCP. Not persisted across
     // process restarts. Clients send it as `Authorization: Bearer <password>`.
     std::wstring Password;
+    bool ObserveOnly = false;
 };
+
+class TimelineStore;
+bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error);
+McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline);
 
 bool SanitizeMcpPassword(
     const std::wstring& raw,
@@ -121,6 +126,7 @@ struct McpToolCatalogEntry
 std::vector<McpToolCatalogEntry> BuildMcpToolCatalogSnapshot();
 bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entry);
 bool McpRequestBodySelfTest();
+bool McpObserveAddressSelfTest();
 bool McpOperationWireSelfTest();
 bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error);
 
@@ -148,6 +154,8 @@ public:
 
     bool IsRunning() const;
     bool AllowWrite() const;
+    bool ObserveOnly() const { return config_.ObserveOnly; }
+    const wchar_t* ScopeName() const;
     // True if name is an advertised non-read-only (write) tool. The kTools table
     // is the single source of truth for write-ness; the engine routes by this.
     bool IsWriteTool(const std::wstring& name) const;
@@ -168,11 +176,14 @@ public:
     std::shared_ptr<McpJob> TryPopJob();
     void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result);
     McpEngineResult OperationStatus(const std::wstring& operationId) const;
+    McpEngineResult DispatchAuthorized(const McpEngineRequest& request, const McpEngineDispatchFn& dispatch) const;
 
 private:
     friend int RunMcpToolCatalogSelfTest();
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
+    void StopLocked();
+    bool AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result) const;
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);
     void AppendAuditLine(const std::wstring& line);
     bool AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstring* error);
@@ -196,7 +207,7 @@ private:
     HANDLE stopEvent_ = nullptr;
     std::atomic<bool> running_{ false };
     std::atomic<bool> stopRequested_{ false };
-    std::mutex stopMutex_;
+    std::mutex lifecycleMutex_;
 
     // Serialized job queue drained by the single engine thread.
     std::mutex queueMutex_;
