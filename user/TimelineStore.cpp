@@ -2561,6 +2561,7 @@ void TimelineStore::Clear()
     EventKeysInOrder.clear();
     EventKeys.clear();
     NextEventId = 1;
+    TiObserverCursor = 0;
     DroppedEvents = 0;
     TiRecentCursorInitialized = false;
     TiRecentCursorSequence = 0;
@@ -2952,6 +2953,60 @@ TimelineIngestResult TimelineStore::IngestSnapshotDiff(
     }
 
     result.Dropped = DroppedEvents - beforeDropped;
+    return result;
+}
+
+TimelineIngestResult TimelineStore::IngestTiObserverActions(const TiObserverSnapshot& snapshot)
+{
+    TimelineIngestResult result{};
+    if (snapshot.Actions.empty()) { return result; }
+    std::lock_guard<std::mutex> lock(Mutex);
+    if (snapshot.Total <= TiObserverCursor) { return result; }
+    const uint64_t first = snapshot.Actions.front().Sequence;
+    if (first > 1 && first - 1 > TiObserverCursor)
+    {
+        result.Warnings.push_back(std::to_wstring(first - 1 - TiObserverCursor) + L" TI observer actions evicted before ingest");
+    }
+    const uint64_t before = DroppedEvents;
+    for (const auto& action : snapshot.Actions)
+    {
+        if (action.Sequence <= TiObserverCursor) { continue; }
+        TimelineEvent row;
+        row.TimestampFileTime = action.ReturnedFileTime;
+        row.Source = L"observer";
+        row.Domain = L"observer_action";
+        row.Entity = L"etw:KnLiveDbg-Ti";
+        row.ProcessId = snapshot.ControllerPid;
+        const wchar_t* effect = L"";
+        switch (action.Request)
+        {
+        case TiObserverRequest::StartSession: row.Action = L"etw.session.start"; effect = L"allocate_session_buffers"; break;
+        case TiObserverRequest::EnableProvider: row.Action = L"etw.provider.enable"; effect = L"change_provider_delivery"; break;
+        case TiObserverRequest::OpenConsumer: row.Action = L"etw.consumer.open"; effect = L"allocate_consumer"; break;
+        case TiObserverRequest::CloseConsumer: row.Action = L"etw.consumer.close"; effect = L"end_consumer_delivery"; break;
+        case TiObserverRequest::QuerySession: row.Action = L"etw.session.query"; effect = L"read_session_properties"; break;
+        case TiObserverRequest::StopSession: row.Action = L"etw.session.stop"; effect = L"stop_session_and_provider_delivery"; break;
+        }
+        const wchar_t* outcome = action.Status == ERROR_SUCCESS ? L"succeeded" : L"failed";
+        if (action.Request == TiObserverRequest::StartSession && action.Status == ERROR_ALREADY_EXISTS) { outcome = L"collision"; }
+        if (action.Request == TiObserverRequest::QuerySession && action.IdentityMismatch) { outcome = L"ownership_mismatch"; }
+        if (action.Request == TiObserverRequest::CloseConsumer && action.Status == ERROR_CTX_CLOSE_PENDING) { outcome = L"close_pending"; }
+        if (action.Request == TiObserverRequest::StopSession && action.Status == ERROR_MORE_DATA) { outcome = L"stopped_properties_truncated"; }
+        if (action.Request == TiObserverRequest::StopSession && action.Status == ERROR_ACTIVE_CONNECTIONS) { outcome = L"stop_in_progress"; }
+        if ((action.Request == TiObserverRequest::StopSession || action.Request == TiObserverRequest::QuerySession) &&
+            action.Status == ERROR_WMI_INSTANCE_NOT_FOUND) { outcome = L"already_absent"; }
+        row.Summary = row.Action + L" " + outcome;
+        row.Evidence = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"}, {L"outcome", outcome},
+            {L"controller_create_time", std::to_wstring(snapshot.ControllerCreateTime)}, {L"sequence", std::to_wstring(action.Sequence)},
+            {L"generation", std::to_wstring(action.Generation)}, {L"requested_utc_filetime", std::to_wstring(action.StartedFileTime)},
+            {L"returned_utc_filetime", std::to_wstring(action.ReturnedFileTime)}, {L"status_domain", L"win32"},
+            {L"status", std::to_wstring(action.Status)}, {L"possible_observer_effect", effect}, {L"effect_verified", L"false"}};
+        if (action.Request == TiObserverRequest::EnableProvider) { row.Evidence[L"provider"] = L"Microsoft-Windows-Threat-Intelligence"; }
+        ++result.SourceRecords;
+        if (AddEventLocked(std::move(row), nullptr, true)) { ++result.Added; }
+        TiObserverCursor = action.Sequence;
+    }
+    result.Dropped = DroppedEvents - before;
     return result;
 }
 
@@ -3685,10 +3740,32 @@ bool TimelineStore::ExportJsonl(const std::wstring& path, std::wstring* error) c
     return WriteSnapshotTextFile(path, BuildTimelineJsonl(events), error);
 }
 
-bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentity* target)
+bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentity* target, bool controllerAction)
 {
-    EnrichTimelineEventProcessContext(&event, Events);
-    NormalizeTimelineEvent(&event);
+    if (controllerAction)
+    {
+        // The PID belongs to the controller. Target-image enrichment or
+        // anomaly inference from an unrelated event would change its meaning.
+        event.Evidence[L"ingest_origin"] = L"local_controller";
+        event.Risk = L"info";
+        event.Confidence = L"controller_reported";
+    }
+    else
+    {
+        if (_wcsicmp(event.Source.c_str(), L"observer") == 0 || _wcsicmp(event.Domain.c_str(), L"observer_action") == 0)
+        {
+            // Evidence lookup accepts aliases and case variants. None of those
+            // spellings can grant a supplied record local controller provenance.
+            for (auto it = event.Evidence.begin(); it != event.Evidence.end(); )
+            {
+                if (TimelineCanonicalEvidenceKey(it->first) == L"ingestorigin") { it = event.Evidence.erase(it); }
+                else { ++it; }
+            }
+            event.Evidence[L"ingest_origin"] = L"supplied_record";
+        }
+        EnrichTimelineEventProcessContext(&event, Events);
+        NormalizeTimelineEvent(&event);
+    }
     auto key = TimelineEventKey(event);
     if (target)
     {

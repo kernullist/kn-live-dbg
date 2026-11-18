@@ -780,6 +780,8 @@ work before judging a quiet run.
 !ti recent 100
 !ti stats
 !ti stop
+!timeline ingest observer
+!timeline query /source observer /domain observer_action
 ```
 
 TI access depends on process protection and Windows policy. The console checks
@@ -789,6 +791,18 @@ JSONL log are separate outputs: a quiet display does not imply no retained
 events, and failed file output does not make the ring durable. Watch changes
 affect live display/selection as documented by `help !ti`; inspect counters and
 log state explicitly.
+
+A TI session name collision returns Win32 183 and leaves the existing logger
+running. The controller checks the GUID on the handle returned by its own
+successful start before requesting a stop. When cleanup is pending, `!ti status`
+shows `trace_resources` and `!ti stop` retries. The observer timeline retains
+the controller's requests and their original Win32 results. For example,
+Win32 `ERROR_MORE_DATA` on a stop means ETW stopped the session and had more
+properties to return. [Windows ControlTraceW contract](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-controltracew)
+
+`KnLiveDbg.exe --self-test ti-ownership` exercises the controller with scripted
+errors and a provider-free private Windows logger. It checks foreign-session
+survival, rollback, same-name replacement and the serialized timeline receipts.
 
 Use [timeline workflows](TIMELINE_COMMAND_USAGE.md) to ingest TI, live kernel
 events and snapshots, query evidence families, export JSONL, and reconcile

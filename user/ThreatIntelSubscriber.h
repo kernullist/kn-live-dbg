@@ -5,6 +5,7 @@
 #include <evntcons.h>
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -72,6 +73,27 @@ struct TiTraceLifecycle
     bool ExitStatusKnown = false;
     bool StopRequested = false;
     bool ExitAfterStopRequest = false;
+};
+
+enum class TiObserverRequest { StartSession, EnableProvider, OpenConsumer, CloseConsumer, QuerySession, StopSession };
+
+struct TiObserverAction
+{
+    uint64_t Sequence = 0;
+    uint64_t Generation = 0;
+    uint64_t StartedFileTime = 0;
+    uint64_t ReturnedFileTime = 0;
+    TiObserverRequest Request{};
+    ULONG Status = 0;
+    bool IdentityMismatch = false;
+};
+
+struct TiObserverSnapshot
+{
+    uint32_t ControllerPid = 0;
+    uint64_t ControllerCreateTime = 0;
+    uint64_t Total = 0;
+    std::vector<TiObserverAction> Actions;
 };
 
 struct TiSequenceSnapshot
@@ -155,6 +177,8 @@ public:
 
     bool Start(const TiOptions& options, std::wstring* error);
     bool Stop(std::wstring* error);
+    bool HasTraceResources() const;
+    TiObserverSnapshot ObserverActions() const;
     bool IsActive() const;
 
     // Every log path this subscriber opened in the process lifetime,
@@ -214,11 +238,14 @@ public:
 
 private:
     friend bool KmonPipelineSelfTest();
+    friend bool TiObserverOwnershipSelfTest(bool native);
     static VOID WINAPI EventRecordCallbackThunk(PEVENT_RECORD eventRecord);
     static ULONG WINAPI BufferCallbackThunk(PEVENT_TRACE_LOGFILEW buffer);
     void OnEventRecord(PEVENT_RECORD eventRecord);
     void ProcessTraceThread(TRACEHANDLE processHandle, uint64_t generation);
     bool StopLocked(std::wstring* error);
+    bool ReleaseSessionLocked(std::wstring* error);
+    void RecordObserverAction(TiObserverRequest request, uint64_t started, ULONG status, bool mismatch = false);
     bool DecodeEvent(PEVENT_RECORD eventRecord, TiEventRecord* out);
     bool DecodePayloadViaTdh(PEVENT_RECORD eventRecord, TiEventRecord* out);
     void DecodePayloadAsRawHex(PEVENT_RECORD eventRecord, TiEventRecord* out);
@@ -246,9 +273,18 @@ private:
 
     // ETW session handles.
     TRACEHANDLE SessionHandle = 0;          // from StartTraceW
+    GUID SessionGuid{};                     // captured on successful acquisition
     TRACEHANDLE ProcessHandle = INVALID_PROCESSTRACE_HANDLE;  // from OpenTraceW
-    std::vector<uint8_t> SessionPropertiesBlob;
     std::wstring SessionName;
+    // StateMutex serializes control calls and their bounded receipts. The
+    // event callback and ProcessTrace worker never write this ledger.
+    std::array<TiObserverAction, 64> ObserverLedger{};
+    uint64_t ObserverTotal = 0;
+    decltype(&::StartTraceW) StartSession = ::StartTraceW;
+    decltype(&::ControlTraceW) ControlSession = ::ControlTraceW;
+    decltype(&::EnableTraceEx2) EnableProvider = ::EnableTraceEx2;
+    decltype(&::OpenTraceW) OpenConsumer = ::OpenTraceW;
+    decltype(&::CloseTrace) CloseConsumer = ::CloseTrace;
 
     // Worker thread that drives ProcessTrace.
     std::thread ProcessThread;
@@ -299,3 +335,4 @@ private:
 };
 
 bool ThreatIntelSubscriberSelfTest();
+bool TiObserverOwnershipSelfTest(bool native);

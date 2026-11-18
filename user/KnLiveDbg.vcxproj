@@ -190,6 +190,7 @@
     <ClCompile Include="QosPolicyScanner.cpp" />
     <ClCompile Include="UserModeHunter.cpp" />
     <ClCompile Include="ThreatIntelSubscriber.cpp" />
+    <ClCompile Include="TiObserverSelfTest.cpp" />
     <ClCompile Include="KmonUserEvidence.cpp" />
     <ClCompile Include="PendingIrpScanner.cpp" />
     <ClCompile Include="PendingIrpBinding.cpp" />

@@ -297,7 +297,8 @@ have separate costs.
   and atomic replacement. They are session artifacts, not reusable credentials.
 - Read-only mode hides write tools and disarms the kernel gate. `--allow-write`
   enables typed mutations. `ti.subscribe start/stop` also requires it despite
-  being an action on a read-catalog entry.
+  being an action on a read-catalog entry. A rejected start or failed cleanup
+  returns a tool error. A session name collision preserves the existing logger.
 - No raw console/kd tool. Callback mutation remains limited to the cooperative
   fixture; arbitrary PID process-protection control is a separate write tool.
 - Current main requires a confirmed kernel write-mode transition before engine

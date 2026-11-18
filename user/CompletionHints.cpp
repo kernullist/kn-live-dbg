@@ -904,7 +904,7 @@ namespace
         { L"dashboard", L"!timeline dashboard", L"write and open the HTML dashboard" },
         { L"reset", L"!timeline reset", L"clear the in-memory timeline" },
         { L"help", L"!timeline help [advanced]", L"compact usage, or advanced ingest/live/query" },
-        { L"ingest", L"!timeline ingest ti|snapshot ...", L"advanced: pull TI ring or a snapshot (hidden from default Tab)" },
+        { L"ingest", L"!timeline ingest ti|observer|snapshot ...", L"advanced: copy TI events, observer actions or a snapshot" },
         { L"update", L"!timeline update [recent|all]", L"advanced: refresh recent evidence" },
         { L"live", L"!timeline live on|off|status", L"advanced: kernel live callbacks" },
         { L"query", L"!timeline query [filters]", L"advanced: list stored events" },
@@ -922,6 +922,7 @@ namespace
     const CompletionHint kTimelineIngestTokens[] =
     {
         { L"ti", L"!timeline ingest ti [recent|all] [/limit]", L"copy TI ring records into the timeline" },
+        { L"observer", L"!timeline ingest observer", L"copy the controller's retained TI control actions into the timeline" },
         { L"snapshot", L"!timeline ingest snapshot [baseline|<path>]", L"ingest a snapshot as timeline events" },
         { L"help", nullptr, L"show ingest usage" },
     };
@@ -1716,7 +1717,7 @@ namespace
         SCOPE(L"targets", L"!timeline targets ti <pid> [after <boot-id> <create-filetime>]", L"list retained TI header-process lifetimes", kHelpOnlyTokens),
         SCOPE(L"", L"!timeline | !timeline dashboard | !timeline reset | !timeline help", L"time-ordered TI/snapshot/live evidence", kTimelineRootTokens),
         SCOPE(L"help", L"!timeline help [advanced]", L"compact or advanced help", kTimelineHelpTokens),
-        SCOPE(L"ingest", L"!timeline ingest ti|snapshot ...", L"pull TI or a snapshot into the store", kTimelineIngestTokens),
+        SCOPE(L"ingest", L"!timeline ingest ti|observer|snapshot ...", L"copy TI events, observer actions or a snapshot", kTimelineIngestTokens),
         SCOPE(L"ingest-ti", L"!timeline ingest ti [recent|all] [/limit]", L"TI ring ingest", kTimelineIngestTiTokens),
         SCOPE(L"ingest-snapshot", L"!timeline ingest snapshot [baseline|<path>]", L"snapshot ingest", kTimelineIngestSnapTokens),
         SCOPE(L"update", L"!timeline update [recent|all] [options]", L"refresh recent evidence", kTimelineUpdateTokens),

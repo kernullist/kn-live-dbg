@@ -205,6 +205,8 @@ Python 3.10 이상으로 `tools/test-mcp-observe-tls.py --exe <KnLiveDbg.exe> --
   비밀을 포함한 보조 파일은 현재 사용자 DACL과 원자적 교체를 사용한다.
 - 읽기 모드는 쓰기 도구를 숨기고 커널 gate도 끈다. `--allow-write`가 typed
   변경을 허용하며 읽기 목록에 있는 `ti.subscribe`의 start/stop도 이 권한이 필요하다.
+  시작이 거부되거나 정리가 실패하면 도구 오류를 반환한다. 세션 이름이 충돌하면
+  기존 세션은 계속 실행된다.
 - raw 콘솔/kd 도구는 없다. 콜백 변경은 협력형 fixture에만 허용한다.
   별도 process-protection 쓰기 도구는 명시한 PID도 지원한다.
 - 현재 main은 커널 쓰기 모드 확인에 성공해야 엔진 작업을 실행한다.

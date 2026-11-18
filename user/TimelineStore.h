@@ -95,6 +95,7 @@ public:
         const std::wstring& sourceName);
     TimelineIngestResult IngestEvents(
         const std::vector<TimelineEvent>& events);
+    TimelineIngestResult IngestTiObserverActions(const TiObserverSnapshot& snapshot);
 
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
@@ -127,7 +128,7 @@ public:
     uint64_t GetTiRecentCursorSequence(bool* initialized) const;
 
 private:
-    bool AddEventLocked(TimelineEvent event, const ObservationIdentity* target = nullptr);
+    bool AddEventLocked(TimelineEvent event, const ObservationIdentity* target = nullptr, bool controllerAction = false);
     void DropOldestEventLocked();
     uint64_t NextEventIdLocked();
 
@@ -141,6 +142,7 @@ private:
     std::deque<RetainedKey> EventKeysInOrder;
     std::set<std::wstring> EventKeys;
     uint64_t NextEventId = 1;
+    uint64_t TiObserverCursor = 0;
     uint64_t DroppedEvents = 0;
     bool TiRecentCursorInitialized = false;
     uint64_t TiRecentCursorSequence = 0; // last ingested ring Sequence

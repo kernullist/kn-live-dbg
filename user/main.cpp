@@ -116,6 +116,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -850,8 +851,7 @@ static BOOL WINAPI ConsoleHandler(DWORD controlType)
         if (sub != nullptr)
         {
             std::wstring stopError;
-            sub->Stop(&stopError);
-            g_TiSubscriberForShutdown.store(nullptr);
+            if (sub->Stop(&stopError)) { g_TiSubscriberForShutdown.store(nullptr); }
         }
         g_StopRequested = true;
         if (g_MainThreadHandle != nullptr)
@@ -20571,6 +20571,7 @@ static void PrintTiHelp()
     std::wcout << L"            [/log <path>] [/ring <N>]\n";
     std::wcout << L"  !ti stop\n";
     std::wcout << L"  !ti status\n";
+    std::wcout << L"  !timeline ingest observer    retain this controller's ETW lifecycle receipts\n";
     std::wcout << L"  !ti add /pid <PID> | /name <imageName>\n";
     std::wcout << L"  !ti remove /pid <PID> | /name <imageName>\n";
     std::wcout << L"  !ti watch                live tail (Ctrl+C to exit)\n";
@@ -20889,9 +20890,15 @@ static void HandleTiCommand(
     const std::vector<std::wstring>& args,
     DebuggerState& state,
     DeviceClient& device,
-    SymbolEngine& symbols)
+    SymbolEngine& symbols,
+    std::wstring* lifecycleError = nullptr)
 {
     TiSubscriber& sub = GetTiSubscriberInstance();
+    auto reportLifecycle = [&](std::wstring_view message)
+    {
+        if (lifecycleError) { lifecycleError->assign(message); }
+    };
+    reportLifecycle(L"invalid TI lifecycle request");
 
     do
     {
@@ -20916,6 +20923,7 @@ static void HandleTiCommand(
         {
             if (sub.IsActive())
             {
+                reportLifecycle(L"TI subscriber is already active");
                 std::wcerr << L"!ti: subscriber already active. use '!ti stop' first or '!ti add' to extend watch.\n";
                 break;
             }
@@ -20925,6 +20933,7 @@ static void HandleTiCommand(
             std::wstring parseError;
             if (!ParseTiStartArgs(args, 2, &options, &parseError))
             {
+                reportLifecycle(parseError);
                 std::wcerr << L"!ti start: " << parseError << L"\n";
                 PrintTiHelp();
                 break;
@@ -20932,6 +20941,7 @@ static void HandleTiCommand(
 
             if (!device.IsOpen())
             {
+                reportLifecycle(L"TI start requires an open driver device");
                 std::wcerr << L"!ti start requires the KnLiveDbg.sys driver device to be open\n";
                 break;
             }
@@ -20946,6 +20956,7 @@ static void HandleTiCommand(
             {
                 if (gateError.empty())
                 {
+                    reportLifecycle(L"TI start rejected by the process protection prerequisite");
                     std::wcerr << L"!ti start: this process is not PPL Antimalware (current Protection=0x"
                                << std::hex << std::setw(2) << std::setfill(L'0')
                                << static_cast<unsigned>(protByte) << std::dec
@@ -20967,16 +20978,15 @@ static void HandleTiCommand(
             // Register for the hard-exit cleanup path BEFORE Start() so a
             // CTRL_CLOSE that arrives in the microsecond gap between Start
             // returning and a post-Start store still tears the session down.
-            // Stop() is idempotent (atomic exchange on Active) so calling
-            // it on a never-started subscriber is a no-op.
+            // Stop() serializes with Start() and needs a successfully acquired handle.
             g_TiSubscriberForShutdown.store(&sub);
 
             DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &options.LogDirectory);
             std::wstring startError;
             if (!sub.Start(options, &startError))
             {
-                // Roll back the registration on failure.
-                g_TiSubscriberForShutdown.store(nullptr);
+                reportLifecycle(startError);
+                if (!sub.HasTraceResources()) { g_TiSubscriberForShutdown.store(nullptr); }
                 std::wcerr << L"!ti start failed: " << startError << L"\n";
                 break;
             }
@@ -20984,6 +20994,7 @@ static void HandleTiCommand(
             PrintColoredText(L"[ti]", KNDBG_COLOR_TITLE);
             std::wcout << L" subscribed to Microsoft-Windows-Threat-Intelligence (all tasks)\n";
             TiSubscriberStats startStats = sub.SnapshotStats();
+            reportLifecycle(L"");
             TiOptions current = sub.CurrentOptions();
             std::wcout << L"     log directory=" << current.LogDirectory
                        << L" base=" << current.LogBaseName
@@ -21021,17 +21032,25 @@ static void HandleTiCommand(
 
         if (action == L"stop")
         {
-            if (!sub.IsActive())
+            if (!sub.HasTraceResources())
             {
+                reportLifecycle(L"TI subscriber has no owned trace resources");
                 std::wcerr << L"!ti: subscriber not active.\n";
                 break;
             }
             std::wstring stopError;
-            sub.Stop(&stopError);
+            if (!sub.Stop(&stopError))
+            {
+                reportLifecycle(stopError);
+                if (!sub.HasTraceResources()) { g_TiSubscriberForShutdown.store(nullptr); }
+                std::wcerr << L"!ti stop: " << stopError << L"\n";
+                break;
+            }
             // Unregister AFTER Stop so the hard-exit path remains armed
             // during the teardown. Stop() is idempotent, so a CTRL_CLOSE
             // racing with our manual stop is harmless either way.
             g_TiSubscriberForShutdown.store(nullptr);
+            reportLifecycle(L"");
             PrintColoredText(L"[ti]", KNDBG_COLOR_TITLE);
             std::wcout << L" stopped. ring and log are kept; use '!ti clear' to drop the ring.\n";
             break;
@@ -21039,11 +21058,14 @@ static void HandleTiCommand(
 
         if (action == L"status")
         {
+            reportLifecycle(L"");
             TiSubscriberStats s = sub.SnapshotStats();
             TiOptions opt = sub.CurrentOptions();
             PrintColoredText(L"[ti.status]", KNDBG_COLOR_TITLE);
             std::wcout << L" active=" << (sub.IsActive() ? L"yes" : L"no")
                        << L" live=" << (sub.IsLiveOutputEnabled() ? L"yes" : L"no")
+                       << L" trace_resources=" << (sub.HasTraceResources() ? L"held" : L"none")
+                       << L" start_status=" << s.Trace.StartStatus
                        << L"\n";
             std::wcout << L"  events received=" << s.EventsReceived
                        << L" kept=" << s.EventsKept
@@ -21337,6 +21359,7 @@ static void PrintTimelineAdvancedHelp()
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
+    std::wcout << L"  !timeline ingest observer   copy retained TI controller requests and their native results\n";
     std::wcout << L"  !timeline targets ti <pid> [after <boot-id> <create-filetime>]  List retained TI header-process lifetimes.\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
@@ -22714,6 +22737,8 @@ static void RefreshTimelineDashboardEvidence(
     std::vector<std::wstring>* warnings)
 {
     TiSubscriber& ti = GetTiSubscriberInstance();
+    const auto observer = state.Timeline.IngestTiObserverActions(ti.ObserverActions());
+    AddTimelineDashboardWarnings(warnings, observer.Warnings);
     TiSubscriberStats tiStats = ti.SnapshotStats();
     bool tiActive = ti.IsActive();
     // Pull only records at/after the TI recent cursor so a 1M ring is not
@@ -24215,7 +24240,7 @@ static void HandleKmonCommand(
                 DefaultLogDirectoryToOriginalExe(state.CloakActive, state.Cloak.OriginalExePath, &tiOptions.LogDirectory);
                 if (!ti.Start(tiOptions, &startError))
                 {
-                    g_TiSubscriberForShutdown.store(nullptr);
+                    if (!ti.HasTraceResources()) { g_TiSubscriberForShutdown.store(nullptr); }
                     std::wcerr << L"!kmon start: TI subscribe failed: " << startError << L"\n";
                     break;
                 }
@@ -24233,8 +24258,8 @@ static void HandleKmonCommand(
                 if (startedTiHere)
                 {
                     std::wstring stopError;
-                    ti.Stop(&stopError);
-                    g_TiSubscriberForShutdown.store(nullptr);
+                    if (ti.Stop(&stopError)) { g_TiSubscriberForShutdown.store(nullptr); }
+                    else { std::wcerr << L"TI cleanup: " << stopError << L"\n"; }
                 }
                 std::wcerr << L"!kmon start: kernel live callbacks were not enabled\n";
                 break;
@@ -24256,8 +24281,8 @@ static void HandleKmonCommand(
                 if (startedTiHere)
                 {
                     std::wstring stopError;
-                    ti.Stop(&stopError);
-                    g_TiSubscriberForShutdown.store(nullptr);
+                    if (ti.Stop(&stopError)) { g_TiSubscriberForShutdown.store(nullptr); }
+                    else { std::wcerr << L"TI cleanup: " << stopError << L"\n"; }
                 }
                 if (!liveWasActive)
                 {
@@ -25149,6 +25174,8 @@ static void HandleTimelineCommand(
                 update.Mode,
                 update.Limit);
             PrintTimelineIngestResult(L"ti", tiResult);
+            const auto observer = state.Timeline.IngestTiObserverActions(sub.ObserverActions());
+            if (observer.SourceRecords || !observer.Warnings.empty()) { PrintTimelineIngestResult(L"observer", observer); }
 
             if (state.HasSnapshotBaseline)
             {
@@ -25524,11 +25551,20 @@ static void HandleTimelineCommand(
         {
             if (args.size() < 3)
             {
-                std::wcerr << L"usage: !timeline ingest ti|snapshot ...\n";
+                std::wcerr << L"usage: !timeline ingest ti|observer|snapshot ...\n";
                 break;
             }
 
             std::wstring source = ToLower(args[2]);
+            if (source == L"observer")
+            {
+                if (args.size() != 3) { std::wcerr << L"usage: !timeline ingest observer\n"; break; }
+                const auto actions = GetTiSubscriberInstance().ObserverActions();
+                auto result = state.Timeline.IngestTiObserverActions(actions);
+                PrintTimelineIngestResult(L"observer", result);
+                std::wcout << L"  TI control calls=" << actions.Total << L" retained=" << actions.Actions.size() << L"\n";
+                break;
+            }
             if (source == L"ti")
             {
                 std::wstring mode = L"recent";
@@ -25637,7 +25673,7 @@ static void HandleTimelineCommand(
                 break;
             }
 
-            std::wcerr << L"!timeline ingest: source must be ti or snapshot\n";
+            std::wcerr << L"!timeline ingest: source must be ti, observer or snapshot\n";
             break;
         }
 
@@ -30388,6 +30424,11 @@ static int RunConsoleSurfaceSelfTest()
         CheckCompletionCandidate(
             &context,
             {L"!timeline", L"ingest"},
+            L"observer",
+            L"timeline-ingest-observer-completion");
+        CheckCompletionCandidate(
+            &context,
+            {L"!timeline", L"ingest"},
             L"snapshot",
             L"timeline-ingest-snapshot-completion");
         CheckCompletionCandidate(
@@ -30858,6 +30899,28 @@ static int RunConsoleSurfaceSelfTest()
             &context,
             ThreatIntelSubscriberSelfTest(),
             L"ti-consumer-lifecycle");
+        CheckConsoleSurfaceSelfTest(&context, TiObserverOwnershipSelfTest(false), L"ti-session-ownership-and-observer-timeline");
+        {
+            DebuggerState state{};
+            DeviceClient unopened;
+            SymbolEngine symbols;
+            std::wstring startError, stopError, statusError;
+            std::wostringstream output, diagnostics;
+            auto* savedOutput = std::wcout.rdbuf(output.rdbuf());
+            auto* savedErrors = std::wcerr.rdbuf(diagnostics.rdbuf());
+            HandleTiCommand({L"!ti", L"start"}, state, unopened, symbols, &startError);
+            HandleTiCommand({L"!ti", L"stop"}, state, unopened, symbols, &stopError);
+            HandleTiCommand({L"!ti", L"status"}, state, unopened, symbols, &statusError);
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            std::wcout.rdbuf(savedOutput);
+            std::wcerr.rdbuf(savedErrors);
+            CheckConsoleSurfaceSelfTest(&context,
+                startError == L"TI start requires an open driver device" &&
+                stopError == L"TI subscriber has no owned trace resources" && statusError.empty() &&
+                output.str().find(L"trace_resources=none") != std::wstring::npos &&
+                output.str().find(L"TI control calls=0 retained=0") != std::wstring::npos,
+                L"ti-command-rejection-and-idle-ingest");
+        }
         CheckConsoleSurfaceSelfTest(
             &context,
             EtwTiCrossSelfTest(),
@@ -31813,7 +31876,8 @@ static int RunConsoleSurfaceSelfTest()
         std::wstring suffixHelpOutput = advancedCapture.str();
         CheckConsoleSurfaceSelfTest(
             &context,
-            suffixHelpOutput.find(L"!timeline ingest ti") != std::wstring::npos,
+            suffixHelpOutput.find(L"!timeline ingest ti") != std::wstring::npos &&
+                suffixHelpOutput.find(L"!timeline ingest observer") != std::wstring::npos,
             L"advanced-help-routes-timeline");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -46893,14 +46957,16 @@ static bool ExecuteAiCapabilityTiSubscribe(
         PrintColoredText(L"ai tool", KNDBG_COLOR_TITLE);
         std::wcout << L": ti.subscribe\n";
         std::wcout << L"tool> " << JoinArgs(args, 0) << L"\n";
-        HandleTiCommand(args, state, device, symbols);
+        std::wstring lifecycleError;
+        HandleTiCommand(args, state, device, symbols, &lifecycleError);
 
         if (structuredJsonOut != nullptr)
         {
             TiSubscriber& ti = GetTiSubscriberInstance();
             *structuredJsonOut = BuildMcpTiStatsJson(ti.SnapshotStats(), ti.IsActive());
         }
-        ok = true;
+        ok = lifecycleError.empty();
+        if (!ok && error) { *error = std::move(lifecycleError); }
     } while (false);
 
     return ok;
@@ -54200,6 +54266,10 @@ int wmain(int argc, wchar_t** argv)
         if (argc >= 3 && ToLower(argv[2]) == L"timeline")
         {
             return RunTimelineSelfTest();
+        }
+        if (argc == 3 && ToLower(argv[2]) == L"ti-ownership")
+        {
+            return TiObserverOwnershipSelfTest(false) && TiObserverOwnershipSelfTest(true) ? 0 : 1;
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-tools")
         {

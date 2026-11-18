@@ -138,6 +138,27 @@ address, size, protection, access, and start address are also promoted to stable
 keys such as `memory_address`, `allocation_size`, `protection`,
 `desired_access`, and `start_address`.
 
+### Inspect this controller's TI requests
+
+```text
+!timeline ingest observer
+!timeline query /source observer /domain observer_action
+```
+
+The controller keeps its latest 64 ETW lifecycle requests across subscription
+attempts. Dashboard refresh and explicit ingest copy new receipts to the
+timeline. The ingest reports how many requests were evicted before it could
+copy them. Each receipt identifies the controller PID and creation time, session
+generation, request and return times, native Win32 status and outcome. The
+possible effect describes what the request could change. `effect_verified=false`
+means the controller did not independently measure that effect.
+
+A session name or GUID collision records `collision` and leaves the existing
+logger running. After a partial start, `!ti status` shows whether trace resources
+still need cleanup. Use `!ti stop` to retry. Locally captured receipts carry
+`ingest_origin=local_controller`. An observer row submitted through generic
+event ingestion carries `ingest_origin=supplied_record`.
+
 ## Scenario: Live Process/Thread/Image Tracking
 
 ```text
@@ -201,6 +222,7 @@ The advanced surface includes:
 !timeline status
 !timeline clear
 !timeline ingest ti [recent|all] [/limit <n>]
+!timeline ingest observer
 !timeline ingest snapshot [baseline|<path>]
 !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]
 !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]

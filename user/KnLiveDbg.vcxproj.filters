@@ -205,6 +205,9 @@
     <ClCompile Include="ThreatIntelSubscriber.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TiObserverSelfTest.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="KmonUserEvidence.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

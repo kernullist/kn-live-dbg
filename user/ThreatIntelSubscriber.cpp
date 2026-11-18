@@ -383,7 +383,8 @@ namespace
         // FileTimeToSystemTime. With ClientContext = 1 (QPC) the value would
         // be raw QPC counts and our JSONL "ts" field would be garbage.
         p->Wnode.ClientContext = 2;
-        UuidCreate(&p->Wnode.Guid);
+        const RPC_STATUS uuid = UuidCreate(&p->Wnode.Guid);
+        if (uuid != RPC_S_OK && uuid != RPC_S_UUID_LOCAL_ONLY) { return false; }
 
         p->BufferSize = 64;          // 64 KB per ETW buffer
         p->MinimumBuffers = 8;
@@ -411,6 +412,13 @@ namespace
         lifecycle->ExitTickMs = tickMs;
         lifecycle->ExitAfterStopRequest = lifecycle->StopRequested;
         return true;
+    }
+
+    uint64_t TiActionTime()
+    {
+        FILETIME utc{};
+        GetSystemTimePreciseAsFileTime(&utc);
+        return (uint64_t(utc.dwHighDateTime) << 32) | utc.dwLowDateTime;
     }
 
     TiSequenceSnapshot SnapshotTiSequenceRange(
@@ -457,11 +465,48 @@ TiSubscriber::~TiSubscriber()
 {
     std::wstring err;
     Stop(&err);
+    // Callbacks retain this object's address until ProcessTrace returns.
+    if (ProcessThread.joinable()) { ProcessThread.join(); }
 }
 
 bool TiSubscriber::IsActive() const
 {
     return Active.load();
+}
+
+bool TiSubscriber::HasTraceResources() const
+{
+    std::lock_guard<std::mutex> lock(StateMutex);
+    return SessionHandle || ProcessHandle != INVALID_PROCESSTRACE_HANDLE || ProcessThread.joinable();
+}
+
+void TiSubscriber::RecordObserverAction(TiObserverRequest request, uint64_t started, ULONG status, bool mismatch)
+{
+    const uint64_t next = ObserverTotal + 1;
+    ObserverLedger[ObserverTotal % ObserverLedger.size()] =
+        {next, TraceLifecycle.Generation, started, TiActionTime(), request, status, mismatch};
+    ObserverTotal = next;
+}
+
+TiObserverSnapshot TiSubscriber::ObserverActions() const
+{
+    std::lock_guard<std::mutex> lock(StateMutex);
+    TiObserverSnapshot snapshot;
+    if (!ObserverTotal) { return snapshot; }
+    snapshot.ControllerPid = GetCurrentProcessId();
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+    {
+        snapshot.ControllerCreateTime = (uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    }
+    snapshot.Total = ObserverTotal;
+    const auto retained = (std::min)(ObserverTotal, static_cast<uint64_t>(ObserverLedger.size()));
+    snapshot.Actions.reserve(static_cast<size_t>(retained));
+    for (uint64_t i = ObserverTotal - retained; i < ObserverTotal; ++i)
+    {
+        snapshot.Actions.push_back(ObserverLedger[i % ObserverLedger.size()]);
+    }
+    return snapshot;
 }
 
 std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid, uint64_t eventTimestamp,
@@ -561,7 +606,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     if (ProcessThread.joinable() || SessionHandle != 0 ||
         ProcessHandle != INVALID_PROCESSTRACE_HANDLE)
     {
-        StopLocked(nullptr);
+        if (!StopLocked(error)) { return false; }
     }
 
     uint64_t generation = 0;
@@ -581,6 +626,14 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     {
         std::lock_guard<std::mutex> traceLock(TraceMutex);
         TraceLifecycle.StartStatus = status;
+    };
+    const auto failAfterCreate = [&](ULONG code, std::wstring message)
+    {
+        setStartStatus(code);
+        std::wstring cleanup;
+        if (!StopLocked(&cleanup)) { message += L"; cleanup: " + cleanup; }
+        if (error) { *error = std::move(message); }
+        return false;
     };
 
     Options = options;
@@ -648,40 +701,33 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         ImageCache.clear();
     }
 
-    // Tear down any leftover session with this name from a prior crash.
+    std::vector<uint8_t> properties;
+    if (!BuildRealtimeSessionProperties(SessionName, &properties))
     {
-        std::vector<uint8_t> stopBlob;
-        BuildRealtimeSessionProperties(SessionName, &stopBlob);
-        ControlTraceW(0, SessionName.c_str(),
-                      reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stopBlob.data()),
-                      EVENT_TRACE_CONTROL_STOP);
+        setStartStatus(ERROR_GEN_FAILURE);
+        if (error) { *error = L"could not create a TI session identity"; }
+        return false;
     }
-
-    BuildRealtimeSessionProperties(SessionName, &SessionPropertiesBlob);
     EVENT_TRACE_PROPERTIES* props =
-        reinterpret_cast<EVENT_TRACE_PROPERTIES*>(SessionPropertiesBlob.data());
+        reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties.data());
 
-    ULONG status = StartTraceW(&SessionHandle, SessionName.c_str(), props);
-    if (status == ERROR_ALREADY_EXISTS)
-    {
-        ControlTraceW(0, SessionName.c_str(), props, EVENT_TRACE_CONTROL_STOP);
-        // StartTraceW mutates the props buffer on failure (writes back
-        // session UUID etc.). Rebuild from scratch before retrying so the
-        // second call does not see a half-initialised blob.
-        BuildRealtimeSessionProperties(SessionName, &SessionPropertiesBlob);
-        props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(SessionPropertiesBlob.data());
-        status = StartTraceW(&SessionHandle, SessionName.c_str(), props);
-    }
+    TRACEHANDLE created = 0;
+    const GUID requestedGuid = props->Wnode.Guid;
+    auto started = TiActionTime();
+    ULONG status = StartSession(&created, SessionName.c_str(), props);
+    RecordObserverAction(TiObserverRequest::StartSession, started, status);
     if (status != ERROR_SUCCESS)
     {
         setStartStatus(status);
         if (error != nullptr)
         {
-            *error = L"StartTraceW failed: " + std::to_wstring(status);
+            *error = status == ERROR_ALREADY_EXISTS ? L"TI session name or GUID is in use (183); existing session preserved" :
+                L"StartTraceW failed: " + std::to_wstring(status);
         }
-        SessionHandle = 0;
         return false;
     }
+    SessionHandle = created;
+    SessionGuid = requestedGuid;
 
     // Enable with stack tracing: the TI provider is manifest-based, so
     // callstacks are requested through ENABLE_TRACE_PARAMETERS with
@@ -696,7 +742,8 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         enableParams.EnableProperty |= EVENT_ENABLE_PROPERTY_STACK_TRACE;
     }
 
-    status = EnableTraceEx2(
+    started = TiActionTime();
+    status = EnableProvider(
         SessionHandle,
         &kThreatIntelligenceProviderGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
@@ -705,23 +752,11 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
         kThreatIntelMatchAllKeyword,
         0,
         &enableParams);
+    RecordObserverAction(TiObserverRequest::EnableProvider, started, status);
 
     if (status != ERROR_SUCCESS)
     {
-        setStartStatus(status);
-        ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        SessionHandle = 0;
-        if (error != nullptr)
-        {
-            std::wstring extra;
-            if (status == ERROR_ACCESS_DENIED)
-            {
-                extra = L" (Microsoft-Windows-Threat-Intelligence requires the consumer to "
-                        L"be a PPL Antimalware process; run 'set-ppl-antimalware' first)";
-            }
-            *error = L"EnableTraceEx2 failed: " + std::to_wstring(status) + extra;
-        }
-        return false;
+        return failAfterCreate(status, L"EnableTraceEx2 failed: " + std::to_wstring(status));
     }
 
     EVENT_TRACE_LOGFILEW logfile = {};
@@ -732,21 +767,13 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     logfile.BufferCallback = &TiSubscriber::BufferCallbackThunk;
     logfile.Context = this;
 
-    ProcessHandle = OpenTraceW(&logfile);
+    started = TiActionTime();
+    ProcessHandle = OpenConsumer(&logfile);
+    const DWORD openStatus = ProcessHandle == INVALID_PROCESSTRACE_HANDLE ? GetLastError() : ERROR_SUCCESS;
+    RecordObserverAction(TiObserverRequest::OpenConsumer, started, openStatus);
     if (ProcessHandle == INVALID_PROCESSTRACE_HANDLE)
     {
-        DWORD gle = GetLastError();
-        setStartStatus(gle);
-        EnableTraceEx2(SessionHandle, &kThreatIntelligenceProviderGuid,
-                       EVENT_CONTROL_CODE_DISABLE_PROVIDER,
-                       TRACE_LEVEL_VERBOSE, 0, 0, 0, nullptr);
-        ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        SessionHandle = 0;
-        if (error != nullptr)
-        {
-            *error = L"OpenTraceW failed (gle=" + std::to_wstring(gle) + L")";
-        }
-        return false;
+        return failAfterCreate(openStatus, L"OpenTraceW failed: " + std::to_wstring(openStatus));
     }
 
     // Logging is part of the subscription contract. Create the requested
@@ -769,14 +796,8 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
     if (logError != ERROR_SUCCESS)
     {
         Stats.LastLogError.store(logError);
-        setStartStatus(logError);
-        StopLocked(nullptr);
-        if (error != nullptr)
-        {
-            *error = L"TI log initialization failed (gle=" + std::to_wstring(logError) +
-                L"): " + Options.LogDirectory;
-        }
-        return false;
+        return failAfterCreate(logError, L"TI log initialization failed (gle=" + std::to_wstring(logError) +
+            L"): " + Options.LogDirectory);
     }
 
     ProcessTraceShouldExit.store(false);
@@ -798,12 +819,7 @@ bool TiSubscriber::Start(const TiOptions& options, std::wstring* error)
             TraceLifecycle.ThreadRunning = false;
             Active.store(false);
         }
-        StopLocked(nullptr);
-        if (error != nullptr)
-        {
-            *error = L"could not create TI trace consumer thread";
-        }
-        return false;
+        return failAfterCreate(ERROR_NOT_ENOUGH_MEMORY, L"could not create TI trace consumer thread");
     }
 
     return true;
@@ -819,86 +835,98 @@ bool TiSubscriber::Stop(std::wstring* error)
     return StopLocked(error);
 }
 
+bool TiSubscriber::ReleaseSessionLocked(std::wstring* error)
+{
+    if (!SessionHandle) { return true; }
+    // Query by handle, with independent room for both strings written by ETW.
+    // A public logger name, or a handle left by a failed start, conveys no ownership.
+    struct ControlBuffer
+    {
+        EVENT_TRACE_PROPERTIES Properties{};
+        wchar_t Logger[1025]{};
+        wchar_t File[1025]{};
+    } buffer;
+    auto prepare = [&]()
+    {
+        buffer.Properties = {};
+        buffer.Properties.Wnode.BufferSize = sizeof(buffer);
+        buffer.Properties.Wnode.Guid = SessionGuid;
+        buffer.Logger[0] = buffer.File[0] = L'\0';
+        buffer.Properties.LoggerNameOffset = offsetof(ControlBuffer, Logger);
+        buffer.Properties.LogFileNameOffset = offsetof(ControlBuffer, File);
+    };
+    prepare();
+    auto started = TiActionTime();
+    ULONG status = ControlSession(SessionHandle, nullptr, &buffer.Properties, EVENT_TRACE_CONTROL_QUERY);
+    const bool mismatch = status == ERROR_SUCCESS && !IsEqualGUID(buffer.Properties.Wnode.Guid, SessionGuid);
+    RecordObserverAction(TiObserverRequest::QuerySession, started, status, mismatch);
+    if (mismatch)
+    {
+        SessionHandle = 0;
+        if (error) { *error = L"TI session identity changed; stopped before sending a stop request"; }
+        return false;
+    }
+    bool released = status == ERROR_WMI_INSTANCE_NOT_FOUND;
+    if (status == ERROR_SUCCESS)
+    {
+        prepare();
+        started = TiActionTime();
+        status = ControlSession(SessionHandle, nullptr, &buffer.Properties, EVENT_TRACE_CONTROL_STOP);
+        RecordObserverAction(TiObserverRequest::StopSession, started, status);
+        // For STOP, ERROR_MORE_DATA describes the returned properties. ETW has
+        // already stopped the session. The same code on QUERY is inconclusive.
+        released = status == ERROR_SUCCESS || status == ERROR_MORE_DATA || status == ERROR_WMI_INSTANCE_NOT_FOUND;
+    }
+    if (released || status == ERROR_INVALID_HANDLE) { SessionHandle = 0; }
+    if (!released && error) { *error = L"TI session cleanup unconfirmed (Win32 " + std::to_wstring(status) + L")"; }
+    return released;
+}
+
 bool TiSubscriber::StopLocked(std::wstring* error)
 {
-
-    bool wasActive = false;
+    if (error) { error->clear(); }
+    if (SessionHandle || ProcessHandle != INVALID_PROCESSTRACE_HANDLE || ProcessThread.joinable())
     {
         std::lock_guard<std::mutex> traceLock(TraceMutex);
         TraceLifecycle.StopRequested = true;
-        wasActive = Active.exchange(false);
+        Active.store(false);
         ProcessTraceShouldExit.store(true);
     }
 
-    // Closing the process handle causes ProcessTrace to return.
+    ULONG closeStatus = ERROR_SUCCESS;
     if (ProcessHandle != INVALID_PROCESSTRACE_HANDLE)
     {
-        CloseTrace(ProcessHandle);
+        const auto started = TiActionTime();
+        closeStatus = CloseConsumer(ProcessHandle);
+        RecordObserverAction(TiObserverRequest::CloseConsumer, started, closeStatus);
+        if (closeStatus == ERROR_SUCCESS || closeStatus == ERROR_CTX_CLOSE_PENDING || closeStatus == ERROR_INVALID_HANDLE)
+        {
+            ProcessHandle = INVALID_PROCESSTRACE_HANDLE;
+        }
     }
-
+    // Stopping the owned logger also disables its provider. It can wake the
+    // worker even when closing the consumer returned an error.
+    const bool released = ReleaseSessionLocked(error);
+    const bool closed = closeStatus == ERROR_SUCCESS || closeStatus == ERROR_CTX_CLOSE_PENDING;
+    if (!closed && error)
+    {
+        if (!error->empty()) { error->append(L"; "); }
+        error->append(L"CloseTrace returned " + std::to_wstring(closeStatus));
+    }
     if (ProcessThread.joinable())
     {
+        bool running;
+        { std::lock_guard<std::mutex> traceLock(TraceMutex); running = TraceLifecycle.ThreadRunning; }
+        // A rejected close leaves a live consumer eligible for retry. Holding
+        // StateMutex across its join would prevent another stop from closing it.
+        if (running && ProcessHandle != INVALID_PROCESSTRACE_HANDLE) { return false; }
         ProcessThread.join();
     }
-    ProcessHandle = INVALID_PROCESSTRACE_HANDLE;
-
-    // Disable provider and stop the session when Start opened one.
-    if (SessionHandle != 0)
-    {
-        EnableTraceEx2(
-            SessionHandle,
-            &kThreatIntelligenceProviderGuid,
-            EVENT_CONTROL_CODE_DISABLE_PROVIDER,
-            TRACE_LEVEL_VERBOSE,
-            0, 0, 0, nullptr);
-
-        if (!SessionPropertiesBlob.empty())
-        {
-            EVENT_TRACE_PROPERTIES* props =
-                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(SessionPropertiesBlob.data());
-            ControlTraceW(SessionHandle, nullptr, props, EVENT_TRACE_CONTROL_STOP);
-        }
-        else
-        {
-            // Partial start may not have built SessionPropertiesBlob yet; still
-            // try a name-based stop for leftover realtime sessions.
-            std::vector<uint8_t> stopBlob;
-            BuildRealtimeSessionProperties(SessionName.empty() ? kDefaultSessionName : SessionName, &stopBlob);
-            ControlTraceW(
-                0,
-                (SessionName.empty() ? kDefaultSessionName : SessionName.c_str()),
-                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stopBlob.data()),
-                EVENT_TRACE_CONTROL_STOP);
-        }
-        SessionHandle = 0;
-    }
-    else if (!wasActive)
-    {
-        // Best-effort: if Active never flipped but a named session may exist
-        // from a half-started attempt, try stop-by-name.
-        if (!SessionName.empty())
-        {
-            std::vector<uint8_t> stopBlob;
-            BuildRealtimeSessionProperties(SessionName, &stopBlob);
-            ControlTraceW(
-                0,
-                SessionName.c_str(),
-                reinterpret_cast<EVENT_TRACE_PROPERTIES*>(stopBlob.data()),
-                EVENT_TRACE_CONTROL_STOP);
-        }
-    }
-
-    // Close log file.
     {
         std::lock_guard<std::mutex> logLock(LogMutex);
         CloseLogLocked();
     }
-
-    if (error != nullptr)
-    {
-        error->clear();
-    }
-    return true;
+    return released && closed;
 }
 
 VOID WINAPI TiSubscriber::EventRecordCallbackThunk(PEVENT_RECORD eventRecord)

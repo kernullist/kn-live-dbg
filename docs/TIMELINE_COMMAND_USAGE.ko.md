@@ -129,6 +129,26 @@ relationship row에서 cross-process/memory pivot으로 보인다.
 같은 공통 field는 `memory_address`, `allocation_size`, `protection`,
 `desired_access`, `start_address` 같은 표준 key로도 승격된다.
 
+### 이 컨트롤러의 TI 요청 확인
+
+```text
+!timeline ingest observer
+!timeline query /source observer /domain observer_action
+```
+
+컨트롤러는 구독 시도 전체에 걸쳐 최근 ETW 제어 요청 64개를 보관한다.
+대시보드를 새로 고치거나 위 명령을 실행하면 새 기록을 타임라인으로 복사한다.
+복사하기 전에 밀려난 기록이 있으면 그 개수를 표시한다. 각 기록에는 컨트롤러
+PID와 프로세스 생성 시각, 세션 세대, 요청·반환 시각, Win32 상태 코드와
+처리 결과가 담긴다. `possible_observer_effect`는 요청이 일으킬 수 있는 영향을
+설명한다. `effect_verified=false`이면 실제 영향은 별도로 측정하지 않았다.
+
+세션 이름이나 GUID가 충돌하면 `collision`을 기록하고 기존 세션은 계속 실행된다.
+시작 도중 실패했을 때는 `!ti status`의 `trace_resources`로 정리할 자원이
+있는지 확인하고 `!ti stop`으로 정리를 재시도한다. 컨트롤러가 직접 수집한
+기록의 출처는 `ingest_origin=local_controller`다. 일반 이벤트 입력 경로로
+받은 관찰자 기록에는 `ingest_origin=supplied_record`가 붙는다.
+
 ## Scenario: Live process/thread/image 추적
 
 ```text
@@ -190,6 +210,7 @@ advanced surface:
 !timeline status
 !timeline clear
 !timeline ingest ti [recent|all] [/limit <n>]
+!timeline ingest observer
 !timeline ingest snapshot [baseline|<path>]
 !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]
 !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]
