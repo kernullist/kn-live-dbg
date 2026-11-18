@@ -392,6 +392,7 @@ private:
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
     void WorkerLoop();
     void ServiceDiscovery();
     KmonDiscoveryDispatch DispatchDiscovery(KmonDiscoveryStep step);
@@ -535,6 +536,13 @@ private:
     void NoteWatchTiWriteIfNeeded(const KmonEvent& event);
     bool GetLiveTargets(DeviceClient** device, SymbolEngine** symbols) const;
     AddressSpaceDescriptor ObservationAddressSpace() const;
+    struct DiagnosticSubject
+    {
+        DiagnosticSubject(uint32_t pid) : Pid(pid) {}
+        DiagnosticSubject(const ObservationIdentity& identity) : Pid(identity.ProcessId), Observation(&identity) {}
+        uint32_t Pid;
+        const ObservationIdentity* Observation = nullptr;
+    };
     bool EmitUnique(
         const std::wstring& kind,
         const std::wstring& key,
@@ -542,7 +550,7 @@ private:
         const std::wstring& layer,
         const std::wstring& summary,
         const std::wstring& notes,
-        uint32_t processId = 0,
+        DiagnosticSubject subject = 0,
         const std::map<std::wstring, std::wstring>& evidence = {});
     bool EmitUniqueBounded(
         size_t limit,
@@ -1582,3 +1590,4 @@ bool KmonImagePreparationIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std::wstring* diagnostics);
 bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);

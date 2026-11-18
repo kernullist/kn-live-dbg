@@ -8,7 +8,7 @@
 enum class ProcessHandleSite
 {
     SelfProbe, IdentityLookup, ObservationSource, TiImageLookup, KmonUserInventory, HuntPublicDetails, HuntPackageIdentity,
-    LayoutCollection, LayoutVerification
+    LayoutCollection, LayoutVerification, ImageSweep, ReferenceVerification, PageCapture, DiagnosticIdentity
 };
 enum class ProcessHandleCall { Open, Duplicate, Close };
 
@@ -142,6 +142,22 @@ public:
             Value = OpenProcess(desiredAccess, FALSE, Acquired.RequestedPid);
             return Value != nullptr;
         });
+    }
+    HANDLE OpenForVmReadOrLimitedQuery(DWORD* readOpenError = nullptr)
+    {
+        if (readOpenError) { *readOpenError = ERROR_SUCCESS; }
+        if (!Acquired.RequestedPid) { return nullptr; }
+        if (!Open(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ))
+        {
+            if (readOpenError) { *readOpenError = GetLastError(); }
+            if (!Open(PROCESS_QUERY_LIMITED_INFORMATION)) { return nullptr; }
+        }
+        return Value;
+    }
+    bool ConflictsWithRequestedIdentity() const
+    {
+        return (Acquired.Bound.Pid && Acquired.Bound.Pid != Acquired.RequestedPid) ||
+            (Acquired.RequestedCreation && Acquired.Bound.Created && Acquired.RequestedCreation != Acquired.Bound.Created);
     }
     bool Duplicate(HANDLE source, uint64_t parentAcquisition = 0)
     {

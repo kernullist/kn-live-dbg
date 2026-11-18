@@ -3100,6 +3100,10 @@ static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
     case ProcessHandleSite::HuntPackageIdentity: return L"hunt_package_identity";
     case ProcessHandleSite::LayoutCollection: return L"layout_collection";
     case ProcessHandleSite::LayoutVerification: return L"layout_verification";
+    case ProcessHandleSite::ImageSweep: return L"image_sweep";
+    case ProcessHandleSite::ReferenceVerification: return L"reference_verification";
+    case ProcessHandleSite::PageCapture: return L"page_capture";
+    case ProcessHandleSite::DiagnosticIdentity: return L"diagnostic_identity";
     }
     return L"unknown";
 }

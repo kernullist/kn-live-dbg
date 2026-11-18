@@ -944,6 +944,17 @@ Its source identity includes the collector and target process generations and
 the declared user address shape. It does not qualify target object layouts,
 WOW64/JIT semantics, address-space mapping epochs or boot/VM identity.
 
+During an image sweep, the controller records the original open and links the
+source's duplicate to that acquisition. When the open identifies a different
+process generation, the sweep skips the duplicate. Reference verification
+checks the queued generation before querying an expected PEB. Ordinary
+user-page capture checks it before querying a region. Diagnostics that carry
+an observation use its boot ID, PID and creation time for deduplication and
+retain those three fields on the event with `identity_source=supplied_observation`.
+Object addresses and session assertions require separate evidence. A PID-only diagnostic records its
+limited-query open when looking up the current generation.
+[Observer handle records](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
 This source admits user ranges only, requires explicit residency consent, and
 discards every failed or short copy. A failed later chunk also discards the
 earlier assembled bytes. Original Win32 read status is retained; the common

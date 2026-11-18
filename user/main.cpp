@@ -54265,12 +54265,22 @@ int wmain(int argc, wchar_t** argv)
         {
             return LayoutProcessHandleFixture() ? 0 : 1;
         }
-        if (argc >= 3 && ToLower(argv[2]) == L"collector-handle-observer")
+        if (argc >= 3 && (ToLower(argv[2]) == L"collector-handle-observer" || ToLower(argv[2]) == L"verification-handle-observer"))
         {
-            if (argc != 4 && !(argc == 5 && ToLower(argv[4]) == L"retention")) { return 2; }
-            uint64_t inherited = 0;
-            if (!ParseUnsigned(argv[3], 10, &inherited) || !inherited || inherited >= UINTPTR_MAX) { return 2; }
-            if (!CollectorProcessHandleFixture(static_cast<uintptr_t>(inherited), argc == 5)) { return 1; }
+            if (ToLower(argv[2]) == L"verification-handle-observer")
+            {
+                if (argc != 3) { return 2; }
+                std::wstring command, diagnostics;
+                if (!std::getline(std::wcin, command) || command != L"check" || !KmonVerificationHandleSelfTest(diagnostics)) { return 1; }
+                std::wcout << diagnostics;
+            }
+            else
+            {
+                if (argc != 4 && !(argc == 5 && ToLower(argv[4]) == L"retention")) { return 2; }
+                uint64_t inherited = 0;
+                if (!ParseUnsigned(argv[3], 10, &inherited) || !inherited || inherited >= UINTPTR_MAX) { return 2; }
+                if (!CollectorProcessHandleFixture(static_cast<uintptr_t>(inherited), argc == 5)) { return 1; }
+            }
             DebuggerState state{};
             HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
             HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);

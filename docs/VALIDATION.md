@@ -7,6 +7,47 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process handles during verification and capture, 2026-11-19
+
+The Windows x64 Release controller had SHA-256
+`5bd91d5d64d6c31459513fb65a0f214a537c0db37322226c1e1c21f8f07a963c`.
+A parent process measured the PID and creation time of each disposable
+controller and independently tried both access masks. The controller used its
+own process, one ordinary data byte and an unopened driver device.
+[Observer handle sites](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
+| Windows open results for `0x410` and `0x1000` | Timeline rows | Capture of the owned byte |
+| --- | ---: | --- |
+| Both allowed | 16 | The matching generation returned the original byte. The stale request skipped the region query. |
+| VM read denied, limited query allowed | 22 | The matching request attempted the region query and returned zero bytes. The stale request skipped the query. |
+| Both denied with Win32 error 5 | 13 | Both requests skipped the region query and returned zero bytes. Both failed opens kept their original errors. |
+
+The totals include the PID-only diagnostic lookup. The parent checked the
+access masks, outcomes, acquisition IDs and close order. A matching image
+source linked its duplicate to the original open. A mismatched creation time
+or two denied opens produced zero duplicates. In the reference verifier,
+only a matching process with a usable handle reached the expected-PEB query.
+
+Before the fix, recording two expired and two future-dated references made
+eight handle calls. The same diagnostic for two submitted creation times
+collapsed into one event with creation time zero. The final binary recorded
+four separate time-rejection diagnostics with zero handle calls in each
+access case. Two additional identity failures retained their respective
+creation times. An explicit identity with an unknown creation time stayed
+unknown on repeated submission.
+
+The image, reference and capture scheduling oracles passed 968, 13,039 and
+23 checks respectively. The separate handle fixture exercised the production
+image-source binding with a declared four-level address space. Driver-delivered image
+sweeps, native fallback and effects on other processes remain unverified.
+To repeat the access cases, run
+`python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`.
+
+The same binary passed 3,081 command checks across 261 routes, 570 console
+checks and 28 timeline checks. From 01:01 to 01:29 KST the host recorded no
+new reboot or bugcheck events or crash dumps. The post-run check found zero
+remaining test processes, running test drivers or fixture listeners.
+
 ## Layout collection and verification handles, 2026-11-19
 
 Windows x64 build 28000.3501 ran the Release controller with SHA-256

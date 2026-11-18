@@ -13,10 +13,20 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <sstream>
 #include <tuple>
 
 namespace
 {
+    ProcessObservationSource OpenImageSweepSource(ObservedProcessHandle& owner, const AddressSpaceDescriptor& space)
+    {
+        const HANDLE process = owner.OpenForVmReadOrLimitedQuery();
+        const auto& opened = owner.Acquisition();
+        return ProcessObservationSource(owner.ConflictsWithRequestedIdentity() ? nullptr : process,
+            opened.RequestedPid, opened.RequestedCreation, space,
+            ControllerProcessHandles(), opened.AcquisitionId);
+    }
+
     std::wstring BytesHex(const std::vector<uint8_t>& bytes)
     {
         const wchar_t* hex = L"0123456789abcdef";
@@ -252,7 +262,7 @@ void KernelMonitor::ApplyImageReferenceResults()
             { work.Scheduling.Finish(now, KmonImageAttemptOutcome::ReferenceUnavailable, false, false, work.RetentionEpisode); }
             EmitUnique(L"coverage.image", L"scan_failed:image:" + found->first, work.Path, L"image",
                 L"executable image reference unavailable", ImageReferencePreparation::OutcomeName(result->Status) +
-                    std::wstring(L": ") + result->Error, work.Identity.ProcessId);
+                    std::wstring(L": ") + result->Error, work.Identity);
         }
     }
 }
@@ -959,12 +969,9 @@ void KernelMonitor::ContinueImageSweeps(uint64_t budgetMs)
     const auto path = selected->Path;
     const auto base = selected->Base;
     const uint32_t pid = identity.ProcessId;
-    HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (pid != 0 && process == nullptr)
-    {
-        process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    }
-    const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
+    ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::ImageSweep, pid, identity.CreateTime);
+    auto processSource = OpenImageSweepSource(owner, device->AddressSpace());
+    const HANDLE process = owner.get();
     ProcessAddressContext context{};
     bool resolved = false, tried = false;
     const auto sameProcess = [&]()
@@ -973,13 +980,12 @@ void KernelMonitor::ContinueImageSweeps(uint64_t budgetMs)
         if (process != nullptr)
         {
             DWORD exitCode = 0;
-            return GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE &&
+            return !owner.ConflictsWithRequestedIdentity() && GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE &&
                 identity.SameInstance(ObserveProcessIdentity(pid, process));
         }
         ProcessAddressContext current{};
         return ResolveObservationProcess(*device, *symbols, identity, &current);
     };
-    ProcessObservationSource processSource(process, pid, identity.CreateTime, device->AddressSpace());
     NativeObservationSource kernelSource(*device);
     auto unavailableCaps = processSource.Capabilities();
     const auto targetId = identity.BootId + L":process:" + std::to_wstring(pid) + L":" + std::to_wstring(identity.CreateTime);
@@ -1056,7 +1062,7 @@ void KernelMonitor::ScanImagePermissionCandidates(const std::wstring& path, uint
     if (identity.ProcessId != 0 && !ResolveHuntAddressSpace(*device, *symbols, identity, &context))
     {
         EmitUnique(L"coverage.image_permissions", L"image:permissions:identity:" + ImageKey(path, base, identity),
-            path, L"image", L"image permission scan unavailable", L"process address-space identity unavailable", identity.ProcessId);
+            path, L"image", L"image permission scan unavailable", L"process address-space identity unavailable", identity);
         return;
     }
     uint32_t checked = 0;
@@ -1256,42 +1262,39 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
             ++ExecutionReferenceDropped;
             ExecutionReferenceExpired += outcome == KmonReferenceOutcome::Expired;
             EmitUnique(L"coverage.references", L"scan_failed:references:" + std::wstring(KmonReferenceOutcomeName(outcome)), L"", L"references",
-                L"queued reference could not start", KmonReferenceOutcomeName(outcome), work.Identity.ProcessId);
+                L"queued reference could not start", KmonReferenceOutcomeName(outcome), work.Identity);
             continue;
         }
         const uint32_t pid = work.Identity.ProcessId;
-        HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (pid != 0 && process == nullptr)
-        {
-            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        }
-        const std::unique_ptr<void, decltype(&CloseHandle)> processOwner(process, &CloseHandle);
+        ObservedProcessHandle processOwner(ControllerProcessHandles(), ProcessHandleSite::ReferenceVerification, pid, work.Identity.CreateTime);
+        const HANDLE process = processOwner.OpenForVmReadOrLimitedQuery();
+        bool pebQueryAttempted = false;
         const auto sameProcess = [&]()
         {
             if (pid == 0)
             {
                 return true;
             }
-            if (work.ExpectedPeb != 0)
+            if (!process)
             {
-                uint64_t peb = 0;
-                if (!QueryExecutionSurfacePeb(process, pid, &peb) || peb != work.ExpectedPeb)
-                {
-                    return false;
-                }
+                ProcessAddressContext current{};
+                return !work.ExpectedPeb && ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current);
             }
-            if (process != nullptr)
+            if (processOwner.ConflictsWithRequestedIdentity() || !work.Identity.SameInstance(ObserveProcessIdentity(pid, process)))
             {
-                return work.Identity.SameInstance(ObserveProcessIdentity(pid, process));
+                return false;
             }
-            ProcessAddressContext current = {};
-            return ResolveHuntAddressSpace(*device, *symbols, work.Identity, &current);
+            if (!work.ExpectedPeb) { return true; }
+            uint64_t peb = 0;
+            pebQueryAttempted = true;
+            return QueryExecutionSurfacePeb(process, pid, &peb) && peb == work.ExpectedPeb;
         };
         if (!sameProcess())
         {
             outcome = KmonReferenceOutcome::IdentityUnavailable;
             EmitUnique(L"coverage.references", L"scan_failed:references:identity:" + std::to_wstring(pid),
-                L"", L"references", L"queued reference has stale or unknown process identity", L"", pid);
+                L"", L"references", L"queued reference has stale or unknown process identity", L"", work.Identity,
+                {{L"expected_peb_query_attempted", pebQueryAttempted ? L"true" : L"false"}});
             continue;
         }
         BOOL wow64 = FALSE;
@@ -1301,7 +1304,7 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
             outcome = KmonReferenceOutcome::ArchitectureUnavailable;
             EmitUnique(L"coverage.references", L"scan_failed:references:architecture:" + std::to_wstring(pid),
                 L"", L"references", L"static target decoding requires a confirmed native x64 process",
-                L"image page comparisons remain available; target architecture is unsupported or unknown", pid);
+                L"image page comparisons remain available; target architecture is unsupported or unknown", work.Identity);
             continue;
         }
         const auto modules = pid == 0 ? symbols->CopyModules() : UserModules(pid);
@@ -1335,7 +1338,7 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
         {
             outcome = KmonReferenceOutcome::MappingUnavailable;
             EmitUnique(L"coverage.execution_path", L"page:unavailable:" + referenceKey, L"", work.Role,
-                L"candidate page is no longer executable or its mapping is unavailable", L"current mapping revalidation failed", pid);
+                L"candidate page is no longer executable or its mapping is unavailable", L"current mapping revalidation failed", work.Identity);
             continue;
         }
         bool physicalPageRead = false;
@@ -1406,7 +1409,7 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
         {
             outcome = KmonReferenceOutcome::Inconsistent;
             EmitUnique(L"coverage.references", L"reference:anchor_changed:" + referenceKey, L"", work.Role,
-                L"reference root or PE metadata changed before decoding", L"queued reference withheld", pid);
+                L"reference root or PE metadata changed before decoding", L"queued reference withheld", work.Identity);
             continue;
         }
         bool imageAllocationExtension = false;
@@ -1751,6 +1754,102 @@ void KernelMonitor::DrainExecutionReferences(DeviceClient* device, SymbolEngine*
         RecordEvent(std::move(event));
         outcome = resolvedOutcome;
     }
+}
+
+bool KmonVerificationHandleSelfTest(std::wstring& diagnostics)
+{
+    KernelMonitor monitor;
+    DeviceClient absent;
+    SymbolEngine symbols;
+    const auto self = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+    if (!self.HasCanonicalKey()) { return false; }
+    auto stale = self;
+    ++stale.CreateTime;
+    std::wostringstream output;
+    const uint8_t ownedByte = 0x35;
+    const auto address = reinterpret_cast<uint64_t>(&ownedByte);
+
+    // A PID-only caller exercises the existing diagnostic key lookup.
+    monitor.EmitUnique(L"coverage.fixture", L"owned_pid_only", L"", L"fixture", L"", L"", self.ProcessId);
+    auto partial = self;
+    partial.CreateTime = 0;
+    partial.Eprocess = 1;
+    partial.SessionKnown = true;
+    const auto beforePartial = ControllerProcessHandles().Snapshot().Total;
+    if (!monitor.EmitUnique(L"coverage.fixture", L"owned_partial", L"", L"fixture", L"", L"", partial) ||
+        monitor.EmitUnique(L"coverage.fixture", L"owned_partial", L"", L"fixture", L"", L"", partial) ||
+        monitor.Ring.back().Observation.Identity.CreateTime != 0 || monitor.Ring.back().Observation.Identity.Eprocess != 0 ||
+        monitor.Ring.back().Observation.Identity.SessionKnown || ControllerProcessHandles().Snapshot().Total != beforePartial)
+    { return false; }
+    for (const auto& identity : {self, stale})
+    {
+        ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::ImageSweep, identity.ProcessId, identity.CreateTime);
+        auto source = OpenImageSweepSource(owner, AddressSpaceDescriptor::FromPagingLevels(4));
+        output << L"[verification.image] requested=" << identity.CreateTime << L" bound=" << !source.Capabilities().SourceId.empty() << L"\n";
+    }
+
+    for (const auto& identity : {self, stale})
+    {
+        // The deliberately wrong expected PEB stops even a matching subject before any target bytes.
+        monitor.QueueExecutionReference(address, 0, L"owned_reference", identity, 0, {}, 1);
+        const auto beforeLiveGate = ControllerProcessHandles().Snapshot().Total;
+        monitor.ScanExecutionReferences(1, 5000);
+        if (monitor.ExecutionReferences.size() != 1 || ControllerProcessHandles().Snapshot().Total != beforeLiveGate) { return false; }
+        monitor.DrainExecutionReferences(&absent, &symbols, 1, 5000, false);
+    }
+    const uint64_t now = GetTickCount64();
+    const bool canExpire = now > KmonReferenceQueue::ExpiryMs;
+    const auto beforeRejected = ControllerProcessHandles().Snapshot().Total;
+    for (const auto& identity : {self, stale})
+    {
+        const auto admit = [&](const wchar_t* role, uint64_t observedMs) {
+            return monitor.ExecutionReferences.Admit({address, 0, ObservationFileTime(), observedMs, identity, role, {}, 1})
+                == KmonReferenceAdmission::Queued;
+        };
+        if (canExpire && !admit(L"owned_expired", now - KmonReferenceQueue::ExpiryMs - 1)) { return false; }
+        if (!admit(L"owned_future", now + 60000)) { return false; }
+        monitor.DrainExecutionReferences(&absent, &symbols, 2, 5000, false);
+    }
+    const auto& outcomes = monitor.ExecutionReferences.Normal().Outcomes;
+    output << L"[verification.rejected] expiry_possible=" << canExpire
+        << L" expired=" << outcomes[static_cast<size_t>(KmonReferenceOutcome::Expired)]
+        << L" future=" << outcomes[static_cast<size_t>(KmonReferenceOutcome::InvalidClock)]
+        << L" unavailable=" << outcomes[static_cast<size_t>(KmonReferenceOutcome::IdentityUnavailable)]
+        << L" handle_calls=" << ControllerProcessHandles().Snapshot().Total - beforeRejected << L"\n";
+    for (const auto& event : monitor.Ring)
+    {
+        const auto key = event.Evidence.find(L"diagnostic_key");
+        if (key == event.Evidence.end()) { continue; }
+        if (event.Observation.Identity.BootId != self.BootId || event.Observation.Identity.ProcessId != self.ProcessId ||
+            event.Evidence.at(L"identity_source") != L"supplied_observation") { return false; }
+        const auto attempt = event.Evidence.find(L"expected_peb_query_attempted");
+        output << L"[verification.reference] key=" << key->second << L" created=" << event.Observation.Identity.CreateTime
+            << L" peb_query=" << (attempt == event.Evidence.end() ? L"absent" : attempt->second) << L"\n";
+    }
+
+    for (const auto& identity : {self, stale})
+    {
+        if (!monitor.QueueCapture(L"owned_byte", address, 1, identity, 0, nullptr)) { return false; }
+    }
+    monitor.CaptureStopping.store(true);
+    monitor.CaptureLoop();
+    KmonEvent event;
+    while (monitor.PipelineEvents.Pop(&event))
+    {
+        if (event.Kind == L"coverage.capture")
+        {
+            output << L"[verification.capture] created=" << event.Observation.Identity.CreateTime << L" reason=" << event.Summary
+                << L" region_query=" << event.Evidence.at(L"process_region_query_attempted") << L"\n";
+        }
+    }
+    KernelMonitor::CapturedPage captured;
+    while (monitor.CapturedPages.Pop(&captured))
+    {
+        if (!captured.Context.Identity.SameInstance(self) || captured.Bytes != std::vector<uint8_t>{ownedByte}) { return false; }
+    }
+    output << L"[verification.bytes] count=" << monitor.CaptureReadBytes.load() << L"\n";
+    diagnostics = output.str();
+    return !absent.IsOpen() && monitor.ExecutionReferences.empty();
 }
 
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics)

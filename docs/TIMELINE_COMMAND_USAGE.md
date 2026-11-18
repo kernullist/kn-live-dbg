@@ -177,6 +177,18 @@ no ownership record.
 | `hunt_package_identity` | Look up package metadata for a snapshot with a known creation time. | Limited query and synchronize (`0x101000`) |
 | `layout_collection` | Open the process for one slice of a layout sweep. A continuation carries the creation time from the unfinished sweep. | Query and VM read (`0x410`), then query only (`0x400`) if the first open fails |
 | `layout_verification` | Recheck a queued layout candidate against its original process and mapping. A candidate already past its 30-second window produces an expired scheduler outcome and zero handle calls. | Query and VM read (`0x410`) |
+| `image_sweep` | Open the process for an image verification slice. A handle-backed source records its duplicate under `observation_source` with the original acquisition ID. | Query and VM read (`0x410`), then limited query (`0x1000`) on failure |
+| `reference_verification` | Check the process named by a queued execution reference. | `0x410`, then `0x1000` on failure |
+| `page_capture` | Open the process for an ordinary user-mode page capture. | `0x410`, then `0x1000` on failure |
+| `diagnostic_identity` | Look up the current creation time for a PID-only diagnostic key when the PID is greater than 4. | Limited query (`0x1000`) |
+
+Compare `requested_create_time` with `observed_create_time` on the open row.
+When both are present and differ, the image sweep skips the duplicate, reference
+verification skips the expected-PEB query, and page capture skips the region
+query. On failure, reference and capture diagnostics expose the corresponding
+`expected_peb_query_attempted` or `process_region_query_attempted` field.
+An expired reference or one with a future observation time keeps its queued
+identity in the diagnostic and makes no process-handle calls.
 
 If an explicit PID watch is withdrawn before the slice runs and there are no
 name watches, the collector reports `process_outside_scope` without opening

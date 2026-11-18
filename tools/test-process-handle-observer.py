@@ -255,6 +255,95 @@ def collector_rows(output):
     return [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
 
 
+def check_verification_handles(exe, directory, deny):
+    full, limited = 0x410, 0x1000
+    with subprocess.Popen([exe, "--self-test", "verification-handle-observer"], cwd=directory, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8") as child:
+        try:
+            pid = child.pid
+            created = creation_time(int(child._handle))
+            if deny:
+                deny_child_access(child, deny)
+            full_status, limited_status = (process_open_status(pid, access) for access in (full, limited))
+            assert (full_status, limited_status) == {0: (0, 0), 0x10: (5, 0), 0x1010: (5, 5)}[deny]
+            output, errors = child.communicate("check\n", timeout=60)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=15)
+        assert child.returncode == 0, errors[-800:]
+
+    def records(label):
+        prefix = f"[verification.{label}] "
+        return [dict(item.split("=", 1) for item in line[len(prefix):].split())
+                for line in output.splitlines() if line.startswith(prefix)]
+
+    opened = full_status == 0 or limited_status == 0
+    stale = created + 1
+    assert records("image") == [{"requested": str(created), "bound": str(int(opened))},
+                                {"requested": str(stale), "bound": "0"}]
+    rejected, = records("rejected")
+    expiry_possible = int(rejected["expiry_possible"])
+    assert expiry_possible in (0, 1)
+    assert (int(rejected["expired"]), int(rejected["future"]), int(rejected["unavailable"])) == (2 * expiry_possible, 2, 2)
+    assert rejected["handle_calls"] == "0", f"reporting rejected work opened handles: {rejected}"
+    references = [(r["key"], int(r["created"]), r["peb_query"]) for r in records("reference")]
+    expected_references = []
+    for generation in (created, stale):
+        expected_references.append((f"scan_failed:references:identity:{pid}", generation,
+                                    str(opened and generation == created).lower()))
+        expected_references.append(("scan_failed:references:invalid_clock", generation, "absent"))
+        if expiry_possible:
+            expected_references.append(("scan_failed:references:expired", generation, "absent"))
+    assert sorted(references) == sorted(expected_references), references
+    failures = [(int(r["created"]), r["reason"], r["region_query"]) for r in records("capture")]
+    assert sorted(failures) == sorted(
+        ([(created, "memory_read_failed", str(opened).lower())] if full_status else []) +
+        [(stale, "process_identity_changed" if opened else "memory_read_failed", "false")]), failures
+    assert records("bytes") == [{"count": str(int(full_status == 0))}]
+
+    # Build the expected acquisition/close sequence from the independent Windows opens.
+    calls = []
+    def add(call, site, generation, access=0, status=0, acquisition=0, parent=0):
+        seq = len(calls) + 1
+        if call != "close" and not status:
+            acquisition = seq
+        calls.append((call, site, generation, access, status, acquisition, parent))
+        return acquisition
+
+    diag = add("open", "diagnostic_identity", 0, limited, limited_status)
+    if diag:
+        add("close", "diagnostic_identity", 0, acquisition=diag)
+    for site in ("image_sweep", "reference_verification", "page_capture"):
+        for generation in (created, stale):
+            original = add("open", site, generation, full, full_status)
+            if not original:
+                original = add("open", site, generation, limited, limited_status)
+            if not original:
+                continue
+            if site == "image_sweep" and generation == created:
+                duplicate = add("duplicate", "observation_source", generation, parent=original)
+                add("close", "observation_source", generation, acquisition=duplicate, parent=original)
+            add("close", site, generation, acquisition=original)
+
+    rows = evidence(collector_rows(output), [c[0] for c in calls], pid, created)
+    for row, (call, site, gen, access, status, acquisition, parent) in zip(rows, calls):
+        assert row["handle_site"] == site and row["requested_pid"] == str(pid)
+        assert row.get("requested_create_time") == (str(gen) if gen else None)
+        assert row["status"] == str(status) and int(row.get("acquisition_id", 0)) == acquisition
+        assert int(row.get("parent_acquisition_id", 0)) == parent
+        if call == "open":
+            assert row["requested_access"] == hex(access)
+        if status:
+            assert not {"observed_pid", "observed_create_time", "identity_win32_status", "acquisition_id"}.intersection(row)
+        else:
+            assert row["observed_pid"] == str(pid) and row["observed_create_time"] == str(created)
+            assert row["identity_win32_status"] == "0" and row["identity_observed_at"] == "acquisition"
+    assert f"source_records={len(rows)} added={len(rows)}" in output and "source_records=0 added=0" in output
+    print(f"Verification handles: deny={deny:#x}, {len(rows)} rows, {len(references)} scope-qualified diagnostics, "
+          f"{2 * expiry_possible + 2} rejected references with zero handle calls.")
+
+
 def check_collector_retention(exe, directory, target, reference):
     output, actor, actor_created = run_child(exe, ["--self-test", "collector-handle-observer", str(reference), "retention"],
                                              directory, reference=reference)
@@ -440,6 +529,8 @@ def main():
         for deny in (0, 0x10, 0x400):
             check_layout_collection(exe, directory, deny)
         check_layout_verification(exe, directory)
+        for deny in (0, 0x10, 0x1010):
+            check_verification_handles(exe, directory, deny)
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")
 

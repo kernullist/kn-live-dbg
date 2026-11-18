@@ -11699,15 +11699,10 @@ std::wstring KernelMonitor::MakeEmittedKey(const std::wstring& key, uint32_t pro
         device = Device;
         symbols = Symbols;
     }
-    HANDLE process = OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION,
-        FALSE,
-        processId);
-    const uint64_t created = QueryPidCreateTime(device, symbols, process, processId);
-    if (process != nullptr)
-    {
-        CloseHandle(process);
-    }
+    ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::DiagnosticIdentity, processId);
+    owner.Open(PROCESS_QUERY_LIMITED_INFORMATION);
+    const auto observed = owner.Acquisition().Bound.Created;
+    const uint64_t created = observed ? observed : QueryPidCreateTime(device, symbols, owner.get(), processId);
     if (created != 0)
     {
         uniqueKey += L":" + std::to_wstring(created);
@@ -11726,12 +11721,17 @@ bool KernelMonitor::EmitUnique(
     const std::wstring& layer,
     const std::wstring& summary,
     const std::wstring& notes,
-    uint32_t processId,
+    DiagnosticSubject subject,
     const std::map<std::wstring, std::wstring>& evidence)
 {
+    const uint32_t processId = subject.Pid;
+    // Work items keep their original identity even when reporting a failure after PID reuse.
+    const std::wstring uniqueKey = subject.Observation
+        ? key + L":observation:" + subject.Observation->BootId + L":" + std::to_wstring(processId) +
+            L":" + std::to_wstring(subject.Observation->CreateTime)
+        : MakeEmittedKey(key, processId);
     bool claimed = false;
     {
-        const std::wstring uniqueKey = MakeEmittedKey(key, processId);
         std::lock_guard<std::mutex> lock(WatchMutex);
         claimed = EmittedMapperKeys.insert(uniqueKey).second;
     }
@@ -11757,6 +11757,14 @@ bool KernelMonitor::EmitUnique(
     }
     event.Observation.Source = layer;
     event.Observation.DependencyGroup = layer;
+    if (subject.Observation)
+    {
+        // A diagnostic identifies the submitted work. It has not verified an object address or session.
+        event.Observation.Identity.BootId = subject.Observation->BootId;
+        event.Observation.Identity.ProcessId = processId;
+        event.Observation.Identity.CreateTime = subject.Observation->CreateTime;
+        event.Evidence[L"identity_source"] = L"supplied_observation";
+    }
     if (event.Kind == L"finding.unexplained_memory")
     {
         event.Evidence[L"relationship"] = L"temporal";

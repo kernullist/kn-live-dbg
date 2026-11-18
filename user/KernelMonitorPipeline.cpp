@@ -699,6 +699,7 @@ void KernelMonitor::CaptureLoop()
             shutdownAttempt = CaptureStopping.load();
             page.RequestAgeAtReadStartMs = page.Context.MonotonicMs - work.SubmittedMs;
             page.Context.Coverage.Attempted = true;
+            bool processRegionQueryAttempted = false;
             if (work.RootCr3 != 0)
             {
                 const OrphanKernelPageRoot root = {work.RootCr3, work.Identity.ProcessId, work.Identity.CreateTime};
@@ -785,19 +786,20 @@ void KernelMonitor::CaptureLoop()
             }
             else
             {
-                HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, work.Identity.ProcessId);
-                if (process == nullptr)
-                {
-                    detail = L"OpenProcess=" + std::to_wstring(GetLastError());
-                    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, work.Identity.ProcessId);
-                }
-                const std::unique_ptr<void, decltype(&CloseHandle)> owner(process, &CloseHandle);
+                ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::PageCapture,
+                    work.Identity.ProcessId, work.Identity.CreateTime);
+                DWORD readOpenError = ERROR_SUCCESS;
+                const HANDLE process = owner.OpenForVmReadOrLimitedQuery(&readOpenError);
+                if (readOpenError) { detail = L"OpenProcess=" + std::to_wstring(readOpenError); }
                 MEMORY_BASIC_INFORMATION region{};
-                const bool regionKnown = process != nullptr &&
+                const bool identityChanged = process && (owner.ConflictsWithRequestedIdentity() ||
+                    !work.Identity.SameInstance(ObserveProcessIdentity(work.Identity.ProcessId, process)));
+                processRegionQueryAttempted = process && !identityChanged;
+                const bool regionKnown = processRegionQueryAttempted &&
                     VirtualQueryEx(process, reinterpret_cast<LPCVOID>(page.Address), &region, sizeof(region)) == sizeof(region);
                 const bool inaccessible = regionKnown && (region.State != MEM_COMMIT ||
                     (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0);
-                if (process != nullptr && !work.Identity.SameInstance(ObserveProcessIdentity(work.Identity.ProcessId, process)))
+                if (identityChanged)
                 {
                     reason = L"process_identity_changed";
                     fatal = true;
@@ -906,6 +908,10 @@ void KernelMonitor::CaptureLoop()
                 event.Observation.Coverage.Reason = reason;
                 event.Evidence[L"capture_id"] = std::to_wstring(work.Id);
                 event.Evidence[L"capture_role"] = work.Role;
+                if (!work.RootCr3 && work.Identity.ProcessId)
+                {
+                    event.Evidence[L"process_region_query_attempted"] = processRegionQueryAttempted ? L"true" : L"false";
+                }
                 event.Evidence[L"address"] = std::to_wstring(page.Address);
                 event.Evidence[L"read_error"] = detail;
                 event.Evidence[L"discardable_section"] = discardableSection;
