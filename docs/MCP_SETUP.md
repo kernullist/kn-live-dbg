@@ -22,7 +22,7 @@ For a separate lab client, `mcp on` binds all adapters; select a reachable targe
 IP from the startup output. The grammar is:
 
 ```text
-mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -31,10 +31,10 @@ mcp off
 options and missing values are rejected before the password prompt. MCP and
 `remote on` cannot listen simultaneously.
 
-Type the temporary password twice. During the MCP engine loop the local prompt
-accepts **`off`** and **`status`**; the full REPL resumes after `off`. Each start
-requires a new session password. Active endpoint/bridge files can contain session
-credentials and are protected for the current user; do not distribute them.
+When a shared-password listener starts, type the temporary password twice.
+During the MCP engine loop the local prompt accepts **`off`** and **`status`**.
+The full REPL resumes after `off`. Active shared-mode endpoint files can contain
+session credentials and have access restricted to the current user.
 
 ## Connect a client
 
@@ -61,6 +61,46 @@ The transport is cleartext HTTP, including credentials and returned memory.
 Use an isolated lab path and scope any required inbound firewall rule to the
 intended client. Loopback is sufficient for a same-machine client. MCP does not
 provide TLS, arbitrary shell execution, raw `kd`, or an arbitrary command tool.
+
+## Give each client one retained source
+
+In the PowerShell process that will launch each client, generate its bearer and
+print the SHA-256 fingerprint for the operator. Keep that process open. To reuse
+the same grant after restarting the client, restore its bearer from the client's
+secret store into `KNLIVEDBG_TOKEN`.
+
+```powershell
+$clientBytes = New-Object byte[] 32
+$clientRng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$clientHash = [Security.Cryptography.SHA256]::Create()
+try {
+    $clientRng.GetBytes($clientBytes)
+    $env:KNLIVEDBG_TOKEN = [BitConverter]::ToString($clientBytes).Replace('-', '').ToLowerInvariant()
+    $clientAscii = [Text.Encoding]::ASCII.GetBytes($env:KNLIVEDBG_TOKEN)
+    [BitConverter]::ToString($clientHash.ComputeHash($clientAscii)).Replace('-', '').ToLowerInvariant()
+} finally {
+    $clientHash.Dispose()
+    $clientRng.Dispose()
+}
+```
+
+The operator enters the printed fingerprints at the debugger prompt. For
+example, `mcp on --observe --principal <first-fingerprint> ti --principal <second-fingerprint> snapshot`
+grants each bearer the corresponding case-sensitive `TimelineEvent.Source`.
+Up to 16 distinct fingerprints can each receive one source. Labels start with
+an ASCII letter or digit and accept letters, digits, dots, underscores and
+hyphens up to 64 characters. Use labels from the retained timeline on this controller.
+
+Connect on loopback with the client's bearer. Read `evidence_source` and
+`observe_budget` from `kn://capabilities`, then call `timeline.query`.
+Omitting `source` selects the granted label. The local endpoint descriptor
+contains connection details and empty credential fields. The bridge and native
+client setup read the bearer from the client process environment.
+
+For recovery, add `--journal <directory>` and enter a separate operator unlock
+password. Reopen that directory in source-scoped mode with the same Windows
+account and unlock password. A client needs its original bearer and source
+grant to read its receipts. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
 
 ## Write policy
 

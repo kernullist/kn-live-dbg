@@ -7,12 +7,23 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <list>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
 struct SnapshotDiffResult;
+
+struct TimelineSourceRow
+{
+    static constexpr size_t MaxLabelUnits = 128;
+    uint64_t TimestampFileTime;
+    uint32_t ProcessId, ThreadId, TargetProcessId;
+    std::optional<std::wstring> Domain, Action;
+};
 
 // A retained query counts every predicate visit, including a nonmatch and a
 // graph lookahead. Concurrent queries can share a listener's remaining count.
@@ -86,6 +97,8 @@ public:
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored, TimelineScanBudget* budget) const;
+    std::vector<TimelineSourceRow> QuerySource(const std::wstring& grantedSource, const TimelineQueryOptions& options,
+        uint64_t& stored, TimelineScanBudget& budget) const;
     std::vector<TimelineEvent> AllEvents() const;
     // Chronological events with EventId > minExclusive. maxCount 0 = unlimited.
     std::vector<TimelineEvent> RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const;
@@ -116,6 +129,8 @@ private:
 
     mutable std::mutex Mutex;
     std::deque<TimelineEvent> Events;
+    // Deque end insertion and front eviction preserve pointers to other rows.
+    std::map<std::wstring, std::list<const TimelineEvent*>> BySource;
     std::deque<std::wstring> EventKeysInOrder;
     std::set<std::wstring> EventKeys;
     uint64_t NextEventId = 1;

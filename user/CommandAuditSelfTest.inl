@@ -639,6 +639,18 @@ static int RunCommandAuditSelfTest()
         !commandinput::ParseListenerOptions({ L"--observe", L"--journal" }, 0, false, 51766, &listen, &error) &&
         !commandinput::ParseListenerOptions({ L"--observe", L"--journal", L"a", L"--journal", L"b" }, 0, false, 51766, &listen, &error) &&
         !commandinput::ParseListenerOptions({ L"--journal", L"a" }, 0, true, 51766, &listen, &error), L"mcp journal requires an explicit observe directory");
+    const std::wstring fingerprint(64, L'a');
+    check(commandinput::ParseListenerOptions({ L"--principal", fingerprint, L"Etw.File-1", L"--observe" }, 0, false, 51766, &listen, &error) &&
+        listen.Principals.size() == 1 && listen.Principals.front().Source == L"Etw.File-1" && listen.BindAddress == L"127.0.0.1",
+        L"mcp principal binds an exact source on observe loopback");
+    for (const auto& tokens : std::vector<std::vector<std::wstring>>{
+        {L"--principal", fingerprint, L"a"}, {L"--observe", L"--principal", fingerprint},
+        {L"--observe", L"--principal", std::wstring(64, L'G'), L"a"}, {L"--observe", L"--principal", fingerprint, L"a*"},
+        {L"--observe", L"--principal", fingerprint, L"a", L"--principal", fingerprint, L"b"},
+        {L"--observe", L"--allow-write", L"--principal", fingerprint, L"alpha"}})
+    {
+        check(!commandinput::ParseListenerOptions(tokens, 0, false, 51766, &listen, &error), L"mcp rejects ambiguous or invalid source grant");
+    }
 
     uint64_t number = 7;
     uint32_t major = 99;

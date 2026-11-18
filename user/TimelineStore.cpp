@@ -2556,6 +2556,7 @@ TimelineStore::TimelineStore(size_t capacity)
 void TimelineStore::Clear()
 {
     std::lock_guard<std::mutex> lock(Mutex);
+    BySource.clear();
     Events.clear();
     EventKeysInOrder.clear();
     EventKeys.clear();
@@ -3030,6 +3031,38 @@ std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& opti
     else { collect(Events.begin(), Events.end()); }
 
     return out;
+}
+
+std::vector<TimelineSourceRow> TimelineStore::QuerySource(const std::wstring& grantedSource, const TimelineQueryOptions& options,
+    uint64_t& stored, TimelineScanBudget& budget) const
+{
+    std::vector<TimelineSourceRow> rows;
+    std::lock_guard<std::mutex> lock(Mutex);
+    stored = 0;
+    const auto found = BySource.find(grantedSource);
+    if (grantedSource.empty() || found == BySource.end() ||
+        (!options.Source.empty() && options.Source != grantedSource)) { return rows; }
+    stored = found->second.size();
+    const auto domain = TimelineToLower(options.Domain);
+    const auto label = [](const std::wstring& text) -> std::optional<std::wstring>
+    {
+        if (text.size() > TimelineSourceRow::MaxLabelUnits) { return std::nullopt; }
+        return text;
+    };
+    auto collect = [&](auto begin, auto end)
+    {
+        for (auto it = begin; it != end && rows.size() < options.Limit; ++it)
+        {
+            if (!budget.Visit()) { break; }
+            const TimelineEvent& event = **it;
+            if ((!domain.empty() && (domain.size() != event.Domain.size() || TimelineToLower(event.Domain) != domain)) ||
+                (options.HasProcessId && options.ProcessId != event.ProcessId && options.ProcessId != event.TargetProcessId)) { continue; }
+            rows.push_back({event.TimestampFileTime, event.ProcessId, event.ThreadId, event.TargetProcessId, label(event.Domain), label(event.Action)});
+        }
+    };
+    if (options.NewestFirst) { collect(found->second.rbegin(), found->second.rend()); }
+    else { collect(found->second.begin(), found->second.end()); }
+    return rows;
 }
 
 std::vector<TimelineEvent> TimelineStore::RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const
@@ -3630,33 +3663,46 @@ bool TimelineStore::ExportJsonl(const std::wstring& path, std::wstring* error) c
 
 bool TimelineStore::AddEventLocked(TimelineEvent event)
 {
-    bool added = false;
     EnrichTimelineEventProcessContext(&event, Events);
     NormalizeTimelineEvent(&event);
-    std::wstring key = TimelineEventKey(event);
-    if (EventKeys.find(key) != EventKeys.end())
-    {
-        return false;
-    }
+    const auto inserted = EventKeys.insert(TimelineEventKey(event));
+    if (!inserted.second) { return false; }
 
-    event.EventId = NextEventIdLocked();
-    Events.push_back(std::move(event));
-    EventKeys.insert(key);
-    EventKeysInOrder.push_back(key);
+    // Publish the dedup key and source pointer together with the retained row.
+    const size_t before = Events.size();
+    auto source = BySource.end();
+    try
+    {
+        EventKeysInOrder.push_back(*inserted.first);
+        Events.push_back(std::move(event));
+        source = BySource.try_emplace(Events.back().Source).first;
+        source->second.push_back(&Events.back());
+    }
+    catch (...)
+    {
+        if (source != BySource.end() && source->second.empty()) { BySource.erase(source); }
+        if (Events.size() > before) { Events.pop_back(); }
+        if (EventKeysInOrder.size() > before) { EventKeysInOrder.pop_back(); }
+        EventKeys.erase(inserted.first);
+        throw;
+    }
+    Events.back().EventId = NextEventIdLocked();
     while (Events.size() > MaxEvents)
     {
         DropOldestEventLocked();
         ++DroppedEvents;
     }
 
-    added = true;
-    return added;
+    return true;
 }
 
 void TimelineStore::DropOldestEventLocked()
 {
     if (!Events.empty())
     {
+        auto source = BySource.find(Events.front().Source);
+        source->second.pop_front();
+        if (source->second.empty()) { BySource.erase(source); }
         Events.pop_front();
     }
     if (!EventKeysInOrder.empty())

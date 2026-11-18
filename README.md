@@ -78,7 +78,8 @@ the cooperative fixture tests do not establish its safety.
 MCP and the human remote console use separate, mutually exclusive listeners.
 Both transports use cleartext HTTP or TCP. MCP starts with writes locked.
 On current `main`, `mcp on --observe` limits a local client to status and
-retained timeline queries. The human remote session follows the local write
+retained timeline queries. Optional source grants restrict each local client
+to one retained source and its own operation receipts. The human remote session follows the local write
 policy. AI provider configuration is independent of these permissions.
 [MCP session scopes](docs/MCP_SERVER_DESIGN.md#observe-sessions-on-current-main)
 

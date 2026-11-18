@@ -19,6 +19,7 @@ $remoteStdoutPath = Join-Path $testRoot "remote-stdout.txt"
 $remoteStderrPath = Join-Path $testRoot "remote-stderr.txt"
 $oldPath = $env:PATH
 $oldCapture = $env:KNLIVEDBG_BRIDGE_CAPTURE
+$oldBearer = $env:KNLIVEDBG_TOKEN
 
 try
 {
@@ -87,9 +88,9 @@ exit /b 0
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        $BridgePath,
+        ('"{0}"' -f $BridgePath),
         "-EndpointPath",
-        $endpointPath,
+        ('"{0}"' -f $endpointPath),
         "-PreferRemote"
     ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $remoteStdoutPath -RedirectStandardError $remoteStderrPath
     if ($remoteProcess.ExitCode -eq 0)
@@ -128,14 +129,45 @@ exit /b 0
         throw "bridge did not use session password`ncaptured: $capturedListen"
     }
 
-    Write-Host "[mcp.bridge.selftest] PASS pinned HTTP-only arguments, wildcard-remote rejection, listen_ips"
+    $principalEndpoint = Get-Content -LiteralPath $endpointPath -Raw | ConvertFrom-Json
+    $principalEndpoint.token_source = 'principal'
+    $principalEndpoint | ConvertTo-Json | Set-Content -LiteralPath $endpointPath -Encoding UTF8
+    $env:KNLIVEDBG_TOKEN = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $BridgePath -EndpointPath $endpointPath
+    $captured = Get-Content -LiteralPath $capturePath -Raw
+    if ($LASTEXITCODE -ne 0 -or !$captured.Contains('Authorization:${KNLIVEDBG_BRIDGE_AUTH}') -or
+        $captured.Contains($env:KNLIVEDBG_TOKEN) -or $captured.Contains('lab1'))
+    {
+        throw 'Source-scoped bridge exposed or selected the wrong credential argument.'
+    }
+    foreach ($case in 'remote', 'missing-bearer', 'foreign-url')
+    {
+        $bridgeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $BridgePath), '-EndpointPath', ('"{0}"' -f $endpointPath))
+        if ($case -eq 'remote') { $bridgeArgs += '-PreferRemote' }
+        if ($case -eq 'missing-bearer') { $env:KNLIVEDBG_TOKEN = $null }
+        if ($case -eq 'foreign-url')
+        {
+            $env:KNLIVEDBG_TOKEN = 'a' * 64
+            $principalEndpoint.url = 'http://192.0.2.10:51766/mcp'
+            $principalEndpoint | ConvertTo-Json | Set-Content -LiteralPath $endpointPath -Encoding UTF8
+        }
+        Remove-Item -LiteralPath $capturePath -ErrorAction SilentlyContinue
+        $denied = Start-Process powershell.exe -ArgumentList $bridgeArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $remoteStdoutPath -RedirectStandardError $remoteStderrPath
+        if ($denied.ExitCode -eq 0 -or (Test-Path -LiteralPath $capturePath)) { throw "Scoped bridge accepted $case" }
+    }
+    Write-Host "[mcp.bridge.selftest] PASS pinned HTTP-only arguments, wildcard-remote rejection, listen_ips, source-scoped credentials"
 }
 finally
 {
     $env:PATH = $oldPath
     $env:KNLIVEDBG_BRIDGE_CAPTURE = $oldCapture
+    $env:KNLIVEDBG_TOKEN = $oldBearer
     if (Test-Path -LiteralPath $testRoot)
     {
-        Remove-Item -LiteralPath $testRoot -Recurse -Force
+        $resolvedTest = (Resolve-Path -LiteralPath $testRoot).Path
+        $resolvedTemp = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path.TrimEnd('\')
+        if ([IO.Path]::GetDirectoryName($resolvedTest) -ne $resolvedTemp -or
+            [IO.Path]::GetFileName($resolvedTest) -notmatch '^knlivedbg-mcp-bridge-[0-9a-f]{32}$') { throw 'Unexpected bridge fixture path' }
+        Remove-Item -LiteralPath $resolvedTest -Recurse -Force
     }
 }

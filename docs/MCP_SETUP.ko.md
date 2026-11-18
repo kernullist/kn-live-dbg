@@ -20,7 +20,7 @@ mcp on --loopback
 출력된 주소 중 클라이언트가 접근할 수 있는 IP를 선택한다.
 
 ```text
-mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -28,9 +28,9 @@ mcp off
 `--bind=<addr>`도 지원한다. 포트는 10진수 1–65535이며, 중복·충돌 옵션과
 누락 값은 비밀번호 입력 전에 거부한다. `remote on`과 동시에 실행할 수 없다.
 
-임시 비밀번호를 두 번 입력한다. MCP 엔진 루프의 로컬 콘솔에서는 **`off`**와
-**`status`**를 입력한다. `off` 뒤에 일반 REPL로 돌아온다. 서버를 다시 켤 때마다
-새 비밀번호가 필요하다. 활성 endpoint/bridge 파일에는 세션 자격 증명이 포함될
+공유 비밀번호 모드에서는 임시 비밀번호를 두 번 입력한다. MCP 엔진 루프의 로컬 콘솔에서는 **`off`**와
+**`status`**를 입력한다. `off` 뒤에 일반 REPL로 돌아온다. 공유 모드로 다시 켜면
+비밀번호를 다시 입력한다. 활성 endpoint/bridge 파일에는 세션 자격 증명이 포함될
 수 있으며 현재 사용자만 접근하도록 보호한다. 이 파일을 배포하지 않는다.
 
 ## 클라이언트 연결
@@ -70,6 +70,21 @@ TLS, 임의 셸 실행, raw `kd`, 임의 콘솔 명령 전달 도구는 제공�
 `mcp on --observe --journal "case operations"`로 시작한다. 처음에는 새
 디렉터리를 지정하고 반환된 작업 ID를 보관한다. 같은 Windows 계정과 MCP
 비밀번호로 같은 디렉터리를 다시 열면 된다. [작업 기록 복구](MCP_SERVER_DESIGN.ko.md#작업-기록-복구)
+
+클라이언트별로 출처를 제한하려면 각 클라이언트의 PowerShell에서 난수 32바이트로
+bearer를 만들고 환경 변수 `KNLIVEDBG_TOKEN`에 보관한다. 운영자에게 전달하는 값은
+64자리 소문자 16진수 bearer의 **ASCII 문자열**로 계산한 SHA-256 지문이다.
+PowerShell 예제는 지문만 출력한다. 같은 클라이언트를 재시작하려면 비밀 저장소에서
+기존 bearer를 복원한다. [자격 증명 생성 예제](MCP_SETUP.md#give-each-client-one-retained-source)
+
+운영자는 예를 들어 `mcp on --observe --principal <첫째-지문> ti --principal <둘째-지문> snapshot`을
+입력한다. 최대 16개 지문에 각각 하나의 `TimelineEvent.Source`를 지정할 수 있다.
+출처는 영문자 또는 숫자로 시작하는 1~64자이며 영문자, 숫자, 점, 밑줄, 하이픈을 허용한다.
+대소문자를 구분하므로 현재 저장된 출처 표기를 사용한다. 각 클라이언트가 루프백으로
+접속해 `kn://capabilities`에서 `evidence_source`와 남은 예산을 확인한다.
+`timeline.query`에서 출처를 생략하면 허가된 출처를 조회한다. 저널을 함께 쓸 때는
+별도의 운영자 암호를 입력한다. 복구 후에도 기존 bearer와 출처가 일치해야 자신의
+영수증을 읽을 수 있다. [출처별 조회 권한](MCP_SERVER_DESIGN.ko.md#출처별-조회-권한)
 
 기본 MCP 모드는 쓰기 도구를 노출하지 않고 엔진 진입 시 커널 write gate도 끈다.
 `mcp on --allow-write`는 typed 쓰기 도구와 gate를 활성화한다.

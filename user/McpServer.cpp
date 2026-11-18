@@ -17,6 +17,7 @@
 #include "TimelineStore.h"
 #include "EvidencePrivacy.h"
 #include "McpOperationJournal.h"
+#include "ContentHash.h"
 
 #include <chrono>
 #include <algorithm>
@@ -622,12 +623,17 @@ namespace
 
     const wchar_t* ScopeNameFor(const McpServerConfig& config)
     {
+        if (!config.Principals.empty()) { return L"observe_source"; }
         if (config.ObserveOnly) { return L"observe"; }
         return config.AllowWrite ? L"legacy_write_enabled" : L"legacy_write_locked";
     }
 
     bool ToolVisible(const McpToolDef& tool, const McpServerConfig& config)
     {
+        if (!config.Principals.empty())
+        {
+            return tool.Observe && tool.ReadOnly && (wcscmp(tool.Name, L"timeline.query") == 0 || wcscmp(tool.Name, L"operations.get") == 0);
+        }
         return config.ObserveOnly ? (tool.Observe && tool.ReadOnly) : (tool.ReadOnly || config.AllowWrite);
     }
 
@@ -755,6 +761,7 @@ namespace
 
     bool ResourceVisible(const std::wstring& uri, const McpServerConfig& config)
     {
+        if (!config.Principals.empty()) { return uri == L"kn://capabilities"; }
         for (const auto& resource : kResources)
         {
             if (uri == resource.Uri) { return !config.ObserveOnly || resource.Observe; }
@@ -768,7 +775,7 @@ namespace
         bool first = true;
         for (const auto& resource : kResources)
         {
-            if (config.ObserveOnly && !resource.Observe) { continue; }
+            if (!ResourceVisible(resource.Uri, config)) { continue; }
             if (!first) { out += L","; }
             first = false;
             out += L"{\"uri\":" + mcpjson::Quote(resource.Uri) + L",\"name\":" + mcpjson::Quote(resource.Name) +
@@ -778,7 +785,7 @@ namespace
         return out;
     }
 
-    std::wstring BuildCapabilitiesResource(const McpServerConfig& config, const std::wstring& budget)
+    std::wstring BuildCapabilitiesResource(const McpServerConfig& config, const std::wstring& budget, const McpObserveGrant& grant)
     {
         std::wstring out = L"{\"server\":";
         out += mcpjson::Quote(kServerName);
@@ -786,6 +793,7 @@ namespace
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
+        if (!grant.Source.empty()) { out += L",\"evidence_source\":" + mcpjson::Quote(grant.Source); }
         if (!config.OperationJournalDirectory.empty()) { out += L",\"operation_journal\":\"bounded_private_journal\""; }
         out += L",\"tools\":";
         out += BuildToolsList(config);
@@ -1050,8 +1058,28 @@ bool IsMcpLoopbackBind(const std::wstring& bindAddress)
            _wcsicmp(value.c_str(), L"[::1]") == 0;
 }
 
+static const McpObserveGrant* AuthenticateObserveGrant(const std::string& authorization, const std::vector<McpObserveGrant>& grants)
+{
+    constexpr size_t prefix = 7;
+    if (authorization.size() != prefix + 64 || _strnicmp(authorization.data(), "Bearer ", prefix) != 0 ||
+        authorization.find_first_not_of("0123456789abcdef", prefix) != std::string::npos) { return nullptr; }
+    ContentHash hash;
+    if (!hash.Add(reinterpret_cast<const uint8_t*>(authorization.data() + prefix), 64)) { return nullptr; }
+    const auto fingerprint = mcpjson::WideToUtf8(hash.Finish());
+    for (const auto& grant : grants)
+    {
+        if (ConstantTimeEqual(fingerprint, mcpjson::WideToUtf8(grant.Fingerprint))) { return &grant; }
+    }
+    return nullptr;
+}
+
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error)
 {
+    if (!config.Principals.empty() && (!config.ObserveOnly || !ValidMcpObserveGrants(config.Principals)))
+    {
+        if (error) { *error = L"--principal requires --observe, a unique SHA-256 bearer fingerprint and an exact source label"; }
+        return false;
+    }
     if (!config.OperationJournalDirectory.empty() && !config.ObserveOnly)
     {
         if (error) { *error = L"--journal requires --observe"; }
@@ -1664,7 +1692,31 @@ McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const T
         return McpAuthorityError(L"observe", true);
     }
     McpEngineResult result;
-    if (request.Name == L"graph.query")
+    if (!request.Grant.Fingerprint.empty() || !request.Grant.Source.empty())
+    {
+        if (request.Name != L"timeline.query" || request.Grant.Fingerprint.empty() || request.Grant.Source.empty() ||
+            (!options.Source.empty() && options.Source != request.Grant.Source)) { return McpAuthorityError(L"observe_source"); }
+        const TimelineQueryOptions query{options.Source, options.Domain, options.HasProcessId, options.ProcessId, options.Limit, options.NewestFirst};
+        uint64_t stored = 0;
+        const auto rows = timeline.QuerySource(request.Grant.Source, query, stored, scan);
+        if (!scan.IsIncomplete())
+        {
+            const auto labelJson = [](const std::optional<std::wstring>& label) { return label ? mcpjson::Quote(*label) : L"null"; };
+            std::wstring body = L"{\"schema\":\"kn.mcp_source_timeline.v1\",\"source\":" + mcpjson::Quote(request.Grant.Source) +
+                L",\"total_stored\":" + std::to_wstring(stored) + L",\"returned\":" + std::to_wstring(rows.size()) + L",\"events\":[";
+            for (const auto& row : rows)
+            {
+                if (body.back() != L'[') { body += L","; }
+                body += L"{\"timestamp_filetime\":" + mcpjson::Quote(std::to_wstring(row.TimestampFileTime)) +
+                    L",\"domain\":" + labelJson(row.Domain) + L",\"action\":" + labelJson(row.Action) +
+                    L",\"pid\":" + std::to_wstring(row.ProcessId) + L",\"tid\":" + std::to_wstring(row.ThreadId) +
+                    L",\"target_pid\":" + std::to_wstring(row.TargetProcessId) + L"}";
+                if (body.size() > McpObserveUsage::MaxResultPayloadBytes) { return ObserveBudgetError(McpBudgetLimit::ResultPayloadBytes, L"dispatch"); }
+            }
+            result.StructuredJson = std::move(body) + L"]}";
+        }
+    }
+    else if (request.Name == L"graph.query")
     {
         const auto graph = timeline.BuildGraph(options, &scan);
         if (!scan.IsIncomplete()) { result.StructuredJson = BuildTimelineGraphJson(graph); }
@@ -1923,7 +1975,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
             cost.PayloadBytes = ObservePayloadCost(result);
             McpBudgetLimit limit = McpBudgetLimit::None;
             if (cost.PayloadBytes > McpObserveUsage::MaxResultPayloadBytes) { limit = McpBudgetLimit::ResultPayloadBytes; }
-            else if (cost.PayloadBytes > McpObserveUsage::MaxPayloadBytes - job->Observe->PayloadBytes) { limit = McpBudgetLimit::PayloadBytes; }
+            else if (cost.PayloadBytes > job->Observe->PayloadLimit - job->Observe->PayloadBytes) { limit = McpBudgetLimit::PayloadBytes; }
             if (limit != McpBudgetLimit::None)
             {
                 const bool unknown = result.OutcomeUnknown;
@@ -1950,7 +2002,13 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
     job->ResultPromise.set_value(std::move(result));
 }
 
-McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) const
+static bool GrantAllowed(const McpServerConfig& config, const McpObserveGrant& grant)
+{
+    if (config.Principals.empty()) { return grant.Fingerprint.empty() && grant.Source.empty(); }
+    return std::find(config.Principals.begin(), config.Principals.end(), grant) != config.Principals.end();
+}
+
+McpEngineResult McpServer::OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant) const
 {
     std::lock_guard<std::mutex> lock(queueMutex_);
     McpEngineResult result;
@@ -1960,13 +2018,14 @@ McpEngineResult McpServer::OperationStatus(const std::wstring& operationId) cons
         result.IsError = true;
         result.Text = L"operation_id must be exactly 32 lowercase hexadecimal characters";
     }
+    else if (!GrantAllowed(config_, grant)) { return McpAuthorityError(ScopeName()); }
     else if (journal_ && !journal_->Healthy())
     {
         return McpJournalUnavailable();
     }
-    else if (!operations_.Get(operationId, &snapshot))
+    else if (!operations_.Get(operationId, &snapshot) || snapshot.OwnerFingerprint != grant.Fingerprint)
     {
-        if (journal_ && journal_->Lookup(operationId, &result.StructuredJson)) { return result; }
+        if (journal_ && journal_->Lookup(operationId, grant, &result.StructuredJson)) { return result; }
         result.IsError = true;
         result.Text = L"operation metadata is not retained; this does not establish an execution outcome";
         result.StructuredJson = L"{\"schema\":\"kn.mcp_operation.v1\",\"operation_id\":" + mcpjson::Quote(operationId) +
@@ -1987,6 +2046,7 @@ const wchar_t* McpServer::ScopeName() const
 static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const McpEngineRequest& request,
     McpEngineResult* result, uint32_t* requestedEvents = nullptr)
 {
+    if (!GrantAllowed(scope, request.Grant)) { *result = McpAuthorityError(ScopeNameFor(scope)); return false; }
     if (request.Kind == McpRequestKind::ResourceRead)
     {
         if (ResourceVisible(request.Name, scope) && request.Name != L"kn://capabilities" &&
@@ -2035,6 +2095,11 @@ static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const Mc
                     return false;
                 }
                 if (requestedEvents) { *requestedEvents = static_cast<uint32_t>(options.Limit); }
+                if (!request.Grant.Source.empty() && !options.Source.empty() && options.Source != request.Grant.Source)
+                {
+                    *result = McpAuthorityError(ScopeNameFor(scope));
+                    return false;
+                }
             }
             return true;
         }
@@ -2051,7 +2116,7 @@ bool McpServer::AuthorizeEngineRequest(const McpEngineRequest& request, McpEngin
 
 static McpBudgetLimit AvailableObserveWork(const McpObserveUsage& usage, const McpEngineRequest& request)
 {
-    if (usage.PayloadBytes == McpObserveUsage::MaxPayloadBytes) { return McpBudgetLimit::PayloadBytes; }
+    if (usage.PayloadBytes == usage.PayloadLimit) { return McpBudgetLimit::PayloadBytes; }
     if (usage.RemainingScan.load(std::memory_order_relaxed) == 0 && request.Kind == McpRequestKind::ToolCall &&
         (request.Name == L"timeline.query" || request.Name == L"timeline.status" || request.Name == L"graph.query"))
     {
@@ -2060,20 +2125,28 @@ static McpBudgetLimit AvailableObserveWork(const McpObserveUsage& usage, const M
     return McpBudgetLimit::None;
 }
 
-std::wstring McpServer::ObserveBudgetJson() const
+std::shared_ptr<McpObserveUsage> McpServer::UsageForGrantLocked(const McpObserveGrant& grant) const
+{
+    if (config_.Principals.empty()) { return observeUsage_; }
+    const auto at = std::find(config_.Principals.begin(), config_.Principals.end(), grant);
+    return at == config_.Principals.end() ? nullptr : principalUsage_[at - config_.Principals.begin()];
+}
+
+std::wstring McpServer::ObserveBudgetJson(const McpObserveGrant& grant) const
 {
     std::lock_guard<std::mutex> lock(queueMutex_);
-    if (!observeUsage_) { return {}; }
-    const auto& usage = *observeUsage_;
+    const auto bucket = UsageForGrantLocked(grant);
+    if (!bucket) { return {}; }
+    const auto& usage = *bucket;
     auto balance = [](uint32_t limit, uint32_t used)
     {
         return L"{\"limit\":" + std::to_wstring(limit) + L",\"used\":" + std::to_wstring(used) +
             L",\"remaining\":" + std::to_wstring(limit - used) + L"}";
     };
     return L"{\"schema\":\"kn.mcp_observe_budget.v1\",\"lifetime\":\"listener\",\"admitted_calls\":" +
-        balance(usage.MaxCalls, usage.AdmittedCalls) + L",\"requested_events\":" + balance(usage.MaxRequestedEvents, usage.RequestedEvents) +
-        L",\"examined_events\":" + balance(usage.MaxExaminedEvents, usage.MaxExaminedEvents - usage.RemainingScan.load(std::memory_order_relaxed)) +
-        L",\"payload_utf8_bytes\":" + balance(usage.MaxPayloadBytes, usage.PayloadBytes) +
+        balance(usage.CallLimit, usage.AdmittedCalls) + L",\"requested_events\":" + balance(usage.RequestLimit, usage.RequestedEvents) +
+        L",\"examined_events\":" + balance(usage.ExaminedLimit, usage.ExaminedLimit - usage.RemainingScan.load(std::memory_order_relaxed)) +
+        L",\"payload_utf8_bytes\":" + balance(usage.PayloadLimit, usage.PayloadBytes) +
         L",\"per_query_examined_events\":" + std::to_wstring(usage.MaxQueryExaminedEvents) +
         L",\"per_result_payload_utf8_bytes\":" + std::to_wstring(usage.MaxResultPayloadBytes) + L"}";
 }
@@ -2091,6 +2164,7 @@ bool McpServer::DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineD
             job->ReadyToDispatch = false;
             scope.ObserveOnly = config_.ObserveOnly;
             scope.AllowWrite = config_.AllowWrite;
+            scope.Principals = config_.Principals;
             if (stopRequested_.load()) { result = McpAuthorityError(ScopeName()); }
             else if (journal_ && !journal_->Healthy()) { result = McpJournalUnavailable(job->OperationId); }
             else if (job->Observe)
@@ -2152,13 +2226,14 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         {
             return false;
         }
+        const auto bucket = UsageForGrantLocked(request.Grant);
         if (config_.ObserveOnly)
         {
-            if (!observeUsage_) { *result = McpAuthorityError(ScopeName()); return true; }
-            const auto& usage = *observeUsage_;
+            if (!bucket) { *result = McpAuthorityError(ScopeName()); return true; }
+            const auto& usage = *bucket;
             auto limit = AvailableObserveWork(usage, request);
-            if (usage.AdmittedCalls == usage.MaxCalls) { limit = McpBudgetLimit::Calls; }
-            else if (requestedEvents > usage.MaxRequestedEvents - usage.RequestedEvents) { limit = McpBudgetLimit::RequestedEvents; }
+            if (usage.AdmittedCalls == usage.CallLimit) { limit = McpBudgetLimit::Calls; }
+            else if (requestedEvents > usage.RequestLimit - usage.RequestedEvents) { limit = McpBudgetLimit::RequestedEvents; }
             if (limit != McpBudgetLimit::None) { *result = ObserveBudgetError(limit, L"admission"); return true; }
         }
         std::optional<McpJournalIdentity> identity;
@@ -2170,13 +2245,13 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
         job = std::make_shared<McpJob>(request, RandomHex(16));
         job->Owner = this;
         job->Generation = listenerGeneration_;
-        job->Observe = observeUsage_;
+        job->Observe = bucket;
         future = job->ResultPromise.get_future();
         queue_.push_back(job);
         try
         {
             const auto observeEvents = job->Observe ? std::optional<uint32_t>(requestedEvents) : std::nullopt;
-            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64(), observeEvents, std::move(identity)))
+            if (!operations_.Begin(job->OperationId, request.Name, GetTickCount64(), observeEvents, std::move(identity), request.Grant.Fingerprint))
             {
                 queue_.pop_back();
                 if (journal_ && !journal_->Healthy()) { *result = McpJournalUnavailable(); return true; }
@@ -2267,7 +2342,12 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             }
             ++listenerGeneration_;
             config_ = config;
-            observeUsage_ = config.ObserveOnly ? std::make_shared<McpObserveUsage>() : nullptr;
+            observeUsage_ = config.ObserveOnly && config.Principals.empty() ? std::make_shared<McpObserveUsage>() : nullptr;
+            principalUsage_.clear();
+            for (size_t i = 0; i < config.Principals.size(); ++i)
+            {
+                principalUsage_.push_back(std::make_shared<McpObserveUsage>(static_cast<uint32_t>(config.Principals.size())));
+            }
             operations_.Reset();
         }
         config_.BindAddress = NormalizeMcpBindAddress(config_.BindAddress);
@@ -2279,7 +2359,10 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         stopRequested_.store(false);
 
         std::wstring passwordError;
-        if (!SanitizeMcpPassword(config_.Password, &token_, &passwordError))
+        const bool scoped = !config_.Principals.empty();
+        if (!config_.Password.empty()) { SecureZeroMemory(config_.Password.data(), config_.Password.size() * sizeof(wchar_t)); }
+        config_.Password.clear();
+        if ((!scoped || !config_.OperationJournalDirectory.empty()) && !SanitizeMcpPassword(config.Password, &config_.Password, &passwordError))
         {
             if (error != nullptr)
             {
@@ -2287,8 +2370,19 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             }
             break;
         }
-        tokenSource_ = L"password";
-        config_.Password = token_;
+        tokenSource_ = scoped ? L"principal" : L"password";
+        if (!scoped) { token_ = config_.Password; }
+        else if (!config_.Password.empty())
+        {
+            auto header = "Bearer " + mcpjson::WideToUtf8(config_.Password);
+            const bool clientSecret = AuthenticateObserveGrant(header, config_.Principals) != nullptr;
+            SecureZeroMemory(header.data(), header.size());
+            if (clientSecret)
+            {
+                if (error) { *error = L"use a separate journal unlock password"; }
+                break;
+            }
+        }
 
         jobReadyEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2428,7 +2522,12 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
         if (!config_.OperationJournalDirectory.empty())
         {
             auto journal = std::make_unique<McpOperationJournal>();
-            if (!journal->Open(config_.OperationJournalDirectory, token_, error)) { break; }
+            if (!journal->Open(config_.OperationJournalDirectory, config_.Password, error, scoped)) { break; }
+            if (scoped)
+            {
+                SecureZeroMemory(config_.Password.data(), config_.Password.size() * sizeof(wchar_t));
+                config_.Password.clear();
+            }
             std::lock_guard<std::mutex> lock(queueMutex_);
             journal_ = std::move(journal);
             operations_.Reset([this](const McpOperationSnapshot& op) { return journal_->Persist(op); });
@@ -2579,6 +2678,7 @@ void McpServer::StopLocked()
 void McpServer::ListenerThreadMain()
 {
     std::vector<char> buffer(65536);
+    std::vector<std::wstring> principalSessions(config_.Principals.size());
 
     OVERLAPPED overlapped = {};
     overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2590,10 +2690,10 @@ void McpServer::ListenerThreadMain()
     // Sends an HTTP response with a JSON (or empty) body. ANSI strings are kept
     // local so they outlive the synchronous HttpSendHttpResponse call.
     auto sendResponse = [&](HTTP_REQUEST_ID requestId, USHORT statusCode, const char* reason, const std::wstring& bodyWide,
-                            bool initialized = false)
+                            const std::wstring* initializedSession = nullptr)
     {
         std::string body = mcpjson::WideToUtf8(bodyWide);
-        std::string sessionAnsi = mcpjson::WideToUtf8(sessionId_);
+        std::string sessionAnsi = mcpjson::WideToUtf8(initializedSession ? *initializedSession : sessionId_);
 
         HTTP_RESPONSE response = {};
         response.StatusCode = statusCode;
@@ -2605,7 +2705,7 @@ void McpServer::ListenerThreadMain()
         response.Headers.KnownHeaders[HttpHeaderContentType].RawValueLength = static_cast<USHORT>(strlen(contentType));
 
         HTTP_UNKNOWN_HEADER unknownHeaders[1] = {};
-        if (!sessionAnsi.empty() && (!config_.ObserveOnly || initialized))
+        if (!sessionAnsi.empty() && (!config_.ObserveOnly || initializedSession))
         {
             unknownHeaders[0].pName = "Mcp-Session-Id";
             unknownHeaders[0].NameLength = static_cast<USHORT>(strlen("Mcp-Session-Id"));
@@ -2731,11 +2831,17 @@ void McpServer::ListenerThreadMain()
         }
 
         std::string authorization = KnownHeader(request, HttpHeaderAuthorization);
-        if (!McpAuthorizationMatchesPassword(authorization, token_))
+        const McpObserveGrant* principal = nullptr;
+        if (!config_.Principals.empty()) { principal = AuthenticateObserveGrant(authorization, config_.Principals); }
+        const bool authorized = principal || (config_.Principals.empty() && McpAuthorizationMatchesPassword(authorization, token_));
+        if (!authorization.empty()) { SecureZeroMemory(authorization.data(), authorization.size()); }
+        if (!authorized)
         {
             sendResponse(requestId, 401, "Unauthorized", L"");
             return;
         }
+        const McpObserveGrant grant = principal ? *principal : McpObserveGrant{};
+        auto& session = principal ? principalSessions[principal - config_.Principals.data()] : sessionId_;
 
         std::string bodyUtf8;
         const ULONG bodyStatus = readBody(requestId, &bodyUtf8);
@@ -2793,14 +2899,15 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"initialize")
         {
-            sessionId_ = RandomHex(16);
+            session = RandomHex(16);
+            if (session.empty()) { sendResponse(requestId, 503, "Unavailable", L""); return; }
             std::wstring result =
                 L"{\"protocolVersion\":" + mcpjson::Quote(kProtocolVersion) +
                 L",\"capabilities\":{\"tools\":{\"listChanged\":false},\"resources\":{},\"prompts\":{}}" +
                 L",\"serverInfo\":{\"name\":" + mcpjson::Quote(kServerName) +
                 L",\"version\":" + mcpjson::Quote(kServerVersion) + L"}}";
             writeAudit(request, L"initialize", L"", L"", L"session-open", false, 0);
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, result), true);
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, result), &session);
             return;
         }
 
@@ -2810,15 +2917,15 @@ void McpServer::ListenerThreadMain()
             return;
         }
 
-        // Every other method requires the single pinned session.
-        if (sessionId_.empty())
+        // Every data-bearing method requires this authenticated principal's session.
+        if (session.empty())
         {
             sendResponse(requestId, 200, "OK", RpcError(idRaw, -32600, L"initialize required before this request"));
             return;
         }
         std::string clientSession;
         UnknownHeader(request, "mcp-session-id", &clientSession);
-        if (mcpjson::Utf8ToWide(clientSession) != sessionId_)
+        if (mcpjson::Utf8ToWide(clientSession) != session)
         {
             sendResponse(requestId, 200, "OK", RpcError(idRaw, -32600, L"invalid or missing Mcp-Session-Id"));
             return;
@@ -2880,7 +2987,7 @@ void McpServer::ListenerThreadMain()
                 }
                 else
                 {
-                    result = OperationStatus(operationId);
+                    result = OperationStatus(operationId, grant);
                 }
                 decision = result.IsError ? L"operation-unavailable" : L"operation-status";
             }
@@ -2888,6 +2995,7 @@ void McpServer::ListenerThreadMain()
             {
                 McpEngineRequest engineRequest;
                 engineRequest.Kind = McpRequestKind::ToolCall;
+                engineRequest.Grant = grant;
                 engineRequest.Name = name;
                 engineRequest.ArgumentsJson = argsRaw;
                 if (!EnqueueAndWait(engineRequest, 30000, &result))
@@ -2927,12 +3035,13 @@ void McpServer::ListenerThreadMain()
             if (uri == L"kn://capabilities")
             {
                 // Static manifest; served transport-side without an engine hop.
-                contentsText = BuildCapabilitiesResource(config_, ObserveBudgetJson());
+                contentsText = BuildCapabilitiesResource(config_, ObserveBudgetJson(grant), grant);
             }
             else if (ResourceVisible(uri, config_))
             {
                 McpEngineRequest engineRequest;
                 engineRequest.Kind = McpRequestKind::ResourceRead;
+                engineRequest.Grant = grant;
                 engineRequest.Name = uri;
                 McpEngineResult result;
                 if (!EnqueueAndWait(engineRequest, 30000, &result))

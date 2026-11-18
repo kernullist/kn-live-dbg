@@ -24,6 +24,13 @@ admitted request, use its operation ID to check the outcome and settled
 `observe_charge`. Pending scan and payload charges are `null`.
 [Listener budget and accounting](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
+With `scope=observe_source`, discovery lists `timeline.query`,
+`operations.get` and `kn://capabilities`. Read `evidence_source` for the exact
+case-sensitive label. `timeline.query` accepts an omitted, empty or matching source
+and returns `kn.mcp_source_timeline.v1`. Both the row count and scan cost
+refer to that source. The budget and receipt lookup belong to the
+authenticated client. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
+
 When `kn://capabilities` reports `operation_journal=bounded_private_journal`,
 `operations.get` can also return a receipt from an earlier listener. Check
 `journal.recovered` and `journal.last_recorded_phase`. A dispatch without a

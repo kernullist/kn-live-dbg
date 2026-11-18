@@ -46,8 +46,8 @@ Timestamps are decimal-string collector boot ticks, not wall time or target time
 The ledger retains at most 256 metadata records, evicts the oldest finished
 record first, and rejects admission if every slot is active. It does not retain
 result payloads. By default, restart clears the ledger. Reinitializing a client
-on the running server preserves it. Lookup uses the shared server password/session, with
-no additional per-principal isolation. `not_retained` establishes no outcome.
+on the running server preserves it. Shared-password listeners share receipt access.
+Source-scoped listeners check receipt ownership. `not_retained` establishes no outcome.
 If the client disconnects before receiving an ID, this interface cannot recover
 that job by request ID. There is no automatic retry, idempotent resubmission,
 rollback, running-job cancellation or standard MCP Tasks API.
@@ -92,7 +92,7 @@ identifiers stay out of that log. The private journal contains recovery metadata
 The controller protects it with user-scoped DPAPI and binds decryption to
 the MCP password and the private directory identity. [Windows Data Protection API](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
 
-All authenticated clients of that observe listener share the journal principal.
+All clients using the shared observe password share its journal principal.
 Keep the Windows account, private directory and password available for
 recovery. An operation ID lost before the caller receives it cannot be
 looked up by its JSON-RPC request ID. An operator who controls the store can
@@ -109,10 +109,10 @@ registers loopback prefixes. Before handling credentials or reading a body,
 the listener verifies both connection addresses are loopback. The host,
 origin, bearer password and initialized session checks still apply.
 The scope lasts until the listener stops. `mcp status`, the endpoint descriptor
-and `kn://capabilities` report `observe`, `legacy_write_locked` or
+and `kn://capabilities` report `observe`, `observe_source`, `legacy_write_locked` or
 `legacy_write_enabled`.
 
-| Observe interface | Accepted requests |
+| Shared observe interface | Accepted requests |
 | --- | --- |
 | Tools | `operations.get`, `timeline.status`, `timeline.query`, `graph.query` and `ti.subscribe` with no action or the exact string `status` |
 | Resources | `kn://capabilities`, `kn://session/info`, `kn://drivers/status` and `kn://ti/stats` |
@@ -130,13 +130,43 @@ The request audit records the scope, decision and admitted operation metadata.
 In observe sessions it omits argument values, hidden or unknown identifiers,
 the protocol session ID and result bodies. Timeline responses can contain the
 original event fields. All clients with the session credential share access to
-those fields. Per-principal evidence filtering remains open. The separate
+those fields. An operator can restrict clients to a source projection as described below. The separate
 one-shot CLI uses its own entry point and policy.
+
+### Source-scoped observation
+
+`mcp on --observe --principal <fingerprint> <source>` starts a loopback
+listener with scope `observe_source`. Each configured SHA-256 fingerprint
+authenticates one bearer and grants one exact retained source label. Each
+bearer has its own protocol session. Reinitializing it replaces only that
+session. The controller accepts up to 16 grants and divides each cumulative
+listener allowance equally among them, rounding down. Reinitialization
+preserves the grant's balance. Each client sees its balance in `kn://capabilities`.
+
+The catalog contains `timeline.query`, `operations.get` and the capabilities
+resource. Admission and dispatch check the grant attached by the transport.
+The store indexes events by case-sensitive source. Traversal, `total_stored`
+and scan charges use the selected index, including after eviction or clear.
+`kn.mcp_source_timeline.v1` returns timestamp in FILETIME units, domain,
+action, PID, TID and target PID. A domain or action longer than 128 UTF-16
+code units is returned as `null`. Global event IDs, enriched raw evidence,
+aggregate status and cross-source graph edges are outside this projection.
+The operator trusts ingestion to assign the source label. The label carries
+no proof of producer identity. Clients share retention capacity in the host store.
+
+A live receipt belongs to its admitted bearer. Durable owners are keyed
+hashes of the fingerprint and source under the private journal key. A
+reconfigured or revoked grant cannot recover the original owner's receipt.
+An unknown ID and another owner's ID yield the same `not_retained` response.
+Separate DPAPI entropy domains prevent a shared-password listener from
+opening a source-scoped journal and vice versa. The operator unlock password
+stays separate from client authentication. The 256-record retention limit
+applies to the whole journal. [Client provisioning](MCP_SETUP.md#give-each-client-one-retained-source)
 
 ### Observe listener budget
 
 Read `observe_budget` in `kn://capabilities` or enter `mcp status` to see
-the limits, usage and remaining allowance. Every client of one observe listener
+the limits, usage and remaining allowance. Every client of one shared-password observe listener
 shares the counters. Repeating `initialize`, changing the JSON-RPC ID or
 retrying a call keeps the same balance. An operator stop and fresh start opens
 a new allowance and a fresh in-memory ledger. An explicitly reopened private

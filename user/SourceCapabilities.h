@@ -163,7 +163,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"no_raw_decoder_or_live_backend;unauthenticated_producer;no_independently_verified_execution;no_x3_x4_or_writer"},
         {L"session", L"observe_scope", L"mcp", L"implemented", L"listener_lifetime",
             L"operator_selected_observe;authenticated_loopback;closed_tool_and_resource_catalog;admission_and_dispatch_checks",
-            L"existing_controller;retained_queries_and_status_only;64_events_per_query;shared_principal;listener_budget_calls_requested_examined_events_and_payload_utf8_bytes;optional_private_operation_journal_256"},
+            L"existing_controller;retained_queries_and_status_only;64_events_per_query;shared_principal;listener_budget_calls_requested_examined_events_and_payload_utf8_bytes;optional_private_operation_journal_256;optional_exact_source_grants_16;principal_scoped_sessions_budgets_and_receipts"},
         {L"session", L"operation_status", L"mcp", L"implemented", L"engine_reported",
             L"authenticated_server;returned_operation_id;retained_metadata",
             L"256_metadata_records;no_effect_verification_or_rollback;no_automatic_retry;no_idempotent_resubmission;no_remote_protocol_adapter"},

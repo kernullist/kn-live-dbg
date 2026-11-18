@@ -2642,7 +2642,10 @@ bool AiProviderRuntime::ProcessCaptureSelfTest()
     {
         return false;
     }
-    if (RunProcessCapture(shell + L"\"for /L %n in (0,0,1) do @echo capture\"", 5,
+    // Reach the byte boundary in a few dozen writes even on a busy host.
+    // The independent no-output case below exercises the deadline.
+    const std::wstring flood = L"\"for /L %n in (0,0,1) do @echo " + std::wstring(2048, L'x') + L"\"";
+    if (RunProcessCapture(shell + flood, 5,
         &output, &code, &error, 64 * 1024) || error != L"Process output exceeded capture limit")
     {
         return false;

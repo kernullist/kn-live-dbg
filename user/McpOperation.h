@@ -47,6 +47,7 @@ struct McpOperationSnapshot
 {
     std::wstring Id;
     std::wstring Name;
+    std::wstring OwnerFingerprint; // Live admission only. Never serialized into a receipt.
     std::wstring State = L"queued";
     uint64_t Order = 0;
     uint64_t QueuedMs = 0;
@@ -71,7 +72,7 @@ public:
 
     bool Begin(const std::wstring& id, const std::wstring& name, uint64_t now,
         std::optional<uint32_t> observeRequestedEvents = std::nullopt,
-        std::optional<McpJournalIdentity> journal = std::nullopt)
+        std::optional<McpJournalIdentity> journal = std::nullopt, const std::wstring& ownerFingerprint = {})
     {
         std::lock_guard<std::mutex> lock(Mutex);
         if (!IsMcpOperationId(id) || name.empty() || name.size() > 512 || Records.count(id) != 0 || Order == UINT64_MAX)
@@ -96,6 +97,7 @@ public:
         McpOperationSnapshot record;
         record.Id = id;
         record.Name = name;
+        record.OwnerFingerprint = ownerFingerprint;
         record.Order = Order + 1;
         record.QueuedMs = now;
         record.ObserveRequestedEvents = observeRequestedEvents;
@@ -224,7 +226,8 @@ inline std::wstring McpOperationJson(const McpOperationSnapshot& operation, bool
     {
         const auto& j = *operation.Journal;
         const auto utc = [](uint64_t time) { return time ? mcpjson::Quote(std::to_wstring(time)) : std::wstring(L"null"); };
-        out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":\"loopback_observe\"";
+        out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":" +
+            mcpjson::Quote(operation.OwnerFingerprint.empty() ? L"loopback_observe" : L"loopback_observe_source");
         out += L",\"principal_id\":" + mcpjson::Quote(j.PrincipalId) + L",\"target_generation\":" + mcpjson::Quote(j.TargetGeneration);
         out += L",\"request_hmac_sha256\":" + mcpjson::Quote(j.RequestHmac) + L",\"utc_clock\":\"windows_filetime_100ns\"";
         out += L",\"admitted_utc\":" + utc(j.AdmittedUtc) + L",\"dispatched_utc\":" + utc(j.DispatchedUtc);

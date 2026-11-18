@@ -25,12 +25,28 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def wire(port, authorization, session, method, params=None):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}, separators=(",", ":"))
+    headers = {"Authorization": authorization, "Content-Type": "application/json"}
+    if session:
+        headers["Mcp-Session-Id"] = session
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=45)
+    try:
+        conn.request("POST", "/mcp/", body, headers)
+        response = conn.getresponse()
+        data = response.read()
+        return response.status, response.getheader("Mcp-Session-Id"), json.loads(data) if data else {}
+    finally:
+        conn.close()
+
+
 class Listener:
-    def __init__(self, exe, root, password):
+    def __init__(self, exe, root, password, grants=(), durable=True):
         self.port = free_port()
         self.password = password
         self.session = None
-        self.proc = subprocess.Popen([exe, "--self-test", "mcp-journal-fixture", root, str(self.port)],
+        options = [value for fingerprint, source in grants for value in ("--principal", fingerprint, source)]
+        self.proc = subprocess.Popen([exe, "--self-test", "mcp-journal-fixture", root if durable else "-", str(self.port), *options],
                                      cwd=root.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
         self.lines = queue.Queue()
@@ -52,26 +68,16 @@ class Listener:
         return self.lines.get(timeout=25)
 
     def rpc(self, method, params=None, wrong_auth=False):
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}, separators=(",", ":"))
         token = "invalid-local-fixture-credential" if wrong_auth else self.password
-        headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
-        if self.session:
-            headers["Mcp-Session-Id"] = self.session
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=45)
-        try:
-            conn.request("POST", "/mcp/", body, headers)
-            response = conn.getresponse()
-            data = response.read()
-            if wrong_auth:
-                assert response.status == 401
-                return
-            assert response.status == 200, response.status
-            if method == "initialize":
-                self.session = response.getheader("Mcp-Session-Id")
-                assert self.session
-            return json.loads(data)["result"]
-        finally:
-            conn.close()
+        status, session, reply = wire(self.port, "Bearer " + token, self.session, method, params)
+        if wrong_auth:
+            assert status == 401
+            return
+        assert status == 200, status
+        if method == "initialize":
+            self.session = session
+            assert self.session
+        return reply["result"]
 
     def lookup(self, identity):
         return self.rpc("tools/call", {"name": "operations.get", "arguments": {"operation_id": identity}})["structuredContent"]
@@ -130,14 +136,14 @@ class Listener:
 
 
 @contextmanager
-def listener(exe, root, password, expected=True):
-    server = Listener(exe, root, password)
+def listener(exe, root, password, expected=True, grants=(), durable=True):
+    server = Listener(exe, root, password, grants, durable)
     try:
         marker = server.lines.get(timeout=30)
         assert marker == ("ready" if expected else "unavailable"), ("listener startup", marker)
-        if expected:
+        if expected and not grants:
             server.rpc("initialize")
-        else:
+        elif not expected:
             assert server.proc.wait(timeout=15) == 1
         yield server
     finally:
@@ -152,8 +158,8 @@ def recovered(server, identity, state, phase):
     return row
 
 
-def verify_owned_plaintext(root, password, original, queued, args):
-    """Independently read just the temporary fixture created by boundaries()."""
+def read_owned_journal(root, password, scoped=False):
+    """Independently decrypt the controller's own temporary fixture."""
     class Blob(ctypes.Structure):
         _fields_ = [("size", ctypes.c_uint32), ("data", ctypes.c_void_p)]
 
@@ -164,7 +170,8 @@ def verify_owned_plaintext(root, password, original, queued, args):
     raw = (root / "operations.knmcpjournal").read_bytes()
     assert raw[:8] == b"KNMCPJ1\0" and int.from_bytes(raw[8:12], "little") == len(raw) - 12
     policy = json.loads((root / "store.knprivacy").read_bytes())
-    salt = hashlib.sha256(("KnLiveDbg.observe.journal.v1\n" + policy["root_identity"] + "\n" + password).encode()).digest()
+    domain = "KnLiveDbg.observe.source.journal.v1" if scoped else "KnLiveDbg.observe.journal.v1"
+    salt = hashlib.sha256((domain + "\n" + policy["root_identity"] + "\n" + password).encode()).digest()
     sealed, sealed_buffer = blob(raw[12:])
     entropy, entropy_buffer = blob(salt)
     clear = Blob()
@@ -183,8 +190,13 @@ def verify_owned_plaintext(root, password, original, queued, args):
         free(clear.data)
     header, key, *records = plaintext.splitlines()
     assert header == b"KnLiveDbg.observe.operations.1" and re.fullmatch(b"[0-9a-f]{64}", key)
-    assert password.encode() not in plaintext and args["source"].encode() not in plaintext
-    rows = [json.loads(line) for line in records]
+    assert password.encode() not in plaintext
+    return plaintext, key, [json.loads(line) for line in records]
+
+
+def verify_owned_plaintext(root, password, original, queued, args):
+    plaintext, key, rows = read_owned_journal(root, password)
+    assert args["source"].encode() not in plaintext
     assert [(r["operation_id"], r["journal"]["last_recorded_phase"]) for r in rows] == [
         (original["operation_id"], "engine_returned"), (queued, "admitted")]
     assert all("structuredContent" not in r and "arguments" not in r and not r["result_payload_retained"] for r in rows)
@@ -356,17 +368,211 @@ def late_return(exe, folder, pool):
     print("late engine return recovered by the operation ID from the timed-out HTTP response", flush=True)
 
 
+class SourceClient:
+    def __init__(self, server, bearer):
+        self.server, self.bearer, self.session = server, bearer, None
+        self.call("initialize")
+
+    def call(self, method, params=None):
+        status, session, reply = wire(self.server.port, "Bearer " + self.bearer, self.session, method, params)
+        assert status == 200
+        if method == "initialize":
+            assert session and session != self.session
+            self.session = session
+        else:
+            assert session is None
+        return reply
+
+    def tool(self, name, args):
+        return self.call("tools/call", {"name": name, "arguments": args})["result"]
+
+    def lookup(self, identity):
+        return self.tool("operations.get", {"operation_id": identity})["structuredContent"]
+
+    def caps(self):
+        reply = self.call("resources/read", {"uri": "kn://capabilities"})
+        return json.loads(reply["result"]["contents"][0]["text"])
+
+    def query(self, pool, args):
+        pending = pool.submit(self.tool, "timeline.query", args)
+        queued = self.server.cmd("queued")
+        assert queued and re.fullmatch(r"queued [0-9a-f]{32}", queued)
+        identity = queued.split()[1]
+        assert self.server.cmd("dispatch") == "dispatched " + identity
+        assert self.server.cmd("return") == "returned"
+        result = pending.result(timeout=45)
+        assert not result["isError"]
+        receipt = result["_meta"]["knlivedbg/operation"]
+        assert receipt["operation_id"] == identity and self.lookup(identity) == receipt
+        return result["structuredContent"], receipt
+
+
+def source_principals(exe, folder, pool, durable):
+    root, unlock = folder / ("scoped" if durable else "volatile"), secrets.token_urlsafe(24)
+    a, b, replacement = (secrets.token_hex(32) for _ in range(3))
+    def grant(bearer, source):
+        return hashlib.sha256(bearer.encode("ascii")).hexdigest(), source
+
+    grants = [grant(a, "alpha"), grant(b, "beta")]
+    with listener(exe, root, unlock, grants=grants, durable=durable) as active:
+        alice, bob = SourceClient(active, a), SourceClient(active, b)
+        assert alice.session != bob.session
+        for invalid in ("Bearer " + unlock, "Bearer " + grants[0][0], a, "Bearer " + replacement):
+            assert wire(active.port, invalid, alice.session, "tools/list") == (401, None, {})
+        assert "error" in wire(active.port, "Bearer " + a, bob.session, "tools/list")[2]
+        assert alice.call("tools/list")["result"] == alice.caps()["tools"]
+        assert {t["name"] for t in alice.caps()["tools"]["tools"]} == {"timeline.query", "operations.get"}
+        assert [r["uri"] for r in alice.call("resources/list")["result"]["resources"]] == ["kn://capabilities"]
+        assert alice.call("prompts/list")["result"] == {"prompts": []}
+        assert alice.caps()["scope"] == "observe_source" and alice.caps()["evidence_source"] == "alpha"
+        baseline = bob.caps()["observe_budget"]
+        assert baseline["admitted_calls"] == {"limit": 64, "used": 0, "remaining": 64}
+        for name, args in (("graph.query", {}), ("timeline.status", {}), ("ti.subscribe", {}),
+                           ("timeline.query", {"source": "Alpha"}), ("timeline.query", {"source": "alpha.more"}),
+                           ("timeline.query", {"source": "beta"}), ("timeline.query", {"principal": "alpha"})):
+            denied = alice.tool(name, args)
+            assert denied["isError"] and "_meta" not in denied
+        assert "error" in alice.call("resources/read", {"uri": "kn://session/info"})
+        assert alice.caps()["observe_budget"] == baseline
+        page, receipt = alice.query(pool, {"limit": "4"})
+        assert page["schema"] == "kn.mcp_source_timeline.v1" and page["source"] == "alpha"
+        assert page["returned"] == page["total_stored"] == 2
+        assert [e["action"] for e in page["events"]] == ["fixture-5", "fixture-1"]
+        assert all(set(e) == {"timestamp_filetime", "domain", "action", "pid", "tid", "target_pid"} for e in page["events"])
+        assert not any(value in json.dumps(page) for value in ("fixture-private", "fixture-2", "fixture-3", "fixture-4"))
+        assert receipt["observe_charge"]["examined_events"] == 2
+        assert bob.caps()["observe_budget"] == baseline
+        original_session = alice.session
+        used = alice.caps()["observe_budget"]
+        alice.call("initialize")
+        assert "error" in wire(active.port, "Bearer " + a, original_session, "tools/list")[2]
+        assert alice.caps()["observe_budget"] == used and bob.caps()["observe_budget"] == baseline
+        other, b_receipt = bob.query(pool, {"source": "beta", "domain": "PROCESS", "pid": "2"})
+        assert other["total_stored"] == other["returned"] == 1 and other["events"][0]["action"] == "fixture-2"
+        assert b_receipt["observe_charge"]["examined_events"] == 1
+        aid, bid = receipt["operation_id"], b_receipt["operation_id"]
+        missing = bob.lookup(secrets.token_hex(16))
+        def invisible(client, identity):
+            assert client.lookup(identity) == dict(missing, operation_id=identity)
+        assert missing["state"] == "not_retained" and not missing["outcome_known"]
+        invisible(bob, aid)
+        invisible(alice, bid)
+        if not durable:
+            assert active.cmd("evict") == "evicted"
+            empty, charge = alice.query(pool, {"limit": "1"})
+            assert empty["total_stored"] == 0 and not empty["events"] and charge["observe_charge"]["examined_events"] == 0
+            survivor, _ = bob.query(pool, {"limit": "2"})
+            assert survivor["total_stored"] == 1 and survivor["events"][0]["action"] is None
+            assert active.cmd("clear") == "cleared"
+            empty, _ = bob.query(pool, {"limit": "1"})
+            assert empty["total_stored"] == 0 and not empty["events"]
+            # Spend only Alice's requested-event share, then check her receipt
+            # and Bob's engine admission after Alice's next request is denied.
+            remaining = alice.caps()["observe_budget"]["requested_events"]["remaining"]
+            while remaining:
+                count = min(64, remaining)
+                alice.query(pool, {"limit": str(count)})
+                remaining -= count
+            denial = alice.tool("timeline.query", {"limit": "1"})
+            assert denial["isError"] and denial["structuredContent"]["dimension"] == "requested_events" and "_meta" not in denial
+            assert alice.lookup(aid) == receipt
+            bob.query(pool, {"limit": "1"})
+        if durable:
+            assert receipt["journal"]["approved_scope"] == "loopback_observe_source"
+            assert receipt["journal"]["principal_id"] != b_receipt["journal"]["principal_id"]
+    audit = (root / "fixture-audit.jsonl" if durable else folder / "fixture-audit.jsonl").read_text(encoding="utf-8-sig")
+    assert all(secret not in audit for secret in (unlock, a, b, grants[0][0], grants[1][0], "fixture-private", "alpha", "beta"))
+    if durable:
+        clear, key, rows = read_owned_journal(root, unlock, scoped=True)
+        assert all(s.encode() not in clear for s in (a, b, grants[0][0], grants[1][0], "alpha", "beta", "fixture-private"))
+        assert [r["operation_id"] for r in rows] == [aid, bid]
+        for row, (fingerprint, source), args in zip(rows, grants, ({"limit": "4"}, {"source": "beta", "domain": "PROCESS", "pid": "2"})):
+            owner = hmac.new(key, f"grant.v1\n{fingerprint}\n{source}".encode(), hashlib.sha256).hexdigest()[:32]
+            assert row["journal"]["principal_id"] == owner
+            frame = (owner + "\ntool\ntimeline.query\n" + json.dumps(args, separators=(",", ":"))).encode()
+            assert row["journal"]["request_hmac_sha256"] == hmac.new(key, frame, hashlib.sha256).hexdigest()
+        # Reopening in shared-password mode cannot recover or replace scoped records.
+        image = root / "operations.knmcpjournal"
+        before = image.read_bytes()
+        with listener(exe, root, unlock, expected=False):
+            pass
+        # A fresh directory distinguishes credential-reuse rejection from a
+        # pre-existing journal that cannot be decrypted with this password.
+        reused_secret_root = folder / "reject-client-as-unlock"
+        with listener(exe, reused_secret_root, a, expected=False, grants=grants):
+            pass
+        assert not reused_secret_root.exists()
+        assert image.read_bytes() == before
+    with listener(exe, root, unlock, grants=list(reversed(grants)), durable=durable) as restarted:
+        alice, bob = SourceClient(restarted, a), SourceClient(restarted, b)
+        for client, identity in ((alice, aid), (bob, bid)):
+            if durable:
+                recovered(client, identity, "succeeded", "engine_returned")
+            else:
+                invisible(client, identity)
+        invisible(alice, bid)
+        invisible(bob, aid)
+    if durable:
+        for dispatch in (False, True):
+            with listener(exe, root, unlock, grants=grants) as active:
+                alice = SourceClient(active, a)
+                pending = pool.submit(alice.tool, "timeline.query", {"limit": "1"})
+                checkpoint = active.cmd("queued")
+                assert re.fullmatch(r"queued [0-9a-f]{32}", checkpoint)
+                interrupted = checkpoint.split()[1]
+                if dispatch:
+                    assert active.cmd("dispatch") == "dispatched " + interrupted
+                active.kill()
+                assert isinstance(pending.exception(timeout=15), (ConnectionError, http.client.RemoteDisconnected))
+            with listener(exe, root, unlock, grants=grants) as restarted:
+                alice, bob = SourceClient(restarted, a), SourceClient(restarted, b)
+                recovered(alice, interrupted, "unknown_outcome" if dispatch else "cancelled_before_execution",
+                          "dispatch_authorized" if dispatch else "admitted")
+                invisible(bob, interrupted)
+        with listener(exe, root, unlock, grants=[grant(a, "beta"), grant(replacement, "beta")]) as changed:
+            assert wire(changed.port, "Bearer " + b, None, "initialize") == (401, None, {})
+            for bearer in (a, replacement):
+                client = SourceClient(changed, bearer)
+                invisible(client, aid)
+                invisible(client, bid)
+        shared = folder / "scope-mode-boundary"
+        with listener(exe, shared, unlock):
+            pass
+        with listener(exe, shared, unlock, expected=False, grants=grants):
+            pass
+        with listener(exe, shared, unlock):
+            pass
+    else:
+        bearers = [secrets.token_hex(32) for _ in range(17)]
+        many = [grant(bearer, "alpha") for bearer in bearers]
+        with listener(exe, root, unlock, grants=many[:16], durable=False) as active:
+            first, last = SourceClient(active, bearers[0]), SourceClient(active, bearers[15])
+            assert first.caps()["observe_budget"]["admitted_calls"]["limit"] == 8
+            _, theirs = first.query(pool, {"source": "", "limit": "1"})
+            assert last.caps()["evidence_source"] == "alpha"
+            invisible(last, theirs["operation_id"])
+        extra = [token for fingerprint, source in many for token in ("--principal", fingerprint, source)]
+        invalid = subprocess.run([exe, "--self-test", "mcp-journal-fixture", "-", str(free_port()), *extra],
+                                 cwd=folder, input="", text=True, capture_output=True, timeout=15)
+        assert invalid.returncode == 2 and "ready" not in invalid.stdout
+    print("source grants: separate credentials, sessions, budgets, projected rows and owned receipts; durable =", durable, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, required=True)
+    parser.add_argument("--principals-only", action="store_true")
     args = parser.parse_args()
     exe = args.exe.resolve(strict=True)
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="kn-mcp-journal-") as directory, ThreadPoolExecutor(max_workers=1) as pool:
         folder = Path(directory)
-        boundaries(exe, folder, pool)
-        late_return(exe, folder, pool)
-        retention(exe, folder, pool)
+        source_principals(exe, folder, pool, durable=False)
+        source_principals(exe, folder, pool, durable=True)
+        if not args.principals_only:
+            boundaries(exe, folder, pool)
+            late_return(exe, folder, pool)
+            retention(exe, folder, pool)
     assert not folder.exists() and hashlib.sha256(exe.read_bytes()).hexdigest() == digest
     print("journal fixtures removed, product SHA-256", digest)
 

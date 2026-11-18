@@ -921,27 +921,70 @@ static bool McpManifestMatches(const std::wstring& response, const wchar_t* list
 
 // A separate process lets the test controller terminate this exact listener
 // after a real queue/dispatch boundary, without running the live debugger.
-int RunMcpJournalFixture(const wchar_t* directory, uint16_t port)
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants)
 {
     McpServer server;
     McpServerConfig config;
     config.Port = port;
     config.ObserveOnly = true;
     config.BindAddress = L"127.0.0.1";
-    config.OperationJournalDirectory = directory;
-    config.AuditPath = config.OperationJournalDirectory + L"\\fixture-audit.jsonl";
+    config.Principals = grants;
+    if (std::wstring(directory) != L"-") { config.OperationJournalDirectory = directory; }
+    config.AuditPath = config.OperationJournalDirectory.empty() ? L"fixture-audit.jsonl" : config.OperationJournalDirectory + L"\\fixture-audit.jsonl";
     std::wstring error, line;
     if (!std::getline(std::wcin, config.Password) || !server.Start(config, &error))
     {
         std::wcout << L"unavailable" << std::endl;
         return 1;
     }
+    if (!grants.empty() && (server.TokenSource() != L"principal" || !server.Password().empty() || !server.Token().empty())) { return 2; }
     std::wcout << L"ready" << std::endl;
     TimelineStore timeline(1);
+    if (!grants.empty())
+    {
+        // Interleave exact, case-variant and prefix labels and carry a raw field
+        // on every row. The wire oracle exercises the normal retained store.
+        uint32_t pid = 0;
+        for (const auto* source : {L"alpha", L"beta", L"Alpha", L"alpha.more", L"alpha"})
+        {
+            TimelineEvent row;
+            row.Source = source;
+            row.Domain = L"process";
+            row.Action = L"fixture-" + std::to_wstring(++pid);
+            row.ProcessId = pid;
+            row.TimestampFileTime = pid;
+            row.Evidence[L"private"] = L"fixture-private-context";
+            row.Summary = L"fixture-private-summary";
+            timeline.IngestEvents({row});
+        }
+    }
     std::shared_ptr<McpJob> job;
     while (std::getline(std::wcin, line) && line != L"stop")
     {
-        if (line == L"queued")
+        if (!grants.empty() && line == L"evict")
+        {
+            timeline.SetCapacity(2048);
+            TimelineEvent row;
+            row.Source = L"alpha.more";
+            row.Domain = L"process";
+            for (uint32_t i = 1; i <= 1023; ++i)
+            {
+                row.TimestampFileTime = i;
+                row.Action = std::to_wstring(i);
+                timeline.IngestEvents({row});
+            }
+            timeline.SetCapacity(1024); // leaves the last alpha row at the front
+            row.Source = L"beta";
+            row.Action.assign(129, L'x');
+            if (timeline.IngestEvents({row, row}).Added != 1) { return 2; }
+            std::wcout << L"evicted" << std::endl;
+        }
+        else if (!grants.empty() && line == L"clear")
+        {
+            timeline.Clear();
+            std::wcout << L"cleared" << std::endl;
+        }
+        else if (line == L"queued")
         {
             if (WaitForSingleObject(server.JobReadyEvent(), 15000) != WAIT_OBJECT_0) { return 2; }
             std::lock_guard<std::mutex> lock(server.queueMutex_);

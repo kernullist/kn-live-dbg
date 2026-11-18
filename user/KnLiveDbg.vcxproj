@@ -369,6 +369,7 @@
     <ClInclude Include="PayloadTracer.h" />
     <ClInclude Include="McpJson.h" />
     <ClInclude Include="McpServer.h" />
+    <ClInclude Include="McpObserveGrant.h" />
     <ClInclude Include="McpOperation.h" />
     <ClInclude Include="McpSelfTest.h" />
     <ClInclude Include="McpOperationJournal.h" />

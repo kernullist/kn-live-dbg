@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Source-scoped MCP observation, 2026-11-18
+
+The Windows x64 Release checks used an HTTP.sys listener on loopback and a
+controller fixture with interleaved retained rows. The fixture exercised the
+product's listener configuration, queue, dispatch, timeline store and optional
+private journal. It did not open a debugger device or load a driver.
+[Client setup](MCP_SETUP.md#give-each-client-one-retained-source)
+
+Windows build 28000.3501 ran Release binary SHA-256
+`36a4c9d1f626c6f20062a9877cf459bd3f4cb6dd0454bfca5d059908aba21681`.
+The complete suite passed 3,057 command checks across 261 commands. The MCP
+catalog, shared observe HTTP, legacy HTTP and timeline suites passed 150,
+98, 29 and 28 checks respectively. Restricted launch checked 70 CLI results.
+
+| Boundary | Observed result |
+| --- | --- |
+| Authentication and discovery | Separate client bearers received distinct protocol sessions. The operator unlock password, a fingerprint presented as a bearer, an unknown bearer and a foreign session failed. Reinitializing one client preserved the other's session and both balances. Discovery exposed two tools and one resource. |
+| Evidence and cost | Of five rows across four source labels, the two authorized clients saw two rows and one row respectively. Case and prefix variants were excluded. Scan charges counted only the granted source. Raw evidence, summaries and global event IDs were absent. Capacity shrink, subsequent eviction, duplicate ingestion and clear produced the expected counts. Oversized labels appeared as `null`. |
+| Per-client ownership | A valid foreign operation ID returned the same fields as an unknown ID. This held for live and recovered records, including a changed source or replacement credential. Clients sharing one source had independent receipt access. Sixteen grants were accepted and a seventeenth was rejected. Exhausting one client's requested-event budget left the other able to query. |
+| Recovery | An independent Python reader decrypted the owned fixture and reproduced each keyed owner ID and request hash. After controlled process termination, only the owner could read the cancelled-before-dispatch or unknown-after-dispatch record. Reordering grants preserved access. Shared and source-scoped journals refused cross-mode opens. The shared-mode regression also recovered 256 of 257 admissions. |
+
+For pre-response interruptions the fixture captured the operation ID at the
+queue checkpoint. A client that loses its ID cannot look it up by request ID.
+The Windows PowerShell provisioning example generated separate credentials
+and printed only their fingerprints. The bridge test used a substitute
+`npx` to inspect its argument boundary and rejection paths. The external
+package's pinned header substitution example was checked separately.
+
+During validation the existing process-output fixture reached its five-second
+deadline before its short lines filled the 64 KiB allowance. A diagnostic
+built from the same capture functions distinguished this from the one-second
+silent-child timeout. The fixture now emits 2,048-character lines. It keeps
+the original limits and assertions. The standalone operation ledger passed
+40 Release checks and the independent JSON oracle checked 12 records. The
+MSVC AddressSanitizer build stopped during Windows interceptor initialization
+before running the ledger tests.
+
 ## Private MCP operation recovery, 2026-11-18
 
 The Windows **28000.3501 x64** Release executable had SHA-256

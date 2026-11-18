@@ -123,6 +123,18 @@ $tokenSource = (Get-JsonStringProperty -Object $endpoint -Name "token_source").T
 $port = Get-JsonStringProperty -Object $endpoint -Name "port"
 $write = Get-JsonStringProperty -Object $endpoint -Name "write"
 
+if ($tokenSource -eq 'principal')
+{
+    if ($PreferRemote -or $loopUrl -cnotmatch '\Ahttp://127\.0\.0\.1:[0-9]{1,5}/mcp/?\z')
+    {
+        throw "Source-scoped clients require the local IPv4 loopback endpoint."
+    }
+    $token = $env:KNLIVEDBG_TOKEN
+    if (!$token -or $token -cnotmatch '\A[0-9a-f]{64}\z')
+    {
+        throw "Set KNLIVEDBG_TOKEN to this client's assigned bearer."
+    }
+}
 if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 4)
 {
     throw "Invalid MCP endpoint password in '$endpointPath' (empty or too short)."
@@ -186,6 +198,11 @@ if ($PrintEndpoint)
 }
 
 $header = "Authorization: Bearer $token"
+if ($tokenSource -eq 'principal')
+{
+    $env:KNLIVEDBG_BRIDGE_AUTH = "Bearer $token"
+    $header = 'Authorization:${KNLIVEDBG_BRIDGE_AUTH}'
+}
 
 $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
 if (-not $npx)

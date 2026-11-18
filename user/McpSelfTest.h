@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
+#include "McpObserveGrant.h"
 
 int RunMcpToolCatalogSelfTest();
 int RunMcpTransportSelfTest(bool observe = false);
-int RunMcpJournalFixture(const wchar_t* directory, uint16_t port);
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants);

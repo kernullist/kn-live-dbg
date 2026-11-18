@@ -4,6 +4,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "McpObserveGrant.h"
 
 namespace commandinput
 {
@@ -105,6 +106,7 @@ namespace commandinput
         bool AllowWrite = false;
         bool ObserveOnly = false;
         std::wstring OperationJournalDirectory;
+        std::vector<McpObserveGrant> Principals;
     };
 
     inline bool ParseListenerOptions(
@@ -133,6 +135,15 @@ namespace commandinput
             {
                 ok = !parsed.ObserveOnly;
                 parsed.ObserveOnly = true;
+            }
+            else if (!remote && arg == L"--principal")
+            {
+                ok = parsed.Principals.size() < 16 && args.size() - index > 2;
+                if (ok)
+                {
+                    parsed.Principals.push_back({ args[index + 1], args[index + 2] });
+                    index += 2;
+                }
             }
             else if (!remote && arg == L"--journal")
             {
@@ -184,6 +195,7 @@ namespace commandinput
             }
         }
         if (!parsed.OperationJournalDirectory.empty() && !parsed.ObserveOnly) { ok = false; }
+        if (!parsed.Principals.empty() && (!parsed.ObserveOnly || !ValidMcpObserveGrants(parsed.Principals))) { ok = false; }
         if (parsed.ObserveOnly)
         {
             ok = ok && !parsed.AllowWrite;

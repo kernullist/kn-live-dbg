@@ -51924,6 +51924,13 @@ static McpEngineResult DispatchMcpRequest(
         result.Text = L"observe dispatch requires an admitted scan budget";
         return result;
     }
+    if (!request.Grant.Fingerprint.empty() || !request.Grant.Source.empty())
+    {
+        if (observeScan) { return ReadMcpObservedTimeline(request, state.Timeline, *observeScan); }
+        result.IsError = true;
+        result.Text = L"source grant requires an admitted observation budget";
+        return result;
+    }
     if (request.Kind == McpRequestKind::ResourceRead)
     {
         if (request.Name == L"kn://session/info")
@@ -52251,7 +52258,7 @@ static bool ReadHiddenConsoleLine(const wchar_t* prompt, std::wstring* line)
     return ok;
 }
 
-static bool PromptMcpSessionPassword(std::wstring* password, std::wstring* error)
+static bool PromptMcpSessionPassword(std::wstring* password, std::wstring* error, bool journalOnly)
 {
     bool ok = false;
     std::wstring first;
@@ -52268,8 +52275,8 @@ static bool PromptMcpSessionPassword(std::wstring* password, std::wstring* error
             break;
         }
 
-        std::wcout << L"Set a temporary MCP password for this session.\n";
-        std::wcout << L"Clients connect with IP, port, and this password.\n";
+        if (journalOnly) { std::wcout << L"Enter the operator password for this private operation journal.\n"; }
+        else { std::wcout << L"Set a temporary MCP password for this session.\nClients connect with IP, port, and this password.\n"; }
         std::wcout.flush();
 
         if (!ReadHiddenConsoleLine(L"MCP password: ", &first) ||
@@ -52299,6 +52306,16 @@ static bool PromptMcpSessionPassword(std::wstring* password, std::wstring* error
     SecureClearWString(&first);
     SecureClearWString(&second);
     return ok;
+}
+
+static void PrintMcpObserveBudget()
+{
+    if (!g_McpServer.ObserveOnly()) { return; }
+    if (g_McpServer.TokenSource() == L"principal")
+    {
+        std::wcout << L"Each client can read its own budget at kn://capabilities.\n";
+    }
+    else { std::wcout << g_McpServer.ObserveBudgetJson() << L"\n"; }
 }
 
 static void RunMcpEngineLoop(
@@ -52365,7 +52382,7 @@ static void RunMcpEngineLoop(
             std::wcout << L"[mcp] running port=" << g_McpServer.Port()
                        << L" scope=" << g_McpServer.ScopeName()
                        << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off") << L"\n";
-            if (g_McpServer.ObserveOnly()) { std::wcout << g_McpServer.ObserveBudgetJson() << L"\n"; }
+            PrintMcpObserveBudget();
         }
 
         std::shared_ptr<McpJob> job;
@@ -52803,6 +52820,7 @@ static std::wstring BuildMcpLoadEnvPowerShell(const std::wstring& endpointPath)
     ps += L"$e = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json\n";
     ps += L"$token = [string]$e.token\n";
     ps += L"if ([string]::IsNullOrWhiteSpace($token)) { $token = [string]$e.password }\n";
+    ps += L"if ($e.token_source -eq 'principal') { $token = $env:KNLIVEDBG_TOKEN; if ($token -cnotmatch '\\A[0-9a-f]{64}\\z' -or !$token) { throw 'Set KNLIVEDBG_TOKEN to your assigned client bearer' } }\n";
     ps += L"$url = [string]$e.url\n";
     ps += L"if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 4) { throw \"invalid password in $p\" }\n";
     ps += L"$parsedUrl = $null\n";
@@ -53105,7 +53123,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53177,7 +53195,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                     std::wcout << L"  remote_url  : " << remoteUrl << L"\n";
                 }
                 std::wcout << L"  client_url  : " << clientUrl << L"\n";
-                std::wcout << L"  password    : <redacted, session-only>\n";
+                if (tokenSource != L"principal") { std::wcout << L"  password    : <redacted, session-only>\n"; }
                 std::wcout << L"  auth        : " << tokenSource << L"\n";
                 std::wcout << L"  port        : " << port << L"\n";
                 std::wcout << L"  write       : " << write << L"\n";
@@ -53214,6 +53232,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         config.AllowWrite = options.AllowWrite;
         config.ObserveOnly = options.ObserveOnly;
         config.OperationJournalDirectory = options.OperationJournalDirectory;
+        config.Principals = std::move(options.Principals);
         if (!ValidateMcpObservationConfig(config, &optionError))
         {
             std::wcerr << L"mcp start failed: " << optionError << L"\n";
@@ -53232,7 +53251,8 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                            std::to_wstring(config.Port) + L".jsonl";
 
         std::wstring passwordError;
-        if (!PromptMcpSessionPassword(&config.Password, &passwordError))
+        const bool scoped = !config.Principals.empty();
+        if ((!scoped || !config.OperationJournalDirectory.empty()) && !PromptMcpSessionPassword(&config.Password, &passwordError, scoped))
         {
             std::wcerr << L"mcp start failed: " << passwordError << L"\n";
             return;
@@ -53325,13 +53345,17 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                    << L"\n";
         std::wcout << L"  audit    : " << g_McpServer.AuditPath() << L"\n";
         std::wcout << L"\n";
-        PrintConsoleOnly(
-            L"  password : " + g_McpServer.Password() +
-            L"  (session only, not written to the log)\n");
-        std::wcout << L"  Client connection (IP + port + password):\n";
-        std::wcout << L"    URL    : http://<ip>:" << g_McpServer.Port() << L"/mcp\n";
-        PrintConsoleOnly(
-            L"    Header : Authorization: Bearer " + g_McpServer.Password() + L"\n");
+        if (scoped)
+        {
+            std::wcout << L"  Clients use their own KNLIVEDBG_TOKEN with " << loopUrl << L"\n";
+        }
+        else
+        {
+            PrintConsoleOnly(L"  password : " + g_McpServer.Password() + L"  (session only, not written to the log)\n");
+            std::wcout << L"  Client connection (IP + port + password):\n";
+            std::wcout << L"    URL    : http://<ip>:" << g_McpServer.Port() << L"/mcp\n";
+            PrintConsoleOnly(L"    Header : Authorization: Bearer " + g_McpServer.Password() + L"\n");
+        }
         std::wcout << L"\n";
         std::wcout << L"  Listening prefixes:\n";
         const std::vector<std::wstring> registeredHosts = g_McpServer.RegisteredHosts();
@@ -53432,16 +53456,16 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
                    << L" bind=" << g_McpServer.BindAddress()
                    << L" wildcard=" << (g_McpServer.WildcardBound() ? L"on" : L"off")
                    << L" write=" << (g_McpServer.AllowWrite() ? L"on" : L"off")
-                   << L" auth=password\n";
-        if (g_McpServer.ObserveOnly()) { std::wcout << g_McpServer.ObserveBudgetJson() << L"\n"; }
+                   << L" auth=" << g_McpServer.TokenSource() << L"\n";
+        PrintMcpObserveBudget();
         std::wcout << L"  endpoint: " << GetMcpEndpointPath() << L"\n";
         std::wcout << L"  bridge  : " << ResolveMcpBridgeScriptPath() << L"\n";
-        std::wcout << L"  clients : IP + port + session password\n";
+        std::wcout << (g_McpServer.TokenSource() == L"principal" ? L"  clients : loopback + assigned bearer\n" : L"  clients : IP + port + session password\n");
     }
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--observe [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }
@@ -54101,8 +54125,13 @@ int wmain(int argc, wchar_t** argv)
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-journal-fixture")
         {
-            uint16_t port = 0;
-            return argc == 5 && commandinput::ParsePort(argv[4], &port) ? RunMcpJournalFixture(argv[3], port) : 2;
+            if (argc < 5) { return 2; }
+            std::vector<std::wstring> options{L"--observe"};
+            options.insert(options.end(), argv + 4, argv + argc);
+            commandinput::ListenerOptions parsed;
+            if (!commandinput::ParseListenerOptions(options, 0, false, 0, &parsed, nullptr) || !parsed.Port ||
+                !parsed.OperationJournalDirectory.empty()) { return 2; }
+            return RunMcpJournalFixture(argv[3], parsed.Port, parsed.Principals);
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
         {

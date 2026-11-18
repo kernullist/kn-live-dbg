@@ -62,13 +62,29 @@ struct McpOperationJournal::Impl
     std::wstring Path, Principal;
     PrivateText Key;
     std::array<uint8_t, 32> Entropy{};
-    using Row = std::pair<std::wstring, std::wstring>;
+    struct Row { std::wstring Id, Owner, Receipt; };
     std::vector<Row> Rows; // admission order, including previous controller generations
     bool Ready = false;
+    bool Scoped = false;
 
     ~Impl() { SecureZeroMemory(Entropy.data(), Entropy.size()); }
 
     DATA_BLOB Salt() { return {static_cast<DWORD>(Entropy.size()), Entropy.data()}; }
+    std::wstring Mac(const std::string& frame) const
+    {
+        std::array<uint8_t, 32> digest{};
+        if (frame.empty() || frame.size() > UINT32_MAX || BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(Key.Bytes.data())), static_cast<ULONG>(Key.Bytes.size()),
+            reinterpret_cast<PUCHAR>(const_cast<char*>(frame.data())), static_cast<ULONG>(frame.size()),
+            digest.data(), static_cast<ULONG>(digest.size())) < 0) { return {}; }
+        return mcpjson::Utf8ToWide(Hex(digest.data(), digest.size()));
+    }
+    std::wstring Owner(const McpObserveGrant& grant) const
+    {
+        if (!Scoped) { return grant.Fingerprint.empty() && grant.Source.empty() ? Principal : L""; }
+        if (grant.Fingerprint.empty() || grant.Source.empty()) { return {}; }
+        return Mac(mcpjson::WideToUtf8(L"grant.v1\n" + grant.Fingerprint + L"\n" + grant.Source)).substr(0, 32);
+    }
     bool SetPrincipal()
     {
         ContentHash hash;
@@ -85,7 +101,7 @@ struct McpOperationJournal::Impl
         clear.Bytes.append(Header).append(Key.Bytes).push_back('\n');
         for (const auto& row : rows)
         {
-            const auto receipt = mcpjson::WideToUtf8(row.second);
+            const auto receipt = mcpjson::WideToUtf8(row.Receipt);
             if (receipt.empty() || receipt.size() > 4096) { return false; }
             clear.Bytes.append(receipt).push_back('\n');
         }
@@ -134,13 +150,15 @@ struct McpOperationJournal::Impl
             const auto end = image.find('\n', pos);
             if (end == image.npos || end - pos > 4096 || Rows.size() >= McpOperationLedger::Capacity) { return false; }
             const auto text = mcpjson::Utf8ToWide(std::string(image.substr(pos, end - pos)));
-            std::wstring id, schema, journal, principal, recovered;
+            std::wstring id, schema, journal, principal, recovered, scope;
             if (!mcpjson::ValidateDocument(text) || !mcpjson::GetString(text, L"schema", &schema) || schema != L"kn.mcp_operation.v1" ||
                 !mcpjson::GetString(text, L"operation_id", &id) || !IsMcpOperationId(id) ||
                 !mcpjson::FindRawValue(text, L"journal", &journal) || !mcpjson::GetString(journal, L"principal_id", &principal) ||
-                principal != Principal || !mcpjson::FindRawValue(journal, L"recovered", &recovered) || recovered != L"true" ||
-                std::any_of(Rows.begin(), Rows.end(), [&](const Row& row) { return row.first == id; })) { return false; }
-            Rows.emplace_back(std::move(id), text);
+                !(Scoped ? IsMcpOperationId(principal) : principal == Principal) ||
+                !mcpjson::GetString(journal, L"approved_scope", &scope) || scope != (Scoped ? L"loopback_observe_source" : L"loopback_observe") ||
+                !mcpjson::FindRawValue(journal, L"recovered", &recovered) || recovered != L"true" ||
+                std::any_of(Rows.begin(), Rows.end(), [&](const Row& row) { return row.Id == id; })) { return false; }
+            Rows.push_back({std::move(id), std::move(principal), text});
             pos = end + 1;
         }
         return true;
@@ -150,13 +168,14 @@ struct McpOperationJournal::Impl
 McpOperationJournal::McpOperationJournal() : Data(std::make_unique<Impl>()) {}
 McpOperationJournal::~McpOperationJournal() = default;
 
-bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring& password, std::wstring* error)
+bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring& password, std::wstring* error, bool scoped)
 {
     if (error) { *error = L"cannot open private operation journal with this credential"; }
     if (Data->Ready || password.empty()) { return false; }
     try
     {
         auto candidate = std::make_unique<Impl>();
+        candidate->Scoped = scoped;
         EvidencePrivacyReport policy;
         bool fresh = false;
         if (!candidate->Guard.Open(directory, false, &policy))
@@ -167,7 +186,8 @@ bool McpOperationJournal::Open(const std::wstring& directory, const std::wstring
         if (!candidate->Lease.Acquire(policy.RootPath, true, nullptr)) { return false; }
         candidate->Path = L"\\\\?\\" + policy.RootPath + L"\\operations.knmcpjournal";
         PrivateText binding;
-        binding.Bytes = mcpjson::WideToUtf8(L"KnLiveDbg.observe.journal.v1\n" + policy.RootIdentity + L"\n");
+        const std::wstring domain = scoped ? L"KnLiveDbg.observe.source.journal.v1\n" : L"KnLiveDbg.observe.journal.v1\n";
+        binding.Bytes = mcpjson::WideToUtf8(domain + policy.RootIdentity + L"\n");
         auto credential = mcpjson::WideToUtf8(password);
         binding.Bytes.append(credential);
         SecureZeroMemory(credential.data(), credential.size());
@@ -193,12 +213,11 @@ std::optional<McpJournalIdentity> McpOperationJournal::Identify(const McpEngineR
     if (!Data->Ready || !IsMcpOperationId(generation)) { return std::nullopt; }
     const auto frame = mcpjson::WideToUtf8((request.Kind == McpRequestKind::ToolCall ? L"tool\n" : L"resource\n") +
         request.Name + L"\n" + request.ArgumentsJson);
-    std::array<uint8_t, 32> digest{};
-    if (frame.empty() || frame.size() > UINT32_MAX || BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,
-        reinterpret_cast<PUCHAR>(Data->Key.Bytes.data()), static_cast<ULONG>(Data->Key.Bytes.size()),
-        reinterpret_cast<PUCHAR>(const_cast<char*>(frame.data())), static_cast<ULONG>(frame.size()),
-        digest.data(), static_cast<ULONG>(digest.size())) < 0) { return std::nullopt; }
-    return McpJournalIdentity{Data->Principal, generation, mcpjson::Utf8ToWide(Hex(digest.data(), digest.size())), McpUtcFileTime()};
+    const auto owner = Data->Owner(request.Grant);
+    if (owner.empty() || frame.empty()) { return std::nullopt; }
+    const auto digest = Data->Mac(Data->Scoped ? mcpjson::WideToUtf8(owner) + "\n" + frame : frame);
+    if (digest.empty()) { return std::nullopt; }
+    return McpJournalIdentity{owner, generation, digest, McpUtcFileTime()};
 }
 
 bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcept
@@ -207,17 +226,20 @@ bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcep
     try
     {
         auto next = Data->Rows;
-        const auto at = std::find_if(next.begin(), next.end(), [&](const Impl::Row& row) { return row.first == operation.Id; });
+        const auto at = std::find_if(next.begin(), next.end(), [&](const Impl::Row& row) { return row.Id == operation.Id; });
         const bool admission = !operation.Dispatched && !operation.Finished;
-        if (admission == (at == next.end()) && operation.Journal && operation.Journal->PrincipalId == Data->Principal)
+        if (admission == (at == next.end()) && operation.Journal &&
+            (Data->Scoped ? (!operation.OwnerFingerprint.empty() && IsMcpOperationId(operation.Journal->PrincipalId)) :
+                operation.OwnerFingerprint.empty() && operation.Journal->PrincipalId == Data->Principal) &&
+            (admission || at->Owner == operation.Journal->PrincipalId))
         {
             auto receipt = McpOperationJson(operation, true);
             if (admission)
             {
                 if (next.size() == McpOperationLedger::Capacity) { next.erase(next.begin()); }
-                next.emplace_back(operation.Id, std::move(receipt));
+                next.push_back({operation.Id, operation.Journal->PrincipalId, std::move(receipt)});
             }
-            else { at->second = std::move(receipt); }
+            else { at->Receipt = std::move(receipt); }
             if (Data->Write(next)) { Data->Rows.swap(next); return true; }
         }
     }
@@ -228,10 +250,13 @@ bool McpOperationJournal::Persist(const McpOperationSnapshot& operation) noexcep
 
 bool McpOperationJournal::Healthy() const { return Data->Ready; }
 
-bool McpOperationJournal::Lookup(const std::wstring& id, std::wstring* receipt) const
+bool McpOperationJournal::Lookup(const std::wstring& id, const McpObserveGrant& grant, std::wstring* receipt) const
 {
-    const auto at = std::find_if(Data->Rows.begin(), Data->Rows.end(), [&](const Impl::Row& row) { return row.first == id; });
-    if (!Data->Ready || at == Data->Rows.end() || !receipt) { return false; }
-    *receipt = at->second;
+    if (!Data->Ready || !receipt) { return false; }
+    const auto owner = Data->Owner(grant);
+    const auto at = std::find_if(Data->Rows.begin(), Data->Rows.end(),
+        [&](const Impl::Row& row) { return row.Id == id && row.Owner == owner; });
+    if (at == Data->Rows.end()) { return false; }
+    *receipt = at->Receipt;
     return true;
 }

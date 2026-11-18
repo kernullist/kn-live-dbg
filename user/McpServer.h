@@ -2,8 +2,9 @@
 
 // In-process MCP (Model Context Protocol) server for KnLiveDbg. Transport is
 // Streamable HTTP (http.sys). Default listen is all interfaces (0.0.0.0 / "+")
-// so multi-adapter hosts do not bind the wrong NIC. Auth is a session password
-// the operator types at `mcp on`. The server owns the HTTP listener thread,
+// so multi-adapter hosts do not bind the wrong NIC. Shared sessions use an
+// operator password. Local observe can authenticate individual source grants.
+// The server owns the HTTP listener thread,
 // authentication, JSON-RPC framing, the static tool/resource/prompt catalog,
 // and a serialized job queue. It NEVER touches the kernel engine directly:
 // each tool/resource call is pushed onto the queue and executed on the single
@@ -25,6 +26,7 @@
 #include <utility>
 #include <vector>
 #include "McpOperation.h"
+#include "McpObserveGrant.h"
 
 enum class McpRequestKind
 {
@@ -40,6 +42,7 @@ struct McpEngineRequest
     McpRequestKind Kind;
     std::wstring Name;
     std::wstring ArgumentsJson;
+    McpObserveGrant Grant{};
 };
 
 struct McpObserveUsage
@@ -51,10 +54,14 @@ struct McpObserveUsage
     static constexpr uint32_t MaxPayloadBytes = 1024 * 1024;
     static constexpr uint32_t MaxResultPayloadBytes = 64 * 1024;
 
+    explicit McpObserveUsage(uint32_t shares = 1)
+        : CallLimit(MaxCalls / shares), RequestLimit(MaxRequestedEvents / shares),
+          ExaminedLimit(MaxExaminedEvents / shares), PayloadLimit(MaxPayloadBytes / shares), RemainingScan(ExaminedLimit) {}
+    const uint32_t CallLimit, RequestLimit, ExaminedLimit, PayloadLimit;
     uint32_t AdmittedCalls = 0;
     uint32_t RequestedEvents = 0;
     uint32_t PayloadBytes = 0;
-    std::atomic<uint32_t> RemainingScan{MaxExaminedEvents};
+    std::atomic<uint32_t> RemainingScan;
 };
 
 // Result produced by the engine-thread dispatch. Text is the primary human/
@@ -116,6 +123,7 @@ struct McpServerConfig
     std::wstring Password;
     bool ObserveOnly = false;
     std::wstring OperationJournalDirectory;
+    std::vector<McpObserveGrant> Principals;
 };
 
 class TimelineStore;
@@ -169,8 +177,8 @@ public:
     McpServer& operator=(const McpServer&) = delete;
 
     // Starts the http.sys listener. Default bind is all interfaces
-    // (http://+:<port>/mcp/). Requires a session password. Returns false (with
-    // error) if the password is invalid or transport initialization fails.
+    // (http://+:<port>/mcp/). Source-scoped observe requires loopback. Invalid
+    // credentials, policy or transport initialization fail startup.
     bool Start(const McpServerConfig& config, std::wstring* error);
 
     // Stops the listener, cancels queued jobs, and joins the listener thread.
@@ -203,18 +211,19 @@ public:
     // pending jobs with TryPopJob(). DispatchJob claims and publishes the job once.
     HANDLE JobReadyEvent() const;
     std::shared_ptr<McpJob> TryPopJob();
-    McpEngineResult OperationStatus(const std::wstring& operationId) const;
-    std::wstring ObserveBudgetJson() const;
+    McpEngineResult OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant = {}) const;
+    std::wstring ObserveBudgetJson(const McpObserveGrant& grant = {}) const;
     bool DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineDispatchFn& dispatch);
 
 private:
     friend int RunMcpToolCatalogSelfTest();
-    friend int RunMcpJournalFixture(const wchar_t*, uint16_t);
+    friend int RunMcpJournalFixture(const wchar_t*, uint16_t, const std::vector<McpObserveGrant>&);
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     void StopLocked();
     void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result, uint32_t examinedEvents = 0);
     bool AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result, uint32_t* requestedEvents = nullptr) const;
+    std::shared_ptr<McpObserveUsage> UsageForGrantLocked(const McpObserveGrant& grant) const;
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);
     void AppendAuditLine(const std::wstring& line);
     bool AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstring* error);
@@ -244,6 +253,7 @@ private:
     mutable std::mutex queueMutex_;
     uint64_t listenerGeneration_ = 0;
     std::shared_ptr<McpObserveUsage> observeUsage_;
+    std::vector<std::shared_ptr<McpObserveUsage>> principalUsage_;
     std::deque<std::shared_ptr<McpJob>> queue_;
     HANDLE jobReadyEvent_ = nullptr;
     size_t maxPending_ = 8;
