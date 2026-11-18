@@ -22946,36 +22946,6 @@ static bool PromptTimelineYesNo(const std::wstring& prompt, bool defaultValue)
     return value;
 }
 
-static bool TimelineLiveIsActive(DeviceClient* device, TimelineLiveStatus* status)
-{
-    bool active = false;
-
-    do
-    {
-        if (device == nullptr || !device->IsOpen())
-        {
-            break;
-        }
-
-        TimelineLiveStatus current = {};
-        std::wstring error;
-        if (!QueryTimelineLiveStatus(device, &current, &error))
-        {
-            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
-            std::wcout << L" status failed: " << error << L"\n";
-            break;
-        }
-
-        if (status != nullptr)
-        {
-            *status = current;
-        }
-        active = (current.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0;
-    } while (false);
-
-    return active;
-}
-
 static bool TimelineLiveErrorLooksAccessDenied(const std::wstring& error)
 {
     std::wstring lowered = ToLower(error);
@@ -23030,7 +23000,8 @@ static void TryEnableTimelineTi(
     } while (false);
 }
 
-static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device, TimelineControlLease* acquired = nullptr)
+static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device,
+    TimelineActivation mode = TimelineActivation::StartIfIdle, TimelineControlLease* acquired = nullptr)
 {
     bool active = false;
     if (acquired) { *acquired = {}; }
@@ -23044,37 +23015,28 @@ static bool TryEnableTimelineLive(DebuggerState& state, DeviceClient* device, Ti
             break;
         }
 
-        TimelineLiveStatus status = {};
-        if (TimelineLiveIsActive(device, &status))
-        {
-            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_DIM);
-            std::wcout << L" already active\n";
-            if (StartTimelineAutoDrainWorker(state, device))
-            {
-                std::wcout << L"[timeline.live] auto-drain running\n";
-            }
-            active = true;
-            break;
-        }
-
+        bool alreadyActive = false;
         std::wstring error;
-        if (!ControlTimelineLive(
-                device,
-                KNDBG_TIMELINE_CONTROL_START,
-                static_cast<uint32_t>(KNDBG_TIMELINE_DEFAULT_CAPACITY),
-                &error, acquired))
+        {
+            std::lock_guard<std::mutex> lock(g_TimelineLiveIoMutex);
+            active = device->ActivateTimeline(mode, KNDBG_TIMELINE_DEFAULT_CAPACITY, alreadyActive, &error, acquired);
+        }
+        if (!active)
         {
             std::wcerr << L"!timeline live on failed: " << error << L"\n";
             PrintTimelineLiveAccessDeniedHint(error);
             break;
         }
-
-        std::wcout << L"[timeline.live] on capacity=" << KNDBG_TIMELINE_DEFAULT_CAPACITY << L"\n";
+        if (alreadyActive)
+        {
+            PrintColoredText(L"[timeline.live]", KNDBG_COLOR_DIM);
+            std::wcout << L" already active\n";
+        }
+        else { std::wcout << L"[timeline.live] on capacity=" << KNDBG_TIMELINE_DEFAULT_CAPACITY << L"\n"; }
         if (StartTimelineAutoDrainWorker(state, device))
         {
             std::wcout << L"[timeline.live] auto-drain running\n";
         }
-        active = true;
     } while (false);
 
     return active;
@@ -24274,7 +24236,7 @@ static void HandleKmonCommand(
             }
 
             TimelineControlLease liveStart;
-            if (!TryEnableTimelineLive(state, &device, &liveStart))
+            if (!TryEnableTimelineLive(state, &device, TimelineActivation::StartIfIdle, &liveStart))
             {
                 if (startedTiHere)
                 {
@@ -25030,8 +24992,6 @@ static void RunTimelineGuidedRefresh(
     DeviceClient* device,
     SymbolEngine* symbols)
 {
-    bool liveActive = TimelineLiveIsActive(device, nullptr);
-
     if (!GetTiSubscriberInstance().IsActive())
     {
         if (PromptTimelineYesNo(L"Enable Threat-Intelligence ETW capture now?", false))
@@ -25045,24 +25005,25 @@ static void RunTimelineGuidedRefresh(
         std::wcout << L" TI ETW already active\n";
     }
 
-    liveActive = TimelineLiveIsActive(device, nullptr);
-    if (!liveActive)
+    bool liveActive = false;
+    TimelineLiveStatus current{};
+    std::wstring liveError;
+    if (!QueryTimelineLiveStatus(device, &current, &liveError))
+    {
+        PrintColoredText(L"[timeline.live]", KNDBG_COLOR_WARN);
+        std::wcout << L" status unavailable: " << liveError << L"\n";
+    }
+    else if (current.Flags & KNDBG_TIMELINE_STATUS_ACTIVE)
+    {
+        liveActive = TryEnableTimelineLive(state, device, TimelineActivation::ReuseOnly);
+    }
+    else
     {
         if (PromptTimelineYesNo(L"Enable kernel live process/image/thread callbacks now?", false))
         {
             liveActive = TryEnableTimelineLive(state, device);
         }
     }
-    else
-    {
-        PrintColoredText(L"[timeline.live]", KNDBG_COLOR_DIM);
-        std::wcout << L" already active\n";
-        if (StartTimelineAutoDrainWorker(state, device))
-        {
-            std::wcout << L"[timeline.live] auto-drain running\n";
-        }
-    }
-
     std::vector<std::wstring> updateArgs;
     updateArgs.push_back(L"!timeline");
     updateArgs.push_back(L"update");

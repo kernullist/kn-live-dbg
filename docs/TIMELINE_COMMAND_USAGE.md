@@ -180,10 +180,19 @@ Preparing an existing ring clears queued events and resets its sequence and
 drop counters. This can already have happened when registration later fails.
 Use `!timeline live status` to inspect an existing collection.
 
+Guided timeline startup and `!kmon start` read the status before submitting
+a start. They reuse an active collection. They start an idle one only when
+it has no registrations, the queue and loss counters are zero, and the next
+event sequence is one. If the status read fails or reports inconsistent fields,
+prior events or pending cleanup, the controller skips the start. This check
+and any resulting control run in order with this
+controller's other live controls, including those on a second device handle.
+
 When KMON startup fails after enabling live collection, automatic rollback
 requires the detailed receipt for a fresh start on the same device-open epoch.
 If this controller submits another live timeline control first, the receipt
-expires for rollback. After a legacy acknowledgment, inspect
+expires for rollback. A guided or KMON caller that adopts the running
+collection also retires that rollback authority. After a legacy acknowledgment, inspect
 `!timeline live status` before explicit cleanup.
 
 An older ABI 17 driver can return `legacy_acknowledged`. A malformed reply

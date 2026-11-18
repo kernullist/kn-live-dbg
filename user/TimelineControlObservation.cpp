@@ -50,6 +50,16 @@ TimelineControlSnapshot TimelineControlJournal::Snapshot() const
     return snapshot;
 }
 
+bool ValidTimelineStartStatus(const KNDBG_TIMELINE_STATUS_RESPONSE& status)
+{
+    using namespace timeline_callbacks;
+    if (status.Size != sizeof(status) || status.Count >= status.NextSequence || status.Count > status.Capacity ||
+        (status.Flags & ~(Registered | Active))) { return false; }
+    if (!status.Capacity) { return !status.Flags && !status.Dropped && status.NextSequence == 1; }
+    if (status.Capacity < KNDBG_TIMELINE_MIN_CAPACITY || status.Capacity > KNDBG_TIMELINE_MAX_CAPACITY) { return false; }
+    return !(status.Flags & Active) || (status.Flags & Registered) == Registered;
+}
+
 bool ValidateTimelineControlReply(const TimelineControlObservation& row)
 {
     const auto& r = row.Receipt;

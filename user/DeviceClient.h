@@ -121,6 +121,7 @@ struct IotraceRecord
 };
 
 struct TimelineControlLease;
+enum class TimelineActivation;
 
 class DeviceClient
 {
@@ -274,6 +275,9 @@ public:
         TimelineControlLease* acquired = nullptr,
         const TimelineControlLease* expected = nullptr);
 
+    bool ActivateTimeline(TimelineActivation mode, uint32_t capacity, bool& alreadyActive, std::wstring* error,
+        TimelineControlLease* acquired = nullptr);
+
     bool QueryTimelineStatus(
         TimelineLiveStatus* status,
         std::wstring* error);
@@ -286,6 +290,8 @@ public:
 
 private:
     void CloseLocked();
+    auto TimelineControlSender();
+    bool ReadTimelineStatus(KNDBG_TIMELINE_STATUS_RESPONSE& response, std::wstring* error);
     bool Ioctl(
         DWORD code,
         void* buffer,

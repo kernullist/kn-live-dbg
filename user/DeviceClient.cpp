@@ -563,6 +563,12 @@ bool DeviceClient::ReadIdt(
     return ok;
 }
 
+auto DeviceClient::TimelineControlSender()
+{
+    return [this](void* buffer, DWORD in, DWORD out, DWORD* returned, DWORD* win32, std::wstring* detail)
+    { return Ioctl(IOCTL_KNDBG_TIMELINE_CONTROL, buffer, in, out, returned, detail, win32, true); };
+}
+
 bool DeviceClient::ControlTimeline(
     uint32_t action,
     uint32_t capacity,
@@ -577,54 +583,43 @@ bool DeviceClient::ControlTimeline(
         if (error) { *error = L"Device is not open"; }
         return false;
     }
-    auto send = [this](void* buffer, DWORD in, DWORD out, DWORD* returned, DWORD* win32, std::wstring* detail)
-    { return Ioctl(IOCTL_KNDBG_TIMELINE_CONTROL, buffer, in, out, returned, detail, win32, true); };
     const bool detailed = (versionFlags_.load() & KNDBG_VERSION_FLAG_TIMELINE_CONTROL_RECEIPT) != 0;
-    return GetTimelineControlJournal().Submit(action, capacity, ObservationEpoch(), detailed, send, error, acquired, expected);
+    return GetTimelineControlJournal().Submit(action, capacity, ObservationEpoch(), detailed, TimelineControlSender(), error, acquired, expected);
 }
 
-bool DeviceClient::QueryTimelineStatus(
-    TimelineLiveStatus* status,
-    std::wstring* error)
+bool DeviceClient::ActivateTimeline(TimelineActivation mode, uint32_t capacity, bool& alreadyActive, std::wstring* error,
+    TimelineControlLease* acquired)
 {
-    bool ok = false;
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    const bool detailed = (versionFlags_.load() & KNDBG_VERSION_FLAG_TIMELINE_CONTROL_RECEIPT) != 0;
+    auto query = [this](KNDBG_TIMELINE_STATUS_RESPONSE& status, std::wstring* message) { return ReadTimelineStatus(status, message); };
+    return GetTimelineControlJournal().Activate(mode, capacity, ObservationEpoch(), detailed, query, TimelineControlSender(), alreadyActive, error, acquired);
+}
 
-    do
+bool DeviceClient::ReadTimelineStatus(KNDBG_TIMELINE_STATUS_RESPONSE& response, std::wstring* error)
+{
+    DWORD returned = 0;
+    if (!Ioctl(IOCTL_KNDBG_TIMELINE_STATUS, &response, 0, sizeof(response), &returned, error)) { return false; }
+    if (returned != sizeof(response) || response.Size != sizeof(response))
     {
-        if (status == nullptr)
-        {
-            if (error != nullptr)
-            {
-                *error = L"Invalid timeline status output";
-            }
-            break;
-        }
+        if (error) { *error = returned < sizeof(response) ? L"Short timeline status response" : L"Invalid timeline status size"; }
+        return false;
+    }
+    return true;
+}
 
-        KNDBG_TIMELINE_STATUS_RESPONSE response = {};
-        DWORD returned = 0;
-        if (!Ioctl(IOCTL_KNDBG_TIMELINE_STATUS, &response, 0, sizeof(response), &returned, error))
-        {
-            break;
-        }
-
-        if (returned < sizeof(response))
-        {
-            if (error != nullptr)
-            {
-                *error = L"Short timeline status response";
-            }
-            break;
-        }
-
-        status->Flags = response.Flags;
-        status->Capacity = response.Capacity;
-        status->Count = response.Count;
-        status->Dropped = response.Dropped;
-        status->NextSequence = response.NextSequence;
-        ok = true;
-    } while (false);
-
-    return ok;
+bool DeviceClient::QueryTimelineStatus(TimelineLiveStatus* status, std::wstring* error)
+{
+    if (!status)
+    {
+        if (error) { *error = L"Invalid timeline status output"; }
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(managedCallbackMutex_);
+    KNDBG_TIMELINE_STATUS_RESPONSE response{};
+    if (!ReadTimelineStatus(response, error)) { return false; }
+    *status = {response.Flags, response.Capacity, response.Count, response.Dropped, response.NextSequence};
+    return true;
 }
 
 bool DeviceClient::DrainTimelineEvents(

@@ -123,6 +123,110 @@ namespace
         return true;
     }
 
+    bool ReturnStartReply(KNDBG_TIMELINE_CONTROL_RECEIPT* buffer, DWORD out, DWORD* bytes, DWORD* win32,
+        const KNDBG_TIMELINE_CONTROL_RECEIPT& installed)
+    {
+        if (out == sizeof(*buffer))
+        {
+            const auto request = buffer->Request;
+            const auto id = buffer->RequestId;
+            *buffer = installed;
+            buffer->Request = request;
+            buffer->RequestId = id;
+        }
+        else if (out != sizeof(buffer->Request)) { return false; }
+        *bytes = out;
+        *win32 = ERROR_SUCCESS;
+        return true;
+    }
+
+    bool GuardedActivation(const KNDBG_TIMELINE_CONTROL_RECEIPT& installed)
+    {
+        TimelineControlJournal journal;
+        KNDBG_TIMELINE_STATUS_RESPONSE status{sizeof(status), 0, 0, 0, 0, 1};
+        const auto fresh = status;
+        bool queryOk = false, reused = true;
+        unsigned sends = 0;
+        std::wstring error;
+        TimelineControlLease lease{};
+        auto query = [&](auto& output, std::wstring* message) {
+            if (!queryOk) { *message = L"fixture status read failed"; return false; }
+            output = status;
+            return true;
+        };
+        auto send = [&](KNDBG_TIMELINE_CONTROL_RECEIPT* buffer, DWORD, DWORD out, DWORD* bytes, DWORD* win32, std::wstring*) {
+            ++sends;
+            return ReturnStartReply(buffer, out, bytes, win32, installed);
+        };
+        auto activate = [&](TimelineActivation mode, bool detailed = true) {
+            error.clear();
+            return journal.Activate(mode, 128, 73, detailed, query, send, reused, &error, &lease);
+        };
+        const auto start = TimelineActivation::StartIfIdle, adopt = TimelineActivation::ReuseOnly;
+        if (activate(start) || reused || error != L"fixture status read failed" || activate(adopt) || sends) { return false; }
+        queryOk = true;
+        const KNDBG_TIMELINE_STATUS_RESPONSE rejected[] = {
+            {0, 0, 0, 0, 0, 1}, {sizeof(status), Active, 128, 0, 0, 1}, {sizeof(status), All, 0, 0, 0, 1},
+            {sizeof(status), 0x40, 128, 0, 0, 1}, {sizeof(status), 0, 127, 0, 0, 1},
+            {sizeof(status), 0, 16385, 0, 0, 1}, {sizeof(status), 0, 128, 129, 0, 130},
+            {sizeof(status), 0, 128, 0, 0, 0}, {sizeof(status), All, 128, 1, 0, 1}, {sizeof(status), Process, 128, 0, 0, 1},
+            {sizeof(status), 0, 128, 1, 0, 2}, {sizeof(status), 0, 128, 0, 1, 2}, {sizeof(status), 0, 128, 0, 0, 23}
+        };
+        for (const auto& input : rejected)
+        {
+            status = input;
+            if (activate(start) || reused || lease.DeviceEpoch || error.empty()) { return false; }
+        }
+        status = fresh;
+        if (activate(adopt) || sends || journal.Snapshot().Total) { return false; }
+        if (!activate(start) || reused || !lease.RequestId || sends != 1) { return false; }
+        const auto original = lease;
+        status = {sizeof(status), All, 128, 3, 1000, 6}; // Filtered thread noise can exceed the sequence count.
+        if (!activate(adopt) || !reused || lease.RequestId || sends != 1 || journal.Snapshot().Total != 1 ||
+            journal.Submit(KNDBG_TIMELINE_CONTROL_STOP, 0, 73, true, send, &error, nullptr, &original) || sends != 1) { return false; }
+        status = {sizeof(status), 0, 128, 0, 0, 1};
+        if (!activate(start, false) || reused || lease.DeviceEpoch != 73 || lease.RequestId || sends != 2) { return false; }
+        std::wcout << L"[callback.activation.fixture] rejected_states=" << std::size(rejected)
+                   << L" fresh_starts=" << sends << L" stale_stops=0\n";
+        return true;
+    }
+
+    bool ConcurrentActivation(const KNDBG_TIMELINE_CONTROL_RECEIPT& installed)
+    {
+        using namespace std::chrono_literals;
+        TimelineControlJournal journal;
+        std::promise<void> firstRead, secondRequested, release;
+        auto observed = firstRead.get_future(), requested = secondRequested.get_future(), proceed = release.get_future();
+        std::atomic<uint32_t> flags{0};
+        std::atomic<unsigned> sends{0};
+        bool firstReused = false, secondReused = false;
+        auto run = [&](bool first, bool& reused) {
+            std::wstring error;
+            auto query = [&](auto& status, std::wstring*) {
+                status = {sizeof(status), flags.load(), 128, 0, 0, 1};
+                if (!first) { return true; }
+                firstRead.set_value();
+                return proceed.wait_for(10s) == std::future_status::ready;
+            };
+            auto send = [&](KNDBG_TIMELINE_CONTROL_RECEIPT* buffer, DWORD, DWORD out, DWORD* bytes, DWORD* win32, std::wstring*) {
+                ++sends;
+                flags.store(All);
+                return ReturnStartReply(buffer, out, bytes, win32, installed);
+            };
+            if (!first) { secondRequested.set_value(); }
+            return journal.Activate(TimelineActivation::StartIfIdle, 128, first ? 17 : 18, true, query, send, reused, &error, nullptr);
+        };
+        auto first = std::async(std::launch::async, [&] { return run(true, firstReused); });
+        const bool holding = observed.wait_for(5s) == std::future_status::ready;
+        auto second = std::async(std::launch::async, [&] { return run(false, secondReused); });
+        const bool competing = requested.wait_for(5s) == std::future_status::ready;
+        release.set_value();
+        const bool a = first.get(), b = second.get();
+        if (!holding || !competing || !a || !b || firstReused || !secondReused || sends.load() != 1 || journal.Snapshot().Total != 1) { return false; }
+        std::wcout << L"[callback.activation.overlap] connections=2 starts=1 reuses=1 receipts=1\n";
+        return true;
+    }
+
     bool PipeControl()
     {
         GUID guid{};
@@ -143,6 +247,11 @@ namespace
         if (client.ControlTimeline(KNDBG_TIMELINE_CONTROL_CLEAR, 0, &error) || journal.Snapshot().Total != before) { return false; }
         if (!client.Open(name, &error)) { std::wcerr << L"test pipe open: " << error << L"\n"; return false; }
         const auto epoch = client.ObservationEpoch();
+        bool reused = true;
+        TimelineControlLease unused{epoch, 5};
+        if (client.ActivateTimeline(TimelineActivation::StartIfIdle, 128, reused, &error, &unused) || reused ||
+            unused.DeviceEpoch || unused.RequestId || error.empty() || journal.Snapshot().Total != before) { return false; }
+        std::wcout << L"[callback.activation.native] status_failed=1 start_receipts=0\n";
         if (client.ControlTimeline(KNDBG_TIMELINE_CONTROL_CLEAR, 0, &error))
         { std::wcerr << L"test pipe unexpectedly acknowledged timeline control\n"; return false; }
         client.Close();
@@ -182,6 +291,9 @@ bool TimelineCallbackOwnershipSelfTest(bool native)
         Denied, Process, &failed) && failed.CallCount == KNDBG_TIMELINE_MAX_CALLBACK_CALLS &&
         Transition(true, 0, {{Process,0,0x103}}, Unsuccessful, 0, nullptr),
         L"original failure, rollback failure and maximum attempts")) { return false; }
+
+    if (!Check(GuardedActivation(start), L"guarded automatic start and reuse") ||
+        !Check(ConcurrentActivation(start), L"serialized activation across device connections")) { return false; }
 
     TimelineControlJournal journal;
     uint32_t sends = 0;

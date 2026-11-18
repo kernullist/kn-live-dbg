@@ -34,6 +34,9 @@ def main():
             raise RuntimeError(run.stdout[-1600:])
         assert not list(Path(directory).iterdir()), "test artifacts remain"
     lines = run.stdout.splitlines()
+    assert lines.count("[callback.activation.fixture] rejected_states=13 fresh_starts=2 stale_stops=0") == 1
+    assert lines.count("[callback.activation.overlap] connections=2 starts=1 reuses=1 receipts=1") == 1
+    assert lines.count("[callback.activation.native] status_failed=1 start_receipts=0") == 1
     failed, detail = receipt(lines, "[callback.fixture.receipt] ")
     assert failed["action"] == "timeline.callbacks.start" and detail["outcome"] == "failed"
     assert detail["possible_observer_effect"] == "initialize_or_reset_ring_and_register_callbacks"

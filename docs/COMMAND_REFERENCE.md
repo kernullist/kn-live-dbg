@@ -811,6 +811,11 @@ acknowledgment is labeled separately. `KnLiveDbg.exe --self-test callback-owners
 exercises the control contract and uses an owned Windows pipe for the native
 transport rejection. [Live callback control results](TIMELINE_COMMAND_USAGE.md#inspect-live-callback-control-results)
 
+Guided timeline activation and `!kmon start` reuse a running collection. An
+automatic start requires a validated, idle status with no event history or
+outstanding callback registrations. An explicit `!timeline live start` resets
+the event ring. Use `!timeline live status` to inspect its counters beforehand.
+
 Use [timeline workflows](TIMELINE_COMMAND_USAGE.md) to ingest TI, live kernel
 events and snapshots, query evidence families, export JSONL, and reconcile
 same-boot baselines. Collection loss and capacity eviction constrain absence

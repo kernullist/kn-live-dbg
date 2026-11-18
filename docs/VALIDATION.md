@@ -7,6 +7,31 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Automatic live timeline startup, 2026-11-18
+
+Windows x64 build 28000.3501 ran the Release controller with SHA-256
+`f27afff1dc6dae80fdde5bc1676e6079f87aae7cb1d35c728d6ef5e6fd456088`.
+This controller uses the existing timeline status and control requests.
+The driver source and wire layout are those from `e338097`.
+[Automatic and explicit startup](TIMELINE_COMMAND_USAGE.md#inspect-live-callback-control-results)
+
+| Check | Observed result |
+| --- | --- |
+| Status before start | An independent hosted check compared 276,480 combinations of status-read success, wire size, flags, capacity, queue count, next sequence, dropped count and activation mode. Three inputs could submit a start. Another 138 could adopt an active collection. Every other input left the send count at zero for that attempt. |
+| Two concurrent callers | The first caller read the idle flags and paused before returning them. A second caller requested activation on another device connection in the same controller. Together they issued one start and produced one control receipt. The second caller reused the collection. A separate test confirmed that adopting an active collection revoked the original caller's automatic stop. |
+| Retained history and compatibility | The packaged test checked a stopped collection with pending events, a drained collection with a prior sequence, dropped events, and residual registrations. Each kept its history during the automatic start check. An idle collection with initial counters accepted both the legacy acknowledgment and the detailed response. |
+| Windows I/O | A private named pipe rejected the status query. The controller returned the Windows error and recorded zero start requests. A subsequent explicit clear reached the pipe and produced its own error receipt. |
+
+The command suite passed 3,081 checks across 261 commands, and the packaged
+callback receipt check passed eight consecutive runs. The standalone
+native-read and JSON checks passed 139 and 14 cases respectively. Post-run
+inspection found zero new bugcheck events, reboot events or crash dumps,
+and zero resident test processes, drivers or test listeners. The hosted
+matrix uses a scripted device. The named pipe exercises Windows I/O. Running
+with a loaded KnLiveDbg driver and tracing independent raw-device clients are
+outside this evidence. The optional MSVC AddressSanitizer matrix stopped at
+Windows interceptor initialization before evaluating a case.
+
 ## Live timeline callback control, 2026-11-18
 
 Windows build 28000.3501 produced the following x64 Release artifacts.
