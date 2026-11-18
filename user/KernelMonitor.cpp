@@ -1,5 +1,6 @@
 #include "KernelMonitor.h"
 #include "KmonUserInventory.h"
+#include "TimelineSelfTest.h"
 #include "KmonUserModuleSource.h"
 #include "ProcessObservationSource.h"
 #include "NativeObservationSource.h"
@@ -8113,11 +8114,10 @@ namespace
         }
         void Resolve(KmonUserTarget& target)
         {
-            const std::unique_ptr<void, decltype(&CloseHandle)> process(
-                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.Pid), &CloseHandle);
-            if (process)
+            ObservedProcessHandle process(ControllerProcessHandles(), ProcessHandleSite::KmonUserInventory, target.Pid);
+            if (process.Open(PROCESS_QUERY_LIMITED_INFORMATION))
             {
-                target.CreateTime = QueryProcessCreateTicks(process.get());
+                target.CreateTime = process.Acquisition().Bound.Created;
                 if (target.CreateTime != 0)
                 {
                     target.PinnedGeneration = true;
@@ -8347,6 +8347,16 @@ void KernelMonitor::CancelUserInventory()
 void KernelMonitor::ResetUserInventory()
 {
     UserInventory.reset(); LastUserInventory.clear(); UserAdmissionPosition = {};
+}
+
+void ReportKmonInventoryHandleFixture(uint32_t pid, const std::wstring& image, std::wostream& out)
+{
+    KmonNativeUserInventorySource native(nullptr, nullptr);
+    KmonUserTarget target;
+    target.Pid = pid;
+    native.Resolve(target);
+    out << L"[collector.inventory] created=" << target.CreateTime << L" pinned=" << target.PinnedGeneration
+        << L" image=" << !target.ImagePath.empty() << L" matches=" << (!target.ImagePath.empty() && _wcsicmp(target.ImagePath.c_str(), image.c_str()) == 0) << L"\n";
 }
 
 bool KmonUserInventoryIntegrationSelfTest(std::wstring* diagnostics)

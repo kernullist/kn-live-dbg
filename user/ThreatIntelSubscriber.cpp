@@ -525,36 +525,19 @@ std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid, uint64_t eventT
         return L"System";
     }
 
-    struct ProcessHandleScope
-    {
-        HANDLE Value = nullptr;
-
-        ~ProcessHandleScope()
-        {
-            if (Value != nullptr)
-            {
-                CloseHandle(Value);
-            }
-        }
-    } process;
+    ObservedProcessHandle process(ControllerProcessHandles(), ProcessHandleSite::TiImageLookup, pid);
     auto readIdentity = [&](uint64_t* created)
     {
-        process.Value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-        FILETIME create = {}, exit = {}, kernel = {}, user = {};
-        const bool known = process.Value != nullptr &&
-            GetProcessTimes(process.Value, &create, &exit, &kernel, &user) != FALSE &&
-            WaitForSingleObject(process.Value, 0) == WAIT_TIMEOUT;
-        if (known)
-        {
-            *created = (static_cast<uint64_t>(create.dwHighDateTime) << 32) | create.dwLowDateTime;
-        }
-        return known;
+        if (!process.Open(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) ||
+            !process.Acquisition().Bound.Created || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT) { return false; }
+        *created = process.Acquisition().Bound.Created;
+        return true;
     };
     auto readPath = [&](std::wstring* path)
     {
         std::vector<wchar_t> buffer(32768, L'\0');
         DWORD length = static_cast<DWORD>(buffer.size());
-        const bool known = QueryFullProcessImageNameW(process.Value, 0, buffer.data(), &length) != FALSE &&
+        const bool known = QueryFullProcessImageNameW(process.get(), 0, buffer.data(), &length) != FALSE &&
             length != 0 && length < buffer.size();
         if (known)
         {
@@ -564,7 +547,7 @@ std::wstring TiSubscriber::GetCachedImageOrResolve(uint32_t pid, uint64_t eventT
     };
     auto stillAlive = [&]()
     {
-        return WaitForSingleObject(process.Value, 0) == WAIT_TIMEOUT;
+        return WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT;
     };
 
     // Every cache hit requires the current generation from this same handle.

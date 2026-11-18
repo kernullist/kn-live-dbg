@@ -151,11 +151,23 @@ PID와 프로세스 생성 시각, 세션 세대, 요청·반환 시각, Win32 �
 
 ### 프로세스 핸들 열기와 닫기 확인
 
-`!timeline ingest observer`는 공용 프로세스 식별 경로와 관측 소스가 실행한
-최근 핸들 호출 64개도 복사한다. 대시보드 새로 고침과 `!timeline update`는
+`!timeline ingest observer`는 컨트롤러가 기록한 최근 프로세스 핸들 호출
+64개도 복사한다. 공용 프로세스 식별 경로, 관측 소스, 아래 수집기가 이 공간을
+함께 쓴다. 대시보드 새로 고침과 `!timeline update`는
 같은 커서를 사용한다. 다시 실행하면 이후 호출만 들어온다. 복사 전에 밀려난
 호출이 있으면 그 개수를 표시한다. 호출자가 빌려준 핸들로 프로세스를 식별하면
 소유권 기록은 생기지 않는다.
+
+| `handle_site` | 프로세스를 여는 이유 | 요청 권한 |
+| --- | --- | --- |
+| `ti_image_lookup` | TI 이벤트와 출력에 쓸 이미지 이름을 조회한다. 캐시에 이름이 있어도 프로세스 생성 시각과 종료 여부를 다시 확인한다. | 제한 조회와 동기화 (`0x101000`) |
+| `kmon_user_inventory` | KMON이 프로세스 목록에 넣기로 한 PID의 생성 시각과 이미지 경로를 조회한다. | 제한 조회 (`0x1000`) |
+| `hunt_public_details` | 조사 목록에 있는 프로세스의 이미지와 세션을 확인한다. 세션을 조회하는 동안 같은 프로세스 핸들을 유지한다. | 제한 조회 (`0x1000`) |
+| `hunt_package_identity` | 스냅샷에 생성 시각이 있는 프로세스의 패키지 정보를 조회한다. | 제한 조회와 동기화 (`0x101000`) |
+
+다른 소유자가 참조를 유지하면 종료된 프로세스의 핸들도 열릴 수 있다. 이때
+열기 행에는 성공이 기록된다. 이미지·세션·패키지 정보를 사용할 수 있는지는
+각 수집기가 따로 확인한다. [Windows 프로세스 ID의 수명](https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803)
 
 `/source observer /domain observer_action`으로 조회한 뒤
 `process.handle.open`, `process.handle.duplicate`, `process.handle.close`를

@@ -4,34 +4,53 @@ import argparse
 import ctypes
 from ctypes import wintypes
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+import _winapi
 
 
-def run_child(exe, arguments, directory):
+def creation_time(handle):
     get_times = ctypes.WinDLL("kernel32", use_last_error=True).GetProcessTimes
     get_times.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     get_times.restype = wintypes.BOOL
-    with subprocess.Popen([exe, *arguments], cwd=directory, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, encoding="utf-8", errors="replace") as child:
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not get_times(handle, *(ctypes.byref(t) for t in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def run_child(exe, arguments, directory, reference=None):
+    startup = None
+    if reference is not None:
+        startup = subprocess.STARTUPINFO()
+        startup.lpAttributeList = {"handle_list": [reference]}
+        os.set_handle_inheritable(reference, True)
+    try:
+        child = subprocess.Popen([exe, *arguments], cwd=directory, startupinfo=startup, close_fds=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 encoding="utf-8", errors="replace")
+    finally:
+        if reference is not None:
+            os.set_handle_inheritable(reference, False)
+    with child:
         try:
-            times = [wintypes.FILETIME() for _ in range(4)]
-            if not get_times(int(child._handle), *(ctypes.byref(value) for value in times)):
-                raise ctypes.WinError(ctypes.get_last_error())
-            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            created = creation_time(int(child._handle))
             output, errors = child.communicate(timeout=60)
         finally:
             if child.poll() is None:
                 child.kill()
                 child.communicate()
         if child.returncode:
-            raise RuntimeError(f"{arguments}: exit {child.returncode}. {errors[-1200:]}")
+            label = arguments[:2] if reference is not None else arguments
+            raise RuntimeError(f"{label}: exit {child.returncode}. {errors[-1200:]}")
         return output, child.pid, created
 
 
-def evidence(rows, calls, pid, created):
+def evidence(rows, calls, pid, created, first_sequence=1):
     assert [row["action"] for row in rows] == ["process.handle." + call for call in calls]
     for index, row in enumerate(rows, start=1):
         assert row["eventId"] == index and row["pid"] == pid and "targetPid" not in row
@@ -40,7 +59,7 @@ def evidence(rows, calls, pid, created):
         fields = row["evidence"]
         assert fields["schema"] == "kn.observer_action.v1" and fields["ingest_origin"] == "local_controller"
         assert fields["actor"] == "controller" and fields["effect_verified"] == "false"
-        assert fields["sequence"] == str(index) and fields["controller_create_time"] == str(created)
+        assert fields["sequence"] == str(first_sequence + index - 1) and fields["controller_create_time"] == str(created)
         assert fields["status_domain"] == "win32" and (fields["status"] == "0") == (fields["outcome"] == "succeeded")
         assert int(fields["requested_utc_filetime"]) > 0 and int(fields["returned_utc_filetime"]) == row["timestampFileTime"]
         assert fields["possible_observer_effect"] and not {"raw_handle", "handle_value", "granted_access"}.intersection(fields)
@@ -75,6 +94,182 @@ def check_denied_open(exe, policy_exe, directory):
     assert row["requested_pid"] == str(pid) and row["requested_create_time"] == str(created)
     assert row["outcome"] == "failed" and row["status"] == "5" and row["requested_access"] == "0x1010"
     assert not {"acquisition_id", "observed_pid", "observed_create_time", "identity_win32_status"}.intersection(row)
+
+
+def process_open_status(pid, mask):
+    open_process = ctypes.WinDLL("kernel32", use_last_error=True).OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    handle = open_process(mask, False, pid)
+    if not handle:
+        return ctypes.get_last_error()
+    _winapi.CloseHandle(handle)
+    return 0
+
+
+def package_path_available(handle):
+    kernel = ctypes.WinDLL("kernel32")
+    name = kernel.GetPackageFullName
+    path = kernel.GetPackagePathByFullName
+    output = [ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR]
+    name.argtypes = [wintypes.HANDLE, *output]
+    path.argtypes = [wintypes.LPCWSTR, *output]
+    def read(query, subject):
+        length = wintypes.DWORD()
+        if query(subject, ctypes.byref(length), None) != 122 or not 0 < length.value <= 32768:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length.value)
+        return buffer.value if query(subject, ctypes.byref(length), buffer) == 0 else ""
+    package = read(name, handle)
+    return bool(package and read(path, package))
+
+
+def deny_child_access(child, mask):
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    pointer = wintypes.LPVOID
+    convert = security.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(pointer), ctypes.POINTER(wintypes.DWORD))
+    apply_dacl = security.SetKernelObjectSecurity
+    apply_dacl.argtypes = (wintypes.HANDLE, wintypes.DWORD, pointer)
+    release = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+    release.argtypes = (pointer,)
+    release.restype = pointer
+    descriptor = pointer()
+    if not convert(f"D:P(D;;{mask:#x};;;WD)(A;;GA;;;OW)", 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not apply_dacl(int(child._handle), 4, descriptor):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        release(descriptor)
+
+
+def collector_rows(output):
+    prefix = "[collector.handle] "
+    return [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
+
+
+def check_collector_retention(exe, directory, target, reference):
+    output, actor, actor_created = run_child(exe, ["--self-test", "collector-handle-observer", str(reference), "retention"],
+                                             directory, reference=reference)
+    rows = evidence(collector_rows(output), ["open", "close"] * 32, actor, actor_created, first_sequence=17)
+    created = creation_time(int(target._handle))
+    for opened, closed in zip(rows[::2], rows[1::2]):
+        assert opened["acquisition_id"] == closed["acquisition_id"] == opened["sequence"]
+        for row in (opened, closed):
+            assert row["handle_site"] == "ti_image_lookup" and row["status"] == row["identity_win32_status"] == "0"
+            assert row["requested_pid"] == row["observed_pid"] == str(target.pid) and row["observed_create_time"] == str(created)
+    assert actor != target.pid and output.count("16 process handle observer actions evicted before ingest") == 1
+    assert output.count("Process handle calls=80 retained=64") == 2
+    assert "source_records=64 added=64" in output and "source_records=0 added=0" in output
+    print("Verified 40 TI name lookups, 80 calls, 64 retained rows and 16 evictions reported once.")
+
+
+def check_collector_run(exe, directory, target, reference, phase):
+    pid, created = target.pid, creation_time(int(target._handle))
+    limited, synchronized = 0x1000, 0x101000
+    statuses = {mask: process_open_status(pid, mask) for mask in (limited, synchronized)}
+    if phase == "live":
+        assert statuses == {limited: 0, synchronized: 0}
+    elif phase == "deny_synchronize":
+        assert statuses == {limited: 0, synchronized: 5}
+    elif phase == "deny_query":
+        assert statuses == {limited: 5, synchronized: 5}
+    alive = target.poll() is None
+    assert alive == (phase != "exited")
+    output, actor, actor_created = run_child(exe, ["--self-test", "collector-handle-observer", str(reference)],
+                                            directory, reference=reference)
+    assert pid != actor
+    def printed(prefix):
+        return [dict(item.split("=", 1) for item in line[len(prefix):].split())
+                for line in output.splitlines() if line.startswith(prefix)]
+    rows = collector_rows(output)
+    requests = [("ti_image_lookup", synchronized, 0)] * 2 + [("kmon_user_inventory", limited, 0)]
+    for expected in (created, created + 1, 0):
+        requests.append(("hunt_public_details", limited, expected))
+        if expected:
+            requests.append(("hunt_package_identity", synchronized, expected))
+    calls = []
+    for _, mask, _ in requests:
+        calls.append("open")
+        if not statuses[mask]:
+            calls.append("close")
+    details = iter(evidence(rows, calls, actor, actor_created))
+    for site, mask, requested in requests:
+        opened = next(details)
+        assert opened["requested_access"] == hex(mask) and int(opened["status"]) == statuses[mask]
+        pair = [opened]
+        if statuses[mask]:
+            assert not {"acquisition_id", "observed_pid", "observed_create_time", "identity_win32_status"}.intersection(opened)
+        else:
+            close = next(details)
+            assert close["acquisition_id"] == opened["acquisition_id"] == opened["sequence"] and close["status"] == "0"
+            pair.append(close)
+            for row in pair:
+                assert row["observed_pid"] == str(pid) and row["observed_create_time"] == str(created)
+                assert row["identity_observed_at"] == "acquisition" and row["identity_win32_status"] == "0"
+        for row in pair:
+            assert row["requested_pid"] == str(pid) and row["handle_site"] == site
+            assert row.get("requested_create_time") == (str(requested) if requested else None)
+    assert output.count(f"Process handle calls={len(rows)} retained={len(rows)}") == 2
+    assert f"source_records={len(rows)} added={len(rows)}" in output and "source_records=0 added=0" in output
+    ti_image = str(int(alive and not statuses[synchronized]))
+    assert printed("[collector.ti] ") == [{"image": ti_image, "matches": ti_image}] * 2
+    inventory, = printed("[collector.inventory] ")
+    assert int(inventory["created"]) == (0 if statuses[limited] else created)
+    assert int(inventory["pinned"]) == int(not statuses[limited]) and inventory["matches"] == inventory["image"]
+    if alive:
+        assert int(inventory["image"]) == int(not statuses[limited])
+    hunt = printed("[collector.hunt] ")
+    assert [int(r["requested"]) for r in hunt] == [created, created + 1, 0]
+    lookup_session = ctypes.WinDLL("kernel32", use_last_error=True).ProcessIdToSessionId
+    lookup_session.argtypes = (wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    session = wintypes.DWORD()
+    session_known = bool(lookup_session(pid, ctypes.byref(session)))
+    has_package = alive and package_path_available(reference)
+    for row in hunt:
+        stale = int(row["requested"]) == created + 1
+        assert int(row["changed"]) == int(not statuses[limited] and (not alive or stale))
+        qualified = alive and not stale and not statuses[limited]
+        assert row["matches"] == row["image"] and int(row["image"]) == int(qualified)
+        assert int(row["session_queries"]) == int(row["pinned_at_session"]) == int(qualified), "session lookup outside qualified handle lifetime"
+        assert int(row["session_known"]) == int(qualified and session_known)
+        if row["session_known"] == "1":
+            assert int(row["session"]) == session.value
+        assert row["package"] == row["package_path"]
+        assert int(row["package"]) == int(has_package and not statuses[synchronized] and int(row["requested"]) == created)
+    print(f"Collector {phase}: {len(requests)} opens, {calls.count('close')} closes, package metadata present={has_package}.")
+
+
+def check_collectors(exe, directory, denied_cases):
+    # The child waits on its parent's pipe. The retained creation handle keeps
+    # its process object identifiable after the child has exited.
+    for restrict in ([False, True] if denied_cases else [False]):
+        with subprocess.Popen([sys.executable, "-I", "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                              cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as target:
+            owner = _winapi.GetCurrentProcess()
+            reference = _winapi.DuplicateHandle(owner, int(target._handle), owner, 0x101000, False, 0)
+            try:
+                if restrict:
+                    deny_child_access(target, 0x100000)
+                    check_collector_run(exe, directory, target, reference, "deny_synchronize")
+                    deny_child_access(target, 0x1000)
+                    check_collector_run(exe, directory, target, reference, "deny_query")
+                else:
+                    check_collector_run(exe, directory, target, reference, "live")
+                    check_collector_retention(exe, directory, target, reference)
+                    target.stdin.close()
+                    assert target.wait(timeout=15) == 0
+                    check_collector_run(exe, directory, target, reference, "exited")
+            finally:
+                _winapi.CloseHandle(reference)
+                target.stdin.close()
+                try:
+                    target.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    target.kill()
+                    target.wait(timeout=15)
+                    raise
 
 
 def main():
@@ -135,6 +330,7 @@ def main():
         if args.policy_exe:
             check_denied_open(exe, args.policy_exe.resolve(strict=True), directory)
             print("Verified Windows access denial (5), one failed open, zero duplicates, reads or closes.")
+        check_collectors(exe, directory, denied_cases=bool(args.policy_exe))
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")
 

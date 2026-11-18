@@ -3087,6 +3087,21 @@ TimelineIngestResult TimelineStore::IngestLiveObserverActions(const TimelineCont
     return result;
 }
 
+static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
+{
+    switch (site)
+    {
+    case ProcessHandleSite::SelfProbe: return L"owned_capability_probe";
+    case ProcessHandleSite::IdentityLookup: return L"identity_lookup";
+    case ProcessHandleSite::ObservationSource: return L"observation_source";
+    case ProcessHandleSite::TiImageLookup: return L"ti_image_lookup";
+    case ProcessHandleSite::KmonUserInventory: return L"kmon_user_inventory";
+    case ProcessHandleSite::HuntPublicDetails: return L"hunt_public_details";
+    case ProcessHandleSite::HuntPackageIdentity: return L"hunt_package_identity";
+    }
+    return L"unknown";
+}
+
 TimelineIngestResult TimelineStore::IngestProcessHandleActions(const ProcessHandleSnapshot& snapshot)
 {
     std::lock_guard<std::mutex> lock(Mutex);
@@ -3098,11 +3113,9 @@ TimelineIngestResult TimelineStore::IngestProcessHandleActions(const ProcessHand
         row.Entity = L"process_handle:controller";
         row.ProcessId = snapshot.ControllerPid;
         row.TimestampFileTime = item.ReturnedUtc;
-        const auto site = item.Site == ProcessHandleSite::SelfProbe ? L"owned_capability_probe" :
-            item.Site == ProcessHandleSite::IdentityLookup ? L"identity_lookup" : L"observation_source";
         const auto outcome = item.Succeeded ? L"succeeded" : L"failed";
         auto& fields = row.Evidence;
-        fields = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"}, {L"handle_site", site},
+        fields = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"}, {L"handle_site", ProcessHandleSiteName(item.Site)},
             {L"sequence", std::to_wstring(item.Sequence)}, {L"controller_create_time", std::to_wstring(snapshot.ControllerCreateTime)},
             {L"requested_pid", std::to_wstring(item.RequestedPid)}, {L"outcome", outcome}, {L"effect_verified", L"false"},
             {L"status_domain", L"win32"}, {L"status", std::to_wstring(item.Status)},

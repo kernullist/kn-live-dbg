@@ -174,3 +174,38 @@ bool ProcessHandleObserverSelfTest(bool emit)
     if (emit) { std::wcout << L"[handle.ownership] calls=10 acquired=4 successful_closes=3 fixture_cleanup=passed concurrent_calls=168 retained=64\n"; }
     return true;
 }
+
+bool CollectorProcessHandleFixture(uintptr_t inherited, bool retention)
+{
+    const auto target = reinterpret_cast<HANDLE>(inherited);
+    DWORD flags = 0;
+    if (!GetHandleInformation(target, &flags) || !(flags & HANDLE_FLAG_INHERIT)) { return false; }
+    const auto identity = ReadProcessHandleIdentity(target);
+    if (!identity.Created || identity.Pid <= 4 || identity.Pid == GetCurrentProcessId()) { return false; }
+    const std::unique_ptr<void, decltype(&CloseHandle)> reference(target, &CloseHandle);
+    std::wstring image(32768, L'\0');
+    DWORD size = static_cast<DWORD>(image.size());
+    if (QueryFullProcessImageNameW(target, 0, image.data(), &size)) { image.resize(size); }
+    else { image.clear(); }
+    const auto leaf = image.substr(image.find_last_of(L"\\/") + 1);
+    TiSubscriber ti;
+    if (!ti.ResolveImageBasename(0).empty() || ti.ResolveImageBasename(4) != L"system") { return false; }
+    if (retention)
+    {
+        if (leaf.empty()) { return false; }
+        for (unsigned i = 0; i < 40; ++i)
+        {
+            if (_wcsicmp(ti.ResolveImageBasename(identity.Pid).c_str(), leaf.c_str()) != 0) { return false; }
+        }
+        return true;
+    }
+    for (int i = 0; i < 2; ++i)
+    {
+        const auto actual = ti.ResolveImageBasename(identity.Pid);
+        std::wcout << L"[collector.ti] image=" << !actual.empty()
+            << L" matches=" << (!actual.empty() && _wcsicmp(actual.c_str(), leaf.c_str()) == 0) << L"\n";
+    }
+    ReportKmonInventoryHandleFixture(identity.Pid, image, std::wcout);
+    ReportHuntMetadataHandleFixture(identity.Pid, identity.Created, image, std::wcout);
+    return true;
+}

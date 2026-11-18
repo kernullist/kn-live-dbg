@@ -161,12 +161,24 @@ event ingestion carries `ingest_origin=supplied_record`.
 
 ### Inspect process handle ownership
 
-`!timeline ingest observer` also copies the last 64 calls made by the shared
-process identity lookup and the handle-backed observation source. Dashboard
+`!timeline ingest observer` also copies the last 64 recorded process handle
+calls. The shared identity lookup, the handle-backed observation source and
+the collectors below use one retention window. Dashboard
 refresh and `!timeline update` use the same cursor. Repeating the ingest
 copies only later calls. If calls have already been evicted, the ingest
 reports how many it missed. Using a caller's borrowed identity handle creates
 no ownership record.
+
+| `handle_site` | Reason for opening the process | Requested access |
+| --- | --- | --- |
+| `ti_image_lookup` | Resolve an image name for a TI event or the printer. Cache hits recheck the process generation and liveness. | Limited query and synchronize (`0x101000`) |
+| `kmon_user_inventory` | Resolve the generation and image path for a PID admitted to KMON's user-process inventory. | Limited query (`0x1000`) |
+| `hunt_public_details` | Check the public image and session for a process in the hunt inventory. The handle stays open during the session lookup. | Limited query (`0x1000`) |
+| `hunt_package_identity` | Look up package metadata for a snapshot with a known creation time. | Limited query and synchronize (`0x101000`) |
+
+An open can succeed for a process that has exited while another owner still
+holds a reference. The row reports that acquisition. Each collector applies
+its own checks before using an image, session or package value. [Windows process ID lifetime](https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803)
 
 Filter on `/source observer /domain observer_action` and look for
 `process.handle.open`, `process.handle.duplicate` and `process.handle.close`.

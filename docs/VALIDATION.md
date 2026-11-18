@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Process metadata collector handles, 2026-11-19
+
+Windows x64 build 28000.3501 ran the Release controller with SHA-256
+`4dcf5bb5ae31f02ede05e4239b9a59cb7abeddfb8a904b25004565875ec2584e`.
+A parent process kept a handle to each test child and read its PID and
+creation time. It read the controller's identity separately. The exported
+rows identified the controller as the actor and the child as the requested
+process.
+[Collector sites and access masks](TIMELINE_COMMAND_USAGE.md#inspect-process-handle-ownership)
+
+| Child state and permissions | Observed results |
+| --- | --- |
+| Running | All eight opens and eight closes succeeded across the TI, KMON and hunt lookups. A hunt request with a different creation time retained both generations in its handle evidence and published no image, session or package. |
+| Exited with a reference held by the parent | All eight opens and closes still succeeded for the same child generation. TI returned no image name. Hunt returned no live image, session or package. KMON retained the generation obtained from the handle. |
+| Synchronize access denied | The two TI opens and two package opens returned Win32 error 5. KMON and the three public hunt requests opened and closed their limited-query handles. |
+| Limited query access denied | All eight opens returned Win32 error 5. Ingest produced eight failed-open rows with zero acquisition IDs, observed target identities or close rows. |
+
+The session timing regression reproduced a PID-based lookup before the
+process handle was opened. After the fix, the test observed the qualified
+handle still open at each session lookup and compared the session ID with
+Windows. The generation-mismatch and access-denial cases made zero session
+queries. Actual PID reuse was outside this test.
+
+Forty consecutive lookups of the same live TI image produced 80 open and
+close calls. Ingest copied sequences 17 through 80, reported 16 evictions
+once, and added zero rows on the second ingest. The target had no registered
+package identity. The package lookup's positive result on a packaged target
+remains unverified.
+
+The same Release controller passed 3,081 command checks across 261 routes
+and 570 console checks. After testing, Windows reported no new reboot or
+bugcheck events or crash dumps. The post-run check found no remaining test
+processes, running test drivers, fixture directories or fixture listener.
+
+Run `tools/validate-runtime-capabilities.ps1` to build the policy fixture,
+then use a standard Windows token to run
+`python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe --policy-exe .build/runtime-capabilities/Release/runtime-capabilities-selftest.exe`.
+The access restrictions applied only to a test child. TI checks exercised its
+image resolver without enabling a trace provider. Other direct process
+opens, independent target-effect measurements and a loaded driver remain
+outside this evidence.
+
 ## Process handle ownership, 2026-11-18
 
 Windows x64 build 28000.3501 ran the Release controller with SHA-256

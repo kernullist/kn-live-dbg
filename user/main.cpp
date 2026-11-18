@@ -54261,6 +54261,18 @@ int wmain(int argc, wchar_t** argv)
         {
             return TiObserverOwnershipSelfTest(false) && TiObserverOwnershipSelfTest(true) ? 0 : 1;
         }
+        if (argc >= 3 && ToLower(argv[2]) == L"collector-handle-observer")
+        {
+            if (argc != 4 && !(argc == 5 && ToLower(argv[4]) == L"retention")) { return 2; }
+            uint64_t inherited = 0;
+            if (!ParseUnsigned(argv[3], 10, &inherited) || !inherited || inherited >= UINTPTR_MAX) { return 2; }
+            if (!CollectorProcessHandleFixture(static_cast<uintptr_t>(inherited), argc == 5)) { return 1; }
+            DebuggerState state{};
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            for (const auto& row : state.Timeline.AllEvents()) { std::wcout << L"[collector.handle] " << TimelineEventToJson(row) << L"\n"; }
+            return 0;
+        }
         if (argc == 3 && ToLower(argv[2]) == L"process-handle-observer")
         {
             if (!ProcessHandleObserverSelfTest(true)) { return 1; }

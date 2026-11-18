@@ -1,5 +1,7 @@
 #include "UserModeHunter.h"
 #include "ExecutableImage.h"
+#include "ProcessHandleObservation.h"
+#include "TimelineSelfTest.h"
 
 #include "BindFilterScanner.h"
 #include "ByovdScanner.h"
@@ -6451,7 +6453,8 @@ namespace
     bool ProcessHandleMatchesSnapshot(
         HANDLE handle,
         const SnapshotProcessRecord& snapshot,
-        bool* lifecycleChanged)
+        bool* lifecycleChanged,
+        const ProcessHandleIdentity* acquisition = nullptr)
     {
         if (lifecycleChanged != nullptr)
         {
@@ -6463,18 +6466,17 @@ namespace
             return false;
         }
 
-        FILETIME createTime = {};
-        FILETIME exitTime = {};
-        FILETIME kernelTime = {};
-        FILETIME userTime = {};
-        if (!GetProcessTimes(
-                handle,
-                &createTime,
-                &exitTime,
-                &kernelTime,
-                &userTime))
+        uint64_t observedCreate = 0;
+        if (acquisition)
         {
-            return false;
+            if (!acquisition->Pid || acquisition->Error) { return false; }
+            observedCreate = acquisition->Created;
+        }
+        else
+        {
+            FILETIME created{}, exited{}, kernel{}, user{};
+            if (!GetProcessTimes(handle, &created, &exited, &kernel, &user)) { return false; }
+            observedCreate = ProcessHandleFileTime(created);
         }
 
         DWORD exitCode = 0;
@@ -6483,15 +6485,11 @@ namespace
             return false;
         }
 
-        ULARGE_INTEGER observedCreate = {};
-        observedCreate.LowPart = createTime.dwLowDateTime;
-        observedCreate.HighPart = createTime.dwHighDateTime;
-
         const bool changed =
             exitCode != STILL_ACTIVE ||
             (snapshot.HasCreateTime &&
              (snapshot.CreateTime == 0 ||
-              observedCreate.QuadPart != snapshot.CreateTime));
+              observedCreate != snapshot.CreateTime));
         if (changed && lifecycleChanged != nullptr)
         {
             *lifecycleChanged = true;
@@ -6499,12 +6497,12 @@ namespace
         return !changed;
     }
 
+    template <typename SessionLookup = decltype(&ProcessIdToSessionId)>
     void QueryProcessPublicDetails(
         HuntProcessRecord* process,
-        bool* lifecycleChanged)
+        bool* lifecycleChanged,
+        SessionLookup readSession = ProcessIdToSessionId)
     {
-        HANDLE handle = nullptr;
-
         if (lifecycleChanged != nullptr)
         {
             *lifecycleChanged = false;
@@ -6516,16 +6514,11 @@ namespace
                 break;
             }
 
-            DWORD sessionId = 0;
-            const bool sessionIdAvailable =
-                ProcessIdToSessionId(
-                    process->ProcessId,
-                    &sessionId) != FALSE;
-
-            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process->ProcessId);
-            if (handle == nullptr)
+            ObservedProcessHandle owner(ControllerProcessHandles(), ProcessHandleSite::HuntPublicDetails,
+                process->ProcessId, process->Kernel.HasCreateTime ? process->Kernel.CreateTime : 0);
+            if (!owner.Open(PROCESS_QUERY_LIMITED_INFORMATION))
             {
-                const DWORD openError = GetLastError();
+                const DWORD openError = owner.Acquisition().Status;
                 if (HasExactProcessIdentity(process->Kernel) &&
                     (openError == ERROR_INVALID_PARAMETER ||
                      openError == ERROR_INVALID_HANDLE ||
@@ -6537,11 +6530,13 @@ namespace
                 break;
             }
 
+            const HANDLE handle = owner.get();
             bool handleLifecycleChanged = false;
             if (!ProcessHandleMatchesSnapshot(
                     handle,
                     process->Kernel,
-                    &handleLifecycleChanged))
+                    &handleLifecycleChanged,
+                    &owner.Acquisition().Bound))
             {
                 if (handleLifecycleChanged &&
                     lifecycleChanged != nullptr)
@@ -6551,7 +6546,10 @@ namespace
                 break;
             }
 
-            if (sessionIdAvailable)
+            // The session API takes a PID. Keep the validated object pinned
+            // from generation validation through the session and image lookups.
+            DWORD sessionId = 0;
+            if (readSession(owner.Acquisition().Bound.Pid, &sessionId))
             {
                 process->SessionId = sessionId;
                 process->HasSessionId = true;
@@ -6564,16 +6562,10 @@ namespace
                 process->ApiImagePath.assign(buffer.data(), length);
             }
         } while (false);
-
-        if (handle != nullptr)
-        {
-            CloseHandle(handle);
-        }
     }
 
     void CollectProcessPackageIdentity(HuntProcessRecord* process)
     {
-        std::unique_ptr<void, decltype(&CloseHandle)> ownedHandle(nullptr, CloseHandle);
         do
         {
             if (process == nullptr)
@@ -6586,12 +6578,11 @@ namespace
             {
                 break;
             }
-            ownedHandle.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, process->ProcessId));
+            ObservedProcessHandle ownedHandle(ControllerProcessHandles(), ProcessHandleSite::HuntPackageIdentity,
+                process->ProcessId, process->Kernel.CreateTime);
+            if (!ownedHandle.Open(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)) { break; }
             const HANDLE handle = ownedHandle.get();
-            FILETIME created = {}, exited = {}, kernel = {}, user = {};
-            if (handle == nullptr || !GetProcessTimes(handle, &created, &exited, &kernel, &user) ||
-                ((static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime) !=
-                    process->Kernel.CreateTime || WaitForSingleObject(handle, 0) != WAIT_TIMEOUT)
+            if (ownedHandle.Acquisition().Bound.Created != process->Kernel.CreateTime || WaitForSingleObject(handle, 0) != WAIT_TIMEOUT)
             {
                 break;
             }
@@ -23709,6 +23700,38 @@ namespace
 std::wstring HuntFirstCommandLineImage(const std::wstring& commandLine)
 {
     return FirstCommandLineImage(commandLine);
+}
+
+void ReportHuntMetadataHandleFixture(uint32_t pid, uint64_t created, const std::wstring& image, std::wostream& out)
+{
+    for (const uint64_t requested : {created, created + 1, uint64_t{0}})
+    {
+        HuntProcessRecord process{};
+        process.ProcessId = process.Kernel.ProcessId = pid;
+        process.Kernel.HasCreateTime = requested != 0;
+        process.Kernel.CreateTime = requested;
+        bool changed = false;
+        unsigned sessionQueries = 0;
+        bool pinnedAtQuery = false;
+        QueryProcessPublicDetails(&process, &changed, [&](DWORD queriedPid, DWORD* session) {
+            ++sessionQueries;
+            const auto snapshot = ControllerProcessHandles().Snapshot();
+            if (!snapshot.Actions.empty())
+            {
+                const auto& last = snapshot.Actions.back();
+                pinnedAtQuery = last.Site == ProcessHandleSite::HuntPublicDetails && last.Call == ProcessHandleCall::Open &&
+                    last.Succeeded && last.Bound.Pid == queriedPid && last.Bound.Created == created;
+            }
+            return ProcessIdToSessionId(queriedPid, session);
+        });
+        CollectProcessPackageIdentity(&process);
+        out << L"[collector.hunt] requested=" << requested << L" changed=" << changed
+            << L" image=" << !process.ApiImagePath.empty()
+            << L" matches=" << (!process.ApiImagePath.empty() && _wcsicmp(process.ApiImagePath.c_str(), image.c_str()) == 0)
+            << L" package=" << !process.ApiPackageFullName.empty() << L" package_path=" << !process.ApiPackagePath.empty()
+            << L" session_queries=" << sessionQueries << L" pinned_at_session=" << pinnedAtQuery
+            << L" session_known=" << process.HasSessionId << L" session=" << process.SessionId << L"\n";
+    }
 }
 
 bool HuntProcessLifecycleSelfTest()

@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <vector>
 
-enum class ProcessHandleSite { SelfProbe, IdentityLookup, ObservationSource };
+enum class ProcessHandleSite
+{
+    SelfProbe, IdentityLookup, ObservationSource, TiImageLookup, KmonUserInventory, HuntPublicDetails, HuntPackageIdentity
+};
 enum class ProcessHandleCall { Open, Duplicate, Close };
 
 struct ProcessHandleIdentity
