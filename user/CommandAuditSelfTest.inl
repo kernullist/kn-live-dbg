@@ -652,6 +652,50 @@ static int RunCommandAuditSelfTest()
         check(!commandinput::ParseListenerOptions(tokens, 0, false, 51766, &listen, &error), L"mcp rejects ambiguous or invalid source grant");
     }
 
+    const std::wstring boot(32, L'b');
+    {
+        std::vector<TiEventRecord> retained;
+        for (uint64_t create = 1; create <= 65; ++create)
+        {
+            TiEventRecord row;
+            row.ProcessBootId = boot;
+            row.ProcessId = 739;
+            row.ProcessCreateTime = create;
+            row.Timestamp = 1000;
+            retained.push_back(std::move(row));
+        }
+        check(state.Timeline.IngestThreatIntel(retained, L"all").Added == 65, L"identical TI rows with separate lifetimes remain distinct");
+        const auto first = run(L"!timeline targets ti 739").Output;
+        const auto next = run(L"!timeline targets ti 739 after " + boot + L" 64").Output;
+        check(first.find(L"\"create_filetime\":\"64\"") != first.npos && first.find(L"\"create_filetime\":\"65\"") == first.npos &&
+            first.find(L"\"more\":true") != first.npos && next.find(L"\"create_filetime\":\"65\"") != next.npos &&
+            next.find(L"\"create_filetime\":\"64\"") == next.npos && next.find(L"\"more\":false") != next.npos,
+            L"operator can enumerate every retained TI header generation through the command dispatcher");
+        const auto malformed = run(L"!timeline targets ti 739 after invalid 64");
+        check(malformed.Error.find(L"invalid continuation") != std::wstring::npos && malformed.Output.find(boot) == std::wstring::npos,
+            L"operator discovery rejects malformed continuation");
+        state.Timeline.Clear();
+        check(run(L"!timeline targets ti 739").Output.find(L"\"targets\":[],\"more\":false") != first.npos,
+            L"clearing retained evidence removes operator discovery entries");
+    }
+    std::vector<std::wstring> targetOptions{L"--observe", L"--principal-target", fingerprint, L"ti", boot, L"73", L"100", L"--target-ttl", L"2"};
+    check(commandinput::ParseListenerOptions(targetOptions, 0, false, 51766, &listen, &error) && listen.Principals.size() == 1 &&
+        listen.Principals[0].Target && listen.Principals[0].Target->SameCanonicalKey({boot, 73, 100}) &&
+        listen.TargetSessionSeconds == 2, L"mcp target grant preserves exact lifetime and expiry");
+    for (const auto& change : std::vector<std::pair<size_t, std::wstring>>{
+        {3, L"TI"}, {4, std::wstring(32, L'0')}, {4, std::wstring(32, L'B')}, {5, L"4"}, {5, L"073"},
+        {5, L"4294967296"}, {6, L"0"}, {6, L"18446744073709551616"}, {8, L"0"}, {8, L"3601"}, {8, L"02"}})
+    {
+        auto invalid = targetOptions;
+        invalid[change.first] = change.second;
+        check(!commandinput::ParseListenerOptions(invalid, 0, false, 51766, &listen, &error), L"mcp rejects invalid target lifetime or duration");
+    }
+    auto repeated = targetOptions;
+    repeated.insert(repeated.end(), {L"--principal", fingerprint, L"ti"});
+    check(!commandinput::ParseListenerOptions(repeated, 0, false, 51766, &listen, &error) &&
+        !commandinput::ParseListenerOptions({L"--observe", L"--target-ttl", L"300"}, 0, false, 51766, &listen, &error),
+        L"mcp rejects duplicate credential or lifetime without a target");
+
     uint64_t number = 7;
     uint32_t major = 99;
     for (const auto& token : { L"", L"0x", L"0n", L"IRP_MJ_", L"+0", L"-0", L"0x+0", L"0n-0" })

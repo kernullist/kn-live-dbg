@@ -21337,6 +21337,7 @@ static void PrintTimelineAdvancedHelp()
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
+    std::wcout << L"  !timeline targets ti <pid> [after <boot-id> <create-filetime>]  List retained TI header-process lifetimes.\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
     std::wcout << L"  !timeline query [/source <name>] [/domain <name>] [/pid <PID>] [/limit <n>] [/oldest|/newest]\n";
@@ -25052,6 +25053,42 @@ static void HandleTimelineCommand(
         }
 
         std::wstring action = ToLower(args[1]);
+        if (action == L"targets")
+        {
+            uint64_t pid = 0;
+            if ((args.size() != 4 && args.size() != 7) || args[2] != L"ti" || !commandinput::ParseDigits(args[3], 10, &pid) ||
+                pid <= 4 || pid > UINT32_MAX || std::to_wstring(pid) != args[3])
+            {
+                std::wcerr << L"usage: !timeline targets ti <pid> [after <boot-id> <create-filetime>]\n";
+                break;
+            }
+            ObservationIdentity after;
+            if (args.size() == 7)
+            {
+                after.BootId = args[5];
+                after.ProcessId = static_cast<uint32_t>(pid);
+                if (args[4] != L"after" || !commandinput::ParseDigits(args[6], 10, &after.CreateTime) ||
+                    args[6] != std::to_wstring(after.CreateTime) || !IsRetainedProcessLifetime(after))
+                {
+                    std::wcerr << L"!timeline targets: invalid continuation boot ID or creation FILETIME\n";
+                    break;
+                }
+            }
+            bool more = false;
+            const auto targets = state.Timeline.RetainedTargets(args[2], static_cast<uint32_t>(pid), more, args.size() == 7 ? &after : nullptr);
+            std::wstring json = L"{\"schema\":\"kn.timeline_retained_targets.v1\",\"source\":\"ti\",\"pid\":" +
+                std::to_wstring(pid) + L",\"targets\":[";
+            for (const auto& target : targets)
+            {
+                if (json.back() != L'[') { json += L","; }
+                json += L"{\"boot_id\":" + mcpjson::Quote(target.BootId) + L",\"pid\":" + std::to_wstring(target.ProcessId) +
+                    L",\"create_filetime\":" + mcpjson::Quote(std::to_wstring(target.CreateTime)) + L"}";
+            }
+            json += more ? L"],\"more\":true}" : L"],\"more\":false}";
+            if (structuredJsonOut) { *structuredJsonOut = json; }
+            std::wcout << json << L"\n";
+            break;
+        }
         if ((action == L"status" || action == L"clear" || action == L"reset") && args.size() != 2)
         {
             std::wcerr << L"!timeline: unexpected extra argument\n";
@@ -53123,7 +53160,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     if (sub == L"help" || sub == L"?")
     {
         std::wcout << L"mcp commands:\n";
-        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"  mcp off | mcp status\n";
         std::wcout << L"  mcp client-setup [claude|claude-code|claude-desktop|cursor|codex|grok|legacy|all]\n";
         std::wcout << L"                     native HTTP setup; Desktop/legacy use the stdio bridge\n";
@@ -53233,6 +53270,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
         config.ObserveOnly = options.ObserveOnly;
         config.OperationJournalDirectory = options.OperationJournalDirectory;
         config.Principals = std::move(options.Principals);
+        config.TargetSessionSeconds = options.TargetSessionSeconds;
         if (!ValidateMcpObservationConfig(config, &optionError))
         {
             std::wcerr << L"mcp start failed: " << optionError << L"\n";
@@ -53465,7 +53503,7 @@ static void HandleMcpCommand(const std::vector<std::wstring>& args)
     else
     {
         std::wcout << L"MCP server: stopped.\n";
-        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
+        std::wcout << L"  usage: mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]\n";
         std::wcout << L"         mcp off | mcp status | mcp client-setup | mcp endpoint | mcp help\n";
         std::wcout << L"  tip  : mcp on prompts for a session password and listens on 0.0.0.0\n";
     }
@@ -54131,7 +54169,7 @@ int wmain(int argc, wchar_t** argv)
             commandinput::ListenerOptions parsed;
             if (!commandinput::ParseListenerOptions(options, 0, false, 0, &parsed, nullptr) || !parsed.Port ||
                 !parsed.OperationJournalDirectory.empty()) { return 2; }
-            return RunMcpJournalFixture(argv[3], parsed.Port, parsed.Principals);
+            return RunMcpJournalFixture(argv[3], parsed.Port, parsed.Principals, parsed.TargetSessionSeconds);
         }
         if (argc >= 3 && ToLower(argv[2]) == L"mcp-http")
         {

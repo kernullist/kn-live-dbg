@@ -7,6 +7,32 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Expiring TI process-lifetime grants, 2026-11-18
+
+Windows x64 build 28000.3501 ran Release binary SHA-256
+`2fb0933502133884cc9c7fd9124d5f447fd3c5021d1de7513419ba4fb6b40981`.
+The fixture used synthetic TI records with the production timeline, HTTP.sys
+loopback listener and DPAPI journal. Live TI collection and a loaded debugger
+driver were outside this run. [Client setup](MCP_SETUP.md#grant-access-to-one-process-lifetime)
+
+The subscriber test exercised the TI provider GUID, a different provider GUID,
+creation-time equality and records with missing or invalid times. The
+production decoder grants lifetime provenance only for a matching provider
+and a validated creation time at or before the event timestamp.
+
+| Boundary | Observed result |
+| --- | --- |
+| Evidence identity | The client authorized for the first lifetime received two header rows. A second client with the same PID and a different creation time received one. A different boot, a payload peer, incomplete identities, a predating event and a matching imported label contributed zero rows to the first client's count and scan cost. Eviction and clear removed its entries. |
+| Operator discovery | The command dispatcher listed 65 retained lifetimes in pages of 64 and one. It rejected a malformed continuation and returned an empty list after clear. |
+| Expiry and renewal | The fixture observed the lease expire while queued, after dequeue and after an actual read. Each caller received `target_session_unavailable` without an operation ID or payload. The first two receipts charged zero examined rows, the last charged one, and all three charged zero payload bytes. Reinitialization rotated both handles and preserved the allowance. |
+| Receipt ownership | An independent decryptor reproduced the owner, target-generation and request HMACs. Recovery worked under a new controller generation for the same grant. Changing the boot, PID, creation time or bearer, or reopening with a source-only grant, returned `not_retained`. Audit and journal checks searched for the fixture's original bearer, fingerprints, boot ID and handles. |
+
+The complete command suite passed 3,074 checks across 261 registered commands.
+The compiled capability contract covered 53 sources and the support matrix matched.
+The standalone Release ledger passed 40 checks and its JSON oracle passed 12
+state records. The optional MSVC AddressSanitizer runtime stopped in Windows
+interceptor initialization before the ledger tests ran.
+
 ## Source-scoped MCP observation, 2026-11-18
 
 The Windows x64 Release checks used an HTTP.sys listener on loopback and a

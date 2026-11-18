@@ -41,11 +41,15 @@ def wire(port, authorization, session, method, params=None):
 
 
 class Listener:
-    def __init__(self, exe, root, password, grants=(), durable=True):
+    def __init__(self, exe, root, password, grants=(), durable=True, target_ttl=None):
         self.port = free_port()
         self.password = password
         self.session = None
-        options = [value for fingerprint, source in grants for value in ("--principal", fingerprint, source)]
+        options = []
+        for grant in grants:
+            options.extend(("--principal" if len(grant) == 2 else "--principal-target", *grant))
+        if target_ttl is not None:
+            options.extend(("--target-ttl", str(target_ttl)))
         self.proc = subprocess.Popen([exe, "--self-test", "mcp-journal-fixture", root if durable else "-", str(self.port), *options],
                                      cwd=root.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
@@ -136,8 +140,8 @@ class Listener:
 
 
 @contextmanager
-def listener(exe, root, password, expected=True, grants=(), durable=True):
-    server = Listener(exe, root, password, grants, durable)
+def listener(exe, root, password, expected=True, grants=(), durable=True, target_ttl=None):
+    server = Listener(exe, root, password, grants, durable, target_ttl)
     try:
         marker = server.lines.get(timeout=30)
         assert marker == ("ready" if expected else "unavailable"), ("listener startup", marker)
@@ -558,18 +562,153 @@ def source_principals(exe, folder, pool, durable):
     print("source grants: separate credentials, sessions, budgets, projected rows and owned receipts; durable =", durable, flush=True)
 
 
+class TargetClient(SourceClient):
+    def __init__(self, server, bearer):
+        super().__init__(server, bearer)
+        self.handle = self.caps()["target_session"]
+        assert re.fullmatch("[0-9a-f]{32}", self.handle) and self.handle != self.session
+
+    def renew(self):
+        old = self.handle
+        self.call("initialize")
+        self.handle = self.caps()["target_session"]
+        assert re.fullmatch("[0-9a-f]{32}", self.handle) and self.handle not in (old, self.session)
+
+    def lookup(self, identity):
+        return self.tool("operations.get", {"operation_id": identity, "target_session": self.handle})["structuredContent"]
+
+
+def target_sessions(exe, folder, pool):
+    root = folder / "targets"
+    unlock, a, b, reader = (secrets.token_hex(32) for _ in range(4))
+    fp, other, source_fp = (hashlib.sha256(value.encode()).hexdigest() for value in (a, b, reader))
+    boot = "b" * 32
+    grant = (fp, "ti", boot, "73", "100")
+    grants = [grant, (other, "ti", boot, "73", "200"), (source_fp, "ti")]
+    def denied(reply):
+        assert reply["isError"] and reply["structuredContent"] == {
+            "schema": "kn.mcp_authority.v1", "scope": "observe_target", "status": "target_session_unavailable"}
+        assert "_meta" not in reply and "Header" not in json.dumps(reply)
+
+    with listener(exe, root, unlock, grants=grants) as active:
+        alice, bob, source = TargetClient(active, a), TargetClient(active, b), SourceClient(active, reader)
+        handle = alice.handle
+        caps = alice.caps()
+        assert caps["scope"] == "observe_target" and caps["target_session_ttl_seconds"] == 300
+        assert caps["tools"] == alice.call("tools/list")["result"]
+        assert {t["name"] for t in caps["tools"]["tools"]} == {"timeline.query", "operations.get"}
+        assert all("target_session" in t["inputSchema"]["required"] for t in caps["tools"]["tools"])
+        assert "target_session" not in source.caps() and bob.handle != handle
+        before = caps["observe_budget"]
+        for invalid in ({}, {"target_session": bob.handle}, {"target_session": alice.session}, {"target_session": "bad"}):
+            denied(alice.tool("timeline.query", invalid))
+            denied(alice.tool("operations.get", dict(invalid, operation_id="d" * 32)))
+        for args in ({"pid": "94"}, {"source": "TI"}, {"source": "beta"}, {"boot_id": boot}):
+            blocked = alice.tool("timeline.query", dict(args, target_session=handle))
+            assert blocked["isError"] and blocked["structuredContent"]["scope"] == "observe_target" and "_meta" not in blocked
+        assert alice.caps()["observe_budget"] == before
+        args = {"target_session": handle, "pid": "73", "limit": "4", "order": "oldest"}
+        data, receipt = alice.query(pool, args)
+        aid = receipt["operation_id"]
+        assert data["schema"] == "kn.mcp_target_timeline.v1" and data["subject"] == "event_header_process"
+        assert data["returned"] == data["total_stored"] == receipt["observe_charge"]["examined_events"] == 2
+        assert [row["action"] for row in data["events"]] == ["HeaderA", "HeaderB"]
+        assert all(set(row) == {"domain", "action", "timestamp_filetime", "pid", "tid"} and row["pid"] == 73 for row in data["events"])
+        other_rows, bob_receipt = bob.query(pool, {"limit": "3", "target_session": bob.handle})
+        assert [r["action"] for r in other_rows["events"]] == ["ReusedPid"]
+        assert bob.lookup(aid)["state"] == source.lookup(aid)["state"] == "not_retained"
+        assert alice.lookup(bob_receipt["operation_id"])["state"] == "not_retained"
+        scoped, source_receipt = source.query(pool, {"limit": "16"})
+        assert "Imported" in [r["action"] for r in scoped["events"]] and all("target_pid" in r for r in scoped["events"])
+        after = alice.caps()["observe_budget"]
+        alice.renew()
+        assert alice.caps()["observe_budget"] == after and bob.caps()["target_session"] == bob.handle
+        denied(alice.tool("operations.get", {"operation_id": aid, "target_session": handle}))
+        assert alice.lookup(aid) == receipt
+        assert active.cmd("evict") == "evicted"
+        empty, charge = alice.query(pool, {"limit": "1", "target_session": alice.handle})
+        assert empty["total_stored"] == charge["observe_charge"]["examined_events"] == 0 and empty["events"] == []
+        assert active.cmd("clear") == "cleared"
+        assert not bob.query(pool, {"limit": "1", "target_session": bob.handle})[0]["events"]
+        secrets_used = (unlock, a, b, reader, fp, other, source_fp, boot, handle, alice.handle, bob.handle)
+
+    clear, key, rows = read_owned_journal(root, unlock, scoped=True)
+    audit = (root / "fixture-audit.jsonl").read_text(encoding="utf-8-sig")
+    assert all(value.encode() not in clear and value not in audit for value in secrets_used)
+    attempts = [json.loads(line) for line in audit.splitlines()]
+    assert any(row["scope"] == "observe_target" and row["decision"] == "target_session_unavailable" for row in attempts)
+    assert any(row["scope"] == "observe_source" and row.get("tool") == "timeline.query" for row in attempts)
+    journal = rows[0]["journal"]
+    def mac(frame):
+        return hmac.new(key, frame.encode(), hashlib.sha256).hexdigest()
+    owner = mac(f"grant.target.v1\n{fp}\nti\n{boot}\n73\n100")[:32]
+    assert journal["approved_scope"] == "loopback_observe_target" and journal["principal_id"] == owner
+    assert journal["target_generation"] == mac(f"target.v1\n{boot}\n73\n100")[:32]
+    assert journal["request_hmac_sha256"] == mac(owner + "\ntool\ntimeline.query\n" + json.dumps(args, separators=(",", ":")))
+    assert journal["effect_verified_utc"] is None
+    with listener(exe, root, unlock, grants=[grant], target_ttl=3) as active:
+        alice = TargetClient(active, a)
+        assert alice.caps()["target_session_ttl_seconds"] == 3
+        old = recovered(alice, aid, "succeeded", "engine_returned")["journal"]
+        _, current = alice.query(pool, {"limit": "1", "target_session": alice.handle})
+        assert old["controller_generation"] != current["journal"]["controller_generation"]
+        assert old["target_generation"] == current["journal"]["target_generation"]
+        for stage in ("queued", "popped", "read"):
+            alice.renew()
+            pending = pool.submit(alice.tool, "timeline.query", {"limit": "1", "target_session": alice.handle})
+            checkpoint = active.cmd("queued")
+            assert checkpoint and re.fullmatch(r"queued [0-9a-f]{32}", checkpoint)
+            identity = checkpoint.split()[1]
+            if stage != "queued":
+                assert active.cmd("dispatch") == "dispatched " + identity
+            if stage == "read":
+                assert active.cmd("return-across-expiry") == "read-across-expiry"
+            else:
+                assert active.cmd("await-expiry") == "expired"
+                denied(pending.result(timeout=5))  # expiry also releases the synchronous HTTP listener
+                assert active.cmd("dispatch" if stage == "queued" else "return") == ("refused" if stage == "queued" else "returned")
+            denied(pending.result(timeout=45))
+            assert alice.caps()["target_session"] is None
+            denied(alice.tool("operations.get", {"operation_id": identity, "target_session": alice.handle}))
+            alice.renew()
+            charge = alice.lookup(identity)
+            assert charge["operation_finished"] and not charge["effects_verified"]
+            assert charge["observe_charge"]["payload_utf8_bytes"] == 0
+            assert charge["observe_charge"]["examined_events"] == (1 if stage == "read" else 0)
+            assert charge["engine_dispatched"] == (stage != "queued")
+    for changed in [(fp, "ti"), (fp, "ti", boot, "73", "200"), (fp, "ti", "c" * 32, "73", "100"),
+                    (fp, "ti", boot, "94", "100"), (other, *grant[1:])]:
+        with listener(exe, root, unlock, grants=[changed]) as active:
+            client = (SourceClient if len(changed) == 2 else TargetClient)(active, b if changed[0] == other else a)
+            assert client.lookup(aid)["state"] == "not_retained"
+    with listener(exe, root, unlock, grants=[(source_fp, *grant[1:])]) as changed:
+        narrowed = TargetClient(changed, reader)
+        assert narrowed.lookup(source_receipt["operation_id"])["state"] == "not_retained"
+
+    with listener(exe, folder / "volatile-targets", unlock, grants=[grant], durable=False) as active:
+        volatile = TargetClient(active, a)
+        data, transient = volatile.query(pool, {"limit": "3", "target_session": volatile.handle})
+        assert len(data["events"]) == 2 and "journal" not in transient and "operation_journal" not in volatile.caps()
+    with listener(exe, folder / "volatile-targets", unlock, grants=[grant], durable=False) as restarted:
+        assert TargetClient(restarted, a).lookup(transient["operation_id"])["state"] == "not_retained"
+    print("target sessions: PID reuse, other boots, peer roles, import, expiry at three boundaries and exact durable ownership passed", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--principals-only", action="store_true")
+    parser.add_argument("--targets-only", action="store_true")
     args = parser.parse_args()
     exe = args.exe.resolve(strict=True)
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="kn-mcp-journal-") as directory, ThreadPoolExecutor(max_workers=1) as pool:
         folder = Path(directory)
-        source_principals(exe, folder, pool, durable=False)
-        source_principals(exe, folder, pool, durable=True)
-        if not args.principals_only:
+        target_sessions(exe, folder, pool)
+        if not args.targets_only:
+            source_principals(exe, folder, pool, durable=False)
+            source_principals(exe, folder, pool, durable=True)
+        if not args.principals_only and not args.targets_only:
             boundaries(exe, folder, pool)
             late_return(exe, folder, pool)
             retention(exe, folder, pool)

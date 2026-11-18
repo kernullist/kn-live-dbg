@@ -78,7 +78,7 @@ namespace
 
     const CompletionHint kMcpRootTokens[] =
     {
-        { L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]", L"start an authenticated MCP listener" },
+        { L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]", L"start an authenticated MCP listener" },
         { L"off", L"mcp off", L"stop the MCP server" },
         { L"status", L"mcp status", L"show listen address, password mode, and write-allow state" },
         { L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"print client config snippets" },
@@ -115,6 +115,8 @@ namespace
         { L"--observe", nullptr, L"loopback status and retained timeline queries only" },
         { L"--journal", L"--journal <directory>", L"recover private observe operation receipts" },
         { L"--principal", L"--principal <fingerprint> <source>", L"restrict one client to one exact retained source" },
+        { L"--principal-target", L"--principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>", L"restrict one client to a retained TI header-process lifetime" },
+        { L"--target-ttl", L"--target-ttl <seconds>", L"target handle lifetime in seconds (1 to 3600, default 300)" },
         { L"--loopback", nullptr, L"listen on 127.0.0.1 only" },
         { L"--bind", L"--bind <addr>", L"0.0.0.0 (default, all adapters), loopback, or a specific IP" },
         { L"help", nullptr, L"show mcp on usage" },
@@ -904,6 +906,7 @@ namespace
         { L"update", L"!timeline update [recent|all]", L"advanced: refresh recent evidence" },
         { L"live", L"!timeline live on|off|status", L"advanced: kernel live callbacks" },
         { L"query", L"!timeline query [filters]", L"advanced: list stored events" },
+        { L"targets", L"!timeline targets ti <pid> [after <boot-id> <create-filetime>]", L"advanced: list retained TI process lifetimes for this PID" },
         { L"graph", L"!timeline graph [filters]", L"advanced: relationship graph" },
         { L"reconcile", L"!timeline reconcile snapshot ...", L"advanced: snapshot vs timeline" },
         { L"export", L"!timeline export <path> [/jsonl]", L"advanced: export the store" },
@@ -1286,7 +1289,7 @@ namespace
     const CompletionScopeTable kMcpScopes[] =
     {
         SCOPE(L"", L"mcp on|off|status|client-setup|endpoint", L"native HTTP MCP server", kMcpRootTokens),
-        SCOPE(L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <ipv4>]", L"start the MCP server", kMcpOnTokens),
+        SCOPE(L"on", L"mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <ipv4>]", L"start the MCP server", kMcpOnTokens),
         SCOPE(L"client-setup", L"mcp client-setup [all|claude|claude-code|claude-desktop|cursor|codex|grok|legacy]", L"client config snippets", kMcpClientTokens),
     };
 
@@ -1708,6 +1711,7 @@ namespace
         SCOPE(L"reset", L"!timeline reset", L"reset command", kHelpOnlyTokens),
         SCOPE(L"status", L"!timeline status", L"status command", kHelpOnlyTokens),
         SCOPE(L"clear", L"!timeline clear", L"clear command", kHelpOnlyTokens),
+        SCOPE(L"targets", L"!timeline targets ti <pid> [after <boot-id> <create-filetime>]", L"list retained TI header-process lifetimes", kHelpOnlyTokens),
         SCOPE(L"", L"!timeline | !timeline dashboard | !timeline reset | !timeline help", L"time-ordered TI/snapshot/live evidence", kTimelineRootTokens),
         SCOPE(L"help", L"!timeline help [advanced]", L"compact or advanced help", kTimelineHelpTokens),
         SCOPE(L"ingest", L"!timeline ingest ti|snapshot ...", L"pull TI or a snapshot into the store", kTimelineIngestTokens),

@@ -107,6 +107,7 @@ namespace commandinput
         bool ObserveOnly = false;
         std::wstring OperationJournalDirectory;
         std::vector<McpObserveGrant> Principals;
+        uint32_t TargetSessionSeconds = 300;
     };
 
     inline bool ParseListenerOptions(
@@ -122,6 +123,7 @@ namespace commandinput
         bool havePort = false;
         bool haveBind = false;
         bool havePeer = false;
+        bool haveTargetTtl = false;
         bool ok = output != nullptr;
         for (size_t index = first; ok && index < args.size(); ++index)
         {
@@ -136,14 +138,32 @@ namespace commandinput
                 ok = !parsed.ObserveOnly;
                 parsed.ObserveOnly = true;
             }
-            else if (!remote && arg == L"--principal")
+            else if (!remote && (arg == L"--principal" || arg == L"--principal-target"))
             {
-                ok = parsed.Principals.size() < 16 && args.size() - index > 2;
+                const bool target = arg == L"--principal-target";
+                const size_t values = target ? 5 : 2;
+                ok = parsed.Principals.size() < 16 && args.size() - index > values;
                 if (ok)
                 {
-                    parsed.Principals.push_back({ args[index + 1], args[index + 2] });
-                    index += 2;
+                    McpObserveGrant grant{ args[index + 1], args[index + 2] };
+                    if (target)
+                    {
+                        uint64_t pid = 0, created = 0;
+                        ok = ParseDigits(args[index + 4], 10, &pid) && pid <= UINT32_MAX && std::to_wstring(pid) == args[index + 4] &&
+                            ParseDigits(args[index + 5], 10, &created) && std::to_wstring(created) == args[index + 5];
+                        if (ok) { grant.Target = ObservationIdentity{args[index + 3], static_cast<uint32_t>(pid), created}; }
+                    }
+                    parsed.Principals.push_back(std::move(grant));
+                    index += values;
                 }
+            }
+            else if (!remote && arg == L"--target-ttl")
+            {
+                uint64_t seconds = 0;
+                ok = !haveTargetTtl && index + 1 < args.size() && ParseDigits(args[++index], 10, &seconds) &&
+                    seconds >= 1 && seconds <= 3600 && std::to_wstring(seconds) == args[index];
+                haveTargetTtl = true;
+                parsed.TargetSessionSeconds = static_cast<uint32_t>(seconds);
             }
             else if (!remote && arg == L"--journal")
             {
@@ -196,6 +216,8 @@ namespace commandinput
         }
         if (!parsed.OperationJournalDirectory.empty() && !parsed.ObserveOnly) { ok = false; }
         if (!parsed.Principals.empty() && (!parsed.ObserveOnly || !ValidMcpObserveGrants(parsed.Principals))) { ok = false; }
+        if (haveTargetTtl && std::none_of(parsed.Principals.begin(), parsed.Principals.end(),
+            [](const auto& grant) { return grant.Target.has_value(); })) { ok = false; }
         if (parsed.ObserveOnly)
         {
             ok = ok && !parsed.AllowWrite;

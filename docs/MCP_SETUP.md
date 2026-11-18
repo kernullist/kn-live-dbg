@@ -22,7 +22,7 @@ For a separate lab client, `mcp on` binds all adapters; select a reachable targe
 IP from the startup output. The grammar is:
 
 ```text
-mcp on [port] [--observe [--principal <fingerprint> <source>]... [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
+mcp on [port] [--observe [--principal <fingerprint> <source> | --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime>]... [--target-ttl <seconds>] [--journal <directory>] | --allow-write] [--loopback] [--bind <addr>]
 mcp status
 mcp off
 ```
@@ -101,6 +101,27 @@ For recovery, add `--journal <directory>` and enter a separate operator unlock
 password. Reopen that directory in source-scoped mode with the same Windows
 account and unlock password. A client needs its original bearer and source
 grant to read its receipts. [Source-scoped observation](MCP_SERVER_DESIGN.md#source-scoped-observation)
+
+### Grant access to one process lifetime
+
+At the debugger prompt, run `!timeline targets ti <pid>`. It lists up to 64
+retained TI header-process lifetimes for that PID. When `more` is true,
+append `after <boot-id> <create-filetime>` with the last entry's values to
+read the next page. Use an entry's `boot_id`,
+`pid` and decimal `create_filetime` in the listener command.
+
+```text
+mcp on --observe --principal-target <fingerprint> ti <boot-id> <pid> <create-filetime> --target-ttl 300
+```
+
+The authenticated client calls `initialize` and reads `target_session` from
+`kn://capabilities`. Send the value as a string argument to each
+`timeline.query` and `operations.get` call, together with the usual
+`Mcp-Session-Id` HTTP header. The handle expires after 300 seconds by default.
+`--target-ttl` accepts 1 through 3600 seconds. After expiry the capability
+value is `null`. Initialize again to get fresh handles and keep the same
+remaining budget. An empty timeline result means the store currently holds
+no matching rows. [Process-lifetime observation](MCP_SERVER_DESIGN.md#process-lifetime-observation)
 
 ## Write policy
 

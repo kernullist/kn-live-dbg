@@ -34,6 +34,7 @@ struct McpJournalIdentity
 {
     std::wstring PrincipalId, TargetGeneration, RequestHmac;
     uint64_t AdmittedUtc = 0, DispatchedUtc = 0, ReturnedUtc = 0;
+    std::wstring ControllerGeneration{};
 };
 
 inline uint64_t McpUtcFileTime()
@@ -226,9 +227,11 @@ inline std::wstring McpOperationJson(const McpOperationSnapshot& operation, bool
     {
         const auto& j = *operation.Journal;
         const auto utc = [](uint64_t time) { return time ? mcpjson::Quote(std::to_wstring(time)) : std::wstring(L"null"); };
-        out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":" +
-            mcpjson::Quote(operation.OwnerFingerprint.empty() ? L"loopback_observe" : L"loopback_observe_source");
+        const wchar_t* scope = operation.OwnerFingerprint.empty() ? L"loopback_observe" : L"loopback_observe_source";
+        if (!j.ControllerGeneration.empty()) { scope = L"loopback_observe_target"; }
+        out += L",\"journal\":{\"schema\":\"kn.mcp_observe_journal.v1\",\"approved_scope\":" + mcpjson::Quote(scope);
         out += L",\"principal_id\":" + mcpjson::Quote(j.PrincipalId) + L",\"target_generation\":" + mcpjson::Quote(j.TargetGeneration);
+        if (!j.ControllerGeneration.empty()) { out += L",\"controller_generation\":" + mcpjson::Quote(j.ControllerGeneration); }
         out += L",\"request_hmac_sha256\":" + mcpjson::Quote(j.RequestHmac) + L",\"utc_clock\":\"windows_filetime_100ns\"";
         out += L",\"admitted_utc\":" + utc(j.AdmittedUtc) + L",\"dispatched_utc\":" + utc(j.DispatchedUtc);
         out += L",\"engine_returned_utc\":" + utc(j.ReturnedUtc) + L",\"effect_verified_utc\":null,\"recovered\":";

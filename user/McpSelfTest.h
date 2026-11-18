@@ -4,4 +4,4 @@
 
 int RunMcpToolCatalogSelfTest();
 int RunMcpTransportSelfTest(bool observe = false);
-int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants);
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants, uint32_t targetSessionSeconds);

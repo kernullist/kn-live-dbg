@@ -79,10 +79,20 @@ struct McpOperationJournal::Impl
             digest.data(), static_cast<ULONG>(digest.size())) < 0) { return {}; }
         return mcpjson::Utf8ToWide(Hex(digest.data(), digest.size()));
     }
+    static std::wstring LifetimeFrame(const ObservationIdentity& target)
+    {
+        return target.BootId + L"\n" + std::to_wstring(target.ProcessId) + L"\n" + std::to_wstring(target.CreateTime);
+    }
     std::wstring Owner(const McpObserveGrant& grant) const
     {
-        if (!Scoped) { return grant.Fingerprint.empty() && grant.Source.empty() ? Principal : L""; }
+        if (!Scoped) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target ? Principal : L""; }
         if (grant.Fingerprint.empty() || grant.Source.empty()) { return {}; }
+        if (grant.Target)
+        {
+            if (grant.Source != L"ti" || !IsRetainedProcessLifetime(*grant.Target)) { return {}; }
+            return Mac(mcpjson::WideToUtf8(L"grant.target.v1\n" + grant.Fingerprint + L"\n" + grant.Source +
+                L"\n" + LifetimeFrame(*grant.Target))).substr(0, 32);
+        }
         return Mac(mcpjson::WideToUtf8(L"grant.v1\n" + grant.Fingerprint + L"\n" + grant.Source)).substr(0, 32);
     }
     bool SetPrincipal()
@@ -155,9 +165,18 @@ struct McpOperationJournal::Impl
                 !mcpjson::GetString(text, L"operation_id", &id) || !IsMcpOperationId(id) ||
                 !mcpjson::FindRawValue(text, L"journal", &journal) || !mcpjson::GetString(journal, L"principal_id", &principal) ||
                 !(Scoped ? IsMcpOperationId(principal) : principal == Principal) ||
-                !mcpjson::GetString(journal, L"approved_scope", &scope) || scope != (Scoped ? L"loopback_observe_source" : L"loopback_observe") ||
+                !mcpjson::GetString(journal, L"approved_scope", &scope) ||
+                (Scoped ? (scope != L"loopback_observe_source" && scope != L"loopback_observe_target") : scope != L"loopback_observe") ||
                 !mcpjson::FindRawValue(journal, L"recovered", &recovered) || recovered != L"true" ||
                 std::any_of(Rows.begin(), Rows.end(), [&](const Row& row) { return row.Id == id; })) { return false; }
+            std::wstring controller, target;
+            const bool targetScoped = scope == L"loopback_observe_target";
+            if (!mcpjson::GetString(journal, L"target_generation", &target) || !IsMcpOperationId(target) ||
+                mcpjson::FindRawValue(journal, L"controller_generation", &controller) != targetScoped ||
+                (targetScoped && (!mcpjson::GetString(journal, L"controller_generation", &controller) || !IsMcpOperationId(controller))))
+            {
+                return false;
+            }
             Rows.push_back({std::move(id), std::move(principal), text});
             pos = end + 1;
         }
@@ -217,6 +236,12 @@ std::optional<McpJournalIdentity> McpOperationJournal::Identify(const McpEngineR
     if (owner.empty() || frame.empty()) { return std::nullopt; }
     const auto digest = Data->Mac(Data->Scoped ? mcpjson::WideToUtf8(owner) + "\n" + frame : frame);
     if (digest.empty()) { return std::nullopt; }
+    if (request.Grant.Target)
+    {
+        const auto target = Data->Mac(mcpjson::WideToUtf8(L"target.v1\n" + Impl::LifetimeFrame(*request.Grant.Target))).substr(0, 32);
+        if (!IsMcpOperationId(target)) { return std::nullopt; }
+        return McpJournalIdentity{owner, target, digest, McpUtcFileTime(), 0, 0, generation};
+    }
     return McpJournalIdentity{owner, generation, digest, McpUtcFileTime()};
 }
 

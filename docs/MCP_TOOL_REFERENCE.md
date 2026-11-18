@@ -24,6 +24,12 @@ admitted request, use its operation ID to check the outcome and settled
 `observe_charge`. Pending scan and payload charges are `null`.
 [Listener budget and accounting](MCP_SERVER_DESIGN.md#observe-listener-budget)
 
+With `scope=observe_target`, both `timeline.query` and `operations.get`
+require the opaque string `target_session` from `kn://capabilities`.
+The query returns `kn.mcp_target_timeline.v1` for the authorized TI header
+process. An expired handle returns `target_session_unavailable`. Initialize
+again to renew it. [Process-lifetime observation](MCP_SERVER_DESIGN.md#process-lifetime-observation)
+
 With `scope=observe_source`, discovery lists `timeline.query`,
 `operations.get` and `kn://capabilities`. Read `evidence_source` for the exact
 case-sensitive label. `timeline.query` accepts an omitted, empty or matching source

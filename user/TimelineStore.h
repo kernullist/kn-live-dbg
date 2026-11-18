@@ -3,6 +3,7 @@
 #include "SnapshotModel.h"
 #include "ThreatIntelSubscriber.h"
 #include "TimelineModel.h"
+#include "ObservationModel.h"
 
 #include <atomic>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct SnapshotDiffResult;
@@ -98,7 +100,9 @@ public:
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored) const;
     std::vector<TimelineEvent> Query(const TimelineQueryOptions& options, uint64_t* totalStored, TimelineScanBudget* budget) const;
     std::vector<TimelineSourceRow> QuerySource(const std::wstring& grantedSource, const TimelineQueryOptions& options,
-        uint64_t& stored, TimelineScanBudget& budget) const;
+        uint64_t& stored, TimelineScanBudget& budget, const ObservationIdentity* target = nullptr) const;
+    std::vector<ObservationIdentity> RetainedTargets(const std::wstring& source, uint32_t pid, bool& more,
+        const ObservationIdentity* after = nullptr) const;
     std::vector<TimelineEvent> AllEvents() const;
     // Chronological events with EventId > minExclusive. maxCount 0 = unlimited.
     std::vector<TimelineEvent> RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const;
@@ -123,15 +127,18 @@ public:
     uint64_t GetTiRecentCursorSequence(bool* initialized) const;
 
 private:
-    bool AddEventLocked(TimelineEvent event);
+    bool AddEventLocked(TimelineEvent event, const ObservationIdentity* target = nullptr);
     void DropOldestEventLocked();
     uint64_t NextEventIdLocked();
 
     mutable std::mutex Mutex;
     std::deque<TimelineEvent> Events;
     // Deque end insertion and front eviction preserve pointers to other rows.
-    std::map<std::wstring, std::list<const TimelineEvent*>> BySource;
-    std::deque<std::wstring> EventKeysInOrder;
+    using GroupKey = std::tuple<std::wstring, uint32_t, std::wstring, uint64_t>; // source, PID, boot GUID, creation FILETIME
+    using GroupIndex = std::map<GroupKey, std::list<const TimelineEvent*>>;
+    GroupIndex Groups;
+    struct RetainedKey { std::wstring Dedup; GroupIndex::iterator Source, Lifetime; };
+    std::deque<RetainedKey> EventKeysInOrder;
     std::set<std::wstring> EventKeys;
     uint64_t NextEventId = 1;
     uint64_t DroppedEvents = 0;

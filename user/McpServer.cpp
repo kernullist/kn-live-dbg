@@ -21,6 +21,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
@@ -621,9 +622,9 @@ namespace
         return IsLoopbackHost(authority);
     }
 
-    const wchar_t* ScopeNameFor(const McpServerConfig& config)
+    const wchar_t* ScopeNameFor(const McpServerConfig& config, const McpObserveGrant& grant = {})
     {
-        if (!config.Principals.empty()) { return L"observe_source"; }
+        if (!config.Principals.empty()) { return grant.Target ? L"observe_target" : L"observe_source"; }
         if (config.ObserveOnly) { return L"observe"; }
         return config.AllowWrite ? L"legacy_write_enabled" : L"legacy_write_locked";
     }
@@ -635,6 +636,32 @@ namespace
             return tool.Observe && tool.ReadOnly && (wcscmp(tool.Name, L"timeline.query") == 0 || wcscmp(tool.Name, L"operations.get") == 0);
         }
         return config.ObserveOnly ? (tool.Observe && tool.ReadOnly) : (tool.ReadOnly || config.AllowWrite);
+    }
+
+    template<size_t N>
+    auto WithTargetSession(const McpToolArg (&args)[N])
+    {
+        std::array<McpToolArg, N + 1> result{};
+        std::copy_n(args, N, result.begin());
+        result.back() = {L"target_session", L"string", true};
+        return result;
+    }
+
+    McpToolDef ScopedTool(McpToolDef tool, bool targetBound)
+    {
+        if (targetBound && wcscmp(tool.Name, L"timeline.query") == 0)
+        {
+            static const auto args = WithTargetSession(kArgsTimelineQuery);
+            tool.Args = args.data();
+            tool.ArgCount = args.size();
+        }
+        else if (targetBound && wcscmp(tool.Name, L"operations.get") == 0)
+        {
+            static const auto args = WithTargetSession(kArgsOperationGet);
+            tool.Args = args.data();
+            tool.ArgCount = args.size();
+        }
+        return tool;
     }
 
     std::wstring BuildToolSchema(const McpToolDef& tool, bool observe)
@@ -667,7 +694,7 @@ namespace
                     else if (key == L"order") { schema += LR"(,"enum":["newest","oldest"])"; }
                     else if (key == L"limit") { schema += LR"(,"pattern":"^([1-9]|[1-5][0-9]|6[0-4])$","default":"50")"; }
                     else if (key == L"pid") { schema += LR"(,"pattern":"^(0|[1-9][0-9]{0,9})$","description":"Decimal PID up to 4294967295")"; }
-                    else if (key == L"operation_id") { schema += LR"(,"pattern":"^[0-9a-f]{32}$")"; }
+                    else if (key == L"operation_id" || key == L"target_session") { schema += LR"(,"pattern":"^[0-9a-f]{32}$")"; }
                     else { schema += LR"(,"maxLength":128,"pattern":"^[^\\u0000-\\u001f\\u007f]*$")"; }
                 }
                 schema += L"}";
@@ -692,7 +719,7 @@ namespace
         return schema;
     }
 
-    std::wstring BuildToolsList(const McpServerConfig& config)
+    std::wstring BuildToolsList(const McpServerConfig& config, bool targetBound = false)
     {
         std::wstring out = L"{\"tools\":[";
         bool first = true;
@@ -714,7 +741,7 @@ namespace
             out += mcpjson::Quote(config.ObserveOnly && wcscmp(tool.Name, L"ti.subscribe") == 0
                 ? L"Read Threat-Intelligence subscription status and counters." : tool.Description);
             out += L",\"inputSchema\":";
-            out += BuildToolSchema(tool, config.ObserveOnly);
+            out += BuildToolSchema(ScopedTool(tool, targetBound), config.ObserveOnly);
             out += L",\"annotations\":{\"readOnlyHint\":";
             out += tool.ReadOnly ? L"true" : L"false";
             out += L",\"openWorldHint\":false";
@@ -785,18 +812,24 @@ namespace
         return out;
     }
 
-    std::wstring BuildCapabilitiesResource(const McpServerConfig& config, const std::wstring& budget, const McpObserveGrant& grant)
+    std::wstring BuildCapabilitiesResource(const McpServerConfig& config, const std::wstring& budget, const McpObserveGrant& grant,
+        const std::wstring& targetSession)
     {
         std::wstring out = L"{\"server\":";
         out += mcpjson::Quote(kServerName);
-        out += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config));
+        out += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config, grant));
         out += L",\"writeEnabled\":";
         out += config.AllowWrite && !config.ObserveOnly ? L"true" : L"false";
         if (!budget.empty()) { out += L",\"observe_budget\":" + budget; }
         if (!grant.Source.empty()) { out += L",\"evidence_source\":" + mcpjson::Quote(grant.Source); }
+        if (grant.Target)
+        {
+            out += L",\"target_session\":" + (targetSession.empty() ? L"null" : mcpjson::Quote(targetSession));
+            out += L",\"target_session_ttl_seconds\":" + std::to_wstring(config.TargetSessionSeconds);
+        }
         if (!config.OperationJournalDirectory.empty()) { out += L",\"operation_journal\":\"bounded_private_journal\""; }
         out += L",\"tools\":";
-        out += BuildToolsList(config);
+        out += BuildToolsList(config, grant.Target.has_value());
         out += L"}";
         return out;
     }
@@ -1075,6 +1108,12 @@ static const McpObserveGrant* AuthenticateObserveGrant(const std::string& author
 
 bool ValidateMcpObservationConfig(const McpServerConfig& config, std::wstring* error)
 {
+    if (!config.TargetSessionSeconds || config.TargetSessionSeconds > 3600 || (config.TargetSessionSeconds != 300 &&
+        std::none_of(config.Principals.begin(), config.Principals.end(), [](const auto& grant) { return grant.Target.has_value(); })))
+    {
+        if (error) { *error = L"--target-ttl requires a process target and a lifetime of 1 to 3600 seconds"; }
+        return false;
+    }
     if (!config.Principals.empty() && (!config.ObserveOnly || !ValidMcpObserveGrants(config.Principals)))
     {
         if (error) { *error = L"--principal requires --observe, a unique SHA-256 bearer fingerprint and an exact source label"; }
@@ -1521,7 +1560,7 @@ bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entr
     return found;
 }
 
-bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error)
+bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error, bool targetBound)
 {
     auto reject = [&](const std::wstring& reason)
     {
@@ -1531,13 +1570,14 @@ bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json
         }
         return false;
     };
-    const McpToolDef* tool = FindTool(name);
+    const McpToolDef* catalog = FindTool(name);
     size_t pos = 0;
     mcpjson::SkipWhitespace(json, &pos);
-    if (tool == nullptr || pos >= json.size() || json[pos] != L'{' || !mcpjson::ValidateDocument(json))
+    if (catalog == nullptr || pos >= json.size() || json[pos] != L'{' || !mcpjson::ValidateDocument(json))
     {
         return reject(L"tool arguments must be a complete JSON object with unique keys");
     }
+    const McpToolDef tool = ScopedTool(*catalog, targetBound);
     ++pos;
     mcpjson::SkipWhitespace(json, &pos);
     while (pos < json.size() && json[pos] != L'}')
@@ -1557,11 +1597,11 @@ bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json
             return reject(L"invalid argument value");
         }
         const McpToolArg* definition = nullptr;
-        for (size_t index = 0; index < tool->ArgCount; ++index)
+        for (size_t index = 0; index < tool.ArgCount; ++index)
         {
-            if (key == tool->Args[index].Name)
+            if (key == tool.Args[index].Name)
             {
-                definition = &tool->Args[index];
+                definition = &tool.Args[index];
                 break;
             }
         }
@@ -1602,13 +1642,18 @@ bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json
             mcpjson::SkipWhitespace(json, &pos);
         }
     }
-    for (size_t index = 0; index < tool->ArgCount; ++index)
+    for (size_t index = 0; index < tool.ArgCount; ++index)
     {
         std::wstring raw;
-        if (tool->Args[index].Required && !mcpjson::FindRawValue(json, tool->Args[index].Name, &raw))
+        if (tool.Args[index].Required && !mcpjson::FindRawValue(json, tool.Args[index].Name, &raw))
         {
-            return reject(std::wstring(L"missing required tool argument: ") + tool->Args[index].Name);
+            return reject(std::wstring(L"missing required tool argument: ") + tool.Args[index].Name);
         }
+    }
+    if (targetBound)
+    {
+        std::wstring handle;
+        if (!mcpjson::GetString(json, L"target_session", &handle) || !IsMcpOperationId(handle)) { return reject(L"invalid target session"); }
     }
     return true;
 }
@@ -1677,40 +1722,57 @@ static McpEngineResult ObserveBudgetError(McpBudgetLimit limit, const wchar_t* s
     return result;
 }
 
+static McpEngineResult McpTargetSessionDenied()
+{
+    McpEngineResult result;
+    result.IsError = true;
+    result.Text = L"Target session unavailable. Initialize and use the handle from kn://capabilities.";
+    result.StructuredJson = LR"({"schema":"kn.mcp_authority.v1","scope":"observe_target","status":"target_session_unavailable"})";
+    return result;
+}
+
 McpEngineResult ReadMcpObservedTimeline(const McpEngineRequest& request, const TimelineStore& timeline, TimelineScanBudget& scan)
 {
+    const wchar_t* scope = request.Grant.Target ? L"observe_target" : request.Grant.Source.empty() ? L"observe" : L"observe_source";
     if (request.Kind != McpRequestKind::ToolCall ||
         (request.Name != L"timeline.status" && request.Name != L"timeline.query" && request.Name != L"graph.query"))
     {
-        return McpAuthorityError(L"observe");
+        return McpAuthorityError(scope);
     }
     TimelineGraphQueryOptions options;
     if (request.ArgumentsJson.size() > 4096 ||
-        !ValidateMcpToolArguments(request.Name, request.ArgumentsJson, nullptr) ||
+        !ValidateMcpToolArguments(request.Name, request.ArgumentsJson, nullptr, request.Grant.Target.has_value()) ||
         !ParseObservedTimelineOptions(request.ArgumentsJson, &options))
     {
-        return McpAuthorityError(L"observe", true);
+        return McpAuthorityError(scope, true);
     }
     McpEngineResult result;
-    if (!request.Grant.Fingerprint.empty() || !request.Grant.Source.empty())
+    if (!request.Grant.Fingerprint.empty() || !request.Grant.Source.empty() || request.Grant.Target)
     {
+        const auto* target = request.Grant.Target ? &*request.Grant.Target : nullptr;
         if (request.Name != L"timeline.query" || request.Grant.Fingerprint.empty() || request.Grant.Source.empty() ||
-            (!options.Source.empty() && options.Source != request.Grant.Source)) { return McpAuthorityError(L"observe_source"); }
+            (!options.Source.empty() && options.Source != request.Grant.Source) ||
+            (target && (!IsRetainedProcessLifetime(*target) || (options.HasProcessId && options.ProcessId != target->ProcessId))))
+        {
+            return McpAuthorityError(scope);
+        }
         const TimelineQueryOptions query{options.Source, options.Domain, options.HasProcessId, options.ProcessId, options.Limit, options.NewestFirst};
         uint64_t stored = 0;
-        const auto rows = timeline.QuerySource(request.Grant.Source, query, stored, scan);
+        const auto rows = timeline.QuerySource(request.Grant.Source, query, stored, scan, target);
         if (!scan.IsIncomplete())
         {
             const auto labelJson = [](const std::optional<std::wstring>& label) { return label ? mcpjson::Quote(*label) : L"null"; };
-            std::wstring body = L"{\"schema\":\"kn.mcp_source_timeline.v1\",\"source\":" + mcpjson::Quote(request.Grant.Source) +
+            std::wstring body = target ? L"{\"schema\":\"kn.mcp_target_timeline.v1\",\"subject\":\"event_header_process\"" : L"{\"schema\":\"kn.mcp_source_timeline.v1\"";
+            body += L",\"source\":" + mcpjson::Quote(request.Grant.Source) +
                 L",\"total_stored\":" + std::to_wstring(stored) + L",\"returned\":" + std::to_wstring(rows.size()) + L",\"events\":[";
             for (const auto& row : rows)
             {
                 if (body.back() != L'[') { body += L","; }
                 body += L"{\"timestamp_filetime\":" + mcpjson::Quote(std::to_wstring(row.TimestampFileTime)) +
                     L",\"domain\":" + labelJson(row.Domain) + L",\"action\":" + labelJson(row.Action) +
-                    L",\"pid\":" + std::to_wstring(row.ProcessId) + L",\"tid\":" + std::to_wstring(row.ThreadId) +
-                    L",\"target_pid\":" + std::to_wstring(row.TargetProcessId) + L"}";
+                    L",\"pid\":" + std::to_wstring(row.ProcessId) + L",\"tid\":" + std::to_wstring(row.ThreadId);
+                if (!target) { body += L",\"target_pid\":" + std::to_wstring(row.TargetProcessId); }
+                body += L"}";
                 if (body.size() > McpObserveUsage::MaxResultPayloadBytes) { return ObserveBudgetError(McpBudgetLimit::ResultPayloadBytes, L"dispatch"); }
             }
             result.StructuredJson = std::move(body) + L"]}";
@@ -1930,7 +1992,14 @@ std::shared_ptr<McpJob> McpServer::TryPopJob()
         {
             job = queue_.front();
             queue_.pop_front();
-            if (!operations_.Start(job->OperationId, GetTickCount64()))
+            if (!TargetSessionAllowedLocked(job->Request.Grant, job->Request.TargetSession))
+            {
+                operations_.CancelQueued(job->OperationId, GetTickCount64());
+                job->ResultPromise.set_value(McpTargetSessionDenied());
+                if (!queue_.empty()) { SetEvent(jobReadyEvent_); }
+                job.reset();
+            }
+            else if (!operations_.Start(job->OperationId, GetTickCount64()))
             {
                 if (journal_ && !journal_->Healthy()) { job->ResultPromise.set_value(McpJournalUnavailable(job->OperationId)); }
                 job.reset();
@@ -1962,6 +2031,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
     // first engine completion wins, including after the waiter has timed out.
     std::lock_guard<std::mutex> lock(queueMutex_);
     if (!job || job->Owner != this || job->Generation != listenerGeneration_) { return; }
+    const bool deliver = TargetSessionAllowedLocked(job->Request.Grant, job->Request.TargetSession);
     McpObserveSettlement cost;
     if (job->Observe)
     {
@@ -1970,7 +2040,7 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
         {
             result = ObserveBudgetError(result.BudgetLimit, L"dispatch");
         }
-        else
+        else if (deliver)
         {
             cost.PayloadBytes = ObservePayloadCost(result);
             McpBudgetLimit limit = McpBudgetLimit::None;
@@ -1989,11 +2059,12 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
     }
     if (!operations_.Complete(job->OperationId, result.IsError, result.OutcomeUnknown, GetTickCount64(), cost))
     {
-        if (journal_ && !journal_->Healthy()) { job->ResultPromise.set_value(McpJournalUnavailable(job->OperationId)); }
+        if (journal_ && !journal_->Healthy()) { job->ResultPromise.set_value(deliver ? McpJournalUnavailable(job->OperationId) : McpTargetSessionDenied()); }
         return;
     }
     job->ReadyToDispatch = false;
     if (job->Observe) { job->Observe->PayloadBytes += cost.PayloadBytes; }
+    if (!deliver) { job->ResultPromise.set_value(McpTargetSessionDenied()); return; }
     McpOperationSnapshot snapshot;
     if (operations_.Get(job->OperationId, &snapshot))
     {
@@ -2004,11 +2075,23 @@ void McpServer::CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult 
 
 static bool GrantAllowed(const McpServerConfig& config, const McpObserveGrant& grant)
 {
-    if (config.Principals.empty()) { return grant.Fingerprint.empty() && grant.Source.empty(); }
+    if (config.Principals.empty()) { return grant.Fingerprint.empty() && grant.Source.empty() && !grant.Target; }
     return std::find(config.Principals.begin(), config.Principals.end(), grant) != config.Principals.end();
 }
 
-McpEngineResult McpServer::OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant) const
+bool McpServer::TargetSessionAllowedLocked(const McpObserveGrant& grant, const std::wstring& handle, uint64_t* expires) const
+{
+    if (expires) { *expires = 0; }
+    if (!grant.Target) { return handle.empty(); }
+    const auto at = std::find(config_.Principals.begin(), config_.Principals.end(), grant);
+    if (at == config_.Principals.end() || handle.empty() || stopRequested_.load()) { return false; }
+    const auto& lease = targetLeases_[at - config_.Principals.begin()];
+    if (lease.Handle != handle || GetTickCount64() >= lease.ExpiresTick) { return false; }
+    if (expires) { *expires = lease.ExpiresTick; }
+    return true;
+}
+
+McpEngineResult McpServer::OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant, const std::wstring& targetSession) const
 {
     std::lock_guard<std::mutex> lock(queueMutex_);
     McpEngineResult result;
@@ -2018,7 +2101,8 @@ McpEngineResult McpServer::OperationStatus(const std::wstring& operationId, cons
         result.IsError = true;
         result.Text = L"operation_id must be exactly 32 lowercase hexadecimal characters";
     }
-    else if (!GrantAllowed(config_, grant)) { return McpAuthorityError(ScopeName()); }
+    else if (!GrantAllowed(config_, grant)) { return McpAuthorityError(ScopeNameFor(config_, grant)); }
+    else if (!TargetSessionAllowedLocked(grant, targetSession)) { return McpTargetSessionDenied(); }
     else if (journal_ && !journal_->Healthy())
     {
         return McpJournalUnavailable();
@@ -2046,7 +2130,8 @@ const wchar_t* McpServer::ScopeName() const
 static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const McpEngineRequest& request,
     McpEngineResult* result, uint32_t* requestedEvents = nullptr)
 {
-    if (!GrantAllowed(scope, request.Grant)) { *result = McpAuthorityError(ScopeNameFor(scope)); return false; }
+    const auto* scopeName = ScopeNameFor(scope, request.Grant);
+    if (!GrantAllowed(scope, request.Grant)) { *result = McpAuthorityError(scopeName); return false; }
     if (request.Kind == McpRequestKind::ResourceRead)
     {
         if (ResourceVisible(request.Name, scope) && request.Name != L"kn://capabilities" &&
@@ -2059,9 +2144,9 @@ static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const Mc
         {
             const auto& args = request.ArgumentsJson;
             std::wstring error;
-            if ((scope.ObserveOnly && args.size() > 4096) || !ValidateMcpToolArguments(request.Name, args, &error))
+            if ((scope.ObserveOnly && args.size() > 4096) || !ValidateMcpToolArguments(request.Name, args, &error, request.Grant.Target.has_value()))
             {
-                *result = McpAuthorityError(ScopeNameFor(scope), true);
+                *result = McpAuthorityError(scopeName, true);
                 if (!scope.ObserveOnly) { result->Text = error; }
                 return false;
             }
@@ -2081,7 +2166,7 @@ static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const Mc
                         (action.empty() || (action.size() == 6 && _wcsicmp(action.c_str(), L"status") == 0));
                     if (!status)
                     {
-                        *result = McpAuthorityError(ScopeNameFor(scope));
+                        *result = McpAuthorityError(scopeName);
                         return false;
                     }
                 }
@@ -2091,20 +2176,30 @@ static bool ValidateEngineRequestForScope(const McpServerConfig& scope, const Mc
                 TimelineGraphQueryOptions options;
                 if (!ParseObservedTimelineOptions(args, &options))
                 {
-                    *result = McpAuthorityError(ScopeNameFor(scope), true);
+                    *result = McpAuthorityError(scopeName, true);
                     return false;
                 }
                 if (requestedEvents) { *requestedEvents = static_cast<uint32_t>(options.Limit); }
+                if (request.Grant.Target)
+                {
+                    std::wstring handle;
+                    if (!mcpjson::GetString(args, L"target_session", &handle) || handle != request.TargetSession ||
+                        (options.HasProcessId && options.ProcessId != request.Grant.Target->ProcessId))
+                    {
+                        *result = McpAuthorityError(L"observe_target");
+                        return false;
+                    }
+                }
                 if (!request.Grant.Source.empty() && !options.Source.empty() && options.Source != request.Grant.Source)
                 {
-                    *result = McpAuthorityError(ScopeNameFor(scope));
+                    *result = McpAuthorityError(scopeName);
                     return false;
                 }
             }
             return true;
         }
     }
-    *result = McpAuthorityError(ScopeNameFor(scope));
+    *result = McpAuthorityError(scopeName);
     return false;
 }
 
@@ -2165,7 +2260,8 @@ bool McpServer::DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineD
             scope.ObserveOnly = config_.ObserveOnly;
             scope.AllowWrite = config_.AllowWrite;
             scope.Principals = config_.Principals;
-            if (stopRequested_.load()) { result = McpAuthorityError(ScopeName()); }
+            if (stopRequested_.load()) { result = McpAuthorityError(ScopeNameFor(scope, job->Request.Grant)); }
+            else if (!TargetSessionAllowedLocked(job->Request.Grant, job->Request.TargetSession)) { result = McpTargetSessionDenied(); }
             else if (journal_ && !journal_->Healthy()) { result = McpJournalUnavailable(job->OperationId); }
             else if (job->Observe)
             {
@@ -2220,16 +2316,18 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
     if (!AuthorizeEngineRequest(request, result, &requestedEvents)) { return true; }
     std::shared_ptr<McpJob> job;
     std::future<McpEngineResult> future;
+    uint64_t targetExpires = 0;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
         if (stopRequested_.load() || queue_.size() >= maxPending_)
         {
             return false;
         }
+        if (!TargetSessionAllowedLocked(request.Grant, request.TargetSession, &targetExpires)) { *result = McpTargetSessionDenied(); return true; }
         const auto bucket = UsageForGrantLocked(request.Grant);
         if (config_.ObserveOnly)
         {
-            if (!bucket) { *result = McpAuthorityError(ScopeName()); return true; }
+            if (!bucket) { *result = McpAuthorityError(ScopeNameFor(config_, request.Grant)); return true; }
             const auto& usage = *bucket;
             auto limit = AvailableObserveWork(usage, request);
             if (usage.AdmittedCalls == usage.CallLimit) { limit = McpBudgetLimit::Calls; }
@@ -2274,7 +2372,8 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
     {
-        if (stopRequested_.load() || std::chrono::steady_clock::now() >= deadline)
+        if (stopRequested_.load() || std::chrono::steady_clock::now() >= deadline ||
+            (targetExpires && GetTickCount64() >= targetExpires))
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
             if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
@@ -2293,6 +2392,7 @@ bool McpServer::EnqueueAndWait(const McpEngineRequest& request, uint32_t timeout
             {
                 operations_.WaitEnded(job->OperationId);
             }
+            if (!TargetSessionAllowedLocked(request.Grant, request.TargetSession)) { *result = McpTargetSessionDenied(); return true; }
             if (journal_ && !journal_->Healthy()) { *result = McpJournalUnavailable(job->OperationId); return true; }
             result->IsError = true;
             result->OutcomeUnknown = !cancelled;
@@ -2344,6 +2444,7 @@ bool McpServer::Start(const McpServerConfig& config, std::wstring* error)
             config_ = config;
             observeUsage_ = config.ObserveOnly && config.Principals.empty() ? std::make_shared<McpObserveUsage>() : nullptr;
             principalUsage_.clear();
+            targetLeases_.assign(config.Principals.size(), TargetLease{});
             for (size_t i = 0; i < config.Principals.size(); ++i)
             {
                 principalUsage_.push_back(std::make_shared<McpObserveUsage>(static_cast<uint32_t>(config.Principals.size())));
@@ -2689,8 +2790,9 @@ void McpServer::ListenerThreadMain()
 
     // Sends an HTTP response with a JSON (or empty) body. ANSI strings are kept
     // local so they outlive the synchronous HttpSendHttpResponse call.
+    struct TargetReply { const McpObserveGrant& Grant; const std::wstring& Handle; const std::wstring& Id; };
     auto sendResponse = [&](HTTP_REQUEST_ID requestId, USHORT statusCode, const char* reason, const std::wstring& bodyWide,
-                            const std::wstring* initializedSession = nullptr)
+                            const std::wstring* initializedSession = nullptr, const TargetReply* target = nullptr)
     {
         std::string body = mcpjson::WideToUtf8(bodyWide);
         std::string sessionAnsi = mcpjson::WideToUtf8(initializedSession ? *initializedSession : sessionId_);
@@ -2715,6 +2817,15 @@ void McpServer::ListenerThreadMain()
             response.Headers.UnknownHeaderCount = 1;
         }
 
+        bool allowed = true;
+        if (target)
+        {
+            // Serialization can outlast a lease. Decide on the bytes immediately
+            // before handing them to HTTP.sys, outside any audit or disk path.
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            allowed = TargetSessionAllowedLocked(target->Grant, target->Handle);
+            if (!allowed) { body = mcpjson::WideToUtf8(RpcResult(target->Id, BuildToolResult(McpTargetSessionDenied()))); }
+        }
         HTTP_DATA_CHUNK chunk = {};
         if (!body.empty())
         {
@@ -2727,6 +2838,7 @@ void McpServer::ListenerThreadMain()
 
         ULONG bytesSent = 0;
         HttpSendHttpResponse(requestQueue_, requestId, 0, &response, nullptr, &bytesSent, nullptr, 0, nullptr, nullptr);
+        return allowed;
     };
 
     auto readBody = [&](HTTP_REQUEST_ID requestId, std::string* body) -> ULONG
@@ -2739,13 +2851,13 @@ void McpServer::ListenerThreadMain()
 
     // Append one forensic JSONL record per data-bearing MCP request. Always on
     // while the server runs (independent of the operator's `ai audit` setting).
-    auto writeAudit = [&](const HTTP_REQUEST* request, const std::wstring& method, const std::wstring& name,
+    auto writeAudit = [&](const McpObserveGrant& grant, const HTTP_REQUEST* request, const std::wstring& method, const std::wstring& name,
                           const std::wstring& args, const std::wstring& decision, bool isError, size_t resultBytes,
                           const std::wstring& operation = L"", const std::wstring& budgetDenial = L"")
     {
         std::wstring record = L"{\"ts\":" + mcpjson::Quote(AuditTimestamp());
         if (!config_.ObserveOnly) { record += L",\"session\":" + mcpjson::Quote(sessionId_); }
-        record += L",\"scope\":" + mcpjson::Quote(ScopeName());
+        record += L",\"scope\":" + mcpjson::Quote(ScopeNameFor(config_, grant));
         record += L",\"peerPort\":" + std::to_wstring(AuditPeerPort(request));
         record += L",\"method\":" + mcpjson::Quote(method);
         const auto* tool = FindTool(name);
@@ -2900,13 +3012,25 @@ void McpServer::ListenerThreadMain()
         if (method == L"initialize")
         {
             session = RandomHex(16);
+            if (grant.Target)
+            {
+                std::lock_guard<std::mutex> lock(queueMutex_);
+                auto& lease = targetLeases_[principal - config_.Principals.data()];
+                lease = {};
+                if (!session.empty())
+                {
+                    lease.Handle = RandomHex(16);
+                    if (lease.Handle.empty()) { session.clear(); }
+                    else { lease.ExpiresTick = GetTickCount64() + uint64_t(config_.TargetSessionSeconds) * 1000; }
+                }
+            }
             if (session.empty()) { sendResponse(requestId, 503, "Unavailable", L""); return; }
             std::wstring result =
                 L"{\"protocolVersion\":" + mcpjson::Quote(kProtocolVersion) +
                 L",\"capabilities\":{\"tools\":{\"listChanged\":false},\"resources\":{},\"prompts\":{}}" +
                 L",\"serverInfo\":{\"name\":" + mcpjson::Quote(kServerName) +
                 L",\"version\":" + mcpjson::Quote(kServerVersion) + L"}}";
-            writeAudit(request, L"initialize", L"", L"", L"session-open", false, 0);
+            writeAudit(grant, request, L"initialize", L"", L"", L"session-open", false, 0);
             sendResponse(requestId, 200, "OK", RpcResult(idRaw, result), &session);
             return;
         }
@@ -2933,7 +3057,7 @@ void McpServer::ListenerThreadMain()
 
         if (method == L"tools/list")
         {
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_)));
+            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolsList(config_, grant.Target.has_value())));
             return;
         }
 
@@ -2955,16 +3079,18 @@ void McpServer::ListenerThreadMain()
             const McpToolDef* tool = FindTool(name);
             if (tool == nullptr && !config_.ObserveOnly)
             {
-                writeAudit(request, L"tools/call", name, argsRaw, L"unknown-tool", true, 0);
+                writeAudit(grant, request, L"tools/call", name, argsRaw, L"unknown-tool", true, 0);
                 sendResponse(requestId, 200, "OK", RpcError(idRaw, -32601, L"unknown tool: " + name));
                 return;
             }
 
             McpEngineResult result;
+            std::wstring targetSession;
+            if (grant.Target && argsRaw.size() <= 4096) { mcpjson::GetString(argsRaw, L"target_session", &targetSession); }
             std::wstring decision = L"ok";
             if (config_.ObserveOnly && (tool == nullptr || !ToolVisible(*tool, config_)))
             {
-                result = McpAuthorityError(ScopeName());
+                result = McpAuthorityError(ScopeNameFor(config_, grant));
                 decision = L"blocked_by_policy";
             }
             else if (tool != nullptr && !tool->ReadOnly && !config_.AllowWrite)
@@ -2979,15 +3105,15 @@ void McpServer::ListenerThreadMain()
                 // This lookup must never queue behind that same operation.
                 std::wstring error;
                 std::wstring operationId;
-                if ((config_.ObserveOnly && argsRaw.size() > 4096) || !ValidateMcpToolArguments(name, argsRaw, &error) ||
+                if ((config_.ObserveOnly && argsRaw.size() > 4096) || !ValidateMcpToolArguments(name, argsRaw, &error, grant.Target.has_value()) ||
                     !mcpjson::GetString(argsRaw, L"operation_id", &operationId))
                 {
-                    result = McpAuthorityError(ScopeName(), true);
+                    result = McpAuthorityError(ScopeNameFor(config_, grant), true);
                     if (!config_.ObserveOnly) { result.Text = error.empty() ? L"operation_id is required" : error; }
                 }
                 else
                 {
-                    result = OperationStatus(operationId, grant);
+                    result = OperationStatus(operationId, grant, targetSession);
                 }
                 decision = result.IsError ? L"operation-unavailable" : L"operation-status";
             }
@@ -2996,6 +3122,7 @@ void McpServer::ListenerThreadMain()
                 McpEngineRequest engineRequest;
                 engineRequest.Kind = McpRequestKind::ToolCall;
                 engineRequest.Grant = grant;
+                engineRequest.TargetSession = targetSession;
                 engineRequest.Name = name;
                 engineRequest.ArgumentsJson = argsRaw;
                 if (!EnqueueAndWait(engineRequest, 30000, &result))
@@ -3012,10 +3139,28 @@ void McpServer::ListenerThreadMain()
                 }
             }
 
-            writeAudit(request, L"tools/call", name, argsRaw, decision, result.IsError,
-                       result.Text.size() + result.StructuredJson.size(), result.OperationJson,
-                       result.BudgetLimit != McpBudgetLimit::None ? result.StructuredJson : L"");
-            sendResponse(requestId, 200, "OK", RpcResult(idRaw, BuildToolResult(result)));
+            const auto auditTool = [&]()
+            {
+                writeAudit(grant, request, L"tools/call", name, argsRaw, decision, result.IsError,
+                    result.Text.size() + result.StructuredJson.size(), result.OperationJson,
+                    result.BudgetLimit != McpBudgetLimit::None ? result.StructuredJson : L"");
+            };
+            const auto reply = RpcResult(idRaw, BuildToolResult(result));
+            if (grant.Target)
+            {
+                const TargetReply target{grant, targetSession, idRaw};
+                if (!sendResponse(requestId, 200, "OK", reply, nullptr, &target))
+                {
+                    result = McpTargetSessionDenied();
+                    decision = L"target_session_unavailable";
+                }
+                auditTool();
+            }
+            else
+            {
+                auditTool();
+                sendResponse(requestId, 200, "OK", reply);
+            }
             return;
         }
 
@@ -3035,7 +3180,14 @@ void McpServer::ListenerThreadMain()
             if (uri == L"kn://capabilities")
             {
                 // Static manifest; served transport-side without an engine hop.
-                contentsText = BuildCapabilitiesResource(config_, ObserveBudgetJson(grant), grant);
+                std::wstring handle;
+                if (grant.Target)
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex_);
+                    const auto& lease = targetLeases_[principal - config_.Principals.data()];
+                    if (GetTickCount64() < lease.ExpiresTick) { handle = lease.Handle; }
+                }
+                contentsText = BuildCapabilitiesResource(config_, ObserveBudgetJson(grant), grant, handle);
             }
             else if (ResourceVisible(uri, config_))
             {
@@ -3046,14 +3198,14 @@ void McpServer::ListenerThreadMain()
                 McpEngineResult result;
                 if (!EnqueueAndWait(engineRequest, 30000, &result))
                 {
-                    writeAudit(request, L"resources/read", uri, L"", L"engine-busy", true, 0);
+                    writeAudit(grant, request, L"resources/read", uri, L"", L"engine-busy", true, 0);
                     sendResponse(requestId, 200, "OK", RpcError(idRaw, -32603, L"engine busy"));
                     return;
                 }
                 if (result.IsError)
                 {
                     const bool exhausted = result.BudgetLimit != McpBudgetLimit::None;
-                    writeAudit(request, L"resources/read", uri, L"", exhausted ? L"budget_exhausted" : L"resource-error",
+                    writeAudit(grant, request, L"resources/read", uri, L"", exhausted ? L"budget_exhausted" : L"resource-error",
                         true, 0, result.OperationJson, exhausted ? result.StructuredJson : L"");
                     std::wstring message = result.Text.empty() ? (L"unknown resource: " + uri) : result.Text;
                     std::wstring data = result.OperationJson;
@@ -3070,13 +3222,13 @@ void McpServer::ListenerThreadMain()
             }
             else
             {
-                writeAudit(request, L"resources/read", uri, L"", config_.ObserveOnly ? L"blocked_by_policy" : L"unknown-resource", true, 0);
+                writeAudit(grant, request, L"resources/read", uri, L"", config_.ObserveOnly ? L"blocked_by_policy" : L"unknown-resource", true, 0);
                 sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602,
                     config_.ObserveOnly ? L"request blocked by MCP session policy" : L"unknown resource: " + uri));
                 return;
             }
 
-            writeAudit(request, L"resources/read", uri, L"", L"ok", false, contentsText.size(), operationJson);
+            writeAudit(grant, request, L"resources/read", uri, L"", L"ok", false, contentsText.size(), operationJson);
             std::wstring result = L"{\"contents\":[{\"uri\":" + mcpjson::Quote(uri) +
                 L",\"mimeType\":\"application/json\",\"text\":" + mcpjson::Quote(contentsText) + L"}]";
             if (!operationJson.empty())
@@ -3098,7 +3250,7 @@ void McpServer::ListenerThreadMain()
         {
             if (config_.ObserveOnly)
             {
-                writeAudit(request, L"prompts/get", L"", L"", L"blocked_by_policy", true, 0);
+                writeAudit(grant, request, L"prompts/get", L"", L"", L"blocked_by_policy", true, 0);
                 sendResponse(requestId, 200, "OK", RpcError(idRaw, -32602, L"request blocked by MCP session policy"));
                 return;
             }

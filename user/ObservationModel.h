@@ -78,6 +78,15 @@ struct ObservationIdentity
     bool SameInstance(const ObservationIdentity& other) const { return CompatibleWith(other); }
 };
 
+// Authorization for a retained user-process event requires the captured boot
+// GUID and creation FILETIME. PID-only and kernel identities do not qualify.
+inline bool IsRetainedProcessLifetime(const ObservationIdentity& identity)
+{
+    return identity.ProcessId > 4 && identity.CreateTime != 0 && identity.BootId.size() == 32 &&
+        identity.BootId.find_first_not_of(L"0123456789abcdef") == std::wstring::npos &&
+        identity.BootId.find_first_not_of(L'0') != std::wstring::npos;
+}
+
 struct ObservationRange
 {
     uint64_t Address = 0;

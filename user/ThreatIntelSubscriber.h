@@ -56,6 +56,9 @@ struct TiEventRecord
     uint32_t TargetProcessId = 0;
     uint64_t TargetProcessCreateTime = 0;
     std::wstring TargetImageBase;
+    // Captured with the header process generation. Raw payload fields and
+    // imported timeline records cannot supply this binding.
+    std::wstring ProcessBootId;
 };
 
 struct TiTraceLifecycle

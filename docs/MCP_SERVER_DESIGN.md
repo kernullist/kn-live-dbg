@@ -81,7 +81,7 @@ write fails, the listener reports `journal_unavailable` and stops admitting
 work. Reopen the store to read the last committed phase. Recovery performs
 a lookup and never replays the original operation.
 
-The receipt includes an opaque ID for the journal's shared principal, a
+The shared-password receipt includes an opaque ID for the journal's principal, a
 random generation for the controller process that owned the retained view,
 the approved observe scope and a keyed SHA-256 hash of the request kind,
 catalog name and UTF-8 argument object. The fields `admitted_utc`,
@@ -162,6 +162,38 @@ Separate DPAPI entropy domains prevent a shared-password listener from
 opening a source-scoped journal and vice versa. The operator unlock password
 stays separate from client authentication. The 256-record retention limit
 applies to the whole journal. [Client provisioning](MCP_SETUP.md#give-each-client-one-retained-source)
+
+### Process-lifetime observation
+
+A local operator can bind a client to retained TI records from one process
+lifetime. The subscriber checks the TI provider GUID and event header PID, validates the process
+creation FILETIME and image through the same process handle, and records the
+boot ID. The store indexes qualifying rows by source, boot ID, PID and creation
+time. Counts and scan charges cover only that index. A reused PID, a PID found
+in the event payload, and a process identity claimed by an imported row each
+fall outside the grant. An imported row and a verified row with identical
+displayed fields occupy separate deduplication entries. A source-wide reader
+can see both. Evicting the final verified row removes the corresponding lifetime index.
+
+The client initializes its protocol session and reads an opaque
+`target_session` from `kn://capabilities`. Both `timeline.query` and
+`operations.get` require that additional argument. Reinitializing rotates
+both handles for this client and preserves its allowance. The listener checks
+the target handle at admission, dequeue, dispatch and publication. An expired
+wait releases the HTTP listener even if the engine has not returned. The
+engine accounts for rows examined and charges zero output bytes when the
+handle has already expired at settlement. HTTP checks again after serialization
+and can withhold a previously settled payload and its operation ID. The owner
+can look up a known ID after renewal.
+`kn.mcp_target_timeline.v1` returns the event timestamp, domain, action,
+header PID and header TID.
+
+For target-scoped journal entries, `target_generation` is a keyed digest of
+the process lifetime. `controller_generation` identifies the controller that
+admitted the request. Recovery requires the original fingerprint, source and
+process lifetime plus a fresh handle. Existing source-only and shared receipts
+keep their original format. With journaling disabled, the receipt expires
+when the listener stops. [Client setup](MCP_SETUP.md#grant-access-to-one-process-lifetime)
 
 ### Observe listener budget
 

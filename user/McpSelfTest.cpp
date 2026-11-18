@@ -921,7 +921,7 @@ static bool McpManifestMatches(const std::wstring& response, const wchar_t* list
 
 // A separate process lets the test controller terminate this exact listener
 // after a real queue/dispatch boundary, without running the live debugger.
-int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants)
+int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vector<McpObserveGrant>& grants, uint32_t targetSessionSeconds)
 {
     McpServer server;
     McpServerConfig config;
@@ -929,6 +929,7 @@ int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vec
     config.ObserveOnly = true;
     config.BindAddress = L"127.0.0.1";
     config.Principals = grants;
+    config.TargetSessionSeconds = targetSessionSeconds;
     if (std::wstring(directory) != L"-") { config.OperationJournalDirectory = directory; }
     config.AuditPath = config.OperationJournalDirectory.empty() ? L"fixture-audit.jsonl" : config.OperationJournalDirectory + L"\\fixture-audit.jsonl";
     std::wstring error, line;
@@ -959,6 +960,58 @@ int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vec
         }
     }
     std::shared_ptr<McpJob> job;
+    const bool targetFixture = std::any_of(grants.begin(), grants.end(), [](const auto& grant) { return grant.Target.has_value(); });
+    std::shared_ptr<McpJob> observedRequest;
+    if (targetFixture)
+    {
+        const std::wstring boot(32, L'b'), otherBoot(32, L'c');
+        auto append = [&](const std::wstring& bootId, uint32_t pid, uint64_t created, uint64_t timestamp, const wchar_t* action)
+        {
+            TiEventRecord event;
+            event.ProcessBootId = bootId;
+            event.ProcessId = pid;
+            event.ProcessCreateTime = created;
+            event.ThreadId = 17;
+            event.TargetProcessId = pid == 73 ? 94 : 73;
+            event.Timestamp = timestamp;
+            event.TaskName = action;
+            return timeline.IngestThreatIntel({event}, L"all", 1).Added;
+        };
+        // Submit the unqualified twin first, then the same row twice with a verified lifetime.
+        if (append({}, 73, 100, 1010, L"HeaderA") != 1 || append(boot, 73, 100, 1010, L"HeaderA") != 1 ||
+            append(boot, 73, 100, 1010, L"HeaderA") != 0) { return 2; }
+        append(boot, 73, 100, 1011, L"HeaderB");
+        append(boot, 73, 200, 1020, L"ReusedPid");
+        append(otherBoot, 73, 100, 1021, L"OtherBoot");
+        append(boot, 94, 100, 1022, L"PayloadPeer");
+        append(boot, 73, 0, 1023, L"MissingCreation");
+        append(boot, 73, 2000, 1024, L"FutureCreation");
+        append(std::wstring(32, L'0'), 73, 100, 1025, L"InvalidBoot");
+        TimelineEvent imported;
+        imported.Source = L"ti";
+        imported.Domain = L"threat-intelligence";
+        imported.Action = L"Imported";
+        imported.ProcessId = 73;
+        imported.Evidence[L"process_instance_id"] = boot + L":73:100";
+        timeline.IngestEvents({imported});
+        bool more = false;
+        if (timeline.RetainedTargets(L"ti", 73, more).size() != 3 || more ||
+            timeline.RetainedTargets(L"ti", 94, more).size() != 1 || more) { return 2; }
+    }
+    auto waitForExpiry = [&](const McpEngineRequest& request)
+    {
+        if (!request.Grant.Target) { return false; }
+        const auto deadline = GetTickCount64() + 15000;
+        for (;;)
+        {
+            {
+                std::lock_guard<std::mutex> lock(server.queueMutex_);
+                if (!server.TargetSessionAllowedLocked(request.Grant, request.TargetSession)) { return true; }
+            }
+            if (GetTickCount64() >= deadline) { return false; }
+            Sleep(10);
+        }
+    };
     while (std::getline(std::wcin, line) && line != L"stop")
     {
         if (!grants.empty() && line == L"evict")
@@ -989,12 +1042,33 @@ int RunMcpJournalFixture(const wchar_t* directory, uint16_t port, const std::vec
             if (WaitForSingleObject(server.JobReadyEvent(), 15000) != WAIT_OBJECT_0) { return 2; }
             std::lock_guard<std::mutex> lock(server.queueMutex_);
             if (server.queue_.size() != 1) { return 2; }
+            if (targetFixture) { observedRequest = server.queue_.front(); }
             std::wcout << L"queued " << server.queue_.front()->OperationId << std::endl;
         }
         else if (line == L"dispatch" && !job)
         {
             job = server.TryPopJob();
             std::wcout << (job ? L"dispatched " + job->OperationId : L"refused") << std::endl;
+        }
+        else if (line == L"await-expiry" && targetFixture)
+        {
+            // The queued HTTP call occupies the listener. Observe its own lease
+            // under the production lock before allowing the next fixture action.
+            if (!observedRequest || !waitForExpiry(observedRequest->Request)) { return 2; }
+            std::wcout << L"expired" << std::endl;
+        }
+        else if (line == L"return-across-expiry" && job && targetFixture)
+        {
+            bool read = false;
+            const bool claimed = server.DispatchJob(job, [&](const McpEngineRequest& request, TimelineScanBudget* scan)
+            {
+                auto result = ReadMcpObservedTimeline(request, timeline, *scan);
+                read = !result.IsError && !result.StructuredJson.empty() && scan->ExaminedCount() > 0;
+                read = waitForExpiry(request) && read;
+                return result;
+            });
+            job.reset();
+            std::wcout << (claimed && read ? L"read-across-expiry" : L"refused") << std::endl;
         }
         else if (line == L"restart-held" && job)
         {

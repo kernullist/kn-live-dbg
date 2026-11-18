@@ -847,7 +847,7 @@ It is not covered by the fixture's cooperative lifetime guarantee. Read the
 | DbgEng | `backend`, `kdinit /local`, `kdinit /remote`, `kd`; stop-state commands require a suitable backend/target |
 | AI | [Provider and guarded-plan guide](AI_ASSISTED_WORKFLOWS.md); remote model availability is external state |
 | Human remote console | [Remote setup](REMOTE_SETUP.md); commands execute on the analysis host |
-| MCP | `mcp on --observe` serves retained timeline queries and status over loopback. Add `--principal <fingerprint> <source>` for each client to restrict row and receipt access. [MCP setup](MCP_SETUP.md#give-each-client-one-retained-source) |
+| MCP | `mcp on --observe` serves retained timeline queries and status over loopback. `--principal <fingerprint> <source>` restricts row and receipt access by source. To grant one TI process lifetime, run `!timeline targets ti <pid>` and use its boot ID, PID and creation FILETIME with `--principal-target`. [MCP setup](MCP_SETUP.md#grant-access-to-one-process-lifetime) |
 
 Use `q` for orderly controller exit. Run fixture and collector lifecycle tests
 from the [manual checklist](MANUAL_TEST_CHECKLIST.md), with failed cleanup kept

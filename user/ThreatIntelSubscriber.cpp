@@ -1,4 +1,5 @@
 #include "ThreatIntelSubscriber.h"
+#include "ObservationWindows.h"
 
 #include <tdh.h>
 #include <evntrace.h>
@@ -37,6 +38,12 @@ static constexpr ULONGLONG kThreatIntelMatchAllKeyword = 0;
 
 namespace
 {
+    bool IsTiHeaderProcessLifetime(const EVENT_HEADER& header, uint64_t created)
+    {
+        return IsEqualGUID(header.ProviderId, kThreatIntelligenceProviderGuid) && header.ProcessId > 4 &&
+            created != 0 && header.TimeStamp.QuadPart > 0 && static_cast<uint64_t>(header.TimeStamp.QuadPart) >= created;
+    }
+
     template <typename Writer>
     bool WriteTiBytes(HANDLE file, const std::string& bytes, Writer write, std::wstring* error)
     {
@@ -1079,6 +1086,7 @@ bool TiSubscriber::DecodeEvent(PEVENT_RECORD eventRecord, TiEventRecord* out)
     out->ProcessCreateTime = 0;
     out->ImagePath = out->Timestamp != 0 ?
         GetCachedImageOrResolve(out->ProcessId, out->Timestamp, &out->ProcessCreateTime) : std::wstring{};
+    out->ProcessBootId = IsTiHeaderProcessLifetime(hdr, out->ProcessCreateTime) ? ObservationBootId() : L"";
 
     bool tdhOk = DecodePayloadViaTdh(eventRecord, out);
     if (!tdhOk)
@@ -1889,6 +1897,17 @@ TiSubscriberStats TiSubscriber::SnapshotStats() const
 
 bool ThreatIntelSubscriberSelfTest()
 {
+    EVENT_HEADER subject{};
+    subject.ProviderId = kThreatIntelligenceProviderGuid;
+    subject.ProcessId = 73;
+    subject.TimeStamp.QuadPart = 100;
+    if (!IsTiHeaderProcessLifetime(subject, 100) || IsTiHeaderProcessLifetime(subject, 101) ||
+        IsTiHeaderProcessLifetime(subject, 0)) { return false; }
+    subject.ProviderId.Data1 ^= 1;
+    if (IsTiHeaderProcessLifetime(subject, 100)) { return false; }
+    subject.ProviderId = kThreatIntelligenceProviderGuid;
+    subject.TimeStamp.QuadPart = -1;
+    if (IsTiHeaderProcessLifetime(subject, 100)) { return false; }
     if (!TiWriteSelfTest())
     {
         return false;

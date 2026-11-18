@@ -2556,7 +2556,7 @@ TimelineStore::TimelineStore(size_t capacity)
 void TimelineStore::Clear()
 {
     std::lock_guard<std::mutex> lock(Mutex);
-    BySource.clear();
+    Groups.clear();
     Events.clear();
     EventKeysInOrder.clear();
     EventKeys.clear();
@@ -2739,7 +2739,11 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
             }
         }
 
-        if (AddEventLocked(std::move(event)))
+        // Only the subscriber's typed header generation can grant access.
+        // TargetProcessId comes from payload interpretation and is a distinct role.
+        const ObservationIdentity lifetime{item.ProcessBootId, item.ProcessId, item.ProcessCreateTime};
+        const bool qualified = IsRetainedProcessLifetime(lifetime) && item.Timestamp >= lifetime.CreateTime;
+        if (AddEventLocked(std::move(event), qualified ? &lifetime : nullptr))
         {
             ++result.Added;
         }
@@ -3034,14 +3038,16 @@ std::vector<TimelineEvent> TimelineStore::Query(const TimelineQueryOptions& opti
 }
 
 std::vector<TimelineSourceRow> TimelineStore::QuerySource(const std::wstring& grantedSource, const TimelineQueryOptions& options,
-    uint64_t& stored, TimelineScanBudget& budget) const
+    uint64_t& stored, TimelineScanBudget& budget, const ObservationIdentity* target) const
 {
     std::vector<TimelineSourceRow> rows;
     std::lock_guard<std::mutex> lock(Mutex);
     stored = 0;
-    const auto found = BySource.find(grantedSource);
-    if (grantedSource.empty() || found == BySource.end() ||
-        (!options.Source.empty() && options.Source != grantedSource)) { return rows; }
+    if (grantedSource.empty() || (!options.Source.empty() && options.Source != grantedSource) ||
+        (target && (!IsRetainedProcessLifetime(*target) || (options.HasProcessId && options.ProcessId != target->ProcessId)))) { return rows; }
+    const auto found = Groups.find(target ? GroupKey{grantedSource, target->ProcessId, target->BootId, target->CreateTime} :
+        GroupKey{grantedSource, 0, L"", 0});
+    if (found == Groups.end()) { return rows; }
     stored = found->second.size();
     const auto domain = TimelineToLower(options.Domain);
     const auto label = [](const std::wstring& text) -> std::optional<std::wstring>
@@ -3057,12 +3063,30 @@ std::vector<TimelineSourceRow> TimelineStore::QuerySource(const std::wstring& gr
             const TimelineEvent& event = **it;
             if ((!domain.empty() && (domain.size() != event.Domain.size() || TimelineToLower(event.Domain) != domain)) ||
                 (options.HasProcessId && options.ProcessId != event.ProcessId && options.ProcessId != event.TargetProcessId)) { continue; }
-            rows.push_back({event.TimestampFileTime, event.ProcessId, event.ThreadId, event.TargetProcessId, label(event.Domain), label(event.Action)});
+            rows.push_back({event.TimestampFileTime, event.ProcessId, event.ThreadId, target ? 0u : event.TargetProcessId, label(event.Domain), label(event.Action)});
         }
     };
     if (options.NewestFirst) { collect(found->second.rbegin(), found->second.rend()); }
     else { collect(found->second.begin(), found->second.end()); }
     return rows;
+}
+
+std::vector<ObservationIdentity> TimelineStore::RetainedTargets(const std::wstring& source, uint32_t pid, bool& more,
+    const ObservationIdentity* after) const
+{
+    std::vector<ObservationIdentity> result;
+    more = false;
+    if (source != L"ti" || pid <= 4 || (after && (!IsRetainedProcessLifetime(*after) || after->ProcessId != pid))) { return result; }
+    std::lock_guard<std::mutex> lock(Mutex);
+    auto at = after ? Groups.upper_bound({source, pid, after->BootId, after->CreateTime}) : Groups.lower_bound({source, pid, L"", 0});
+    for (; at != Groups.end(); ++at)
+    {
+        const auto& [label, subject, boot, created] = at->first;
+        if (label != source || subject != pid) { break; }
+        if (result.size() == 64) { more = true; break; }
+        result.push_back({boot, subject, created});
+    }
+    return result;
 }
 
 std::vector<TimelineEvent> TimelineStore::RecentAfterEventId(uint64_t minExclusive, size_t maxCount) const
@@ -3661,26 +3685,43 @@ bool TimelineStore::ExportJsonl(const std::wstring& path, std::wstring* error) c
     return WriteSnapshotTextFile(path, BuildTimelineJsonl(events), error);
 }
 
-bool TimelineStore::AddEventLocked(TimelineEvent event)
+bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentity* target)
 {
     EnrichTimelineEventProcessContext(&event, Events);
     NormalizeTimelineEvent(&event);
-    const auto inserted = EventKeys.insert(TimelineEventKey(event));
+    auto key = TimelineEventKey(event);
+    if (target)
+    {
+        // An identical unbound import cannot occupy the trusted row's dedup slot.
+        key = L"header-lifetime.v1|" + target->BootId + L"|" + std::to_wstring(target->CreateTime) + L"|" + key;
+    }
+    const auto inserted = EventKeys.insert(std::move(key));
     if (!inserted.second) { return false; }
 
     // Publish the dedup key and source pointer together with the retained row.
     const size_t before = Events.size();
-    auto source = BySource.end();
+    auto source = Groups.end(), lifetime = Groups.end();
+    bool sourceLinked = false;
     try
     {
-        EventKeysInOrder.push_back(*inserted.first);
+        EventKeysInOrder.push_back({*inserted.first, Groups.end(), Groups.end()});
         Events.push_back(std::move(event));
-        source = BySource.try_emplace(Events.back().Source).first;
+        source = Groups.try_emplace(GroupKey{Events.back().Source, 0, L"", 0}).first;
         source->second.push_back(&Events.back());
+        sourceLinked = true;
+        EventKeysInOrder.back().Source = source;
+        if (target)
+        {
+            lifetime = Groups.try_emplace(GroupKey{Events.back().Source, target->ProcessId, target->BootId, target->CreateTime}).first;
+            lifetime->second.push_back(&Events.back());
+            EventKeysInOrder.back().Lifetime = lifetime;
+        }
     }
     catch (...)
     {
-        if (source != BySource.end() && source->second.empty()) { BySource.erase(source); }
+        if (lifetime != Groups.end() && lifetime->second.empty()) { Groups.erase(lifetime); }
+        if (sourceLinked) { source->second.pop_back(); }
+        if (source != Groups.end() && source->second.empty()) { Groups.erase(source); }
         if (Events.size() > before) { Events.pop_back(); }
         if (EventKeysInOrder.size() > before) { EventKeysInOrder.pop_back(); }
         EventKeys.erase(inserted.first);
@@ -3698,18 +3739,17 @@ bool TimelineStore::AddEventLocked(TimelineEvent event)
 
 void TimelineStore::DropOldestEventLocked()
 {
-    if (!Events.empty())
+    if (Events.empty()) { return; }
+    const auto& keys = EventKeysInOrder.front();
+    for (auto group : {keys.Source, keys.Lifetime})
     {
-        auto source = BySource.find(Events.front().Source);
-        source->second.pop_front();
-        if (source->second.empty()) { BySource.erase(source); }
-        Events.pop_front();
+        if (group == Groups.end()) { continue; }
+        group->second.pop_front();
+        if (group->second.empty()) { Groups.erase(group); }
     }
-    if (!EventKeysInOrder.empty())
-    {
-        EventKeys.erase(EventKeysInOrder.front());
-        EventKeysInOrder.pop_front();
-    }
+    EventKeys.erase(keys.Dedup);
+    EventKeysInOrder.pop_front();
+    Events.pop_front();
 }
 
 uint64_t TimelineStore::NextEventIdLocked()

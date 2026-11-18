@@ -43,6 +43,7 @@ struct McpEngineRequest
     std::wstring Name;
     std::wstring ArgumentsJson;
     McpObserveGrant Grant{};
+    std::wstring TargetSession{};
 };
 
 struct McpObserveUsage
@@ -124,6 +125,7 @@ struct McpServerConfig
     bool ObserveOnly = false;
     std::wstring OperationJournalDirectory;
     std::vector<McpObserveGrant> Principals;
+    uint32_t TargetSessionSeconds = 300;
 };
 
 class TimelineStore;
@@ -165,7 +167,7 @@ bool FindMcpToolCatalogEntry(const std::wstring& name, McpToolCatalogEntry* entr
 bool McpRequestBodySelfTest();
 bool McpObserveAddressSelfTest();
 bool McpOperationWireSelfTest();
-bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error);
+bool ValidateMcpToolArguments(const std::wstring& name, const std::wstring& json, std::wstring* error, bool targetBound = false);
 
 class McpServer
 {
@@ -211,19 +213,20 @@ public:
     // pending jobs with TryPopJob(). DispatchJob claims and publishes the job once.
     HANDLE JobReadyEvent() const;
     std::shared_ptr<McpJob> TryPopJob();
-    McpEngineResult OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant = {}) const;
+    McpEngineResult OperationStatus(const std::wstring& operationId, const McpObserveGrant& grant = {}, const std::wstring& targetSession = {}) const;
     std::wstring ObserveBudgetJson(const McpObserveGrant& grant = {}) const;
     bool DispatchJob(const std::shared_ptr<McpJob>& job, const McpEngineDispatchFn& dispatch);
 
 private:
     friend int RunMcpToolCatalogSelfTest();
-    friend int RunMcpJournalFixture(const wchar_t*, uint16_t, const std::vector<McpObserveGrant>&);
+    friend int RunMcpJournalFixture(const wchar_t*, uint16_t, const std::vector<McpObserveGrant>&, uint32_t);
     // Listener-side (transport) helpers.
     void ListenerThreadMain();
     void StopLocked();
     void CompleteJob(const std::shared_ptr<McpJob>& job, McpEngineResult result, uint32_t examinedEvents = 0);
     bool AuthorizeEngineRequest(const McpEngineRequest& request, McpEngineResult* result, uint32_t* requestedEvents = nullptr) const;
     std::shared_ptr<McpObserveUsage> UsageForGrantLocked(const McpObserveGrant& grant) const;
+    bool TargetSessionAllowedLocked(const McpObserveGrant& grant, const std::wstring& handle, uint64_t* expires = nullptr) const;
     bool EnqueueAndWait(const McpEngineRequest& request, uint32_t timeoutMs, McpEngineResult* result);
     void AppendAuditLine(const std::wstring& line);
     bool AddUrlPrefix(void* urlGroup, const std::wstring& host, std::wstring* error);
@@ -254,6 +257,8 @@ private:
     uint64_t listenerGeneration_ = 0;
     std::shared_ptr<McpObserveUsage> observeUsage_;
     std::vector<std::shared_ptr<McpObserveUsage>> principalUsage_;
+    struct TargetLease { std::wstring Handle; uint64_t ExpiresTick = 0; };
+    std::vector<TargetLease> targetLeases_; // indexed by authenticated grant, protected by queueMutex_
     std::deque<std::shared_ptr<McpJob>> queue_;
     HANDLE jobReadyEvent_ = nullptr;
     size_t maxPending_ = 8;
