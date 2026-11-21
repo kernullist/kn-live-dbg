@@ -1010,6 +1010,15 @@ logger ID and clock order. Address-space identity and retained executable
 bytes still require another source.
 [ETL process evidence](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
 
+With `--reference-image` the reader opens a second digest-pinned local file.
+The existing PE identity parser consumes its read handle. A sample with a
+process-bound image RVA can compare the loader's identifying fields against
+that PE and hash a bounded range in a declared executable section. Reports
+retain contradictory field values, the reference digest, and the distinction
+between sampled addresses and bytes observed on disk. Runtime page contents
+and the sample's code version require capture-time evidence.
+[Reference file comparison](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
+
 `--etl-switches` uses the same pinned input and raw ETW callbacks to page
 through Thread/CSwitch v2, v3 and v4. The event header and scheduler payload
 retain their own IDs. An original record ordinal locates the switch across

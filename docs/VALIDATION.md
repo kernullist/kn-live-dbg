@@ -4937,6 +4937,50 @@ Public ETL process layouts observed here are v4 and v5. V2, v3 and 32-bit
 process payload coverage comes from constructed records.
 [Process evidence contract](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
 
+### Compare a PE reference with original loader records
+
+On 2026-11-22 the five pinned ETLs in the process table supplied 192,389
+CPU samples. The ETWAnalyzer scheduler trace provided 18,556 of them. The
+independent checker reads the original `tracerpt -rts` loader fields and
+uses Python to parse the supplied PE section table and hash its raw bytes.
+Microsoft's symbol store serves the tested `msvcrt.dll` with SHA-256
+`dd7c8bc34cdbe30ef921395e874909bbf6be53803822164f75f7207e9f085650`.
+All 152 samples whose recorded fields agreed with this file yielded the
+expected offsets, lengths and window hashes. The trace had 1,960 other
+process-bound image samples and 16,444 samples without a process-bound
+image. Its `DefaultBase` for the accepted image matched the reported
+load base. After a one-byte truncation, all 152 sample ordinals were still
+present and every corresponding file window was withheld. None of the
+other four ETLs had a process-bound image RVA to compare. [Microsoft reference DLL](https://msdl.microsoft.com/download/symbols/msvcrt.dll/564F9F399e000/msvcrt.dll)
+
+```powershell
+$pe = Get-Item .\reference\msvcrt.dll
+$pePin = 'dd7c8bc34cdbe30ef921395e874909bbf6be53803822164f75f7207e9f085650'
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-samples 18556 --reference-image $pe.FullName $pePin --all-pages --expect-reference-windows 152 --check-short-tail
+```
+
+A second run used `coreclr.dll` from the official .NET 6.0.0 win-x64
+runtime ZIP. The ZIP matched the distribution SHA-512. The DLL's SHA-256
+was `b33c50b90daa836a0c33a3a43b117af0c6c1502941d8b83d4029a15cc5e332a7`.
+The loader name, size and stamp agreed for 1,252 samples. The recorded
+checksum was 5,165,493 and the PE header checksum was 5,128,662. These
+samples produced no file windows. Both runs kept the runtime code version
+unqualified. [Microsoft .NET 6 release hashes](https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/6.0/releases.json)
+
+The native controls check one-byte section tails, raw padding, zero-fill,
+nonexecutables, conflicting fields and missing build information. An owned
+test PE contains a known marker in a declared executable section. Its RVA
+is obtained inside that test process and compared with the independently
+calculated file-window digest using constructed loader fields. The check
+passed in PE32 and PE32+ processes and in the x64 ASan harness with the
+process-local interception setting documented below. An overlapping read
+confirmed that both input files denied write and delete access during the
+comparison and released both handles afterwards. Their hashes stayed intact.
+All 28 earlier profile and switch pages checked against the parent executable
+had byte-identical output. Public ETLs and reference files stay outside
+the repository.
+[Reference input and report](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

@@ -1,5 +1,7 @@
 #include "EtlProfile.h"
 #include "EtlProcessEvidence.h"
+#include "EtlReferenceImage.h"
+#include "ReferenceArtifact.h"
 #include "EtlScheduleIntervals.h"
 #include "ArtifactOutput.h"
 #include "RuntimeCapabilities.h"
@@ -21,7 +23,7 @@ namespace
     {
         uint32_t after = 0;
         uint32_t limit = 64;
-        std::wstring digest;
+        std::wstring digest, referencePath, referenceDigest;
         bool switches = false, threads = false, images = false, processes = false;
         bool intervals = false, haveTid = false;
         uint32_t tid = 0;
@@ -31,6 +33,7 @@ namespace
         {
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
+            if (!referencePath.empty()) { return L"{\"schema\":\"kn.etl_profile.v5\",\"status\":"; }
             if (processes) { return L"{\"schema\":\"kn.etl_profile.v4\",\"status\":"; }
             if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
             return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
@@ -51,20 +54,32 @@ namespace
         return true;
     }
 
+    bool Digest(const std::wstring& input, std::wstring& result)
+    {
+        if (input.size() != 64 || input.find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
+        result = input;
+        std::transform(result.begin(), result.end(), result.begin(),
+            [](wchar_t c) { return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
+        return true;
+    }
+
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 10 || args[0].empty() ||
-            args[1] != L"--sha256" || args[2].size() != 64 ||
-            args[2].find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
-        options.digest = args[2];
-        std::transform(options.digest.begin(), options.digest.end(), options.digest.begin(),
-            [](wchar_t c) { return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
+        if (args.size() < 3 || args.size() > 13 || args[0].empty() ||
+            args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
         {
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
             if (args[i] == L"--process-evidence" && !options.switches && !options.processes) { options.processes = true; continue; }
+            if (args[i] == L"--reference-image" && !options.switches && options.referencePath.empty())
+            {
+                if (args.size() - i < 3 || args[i + 1].empty() || !Digest(args[i + 2], options.referenceDigest)) { return false; }
+                options.referencePath = args[i + 1];
+                i += 2;
+                continue;
+            }
             if (args[i] == L"--intervals" && options.switches && !options.intervals) { options.intervals = true; continue; }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
@@ -76,6 +91,7 @@ namespace
             else { return false; }
             ++i;
         }
+        if (!options.referencePath.empty()) { options.images = true; options.processes = true; }
         return true;
     }
 
@@ -171,7 +187,7 @@ namespace
     };
 
     bool OpenSource(const std::filesystem::path& path, symbol_artifacts::Directories& parents,
-        SchemaArtifact& source, std::wstring& volumePath)
+        SchemaArtifact& source, std::wstring& volumePath, uint64_t maximum = MaxBytes)
     {
         HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -181,7 +197,7 @@ namespace
         constexpr DWORD excluded = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE |
             FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
         if (!GetFileInformationByHandleEx(raw, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-            (attributes.FileAttributes & excluded) || !source.OpenHandle(raw, MaxBytes) || !source.PathNamesFile())
+            (attributes.FileAttributes & excluded) || !source.OpenHandle(raw, maximum) || !source.PathNamesFile())
         { return false; }
         // OpenTrace takes a name. Use the leased file's volume GUID and the
         // pinned directory hierarchy for the entire decode, including reopens.
@@ -281,12 +297,40 @@ namespace
                 L",\"start_record\":" + std::to_wstring(p.before->record) + L"}" : L"null") + L"}";
     }
 
-    std::wstring ImageProcessJson(const etl_profile::ProcessPair& process, const etl_profile::ImageMatch& image, bool reversedClock)
+    std::wstring ImageProcessJson(const etl_profile::ProcessPair& process, const etl_profile::ImageMatch& image,
+        const etl_profile::ProcessImagePair& bound)
     {
-        const auto bound = etl_profile::ImageInProcess(process, image, reversedClock);
         return L",\"image_process_evidence\":{\"relation\":" + Quote(bound.relation) + L",\"process_start_record\":" +
             (bound.paired ? std::to_wstring(process.before->record) : L"null") + L",\"reported_rva\":" +
             (bound.paired ? Hex(image.rva) : L"null") + L"}";
+    }
+
+    const wchar_t* FieldJson(etl_profile::FieldComparison value)
+    {
+        using etl_profile::FieldComparison;
+        return value == FieldComparison::Unavailable ? L"null" : value == FieldComparison::Equal ? L"true" : L"false";
+    }
+
+    bool AppendReferenceEvidence(std::wstring& report, const etl_profile::ReferenceImage& reference,
+        const etl_profile::ImageIndex& index, const etl_profile::ImageMatch& image, const etl_profile::ProcessImagePair& bound)
+    {
+        const auto* point = bound.paired ? image.witnesses[0].before : nullptr;
+        const auto result = etl_profile::CompareReference(reference, point, point ? index.Name(*point) : std::wstring_view{}, image.rva);
+        report += L",\"reference_evidence\":{\"relation\":" + Quote(result.relation) + L",\"loader_fields\":";
+        if (point)
+        {
+            report += std::wstring(L"{\"file_name\":") + FieldJson(result.name) + L",\"image_size\":" + FieldJson(result.size) +
+                L",\"pe_timestamp\":" + FieldJson(result.stamp) + L",\"image_checksum\":" + FieldJson(result.checksum) +
+                L",\"default_base_relation\":" + Quote(result.defaultBase) + L"}";
+        }
+        else { report += L"null"; }
+        report += L",\"file_location\":" + Quote(result.location) + L",\"reference_window\":";
+        if (!result.length) { report += L"null}"; return true; }
+        const auto digest = etl_profile::ReferenceWindowHash(reference, result);
+        if (digest.empty()) { return false; }
+        report += L"{\"file_offset\":" + std::to_wstring(result.offset) + L",\"byte_count\":" + std::to_wstring(result.length) +
+            L",\"sha256\":" + Quote(digest) + L"}}";
+        return true;
     }
 
     template<typename Event, typename Format>
@@ -401,11 +445,12 @@ namespace
             RecordHeaderJson(s) + intervals + L"}";
     }
 
-    int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0)
+    int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0, const std::wstring& referenceDigest = {})
     {
         const auto report = std::wstring(options.Prefix()) + Quote(status) + L",\"source_sha256\":" +
             (digest.empty() ? L"null" : Quote(digest)) + L",\"win32_status\":" +
-            (error ? std::to_wstring(error) : L"null") + L"}";
+            (error ? std::to_wstring(error) : L"null") + (options.referencePath.empty() ? L"" :
+                L",\"reference_sha256\":" + (referenceDigest.empty() ? L"null" : Quote(referenceDigest))) + L"}";
         return WriteCapabilityJson(report) ? 1 : 2;
     }
 
@@ -428,7 +473,8 @@ namespace
             !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete();
     }
 
-    std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting)
+    std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
+        const etl_profile::ReferenceImage* reference)
     {
         const auto clock = h.ReservedFlags == 1 ? L"qpc" : h.ReservedFlags == 2 ? L"system_time" :
             h.ReservedFlags == 3 ? L"cpu_cycle" : L"unknown";
@@ -522,6 +568,16 @@ namespace
                 L",\"image_binding_clock_reversed\":" + (scan.options.images ? (index.imageClock.reversed ? L"true" : L"false") : L"null") +
                 L",\"generation_scope\":\"source_sha256_and_start_record\",\"creation_filetime\":null}";
         }
+        if (reference)
+        {
+            const auto& pe = reference->pe;
+            result += L",\"reference_image\":{\"file_sha256\":" + Quote(reference->file.Sha256) +
+                L",\"file_bytes\":" + std::to_wstring(reference->file.Bytes()) + L",\"file_name\":" + Quote(reference->leaf) +
+                L",\"machine\":" + std::to_wstring(pe.Machine) + L",\"optional_magic\":" + std::to_wstring(pe.OptionalMagic) +
+                L",\"image_size\":" + Hex(pe.SizeOfImage) + L",\"pe_timestamp\":" + std::to_wstring(pe.TimeDateStamp) +
+                L",\"image_checksum\":" + std::to_wstring(pe.CheckSum) + L",\"preferred_base\":" + Hex(pe.ImageBase) +
+                L",\"max_window_bytes\":" + std::to_wstring(etl_profile::MaxReferenceWindow) + L",\"runtime_bytes_observed\":false}";
+        }
         std::vector<const etl_profile::ImageEvent*> records;
         std::vector<const etl_profile::ProcessEvent*> processRecords;
         result += L",\"samples\":[";
@@ -543,7 +599,12 @@ namespace
                     const uint32_t pid = pair.pairedPid ? pair.before->pid : 0;
                     const auto image = scan.imageIndex.Lookup(scan.page[i], pid, comparableClock, captureGap);
                     evidence += ImageMatchJson(image, records);
-                    if (scan.options.processes) { evidence += ImageProcessJson(process, image, scan.processIndex.imageClock.reversed); }
+                    if (scan.options.processes)
+                    {
+                        const auto bound = etl_profile::ImageInProcess(process, image, scan.processIndex.imageClock.reversed);
+                        evidence += ImageProcessJson(process, image, bound);
+                        if (reference && !AppendReferenceEvidence(evidence, *reference, scan.imageIndex, image, bound)) { return {}; }
+                    }
                 }
                 result += SampleJson(scan.page[i], &pair, evidence, scan.options.processes);
             }
@@ -596,19 +657,8 @@ namespace
 
 }
 
-static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
+static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
 {
-    Scan scan;
-    scan.options.switches = switches;
-    if (!Parse(args, scan.options))
-    {
-        return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [switches] {
-            std::wcerr << (switches ?
-                L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
-                L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence]\n");
-            return 2;
-        });
-    }
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
     SchemaArtifact source;
@@ -619,6 +669,24 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options, L"source_unavailable"); });
     }
     if (source.Sha256 != scan.options.digest) { return Failure(scan.options, L"digest_mismatch", source.Sha256); }
+    symbol_artifacts::Directories referenceParents;
+    etl_profile::ReferenceImage reference;
+    std::wstring referenceVolumePath;
+    if (!scan.options.referencePath.empty())
+    {
+        std::filesystem::path referencePath;
+        if (!symbol_artifacts::LocalRoot(scan.options.referencePath, &referencePath) ||
+            !referenceParents.Pin(referencePath.parent_path(), false) ||
+            !OpenSource(referencePath, referenceParents, reference.file, referenceVolumePath, ReferenceArtifactMaxBytes))
+        { return Failure(scan.options, L"reference_unavailable", source.Sha256); }
+        if (source.PathNamesFile(referenceVolumePath))
+        { return Failure(scan.options, L"reference_is_trace", source.Sha256, 0, reference.file.Sha256); }
+        if (reference.file.Sha256 != scan.options.referenceDigest)
+        { return Failure(scan.options, L"reference_digest_mismatch", source.Sha256, 0, reference.file.Sha256); }
+        if (!executable_image::ReadDiskPeIdentityHandle(reference.file.Handle(), &reference.pe, nullptr))
+        { return Failure(scan.options, L"reference_invalid_pe", source.Sha256, 0, reference.file.Sha256); }
+        reference.leaf = referencePath.filename().wstring();
+    }
     auto log = ConfigureLog(volumePath, scan);
     Trace trace;
     trace.handle = OpenTraceW(&log);
@@ -653,7 +721,39 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
     }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     if (scan.options.processes && scan.processIndex.Complete()) { scan.processIndex.Sort(); }
-    return WriteCapabilityJson(Report(scan, log.LogfileHeader, source, accounting)) ? (partial ? 1 : 0) : 2;
+    const bool haveReference = !scan.options.referencePath.empty();
+    const auto report = Report(scan, log.LogfileHeader, source, accounting, haveReference ? &reference : nullptr);
+    if (haveReference && (!reference.file.PathNamesFile(referenceVolumePath) || !reference.file.Unchanged()))
+    { return Failure(scan.options, L"reference_changed", source.Sha256); }
+    if (report.empty()) { return Failure(scan.options, L"reference_read_failed", source.Sha256, 0, reference.file.Sha256); }
+    return WriteCapabilityJson(report) ? (partial ? 1 : 0) : 2;
+}
+
+static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
+{
+    Scan scan;
+    scan.options.switches = switches;
+    if (Parse(args, scan.options))
+    {
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, scan.options.referencePath, [&] { return ReadValidatedEtl(args, scan); });
+    }
+    const auto sink = GetStdHandle(STD_ERROR_HANDLE);
+    const bool disk = GetFileType(sink) == FILE_TYPE_DISK;
+    const auto references = disk ? std::count(args.begin(), args.end(), L"--reference-image") : 0;
+    std::vector<DistinctArtifactInput> guards(disk ? 1 + references : 0);
+    if (disk && !args.empty())
+    {
+        if (!guards[0].Hold(sink, args[0])) { return 2; }
+        size_t guard = 1;
+        for (size_t i = 0; i + 1 < args.size(); ++i)
+        {
+            if (args[i] == L"--reference-image" && !guards[guard++].Hold(sink, args[i + 1])) { return 2; }
+        }
+    }
+    std::wcerr << (switches ?
+        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
+        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--reference-image <local.pe> <pe-sha256>]\n");
+    return 2;
 }
 
 int RunEtlProfile(const std::vector<std::wstring>& args)

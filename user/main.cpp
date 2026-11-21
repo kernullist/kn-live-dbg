@@ -54135,7 +54135,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
-        std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence]   read saved CPU samples\n";
+        std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--reference-image <local.pe> <pe-sha256>]   read saved CPU samples\n";
         std::wcout << L"  KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N] [--intervals] [--thread-id N]   read saved context switches\n";
         std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea [--event-xml <file> --event-sha256 <digest>]]   compare saved stop, stack and WHEA evidence\n";
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";

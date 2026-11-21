@@ -489,6 +489,9 @@
     <ClInclude Include="EtlThreadEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlReferenceImage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlProcessEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>

@@ -26,7 +26,7 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         assert not result.stdout
         return None
     value = json.loads(result.stdout.decode("utf-8"))
-    version = 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
+    version = 5 if "--reference-image" in args else 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
     switch_version = 2 if "--intervals" in args or "--thread-id" in args else 1
     assert value["schema"] == (f"kn.etl_switches.v{switch_version}" if switches else f"kn.etl_profile.v{version}")
     return value
@@ -315,7 +315,7 @@ def compare_thread(pair, row, events, coverage, clock_ok, include_logger=False):
     return paired_pid
 
 
-def compare(report, pin, size, records, oracle_rows, after, limit, threads, images, processes=None):
+def compare(report, pin, size, records, oracle_rows, after, limit, threads, images, processes=None, reference=None):
     assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == size
     assert (report["provider_guid"], report["event_id"], report["opcode"], report["version"]) == (
         "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", 0, 46, 2)
@@ -339,6 +339,10 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
         assert meta["decoded_events"] == meta["retained_events"] == total and meta["unsupported_events"] == 0
     else:
         assert "thread_source" not in report
+    if reference is not None:
+        assert report["reference_image"] == reference.source
+    else:
+        assert "reference_image" not in report
     referenced, process_refs = set(), set()
     if processes is not None:
         assert report["process_source"] == processes.metadata(images is not None)
@@ -372,10 +376,15 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
             if images is not None:
                 answer = images.expected(row, pid, coverage, clock_ok)
                 if processes is not None:
-                    assert row["image_process_evidence"] == processes.image_in_process(process_answer, answer, images), ("image in process", seq)
+                    bound = processes.image_in_process(process_answer, answer, images)
+                    assert row["image_process_evidence"] == bound, ("image in process", seq)
+                    if reference is not None:
+                        assert row["reference_evidence"] == reference.expected(bound, answer, images), ("reference", seq)
                 assert row["image_evidence"] == answer, ("image relation", seq)
                 for witness in answer["witnesses"]:
                     referenced.update(n for n in (witness["before_record"], witness["after_record"]) if n is not None)
+        if reference is None:
+            assert "reference_evidence" not in row
         if processes is None:
             assert "process_evidence" not in row
         if processes is None or images is None:
@@ -405,7 +414,7 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
     return rows
 
 
-def check_directory_lease(exe, etl, pin, parent, switches=False, options=()):
+def check_directory_lease(exe, etl, pin, parent, switches=False, options=(), status="source_unavailable"):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
@@ -416,7 +425,7 @@ def check_directory_lease(exe, etl, pin, parent, switches=False, options=()):
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        assert run(exe, etl, pin, *options, rc=1, switches=switches)["status"] == "source_unavailable"
+        assert run(exe, etl, pin, *options, rc=1, switches=switches)["status"] == status
     finally:
         kernel.CloseHandle(handle)
 
@@ -442,24 +451,43 @@ def page_cases(count, all_pages):
     return pages
 
 
-def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images, join_processes):
+def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images, join_processes,
+             reference_args=None, expected_windows=None):
     size = etl.stat().st_size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
+    reference = None
+    if reference_args is not None:
+        metadata_dir = folder / "reference"
+        metadata_dir.mkdir()
+        original = Path(reference_args[0]).resolve(strict=True)
+        local = metadata_dir / original.name
+        shutil.copyfile(original, local)
+        reference = run_path(str(Path(__file__).with_name("etl_reference_oracle.py")))["ReferenceOracle"](local, reference_args[1])
+        join_images = join_processes = True
     processes = run_path(str(Path(__file__).with_name("etl_process_oracle.py")))["ProcessOracle"]() if join_processes else None
     records, samples, threads, images, _ = oracle(etl, folder, join_images, processes=processes)
     evidence_args = [f for enabled, f in ((join_processes, "--process-evidence"), (join_images, "--image-evidence"),
                                           (join_threads, "--thread-evidence")) if enabled]
+    if reference is not None:
+        evidence_args = ["--reference-image", reference.path, reference_args[1].upper()]
     join_threads = join_threads or join_images or join_processes
     assert len(samples) == expected_count, (len(samples), expected_count)
     pages = page_cases(len(samples), all_pages)
     compared, compared_images, compared_processes, compared_bindings = {}, {}, {}, {}
+    reference_rows, differing_checksums = {}, set()
     for after, limit in pages:
         # The first call exercises the defaults, subsequent calls explicit paging.
         args = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
         report = run(exe, etl, pin.upper(), *evidence_args, *args)
-        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images, processes)
+        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images, processes, reference)
         for row in rows:
+            if reference is not None:
+                ref = row["reference_evidence"]
+                reference_rows[row["sample_ordinal"]] = (ref["relation"], ref["file_location"])
+                fields = ref["loader_fields"]
+                if fields and fields["file_name"] and fields["image_size"] and fields["pe_timestamp"] and fields["image_checksum"] is False:
+                    differing_checksums.add(row["sample_ordinal"])
             if join_processes:
                 compared_processes[row["sample_ordinal"]] = row["process_evidence"]["relation"]
                 if join_images:
@@ -504,6 +532,23 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
             assert all(r["image_evidence"]["reported_rva"] is None for r in partial["samples"])
         if join_processes:
             assert all(r["process_evidence"]["recorded_generation"] is None for r in partial["samples"])
+            if reference is not None:
+                assert all(r["reference_evidence"]["reference_window"] is None for r in partial["samples"])
+                surviving = [n for n, (_, location) in reference_rows.items()
+                             if location == "executable_file_bytes" and n <= partial["decoded_samples"]]
+                if surviving:
+                    checked = set()
+                    for offset in sorted({(n - 1) // 128 * 128 for n in surviving}):
+                        clipped = run(exe, trimmed, trimmed_pin, "--after", offset, "--limit", 128, *evidence_args, rc=1)
+                        assert clipped["status"] == "partial"
+                        for row in clipped["samples"]:
+                            n = row["sample_ordinal"]
+                            assert row["record_ordinal"] == samples[n - 1][0]
+                            assert row["reference_evidence"]["reference_window"] is None
+                            if reference_rows.get(n, (None, None))[1] == "executable_file_bytes":
+                                checked.add(n)
+                    assert checked == set(surviving)
+                    print("Former reference windows withheld on the clipped trace:", len(checked))
             if join_images:
                 assert all(r["image_process_evidence"]["reported_rva"] is None for r in partial["samples"])
     assert run(exe, etl, pin, *evidence_args, "--after", len(samples) + 1, rc=1)["status"] == "cursor_out_of_range"
@@ -521,6 +566,14 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     assert run(exe, missing, pin, rc=1)["status"] == "source_unavailable"
     check_directory_lease(exe, etl, pin, folder, options=evidence_args)
     check_output_alias(exe, "--etl-profile", etl, pin, folder, options=evidence_args)
+    if reference is not None:
+        reference.controls(exe, etl, pin, folder, run)
+        check_directory_lease(exe, etl, pin, reference.path.parent, options=evidence_args, status="reference_unavailable")
+        windows = sum(location == "executable_file_bytes" for _, location in reference_rows.values())
+        if expected_windows is not None:
+            assert windows == expected_windows, (windows, expected_windows)
+        print("Reference comparison:", dict(Counter(reference_rows.values())), "file windows:", windows)
+        print("Samples with matching name, size and stamp but a different checksum:", len(differing_checksums))
     if join_processes:
         print("Process source:", len(processes.points), "Defunct:", processes.defunct, "Raw process payloads:", processes.raw)
         print("Process relations:", dict(Counter(compared_processes.values())), "Image in process:", dict(Counter(compared_bindings.values())))
@@ -669,14 +722,18 @@ def main():
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
     parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
     parser.add_argument("--process-evidence", action="store_true", help="Check process lifetimes and optional image brackets for each sample")
+    parser.add_argument("--reference-image", nargs=2, metavar=("LOCAL_PE", "PE_SHA256"), help="Check an explicit PE against ETL image records and the raw file bytes")
+    parser.add_argument("--expect-reference-windows", type=int, help="Require this number of distinct samples with a verified file window on --all-pages")
     parser.add_argument("--intervals", action="store_true", help="Compare CPU, off-CPU and ReadyThread boundaries for each switch")
     parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample or switch in 128-row pages")
     parser.add_argument("--check-short-tail", action="store_true",
                         help="For fixtures with a populated last buffer, require detection after removing its last byte")
     args = parser.parse_args()
+    if args.expect_reference_windows is not None and (not args.reference_image or not args.all_pages or args.expect_reference_windows < 0):
+        parser.error("Expected reference windows require --reference-image and --all-pages.")
     if args.intervals and args.expect_switches is None:
         parser.error("Interval checks require --expect-switches.")
-    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence or args.process_evidence):
+    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence or args.process_evidence or args.reference_image):
         parser.error("Thread, process and image joins apply to sampled profiles.")
     with tempfile.TemporaryDirectory(prefix="kn-etl-profile-") as directory:
         folder = Path(directory)
@@ -688,7 +745,7 @@ def main():
             exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail, args.intervals)
         else:
             exercise(exe, etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail,
-                     args.thread_evidence, args.image_evidence, args.process_evidence)
+                     args.thread_evidence, args.image_evidence, args.process_evidence, args.reference_image, args.expect_reference_windows)
 
 
 if __name__ == "__main__":

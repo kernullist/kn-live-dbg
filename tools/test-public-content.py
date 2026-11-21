@@ -176,6 +176,13 @@ class PublicContentTests(unittest.TestCase):
         edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
         source = dict(thread_filter=5, matched_switches=2)
         split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
+        v5 = "kn.etl_profile.v5"
+        artifact = dict(max_window_bytes=32, file_sha256="a" * 64, file_bytes=1024)
+        reference_name = dict(file_sha256="a" * 64, file_bytes=1024, file_name="fixture.bin")
+        reference_error = dict(reference_sha256="b" * 64, win32_status=None, source_sha256="a" * 64)
+        fields = dict(default_base_relation="recorded_load", image_checksum=True, image_size=True)
+        window = dict(file_offset=512, byte_count=13, sha256="b" * 64)
+        admitted = dict(reference_window=window, file_location="executable_file_bytes", loader_fields=fields)
         v4 = "kn.etl_profile.v4"
         process = dict(relation="start_end", candidate_pid=5, before_record=6, after_record=9,
                        opaque_key_comparison="equal", recorded_generation=dict(payload_pid=5, start_record=6))
@@ -183,6 +190,7 @@ class PublicContentTests(unittest.TestCase):
         process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
         process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
         for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=v5, samples=[]), dict(samples=[], schema=v5), artifact, fields, window, admitted, reference_name, reference_error,
                        dict(schema=v4, samples=[]), dict(samples=[], schema=v4), process, process["recorded_generation"],
                        process_point, process_image, process_source,
                        dict(schema=intervals, switches=[]), dict(switches=[], schema=intervals),

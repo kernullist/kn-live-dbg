@@ -168,6 +168,48 @@ defunct count and clock reversals. The process index holds up to 65,536
 records. An overflow returns `partial` and `index_limit` for process lookups.
 File and event limits also apply. Keep the reports with the private ETL.
 
+### Compare a recorded image with a pinned PE
+
+`--reference-image <local.pe> <pe-sha256>` adds a second, explicitly named
+input to the saved CPU profile. It enables process and image evidence and
+returns `kn.etl_profile.v5`. Repeat both file names and digests when paging.
+The reference must be a resident file on a fixed local volume, up to 64 MiB.
+The reader parses its PE headers through a leased file handle, keeps both
+directory chains pinned through the scan and checks the reference bytes again
+before publishing the page. File names found in ETL events stay in the report.
+
+`reference_image` gives the reference SHA-256, size, supplied leaf name, PE
+machine, optional-header magic, image size, COFF stamp, header checksum and
+preferred base. Each sample's `reference_evidence` starts from the loader
+pair admitted by `image_process_evidence`. `loader_fields` compares the
+Windows leaf names without case sensitivity, the image sizes, and any usable
+stamp or checksum. A zero or all-ones recorded stamp and a zero recorded
+checksum each yield `null` for that comparison. The event header's pointer
+width describes the event layout.
+
+| Reference relation | Evidence |
+| --- | --- |
+| `process_image_unavailable` | The trace could not bind a loader pair to the sampled process generation. |
+| `loader_field_conflict` | At least one comparable name, size, stamp or checksum differs. |
+| `build_fields_unavailable` | Both recorded build fields are unavailable. |
+| `default_base_unresolved` | The reported nonzero default base differs from both the recorded load base and the file's preferred base. |
+| `recorded_fields_agree` | The comparable fields agree, including at least one build field. |
+
+`default_base_relation` records which base values agree. A loader can report
+its load base in the ETL default-base field. When the file comparison
+succeeds, `file_location` describes the sampled RVA in the supplied PE.
+An RVA in an executable section can yield a `reference_window` with the
+file offset, byte count and SHA-256 of up to 32 bytes starting at that RVA.
+The window ends at the earlier of the section's declared virtual and raw
+extent. Headers, section gaps, raw padding, virtual zero-fill and sections
+without execute permission have no window. The digest describes the raw
+file before relocation or runtime modification. The page keeps
+`qualification.code_version` null and `runtime_bytes_observed` false.
+
+A missing reference, a reference digest mismatch or invalid PE returns exit 1
+with a status and no sample rows. A partial ETL still reports its observed
+sample rows and withholds their reference windows. [Windows PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) · [ETW image fields](https://learn.microsoft.com/en-us/windows/win32/etw/image-load)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

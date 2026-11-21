@@ -984,6 +984,28 @@ Use the same digest and options with `--after $page.next_after` to continue
 when `next_after` has a value.
 [Process generation fields and limits](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
 
+### Compare a sampled image with an explicit PE file
+
+Pass the local reference path and its SHA-256 together. Use the digest of the
+specific build under review and keep the recorded leaf name when copying
+the file. The following example lists the samples on one page that have
+file-backed reference bytes.
+
+```powershell
+$etl = Get-Item .\capture.etl
+$pe = Get-Item .\reference\msvcrt.dll
+$pin = (Get-FileHash -LiteralPath $etl.FullName -Algorithm SHA256).Hash
+$pePin = (Get-FileHash -LiteralPath $pe.FullName -Algorithm SHA256).Hash
+$page = & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --reference-image $pe.FullName $pePin --limit 128 | ConvertFrom-Json
+$page.reference_image
+$page.samples | Where-Object { $null -ne $_.reference_evidence.reference_window } |
+    Select-Object sample_ordinal, reference_evidence
+```
+
+Continue with `--after $page.next_after` when the cursor has a value, using
+the same reference and ETL. Each window hash belongs to the supplied file.
+[Reference comparison fields](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

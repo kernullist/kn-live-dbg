@@ -3,6 +3,7 @@
 #include "../user/EtlImageEvidence.h"
 #include "../user/EtlScheduleIntervals.h"
 #include "etl-process-evidence-selftest.h"
+#include "etl-reference-image-selftest.h"
 
 #include <array>
 
@@ -698,7 +699,7 @@ int wmain(int argc, wchar_t** argv)
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
             CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
-            etl_process_test::Check() ? 0 : 1;
+            etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {
