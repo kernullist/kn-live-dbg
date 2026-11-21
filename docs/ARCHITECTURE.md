@@ -951,6 +951,28 @@ the lower layer has a result. Host and boot provenance, IRP allocation
 history, user completion and joins to other providers require independent
 evidence. [Capture and replay the fixture](COMMAND_REFERENCE.md#capture-a-cooperative-kernel-io-trace)
 
+### Windows thread termination waits
+
+Windows Wait Chain Traversal can report a blocked thread followed by a
+`WctThreadWaitType` object and a second thread. The replayer emits a
+`waits_for_thread_termination` edge when the middle object has
+`WctStatusOwned` and both distinct threads belong to the requested process
+generation. Each thread's creation time and live handle checks bracket the
+same query. The edge cites all three raw nodes and both handle witnesses.
+The target thread object becomes signaled on termination.
+[Windows wait chain traversal](https://learn.microsoft.com/en-us/windows/win32/debug/wait-chain-traversal)
+and [thread termination](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-thread).
+
+A traversal can contain both a mutex owner and a target thread. Replay
+keeps their dependency types in the directed cycle signature. Two roots
+must agree on the member generations, direction and type of every
+dependency before a measured overlap can corroborate the cycle. The
+diagnosis identifies a reported termination wait separately from lock
+contention. Alternative wait objects, timeout, cancellation, the target's
+eventual exit and the wait call's final result require other evidence.
+A finite wait can expire after Windows reports a cycle.
+[Capture and replay a wait chain](COMMAND_REFERENCE.md#capture-a-windows-wait-chain)
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in

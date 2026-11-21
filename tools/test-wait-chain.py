@@ -181,6 +181,91 @@ def acquire(exe, participants):
     return target, raw
 
 
+def acquire_thread_wait(exe, case):
+    # Start both threads before opening their handles. No dependency is accepted
+    # until WCT actually returns the expected two pinned thread generations.
+    starts = queue.Queue()
+    go, finish = threading.Event(), threading.Event()
+    handles, errors, results = [], [], [None, None]
+    mixed = case == "mixed"
+    latch = mutex(None, False, None) if mixed else None
+    if mixed and not latch:
+        raise c.WinError(c.get_last_error())
+
+    def worker(index):
+        acquired = False
+        try:
+            if mixed and index == 0:
+                acquired = wait(latch, 1000) == 0
+                if not acquired:
+                    raise AssertionError("fixture mutex acquisition failed")
+            starts.put((index, threading.get_native_id(), creation(True)))
+            if not go.wait(8) or len(handles) != 2:
+                return
+            if case == "one_way" and index == 1:
+                if not finish.wait(15):
+                    raise AssertionError("fixture peer release timed out")
+            elif mixed and index == 1:
+                results[index] = wait(latch, 15000)
+                acquired = results[index] == 0
+            else:
+                timeout = 4500 if index == 0 and case != "one_way" else 15000
+                results[index] = wait(handles[1 - index], timeout)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if acquired and not release(latch):
+                errors.append(c.WinError(c.get_last_error()))
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    open_thread = api("OpenThread", w.HANDLE, w.DWORD, w.BOOL, w.DWORD)
+    raw = {}
+    try:
+        for th in workers:
+            th.start()
+        identities = sorted(starts.get(timeout=5) for _ in workers)
+        target = dict(pid=process_id(), process_created=creation(False), threads=[v[1:] for v in identities])
+        tids = [v[1] for v in identities]
+        for tid in tids:
+            handle = open_thread(0x100000 | 0x0800, False, tid)
+            if not handle:
+                raise c.WinError(c.get_last_error())
+            handles.append(handle)
+        go.set()
+        end = time.monotonic() + 3.5
+        while time.monotonic() < end:
+            data = capture(exe, target)
+            q = json.loads(data)["query"]
+            chain = [n["tid"] for n in q["nodes"] if n["type"] == 8] if q else []
+            if (q and q["ok"] and q["cycle"] == (case != "one_way") and
+                    chain == (tids if case == "one_way" else tids + tids[:1]) and
+                    [n["type"] for n in q["nodes"][1::2]] == ([6] if case == "one_way" else [6, 3 if mixed else 6])):
+                raw["single"] = data
+                break
+        if "single" not in raw:
+            raise AssertionError("WCT did not observe the controlled thread wait")
+        raw["series"] = run(series_args(exe, target, 3, 30))
+    finally:
+        go.set()
+        finish.set()
+        for th in workers:
+            if th.ident is not None:
+                th.join()  # Every fixture wait is bounded. Keep handles valid until the workers return.
+        for handle in handles:
+            if wait(handle, 1000) != 0:
+                errors.append(AssertionError("native thread handle did not signal after worker exit"))
+            if not close(handle):
+                errors.append(c.WinError(c.get_last_error()))
+        if latch and not close(latch):
+            errors.append(c.WinError(c.get_last_error()))
+    if errors or any(th.is_alive() for th in workers):
+        raise AssertionError(f"thread wait fixture cleanup failed: {errors}")
+    expected = [0, None] if case == "one_way" else [WAIT_TIMEOUT, 0]
+    if results != expected:
+        raise AssertionError(f"native wait results differ: {results}, expected {expected}")
+    return target, raw
+
+
 class WaitTests(unittest.TestCase):
     def replay(self, raw, expected=0, pin=None, *, diagnose=False):
         path = self.folder / "review.json"
@@ -197,9 +282,9 @@ class WaitTests(unittest.TestCase):
     def check_series(self, payload, expected=0):
         return self.replay(json.dumps(payload, separators=(",", ":")).encode(), expected)
 
-    def timed_rounds(self, count, name="closed_series"):
+    def timed_rounds(self, count, name="closed_series", *, raw=None):
         # Replace timings explicitly so scheduler jitter cannot select the verdict.
-        data = json.loads(self.original[name])
+        data = json.loads(self.original[name] if raw is None else raw)
         data.update(planned_rounds=count, qpc_hz="1000000", pause_ms=50)
         data["rounds"] = data["rounds"][:count]
         for i, row in enumerate(data["rounds"]):
@@ -627,6 +712,82 @@ class WaitTests(unittest.TestCase):
         ):
             self.assertEqual(self.altered(change)["conclusion"], "inconclusive")
 
+    def test_thread_termination_dependencies(self):
+        for case, (target, original) in self.thread_waits.items():
+            first, second = target["threads"]
+            report = self.replay(original["single"])
+            raw = json.loads(original["single"])
+            direct = [e for e in report["edges"] if e["relation"] == "waits_for_thread_termination"]
+            self.assertEqual(len(direct), 2 if case == "mutual" else 1)
+            edge = direct[0]
+            self.assertEqual((edge["thread_id"], edge["thread_created"]), first)
+            self.assertEqual((edge["target_tid"], edge["target_created"]), second)
+            self.assertEqual(edge["node_indices"], [0, 1, 2])
+            self.assertEqual(edge["wait_selection"], "unknown")
+            self.assertEqual([raw["query"]["nodes"][i]["type"] for i in edge["node_indices"]], [8, 6, 8])
+            self.assertEqual(set(edge["evidence"]), {"/query/nodes/0", "/query/nodes/1", "/query/nodes/2",
+                                                     "/process", "/threads/0", "/threads/1"})
+            self.assertEqual(sum(e["relation"] == "owned_by" for e in report["edges"]), int(case == "mixed"))
+            self.assertFalse(report["deadlock_established"])
+            self.assertEqual(report["potential_cycle"] is not None, case != "one_way")
+            diagnosis = self.replay(original["single"], diagnose=True)
+            candidate = diagnosis["candidates"][-1]
+            self.assertEqual(candidate["candidate"], "primary_waited_for_thread_termination")
+            fact, = [diagnosis["facts"][i] for i in candidate["supporting_facts"]]
+            self.assertEqual((fact["target_tid"], fact["target_created"]), second)
+            self.assertIn("wait_completion", candidate["unobserved"])
+            self.assertFalse(diagnosis["cause_of_hang_established"])
+
+    def test_thread_wait_paired_roots_and_semantics(self):
+        for case, (target, original) in self.thread_waits.items():
+            data = json.loads(original["series"])
+            result = self.replay(original["series"])
+            for i, r in enumerate(result["rounds"]):
+                for j, v in enumerate(r["views"]):
+                    source = data["rounds"][i]["views"][j]["receipt"]
+                    for e in v["edges"]:
+                        if e["relation"] == "waits_for_thread_termination":
+                            prefix = f"/rounds/{i}/views/{j}/receipt/"
+                            self.assertTrue(all(s.startswith(prefix) for s in e["evidence"]))
+                            self.assertEqual(source["query"]["nodes"][e["node_indices"][2]]["tid"], e["target_tid"])
+                    self.assertEqual(bool(v["potential_cycle"]), case != "one_way")
+            if case == "one_way":
+                self.assertFalse(result["repeated_groups"])
+                continue
+            # Actual overlap depends on scheduling. Use the recorded dispatch
+            # and explicit, compatible clock bounds for a deterministic control.
+            controlled = self.timed_rounds(3, raw=original["series"])
+            repeated = self.check_series(controlled)
+            relations = repeated["repeated_groups"][0]["relations"]
+            direct = [r for r in relations if r.get("wait_semantics") == "thread_termination"]
+            self.assertEqual(len(direct), 2 if case == "mutual" else 1)
+            self.assertTrue(all("owner_tid" not in r for r in direct))
+            changed = copy.deepcopy(controlled)
+            for r in changed["rounds"]:
+                objects = r["views"][1]["receipt"]["query"]["nodes"][1::2]
+                next(n for n in objects if n["type"] == 6)["type"] = 3
+            self.assertFalse(self.check_series(changed)["repeated_groups"])
+
+    def test_thread_wait_requires_owned_status_and_both_pins(self):
+        _, original = self.thread_waits["one_way"]
+        for mutate in (
+            lambda c: c["query"]["nodes"][1].update(type=7),
+            lambda c: c["query"]["nodes"][1].update(status=7),
+            lambda c: c["query"]["nodes"][0].update(status=2),
+            lambda c: c["query"]["nodes"][2].update(pid=c["requested"]["pid"] + 1),
+            lambda c: c["threads"][1]["after"].update(result=0),
+            lambda c: c["query"]["nodes"][2].update(tid=next(n for n in range(1, 5)
+                                                              if n not in {p["id"] for p in c["threads"]})),
+            lambda c: c["query"]["nodes"][2].update(tid=c["requested"]["tid"]),
+            lambda c: c["query"].update(nodes=c["query"]["nodes"][:2], reported=2),
+        ):
+            raw = json.loads(original["single"])
+            mutate(raw)
+            data = json.dumps(raw).encode()
+            self.assertFalse(self.replay(data)["edges"])
+            self.assertFalse(any(f["kind"] == "thread_termination_wait_observed"
+                                 for f in self.replay(data, diagnose=True)["facts"]))
+
     def test_lock_semantics_and_unbound_owner(self):
         def critical_sections(c):
             for node in c["query"]["nodes"][1::2]:
@@ -693,8 +854,12 @@ def main():
         WaitTests.target, WaitTests.original = acquire(WaitTests.exe, 2)
         WaitTests.triangle, triangle = acquire(WaitTests.exe, 3)
         WaitTests.original.update({"triangle_" + name: data for name, data in triangle.items()})
+        WaitTests.thread_waits = {kind: acquire_thread_wait(WaitTests.exe, kind) for kind in ("one_way", "mutual", "mixed")}
         if args.keep:
             args.keep.mkdir()
+            for name, (_, captures) in WaitTests.thread_waits.items():
+                for shape, data in captures.items():
+                    (args.keep / ("thread_" + name + "_" + shape + ".json")).write_bytes(data)
             for name, data in WaitTests.original.items():
                 (args.keep / (name + ".json")).write_bytes(data)
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(WaitTests)

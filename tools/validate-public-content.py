@@ -81,19 +81,22 @@ def text_views(data: bytes) -> list[str]:
             "\n".join(s.decode("utf-16-le") for s in wide_strings)]
 
 
-WHEA_FIELD_SETS = tuple(frozenset(fields) for fields in (
+DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
     ("type_guid", "revision", "offset", "length", "sha256"),
     ("notify_type", "creator", "revision", "record_id"),
     ("bank", "status", "valid", "matches_stop_status"),
     ("provider", "channel", "event_record_id", "system_time_utc"),
     ("valid_bits", "physical_address", "physical_address_mask", "error_type"),
+    ("relation", "node_indices", "thread_created", "target_tid", "target_created"),
+    ("kind", "round", "evidence", "target_tid", "target_created"),
+    ("waiter_tid", "waiter_created", "wait_semantics", "target_tid", "target_created"),
 ))
-WHEA_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
+EVIDENCE_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
 JSON_SPACE = re.compile(r'[ \t\r\n]*')
 
 
-def detached_whea_object(text: str, offset: int, decoder: json.JSONDecoder) -> bool:
+def detached_evidence_object(text: str, offset: int, decoder: json.JSONDecoder) -> bool:
     # Count keys in one object. Exporters may reorder them or stop during its final value.
     keys = set()
     pos = JSON_SPACE.match(text, offset + 1).end()
@@ -104,7 +107,7 @@ def detached_whea_object(text: str, offset: int, decoder: json.JSONDecoder) -> b
             if not text.startswith(":", pos):
                 break
             keys.add(key)
-            if any(fields <= keys for fields in WHEA_FIELD_SETS):
+            if any(fields <= keys for fields in DETACHED_FIELD_SETS):
                 return True
             pos = JSON_SPACE.match(text, pos + 1).end()
             _, pos = decoder.raw_decode(text, pos)
@@ -167,7 +170,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1",
-                                                                  "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
+                                                                  "kn.wait_", '"target_created"', '"begin_qpc"',
+                                                                 "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
@@ -231,14 +235,14 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"')):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"')):
             decoder = json.JSONDecoder()
-            for match in WHEA_OBJECT_START.finditer(text):
-                if detached_whea_object(text, match.start(1), decoder):
+            for match in EVIDENCE_OBJECT_START.finditer(text):
+                if detached_evidence_object(text, match.start(1), decoder):
                     add("private-evidence-bundle", text.count("\n", 0, match.start(1)) + 1)
                     break
         # WCT output may be redirected or cut between individually flushed rounds.
-        if not binary and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):
+        if (not binary or view is not data) and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):
             record = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.wait_(?:chain|assessment|diagnosis|series(?:_assessment)?)\.v1"\s*(?:[,}]|$)', text)
             if not record:
                 record = re.search(r'(?m)^[ \t]*,?[ \t]*\{[ \t]*"pause"\s*:[^\r\n]*?"receipt"\s*:\s*'

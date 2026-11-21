@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Thread termination in Windows wait chains, 2026-11-22
+
+The Windows x64 Release controller had SHA-256
+`5f78c78e831508324da0ae29547c34f69d7c5a2b52f3068d7d8c25ae430f7ae7`.
+Two owned threads used Win32 thread handles in a one-way wait, a mutual
+wait and a mixed cycle. In the mixed case the first thread held a mutex
+while waiting for the second to terminate. In both cycles the first
+wait returned `WAIT_TIMEOUT` and the peer's wait returned success. Both
+thread handles then signaled. Only the fixture observed these results. The replay retained the original WCT
+observations and left the eventual wake reason unknown.
+
+| Paired capture | Successful traversals | Views with a potential cycle | Corroborated rounds |
+| --- | ---: | ---: | ---: |
+| One-way termination wait | 6/6 | 0 | 0/3 |
+| Mutual termination waits | 6/6 | 6 | 3/3 |
+| Thread termination and mutex | 6/6 | 6 | 2/3 |
+
+The remaining mixed round lacked a qualifying measured overlap. The
+single-root assessments cited the two thread generations, the middle
+object and the handle witnesses. Tests removed a pin, changed the object
+type or status, supplied a foreign or self target and gave the two roots
+different dependency types. The wait suite passed all 18 tests. The 18
+previously retained receipts reproduced both their assessments and
+diagnoses byte for byte. All 25 publication tests passed, including
+detached termination edges, directed relations and diagnosis facts.
+[Traverse thread termination waits](ARCHITECTURE.md#windows-thread-termination-waits)
+
 ## Cooperative kernel I/O trace, 2026-11-22
 
 The x64 Release solution and Debug minifilter fixture built with WDK

@@ -703,9 +703,11 @@ object names. Store the private receipt, assessment and pin together to
 repeat the analysis on the same bytes after process exit.
 
 Replay derives `waits_for` and `owned_by` edges for mutexes and critical
-sections. Each edge cites its raw node positions and thread pin in the
-receipt identified by the SHA-256. Lock identities are local to that
-traversal. A `potential_wait_cycle` requires a Windows cycle flag and a
+sections. A `waits_for_thread_termination` edge cites the blocked thread,
+the WCT thread-wait object and a distinct target thread with its own
+creation time. Both handle checks bracket the query. The capture pin
+identifies the original nodes and handle witnesses. Lock identities are
+local to that traversal. A `potential_wait_cycle` requires a Windows cycle flag and a
 closed chain of at least two distinct threads whose handles bracket the
 query. The report stops interpreting the chain at a foreign or unqualified
 thread. A single returned thread can also mean Windows could not observe
@@ -756,8 +758,8 @@ preserves the setup error and both traversal results.
 [Windows high-resolution timestamps](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
 
 A corroborated round requires both views to close the same directed cycle
-through both chosen roots, with matching thread generations and exclusive
-lock types. `repeated_groups` lists runs of consecutive corroborated rounds
+through both chosen roots, with matching thread generations and dependency
+types. A target thread and a mutex owner have distinct roles in a mixed cycle. `repeated_groups` lists runs of consecutive corroborated rounds
 with the same cycle. Each interval between rounds must have a recorded wait
 timeout and a measured gap of at least the requested pause. Separate partial
 chains cannot close a cycle. `repeated_potential_wait_cycle` describes
@@ -778,7 +780,7 @@ report. The command also works after the target process has exited.
 python tools/replay-wait-chain.py $file --sha256 $pin --diagnose
 ```
 
-The two candidates ask different questions about the primary thread.
+The diagnosis compares the recorded explanations for the primary thread.
 
 - Could the first observed cycle involving this thread generation have
   persisted until collection ended? The report lists every matching view
@@ -792,6 +794,10 @@ The two candidates ask different questions about the primary thread.
   when the chain has no repeated thread or scope boundary. A qualified
   cycle involving the primary thread supplies counterevidence. An
   unsupported tail or a missing traversal leaves the question open.
+- When WCT reports a generation-bound thread termination wait, the report
+  includes `primary_waited_for_thread_termination`. Its facts identify the
+  target thread in the original traversal. Establishing how the waiter
+  woke requires its wait result and independent target-exit evidence.
 
 Each entry in `supporting_facts` and `counterevidence` is a zero-based
 index into `facts`. Each fact cites JSON pointers into the original file

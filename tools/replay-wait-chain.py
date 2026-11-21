@@ -10,8 +10,9 @@ import sys
 DWORD = (1 << 32) - 1
 U64 = (1 << 64) - 1
 LIMIT = 16  # WCT_MAX_NODE_COUNT
-THREAD, BLOCKED, OWNED = 8, 3, 6
+THREAD, THREAD_WAIT, BLOCKED, OWNED = 8, 6, 3, 6
 LOCKS = {1: "critical_section", 3: "mutex"}
+DEPENDENCIES = {**LOCKS, THREAD_WAIT: "thread_termination"}
 PARTIAL = {234, 565}  # ERROR_MORE_DATA, ERROR_TOO_MANY_THREADS
 WAIT_TIMEOUT, WAIT_FAILED = 258, DWORD
 
@@ -200,16 +201,26 @@ def assess(c, digest):
 
     complete = set()
     for i in range(0, len(nodes) - 1, 2):
-        waiter, lock = thread(nodes[i]), nodes[i + 1]
-        semantics = LOCKS.get(lock["type"])
-        if not waiter or nodes[i]["status"] != BLOCKED or not semantics or lock["status"] != OWNED:
+        waiter, object_node = thread(nodes[i]), nodes[i + 1]
+        if not waiter or nodes[i]["status"] != BLOCKED or object_node["status"] != OWNED:
             continue
-        edge("waits_for", i, i + 1, semantics, waiter)
-        if i + 2 < len(nodes):
-            owner = thread(nodes[i + 2])
-            if owner:
-                edge("owned_by", i + 1, i + 2, semantics, owner)
-                if waiter != owner:
+        target = thread(nodes[i + 2]) if i + 2 < len(nodes) else None
+        if object_node["type"] == THREAD_WAIT:
+            if target and target != waiter:
+                report["edges"].append(dict(relation="waits_for_thread_termination", node_indices=[i, i + 1, i + 2],
+                                            thread_id=waiter[0], thread_created=waiter[1],
+                                            target_tid=target[0], target_created=target[1], wait_selection="unknown",
+                                            observation="/query",
+                                            evidence=[f"/query/nodes/{n}" for n in range(i, i + 3)] +
+                                                     ["/process", f"/threads/{pin_positions[waiter[0]]}",
+                                                      f"/threads/{pin_positions[target[0]]}"]))
+                complete.add(i)
+        elif object_node["type"] in LOCKS:
+            semantics = LOCKS[object_node["type"]]
+            edge("waits_for", i, i + 1, semantics, waiter)
+            if target:
+                edge("owned_by", i + 1, i + 2, semantics, target)
+                if waiter != target:
                     complete.add(i)
 
     if report["scope_boundary"] is not None:
@@ -225,7 +236,9 @@ def assess(c, digest):
                 report["potential_cycle"] = dict(node_indices=list(range(first, last + 1)),
                                                  evidence="/query", distinct_threads=len(members))
                 report["conclusion"] = "potential_wait_cycle"
-                report["reason"] = "wct_cycle_with_pinned_exclusive_lock_chain"
+                report["reason"] = ("wct_cycle_with_pinned_thread_termination_wait" if
+                                    any(nodes[i + 1]["type"] == THREAD_WAIT for i in segment) else
+                                    "wct_cycle_with_pinned_exclusive_lock_chain")
                 report["next_observation"] = "repeat_for_the_same_generations_or_collect_a_frozen_wait_snapshot"
                 return report
     if final["cycle"]:
@@ -260,15 +273,22 @@ def cycle_signature(c, cycle):
     generations = {t["requested"]: t["created"] for t in c["threads"]}
     arcs = []
     for i in range(cycle["node_indices"][0], cycle["node_indices"][-1], 2):
-        waiter, owner = nodes[i]["tid"], nodes[i + 2]["tid"]
-        arcs.append((waiter, generations[waiter], LOCKS[nodes[i + 1]["type"]], owner, generations[owner]))
+        waiter, target = nodes[i]["tid"], nodes[i + 2]["tid"]
+        arcs.append((waiter, generations[waiter], DEPENDENCIES[nodes[i + 1]["type"]], target, generations[target]))
     # Traversals of the same directed cycle can start at different members.
     return tuple(sorted(arcs))
 
 
 def cycle_relations(ring):
-    return [dict(waiter_tid=w, waiter_created=wc, lock_semantics=lock, owner_tid=o, owner_created=oc)
-            for w, wc, lock, o, oc in ring]
+    relations = []
+    for waiter, created, semantics, target, target_created in ring:
+        row = dict(waiter_tid=waiter, waiter_created=created)
+        if semantics == "thread_termination":
+            row.update(wait_semantics=semantics, target_tid=target, target_created=target_created)
+        else:
+            row.update(lock_semantics=semantics, owner_tid=target, owner_created=target_created)
+        relations.append(row)
+    return relations
 
 
 def series_view(view, digest, base):
@@ -561,6 +581,7 @@ def diagnose(capture, assessment):
     primary = rounds[0][0][0]["requested"]
     primary_key = (primary["tid"], primary["thread_created"])
     facts, open_waits, closed_views, gaps = [], [], [], []
+    termination_waits = []
     reference_support, different_cycles = [], []
     reference = None
     first_round = None
@@ -574,6 +595,13 @@ def diagnose(capture, assessment):
         for c, a, base in views:
             q = c["query"]
             issued += q is not None
+            primary_targets = [e for e in a["edges"] if e["relation"] == "waits_for_thread_termination"
+                               and (e["thread_id"], e["thread_created"]) == primary_key]
+            for dependency in primary_targets:
+                termination_waits.append(fact("thread_termination_wait_observed", index,
+                                              [base + "/query", *dependency["evidence"]],
+                                              target_tid=dependency["target_tid"],
+                                              target_created=dependency["target_created"]))
             cycle = a["potential_cycle"]
             ring = cycle_signature(c, cycle)
             if ring and any((arc[0], arc[1]) == primary_key for arc in ring):
@@ -604,6 +632,8 @@ def diagnose(capture, assessment):
                                             *wait["evidence"], *owner["evidence"]],
                                            root_tid=c["requested"]["tid"]))
                     continue
+                elif primary_targets:
+                    continue
             gaps.append(dict(round=index + 1, receipt=base, reason=reason))
 
     ended = []
@@ -632,7 +662,7 @@ def diagnose(capture, assessment):
         cycle_status = "reference_member_or_process_terminated"
         next_cycle = "review_recorded_wait_completions_releases_and_timeouts_before_exit"
     contention_status = "cycle_reported_in_recording" if closed_views else "owned_wait_observed" if open_waits else "insufficient_evidence"
-    return dict(schema="kn.wait_diagnosis.v1", receipt_sha256=assessment["receipt_sha256"],
+    report = dict(schema="kn.wait_diagnosis.v1", receipt_sha256=assessment["receipt_sha256"],
                 source_schema=capture["schema"], primary=primary, facts=facts,
                 coverage=dict(planned_queries=planned_queries, issued_queries=issued, unissued_queries=planned_queries-issued,
                               planned_rounds=planned_rounds, recorded_rounds=len(rounds),
@@ -648,6 +678,18 @@ def diagnose(capture, assessment):
                          next_observation="record_owner_progress_and_wait_completion_or_timeout")],
                 deadlock_established=False, cause_of_hang_established=False, intent_assessed=False,
                 whole_host_assessed=False, collector_authenticated=False)
+    if reference and any(arc[2] == "thread_termination" for arc in reference):
+        unknown = report["candidates"][0]["unobserved"]
+        if all(arc[2] == "thread_termination" for arc in reference):
+            unknown.remove("lock_lifetimes")
+        unknown.append("thread_wait_completion")
+    if termination_waits:
+        report["candidates"].append(dict(candidate="primary_waited_for_thread_termination",
+                                         status="dependency_observed", supporting_facts=termination_waits,
+                                         counterevidence=[], unobserved=["wait_completion", "alternative_wait_objects", "timeout_or_cancellation",
+                                                                        "target_exit_as_cause_of_wakeup"],
+                                         next_observation="record_the_wait_result_and_target_thread_exit"))
+    return report
 
 
 def unique_object(pairs):

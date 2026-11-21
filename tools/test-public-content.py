@@ -160,6 +160,22 @@ class PublicContentTests(unittest.TestCase):
                     rules = {f["rule"] for f in AUDIT.inspect("trace.log", (prefix + fragment).encode(encoding))}
                     self.assertIn("private-evidence-bundle", rules)
 
+    def test_detached_thread_wait_dependencies(self):
+        rows = (
+            dict(target_created="12", target_tid=3, thread_created="11", node_indices=[0, 1, 2],
+                 relation="waits_for_thread_termination"),
+            dict(evidence=["/threads/0"], kind="thread_termination_wait_observed", round=1,
+                 target_tid=3, target_created="12"),
+            dict(waiter_created="11", waiter_tid=2, wait_semantics="thread_termination", target_tid=3,
+                 target_created="12"))
+        for row in rows:
+            for text in (json.dumps(row), "log\n" + json.dumps(row, indent=2)[:-2]):
+                for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                    self.assertIn("private-evidence-bundle",
+                                  {f["rule"] for f in AUDIT.inspect("renamed.txt", text.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b'Fields "target_created" and "target_tid" identify the peer.'))
+        self.assertFalse(AUDIT.inspect("example.json", b'{"target_created": null, "target_tid": null}'))
+
     def test_private_benchmark_archive(self):
         head = b"PK\x03\x04" + bytes(26)
         self.assertEqual(AUDIT.path_rule("case.KNBENCH"), "private-container-or-capture")
