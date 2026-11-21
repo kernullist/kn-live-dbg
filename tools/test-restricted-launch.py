@@ -79,6 +79,7 @@ def main():
                     ["--schema-worker"], ["--symbol-index-worker"], ["--self-test", "all"],
                     ["--offline", "!kmon", "init-store", str(root / "denied-store"), "/acl-only"],
                     ["--offline", "!kmon", "gc", str(root), "PRIVATE-SENTINEL", "/apply", "1"],
+                    ["--io-lifecycle", "50", str(root)],
                     ["--wait-chain", "1", "1", "1", "1", "--corroborate", "2", "2", "2", "10"],
                     ["--wait-chain", "1", "1", "1", "1"], ["--verify-process-image"], ["write", "on"], ["!kmon", "on"], ["kdinit"],
                     ["--capabilities", "--probe"], ["trace", str(trace)], ["PRIVATE-SENTINEL"],

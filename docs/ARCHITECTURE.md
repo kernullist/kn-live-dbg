@@ -869,8 +869,40 @@ Collector tick boundaries describe a non-atomic scan interval, not dispatch or
 completion latency. Enumeration coverage remains scoped to supplied ETHREADs.
 The [bound capture and offline replay](#pending-irp-schema-and-runtime-binding)
 preserve the original read evidence. IRP allocation references, cross-observation
-joins, dispatch/completion event providers, wait/lock graphs and deadlock
-diagnosis remain open.
+joins to kernel dispatch and completion, frozen wait graphs and attribution
+of a deadlock remain open.
+
+### Directory I/O request lifetimes
+
+The Windows directory notification provider retains one opened directory,
+a unique manual-reset event, a notification buffer and an `OVERLAPPED`
+record for each request. It assigns the request a generation within a
+fresh provider run and records the issuing process and thread creation
+times. Requests for the same directory remain distinct. The shared wait
+records its ordered generation list and the native index of the event that
+signaled, so completion order can differ from submission order.
+[Windows directory change notifications](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
+
+| Evidence in the journal | State that replay can support |
+| --- | --- |
+| Directory admitted and request prepared | `RequestObserved` |
+| Windows accepted the overlapped request | `SubmissionObserved` |
+| Nonblocking result returned `ERROR_IO_INCOMPLETE` | `PendingObserved` |
+| Cancellation attempted on the retained handle and operation | `CancellationAttempted` |
+| Signaled private event and a successful, aborted or enumeration-required result for that operation | `CompletionObserved` |
+| Final result agreed with the earlier witnesses, the final event wait succeeded and both handles closed | `RetiredWithKnownOutcome` |
+
+Replay retains every original query, timeout and cancellation result by
+line number. A zero-byte successful result leaves change details unavailable.
+`ERROR_NOTIFY_ENUM_DIR` records that Windows requires a directory enumeration.
+A failed query can leave `UnknownOutcome` even after both handles close.
+An inconsistent byte count or an event observed as unsignaled after its
+selection produces `IdentityConflict`. A hash binds the bytes used for
+replay. Kernel dispatch, an IRP allocation generation and correspondence
+with a KMON snapshot still require another source.
+[Windows overlapped results](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult)
+
+[Capture and replay a request](COMMAND_REFERENCE.md#trace-an-io-request-through-completion)
 
 ## Imported execution samples
 

@@ -249,6 +249,7 @@
     <ClCompile Include="ObservationReadRoutingJson.cpp" />
     <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
+    <ClCompile Include="IoLifecycleCapture.cpp" />
     <ClCompile Include="WaitChainCapture.cpp" />
     <ClCompile Include="ImageVerificationRecipe.cpp" />
     <ClCompile Include="ImageProof.cpp" />
@@ -454,6 +455,7 @@
     <ClInclude Include="ObservationReadSetParser.h" />
     <ClInclude Include="BoundedObservationJson.h" />
     <ClInclude Include="ProcessImageCapture.h" />
+    <ClInclude Include="IoLifecycleCapture.h" />
     <ClInclude Include="WaitChainCapture.h" />
     <ClInclude Include="ImageProof.h" />
     <ClInclude Include="ImageClaimPublication.h" />

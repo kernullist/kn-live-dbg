@@ -590,6 +590,47 @@ hash and unchecked runtime-invariant status. MCP `symbol.search` adds size
 availability, index hashes and a coverage note; incomplete results set `truncated`.
 See [index scope and limits](ARCHITECTURE.md#live-symbol-and-type-index-broker).
 
+## Trace an I/O request through completion
+
+`KnLiveDbg.exe --io-lifecycle <wait-ms> <local-directory> [directories...]`
+issues one asynchronous directory notification per argument. Supply 1–8
+existing directories on fixed local volumes and 1–30000 ms of observation
+time. Each request watches file and directory name changes in the selected
+directory itself. The collector checks non-reparse ancestors with its current
+credentials. Unavailable paths have their own admission result. The controller
+records counts and Win32 results. Directory
+contents, names of changed files and kernel addresses are omitted.
+
+This PowerShell example watches the current directory and saves the original
+private JSON Lines journal. Keep the argument order with the SHA-256 to map
+each request generation back to its directory.
+
+```powershell
+$directory = (Get-Item -LiteralPath .).FullName
+$records = & .\x64\Release\KnLiveDbg.exe --io-lifecycle 250 $directory
+if ($LASTEXITCODE -ne 0) { throw 'I/O lifecycle capture failed' }
+$file = [IO.Path]::GetTempFileName()
+[IO.File]::WriteAllLines($file, [string[]]$records, [Text.Encoding]::ASCII)
+$pin = python -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" $file
+python tools/replay-io-lifecycle.py $file --sha256 $pin
+```
+
+A quiet directory normally produces a pending observation, a wait timeout,
+a cancellation attempt and a final aborted result. A change can complete
+the request while cancellation is in progress. Read `native_final_result`
+and `observed_completion` for the outcome of each generation. The wait
+budget starts after submissions. Windows controls how long final
+cancellation and cleanup take.
+[Windows cancellation semantics](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex)
+
+Replay returns a private `kn.io_lifetime_assessment.v1` report. Its
+`evidence_lines` refer to one-based physical lines in the hashed journal.
+A final line cut before its newline remains uncommitted. A missing sequence
+ends the qualified prefix. Later records remain visible under
+`unjoined_records`. The original plan supplies the denominator even when
+a directory was unavailable or a request's final outcome is unknown.
+[Request identity and state transitions](ARCHITECTURE.md#directory-io-request-lifetimes)
+
 ## Capture a Windows wait chain
 
 Use `--wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>`

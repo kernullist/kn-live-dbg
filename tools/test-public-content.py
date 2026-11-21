@@ -67,6 +67,16 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle",
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
+    def test_io_lifecycle_journals_and_reports(self):
+        for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
+            first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})
+            reordered = json.dumps({"kind": "result", "schema": schema, "seq": 1})
+            for sample in (first, "log\n" + first[:-4], "log\n" + reordered + "\n" + reordered):
+                for encoding in ("utf-8", "utf-16"):
+                    findings = AUDIT.inspect("unrelated-name.txt", sample.encode(encoding))
+                    self.assertIn("private-evidence-bundle", {f["rule"] for f in findings})
+            self.assertFalse(AUDIT.inspect("guide.md", ("See the " + schema + " journal.").encode()))
+
     def test_wait_captures_and_reports(self):
         for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1"):
             intact = json.dumps({"requested": {}, "schema": schema})

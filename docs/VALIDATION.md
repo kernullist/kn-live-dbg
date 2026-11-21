@@ -7,6 +7,52 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Overlapped directory I/O lifetimes, 2026-11-22
+
+The Windows x64 Release controller had SHA-256
+`b4bc32d8f1067d71e32fa3c7fd9ee9c039dfc5f9f1fcc8429c6c8ae11103e2a9`.
+The fixture issued real directory notifications and waited for the collector
+to report its outstanding requests before creating files. It created a
+file for generation 2 first, then waited for that generation's release
+before creating a file for generation 1. The two directory identities
+matched the fixture's independent filesystem IDs. Their reported byte
+counts matched the lengths of the corresponding notification entries.
+
+| Owned run | Planned / queued | Successful / aborted | Unknown outcomes |
+| --- | ---: | ---: | ---: |
+| Reverse-order changes, quiet directory, two unavailable paths | 5 / 3 | 2 / 1 | 2 |
+| Two requests for the same quiet directory | 2 / 2 | 0 / 2 | 0 |
+| Change after the observer's timeout | 1 / 1 | 1 / 0 | 0 |
+
+In the last run a one-byte output pipe held the collector inside its
+timeout record while the fixture created the file. `CancelIoEx` then
+returned `ERROR_NOT_FOUND` (1168). The final result on the retained
+operation reported success and 44 bytes. In the quiet-directory run both
+cancellation calls succeeded and both final results were
+`ERROR_OPERATION_ABORTED` (995). The three original journals reproduced
+their assessments twice after process exit. All 66 state evidence links
+resolved to physical lines in the corresponding journal.
+[Capture and replay a request](COMMAND_REFERENCE.md#trace-an-io-request-through-completion)
+
+Nine I/O regressions passed, including eight simultaneous generations,
+a reader disconnect, exclusive reopening of a rejected file while other
+requests were pending, interrupted publication and contradictory result
+witnesses. Repinned controls covered missing sequences, generation reuse,
+failed submission, notification overflow and unconfirmed handle release.
+The same controller passed 15 wait-chain regressions, 76 restricted launch
+checks, 56 source contracts, 3,081 command checks and its runtime probe.
+The runtime policy suite passed 33 checks. The documented PowerShell example
+ran and the support matrix matched the binary. All 20 publication tests
+passed. Twelve private variants of the actual journal and assessment were
+flagged, including detached lines, reordered JSON fields and UTF-16 logs.
+
+From 23:58 KST on November 21 to 00:19 KST on November 22 the host recorded
+zero new reboot or bugcheck events and zero new crash dumps. The final
+check found zero remaining fixture processes, temporary fixture directories
+or running test drivers. These observations cover the controller's own
+Windows I/O. Matching a kernel IRP allocation to its driver dispatch and
+completion still requires an independent lifetime source.
+
 ## Offline comparison of wait explanations, 2026-11-21
 
 After the owned mutex fixtures exited, the Python replayer diagnosed 18

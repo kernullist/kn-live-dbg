@@ -169,6 +169,9 @@ def main():
     assert wait["availability"] == "not_probed" and wait["consistency"] == "one_live_traversal"
     assert wait["address_contract"] == "not_an_address_reader"
     assert "requested_process_and_thread_creation" in wait["requirements"] and "no_timeout_or_deadlock_proof" in wait["limits"]
+    life = by_key[("diagnostics", "io_request_lifetime", "win32_directory_changes")]
+    assert life["consistency"] == "retained_overlapped_request" and life["address_contract"] == "not_an_address_reader"
+    assert "per_generation_manual_reset_event" in life["requirements"] and "no_kernel_dispatch_identity" in life["limits"]
     repeat = by_key[("diagnostics", "wait_cycle_corroboration", "windows_wct")]
     assert repeat["consistency"] == "paired_live_traversals" and repeat["address_contract"] == "not_an_address_reader"
     assert "measured_qpc_overlap" in repeat["requirements"] and "gaps_and_missing_roots_in_denominator" in repeat["limits"]
