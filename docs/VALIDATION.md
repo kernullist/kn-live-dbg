@@ -4834,6 +4834,27 @@ opcodes, PID reuse, conflicts, equal or reversed timestamps, a supplied
 capture-gap flag and the first event beyond the index limit. Context switches, independently
 verified code and cross-file lifetime identity require additional evidence.
 
+### Thread version 3 with a name suffix
+
+The `SimpleAllocator-dotnet6.etl` file has SHA-256
+`5876415dbc49e6b86bd96906e77a2237deced01a8841684644f3bd303a1cf812`.
+Windows delivered 418,378 events, including 5,496 CPU samples and 8,966
+thread boundaries. The native event headers and Windows `tracerpt` both
+identified the boundaries as version 3. A comparison of the raw envelope
+lengths with the fixed layout exposed the optional terminated name suffix.
+[PerfView test archive](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/TraceEvent.Tests/inputs/AutomatedAnalysis/SimpleAllocator-dotnet6.etl.zip)
+
+Use `--expect-samples 5496 --thread-evidence --all-pages` for
+this fixture. Windows XML supplied all 5,496 samples as named fields. It
+returned `ProcessingErrorData` with the original payload for all 8,966
+thread events. The checker decoded their two 32-bit IDs and compared every
+sample's boundary ordinals, raw times and payload IDs. Actual start/end
+records bracketed 25 samples. Rundown contributed to 4,487 sample brackets. Recorded names stay in the source ETL.
+The native harness covers empty and nonempty names, supplementary characters,
+missing and embedded terminators, odd lengths, unpaired surrogates and the
+largest even payload representable by the ETW length field. Fourteen saved
+v1/v2 pages from the earlier fixtures retained their exact UTF-8 contents.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

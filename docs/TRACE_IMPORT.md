@@ -48,6 +48,12 @@ events from the same ETL. The payload supplies the PID and TID.
 `thread_source` gives the provider, version and decoded, retained and
 unsupported record counts for those four opcodes. [Windows thread events](https://learn.microsoft.com/en-us/windows/win32/etw/thread-typegroup1)
 
+A version-3 thread record may end at its fixed fields or append one
+NUL-terminated UTF-16LE thread name. The decoder checks the full suffix,
+including surrogate pairs and the terminator. The index stores only the
+record ordinal, timestamp, opcode and payload IDs. A malformed suffix counts
+as an unsupported event. [PerfView thread parser](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/Parsers/KernelTraceEventParser.cs#L4062)
+
 Each sample's `thread_evidence.before` and `after` locate the closest records
 for its TID by ETW callback ordinal. Each available point includes its event
 kind, ordinal, raw timestamp, opcode, payload PID and payload TID. A TID of

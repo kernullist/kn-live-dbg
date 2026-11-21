@@ -78,7 +78,7 @@ static bool CheckProfileRecord()
 static bool CheckThreadEvidence()
 {
     using namespace etl_profile;
-    std::array<uint8_t, 73> bytes{};
+    std::array<uint8_t, 89> bytes{};
     const uint32_t payloadPid = 71, payloadTid = 93;
     auto* data = bytes.data() + 1;
     std::memcpy(data, &payloadPid, 4);
@@ -101,8 +101,30 @@ static bool CheckThreadEvidence()
                 point.tick != 441 || point.record != 17 || point.opcode != op) { return false; }
             --record.UserDataLength;
             if (DecodeThread(record, 17, point) != Match::Unsupported) { return false; }
+            const auto fixed = size_t{16} + 7 * width;
+            auto suffix = [&](std::initializer_list<uint8_t> units, Match want) {
+                std::copy(units.begin(), units.end(), data + fixed);
+                record.UserDataLength = static_cast<USHORT>(fixed + units.size());
+                if (DecodeThread(record, 17, point) != want) { return false; }
+                return want != Match::Decoded || (point.pid == payloadPid && point.tid == payloadTid);
+            };
+            if (!suffix({0, 0}, Match::Decoded) || !suffix({0x41, 0, 0, 0}, Match::Decoded) ||
+                !suffix({0x3d, 0xd8, 0, 0xde, 0, 0}, Match::Decoded) ||
+                !suffix({0}, Match::Unsupported) || !suffix({0x41, 0}, Match::Unsupported) ||
+                !suffix({0, 0, 0x41, 0}, Match::Unsupported) || !suffix({0, 0, 0, 0}, Match::Unsupported) ||
+                !suffix({0x3d, 0xd8, 0, 0}, Match::Unsupported) || !suffix({0, 0xde, 0, 0}, Match::Unsupported) ||
+                !suffix({0x3d, 0xd8, 0x41, 0, 0, 0}, Match::Unsupported)) { return false; }
         }
     }
+    std::vector<uint8_t> large(UINT16_MAX);
+    for (size_t offset = 72; offset < UINT16_MAX - 3; offset += 2) { large[offset] = 'a'; }
+    record.UserData = large.data();
+    record.UserDataLength = UINT16_MAX - 1;
+    ThreadEvent boundary{};
+    if (DecodeThread(record, 1, boundary) != Match::Decoded) { return false; }
+    ++record.UserDataLength;
+    if (DecodeThread(record, 1, boundary) != Match::Unsupported) { return false; }
+    record.UserData = data;
     record.UserDataLength = 72;
     ThreadIndex index;
     index.Prepare();

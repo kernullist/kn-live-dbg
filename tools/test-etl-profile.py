@@ -2,7 +2,6 @@
 import argparse
 import bisect
 from collections import Counter, defaultdict
-import csv
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -12,6 +11,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import struct
+from xml.etree import ElementTree
 
 
 def run(exe, etl, digest, *args, rc=0):
@@ -27,29 +28,62 @@ def run(exe, etl, digest, *args, rc=0):
 
 
 def oracle(etl, folder):
-    csv_path = folder / "raw.csv"
+    # The XML event envelope gives an ordinal even when TDH cannot format a
+    # field. In that case Windows still exports the original event payload.
+    xml_path = folder / "raw.xml"
     tracerpt = Path(os.environ["SystemRoot"]) / "System32" / "tracerpt.exe"
-    subprocess.run([tracerpt, etl, "-o", csv_path, "-of", "CSV", "-rts", "-y"],
-                   cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=180)
-    samples = []
-    threads = defaultdict(list)
-    records = 0
-    # The compared columns are ASCII numbers and MOF event names. Preserve
-    # every CSV record, including unrelated provider payloads in the local ACP.
-    with csv_path.open(encoding="latin-1", newline="") as f:
-        rows = csv.reader(f, skipinitialspace=True)
-        header = [name.strip() for name in next(rows)]
-        assert header[0] == "Event Name" and header[16] == "Clock-Time" and header[19] == "User Data"
-        for records, fields in enumerate(rows, 1):
-            if (len(fields) >= 21 and fields[0] == "Thread" and fields[2:4] == ["0", "3"] and
-                    fields[1] in ("Start", "End", "DCStart", "DCEnd")):
-                pid, tid = (int(value, 0) for value in fields[19:21])
-                threads[tid].append((records, int(fields[16]), int(fields[6]), pid, tid))
-            if fields[:4] != ["PerfInfo", "SampleProf", "0", "2"] or fields[6] != "46":
+    subprocess.run([tracerpt, etl, "-o", xml_path, "-of", "XML", "-rts", "-y"],
+                   cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=240)
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    trace_ns = "{http://schemas.microsoft.com/win/2004/08/events/trace}"
+    thread_guid = "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c"
+    profile_guid = "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc"
+    samples, threads = [], defaultdict(list)
+    records = raw_threads = raw_samples = 0
+    with xml_path.open("rb") as stream:
+        events = ElementTree.iterparse(stream, events=("start", "end"))
+        _, root = next(events)
+        for action, event in events:
+            if action != "end" or event.tag != ns + "Event":
                 continue
-            assert len(fields) == 23
-            samples.append((records, *(int(fields[i], 0) for i in
-                                (16, 11, 19, 20, 21, 22, 9, 10, 8, 4, 5, 7))))
+            records += 1
+            guid = (event.findtext(trace_ns + "ExtendedTracingInfo/" + trace_ns + "EventGuid") or "").strip("{}").lower()
+            if guid in (thread_guid, profile_guid):
+                system = event.find(ns + "System")
+                descriptor = {x.tag.removeprefix(ns): x.text for x in system}
+                opcode = int(descriptor["Opcode"])
+                profile = (guid, descriptor["EventID"], opcode, descriptor["Version"]) == (profile_guid, "0", 46, "2")
+                thread = guid == thread_guid and descriptor["EventID"] == "0" and 1 <= opcode <= 4 and descriptor["Version"] == "3"
+                if profile or thread:
+                    tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
+                    values = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
+                    if values:
+                        if profile:
+                            ip, tid, count, reserved = (int(values[key], 0) for key in
+                                                        ("InstructionPointer", "ThreadId", "Count", "Reserved"))
+                        else:
+                            pid, tid = (int(values[key], 0) for key in ("ProcessId", "TThreadId"))
+                    else:
+                        raw = bytes.fromhex(event.findtext(ns + "ProcessingErrorData/" + ns + "EventPayload") or "")
+                        if profile:
+                            assert len(raw) in (12, 16)
+                            ip = int.from_bytes(raw[:-8], "little")
+                            tid, count, reserved = struct.unpack("<IHH", raw[-8:])
+                            raw_samples += 1
+                        else:
+                            pid, tid = struct.unpack_from("<II", raw)
+                            raw_threads += 1
+                    if thread:
+                        threads[tid].append((records, tick, opcode, pid, tid))
+                    else:
+                        header = system.find(ns + "Execution").attrib
+                        samples.append((records, tick, int(header["ProcessorID"], 0), ip, tid, count, reserved,
+                                        int(header["ProcessID"], 0), int(header["ThreadID"], 0),
+                                        int(descriptor["Keywords"], 0), int(descriptor["Channel"] or "0", 0),
+                                        int(descriptor["Level"], 0), int(descriptor["Task"], 0)))
+            event.clear()
+            root.clear()
+    print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
     return records, samples, threads
 
 

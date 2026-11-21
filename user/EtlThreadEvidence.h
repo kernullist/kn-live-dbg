@@ -17,6 +17,29 @@ namespace etl_profile
         bool transitionConflict = false, clockConflict = false;
     };
 
+    // Some version-3 producers append a terminated UTF-16LE thread name.
+    // Validate its exact extent without allocating or retaining any name.
+    inline bool ThreadPayloadFits(const uint8_t* bytes, size_t size, size_t fixed)
+    {
+        if (!bytes || size < fixed) { return false; }
+        if (size == fixed) { return true; }
+        if ((size - fixed) % 2) { return false; }
+        bool needLow = false;
+        for (size_t offset = fixed; offset < size; offset += 2)
+        {
+            const unsigned unit = bytes[offset] | (static_cast<unsigned>(bytes[offset + 1]) << 8);
+            if (unit == 0) { return !needLow && offset + 2 == size; }
+            if (needLow)
+            {
+                if (unit < 0xdc00 || unit > 0xdfff) { return false; }
+                needLow = false;
+            }
+            else if (unit >= 0xd800 && unit <= 0xdbff) { needLow = true; }
+            else if (unit >= 0xdc00 && unit <= 0xdfff) { return false; }
+        }
+        return false;
+    }
+
     inline Match DecodeThread(const EVENT_RECORD& event, uint32_t ordinal, ThreadEvent& result)
     {
         const auto& h = event.EventHeader;
@@ -24,8 +47,8 @@ namespace etl_profile
         if (!IsEqualGUID(h.ProviderId, ThreadProvider) || d.Opcode < 1 || d.Opcode > 4) { return Match::Other; }
         const auto width = ClassicPointerWidth(h, 3);
         // Thread_V3_TypeGroup1 contains two IDs, seven pointers, a tag and four byte fields.
-        if (!width || !event.UserData || event.UserDataLength != 16 + 7 * width) { return Match::Unsupported; }
         const auto bytes = static_cast<const uint8_t*>(event.UserData);
+        if (!width || !ThreadPayloadFits(bytes, event.UserDataLength, 16 + 7 * width)) { return Match::Unsupported; }
         std::memcpy(&result.pid, bytes, sizeof(result.pid));
         std::memcpy(&result.tid, bytes + 4, sizeof(result.tid));
         result.record = ordinal;
