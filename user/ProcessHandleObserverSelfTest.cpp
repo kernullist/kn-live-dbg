@@ -1,5 +1,6 @@
 #include "KernelMonitor.h"
 #include "DeviceClient.h"
+#include "HandleTableScanner.h"
 #include "ProcessObservationSource.h"
 #include "ProcessLayoutMonitor.h"
 #include "ProcessLoggingObservation.h"
@@ -626,6 +627,160 @@ bool KmonProcessLoggingSelfTest(std::wstring& diagnostics)
     store.Clear();
     if (store.IngestProcessLoggingActions(native.Snapshot()).Added != 5) { return false; }
     for (const auto& event : store.AllEvents()) { out << L"[logging.native-model] " << TimelineEventToJson(event) << L"\n"; }
+    diagnostics = out.str();
+    return true;
+}
+
+bool KmonHandleScanObserverSelfTest(HANDLE subjectProcess, std::wstring& diagnostics)
+{
+    const auto self = ReadProcessHandleIdentity(GetCurrentProcess());
+    const auto subject = ReadProcessHandleIdentity(subjectProcess);
+    DWORD exitCode = 0;
+    if (!self.Created || !subject.Created || subject.Pid == self.Pid ||
+        !GetExitCodeProcess(subjectProcess, &exitCode) || exitCode != STILL_ACTIVE) { return false; }
+    std::wostringstream out;
+    const auto run = [&](const wchar_t* name, DWORD pid, auto exercise) {
+        KernelMonitor monitor;
+        const auto before = ControllerProcessHandles().Snapshot().Total;
+        exercise(monitor);
+        const auto it = monitor.HandleWatches.find(pid);
+        const auto* state = it == monitor.HandleWatches.end() ? nullptr : it->second.get();
+        out << L"[scan.case] name=" << name << L" before=" << before << L" after=" << ControllerProcessHandles().Snapshot().Total
+            << L" generation=" << (state ? state->Files.Generation : 0) << L" graph_after=" << (state ? state->GraphAfter : 0) << L"\n";
+        for (const auto& event : monitor.Ring)
+        {
+            const auto field = [&](const wchar_t* key) {
+                const auto found = event.Evidence.find(key);
+                return found == event.Evidence.end() ? std::wstring(L"-") : found->second;
+            };
+            out << L"[scan.event] name=" << name << L" pid=" << event.Observation.Identity.ProcessId
+                << L" created=" << event.Observation.Identity.CreateTime << L" state=" << field(L"state")
+                << L" diagnostic=" << field(L"diagnostic_key") << L" snapshot=" << field(L"snapshot_generation")
+                << L" before=" << field(L"snapshot_before_acquisition_id") << L" after=" << field(L"snapshot_after_acquisition_id")
+                << L" graph=" << field(L"owner_acquisition_id") << L" controller=" << field(L"controller_pid")
+                << L" controller_created=" << field(L"controller_create_time") << L" baseline="
+                << (field(L"notes").find(L"first_owner_scan=1") != std::wstring::npos) << L"\n";
+        }
+    };
+    const auto files = [](KernelMonitor& m, DWORD pid, const std::vector<NativeHandleEntry>& entries) {
+        auto owner = m.BeginHandleScan(pid);
+        if (owner.Watch && m.ObserveFileScanOwner(owner, false, nullptr, nullptr, owner.BeforeAcquisition))
+        {
+            m.FinishWatchedFileSnapshot(owner, entries, {}, nullptr, nullptr);
+        }
+    };
+    const auto graph = [](KernelMonitor& m, DWORD pid, const HandleTableScanResult& result, const std::wstring* error) {
+        auto owner = m.BeginHandleScan(pid);
+        if (!owner.Watch) { return; }
+        ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::HandleGraphOwner, pid, owner.Identity.CreateTime);
+        if (m.PinHandleGraphOwner(owner, pin)) { m.FinishWatchedHandleGraph(owner, pin, result, error); }
+    };
+    const auto promote = [](KernelMonitor& m, DWORD pid, uint64_t created) {
+        m.WatchPids.insert(pid);
+        m.WatchPromotedPids.insert(pid);
+        if (created) { m.WatchPromotedCreated[pid] = created; }
+    };
+    // These records have no live objects or device. Windows only supplies the owner's process handle.
+    HandleTableScanResult complete;
+    complete.CoverageComplete = complete.ObjectTypeCoverageComplete = complete.RelationshipCoverageComplete = true;
+    complete.NextHandleAfter = 8;
+    HandleTableRecord record;
+    record.OwnerPid = self.Pid;
+    record.TypeName = L"IoCompletion";
+    record.GrantedAccess = 1;
+    record.HandleValue = 4;
+    complete.Records.push_back(record);
+    run(L"resumed", self.Pid, [&](KernelMonitor& m) {
+        m.AddWatchPid(self.Pid);
+        std::vector<NativeHandleEntry> entries(129);
+        for (size_t i = 0; i < entries.size(); ++i) { entries[i].HandleValue = 4 * (i + 1); }
+        files(m, self.Pid, entries);
+        files(m, self.Pid, entries);
+        entries.pop_back();
+        files(m, self.Pid, entries);
+        const std::wstring failure = L"fixture snapshot unavailable";
+        graph(m, self.Pid, complete, &failure);
+        graph(m, self.Pid, complete, nullptr);
+        auto partial = complete;
+        partial.CoverageComplete = false;
+        partial.NextHandleAfter = 12;
+        partial.Records.front().HandleValue = 8;
+        graph(m, self.Pid, partial, nullptr);
+    });
+    const auto both = [&](KernelMonitor& m, DWORD pid) { files(m, pid, {}); graph(m, pid, complete, nullptr); };
+    run(L"promoted", self.Pid, [&](KernelMonitor& m) { promote(m, self.Pid, self.Created); both(m, self.Pid); });
+    run(L"stale", self.Pid, [&](KernelMonitor& m) { promote(m, self.Pid, self.Created + 1); both(m, self.Pid); });
+    run(L"unbound", self.Pid, [&](KernelMonitor& m) { promote(m, self.Pid, 0); both(m, self.Pid); });
+    run(L"explicit_overlap", self.Pid, [&](KernelMonitor& m) {
+        promote(m, self.Pid, self.Created + 1); m.AddWatchPid(self.Pid); both(m, self.Pid);
+    });
+    bool observedExit = false;
+    run(L"exit_during_scan", subject.Pid, [&](KernelMonitor& m) {
+        promote(m, subject.Pid, subject.Created);
+        auto fileOwner = m.BeginHandleScan(subject.Pid);
+        if (!m.ObserveFileScanOwner(fileOwner, false, nullptr, nullptr, fileOwner.BeforeAcquisition)) { return; }
+        {
+            auto graphOwner = m.BeginHandleScan(subject.Pid);
+            ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::HandleGraphOwner, subject.Pid, subject.Created);
+            if (!m.PinHandleGraphOwner(graphOwner, pin)) { return; }
+            std::wcout << L"[scan.owner] pinned\n" << std::flush;
+            std::wstring ack;
+            observedExit = std::getline(std::wcin, ack) && ack == L"exited" &&
+                WaitForSingleObject(subjectProcess, 0) == WAIT_OBJECT_0;
+            if (!observedExit) { return; }
+            m.FinishWatchedHandleGraph(graphOwner, pin, complete, nullptr);
+        }
+        m.FinishWatchedFileSnapshot(fileOwner, {}, {}, nullptr, nullptr);
+    });
+    if (!observedExit) { return false; }
+    run(L"exited", subject.Pid, [&](KernelMonitor& m) { promote(m, subject.Pid, subject.Created); both(m, subject.Pid); });
+    run(L"missing", UINT32_MAX, [&](KernelMonitor& m) { m.AddWatchPid(UINT32_MAX); both(m, UINT32_MAX); });
+    run(L"stopping", self.Pid, [&](KernelMonitor& m) { m.AddWatchPid(self.Pid); m.StopRequested.store(true); both(m, self.Pid); });
+    for (bool repin : {false, true})
+    {
+        run(repin ? L"repinned" : L"readded", self.Pid, [&](KernelMonitor& m) {
+            if (repin) { promote(m, self.Pid, self.Created); }
+            else { m.AddWatchPid(self.Pid); }
+            auto fileOwner = m.BeginHandleScan(self.Pid);
+            const bool sampled = m.ObserveFileScanOwner(fileOwner, false, nullptr, nullptr, fileOwner.BeforeAcquisition);
+            auto graphOwner = m.BeginHandleScan(self.Pid);
+            ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::HandleGraphOwner, self.Pid, graphOwner.Identity.CreateTime);
+            const bool pinned = m.PinHandleGraphOwner(graphOwner, pin);
+            auto replace = std::async(std::launch::async, [&] {
+                if (repin)
+                {
+                    std::lock_guard<std::mutex> lock(m.WatchMutex);
+                    m.WatchPromotedCreated[self.Pid] = self.Created + 1;
+                }
+                else
+                {
+                    m.RemoveWatchPid(self.Pid);
+                    m.AddWatchPid(self.Pid);
+                    m.BeginHandleScan(self.Pid);
+                }
+            });
+            replace.get();
+            if (sampled) { m.FinishWatchedFileSnapshot(fileOwner, {}, {}, nullptr, nullptr); }
+            if (pinned) { m.FinishWatchedHandleGraph(graphOwner, pin, complete, nullptr); }
+        });
+    }
+    run(L"withdrawn_during_read", self.Pid, [&](KernelMonitor& m) {
+        m.AddWatchPid(self.Pid);
+        auto owner = m.BeginHandleScan(self.Pid);
+        if (!m.ObserveFileScanOwner(owner, false, nullptr, nullptr, owner.BeforeAcquisition)) { return; }
+        NativeHandleEntry entry{};
+        entry.HandleValue = 4;
+        entry.Object = reinterpret_cast<void*>(0xffff800000000000ULL);
+        m.ChannelLayout.Valid = true;
+        // The sentinel only invokes this in-memory reader. It never dereferences the supplied address.
+        const KmonMemoryReader withdraw = [&](uint64_t, size_t, void*) {
+            m.RemoveWatchPid(self.Pid);
+            m.AddWatchPid(self.Pid);
+            m.BeginHandleScan(self.Pid);
+            return false;
+        };
+        m.FinishWatchedFileSnapshot(owner, {entry}, withdraw, nullptr, nullptr);
+    });
     diagnostics = out.str();
     return true;
 }

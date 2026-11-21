@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -59,6 +60,8 @@
 #include <vector>
 
 struct KernelCallbackRecord;
+struct HandleTableScanResult;
+class ObservedProcessHandle;
 
 struct KmonImageScanCursor
 {
@@ -394,6 +397,7 @@ private:
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
     friend bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
+    friend bool KmonHandleScanObserverSelfTest(HANDLE subjectProcess, std::wstring& diagnostics);
     friend bool KmonProcessLoggingSelfTest(std::wstring& diagnostics);
     void WorkerLoop();
     void ServiceDiscovery();
@@ -583,6 +587,28 @@ private:
     void NoteLoggingFailure(uint32_t pid, uint64_t created, bool qualified, bool unconfirmed);
     void ReleaseProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created, const wchar_t* priorRejection = nullptr);
     bool NoteWatchActivityTask(uint32_t pid, const std::wstring& task);
+    struct HandleWatchState
+    {
+        KmonHandleHistory Files;
+        uint64_t GraphCreated = 0;
+        uint64_t GraphAfter = 0;
+    };
+    struct HandleScanOwner
+    {
+        ObservationIdentity Identity;
+        std::shared_ptr<HandleWatchState> Watch;
+        uint64_t BeforeAcquisition = 0;
+    };
+    HandleScanOwner BeginHandleScan(uint32_t pid);
+    bool HandleScanCurrentLocked(const HandleScanOwner& owner) const;
+    bool ObserveFileScanOwner(HandleScanOwner& owner, bool after, DeviceClient* device, SymbolEngine* symbols,
+        uint64_t& acquisition);
+    void FinishWatchedFileSnapshot(HandleScanOwner& owner, const std::vector<NativeHandleEntry>& entries,
+        const KmonMemoryReader& read, DeviceClient* device, SymbolEngine* symbols);
+    bool PinHandleGraphOwner(HandleScanOwner& owner, ObservedProcessHandle& pin);
+    void FinishWatchedHandleGraph(const HandleScanOwner& owner, const ObservedProcessHandle& pin,
+        const HandleTableScanResult& result, const std::wstring* failure);
+    void ClearHandleScanDiagnostic(const std::wstring& key, const ObservationIdentity& identity);
     void ScanWatchedHandleTables();
     void ScanWatchedHandleCapabilities();
     void DrainIotraceEvents();
@@ -949,7 +975,7 @@ private:
     // First-seen TI task names per watched pid backing loader.activity.
     std::unordered_map<uint32_t, std::unordered_set<std::wstring>> WatchActivityTasks;
     // Worker-owned snapshots; WatchMutex protects lifecycle/reset access.
-    std::map<uint32_t, KmonHandleHistory> WatchKnownHandles;
+    std::map<uint32_t, std::shared_ptr<HandleWatchState>> HandleWatches;
     uint32_t WatchHandleLastPid = 0;
     uint32_t WatchFileTypeIndex = 0;
     bool WatchFileTypeKnown = false;
@@ -1214,8 +1240,6 @@ private:
     uint64_t WatchedHandleCursor = 0;
     uint64_t NextRegionFollowupTickMs = 0;
     bool RegionFollowupPending = false;
-    std::map<uint32_t, uint64_t> WatchedHandleGenerations;
-    std::map<std::pair<uint32_t, uint64_t>, uint64_t> WatchedHandleAfter;
     // Stage 1: kernel-thread scan cadence and the two-scan confirmation that
     // keeps a thread-creation race from printing a hidden-thread verdict.
     std::map<std::wstring, KmonRepeatObservation> ThreadHiddenStrikes;
@@ -1597,4 +1621,5 @@ bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
 bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
+bool KmonHandleScanObserverSelfTest(HANDLE subjectProcess, std::wstring& diagnostics);
 bool KmonProcessLoggingSelfTest(std::wstring& diagnostics);

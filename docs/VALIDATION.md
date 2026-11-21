@@ -7,6 +7,47 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## KMON watched handle scans, 2026-11-21
+
+On `main` at `2f6742f`, the file snapshot probes and the handle graph owner
+pin called `OpenProcess` outside the observer journal. The graph scanner
+also saved its cursor by PID and creation time after the scan returned, even
+if the operator had removed the watch in the meantime.
+
+The Windows x64 Release controller tested here has SHA-256
+`eaa2f697d8d4147581a12f9a517f911f6e8ed16afd254d0dd2f7fb3000b072d9`.
+Three controllers each ran 12 cases. The parent checked their access masks
+and creation times independently. Each also sampled a separate owned process
+while it was running. The parent waited for the graph pin, released that
+process and confirmed its exit before allowing the scan to finish.
+
+| Access to the fixture controller | Observer rows | File lifecycle rows in the three-pass case |
+| --- | ---: | ---: |
+| Limited query and synchronize allowed | 58 | 130 |
+| Limited query denied | 29 | 0 |
+| Synchronize denied | 50 | 130 |
+
+The 129th file in a baseline crossed the 128-record pass limit and retained
+the original snapshot's two receipt IDs. The next complete snapshot recorded
+its closure. For a pinned owner, failed, partial and complete graph results
+carried the owner's identity. The fixture also checked that owner exit, a changed
+promotion and removal followed by re-registration could not advance the new
+watch cursor. Repeated acquisition IDs across controllers resolved to
+distinct controller PIDs and creation times. A second observer ingest added
+zero rows. [Reading handle scan receipts](TIMELINE_COMMAND_USAGE.md#trace-a-watched-handle-scan)
+
+Run `python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`
+from the repository. Windows supplied the process handles, access denials and
+exit signals. The file and graph publication paths consumed fixed records.
+The standalone core test located its own open file in a native snapshot.
+Live device-backed graph traversal, PDB-based object reads and the kernel
+fallback for creation time remain unverified by this run.
+
+The same controller passed the integrated CLI suite and the timeline, MCP
+observer, scheduler and source-contract regressions. Between 21:09 and 21:33
+KST the host recorded zero new bugchecks, unexpected reboots or dump files.
+The final check found no fixture process or running KnLiveDbg test driver.
+
 ## KMON process logging results, 2026-11-21
 
 On the previous `main` controller (`4ca32e2`), an owned-process fixture

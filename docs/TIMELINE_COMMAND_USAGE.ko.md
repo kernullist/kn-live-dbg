@@ -174,6 +174,9 @@ PID와 프로세스 생성 시각, 세션 세대, 요청·반환 시각, Win32 �
 | `watch_promotion` | 이름이 일치해 감시 목록에 추가할 프로세스의 생성 시각을 조회한다. | 제한 조회(`0x1000`) |
 | `logging_identity` | KMON이 로깅을 설정하거나 이전에 성공한 요청을 해제하는 동안 해당 프로세스의 핸들을 유지한다. | 제한 조회(`0x1000`) |
 | `logging_control` | 해당 프로세스에 사용자 모드 로깅을 요청할 제어 핸들을 연다. | 정보 설정(`0x200`) |
+| `handle_snapshot_before` | 파일 핸들 스냅샷을 수집하기 전에 소유 프로세스의 생성 시각을 조회한다. | 제한 조회(`0x1000`) |
+| `handle_snapshot_after` | 스냅샷을 수집한 뒤 같은 프로세스인지 확인한다. | 제한 조회(`0x1000`) |
+| `handle_graph_owner` | 핸들 그래프를 조사하는 동안 소유 프로세스의 핸들을 유지하고 종료 여부를 확인한다. | 제한 조회 및 동기화(`0x101000`) |
 
 감시를 해제한 뒤 KMON 이벤트 로그의 `coverage.logging`을 확인한다.
 `cleanup_decision`에는 제어를 건너뛴 사유 또는 `control_attempted`가 기록된다.
@@ -214,6 +217,20 @@ PID가 요청과 다르면 확인한 PID만 기록하고 생성 시각 조회는
 이상 분석은 대상 이벤트만 사용한다. 일회성 자체 읽기에 성공하면 이 호출 네
 건이 `process_handle_timeline.events`에 담긴다. 다른 수집기의 직접
 `OpenProcess` 호출은 별도 범위다. [Windows DuplicateHandle](https://learn.microsoft.com/ko-kr/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+
+### 감시 중인 프로세스의 핸들 조사 추적
+
+`!timeline ingest observer`를 실행한 뒤 `!timeline query /source observer /domain observer_action`으로
+컨트롤러의 핸들 열기와 닫기를 조회한다. KMON 파일 핸들 이벤트의 `snapshot_before_acquisition_id`와
+`snapshot_after_acquisition_id`는 해당 변화를 관측한 스냅샷의 앞뒤 핸들 기록을 가리킨다.
+출력이 다음 조사 차례로 미뤄져도 최초 관측의 ID를 유지한다. 열기에 실패하면 획득 ID가 없다.
+이때 기존 장치 조회로 생성 시각을 확인할 수 있어도 타임라인에는 Windows 열기 실패가 그대로 남는다.
+
+그래프 결과나 소유 프로세스를 확보한 뒤의 진단은 `owner_acquisition_id`로 같은 컨트롤러의 핸들 기록과 연결한다.
+여러 로그를 합칠 때는 `controller_pid`와 `controller_create_time`도 대조한다. 획득 ID는 컨트롤러를 재시작하면 다시 쓰인다.
+이 핸들은 소유 프로세스의 수명을 고정한다. 스냅샷에 나타난 개별 객체의 수명과 핸들의 출처는 별도 증거가 필요하다.
+자동으로 추가한 감시 대상의 생성 시각을 모르면 두 조사를 보류한다. PID를 감시 목록에서 제거한 뒤 다시 추가하면
+파일 핸들 이력과 그래프 커서는 처음부터 시작한다.
 
 ### KMON 프로세스 로깅 요청 확인
 

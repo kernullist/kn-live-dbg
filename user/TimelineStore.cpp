@@ -3178,6 +3178,9 @@ static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
     case ProcessHandleSite::WatchPromotion: return L"watch_promotion";
     case ProcessHandleSite::LoggingIdentity: return L"logging_identity";
     case ProcessHandleSite::LoggingControl: return L"logging_control";
+    case ProcessHandleSite::HandleSnapshotBefore: return L"handle_snapshot_before";
+    case ProcessHandleSite::HandleSnapshotAfter: return L"handle_snapshot_after";
+    case ProcessHandleSite::HandleGraphOwner: return L"handle_graph_owner";
     }
     return L"unknown";
 }

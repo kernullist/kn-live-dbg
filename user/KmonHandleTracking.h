@@ -283,13 +283,15 @@ struct KmonHandleHistory
     uint64_t CreateTime = 0;
     uint64_t Generation = 0;
     uint64_t LastCompleteMs = 0;
+    uint64_t BeforeAcquisition = 0, AfterAcquisition = 0;
     bool Initialized = false;
     std::map<KmonHandleKey, NativeHandleEntry> Previous;
     std::set<KmonHandleKey> Retired;
     std::vector<KmonHandleChange> Pending;
     size_t Cursor = 0;
 
-    void Update(uint64_t created, const std::vector<NativeHandleEntry>& entries, bool complete)
+    void Update(uint64_t created, const std::vector<NativeHandleEntry>& entries, bool complete,
+        uint64_t beforeAcquisition = 0, uint64_t afterAcquisition = 0)
     {
         if (created == 0 || !complete)
         {
@@ -301,6 +303,8 @@ struct KmonHandleHistory
             CreateTime = created;
         }
         ++Generation;
+        BeforeAcquisition = beforeAcquisition;
+        AfterAcquisition = afterAcquisition;
         Pending.clear();
         Cursor = 0;
         std::map<KmonHandleKey, NativeHandleEntry> current;

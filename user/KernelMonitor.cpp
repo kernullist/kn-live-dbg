@@ -8612,13 +8612,13 @@ KmonStats KernelMonitor::SnapshotStats() const
         const uint64_t now = GetTickCount64();
         for (uint32_t pid : WatchPids)
         {
-            const auto it = WatchKnownHandles.find(pid);
-            const uint64_t completed = it == WatchKnownHandles.end() || it->second.LastCompleteMs == 0
-                ? StartTickMs.load() : it->second.LastCompleteMs;
+            const auto it = HandleWatches.find(pid);
+            const uint64_t completed = it == HandleWatches.end() || it->second->Files.LastCompleteMs == 0
+                ? StartTickMs.load() : it->second->Files.LastCompleteMs;
             stats.HandleOldestScanAgeMs = (std::max)(stats.HandleOldestScanAgeMs, now - (std::min)(now, completed));
-            if (it != WatchKnownHandles.end())
+            if (it != HandleWatches.end())
             {
-                stats.HandlePendingRecords += it->second.Pending.size() - it->second.Cursor;
+                stats.HandlePendingRecords += it->second->Files.Pending.size() - it->second->Files.Cursor;
             }
         }
     }
@@ -8777,7 +8777,6 @@ bool KernelMonitor::Start(
                 WatchPromotedCreated.clear();
                 WatchChildPids.clear();
                 WatchActivityTasks.clear();
-                WatchKnownHandles.clear();
                 WatchHandleLastPid = 0;
                 ChannelLayout = {};
                 WatchFileTypeKnown = false;
@@ -9073,9 +9072,8 @@ void KernelMonitor::ResetTemporalDetections()
     RegionHistory.Clear();
     NextRegionFollowupTickMs = 0;
     RegionFollowupPending = false;
+    HandleWatches.clear();
     WatchedHandleCursor = 0;
-    WatchedHandleGenerations.clear();
-    WatchedHandleAfter.clear();
     DriverTamperStrikes.clear();
     DriverTamperLastCheckMs.clear();
     DriverTamperOrder.clear();
@@ -20225,6 +20223,97 @@ void KernelMonitor::ReleaseProcessLogging(DeviceClient* device, uint32_t pid, ui
     RecordEvent(std::move(event));
 }
 
+KernelMonitor::HandleScanOwner KernelMonitor::BeginHandleScan(uint32_t pid)
+{
+    HandleScanOwner owner;
+    owner.Identity.BootId = ObservationBootId();
+    owner.Identity.ProcessId = pid;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (StopRequested.load() || !WatchPids.count(pid)) { return owner; }
+        const auto promoted = WatchPromotedCreated.find(pid);
+        const bool explicitPid = WatchExplicitPids.count(pid) != 0;
+        if (!explicitPid && promoted != WatchPromotedCreated.end()) { owner.Identity.CreateTime = promoted->second; }
+        if (explicitPid || owner.Identity.CreateTime)
+        {
+            auto it = HandleWatches.find(pid);
+            if (it == HandleWatches.end()) { it = HandleWatches.emplace(pid, std::make_shared<HandleWatchState>()).first; }
+            owner.Watch = it->second;
+        }
+    }
+    const std::wstring key = L"scan_failed:handles:watch_generation:" + std::to_wstring(pid);
+    ObservationIdentity requested = owner.Identity;
+    requested.CreateTime = 0;
+    if (!owner.Watch)
+    {
+        EmitUnique(L"coverage.handles", key, L"", L"handle",
+            L"handle scan deferred until the promoted watch has a process creation time", L"", requested);
+    }
+    else { ClearEmittedKey(ObservationDiagnosticKey(key, requested)); }
+    return owner;
+}
+
+// WatchMutex protects both membership and the baseline. Removing and re-adding the same PID
+// creates a distinct state even when Windows still reports the same process creation time.
+bool KernelMonitor::HandleScanCurrentLocked(const HandleScanOwner& owner) const
+{
+    const auto pid = owner.Identity.ProcessId;
+    const auto it = HandleWatches.find(pid);
+    if (StopRequested.load() || !WatchPids.count(pid) || !owner.Watch || it == HandleWatches.end() || it->second != owner.Watch) { return false; }
+    if (WatchExplicitPids.count(pid)) { return true; }
+    const auto promoted = WatchPromotedCreated.find(pid);
+    return promoted != WatchPromotedCreated.end() && owner.Identity.CreateTime && promoted->second == owner.Identity.CreateTime;
+}
+
+void KernelMonitor::ClearHandleScanDiagnostic(const std::wstring& key, const ObservationIdentity& identity)
+{
+    ClearEmittedKey(ObservationDiagnosticKey(key, identity));
+    if (identity.CreateTime)
+    {
+        ObservationIdentity unknown = identity;
+        unknown.CreateTime = 0;
+        ClearEmittedKey(ObservationDiagnosticKey(key, unknown));
+    }
+}
+
+bool KernelMonitor::ObserveFileScanOwner(HandleScanOwner& owner, bool after, DeviceClient* device,
+    SymbolEngine* symbols, uint64_t& acquisition)
+{
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return false; }
+    }
+    const uint32_t pid = owner.Identity.ProcessId;
+    ObservedProcessHandle sample(ControllerProcessHandles(),
+        after ? ProcessHandleSite::HandleSnapshotAfter : ProcessHandleSite::HandleSnapshotBefore,
+        pid, owner.Identity.CreateTime);
+    sample.Open(PROCESS_QUERY_LIMITED_INFORMATION);
+    const auto& action = sample.Acquisition();
+    acquisition = action.AcquisitionId;
+    DWORD code = 0;
+    const bool exited = sample.get() && GetExitCodeProcess(sample.get(), &code) && code != STILL_ACTIVE;
+    uint64_t created = action.Bound.Created;
+    if (!created && !exited && !sample.ConflictsWithRequestedIdentity())
+    {
+        created = QueryPidCreateTime(device, symbols, sample.get(), pid);
+    }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return false; }
+    }
+    const std::wstring key = L"scan_failed:handles:identity:" + std::to_wstring(pid);
+    if (!created || exited || sample.ConflictsWithRequestedIdentity() ||
+        (owner.Identity.CreateTime && created != owner.Identity.CreateTime))
+    {
+        EmitUnique(L"coverage.handles", key, L"", L"handle",
+            L"process identity unavailable, exited or changed during snapshot", L"", owner.Identity);
+        return false;
+    }
+    owner.Identity.CreateTime = created;
+    if (after) { ClearHandleScanDiagnostic(key, owner.Identity); }
+    return true;
+}
+
 // Complete native snapshots drive lifecycle; channel reads have a resumable budget.
 void KernelMonitor::ScanWatchedHandleTables()
 {
@@ -20278,21 +20367,16 @@ void KernelMonitor::ScanWatchedHandleTables()
             resolve(L"nt!_DRIVER_OBJECT", L"Type", &ChannelLayout.DriverType) &&
             resolve(L"nt!_DRIVER_OBJECT", L"DriverStart", &ChannelLayout.DriverStart);
     }
-    const auto creation = [device, symbols](uint32_t pid)
-    {
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        const uint64_t created = QueryPidCreateTime(device, symbols, process, pid);
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-        return created;
-    };
-    std::map<uint32_t, uint64_t> before;
+    std::map<uint32_t, HandleScanOwner> owners;
     for (uint32_t pid : pids)
     {
-        before[pid] = creation(pid);
+        auto owner = BeginHandleScan(pid);
+        if (owner.Watch && ObserveFileScanOwner(owner, false, device, symbols, owner.BeforeAcquisition))
+        {
+            owners.emplace(pid, std::move(owner));
+        }
     }
+    if (owners.empty()) { return; }
     std::vector<NativeHandleEntry> snapshot;
     std::wstring error;
     if (!QueryNativeHandleSnapshot(&snapshot, &error))
@@ -20305,7 +20389,7 @@ void KernelMonitor::ScanWatchedHandleTables()
     std::map<uint32_t, std::vector<NativeHandleEntry>> perPid;
     for (const auto& entry : snapshot)
     {
-        if (entry.UniqueProcessId <= UINT32_MAX && before.count(static_cast<uint32_t>(entry.UniqueProcessId)) != 0 &&
+        if (entry.UniqueProcessId <= UINT32_MAX && owners.count(static_cast<uint32_t>(entry.UniqueProcessId)) != 0 &&
             entry.ObjectTypeIndex == WatchFileTypeIndex)
         {
             perPid[static_cast<uint32_t>(entry.UniqueProcessId)].push_back(entry);
@@ -20323,94 +20407,113 @@ void KernelMonitor::ScanWatchedHandleTables()
     };
     for (uint32_t pid : pids)
     {
-        if (StopRequested.load())
-        {
-            break;
-        }
-        const uint64_t created = creation(pid);
-        if (created == 0 || created != before[pid])
-        {
-            EmitUnique(L"coverage.handles", L"scan_failed:handles:identity:" + std::to_wstring(pid),
-                L"", L"handle", L"process identity unavailable or changed during snapshot", L"", pid);
-            continue;
-        }
-        KmonHandleHistory history;
-        {
-            std::lock_guard<std::mutex> lock(WatchMutex);
-            history = WatchKnownHandles[pid];
-        }
-        if (history.CreateTime != created || history.Cursor >= history.Pending.size())
-        {
-            history.Update(created, perPid[pid], true);
-        }
-        std::set<KmonHandleKey> liveKeys;
-        for (const auto& entry : perPid[pid])
-        {
-            liveKeys.emplace(entry.HandleValue, reinterpret_cast<uint64_t>(entry.Object));
-        }
-        const size_t end = (std::min)(history.Pending.size(), history.Cursor + 128);
-        for (; history.Cursor < end; ++history.Cursor)
-        {
-            const auto& change = history.Pending[history.Cursor];
-            const uint64_t object = reinterpret_cast<uint64_t>(change.Entry.Object);
-            const bool current = liveKeys.count({change.Entry.HandleValue, object}) != 0;
-            KmonChannel channel;
-            if (change.State != L"closed" && current)
-            {
-                channel = ResolveKmonChannel(object, ChannelLayout, read);
-            }
-            else
-            {
-                channel.Status = L"historical_handle_no_live_object_read";
-            }
-            KmonEvent event;
-            FILETIME now = {};
-            GetSystemTimeAsFileTime(&now);
-            event.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
-            event.Kind = L"driver.handle";
-            event.ProcessId = pid;
-            event.Summary = L"File handle " + change.State + L" pid=" + std::to_wstring(pid) +
-                L" handle=" + HexU64(change.Entry.HandleValue) + L" channel=" + channel.Class;
-            event.Evidence[L"source"] = L"native_handle_snapshot+pdb_object_read";
-            event.Evidence[L"relationship"] = L"object";
-            event.Evidence[L"state"] = change.State;
-            event.Evidence[L"process_create_time"] = std::to_wstring(created);
-            event.Evidence[L"snapshot_generation"] = std::to_wstring(change.Generation);
-            event.Evidence[L"handle"] = HexU64(change.Entry.HandleValue);
-            event.Evidence[L"file_object"] = HexU64(object);
-            event.Evidence[L"access"] = HexU64(change.Entry.GrantedAccess);
-            event.Evidence[L"channel_class"] = channel.Class;
-            event.Evidence[L"channel_status"] = channel.Status;
-            event.Evidence[L"channel_complete"] = channel.Complete ? L"true" : L"false";
-            event.Evidence[L"handle_snapshot_complete"] = L"true";
-            for (size_t i = 0; i < channel.Stack.size(); ++i)
-            {
-                const auto& link = channel.Stack[i];
-                const std::wstring prefix = L"stack_" + std::to_wstring(i) + L"_";
-                event.Evidence[prefix + L"device"] = HexU64(link.Device);
-                event.Evidence[prefix + L"driver"] = HexU64(link.Driver);
-                event.Evidence[prefix + L"image"] = HexU64(link.Image);
-                event.Evidence[prefix + L"device_type"] = HexU64(link.DeviceType);
-            }
-            RecordEvent(std::move(event));
-        }
-        if (history.Cursor == history.Pending.size())
-        {
-            history.LastCompleteMs = GetTickCount64();
-        }
-        {
-            std::lock_guard<std::mutex> lock(WatchMutex);
-            if (WatchPids.count(pid) != 0)
-            {
-                WatchKnownHandles[pid] = std::move(history);
-            }
-        }
+        if (StopRequested.load()) { break; }
+        auto owner = owners.find(pid);
+        if (owner != owners.end()) { FinishWatchedFileSnapshot(owner->second, perPid[pid], read, device, symbols); }
     }
 }
 
-// Iotrace control: the driver interposes the target's IRP_MJ_DEVICE_CONTROL
-// and the worker loop drains the non-paged ring into driver.ioctl events
-// (first seen per caller pid + ioctl code).
+// Acquisition IDs start again in each controller process.
+static std::map<std::wstring, std::wstring> HandleScanControllerEvidence()
+{
+    const auto controller = ReadProcessHandleIdentity(GetCurrentProcess());
+    std::map<std::wstring, std::wstring> fields{{L"controller_pid", std::to_wstring(GetCurrentProcessId())}};
+    if (controller.Created) { fields.emplace(L"controller_create_time", std::to_wstring(controller.Created)); }
+    return fields;
+}
+
+void KernelMonitor::FinishWatchedFileSnapshot(HandleScanOwner& owner, const std::vector<NativeHandleEntry>& entries,
+    const KmonMemoryReader& read, DeviceClient* device, SymbolEngine* symbols)
+{
+    uint64_t afterAcquisition = 0;
+    if (!ObserveFileScanOwner(owner, true, device, symbols, afterAcquisition)) { return; }
+    const auto pid = owner.Identity.ProcessId;
+    const auto created = owner.Identity.CreateTime;
+    KmonHandleHistory history;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return; }
+        history = owner.Watch->Files;
+    }
+    if (history.CreateTime != created || history.Cursor >= history.Pending.size())
+    {
+        history.Update(created, entries, true, owner.BeforeAcquisition, afterAcquisition);
+    }
+    std::set<KmonHandleKey> liveKeys;
+    for (const auto& entry : entries)
+    {
+        liveKeys.emplace(entry.HandleValue, reinterpret_cast<uint64_t>(entry.Object));
+    }
+    std::map<std::wstring, std::wstring> receipt;
+    if (history.BeforeAcquisition || history.AfterAcquisition)
+    {
+        receipt = HandleScanControllerEvidence();
+        if (history.BeforeAcquisition) { receipt.emplace(L"snapshot_before_acquisition_id", std::to_wstring(history.BeforeAcquisition)); }
+        if (history.AfterAcquisition) { receipt.emplace(L"snapshot_after_acquisition_id", std::to_wstring(history.AfterAcquisition)); }
+    }
+    std::vector<KmonEvent> events;
+    const size_t end = (std::min)(history.Pending.size(), history.Cursor + 128);
+    events.reserve(end - history.Cursor);
+    for (; history.Cursor < end; ++history.Cursor)
+    {
+        const auto& change = history.Pending[history.Cursor];
+        const uint64_t object = reinterpret_cast<uint64_t>(change.Entry.Object);
+        const bool current = liveKeys.count({change.Entry.HandleValue, object}) != 0;
+        KmonChannel channel;
+        if (change.State != L"closed" && current)
+        {
+            channel = ResolveKmonChannel(object, ChannelLayout, read);
+        }
+        else
+        {
+            channel.Status = L"historical_handle_no_live_object_read";
+        }
+        KmonEvent event;
+        FILETIME now = {};
+        GetSystemTimeAsFileTime(&now);
+        event.Timestamp = (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+        event.Kind = L"driver.handle";
+        event.ProcessId = pid;
+        event.Observation.Identity = owner.Identity;
+        event.Observation.Source = L"native_handle_snapshot";
+        event.Evidence = receipt;
+        event.Summary = L"File handle " + change.State + L" pid=" + std::to_wstring(pid) +
+            L" handle=" + HexU64(change.Entry.HandleValue) + L" channel=" + channel.Class;
+        event.Evidence[L"source"] = L"native_handle_snapshot+pdb_object_read";
+        event.Evidence[L"relationship"] = L"object";
+        event.Evidence[L"state"] = change.State;
+        event.Evidence[L"process_create_time"] = std::to_wstring(created);
+        event.Evidence[L"snapshot_generation"] = std::to_wstring(change.Generation);
+        event.Evidence[L"handle"] = HexU64(change.Entry.HandleValue);
+        event.Evidence[L"file_object"] = HexU64(object);
+        event.Evidence[L"access"] = HexU64(change.Entry.GrantedAccess);
+        event.Evidence[L"channel_class"] = channel.Class;
+        event.Evidence[L"channel_status"] = channel.Status;
+        event.Evidence[L"channel_complete"] = channel.Complete ? L"true" : L"false";
+        event.Evidence[L"handle_snapshot_complete"] = L"true";
+        for (size_t i = 0; i < channel.Stack.size(); ++i)
+        {
+            const auto& link = channel.Stack[i];
+            const std::wstring prefix = L"stack_" + std::to_wstring(i) + L"_";
+            event.Evidence[prefix + L"device"] = HexU64(link.Device);
+            event.Evidence[prefix + L"driver"] = HexU64(link.Driver);
+            event.Evidence[prefix + L"image"] = HexU64(link.Image);
+            event.Evidence[prefix + L"device_type"] = HexU64(link.DeviceType);
+        }
+        events.push_back(std::move(event));
+    }
+    if (history.Cursor == history.Pending.size())
+    {
+        history.LastCompleteMs = GetTickCount64();
+    }
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return; }
+        owner.Watch->Files = std::move(history);
+    }
+    for (auto& event : events) { RecordEvent(std::move(event)); }
+}
+
 void KernelMonitor::ScanWatchedHandleCapabilities()
 {
     DeviceClient* device = nullptr;
@@ -20429,17 +20532,6 @@ void KernelMonitor::ScanWatchedHandleCapabilities()
     {
         std::lock_guard<std::mutex> watchLock(WatchMutex);
         pids.assign(WatchPids.begin(), WatchPids.end());
-        for (auto it = WatchedHandleAfter.begin(); it != WatchedHandleAfter.end();)
-        {
-            if (WatchPids.find(it->first.first) == WatchPids.end())
-            {
-                it = WatchedHandleAfter.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
     }
     if (pids.empty())
     {
@@ -20476,17 +20568,10 @@ void KernelMonitor::ScanWatchedHandleCapabilities()
     HandleTableScanner scanner(*device, *symbols);
     for (uint32_t pid : pids)
     {
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-        const std::unique_ptr<void, decltype(&CloseHandle)> pinned(process, &CloseHandle);
-        const uint64_t created = process != nullptr ? QueryProcessCreateTicks(process) : 0;
-        const std::wstring generationKey = L"scan_failed:handles:generation:" + std::to_wstring(pid);
-        if (process == nullptr || created == 0 || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
-        {
-            EmitUnique(L"driver.handle", generationKey, L"", L"handle",
-                L"handle graph owner identity could not be pinned", L"owner pid=" + std::to_wstring(pid), pid);
-            continue;
-        }
-        ClearEmittedKeyForPid(generationKey, pid);
+        auto owner = BeginHandleScan(pid);
+        if (!owner.Watch) { continue; }
+        ObservedProcessHandle pin(ControllerProcessHandles(), ProcessHandleSite::HandleGraphOwner, pid, owner.Identity.CreateTime);
+        if (!PinHandleGraphOwner(owner, pin)) { continue; }
         HandleTableScanOptions options = {};
         options.HasOwnerPid = true;
         options.OwnerPid = pid;
@@ -20496,111 +20581,130 @@ void KernelMonitor::ScanWatchedHandleCapabilities()
         options.MaxHandlesPerPass = 4096;
         {
             std::lock_guard<std::mutex> watchLock(WatchMutex);
-            auto it = WatchedHandleAfter.lower_bound({pid, 0});
-            while (it != WatchedHandleAfter.end() && it->first.first == pid)
-            {
-                if (it->first.second != created)
-                {
-                    it = WatchedHandleAfter.erase(it);
-                }
-                else
-                {
-                    options.HandleAfter = it->second;
-                    ++it;
-                }
-            }
+            if (!HandleScanCurrentLocked(owner)) { continue; }
+            if (owner.Watch->GraphCreated == owner.Identity.CreateTime) { options.HandleAfter = owner.Watch->GraphAfter; }
         }
         HandleTableScanResult result = {};
         std::wstring error;
-        const std::wstring failKey =
-            L"scan_failed:handles:" + std::to_wstring(pid);
-        if (!scanner.Scan(options, &result, &error))
+        const bool ok = scanner.Scan(options, &result, &error);
+        FinishWatchedHandleGraph(owner, pin, result, ok ? nullptr : &error);
+    }
+}
+
+bool KernelMonitor::PinHandleGraphOwner(HandleScanOwner& owner, ObservedProcessHandle& pin)
+{
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return false; }
+    }
+    const auto pid = owner.Identity.ProcessId;
+    const std::wstring key = L"scan_failed:handles:generation:" + std::to_wstring(pid);
+    const bool opened = pin.Open(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE);
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return false; }
+    }
+    const auto& bound = pin.Acquisition().Bound;
+    if (!opened || bound.Pid != pid || !bound.Created || pin.ConflictsWithRequestedIdentity() ||
+        WaitForSingleObject(pin.get(), 0) != WAIT_TIMEOUT)
+    {
+        EmitUnique(L"driver.handle", key, L"", L"handle", L"handle graph owner identity could not be pinned",
+            L"owner pid=" + std::to_wstring(pid), owner.Identity);
+        return false;
+    }
+    owner.Identity.CreateTime = bound.Created;
+    ClearHandleScanDiagnostic(key, owner.Identity);
+    return true;
+}
+
+void KernelMonitor::FinishWatchedHandleGraph(const HandleScanOwner& owner, const ObservedProcessHandle& pin,
+    const HandleTableScanResult& result, const std::wstring* failure)
+{
+    const auto pid = owner.Identity.ProcessId;
+    const auto created = owner.Identity.CreateTime;
+    const std::wstring failKey = L"scan_failed:handles:" + std::to_wstring(pid);
+    const bool live = WaitForSingleObject(pin.get(), 0) == WAIT_TIMEOUT && QueryProcessCreateTicks(pin.get()) == created;
+    bool firstBaseline = false;
+    {
+        std::lock_guard<std::mutex> lock(WatchMutex);
+        if (!HandleScanCurrentLocked(owner)) { return; }
+        firstBaseline = owner.Watch->GraphCreated != created;
+        if (live && !failure)
         {
-            EmitUnique(
-                L"driver.handle",
-                failKey,
-                std::wstring(),
-                L"handle",
-                L"handle-table scan failed for pid=" + std::to_wstring(pid),
-                error.empty() ? L"Scan returned false" : error,
-                pid);
+            owner.Watch->GraphCreated = created;
+            owner.Watch->GraphAfter = result.NextHandleAfter;
+        }
+    }
+    auto evidence = HandleScanControllerEvidence();
+    evidence.emplace(L"owner_acquisition_id", std::to_wstring(pin.Acquisition().AcquisitionId));
+    if (!live)
+    {
+        EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph discarded after owner generation change",
+            L"", owner.Identity, evidence);
+        return;
+    }
+    if (failure)
+    {
+        EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle-table scan failed for pid=" + std::to_wstring(pid),
+            failure->empty() ? L"Scan returned false" : *failure, owner.Identity, evidence);
+        return;
+    }
+    if (!result.CoverageComplete || result.Truncated || !result.ObjectTypeCoverageComplete ||
+        !result.RelationshipCoverageComplete || (result.ProcessInventoryRequested && !result.ProcessInventoryComplete))
+    {
+        EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph coverage is partial",
+            L"records=" + std::to_wstring(result.Records.size()) + L" truncated=" +
+            std::to_wstring(result.Truncated) + L" type_failures=" + std::to_wstring(result.ObjectTypeReadFailures) +
+            L" relationship_failures=" + std::to_wstring(result.RelationshipReadFailures) +
+            L" relationship_unsupported=" + std::to_wstring(result.RelationshipUnsupported) +
+            L" process_inventory_requested=" + std::to_wstring(result.ProcessInventoryRequested) +
+            L" process_inventory_complete=" + std::to_wstring(result.ProcessInventoryComplete) +
+            L" handles_visited=" + std::to_wstring(result.HandlesVisited) +
+            L" handle_candidates=" + std::to_wstring(result.HandleCandidates) +
+            L" relationship_reads=" + std::to_wstring(result.RelationshipReadAttempts) +
+            L" read_budget_exhausted=" + std::to_wstring(result.RelationshipBudgetExhausted) +
+            L" next_handle_after=" + HexU64(result.NextHandleAfter), owner.Identity, evidence);
+    }
+    else
+    {
+        ClearHandleScanDiagnostic(failKey, owner.Identity);
+    }
+
+    for (const HandleTableRecord& record : result.Records)
+    {
+        const bool processAccess = record.TypeName == L"Process" &&
+            (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle);
+        const bool threadAccess = record.TypeName == L"Thread" && (record.GrantedAccess & 0x0033u) != 0;
+        const bool queueAccess = (record.TypeName == L"IoCompletion" || record.TypeName == L"TpWorkerFactory") &&
+            record.GrantedAccess != 0;
+        const bool fileHandle = record.TypeName == L"File" ||
+            (WatchFileTypeKnown && record.ObjectTypeIndex == WatchFileTypeIndex);
+        const bool deviceChannel = fileHandle && record.DeviceObject != 0 &&
+            (record.DeviceType == 0x22 || record.DeviceType >= 0x8000);
+        if (!processAccess && !threadAccess && !queueAccess && !deviceChannel)
+        {
             continue;
         }
-        if (QueryProcessCreateTicks(process) != created || WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
-        {
-            EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph discarded after owner generation change", L"", pid);
-            continue;
-        }
-        if (!result.CoverageComplete || result.Truncated || !result.ObjectTypeCoverageComplete ||
-            !result.RelationshipCoverageComplete || (result.ProcessInventoryRequested && !result.ProcessInventoryComplete))
-        {
-            EmitUnique(L"driver.handle", failKey, L"", L"handle", L"handle graph coverage is partial",
-                L"records=" + std::to_wstring(result.Records.size()) + L" truncated=" +
-                std::to_wstring(result.Truncated) + L" type_failures=" + std::to_wstring(result.ObjectTypeReadFailures) +
-                L" relationship_failures=" + std::to_wstring(result.RelationshipReadFailures) +
-                L" relationship_unsupported=" + std::to_wstring(result.RelationshipUnsupported) +
-                L" process_inventory_requested=" + std::to_wstring(result.ProcessInventoryRequested) +
-                L" process_inventory_complete=" + std::to_wstring(result.ProcessInventoryComplete) +
-                L" handles_visited=" + std::to_wstring(result.HandlesVisited) +
-                L" handle_candidates=" + std::to_wstring(result.HandleCandidates) +
-                L" relationship_reads=" + std::to_wstring(result.RelationshipReadAttempts) +
-                L" read_budget_exhausted=" + std::to_wstring(result.RelationshipBudgetExhausted) +
-                L" next_handle_after=" + HexU64(result.NextHandleAfter), pid);
-        }
-        else
-        {
-            ClearEmittedKeyForPid(failKey, pid);
-        }
-
-        bool firstBaseline = false;
-        {
-            std::lock_guard<std::mutex> watchLock(WatchMutex);
-            firstBaseline = WatchedHandleGenerations.find(pid) == WatchedHandleGenerations.end() ||
-                WatchedHandleGenerations[pid] != created;
-        }
-
-        for (const HandleTableRecord& record : result.Records)
-        {
-            const bool processAccess = record.TypeName == L"Process" &&
-                (record.VmRead || record.VmWrite || record.VmOperation || record.DupHandle);
-            const bool threadAccess = record.TypeName == L"Thread" && (record.GrantedAccess & 0x0033u) != 0;
-            const bool queueAccess = (record.TypeName == L"IoCompletion" || record.TypeName == L"TpWorkerFactory") &&
-                record.GrantedAccess != 0;
-            const bool fileHandle = record.TypeName == L"File" ||
-                (WatchFileTypeKnown && record.ObjectTypeIndex == WatchFileTypeIndex);
-            const bool deviceChannel = fileHandle && record.DeviceObject != 0 &&
-                (record.DeviceType == 0x22 || record.DeviceType >= 0x8000);
-            if (!processAccess && !threadAccess && !queueAccess && !deviceChannel)
-            {
-                continue;
-            }
-            EmitUnique(
-                L"driver.handle",
-                L"driver_handle:" + std::to_wstring(pid) + L":" +
-                    HexU64(created) + L":" + HandleTableRecordIdentity(record),
-                std::wstring(),
-                L"handle",
-                L"watched process holds a capability-bearing object handle pid=" +
-                    std::to_wstring(pid),
-                L"handle=" + HexU64(record.HandleValue) +
-                    L" object=" + HexU64(record.Object) +
-                    L" access=" + HexU64(record.GrantedAccess) + L" type=" + record.TypeName +
-                    L" first_owner_scan=" + std::to_wstring(firstBaseline) +
-                    L" target_pid=" + std::to_wstring(record.TargetPid) +
-                    L" target_create_time=" + HexU64(record.TargetCreateTime) +
-                    L" target_identity_known=" + std::to_wstring(record.TargetIdentityKnown) +
-                    L" object_type_validated=" + std::to_wstring(record.ObjectTypeValidated) +
-                    L" relationship_resolved=" + std::to_wstring(record.RelationshipResolved) +
-                    L" device_object=" + HexU64(record.DeviceObject) + L" driver_object=" + HexU64(record.DriverObject) +
-                    L" source=snapshot; handle_origin_not_proven; target_object_lifetime_not_pinned",
-                pid);
-        }
-
-        {
-            std::lock_guard<std::mutex> watchLock(WatchMutex);
-            WatchedHandleGenerations[pid] = created;
-            WatchedHandleAfter[{pid, created}] = result.NextHandleAfter;
-        }
+        EmitUnique(
+            L"driver.handle",
+            L"driver_handle:" + std::to_wstring(pid) + L":" +
+                HexU64(created) + L":" + HandleTableRecordIdentity(record),
+            std::wstring(),
+            L"handle",
+            L"watched process holds a capability-bearing object handle pid=" +
+                std::to_wstring(pid),
+            L"handle=" + HexU64(record.HandleValue) +
+                L" object=" + HexU64(record.Object) +
+                L" access=" + HexU64(record.GrantedAccess) + L" type=" + record.TypeName +
+                L" first_owner_scan=" + std::to_wstring(firstBaseline) +
+                L" target_pid=" + std::to_wstring(record.TargetPid) +
+                L" target_create_time=" + HexU64(record.TargetCreateTime) +
+                L" target_identity_known=" + std::to_wstring(record.TargetIdentityKnown) +
+                L" object_type_validated=" + std::to_wstring(record.ObjectTypeValidated) +
+                L" relationship_resolved=" + std::to_wstring(record.RelationshipResolved) +
+                L" device_object=" + HexU64(record.DeviceObject) + L" driver_object=" + HexU64(record.DriverObject) +
+                L" source=snapshot; handle_origin_not_proven; target_object_lifetime_not_pinned",
+            owner.Identity, evidence);
     }
 }
 
@@ -20991,10 +21095,7 @@ void KernelMonitor::PruneStalePromotedWatches()
             WatchPromotedCreated.erase(pid);
             WatchChildPids.erase(pid);
             WatchActivityTasks.erase(pid);
-            WatchKnownHandles.erase(pid);
-            WatchedHandleGenerations.erase(pid);
-            auto cursor = WatchedHandleAfter.lower_bound({pid, 0});
-            while (cursor != WatchedHandleAfter.end() && cursor->first.first == pid) { cursor = WatchedHandleAfter.erase(cursor); }
+            HandleWatches.erase(pid);
             if (!WatchExplicitPids.count(pid))
             {
                 WatchPids.erase(pid);
@@ -21565,6 +21666,7 @@ bool KernelMonitor::RemoveWatchPid(uint32_t pid)
         WatchChildPids.erase(pid);
         WatchActivityTasks.erase(pid);
         removed = WatchPids.erase(pid) != 0;
+        HandleWatches.erase(pid);
         const auto enabled = LoggingEnabledPids.find(pid);
         if (enabled != LoggingEnabledPids.end())
         {

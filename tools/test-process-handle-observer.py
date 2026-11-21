@@ -255,26 +255,48 @@ def collector_rows(output):
     return [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
 
 
-def run_watch_maintenance(exe, directory, deny_query):
-    # A retained reference keeps the already-exited child's PID allocated for the liveness case.
-    with subprocess.Popen([sys.executable, "-I", "-B", "-c", "pass"], cwd=directory) as exited:
-        assert exited.wait(timeout=30) == 0
-        assert process_open_status(exited.pid, 0x1000) == 0
-        exited_created = creation_time(int(exited._handle))
+def run_watch_fixture(exe, directory, fixture, deny_query, deny_sync=False):
+    scan = fixture == "watch-handle-scan-observer"
+    # EOF releases this disposable process. Its retained handle keeps the PID stable after exit.
+    with subprocess.Popen([sys.executable, "-I", "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                          cwd=directory, stdin=subprocess.PIPE) as subject:
+        if not scan:
+            subject.communicate(timeout=30)
+            assert subject.returncode == 0
+        subject_created = creation_time(int(subject._handle))
+        access = 0x101000 if scan else 0x1000
+        assert process_open_status(subject.pid, access) == 0
         current = _winapi.GetCurrentProcess()
-        reference = _winapi.DuplicateHandle(current, int(exited._handle), current, 0x1000, True, 0)
+        reference = _winapi.DuplicateHandle(current, int(subject._handle), current, access, True, 0)
         try:
             startup = subprocess.STARTUPINFO()
             startup.lpAttributeList = {"handle_list": [reference]}
-            with subprocess.Popen([exe, "--self-test", "watch-maintenance-observer", str(reference)],
+            with subprocess.Popen([exe, "--self-test", fixture, str(reference)],
                                   cwd=directory, startupinfo=startup, close_fds=True, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8") as child:
                 try:
                     created = creation_time(int(child._handle))
-                    deny_child_access(child, 0x200 | (0x1000 if deny_query else 0))
+                    deny_child_access(child, 0x200 | (0x1000 if deny_query else 0) | (0x100000 if deny_sync else 0))
                     assert process_open_status(child.pid, 0x200) == 5
                     assert process_open_status(child.pid, 0x1000) == (5 if deny_query else 0)
-                    output, errors = child.communicate("check\n", timeout=90)
+                    assert process_open_status(child.pid, 0x101000) == (5 if deny_query or deny_sync else 0)
+                    command = "check\n"
+                    if scan:
+                        child.stdin.write(command)
+                        child.stdin.flush()
+                        with ThreadPoolExecutor(max_workers=1) as reader:
+                            ready = reader.submit(child.stdout.readline)
+                            try:
+                                assert ready.result(timeout=30).strip() == "[scan.owner] pinned"
+                            except BaseException:
+                                if child.poll() is None:
+                                    child.kill()
+                                raise
+                        assert subject.poll() is None
+                        subject.communicate(timeout=30)
+                        assert subject.returncode == 0
+                        command = "exited\n"
+                    output, errors = child.communicate(command, timeout=90)
                 finally:
                     if child.poll() is None:
                         child.kill()
@@ -282,13 +304,117 @@ def run_watch_maintenance(exe, directory, deny_query):
                 assert child.returncode == 0, errors[-800:]
         finally:
             _winapi.CloseHandle(reference)
-    return output, child.pid, created, exited.pid, exited_created
+    return output, child.pid, created, subject.pid, subject_created
+
+
+def check_watch_handle_scans(exe, directory, deny_query, deny_sync=False):
+    output, pid, created, exited, exited_created = run_watch_fixture(
+        exe, directory, "watch-handle-scan-observer", deny_query, deny_sync)
+    rows = collector_rows(output)
+    fields = evidence(rows, [r["action"].rsplit(".", 1)[1] for r in rows], pid, created)
+    cases, events = {}, {}
+    for line in output.splitlines():
+        if line.startswith(("[scan.case] ", "[scan.event] ")):
+            prefix, payload = line.split(" ", 1)
+            item = dict(entry.split("=", 1) for entry in payload.split())
+            if prefix == "[scan.case]":
+                assert item["name"] not in cases
+                cases[item["name"]] = {k: int(v) for k, v in item.items() if k != "name"}
+            else:
+                events.setdefault(item["name"], []).append(item)
+    before, after, graph = "handle_snapshot_before", "handle_snapshot_after", "handle_graph_owner"
+    file_pass = [before] if deny_query else [before, after]
+    paths = {"resumed": file_pass * 3 + [graph] * 3, "promoted": file_pass + [graph],
+             "stale": [before, graph], "unbound": [], "explicit_overlap": file_pass + [graph],
+             "exit_during_scan": [before, graph, after], "exited": [before, graph],
+             "missing": [before, graph], "stopping": [], "readded": [before, graph],
+             "repinned": [before, graph], "withdrawn_during_read": file_pass}
+    assert list(cases) == list(paths)
+    cursor = 0
+    calls = {}
+    for name, sites in paths.items():
+        case = cases[name]
+        assert cursor == case["before"]
+        is_subject = name in ("exited", "exit_during_scan")
+        target = exited if is_subject else 0xffffffff if name == "missing" else pid
+        actual = exited_created if is_subject else created
+        requested = actual if is_subject or name in ("promoted", "repinned") else created + 1 if name == "stale" else 0
+        calls[name] = []
+        for site in sites:
+            status = 87 if name == "missing" else 5 if not is_subject and (deny_query or site == graph and deny_sync) else 0
+            count = 1 if status else 2
+            selected = fields[cursor:cursor + count]
+            assert len(selected) == count and [r["action"] for r in rows[cursor:cursor + count]] == (
+                ["process.handle.open"] if status else ["process.handle.open", "process.handle.close"])
+            opened = selected[0]
+            assert opened["requested_access"] == ("0x101000" if site == graph else "0x1000")
+            for part in selected:
+                assert part["handle_site"] == site and int(part["requested_pid"]) == target
+                assert int(part.get("requested_create_time", "0")) == (actual if site == after else requested)
+                assert int(part["status"]) == status
+                if status:
+                    assert not {"observed_create_time", "acquisition_id", "observed_pid"}.intersection(part)
+                else:
+                    assert int(part["observed_pid"]) == target and int(part["observed_create_time"]) == actual
+                    assert part["acquisition_id"] == opened["sequence"] and part["identity_win32_status"] == "0"
+            calls[name].append(opened.get("acquisition_id"))
+            cursor += count
+        assert cursor == case["after"]
+        usable = name in ("resumed", "promoted", "explicit_overlap")
+        assert case["generation"] == (2 if name == "resumed" else 1) * (usable and not deny_query)
+        expected_cursor = (12 if name == "resumed" else 8) if usable and not deny_query and not deny_sync else 0
+        assert case["graph_after"] == expected_cursor
+    assert cursor == len(fields)
+    assert f"source_records={cursor} added={cursor}" in output and "source_records=0 added=0" in output
+    for group in events.values():
+        for event in group:
+            if any(event[k] != "-" for k in ("before", "after", "graph")):
+                assert event.get("controller") == str(pid) and event.get("controller_created") == str(created), (
+                    "handle acquisition needs the originating controller generation", event["name"])
+    assert not events.get("stopping")
+    for name in ("stale", "exited", "missing", "unbound"):
+        target = exited if name == "exited" else 0xffffffff if name == "missing" else pid
+        expected = {"stale": created + 1, "exited": exited_created}.get(name, 0)
+        reasons = ["watch_generation"] if name == "unbound" else ["identity", "generation"]
+        assert [e["diagnostic"] for e in events[name]] == [f"scan_failed:handles:{r}:{target}" for r in reasons]
+        assert all(int(e["pid"]) == target and int(e["created"]) == expected for e in events[name])
+    rejected = events["exit_during_scan"]
+    assert [e["diagnostic"] for e in rejected] == [f"scan_failed:handles:{exited}", f"scan_failed:handles:identity:{exited}"]
+    assert rejected[0]["graph"] == calls["exit_during_scan"][1]
+    assert all(int(e["created"]) == exited_created and int(e["pid"]) == exited and e["state"] == "-" for e in rejected)
+    for name in ("readded", "repinned", "withdrawn_during_read"):
+        assert all(e["diagnostic"] != "-" and e["state"] == e["graph"] == "-" for e in events.get(name, []))
+        if not deny_query and not deny_sync:
+            assert not events.get(name)
+    file_rows = [e for e in events["resumed"] if e["state"] != "-"]
+    assert len(file_rows) == (0 if deny_query else 130)
+    if file_rows:
+        for i, row in enumerate(file_rows):
+            # The 129th baseline entry is delivered during pass two but belongs to the first snapshot.
+            a, b = (0, 1) if i < 129 else (4, 5)
+            assert (row["before"], row["after"]) == (calls["resumed"][a], calls["resumed"][b])
+            assert row["state"] == ("present_at_attach" if i < 129 else "closed")
+            assert int(row["snapshot"]) == (1 if i < 129 else 2)
+            assert int(row["pid"]) == pid and int(row["created"]) == created
+    for name in ("resumed", "promoted", "explicit_overlap"):
+        graph_rows = [e for e in events.get(name, []) if e["graph"] != "-"]
+        if deny_query or deny_sync:
+            assert not graph_rows
+        else:
+            a = calls[name]
+            assert [e["graph"] for e in graph_rows] == ([a[-3], a[-2], a[-1], a[-1]] if name == "resumed" else [a[-1]])
+            assert [e["baseline"] for e in graph_rows if e["diagnostic"] == "-"] == (["1", "0"] if name == "resumed" else ["1"])
+            assert all(int(e["created"]) == created and int(e["pid"]) == pid for e in graph_rows)
+    print(f"Watched handle scans: query_denied={deny_query} synchronize_denied={deny_sync}, "
+          f"{len(cases)} cases, {cursor} observer rows, {len(file_rows)} file lifecycle rows.")
+    linked_ids = {e[k] for group in events.values() for e in group for k in ("before", "after", "graph") if e[k] != "-"}
+    return (pid, created), linked_ids
 
 
 def check_watch_maintenance(exe, directory, deny_query):
     missing = 0xffffffff
     assert process_open_status(missing, 0x1000) == 87
-    output, pid, created, exited, exited_created = run_watch_maintenance(exe, directory, deny_query)
+    output, pid, created, exited, exited_created = run_watch_fixture(exe, directory, "watch-maintenance-observer", deny_query)
     ingested = collector_rows(output)
     rows = [row for row in ingested if row["entity"] == "process_handle:controller"]
     logging = [row for row in ingested if row["entity"] == "process_logging:controller"]
@@ -805,6 +931,12 @@ def main():
             check_verification_handles(exe, directory, deny)
         for deny_query in (False, True):
             check_watch_maintenance(exe, directory, deny_query)
+        profiles = ((False, False), (True, False), (False, True))
+        with ThreadPoolExecutor(max_workers=len(profiles)) as pool:
+            runs = [pool.submit(check_watch_handle_scans, exe, directory, query, sync) for query, sync in profiles]
+            scans = [run.result() for run in runs]
+        assert len({controller for controller, ids in scans}) == len(profiles)
+        assert scans[0][1] & scans[2][1], "expected acquisition IDs to repeat in different controllers"
         check_process_logging(exe, directory)
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")

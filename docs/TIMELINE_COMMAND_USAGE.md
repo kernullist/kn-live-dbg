@@ -185,6 +185,9 @@ no ownership record.
 | `watch_promotion` | Look up the process generation when adding a name-matched watch. | Limited query (`0x1000`) |
 | `logging_identity` | Hold the process identity while KMON attempts to change its logging or release a prior successful request. | Limited query (`0x1000`) |
 | `logging_control` | Request the existing user-mode control handle for that process generation. | Set information (`0x200`) |
+| `handle_snapshot_before` | Sample the owner before collecting a watched file-handle snapshot. | Limited query (`0x1000`) |
+| `handle_snapshot_after` | Recheck the same generation after the snapshot. | Limited query (`0x1000`) |
+| `handle_graph_owner` | Hold the owner through one handle-graph scan and check that it is still running. | Limited query and synchronize (`0x101000`) |
 
 For watch cleanup, find the `coverage.logging` event in KMON's event log.
 `cleanup_decision` gives the reason for skipping a control or records
@@ -235,6 +238,25 @@ reconciliation and live anomaly analysis use target events. The one-shot
 self-read exports its own four calls in `process_handle_timeline.events` on
 success. Other collectors that call `OpenProcess` directly have separate
 coverage. [Windows DuplicateHandle](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+
+### Trace a watched handle scan
+
+Run `!timeline ingest observer` and `!timeline query /source observer /domain observer_action`.
+The three handle sites above identify the controller's opens and closes. A KMON
+file lifecycle row carries the acquisition IDs from the snapshot that established
+the change in `snapshot_before_acquisition_id` and `snapshot_after_acquisition_id`.
+A row delivered on a later pass keeps those original IDs. A failed open has no
+acquisition ID. The file scanner can still obtain the creation time through its
+existing device lookup. The failed Windows call remains visible in the timeline.
+
+For a graph record or a scan diagnostic produced while the owner was pinned,
+match `owner_acquisition_id` to the same controller's handle row. Use
+`controller_pid` and `controller_create_time` to identify the controller when
+combining logs. An acquisition ID can repeat after a restart. The graph pin
+holds the owner process only. Object lifetime and the origin of handles in the
+snapshot require separate evidence. A promoted watch with no recorded creation
+time defers both scans. Removing and re-adding a PID starts a new file history
+and graph cursor.
 
 ### Inspect KMON process logging requests
 

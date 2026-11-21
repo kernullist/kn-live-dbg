@@ -1949,6 +1949,15 @@ creation-time mismatch, an invalid PID or a reported exit can retire a
 promoted entry. An access error alone leaves its status uncertain. Explicit PID
 watches retain their independent membership.
 
+The file-handle scanner samples the owner before and after a complete native
+snapshot and skips an owner whose exit code indicates termination. The
+handle-graph scanner retains its owner handle across the device scan and checks
+the process wait state before accepting the result. Both record their process opens and closes in the observer timeline.
+A promoted owner must match its recorded creation time. Each watch registration
+owns its file history and graph cursor. Removing the watch discards that state.
+A scan still in progress can publish its batch only if the same registration
+and owner generation pass the final check. [Handle scan receipts](TIMELINE_COMMAND_USAGE.md#trace-a-watched-handle-scan)
+
 KMON holds a limited-query handle for the subject when it attempts to change
 process logging. Pruning, manual removal and shutdown can request cleanup only
 for a generation with an earlier successful request in this controller.
