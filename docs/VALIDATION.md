@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Windows user-mode wait chains, 2026-11-21
+
+The Windows x64 Release controller had SHA-256
+`979a981bf0fba9a02744ffedf319007aa882bd653118550b592bb9fe1748bd03`.
+Two threads in an owned process each acquired a Windows mutex. The controller
+first observed one thread waiting on the other's mutex. After the second
+thread entered its reciprocal wait, Windows reported a cycle. The second
+wait timed out and the first thread acquired the released mutex. The parent
+verified both return values and the fixture's normal exit.
+
+| Final Windows traversal | Raw nodes | Replayed edges | Assessment |
+| --- | ---: | ---: | --- |
+| One-way contention | 3 | 2 | Inconclusive |
+| Reciprocal mutex waits | 5 | 4 | Potential wait cycle |
+
+After process exit, the same receipts reproduced both reports byte for byte.
+Changed process and thread creation times and a new request for the retired
+target produced zero graph edges. Repinned copies exercised an incomplete
+traversal, unsupported ownership, terminated or missing thread witnesses,
+an apparent recursive self-wait and a closed suffix beyond a foreign thread.
+Critical-section rows were tested in replay. The native fixture used mutexes.
+These live traversals leave persistent deadlock and kernel wait graphs open.
+[Capture and replay a wait chain](COMMAND_REFERENCE.md#capture-a-windows-wait-chain)
+
+The six wait-chain regression tests, 72 restricted launch checks, 54 source
+contracts and 3,081 command checks passed. The generated support matrix
+matched the binary. All 17 public-content tests passed. The scanner also
+recognized renamed, truncated and UTF-16 copies of the actual private
+receipt and assessment. Between 22:23 and 22:42 KST the host recorded zero new
+reboot or bugcheck events and zero new crash dumps. The final check found
+zero remaining wait-chain fixture processes, temporary fixture directories
+or running test drivers.
+
 ## Paired module collection costs, 2026-11-21
 
 The Windows x64 Release validation core had SHA-256

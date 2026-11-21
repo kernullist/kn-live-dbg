@@ -13,7 +13,7 @@ does not repeat or renew the binary-specific tests in [validation status](VALIDA
 | --- | --- |
 | [Project README](../README.md) | Download, quick start, scope |
 | [Build and release](BUILD_AND_RELEASE.md) | Toolchain, signing, versioning, package validation, public-content checks |
-| [Command guide](COMMAND_REFERENCE.md) | Memory, scanners, snapshots, collection, dumps |
+| [Command guide](COMMAND_REFERENCE.md) | Memory, scanners, snapshots, collection, dumps and [Windows wait chains](COMMAND_REFERENCE.md#capture-a-windows-wait-chain) |
 | [Trace import](TRACE_IMPORT.md) | Normalized external samples, code/loss scope and producer-claim limits |
 | [Command coverage](WINDBG_COMMAND_COVERAGE.md) | Native and DbgEng routing |
 | [AI workflows](AI_ASSISTED_WORKFLOWS.md) | Configuration, plans, confirmation, logs |

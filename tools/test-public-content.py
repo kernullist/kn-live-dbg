@@ -65,6 +65,16 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle",
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
+    def test_wait_captures_and_reports(self):
+        for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1"):
+            intact = json.dumps({"requested": {}, "schema": schema})
+            cut = "log start\n" + json.dumps({"schema": schema, "requested": {}}, indent=2)[:-3]
+            for text in (intact, cut):
+                for encoding in ("utf-8", "utf-16"):
+                    rules = {f["rule"] for f in AUDIT.inspect("unrelated-name.txt", text.encode(encoding))}
+                    self.assertIn("private-evidence-bundle", rules)
+            self.assertEqual(AUDIT.inspect("guide.md", ("See the " + schema + " schema.").encode()), [])
+
     def test_private_benchmark_archive(self):
         head = b"PK\x03\x04" + bytes(26)
         self.assertEqual(AUDIT.path_rule("case.KNBENCH"), "private-container-or-capture")

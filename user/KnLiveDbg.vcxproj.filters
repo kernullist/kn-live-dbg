@@ -136,6 +136,9 @@
     <ClCompile Include="HvPostureScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WaitChainCapture.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="DumpAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -454,6 +457,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HvPostureScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WaitChainCapture.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="DumpAnalyzer.h">

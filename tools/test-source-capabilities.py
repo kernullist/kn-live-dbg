@@ -165,6 +165,10 @@ def main():
     assert "per_original_policy_partitions" in image_claims["limits"] and "original_claim_reproduction_requires_publication" in image_claims["limits"]
     assert "collection_membership_separate" in image_claims["limits"]
     assert "slice_sweep_2Mi_UTF16_units" in image_claims["limits"]
+    wait = by_key[("diagnostics", "wait_chain", "windows_wct")]
+    assert wait["availability"] == "not_probed" and wait["consistency"] == "one_live_traversal"
+    assert wait["address_contract"] == "not_an_address_reader"
+    assert "requested_process_and_thread_creation" in wait["requirements"] and "no_timeout_or_deadlock_proof" in wait["limits"]
     image_replay = by_key[("image", "replay_verification", "recipe")]
     assert "exact_recorded_claim_reproduction" in image_replay["requirements"] and "legacy_claim_not_recorded" in image_replay["limits"]
     assert "no_hard_deadline_or_measured_slo" in by_key[("scheduler", "capture_timing", "native")]["limits"]

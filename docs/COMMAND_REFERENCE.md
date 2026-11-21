@@ -590,6 +590,53 @@ hash and unchecked runtime-invariant status. MCP `symbol.search` adds size
 availability, index hashes and a coverage note; incomplete results set `truncated`.
 See [index scope and limits](ARCHITECTURE.md#live-symbol-and-type-index-broker).
 
+## Capture a Windows wait chain
+
+Use `--wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>`
+to investigate a particular thread in a live process. All four arguments are
+decimal. The controller opens query and synchronize handles, checks both
+creation times, and calls Windows Wait Chain Traversal (WCT) with flags zero.
+The first traversal discovers same-process threads to pin. The second supplies
+the graph. Both calls are synchronous and can block until Windows returns.
+The controller uses its existing privileges. Windows may deny the traversal
+or return a partial chain. [Windows WCT](https://learn.microsoft.com/en-us/windows/win32/debug/wait-chain-traversal)
+and [query results and access limits](https://learn.microsoft.com/en-us/windows/win32/api/wct/nf-wct-getthreadwaitchain).
+
+This PowerShell example captures a thread in the current shell and saves the
+ASCII receipt in a new temporary file. Choose the process and thread of
+interest when investigating a hang.
+
+```powershell
+$target = Get-Process -Id $PID
+$thread = $target.Threads | Sort-Object Id | Select-Object -First 1
+$pc = $target.StartTime.ToUniversalTime().ToFileTimeUtc()
+$tc = $thread.StartTime.ToUniversalTime().ToFileTimeUtc()
+$receipt = & .\x64\Release\KnLiveDbg.exe --wait-chain $target.Id $pc $thread.Id $tc
+if ($LASTEXITCODE -ne 0) { throw 'Wait-chain capture failed' }
+$file = [IO.Path]::GetTempFileName()
+Set-Content -LiteralPath $file -Value $receipt -Encoding ascii
+$pin = python -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" $file
+python tools/replay-wait-chain.py $file --sha256 $pin
+```
+
+A successful command writes one receipt, including when access fails or a
+generation changes. Inspect `session`, `discovery`, `query` and the handle
+witnesses for the original result and Win32 errors. A syntax error exits 2.
+The receipt keeps native node types, statuses and thread counters. It omits
+object names. Store the private receipt, assessment and pin together to
+repeat the analysis on the same bytes after process exit.
+
+Replay derives `waits_for` and `owned_by` edges for mutexes and critical
+sections. Each edge cites its raw node positions and thread pin in the
+receipt identified by the SHA-256. Lock identities are local to that
+traversal. A `potential_wait_cycle` requires a Windows cycle flag and a
+closed chain of at least two distinct threads whose handles bracket the
+query. The report stops interpreting the chain at a foreign or unqualified
+thread. A single returned thread can also mean Windows could not observe
+the wait. A live traversal leaves simultaneity, duration, timeout,
+cancellation and a whole-host diagnosis unresolved. WCT reserves its lock
+timeout and alertable fields. [WCT node fields](https://learn.microsoft.com/en-us/windows/win32/api/wct/ns-wct-waitchain_node_info)
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

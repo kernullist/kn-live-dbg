@@ -113,7 +113,7 @@ inline const wchar_t* CapabilityAddressContract(const std::wstring& domain,
     {
         return L"backend_defined;command_text_only";
     }
-    if (domain == L"schema" || domain == L"session" || domain == L"scheduler")
+    if (domain == L"schema" || domain == L"session" || domain == L"scheduler" || backend == L"windows_wct")
     {
         return L"not_an_address_reader";
     }
