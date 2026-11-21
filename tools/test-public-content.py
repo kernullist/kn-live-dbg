@@ -1,7 +1,9 @@
 """Regression tests for publication checks; all secret-shaped data is synthetic."""
+from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -93,6 +95,33 @@ class PublicContentTests(unittest.TestCase):
         for raw in (head + b"KNMC", b"\0journal page" + b'{"schema":"kn.owned_module_attempt_receipt.v1",'):
             self.assertIn("private-benchmark-campaign", {f["rule"] for f in AUDIT.inspect("renamed.db", raw)})
         self.assertFalse(AUDIT.inspect("ordinary.db", head + bytes(4)))
+
+    def test_paired_benchmark_documents(self):
+        for kind in ("benchmark", "truth", "plan"):
+            schema = f"kn.owned_module_{kind}.v2"
+            complete = json.dumps({"run_id": "synthetic", "schema": schema})
+            cut = "worker output\n" + json.dumps({"schema": schema, "record": ["sample"]}, indent=2)[:-6]
+            header = 'worker output\n{"schema":"' + schema + '"'
+            for raw in (complete, cut, header):
+                for encoding in ("utf-8", "utf-16"):
+                    rules = {f["rule"] for f in AUDIT.inspect("renamed.txt", raw.encode(encoding))}
+                    self.assertIn("private-evidence-bundle", rules)
+            self.assertEqual(AUDIT.inspect("guide.md", f"The format is {schema}.".encode()), [])
+        self.assertEqual(AUDIT.inspect("other.json", b'{"schema":[]}'), [])
+
+    def test_paired_plan_in_sqlite_recovery_page(self):
+        plan = json.dumps({"schema": "kn.owned_module_plan.v2", "tickets": ["synthetic"]},
+                          separators=(",", ":")).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "fixture.db"
+            with closing(sqlite3.connect(db)) as connection:
+                self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                connection.execute("CREATE TABLE plans (record BLOB)")
+                connection.execute("INSERT INTO plans VALUES (?)", (plan,))
+                connection.commit()
+                page = Path(str(db) + "-wal").read_bytes()
+                self.assertIn(plan, page)
+                self.assertIn("private-benchmark-campaign", {f["rule"] for f in AUDIT.inspect("renamed.dat", page)})
 
     def test_owned_module_workload_transcripts(self):
         schema = "kn.owned_module_workload.v1"

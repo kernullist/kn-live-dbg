@@ -199,6 +199,12 @@ development workload. The measurements cover work during the requests.
 Host-wide overhead, game-frame latency, peak memory during a request and
 independently sampled performance estimates remain open.
 
+Keep the paired plan, manifest and truth journal private, including extracted
+copies. The publication check recognizes their v2 schemas in complete JSON
+and in interrupted output that retains the opening schema field. It also
+recognizes the compact v2 plan in SQLite recovery pages.
+[Publication check results](VALIDATION.md#paired-module-collection-costs-2026-11-21)
+
 ## Run the synthetic example
 
 Python 3.11 and the standard library are sufficient. From the repository root:

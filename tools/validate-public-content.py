@@ -17,6 +17,18 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
+BENCHMARK_RECORD_SCHEMAS = frozenset(
+    f"kn.owned_module_{kind}.{version}"
+    for version, kinds in (
+        ("v1", ("benchmark", "truth", "evaluation", "plan", "campaign", "campaign_evaluation",
+                "attempt", "attempt_receipt", "watch", "worker_failure")),
+        ("v2", ("benchmark", "truth", "plan")),
+    )
+    for kind in kinds
+)
+BENCHMARK_RECORD_START = re.compile(
+    r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"(?:' +
+    "|".join(re.escape(schema) for schema in sorted(BENCHMARK_RECORD_SCHEMAS)) + r')"\s*(?:[,}]|$)')
 RULES = {
     "private-key": re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"),
     "provider-token": re.compile(
@@ -97,6 +109,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     binary = b"\0" in data[:8192] and not data.startswith((b"\xff\xfe", b"\xfe\xff"))
     if ((data.startswith(b"SQLite format 3\0") and data[68:72] == b"KNMC") or
             (binary and any(marker in data for marker in (b'{"schema":"kn.owned_module_plan.v1",',
+                                                         b'{"schema":"kn.owned_module_plan.v2",',
                                                          b'{"schema":"kn.owned_module_attempt_receipt.v1",')))):
         add("private-benchmark-campaign")
         return findings
@@ -105,10 +118,11 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         if text.lstrip().startswith("{"):
             try:
                 document = json.loads(text)
-                if (isinstance(document, dict) and document.get("schema") == "kn.capabilities.v1" and
+                schema = document.get("schema") if isinstance(document, dict) else None
+                if (schema == "kn.capabilities.v1" and
                         (document.get("target_probed") is not False or document.get("scope") == "runtime_probe" or "probe" in document)):
                     add("private-runtime-probe")
-                if isinstance(document, dict) and document.get("schema") in {
+                if isinstance(schema, str) and (schema in BENCHMARK_RECORD_SCHEMAS or schema in {
                     "kmon.bundle.v1", "kmon.bundle.v2", "kmon.evidence.v1", "kmon.evidence.v2", "kn.temporal_facts.v1", "kmon.evidence_session.v1",
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                     "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
@@ -123,12 +137,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
                     "kn.wait_chain.v1", "kn.wait_assessment.v1",
-                    "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1",
-                    "kn.owned_module_benchmark.v1", "kn.owned_module_truth.v1", "kn.owned_module_evaluation.v1",
-                    "kn.owned_module_plan.v1", "kn.owned_module_campaign.v1", "kn.owned_module_campaign_evaluation.v1",
-                    "kn.owned_module_attempt.v1", "kn.owned_module_attempt_receipt.v1", "kn.owned_module_watch.v1",
-                    "kn.owned_module_worker_failure.v1"
-                }:
+                    "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"
+                }):
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):
                 pass
@@ -140,8 +150,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # The workload emits one tagged object per reply. A transcript can
         # include multiple replies, a log banner or a partially written tail.
         if not binary and "kn.owned_module_" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
-            partial = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.owned_module_(?:truth|benchmark|evaluation|'
-                                r'plan|campaign|campaign_evaluation|attempt|attempt_receipt|watch|worker_failure)\.v1"\s*,', text)
+            partial = BENCHMARK_RECORD_START.search(text)
             if partial:
                 add("private-evidence-bundle", text.count("\n", 0, partial.start()) + 1)
         if not binary and "kn.owned_module_workload.v1" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):

@@ -68,6 +68,12 @@ passed. Between 21:46 and 22:07 KST the host recorded zero new reboot or
 bugcheck events and zero new crash dumps. The final check found no remaining
 fixture process or running test driver.
 
+The public-content check was also exercised on extracted data from this run.
+It flagged all 16 private files, including complete, interrupted and UTF-16
+records, the renamed package, database and snapshot, and a SQLite recovery
+page containing the registered plan. A format description and an unrelated
+JSON document passed. All 19 publication-check regressions passed.
+
 ## KMON watched handle scans, 2026-11-21
 
 On `main` at `2f6742f`, the file snapshot probes and the handle graph owner
