@@ -1612,6 +1612,8 @@ namespace executable_image
                 break;
             }
 
+            metadata->DebugDirectoryRva = debugRva;
+            metadata->DebugDirectorySize = debugSize;
             if (debugSize != 0 && debugSize <= 1024 * sizeof(IMAGE_DEBUG_DIRECTORY) &&
                 (debugSize % sizeof(IMAGE_DEBUG_DIRECTORY)) == 0)
             {

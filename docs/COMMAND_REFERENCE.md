@@ -1006,6 +1006,20 @@ Continue with `--after $page.next_after` when the cursor has a value, using
 the same reference and ETL. Each window hash belongs to the supplied file.
 [Reference comparison fields](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
 
+To include the build identity recorded by the trace merger, add
+`--build-evidence`. With the same ETL, PE and digests as above, the following
+page shows which samples have matching RSDS markers at both image boundaries.
+
+```powershell
+$page = & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --build-evidence --reference-image $pe.FullName $pePin --limit 128 | ConvertFrom-Json
+$page.reference_build
+$page.samples | Where-Object { $_.build_evidence.relation -eq 'paired_merge_build' } |
+    Select-Object sample_ordinal, build_evidence, reference_evidence
+```
+
+Omit `--reference-image` and its two arguments to inspect the ETL markers
+alone. [Merge-time build fields](TRACE_IMPORT.md#compare-merge-time-build-identifiers)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

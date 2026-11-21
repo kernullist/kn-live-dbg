@@ -4981,6 +4981,43 @@ had byte-identical output. Public ETLs and reference files stay outside
 the repository.
 [Reference input and report](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
 
+### Compare merge-time build identity across saved ETLs
+
+On 2026-11-22 the independent checker decoded the ImageID task's binary
+payloads from Windows `tracerpt -rts` and compared its source ordinals with
+`--build-evidence`. The checker compared all 192,389 CPU samples across the five ETLs in
+the process-generation table. It counted 70,018 ImageID records, 69,086
+native RSDS records and 846 no-debug-ID markers.
+All observed marker layouts used 8-byte pointers, including the x86 workload.
+The native harness also exercised 4-byte payloads. Markers and loaders often
+had intervening events. Some loader stamps were zero although the corresponding
+merge records had a stamp. The report preserves both.
+
+The scheduler trace contained 18,556 samples. Both image endpoints reported
+the same merge build for all 2,112 samples with a process-bound image.
+Comparing the pinned Microsoft `msvcrt.dll` above gave 152 hash windows.
+After removing one byte from an owned trace copy, all 152 sample ordinals
+survived and none retained a file window. The .NET reference matched the
+merge GUID, unsigned PDB age and merge timestamp for 1,252 same-name samples.
+Their original loader checksum differed from the PE header checksum and the
+reader withheld every window. These comparisons cover the file inspected by
+the merger and the explicitly supplied PE. The memory bytes at sampling time
+and the producer's authenticity remain unknown.
+
+```powershell
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-samples 18556 --build-evidence --reference-image $pe.FullName $pePin --all-pages --expect-reference-windows 152 --check-short-tail
+```
+
+The empty ETL control exercises 36 inert PE32 and PE32+ layout cases with a single
+mapped or raw-only RSDS, missing or duplicate entries, conflicting offsets,
+truncated data, padding and partial section extents. The native harness also
+checks logger/PID collisions, record order, loss, index exhaustion, missing
+boundaries and changed GUIDs or ages. The native record checks passed in
+32-bit and 64-bit Release processes. The x64 ASan harness passed with the
+previously documented process-local interceptor setting and startup warnings.
+All 45 baseline pages from the older profile and switch schemas matched the
+parent executable byte for byte. [Merge-time build report](TRACE_IMPORT.md#compare-merge-time-build-identifiers)
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

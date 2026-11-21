@@ -466,6 +466,8 @@
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />
     <ClInclude Include="EtlProcessEvidence.h" />
+    <ClInclude Include="EtlBuildEvidence.h" />
+    <ClInclude Include="EtlReferenceBuild.h" />
     <ClInclude Include="EtlReferenceImage.h" />
     <ClInclude Include="EtlSwitchRecord.h" />
     <ClInclude Include="EtlScheduleIntervals.h" />

@@ -37,7 +37,7 @@ class ReferenceOracle:
         self.ordinal_compare.argtypes = (ctypes.c_wchar_p, ctypes.c_int, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_int)
         self.ordinal_compare.restype = ctypes.c_int
 
-    def expected(self, bound, image, images):
+    def expected(self, bound, image, images, build=None):
         result = dict(relation="process_image_unavailable", loader_fields=None, file_location="uncompared", reference_window=None)
         if bound["reported_rva"] is None:
             return result
@@ -61,7 +61,11 @@ class ReferenceOracle:
         result["loader_fields"] = fields
         if False in fields.values():
             result["relation"] = "loader_field_conflict"
-        elif fields["pe_timestamp"] is None and fields["image_checksum"] is None:
+        elif build is not None and (build["reference_comparison"] is None or build["reference_comparison"]["rsds_guid_equal"] is None):
+            result["relation"] = "build_id_unavailable"
+        elif build is not None and False in build["reference_comparison"].values():
+            result["relation"] = "merge_build_conflict"
+        elif build is None and fields["pe_timestamp"] is None and fields["image_checksum"] is None:
             result["relation"] = "build_fields_unavailable"
         elif fields["default_base_relation"] == "unexplained":
             result["relation"] = "default_base_unresolved"

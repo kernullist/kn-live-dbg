@@ -26,7 +26,7 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         assert not result.stdout
         return None
     value = json.loads(result.stdout.decode("utf-8"))
-    version = 5 if "--reference-image" in args else 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
+    version = 6 if "--build-evidence" in args else 5 if "--reference-image" in args else 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
     switch_version = 2 if "--intervals" in args or "--thread-id" in args else 1
     assert value["schema"] == (f"kn.etl_switches.v{switch_version}" if switches else f"kn.etl_profile.v{version}")
     return value
@@ -137,7 +137,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -177,6 +177,8 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None, process
                 width = event.find(ns + "EventData/" + ns + "Data[@Name='PointerSize']")
                 if width is not None:
                     pointer_width = int(width.text, 0)
+            if builds is not None and guid == "b3e675d7-2554-4f18-830b-2762732560de":
+                builds.add(event, ns, records, pointer_width)
             if want_images and guid == IMAGE_GUID:
                 system = event.find(ns + "System")
                 version = int(system.findtext(ns + "Version"))
@@ -266,6 +268,8 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None, process
                                         int(descriptor["Level"], 0), int(descriptor["Task"], 0)))
             event.clear()
             root.clear()
+    if builds is not None:
+        xml_path.unlink()
     if not want_switches:
         print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
     if processes is not None:
@@ -315,7 +319,7 @@ def compare_thread(pair, row, events, coverage, clock_ok, include_logger=False):
     return paired_pid
 
 
-def compare(report, pin, size, records, oracle_rows, after, limit, threads, images, processes=None, reference=None):
+def compare(report, pin, size, records, oracle_rows, after, limit, threads, images, processes=None, reference=None, builds=None):
     assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == size
     assert (report["provider_guid"], report["event_id"], report["opcode"], report["version"]) == (
         "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", 0, 46, 2)
@@ -343,6 +347,10 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
         assert report["reference_image"] == reference.source
     else:
         assert "reference_image" not in report
+    if builds is not None:
+        builds.check_records(report, images)
+    else:
+        assert "build_source" not in report and "build_records" not in report and "reference_build" not in report
     referenced, process_refs = set(), set()
     if processes is not None:
         assert report["process_source"] == processes.metadata(images is not None)
@@ -378,8 +386,10 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
                 if processes is not None:
                     bound = processes.image_in_process(process_answer, answer, images)
                     assert row["image_process_evidence"] == bound, ("image in process", seq)
+                    build = builds.expected(bound, answer, images, coverage and clock_ok) if builds is not None else None
+                    assert row.get("build_evidence") == build
                     if reference is not None:
-                        assert row["reference_evidence"] == reference.expected(bound, answer, images), ("reference", seq)
+                        assert row["reference_evidence"] == reference.expected(bound, answer, images, build), ("reference", seq)
                 assert row["image_evidence"] == answer, ("image relation", seq)
                 for witness in answer["witnesses"]:
                     referenced.update(n for n in (witness["before_record"], witness["after_record"]) if n is not None)
@@ -409,6 +419,8 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
             expected = images.by_ordinal[point["record_ordinal"]]
             if processes is not None:
                 expected = dict(expected, logger_id=rows[0]["logger_id"])
+            if builds is not None:
+                expected = dict(expected, merge_build=builds.endpoint(expected, coverage and clock_ok))
             assert point == expected, ("image record", point["record_ordinal"], [k for k in expected if expected[k] != point.get(k)])
     assert report["next_after"] == (after + limit if after + limit < len(oracle_rows) else None)
     return rows
@@ -452,7 +464,7 @@ def page_cases(count, all_pages):
 
 
 def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images, join_processes,
-             reference_args=None, expected_windows=None):
+             reference_args=None, expected_windows=None, join_builds=False):
     size = etl.stat().st_size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
@@ -465,29 +477,50 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
         shutil.copyfile(original, local)
         reference = run_path(str(Path(__file__).with_name("etl_reference_oracle.py")))["ReferenceOracle"](local, reference_args[1])
         join_images = join_processes = True
+    builds = None
+    if join_builds:
+        module = run_path(str(Path(__file__).with_name("etl_build_oracle.py")))
+        builds = module["BuildOracle"](reference)
+        if expected_count == 0:
+            module["check_reference_layouts"](exe, etl, pin, folder, run)
+        join_images = join_processes = True
     processes = run_path(str(Path(__file__).with_name("etl_process_oracle.py")))["ProcessOracle"]() if join_processes else None
-    records, samples, threads, images, _ = oracle(etl, folder, join_images, processes=processes)
+    records, samples, threads, images, _ = oracle(etl, folder, join_images, processes=processes, builds=builds)
+    if builds is not None:
+        builds.prepare(images)
     evidence_args = [f for enabled, f in ((join_processes, "--process-evidence"), (join_images, "--image-evidence"),
                                           (join_threads, "--thread-evidence")) if enabled]
     if reference is not None:
         evidence_args = ["--reference-image", reference.path, reference_args[1].upper()]
+    if builds is not None:
+        evidence_args = ["--build-evidence"] + (evidence_args if reference is not None else [])
+        canonical = run(exe, etl, pin, *evidence_args, "--limit", 3)
+        assert run(exe, etl, pin, "--process-evidence", "--image-evidence", "--thread-evidence", *evidence_args,
+                   "--limit", 3, "--after", 0) == canonical
+        run(exe, etl, pin, "--build-evidence", switches=True, rc=2)
     join_threads = join_threads or join_images or join_processes
     assert len(samples) == expected_count, (len(samples), expected_count)
     pages = page_cases(len(samples), all_pages)
     compared, compared_images, compared_processes, compared_bindings = {}, {}, {}, {}
-    reference_rows, differing_checksums = {}, set()
+    reference_rows, differing_checksums, build_rows = {}, set(), {}
+    same_rsds_with_checksum_conflict = set()
     for after, limit in pages:
         # The first call exercises the defaults, subsequent calls explicit paging.
         args = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
         report = run(exe, etl, pin.upper(), *evidence_args, *args)
-        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images, processes, reference)
+        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images, processes, reference, builds)
         for row in rows:
+            if builds is not None:
+                build_rows[row["sample_ordinal"]] = row["build_evidence"]["relation"]
             if reference is not None:
                 ref = row["reference_evidence"]
                 reference_rows[row["sample_ordinal"]] = (ref["relation"], ref["file_location"])
                 fields = ref["loader_fields"]
                 if fields and fields["file_name"] and fields["image_size"] and fields["pe_timestamp"] and fields["image_checksum"] is False:
                     differing_checksums.add(row["sample_ordinal"])
+                    comparison = row.get("build_evidence", {}).get("reference_comparison")
+                    if comparison and all(value is True for value in comparison.values()):
+                        same_rsds_with_checksum_conflict.add(row["sample_ordinal"])
             if join_processes:
                 compared_processes[row["sample_ordinal"]] = row["process_evidence"]["relation"]
                 if join_images:
@@ -528,6 +561,9 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
         assert partial["records_seen"] < records
         if join_threads:
             assert all(r["thread_evidence"]["paired_record_pid"] is None for r in partial["samples"])
+        if builds is not None:
+            assert all(r["build_evidence"]["relation"] == "process_image_unavailable" for r in partial["samples"])
+            assert all(p["merge_build"]["relation"] == "coverage_unqualified" for p in partial["image_records"])
         if join_images:
             assert all(r["image_evidence"]["reported_rva"] is None for r in partial["samples"])
         if join_processes:
@@ -556,7 +592,7 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     assert run(exe, etl, wrong, *evidence_args, rc=1)["status"] == "digest_mismatch"
     for args in (("--after", "-1"), ("--limit", 0), ("--limit", 129), ("--after", "01"),
                  ("--after", 1, "--after", 2), ("--limit", "1", "--limit", "2"), ("--thread-evidence", "--thread-evidence"),
-                 ("--image-evidence", "--image-evidence"), ("--process-evidence", "--process-evidence")):
+                 ("--image-evidence", "--image-evidence"), ("--process-evidence", "--process-evidence"), ("--build-evidence", "--build-evidence")):
         run(exe, etl, pin, *args, rc=2)
     bad = folder / "invalid.etl"
     bad.write_bytes(b"invalid test input")
@@ -574,6 +610,11 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
             assert windows == expected_windows, (windows, expected_windows)
         print("Reference comparison:", dict(Counter(reference_rows.values())), "file windows:", windows)
         print("Samples with matching name, size and stamp but a different checksum:", len(differing_checksums))
+        if builds is not None:
+            print("Matching merge GUID, age and stamp despite a loader checksum conflict:", len(same_rsds_with_checksum_conflict))
+    if builds is not None:
+        print("Merge marker opcodes:", dict(Counter(m["opcode"] for m in builds.by_record.values())),
+              "Sample build relations:", dict(Counter(build_rows.values())))
     if join_processes:
         print("Process source:", len(processes.points), "Defunct:", processes.defunct, "Raw process payloads:", processes.raw)
         print("Process relations:", dict(Counter(compared_processes.values())), "Image in process:", dict(Counter(compared_bindings.values())))
@@ -722,6 +763,7 @@ def main():
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
     parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
     parser.add_argument("--process-evidence", action="store_true", help="Check process lifetimes and optional image brackets for each sample")
+    parser.add_argument("--build-evidence", action="store_true", help="Check original merge marker payloads at both image boundaries")
     parser.add_argument("--reference-image", nargs=2, metavar=("LOCAL_PE", "PE_SHA256"), help="Check an explicit PE against ETL image records and the raw file bytes")
     parser.add_argument("--expect-reference-windows", type=int, help="Require this number of distinct samples with a verified file window on --all-pages")
     parser.add_argument("--intervals", action="store_true", help="Compare CPU, off-CPU and ReadyThread boundaries for each switch")
@@ -733,7 +775,7 @@ def main():
         parser.error("Expected reference windows require --reference-image and --all-pages.")
     if args.intervals and args.expect_switches is None:
         parser.error("Interval checks require --expect-switches.")
-    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence or args.process_evidence or args.reference_image):
+    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence or args.process_evidence or args.reference_image or args.build_evidence):
         parser.error("Thread, process and image joins apply to sampled profiles.")
     with tempfile.TemporaryDirectory(prefix="kn-etl-profile-") as directory:
         folder = Path(directory)
@@ -745,7 +787,7 @@ def main():
             exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail, args.intervals)
         else:
             exercise(exe, etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail,
-                     args.thread_evidence, args.image_evidence, args.process_evidence, args.reference_image, args.expect_reference_windows)
+                     args.thread_evidence, args.image_evidence, args.process_evidence, args.reference_image, args.expect_reference_windows, args.build_evidence)
 
 
 if __name__ == "__main__":

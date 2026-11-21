@@ -4,6 +4,7 @@
 #include "../user/EtlScheduleIntervals.h"
 #include "etl-process-evidence-selftest.h"
 #include "etl-reference-image-selftest.h"
+#include "etl-build-evidence-selftest.h"
 
 #include <array>
 
@@ -699,6 +700,7 @@ int wmain(int argc, wchar_t** argv)
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
             CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
+            etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")

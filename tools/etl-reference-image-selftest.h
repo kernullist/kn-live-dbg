@@ -94,7 +94,34 @@ namespace etl_reference_test
             auto unknown = at(0x1000);
             if (unknown.length || !is(unknown.relation, L"build_fields_unavailable")) { return false; }
         }
+        // When the original numeric build fields are unavailable, an equal
+        // merge pair and an unambiguous reference RSDS can discriminate builds.
+        BuildEvent rsds{};
+        rsds.guid = ImageIdProvider;
+        rsds.age = UINT32_MAX;
+        BuildPair pair{L"paired_merge_build", &rsds, pe.TimeDateStamp};
+        reference.build = {L"unique_rsds", rsds.guid, rsds.age, true};
+        auto withBuild = [&] { return CompareReference(reference, &record, name, 0x1000, &pair); };
+        if (withBuild().length != MaxReferenceWindow) { return false; }
+        ++pair.stamp;
+        if (withBuild().length || !is(withBuild().relation, L"merge_build_conflict")) { return false; }
+        pair.stamp = pe.TimeDateStamp;
         record.stamp = pe.TimeDateStamp;
+        record.checksum = pe.CheckSum;
+        --rsds.age;
+        if (withBuild().length || !is(withBuild().relation, L"merge_build_conflict")) { return false; }
+        ++rsds.age;
+        ++rsds.guid.Data1;
+        if (withBuild().length) { return false; }
+        rsds.guid = reference.build.guid;
+        ++record.checksum;
+        if (withBuild().length || !is(withBuild().relation, L"loader_field_conflict")) { return false; }
+        record.checksum = 0;
+        reference.build.valid = false;
+        if (withBuild().length || !is(withBuild().relation, L"build_id_unavailable")) { return false; }
+        reference.build.valid = true;
+        pair.rsds = nullptr;
+        if (withBuild().length || !is(withBuild().relation, L"build_id_unavailable") || !at(0x1000).length) { return false; }
         record.preferred = 0;
         if (at(0x1000).checksum != FieldComparison::Unavailable || !is(at(0x1000).defaultBase, L"unavailable") ||
             !at(0x1000).length) { return false; }

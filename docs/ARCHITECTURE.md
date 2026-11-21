@@ -1019,6 +1019,14 @@ between sampled addresses and bytes observed on disk. Runtime page contents
 and the sample's code version require capture-time evidence.
 [Reference file comparison](TRACE_IMPORT.md#compare-a-recorded-image-with-a-pinned-pe)
 
+In build-evidence mode the ETL reader indexes the merger's v2 ImageID and
+native RSDS records separately from the original loader records. It locates
+each marker by event clock tick, logger, payload PID and image base, retaining
+original ordinals on each boundary. Both endpoints must agree before a
+sample can be compared to the explicit reference's CodeView identity. The
+reference reader checks the declared debug directory and file bounds through
+the same lease used for its SHA-256. [Merge-time build comparison](TRACE_IMPORT.md#compare-merge-time-build-identifiers)
+
 `--etl-switches` uses the same pinned input and raw ETW callbacks to page
 through Thread/CSwitch v2, v3 and v4. The event header and scheduler payload
 retain their own IDs. An original record ordinal locates the switch across

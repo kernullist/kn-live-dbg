@@ -59,6 +59,8 @@ namespace executable_image
         uint32_t CheckSum = 0;
         uint16_t Machine = 0;
         uint16_t OptionalMagic = 0;
+        uint32_t DebugDirectoryRva = 0;
+        uint32_t DebugDirectorySize = 0;
         uint32_t PdbRva = 0;
         // Source record extent for bounded artifact-name discovery. This is not
         // part of the image comparison/normalization proof contract.

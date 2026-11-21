@@ -1,8 +1,6 @@
 #pragma once
 
-#include "EtlImageEvidence.h"
-#include "ExecutableImage.h"
-#include "SchemaArtifact.h"
+#include "EtlReferenceBuild.h"
 
 namespace etl_profile
 {
@@ -13,6 +11,7 @@ namespace etl_profile
         SchemaArtifact file;
         executable_image::DiskPeMetadata pe;
         std::wstring leaf;
+        ReferenceBuild build;
     };
 
     enum class FieldComparison { Unavailable, Equal, Different };
@@ -21,6 +20,21 @@ namespace etl_profile
     {
         if (!available) { return FieldComparison::Unavailable; }
         return recorded == supplied ? FieldComparison::Equal : FieldComparison::Different;
+    }
+
+    struct MergeFieldComparison
+    {
+        FieldComparison guid{}, age{}, stamp{};
+    };
+
+    inline MergeFieldComparison CompareMergeFields(const ReferenceImage& reference, const BuildPair& pair)
+    {
+        if (!pair.rsds) { return {}; }
+        const auto& file = reference.build;
+        auto guid = FieldComparison::Unavailable;
+        if (file.valid) { guid = IsEqualGUID(pair.rsds->guid, file.guid) ? FieldComparison::Equal : FieldComparison::Different; }
+        return {guid, CompareField(pair.rsds->age, file.age, file.valid),
+            CompareField(pair.stamp, reference.pe.TimeDateStamp, BuildStampPresent(pair.stamp))};
     }
 
     struct ReferenceComparison
@@ -34,7 +48,7 @@ namespace etl_profile
     };
 
     inline ReferenceComparison CompareReference(const ReferenceImage& reference, const ImageEvent* record,
-        std::wstring_view recordedName, uint64_t rva)
+        std::wstring_view recordedName, uint64_t rva, const BuildPair* build = nullptr)
     {
         ReferenceComparison result;
         if (!record) { return result; }
@@ -59,7 +73,14 @@ namespace etl_profile
         {
             if (comparison == FieldComparison::Different) { result.relation = L"loader_field_conflict"; return result; }
         }
-        if (result.stamp == FieldComparison::Unavailable && result.checksum == FieldComparison::Unavailable)
+        if (build)
+        {
+            const auto fields = CompareMergeFields(reference, *build);
+            if (fields.guid == FieldComparison::Unavailable) { result.relation = L"build_id_unavailable"; return result; }
+            if (fields.guid == FieldComparison::Different || fields.age == FieldComparison::Different || fields.stamp == FieldComparison::Different)
+            { result.relation = L"merge_build_conflict"; return result; }
+        }
+        else if (result.stamp == FieldComparison::Unavailable && result.checksum == FieldComparison::Unavailable)
         { result.relation = L"build_fields_unavailable"; return result; }
 
         if (record->preferred && !diskBase && !loadBase) { result.relation = L"default_base_unresolved"; return result; }

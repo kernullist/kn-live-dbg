@@ -25,7 +25,7 @@ namespace
         uint32_t limit = 64;
         std::wstring digest, referencePath, referenceDigest;
         bool switches = false, threads = false, images = false, processes = false;
-        bool intervals = false, haveTid = false;
+        bool intervals = false, haveTid = false, builds = false;
         uint32_t tid = 0;
         bool WithIntervals() const { return intervals || haveTid; }
         bool WithThreads() const { return threads || images || processes; }
@@ -33,6 +33,7 @@ namespace
         {
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
+            if (builds) { return L"{\"schema\":\"kn.etl_profile.v6\",\"status\":"; }
             if (!referencePath.empty()) { return L"{\"schema\":\"kn.etl_profile.v5\",\"status\":"; }
             if (processes) { return L"{\"schema\":\"kn.etl_profile.v4\",\"status\":"; }
             if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
@@ -65,7 +66,7 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 13 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 14 || args[0].empty() ||
             args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
@@ -73,6 +74,7 @@ namespace
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
             if (args[i] == L"--process-evidence" && !options.switches && !options.processes) { options.processes = true; continue; }
+            if (args[i] == L"--build-evidence" && !options.switches && !options.builds) { options.builds = true; continue; }
             if (args[i] == L"--reference-image" && !options.switches && options.referencePath.empty())
             {
                 if (args.size() - i < 3 || args[i + 1].empty() || !Digest(args[i + 2], options.referenceDigest)) { return false; }
@@ -91,7 +93,7 @@ namespace
             else { return false; }
             ++i;
         }
-        if (!options.referencePath.empty()) { options.images = true; options.processes = true; }
+        if (options.builds || !options.referencePath.empty()) { options.images = true; options.processes = true; }
         return true;
     }
 
@@ -107,6 +109,7 @@ namespace
         Options options;
         etl_profile::ThreadIndex threadIndex;
         etl_profile::ImageIndex imageIndex;
+        etl_profile::BuildIndex buildIndex;
         etl_profile::ProcessIndex processIndex;
         etl_profile::ScheduleHistory history;
         std::array<Sample, MaxPage> page{};
@@ -151,6 +154,7 @@ namespace
             h.EventDescriptor.Opcode >= 32 && h.EventDescriptor.Opcode <= 34) { ++scan.lossMarkers; }
         if (scan.replaying) { ReplayRecord(*event, scan); return; }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.builds) { scan.buildIndex.Observe(*event, scan.records); }
         if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
         if (scan.options.processes) { scan.processIndex.Observe(*event, scan.records, scan.options.images); }
         const bool keep = scan.matched >= scan.options.after && scan.used < scan.options.limit;
@@ -311,11 +315,59 @@ namespace
         return value == FieldComparison::Unavailable ? L"null" : value == FieldComparison::Equal ? L"true" : L"false";
     }
 
+    std::wstring BuildGuid(const GUID& id)
+    {
+        wchar_t out[37]{};
+        swprintf_s(out, L"%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", id.Data1, id.Data2, id.Data3,
+            id.Data4[0], id.Data4[1], id.Data4[2], id.Data4[3], id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
+        return Quote(out);
+    }
+
+    std::wstring BuildEventJson(const etl_profile::BuildEvent& e)
+    {
+        auto out = L"{\"record_ordinal\":" + std::to_wstring(e.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e.tick)) +
+            L",\"version\":2,\"opcode\":" + std::to_wstring(e.opcode) + L",\"pointer_bytes\":" + std::to_wstring(e.width) +
+            L",\"logger_id\":" + std::to_wstring(e.logger) + L",\"header_process_id\":" + std::to_wstring(e.headerPid) +
+            L",\"payload_pid\":" + std::to_wstring(e.pid) + L",\"image_base\":" + Hex(e.base);
+        if (!e.opcode) { out += L",\"image_size\":" + Hex(e.size) + L",\"pe_timestamp\":" + std::to_wstring(e.stamp); }
+        if (e.opcode == 36) { out += L",\"rsds_guid\":" + BuildGuid(e.guid) + L",\"pdb_age\":" + std::to_wstring(e.age); }
+        return out + L"}";
+    }
+
+    std::wstring MarkerJson(const etl_profile::MarkerRange& range, std::vector<const etl_profile::BuildEvent*>& records)
+    {
+        auto out = L"{\"marker_count\":" + std::to_wstring(range.count) + L",\"marker_records\":[";
+        for (size_t i = 0; i < (std::min)(range.count, size_t{2}); ++i)
+        {
+            if (i) { out += L','; }
+            records.push_back(range.first + i);
+            out += std::to_wstring(range.first[i].record);
+        }
+        return out + L"]}";
+    }
+
+    std::wstring BuildEndpointJson(const etl_profile::BuildEndpoint& e, std::vector<const etl_profile::BuildEvent*>& records)
+    {
+        return L",\"merge_build\":{\"relation\":" + Quote(e.relation) + L",\"loader_count\":" + std::to_wstring(e.loaders) +
+            L",\"image_id\":" + MarkerJson(e.info, records) + L",\"no_debug_id\":" + MarkerJson(e.none, records) +
+            L",\"native_rsds\":" + MarkerJson(e.rsds, records) + L"}";
+    }
+
+    std::wstring BuildPairJson(const etl_profile::BuildPair& pair, const etl_profile::ReferenceImage* reference)
+    {
+        auto out = L",\"build_evidence\":{\"relation\":" + Quote(pair.relation) + L",\"reference_comparison\":";
+        if (!pair.rsds || !reference) { return out + L"null}"; }
+        const auto fields = etl_profile::CompareMergeFields(*reference, pair);
+        return out + L"{\"rsds_guid_equal\":" + FieldJson(fields.guid) + L",\"pdb_age_equal\":" + FieldJson(fields.age) +
+            L",\"merge_timestamp_equal\":" + FieldJson(fields.stamp) + L"}}";
+    }
+
     bool AppendReferenceEvidence(std::wstring& report, const etl_profile::ReferenceImage& reference,
-        const etl_profile::ImageIndex& index, const etl_profile::ImageMatch& image, const etl_profile::ProcessImagePair& bound)
+        const etl_profile::ImageIndex& index, const etl_profile::ImageMatch& image, const etl_profile::ProcessImagePair& bound,
+        const etl_profile::BuildPair* build)
     {
         const auto* point = bound.paired ? image.witnesses[0].before : nullptr;
-        const auto result = etl_profile::CompareReference(reference, point, point ? index.Name(*point) : std::wstring_view{}, image.rva);
+        const auto result = etl_profile::CompareReference(reference, point, point ? index.Name(*point) : std::wstring_view{}, image.rva, build);
         report += L",\"reference_evidence\":{\"relation\":" + Quote(result.relation) + L",\"loader_fields\":";
         if (point)
         {
@@ -470,7 +522,7 @@ namespace
     bool Partial(const Scan& scan, BufferAccounting accounting)
     {
         return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
-            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete();
+            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete();
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
@@ -568,6 +620,17 @@ namespace
                 L",\"image_binding_clock_reversed\":" + (scan.options.images ? (index.imageClock.reversed ? L"true" : L"false") : L"null") +
                 L",\"generation_scope\":\"source_sha256_and_start_record\",\"creation_filetime\":null}";
         }
+        const bool buildCoverage = comparableClock && !captureGap && scan.imageIndex.Complete() && !scan.imageIndex.unsupported;
+        if (scan.options.builds)
+        {
+            const auto& index = scan.buildIndex;
+            result += L",\"build_source\":{\"provider_guid\":\"b3e675d7-2554-4f18-830b-2762732560de\",\"event_id\":0,"
+                L"\"version\":2,\"opcodes\":[0,32,36],\"origin\":\"merge_metadata\",\"producer_authenticity\":\"unverified\","
+                L"\"runtime_bytes_observed\":false,\"decoded_events\":" + std::to_wstring(index.decoded) +
+                L",\"retained_events\":" + std::to_wstring(index.events.size()) + L",\"unsupported_events\":" +
+                std::to_wstring(index.unsupported) + L",\"other_opcodes\":" + std::to_wstring(index.other) +
+                L",\"header_pid_conflicts\":" + std::to_wstring(index.pidConflicts) + L"}";
+        }
         if (reference)
         {
             const auto& pe = reference->pe;
@@ -578,6 +641,13 @@ namespace
                 L",\"image_checksum\":" + std::to_wstring(pe.CheckSum) + L",\"preferred_base\":" + Hex(pe.ImageBase) +
                 L",\"max_window_bytes\":" + std::to_wstring(etl_profile::MaxReferenceWindow) + L",\"runtime_bytes_observed\":false}";
         }
+        if (reference && scan.options.builds)
+        {
+            const auto& b = reference->build;
+            result += L",\"reference_build\":{\"status\":" + Quote(b.status) + L",\"rsds_guid\":" +
+                (b.valid ? BuildGuid(b.guid) : L"null") + L",\"pdb_age\":" + (b.valid ? std::to_wstring(b.age) : L"null") + L"}";
+        }
+        std::vector<const etl_profile::BuildEvent*> buildRecords;
         std::vector<const etl_profile::ImageEvent*> records;
         std::vector<const etl_profile::ProcessEvent*> processRecords;
         result += L",\"samples\":[";
@@ -603,7 +673,19 @@ namespace
                     {
                         const auto bound = etl_profile::ImageInProcess(process, image, scan.processIndex.imageClock.reversed);
                         evidence += ImageProcessJson(process, image, bound);
-                        if (reference && !AppendReferenceEvidence(evidence, *reference, scan.imageIndex, image, bound)) { return {}; }
+                        etl_profile::BuildPair build;
+                        if (scan.options.builds)
+                        {
+                            if (bound.paired)
+                            {
+                                const auto& witness = image.witnesses[0];
+                                build = etl_profile::MatchBuildPair(scan.buildIndex.At(*witness.before, buildCoverage),
+                                    scan.buildIndex.At(*witness.after, buildCoverage));
+                            }
+                            evidence += BuildPairJson(build, reference);
+                        }
+                        if (reference && !AppendReferenceEvidence(evidence, *reference, scan.imageIndex, image, bound,
+                            scan.options.builds ? &build : nullptr)) { return {}; }
                     }
                 }
                 result += SampleJson(scan.page[i], &pair, evidence, scan.options.processes);
@@ -613,9 +695,16 @@ namespace
         if (scan.options.images)
         {
             AppendRecords(result, L"image_records", records, [&](const auto& e) {
-                return ImageEventJson(e, scan.imageIndex, scan.options.processes);
+                auto row = ImageEventJson(e, scan.imageIndex, scan.options.processes);
+                if (scan.options.builds)
+                {
+                    row.pop_back();
+                    row += BuildEndpointJson(scan.buildIndex.At(e, buildCoverage), buildRecords) + L"}";
+                }
+                return row;
             });
         }
+        if (scan.options.builds) { AppendRecords(result, L"build_records", buildRecords, BuildEventJson); }
         if (scan.options.processes) { AppendRecords(result, L"process_records", processRecords, ProcessEventJson); }
         return result + L"]}";
     }
@@ -685,6 +774,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         { return Failure(scan.options, L"reference_digest_mismatch", source.Sha256, 0, reference.file.Sha256); }
         if (!executable_image::ReadDiskPeIdentityHandle(reference.file.Handle(), &reference.pe, nullptr))
         { return Failure(scan.options, L"reference_invalid_pe", source.Sha256, 0, reference.file.Sha256); }
+        if (scan.options.builds) { reference.build = etl_profile::ReadReferenceBuild(reference.file, reference.pe); }
         reference.leaf = referencePath.filename().wstring();
     }
     auto log = ConfigureLog(volumePath, scan);
@@ -697,6 +787,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         try
         {
             scan.threadIndex.Prepare();
+            if (scan.options.builds) { scan.buildIndex.Prepare(); }
             if (scan.options.images) { scan.imageIndex.Prepare(); }
             if (scan.options.processes) { scan.processIndex.Prepare(); }
         }
@@ -721,6 +812,11 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     if (scan.options.processes && scan.processIndex.Complete()) { scan.processIndex.Sort(); }
+    if (scan.options.builds)
+    {
+        try { scan.buildIndex.Sort(scan.imageIndex); }
+        catch (const std::bad_alloc&) { return Failure(scan.options, L"evidence_index_unavailable", source.Sha256); }
+    }
     const bool haveReference = !scan.options.referencePath.empty();
     const auto report = Report(scan, log.LogfileHeader, source, accounting, haveReference ? &reference : nullptr);
     if (haveReference && (!reference.file.PathNamesFile(referenceVolumePath) || !reference.file.Unchanged()))
@@ -752,7 +848,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
     }
     std::wcerr << (switches ?
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
-        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--reference-image <local.pe> <pe-sha256>]\n");
+        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--reference-image <local.pe> <pe-sha256>]\n");
     return 2;
 }
 

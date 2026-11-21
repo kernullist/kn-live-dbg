@@ -176,6 +176,9 @@ class PublicContentTests(unittest.TestCase):
         edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
         source = dict(thread_filter=5, matched_switches=2)
         split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
+        v6 = "kn.etl_profile.v6"
+        rsds = dict(rsds_guid="00000000-0000-0000-0000-000000000000", pdb_age=0)
+        markers = dict(marker_count=1, marker_records=[8])
         v5 = "kn.etl_profile.v5"
         artifact = dict(max_window_bytes=32, file_sha256="a" * 64, file_bytes=1024)
         reference_name = dict(file_sha256="a" * 64, file_bytes=1024, file_name="fixture.bin")
@@ -190,6 +193,11 @@ class PublicContentTests(unittest.TestCase):
         process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
         process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
         for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=v6, samples=[]), dict(build_records=[], schema=v6), rsds, markers,
+                       dict(loader_count=1, native_rsds=markers), dict(relation="endpoint_unqualified", reference_comparison=None),
+                       dict(rsds_guid_equal=True, pdb_age_equal=True, merge_timestamp_equal=None),
+                       dict(other_opcodes=0, header_pid_conflicts=1),
+                       dict(record_ordinal=1, header_process_id=3, payload_pid=3, image_base="0x1000"),
                        dict(schema=v5, samples=[]), dict(samples=[], schema=v5), artifact, fields, window, admitted, reference_name, reference_error,
                        dict(schema=v4, samples=[]), dict(samples=[], schema=v4), process, process["recorded_generation"],
                        process_point, process_image, process_source,

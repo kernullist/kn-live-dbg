@@ -176,7 +176,7 @@ returns `kn.etl_profile.v5`. Repeat both file names and digests when paging.
 The reference must be a resident file on a fixed local volume, up to 64 MiB.
 The reader parses its PE headers through a leased file handle, keeps both
 directory chains pinned through the scan and checks the reference bytes again
-before publishing the page. File names found in ETL events stay in the report.
+before publishing the page. The report preserves file names from the loader records.
 
 `reference_image` gives the reference SHA-256, size, supplied leaf name, PE
 machine, optional-header magic, image size, COFF stamp, header checksum and
@@ -209,6 +209,46 @@ file before relocation or runtime modification. The page keeps
 A missing reference, a reference digest mismatch or invalid PE returns exit 1
 with a status and no sample rows. A partial ETL still reports its observed
 sample rows and withholds their reference windows. [Windows PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) · [ETW image fields](https://learn.microsoft.com/en-us/windows/win32/etw/image-load)
+
+### Compare merge-time build identifiers
+
+Add `--build-evidence` to `--etl-profile` for `kn.etl_profile.v6`. It enables
+the process and image evidence used to locate a sample. It works with or
+without an explicitly pinned reference PE. The Windows trace merger can add
+ImageID and native RSDS records by inspecting files during the merge.
+`build_source.origin` records that provenance. Capture-time memory contents,
+the producer's authenticity and the sampled code version remain unknown.
+[Microsoft PerfView merge-event parser](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/Parsers/SymbolTraceEventParser.cs)
+
+Each returned image record has a `merge_build` object. The reader looks
+for one loader at the same raw timestamp, logger, payload PID and image base.
+It counts ImageID (opcode 0), the observed v2 no-debug-ID marker (32) and
+native RSDS (36) separately. Each role lists up to two original callback
+ordinals. `build_records` contains those referenced events once, including
+raw image sizes, COFF stamps, RSDS GUIDs and unsigned PDB ages as applicable.
+The reader discards the embedded original-image and PDB names. Other opcodes
+have a separate count, including managed and portable debug records.
+
+A qualified endpoint requires one ImageID and one native RSDS, matching
+pointer widths and image size, consistent available stamps, a nonzero GUID,
+and no competing marker. Malformed supported records, conflicting marker
+header and payload PIDs, source loss, unusable clocks and incomplete indexes
+withhold qualification. The build index retains up to 131,072 decoded
+records. A sample receives `paired_merge_build` only when both boundaries
+of its process-bound image agree on the merge stamp, GUID and age.
+
+With `--reference-image`, `reference_build` reports whether the supplied
+file has one readable RSDS CodeView record. Mapped entries must agree on
+their RVA and file offset, and fit within the headers or a section's declared
+virtual and raw extents. A raw-only entry may reference data outside the
+mapped image. The reader accepts up to 1,024 debug directory entries and up
+to 65,536 bytes in the single CodeView record. Multiple CodeView entries,
+invalid extents and a missing
+usable identity withhold the file window. `build_evidence.reference_comparison`
+exposes the GUID, age and available merge-stamp comparisons even if a loader
+checksum conflicts. A matching build pair can distinguish the supplied PE
+when neither loader checksum nor loader stamp is available. Every comparable
+loader field must still agree. [Microsoft PE debug directory](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#debug-directory-image-only)
 
 ## Saved Windows context switches
 
