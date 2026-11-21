@@ -1,5 +1,6 @@
 #include "EtlProfile.h"
 #include "EtlThreadEvidence.h"
+#include "EtlImageEvidence.h"
 #include "ArtifactOutput.h"
 #include "RuntimeCapabilities.h"
 
@@ -14,10 +15,6 @@ namespace
     constexpr uint64_t MaxBytes = 512ull << 20;
     constexpr uint32_t MaxRecords = 2'000'000;
     constexpr uint32_t MaxPage = 128;
-    const wchar_t* Prefix(bool threads)
-    {
-        return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
-    }
     using mcpjson::Quote;
 
     struct Options
@@ -25,7 +22,13 @@ namespace
         uint32_t after = 0;
         uint32_t limit = 64;
         std::wstring digest;
-        bool threads = false;
+        bool threads = false, images = false;
+        bool WithThreads() const { return threads || images; }
+        const wchar_t* Prefix() const
+        {
+            if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
+            return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
+        }
     };
 
     bool Decimal(const std::wstring& text, uint32_t maximum, uint32_t& value)
@@ -44,7 +47,7 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 8 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 9 || args[0].empty() ||
             args[1] != L"--sha256" || args[2].size() != 64 ||
             args[2].find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
         options.digest = args[2];
@@ -54,6 +57,7 @@ namespace
         for (size_t i = 3; i < args.size(); ++i)
         {
             if (args[i] == L"--thread-evidence" && !options.threads) { options.threads = true; continue; }
+            if (args[i] == L"--image-evidence" && !options.images) { options.images = true; continue; }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
             { haveAfter = true; }
@@ -69,6 +73,7 @@ namespace
     {
         Options options;
         etl_profile::ThreadIndex threadIndex;
+        etl_profile::ImageIndex imageIndex;
         uint32_t records = 0, samples = 0, unsupported = 0, lossMarkers = 0;
         uint64_t processedBuffers = 0;
         bool budgetExceeded = false;
@@ -81,7 +86,8 @@ namespace
         auto& scan = *static_cast<Scan*>(event->UserContext);
         if (scan.records == MaxRecords) { scan.budgetExceeded = true; return; }
         ++scan.records;
-        if (scan.options.threads) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
         const auto& h = event->EventHeader;
         if (IsEqualGUID(h.ProviderId, LostEvent) && (h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) &&
             h.EventDescriptor.Opcode >= 32 && h.EventDescriptor.Opcode <= 34) { ++scan.lossMarkers; }
@@ -164,7 +170,37 @@ namespace
             L",\"after\":" + ThreadPointJson(pair.after) + L"}";
     }
 
-    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread)
+    std::wstring ImageEventJson(const etl_profile::ImageEvent& e, const etl_profile::ImageIndex& index)
+    {
+        return L"{\"record_ordinal\":" + std::to_wstring(e.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e.tick)) +
+            L",\"opcode\":" + std::to_wstring(e.opcode) + L",\"version\":" + std::to_wstring(e.version) +
+            L",\"pointer_bytes\":" + std::to_wstring(e.width) + L",\"payload_pid\":" + std::to_wstring(e.pid) +
+            L",\"image_base\":" + Hex(e.base) + L",\"image_size\":" + Hex(e.size) + L",\"preferred_base\":" + Hex(e.preferred) +
+            L",\"image_checksum\":" + std::to_wstring(e.checksum) + L",\"pe_timestamp\":" + std::to_wstring(e.stamp) +
+            L",\"signature_level\":" + (e.version == 3 ? std::to_wstring(e.signatureLevel) : L"null") +
+            L",\"signature_type\":" + (e.version == 3 ? std::to_wstring(e.signatureType) : L"null") +
+            L",\"recorded_file_name\":" + Quote(std::wstring(index.Name(e))) + L"}";
+    }
+
+    std::wstring ImageMatchJson(const etl_profile::ImageMatch& match, std::vector<const etl_profile::ImageEvent*>& records)
+    {
+        auto result = L",\"image_evidence\":{\"relation\":" + Quote(match.relation) +
+            L",\"candidate_ranges\":" + std::to_wstring(match.count) + L",\"reported_rva\":" +
+            (match.paired ? Hex(match.rva) : L"null") + L",\"witnesses\":[";
+        for (size_t i = 0; i < (std::min)(match.count, match.witnesses.size()); ++i)
+        {
+            const auto& w = match.witnesses[i];
+            if (i) { result += L','; }
+            if (w.before) { records.push_back(w.before); }
+            if (w.after) { records.push_back(w.after); }
+            result += L"{\"relation\":" + Quote(w.relation) + L",\"before_record\":" +
+                (w.before ? std::to_wstring(w.before->record) : L"null") + L",\"after_record\":" +
+                (w.after ? std::to_wstring(w.after->record) : L"null") + L"}";
+        }
+        return result + L"]}";
+    }
+
+    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread, const std::wstring& image = {})
     {
         return L"{\"sample_ordinal\":" + std::to_wstring(s.ordinal) + L",\"record_ordinal\":" + std::to_wstring(s.record) +
             L",\"raw_timestamp\":" + Quote(std::to_wstring(s.timestamp)) + L",\"cpu\":" + std::to_wstring(s.cpu) +
@@ -177,12 +213,12 @@ namespace
             L",\"event_level\":" + std::to_wstring(s.level) + L",\"event_channel\":" + std::to_wstring(s.channel) +
             L",\"event_task\":" + std::to_wstring(s.task) + L",\"extended_data_items\":" + std::to_wstring(s.extendedItems) +
             L",\"stack_extension_items\":" + std::to_wstring(s.stackItems) +
-            (thread ? ThreadPairJson(*thread) : L"") + L"}";
+            (thread ? ThreadPairJson(*thread) : L"") + image + L"}";
     }
 
-    int Failure(bool threads, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0)
+    int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0)
     {
-        const auto report = std::wstring(Prefix(threads)) + Quote(status) + L",\"source_sha256\":" +
+        const auto report = std::wstring(options.Prefix()) + Quote(status) + L",\"source_sha256\":" +
             (digest.empty() ? L"null" : Quote(digest)) + L",\"win32_status\":" +
             (error ? std::to_wstring(error) : L"null") + L"}";
         return WriteCapabilityJson(report) ? 1 : 2;
@@ -203,7 +239,8 @@ namespace
 
     bool Partial(const Scan& scan, BufferAccounting accounting)
     {
-        return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More || !scan.threadIndex.Complete();
+        return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
+            !scan.threadIndex.Complete() || !scan.imageIndex.Complete();
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting)
@@ -214,7 +251,7 @@ namespace
         const auto comparison = accounting == BufferAccounting::Matched ? L"matched" :
             accounting == BufferAccounting::Fewer ? L"fewer_than_declared" :
             accounting == BufferAccounting::More ? L"more_than_declared" : L"not_comparable";
-        auto result = std::wstring(Prefix(scan.options.threads)) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
+        auto result = std::wstring(scan.options.Prefix()) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
             L",\"source_bytes\":" + std::to_wstring(source.Bytes()) +
             L",\"provider_guid\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\",\"event_id\":0,\"opcode\":46,\"version\":2" +
             L",\"clock\":{\"raw_type\":" + std::to_wstring(h.ReservedFlags) + L",\"kind\":" + Quote(clock) +
@@ -234,25 +271,51 @@ namespace
             L",\"unsupported_profile_records\":" + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
             L",\"next_after\":" + (scan.used && scan.page[scan.used - 1].ordinal < scan.samples ?
                 std::to_wstring(scan.page[scan.used - 1].ordinal) : L"null");
-        if (scan.options.threads)
+        if (scan.options.WithThreads())
         {
             result += L",\"thread_source\":{\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"version\":3,"
                 L"\"decoded_events\":" + std::to_wstring(scan.threadIndex.decoded) +
                 L",\"retained_events\":" + std::to_wstring(scan.threadIndex.events.size()) +
                 L",\"unsupported_events\":" + std::to_wstring(scan.threadIndex.unsupported) + L"}";
         }
+        if (scan.options.images)
+        {
+            result += L",\"image_source\":{\"provider_guid\":\"2cb15d1d-5fc1-11d2-abe1-00a0c911f518\",\"versions\":[2,3],"
+                L"\"decoded_events\":" + std::to_wstring(scan.imageIndex.decoded) +
+                L",\"retained_events\":" + std::to_wstring(scan.imageIndex.events.size()) +
+                L",\"unsupported_events\":" + std::to_wstring(scan.imageIndex.unsupported) +
+                L",\"retention\":" + Quote(scan.imageIndex.retention) + L"}";
+        }
+        std::vector<const etl_profile::ImageEvent*> records;
         const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
         const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
         result += L",\"samples\":[";
         for (size_t i = 0; i < scan.used; ++i)
         {
             if (i) { result += L','; }
-            if (scan.options.threads)
+            if (scan.options.WithThreads())
             {
                 const auto pair = scan.threadIndex.Lookup(scan.page[i], comparableClock, captureGap);
-                result += SampleJson(scan.page[i], &pair);
+                if (scan.options.images)
+                {
+                    const uint32_t pid = pair.pairedPid ? pair.before->pid : 0;
+                    const auto image = scan.imageIndex.Lookup(scan.page[i], pid, comparableClock, captureGap);
+                    result += SampleJson(scan.page[i], &pair, ImageMatchJson(image, records));
+                }
+                else { result += SampleJson(scan.page[i], &pair); }
             }
             else { result += SampleJson(scan.page[i], nullptr); }
+        }
+        if (scan.options.images)
+        {
+            result += L"],\"image_records\":[";
+            std::sort(records.begin(), records.end(), [](const auto* a, const auto* b) { return a->record < b->record; });
+            records.erase(std::unique(records.begin(), records.end()), records.end());
+            for (size_t i = 0; i < records.size(); ++i)
+            {
+                if (i) { result += L','; }
+                result += ImageEventJson(*records[i], scan.imageIndex);
+            }
         }
         return result + L"]}";
     }
@@ -264,7 +327,7 @@ int RunEtlProfile(const std::vector<std::wstring>& args)
     if (!Parse(args, scan.options))
     {
         return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence]\n";
+            std::wcerr << L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence]\n";
             return 2;
         });
     }
@@ -275,9 +338,9 @@ int RunEtlProfile(const std::vector<std::wstring>& args)
     if (!symbol_artifacts::LocalRoot(args[0], &path) || !parents.Pin(path.parent_path(), false) ||
         !OpenSource(path, parents, source, volumePath))
     {
-        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options.threads, L"source_unavailable"); });
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options, L"source_unavailable"); });
     }
-    if (source.Sha256 != scan.options.digest) { return Failure(scan.options.threads, L"digest_mismatch", source.Sha256); }
+    if (source.Sha256 != scan.options.digest) { return Failure(scan.options, L"digest_mismatch", source.Sha256); }
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = volumePath.data();
     log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
@@ -286,20 +349,26 @@ int RunEtlProfile(const std::vector<std::wstring>& args)
     log.Context = &scan;
     Trace trace;
     trace.handle = OpenTraceW(&log);
-    if (trace.handle == INVALID_PROCESSTRACE_HANDLE) { return Failure(scan.options.threads, L"open_trace_failed", source.Sha256, GetLastError()); }
-    if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return Failure(scan.options.threads, L"segmented_source", source.Sha256); }
-    if (scan.options.threads)
+    if (trace.handle == INVALID_PROCESSTRACE_HANDLE) { return Failure(scan.options, L"open_trace_failed", source.Sha256, GetLastError()); }
+    if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return Failure(scan.options, L"segmented_source", source.Sha256); }
+    if (scan.options.WithThreads())
     {
-        try { scan.threadIndex.Prepare(); }
-        catch (const std::bad_alloc&) { return Failure(true, L"thread_index_unavailable", source.Sha256); }
+        try
+        {
+            scan.threadIndex.Prepare();
+            if (scan.options.images) { scan.imageIndex.Prepare(); }
+        }
+        catch (const std::bad_alloc&)
+        { return Failure(scan.options, scan.options.images ? L"evidence_index_unavailable" : L"thread_index_unavailable", source.Sha256); }
     }
     const auto status = ProcessTrace(&trace.handle, 1, nullptr, nullptr);
-    if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options.threads, L"source_changed"); }
-    if (scan.budgetExceeded) { return Failure(scan.options.threads, L"record_budget_exceeded", source.Sha256); }
-    if (status != ERROR_SUCCESS) { return Failure(scan.options.threads, L"process_trace_failed", source.Sha256, status); }
+    if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
+    if (scan.budgetExceeded) { return Failure(scan.options, L"record_budget_exceeded", source.Sha256); }
+    if (status != ERROR_SUCCESS) { return Failure(scan.options, L"process_trace_failed", source.Sha256, status); }
     const auto accounting = AccountBuffers(scan, log.LogfileHeader);
     const bool partial = Partial(scan, accounting);
-    if (scan.options.threads && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
-    if (!partial && scan.options.after > scan.samples) { return Failure(scan.options.threads, L"cursor_out_of_range", source.Sha256); }
+    if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
+    if (!partial && scan.options.after > scan.samples) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     return WriteCapabilityJson(Report(scan, log.LogfileHeader, source, accounting)) ? (partial ? 1 : 0) : 2;
 }

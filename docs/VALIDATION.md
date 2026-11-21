@@ -4855,6 +4855,38 @@ missing and embedded terminators, odd lengths, unpaired surrogates and the
 largest even payload representable by the ETW length field. Fourteen saved
 v1/v2 pages from the earlier fixtures retained their exact UTF-8 contents.
 
+### Image range comparison
+
+On 2026-11-22, the public `--image-evidence` command and Windows
+`tracerpt -rts` agreed on all 173,833 sample rows from the four pinned
+files above. The checker used TDH's named Image fields and an independent
+chronological history for each PID and base. For every referenced record it
+compared the original ordinal, raw tick, opcode, version, pointer width,
+payload PID, bases, size, PE fields, signature fields and exact file name.
+
+| Source | Image records | Load/unload | With rundown | Identity conflict | No recorded range | No paired thread PID |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| x64 fixture | 3,596 | 0 | 422 | 506 | 5,273 | 73,327 |
+| x86 fixture | 3,734 | 2 | 881 | 2,356 | 3,431 | 82,139 |
+| SimpleAllocator | 44,895 | 0 | 2,831 | 0 | 1,681 | 984 |
+| Control | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Run `tools/test-etl-profile.py` with `--image-evidence --all-pages
+--check-short-tail` and the pinned digest and sample count for each file.
+The x64 and x86 fixture names describe the workload. Both carried version-2
+image events with 64-bit kernel pointers. SimpleAllocator carried version 3.
+The two load/unload samples and 4,134 samples bracketed using rundown have a
+source-reported RVA. These fixtures supply no independent process generation
+or retained code bytes for those samples.
+
+The native harness exercised both pointer widths, remapping at the same
+base, overlapping ranges, name and signature disagreement, time ordering,
+incomplete coverage, the last representable address and both index limits.
+The ordinary Release run and the process-scoped ASan run passed the layout
+checks and 93 normalized controls. The latter used the interceptor override
+described above and emitted the startup warning. Fourteen saved v1/v2 pages
+matched their earlier output byte for byte.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

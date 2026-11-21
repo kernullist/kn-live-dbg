@@ -992,6 +992,16 @@ timestamps, consistent thread transitions and an intact bounded index.
 Rundown records describe membership at collection time. The association
 stays local to the pinned ETL.
 
+`--image-evidence` extends the thread report with classic Image v2/v3 load,
+unload and rundown records. The index groups each payload PID and image base
+by original event ordinal. A paired thread PID narrows the search to recorded
+ranges for that process number. A reported RVA requires one consistent pair
+of enclosing image records. The page retains references to contrary records,
+including overlapping ranges. Each referenced image carries its original
+file name and PE metadata. Binding those records to a process generation,
+an address space and retained executable bytes is a separate step.
+[ETL image evidence](TRACE_IMPORT.md#locate-image-records-for-a-sampled-ip)
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in

@@ -159,7 +159,16 @@ class PublicContentTests(unittest.TestCase):
         v2 = "kn.etl_profile.v2"
         point = dict(record_ordinal=1, raw_timestamp="2", event="start", opcode=1, payload_pid=3, payload_tid=4)
         pair = dict(relation="one_boundary", paired_record_pid=None, before=point, after=None)
-        for record in (dict(schema=v2, samples=[]), point, pair):
+        v3 = "kn.etl_profile.v3"
+        image = dict(record_ordinal=8, raw_timestamp="9", payload_pid=3, image_base="0x20", image_size="0x10")
+        identity = dict(image_checksum=4, pe_timestamp=5, recorded_file_name="sample.dll")
+        witness = dict(relation="one_boundary", before_record=8, after_record=None)
+        evidence = dict(relation="one_boundary", candidate_ranges=1, reported_rva=None, witnesses=[witness])
+        for record in (dict(schema=v2, samples=[]), point, pair, dict(schema=v3, image_records=[]),
+                       image, identity, evidence, witness):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                intact = json.dumps(record, indent=2).encode(encoding)
+                self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("page.txt", intact)})
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 fragment = ("log\n" + json.dumps(record)[:-1]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("fragment.txt", fragment)})
@@ -168,7 +177,8 @@ class PublicContentTests(unittest.TestCase):
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
             self.assertIn("private-evidence-bundle", {r["rule"] for r in
                           AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
-        self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + schema + ".").encode()), [])
+        for version in (schema, v2, v3):
+            self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + version + ".").encode()), [])
 
     def test_wait_captures_and_reports(self):
         for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1"):

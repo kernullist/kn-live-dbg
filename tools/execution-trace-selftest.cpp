@@ -1,5 +1,6 @@
 #include "../user/ExecutionTrace.h"
 #include "../user/EtlThreadEvidence.h"
+#include "../user/EtlImageEvidence.h"
 
 #include <array>
 
@@ -189,11 +190,174 @@ static bool CheckThreadEvidence()
     return index.events.size() == MaxThreadEvents && index.decoded == MaxThreadEvents + 1 && check(L"index_limit", false);
 }
 
+static bool CheckImageLayout()
+{
+    using namespace etl_profile;
+    ImageEvent point{};
+    const uint8_t* name = nullptr;
+    std::array<uint8_t, 73> storage{};
+    auto* bytes = storage.data() + 1;
+    EVENT_RECORD record{};
+    auto& h = record.EventHeader;
+    h.ProviderId = ImageProvider;
+    h.TimeStamp.QuadPart = 123;
+    record.UserData = bytes;
+    for (uint8_t width : {uint8_t{4}, uint8_t{8}})
+    {
+        h.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | (width == 4 ? EVENT_HEADER_FLAG_32_BIT_HEADER : EVENT_HEADER_FLAG_64_BIT_HEADER);
+        const uint64_t max = width == 4 ? UINT32_MAX : UINT64_MAX;
+        const uint64_t base = max - 3, size = 4, preferred = base - 91;
+        const size_t fixed = 3 * width + 32;
+        std::memcpy(bytes, &base, width);
+        std::memcpy(bytes + width, &size, width);
+        const uint32_t metadata[] = {19, 0xabcd, 4321, 0x0908};
+        std::memcpy(bytes + 2 * width, metadata, sizeof(metadata));
+        std::memcpy(bytes + 2 * width + 16, &preferred, width);
+        const uint8_t suffix[] = {0x3d, 0xd8, 0, 0xde, 0, 0};
+        std::memcpy(bytes + fixed, suffix, sizeof(suffix));
+        record.UserDataLength = static_cast<USHORT>(fixed + sizeof(suffix));
+        for (uint8_t version : {uint8_t{2}, uint8_t{3}})
+        {
+            h.EventDescriptor.Version = version;
+            for (uint8_t op : {uint8_t{2}, uint8_t{3}, uint8_t{4}, uint8_t{10}})
+            {
+                h.EventDescriptor.Opcode = op;
+                if (DecodeImage(record, 14, point, name) != Match::Decoded || name != bytes + fixed ||
+                    point.nameUnits != 2 || point.base != base || point.size != size || point.preferred != preferred ||
+                    point.checksum != metadata[1] || point.stamp != metadata[2] || point.pid != metadata[0] ||
+                    point.version != version || point.width != width || point.opcode != op || point.record != 14 ||
+                    point.tick != 123 || point.signatureLevel != (version == 3 ? 8 : 0) ||
+                    point.signatureType != (version == 3 ? 9 : 0)) { return false; }
+            }
+        }
+        auto bad = record;
+        for (const size_t n : {fixed - 1, fixed, fixed + 2, fixed + 4, fixed + 5, fixed + 8})
+        {
+            bad.UserDataLength = static_cast<USHORT>(n);
+            if (DecodeImage(bad, 1, point, name) != Match::Unsupported) { return false; }
+        }
+        bad = record;
+        bad.EventHeader.Flags |= EVENT_HEADER_FLAG_64_BIT_HEADER | EVENT_HEADER_FLAG_32_BIT_HEADER;
+        if (DecodeImage(bad, 1, point, name) != Match::Unsupported) { return false; }
+        bad = record;
+        bad.EventHeader.EventDescriptor.Version = 4;
+        if (DecodeImage(bad, 1, point, name) != Match::Unsupported) { return false; }
+        bad.EventHeader.EventDescriptor.Opcode = 33;
+        if (DecodeImage(bad, 1, point, name) != Match::Other) { return false; }
+        bytes[width] = 0;
+        if (DecodeImage(record, 1, point, name) != Match::Unsupported) { return false; }
+        bytes[width] = 5;
+        if (DecodeImage(record, 1, point, name) != Match::Unsupported) { return false; }
+        bytes[width] = 4;
+        bytes[fixed + 3] = 0;
+        if (DecodeImage(record, 1, point, name) != Match::Unsupported) { return false; }
+    }
+    std::memset(bytes, 0, 64);
+    bytes[8] = 1;
+    bytes[56] = 'a';
+    record.UserDataLength = 60;
+    ImageIndex index;
+    index.Prepare();
+    index.names.resize(MaxImageNameUnits - 1);
+    index.Observe(record, 1);
+    index.Observe(record, 2);
+    index.Observe(record, 3);
+    Sample sample{};
+    if (index.names.size() != MaxImageNameUnits || index.events.size() != 1 || index.decoded != 3 ||
+        index.Name(index.events.front()) != L"a" || std::wstring_view(index.retention) != L"name_limit" ||
+        std::wstring_view(index.Lookup(sample, 19, true, false).relation) != L"index_limit") { return false; }
+    index.names.clear();
+    index.events.clear();
+    index.decoded = 0;
+    for (uint32_t i = 0; i <= MaxImageEvents; ++i) { index.Observe(record, i + 1); }
+    return index.events.size() == MaxImageEvents && index.decoded == MaxImageEvents + 1 &&
+        std::wstring_view(index.retention) == L"event_limit" && !index.Complete();
+}
+
+static bool CheckImageEvidence()
+{
+    using namespace etl_profile;
+    ImageIndex index;
+    index.names = {L'A', L'B'};
+    auto point = [](uint32_t n, uint8_t op, uint32_t pid, uint64_t base) {
+        ImageEvent e{};
+        e.record = n; e.tick = 10 * n; e.opcode = op; e.pid = pid;
+        e.base = base; e.size = 0x100; e.nameUnits = 1; e.width = 8; e.version = 3;
+        return e;
+    };
+    const auto load = point(10, 10, 19, 0x1200), unload = point(30, 2, 19, 0x1200);
+    Sample sample{};
+    sample.ip = 0x1260;
+    sample.record = 20;
+    sample.timestamp = 200;
+    auto lookup = [&](uint32_t pid = 19, bool clock = true, bool gap = false) {
+        index.decoded = static_cast<uint32_t>(index.events.size());
+        index.Sort();
+        return index.Lookup(sample, pid, clock, gap);
+    };
+    auto is = [](const ImageMatch& result, const wchar_t* relation, bool paired = false) {
+        return result.paired == paired && std::wstring_view(result.relation) == relation;
+    };
+    index.events = {unload, load, point(8, 10, 71, load.base), point(32, 2, 71, load.base)};
+    auto matched = lookup();
+    if (!is(matched, L"load_unload", true) || matched.count != 1 || matched.rva != 0x60 ||
+        matched.witnesses[0].before->record != 10 || matched.witnesses[0].after->record != 30 ||
+        !is(lookup(12), L"no_recorded_range") || !is(lookup(0), L"thread_pid_unavailable") ||
+        !is(lookup(19, false), L"clock_unqualified") || !is(lookup(19, true, true), L"coverage_unqualified")) { return false; }
+    index.unsupported = 1;
+    if (!is(lookup(), L"coverage_unqualified")) { return false; }
+    index.unsupported = 0;
+    sample.ip = load.base + load.size;
+    if (!is(lookup(), L"no_recorded_range")) { return false; }
+    sample.ip = load.base;
+    if (!is(lookup(), L"load_unload", true) || lookup().rva != 0) { return false; }
+    sample.ip = load.base + 0x60;
+    index.events = {load};
+    if (!is(lookup(), L"one_boundary") || lookup().witnesses[0].after) { return false; }
+    index.events = {point(10, 2, 19, load.base), point(30, 10, 19, load.base)};
+    if (!is(lookup(), L"no_recorded_range")) { return false; }
+    index.events = {point(10, 3, 19, load.base), point(30, 4, 19, load.base)};
+    if (!is(lookup(), L"rundown_bracket", true)) { return false; }
+    index.events[0].tick = sample.timestamp;
+    if (!is(lookup(), L"clock_unqualified")) { return false; }
+    index.events[0].tick = 400;
+    if (!is(lookup(), L"clock_unqualified")) { return false; }
+    index.events = {load, unload};
+    index.events[1].nameOffset = 1;
+    if (!is(lookup(), L"image_identity_conflict")) { return false; }
+    index.events[1] = unload;
+    index.events[1].signatureType = 7;
+    if (!is(lookup(), L"image_identity_conflict")) { return false; }
+    index.events[1] = unload;
+    index.events[1].size = 64;
+    if (!is(lookup(), L"image_identity_conflict")) { return false; }
+    index.events[1] = unload;
+    index.events[0].nameUnits = index.events[1].nameUnits = 0;
+    if (!is(lookup(), L"missing_image_name")) { return false; }
+    index.events = {load, unload, point(31, 10, 19, load.base), point(45, 2, 19, load.base)};
+    index.events[2].nameOffset = index.events[3].nameOffset = 1;
+    if (!is(lookup(), L"load_unload", true)) { return false; }
+    sample.record = 40;
+    sample.timestamp = 400;
+    auto remap = lookup();
+    if (!is(remap, L"load_unload", true) || index.Name(*remap.witnesses[0].before) != L"B") { return false; }
+    sample.record = 20;
+    sample.timestamp = 200;
+    index.events = {load, unload, point(12, 10, 19, 0x1220), point(35, 2, 19, 0x1220), point(5, 3, 19, 0x1240)};
+    auto overlap = lookup();
+    if (!is(overlap, L"overlapping_ranges") || overlap.count != 3 ||
+        overlap.witnesses[0].before->base != 0x1240 || overlap.witnesses[1].before->base != 0x1220) { return false; }
+    index.events = {load, unload, point(5, 10, 19, 0x1220), point(12, 2, 19, 0x1220)};
+    if (!is(lookup(), L"load_unload", true)) { return false; }
+    index.events.push_back(point(11, 3, 19, load.base));
+    return is(lookup(), L"conflicting_transitions");
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
-        return CheckProfileRecord() && CheckThreadEvidence() ? 0 : 1;
+        return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

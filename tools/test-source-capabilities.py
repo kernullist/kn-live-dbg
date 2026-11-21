@@ -200,6 +200,8 @@ def main():
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]
     assert "thread_v3_start_end_and_rundown_records" in profile["requirements"] and "65536_thread_events" in profile["limits"]
+    assert "process_scoped_image_v2_v3_load_unload_and_rundown" in profile["requirements"]
+    assert "65536_image_events" in profile["limits"] and "16MiB_image_names" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
     observe = by_key[("session", "observe_scope", "mcp")]
     assert observe["consistency"] == "listener_lifetime"
@@ -227,6 +229,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
+    assert "--etl-profile" in help_result.stdout and "--image-evidence" in help_result.stdout
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
     assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout

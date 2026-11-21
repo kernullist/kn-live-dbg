@@ -21,6 +21,26 @@ namespace etl_profile
 
     enum class Match { Other, Unsupported, Decoded };
 
+    // ETW payloads may be unaligned. Require exactly one complete UTF-16LE string.
+    inline bool TerminatedUtf16(const uint8_t* bytes, size_t size)
+    {
+        if (!bytes || !size || size % 2) { return false; }
+        bool needLow = false;
+        for (size_t offset = 0; offset < size; offset += 2)
+        {
+            const unsigned unit = bytes[offset] | (static_cast<unsigned>(bytes[offset + 1]) << 8);
+            if (unit == 0) { return !needLow && offset + 2 == size; }
+            if (needLow)
+            {
+                if (unit < 0xdc00 || unit > 0xdfff) { return false; }
+                needLow = false;
+            }
+            else if (unit >= 0xd800 && unit <= 0xdbff) { needLow = true; }
+            else if (unit >= 0xdc00 && unit <= 0xdfff) { return false; }
+        }
+        return false;
+    }
+
     inline uint8_t ClassicPointerWidth(const EVENT_HEADER& header, uint8_t version)
     {
         if (header.EventDescriptor.Id != 0 || header.EventDescriptor.Version != version ||

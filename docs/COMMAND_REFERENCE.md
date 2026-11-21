@@ -955,6 +955,16 @@ records agree and coverage permits the comparison.
 & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 8 --thread-evidence
 ```
 
+Use `--image-evidence` to include the thread boundaries and check which
+recorded image range contains the sampled IP in the same PID. Look up each
+witness ordinal in `image_records`. A null `reported_rva` leaves the
+association unresolved. Keep the report private because it carries the
+original file names. [Image evidence fields](TRACE_IMPORT.md#locate-image-records-for-a-sampled-ip)
+
+```powershell
+& KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 8 --image-evidence
+```
+
 ## Whole-host hunt
 
 ```text

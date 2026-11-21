@@ -72,6 +72,44 @@ decoded sample rows and disables lookups across the incomplete index.
 Thread creation FILETIME, authenticated process ownership and code version
 remain unknown.
 
+### Locate image records for a sampled IP
+
+Add `--image-evidence` to request `kn.etl_profile.v3`. This includes the
+thread evidence and uses its `paired_record_pid` to look up classic Image
+version-2 and version-3 records in the same ETL. Load (10) and unload (2)
+report changes. DCStart (3) and DCEnd (4) report the images present during
+collection startup and shutdown. An image range covers its base through the
+byte before base plus size. The reader rejects zero or overflowing sizes and
+requires a complete, terminated UTF-16LE name field.
+[Windows image events](https://learn.microsoft.com/en-us/windows/win32/etw/image-load)
+
+For each PID and base, the reader finds the closest image records before and
+after the sample ordinal. `reported_rva` is the sampled IP minus the recorded
+base. It requires one candidate, two enclosing records with strictly ordered
+raw timestamps, consistent transitions and matching size, pointer width,
+preferred base, PE checksum, PE timestamp, version and nonempty file name.
+Version-3 signature level and type must also agree. The clock and loss checks
+used for thread evidence apply here. `load_unload` identifies two change
+events. `rundown_bracket` indicates that at least one endpoint is a snapshot.
+One boundary, conflicting records, an unusable paired PID or overlapping
+ranges leave the RVA null. A kernel address has no implicit fallback to a
+different process. Process generation, authenticated execution and the bytes
+at that RVA still require independent evidence.
+
+`image_evidence.candidate_ranges` counts all candidate bases. `witnesses`
+holds the before/after record ordinals for up to two candidates, highest base
+first. `image_records` contains each referenced record once in original
+ordinal order. It preserves raw ticks, payload PID, image and preferred
+bases, size, PE metadata, version-3 signature fields and the exact recorded
+file name. These names can expose private paths. The reader treats them as
+data and never opens them.
+
+`image_source` reports decoded, retained and unsupported counts. An
+unsupported image boundary withholds paired RVAs. The index retains at most
+65,536 events and 16 MiB of UTF-16 name data. When either limit is exceeded,
+`retention` identifies the exhausted limit, the command returns `partial`
+and all image lookups report `index_limit`.
+
 ## Normalized execution trace import
 
 This adapter reads local normalized JSON.

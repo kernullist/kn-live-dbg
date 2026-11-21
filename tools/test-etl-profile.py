@@ -23,11 +23,96 @@ def run(exe, etl, digest, *args, rc=0):
         assert not result.stdout
         return None
     value = json.loads(result.stdout.decode("utf-8"))
-    assert value["schema"] == ("kn.etl_profile.v2" if "--thread-evidence" in args else "kn.etl_profile.v1")
+    version = 3 if "--image-evidence" in args else (2 if "--thread-evidence" in args else 1)
+    assert value["schema"] == f"kn.etl_profile.v{version}"
     return value
 
 
-def oracle(etl, folder):
+IMAGE_GUID = "2cb15d1d-5fc1-11d2-abe1-00a0c911f518"
+
+
+class ImageOracle:
+    """Use TDH's named image fields and a chronological history at each PID/base."""
+
+    def __init__(self):
+        self.by_ordinal = {}
+        self.by_pid = defaultdict(lambda: defaultdict(list))
+
+    def add(self, ordinal, tick, version, op, width, fields):
+        def integer(key):
+            return int(fields[key], 0)
+
+        assert width in (4, 8)
+        pid, base = integer("ProcessId"), integer("ImageBase")
+        point = dict(record_ordinal=ordinal, raw_timestamp=str(tick), opcode=op, version=version,
+                     pointer_bytes=width, payload_pid=pid, image_base=hex(base), image_size=hex(integer("ImageSize")),
+                     preferred_base=hex(integer("DefaultBase")), image_checksum=integer("ImageChecksum"),
+                     pe_timestamp=integer("TimeDateStamp"), recorded_file_name=fields["FileName"] or "",
+                     signature_level=integer("SignatureLevel") if version == 3 else None,
+                     signature_type=integer("SignatureType") if version == 3 else None)
+        self.by_ordinal[ordinal] = point
+        self.by_pid[pid][base].append(ordinal)
+
+    def prepare(self):
+        self.ranges = defaultdict(list)
+        for pid, bases in self.by_pid.items():
+            for base, ordinals in sorted(bases.items(), reverse=True):
+                points = [self.by_ordinal[n] for n in ordinals]
+                end = base + max(int(p["image_size"], 0) for p in points)
+                opening = [p["opcode"] in (3, 10) for p in points]
+                ticks = [int(p["raw_timestamp"]) for p in points]
+                alternates = all(a != b for a, b in zip(opening, opening[1:]))
+                ordered = all(a < b for a, b in zip(ticks, ticks[1:]))
+                self.ranges[pid].append((base, end, ordinals, alternates, ordered))
+
+    def expected(self, row, pid, coverage, clock_ok):
+        ip = int(row["instruction_pointer"], 0)
+        ordinal, tick = row["record_ordinal"], int(row["raw_timestamp"])
+        candidates = []
+        paired_rva = None
+        for base, end, history, alternates, ordered in self.ranges.get(pid, ()):
+            if not base <= ip < end:
+                continue
+            pos = bisect.bisect_left(history, ordinal)
+            before = history[pos - 1] if pos else None
+            after = history[pos] if pos < len(history) else None
+            a, b = self.by_ordinal.get(before), self.by_ordinal.get(after)
+            in_a = a and ip < base + int(a["image_size"], 0)
+            in_b = b and ip < base + int(b["image_size"], 0)
+            if not alternates:
+                relation = "conflicting_transitions"
+            elif not ordered:
+                relation = "clock_unqualified"
+            elif not (in_a or in_b):
+                continue
+            elif not clock_ok or (a and int(a["raw_timestamp"]) >= tick) or (b and int(b["raw_timestamp"]) <= tick):
+                relation = "clock_unqualified"
+            elif not ((in_a and a["opcode"] in (3, 10)) or (in_b and b["opcode"] in (2, 4))):
+                continue
+            elif not (a and b):
+                relation = "one_boundary"
+            elif any(a[k] != b[k] for k in ("image_size", "version", "pointer_bytes", "preferred_base", "image_checksum",
+                                            "pe_timestamp", "signature_level", "signature_type", "recorded_file_name")):
+                relation = "image_identity_conflict"
+            elif not a["recorded_file_name"]:
+                relation = "missing_image_name"
+            elif not coverage:
+                relation = "coverage_unqualified"
+            else:
+                relation = "load_unload" if (a["opcode"], b["opcode"]) == (10, 2) else "rundown_bracket"
+                paired_rva = hex(ip - base)
+            candidates.append(dict(relation=relation, before_record=before, after_record=after))
+        if len(candidates) == 1:
+            relation = candidates[0]["relation"]
+        elif candidates:
+            relation = "overlapping_ranges"
+        else:
+            relation = "no_recorded_range" if pid else "thread_pid_unavailable"
+        return dict(relation=relation, candidate_ranges=len(candidates),
+                    reported_rva=paired_rva if len(candidates) == 1 else None, witnesses=candidates[:2])
+
+
+def oracle(etl, folder, want_images):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -39,6 +124,8 @@ def oracle(etl, folder):
     thread_guid = "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c"
     profile_guid = "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc"
     samples, threads = [], defaultdict(list)
+    images = ImageOracle() if want_images else None
+    pointer_width = None
     records = raw_threads = raw_samples = 0
     with xml_path.open("rb") as stream:
         events = ElementTree.iterparse(stream, events=("start", "end"))
@@ -48,6 +135,18 @@ def oracle(etl, folder):
                 continue
             records += 1
             guid = (event.findtext(trace_ns + "ExtendedTracingInfo/" + trace_ns + "EventGuid") or "").strip("{}").lower()
+            if want_images and guid == "68fdd900-4a3e-11d1-84f4-0000f80464e3":
+                width = event.find(ns + "EventData/" + ns + "Data[@Name='PointerSize']")
+                if width is not None:
+                    pointer_width = int(width.text, 0)
+            if want_images and guid == IMAGE_GUID:
+                system = event.find(ns + "System")
+                version = int(system.findtext(ns + "Version"))
+                op = int(system.findtext(ns + "Opcode"))
+                if system.findtext(ns + "EventID") == "0" and version in (2, 3) and op in (2, 3, 4, 10):
+                    fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
+                    tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
+                    images.add(records, tick, version, op, pointer_width, fields)
             if guid in (thread_guid, profile_guid):
                 system = event.find(ns + "System")
                 descriptor = {x.tag.removeprefix(ns): x.text for x in system}
@@ -84,7 +183,9 @@ def oracle(etl, folder):
             event.clear()
             root.clear()
     print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
-    return records, samples, threads
+    if images is not None:
+        images.prepare()
+    return records, samples, threads, images
 
 
 def compare_thread(pair, row, events, coverage, clock_ok):
@@ -121,9 +222,10 @@ def compare_thread(pair, row, events, coverage, clock_ok):
         relation = "start_end" if (left[2], right[2]) == (1, 2) else "rundown_bracket"
         paired_pid = left[3]
     assert pair == dict(relation=relation, before=point(left), after=point(right), paired_record_pid=paired_pid)
+    return paired_pid
 
 
-def compare(report, pin, size, records, oracle_rows, after, limit, threads):
+def compare(report, pin, size, records, oracle_rows, after, limit, threads, images):
     assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == size
     assert (report["provider_guid"], report["event_id"], report["opcode"], report["version"]) == (
         "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", 0, 46, 2)
@@ -147,6 +249,13 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads):
         assert meta["decoded_events"] == meta["retained_events"] == total and meta["unsupported_events"] == 0
     else:
         assert "thread_source" not in report
+    referenced = set()
+    if images is not None:
+        count = len(images.by_ordinal)
+        assert report["image_source"] == dict(provider_guid=IMAGE_GUID, versions=[2, 3], decoded_events=count,
+                                              retained_events=count, unsupported_events=0, retention="complete")
+    else:
+        assert "image_source" not in report and "image_records" not in report
     rows = report["samples"]
     wanted = oracle_rows[after:after + limit]
     assert len(rows) == len(wanted)
@@ -161,11 +270,23 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads):
             coverage = report["buffer_comparison"] == "matched" and not (h["events_lost"] or h["buffers_lost"] or report["loss_marker_records"])
             clock = report["clock"]
             clock_ok = clock["raw_type"] == 2 or (clock["raw_type"] == 1 and int(clock["header_perf_frequency"]) > 0)
-            compare_thread(row["thread_evidence"], row, threads.get(row["sampled_thread_id"], []), coverage, clock_ok)
-        else:
+            pid = compare_thread(row["thread_evidence"], row, threads.get(row["sampled_thread_id"], []), coverage, clock_ok)
+            if images is not None:
+                answer = images.expected(row, pid, coverage, clock_ok)
+                assert row["image_evidence"] == answer, ("image relation", seq)
+                for witness in answer["witnesses"]:
+                    referenced.update(n for n in (witness["before_record"], witness["after_record"]) if n is not None)
+        if images is None:
+            assert "image_evidence" not in row
+        if threads is None:
             assert "thread_evidence" not in row
         assert row["pointer_bytes"] in (4, 8)
         assert row["cpu_field"] == ("processor_index" if row["header_flags"] & 0x200 else "processor_number")
+    if images is not None:
+        assert [p["record_ordinal"] for p in report["image_records"]] == sorted(referenced)
+        for point in report["image_records"]:
+            expected = images.by_ordinal[point["record_ordinal"]]
+            assert point == expected, ("image record", point["record_ordinal"], [k for k in expected if expected[k] != point.get(k)])
     assert report["next_after"] == (after + limit if after + limit < len(oracle_rows) else None)
     return rows
 
@@ -186,25 +307,34 @@ def check_directory_lease(exe, etl, pin, parent):
         kernel.CloseHandle(handle)
 
 
-def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads):
+def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images):
     size = etl.stat().st_size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
-    records, samples, threads = oracle(etl, folder)
-    thread_args = ["--thread-evidence"] if join_threads else []
+    records, samples, threads, images = oracle(etl, folder, join_images)
+    evidence_args = ["--image-evidence"] if join_images else (["--thread-evidence"] if join_threads else [])
+    join_threads = join_threads or join_images
     assert len(samples) == expected_count, (len(samples), expected_count)
     pages = [(0, 64), (0, 1), (min(1, len(samples)), 128), (len(samples) // 2, 128),
              (max(0, len(samples) - 3), 128), (len(samples), 1)]
     if all_pages:
         pages.extend((offset, 128) for offset in range(0, len(samples), 128))
-    compared = {}
+    compared, compared_images = {}, {}
     for after, limit in pages:
         # The first call exercises the defaults, subsequent calls explicit paging.
         args = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
-        report = run(exe, etl, pin.upper(), *thread_args, *args)
-        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None)
+        report = run(exe, etl, pin.upper(), *evidence_args, *args)
+        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images)
         for row in rows:
+            if join_images:
+                compared_images[row["sample_ordinal"]] = row["image_evidence"]["relation"]
             compared[row["sample_ordinal"]] = row.get("thread_evidence", {}).get("relation")
+    if join_images:
+        first = run(exe, etl, pin, "--image-evidence", "--limit", 4)
+        for flags in (("--image-evidence", "--thread-evidence"), ("--thread-evidence", "--image-evidence")):
+            assert run(exe, etl, pin, *flags, "--after", 0, "--limit", 4) == first
+        for flags, evidence in (([], None), (["--thread-evidence"], threads)):
+            compare(run(exe, etl, pin, *flags, "--limit", 4), pin, size, records, samples, 0, 4, evidence, None)
     if all_pages:
         assert len(compared) == len(samples)
     if short_tail:
@@ -214,18 +344,21 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
             output.truncate(size - 1)
         with trimmed.open("rb") as f:
             trimmed_pin = hashlib.file_digest(f, "sha256").hexdigest()
-        partial = run(exe, trimmed, trimmed_pin, "--limit", 1, *thread_args, rc=1)
+        partial = run(exe, trimmed, trimmed_pin, "--limit", 1, *evidence_args, rc=1)
         assert partial["source_sha256"] == trimmed_pin and partial["status"] == "partial"
         assert partial["buffer_comparison"] == "fewer_than_declared"
         assert partial["buffers_processed"] < partial["log_header"]["buffers_written"]
         assert partial["records_seen"] < records
         if join_threads:
             assert all(r["thread_evidence"]["paired_record_pid"] is None for r in partial["samples"])
+        if join_images:
+            assert all(r["image_evidence"]["reported_rva"] is None for r in partial["samples"])
     assert run(exe, etl, pin, "--after", len(samples) + 1, rc=1)["status"] == "cursor_out_of_range"
     wrong = ("0" if pin[0] != "0" else "1") + pin[1:]
-    assert run(exe, etl, wrong, *thread_args, rc=1)["status"] == "digest_mismatch"
+    assert run(exe, etl, wrong, *evidence_args, rc=1)["status"] == "digest_mismatch"
     for args in (("--after", "-1"), ("--limit", 0), ("--limit", 129), ("--after", "01"),
-                 ("--after", 1, "--after", 2), ("--limit", "1", "--limit", "2"), ("--thread-evidence", "--thread-evidence")):
+                 ("--after", 1, "--after", 2), ("--limit", "1", "--limit", "2"), ("--thread-evidence", "--thread-evidence"),
+                 ("--image-evidence", "--image-evidence")):
         run(exe, etl, pin, *args, rc=2)
     bad = folder / "invalid.etl"
     bad.write_bytes(b"invalid test input")
@@ -243,6 +376,8 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     assert result.returncode != 0 and etl.stat().st_size == size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
+    if join_images:
+        print("Image events:", len(images.by_ordinal), "Sample relations:", dict(Counter(compared_images.values())))
     if join_threads:
         print("Thread events:", sum(map(len, threads.values())), "Sample relations:", dict(Counter(compared.values())))
     print(f"ETL profile passed. {records} events, {len(samples)} CPU samples, {len(compared)} distinct sample rows compared.")
@@ -255,6 +390,7 @@ def main():
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--expect-samples", type=int, required=True)
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
+    parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
     parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample in 128-row pages")
     parser.add_argument("--check-short-tail", action="store_true",
                         help="For fixtures with a populated last buffer, require detection after removing its last byte")
@@ -264,7 +400,7 @@ def main():
         (folder / "source").mkdir()
         etl = folder / "source" / "input.etl"
         shutil.copyfile(args.etl, etl)
-        exercise(args.exe.resolve(strict=True), etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail, args.thread_evidence)
+        exercise(args.exe.resolve(strict=True), etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail, args.thread_evidence, args.image_evidence)
 
 
 if __name__ == "__main__":
