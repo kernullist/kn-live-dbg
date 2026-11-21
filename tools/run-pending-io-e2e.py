@@ -92,9 +92,12 @@ def final_balanced(state):
 
 
 class Port:
-    def __init__(self):
+    def __init__(self, context=b''):
+        if len(context) > 0xffff:
+            raise ValueError('connection context exceeds the Filter Manager WORD length')
         self.handle = w.HANDLE()
-        hr = flt.FilterConnectCommunicationPort(PORT, 0, None, 0, None, c.byref(self.handle))
+        buffer = c.create_string_buffer(context) if context else None
+        hr = flt.FilterConnectCommunicationPort(PORT, 0, buffer, len(context), None, c.byref(self.handle))
         if hr < 0:
             raise OSError(f'connect: 0x{hr & 0xffffffff:08x}')
 
@@ -227,8 +230,8 @@ def child_io(path):
         kernel.CloseHandle(read_handle)
 
 
-def child_owner():
-    with Port() as owner:
+def child_owner(context=b''):
+    with Port(context) as owner:
         print(json.dumps(dict(pid=os.getpid(), handle=owner.handle.value)), flush=True)
         for line in sys.stdin:
             command = json.loads(line)
@@ -612,6 +615,8 @@ if __name__ == '__main__':
             child_owner()
         else:
             main()
+    except SystemExit:
+        raise
     except BaseException:
         traceback.print_exc()
         sys.exit(1)

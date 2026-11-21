@@ -20,6 +20,20 @@ class PublicContentTests(unittest.TestCase):
             self.assertIn("private-operation-journal", {r["rule"] for r in AUDIT.inspect(path, b"KNMCPJ1\0ciphertext")})
         self.assertEqual(AUDIT.inspect("journal.cpp", b'const char* prefix = "KNMCPJ1";'), [])
 
+    def test_pending_io_trace_pages_and_assessment(self):
+        for name in ("report.KNIOTRACE", "report.kniotrace.pending-1"):
+            self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
+        for data in (b"KNIT", b"KNIT\x01", b"KNIT" + bytes.fromhex("0100000088020000") + bytes(636)):
+            self.assertIn("private-pending-io-trace", {r["rule"] for r in AUDIT.inspect("renamed.dat", data)})
+        self.assertEqual(AUDIT.inspect("guide.md", b"KNIT pages are little endian."), [])
+        schema = "kn.pending_io_trace.v1"
+        for data in (json.dumps({"items": [], "schema": schema}),
+                     "log\n" + json.dumps({"schema": schema, "requests": []}, indent=2)[:-2]):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle",
+                              {r["rule"] for r in AUDIT.inspect("renamed.txt", data.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", ("Replay returns " + schema).encode()))
+
     def test_private_symbol_index(self):
         for name in ("symbols.KNSYMIDX", "symbols.knsymidx.pending-1"):
             self.assertTrue(AUDIT.inspect(name, b"empty"))

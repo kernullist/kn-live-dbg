@@ -102,8 +102,10 @@
     <ClCompile Include="PendingIo.cpp" />
     <ClInclude Include="ManagedCallbacks.h" />
     <ClInclude Include="PendingIo.h" />
+    <ClInclude Include="PendingIoTrace.h" />
     <ClInclude Include="..\shared\KnLiveDbgManagedCallbacks.h" />
     <ClInclude Include="..\shared\KnLiveDbgPendingIo.h" />
+    <ClInclude Include="..\shared\KnLiveDbgIoTrace.h" />
   </ItemGroup>
   <ItemDefinitionGroup>
     <Link>

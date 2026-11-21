@@ -21,6 +21,8 @@
 *.knchunk.pending-*
 *.knschema
 *.knschema.pending-*
+*.kniotrace
+*.kniotrace.pending-*
 *.knirp
 *.knirp.pending-*
 *.knirpledger

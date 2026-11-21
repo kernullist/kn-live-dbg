@@ -631,6 +631,41 @@ ends the qualified prefix. Later records remain visible under
 a directory was unavailable or a request's final outcome is unknown.
 [Request identity and state transitions](ARCHITECTURE.md#directory-io-request-lifetimes)
 
+## Capture a cooperative kernel I/O trace
+
+On an elevated Windows test host, build the Release fixture and run the
+collector from a checkout on `C:`. Give it a new output directory. The runner
+loads its own minifilter, admits two concurrent READs through one file handle,
+cancels one, then repeats the batch with the upper instance detached. It
+checks the child results and the final unload ledgers. The status-only port
+and a separate trace connection are also exercised. The runner records the
+SHA-256 of each original page stream in `journal.jsonl`.
+
+```powershell
+python tools/run-pending-io-trace-e2e.py --output .build/pending-trace-current
+```
+
+The following offline example replays the retired batch using the pin the
+collector saved. Use `pending.kniotrace` for the earlier two-pending capture
+or `drained.kniotrace` for the re-armed batch after upper detach.
+
+```powershell
+$folder = '.build/pending-trace-current'
+$name = 'retired.kniotrace'
+$entries = Get-Content -LiteralPath (Join-Path $folder 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json }
+$capture = @($entries | Where-Object { $_.kind -eq 'capture' -and $_.file -eq $name })
+if ($capture.Count -ne 1) { throw 'Expected one recorded capture pin' }
+python tools/replay-pending-io-trace.py (Join-Path $folder $name) --sha256 $capture[0].sha256
+```
+
+The private `kn.pending_io_trace.v1` report identifies the provider, capture
+epoch, observed sequence range and overwritten intervals. Each event includes
+its byte offset in the original file. `upper_status` is available only for a
+qualified, retired upper observation. Layer records preserve their own statuses
+and pending intervals in QPC ticks. A hash mismatch, mixed capture or broken
+page cursor fails the command. The user-mode protocol and replay tests run
+through `tools/validate-pending-io-trace.ps1`. [Evidence and identity rules](ARCHITECTURE.md#cooperative-kernel-io-request-lifetimes)
+
 ## Capture a Windows wait chain
 
 Use `--wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>`

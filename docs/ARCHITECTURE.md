@@ -904,6 +904,53 @@ with a KMON snapshot still require another source.
 
 [Capture and replay a request](COMMAND_REFERENCE.md#trace-an-io-request-through-completion)
 
+### Cooperative kernel I/O request lifetimes
+
+The pending-I/O fixture can record the CREATE and READ requests that its owner
+admits on an opted-in Filter Manager connection. The provider assigns a fresh
+capture UUID per connection, a request generation at upper admission and an
+instance number at attachment. A lower READ inherits the upper generation
+only after the callback data, file object, referenced requestor, owner and
+topology checks succeed. No process, file, IRP or callback address appears
+in the records. Two requests can share every file parameter and still have
+different lifetimes.
+
+| Recorded event | Evidence available at that point |
+| --- | --- |
+| `dispatch_observed` | The cooperative instance admitted this pre-operation callback. |
+| `pre_pending` or `post_pending` | The fixture retained a worker reference and queued this operation. |
+| `cancel_observed` | Filter Manager reported the held operation's cancellation flag set. |
+| `pre_forward_selected` or `pre_complete_selected` | The fixture selected its pre-operation disposition. A local completion records its NTSTATUS. |
+| `post_observed` | A normal post callback supplied the operation status. A successful READ can also supply a validated byte count. |
+| `draining` | Filter Manager requested completion-context cleanup during detach. The recorder skips the copied I/O status. |
+| `post_resume_selected` or `retired` | The worker selected resumption, or the fixture retired its logical reference. |
+| `context_unavailable` | Admission was recorded and context allocation failed. Later outcome evidence is unavailable at this layer. |
+
+The optional v1 connection context is 16 bytes. A 40-byte read request returns
+a 648-byte page with the capture epoch, QPC frequency, cursor, available range,
+loss flags and up to eight events. Each connection retains the latest 128
+events across control release and re-ARM. Up to 16 rings can exist, counting
+allocation and disconnect in progress. Disconnect releases the nonpaged
+ring and its referenced creator process. The ordinary v7 control and status ABI
+remains available. A trace query copies its snapshot under the publication
+lock and writes to the caller after releasing it. The post-unregister trace
+ledger counts ring allocations and frees and trace message entries and exits.
+[Filter Manager message buffers](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_message_notify)
+and [post-operation draining](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_post_operation_callback).
+
+Offline replay pins the original pages by SHA-256, ends the assessment at
+the first reply's high-water mark and cites the byte offset of each event.
+The report counts later rows received in the original pages. Overwritten
+intervals remain visible, including loss between page reads.
+Sequence and generation determine order and membership. QPC measures
+per-layer pending and dispatch-to-observed-outcome intervals when their
+endpoints survive and the clock is ordered. An upper outcome requires a
+consistent upper disposition or normal post and retirement of the observed
+layers. A draining upper callback can leave its outcome unknown even when
+the lower layer has a result. Host and boot provenance, IRP allocation
+history, user completion and joins to other providers require independent
+evidence. [Capture and replay the fixture](COMMAND_REFERENCE.md#capture-a-cooperative-kernel-io-trace)
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in

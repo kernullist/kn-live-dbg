@@ -1,13 +1,21 @@
 #include "PendingIo.h"
+#include "PendingIoTrace.h"
 #include "../shared/KnLiveDbgPendingIo.h"
 
 namespace
 {
     constexpr ULONG kTag = 'ipNK';
+    static_assert(KnIoTrace::ReadMajor == IRP_MJ_READ, "trace READ discriminator");
     struct Instance
     {
+        KnIoTrace::U64 TraceId;
         bool Lower;
         bool Stopping;
+    };
+    struct TraceSource
+    {
+        KnIoTrace::U64 Request;
+        ULONG Major, ReadLength;
     };
     struct Operation
     {
@@ -20,12 +28,28 @@ namespace
         PFLT_CALLBACK_DATA PreIdentity; // Identity only, never dereferenced after pre.
         ULONGLONG Generation;
         ULONG_PTR Owner;
+        TraceSource Trace;
         ULONG Mode, DelayMilliseconds, WakeReason;
         ULONG Gate, GateMilliseconds;
         bool LowerClaimed, PostWork;
         KEVENT Resume;
     };
-    struct Client { ULONG_PTR Id; PFLT_PORT Port; HANDLE Pid; };
+    struct Client
+    {
+        ULONG_PTR Id;
+        PFLT_PORT Port;
+        HANDLE Pid;
+        PEPROCESS TraceOwner;
+        KnIoTrace::Ring* Trace;
+    };
+    KnIoTrace::U64 g_NextInstance;
+    struct TraceAudit
+    {
+        ULONG Magic, Version, Size, AvailableSlots;
+        LONG64 Allocated, Freed, PageStarted, PageCompleted;
+    };
+    static_assert(sizeof(TraceAudit) == 48, "final trace ledger ABI");
+    TraceAudit g_TraceAudit = {KnIoTrace::Magic, KnIoTrace::Version, sizeof(TraceAudit), 0, 0, 0, 0, 0};
 
     PFLT_FILTER g_Filter;
     PFLT_PORT g_Server;
@@ -35,6 +59,7 @@ namespace
     KMUTEX g_Control;
     LIST_ENTRY g_Operations, g_Work;
     Client g_Clients[16];
+    KSEMAPHORE g_TraceSlots;
     ULONG_PTR g_NextClient, g_Owner;
     PEPROCESS g_OwnerProcess, g_Target;
     ULONG g_Delay;
@@ -49,6 +74,40 @@ namespace
     {
         for (auto& client : g_Clients) if (id != 0 && client.Id == id) return &client;
         return nullptr;
+    }
+
+    bool IsCaller(const Client* client)
+    {
+        return client != nullptr && client->Pid == PsGetCurrentProcessId() &&
+            (client->TraceOwner == nullptr || client->TraceOwner == PsGetCurrentProcess());
+    }
+
+    // g_Lock serializes publication with page reads and client disconnect.
+    void RecordLocked(ULONG_PTR owner, const TraceSource& source, const Instance* state,
+        ULONGLONG topology, KnIoTrace::Kind kind, ULONG flags = 0, NTSTATUS status = 0, ULONGLONG bytes = 0)
+    {
+        if (source.Request == 0) return;
+        auto client = FindClient(owner);
+        if (client == nullptr || client->Trace == nullptr) return;
+        KnIoTrace::Event event = {};
+        event.Request = source.Request;
+        event.Topology = topology;
+        event.Instance = state->TraceId;
+        event.Qpc = static_cast<ULONGLONG>(KeQueryPerformanceCounter(nullptr).QuadPart);
+        event.Bytes = bytes;
+        event.Kind = kind;
+        event.Major = source.Major;
+        event.Layer = state->Lower ? KnIoTrace::Lower : KnIoTrace::Upper;
+        event.Flags = flags;
+        event.Status = static_cast<ULONG>(status);
+        event.ReadLength = source.ReadLength;
+        client->Trace->Record(event);
+    }
+
+    void RecordLocked(const Operation* op, KnIoTrace::Kind kind, ULONG flags = 0,
+        NTSTATUS status = 0, ULONGLONG bytes = 0)
+    {
+        RecordLocked(op->Owner, op->Trace, op->InstanceState, op->Generation, kind, flags, status, bytes);
     }
 
     void DropReference(Operation* operation)
@@ -70,7 +129,11 @@ namespace
         const bool first = InterlockedCompareExchange(&operation->LogicalReleased, 1, 0) == 0;
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
-        if (first) ++g_Status.LogicalCompleted;
+        if (first)
+        {
+            ++g_Status.LogicalCompleted;
+            RecordLocked(operation, KnIoTrace::Retired);
+        }
         else ++g_Status.Violations;
         KeReleaseSpinLock(&g_Lock, irql);
         if (first) DropReference(operation);
@@ -231,12 +294,13 @@ namespace
         ++g_Status.QueueDepth;
         if (post) ++g_Status.PostQueued;
         else ++g_Status.PreQueued;
+        RecordLocked(operation, post ? KnIoTrace::PostPending : KnIoTrace::PrePending);
         KeSetEvent(&g_WorkAvailable, IO_NO_INCREMENT, FALSE);
         KeReleaseSpinLock(&g_Lock, irql);
         return true;
     }
 
-    NTSTATUS WaitPre(Operation* operation, PFLT_CALLBACK_DATA data)
+    NTSTATUS WaitPre(Operation* operation, PFLT_CALLBACK_DATA data, bool& cancelObserved)
     {
         const ULONGLONG deadline = KeQueryInterruptTime() +
             static_cast<ULONGLONG>(operation->DelayMilliseconds) * 10000;
@@ -246,13 +310,21 @@ namespace
             // thread's cancellable wait. Check the held IRP itself as well.
             // This fixture admits a bounded target batch, with a 10 ms poll;
             // it does not install another cancel callback with a separate lifetime.
-            if (FltIsIoCanceled(data)) return STATUS_CANCELLED;
+            if (FltIsIoCanceled(data))
+            {
+                cancelObserved = true;
+                return STATUS_CANCELLED;
+            }
             const ULONGLONG now = KeQueryInterruptTime();
             if (now >= deadline) return STATUS_TIMEOUT;
             LARGE_INTEGER timeout;
             timeout.QuadPart = -static_cast<LONGLONG>(min(deadline - now, 100000ull));
             const NTSTATUS status = FltCancellableWaitForSingleObject(&operation->Resume, &timeout, data);
-            if (FltIsIoCanceled(data)) return STATUS_CANCELLED;
+            if (FltIsIoCanceled(data))
+            {
+                cancelObserved = true;
+                return STATUS_CANCELLED;
+            }
             if (status != STATUS_TIMEOUT) return status;
         }
     }
@@ -274,6 +346,7 @@ namespace
         KeDelayExecutionThread(KernelMode, FALSE, &timeout);
         const bool cancelled = FltIsIoCanceled(data) != FALSE;
         KeAcquireSpinLock(&g_Lock, &irql);
+        if (cancelled) RecordLocked(operation, KnIoTrace::CancelObserved);
         if (early)
         {
             ++g_Status.BeforeLowerCompleted;
@@ -334,9 +407,10 @@ namespace
                 // installed by us. FltMgr safely arbitrates cancellation of this wait.
                 // Post already owns the completion: preserve the underlying result
                 // and always resume completion, including owner exit/teardown.
+                bool cancelObserved = false;
                 const NTSTATUS waited = post
                     ? KeWaitForSingleObject(&operation->Resume, Executive, KernelMode, FALSE, &timeout)
-                    : WaitPre(operation, data);
+                    : WaitPre(operation, data, cancelObserved);
                 KeAcquireSpinLock(&g_Lock, &irql);
                 // A READ may continue in the System process only with its pages
                 // locked. This guard also prevents future queue changes from
@@ -346,11 +420,21 @@ namespace
                 if (missingMdl) ++g_Status.Violations;
                 const bool cancel = missingMdl || !NT_SUCCESS(waited) || operation->WakeReason >= 2 ||
                     g_Status.Stopping || operation->InstanceState->Stopping;
-                if (post) ++g_Status.PostCompleted;
+                if (cancelObserved) RecordLocked(operation, KnIoTrace::CancelObserved);
+                if (post)
+                {
+                    ++g_Status.PostCompleted;
+                    RecordLocked(operation, KnIoTrace::PostResumeSelected);
+                }
                 else
                 {
                     ++g_Status.PreCompleted;
-                    if (cancel) ++g_Status.PreCancelled;
+                    if (cancel)
+                    {
+                        ++g_Status.PreCancelled;
+                        RecordLocked(operation, KnIoTrace::PreCompleteSelected, KnIoTrace::HasStatus, STATUS_CANCELLED);
+                    }
+                    else RecordLocked(operation, KnIoTrace::PreForwardSelected);
                 }
                 KeReleaseSpinLock(&g_Lock, irql);
                 if (post)
@@ -387,9 +471,50 @@ namespace
         KeReleaseSpinLock(&g_Lock, irql);
     }
 
-    NTSTATUS FLTAPI Connect(PFLT_PORT port, PVOID, PVOID, ULONG size, PVOID* cookie)
+    void FreeTrace(KnIoTrace::Ring* trace, PEPROCESS traceOwner)
     {
-        if (size != 0) return STATUS_INVALID_PARAMETER;
+        ObDereferenceObject(traceOwner);
+        ExFreePoolWithTag(trace, kTag);
+        InterlockedIncrement64(&g_TraceAudit.Freed);
+        KeReleaseSemaphore(&g_TraceSlots, IO_NO_INCREMENT, 1, FALSE);
+    }
+
+    NTSTATUS FLTAPI Connect(PFLT_PORT port, PVOID, PVOID context, ULONG size, PVOID* cookie)
+    {
+        KnIoTrace::Ring* trace = nullptr;
+        PEPROCESS traceOwner = nullptr;
+        if (size != 0)
+        {
+            if (size != sizeof(KnIoTrace::Connect) || context == nullptr) return STATUS_INVALID_PARAMETER;
+            KnIoTrace::Connect request = {};
+            __try { RtlCopyMemory(&request, context, sizeof(request)); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
+            if (request.Magic != KnIoTrace::Magic || request.Version != KnIoTrace::Version ||
+                request.Size != sizeof(request) || request.Reserved != 0) return STATUS_INVALID_PARAMETER;
+            UUID capture = {};
+            const NTSTATUS uuidStatus = ExUuidCreate(&capture);
+            if (uuidStatus != STATUS_SUCCESS) return NT_SUCCESS(uuidStatus) ? STATUS_RETRY : uuidStatus;
+            LARGE_INTEGER frequency;
+            KeQueryPerformanceCounter(&frequency);
+            if (frequency.QuadPart <= 0) return STATUS_DEVICE_NOT_READY;
+            // Hold a credit from before allocation until after free. A disconnect
+            // can still be closing its port after the client slot became reusable.
+            LARGE_INTEGER immediate = {};
+            if (KeWaitForSingleObject(&g_TraceSlots, Executive, KernelMode, FALSE, &immediate) != STATUS_SUCCESS)
+                return STATUS_INSUFFICIENT_RESOURCES;
+            trace = static_cast<KnIoTrace::Ring*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*trace), kTag));
+            if (trace == nullptr)
+            {
+                KeReleaseSemaphore(&g_TraceSlots, IO_NO_INCREMENT, 1, FALSE);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            static_assert(sizeof(capture) == sizeof(trace->Capture), "capture epoch size");
+            RtlCopyMemory(&trace->Capture, &capture, sizeof(capture));
+            trace->Frequency = static_cast<ULONGLONG>(frequency.QuadPart);
+            traceOwner = PsGetCurrentProcess();
+            ObReferenceObject(traceOwner);
+            InterlockedIncrement64(&g_TraceAudit.Allocated);
+        }
         LockControl();
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
@@ -400,7 +525,7 @@ namespace
             for (auto& client : g_Clients)
             {
                 if (client.Id != 0) continue;
-                client = {++g_NextClient, port, PsGetCurrentProcessId()};
+                client = {++g_NextClient, port, PsGetCurrentProcessId(), traceOwner, trace};
                 *cookie = reinterpret_cast<PVOID>(client.Id);
                 ++g_Status.Connections;
                 status = STATUS_SUCCESS;
@@ -409,6 +534,7 @@ namespace
         }
         KeReleaseSpinLock(&g_Lock, irql);
         UnlockControl();
+        if (!NT_SUCCESS(status) && trace != nullptr) FreeTrace(trace, traceOwner);
         return status;
     }
 
@@ -418,24 +544,59 @@ namespace
         const ULONG_PTR id = reinterpret_cast<ULONG_PTR>(cookie);
         if (g_Owner == id) ReleaseOwner(true);
         PFLT_PORT port = nullptr;
+        KnIoTrace::Ring* trace = nullptr;
+        PEPROCESS traceOwner = nullptr;
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
         auto client = FindClient(id);
         if (client != nullptr)
         {
             port = client->Port;
+            trace = client->Trace;
+            traceOwner = client->TraceOwner;
             *client = {};
             --g_Status.Connections;
         }
         KeReleaseSpinLock(&g_Lock, irql);
         UnlockControl();
         if (port != nullptr) FltCloseClientPort(g_Filter, &port);
+        if (trace != nullptr) FreeTrace(trace, traceOwner);
+    }
+
+    NTSTATUS ReadTrace(PVOID cookie, PVOID input, PVOID output, ULONG outputSize, PULONG returned)
+    {
+        if (input == nullptr || output == nullptr || outputSize < sizeof(KnIoTrace::Page))
+            return STATUS_INVALID_PARAMETER;
+        KnIoTrace::Query request;
+        __try { RtlCopyMemory(&request, input, sizeof(request)); ProbeForWrite(output, sizeof(KnIoTrace::Page), 1); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return GetExceptionCode(); }
+        KnIoTrace::Page page = {};
+        NTSTATUS status = STATUS_ACCESS_DENIED;
+        KIRQL irql;
+        KeAcquireSpinLock(&g_Lock, &irql);
+        auto client = FindClient(reinterpret_cast<ULONG_PTR>(cookie));
+        if (IsCaller(client) && client->Trace != nullptr)
+            status = client->Trace->Read(request, page) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+        KeReleaseSpinLock(&g_Lock, irql);
+        if (NT_SUCCESS(status))
+        {
+            __try { RtlCopyMemory(output, &page, sizeof(page)); *returned = sizeof(page); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { status = GetExceptionCode(); }
+        }
+        return status;
     }
 
     NTSTATUS FLTAPI Message(PVOID cookie, PVOID input, ULONG inputSize,
         PVOID output, ULONG outputSize, PULONG returned)
     {
         *returned = 0;
+        if (inputSize == sizeof(KnIoTrace::Query))
+        {
+            InterlockedIncrement64(&g_TraceAudit.PageStarted);
+            const NTSTATUS status = ReadTrace(cookie, input, output, outputSize, returned);
+            InterlockedIncrement64(&g_TraceAudit.PageCompleted);
+            return status;
+        }
         if (input == nullptr || inputSize != sizeof(KNDBG_PENDING_REQUEST) ||
             output == nullptr || outputSize < sizeof(KNDBG_PENDING_STATUS)) return STATUS_INVALID_PARAMETER;
         KNDBG_PENDING_REQUEST request = {};
@@ -482,7 +643,7 @@ namespace
             KIRQL irql;
             KeAcquireSpinLock(&g_Lock, &irql);
             auto client = FindClient(reinterpret_cast<ULONG_PTR>(cookie));
-            const bool allowed = client != nullptr && client->Pid == PsGetCurrentProcessId();
+            const bool allowed = IsCaller(client);
             if (allowed)
             {
                 ++g_Status.QueryStarted;
@@ -528,7 +689,7 @@ namespace
         KIRQL irql;
         KeAcquireSpinLock(&g_Lock, &irql);
         auto client = FindClient(id);
-        if (client == nullptr || client->Pid != PsGetCurrentProcessId()) status = STATUS_ACCESS_DENIED;
+        if (!IsCaller(client)) status = STATUS_ACCESS_DENIED;
         else if (g_Status.Stopping) status = STATUS_FLT_DELETING_OBJECT;
         else if (g_Owner != 0 && g_Owner != id) status = STATUS_DEVICE_BUSY;
         else if (arm && !NT_SUCCESS(targetStatus))
@@ -594,6 +755,7 @@ void PendingIoInitialize()
 {
     KeInitializeSpinLock(&g_Lock);
     KeInitializeMutex(&g_Control, 0);
+    KeInitializeSemaphore(&g_TraceSlots, RTL_NUMBER_OF(g_Clients), RTL_NUMBER_OF(g_Clients));
     KeInitializeEvent(&g_WorkAvailable, SynchronizationEvent, FALSE);
     InitializeListHead(&g_Work);
     InitializeListHead(&g_Operations);
@@ -668,6 +830,12 @@ void PendingIoUnregistered()
     if (NT_SUCCESS(ZwOpenKey(&key, KEY_SET_VALUE, &attributes)))
     {
         ZwSetValueKey(key, &value, 0, REG_BINARY, &g_Status, sizeof(g_Status));
+        if (g_TraceAudit.Allocated || g_TraceAudit.PageStarted)
+        {
+            g_TraceAudit.AvailableSlots = static_cast<ULONG>(KeReadStateSemaphore(&g_TraceSlots));
+            UNICODE_STRING traceValue = RTL_CONSTANT_STRING(L"PendingIoTraceFinalAudit");
+            ZwSetValueKey(key, &traceValue, 0, REG_BINARY, &g_TraceAudit, sizeof(g_TraceAudit));
+        }
         ZwClose(key);
     }
     g_Filter = nullptr;
@@ -722,6 +890,7 @@ NTSTATUS PendingIoInstanceSetup(PCFLT_RELATED_OBJECTS objects)
     RtlZeroMemory(state, sizeof(*state));
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
+    if (g_NextInstance != ~KnIoTrace::U64{0}) state->TraceId = ++g_NextInstance;
     ++g_Status.LiveInstances;
     KeReleaseSpinLock(&g_Lock, irql);
     alignas(8) UCHAR buffer[1024];
@@ -804,6 +973,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     ULONG mode = 0, delay = 0, gate = 0, gateMilliseconds = 0;
     ULONG_PTR owner = 0;
     ULONGLONG generation = 0;
+    TraceSource trace = {};
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     if (!g_Status.Stopping && !state->Stopping)
@@ -824,6 +994,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
             }
             else ObReferenceObject(target);
             delay = g_Delay; owner = g_Owner;
+            auto client = FindClient(owner);
+            if (client != nullptr && client->Trace != nullptr) trace.Request = client->Trace->BeginRequest();
             gate = g_Gate; gateMilliseconds = g_GateMilliseconds;
             // Hold only the first worker. The remaining READs can accumulate
             // behind it, then drain without serial per-request test delays.
@@ -869,6 +1041,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
                     target = requestor; ObReferenceObject(target);
                     delay = upper->DelayMilliseconds; owner = upper->Owner;
                     generation = upper->Generation;
+                    trace.Request = upper->Trace.Request;
                     gate = upper->Gate; gateMilliseconds = upper->GateMilliseconds;
                     break;
                 }
@@ -884,11 +1057,15 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     // The small, nonpaged allocation is valid at DISPATCH_LEVEL. Keep arm
     // consumption and publication atomic with owner/target exit and new ARM
     // requests: no unlisted operation may escape cancellation in that gap.
+    trace.Major = data->Iopb->MajorFunction;
+    trace.ReadLength = trace.Major == IRP_MJ_READ ? data->Iopb->Parameters.Read.Length : 0;
+    RecordLocked(owner, trace, state, generation, KnIoTrace::DispatchObserved);
     Operation* operation = mode == KNDBG_PENDING_FAIL_ALLOC ? nullptr :
         static_cast<Operation*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(Operation), kTag));
     if (operation == nullptr)
     {
         ++g_Status.AllocFailed;
+        RecordLocked(owner, trace, state, generation, KnIoTrace::ContextUnavailable);
         KeReleaseSpinLock(&g_Lock, irql);
         FltReleaseContext(state); ObDereferenceObject(target);
         return FLT_PREOP_SUCCESS_WITH_CALLBACK;
@@ -901,6 +1078,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     operation->TargetProcess = target;
     operation->Mode = mode;
     operation->Owner = owner;
+    operation->Trace = trace;
     operation->DelayMilliseconds = delay;
     operation->Gate = gate;
     operation->GateMilliseconds = gateMilliseconds;
@@ -933,6 +1111,9 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
             // was never queued, so the callback still owns its completion.
             data->IoStatus.Status = NT_SUCCESS(locked) ? STATUS_INVALID_USER_BUFFER : locked;
             data->IoStatus.Information = 0;
+            KeAcquireSpinLock(&g_Lock, &irql);
+            RecordLocked(operation, KnIoTrace::PreCompleteSelected, KnIoTrace::HasStatus, data->IoStatus.Status);
+            KeReleaseSpinLock(&g_Lock, irql);
             FinishLogical(operation);
             return FLT_PREOP_COMPLETE;
         }
@@ -940,6 +1121,12 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI PendingIoPreOperation(PFLT_CALLBACK_DATA data,
     // On queue failure, continue inline with a valid buffer and pass only the
     // context to post. No completion worker has acquired this request.
     if (pend && Queue(operation, data, false)) return FLT_PREOP_PENDING;
+    if (operation->Trace.Request != 0)
+    {
+        KeAcquireSpinLock(&g_Lock, &irql);
+        RecordLocked(operation, KnIoTrace::PreForwardSelected);
+        KeReleaseSpinLock(&g_Lock, irql);
+    }
     *completionContext = operation;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -953,7 +1140,18 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI PendingIoPostOperation(PFLT_CALLBACK_DATA data
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     ++g_Status.PostCalled;
-    if (draining) ++g_Status.PostDrained;
+    if (draining)
+    {
+        ++g_Status.PostDrained;
+        RecordLocked(operation, KnIoTrace::Draining);
+    }
+    else if (operation->Trace.Request != 0)
+    {
+        const NTSTATUS status = data->IoStatus.Status;
+        const auto transfer = KnIoTrace::PostTransfer(operation->Trace.Major, static_cast<ULONG>(status),
+            operation->Trace.ReadLength, [data]() { return data->IoStatus.Information; });
+        RecordLocked(operation, KnIoTrace::PostObserved, transfer.Flags, status, transfer.Bytes);
+    }
     KeReleaseSpinLock(&g_Lock, irql);
     // Mandatory context cleanup is independent of the managed counting bodies.
     // A draining post must never queue more work or run normal completion logic.

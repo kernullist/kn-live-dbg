@@ -7,6 +7,38 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Cooperative kernel I/O trace, 2026-11-22
+
+The x64 Release solution and Debug minifilter fixture built with WDK
+10.0.26100.0. The Release fixture had SHA-256
+`e96cdf2e32e4e3b056266a95555bf5960461d274840b14a4a9de71e34b502b52`. Review covered request and instance generation, disconnect
+during publication, logical and worker references, output copying and the
+draining callback. A nonblocking pool reservation bounds the number of
+trace rings through disconnect. The legacy status request and reply still
+measure 32 and 528 bytes.
+
+Twelve user-mode tests exercised the production ring and READ byte-count
+code, the capture client and the offline decoder. An MSVC x64 host program
+produced 18 interleaved events for two request generations in three pages
+(1,944 bytes). Python independently checked the wire layout, byte offsets,
+opposite completion order and layer intervals. Other cases covered stale
+epochs, overwritten pages, integer exhaustion, conflicting identities,
+incomplete retirement, a broken pin and interrupted output. The documented
+offline replay produced the same assessment in both Windows PowerShell and
+PowerShell 7. Nine existing directory I/O tests and all 24 publication
+tests passed. [Run the capture or replay](COMMAND_REFERENCE.md#capture-a-cooperative-kernel-io-trace)
+
+The default MSVC AddressSanitizer runtime stopped before `main` at
+`interception_win.cpp:193`. Allowing it to skip the unsupported Windows
+interception let the instrumented program produce the identical pages
+and pass the host suite. Full interceptor coverage remains unverified.
+
+The live runner exited 2 at its elevation check before creating the output
+directory. Filter Manager enumeration returned access denied, and the
+fixture service was absent. Actual callback delivery, upper detach during
+the lower pending interval, and the trace allocation and message ledgers
+after unload still require an elevated test host. [Live acceptance checks](MANUAL_TEST_CHECKLIST.md#pending-io-and-runner-failure-validation)
+
 ## WHEA event XML comparison, 2026-11-22
 
 The x64 Release controller had SHA-256

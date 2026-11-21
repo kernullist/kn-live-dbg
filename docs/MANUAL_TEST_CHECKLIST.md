@@ -355,6 +355,15 @@ the matching `x64/Release/KnLiveDbgMiniFilterFixture.sys`. Build before loading 
 fixture, keep its service absent at the start, and use a fresh output directory
 for each run. Build and run the fixture suites sequentially.
 
+For the generation trace, run `python tools/run-pending-io-trace-e2e.py
+--output .build/pending-trace-current` on the fixture volume. Verify two
+distinct pending generations, one aborted READ and one matching 4,096-byte
+READ. In the re-armed batch require both upper draining observations while
+the lower READs are pending. Confirm both original capture pins and the
+draining pin replay after unload. Require both ledgers to balance, three
+freed trace rings, 16 available ring slots, all page callbacks returned, zero cleanup errors and
+absence of the fixture service and filter. [Capture and replay commands](COMMAND_REFERENCE.md#capture-a-cooperative-kernel-io-trace)
+
 Both query runners support `--help` without elevation or fixture setup. Help
 must exit 0 without a traceback; missing required arguments and invalid reader
 counts must exit 2 before loading a driver.
