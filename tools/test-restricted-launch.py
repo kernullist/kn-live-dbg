@@ -80,6 +80,7 @@ def main():
                     ["--offline", "!kmon", "init-store", str(root / "denied-store"), "/acl-only"],
                     ["--offline", "!kmon", "gc", str(root), "PRIVATE-SENTINEL", "/apply", "1"],
                     ["--crash-diagnose", str(trace), "--sha256", digest],
+                    ["--crash-diagnose", str(trace), "--sha256", digest, "--whea"],
                     ["--io-lifecycle", "50", str(root)],
                     ["--wait-chain", "1", "1", "1", "1", "--corroborate", "2", "2", "2", "10"],
                     ["--wait-chain", "1", "1", "1", "1"], ["--verify-process-image"], ["write", "on"], ["!kmon", "on"], ["kdinit"],

@@ -40,6 +40,7 @@ def main():
     by_key = dict(zip(keys, data["capabilities"]))
     crash = by_key[("diagnostics", "crash_diagnosis", "dbgeng_dump")]
     assert crash["consistency"] == "pinned_offline_dump" and "typed_bugcheck_and_stack" in crash["requirements"]
+    assert "optional_stop_parameter_2_cper" in crash["requirements"] and "cper_1MiB_128_sections_512_reads" in crash["limits"]
     assert crash["address_contract"] == "typed_amd64_saved_context;no_arbitrary_address_input"
     assert "no_host_crash_or_culprit_attribution" in crash["limits"]
     reference_scheduler = by_key[("scheduler", "reference_admission", "native")]

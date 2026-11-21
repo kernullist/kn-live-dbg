@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Stop-linked WHEA records, 2026-11-22
+
+The x64 Release controller had SHA-256
+`11f257ec5def58ba01e1033d49b3352e284ae49c299af879d61918274387a72d`.
+The production client used DbgEng 10.0.26100.2454. Windows SDK `kd.exe`
+10.0.26100.6584 extracted the same 2,199 bytes from an owned small dump
+at bugcheck parameter 2. The five section payloads appeared in reverse
+descriptor order with gaps and spare capacity. The bytes matched the
+original fixture, and their SHA-256 matched the report. Two runs produced
+identical v2 output. All nine retained v1 reports matched the output from
+the preceding controller byte for byte. [Run the WHEA query](COMMAND_REFERENCE.md#read-the-whea-record-from-a-saved-bugcheck)
+
+Nine WHEA tests covered short reads in the header and body, the 1 MiB
+and 128-section limits, invalid and overlapping extents, unsupported
+revisions, field validity and opaque sections. Machine-check controls
+compared versions 2, 3 and 4, including a match in an extra bank, a
+different status, an invalid bank and a matched status with the uncorrected
+bit clear. Missing evidence and contradictory evidence resolved to
+separate fields. The suite also exercised unsupported stops, dump attributes,
+unavailable initial state, input redirection through a hard link and a
+wrong digest. Both documented examples ran in Windows PowerShell and
+PowerShell 7.
+
+The same controller passed 11 crash diagnosis tests, 227 dump-source CLI
+checks, 15 wait-chain tests, nine directory I/O tests, 80 restricted-launch
+checks, 57 source contracts and 3,081 command checks. The support matrix
+matched. One dump-source file-symlink check was skipped on this host.
+All 22 publication tests passed. The scanner flagged 27 original,
+renamed, detached or re-encoded variants of the WHEA evidence.
+
+From 01:14 to 01:34 KST the host kept the same boot and recorded zero new
+bugcheck or reboot events or crash dumps. No fixture process, temporary
+test directory or running test driver remained. All positive WHEA inputs
+were synthetic. The host had no saved crash dump or matching System
+WHEA-Logger event for an independent incident comparison.
+[Evidence limits](ARCHITECTURE.md#stop-linked-whea-records)
+
 ## Saved kernel crash diagnosis, 2026-11-22
 
 The x64 Release controller had SHA-256

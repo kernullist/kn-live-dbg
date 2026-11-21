@@ -1074,6 +1074,41 @@ through a hard link. Keep the dump
 and the JSON private. Module ranges, stack coordinates and stop
 parameters can identify the target. [Dump diagnosis evidence](ARCHITECTURE.md#typed-crash-dump-diagnosis)
 
+### Read the WHEA record from a saved bugcheck
+
+Add `--whea` to request `kn.crash_diagnosis.v2`. On a qualified `0x124`
+dump, the command follows the second stored bugcheck parameter to one
+Common Platform Error Record (CPER). The default command continues to
+return `kn.crash_diagnosis.v1`.
+
+```powershell
+$dump = Get-Item -LiteralPath '.\saved-kernel.dmp'
+$pin = (Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256).Hash
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $pin --whea
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+$report.status
+$report.whea_record | Format-List status, captured_bytes, captured_sha256, qualifiers
+$report.whea_record.sections | Format-Table type, severity, decode
+$report.assessment.hypotheses | Where-Object candidate -eq 'fatal_error_reported_at_stop' |
+    Format-List candidate, state, contrary, missing, next
+```
+
+Read `whea_record.status` even on exit 0. `linked` means the entire declared
+record and its section extents were available. Each section has an offset,
+length, GUID and SHA-256. `decode` identifies the fields supported for that
+section. `incomplete_read` includes the count and hash of the contiguous
+bytes recovered, plus each debugger request and its HRESULT. A malformed
+descriptor, unsupported revision or budget limit has its own status.
+Input admission failures contain only the diagnosis status.
+
+For a machine-check exception, `matches_stop_status` compares a valid
+bank with parameters 3 and 4. A null comparison identifies missing or
+inapplicable data. `qualifiers` and the hypothesis's `contrary` and
+`missing` evidence distinguish conflicting observations from unavailable
+ones. Hardware identifiers, addresses and the report belong with the
+original private dump. [WHEA evidence boundaries](ARCHITECTURE.md#stop-linked-whea-records)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

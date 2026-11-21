@@ -3486,6 +3486,41 @@ allocation history and causal attribution require other sources.
 The one-shot client uses typed calls with local search paths, module
 symbol loading and image mapping disabled. [WHEA stop parameters](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-0x124---whea-uncorrectable-error)
 
+### Stop-linked WHEA records
+
+The optional WHEA query requires a saved AMD64 kernel target at its
+initial break, an ordinary dump with recognized attributes and agreement
+between both stop decoders on `0x124` and all four parameters. Parameter 1
+must describe a documented AMD64-compatible source. Parameter 2 supplies
+the sole starting address. The typed client reads through the same dump
+handle session and stops at the declared record extent. [Windows WHEA stop parameters](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-0x124---whea-uncorrectable-error)
+
+Each `ReadVirtual` request stops at a 4 KiB boundary. Successful short
+reads extend the contiguous prefix. An error or zero-byte return ends
+acquisition. The report retains request offsets, HRESULTs, byte counts
+and the SHA-256 of the successfully read prefix. The limits are 1 MiB,
+128 descriptors and 512 calls. Header revision `0x0210` and descriptor
+revision `0x0300` use the Windows SDK layouts. Descriptors must name
+nonempty, disjoint sections beyond their table. Descriptor order,
+padding and trailing capacity are preserved by the full record hash.
+[DbgEng virtual reads](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugdataspaces-readvirtual),
+[UEFI Common Platform Error Record](https://uefi.org/specs/UEFI/2.10/Apx_N_Common_Platform_Error_Record.html)
+
+Memory, generic processor and PCI Express sections expose selected fields
+when the producer sets their validity bits. Windows x86/x64 machine-check
+section versions 2 through 4 expose the bank status and qualified address
+and miscellaneous registers. Version 4 includes the counted extra banks.
+Each valid bank can be compared with the two 32-bit halves of the status
+in a machine-check stop. Unrecognized sections keep their GUID, extent and
+payload digest. [Windows machine-check section](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_whea_xpf_mca_section)
+
+The fatal-error hypothesis checks the header against the most severe
+section and retains qualifications such as simulation, recovery, an older
+record, a driver-provided source or inconsistent bank status. Missing
+bytes and undecodable fields remain explicit. Verifying the crash on a
+particular host or attributing it to a device or driver requires evidence
+independent of the dump.
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

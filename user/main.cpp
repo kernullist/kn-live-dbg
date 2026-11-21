@@ -54134,7 +54134,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
-        std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest>   compare saved stop data and debugger stack\n";
+        std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea]   compare saved stop data, stack and optional WHEA record\n";
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";
         std::wcout << L"  KnLiveDbg.exe --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>   capture one Windows wait chain\n";
         std::wcout << L"    --corroborate <peer-tid> <peer-creation-filetime> <rounds 2..8> <pause-ms 1..5000>   repeat paired WCT queries\n";

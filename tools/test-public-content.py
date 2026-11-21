@@ -80,6 +80,23 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data.encode(encoding))})
         self.assertEqual(AUDIT.inspect("guide.md", ("See " + schema + " for the report.").encode()), [])
 
+    def test_whea_record_and_detached_sections(self):
+        for raw in (b"CPER", b"CPER\x10", b"CPER\x10\x02\xff", b"CPER" + bytes(5), b"CPER" + bytes.fromhex("1002ffffffff") + bytes(128)):
+            self.assertIn("private-whea-record", {f["rule"] for f in AUDIT.inspect("renamed.dat", raw)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"CPER records can include padding."))
+        schema = "kn.crash_diagnosis.v2"
+        cases = (json.dumps({"header": {}, "schema": schema}), "log\n" + json.dumps({"whea_record": {}, "schema": schema}),
+                 "log\n" + json.dumps({"schema": schema, "status": "matched"}, indent=2)[:-3],
+                 json.dumps({"status": "linked", "reads": [], "captured_bytes": 4, "captured_sha256": "x"}, indent=2),
+                 json.dumps({"type_guid": "id", "revision": 0, "offset": 1, "length": 2, "sha256": "x"}, indent=2),
+                 json.dumps({"revision": 1, "record_id": 1, "creator": "id", "notify_type": "id"}),
+                 json.dumps({"bank": 1, "status": "0x0", "valid": False, "matches_stop_status": None}),
+                 json.dumps({"valid_bits": 0, "physical_address": None, "physical_address_mask": None, "error_type": None}))
+        for sample in cases:
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.log", sample.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
+
     def test_io_lifecycle_journals_and_reports(self):
         for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
             first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})

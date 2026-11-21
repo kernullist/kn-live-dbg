@@ -1,4 +1,5 @@
 #include "CrashDumpDiagnosis.h"
+#include "WheaRecord.h"
 #include "RuntimeCapabilities.h"
 #include "SymbolArtifactCache.h"
 
@@ -17,7 +18,11 @@ namespace
     using mcpjson::Quote;
     constexpr uint64_t MaxDumpBytes = 16ull << 30;
     constexpr ULONG MaxFrames = 32;
-    const std::wstring Prefix = L"{\"schema\":\"kn.crash_diagnosis.v1\",\"status\":";
+    std::wstring Prefix(bool withWhea)
+    {
+        return withWhea ? L"{\"schema\":\"kn.crash_diagnosis.v2\",\"status\":" :
+            L"{\"schema\":\"kn.crash_diagnosis.v1\",\"status\":";
+    }
 
     std::wstring Hex(uint64_t value)
     {
@@ -122,7 +127,8 @@ namespace
         e.frames += L"]";
     }
 
-    void Inspect(HANDLE file, const CONTEXT& headerContext, bool hasContext, Engine& e)
+    void Inspect(HANDLE file, const CONTEXT& headerContext, bool hasContext, Engine& e,
+        const Stop& headerStop, bool ordinaryDump, WheaRecord* record)
     {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         e.Call(L"com_initialize", initialized);
@@ -175,6 +181,18 @@ namespace
                 const bool state = e.Call(L"execution_status", control->GetExecutionStatus(&status));
                 if (state) { e.execution = std::to_wstring(status); }
                 e.initialStop = event && state && status == DEBUG_STATUS_BREAK;
+                if (record && e.stop)
+                {
+                    if (!(*e.stop == headerStop)) { record->status = L"conflicting_stop_data"; }
+                    else if (headerStop.code != 0x124) { record->status = L"different_stop_code"; }
+                    else if (!ordinaryDump) { record->status = L"unqualified_dump_attributes"; }
+                    else if (!e.initialStop) { record->status = L"initial_stop_unavailable"; }
+                    else
+                    {
+                        InspectStopWheaRecord(*client.Get(), headerStop.args[0], headerStop.args[1],
+                            headerStop.args[2], headerStop.args[3], *record);
+                    }
+                }
                 if (e.initialStop)
                 {
                     ComPtr<IDebugRegisters> registers;
@@ -225,19 +243,20 @@ namespace
         return write();
     }
 
-    int Failure(const wchar_t* status)
+    int Failure(bool withWhea, const wchar_t* status)
     {
-        return WriteCapabilityJson(Prefix + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
+        return WriteCapabilityJson(Prefix(withWhea) + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
     }
 }
 
 int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
 {
-    if (args.size() != 3 || args[1] != L"--sha256" || args[2].size() != 64 ||
+    const bool withWhea = args.size() == 4 && args[3] == L"--whea";
+    if ((!withWhea && args.size() != 3) || args[1] != L"--sha256" || args[2].size() != 64 ||
         args[2].find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos)
     {
         return WriteInputError(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest>\n";
+            std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea]\n";
             return 2;
         });
     }
@@ -250,14 +269,14 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
     if (!symbol_artifacts::LocalRoot(args[0], &path) || !parents.Pin(path.parent_path(), false) ||
         !source.Open(path.wstring(), MaxDumpBytes))
     {
-        return WriteInputError(STD_OUTPUT_HANDLE, args[0], [] { return Failure(L"source_unavailable"); });
+        return WriteInputError(STD_OUTPUT_HANDLE, args[0], [withWhea] { return Failure(withWhea, L"source_unavailable"); });
     }
-    if (source.Sha256 != expected) { return Failure(L"digest_mismatch"); }
+    if (source.Sha256 != expected) { return Failure(withWhea, L"digest_mismatch"); }
     DUMP_HEADER64 h{};
     DWORD got = 0;
     if (!approved_file::ReadAt(source.Handle(), 0, &h, sizeof(h), &got) || got != sizeof(h) ||
         h.Signature != DUMP_SIGNATURE64 || h.ValidDump != DUMP_VALID_DUMP64 ||
-        h.MachineImageType != IMAGE_FILE_MACHINE_AMD64) { return Failure(L"unsupported_header"); }
+        h.MachineImageType != IMAGE_FILE_MACHINE_AMD64) { return Failure(withWhea, L"unsupported_header"); }
 
     Stop stop{h.BugCheckCode, {h.BugCheckParameter1, h.BugCheckParameter2, h.BugCheckParameter3, h.BugCheckParameter4}};
     CONTEXT context{};
@@ -266,11 +285,13 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
     const bool hasContext = (context.ContextFlags & 0x00ff0001u) == CONTEXT_CONTROL && context.Rip && context.Rsp;
     const bool knownAttributes = (h.Attributes.Attributes & ~0x3ffu) == 0;
     Engine e;
-    Inspect(source.Handle(), context, hasContext, e);
-    if (!source.Unchanged()) { return Failure(L"source_changed_or_unreadable"); }
+    const bool ordinaryDump = knownAttributes && !h.Attributes.LiveDumpGeneratedDump && !h.Attributes.DumpIsGeneratedOffline;
+    WheaRecord record;
+    Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, withWhea ? &record : nullptr);
+    if (!source.Unchanged()) { return Failure(withWhea, L"source_changed_or_unreadable"); }
     const bool match = e.stop && *e.stop == stop;
     const auto status = !e.stop ? L"header_only" : !match ? L"conflicting_stop_data" : L"matched_stop_data";
-    std::wstring report = Prefix + Quote(status) + L",\"dump_sha256\":" + Quote(source.Sha256) +
+    std::wstring report = Prefix(withWhea) + Quote(status) + L",\"dump_sha256\":" + Quote(source.Sha256) +
         L",\"bytes\":" + std::to_wstring(source.Bytes()) + L",\"source_authenticated\":false,\"header\":{\"machine\":" + Hex(h.MachineImageType) + L",\"type\":" + std::to_wstring(h.DumpType) +
         L",\"bugcheck\":" + stop.Json() + L",\"attribute_bits\":" + Hex(h.Attributes.Attributes) +
         L",\"live_dump\":" + (knownAttributes ? Bool(h.Attributes.LiveDumpGeneratedDump != 0) : L"null") +
@@ -281,19 +302,22 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
         L"},\"initial_stop\":" + Bool(e.initialStop) + L",\"target\":" + e.type + L",\"execution_status\":" + e.execution + L",\"bugcheck\":" +
         (e.stop ? e.stop->Json() : L"null") + L",\"selected_context\":" + e.selected +
         L",\"frames\":" + e.frames + L",\"frame_limit_reached\":" + Bool(e.atLimit) + L"}";
+    if (withWhea) { report += L",\"whea_record\":" + record.Json(); }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
         L",\"unwind_quality\":\"unverified\",\"host_crash_verified\":false,\"attributed_cause\":null,\"hypotheses\":[";
     const bool whea = match && stop.code == 0x124;
-    const bool stopEvidence = e.initialStop && knownAttributes && !h.Attributes.LiveDumpGeneratedDump && !h.Attributes.DumpIsGeneratedOffline;
+    const bool stopEvidence = e.initialStop && ordinaryDump;
     const bool located = match && stop.code && e.sameContext.value_or(true) && e.topInModule && e.topMatches.value_or(false);
     report += L"{\"candidate\":\"whea_reported_condition\",\"state\":" +
         Quote(whea ? (stopEvidence ? L"supported_by_stop_tuple" : L"code_recorded_only") :
             (match && stop.code ? L"different_stop_code" : L"unresolved")) +
         L",\"support\":" + (whea ? L"[\"/header/bugcheck\",\"/dbgeng/bugcheck\"]" : L"[]") +
         L",\"contrary\":" + (match && stop.code && !whea ? L"[\"/header/bugcheck\",\"/dbgeng/bugcheck\"]" : L"[]") +
-        L",\"next\":\"inspect_the_corresponding_whea_error_record\"},";
+        L",\"next\":" + Quote(withWhea && record.status == L"linked" ? L"inspect_the_linked_whea_sections" :
+            L"inspect_the_corresponding_whea_error_record") + L"},";
+    if (withWhea) { report += record.Hypothesis() + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
         L",\"support\":" + (located ?
