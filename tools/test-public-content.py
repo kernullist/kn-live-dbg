@@ -97,6 +97,27 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.log", sample.encode(encoding))})
         self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
 
+    def test_whea_export_and_event_comparison(self):
+        name = "Microsoft-Windows-WHEA-Logger"
+        guid = "{c26c4f3c-3f66-4e99-8f8a-39405cfed220}"
+        header = '<e:Event xmlns:e="urn:test"><e:System><e:Provider '
+        schema = "kn.whea_event_comparison.v1"
+        for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+            for attribute in (f'Name="{name}"', f"Guid='{guid.upper()}'"):
+                content = ("log\n" + header + attribute + "/>").encode(encoding)
+                self.assertIn("private-whea-event", {f["rule"] for f in AUDIT.inspect("export.txt", content)})
+            for report in ({"schema": schema}, {"provider": name, "channel": "System", "event_record_id": "1", "system_time_utc": "time"}):
+                content = ("log\n" + json.dumps(report, indent=2)).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("result.txt", content)})
+        self.assertFalse(AUDIT.inspect("guide.md", ("Use the " + name + " provider.").encode()))
+        scattered = '\n'.join(json.dumps({key: "example"}) for key in ("provider", "channel", "event_record_id", "system_time_utc"))
+        self.assertFalse(AUDIT.inspect("examples.txt", scattered.encode()))
+        nested = json.dumps({"provider": name, "channel": "System", "inner": {"event_record_id": "1", "system_time_utc": "time"}})
+        self.assertFalse(AUDIT.inspect("examples.txt", nested.encode()))
+        partial = 'log\n' + json.dumps({"provider": name, "channel": "System", "event_record_id": "1", "system_time_utc": "time"}, indent=2)[:-5]
+        self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("result.txt", partial.encode())})
+
+
     def test_io_lifecycle_journals_and_reports(self):
         for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
             first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})

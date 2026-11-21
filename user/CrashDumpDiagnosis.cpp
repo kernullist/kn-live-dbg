@@ -1,5 +1,6 @@
 #include "CrashDumpDiagnosis.h"
 #include "WheaRecord.h"
+#include "WheaEvent.h"
 #include "RuntimeCapabilities.h"
 #include "SymbolArtifactCache.h"
 
@@ -247,22 +248,23 @@ namespace
     {
         return WriteCapabilityJson(Prefix(withWhea) + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
     }
+
+    bool IsDigest(const std::wstring& text)
+    {
+        return text.size() == 64 && text.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos;
+    }
+
+    std::wstring LowerDigest(std::wstring digest)
+    {
+        std::transform(digest.begin(), digest.end(), digest.begin(), [](wchar_t c) {
+            return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
+        return digest;
+    }
 }
 
-int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
+static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool withEvent)
 {
-    const bool withWhea = args.size() == 4 && args[3] == L"--whea";
-    if ((!withWhea && args.size() != 3) || args[1] != L"--sha256" || args[2].size() != 64 ||
-        args[2].find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos)
-    {
-        return WriteInputError(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea]\n";
-            return 2;
-        });
-    }
-    std::wstring expected = args[2];
-    std::transform(expected.begin(), expected.end(), expected.begin(), [](wchar_t c) {
-        return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
+    const auto expected = LowerDigest(args[2]);
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
     SchemaArtifact source;
@@ -288,6 +290,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
     const bool ordinaryDump = knownAttributes && !h.Attributes.LiveDumpGeneratedDump && !h.Attributes.DumpIsGeneratedOffline;
     WheaRecord record;
     Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, withWhea ? &record : nullptr);
+    const auto event = withEvent ? CompareSavedWheaEvent(args[5], LowerDigest(args[7]), record) : WheaEventComparison{};
     if (!source.Unchanged()) { return Failure(withWhea, L"source_changed_or_unreadable"); }
     const bool match = e.stop && *e.stop == stop;
     const auto status = !e.stop ? L"header_only" : !match ? L"conflicting_stop_data" : L"matched_stop_data";
@@ -303,6 +306,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
         (e.stop ? e.stop->Json() : L"null") + L",\"selected_context\":" + e.selected +
         L",\"frames\":" + e.frames + L",\"frame_limit_reached\":" + Bool(e.atLimit) + L"}";
     if (withWhea) { report += L",\"whea_record\":" + record.Json(); }
+    if (withEvent) { report += L",\"whea_event\":" + event.report; }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
@@ -318,6 +322,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
         L",\"next\":" + Quote(withWhea && record.status == L"linked" ? L"inspect_the_linked_whea_sections" :
             L"inspect_the_corresponding_whea_error_record") + L"},";
     if (withWhea) { report += record.Hypothesis() + L","; }
+    if (withEvent) { report += event.Hypothesis() + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
         L",\"support\":" + (located ?
@@ -328,4 +333,35 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
     report += L"{\"candidate\":\"earlier_corruption\",\"state\":\"unresolved\",\"support\":[],\"contrary\":[],"
         L"\"next\":\"compare_prior_object_and_allocation_history\"}]}}";
     return WriteCapabilityJson(report) ? (match ? 0 : 1) : 2;
+}
+
+int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
+{
+    const bool withEvent = args.size() == 8 && args[3] == L"--whea" && args[4] == L"--event-xml" &&
+        args[6] == L"--event-sha256" && IsDigest(args[7]);
+    const bool withWhea = withEvent || (args.size() == 4 && args[3] == L"--whea");
+    if ((!withWhea && args.size() != 3) || args[1] != L"--sha256" || !IsDigest(args[2]))
+    {
+        auto usage = [&] {
+            return WriteInputError(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
+                std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
+                    L"[--whea [--event-xml <file> --event-sha256 <digest>]]\n";
+                return 2;
+            });
+        };
+        const auto option = std::find(args.begin(), args.end(), L"--event-xml");
+        if (option != args.end() && option + 1 != args.end())
+        {
+            if (std::find(option + 1, args.end(), L"--event-xml") != args.end() &&
+                GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK) { return 2; }
+            return WriteInputError(STD_ERROR_HANDLE, *(option + 1), usage);
+        }
+        return usage();
+    }
+    if (withEvent)
+    {
+        // Keep a disk output distinct from both input identities, even if the XML read lease fails.
+        return WriteInputError(STD_OUTPUT_HANDLE, args[5], [&] { return Diagnose(args, true, true); });
+    }
+    return Diagnose(args, withWhea, false);
 }

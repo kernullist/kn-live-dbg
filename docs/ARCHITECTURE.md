@@ -3521,6 +3521,28 @@ bytes and undecodable fields remain explicit. Verifying the crash on a
 particular host or attributing it to a device or driver requires evidence
 independent of the dump.
 
+### Saved WHEA event comparison
+
+An optional second fixed-drive input holds the XML of one Windows System
+event. Its own SHA-256 pin and read lease bind the comparison to the
+export's bytes. The command uses XmlLite in document mode with DTDs
+prohibited, external resolution disabled and a 32-level depth limit.
+Input is bounded to 8 MiB, 4,096 reader nodes and 1 MiB of decoded
+payload. The event parser accepts XML namespaces and consumes named
+fields only at their Windows Event schema locations. Duplicate identity
+or payload fields leave the comparison unresolved. [Windows Event schema](https://learn.microsoft.com/en-us/windows/win32/wes/eventschema-eventtype-complextype),
+[Windows event rendering](https://learn.microsoft.com/en-us/windows/win32/wes/rendering-events)
+
+The installed WHEA-Logger version-zero templates for IDs 1–3, 16–29
+and 40–47 expose `Length` and binary `RawData`. The comparison checks the
+System channel, provider name and GUID, event ID and version, record ID,
+UTC timestamp and decoded length. If the dump has a linked CPER, the
+report compares the complete byte lengths and SHA-256 digests and cites both
+observations. A partial dump or unavailable event retains the corresponding
+missing evidence. Matching bytes corroborate the representation in the
+two inputs. Export provenance, host identity, boot identity and the
+cause of the crash remain separate questions.
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

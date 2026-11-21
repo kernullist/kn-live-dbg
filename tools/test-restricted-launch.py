@@ -81,6 +81,7 @@ def main():
                     ["--offline", "!kmon", "gc", str(root), "PRIVATE-SENTINEL", "/apply", "1"],
                     ["--crash-diagnose", str(trace), "--sha256", digest],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--whea"],
+                    ["--crash-diagnose", str(trace), "--sha256", digest, "--whea", "--event-xml", str(trace), "--event-sha256", digest],
                     ["--io-lifecycle", "50", str(root)],
                     ["--wait-chain", "1", "1", "1", "1", "--corroborate", "2", "2", "2", "10"],
                     ["--wait-chain", "1", "1", "1", "1"], ["--verify-process-image"], ["write", "on"], ["!kmon", "on"], ["kdinit"],

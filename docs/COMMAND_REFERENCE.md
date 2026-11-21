@@ -1109,6 +1109,36 @@ inapplicable data. `qualifiers` and the hypothesis's `contrary` and
 ones. Hardware identifiers, addresses and the report belong with the
 original private dump. [WHEA evidence boundaries](ARCHITECTURE.md#stop-linked-whea-records)
 
+### Compare a saved WHEA event with the dump
+
+Use the XML view of **one** System event exported independently of the dump.
+Windows Event Viewer and `EventLogRecord.ToXml()` use the Windows Event
+namespace. Keep each original and its SHA-256. The command takes the
+dump pin and the event pin separately.
+
+```powershell
+$dump = Get-Item -LiteralPath '.\saved-kernel.dmp'
+$eventXml = Get-Item -LiteralPath '.\whea-event.xml'
+$dumpPin = (Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256).Hash
+$eventPin = (Get-FileHash -LiteralPath $eventXml.FullName -Algorithm SHA256).Hash
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $dumpPin --whea --event-xml $eventXml.FullName --event-sha256 $eventPin
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+$report.status
+$report.whea_event | Format-List status, same_payload_bytes, payload_sha256, dump_record_sha256
+$report.whea_event.event | Format-List event_id, event_record_id, system_time_utc
+```
+
+`matching_payload_bytes` means the event payload and the entire linked
+dump record have equal lengths and SHA-256 digests. A change in padding
+alone produces `different_payload_bytes`. A missing dump page, wrong
+event pin, unsupported provider or incomplete event leaves
+`same_payload_bytes` null. Exit 0 still means the two dump stop tuples
+agree. Use `whea_event.status` for the comparison. The report preserves
+the Windows event record ID and the timestamp from the export. Verifying
+which host and boot produced them requires independent evidence.
+[Event comparison boundaries](ARCHITECTURE.md#saved-whea-event-comparison)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

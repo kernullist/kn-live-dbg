@@ -7,6 +7,41 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## WHEA event XML comparison, 2026-11-22
+
+The x64 Release controller had SHA-256
+`9029964e6b3ee1d3899bbd4cfd53ddee66b4c4906048ddc40e6171558177e012`. A separately rendered
+UTF-16 event contained the 2,199 bytes previously extracted from a small
+dump by Windows SDK `kd.exe`. Independent .NET XML and SHA-256 operations
+in Windows PowerShell and PowerShell 7 reproduced the digest from the
+native comparison. Reading the two inputs twice returned byte-identical
+JSON. Nine previously retained v1 reports and the retained WHEA v2 report
+also matched their original bytes when the event option was omitted.
+[Run the comparison](COMMAND_REFERENCE.md#compare-a-saved-whea-event-with-the-dump)
+
+Ten event tests exercised complete and partial CPERs, a padding-only
+difference, wrong pins, named fields and namespaces, invalid or duplicate
+fields, UTF-8 and both UTF-16 byte orders, file and parser limits, a
+reparse directory, a concurrent writer and hard-link redirection. A
+1 MiB CPER matched a UTF-16 export at the payload limit. The external
+DTD test recorded zero loopback connections. The installed WHEA-Logger
+manifest supplied the provider GUID and both payload fields for all 25
+version-zero event IDs supported here. A real System event exported by
+another provider produced `different_event_source`. Every positive event
+comparison used synthetic incident data.
+
+The final controller passed nine WHEA record tests, 11 crash tests,
+227 dump CLI checks with one file-symlink control skipped, 15 wait tests,
+nine I/O tests, 82 restricted launches, 57 source contracts and 3,081
+command checks. The compiled support matrix matched. All three documented
+examples ran in both PowerShell editions. The publication tests passed
+all 23 cases and the scanner recognized 32 variants of the XML and
+private comparison data. From 01:45 to 01:56 KST the host kept the same
+boot, with zero new reboot events, bugchecks or crash dumps and no
+remaining fixture process, temporary directory or running test driver.
+Incident attribution and independent boot or capture provenance remain
+open. [Comparison boundaries](ARCHITECTURE.md#saved-whea-event-comparison)
+
 ## Stop-linked WHEA records, 2026-11-22
 
 The x64 Release controller had SHA-256

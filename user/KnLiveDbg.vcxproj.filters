@@ -142,6 +142,9 @@
     <ClCompile Include="WheaRecord.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WheaEvent.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="IoLifecycleCapture.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -472,6 +475,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WheaRecord.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WheaEvent.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="IoLifecycleCapture.h">

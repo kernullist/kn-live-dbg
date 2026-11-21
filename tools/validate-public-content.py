@@ -81,6 +81,42 @@ def text_views(data: bytes) -> list[str]:
             "\n".join(s.decode("utf-16-le") for s in wide_strings)]
 
 
+WHEA_FIELD_SETS = tuple(frozenset(fields) for fields in (
+    ("captured_sha256", "captured_bytes", "reads", "status"),
+    ("type_guid", "revision", "offset", "length", "sha256"),
+    ("notify_type", "creator", "revision", "record_id"),
+    ("bank", "status", "valid", "matches_stop_status"),
+    ("provider", "channel", "event_record_id", "system_time_utc"),
+    ("valid_bits", "physical_address", "physical_address_mask", "error_type"),
+))
+WHEA_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
+JSON_SPACE = re.compile(r'[ \t\r\n]*')
+
+
+def detached_whea_object(text: str, offset: int, decoder: json.JSONDecoder) -> bool:
+    # Count keys in one object. Exporters may reorder them or stop during its final value.
+    keys = set()
+    pos = JSON_SPACE.match(text, offset + 1).end()
+    try:
+        while text.startswith('"', pos):
+            key, pos = decoder.raw_decode(text, pos)
+            pos = JSON_SPACE.match(text, pos).end()
+            if not text.startswith(":", pos):
+                break
+            keys.add(key)
+            if any(fields <= keys for fields in WHEA_FIELD_SETS):
+                return True
+            pos = JSON_SPACE.match(text, pos + 1).end()
+            _, pos = decoder.raw_decode(text, pos)
+            pos = JSON_SPACE.match(text, pos).end()
+            if not text.startswith(",", pos):
+                break
+            pos = JSON_SPACE.match(text, pos + 1).end()
+    except (ValueError, RecursionError):
+        pass
+    return False
+
+
 def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list[dict]:
     findings = []
     reported_name = name
@@ -126,11 +162,18 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         for encoding, lane, bom in (("utf-16-le", 1, b"\xff\xfe"), ("utf-16-be", 0, b"\xfe\xff")):
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
-                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", '"virtual"', '"captured_sha256"', '"type_guid"',
+                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1",
+                                                                  "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
     for text in text_views(view):
+        if (not binary or view is not data) and "Provider" in text and ("Microsoft-Windows-WHEA-Logger" in text or
+                "c26c4f3c-3f66-4e99-8f8a-39405cfed220" in text.lower()):
+            # Preserve exported Windows Event XML even after renaming or adding a log banner.
+            if re.search(r'(?im)(?:^|>)[ \t\r\n]*<(?:[\w.-]+:)?(?:Event|Provider)\b', text) and re.search(
+                    r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})["']''', text):
+                add("private-whea-event")
         # Capture contents remain private even if the extension was changed.
         if text.lstrip().startswith("{"):
             try:
@@ -149,7 +192,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
-                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2",
+                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
@@ -161,20 +204,20 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             except (ValueError, RecursionError):
                 pass
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
-        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.crash_diagnosis" in text) and
+        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|crash_diagnosis\.v[12])"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:
                 for number, line in enumerate(text.splitlines(), 1):
-                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.crash_diagnosis" in line):
+                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.crash_diagnosis" in line or "kn.whea_event_comparison" in line):
                         continue
                     try:
                         row = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2"):
+                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1"):
                         add("private-evidence-bundle", number)
                         break
         if ((not binary or view is not data) and '"virtual"' in text and
@@ -184,17 +227,11 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"')):
-            # Detached header, section, memory and MCA observations carry target identifiers.
-            signatures = (("captured_sha256", "captured_bytes", "reads", "status"),
-                          ("type_guid", "revision", "offset", "length", "sha256"),
-                          ("notify_type", "creator", "revision", "record_id"),
-                          ("bank", "status", "valid", "matches_stop_status"),
-                          ("valid_bits", "physical_address", "physical_address_mask", "error_type"))
-            for keys in signatures:
-                if all('"' + key + '"' in text for key in keys) and re.search(
-                        r'(?m)^[ \t,]*\{\s*"(?:' + "|".join(keys) + r'|type|severity|address|misc)"\s*:', text):
-                    add("private-evidence-bundle")
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"')):
+            decoder = json.JSONDecoder()
+            for match in WHEA_OBJECT_START.finditer(text):
+                if detached_whea_object(text, match.start(1), decoder):
+                    add("private-evidence-bundle", text.count("\n", 0, match.start(1)) + 1)
                     break
         # WCT output may be redirected or cut between individually flushed rounds.
         if not binary and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):

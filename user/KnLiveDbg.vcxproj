@@ -251,6 +251,7 @@
     <ClCompile Include="ProcessImageCapture.cpp" />
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
     <ClCompile Include="WheaRecord.cpp" />
+    <ClCompile Include="WheaEvent.cpp" />
     <ClCompile Include="IoLifecycleCapture.cpp" />
     <ClCompile Include="WaitChainCapture.cpp" />
     <ClCompile Include="ImageVerificationRecipe.cpp" />
@@ -459,6 +460,7 @@
     <ClInclude Include="ProcessImageCapture.h" />
     <ClInclude Include="CrashDumpDiagnosis.h" />
     <ClInclude Include="WheaRecord.h" />
+    <ClInclude Include="WheaEvent.h" />
     <ClInclude Include="IoLifecycleCapture.h" />
     <ClInclude Include="WaitChainCapture.h" />
     <ClInclude Include="ImageProof.h" />
