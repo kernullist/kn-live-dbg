@@ -19,7 +19,7 @@ namespace etl_profile
         uint64_t base = 0, size = 0, preferred = 0;
         int64_t tick = 0;
         uint32_t record = 0, pid = 0, checksum = 0, stamp = 0, nameOffset = 0;
-        uint16_t nameUnits = 0;
+        uint16_t nameUnits = 0, logger = 0;
         uint8_t version = 0, opcode = 0, width = 0, signatureLevel = 0, signatureType = 0;
     };
 
@@ -55,6 +55,7 @@ namespace etl_profile
         std::memcpy(&result.preferred, fields + 16, width);
         result.record = ordinal;
         result.tick = h.TimeStamp.QuadPart;
+        result.logger = event.BufferContext.LoggerId;
         result.opcode = d.Opcode;
         result.version = d.Version;
         result.width = width;
@@ -68,7 +69,7 @@ namespace etl_profile
         uint32_t pid;
         uint64_t base, last, prefixLast;
         size_t first, end;
-        bool transitionConflict, clockConflict;
+        bool transitionConflict, clockConflict, mixedLoggers = false;
     };
 
     struct ImageWitness
@@ -76,7 +77,7 @@ namespace etl_profile
         const ImageEvent* before = nullptr;
         const ImageEvent* after = nullptr;
         const wchar_t* relation = nullptr;
-        bool paired = false;
+        bool paired = false, mixedLoggers = false;
     };
 
     struct ImageMatch
@@ -148,6 +149,7 @@ namespace etl_profile
                     group.last = (std::max)(group.last, current.base + (current.size - 1));
                     group.transitionConflict |= ImageOpening(previous.opcode) == ImageOpening(current.opcode);
                     group.clockConflict |= previous.tick >= current.tick;
+                    group.mixedLoggers |= previous.logger != current.logger;
                 }
                 group.prefixLast = groups.empty() || groups.back().pid != head.pid ? group.last :
                     (std::max)(groups.back().prefixLast, group.last);
@@ -197,7 +199,8 @@ namespace etl_profile
                 const auto& group = *--it;
                 if (group.pid != pairedPid || group.prefixLast < sample.ip) { break; }
                 if (group.last < sample.ip) { continue; }
-                const auto witness = At(group, sample, clock, gap);
+                auto witness = At(group, sample, clock, gap);
+                witness.mixedLoggers = group.mixedLoggers;
                 if (!witness.relation) { continue; }
                 if (result.count < result.witnesses.size()) { result.witnesses[result.count] = witness; }
                 ++result.count;

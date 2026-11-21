@@ -1,6 +1,5 @@
 #include "EtlProfile.h"
-#include "EtlThreadEvidence.h"
-#include "EtlImageEvidence.h"
+#include "EtlProcessEvidence.h"
 #include "EtlScheduleIntervals.h"
 #include "ArtifactOutput.h"
 #include "RuntimeCapabilities.h"
@@ -23,15 +22,16 @@ namespace
         uint32_t after = 0;
         uint32_t limit = 64;
         std::wstring digest;
-        bool switches = false, threads = false, images = false;
+        bool switches = false, threads = false, images = false, processes = false;
         bool intervals = false, haveTid = false;
         uint32_t tid = 0;
         bool WithIntervals() const { return intervals || haveTid; }
-        bool WithThreads() const { return threads || images; }
+        bool WithThreads() const { return threads || images || processes; }
         const wchar_t* Prefix() const
         {
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
+            if (processes) { return L"{\"schema\":\"kn.etl_profile.v4\",\"status\":"; }
             if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
             return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
         }
@@ -64,6 +64,7 @@ namespace
         {
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
+            if (args[i] == L"--process-evidence" && !options.switches && !options.processes) { options.processes = true; continue; }
             if (args[i] == L"--intervals" && options.switches && !options.intervals) { options.intervals = true; continue; }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
@@ -90,6 +91,7 @@ namespace
         Options options;
         etl_profile::ThreadIndex threadIndex;
         etl_profile::ImageIndex imageIndex;
+        etl_profile::ProcessIndex processIndex;
         etl_profile::ScheduleHistory history;
         std::array<Sample, MaxPage> page{};
         std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
@@ -134,6 +136,7 @@ namespace
         if (scan.replaying) { ReplayRecord(*event, scan); return; }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
         if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
+        if (scan.options.processes) { scan.processIndex.Observe(*event, scan.records, scan.options.images); }
         const bool keep = scan.matched >= scan.options.after && scan.used < scan.options.limit;
         etl_profile::SwitchEvent scratch;
         auto* sw = keep ? &scan.switchPage[scan.used] : (scan.options.haveTid ? &scratch : nullptr);
@@ -205,22 +208,27 @@ namespace
         return Quote(text);
     }
 
-    std::wstring ThreadPointJson(const etl_profile::ThreadEvent* e)
+    std::wstring LoggerJson(uint16_t logger, bool include)
+    {
+        return include ? L",\"logger_id\":" + std::to_wstring(logger) : std::wstring{};
+    }
+
+    std::wstring ThreadPointJson(const etl_profile::ThreadEvent* e, bool includeLogger)
     {
         if (!e) { return L"null"; }
         return L"{\"record_ordinal\":" + std::to_wstring(e->record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e->tick)) +
             L",\"event\":" + Quote(etl_profile::ThreadEventName(e->opcode)) + L",\"opcode\":" + std::to_wstring(e->opcode) +
-            L",\"payload_pid\":" + std::to_wstring(e->pid) + L",\"payload_tid\":" + std::to_wstring(e->tid) + L"}";
+            L",\"payload_pid\":" + std::to_wstring(e->pid) + L",\"payload_tid\":" + std::to_wstring(e->tid) + LoggerJson(e->logger, includeLogger) + L"}";
     }
 
-    std::wstring ThreadPairJson(const etl_profile::ThreadPair& pair)
+    std::wstring ThreadPairJson(const etl_profile::ThreadPair& pair, bool includeLogger)
     {
         return L",\"thread_evidence\":{\"relation\":" + Quote(pair.relation) + L",\"paired_record_pid\":" +
-            (pair.pairedPid ? std::to_wstring(pair.before->pid) : L"null") + L",\"before\":" + ThreadPointJson(pair.before) +
-            L",\"after\":" + ThreadPointJson(pair.after) + L"}";
+            (pair.pairedPid ? std::to_wstring(pair.before->pid) : L"null") + L",\"before\":" + ThreadPointJson(pair.before, includeLogger) +
+            L",\"after\":" + ThreadPointJson(pair.after, includeLogger) + L"}";
     }
 
-    std::wstring ImageEventJson(const etl_profile::ImageEvent& e, const etl_profile::ImageIndex& index)
+    std::wstring ImageEventJson(const etl_profile::ImageEvent& e, const etl_profile::ImageIndex& index, bool includeLogger)
     {
         return L"{\"record_ordinal\":" + std::to_wstring(e.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e.tick)) +
             L",\"opcode\":" + std::to_wstring(e.opcode) + L",\"version\":" + std::to_wstring(e.version) +
@@ -229,7 +237,7 @@ namespace
             L",\"image_checksum\":" + std::to_wstring(e.checksum) + L",\"pe_timestamp\":" + std::to_wstring(e.stamp) +
             L",\"signature_level\":" + (e.version == 3 ? std::to_wstring(e.signatureLevel) : L"null") +
             L",\"signature_type\":" + (e.version == 3 ? std::to_wstring(e.signatureType) : L"null") +
-            L",\"recorded_file_name\":" + Quote(std::wstring(index.Name(e))) + L"}";
+            L",\"recorded_file_name\":" + Quote(std::wstring(index.Name(e))) + LoggerJson(e.logger, includeLogger) + L"}";
     }
 
     std::wstring ImageMatchJson(const etl_profile::ImageMatch& match, std::vector<const etl_profile::ImageEvent*>& records)
@@ -250,6 +258,52 @@ namespace
         return result + L"]}";
     }
 
+    std::wstring ProcessEventJson(const etl_profile::ProcessEvent& e)
+    {
+        return L"{\"record_ordinal\":" + std::to_wstring(e.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e.tick)) +
+            L",\"event\":" + Quote(e.opcode == 39 ? L"defunct" : etl_profile::ThreadEventName(e.opcode)) +
+            L",\"opcode\":" + std::to_wstring(e.opcode) + L",\"version\":" + std::to_wstring(e.version) +
+            L",\"pointer_bytes\":" + std::to_wstring(e.width) + L",\"logger_id\":" + std::to_wstring(e.logger) +
+            L",\"payload_pid\":" + std::to_wstring(e.pid) + L",\"parent_pid\":" + std::to_wstring(e.parent) +
+            L",\"session_id\":" + std::to_wstring(e.session) + L",\"exit_status\":" + std::to_wstring(e.exitStatus) +
+            L",\"defunct_exit_time_raw\":" + (e.version == 5 ? Quote(std::to_wstring(e.exitTime)) : L"null") + L"}";
+    }
+
+    std::wstring ProcessPairJson(const etl_profile::ProcessPair& p, std::vector<const etl_profile::ProcessEvent*>& records)
+    {
+        if (p.before) { records.push_back(p.before); }
+        if (p.after) { records.push_back(p.after); }
+        return L",\"process_evidence\":{\"relation\":" + Quote(p.relation) + L",\"candidate_pid\":" +
+            (p.candidatePid ? std::to_wstring(p.candidatePid) : L"null") + L",\"before_record\":" +
+            (p.before ? std::to_wstring(p.before->record) : L"null") + L",\"after_record\":" +
+            (p.after ? std::to_wstring(p.after->record) : L"null") + L",\"opaque_key_comparison\":" + Quote(p.keyComparison) +
+            L",\"recorded_generation\":" + (p.generation ? L"{\"payload_pid\":" + std::to_wstring(p.candidatePid) +
+                L",\"start_record\":" + std::to_wstring(p.before->record) + L"}" : L"null") + L"}";
+    }
+
+    std::wstring ImageProcessJson(const etl_profile::ProcessPair& process, const etl_profile::ImageMatch& image, bool reversedClock)
+    {
+        const auto bound = etl_profile::ImageInProcess(process, image, reversedClock);
+        return L",\"image_process_evidence\":{\"relation\":" + Quote(bound.relation) + L",\"process_start_record\":" +
+            (bound.paired ? std::to_wstring(process.before->record) : L"null") + L",\"reported_rva\":" +
+            (bound.paired ? Hex(image.rva) : L"null") + L"}";
+    }
+
+    template<typename Event, typename Format>
+    void AppendRecords(std::wstring& result, const wchar_t* name, std::vector<const Event*>& records, Format format)
+    {
+        result += L"],\"";
+        result += name;
+        result += L"\":[";
+        std::sort(records.begin(), records.end(), [](const Event* a, const Event* b) { return a->record < b->record; });
+        records.erase(std::unique(records.begin(), records.end()), records.end());
+        for (size_t i = 0; i < records.size(); ++i)
+        {
+            if (i) { result += L','; }
+            result += format(*records[i]);
+        }
+    }
+
     std::wstring RecordLocationJson(const etl_profile::RecordEnvelope& s)
     {
         return L",\"record_ordinal\":" + std::to_wstring(s.record) +
@@ -267,13 +321,14 @@ namespace
             L",\"stack_extension_items\":" + std::to_wstring(s.stackItems);
     }
 
-    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread, const std::wstring& image = {})
+    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread,
+        const std::wstring& evidence = {}, bool includeLogger = false)
     {
         return L"{\"sample_ordinal\":" + std::to_wstring(s.ordinal) + RecordLocationJson(s) +
             L",\"instruction_pointer\":" + Hex(s.ip) + L",\"sampled_thread_id\":" + std::to_wstring(s.tid) +
             L",\"count_field\":" + std::to_wstring(s.count) + L",\"reserved_field\":" + std::to_wstring(s.reserved) +
             RecordHeaderJson(s) +
-            (thread ? ThreadPairJson(*thread) : L"") + image + L"}";
+            (thread ? ThreadPairJson(*thread, includeLogger) : L"") + evidence + L"}";
     }
 
     std::wstring ScheduleRefJson(const etl_profile::ScheduleRef& ref)
@@ -370,7 +425,7 @@ namespace
     bool Partial(const Scan& scan, BufferAccounting accounting)
     {
         return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
-            !scan.threadIndex.Complete() || !scan.imageIndex.Complete();
+            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete();
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting)
@@ -455,7 +510,20 @@ namespace
                 L",\"unsupported_events\":" + std::to_wstring(scan.imageIndex.unsupported) +
                 L",\"retention\":" + Quote(scan.imageIndex.retention) + L"}";
         }
+        if (scan.options.processes)
+        {
+            const auto& index = scan.processIndex;
+            result += L",\"process_source\":{\"provider_guid\":\"3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c\","
+                L"\"event_id\":0,\"lifecycle_opcodes\":[1,2,3,4],\"lifecycle_versions\":[2,3,4],"
+                L"\"defunct_opcode\":39,\"defunct_versions\":[2,3,4,5],\"decoded_events\":" + std::to_wstring(index.decoded) +
+                L",\"retained_events\":" + std::to_wstring(index.events.size()) + L",\"unsupported_events\":" +
+                std::to_wstring(index.unsupported) + L",\"defunct_events\":" + std::to_wstring(index.defunct) +
+                L",\"source_clock_reversed\":" + (index.processClock.reversed ? L"true" : L"false") +
+                L",\"image_binding_clock_reversed\":" + (scan.options.images ? (index.imageClock.reversed ? L"true" : L"false") : L"null") +
+                L",\"generation_scope\":\"source_sha256_and_start_record\",\"creation_filetime\":null}";
+        }
         std::vector<const etl_profile::ImageEvent*> records;
+        std::vector<const etl_profile::ProcessEvent*> processRecords;
         result += L",\"samples\":[";
         for (size_t i = 0; i < scan.used; ++i)
         {
@@ -463,27 +531,31 @@ namespace
             if (scan.options.WithThreads())
             {
                 const auto pair = scan.threadIndex.Lookup(scan.page[i], comparableClock, captureGap);
+                std::wstring evidence;
+                etl_profile::ProcessPair process;
+                if (scan.options.processes)
+                {
+                    process = scan.processIndex.Lookup(scan.page[i], pair, comparableClock, captureGap || scan.unsupported);
+                    evidence = ProcessPairJson(process, processRecords);
+                }
                 if (scan.options.images)
                 {
                     const uint32_t pid = pair.pairedPid ? pair.before->pid : 0;
                     const auto image = scan.imageIndex.Lookup(scan.page[i], pid, comparableClock, captureGap);
-                    result += SampleJson(scan.page[i], &pair, ImageMatchJson(image, records));
+                    evidence += ImageMatchJson(image, records);
+                    if (scan.options.processes) { evidence += ImageProcessJson(process, image, scan.processIndex.imageClock.reversed); }
                 }
-                else { result += SampleJson(scan.page[i], &pair); }
+                result += SampleJson(scan.page[i], &pair, evidence, scan.options.processes);
             }
             else { result += SampleJson(scan.page[i], nullptr); }
         }
         if (scan.options.images)
         {
-            result += L"],\"image_records\":[";
-            std::sort(records.begin(), records.end(), [](const auto* a, const auto* b) { return a->record < b->record; });
-            records.erase(std::unique(records.begin(), records.end()), records.end());
-            for (size_t i = 0; i < records.size(); ++i)
-            {
-                if (i) { result += L','; }
-                result += ImageEventJson(*records[i], scan.imageIndex);
-            }
+            AppendRecords(result, L"image_records", records, [&](const auto& e) {
+                return ImageEventJson(e, scan.imageIndex, scan.options.processes);
+            });
         }
+        if (scan.options.processes) { AppendRecords(result, L"process_records", processRecords, ProcessEventJson); }
         return result + L"]}";
     }
 
@@ -533,7 +605,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [switches] {
             std::wcerr << (switches ?
                 L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
-                L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence]\n");
+                L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence]\n");
             return 2;
         });
     }
@@ -558,9 +630,10 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         {
             scan.threadIndex.Prepare();
             if (scan.options.images) { scan.imageIndex.Prepare(); }
+            if (scan.options.processes) { scan.processIndex.Prepare(); }
         }
         catch (const std::bad_alloc&)
-        { return Failure(scan.options, scan.options.images ? L"evidence_index_unavailable" : L"thread_index_unavailable", source.Sha256); }
+        { return Failure(scan.options, (scan.options.images || scan.options.processes) ? L"evidence_index_unavailable" : L"thread_index_unavailable", source.Sha256); }
     }
     const auto status = ProcessTrace(&trace.handle, 1, nullptr, nullptr);
     if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
@@ -579,6 +652,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         if (replay != ERROR_SUCCESS) { return Failure(scan.options, L"interval_replay_failed", source.Sha256, replay); }
     }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
+    if (scan.options.processes && scan.processIndex.Complete()) { scan.processIndex.Sort(); }
     return WriteCapabilityJson(Report(scan, log.LogfileHeader, source, accounting)) ? (partial ? 1 : 0) : 2;
 }
 

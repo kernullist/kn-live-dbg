@@ -206,6 +206,8 @@ def main():
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]
     assert "thread_v3_start_end_and_rundown_records" in profile["requirements"] and "65536_thread_events" in profile["limits"]
     assert "process_scoped_image_v2_v3_load_unload_and_rundown" in profile["requirements"]
+    assert all(s in profile["requirements"] for s in ("opt_in_process_lifecycle_v2_v3_v4", "defunct_v2_to_v5", "image_bracket_in_recorded_process_generation"))
+    assert all(s in profile["limits"] for s in ("65536_process_events", "source_local_process_generation"))
     assert "65536_image_events" in profile["limits"] and "16MiB_image_names" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
     observe = by_key[("session", "observe_scope", "mcp")]
@@ -235,7 +237,7 @@ def main():
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
     assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id"))
-    assert "--etl-profile" in help_result.stdout and "--image-evidence" in help_result.stdout
+    assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
     assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout

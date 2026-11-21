@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 import ctypes
 from ctypes import wintypes
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,7 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         assert not result.stdout
         return None
     value = json.loads(result.stdout.decode("utf-8"))
-    version = 3 if "--image-evidence" in args else (2 if "--thread-evidence" in args else 1)
+    version = 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
     switch_version = 2 if "--intervals" in args or "--thread-id" in args else 1
     assert value["schema"] == (f"kn.etl_switches.v{switch_version}" if switches else f"kn.etl_profile.v{version}")
     return value
@@ -136,7 +137,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False, schedule=None):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -158,7 +159,12 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None):
         # every selected value. Image evidence needs the original Unicode names.
         prefix = stream.read(4)
         stream.seek(0)
-        single_byte = want_switches and b"\0" not in prefix and not prefix.startswith((b"\xff\xfe", b"\xfe\xff"))
+        narrow_xml = b"\0" not in prefix and not prefix.startswith((b"\xff\xfe", b"\xfe\xff"))
+        single_byte = narrow_xml and (want_switches or processes is not None and not want_images)
+        if narrow_xml and processes is not None and want_images:
+            # Keep valid UTF-8 image names. Some tracerpt builds write unrelated provider text
+            # in a local code page. Refuse to verify any selected name with a replacement character.
+            stream = io.TextIOWrapper(stream, encoding="utf-8-sig", errors="replace")
         parser = ElementTree.XMLParser(encoding="iso-8859-1") if single_byte else None
         events = ElementTree.iterparse(stream, events=("start", "end"), parser=parser)
         _, root = next(events)
@@ -167,7 +173,7 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None):
                 continue
             records += 1
             guid = (event.findtext(trace_ns + "ExtendedTracingInfo/" + trace_ns + "EventGuid") or "").strip("{}").lower()
-            if want_images and guid == "68fdd900-4a3e-11d1-84f4-0000f80464e3":
+            if (want_images or processes is not None) and guid == "68fdd900-4a3e-11d1-84f4-0000f80464e3":
                 width = event.find(ns + "EventData/" + ns + "Data[@Name='PointerSize']")
                 if width is not None:
                     pointer_width = int(width.text, 0)
@@ -175,10 +181,25 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None):
                 system = event.find(ns + "System")
                 version = int(system.findtext(ns + "Version"))
                 op = int(system.findtext(ns + "Opcode"))
+                if processes is not None and op in (2, 3, 4, 10):
+                    processes.image_tick(int(system.find(ns + "TimeCreated").attrib["RawTime"]))
                 if system.findtext(ns + "EventID") == "0" and version in (2, 3) and op in (2, 3, 4, 10):
                     fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
                     tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
+                    if processes is not None:
+                        assert "\ufffd" not in (fields.get("FileName") or ""), ("unqualified XML image name", records)
                     images.add(records, tick, version, op, pointer_width, fields)
+            if processes is not None and guid in ("3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c", thread_guid, profile_guid):
+                system = event.find(ns + "System")
+                op = int(system.findtext(ns + "Opcode"))
+                process = guid == "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c" and op in (1, 2, 3, 4, 39)
+                if process or guid == thread_guid and 1 <= op <= 4 or guid == profile_guid and op == 46:
+                    tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
+                    processes.tick(tick)
+                    if process and system.findtext(ns + "EventID") == "0":
+                        fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
+                        raw = event.findtext(ns + "ProcessingErrorData/" + ns + "EventPayload")
+                        processes.add(records, tick, op, int(system.findtext(ns + "Version")), pointer_width, fields, raw)
             if want_switches and guid == thread_guid:
                 system = event.find(ns + "System")
                 if system.findtext(ns + "EventID") == "0" and system.findtext(ns + "Opcode") == "36":
@@ -247,12 +268,14 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None):
             root.clear()
     if not want_switches:
         print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
+    if processes is not None:
+        processes.prepare()
     if images is not None:
         images.prepare()
     return records, samples, threads, images, switches
 
 
-def compare_thread(pair, row, events, coverage, clock_ok):
+def compare_thread(pair, row, events, coverage, clock_ok, include_logger=False):
     names = {1: "start", 2: "end", 3: "rundown_start", 4: "rundown_end"}
     pos = bisect.bisect_left(events, (row["record_ordinal"],))
     left, right = events[pos - 1] if pos else None, events[pos] if pos < len(events) else None
@@ -261,8 +284,11 @@ def compare_thread(pair, row, events, coverage, clock_ok):
         if e is None:
             return None
         ordinal, tick, opcode, pid, tid = e
-        return dict(record_ordinal=ordinal, raw_timestamp=str(tick), event=names[opcode],
-                    opcode=opcode, payload_pid=pid, payload_tid=tid)
+        expected = dict(record_ordinal=ordinal, raw_timestamp=str(tick), event=names[opcode],
+                        opcode=opcode, payload_pid=pid, payload_tid=tid)
+        if include_logger:
+            expected["logger_id"] = row["logger_id"]
+        return expected
 
     paired_pid = None
     if row["sampled_thread_id"] in (0, 0xffffffff):
@@ -289,7 +315,7 @@ def compare_thread(pair, row, events, coverage, clock_ok):
     return paired_pid
 
 
-def compare(report, pin, size, records, oracle_rows, after, limit, threads, images):
+def compare(report, pin, size, records, oracle_rows, after, limit, threads, images, processes=None):
     assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == size
     assert (report["provider_guid"], report["event_id"], report["opcode"], report["version"]) == (
         "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", 0, 46, 2)
@@ -313,7 +339,11 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
         assert meta["decoded_events"] == meta["retained_events"] == total and meta["unsupported_events"] == 0
     else:
         assert "thread_source" not in report
-    referenced = set()
+    referenced, process_refs = set(), set()
+    if processes is not None:
+        assert report["process_source"] == processes.metadata(images is not None)
+    else:
+        assert "process_source" not in report and "process_records" not in report
     if images is not None:
         count = len(images.by_ordinal)
         assert report["image_source"] == dict(provider_guid=IMAGE_GUID, versions=[2, 3], decoded_events=count,
@@ -334,22 +364,42 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
             coverage = report["buffer_comparison"] == "matched" and not (h["events_lost"] or h["buffers_lost"] or report["loss_marker_records"])
             clock = report["clock"]
             clock_ok = clock["raw_type"] == 2 or (clock["raw_type"] == 1 and int(clock["header_perf_frequency"]) > 0)
-            pid = compare_thread(row["thread_evidence"], row, threads.get(row["sampled_thread_id"], []), coverage, clock_ok)
+            pid = compare_thread(row["thread_evidence"], row, threads.get(row["sampled_thread_id"], []), coverage, clock_ok, processes is not None)
+            if processes is not None:
+                process_answer = processes.expected(row, clock_ok, coverage and not report["unsupported_profile_records"])
+                assert row["process_evidence"] == process_answer, ("process relation", seq, row["process_evidence"]["relation"], process_answer["relation"])
+                process_refs.update(n for n in (process_answer["before_record"], process_answer["after_record"]) if n is not None)
             if images is not None:
                 answer = images.expected(row, pid, coverage, clock_ok)
+                if processes is not None:
+                    assert row["image_process_evidence"] == processes.image_in_process(process_answer, answer, images), ("image in process", seq)
                 assert row["image_evidence"] == answer, ("image relation", seq)
                 for witness in answer["witnesses"]:
                     referenced.update(n for n in (witness["before_record"], witness["after_record"]) if n is not None)
+        if processes is None:
+            assert "process_evidence" not in row
+        if processes is None or images is None:
+            assert "image_process_evidence" not in row
         if images is None:
             assert "image_evidence" not in row
         if threads is None:
             assert "thread_evidence" not in row
         assert row["pointer_bytes"] in (4, 8)
         assert row["cpu_field"] == ("processor_index" if row["header_flags"] & 0x200 else "processor_number")
+    if processes is not None:
+        assert [p["record_ordinal"] for p in report["process_records"]] == sorted(process_refs)
+        # tracerpt does not export the native logger ID. These comparisons use single-logger fixtures.
+        if rows:
+            assert len({r["logger_id"] for r in rows}) == 1
+        for actual in report["process_records"]:
+            expected = dict(processes.points[actual["record_ordinal"]], logger_id=rows[0]["logger_id"])
+            assert actual == expected, ("process record", actual["record_ordinal"], [k for k in expected if actual.get(k) != expected[k]])
     if images is not None:
         assert [p["record_ordinal"] for p in report["image_records"]] == sorted(referenced)
         for point in report["image_records"]:
             expected = images.by_ordinal[point["record_ordinal"]]
+            if processes is not None:
+                expected = dict(expected, logger_id=rows[0]["logger_id"])
             assert point == expected, ("image record", point["record_ordinal"], [k for k in expected if expected[k] != point.get(k)])
     assert report["next_after"] == (after + limit if after + limit < len(oracle_rows) else None)
     return rows
@@ -392,25 +442,42 @@ def page_cases(count, all_pages):
     return pages
 
 
-def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images):
+def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images, join_processes):
     size = etl.stat().st_size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
-    records, samples, threads, images, _ = oracle(etl, folder, join_images)
-    evidence_args = ["--image-evidence"] if join_images else (["--thread-evidence"] if join_threads else [])
-    join_threads = join_threads or join_images
+    processes = run_path(str(Path(__file__).with_name("etl_process_oracle.py")))["ProcessOracle"]() if join_processes else None
+    records, samples, threads, images, _ = oracle(etl, folder, join_images, processes=processes)
+    evidence_args = [f for enabled, f in ((join_processes, "--process-evidence"), (join_images, "--image-evidence"),
+                                          (join_threads, "--thread-evidence")) if enabled]
+    join_threads = join_threads or join_images or join_processes
     assert len(samples) == expected_count, (len(samples), expected_count)
     pages = page_cases(len(samples), all_pages)
-    compared, compared_images = {}, {}
+    compared, compared_images, compared_processes, compared_bindings = {}, {}, {}, {}
     for after, limit in pages:
         # The first call exercises the defaults, subsequent calls explicit paging.
         args = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
         report = run(exe, etl, pin.upper(), *evidence_args, *args)
-        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images)
+        rows = compare(report, pin, size, records, samples, after, limit, threads if join_threads else None, images, processes)
         for row in rows:
+            if join_processes:
+                compared_processes[row["sample_ordinal"]] = row["process_evidence"]["relation"]
+                if join_images:
+                    compared_bindings[row["sample_ordinal"]] = row["image_process_evidence"]["relation"]
             if join_images:
                 compared_images[row["sample_ordinal"]] = row["image_evidence"]["relation"]
             compared[row["sample_ordinal"]] = row.get("thread_evidence", {}).get("relation")
+    if join_processes:
+        # All flag orders preserve the two independent evidence requests and the selected page.
+        canonical = ["--process-evidence"] + (["--image-evidence"] if join_images else [])
+        first = run(exe, etl, pin, *canonical, "--limit", 4)
+        for flags in (canonical[::-1], ["--thread-evidence", *canonical], [*canonical[::-1], "--thread-evidence"]):
+            assert run(exe, etl, pin, "--after", 0, *flags, "--limit", 4) == first
+        if join_images:
+            for after, limit in ((0, 4), (len(samples) // 2, 128)):
+                compare(run(exe, etl, pin, "--process-evidence", "--after", after, "--limit", limit),
+                        pin, size, records, samples, after, limit, threads, None, processes)
+        run(exe, etl, pin, "--process-evidence", switches=True, rc=2)
     if join_images:
         first = run(exe, etl, pin, "--image-evidence", "--limit", 4)
         for flags in (("--image-evidence", "--thread-evidence"), ("--thread-evidence", "--image-evidence")):
@@ -426,7 +493,7 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
             output.truncate(size - 1)
         with trimmed.open("rb") as f:
             trimmed_pin = hashlib.file_digest(f, "sha256").hexdigest()
-        partial = run(exe, trimmed, trimmed_pin, "--limit", 1, *evidence_args, rc=1)
+        partial = run(exe, trimmed, trimmed_pin, "--limit", 128 if join_processes else 1, *evidence_args, rc=1)
         assert partial["source_sha256"] == trimmed_pin and partial["status"] == "partial"
         assert partial["buffer_comparison"] == "fewer_than_declared"
         assert partial["buffers_processed"] < partial["log_header"]["buffers_written"]
@@ -435,12 +502,16 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
             assert all(r["thread_evidence"]["paired_record_pid"] is None for r in partial["samples"])
         if join_images:
             assert all(r["image_evidence"]["reported_rva"] is None for r in partial["samples"])
-    assert run(exe, etl, pin, "--after", len(samples) + 1, rc=1)["status"] == "cursor_out_of_range"
+        if join_processes:
+            assert all(r["process_evidence"]["recorded_generation"] is None for r in partial["samples"])
+            if join_images:
+                assert all(r["image_process_evidence"]["reported_rva"] is None for r in partial["samples"])
+    assert run(exe, etl, pin, *evidence_args, "--after", len(samples) + 1, rc=1)["status"] == "cursor_out_of_range"
     wrong = ("0" if pin[0] != "0" else "1") + pin[1:]
     assert run(exe, etl, wrong, *evidence_args, rc=1)["status"] == "digest_mismatch"
     for args in (("--after", "-1"), ("--limit", 0), ("--limit", 129), ("--after", "01"),
                  ("--after", 1, "--after", 2), ("--limit", "1", "--limit", "2"), ("--thread-evidence", "--thread-evidence"),
-                 ("--image-evidence", "--image-evidence")):
+                 ("--image-evidence", "--image-evidence"), ("--process-evidence", "--process-evidence")):
         run(exe, etl, pin, *args, rc=2)
     bad = folder / "invalid.etl"
     bad.write_bytes(b"invalid test input")
@@ -448,8 +519,11 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     assert run(exe, bad, bad_pin, rc=1)["status"] in ("open_trace_failed", "process_trace_failed")
     missing = folder / "missing.etl"
     assert run(exe, missing, pin, rc=1)["status"] == "source_unavailable"
-    check_directory_lease(exe, etl, pin, folder)
-    check_output_alias(exe, "--etl-profile", etl, pin, folder)
+    check_directory_lease(exe, etl, pin, folder, options=evidence_args)
+    check_output_alias(exe, "--etl-profile", etl, pin, folder, options=evidence_args)
+    if join_processes:
+        print("Process source:", len(processes.points), "Defunct:", processes.defunct, "Raw process payloads:", processes.raw)
+        print("Process relations:", dict(Counter(compared_processes.values())), "Image in process:", dict(Counter(compared_bindings.values())))
     if join_images:
         print("Image events:", len(images.by_ordinal), "Sample relations:", dict(Counter(compared_images.values())))
     if join_threads:
@@ -594,6 +668,7 @@ def main():
     counts.add_argument("--expect-switches", type=int, help="Check the standalone saved context-switch command")
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
     parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
+    parser.add_argument("--process-evidence", action="store_true", help="Check process lifetimes and optional image brackets for each sample")
     parser.add_argument("--intervals", action="store_true", help="Compare CPU, off-CPU and ReadyThread boundaries for each switch")
     parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample or switch in 128-row pages")
     parser.add_argument("--check-short-tail", action="store_true",
@@ -601,8 +676,8 @@ def main():
     args = parser.parse_args()
     if args.intervals and args.expect_switches is None:
         parser.error("Interval checks require --expect-switches.")
-    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence):
-        parser.error("Thread and image joins apply to sampled profiles.")
+    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence or args.process_evidence):
+        parser.error("Thread, process and image joins apply to sampled profiles.")
     with tempfile.TemporaryDirectory(prefix="kn-etl-profile-") as directory:
         folder = Path(directory)
         (folder / "source").mkdir()
@@ -613,7 +688,7 @@ def main():
             exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail, args.intervals)
         else:
             exercise(exe, etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail,
-                     args.thread_evidence, args.image_evidence)
+                     args.thread_evidence, args.image_evidence, args.process_evidence)
 
 
 if __name__ == "__main__":

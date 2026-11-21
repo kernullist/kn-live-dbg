@@ -4887,6 +4887,56 @@ checks and 93 normalized controls. The latter used the interceptor override
 described above and emitted the startup warning. Fourteen saved v1/v2 pages
 matched their earlier output byte for byte.
 
+### Process generation and image containment
+
+The `--process-evidence` comparison uses the public PerfView x64 and x86
+workloads, the allocator trace above, and the ETWAnalyzer scheduler trace
+identified below. Windows `tracerpt -rts` supplied the original process
+record ordinals, ticks, opcodes and named fields. The checker reconstructs
+each PID's history and checks the two process witnesses for each sampled
+thread. With `--image-evidence` it also compares the loader records against
+the process interval. It preserves the `ExitTime` field in version-5 defunct
+records as an unsigned integer. All tested captures use one native logger
+and 64-bit process event headers, including the x86 workload.
+
+```powershell
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-samples 18556 --process-evidence --image-evidence --all-pages --check-short-tail
+```
+
+| Pinned ETL | Samples compared | Process records, including defunct | Samples inside actual process start/end | Samples with image pair inside that process |
+| --- | ---: | ---: | ---: | ---: |
+| ETWAnalyzer scheduler | 18,556 | 358 | 4,675 | 2,112 |
+| PerfView x64 workload | 79,528 | 68 | 5,126 | 0 |
+| PerfView x86 workload | 88,809 | 74 | 4,897 | 0 |
+| Allocator | 5,496 | 1,303 | 0 | 0 |
+| 23-event control | 0 | 0 | 0 | 0 |
+
+A separate callback comparison covered all 1,803 process records, including
+798 defunct records. Digests of the reported numeric fields, source ordinals,
+ticks and opaque-key presence and equality matched the Windows XML. After
+the scheduler file was shortened by one byte, 17 previously qualified samples
+on one page retained both original process witnesses. The reader withheld the
+generation and process-bound RVA for those samples. Fifty distinct page
+hashes from earlier profile and switch formats matched their original values.
+
+The scheduler trace had 69 version-5 defunct records and 818 sample
+associations supported by process rundown. All 4,512 process brackets in
+the allocator trace used rundown. The checker also exercises a zero-row
+page, flag ordering, truncated buffers, output aliases and pinned ancestor
+directories. The scheduler export contains non-UTF-8 text from unrelated
+providers. In combined mode the comparison requires every selected image
+filename to decode without a replacement character.
+
+Release and ASan native checks cover 32-bit and 64-bit event layouts,
+WBEM SIDs, all supported opcode/version combinations, malformed strings,
+the first process record beyond the retention limit, PID reuse, conflicting
+keys and loggers, distinct raw clock conflicts, and process or image
+boundaries outside an otherwise plausible pair. The Windows ASan run used
+the process-local interception override described in the scheduler checks.
+Public ETL process layouts observed here are v4 and v5. V2, v3 and 32-bit
+process payload coverage comes from constructed records.
+[Process evidence contract](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

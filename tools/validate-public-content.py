@@ -83,7 +83,9 @@ def text_views(data: bytes) -> list[str]:
 
 ETL_ROW_MARKERS = ('"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
-                   '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v')
+                   '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4',
+                   '"recorded_generation"', '"candidate_pid"', '"parent_pid"', '"start_record"', '"process_start_record"',
+                   '"generation_scope"', '"opaque_key_comparison"')
 
 DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
@@ -112,6 +114,12 @@ DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("record_ordinal", "raw_timestamp", "logger_id", "payload_tid", "kind"),
     ("thread_filter", "matched_switches"),
     ("ready_to_switch_in_ticks", "switch_out_to_ready_ticks"),
+    ("payload_pid", "start_record"),
+    ("candidate_pid", "relation", "before_record"),
+    ("recorded_generation", "opaque_key_comparison"),
+    ("parent_pid", "session_id", "payload_pid", "exit_status"),
+    ("relation", "process_start_record", "reported_rva"),
+    ("generation_scope", "decoded_events", "defunct_events"),
 ))
 EVIDENCE_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
 JSON_SPACE = re.compile(r'[ \t\r\n]*')
@@ -132,7 +140,7 @@ def detached_evidence_object(text: str, offset: int, decoder: json.JSONDecoder) 
                 return True
             pos = JSON_SPACE.match(text, pos + 1).end()
             value, pos = decoder.raw_decode(text, pos)
-            if key == "schema" and value in ("kn.etl_switches.v1", "kn.etl_switches.v2"):
+            if key == "schema" and value in ("kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_profile.v4"):
                 return True
             pos = JSON_SPACE.match(text, pos).end()
             if not text.startswith(",", pos):
@@ -233,7 +241,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
-                    "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.mcp_operation.v1",
+                    "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.mcp_operation.v1",
                     "kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1",
                     "kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1",
                     "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"
@@ -244,7 +252,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|etl_profile\.v[123]|etl_switches\.v[12])"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|etl_profile\.v[1234]|etl_switches\.v[12])"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:
@@ -255,7 +263,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                         row = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1", "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_switches.v1", "kn.etl_switches.v2"):
+                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1", "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_switches.v1", "kn.etl_switches.v2"):
                         add("private-evidence-bundle", number)
                         break
         if ((not binary or view is not data) and '"virtual"' in text and

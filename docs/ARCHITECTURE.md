@@ -998,9 +998,17 @@ by original event ordinal. A paired thread PID narrows the search to recorded
 ranges for that process number. A reported RVA requires one consistent pair
 of enclosing image records. The page retains references to contrary records,
 including overlapping ranges. Each referenced image carries its original
-file name and PE metadata. Binding those records to a process generation,
-an address space and retained executable bytes is a separate step.
-[ETL image evidence](TRACE_IMPORT.md#locate-image-records-for-a-sampled-ip)
+file name and PE metadata. [ETL image evidence](TRACE_IMPORT.md#locate-image-records-for-a-sampled-ip)
+
+With `--process-evidence` the same scan indexes Process v2–v4 lifetimes and
+v2–v5 defunct records by payload PID and callback ordinal. A real start and
+end must enclose the qualified thread records in both ordinal and raw clock
+order. The start ordinal identifies an instance within the pinned file.
+Rundown and defunct records retain their distinct meanings. Combined process
+and image evidence checks the loader boundaries for that instance, including
+logger ID and clock order. Address-space identity and retained executable
+bytes still require another source.
+[ETL process evidence](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
 
 `--etl-switches` uses the same pinned input and raw ETW callbacks to page
 through Thread/CSwitch v2, v3 and v4. The event header and scheduler payload

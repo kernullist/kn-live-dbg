@@ -14,6 +14,8 @@ namespace etl_profile
         int64_t tick;
         uint8_t opcode;
         bool transitionConflict = false, clockConflict = false;
+        uint16_t logger = 0;
+        bool mixedLoggers = false;
     };
 
     inline Match DecodeThread(const EVENT_RECORD& event, uint32_t ordinal, ThreadEvent& result)
@@ -33,6 +35,7 @@ namespace etl_profile
         result.record = ordinal;
         result.tick = h.TimeStamp.QuadPart;
         result.opcode = d.Opcode;
+        result.logger = event.BufferContext.LoggerId;
         return Match::Decoded;
     }
 
@@ -85,18 +88,20 @@ namespace etl_profile
             for (size_t first = 0; first < events.size();)
             {
                 size_t end = first + 1;
-                bool badTransitions = false, badClock = false;
+                bool badTransitions = false, badClock = false, mixedLoggers = false;
                 while (end < events.size() && events[end].tid == events[first].tid)
                 {
                     const auto& previous = events[end - 1];
                     const auto& current = events[end++];
                     badTransitions |= Opening(previous.opcode) == Opening(current.opcode);
                     badClock |= previous.tick >= current.tick;
+                    mixedLoggers |= previous.logger != current.logger;
                 }
                 for (size_t i = first; i < end; ++i)
                 {
                     events[i].transitionConflict = badTransitions;
                     events[i].clockConflict = badClock;
+                    events[i].mixedLoggers = mixedLoggers;
                 }
                 first = end;
             }

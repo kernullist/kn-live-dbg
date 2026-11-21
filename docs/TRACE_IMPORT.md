@@ -25,8 +25,8 @@ counts matching provider/opcode envelopes outside the supported layout.
 The header supplies the clock type, performance-counter frequency, capture
 times and loss counters. `raw_timestamp` stays in the original clock domain.
 A stack extension count applies to that event. The recording privilege, stack
-policy, exact intervals of lost samples, process generation, address space,
-VTL and code version remain unknown. The reader assigns `unqualified` to the
+policy, exact intervals of lost samples, authenticated process generation,
+address space, VTL and code version remain unknown. The reader assigns `unqualified` to the
 verified execution level. Thread/image lifetimes and exact code bytes require
 separate evidence before an execution claim can be joined to another source.
 
@@ -50,8 +50,8 @@ unsupported record counts for those four opcodes. [Windows thread events](https:
 
 A version-3 thread record may end at its fixed fields or append one
 NUL-terminated UTF-16LE thread name. The decoder checks the full suffix,
-including surrogate pairs and the terminator. The index stores only the
-record ordinal, timestamp, opcode and payload IDs. A malformed suffix counts
+including surrogate pairs and the terminator. The index retains the
+record ordinal, timestamp, opcode, logger ID and payload IDs. A malformed suffix counts
 as an unsupported event. [PerfView thread parser](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/Parsers/KernelTraceEventParser.cs#L4062)
 
 Each sample's `thread_evidence.before` and `after` locate the closest records
@@ -109,6 +109,64 @@ unsupported image boundary withholds paired RVAs. The index retains at most
 65,536 events and 16 MiB of UTF-16 name data. When either limit is exceeded,
 `retention` identifies the exhausted limit, the command returns `partial`
 and all image lookups report `index_limit`.
+
+### Match a sample to a recorded process generation
+
+Add `--process-evidence` to `--etl-profile` to get a `kn.etl_profile.v4`
+page. This includes thread evidence. Add `--image-evidence` to check the
+image range in the same process instance. All modes use the original
+sample ordinals, digest and pagination.
+
+The reader follows the sampled payload TID to thread records, then looks
+up their shared payload PID in classic Process v2, v3 and v4 events.
+Opcodes 1 and 2 record process start and end. Opcodes 3 and 4 enumerate
+processes at the start and end of collection. Opcode 39 records a defunct
+process. Versions 2 through 5 of that event are recognized. A defunct
+record encountered at a sample boundary leaves the generation unresolved.
+The decoder follows the `Process_V2_TypeGroup1`, `Process_V3_TypeGroup1`,
+`Process_V4_TypeGroup1` and `Process_Defunct_TypeGroup1` definitions in
+Windows Kit `wmicore.mof`.
+[Windows Process events](https://learn.microsoft.com/en-us/windows/win32/etw/process)
+[Process event fields](https://learn.microsoft.com/en-us/windows/win32/etw/process-typegroup1)
+
+`process_evidence.before_record` and `after_record` reference the nearest
+records for the candidate PID. `process_records` lists the referenced
+records once per page in original order. It includes their raw timestamps,
+provider version, pointer width, logger ID, payload PID, parent PID, session
+and exit status. Version-5 defunct records also preserve the original
+unsigned `ExitTime` value in `defunct_exit_time_raw`. The report keeps it
+separate from the ETL clock. The decoder checks the extent
+of the SID, ANSI image label and UTF-16 strings. It retains numeric fields
+and compares opaque process keys within the source. Only the comparison
+outcome appears in the report.
+[Windows MOF encoding for SIDs](https://learn.microsoft.com/en-us/windows/win32/etw/event-tracing-mof-qualifiers)
+
+A `start_end` result requires an actual process start and end that enclose
+the sampled thread's two records in both callback order and raw ticks.
+The process records must agree on parent PID, session and layout. Two
+reported nonzero keys must agree. Missing keys stay visible in
+`opaque_key_comparison`. Process and thread witnesses must share the
+sample's logger. The digest, payload PID and
+`recorded_generation.start_record` identify this instance within the file.
+A later process reusing the PID receives its own start ordinal.
+`rundown_bracket` preserves an observed snapshot interval and leaves
+`recorded_generation` null. A conflicting key, repeated transition, clock
+reversal, unsupported boundary or capture gap also withholds the generation.
+A structurally matching thread PID can still point to raw process records
+when the thread association lacks coverage.
+
+When both evidence options are present, `image_process_evidence` checks the
+paired loader records against the qualified process generation. A nonnull
+`reported_rva` requires the image load/rundown and unload/rundown endpoints
+to lie strictly inside the process endpoints, with consistent loggers and
+clocks. `image_evidence` retains the original range comparison for the numeric
+PID. Binding these records to an OS creation FILETIME, an authenticated
+collector or retained code bytes requires separate evidence.
+
+`process_source` records input versions, decoded and unsupported counts,
+defunct count and clock reversals. The process index holds up to 65,536
+records. An overflow returns `partial` and `index_limit` for process lookups.
+File and event limits also apply. Keep the reports with the private ETL.
 
 ## Saved Windows context switches
 

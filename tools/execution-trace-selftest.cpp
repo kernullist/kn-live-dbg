@@ -2,6 +2,7 @@
 #include "../user/EtlThreadEvidence.h"
 #include "../user/EtlImageEvidence.h"
 #include "../user/EtlScheduleIntervals.h"
+#include "etl-process-evidence-selftest.h"
 
 #include <array>
 
@@ -696,7 +697,8 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() ? 0 : 1;
+            CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
+            etl_process_test::Check() ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

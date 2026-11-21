@@ -965,6 +965,25 @@ original file names. [Image evidence fields](TRACE_IMPORT.md#locate-image-record
 & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 8 --image-evidence
 ```
 
+Use `--process-evidence` to follow the thread's payload PID to the process
+records around a CPU sample. This example also checks whether the loader
+records supporting its RVA lie inside the recorded process generation.
+
+```powershell
+$page = & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --process-evidence --image-evidence --limit 64 | ConvertFrom-Json
+$sample = $page.samples | Where-Object { $null -ne $_.process_evidence.recorded_generation } | Select-Object -First 1
+if ($null -ne $sample) {
+    $sample.process_evidence
+    $ordinals = @($sample.process_evidence.before_record, $sample.process_evidence.after_record)
+    $page.process_records | Where-Object { $_.record_ordinal -in $ordinals }
+    $sample.image_process_evidence
+}
+```
+
+Use the same digest and options with `--after $page.next_after` to continue
+when `next_after` has a value.
+[Process generation fields and limits](TRACE_IMPORT.md#match-a-sample-to-a-recorded-process-generation)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

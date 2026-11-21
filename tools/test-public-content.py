@@ -176,7 +176,15 @@ class PublicContentTests(unittest.TestCase):
         edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
         source = dict(thread_filter=5, matched_switches=2)
         split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
+        v4 = "kn.etl_profile.v4"
+        process = dict(relation="start_end", candidate_pid=5, before_record=6, after_record=9,
+                       opaque_key_comparison="equal", recorded_generation=dict(payload_pid=5, start_record=6))
+        process_point = dict(payload_pid=5, parent_pid=4, session_id=1, exit_status=0)
+        process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
+        process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
         for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=v4, samples=[]), dict(samples=[], schema=v4), process, process["recorded_generation"],
+                       process_point, process_image, process_source,
                        dict(schema=intervals, switches=[]), dict(switches=[], schema=intervals),
                        cpu_span, off_cpu, readiness, ready_point, edge, source, split,
                        dict(schema=v2, samples=[]), point, pair, dict(schema=v3, image_records=[]),
@@ -192,7 +200,7 @@ class PublicContentTests(unittest.TestCase):
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
             self.assertIn("private-evidence-bundle", {r["rule"] for r in
                           AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
-        for version in (schema, v2, v3, switch_schema, intervals):
+        for version in (schema, v2, v3, v4, switch_schema, intervals):
             self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + version + ".").encode()), [])
 
     def test_wait_captures_and_reports(self):
