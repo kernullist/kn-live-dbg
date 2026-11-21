@@ -1,6 +1,8 @@
 #include "KernelMonitor.h"
+#include "DeviceClient.h"
 #include "ProcessObservationSource.h"
 #include "ProcessLayoutMonitor.h"
+#include "ProcessLoggingObservation.h"
 #include "TimelineSelfTest.h"
 #include "TimelineStore.h"
 
@@ -8,6 +10,7 @@
 #include <condition_variable>
 #include <future>
 #include <iostream>
+#include <objbase.h>
 #include <sstream>
 
 namespace
@@ -278,11 +281,19 @@ bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostic
         exercise(monitor);
         std::wstring decision = L"none", outcome = L"none", enableDecision = L"none";
         uint64_t decisionGeneration = 0, acquisition = 0;
+        std::vector<uint64_t> heldAcquisitions;
         size_t receipts = 0;
         for (const auto& event : monitor.Ring)
         {
             const auto found = event.Evidence.find(L"cleanup_decision");
             const auto enable = event.Evidence.find(L"enable_decision");
+            const auto retry = event.Evidence.find(L"retry_decision");
+            if (retry != event.Evidence.end())
+            {
+                valid = valid && retry->second == L"held_unconfirmed" &&
+                    event.Observation.Identity.CreateTime == self.Created && event.Evidence.at(L"effect_verified") == L"false";
+                heldAcquisitions.push_back(std::stoull(event.Evidence.at(L"identity_acquisition_id")));
+            }
             if (enable != event.Evidence.end()) { enableDecision = enable->second; }
             if (found == event.Evidence.end() && enable == event.Evidence.end()) { continue; }
             valid = valid && event.Observation.Identity.ProcessId == pid && event.Evidence.at(L"effect_verified") == L"false";
@@ -301,7 +312,9 @@ bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostic
             << L" enabled=" << monitor.LoggingEnabledPids.size() << L" enabled_count=" << monitor.LoggingEnabledCount.load()
             << L" failed=" << monitor.LoggingFailedPids.size() << L" decision=" << decision << L" receipts=" << receipts
             << L" outcome=" << outcome << L" generation=" << decisionGeneration << L" acquisition=" << acquisition
-            << L" enable_decision=" << enableDecision << L"\n";
+            << L" enable_decision=" << enableDecision << L" held_ids=";
+        for (size_t i = 0; i < heldAcquisitions.size(); ++i) { result << (i ? L"," : L"") << heldAcquisitions[i]; }
+        result << L"\n";
         monitor.Active.store(false);
         monitor.LoggingEnabledPids.clear(); // Artificial entries must not dispatch during the fixture destructor.
         monitor.LoggingEnabledCount.store(0);
@@ -321,7 +334,7 @@ bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostic
     });
     run(L"failed_only", [&](KernelMonitor& monitor) {
         promote(monitor, self.Created);
-        monitor.LoggingFailedPids[pid] = self.Created;
+        monitor.LoggingFailedPids[pid] = {self.Created, false};
         monitor.PruneStalePromotedWatches();
     });
     run(L"withdrawn_current", [&](KernelMonitor& monitor) {
@@ -339,14 +352,14 @@ bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostic
         monitor.WatchPids.insert(pid);
         monitor.WatchExplicitPids.insert(pid);
         priorEnable(monitor, self.Created);
-        monitor.LoggingFailedPids[pid] = self.Created + 1;
+        monitor.LoggingFailedPids[pid] = {self.Created + 1, false};
         monitor.PruneStalePromotedWatches();
     });
     run(L"missing_logging", [&](KernelMonitor& monitor) {
         constexpr uint32_t missing = UINT32_MAX;
         monitor.WatchPids.insert(missing);
         monitor.WatchExplicitPids.insert(missing);
-        monitor.LoggingFailedPids[missing] = 0;
+        monitor.LoggingFailedPids[missing] = {};
         monitor.PruneStalePromotedWatches();
     });
     run(L"child_only", [&](KernelMonitor& monitor) {
@@ -445,18 +458,174 @@ bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostic
         monitor.Stop(nullptr);
         remove.join();
     });
+    const auto enable = [&](KernelMonitor& monitor) {
+        if (monitor.LogHandle == INVALID_HANDLE_VALUE)
+        {
+            monitor.LogHandle = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+        if (monitor.LogHandle == INVALID_HANDLE_VALUE) { valid = false; return; }
+        monitor.Active.store(true);
+        monitor.EnableLoggingForPid(pid);
+        monitor.Active.store(false);
+    };
     for (bool stale : {false, true})
     {
         run(stale ? L"enable_stale" : L"enable_current", [&](KernelMonitor& monitor) {
             promote(monitor, self.Created + stale);
-            monitor.LogHandle = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (monitor.LogHandle == INVALID_HANDLE_VALUE) { valid = false; return; }
-            monitor.Active.store(true);
-            monitor.EnableLoggingForPid(pid);
-            monitor.Active.store(false);
+            enable(monitor);
+        });
+        run(stale ? L"held_other_generation" : L"held_current", [&](KernelMonitor& monitor) {
+            promote(monitor, self.Created);
+            ProcessLoggingAction earlier;
+            earlier.Subject.Pid = pid;
+            KNDBG_SET_PROCESS_LOGGING_RESPONSE shortReply{};
+            DecodeProcessLoggingReply(earlier, true, shortReply);
+            monitor.NoteLoggingFailure(pid, self.Created + stale, true, earlier.Unconfirmed());
+            monitor.NoteLoggingFailure(pid, 0, false, false);
+            enable(monitor);
+            const auto& failure = monitor.LoggingFailedPids.at(pid);
+            valid = valid && (failure.Unconfirmed ? failure.Created == self.Created + stale : stale && failure.Created == self.Created);
         });
     }
+    run(L"held_withdrawn", [&](KernelMonitor& monitor) {
+        monitor.WatchPids.insert(pid);
+        monitor.NoteLoggingFailure(pid, self.Created, true, true);
+        monitor.RemoveWatchPid(pid);
+        valid = valid && monitor.LoggingFailedPids.empty();
+        promote(monitor, self.Created);
+        enable(monitor);
+    });
+    run(L"device_uncertain", [&](KernelMonitor& monitor) {
+        GUID guid{};
+        wchar_t token[40]{};
+        if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(guid, token, 40)) { valid = false; return; }
+        const std::wstring name = L"\\\\.\\pipe\\KnLiveDbg-LoggingReceipt-" + std::wstring(token);
+        const std::wstring next = name + L"-next";
+        const auto create = [](const std::wstring& path) {
+            return CreateNamedPipeW(path.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1024, 1024, 0, nullptr);
+        };
+        struct Pipe { HANDLE Value; ~Pipe() { if (Value != INVALID_HANDLE_VALUE) { CloseHandle(Value); } } };
+        Pipe server{create(name)}, replacement{create(next)};
+        DeviceClient client;
+        ULONG peer = 0;
+        if (server.Value == INVALID_HANDLE_VALUE || replacement.Value == INVALID_HANDLE_VALUE || !client.Open(name, nullptr) ||
+            !GetNamedPipeClientProcessId(server.Value, &peer) || peer != pid) { valid = false; return; }
+        const auto epoch = client.ObservationEpoch();
+        monitor.Device = &client;
+        for (int watch = 0; watch < 2; ++watch)
+        {
+            valid = monitor.AddWatchPid(pid) && valid;
+            enable(monitor);
+            enable(monitor);
+            valid = monitor.RemoveWatchPid(pid) && valid;
+        }
+        monitor.Device = nullptr;
+        if (!client.Open(next, nullptr) || !GetNamedPipeClientProcessId(replacement.Value, &peer) || peer != pid) { valid = false; return; }
+        ProcessLoggingAction stale;
+        uint32_t untouched = 99;
+        valid = !client.SetProcessLogging(pid, KNDBG_PROCESS_LOG_DEFAULT, &untouched, nullptr, nullptr, nullptr, nullptr, false, &stale, epoch) &&
+            stale.Step == ProcessLoggingStep::DriverNotSubmitted && stale.Win32Status == ERROR_INVALID_HANDLE && !stale.ReturnedBytes &&
+            !stale.Unconfirmed() && stale.ExpectedDeviceEpoch == epoch && stale.DeviceEpoch == client.ObservationEpoch() &&
+            stale.DeviceEpoch != epoch && untouched == 99 && valid;
+    });
     diagnostics = result.str();
     return valid;
+}
+
+bool KmonProcessLoggingSelfTest(std::wstring& diagnostics)
+{
+    const auto self = ReadProcessHandleIdentity(GetCurrentProcess());
+    if (!self.Created || self.Pid != GetCurrentProcessId()) { return false; }
+
+    // This disposable controller can request the normal enable only on itself. Its device stays unopened.
+    KernelMonitor monitor;
+    monitor.WatchPids.insert(self.Pid);
+    monitor.WatchExplicitPids.insert(self.Pid);
+    monitor.LogHandle = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (monitor.LogHandle == INVALID_HANDLE_VALUE) { return false; }
+    monitor.Active.store(true);
+    monitor.EnableLoggingForPid(self.Pid);
+    const bool owned = monitor.LoggingEnabledPids.count(self.Pid) != 0;
+    if (owned) { monitor.EnableLoggingForPid(self.Pid); }
+    monitor.Active.store(false);
+    monitor.LoggingEnabledPids.clear(); // Process exit ends the subject's lifetime.
+    monitor.LoggingEnabledCount.store(0);
+    std::wostringstream out;
+    out << L"[logging.self] owned=" << owned << L" failed=" << monitor.LoggingFailedPids.size() << L"\n";
+
+    // Decode fixed reply bytes in an isolated journal. No test reply reaches a device or the controller journal.
+    ProcessLoggingJournal journal;
+    ProcessLoggingAction row;
+    row.Subject = {self.Pid, self.Created, 1};
+    row.RequestedUtc = row.ReturnedUtc = TimelineControlUtc();
+    row.RequestedFlags = KNDBG_PROCESS_LOG_DEFAULT;
+    const auto record = [&](bool delivered, DWORD bytes, uint32_t size, uint32_t pid, uint32_t klass, uint32_t flags, uint32_t status) {
+        KNDBG_SET_PROCESS_LOGGING_RESPONSE reply{};
+        reply.Size = size; reply.ProcessId = pid; reply.InformationClassUsed = klass;
+        reply.LoggingFlagsApplied = flags; reply.NtStatus = status;
+        row.Win32Status = delivered ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+        row.ReturnedBytes = bytes;
+        DecodeProcessLoggingReply(row, delivered, reply);
+        journal.Record(row);
+    };
+    const uint32_t bytes = sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE);
+    const uint32_t full = KNDBG_PROCESS_INFO_ENABLE_LOGGING, legacy = KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING;
+    record(true, bytes, bytes, self.Pid, full, 63, 0);
+    record(true, bytes, bytes, self.Pid, legacy, 63, 0);
+    record(true, bytes, bytes, self.Pid, legacy, 3, 0);
+    record(true, bytes, bytes, self.Pid, full, 63, 0xc0000022u);
+    record(false, bytes, bytes, self.Pid, full, 63, 0);
+    record(true, bytes - 1, bytes, self.Pid, full, 63, 0);
+    record(true, bytes, bytes - 1, self.Pid, full, 63, 0);
+    record(true, bytes, bytes, self.Pid + 1, full, 63, 0);
+    record(true, bytes, bytes, self.Pid, full, 0, 0);
+    record(true, bytes, bytes, self.Pid, legacy, 1, 0);
+    record(true, bytes, bytes, self.Pid, 0, 63, 0);
+    row.RequestedFlags = 0;
+    record(true, bytes, bytes, self.Pid, full, 0, 0);
+    record(true, bytes, bytes, self.Pid, full, 63, 0);
+    row.RequestedFlags = 63;
+    record(true, bytes, bytes, self.Pid, full, 63, STATUS_PENDING);
+    record(true, bytes, bytes, self.Pid, full, 63, 0x102u);
+    record(true, bytes, bytes, self.Pid, full, 63, 0x80000005u);
+    record(true, bytes + 1, bytes, self.Pid, full, 63, 0);
+    row.RequestedFlags = 32;
+    record(true, bytes, bytes, self.Pid, legacy, 32, 0);
+    if (row.ReportedSuccess() || !row.Unconfirmed()) { return false; }
+
+    TimelineStore store;
+    const auto early = journal.Snapshot();
+    if (store.IngestProcessLoggingActions(early).Added != early.Total) { return false; }
+    for (const auto& event : store.AllEvents()) { out << L"[logging.reply] " << TimelineEventToJson(event) << L"\n"; }
+    for (int i = 0; i < 70; ++i) { journal.Record(row); }
+    const auto late = journal.Snapshot();
+    const auto gap = store.IngestProcessLoggingActions(late);
+    if (gap.Added != 64 || gap.Warnings.size() != 1 || gap.Warnings[0] != L"6 process logging observer actions evicted before ingest" ||
+        store.IngestProcessLoggingActions(early).SourceRecords || store.IngestProcessLoggingActions(late).SourceRecords) { return false; }
+    store.Clear();
+    if (store.IngestProcessLoggingActions(late).Added != 64) { return false; }
+
+    DeviceClient closed;
+    ProcessLoggingAction missing;
+    uint32_t untouched = 99;
+    if (closed.SetProcessLogging(self.Pid, 0, &untouched, nullptr, nullptr, nullptr, nullptr, false, &missing) ||
+        missing.Unconfirmed() || missing.Step != ProcessLoggingStep::DriverNotSubmitted || missing.Win32Status != ERROR_INVALID_HANDLE ||
+        missing.ReturnedBytes || missing.RequestedFlags != KNDBG_PROCESS_LOG_DEFAULT || untouched != 99) { return false; }
+    if (closed.SetProcessLogging(0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, false, &missing) ||
+        missing.Step != ProcessLoggingStep::DriverNotSubmitted || missing.Win32Status != ERROR_INVALID_PARAMETER) { return false; }
+
+    ProcessLoggingJournal native;
+    for (uint32_t status : {0u, static_cast<uint32_t>(STATUS_PENDING), 0x40000000u, 0x80000005u, 0xc0000022u})
+    {
+        row.Step = ProcessLoggingStep::NativeReturned;
+        row.RequestedFlags = 63; row.InformationClass = legacy; row.CallFlags = 3; row.NtStatus = status;
+        native.Record(row);
+    }
+    store.Clear();
+    if (store.IngestProcessLoggingActions(native.Snapshot()).Added != 5) { return false; }
+    for (const auto& event : store.AllEvents()) { out << L"[logging.native-model] " << TimelineEventToJson(event) << L"\n"; }
+    diagnostics = out.str();
+    return true;
 }

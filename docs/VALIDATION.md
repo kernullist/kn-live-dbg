@@ -7,6 +7,57 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## KMON process logging results, 2026-11-21
+
+On the previous `main` controller (`4ca32e2`), an owned-process fixture
+produced 36 handle rows, including five denied control opens. Observer ingest
+produced zero process logging rows. Those handle rows alone could not identify
+the logging operation or the backend result. [Reading logging request evidence](TIMELINE_COMMAND_USAGE.md#inspect-kmon-process-logging-requests)
+
+The Windows fixture uses its own controller as the logging subject. For the
+access-denial cases the parent independently checks the process creation time
+and access masks before releasing the child. Two private local named pipes
+exercise transport failure and handle replacement. The fixture checks the
+client PID on both pipes. A separate controller exercises the existing native
+enable path on itself. Fixed response buffers cover cases that the native
+calls and the pipe cannot produce.
+
+The final Windows x64 Release controller had SHA-256
+`dbe6cee972614a9bb82302f5cd66bc71feacf95d01f55deea2960fbda4037ec7`.
+The parent ran 27 watch cases in each access configuration and compared every
+row returned by the interactive observer query with the ingested rows.
+
+| Windows access to the fixture process | Handle rows | Logging rows | Observed result |
+| --- | ---: | ---: | --- |
+| Limited query allowed, set-information denied | 54 | 11 | Nine user-mode attempts stopped at the control open with Win32 error 5. Two explicitly opened watches each submitted one request to the private pipe. Windows returned error 1 with zero reply bytes. |
+| Limited query and set-information denied | 24 | 0 | Identity qualification stopped each request before control. |
+
+Within each of the two watches, a second call to the watch enable path submitted no further control request.
+Removing the watch produced no cleanup request. Re-adding the same PID produced
+a new acquisition ID and a new retry diagnostic. Replacing the pipe connection
+rejected the old epoch before transport. In the separate native run the
+control handle opened, and both information classes returned `0xC0000022`.
+KMON recorded both results and acquired no cleanup ownership.
+
+Sixteen additional disposable controllers repeated the watch cases under the
+two access profiles. Each run checked the two independent watch admissions,
+the overlapping manual removal and shutdown, and the observer query output.
+
+Eighteen data-only driver replies and five native status samples covered the
+legacy mask, wrong subject, inconsistent lengths or flags, pending status
+and other unconfirmed results. An isolated journal retained 64 rows after an
+overflow, reported six rows lost between ingests and did not replay an older
+snapshot. Actual logging success on a kernel device, final target settings,
+ETW delivery and coordination with other logging clients remain unverified.
+Run `python tools/test-process-handle-observer.py --exe x64/Release/KnLiveDbg.exe`
+with 64-bit Python to reproduce these cases.
+
+On this Release build, the analysis and discovery scheduling oracles passed
+6,742 and 70,170 checks. The console passed 570 checks and the command suite
+passed 3,081 checks across 261 routes. From 20:47 to 21:01 KST on November 21,
+the host logged no new reboot, bugcheck or crash dump. The final check found
+zero remaining test processes, test drivers or fixture listeners.
+
 ## Watched process identity and logging cleanup, 2026-11-19
 
 The Windows x64 Release controller had SHA-256

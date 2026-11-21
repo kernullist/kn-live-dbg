@@ -1956,6 +1956,26 @@ A known mismatch retires the local record. An unresolved identity produces
 a cleanup diagnostic. The handle pins the original process object through the
 existing control path. [Windows process ID lifetime](https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803)
 
+The observer timeline retains each KMON process logging backend attempt with
+the acquisition ID of that identity handle. It records the native return and
+the mask submitted for each information class. For a driver call, it checks
+the response size, PID, class and reported flags before accepting success.
+The client holds the device connection lock from the epoch check through the
+return. A request carrying an old epoch cannot act through a replacement handle.
+The legacy class can echo the requested mask even though it handles only
+read/write VM logging. Verification of the target's previous and final
+settings requires a separate observation. [Logging request fields](TIMELINE_COMMAND_USAGE.md#inspect-kmon-process-logging-requests)
+
+An ambiguous enable result stays with the watched process generation.
+Subsequent scans can recheck identity but cannot submit another enable for
+that generation or take cleanup ownership from that result. Losing query
+access preserves this record. Removing the watch or ending the KMON session
+retires it. If the same process is watched again, a new uncertain request gets
+its own acquisition ID and retry diagnostic. These logging setters require
+`STATUS_SUCCESS` for cleanup ownership.
+A pending, timeout, informational or warning result keeps its raw status and
+leaves completion open. [Microsoft NTSTATUS values](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55)
+
 A discovery turn has a 250 ms cooperative budget that includes interleaved
 analysis service between scanners. It admits at most one dispatch cycle per
 group per turn. The worker first gives analysis its independent turn, then

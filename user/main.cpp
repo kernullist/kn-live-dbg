@@ -14,6 +14,7 @@
 #include "CompletionHints.h"
 #include "DbgEngBackend.h"
 #include "DeviceClient.h"
+#include "ProcessLoggingObservation.h"
 #include "DriverService.h"
 #include "EtwScanner.h"
 #include "FirmwareTableScanner.h"
@@ -21360,7 +21361,7 @@ static void PrintTimelineAdvancedHelp()
     std::wcout << L"  !timeline status\n";
     std::wcout << L"  !timeline clear\n";
     std::wcout << L"  !timeline ingest ti [recent|all] [/limit <n>]\n";
-    std::wcout << L"  !timeline ingest observer   copy retained ETW, live callback and process handle results\n";
+    std::wcout << L"  !timeline ingest observer   copy ETW, live callback, process handle and process logging results\n";
     std::wcout << L"  !timeline targets ti <pid> [after <boot-id> <create-filetime>]  List retained TI header-process lifetimes.\n";
     std::wcout << L"  !timeline ingest snapshot [baseline|<path>]\n";
     std::wcout << L"  !timeline live on|off|status|start|stop|clear|drain [/capacity <n>] [/limit <n>]\n";
@@ -22739,8 +22740,10 @@ static TimelineIngestResult IngestControllerActions(TimelineStore& store, bool p
     const auto ti = GetTiSubscriberInstance().ObserverActions();
     const auto live = GetTimelineControlJournal().Snapshot();
     const auto handles = ControllerProcessHandles().Snapshot();
+    const auto logging = ControllerProcessLogging().Snapshot();
     auto result = store.IngestTiObserverActions(ti);
-    for (const auto& part : {store.IngestLiveObserverActions(live), store.IngestProcessHandleActions(handles)})
+    for (const auto& part : {store.IngestLiveObserverActions(live), store.IngestProcessHandleActions(handles),
+            store.IngestProcessLoggingActions(logging)})
     {
         result.SourceRecords += part.SourceRecords;
         result.Added += part.Added;
@@ -22751,7 +22754,8 @@ static TimelineIngestResult IngestControllerActions(TimelineStore& store, bool p
     {
         std::wcout << L"  TI control calls=" << ti.Total << L" retained=" << ti.Actions.size()
                    << L"\n  Live callback control calls=" << live.Total << L" retained=" << live.Actions.size()
-                   << L"\n  Process handle calls=" << handles.Total << L" retained=" << handles.Actions.size() << L"\n";
+                   << L"\n  Process handle calls=" << handles.Total << L" retained=" << handles.Actions.size()
+                   << L"\n  Process logging attempts=" << logging.Total << L" retained=" << logging.Actions.size() << L"\n";
     }
     return result;
 }
@@ -31867,7 +31871,8 @@ static int RunConsoleSurfaceSelfTest()
         CheckConsoleSurfaceSelfTest(
             &context,
             suffixHelpOutput.find(L"!timeline ingest ti") != std::wstring::npos &&
-                suffixHelpOutput.find(L"!timeline ingest observer") != std::wstring::npos,
+                suffixHelpOutput.find(L"!timeline ingest observer") != std::wstring::npos &&
+                suffixHelpOutput.find(L"process handle and process logging results") != std::wstring::npos,
             L"advanced-help-routes-timeline");
         CheckConsoleSurfaceSelfTest(
             &context,
@@ -54266,9 +54271,15 @@ int wmain(int argc, wchar_t** argv)
             return LayoutProcessHandleFixture() ? 0 : 1;
         }
         if (argc >= 3 && (ToLower(argv[2]) == L"collector-handle-observer" || ToLower(argv[2]) == L"verification-handle-observer" ||
-            ToLower(argv[2]) == L"watch-maintenance-observer"))
+            ToLower(argv[2]) == L"watch-maintenance-observer" || ToLower(argv[2]) == L"process-logging-observer"))
         {
-            if (ToLower(argv[2]) == L"watch-maintenance-observer")
+            if (ToLower(argv[2]) == L"process-logging-observer")
+            {
+                std::wstring diagnostics;
+                if (argc != 3 || !KmonProcessLoggingSelfTest(diagnostics)) { return 1; }
+                std::wcout << diagnostics;
+            }
+            else if (ToLower(argv[2]) == L"watch-maintenance-observer")
             {
                 uint64_t inherited = 0;
                 if (argc != 4 || !ParseUnsigned(argv[3], 10, &inherited) || !inherited || inherited >= UINTPTR_MAX) { return 2; }
@@ -54294,6 +54305,13 @@ int wmain(int argc, wchar_t** argv)
             DebuggerState state{};
             HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
             HandleTimelineCommand({L"!timeline", L"ingest", L"observer"}, state);
+            if (ToLower(argv[2]) == L"process-logging-observer" || ToLower(argv[2]) == L"watch-maintenance-observer")
+            {
+                std::wstring query;
+                HandleTimelineCommand({L"!timeline", L"query", L"/source", L"observer", L"/domain", L"observer_action", L"/oldest",
+                    L"/limit", L"128"}, state, &query);
+                std::wcout << L"[logging.query] " << query << L"\n";
+            }
             for (const auto& row : state.Timeline.AllEvents()) { std::wcout << L"[collector.handle] " << TimelineEventToJson(row) << L"\n"; }
             return 0;
         }

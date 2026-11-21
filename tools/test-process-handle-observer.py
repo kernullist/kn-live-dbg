@@ -289,7 +289,10 @@ def check_watch_maintenance(exe, directory, deny_query):
     missing = 0xffffffff
     assert process_open_status(missing, 0x1000) == 87
     output, pid, created, exited, exited_created = run_watch_maintenance(exe, directory, deny_query)
-    rows = collector_rows(output)
+    ingested = collector_rows(output)
+    rows = [row for row in ingested if row["entity"] == "process_handle:controller"]
+    logging = [row for row in ingested if row["entity"] == "process_logging:controller"]
+    assert len(ingested) == len(rows) + len(logging)
     fields = evidence(rows, [row["action"].rsplit(".", 1)[1] for row in rows], pid, created)
     cases = {}
     cursor = 0
@@ -304,10 +307,47 @@ def check_watch_maintenance(exe, directory, deny_query):
         cursor = end
     assert cursor == len(rows) and cursor < 64
     case_count = len(cases)
-    assert f"source_records={cursor} added={cursor}" in output and "source_records=0 added=0" in output
+    total = len(ingested)
+    assert f"source_records={total} added={total}" in output and "source_records=0 added=0" in output
+    denied_controls = [row["evidence"] for row in rows if row["action"] == "process.handle.open" and
+                       row["evidence"]["handle_site"] == "logging_control"]
+    check_logging_query(output, ingested)
+    user_attempts = [row for row in logging if row["evidence"]["backend"] == "user"]
+    driver_attempts = [row for row in logging if row["evidence"]["backend"] == "driver"]
+    assert len(user_attempts) == len(denied_controls) == (0 if deny_query else 9)
+    expected_backends = [] if deny_query else ["user"] * 7 + ["user", "driver"] * 2
+    assert [r["evidence"]["backend"] for r in logging] == expected_backends
+    by_id = {r["eventId"]: logging_fields(r, pid, created, i) for i, r in enumerate(logging, 1)}
+    for index, (receipt, control) in enumerate(zip(user_attempts, denied_controls), 1):
+        f = by_id[receipt["eventId"]]
+        assert f["outcome"] == "control_open_failed" and f["backend"] == "user"
+        assert f["status_domain"] == "win32" and f["status"] == control["status"] == "5"
+        assert f["control_open_sequence"] == control["sequence"]
+        assert f["requested_utc_filetime"] == control["requested_utc_filetime"]
+        assert f["returned_utc_filetime"] == control["returned_utc_filetime"]
+        pin = fields[int(f["identity_acquisition_id"]) - 1]
+        assert pin["handle_site"] == "logging_identity" and pin["observed_create_time"] == str(created)
+        assert f["requested_create_time"] == str(created)
+        assert receipt["action"] == ("process.logging.cleanup" if index <= 4 else "process.logging.enable")
+        assert f["requested_flags"] == ("0x0" if index <= 4 else "0x3f")
+        assert not {"information_class", "submitted_flags", "transport_win32_status", "reported_scope"}.intersection(f)
+    transport_status = None
+    hold_ids = []
+    for receipt, native in zip(driver_attempts, user_attempts[-2:]):
+        f = by_id[receipt["eventId"]]
+        assert f["status_domain"] == "win32" and f["outcome"] == "transport_failed"
+        assert receipt["action"] == "process.logging.enable" and f["requested_flags"] == "0x3f" and f["returned_bytes"] == "0"
+        assert int(f["device_epoch"]) > 0 and f["device_epoch"] == f["requested_device_epoch"]
+        transport_status = int(f["transport_win32_status"])
+        assert transport_status != 0 and transport_status == int(f["status"])
+        assert f["identity_acquisition_id"] == native["evidence"]["identity_acquisition_id"]
+        hold_ids.append(f["identity_acquisition_id"])
+        assert not {"information_class", "driver_reported_flags", "reported_scope", "control_open_sequence"}.intersection(f)
+    assert len(set(hold_ids)) == (0 if deny_query else 2)
 
     def check(name, state, expected, calls, decision="none", target=pid, bound=created, enable="none"):
         case, batch = cases.pop(name)
+        assert case["held_ids"] == (",".join(hold_ids) if name == "device_uncertain" else "")
         assert tuple(int(case[k]) for k in ("watched", "promoted", "enabled", "failed")) == state, (name, case)
         assert case["enabled_count"] == case["enabled"] and case["decision"] == decision, (name, case)
         assert case["enable_decision"] == enable
@@ -321,7 +361,8 @@ def check_watch_maintenance(exe, directory, deny_query):
         active = {}
         for (row, f), (action, site) in zip(batch, calls):
             assert f["requested_pid"] == str(target), (name, f)
-            assert int(f.get("requested_create_time", 0)) == expected, (name, f)
+            requested = bound if site == "logging_control" else expected
+            assert int(f.get("requested_create_time", 0)) == requested, (name, f)
             status = 0
             if action == "open":
                 assert int(f["requested_access"], 16) == (0x200 if site == "logging_control" else 0x1000)
@@ -378,9 +419,112 @@ def check_watch_maintenance(exe, directory, deny_query):
     check("enable_current", (1, 1, 0, 1), created, current,
           enable="open_failed" if deny_query else "none")
     check("enable_stale", (1, 1, 0, 1), created + 1, query(guard), enable="open_failed" if deny_query else "generation_changed")
+    check("held_current", (1, 1, 0, 1), created, query(guard), enable="open_failed" if deny_query else "none")
+    for case_name in ("held_other_generation", "held_withdrawn"):
+        check(case_name, (1, 1, 0, 1), created, current, enable="open_failed" if deny_query else "none")
+    check("device_uncertain", empty, 0, (current + query(guard)) * 2, enable="open_failed" if deny_query else "none")
     assert not cases
-    print(f"Watch maintenance: query_denied={deny_query}, {case_count} cases, {cursor} handle rows; "
-          "exited, missing, stale, unknown and unowned cases checked.")
+    print(f"Watch maintenance: query_denied={deny_query}, {case_count} cases, {cursor} handle rows, "
+          f"{len(logging)} logging receipts, pipe transport={transport_status}. Exited, uncertain, stale and withdrawn cases checked.")
+
+
+def check_logging_query(output, ingested):
+    prefix = "[logging.query] "
+    assert output.count(prefix) == 1
+    query, _ = json.JSONDecoder().raw_decode(output.split(prefix, 1)[1].lstrip())
+    assert query["count"] == query["totalStored"] == len(ingested)
+    assert sorted(query["events"], key=lambda r: r["eventId"]) == sorted(ingested, key=lambda r: r["eventId"])
+
+
+def logging_fields(row, pid, created, sequence):
+    assert row["pid"] == pid and "targetPid" not in row
+    assert (row["source"], row["domain"], row["entity"]) == ("observer", "observer_action", "process_logging:controller")
+    assert (row["risk"], row["confidence"]) == ("info", "controller_reported")
+    f = row["evidence"]
+    required = {"schema", "actor", "backend", "sequence", "controller_create_time", "requested_pid", "requested_create_time",
+                "identity_acquisition_id", "requested_flags", "requested_utc_filetime", "returned_utc_filetime", "status_domain",
+                "status", "outcome", "effect_verified", "possible_observer_effect", "ingest_origin"}
+    optional = {"target_boot_id", "control_open_sequence", "transport_win32_status", "returned_bytes", "information_class",
+                "submitted_flags", "driver_reported_flags", "reported_scope", "requested_device_epoch", "device_epoch"}
+    assert required <= set(f) <= required | optional
+    assert f["schema"] == "kn.observer_action.v1" and f["ingest_origin"] == "local_controller" and f["actor"] == "controller"
+    assert f["effect_verified"] == "false" and f["possible_observer_effect"] == "change_process_event_logging"
+    assert f["sequence"] == str(sequence) and f["requested_pid"] == str(pid)
+    assert f["controller_create_time"] == f["requested_create_time"] == str(created) and int(f["identity_acquisition_id"]) > 0
+    if "target_boot_id" in f:
+        assert re.fullmatch(r"[0-9a-f]{32}", f["target_boot_id"])
+    assert 0 < int(f["requested_utc_filetime"]) <= int(f["returned_utc_filetime"]) == row["timestampFileTime"]
+    assert row["summary"] == row["action"] + " " + f["outcome"]
+    return f
+
+
+def check_process_logging(exe, directory):
+    output, pid, created = run_child(exe, ["--self-test", "process-logging-observer"], directory)
+    all_rows = collector_rows(output)
+    check_logging_query(output, all_rows)
+    handles = [r["evidence"] for r in all_rows if r["entity"] == "process_handle:controller"]
+    actual = [r for r in all_rows if r["entity"] == "process_logging:controller"]
+    assert len(actual) in (1, 2) and len(all_rows) == len(handles) + len(actual)
+    assert f"source_records={len(all_rows)} added={len(all_rows)}" in output and "source_records=0 added=0" in output
+    for i, row in enumerate(actual, 1):
+        f = logging_fields(row, pid, created, i)
+        assert row["action"] == "process.logging.enable" and f["backend"] == "user" and f["requested_flags"] == "0x3f"
+        assert f["status_domain"] == "ntstatus" and "transport_win32_status" not in f and "driver_reported_flags" not in f
+        assert (int(f["information_class"]), int(f["submitted_flags"], 16)) == ((96, 63) if i == 1 else (87, 3))
+        pin, control = (handles[int(f[key]) - 1] for key in ("identity_acquisition_id", "control_open_sequence"))
+        assert pin["handle_site"] == "logging_identity" and pin["observed_create_time"] == str(created)
+        assert control["handle_site"] == "logging_control" and control["status"] == "0"
+        assert int(control["returned_utc_filetime"]) <= int(f["requested_utc_filetime"])
+        status = int(f["status"])
+        success = status == 0
+        outcome = ("success_reported" if success else "pending" if status == 0x103 else
+                   "failure_reported" if status >> 30 == 3 else "status_unconfirmed")
+        assert f["outcome"] == outcome
+        assert f.get("reported_scope") == (("requested_flags" if i == 1 else "read_write_vm_only") if success else None)
+        if i < len(actual):
+            assert outcome == "failure_reported"
+    assert f"[logging.self] owned={int(success)} failed={int(not success)}" in output
+    assert len(actual) == 2 or outcome != "failure_reported"
+
+    reply_rows = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines() if line.startswith("[logging.reply] ")]
+    # Independent wire expectations for full and legacy replies, NT failure, transport failure,
+    # short lengths, wrong subject, inconsistent masks/classes, then two cleanup replies.
+    expected = [
+        ("success_reported", 96, 63, 0), ("success_reported", 87, 63, 0), ("success_reported", 87, 3, 0),
+        ("failure_reported", 96, 63, 0xc0000022), ("transport_failed", None, None, 5),
+        ("invalid_reply", None, None, 0), ("invalid_reply", None, None, 0), ("invalid_reply", None, None, 0),
+        ("inconsistent_reply", 96, 0, 0), ("inconsistent_reply", 87, 1, 0), ("inconsistent_reply", 0, 63, 0),
+        ("success_reported", 96, 0, 0), ("inconsistent_reply", 96, 63, 0),
+        ("pending", 96, 63, 0x103), ("status_unconfirmed", 96, 63, 0x102),
+        ("status_unconfirmed", 96, 63, 0x80000005), ("invalid_reply", None, None, 0),
+        ("inconsistent_reply", 87, 32, 0),
+    ]
+    assert len(expected) == len(reply_rows)
+    for i, (row, (outcome, cls, flags, status)) in enumerate(zip(reply_rows, expected), 1):
+        f = logging_fields(row, pid, created, i)
+        requested = 0 if i in (12, 13) else 32 if i == 18 else 63
+        assert row["action"] == ("process.logging.enable" if requested else "process.logging.cleanup")
+        assert f["backend"] == "driver" and f["requested_flags"] == hex(requested)
+        assert f["outcome"] == outcome and int(f["status"]) == status
+        assert int(f["transport_win32_status"]) == (5 if i == 5 else 0) and int(f["returned_bytes"]) == {6: 31, 17: 33}.get(i, 32)
+        assert f["status_domain"] == ("ntstatus" if cls is not None else "win32")
+        assert f.get("information_class") == (str(cls) if cls is not None else None)
+        assert f.get("driver_reported_flags") == (hex(flags) if flags is not None else None)
+        assert not {"control_open_sequence", "submitted_flags"}.intersection(f)
+        scope = "read_write_vm_only" if cls == 87 else "requested_flags"
+        assert f.get("reported_scope") == (scope if outcome == "success_reported" else None)
+    simulated = [json.loads(line.split(" ", 1)[1]) for line in output.splitlines() if line.startswith("[logging.native-model] ")]
+    statuses = [(0, "success_reported"), (0x103, "pending"), (0x40000000, "status_unconfirmed"),
+                (0x80000005, "status_unconfirmed"), (0xc0000022, "failure_reported")]
+    assert len(simulated) == len(statuses)
+    for i, (row, (status, outcome)) in enumerate(zip(simulated, statuses), 1):
+        f = logging_fields(row, pid, created, i)
+        assert f["backend"] == "user" and int(f["status"]) == status and f["outcome"] == outcome
+        assert f["status_domain"] == "ntstatus" and f["information_class"] == "87" and f["submitted_flags"] == "0x3"
+        assert f.get("reported_scope") == ("read_write_vm_only" if status == 0 else None)
+    print(f"Process logging: {len(actual)} native return(s), owned={int(success)}, statuses="
+          f"{[r['evidence']['status'] for r in actual]}, {len(expected)} driver and {len(simulated)} native data-only replies, "
+          "closed client, retention and replay checked.")
 
 
 def check_verification_handles(exe, directory, deny):
@@ -661,6 +805,7 @@ def main():
             check_verification_handles(exe, directory, deny)
         for deny_query in (False, True):
             check_watch_maintenance(exe, directory, deny_query)
+        check_process_logging(exe, directory)
         assert not list(Path(directory).iterdir()), "test files remain"
     print("Verified 4 probe calls, 10 ownership fixture calls, 2 mismatched-PID calls, 2 CLI rows and 168 concurrent calls.")
 

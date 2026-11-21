@@ -606,6 +606,9 @@
     <ClInclude Include="ProcessHandleObservation.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessLoggingObservation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="PoolScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>

@@ -418,6 +418,7 @@
     <ClInclude Include="TimelineStore.h" />
     <ClInclude Include="TimelineControlObservation.h" />
     <ClInclude Include="ProcessHandleObservation.h" />
+    <ClInclude Include="ProcessLoggingObservation.h" />
     <ClInclude Include="PoolScanner.h" />
     <ClInclude Include="SnapshotCollector.h" />
     <ClInclude Include="SnapshotDiff.h" />

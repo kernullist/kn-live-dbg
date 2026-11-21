@@ -236,6 +236,31 @@ self-read exports its own four calls in `process_handle_timeline.events` on
 success. Other collectors that call `OpenProcess` directly have separate
 coverage. [Windows DuplicateHandle](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
 
+### Inspect KMON process logging requests
+
+Run `!timeline ingest observer` and `!timeline query /source observer /domain observer_action`.
+Look for `process.logging.enable` and `process.logging.cleanup`. The controller
+retains the latest 64 logging attempts separately from handle calls. The
+identity acquisition ID joins all attempts for the same request to the held
+process handle. The PID at the top of the row belongs to the controller.
+The requested PID, creation time and available boot ID identify the subject
+in the evidence.
+
+| Outcome | What the controller observed |
+| --- | --- |
+| `control_open_failed`, `api_unavailable` | The user-mode request stopped before the native setter. The record carries the Win32 error. |
+| `not_submitted` | The expected device connection closed or was replaced. The row records the controller's decision and the available connection epochs. |
+| `success_reported`, `failure_reported` | A native call or a matching driver reply supplied an NTSTATUS. Each native call has its own time interval, information class and submitted mask. A driver row keeps the transport result and the mask it reported. |
+| `transport_failed`, `invalid_reply`, `inconsistent_reply`, `pending`, `status_unconfirmed` | The controller could not confirm completion. KMON records `retry_decision=held_unconfirmed` for an enable and holds further attempts while this generation remains watched. |
+
+The legacy information class covers only read/write VM logging. A successful
+legacy reply carries `reported_scope=read_write_vm_only`, including when the
+driver echoes the full request mask. Every row carries `effect_verified=false`.
+A later view of target settings or delivered ETW events requires separate evidence.
+For cleanup, the KMON summary can report success when one backend returned success.
+Use the individual rows to see how the other backend returned.
+KMON's `coverage.logging` diagnostics also give the reason when the identity check prevents a request.
+
 ### Inspect live callback control results
 
 After `!timeline live start`, `stop` or `clear`, use `!timeline ingest observer`

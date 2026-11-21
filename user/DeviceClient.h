@@ -10,6 +10,8 @@
 #include "NativeReadObservation.h"
 #include "../shared/KnLiveDbgManagedCallbacks.h"
 
+struct ProcessLoggingAction;
+
 struct PhysicalTranslationInfo
 {
     uint32_t Flags;
@@ -242,7 +244,9 @@ public:
         uint32_t* ntStatus,
         uint64_t* eprocessAddress,
         std::wstring* error,
-        bool disable = false);
+        bool disable = false,
+        ProcessLoggingAction* observation = nullptr,
+        uint64_t expectedDeviceEpoch = 0);
 
     // Reads one architectural MSR (must be a KNDBG_MSR_* whitelist value) on
     // the requested logical processor. Read-only; does not require write mode.

@@ -215,6 +215,26 @@ PID가 요청과 다르면 확인한 PID만 기록하고 생성 시각 조회는
 건이 `process_handle_timeline.events`에 담긴다. 다른 수집기의 직접
 `OpenProcess` 호출은 별도 범위다. [Windows DuplicateHandle](https://learn.microsoft.com/ko-kr/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
 
+### KMON 프로세스 로깅 요청 확인
+
+`!timeline ingest observer`를 실행한 다음 `!timeline query /source observer /domain observer_action`에서
+`process.logging.enable`과 `process.logging.cleanup`을 찾는다. 컨트롤러는 최근 로깅 시도 64건을
+핸들 기록과 별도로 보관한다. 한 요청에서 나온 시도들은 `identity_acquisition_id`로 대상 확인에 사용한
+핸들에 연결된다. 행 상단 PID는 컨트롤러 PID다. 대상 PID와 생성 시각, 확인된 부팅 ID는 증거 필드에 있다.
+
+| 결과 | 컨트롤러가 확인한 내용 |
+| --- | --- |
+| `control_open_failed`, `api_unavailable` | 사용자 모드에서 설정 함수를 호출하기 전에 중단했다. Win32 오류를 남긴다. |
+| `not_submitted` | 요청에 연결된 장치가 닫혔거나 다른 연결로 바뀌었다. 컨트롤러가 제어를 건너뛴 사유와 확인한 연결 세대 번호를 남긴다. |
+| `success_reported`, `failure_reported` | 네이티브 호출 또는 대상이 일치하는 드라이버 응답에서 NTSTATUS를 받았다. 네이티브 호출마다 시각·정보 클래스·제출한 플래그가 남는다. 드라이버 행에는 전송 결과와 드라이버가 보고한 플래그가 남는다. |
+| `transport_failed`, `invalid_reply`, `inconsistent_reply`, `pending`, `status_unconfirmed` | 완료 여부를 확인할 수 없다. 로깅을 켜던 중이었다면 `retry_decision=held_unconfirmed`을 기록하고 같은 프로세스를 감시하는 동안 후속 제어 요청을 보류한다. |
+
+구형 정보 클래스는 VM 읽기·쓰기 로깅만 다룬다. 드라이버가 요청 플래그 전체를 돌려줘도 이 클래스의 성공 행에는
+`reported_scope=read_write_vm_only`가 표시된다. 모든 행의 `effect_verified` 값은 `false`다.
+실제 대상 설정이나 ETW 이벤트 전달 여부는 별도 증거로 확인해야 한다. KMON 해제 요약은 한 백엔드가 성공을 반환하면
+성공으로 집계할 수 있다. 다른 백엔드의 결과는 개별 행에서 확인한다. 대상 확인 단계에서 제어를 보류한 사유는
+기존 KMON 진단 `coverage.logging`에 남는다.
+
 ### 라이브 콜백 제어 결과 확인
 
 `!timeline live start`, `stop`, `clear` 실행 뒤 `!timeline ingest observer`와

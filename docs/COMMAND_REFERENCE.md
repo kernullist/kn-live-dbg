@@ -827,6 +827,10 @@ automatic start requires a validated, idle status with no event history or
 outstanding callback registrations. An explicit `!timeline live start` resets
 the event ring. Use `!timeline live status` to inspect its counters beforehand.
 
+The observer commands also show KMON process logging attempts. The requested
+PID and creation time identify the process. Use the identity acquisition ID
+to follow the user-mode and driver results for the same request. [Process logging request fields](TIMELINE_COMMAND_USAGE.md#inspect-kmon-process-logging-requests)
+
 Use [timeline workflows](TIMELINE_COMMAND_USAGE.md) to ingest TI, live kernel
 events and snapshots, query evidence families, export JSONL, and reconcile
 same-boot baselines. Collection loss and capacity eviction constrain absence

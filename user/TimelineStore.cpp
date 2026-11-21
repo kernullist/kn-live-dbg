@@ -1,4 +1,6 @@
 #include "TimelineStore.h"
+#include "ObservationWindows.h"
+#include "ProcessLoggingObservation.h"
 
 #include "SnapshotDiff.h"
 #include "SnapshotJson.h"
@@ -2569,6 +2571,7 @@ void TimelineStore::Clear()
     TiObserverCursor = 0;
     LiveObserverCursor = 0;
     ProcessHandleCursor = 0;
+    ProcessLoggingCursor = 0;
     DroppedEvents = 0;
     TiRecentCursorInitialized = false;
     TiRecentCursorSequence = 0;
@@ -3080,6 +3083,73 @@ TimelineIngestResult TimelineStore::IngestLiveObserverActions(const TimelineCont
             }
         }
         row.Evidence[L"outcome"] = outcome;
+        row.Summary = row.Action + L" " + outcome;
+        return AddEventLocked(std::move(row), nullptr, true);
+    });
+    result.Dropped = DroppedEvents - before;
+    return result;
+}
+
+TimelineIngestResult TimelineStore::IngestProcessLoggingActions(const ProcessLoggingSnapshot& snapshot)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    const auto before = DroppedEvents;
+    auto result = CopyObserverActions(snapshot, ProcessLoggingCursor, L"process logging", [&](const ProcessLoggingAction& item) {
+        TimelineEvent row;
+        row.Source = L"observer";
+        row.Domain = L"observer_action";
+        row.Entity = L"process_logging:controller";
+        row.ProcessId = snapshot.ControllerPid;
+        row.TimestampFileTime = item.ReturnedUtc;
+        row.Action = item.RequestedFlags ? L"process.logging.enable" : L"process.logging.cleanup";
+        const bool native = item.Step == ProcessLoggingStep::ControlOpenFailed || item.Step == ProcessLoggingStep::ApiUnavailable ||
+            item.Step == ProcessLoggingStep::NativeReturned;
+        const bool operationStatus = item.HasOperationStatus() || item.Step == ProcessLoggingStep::DriverInconsistentReply;
+        const wchar_t* outcome = L"unconfirmed";
+        switch (item.Step)
+        {
+        case ProcessLoggingStep::ControlOpenFailed: outcome = L"control_open_failed"; break;
+        case ProcessLoggingStep::ApiUnavailable: outcome = L"api_unavailable"; break;
+        case ProcessLoggingStep::DriverNotSubmitted: outcome = L"not_submitted"; break;
+        case ProcessLoggingStep::DriverTransportFailed: outcome = L"transport_failed"; break;
+        case ProcessLoggingStep::DriverInvalidEnvelope: outcome = L"invalid_reply"; break;
+        case ProcessLoggingStep::DriverInconsistentReply: outcome = L"inconsistent_reply"; break;
+        case ProcessLoggingStep::NativeReturned:
+        case ProcessLoggingStep::DriverReturned:
+            if (item.NtStatus == STATUS_PENDING) { outcome = L"pending"; }
+            else if (item.Unconfirmed()) { outcome = L"status_unconfirmed"; }
+            else { outcome = item.ReportedSuccess() ? L"success_reported" : L"failure_reported"; }
+            break;
+        }
+        auto& fields = row.Evidence;
+        const wchar_t* statusDomain = operationStatus ? L"ntstatus" : L"win32";
+        if (item.Step == ProcessLoggingStep::DriverNotSubmitted) { statusDomain = L"controller_win32"; }
+        fields = {{L"schema", L"kn.observer_action.v1"}, {L"actor", L"controller"}, {L"backend", native ? L"user" : L"driver"},
+            {L"sequence", std::to_wstring(item.Sequence)}, {L"controller_create_time", std::to_wstring(snapshot.ControllerCreateTime)},
+            {L"requested_pid", std::to_wstring(item.Subject.Pid)}, {L"requested_create_time", std::to_wstring(item.Subject.Created)},
+            {L"identity_acquisition_id", std::to_wstring(item.Subject.IdentityAcquisition)}, {L"requested_flags", HexU64(item.RequestedFlags)},
+            {L"requested_utc_filetime", std::to_wstring(item.RequestedUtc)}, {L"returned_utc_filetime", std::to_wstring(item.ReturnedUtc)},
+            {L"status_domain", statusDomain}, {L"status", std::to_wstring(operationStatus ? item.NtStatus : item.Win32Status)},
+            {L"outcome", outcome}, {L"effect_verified", L"false"}, {L"possible_observer_effect", L"change_process_event_logging"}};
+        if (!ObservationBootId().empty()) { fields[L"target_boot_id"] = ObservationBootId(); }
+        if (item.ControlOpenSequence) { fields[L"control_open_sequence"] = std::to_wstring(item.ControlOpenSequence); }
+        if (item.ExpectedDeviceEpoch) { fields[L"requested_device_epoch"] = std::to_wstring(item.ExpectedDeviceEpoch); }
+        if (item.DeviceEpoch) { fields[L"device_epoch"] = std::to_wstring(item.DeviceEpoch); }
+        if (!native && item.Step != ProcessLoggingStep::DriverNotSubmitted)
+        {
+            fields[L"transport_win32_status"] = std::to_wstring(item.Win32Status);
+            fields[L"returned_bytes"] = std::to_wstring(item.ReturnedBytes);
+        }
+        if (operationStatus)
+        {
+            fields[L"information_class"] = std::to_wstring(item.InformationClass);
+            fields[native ? L"submitted_flags" : L"driver_reported_flags"] = HexU64(item.CallFlags);
+            if (item.ReportedSuccess())
+            {
+                fields[L"reported_scope"] = item.InformationClass == KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING ?
+                    L"read_write_vm_only" : L"requested_flags";
+            }
+        }
         row.Summary = row.Action + L" " + outcome;
         return AddEventLocked(std::move(row), nullptr, true);
     });

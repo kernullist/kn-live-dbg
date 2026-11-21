@@ -394,6 +394,7 @@ private:
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
     friend bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
+    friend bool KmonProcessLoggingSelfTest(std::wstring& diagnostics);
     void WorkerLoop();
     void ServiceDiscovery();
     KmonDiscoveryDispatch DispatchDiscovery(KmonDiscoveryStep step);
@@ -579,6 +580,7 @@ private:
     void ArmMapperWatch(const KmonEvent& event);
     void MaybeEmitShortLived(const KmonEvent& unloadEvent);
     void EnableLoggingForPid(uint32_t pid);
+    void NoteLoggingFailure(uint32_t pid, uint64_t created, bool qualified, bool unconfirmed);
     void ReleaseProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created, const wchar_t* priorRejection = nullptr);
     bool NoteWatchActivityTask(uint32_t pid, const std::wstring& task);
     void ScanWatchedHandleTables();
@@ -960,7 +962,8 @@ private:
     std::set<std::pair<uint32_t, uint64_t>> IotraceSeen;
     bool IotraceSeenCapNoted = false;
     std::unordered_map<uint32_t, uint64_t> LoggingEnabledPids;
-    std::unordered_map<uint32_t, uint64_t> LoggingFailedPids;
+    struct LoggingFailure { uint64_t Created = 0; bool Unconfirmed = false; };
+    std::unordered_map<uint32_t, LoggingFailure> LoggingFailedPids;
     std::map<uint32_t, uint64_t> RecentCreatePids;
     std::unordered_set<uint32_t> EmittedUnnamedPids;
     std::unordered_set<std::wstring> EmittedMapperKeys;
@@ -1594,3 +1597,4 @@ bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
 bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
 bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
+bool KmonProcessLoggingSelfTest(std::wstring& diagnostics);

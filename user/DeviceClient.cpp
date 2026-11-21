@@ -1,5 +1,6 @@
 #include "DeviceClient.h"
 #include "TimelineControlObservation.h"
+#include "ProcessLoggingObservation.h"
 #include "CommandInput.h"
 #include "NativeHandleSnapshot.h"
 #include "SessionWritePolicy.h"
@@ -1636,14 +1637,25 @@ bool DeviceClient::SetProcessLogging(
     uint32_t* ntStatus,
     uint64_t* eprocessAddress,
     std::wstring* error,
-    bool disable)
+    bool disable,
+    ProcessLoggingAction* observation,
+    uint64_t expectedDeviceEpoch)
 {
+    std::lock_guard<std::mutex> connection(managedCallbackMutex_);
     bool ok = false;
+    ProcessLoggingAction result;
+    result.Subject.Pid = processId;
+    result.RequestedUtc = TimelineControlUtc();
+    result.ExpectedDeviceEpoch = expectedDeviceEpoch;
+    result.DeviceEpoch = ObservationEpoch();
+    result.RequestedFlags = disable ? 0 : (loggingFlags ? loggingFlags : KNDBG_PROCESS_LOG_DEFAULT);
+    result.Step = ProcessLoggingStep::DriverNotSubmitted;
 
     do
     {
         if (processId == 0)
         {
+            result.Win32Status = ERROR_INVALID_PARAMETER;
             if (error != nullptr)
             {
                 *error = L"Invalid SetProcessLogging request";
@@ -1651,6 +1663,12 @@ bool DeviceClient::SetProcessLogging(
             break;
         }
 
+        if (!result.DeviceEpoch || (expectedDeviceEpoch && expectedDeviceEpoch != result.DeviceEpoch))
+        {
+            result.Win32Status = ERROR_INVALID_HANDLE;
+            if (error) { *error = L"Process logging device connection unavailable or replaced"; }
+            break;
+        }
         union
         {
             KNDBG_SET_PROCESS_LOGGING_REQUEST Request;
@@ -1664,28 +1682,20 @@ bool DeviceClient::SetProcessLogging(
         buffer.Request.Size = sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST);
         buffer.Request.ProcessId = processId;
         buffer.Request.Flags = disable ? KNDBG_SET_PROCESS_LOGGING_FLAG_DISABLE : 0;
-        buffer.Request.LoggingFlags = disable
-            ? 0
-            : ((loggingFlags == 0) ? KNDBG_PROCESS_LOG_DEFAULT : loggingFlags);
+        buffer.Request.LoggingFlags = result.RequestedFlags;
         buffer.Request.Acknowledge = KNDBG_WRITE_ACK_MAGIC;
 
-        DWORD returned = 0;
-        if (!Ioctl(
-                IOCTL_KNDBG_SET_PROCESS_LOGGING,
-                &buffer,
-                sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST),
-                sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE),
-                &returned,
-                error))
+        result.RequestedUtc = TimelineControlUtc();
+        const bool delivered = Ioctl(IOCTL_KNDBG_SET_PROCESS_LOGGING, &buffer,
+            sizeof(KNDBG_SET_PROCESS_LOGGING_REQUEST), sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE),
+            &result.ReturnedBytes, error, &result.Win32Status, true);
+        result.ReturnedUtc = TimelineControlUtc();
+        DecodeProcessLoggingReply(result, delivered, buffer.Response);
+        if (result.Step != ProcessLoggingStep::DriverReturned)
         {
-            break;
-        }
-
-        if (returned < sizeof(KNDBG_SET_PROCESS_LOGGING_RESPONSE))
-        {
-            if (error != nullptr)
+            if (delivered && error != nullptr)
             {
-                *error = L"Short SetProcessLogging response";
+                *error = L"Invalid SetProcessLogging response, outcome unconfirmed";
             }
             break;
         }
@@ -1710,6 +1720,8 @@ bool DeviceClient::SetProcessLogging(
         ok = true;
     } while (false);
 
+    if (!result.ReturnedUtc) { result.ReturnedUtc = TimelineControlUtc(); }
+    if (observation) { *observation = result; }
     return ok;
 }
 

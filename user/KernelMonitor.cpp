@@ -3,6 +3,8 @@
 #include "TimelineSelfTest.h"
 #include "KmonUserModuleSource.h"
 #include "ProcessObservationSource.h"
+#include "ProcessLoggingObservation.h"
+#include "TimelineControlObservation.h"
 #include "NativeObservationSource.h"
 #include "PendingIrpReport.h"
 #include "KmonImportResolver.h"
@@ -80,8 +82,6 @@ namespace
     constexpr uint32_t kMapperWatchKpageIntervalMs = 1500;
     constexpr uint32_t kMapperWatchEmitDebounceMs = 2000;
     constexpr uint16_t kImageFileMachineAmd64 = 0x8664;
-    constexpr ULONG kProcessEnableLogging = 96;
-    constexpr ULONG kProcessEnableReadWriteVmLogging = 87;
 
     std::wstring HexU64(uint64_t value)
     {
@@ -6684,64 +6684,50 @@ namespace
     typedef LONG NTSTATUS;
     typedef NTSTATUS(NTAPI* NtSetInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG);
 
-    bool TryEnableLoggingUsermode(uint32_t pid, uint32_t loggingFlags, uint32_t* infoClass, uint64_t created)
+    ProcessLoggingAction SubmitUserProcessLogging(const ProcessLoggingSubject& target, uint32_t loggingFlags)
     {
-        bool ok = false;
-        ObservedProcessHandle control(ControllerProcessHandles(), ProcessHandleSite::LoggingControl, pid, created);
-
-        do
+        ProcessLoggingAction row;
+        row.Subject = target;
+        row.RequestedFlags = loggingFlags;
+        ObservedProcessHandle control(ControllerProcessHandles(), ProcessHandleSite::LoggingControl, target.Pid, target.Created);
+        const bool opened = control.Open(PROCESS_SET_INFORMATION);
+        const auto& attempt = control.Acquisition();
+        row.ControlOpenSequence = attempt.Sequence;
+        if (!opened)
         {
-            if (infoClass != nullptr)
-            {
-                *infoClass = 0;
-            }
-            if (!control.Open(PROCESS_SET_INFORMATION))
-            {
-                break;
-            }
-            const HANDLE process = control.get();
-
-            HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-            if (ntdll == nullptr)
-            {
-                break;
-            }
-
-            auto setInfo = reinterpret_cast<NtSetInformationProcessFn>(
-                GetProcAddress(ntdll, "NtSetInformationProcess"));
-            if (setInfo == nullptr)
-            {
-                break;
-            }
-
-            ULONG flags = loggingFlags;
-            ULONG classUsed = kProcessEnableLogging;
-            NTSTATUS status = setInfo(
-                process,
-                kProcessEnableLogging,
-                &flags,
-                sizeof(flags));
-            if (status < 0)
-            {
-                UCHAR smallFlags = static_cast<UCHAR>(loggingFlags & 0x3u);
-                classUsed = kProcessEnableReadWriteVmLogging;
-                status = setInfo(
-                    process,
-                    kProcessEnableReadWriteVmLogging,
-                    &smallFlags,
-                    sizeof(smallFlags));
-            }
-            if (status >= 0)
-            {
-                if (infoClass != nullptr)
-                {
-                    *infoClass = classUsed;
-                }
-                ok = true;
-            }
-        } while (false);
-
-        return ok;
+            row.RequestedUtc = attempt.RequestedUtc;
+            row.ReturnedUtc = attempt.ReturnedUtc;
+            row.Win32Status = attempt.Status;
+            row.Step = ProcessLoggingStep::ControlOpenFailed;
+            ControllerProcessLogging().Record(row);
+            return row;
+        }
+        row.RequestedUtc = TimelineControlUtc();
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        auto setInfo = ntdll ? reinterpret_cast<NtSetInformationProcessFn>(GetProcAddress(ntdll, "NtSetInformationProcess")) : nullptr;
+        if (!setInfo)
+        {
+            row.Win32Status = GetLastError();
+            row.ReturnedUtc = TimelineControlUtc();
+            row.Step = ProcessLoggingStep::ApiUnavailable;
+            ControllerProcessLogging().Record(row);
+            return row;
+        }
+        const auto submit = [&](ULONG informationClass, auto flags) {
+            row.Step = ProcessLoggingStep::NativeReturned;
+            row.InformationClass = informationClass;
+            row.CallFlags = flags;
+            row.RequestedUtc = TimelineControlUtc();
+            row.NtStatus = static_cast<uint32_t>(setInfo(control.get(), informationClass, &flags, sizeof(flags)));
+            row.ReturnedUtc = TimelineControlUtc();
+            ControllerProcessLogging().Record(row);
+        };
+        submit(KNDBG_PROCESS_INFO_ENABLE_LOGGING, static_cast<ULONG>(loggingFlags));
+        if (!row.ReportedSuccess() && !row.Unconfirmed())
+        {
+            submit(KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING, static_cast<UCHAR>(loggingFlags & 3u));
+        }
+        return row;
     }
 
     // Keep the identity handle until the caller has finished its PID-based operation.
@@ -6758,28 +6744,23 @@ namespace
         return exitCode == STILL_ACTIVE ? nullptr : L"process_exited";
     }
 
-    bool DisableProcessLogging(DeviceClient* device, uint32_t pid, uint64_t created)
+    ProcessLoggingAction SubmitDriverProcessLogging(DeviceClient& device, uint64_t epoch, const ProcessLoggingSubject& target, uint32_t flags)
     {
-        const bool userReportedSuccess = TryEnableLoggingUsermode(pid, 0, nullptr, created);
-        if (device == nullptr || !device->IsOpen())
-        {
-            return userReportedSuccess;
-        }
-        uint32_t applied = 0;
-        uint32_t infoClass = 0;
-        uint32_t ntStatus = 0;
-        uint64_t eprocess = 0;
+        ProcessLoggingAction result;
         std::wstring error;
-        const bool reply = device->SetProcessLogging(
-            pid,
-            0,
-            &applied,
-            &infoClass,
-            &ntStatus,
-            &eprocess,
-            &error,
-            true);
-        return userReportedSuccess || (reply && !(ntStatus & 0x80000000u) && applied == 0);
+        device.SetProcessLogging(target.Pid, flags, nullptr, nullptr, nullptr, nullptr, &error, flags == 0, &result, epoch);
+        result.Subject = target;
+        ControllerProcessLogging().Record(result);
+        return result;
+    }
+
+    bool DisableProcessLogging(DeviceClient* device, const ProcessLoggingSubject& target)
+    {
+        const uint64_t epoch = device ? device->ObservationEpoch() : 0;
+        const auto user = SubmitUserProcessLogging(target, 0);
+        if (user.Unconfirmed() || !epoch) { return user.ReportedSuccess(); }
+        const auto result = SubmitDriverProcessLogging(*device, epoch, target, 0);
+        return user.ReportedSuccess() || result.ReportedSuccess();
     }
 
     bool CollectToolhelpPidsByName(
@@ -20066,6 +20047,24 @@ KmonUserDeepResult KernelMonitor::InspectUserTarget(UserDeepWork& work, size_t i
     return StopRequested.load() ? KmonUserDeepResult::Cancelled : KmonUserDeepResult::Returned;
 }
 
+void KernelMonitor::NoteLoggingFailure(uint32_t pid, uint64_t created, bool qualified, bool unconfirmed)
+{
+    std::lock_guard<std::mutex> lock(WatchMutex);
+    auto [it, inserted] = LoggingFailedPids.try_emplace(pid, LoggingFailure{created, unconfirmed});
+    if (!inserted)
+    {
+        // Losing query access does not clear an outstanding result for a known process.
+        if (!qualified && it->second.Unconfirmed) { return; }
+        if (it->second.Created == created)
+        {
+            it->second.Unconfirmed |= unconfirmed;
+            return;
+        }
+        it->second = {created, unconfirmed};
+    }
+    LoggingFailedCount.fetch_add(1);
+}
+
 void KernelMonitor::EnableLoggingForPid(uint32_t pid)
 {
     std::lock_guard<std::mutex> loggingLock(LoggingControlMutex);
@@ -20075,9 +20074,11 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
 
     DeviceClient* device = nullptr;
+    uint64_t epoch = 0;
     {
         std::lock_guard<std::mutex> lock(StateMutex);
         device = Device;
+        if (device) { epoch = device->ObservationEpoch(); }
     }
     uint64_t expected = 0;
     {
@@ -20105,46 +20106,32 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
         {
             return;
         }
+        const auto failure = LoggingFailedPids.find(pid);
+        if (qualified && failure != LoggingFailedPids.end() && failure->second.Created == created &&
+            failure->second.Unconfirmed) { return; }
     }
 
-    uint32_t infoClass = 0;
-    bool enabled = qualified && TryEnableLoggingUsermode(
-        pid,
-        KNDBG_PROCESS_LOG_DEFAULT,
-        &infoClass, created);
-    if (qualified && !enabled)
+    const ProcessLoggingSubject target{pid, created, pin.Acquisition().AcquisitionId};
+    ProcessLoggingAction result;
+    if (qualified) { result = SubmitUserProcessLogging(target, KNDBG_PROCESS_LOG_DEFAULT); }
+    if (qualified && !result.ReportedSuccess() && !result.Unconfirmed())
     {
         if (device == nullptr)
         {
             std::lock_guard<std::mutex> lock(StateMutex);
             device = Device;
+            if (device) { epoch = device->ObservationEpoch(); }
         }
-        if (device != nullptr && device->IsOpen())
+        if (epoch)
         {
-            uint32_t applied = 0;
-            uint32_t ntStatus = 0;
-            uint64_t eprocess = 0;
-            std::wstring error;
-            enabled = device->SetProcessLogging(
-                pid,
-                KNDBG_PROCESS_LOG_DEFAULT,
-                &applied,
-                &infoClass,
-                &ntStatus,
-                &eprocess,
-                &error);
-            if (enabled && (ntStatus & 0x80000000u) != 0)
-            {
-                enabled = false;
-            }
+            result = SubmitDriverProcessLogging(*device, epoch, target, KNDBG_PROCESS_LOG_DEFAULT);
         }
     }
 
     const std::wstring loggingPartialKey =
         L"scan_failed:logging:partial:" + std::to_wstring(pid);
-    const bool partialLogging =
-        enabled &&
-        infoClass == kProcessEnableReadWriteVmLogging;
+    const bool enabled = qualified && result.ReportedSuccess();
+    const bool partialLogging = enabled && result.InformationClass == KNDBG_PROCESS_INFO_ENABLE_READWRITEVM_LOGGING;
     if (partialLogging)
     {
         EmitUnique(
@@ -20183,14 +20170,19 @@ void KernelMonitor::EnableLoggingForPid(uint32_t pid)
     }
     else
     {
+        NoteLoggingFailure(pid, created, qualified, result.Unconfirmed());
+        if (result.Unconfirmed())
         {
-            std::lock_guard<std::mutex> watchLock(WatchMutex);
-            const auto it = LoggingFailedPids.find(pid);
-            if (it == LoggingFailedPids.end() || it->second != created)
-            {
-                LoggingFailedPids[pid] = created;
-                LoggingFailedCount.fetch_add(1);
-            }
+            KmonEvent event;
+            event.Kind = L"coverage.logging";
+            event.Task = L"enable";
+            event.ProcessId = pid;
+            event.Observation.Identity = subject;
+            event.Observation.Source = L"process_logging";
+            event.Summary = L"automatic process logging retry held after unconfirmed result";
+            event.Evidence = {{L"retry_decision", L"held_unconfirmed"}, {L"identity_acquisition_id", std::to_wstring(target.IdentityAcquisition)},
+                {L"effect_verified", L"false"}};
+            RecordEvent(std::move(event));
         }
         if (rejection)
         {
@@ -20212,7 +20204,8 @@ void KernelMonitor::ReleaseProcessLogging(DeviceClient* device, uint32_t pid, ui
         if (!decision)
         {
             decision = L"control_attempted";
-            outcome = DisableProcessLogging(device, pid, created) ? L"success_reported" : L"unconfirmed";
+            const ProcessLoggingSubject target{pid, created, pin.Acquisition().AcquisitionId};
+            outcome = DisableProcessLogging(device, target) ? L"success_reported" : L"unconfirmed";
         }
         acquisition = pin.Acquisition().AcquisitionId;
     }
@@ -20946,7 +20939,7 @@ void KernelMonitor::PruneStalePromotedWatches()
         promoted = WatchPromotedPids;
         children = WatchChildPids;
         watchPins = WatchPromotedCreated;
-        loggingPins = LoggingFailedPids;
+        for (const auto& entry : LoggingFailedPids) { loggingPins.emplace(entry.first, entry.second.Created); }
         for (const auto& entry : LoggingEnabledPids)
         {
             auto [it, inserted] = loggingPins.insert(entry);
@@ -21036,7 +21029,7 @@ void KernelMonitor::PruneStalePromotedWatches()
             LoggingEnabledCount.store(LoggingEnabledPids.size());
         }
         const auto failed = LoggingFailedPids.find(pid);
-        if (failed != LoggingFailedPids.end() && sample.Rejection(failed->second)) { LoggingFailedPids.erase(failed); }
+        if (failed != LoggingFailedPids.end() && sample.Rejection(failed->second.Created)) { LoggingFailedPids.erase(failed); }
     }
 }
 
