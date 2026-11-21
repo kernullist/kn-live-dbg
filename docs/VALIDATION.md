@@ -5018,6 +5018,52 @@ previously documented process-local interceptor setting and startup warnings.
 All 45 baseline pages from the older profile and switch schemas matched the
 parent executable byte for byte. [Merge-time build report](TRACE_IMPORT.md#compare-merge-time-build-identifiers)
 
+### Recorded capture settings in saved ETLs
+
+On 2026-11-22 the capture-settings checker compared every CPU sample and
+context switch in the five pinned ETLs below. Windows `tracerpt -rts`
+supplied callback order, raw timestamps and payload fields. A separate
+`OpenTraceW` reader checked the native logger ID, header flags, original
+record ordinal, CPU and payload length of all 28 setting records.
+Each file with settings used logger ID zero. The scheduler file held three
+distinct group masks under that ID.
+
+| Pinned ETL | Samples | Samples with matching group masks | Samples with a recorded 1 ms period | Switches | Switches with matching group masks |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ETWAnalyzer scheduler | 18,556 | 17,434 | 0 | 168,474 | 157,677 |
+| PerfView x64 workload | 79,528 | 79,464 | 79,450 | 0 | 0 |
+| PerfView x86 workload | 88,809 | 88,745 | 88,753 | 0 | 0 |
+| SimpleAllocator | 5,496 | 4,822 | 4,694 | 0 | 0 |
+| 23-event control | 0 | 0 | 0 | 0 | 0 |
+
+The three PerfView workloads contained a timer CollectionStart and
+CollectionEnd with source zero and a reported interval of 10,000 in
+100-nanosecond units. The scheduler file contained only CollectionEnd.
+Its 18,556 samples had no recorded period. All five log headers reported
+a timer resolution of 156,250 in the same units. The files supplied
+version-2 mask records and version-3 interval records with 64-bit headers.
+
+```powershell
+python tools/test-etl-capture-settings.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --all-pages --check-short-tail --expect-timed-samples 0
+```
+
+The command above uses the scheduler ETL. The PerfView x64 workload uses
+`--expect-timed-samples 79450`. For each trace containing CPU samples, the
+checker removed one byte from a copy. The tested pages still contained
+1,075 previously qualified CPU samples and 365 previously qualified switches
+at their original ordinals and raw timestamps. Every surviving row on
+those pages reported unqualified coverage.
+
+Native tests exercised 32-bit and 64-bit headers, changing intervals,
+conflicting boundary records, loss markers, unsupported layouts and both
+retention limits. The 32-bit and 64-bit Release checks passed. The x64
+ASan run passed with the previously documented process-local interceptor
+setting and startup warnings. All 60 baseline reports from the older
+profile and switch schemas matched the parent executable byte for byte.
+The public files supplied no loss-marker example and do not establish
+recording privilege, original session identity or the memory bytes at
+sampling time. [Capture settings and interpretation](TRACE_IMPORT.md#read-recorded-capture-settings)
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

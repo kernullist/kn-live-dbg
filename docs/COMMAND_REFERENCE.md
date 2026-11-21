@@ -947,6 +947,23 @@ pointer and original record ordinal. Check `status`, `buffer_comparison` and
 the reported loss counters before interpreting the page. A buffer-count
 mismatch returns `partial` and exit 1. [ETL fields and limits](TRACE_IMPORT.md#saved-windows-cpu-samples)
 
+Use `--capture-settings` to inspect the collector records surrounding a
+sample. The same option on `--etl-switches` reports the group-mask witnesses
+for each switch. A reported timer period uses 100-nanosecond units.
+
+```powershell
+$etl = Get-Item .\capture.etl
+$pin = (Get-FileHash -LiteralPath $etl.FullName -Algorithm SHA256).Hash
+$page = & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --capture-settings --limit 8 | ConvertFrom-Json
+$page.capture_settings.records | Select-Object record_ordinal, kind, opcode, profile_source_name
+$page.samples | Select-Object sample_ordinal, @{Name='TimerPeriod100ns'; Expression={$_.capture_setting_evidence.timer_bracket.reported_period_100ns}}
+$switches = & KnLiveDbg.exe --etl-switches $etl.FullName --sha256 $pin --capture-settings --limit 8 | ConvertFrom-Json
+$switches.switches | Select-Object switch_ordinal, capture_setting_evidence
+```
+
+Look up each witness by its original record ordinal in the manifest.
+[Capture settings and limits](TRACE_IMPORT.md#read-recorded-capture-settings)
+
 Add `--thread-evidence` to inspect the nearest start, end or rundown records
 for each sampled TID. `paired_record_pid` is populated when both source
 records agree and coverage permits the comparison.

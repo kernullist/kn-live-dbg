@@ -1,4 +1,5 @@
 #include "EtlProfile.h"
+#include "EtlCaptureSettings.h"
 #include "EtlProcessEvidence.h"
 #include "EtlReferenceImage.h"
 #include "ReferenceArtifact.h"
@@ -13,7 +14,6 @@
 namespace
 {
     using etl_profile::Sample;
-    constexpr GUID LostEvent = {0x6a399ae0, 0x4bc6, 0x4de9, {0x87, 0x0b, 0x36, 0x57, 0xf8, 0x94, 0x7e, 0x7e}};
     constexpr uint64_t MaxBytes = 512ull << 20;
     constexpr uint32_t MaxRecords = 2'000'000;
     constexpr uint32_t MaxPage = 128;
@@ -25,12 +25,13 @@ namespace
         uint32_t limit = 64;
         std::wstring digest, referencePath, referenceDigest;
         bool switches = false, threads = false, images = false, processes = false;
-        bool intervals = false, haveTid = false, builds = false;
+        bool intervals = false, haveTid = false, builds = false, settings = false;
         uint32_t tid = 0;
         bool WithIntervals() const { return intervals || haveTid; }
         bool WithThreads() const { return threads || images || processes; }
         const wchar_t* Prefix() const
         {
+            if (settings) { return switches ? L"{\"schema\":\"kn.etl_switches.v3\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v7\",\"status\":"; }
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
             if (builds) { return L"{\"schema\":\"kn.etl_profile.v6\",\"status\":"; }
@@ -66,11 +67,12 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 14 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 15 || args[0].empty() ||
             args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
         {
+            if (args[i] == L"--capture-settings" && !options.settings) { options.settings = true; continue; }
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
             if (args[i] == L"--process-evidence" && !options.switches && !options.processes) { options.processes = true; continue; }
@@ -110,6 +112,7 @@ namespace
         etl_profile::ThreadIndex threadIndex;
         etl_profile::ImageIndex imageIndex;
         etl_profile::BuildIndex buildIndex;
+        etl_profile::CaptureSettings settings;
         etl_profile::ProcessIndex processIndex;
         etl_profile::ScheduleHistory history;
         std::array<Sample, MaxPage> page{};
@@ -150,9 +153,9 @@ namespace
         if (scan.records == MaxRecords) { scan.budgetExceeded = true; return; }
         ++scan.records;
         const auto& h = event->EventHeader;
-        if (IsEqualGUID(h.ProviderId, LostEvent) && (h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) &&
-            h.EventDescriptor.Opcode >= 32 && h.EventDescriptor.Opcode <= 34) { ++scan.lossMarkers; }
+        if (etl_profile::LossMarker(h)) { ++scan.lossMarkers; }
         if (scan.replaying) { ReplayRecord(*event, scan); return; }
+        if (scan.options.settings) { scan.settings.Observe(*event, scan.records); }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
         if (scan.options.builds) { scan.buildIndex.Observe(*event, scan.records); }
         if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
@@ -231,6 +234,78 @@ namespace
     std::wstring LoggerJson(uint16_t logger, bool include)
     {
         return include ? L",\"logger_id\":" + std::to_wstring(logger) : std::wstring{};
+    }
+
+    std::wstring SettingsManifestJson(const etl_profile::CaptureSettings& s, const TRACE_LOGFILE_HEADER& header)
+    {
+        auto out = std::wstring(L",\"capture_settings\":{\"scope\":\"saved_file_logger_records\",\"original_session_id\":null,") +
+            L"\"mask_provider\":\"68fdd900-4a3e-11d1-84f4-0000f80464e3\",\"interval_provider\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\"," +
+            L"\"loss_provider\":\"6a399ae0-4bc6-4de9-870b-3657f8947e7e\",\"header_timer_resolution_100ns\":" +
+            std::to_wstring(header.TimerResolution) + L",\"group_mask_records\":" + std::to_wstring(s.maskCount) +
+            L",\"profile_interval_records\":" + std::to_wstring(s.intervalCount) + L",\"loss_indications\":" + std::to_wstring(s.lossCount) +
+            L",\"unsupported_group_masks\":" + std::to_wstring(s.unsupportedMasks) +
+            L",\"unsupported_profile_intervals\":" + std::to_wstring(s.unsupportedIntervals) +
+            L",\"retained_records\":" + std::to_wstring(s.records.size()) + L",\"retention\":" + Quote(s.retention) + L",\"records\":[";
+        for (const auto& e : s.records)
+        {
+            if (&e != s.records.data()) { out += L','; }
+            out += L"{\"record_ordinal\":" + std::to_wstring(e.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(e.tick)) +
+                L",\"logger_id\":" + std::to_wstring(e.logger) + L",\"cpu\":" + std::to_wstring(e.cpu) +
+                L",\"cpu_field\":" + Quote((e.flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) ? L"processor_index" : L"processor_number") +
+                L",\"header_flags\":" + std::to_wstring(e.flags) + L",\"pointer_bytes\":" + (e.width ? std::to_wstring(e.width) : L"null") +
+                L",\"event_id\":" + std::to_wstring(e.eventId) + L",\"version\":" + std::to_wstring(e.version) +
+                L",\"opcode\":" + std::to_wstring(e.opcode) + L",\"event_keyword\":" + Hex(e.keyword) +
+                L",\"event_level\":" + std::to_wstring(e.level) + L",\"event_channel\":" + std::to_wstring(e.channel) +
+                L",\"event_task\":" + std::to_wstring(e.task) + L",\"payload_bytes\":" + std::to_wstring(e.payloadBytes);
+            const bool mask = e.kind == etl_profile::SettingKind::GroupMask;
+            const bool loss = e.kind == etl_profile::SettingKind::Loss;
+            out += L",\"kind\":" + Quote(mask ? L"group_mask" : loss ? L"loss_indication" : L"profile_interval") +
+                L",\"payload_status\":" + Quote(loss ? L"envelope_only" : e.supported ? L"decoded" : L"unsupported");
+            if (e.supported && mask)
+            {
+                out += L",\"group_masks\":[";
+                for (size_t i = 0; i < e.masks.size(); ++i)
+                {
+                    if (i) { out += L','; }
+                    out += std::to_wstring(e.masks[i]);
+                }
+                out += L"],\"kernel_event_version\":" + (e.version == 2 ? std::to_wstring(e.kernelVersion) : L"null");
+            }
+            else if (e.supported && !loss)
+            {
+                out += L",\"profile_source\":" + std::to_wstring(e.source) +
+                    L",\"new_interval_raw\":" + std::to_wstring(e.newInterval) + L",\"old_interval_raw\":" + std::to_wstring(e.oldInterval) +
+                    L",\"profile_source_name\":" + (e.version == 3 ? Quote(std::wstring(s.Name(e))) : L"null");
+            }
+            out += L'}';
+        }
+        return out + L"]}";
+    }
+
+    std::wstring SettingBracketJson(const etl_profile::SettingBracket& r, bool timer)
+    {
+        auto ordinal = [](const etl_profile::SettingRecord* p) { return p ? std::to_wstring(p->record) : std::wstring(L"null"); };
+        auto out = L"{\"relation\":" + Quote(r.relation) + L",\"before_record\":" + ordinal(r.before) +
+            L",\"after_record\":" + ordinal(r.after);
+        if (timer)
+        {
+            out += L",\"collection_start_record\":" + ordinal(r.start) + L",\"collection_end_record\":" + ordinal(r.end) +
+                L",\"reported_period_100ns\":" + (r.period ? std::to_wstring(r.period) : L"null");
+        }
+        return out + L"}";
+    }
+
+    std::wstring SettingsEvidenceJson(const Scan& scan, const etl_profile::RecordEnvelope& row, bool clock, bool gap)
+    {
+        if (!scan.options.settings) { return {}; }
+        using etl_profile::SettingKind;
+        auto out = std::wstring(L",\"capture_setting_evidence\":{\"group_mask_bracket\":") +
+            SettingBracketJson(scan.settings.At(row, SettingKind::GroupMask, clock, gap), false);
+        if (!scan.options.switches)
+        {
+            out += L",\"timer_bracket\":" + SettingBracketJson(scan.settings.At(row, SettingKind::ProfileInterval, clock, gap), true);
+        }
+        return out + L"}";
     }
 
     std::wstring ThreadPointJson(const etl_profile::ThreadEvent* e, bool includeLogger)
@@ -522,7 +597,7 @@ namespace
     bool Partial(const Scan& scan, BufferAccounting accounting)
     {
         return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
-            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete();
+            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete() || !scan.settings.Complete();
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
@@ -565,6 +640,7 @@ namespace
                 std::to_wstring(scan.options.after + scan.used) : L"null");
         const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
         const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
+        if (scan.options.settings) { result += SettingsManifestJson(scan.settings, h); }
         if (scan.options.switches)
         {
             if (scan.options.WithIntervals())
@@ -589,7 +665,7 @@ namespace
                 if (i) { result += L','; }
                 const auto intervals = scan.options.WithIntervals() ?
                     IntervalsJson(scan, i, comparableClock, captureGap || scan.unsupported) : std::wstring{};
-                result += SwitchJson(scan.switchPage[i], intervals);
+                result += SwitchJson(scan.switchPage[i], intervals + SettingsEvidenceJson(scan, scan.switchPage[i], comparableClock, captureGap));
             }
             return result + L"]}";
         }
@@ -688,9 +764,10 @@ namespace
                             scan.options.builds ? &build : nullptr)) { return {}; }
                     }
                 }
+                evidence += SettingsEvidenceJson(scan, scan.page[i], comparableClock, captureGap);
                 result += SampleJson(scan.page[i], &pair, evidence, scan.options.processes);
             }
-            else { result += SampleJson(scan.page[i], nullptr); }
+            else { result += SampleJson(scan.page[i], nullptr, SettingsEvidenceJson(scan, scan.page[i], comparableClock, captureGap)); }
         }
         if (scan.options.images)
         {
@@ -782,6 +859,11 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     trace.handle = OpenTraceW(&log);
     if (trace.handle == INVALID_PROCESSTRACE_HANDLE) { return Failure(scan.options, L"open_trace_failed", source.Sha256, GetLastError()); }
     if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return Failure(scan.options, L"segmented_source", source.Sha256); }
+    if (scan.options.settings)
+    {
+        try { scan.settings.Prepare(); }
+        catch (const std::bad_alloc&) { return Failure(scan.options, L"settings_index_unavailable", source.Sha256); }
+    }
     if (scan.options.WithThreads())
     {
         try
@@ -847,8 +929,8 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         }
     }
     std::wcerr << (switches ?
-        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
-        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--reference-image <local.pe> <pe-sha256>]\n");
+        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings]\n" :
+        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>]\n");
     return 2;
 }
 

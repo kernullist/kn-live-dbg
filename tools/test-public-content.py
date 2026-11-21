@@ -176,6 +176,9 @@ class PublicContentTests(unittest.TestCase):
         edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
         source = dict(thread_filter=5, matched_switches=2)
         split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
+        v7 = "kn.etl_profile.v7"
+        switch_settings = "kn.etl_switches.v3"
+        mask_bracket = dict(relation="equal_group_snapshots", before_record=5, after_record=6)
         v6 = "kn.etl_profile.v6"
         rsds = dict(rsds_guid="00000000-0000-0000-0000-000000000000", pdb_age=0)
         markers = dict(marker_count=1, marker_records=[8])
@@ -193,6 +196,11 @@ class PublicContentTests(unittest.TestCase):
         process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
         process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
         for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=v7, samples=[]), dict(samples=[], schema=v7), dict(switches=[], schema=switch_settings),
+                       dict(group_mask_records=1, profile_interval_records=2), dict(group_masks=[0] * 8, kernel_event_version=0),
+                       dict(profile_source=0, new_interval_raw=10000, old_interval_raw=10000, profile_source_name="Timer"),
+                       dict(header_flags=832, payload_bytes=0, record_ordinal=5, raw_timestamp="100"),
+                       dict(group_mask_bracket=mask_bracket), dict(collection_start_record=4, reported_period_100ns=10000),
                        dict(schema=v6, samples=[]), dict(build_records=[], schema=v6), rsds, markers,
                        dict(loader_count=1, native_rsds=markers), dict(relation="endpoint_unqualified", reference_comparison=None),
                        dict(rsds_guid_equal=True, pdb_age_equal=True, merge_timestamp_equal=None),

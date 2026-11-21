@@ -489,6 +489,9 @@
     <ClInclude Include="EtlThreadEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlCaptureSettings.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlBuildEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>

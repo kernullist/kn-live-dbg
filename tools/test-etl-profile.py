@@ -26,9 +26,15 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         assert not result.stdout
         return None
     value = json.loads(result.stdout.decode("utf-8"))
-    version = 6 if "--build-evidence" in args else 5 if "--reference-image" in args else 4 if "--process-evidence" in args else 3 if "--image-evidence" in args else 2 if "--thread-evidence" in args else 1
-    switch_version = 2 if "--intervals" in args or "--thread-id" in args else 1
-    assert value["schema"] == (f"kn.etl_switches.v{switch_version}" if switches else f"kn.etl_profile.v{version}")
+    if switches:
+        versions = {"--intervals": 2, "--thread-id": 2, "--capture-settings": 3}
+        family = "kn.etl_switches"
+    else:
+        versions = {"--thread-evidence": 2, "--image-evidence": 3, "--process-evidence": 4,
+                    "--reference-image": 5, "--build-evidence": 6, "--capture-settings": 7}
+        family = "kn.etl_profile"
+    version = max((v for flag, v in versions.items() if flag in args), default=1)
+    assert value["schema"] == f"{family}.v{version}"
     return value
 
 

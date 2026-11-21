@@ -40,6 +40,53 @@ exit 1. Malformed arguments and output failures return exit 2. A rotating
 multi-file session requires separate segment provenance. Keep ETLs and JSON
 reports private. [Windows trace file header](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header)
 
+### Read recorded capture settings
+
+Add `--capture-settings` to `--etl-profile` or `--etl-switches` for
+`kn.etl_profile.v7` or `kn.etl_switches.v3`. It works with the other evidence
+and paging options. Every page includes the same file-scoped
+`capture_settings.records` in original callback order, including when there
+are no samples or switches. The enclosing ETL SHA-256 and the one-based
+record ordinal locate each witness.
+
+| Record | Retained evidence |
+| --- | --- |
+| EventTrace Extension / EndExtension, opcodes 5 / 32 | Eight unsigned group-mask words. Versions 0 and 1 have 32 payload bytes. Version 2 adds the kernel event version. |
+| PerfInfo SetInterval / CollectionStart / CollectionEnd, opcodes 72 / 73 / 74 | Profile source and raw new and old intervals. Version 2 has 12 payload bytes. Version 3 adds one terminated UTF-16 source name. |
+| Lost_Event, opcodes 32 / 33 / 34 | Original loss-indication envelope, including ordinal, tick and opcode. Its position does not identify a lost sample's time or type. |
+
+Each envelope retains the logger ID, raw timestamp, CPU field, original
+descriptor (including keyword), header flags and payload length. A recognized
+record with an unsupported layout retains its envelope and contributes to the
+unsupported count for its family. The reader keeps up to 1,024 setting and
+loss records and 65,536 UTF-16 name units. If a record would exceed either
+limit, the page reports partial coverage, the retained prefix and totals
+across the whole scan.
+[Microsoft PerfView kernel parser](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/Parsers/KernelTraceEventParser.cs) · [ETW loss indications](https://learn.microsoft.com/en-us/windows/win32/etw/rt-lostevent)
+
+Each sample or switch points to surrounding group-mask records for its file
+logger. `equal_group_snapshots` means a start and an end reported the same
+eight words and kernel event version. Merged traces can carry different
+original collections under one logger ID. The manifest keeps those snapshots
+separate. The original session identity, effective enable flags, stack
+capture policy, recording privilege and producer authenticity remain unknown.
+
+For a CPU sample, `timer_bracket` also identifies the nearest timer-source
+records and their enclosing CollectionStart and CollectionEnd. Source zero
+is the timer. The reader compares the preceding new interval with the
+following old interval. The values must agree and be nonzero. At each
+collection boundary the old and new values must also agree, including when
+a SetInterval divides the collection into segments with distinct periods.
+The records must bracket the row in both callback order and raw time,
+with a comparable clock, matching layouts and consistent version-3 source
+names. Repeated opening or closing boundaries, missing witnesses, loss,
+incomplete retention or unsupported records in the relevant family withhold
+the derived value. Other profile sources retain their raw units.
+
+`reported_period_100ns` describes the timer setting between witnesses.
+`header_timer_resolution_100ns` gives the separate log header value. Neither
+measures elapsed execution time for a sample. [Xperf timer interval units](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/start) · [ETW file header](https://learn.microsoft.com/en-us/windows/win32/etw/eventtrace-header)
+
 ### Match a CPU sample to thread records
 
 Add `--thread-evidence` to return `kn.etl_profile.v2`. For each page, the

@@ -1035,6 +1035,14 @@ the wait-mode or flags byte according to the event version. The report exposes
 the incoming wait-time value as recorded.
 [Saved context switches](TRACE_IMPORT.md#saved-windows-context-switches)
 
+The sample and switch readers share a bounded capture-settings index.
+EventTrace group-mask snapshots, PerfInfo sampling-interval records and loss
+indications stay in callback order under the ETL digest. A row's file logger,
+ordinal and tick delimit candidate witnesses. The sampling interval also
+requires a complete timer collection bracket. Separate source settings in a
+merged file can share a logger ID. Original session identity and capture
+privilege require independent evidence. [Recorded capture settings](TRACE_IMPORT.md#read-recorded-capture-settings)
+
 In interval mode a second pass indexes one preceding switch per CPU and
 thread transitions for the TIDs on the page. It follows those TIDs across
 CPUs and uses Thread v3 lifetime events to delimit numeric ID reuse.

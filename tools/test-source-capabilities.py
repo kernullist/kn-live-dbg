@@ -200,6 +200,7 @@ def main():
     assert switches["implementation"] == "implemented" and switches["consistency"] == "reported_scheduler_event"
     assert "classic_thread_opcode36_versions2_3_4" in switches["requirements"]
     assert all(item in switches["requirements"] for item in ("opt_in_on_cpu_and_off_cpu_intervals", "readythread_v2_boundaries", "numeric_tid_filter"))
+    assert "recorded_capture_settings" in switches["requirements"] and "1024_capture_setting_records" in switches["limits"]
     assert "no_authenticated_thread_lifetime_or_wait_cause" in switches["limits"]
     profile = by_key[("execution", "cpu_profile", "etl")]
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
@@ -210,6 +211,8 @@ def main():
     assert all(s in profile["limits"] for s in ("65536_process_events", "source_local_process_generation"))
     assert all(s in profile["requirements"] for s in ("explicit_pinned_pe_reference", "file_backed_executable_window_sha256", "opt_in_merge_image_id_and_native_rsds"))
     assert all(s in profile["limits"] for s in ("64MiB_reference_file", "32_byte_reference_window", "131072_merge_markers", "runtime_bytes_unobserved"))
+    assert all(s in profile["requirements"] for s in ("timer_interval_brackets", "recorded_capture_settings"))
+    assert "1024_capture_setting_records" in profile["limits"]
     assert "65536_image_events" in profile["limits"] and "16MiB_image_names" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
     observe = by_key[("session", "observe_scope", "mcp")]
@@ -238,7 +241,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id"))
+    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings"))
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
