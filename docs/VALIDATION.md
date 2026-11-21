@@ -4915,6 +4915,47 @@ The raw switch evidence leaves thread generations, elapsed running or
 waiting intervals and cause of a wait unresolved. The public trace comparison
 covers version 4. Version 2 and 3 coverage uses constructed records.
 
+### Scheduler interval comparison
+
+The same public ETL contains 92,913 ReadyThread v2 records and 4,801 Thread
+v3 start, end and rundown records. The checker reads the Windows XML in
+record order, indexes transitions by CPU and TID, and locates ready records
+between the original switch events. For each CLI row it compares the reported duration,
+relation, original event ordinal, timestamp, CPU, payload fields and
+references. Logger ID and the processor-index flag come from the native
+envelope. All scheduler switches in this file used one logger and indexed
+CPU numbers.
+
+```powershell
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-switches 168474 --intervals --all-pages --check-short-tail
+```
+
+| Result on the public ETL | Count |
+| --- | ---: |
+| Switches compared | 168,474 |
+| Nonidle / idle CPU residency spans | 96,827 / 71,450 |
+| CPU spans withheld at a thread start, end or rundown boundary | 189 |
+| First switch on each CPU, with no earlier endpoint | 8 |
+| Off-CPU spans / spans returning on another CPU | 95,963 / 50,418 |
+| Waiting state followed by a qualified ready and switch-in | 80,728 |
+| Other outgoing state followed by a qualified ready and switch-in | 892 |
+| Off-CPU spans with no ready, unknown ready flags or ambiguous ready time | 5,109 / 9,196 / 38 |
+
+The checker also exercises filtered and unfiltered page boundaries, both
+switch roles, a zero-switch control and a shortened final buffer. The
+shortened trace retains readable switch rows and suppresses elapsed values.
+The 33 saved output hashes from the preceding raw switch and CPU profile
+schemas cover default, thread-evidence and image-evidence modes.
+
+The native harness covers ambiguous CPU numbering, mixed loggers, signed
+tick extremes, same-row roles, late continuity conflicts, thread reuse,
+multiple ready records and deferred readiness. Release and ASan each also
+ran 93 normalized-import controls. The Windows ASan run used the
+process-local `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` setting and
+reported interception warnings. Public trace coverage is CSwitch v4,
+ReadyThread v2 and Thread v3 on this QPC capture. The measured intervals
+retain file-local numeric TIDs. Wait-object identity requires another source.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

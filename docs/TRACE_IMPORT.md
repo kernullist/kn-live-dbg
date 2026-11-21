@@ -136,6 +136,54 @@ no assigned time unit in this report. A thread's wait duration, creation
 identity and process generation require more evidence. Keep the ETL and
 its switch reports private.
 
+### Reconstruct scheduler intervals
+
+Add `--intervals` to `--etl-switches` for a `kn.etl_switches.v2` page. To
+follow a numeric thread ID, use `--thread-id N`. This selects switches where
+either the outgoing or incoming TID equals `N` and enables intervals.
+`match_ordinal` and `next_after` count matching switches. `switch_ordinal`
+and `record_ordinal` retain their positions in the original trace. Keep the
+thread filter and input digest when continuing a page.
+
+| Field | Source of the elapsed ticks |
+| --- | --- |
+| `on_cpu` | The outgoing TID must match the immediately preceding switch-in on this CPU. For a nonzero TID its most recent thread transition must be that same switch-in. TID zero measures idle residency separately on each CPU. |
+| `off_cpu` | The incoming nonidle TID must have a preceding switch-out with no intervening switch or decoded lifetime boundary for that TID. Its two endpoints can lie on different CPUs. |
+| `off_cpu.readiness` | A classic Thread/ReadyThread v2 record (opcode 50) for the **payload** TID must lie strictly between those endpoints. Exactly one dispatchable record must end the sequence. `switch_out_to_ready_ticks` and `ready_to_switch_in_ticks` measure the two parts. |
+
+`previous_switch`, `previous_thread_event` and `other_thread_event` identify
+the original records, including conflicting transitions and thread start,
+end or rundown boundaries. `first_ready` and, for sequences of two or more,
+`last_ready` preserve the raw ready flags, adjustment fields and reserved
+byte. Flag 1 marks a DPC ready. Flag bits 2 and 4 describe swapped-out state
+that requires a further ready event. Unknown bits, multiple dispatchable
+records, a deferred final record or ambiguous timestamps leave both parts
+null. `waiting_ready_switch_in` additionally requires outgoing state 5
+(Waiting). Other outgoing states use `ready_switch_in`. The interval identifies
+when a recorded TID became ready. The wait object and cause remain unknown.
+[Windows ReadyThread definition](https://learn.microsoft.com/en-us/windows/win32/etw/readythread)
+[Windows CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis)
+
+The reader makes two passes over the same leased file and checks file
+identity and SHA-256 after each. It tracks all reported processors and the
+TIDs appearing on the selected page. Late conflicts can therefore invalidate
+an earlier pair. Sequential buffer accounting, reported loss, unsupported
+records, CPU numbering, logger identity, thread transitions and clock
+ordering qualify the result. Legacy processor numbers with more than 64
+reported processors have ambiguous scope. An unsupported readiness record
+suppresses subdivision. Unsupported thread boundaries suppress nonidle
+durations. A missing ready record leaves a qualified off-CPU interval whole.
+The relation on each field gives the reason for a null duration.
+
+Elapsed values and raw timestamps are exact decimal strings. Use
+`interval_source.ticks_per_second` for a QPC or system-time clock. Processor
+cycle clocks and unknown clock types have no qualified rate here. On-CPU
+time measures scheduler residency, which may include interrupt or DPC
+activity. Instruction attribution and authenticated thread generations
+require separate evidence. The incoming `new_wait_time` payload keeps
+its original, unspecified unit. Store both full pages and extracted intervals
+with the private trace.
+
 ## Normalized execution trace import
 
 This adapter reads local normalized JSON.

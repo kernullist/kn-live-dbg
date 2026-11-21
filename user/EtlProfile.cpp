@@ -1,7 +1,7 @@
 #include "EtlProfile.h"
 #include "EtlThreadEvidence.h"
 #include "EtlImageEvidence.h"
-#include "EtlSwitchRecord.h"
+#include "EtlScheduleIntervals.h"
 #include "ArtifactOutput.h"
 #include "RuntimeCapabilities.h"
 
@@ -24,9 +24,13 @@ namespace
         uint32_t limit = 64;
         std::wstring digest;
         bool switches = false, threads = false, images = false;
+        bool intervals = false, haveTid = false;
+        uint32_t tid = 0;
+        bool WithIntervals() const { return intervals || haveTid; }
         bool WithThreads() const { return threads || images; }
         const wchar_t* Prefix() const
         {
+            if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
             if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
             return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
@@ -49,7 +53,7 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 9 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 10 || args[0].empty() ||
             args[1] != L"--sha256" || args[2].size() != 64 ||
             args[2].find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
         options.digest = args[2];
@@ -60,47 +64,86 @@ namespace
         {
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
+            if (args[i] == L"--intervals" && options.switches && !options.intervals) { options.intervals = true; continue; }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
             { haveAfter = true; }
             else if (args[i] == L"--limit" && !haveLimit && Decimal(args[i + 1], MaxPage, options.limit) && options.limit)
             { haveLimit = true; }
+            else if (args[i] == L"--thread-id" && options.switches && !options.haveTid && Decimal(args[i + 1], UINT32_MAX, options.tid))
+            { options.haveTid = true; }
             else { return false; }
             ++i;
         }
         return true;
     }
 
-    struct Scan
+    struct TraceCounts
+    {
+        uint32_t records = 0, decoded = 0, unsupported = 0, lossMarkers = 0;
+        uint64_t processedBuffers = 0;
+        bool budgetExceeded = false;
+    };
+
+    struct Scan : TraceCounts
     {
         Options options;
         etl_profile::ThreadIndex threadIndex;
         etl_profile::ImageIndex imageIndex;
-        uint32_t records = 0, decoded = 0, unsupported = 0, lossMarkers = 0;
-        uint64_t processedBuffers = 0;
-        bool budgetExceeded = false;
+        etl_profile::ScheduleHistory history;
         std::array<Sample, MaxPage> page{};
         std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
-        size_t used = 0;
+        std::array<etl_profile::IntervalWitnesses, MaxPage> witnesses{};
+        uint32_t matched = 0;
+        size_t used = 0, replayedRows = 0;
+        bool replaying = false, replayMismatch = false;
     };
+
+    void ReplayRecord(const EVENT_RECORD& event, Scan& scan)
+    {
+        if (!IsEqualGUID(event.EventHeader.ProviderId, etl_profile::ThreadProvider)) { return; }
+        if (event.EventHeader.EventDescriptor.Opcode != 36)
+        {
+            scan.history.OtherThreadEvent(event, scan.records);
+            return;
+        }
+        etl_profile::SwitchEvent point{};
+        if (etl_profile::DecodeSwitch(event, &point) != etl_profile::Match::Decoded) { ++scan.unsupported; return; }
+        point.record = scan.records;
+        point.ordinal = ++scan.decoded;
+        etl_profile::IntervalWitnesses* witnesses = nullptr;
+        if (scan.replayedRows < scan.used && scan.switchPage[scan.replayedRows].record == point.record)
+        {
+            const auto& first = scan.switchPage[scan.replayedRows];
+            scan.replayMismatch |= first.ordinal != point.ordinal || first.timestamp != point.timestamp ||
+                first.cpu != point.cpu || first.flags != point.flags || first.loggerId != point.loggerId ||
+                first.version != point.version || std::memcmp(&first.fields, &point.fields, sizeof(point.fields)) != 0;
+            witnesses = &scan.witnesses[scan.replayedRows++];
+        }
+        scan.history.Observe(point, witnesses);
+    }
 
     void WINAPI OnRecord(PEVENT_RECORD event)
     {
         auto& scan = *static_cast<Scan*>(event->UserContext);
         if (scan.records == MaxRecords) { scan.budgetExceeded = true; return; }
         ++scan.records;
-        if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
-        if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
         const auto& h = event->EventHeader;
         if (IsEqualGUID(h.ProviderId, LostEvent) && (h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) &&
             h.EventDescriptor.Opcode >= 32 && h.EventDescriptor.Opcode <= 34) { ++scan.lossMarkers; }
-        const bool keep = scan.decoded >= scan.options.after && scan.used < scan.options.limit;
-        const auto match = scan.options.switches ?
-            etl_profile::DecodeSwitch(*event, keep ? &scan.switchPage[scan.used] : nullptr) :
+        if (scan.replaying) { ReplayRecord(*event, scan); return; }
+        if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
+        const bool keep = scan.matched >= scan.options.after && scan.used < scan.options.limit;
+        etl_profile::SwitchEvent scratch;
+        auto* sw = keep ? &scan.switchPage[scan.used] : (scan.options.haveTid ? &scratch : nullptr);
+        const auto match = scan.options.switches ? etl_profile::DecodeSwitch(*event, sw) :
             etl_profile::Decode(*event, keep ? &scan.page[scan.used] : nullptr);
         if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
         if (match != etl_profile::Match::Decoded) { return; }
         ++scan.decoded;
+        if (scan.options.haveTid && sw->fields.oldTid != scan.options.tid && sw->fields.newTid != scan.options.tid) { return; }
+        ++scan.matched;
         if (keep)
         {
             etl_profile::RecordEnvelope& row = scan.options.switches ?
@@ -233,7 +276,62 @@ namespace
             (thread ? ThreadPairJson(*thread) : L"") + image + L"}";
     }
 
-    std::wstring SwitchJson(const etl_profile::SwitchEvent& s)
+    std::wstring ScheduleRefJson(const etl_profile::ScheduleRef& ref)
+    {
+        return L"\"record_ordinal\":" + std::to_wstring(ref.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(ref.tick)) +
+            L",\"cpu\":" + std::to_wstring(ref.cpu) + L",\"cpu_field\":" + Quote(ref.indexed ? L"processor_index" : L"processor_number") +
+            L",\"logger_id\":" + std::to_wstring(ref.logger);
+    }
+
+    std::wstring EdgeJson(const etl_profile::ScheduleEdge& edge)
+    {
+        using etl_profile::EdgeKind;
+        if (!edge.at.record) { return L"null"; }
+        const bool boundary = edge.kind == EdgeKind::Boundary;
+        const auto kind = boundary ? etl_profile::ThreadEventName(edge.opcode) : edge.kind == EdgeKind::In ? L"switch_in" : L"switch_out";
+        auto json = L"{" + ScheduleRefJson(edge.at) + L",\"kind\":" + Quote(kind) + L",\"payload_tid\":" + std::to_wstring(edge.tid) +
+            L",\"version\":" + std::to_wstring(edge.version) + L",\"opcode\":" + std::to_wstring(edge.opcode);
+        if (boundary) { json += L",\"payload_pid\":" + std::to_wstring(edge.pid); }
+        else { json += L",\"switch_ordinal\":" + std::to_wstring(edge.switchOrdinal); }
+        if (edge.kind == EdgeKind::Out)
+        { json += L",\"old_state\":" + std::to_wstring(edge.state) + L",\"old_wait_reason\":" + std::to_wstring(edge.reason); }
+        return json + L"}";
+    }
+
+    std::wstring ReadyJson(const etl_profile::ReadyPoint& p)
+    {
+        if (!p.at.record) { return L"null"; }
+        return L"{" + ScheduleRefJson(p.at) + L",\"payload_tid\":" + std::to_wstring(p.tid) +
+            L",\"adjust_reason\":" + std::to_wstring(p.reason) + L",\"adjust_increment\":" + std::to_wstring(p.increment) +
+            L",\"ready_flags\":" + std::to_wstring(p.flags) + L",\"reserved_field\":" + std::to_wstring(p.reserved) + L"}";
+    }
+
+    std::wstring Elapsed(bool measured, int64_t begin, int64_t end)
+    {
+        return measured ? Quote(std::to_wstring(etl_profile::TickDistance(begin, end))) : L"null";
+    }
+
+    std::wstring IntervalsJson(const Scan& scan, size_t index, bool clock, bool gap)
+    {
+        const auto& e = scan.switchPage[index];
+        const auto& w = scan.witnesses[index];
+        const auto& out = w.previousIncomingThread;
+        const auto run = etl_profile::AssessSpan(scan.history, e, w, true, clock, gap);
+        const auto off = etl_profile::AssessSpan(scan.history, e, w, false, clock, gap);
+        const auto ready = etl_profile::AssessReady(w.ready, out, e, off.measured, scan.history.unsupportedReady);
+        return L",\"match_ordinal\":" + std::to_wstring(scan.options.after + index + 1) +
+            L",\"on_cpu\":{\"relation\":" + Quote(run.relation) + L",\"elapsed_ticks\":" +
+            Elapsed(run.measured, w.previousCpu.at.tick, e.timestamp) + L",\"previous_switch\":" + EdgeJson(w.previousCpu) +
+            L",\"other_thread_event\":" + (etl_profile::SameTransition(w.previousOutgoingThread, w.previousCpu) ? L"null" : EdgeJson(w.previousOutgoingThread)) +
+            L"},\"off_cpu\":{\"relation\":" + Quote(off.relation) + L",\"elapsed_ticks\":" + Elapsed(off.measured, out.at.tick, e.timestamp) +
+            L",\"previous_thread_event\":" + EdgeJson(out) + L",\"readiness\":{\"relation\":" + Quote(ready.relation) +
+            L",\"ready_records\":" + std::to_wstring(w.ready.count) + L",\"dispatchable_records\":" + std::to_wstring(w.ready.dispatchable) +
+            L",\"first_ready\":" + ReadyJson(w.ready.first) + L",\"last_ready\":" + (w.ready.count > 1 ? ReadyJson(w.ready.last) : L"null") +
+            L",\"switch_out_to_ready_ticks\":" + Elapsed(ready.measured, out.at.tick, w.ready.last.at.tick) +
+            L",\"ready_to_switch_in_ticks\":" + Elapsed(ready.measured, w.ready.last.at.tick, e.timestamp) + L"}}";
+    }
+
+    std::wstring SwitchJson(const etl_profile::SwitchEvent& s, const std::wstring& intervals)
     {
         const auto& f = s.fields;
         return L"{\"switch_ordinal\":" + std::to_wstring(s.ordinal) + RecordLocationJson(s) +
@@ -245,7 +343,7 @@ namespace
             L",\"thread_flags\":" + (s.version >= 3 ? std::to_wstring(static_cast<uint8_t>(f.modeOrFlags)) : L"null") +
             L",\"old_state\":" + std::to_wstring(f.oldState) + L",\"old_wait_ideal_processor\":" + std::to_wstring(f.idealProcessor) +
             L",\"new_wait_time\":" + std::to_wstring(f.newWaitTime) + L",\"reserved_field\":" + std::to_wstring(f.reserved) +
-            RecordHeaderJson(s) + L"}";
+            RecordHeaderJson(s) + intervals + L"}";
     }
 
     int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0)
@@ -295,7 +393,10 @@ namespace
             L",\"end_filetime\":" + Quote(std::to_wstring(h.EndTime.QuadPart)) +
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
-            (scan.options.switches ?
+            (scan.options.WithIntervals() ?
+                L",\"qualification\":{\"evidence\":\"reported_scheduler_intervals\",\"producer_authenticity\":\"unverified\","
+                L"\"thread_lifetime\":null,\"process_generation\":null,\"wait_object\":null,\"wait_cause\":null,\"wait_time_unit\":null,"
+                L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"capture_privilege\":null}" : scan.options.switches ?
                 L",\"qualification\":{\"evidence\":\"reported_context_switch\",\"producer_authenticity\":\"unverified\","
                 L"\"thread_lifetime\":null,\"process_generation\":null,\"wait_duration\":null,\"wait_time_unit\":null,"
                 L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"capture_privilege\":null}" :
@@ -307,15 +408,35 @@ namespace
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
             (scan.options.switches ? L",\"unsupported_switch_records\":" : L",\"unsupported_profile_records\":") + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
-            L",\"next_after\":" + (scan.used && scan.options.after + scan.used < scan.decoded ?
+            L",\"next_after\":" + (scan.used && scan.options.after + scan.used < scan.matched ?
                 std::to_wstring(scan.options.after + scan.used) : L"null");
+        const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
+        const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
         if (scan.options.switches)
         {
+            if (scan.options.WithIntervals())
+            {
+                const auto& history = scan.history;
+                const auto hz = h.ReservedFlags == 2 ? 10'000'000ll : h.PerfFreq.QuadPart;
+                result += L",\"interval_source\":{\"thread_filter\":" + (scan.options.haveTid ? std::to_wstring(scan.options.tid) : L"null") +
+                    L",\"matched_switches\":" + std::to_wstring(scan.matched) + L",\"ticks_per_second\":" +
+                    (comparableClock ? Quote(std::to_wstring(hz)) : L"null") + L",\"ready_opcode\":50,\"ready_version\":2,\"ready_records\":" +
+                    std::to_wstring(history.readyCount) + L",\"unsupported_ready_records\":" + std::to_wstring(history.unsupportedReady) +
+                    L",\"boundary_version\":3,\"thread_boundaries\":" + std::to_wstring(history.boundaries) +
+                    L",\"unsupported_thread_boundaries\":" + std::to_wstring(history.unsupportedBoundaries) +
+                    L",\"cpu_scope\":" + Quote(history.ambiguousScope ? L"unqualified" : history.seenSwitch ? L"comparable" : L"unobserved") +
+                    L",\"cpus_with_tid_conflict\":" + std::to_wstring(history.cpuConflicts) +
+                    L",\"cpus_with_clock_conflict\":" + std::to_wstring(history.cpuClockConflicts) +
+                    L",\"unknown_switch_tid\":" + (history.unknownSwitchTid ? L"true" : L"false") +
+                    L",\"scheduler_clock_reversed\":" + (history.reversedClock ? L"true}" : L"false}");
+            }
             result += L",\"switches\":[";
             for (size_t i = 0; i < scan.used; ++i)
             {
                 if (i) { result += L','; }
-                result += SwitchJson(scan.switchPage[i]);
+                const auto intervals = scan.options.WithIntervals() ?
+                    IntervalsJson(scan, i, comparableClock, captureGap || scan.unsupported) : std::wstring{};
+                result += SwitchJson(scan.switchPage[i], intervals);
             }
             return result + L"]}";
         }
@@ -335,8 +456,6 @@ namespace
                 L",\"retention\":" + Quote(scan.imageIndex.retention) + L"}";
         }
         std::vector<const etl_profile::ImageEvent*> records;
-        const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
-        const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
         result += L",\"samples\":[";
         for (size_t i = 0; i < scan.used; ++i)
         {
@@ -367,6 +486,42 @@ namespace
         }
         return result + L"]}";
     }
+
+    EVENT_TRACE_LOGFILEW ConfigureLog(std::wstring& volumePath, Scan& scan)
+    {
+        EVENT_TRACE_LOGFILEW log{};
+        log.LogFileName = volumePath.data();
+        log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+        log.EventRecordCallback = OnRecord;
+        log.BufferCallback = OnBuffer;
+        log.Context = &scan;
+        return log;
+    }
+
+    ULONG ReplayIntervals(Scan& scan, std::wstring& path, const TRACE_LOGFILE_HEADER& original)
+    {
+        const TraceCounts first = scan;
+        static_cast<TraceCounts&>(scan) = {};
+        scan.replaying = true;
+        auto log = ConfigureLog(path, scan);
+        Trace replay;
+        replay.handle = OpenTraceW(&log);
+        if (replay.handle == INVALID_PROCESSTRACE_HANDLE) { return GetLastError(); }
+        const auto status = ProcessTrace(&replay.handle, 1, nullptr, nullptr);
+        if (status != ERROR_SUCCESS) { return status; }
+        const auto& h = log.LogfileHeader;
+        if (scan.replayMismatch || scan.replayedRows != scan.used || scan.budgetExceeded ||
+            scan.records != first.records || scan.decoded != first.decoded || scan.unsupported != first.unsupported ||
+            scan.processedBuffers != first.processedBuffers || scan.lossMarkers != first.lossMarkers ||
+            h.StartTime.QuadPart != original.StartTime.QuadPart || h.EndTime.QuadPart != original.EndTime.QuadPart ||
+            h.BootTime.QuadPart != original.BootTime.QuadPart || h.ReservedFlags != original.ReservedFlags ||
+            h.PerfFreq.QuadPart != original.PerfFreq.QuadPart || h.NumberOfProcessors != original.NumberOfProcessors ||
+            h.PointerSize != original.PointerSize || h.LogFileMode != original.LogFileMode ||
+            h.BuffersWritten != original.BuffersWritten || h.BuffersLost != original.BuffersLost || h.EventsLost != original.EventsLost)
+        { return ERROR_INVALID_DATA; }
+        return ERROR_SUCCESS;
+    }
+
 }
 
 static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
@@ -377,7 +532,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
     {
         return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [switches] {
             std::wcerr << (switches ?
-                L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128]\n" :
+                L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N]\n" :
                 L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence]\n");
             return 2;
         });
@@ -392,12 +547,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options, L"source_unavailable"); });
     }
     if (source.Sha256 != scan.options.digest) { return Failure(scan.options, L"digest_mismatch", source.Sha256); }
-    EVENT_TRACE_LOGFILEW log{};
-    log.LogFileName = volumePath.data();
-    log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-    log.EventRecordCallback = OnRecord;
-    log.BufferCallback = OnBuffer;
-    log.Context = &scan;
+    auto log = ConfigureLog(volumePath, scan);
     Trace trace;
     trace.handle = OpenTraceW(&log);
     if (trace.handle == INVALID_PROCESSTRACE_HANDLE) { return Failure(scan.options, L"open_trace_failed", source.Sha256, GetLastError()); }
@@ -419,7 +569,15 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
     const auto accounting = AccountBuffers(scan, log.LogfileHeader);
     const bool partial = Partial(scan, accounting);
     if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
-    if (!partial && scan.options.after > scan.decoded) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (!partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (scan.options.WithIntervals())
+    {
+        try { scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.switchPage.data(), scan.used); }
+        catch (const std::bad_alloc&) { return Failure(scan.options, L"interval_index_unavailable", source.Sha256); }
+        const auto replay = ReplayIntervals(scan, volumePath, log.LogfileHeader);
+        if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
+        if (replay != ERROR_SUCCESS) { return Failure(scan.options, L"interval_replay_failed", source.Sha256, replay); }
+    }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     return WriteCapabilityJson(Report(scan, log.LogfileHeader, source, accounting)) ? (partial ? 1 : 0) : 2;
 }

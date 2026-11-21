@@ -168,7 +168,17 @@ class PublicContentTests(unittest.TestCase):
         location = dict(switch_ordinal=1, record_ordinal=2, raw_timestamp="3", cpu=0)
         tids = dict(new_thread_id=4, old_thread_id=5, new_priority=8, old_priority=9)
         wait = dict(old_thread_id=4, new_thread_id=5, old_wait_reason=17)
+        intervals = "kn.etl_switches.v2"
+        cpu_span = dict(relation="running_on_cpu", elapsed_ticks="10", previous_switch=None)
+        off_cpu = dict(previous_thread_event=None, relation="off_cpu", elapsed_ticks="30")
+        readiness = dict(relation="ready_unobserved", ready_records=0, dispatchable_records=0)
+        ready_point = dict(ready_flags=1, payload_tid=5, adjust_increment=-1)
+        edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
+        source = dict(thread_filter=5, matched_switches=2)
+        split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
         for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=intervals, switches=[]), dict(switches=[], schema=intervals),
+                       cpu_span, off_cpu, readiness, ready_point, edge, source, split,
                        dict(schema=v2, samples=[]), point, pair, dict(schema=v3, image_records=[]),
                        image, identity, evidence, witness):
             for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
@@ -182,7 +192,7 @@ class PublicContentTests(unittest.TestCase):
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
             self.assertIn("private-evidence-bundle", {r["rule"] for r in
                           AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
-        for version in (schema, v2, v3, switch_schema):
+        for version in (schema, v2, v3, switch_schema, intervals):
             self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + version + ".").encode()), [])
 
     def test_wait_captures_and_reports(self):

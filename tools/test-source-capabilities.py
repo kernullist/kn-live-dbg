@@ -199,7 +199,8 @@ def main():
     switches = by_key[("execution", "context_switch", "etl")]
     assert switches["implementation"] == "implemented" and switches["consistency"] == "reported_scheduler_event"
     assert "classic_thread_opcode36_versions2_3_4" in switches["requirements"]
-    assert "no_wait_duration_or_thread_lifetime" in switches["limits"]
+    assert all(item in switches["requirements"] for item in ("opt_in_on_cpu_and_off_cpu_intervals", "readythread_v2_boundaries", "numeric_tid_filter"))
+    assert "no_authenticated_thread_lifetime_or_wait_cause" in switches["limits"]
     profile = by_key[("execution", "cpu_profile", "etl")]
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]
@@ -233,7 +234,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert "--etl-switches" in help_result.stdout
+    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id"))
     assert "--etl-profile" in help_result.stdout and "--image-evidence" in help_result.stdout
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout

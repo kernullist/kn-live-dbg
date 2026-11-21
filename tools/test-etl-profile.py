@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from runpy import run_path
 import shutil
 import subprocess
 import tempfile
@@ -25,7 +26,8 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         return None
     value = json.loads(result.stdout.decode("utf-8"))
     version = 3 if "--image-evidence" in args else (2 if "--thread-evidence" in args else 1)
-    assert value["schema"] == ("kn.etl_switches.v1" if switches else f"kn.etl_profile.v{version}")
+    switch_version = 2 if "--intervals" in args or "--thread-id" in args else 1
+    assert value["schema"] == (f"kn.etl_switches.v{switch_version}" if switches else f"kn.etl_profile.v{version}")
     return value
 
 
@@ -134,7 +136,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -184,6 +186,30 @@ def oracle(etl, folder, want_images, want_switches=False):
                     if version in (2, 3, 4):
                         fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
                         switches.append(switch_values(system, ns, fields, records, version))
+                        if schedule is not None:
+                            r = switches[-1]
+                            schedule.switch(records, r[1], r[2], version, len(switches), r[10], r[11], r[19], r[16])
+                elif schedule is not None and system.findtext(ns + "EventID") == "0":
+                    opcode = int(system.findtext(ns + "Opcode"))
+                    version = int(system.findtext(ns + "Version"))
+                    if (opcode == 50 and version == 2) or (1 <= opcode <= 4 and version == 3):
+                        tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
+                        cpu = int(system.find(ns + "Execution").attrib["ProcessorID"], 0)
+                        fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
+                        if opcode == 50:
+                            assert all(value.isascii() for value in fields.values())
+                            tid, reason, increment, flags, reserved = (int(fields[k], 0) for k in
+                                ("TThreadId", "AdjustReason", "AdjustIncrement", "Flag", "Reserved"))
+                            def signed(v):
+                                return (v + 128) % 256 - 128
+                            schedule.readiness(records, tick, cpu, tid, signed(reason), signed(increment), flags & 255, signed(reserved))
+                        else:
+                            if fields:
+                                pid, tid = (int(fields[k], 0) for k in ("ProcessId", "TThreadId"))
+                            else:
+                                payload = bytes.fromhex(event.findtext(ns + "ProcessingErrorData/" + ns + "EventPayload"))
+                                pid, tid = struct.unpack_from("<II", payload)
+                            schedule.boundary(records, tick, cpu, opcode, pid, tid)
             if not want_switches and guid in (thread_guid, profile_guid):
                 system = event.find(ns + "System")
                 descriptor = {x.tag.removeprefix(ns): x.text for x in system}
@@ -329,7 +355,7 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
     return rows
 
 
-def check_directory_lease(exe, etl, pin, parent, switches=False):
+def check_directory_lease(exe, etl, pin, parent, switches=False, options=()):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
@@ -340,18 +366,18 @@ def check_directory_lease(exe, etl, pin, parent, switches=False):
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        assert run(exe, etl, pin, rc=1, switches=switches)["status"] == "source_unavailable"
+        assert run(exe, etl, pin, *options, rc=1, switches=switches)["status"] == "source_unavailable"
     finally:
         kernel.CloseHandle(handle)
 
 
-def check_output_alias(exe, command, etl, pin, folder):
+def check_output_alias(exe, command, etl, pin, folder, options=()):
     # The writable stdout hard link must not receive even an error report.
     size = etl.stat().st_size
     hardlink = folder / "same-source.bin"
     os.link(etl, hardlink)
     with hardlink.open("ab", buffering=0) as redirected:
-        result = subprocess.run([exe, command, etl, "--sha256", pin],
+        result = subprocess.run([exe, command, etl, "--sha256", pin, *options],
                                 stdout=redirected, stderr=subprocess.PIPE, timeout=30)
     assert result.returncode != 0 and etl.stat().st_size == size
     with etl.open("rb") as f:
@@ -431,24 +457,50 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     print(f"ETL profile passed. {records} events, {len(samples)} CPU samples, {len(compared)} distinct sample rows compared.")
 
 
-def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_tail):
+def complete_switch_coverage(report):
+    header = report["log_header"]
+    return (report["buffer_comparison"] == "matched" and not report["unsupported_switch_records"] and
+            not (header["buffers_lost"] or header["events_lost"] or report["loss_marker_records"]))
+
+
+def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_tail, intervals):
     with etl.open("rb") as source:
         assert hashlib.file_digest(source, "sha256").hexdigest() == pin
-    records, _, _, _, expected = oracle(etl, folder, False, want_switches=True)
+    schedule = run_path(str(Path(__file__).with_name("etl_schedule_oracle.py")))["ScheduleOracle"]() if intervals else None
+    records, _, _, _, expected = oracle(etl, folder, False, want_switches=True, schedule=schedule)
+    if schedule is not None:
+        schedule.prepare()
+    flags = ["--intervals"] if intervals else []
+    run_counts, off_counts, ready_counts = Counter(), Counter(), Counter()
+    migrated = 0
     assert len(expected) == expected_count, (len(expected), expected_count)
     compared = set()
     for after, limit in page_cases(expected_count, all_pages):
         options = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
-        report = run(exe, etl, pin, *options, switches=True)
+        report = run(exe, etl, pin, *flags, *options, switches=True)
         assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == etl.stat().st_size
         assert (report["provider_guid"], report["event_id"], report["opcode"], report["versions"]) == (
             "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c", 0, 36, [2, 3, 4])
         assert (report["records_seen"], report["decoded_switches"], report["unsupported_switch_records"]) == (records, expected_count, 0)
         assert "samples" not in report and report["after"] == after
         assert report["next_after"] == (after + limit if after + limit < expected_count else None)
-        assert report["qualification"] == dict(evidence="reported_context_switch", producer_authenticity="unverified",
-                                              thread_lifetime=None, process_generation=None, wait_duration=None, wait_time_unit=None,
-                                              capture_enable_flags=None, capture_privilege=None, stack_capture_policy=None)
+        qualification = dict(producer_authenticity="unverified", thread_lifetime=None, process_generation=None, wait_time_unit=None,
+                             capture_enable_flags=None, capture_privilege=None, stack_capture_policy=None)
+        if intervals:
+            qualification.update(evidence="reported_scheduler_intervals", wait_object=None, wait_cause=None)
+            meta = report["interval_source"]
+            clock = report["clock"]
+            hz = 10_000_000 if clock["raw_type"] == 2 else int(clock["header_perf_frequency"]) if clock["raw_type"] == 1 else 0
+            assert meta == dict(thread_filter=None, matched_switches=expected_count, ticks_per_second=str(hz) if hz > 0 else None,
+                                ready_opcode=50, ready_version=2, ready_records=schedule.ready_count, unsupported_ready_records=0,
+                                boundary_version=3, thread_boundaries=schedule.boundaries, unsupported_thread_boundaries=0,
+                                cpu_scope="comparable" if expected else "unobserved", cpus_with_tid_conflict=len(schedule.bad_cpus),
+                                cpus_with_clock_conflict=len(schedule.bad_cpu_times), unknown_switch_tid=schedule.unknown_tid,
+                                scheduler_clock_reversed=schedule.reversed_clock)
+        else:
+            qualification.update(evidence="reported_context_switch", wait_duration=None)
+            assert "interval_source" not in report
+        assert report["qualification"] == qualification
         header = report["log_header"]
         assert header["events_lost"] >= 0 and header["buffers_lost"] >= 0 and report["loss_marker_records"] >= 0
         if report["buffer_comparison"] == "matched":
@@ -456,6 +508,7 @@ def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_ta
         else:
             assert report["buffer_comparison"] == "not_comparable"
         rows = report["switches"]
+        covered = complete_switch_coverage(report)
         assert len(rows) == len(expected[after:after + limit])
         for seq, row in enumerate(rows, after + 1):
             fields = (row["record_ordinal"], int(row["raw_timestamp"]), row["cpu"], row["header_process_id"], row["header_thread_id"],
@@ -467,7 +520,44 @@ def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_ta
                 [i for i, pair in enumerate(zip(fields, expected[seq - 1])) if pair[0] != pair[1]])
             assert row["cpu_field"] == ("processor_index" if row["header_flags"] & 0x200 else "processor_number")
             assert row["pointer_bytes"] in (4, 8) and 0 <= row["stack_extension_items"] <= row["extended_data_items"]
+            if intervals:
+                assert row["match_ordinal"] == seq
+                on, off, ready = schedule.compare(row, hz > 0, covered)
+                if seq not in compared:
+                    run_counts[on] += 1
+                    off_counts[off] += 1
+                    ready_counts[ready] += 1
+                    if off == "off_cpu" and row["off_cpu"]["previous_thread_event"]["cpu"] != row["cpu"]:
+                        migrated += 1
+            else:
+                assert "on_cpu" not in row and "off_cpu" not in row and "match_ordinal" not in row
             compared.add(seq)
+    if intervals:
+        workload_tids = Counter(r[10] for r in expected if r[10] not in (0, 0xffffffff))
+        probes = {0, 0xffffffff}
+        if workload_tids:
+            probes.add(workload_tids.most_common(1)[0][0])
+        for tid in probes:
+            ordinals = [n for n, r in enumerate(expected, 1) if tid in r[10:12]]
+            for after in {0, len(ordinals) // 2, max(0, len(ordinals) - 4), len(ordinals)}:
+                args = ("--thread-id", tid, "--after", after, "--limit", 8)
+                page = run(exe, etl, pin, *args, switches=True)
+                assert page == run(exe, etl, pin, "--intervals", *args, switches=True)
+                if after == 0:
+                    assert page == run(exe, etl, pin, *args, "--intervals", switches=True)
+                assert page["interval_source"]["thread_filter"] == tid and page["interval_source"]["matched_switches"] == len(ordinals)
+                assert page["next_after"] == (after + 8 if after + 8 < len(ordinals) else None)
+                assert [r["switch_ordinal"] for r in page["switches"]] == ordinals[after:after + 8]
+                for match, row in enumerate(page["switches"], after + 1):
+                    assert row["match_ordinal"] == match
+                    schedule.compare(row, page["interval_source"]["ticks_per_second"] is not None, complete_switch_coverage(page))
+            assert run(exe, etl, pin, "--thread-id", tid, "--after", len(ordinals) + 1, switches=True, rc=1)["status"] == "cursor_out_of_range"
+        for args in (("--intervals", "--intervals"), ("--thread-id",), ("--thread-id", "01"), ("--thread-id", "-1"),
+                     ("--thread-id", "4294967296"), ("--thread-id", 0, "--thread-id", 0)):
+            run(exe, etl, pin, *args, switches=True, rc=2)
+        for args in (("--intervals",), ("--thread-id", 1)):
+            run(exe, etl, pin, *args, rc=2)
+        print("On-CPU", dict(run_counts), "Off-CPU", dict(off_counts), "Readiness", dict(ready_counts), "Changed CPU", migrated)
     if all_pages:
         assert len(compared) == expected_count
     if short_tail:
@@ -477,17 +567,20 @@ def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_ta
             out.truncate(etl.stat().st_size - 1)
         with trimmed.open("rb") as f:
             short_pin = hashlib.file_digest(f, "sha256").hexdigest()
-        partial = run(exe, trimmed, short_pin, "--limit", 1, switches=True, rc=1)
+        partial = run(exe, trimmed, short_pin, *flags, "--limit", 128, switches=True, rc=1)
         assert partial["status"] == "partial" and partial["buffer_comparison"] == "fewer_than_declared"
         assert partial["buffers_processed"] < partial["log_header"]["buffers_written"] and partial["records_seen"] < records
     wrong = ("0" if pin[0] != "0" else "1") + pin[1:]
-    assert run(exe, etl, wrong, switches=True, rc=1)["status"] == "digest_mismatch"
-    assert run(exe, etl, pin, "--after", expected_count + 1, switches=True, rc=1)["status"] == "cursor_out_of_range"
-    assert run(exe, folder / "missing.etl", pin, switches=True, rc=1)["status"] == "source_unavailable"
+    if short_tail and intervals:
+        assert all(r["on_cpu"]["elapsed_ticks"] is None and r["off_cpu"]["elapsed_ticks"] is None and
+                   r["off_cpu"]["readiness"]["ready_to_switch_in_ticks"] is None for r in partial["switches"])
+    assert run(exe, etl, wrong, *flags, switches=True, rc=1)["status"] == "digest_mismatch"
+    assert run(exe, etl, pin, *flags, "--after", expected_count + 1, switches=True, rc=1)["status"] == "cursor_out_of_range"
+    assert run(exe, folder / "missing.etl", pin, *flags, switches=True, rc=1)["status"] == "source_unavailable"
     for options in (("--thread-evidence",), ("--image-evidence",), ("--limit", 0), ("--limit", 129), ("--after", "-1")):
         run(exe, etl, pin, *options, switches=True, rc=2)
-    check_directory_lease(exe, etl, pin, folder, switches=True)
-    check_output_alias(exe, "--etl-switches", etl, pin, folder)
+    check_directory_lease(exe, etl, pin, folder, switches=True, options=flags)
+    check_output_alias(exe, "--etl-switches", etl, pin, folder, options=flags)
     print(f"ETL switches passed. {records} events, {expected_count} switches, {len(compared)} distinct switch rows compared.")
 
 
@@ -501,10 +594,13 @@ def main():
     counts.add_argument("--expect-switches", type=int, help="Check the standalone saved context-switch command")
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
     parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
-    parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample in 128-row pages")
+    parser.add_argument("--intervals", action="store_true", help="Compare CPU, off-CPU and ReadyThread boundaries for each switch")
+    parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample or switch in 128-row pages")
     parser.add_argument("--check-short-tail", action="store_true",
                         help="For fixtures with a populated last buffer, require detection after removing its last byte")
     args = parser.parse_args()
+    if args.intervals and args.expect_switches is None:
+        parser.error("Interval checks require --expect-switches.")
     if args.expect_switches is not None and (args.thread_evidence or args.image_evidence):
         parser.error("Thread and image joins apply to sampled profiles.")
     with tempfile.TemporaryDirectory(prefix="kn-etl-profile-") as directory:
@@ -514,7 +610,7 @@ def main():
         shutil.copyfile(args.etl, etl)
         exe = args.exe.resolve(strict=True)
         if args.expect_switches is not None:
-            exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail)
+            exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail, args.intervals)
         else:
             exercise(exe, etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail,
                      args.thread_evidence, args.image_evidence)

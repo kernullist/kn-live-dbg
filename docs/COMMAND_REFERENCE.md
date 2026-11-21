@@ -981,6 +981,24 @@ Inspect `version` before interpreting `old_wait_mode` or `thread_flags`.
 The raw timestamps and `new_wait_time` have distinct meanings.
 [Switch fields and limits](TRACE_IMPORT.md#saved-windows-context-switches)
 
+To read elapsed scheduler ticks, use `--intervals`. A `--thread-id` filter
+selects both switch directions and enables the same interval report. This
+example follows the first nonidle incoming TID on the page above.
+
+```powershell
+$chosen = $page.switches | Where-Object { $_.new_thread_id -gt 0 -and $_.new_thread_id -lt [uint32]::MaxValue } | Select-Object -First 1
+if ($null -ne $chosen) {
+    $targetTid = $chosen.new_thread_id
+    $threadPage = & KnLiveDbg.exe --etl-switches $etl.FullName --sha256 $pin --thread-id $targetTid --limit 64 | ConvertFrom-Json
+    $threadPage.switches | Select-Object switch_ordinal, cpu, on_cpu, off_cpu
+    if ($null -ne $threadPage.next_after) {
+        & KnLiveDbg.exe --etl-switches $etl.FullName --sha256 $pin --thread-id $targetTid --after $threadPage.next_after --limit 64
+    }
+}
+```
+
+[Interval fields, clock and coverage](TRACE_IMPORT.md#reconstruct-scheduler-intervals)
+
 ## Whole-host hunt
 
 ```text

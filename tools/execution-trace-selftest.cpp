@@ -1,7 +1,7 @@
 #include "../user/ExecutionTrace.h"
 #include "../user/EtlThreadEvidence.h"
 #include "../user/EtlImageEvidence.h"
-#include "../user/EtlSwitchRecord.h"
+#include "../user/EtlScheduleIntervals.h"
 
 #include <array>
 
@@ -428,11 +428,275 @@ static bool CheckSwitchRecord()
     return DecodeSwitch(bad, nullptr) == Match::Other;
 }
 
+static EVENT_RECORD SchedulerRecord(void* data, USHORT size, uint8_t opcode, uint8_t version, int64_t tick)
+{
+    EVENT_RECORD e{};
+    e.EventHeader.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER | EVENT_HEADER_FLAG_PROCESSOR_INDEX;
+    e.EventHeader.ProviderId = etl_profile::ThreadProvider;
+    e.EventHeader.EventDescriptor.Opcode = opcode;
+    e.EventHeader.EventDescriptor.Version = version;
+    e.EventHeader.TimeStamp.QuadPart = tick;
+    e.BufferContext.ProcessorIndex = 1;
+    e.BufferContext.LoggerId = 7;
+    e.UserData = data;
+    e.UserDataLength = size;
+    return e;
+}
+
+static bool CheckReadyLayout()
+{
+    using namespace etl_profile;
+    std::array<uint8_t, 9> storage{0, 0x12, 0x34, 0x56, 0x78, 0xfe, 0x81, 0x84, 0xff};
+    auto e = SchedulerRecord(storage.data() + 1, 8, 50, 2, -10);
+    ReadyPoint p{};
+    for (const auto width : std::array<USHORT, 2>{EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_HEADER_FLAG_64_BIT_HEADER})
+    {
+        e.EventHeader.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | width | EVENT_HEADER_FLAG_PROCESSOR_INDEX;
+        if (DecodeReady(e, 9, p) != Match::Decoded || p.tid != 0x78563412 || p.reason != -2 || p.increment != -127 ||
+            p.flags != 0x84 || p.reserved != -1 || p.at.tick != -10 || p.at.record != 9 || p.at.logger != 7 ||
+            !p.at.indexed || p.at.cpu != 1) { return false; }
+    }
+    for (const auto len : std::array<USHORT, 3>{0, 7, 9})
+    {
+        auto bad = e;
+        bad.UserDataLength = len;
+        if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    }
+    auto bad = e;
+    bad.UserData = nullptr;
+    if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    bad = e;
+    bad.ExtendedDataCount = 1;
+    if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    bad = e;
+    ++bad.EventHeader.EventDescriptor.Version;
+    if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    bad = e;
+    ++bad.EventHeader.EventDescriptor.Id;
+    if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    bad = e;
+    bad.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
+    if (DecodeReady(bad, 1, p) != Match::Unsupported) { return false; }
+    bad = e;
+    ++bad.EventHeader.EventDescriptor.Opcode;
+    if (DecodeReady(bad, 1, p) != Match::Other) { return false; }
+    e.EventHeader.ProviderId = {};
+    return DecodeReady(e, 1, p) == Match::Other;
+}
+
+static etl_profile::SwitchEvent SwitchAt(uint32_t record, int64_t tick, uint32_t cpu, uint32_t out, uint32_t in)
+{
+    etl_profile::SwitchEvent e{};
+    e.record = e.ordinal = record;
+    e.timestamp = tick;
+    e.cpu = cpu;
+    e.loggerId = 7;
+    e.flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER | EVENT_HEADER_FLAG_PROCESSOR_INDEX;
+    e.version = 4;
+    e.fields.oldTid = out;
+    e.fields.newTid = in;
+    e.fields.oldState = 5;
+    e.fields.oldWaitReason = 17;
+    return e;
+}
+
+static bool IsSpan(etl_profile::ReportedSpan span, const wchar_t* name, bool measured = false)
+{
+    return span.measured == measured && std::wstring(span.relation) == name;
+}
+
+static bool CheckSchedulingIntervals()
+{
+    using namespace etl_profile;
+    const auto first = SwitchAt(1, 100, 0, 500, 42), leave = SwitchAt(2, 200, 0, 42, 50);
+    const auto back = SwitchAt(5, 300, 1, 700, 42), stop = SwitchAt(6, 350, 1, 42, 900);
+    const std::array<SwitchEvent, 3> page{leave, back, stop};
+    ScheduleHistory h;
+    h.Prepare(2, page.data(), page.size());
+    IntervalWitnesses atLeave{}, atBack{}, atStop{};
+    h.Observe(first, nullptr);
+    h.Observe(leave, &atLeave);
+    auto beforeReady = h;
+    std::array<uint8_t, 8> payload{42, 0, 0, 0, 2, 3, 2, 0};
+    auto deferred = SchedulerRecord(payload.data(), 8, 50, 2, 220);
+    h.OtherThreadEvent(deferred, 3);
+    auto ready = deferred;
+    payload[6] = 1;
+    ready.EventHeader.TimeStamp.QuadPart = 240;
+    h.OtherThreadEvent(ready, 4);
+    h.Observe(back, &atBack);
+    h.Observe(stop, &atStop);
+    const auto& seq = atBack.ready;
+    const auto& out = atBack.previousIncomingThread;
+    auto off = [&](const ScheduleHistory& history) { return AssessSpan(history, back, atBack, false, true, false); };
+    auto split = [&](const ReadySequence& s) { return AssessReady(s, out, back, true, 0); };
+    if (!IsSpan(AssessSpan(h, leave, atLeave, true, true, false), L"running_on_cpu", true) ||
+        !IsSpan(AssessSpan(h, stop, atStop, true, true, false), L"running_on_cpu", true) ||
+        !IsSpan(off(h), L"off_cpu", true) || !IsSpan(split(seq), L"waiting_ready_switch_in", true) ||
+        out.at.cpu == back.cpu || out.at.record != 2 || out.reason != 17 ||
+        seq.count != 2 || seq.dispatchable != 1 || seq.first.at.record != 3 || seq.last.at.record != 4 ||
+        TickDistance(out.at.tick, seq.last.at.tick) != 40 || TickDistance(seq.last.at.tick, back.timestamp) != 60 ||
+        TickDistance(INT64_MIN, INT64_MAX) != UINT64_MAX) { return false; }
+    auto preempted = out;
+    preempted.state = 1;
+    if (!IsSpan(AssessReady(seq, preempted, back, true, 0), L"ready_switch_in", true) ||
+        !IsSpan(AssessReady(seq, out, back, false, 0), L"off_cpu_unqualified") ||
+        !IsSpan(AssessReady(seq, out, back, true, 1), L"ready_coverage_unqualified") ||
+        !IsSpan(split({}), L"ready_unobserved") ||
+        !IsSpan(AssessSpan(h, back, atBack, false, false, false), L"clock_unqualified") ||
+        !IsSpan(AssessSpan(h, back, atBack, false, true, true), L"coverage_unqualified")) { return false; }
+
+    ReadySequence changes;
+    changes.Append(seq.first);
+    if (!IsSpan(split(changes), L"ready_deferred")) { return false; }
+    auto candidate = seq.last;
+    candidate.flags = 8;
+    changes.Append(candidate);
+    if (!IsSpan(split(changes), L"ready_flags_unqualified")) { return false; }
+    changes = {};
+    changes.Append(seq.last);
+    candidate = seq.last;
+    candidate.at.tick += 5;
+    changes.Append(candidate);
+    if (!IsSpan(split(changes), L"ready_sequence_conflict")) { return false; }
+    changes = {};
+    changes.Append(seq.last);
+    candidate.flags = 4;
+    changes.Append(candidate);
+    if (!IsSpan(split(changes), L"ready_sequence_conflict")) { return false; }
+    changes = {};
+    changes.Append(seq.first);
+    candidate = seq.last;
+    ++candidate.at.logger;
+    changes.Append(candidate);
+    if (!IsSpan(split(changes), L"ready_scope_unqualified")) { return false; }
+    for (const int64_t tick : {200, 220, 219, 300, 301})
+    {
+        changes = {};
+        changes.Append(seq.first);
+        candidate = seq.last;
+        candidate.at.tick = tick;
+        changes.Append(candidate);
+        if (!IsSpan(split(changes), L"ready_clock_unqualified")) { return false; }
+    }
+
+    // Each lifecycle opcode splits the chain at the reused numeric thread ID.
+    std::array<uint32_t, 18> boundary{123, 42};
+    auto lifetime = SchedulerRecord(boundary.data(), 72, 1, 3, 260);
+    for (uint8_t op = 1; op <= 4; ++op)
+    {
+        auto reuse = beforeReady;
+        lifetime.EventHeader.EventDescriptor.Opcode = op;
+        reuse.OtherThreadEvent(lifetime, 4);
+        IntervalWitnesses atReuse{}, afterReuse{};
+        reuse.Observe(back, &atReuse);
+        reuse.Observe(stop, &afterReuse);
+        if (!IsSpan(AssessSpan(reuse, back, atReuse, false, true, false), L"thread_boundary") ||
+            atReuse.previousIncomingThread.pid != 123 || atReuse.previousIncomingThread.opcode != op ||
+            atReuse.ready.count || !IsSpan(AssessSpan(reuse, stop, afterReuse, true, true, false), L"running_on_cpu", true))
+        { return false; }
+    }
+    auto failed = h;
+    lifetime.EventHeader.EventDescriptor.Version = 4;
+    failed.OtherThreadEvent(lifetime, 7);
+    if (failed.unsupportedBoundaries != 1 || !IsSpan(off(failed), L"coverage_unqualified")) { return false; }
+    failed = h;
+    ready.UserDataLength = 7;
+    failed.OtherThreadEvent(ready, 7);
+    if (failed.unsupportedReady != 1 || !IsSpan(off(failed), L"off_cpu", true) ||
+        !IsSpan(AssessReady(seq, out, back, true, failed.unsupportedReady), L"ready_coverage_unqualified")) { return false; }
+    failed = h;
+    failed.Observe(SwitchAt(7, 380, 0, UINT32_MAX, 999), nullptr);
+    if (!failed.unknownSwitchTid || !IsSpan(off(failed), L"coverage_unqualified")) { return false; }
+    failed = h;
+    failed.Observe(SwitchAt(7, 380, 0, 888, 999), nullptr);
+    if (failed.cpuConflicts != 1 || !IsSpan(off(failed), L"cpu_history_conflict")) { return false; }
+    failed = h;
+    failed.Observe(SwitchAt(7, 380, 0, 50, 900), nullptr);
+    if (!IsSpan(AssessSpan(failed, back, atBack, false, true, false), L"off_cpu", true) ||
+        !failed.Watch(900)->badTransitions) { return false; }
+    failed = h;
+    ready.UserDataLength = 8;
+    ready.EventHeader.TimeStamp.QuadPart = 310;
+    failed.OtherThreadEvent(ready, 7);
+    if (!failed.reversedClock || !IsSpan(off(failed), L"clock_unqualified")) { return false; }
+    return true;
+}
+
+static bool CheckSchedulerScopes()
+{
+    using namespace etl_profile;
+    auto a = SwitchAt(1, 10, 0, 12, 34), b = SwitchAt(2, 20, 0, 12, 56);
+    IntervalWitnesses w{};
+    ScheduleHistory conflict;
+    conflict.Prepare(2, &b, 1);
+    conflict.Observe(a, nullptr);
+    conflict.Observe(b, &w);
+    if (!IsSpan(AssessSpan(conflict, b, w, true, true, false), L"cpu_tid_conflict") ||
+        w.previousCpu.at.record != w.previousOutgoingThread.at.record ||
+        SameTransition(w.previousCpu, w.previousOutgoingThread)) { return false; }
+
+    b = SwitchAt(2, 20, 0, 34, 34);
+    ScheduleHistory self;
+    self.Prepare(2, &b, 1);
+    self.Observe(a, nullptr);
+    self.Observe(b, &w);
+    if (!IsSpan(AssessSpan(self, b, w, false, true, false), L"same_switch") ||
+        !IsSpan(AssessSpan(self, b, w, true, true, false), L"running_on_cpu", true) ||
+        !SameTransition(w.previousOutgoingThread, w.previousCpu)) { return false; }
+
+    a = SwitchAt(1, 10, 0, 8, 0);
+    b = SwitchAt(3, 30, 0, 0, 0);
+    ScheduleHistory idle;
+    idle.Prepare(2, &b, 1);
+    idle.Observe(a, nullptr);
+    idle.Observe(SwitchAt(2, 20, 1, 8, 0), nullptr);
+    w = {};
+    idle.Observe(b, &w);
+    if (!idle.threads.empty() || w.previousCpu.at.record != 1 ||
+        !IsSpan(AssessSpan(idle, b, w, true, true, false), L"idle_on_cpu", true) ||
+        !IsSpan(AssessSpan(idle, b, w, false, true, false), L"idle_tid")) { return false; }
+    auto unknown = SwitchAt(4, 40, 0, UINT32_MAX, UINT32_MAX);
+    if (!IsSpan(AssessSpan(idle, unknown, {}, true, true, false), L"unusable_tid") ||
+        !IsSpan(AssessSpan(idle, unknown, {}, false, true, false), L"unusable_tid")) { return false; }
+    auto zeroTime = idle;
+    zeroTime.Observe(SwitchAt(4, 30, 0, 0, 7), nullptr);
+    if (zeroTime.cpuClockConflicts != 1 || !IsSpan(AssessSpan(zeroTime, b, w, true, true, false), L"clock_unqualified"))
+    { return false; }
+    for (int i = 0; i < 5; ++i)
+    {
+        ScheduleHistory scope;
+        scope.Prepare(i == 0 ? 65 : i == 1 ? 65537 : 2, &b, 1);
+        auto start = a, end = b;
+        if (i == 0 || i == 2) { end.flags &= ~EVENT_HEADER_FLAG_PROCESSOR_INDEX; }
+        if (i == 0) { start.flags = end.flags; }
+        if (i == 3) { ++end.loggerId; }
+        if (i == 4) { end.cpu = 2; }
+        scope.Observe(start, nullptr);
+        IntervalWitnesses probe{};
+        scope.Observe(end, &probe);
+        if (!IsSpan(AssessSpan(scope, end, probe, true, true, false), L"processor_scope_unqualified")) { return false; }
+    }
+    // A switch on CPU 1 provides a second incoming edge for the same watched TID.
+    a = SwitchAt(1, 10, 0, 9, 42);
+    b = SwitchAt(2, 20, 0, 42, 8);
+    auto cross = SwitchAt(3, 25, 1, 7, 42);
+    ScheduleHistory duplicate;
+    duplicate.Prepare(2, &b, 1);
+    duplicate.Observe(a, nullptr);
+    IntervalWitnesses earlier{};
+    duplicate.Observe(b, &earlier);
+    duplicate.Observe(cross, nullptr);
+    duplicate.Observe(SwitchAt(4, 30, 0, 8, 42), nullptr);
+    return IsSpan(AssessSpan(duplicate, b, earlier, true, true, false), L"thread_transition_conflict");
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
-        return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() && CheckSwitchRecord() ? 0 : 1;
+        return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
+            CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

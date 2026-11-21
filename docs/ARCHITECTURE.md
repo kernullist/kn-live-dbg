@@ -1007,9 +1007,17 @@ through Thread/CSwitch v2, v3 and v4. The event header and scheduler payload
 retain their own IDs. An original record ordinal locates the switch across
 all events in the file and a switch ordinal drives paging. The decoder retains
 the wait-mode or flags byte according to the event version. The report exposes
-the incoming wait-time value as recorded. Per-thread scheduling
-intervals require additional correlation.
+the incoming wait-time value as recorded.
 [Saved context switches](TRACE_IMPORT.md#saved-windows-context-switches)
+
+In interval mode a second pass indexes one preceding switch per CPU and
+thread transitions for the TIDs on the page. It follows those TIDs across
+CPUs and uses Thread v3 lifetime events to delimit numeric ID reuse.
+Thread/ReadyThread v2 can divide an off-CPU span at a recorded ready point.
+The report carries the original source ordinals and qualifies durations
+against the whole file's clock, continuity and loss evidence. A TID filter
+selects the page while replay still examines all switches.
+[Interval evidence and limits](TRACE_IMPORT.md#reconstruct-scheduler-intervals)
 
 ## Imported execution samples
 
