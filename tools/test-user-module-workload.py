@@ -30,6 +30,8 @@ def api(name, result, *args):
 
 
 tick = api('GetTickCount64', c.c_uint64)
+performance_counter = api('QueryPerformanceCounter', w.BOOL, c.POINTER(c.c_int64))
+performance_frequency = api('QueryPerformanceFrequency', w.BOOL, c.POINTER(c.c_int64))
 self_handle = api('GetCurrentProcess', w.HANDLE)
 peer_pid = api('GetProcessId', w.DWORD, w.HANDLE)
 module_base = api('GetModuleHandleW', w.HMODULE, w.LPCWSTR)
@@ -76,6 +78,41 @@ class ExtendedLimits(c.Structure):
     _fields_ = [('basic', BasicLimits), ('io', c.c_uint64 * 6), ('memory', c.c_size_t * 4)]
 
 
+class ProcessMemory(c.Structure):
+    _fields_ = [('cb', w.DWORD), ('page_faults', w.DWORD),
+                ('peak_working_set', c.c_size_t), ('working_set', c.c_size_t),
+                ('other_memory', c.c_size_t * 6)]
+
+
+process_io = api('GetProcessIoCounters', w.BOOL, w.HANDLE, c.POINTER(c.c_uint64 * 6))
+process_memory = api('K32GetProcessMemoryInfo', w.BOOL, w.HANDLE, c.POINTER(ProcessMemory), w.DWORD)
+
+
+def performance_value(query):
+    value = c.c_int64()
+    native(query(c.byref(value)))
+    return value.value
+
+
+def collector_sample(handle):
+    from owned_module_benchmark import IO_FIELDS
+    begin_ms, begin_qpc = tick(), performance_value(performance_counter)
+    times = [w.FILETIME() for _ in range(4)]
+    native(process_times(handle, *(c.byref(v) for v in times)))
+    created, _, kernel, user = [(t.dwHighDateTime << 32) | t.dwLowDateTime for t in times]
+    pid = native(peer_pid(handle))
+    io = (c.c_uint64 * 6)()
+    io_error = None if process_io(handle, c.byref(io)) else c.get_last_error()
+    memory = ProcessMemory()
+    memory.cb = c.sizeof(memory)
+    memory_error = None if process_memory(handle, c.byref(memory), memory.cb) else c.get_last_error()
+    end_qpc, end_ms = performance_value(performance_counter), tick()
+    return dict(process=[pid, str(created)], begin_ms=begin_ms, end_ms=end_ms,
+                begin_qpc=str(begin_qpc), end_qpc=str(end_qpc), kernel_100ns=str(kernel), user_100ns=str(user),
+                io_error=io_error, io=dict(zip(IO_FIELDS, map(str, io))) if io_error is None else None,
+                memory_error=memory_error, working_set_bytes=str(memory.working_set) if memory_error is None else None)
+
+
 class Accounting(c.Structure):
     _fields_ = [('times', c.c_int64 * 4), ('faults', w.DWORD), ('total', w.DWORD), ('active', w.DWORD), ('terminated', w.DWORD)]
 
@@ -102,11 +139,14 @@ def leased_file(path):
 
 
 class BenchmarkCapture:
-    def __init__(self, stack, exe, ticket=None):
+    def __init__(self, stack, exe, ticket=None, paired_costs=False):
         from owned_module_benchmark import LIMITS
         self.run_id = ticket or uuid.uuid4().hex
         self.parts, self.file_ids, self.worlds = {}, {}, []
         self.owner_loss = None
+        self.paired_costs = paired_costs
+        self.qpc_hz = performance_value(performance_frequency) if paired_costs else None
+        self.measured_requests = {'inventory': 0, 'dispatch': 0}
         for name, path in [('collector.bin', exe), ('target.bin', sys.executable), ('controller.py', __file__)]:
             stream, self.file_ids[name] = stack.enter_context(leased_file(path))
             data = stream.read(LIMITS[name] + 1)
@@ -129,16 +169,40 @@ class BenchmarkCapture:
     def event(self, kind, **values):
         self.worlds[-1]['events'].append(dict(kind=kind, **values))
 
+    def request(self, peer, kind):
+        from owned_module_benchmark import arm_order
+        arms = []
+        if self.paired_costs and self.worlds[-1]['name'] == 'fixed':
+            ordinal = self.measured_requests[kind]
+            self.measured_requests[kind] += 1
+            for mode in arm_order(self.run_id, kind, ordinal):
+                before = collector_sample(int(peer.proc._handle))
+                reply = peer.request(kind if mode == 'observe' else 'idle', measured=True)
+                after = collector_sample(int(peer.proc._handle))
+                arms.append(dict(mode=mode, before=before, start=reply['controller_start'],
+                                 end=reply['controller_end'], after=after))
+                if mode == 'observe':
+                    source = reply
+        else:
+            source = peer.request(kind)
+        event = dict(start=source['controller_start'], end=source['controller_end'])
+        if arms:
+            event['arms'] = arms
+        self.event(kind, **event)
+        return source
+
     def publish(self, destination):
-        from owned_module_benchmark import encoded, write_bundle
-        self.parts['truth.json'] = encoded(dict(schema='kn.owned_module_truth.v1', run_id=self.run_id,
+        from owned_module_benchmark import PAIRED_SCHEMA, encoded, write_bundle
+        self.parts['truth.json'] = encoded(dict(schema='kn.owned_module_truth.v2' if self.paired_costs else 'kn.owned_module_truth.v1', run_id=self.run_id,
                                                 worlds=self.worlds, owner_loss=self.owner_loss))
         machine = platform.machine().lower()
         arch = {'amd64': 'amd64', 'arm64': 'arm64', 'x86': 'x86'}.get(machine, 'unknown')
-        manifest = dict(schema='kn.owned_module_benchmark.v1', run_id=self.run_id, clock='GetTickCount64_ms',
+        manifest = dict(schema=PAIRED_SCHEMA if self.paired_costs else 'kn.owned_module_benchmark.v1', run_id=self.run_id, clock='GetTickCount64_ms',
                         rounds=ROUNDS, cadence_ms=CADENCE_MS, collector_file_id=self.file_ids['collector.bin'],
                         target_file_id=self.file_ids['target.bin'],
                         environment=dict(os_build=str(sys.getwindowsversion().build), architecture=arch))
+        if self.paired_costs:
+            manifest["qpc_hz"] = str(self.qpc_hz)
         return write_bundle(destination, manifest, self.parts)
 
 
@@ -202,9 +266,10 @@ class Peer:
         require(data.get('kind') == kind, f'expected {kind} acknowledgement')
         return data
 
-    def request(self, kind):
+    def request(self, kind, measured=False):
+        command = ('timed ' if measured else '') + kind
         start = tick()
-        self.proc.stdin.write((kind + '\n').encode('ascii'))
+        self.proc.stdin.write((command + '\n').encode('ascii'))
         self.proc.stdin.flush()
         row = self.receive(kind)
         row['controller_start'], row['controller_end'] = start, tick()
@@ -444,9 +509,7 @@ def world(exe, changing, trace, capture=None):
                 while (remaining := due - tick()) > 0:
                     time.sleep(remaining / 1000)
             expected_members = sorted(population.live())
-            frame = peer.request('inventory')
-            if capture is not None:
-                capture.event('inventory', start=frame['controller_start'], end=frame['controller_end'])
+            frame = capture.request(peer, 'inventory') if capture else peer.request('inventory')
             frame['controller_members'] = expected_members
             selected = verify_inventory(frame, population, i + 1)
             if frames:
@@ -457,9 +520,7 @@ def world(exe, changing, trace, capture=None):
                 population.rows[victim]['role'] = 'exit_after_selection'
                 population.stop(victim)
             for key in selected:
-                visit = peer.request('dispatch')
-                if capture is not None:
-                    capture.event('dispatch', start=visit['controller_start'], end=visit['controller_end'])
+                visit = capture.request(peer, 'dispatch') if capture else peer.request('dispatch')
                 verify_visit(visit, key, population)
         finish = peer.request('finish')
         ledger = finish['ledger']
@@ -585,7 +646,7 @@ def finish_worker(worker, job, bound, end):
 
 def supervised_attempt(args):
     import owned_module_campaign as campaign
-    from owned_module_benchmark import read_bundle
+    from owned_module_benchmark import PAIRED_SCHEMA, read_bundle
 
     admission = dict(supervisor=[os.getpid(), str(creation(self_handle()))], tick_ms=tick())
     plan, admission = campaign.admit(args.campaign, args.plan_sha256, args.slot, admission)
@@ -609,6 +670,8 @@ def supervised_attempt(args):
                     raise FileExistsError("registered output is already occupied")
                 argv = [sys.executable, str(Path(__file__).resolve()), "--campaign-worker", "--core-exe",
                         str(args.core_exe.resolve()), "--benchmark-out", str(destination.resolve())]
+                if plan.get("paired_costs"):
+                    argv.append("--paired-costs")
                 with owned_job() as job:
                     worker = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, close_fds=True,
                                               creationflags=subprocess.DETACHED_PROCESS)
@@ -635,6 +698,7 @@ def supervised_attempt(args):
                             end["outcome"] = "invalid_package"
                             manifest, _ = read_bundle(destination, pin, json.loads)
                             require(manifest["run_id"] == ticket and
+                                     (manifest["schema"] == PAIRED_SCHEMA) == plan.get("paired_costs", False) and
                                     all(manifest["artifacts"][k] == inputs[k] for k in campaign.IMAGES), "package differs from registered inputs")
                             end.update(outcome="published", package_sha256=pin)
                     except subprocess.TimeoutExpired:
@@ -702,7 +766,7 @@ def run_workload(args, ticket):
     try:
         exe = args.core_exe.resolve()
         with ExitStack() as stack:
-            capture = BenchmarkCapture(stack, exe, ticket) if args.benchmark_out else None
+            capture = BenchmarkCapture(stack, exe, ticket, args.paired_costs) if args.benchmark_out else None
             worlds = []
             for changing in (False, True):
                 phase = "changing" if changing else "fixed"
@@ -739,6 +803,7 @@ def run_workload(args, ticket):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--core-exe', type=Path)
+    parser.add_argument('--paired-costs', action='store_true', help='pair each fixed-job census and visit with an idle request')
     parser.add_argument('--trace', action='store_true', help='include private generation and acquisition evidence on stdout')
     parser.add_argument('--benchmark-out', type=Path, help='publish a new private replay package and return its SHA-256 pin')
     parser.add_argument('--campaign', type=Path, help='run one pre-registered acquisition slot')
@@ -750,6 +815,8 @@ if __name__ == '__main__':
     parser.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--interrupt-controller', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.paired_costs and (not args.benchmark_out or not args.core_exe or args.child or args.interrupt_controller):
+        parser.error('--paired-costs requires --benchmark-out and --core-exe')
     if args.watch_owner or any(x is not None for x in (args.campaign, args.slot, args.plan_sha256, args.watch_seconds)):
         import sqlite3
         if (not all(x is not None for x in (args.campaign, args.slot, args.plan_sha256)) or

@@ -55,9 +55,9 @@ def managed(argv):
         p._handle.Close()
 
 
-def plan(directory, exe, slots, timeout):
+def plan(directory, exe, slots, timeout, *, paired=False):
     raw = cli([TOOLS / "owned_module_campaign.py", "create", "--directory", directory, "--core-exe", exe,
-               "--attempts", slots, "--timeout-ms", timeout])
+               "--attempts", slots, "--timeout-ms", timeout] + (["--paired-costs"] if paired else []))
     pin = json.loads(raw)["plan_sha256"]
     (directory / "plan.pin").write_text(pin, encoding="ascii")
     return pin
@@ -231,6 +231,42 @@ class CampaignTests(unittest.TestCase):
     def setUp(self):
         self.snapshot = json.loads(self.path.read_bytes())
 
+    def test_paired_plan_and_missing_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="kn-owned-paired-") as tmp:
+            root = Path(tmp)
+            series = root / "series"
+            plan_pin = plan(series, self.core, 2, 180000, paired=True)
+            args = [RUNNER, "--campaign", series, "--plan-sha256", plan_pin, "--slot", 1, "--core-exe", self.core]
+            cli([*args, "--paired-costs"], 2)
+            cli(args)
+            path, pin = freeze(series, plan_pin, "cutoff")
+            result = json.loads(replay(path, pin, plan_pin))
+            self.assertEqual(result["paired_costs_per_planned_run"], dict(numerator=1, denominator=2, value=0.5))
+            measured, pending = result["attempts"]
+            self.assertEqual(measured["workloads"][0]["paired_costs"]["operations"]["inventory"]["pairs"], 16)
+            self.assertIsNone(pending["workloads"])
+            copy = root / "cutoff.knruns"
+            copy.write_bytes(path.read_bytes())
+            missing = json.loads(replay(copy, pin, plan_pin))
+            self.assertEqual(missing["paired_costs_per_planned_run"], dict(numerator=0, denominator=2, value=0.0))
+
+            # A valid legacy package may describe the same ticket and inputs but carries no paired measurement.
+            legacy = self.snapshot["attempts"][0]
+            old = campaign.package_path(self.path.parent, legacy["ticket"])
+            manifest, contents = package.read_bundle(old, legacy["ended"]["package_sha256"], json.loads)
+            snapshot = json.loads(copy.read_bytes())
+            row = snapshot["attempts"][0]
+            truth = json.loads(contents["truth.json"])
+            truth["run_id"] = manifest["run_id"] = row["ticket"]
+            contents["truth.json"] = package.encoded(truth)
+            dest = campaign.package_path(root, row["ticket"])
+            row["ended"]["package_sha256"] = package.write_bundle(dest, manifest, contents)
+            plain = json.loads(cli([EVALUATE, "--owned-module-run", dest, "--sha256", row["ended"]["package_sha256"]]))
+            self.assertNotIn("paired_costs", plain["scopes"][0])
+            raw = json.dumps(snapshot).encode()
+            copy.write_bytes(raw)
+            replay(copy, hashlib.sha256(raw).hexdigest(), plan_pin, 2)
+
     def test_real_denominators_and_cost_scope(self):
         result = json.loads(replay(self.path, self.pin, self.plan))
         self.assertEqual(result["counts"], {"planned": 6, "admitted": 5, "worker_bound": 3, "terminal": 4, "unresolved": 1,
@@ -371,7 +407,8 @@ def main():
             root.mkdir()
         else:
             root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="kn-owned-campaign-")))
-        CampaignTests.path, CampaignTests.pin, CampaignTests.plan = acquire(root, args.core_exe.resolve(strict=True))
+        CampaignTests.core = args.core_exe.resolve(strict=True)
+        CampaignTests.path, CampaignTests.pin, CampaignTests.plan = acquire(root, CampaignTests.core)
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(CampaignTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 

@@ -35,8 +35,13 @@ def content_pin(value):
 
 
 def validate_plan(plan, pin):
-    fields(plan, "schema campaign_id tickets timeout_ms inputs", "campaign plan")
-    check(plan["schema"] == "kn.owned_module_plan.v1" and content_pin(plan) == digest(pin), "campaign plan pin mismatch")
+    paired = type(plan) is dict and plan.get("schema") == "kn.owned_module_plan.v2"
+    fields(plan, "schema campaign_id tickets timeout_ms inputs" + (" paired_costs" if paired else ""), "campaign plan")
+    check(content_pin(plan) == digest(pin), "campaign plan pin mismatch")
+    if paired:
+        check(plan["paired_costs"] is True, "paired campaign requires paired costs")
+    else:
+        check(plan["schema"] == "kn.owned_module_plan.v1", "unknown campaign design")
     tickets = plan["tickets"]
     check(type(tickets) is list and 1 <= len(tickets) <= MAX_SLOTS, "invalid planned denominator")
     ids = [plan["campaign_id"], *tickets]
@@ -78,7 +83,7 @@ def database(directory, mode):
             yield db
 
 
-def create(directory, exe, count, timeout):
+def create(directory, exe, count, timeout, paired_costs=False):
     check(1 <= uint(count, MAX_SLOTS) and 1 <= uint(timeout, 3600000), "invalid campaign size or deadline")
     inputs = {}
     for name, path in input_paths(exe).items():
@@ -86,6 +91,8 @@ def create(directory, exe, count, timeout):
             inputs[name] = input_hash(stream, name)
     plan = dict(schema="kn.owned_module_plan.v1", campaign_id=uuid.uuid4().hex, timeout_ms=timeout,
                 inputs=inputs, tickets=[uuid.uuid4().hex for _ in range(count)])
+    if paired_costs:
+        plan.update(schema="kn.owned_module_plan.v2", paired_costs=True)
     pin = content_pin(plan)
     validate_plan(plan, pin)
     directory.mkdir()
@@ -296,6 +303,7 @@ def main():
     init.add_argument("--directory", required=True, type=Path)
     init.add_argument("--core-exe", required=True, type=Path)
     init.add_argument("--attempts", required=True, type=int)
+    init.add_argument("--paired-costs", action="store_true", help="require a paired fixed-job measurement in each package")
     init.add_argument("--timeout-ms", type=int, default=180000)
     snapshot = sub.add_parser("snapshot")
     snapshot.add_argument("--directory", required=True, type=Path)
@@ -304,7 +312,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.op == "create":
-            result = {"plan_sha256": create(args.directory, args.core_exe, args.attempts, args.timeout_ms)}
+            result = {"plan_sha256": create(args.directory, args.core_exe, args.attempts, args.timeout_ms, args.paired_costs)}
         else:
             result = {"snapshot_sha256": freeze(args.directory, args.plan_sha256, args.out)}
     except (OSError, ValueError, TypeError, sqlite3.Error, RecursionError) as exc:

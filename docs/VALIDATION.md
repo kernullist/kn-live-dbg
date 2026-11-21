@@ -7,6 +7,34 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Paired module collection costs, 2026-11-21
+
+The Windows x64 Release validation core had SHA-256
+`43ca5d7c057aa8ff97b0ee1f20c784566e03921fccb1746dc91c8f19e5280f81`.
+One of two registered campaign slots ran. Its collector served each real
+request and its paired idle request over the same pipes while 12 owned
+target processes waited. Each request type ran equally often in both orders.
+
+| Operation | Pairs | Collector time over idle, total (ms) | Supervisor round trip over idle, total (ms) |
+| --- | ---: | ---: | ---: |
+| Job process census | 16 | 7.2252 | 8.8101 |
+| Module visit | 128 | 75.6941 | 78.4712 |
+
+The values are sums of paired differences in one development run. All
+128 module visits observed the selected target. After the processes exited,
+offline replay reproduced the campaign report byte for byte and retained
+the unrun slot in the denominator. The fixture provides no estimate of
+game-frame latency or host-wide overhead.
+[Measurement procedure and counter definitions](BENCHMARK_CORPUS.md#measure-paired-collector-costs)
+
+The Release core gate passed, including 11 replay tests and six campaign
+tests. Altered packages covered a missing idle reply, conflicting collector
+identities and clocks, partial counter availability, and an unpaired run
+submitted for a paired slot. All 13 imported-corpus evaluator tests also
+passed. Between 21:46 and 22:07 KST the host recorded zero new reboot or
+bugcheck events and zero new crash dumps. The final check found no remaining
+fixture process or running test driver.
+
 ## KMON watched handle scans, 2026-11-21
 
 On `main` at `2f6742f`, the file snapshot probes and the handle graph owner

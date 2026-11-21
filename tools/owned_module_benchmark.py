@@ -14,6 +14,10 @@ import zipfile
 MIB = 1024 * 1024
 MANIFEST = "owned-module-manifest.json"
 WORLDS = ("fixed", "changing")
+PAIRED_SCHEMA = "kn.owned_module_benchmark.v2"
+IO_FIELDS = ("read_operations", "write_operations", "other_operations", "read_bytes", "written_bytes", "other_bytes")
+COST_COUNTERS = ("user_100ns", "kernel_100ns", *IO_FIELDS)
+COST_METRICS = ("roundtrip_ns", "native_service_ns", *COST_COUNTERS, "working_set_change_bytes")
 LIMITS = {MANIFEST: 64 * 1024, "truth.json": 2 * MIB, "fixed.jsonl": 4 * MIB, "changing.jsonl": 4 * MIB,
           "collector.bin": 32 * MIB, "target.bin": 32 * MIB, "controller.py": MIB}
 MAX_PACKAGE = sum(LIMITS.values()) + 64 * 1024
@@ -135,8 +139,12 @@ def read_bundle(path, expected, decode):
     except (zipfile.BadZipFile, NotImplementedError) as exc:
         raise ValueError("invalid package member encoding or checksum") from exc
     manifest = decode(parts.pop(MANIFEST))
-    fields(manifest, "schema run_id clock rounds cadence_ms environment collector_file_id target_file_id artifacts", "manifest")
-    check(manifest["schema"] == "kn.owned_module_benchmark.v1" and manifest["clock"] == "GetTickCount64_ms" and
+    paired = type(manifest) is dict and manifest.get("schema") == PAIRED_SCHEMA
+    fields(manifest, "schema run_id clock rounds cadence_ms environment collector_file_id target_file_id artifacts" +
+           (" qpc_hz" if paired else ""), "manifest")
+    if paired:
+        check(decimal(manifest["qpc_hz"]) > 0, "invalid supervisor performance frequency")
+    check(manifest["schema"] in ("kn.owned_module_benchmark.v1", PAIRED_SCHEMA) and manifest["clock"] == "GetTickCount64_ms" and
           uint(manifest["rounds"]) == 16 and uint(manifest["cadence_ms"]) == 25, "unknown acquisition contract")
     check(isinstance(manifest["run_id"], str) and re.fullmatch("[0-9a-f]{32}", manifest["run_id"]), "invalid run identity")
     for name in ("collector_file_id", "target_file_id"):
@@ -152,27 +160,129 @@ def read_bundle(path, expected, decode):
 
 
 class Replies:
-    def __init__(self, raw, decode):
-        check(raw.endswith(b"\n") and raw.count(b"\n") <= 2 + 16 * 9, "incomplete or oversized observer transcript")
+    def __init__(self, raw, decode, paired=False):
+        limit = 2 + 16 * 9 * (2 if paired else 1)
+        check(raw.endswith(b"\n") and raw.count(b"\n") <= limit, "incomplete or oversized observer transcript")
         self.lines = raw[:-1].split(b"\n")
         self.index = 0
         self.decode = decode
 
-    def take(self, kind):
+    def take(self, kind, measured=False):
         check(self.index < len(self.lines), "missing observer reply")
         wire = self.decode(self.lines[self.index])
         self.index += 1
-        fields(wire, "schema payload", "observer envelope")
+        fields(wire, "schema payload qpc" if measured else "schema payload", "observer envelope")
         data = wire["payload"]
         check(wire["schema"] == "kn.owned_module_workload.v1" and type(data) is dict and data.get("kind") == kind,
               "observer reply does not match the controller request")
-        return data
+        return (data, wire["qpc"]) if measured else data
 
 
 def bracket(event, previous, *names):
     times = [uint(event[k]) for k in names]
     check(previous <= times[0] and all(a <= b for a, b in zip(times, times[1:])), "nonmonotonic controller chronology")
     return times[-1]
+
+
+def arm_order(run_id, kind, ordinal):
+    # Counterbalance each operation independently. A registered run fixes its ticket before admission.
+    idle_first = (int(run_id[-1], 16) + ordinal + (kind == "dispatch")) % 2 == 0
+    return ("idle", "observe") if idle_first else ("observe", "idle")
+
+
+class PairedCosts:
+    def __init__(self, run_id, collector, frequency):
+        self.run_id, self.collector, self.frequency = run_id, collector, frequency
+        self.last_qpc = 0
+        self.last_counters = {}
+        self.groups = {kind: dict(pairs=0, observe_first=0,
+                                  totals={metric: Counter() for metric in COST_METRICS})
+                       for kind in ("inventory", "dispatch")}
+        self.links = []
+
+    def sample(self, row, previous_ms):
+        fields(row, "process begin_ms end_ms begin_qpc end_qpc kernel_100ns user_100ns io_error io memory_error working_set_bytes",
+               "collector cost sample")
+        check(identity(row["process"]) == self.collector, "collector cost sample belongs to a different generation")
+        end_ms = bracket(row, previous_ms, "begin_ms", "end_ms")
+        first, last = decimal(row["begin_qpc"]), decimal(row["end_qpc"])
+        check(self.last_qpc <= first <= last, "nonmonotonic performance counter")
+        self.last_qpc = last
+        values = {k: decimal(row[k]) for k in ("user_100ns", "kernel_100ns")}
+        if row["io_error"] is not None:
+            uint(row["io_error"], 0xffffffff)
+            check(row["io"] is None, "failed I/O query supplied counters")
+        else:
+            fields(row["io"], " ".join(IO_FIELDS), "process I/O counters")
+            values.update({k: decimal(row["io"][k]) for k in IO_FIELDS})
+        for k, value in values.items():
+            check(value >= self.last_counters.get(k, 0), "process cumulative counter regressed")
+            self.last_counters[k] = value
+        if row["memory_error"] is not None:
+            uint(row["memory_error"], 0xffffffff)
+            check(row["working_set_bytes"] is None, "failed memory query supplied a working set")
+        else:
+            values["working_set_change_bytes"] = decimal(row["working_set_bytes"])
+        return end_ms, first, last, values
+
+    def request(self, event, replies, previous, truth_index):
+        kind = event["kind"]
+        fields(event, "kind start end arms", "paired controller request")
+        arms = event["arms"]
+        check(type(arms) is list and len(arms) == 2, "incomplete pair")
+        group = self.groups[kind]
+        order = arm_order(self.run_id, kind, group["pairs"])
+        values, lines = {}, {}
+        for mode, arm in zip(order, arms):
+            fields(arm, "mode before start end after", "measured arm")
+            check(arm["mode"] == mode, "arm differs from registered order")
+            previous, _, sample_end, before = self.sample(arm["before"], previous)
+            end = bracket(arm, previous, "start", "end")
+            reply, native = replies.take(kind if mode == "observe" else "idle", measured=True)
+            lines[mode] = replies.index
+            if mode == "idle":
+                fields(reply, "kind tick", "idle receipt")
+                check(arm["start"] <= uint(reply["tick"]) <= end, "idle receipt outside its request")
+            else:
+                check(uint(event["start"]) == arm["start"] and uint(event["end"]) == end,
+                      "observation request differs from measured interval")
+                source = reply
+            previous, sample_begin, _, after = self.sample(arm["after"], end)
+            values[mode] = {k: after[k] - before[k] for k in before.keys() & after.keys()}
+            fields(native, "process hz begin end", "native performance counter")
+            check(identity(native["process"]) == self.collector, "native measurement belongs to a different collector")
+            start_qpc, end_qpc = decimal(native["begin"]), decimal(native["end"])
+            check(decimal(native["hz"]) == self.frequency, "native and supervisor performance frequencies differ")
+            # Across threads Windows treats ordering within one performance-counter tick as ambiguous.
+            check(start_qpc <= end_qpc and sample_end <= start_qpc + 1 and end_qpc <= sample_begin + 1,
+                  "native service outside supervisor performance interval")
+            values[mode]["roundtrip_ns"] = (sample_begin - sample_end) * 1_000_000_000 // self.frequency
+            values[mode]["native_service_ns"] = (end_qpc - start_qpc) * 1_000_000_000 // self.frequency
+        for k, total in group["totals"].items():
+            if k in values["observe"] and k in values["idle"]:
+                total["paired"] += 1
+                total["observed"] += values["observe"][k]
+                total["idle"] += values["idle"][k]
+        group["pairs"] += 1
+        group["observe_first"] += order[0] == "observe"
+        self.links.append(dict(kind=kind, truth_event=truth_index, source_reply=lines["observe"], idle_reply=lines["idle"]))
+        return source, lines["observe"], previous
+
+    def report(self):
+        result = {}
+        for kind, group in self.groups.items():
+            metrics = {}
+            for metric, total in group["totals"].items():
+                pairs, observed, idle = total["paired"], total["observed"], total["idle"]
+                metrics[metric] = dict(paired=pairs, unavailable_pairs=group["pairs"] - pairs,
+                                       observed_total=str(observed) if pairs else None,
+                                       idle_total=str(idle) if pairs else None,
+                                       observed_minus_idle=str(observed - idle) if pairs else None)
+            result[kind] = dict(pairs=group["pairs"], observe_first=group["observe_first"],
+                                idle_first=group["pairs"] - group["observe_first"], metrics=metrics)
+        return dict(basis="same_collector_fixed_owned_job", collector=list(self.collector),
+                    interval_clock="windows_query_performance_counter", frequency_hz=str(self.frequency),
+                    operations=result, receipts=self.links)
 
 
 def read_visit(data, row, key, live, start, end):
@@ -262,6 +372,9 @@ def replay_world(name, truth, replies, manifest, seen, previous):
     check(truth["name"] == name and truth["collector_file_id"] == manifest["collector_file_id"] and
           collector not in seen, "observer binding mismatch")
     seen.add(collector)
+    costs = None
+    if name == "fixed" and manifest["schema"] == PAIRED_SCHEMA:
+        costs = PairedCosts(manifest["run_id"], collector, decimal(manifest["qpc_hz"]))
     fields(replies.take("ready"), "kind", "ready acknowledgement")
     events = truth["events"]
     check(type(events) is list and 1 <= len(events) <= 256, "invalid controller journal size")
@@ -277,6 +390,14 @@ def replay_world(name, truth, replies, manifest, seen, previous):
         check(type(event) is dict, "invalid controller event")
         kind = event.get("kind")
         check(cutoff is None or kind == "exit", "acquisition after cutoff")
+        if kind in ("inventory", "dispatch"):
+            if costs:
+                data, source_reply, previous = costs.request(event, replies, previous, index)
+            else:
+                fields(event, "kind start end", "source request")
+                previous = bracket(event, previous, "start", "end")
+                data = replies.take(kind)
+                source_reply = replies.index
         if kind == "ready":
             fields(event, "kind child parent image_file_id role member base launch ready confirmed", "child readiness")
             key = identity(event["child"])
@@ -321,13 +442,10 @@ def replay_world(name, truth, replies, manifest, seen, previous):
                 departures[rounds, row["exit_boundary"]] += 1
             live.remove(key)
         elif kind == "inventory":
-            fields(event, "kind start end", "inventory request")
-            previous = bracket(event, previous, "start", "end")
             check(not selected, "new inventory with pending dispatches")
-            data = replies.take(kind)
             fields(data, "kind start admission members selected loan", "inventory reply")
             admission = uint(data["admission"])
-            check(event["start"] <= uint(data["start"]) <= admission <= previous and
+            check(event["start"] <= uint(data["start"]) <= admission <= event["end"] and
                   (last_admission is None or data["start"] >= last_admission + manifest["cadence_ms"]), "invalid census timing")
             last_admission = admission
             members = set(identities(data["members"], 64))
@@ -348,19 +466,17 @@ def replay_world(name, truth, replies, manifest, seen, previous):
                 check(picked, "missing controlled selection")
                 selected_exit = picked[0]
         elif kind == "dispatch":
-            fields(event, "kind start end", "dispatch request")
-            previous = bracket(event, previous, "start", "end")
             check(selected and selected_exit is None, "dispatch contradicts selection or controlled exit")
             key = selected.popleft()
             row = population[key]
             already_observed = row["last_success"] is not None
-            result = read_visit(replies.take(kind), row, key, key in live, event["start"], previous)
+            result = read_visit(data, row, key, key in live, event["start"], event["end"])
             first_observations += result == "observed" and not already_observed
-            row["last_reply"] = replies.index
+            row["last_reply"] = source_reply
             if result == "observed" and row["first_qualified_reply"] is None:
-                row["first_qualified_reply"] = replies.index
+                row["first_qualified_reply"] = source_reply
             if result in ERRORS and row["first_error_reply"] is None:
-                row["first_error_reply"] = replies.index
+                row["first_error_reply"] = source_reply
             counts[result] += 1
         elif kind == "finish":
             fields(event, "kind start end cutoff code", "finish request")
@@ -419,6 +535,8 @@ def replay_world(name, truth, replies, manifest, seen, previous):
                           elapsed_us=None if end is None else str(uint((end - row["ready"]) * 1000))))
     scope = dict(workload=name, censuses=rounds, attempts=sum(counts.values()), source_results=dict(sorted(counts.items())),
                  out_of_scope_controls=births[0, "out_of_scope"], job_active_after_cleanup=truth["job_active_after_cleanup"], cases=cases)
+    if costs:
+        scope["paired_costs"] = costs.report()
     return scope, previous
 
 
@@ -426,13 +544,14 @@ def verified_run(path, pin, decode):
     manifest, parts = read_bundle(path, pin, decode)
     truth = decode(parts["truth.json"])
     fields(truth, "schema run_id worlds owner_loss", "controller truth")
-    check(truth["schema"] == "kn.owned_module_truth.v1" and truth["run_id"] == manifest["run_id"] and
+    paired = manifest["schema"] == PAIRED_SCHEMA
+    check(truth["schema"] == ("kn.owned_module_truth.v2" if paired else "kn.owned_module_truth.v1") and truth["run_id"] == manifest["run_id"] and
           type(truth["worlds"]) is list and len(truth["worlds"]) == 2, "truth belongs to a different or incomplete run")
     seen = verify_owner_loss(truth["owner_loss"], manifest)
     worlds = []
     previous = 0
     for name, world in zip(WORLDS, truth["worlds"]):
-        replies = Replies(parts[name + ".jsonl"], decode)
+        replies = Replies(parts[name + ".jsonl"], decode, paired=paired and name == "fixed")
         scope, previous = replay_world(name, world, replies, manifest, seen, previous)
         worlds.append(scope)
     return manifest, worlds

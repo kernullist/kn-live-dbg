@@ -136,14 +136,68 @@ operation counts, peak job memory in bytes, total processes and the final
 active count. The scope includes the assigned worker and its descendants in
 the nested jobs. Peak-memory query failures retain their error and a null
 value. Admission-to-terminal elapsed time uses the supervisor's
-`GetTickCount64` clock. Calibrated collector overhead, host-wide effects
-and game latency require separate measurements. [Windows job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_and_io_accounting_information)
+`GetTickCount64` clock. The fixed workload can also measure individual
+collector requests against an idle control. [Windows job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_and_io_accounting_information)
 and [peak job memory](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information).
 
 Keep the registry, its SQLite recovery files, snapshots, packages and
 reports private. The pins bind the operator's pre-registered plan and chosen
 snapshot. Third-party provenance and runs performed outside that registry
 remain outside this measurement.
+
+## Measure paired collector costs
+
+Add `--paired-costs` when creating a campaign to require the measurement for
+each registered slot. The supervisor passes the registered setting to its
+worker. The fixed workload keeps the same 12 target processes alive and uses
+the same collector and pipes for both arms. Each census and each module visit
+has one matching idle request. The ticket sets the first arm. The order then
+alternates separately for censuses and visits. The changing workload continues
+to measure process lifetimes.
+
+```powershell
+$core = '.build/kmon-core/Release/kmon-core-Release.exe'
+$series = '.build/module-cost-series'
+$plan = (python tools/owned_module_campaign.py create --directory $series --core-exe $core --attempts 2 --paired-costs | ConvertFrom-Json).plan_sha256
+python tools/test-user-module-workload.py --campaign $series --slot 1 --plan-sha256 $plan --core-exe $core
+$snapshot = Join-Path $series 'first.knruns'
+$pin = (python tools/owned_module_campaign.py snapshot --directory $series --plan-sha256 $plan --out $snapshot | ConvertFrom-Json).snapshot_sha256
+python tools/evaluate-corpus.py --owned-module-campaign $snapshot --sha256 $pin --plan-sha256 $plan
+```
+
+For a standalone run, add `--paired-costs` to the `--benchmark-out` command.
+Both acquisition paths produce a v2 package. Its fixed-scope report contains
+`paired_costs.operations.inventory` and `paired_costs.operations.dispatch`.
+The source and idle line numbers in `receipts` point into the original
+`fixed.jsonl`. The corresponding `truth_event` contains the supervisor's
+before and after samples. Replay reads v1 packages with their original
+unpaired semantics.
+
+| Metric | Interval and unit |
+| --- | --- |
+| `native_service_ns` | Time inside the collector from command dispatch through payload construction, converted from performance-counter ticks |
+| `roundtrip_ns` | Supervisor interval around one request and its decoded response, including pipe traffic and scheduling |
+| `user_100ns`, `kernel_100ns` | Change in cumulative CPU time for the collector process, in 100 ns units |
+| I/O operation and byte counts | Change in the collector's read, write and other counters, including its pipe I/O |
+| `working_set_change_bytes` | Signed difference between the two sampled working-set sizes, in bytes |
+
+The supervisor samples the same open process handle throughout. Replay checks
+the collector PID and creation time, the two reported counter frequencies and
+the native interval against its supervisor bracket. Each interval is rounded
+down to whole nanoseconds before addition. A metric reports the number of
+complete pairs, both totals and their signed difference. A failed counter
+query retains its Windows error. If either arm lacks that metric, the pair is
+excluded from both totals. Zero usable pairs produce null totals.
+[Windows performance-counter ordering](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps),
+[process CPU time](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes),
+[process I/O](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessiocounters),
+[working-set counters](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters).
+
+The campaign field `paired_costs_per_planned_run` counts verified measured
+packages over all registered slots. Each package reports one controlled
+development workload. The measurements cover work during the requests.
+Host-wide overhead, game-frame latency, peak memory during a request and
+independently sampled performance estimates remain open.
 
 ## Run the synthetic example
 

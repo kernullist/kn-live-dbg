@@ -1,6 +1,6 @@
 """Check independent replay and altered copies of an actual owned Windows workload."""
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
@@ -35,7 +35,7 @@ def json_bytes(value):
     return (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-class ReplayTests(unittest.TestCase):
+class PackageTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="kn-owned-replay-")
         self.addCleanup(directory.cleanup)
@@ -74,6 +74,8 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, reason):
             evaluator.evaluate_owned(self.copy, pin)
 
+
+class ReplayTests(PackageTests):
     def test_known_cohorts_and_raw_pointers(self):
         report = evaluator.evaluate_owned(self.evidence, self.pin)
         self.assertEqual(report["artifacts"], {k: sha(v) for k, v in self.parts.items()})
@@ -274,6 +276,142 @@ class ReplayTests(unittest.TestCase):
             self.assertNotIn(b"Traceback", run.stderr)
 
 
+class PairedCostTests(PackageTests):
+    def test_raw_pairs_and_totals(self):
+        report = evaluator.evaluate_owned(self.evidence, self.pin)
+        fixed, changing = report["scopes"]
+        self.assertNotIn("paired_costs", changing)
+        cost = fixed["paired_costs"]
+        truth = json.loads(self.parts["truth.json"])["worlds"][0]
+        wires = [json.loads(line) for line in self.parts["fixed.jsonl"].splitlines()]
+        hz = int(self.manifest["qpc_hz"])
+        self.assertEqual(cost["collector"], truth["collector"])
+        self.assertEqual((cost["interval_clock"], int(cost["frequency_hz"])), ("windows_query_performance_counter", hz))
+        requests = [(i, e) for i, e in enumerate(truth["events"], 1) if "arms" in e]
+        self.assertEqual(len(requests), len(cost["receipts"]))
+        self.assertEqual(len(wires), 2 + 2 * len(requests))
+        totals, first = defaultdict(list), Counter()
+        counts = Counter()
+        for n, ((index, event), link) in enumerate(zip(requests, cost["receipts"])):
+            kind = event["kind"]
+            order = [arm["mode"] for arm in event["arms"]]
+            lead = (int(self.manifest["run_id"][-1], 16) + counts[kind] + int(kind == "dispatch")) % 2
+            self.assertEqual(order, ["observe", "idle"] if lead else ["idle", "observe"])
+            counts[kind] += 1
+            first[kind] += lead
+            self.assertEqual((link["kind"], link["truth_event"]), (kind, index))
+            pair = {}
+            for offset, arm in enumerate(event["arms"]):
+                mode = arm["mode"]
+                physical = 2 + n * 2 + offset
+                self.assertEqual(link["source_reply" if mode == "observe" else "idle_reply"], physical)
+                wire = wires[physical - 1]
+                self.assertEqual(wire["payload"]["kind"], kind if mode == "observe" else "idle")
+                before, after = arm["before"], arm["after"]
+                self.assertEqual(before["process"], truth["collector"])
+                self.assertEqual(after["process"], truth["collector"])
+                start, end = int(before["end_qpc"]), int(after["begin_qpc"])
+                native = wire["qpc"]
+                self.assertEqual(native["process"], truth["collector"])
+                self.assertEqual(int(native["hz"]), hz)
+                self.assertLessEqual(start - 1, int(native["begin"]))
+                self.assertLessEqual(int(native["end"]), end + 1)
+                metrics = {k: int(after[k]) - int(before[k]) for k in ("user_100ns", "kernel_100ns")}
+                metrics["roundtrip_ns"] = (end - start) * 10**9 // hz
+                metrics["native_service_ns"] = (int(native["end"]) - int(native["begin"])) * 10**9 // hz
+                if before["io"] is not None and after["io"] is not None:
+                    metrics.update({k: int(after["io"][k]) - int(before["io"][k]) for k in before["io"]})
+                if before["working_set_bytes"] is not None and after["working_set_bytes"] is not None:
+                    metrics["working_set_change_bytes"] = int(after["working_set_bytes"]) - int(before["working_set_bytes"])
+                pair[mode] = metrics
+            for k in pair["observe"].keys() & pair["idle"].keys():
+                totals[kind, k].append((pair["observe"][k], pair["idle"][k]))
+        self.assertEqual((counts["inventory"], counts["dispatch"]), (16, fixed["attempts"]))
+        for kind, group in cost["operations"].items():
+            self.assertEqual((group["pairs"], group["observe_first"], group["idle_first"]),
+                             (counts[kind], first[kind], counts[kind] - first[kind]))
+            for k, metric in group["metrics"].items():
+                samples = totals[kind, k]
+                obs, idle = (sum(x[i] for x in samples) for i in (0, 1))
+                self.assertEqual(metric, dict(paired=len(samples), unavailable_pairs=counts[kind]-len(samples),
+                                              observed_total=str(obs) if samples else None, idle_total=str(idle) if samples else None,
+                                              observed_minus_idle=str(obs-idle) if samples else None))
+        for row in fixed["cases"]:
+            for k in ("first_qualified_reply", "outcome_reply", "elapsed_reply"):
+                if row[k] is not None:
+                    native = wires[row[k] - 1]["payload"]
+                    self.assertEqual((native["kind"], native["key"]), ("dispatch", truth["events"][row["truth_event"] - 1]["child"]))
+
+    def test_unavailable_counters_and_signed_deltas(self):
+        def alter(world):
+            for e in world["events"]:
+                if "arms" not in e:
+                    continue
+                for arm in e["arms"]:
+                    if arm["mode"] == "idle":
+                        arm["before"].update(io=None, io_error=0)
+                    for edge in ("before", "after"):
+                        arm[edge].update(memory_error=None, working_set_bytes="4096")
+                    if arm["mode"] == "observe":
+                        arm["after"]["working_set_bytes"] = "0"
+            first_inventory = next(e for e in world["events"] if e["kind"] == "inventory")
+            idle = next(arm for arm in first_inventory["arms"] if arm["mode"] == "idle")
+            idle["after"].update(memory_error=5, working_set_bytes=None)
+        pin = self.changed_world("fixed", journal=alter)
+        cost = evaluator.evaluate_owned(self.copy, pin)["scopes"][0]["paired_costs"]
+        for kind, group in cost["operations"].items():
+            n, metrics = group["pairs"], group["metrics"]
+            for key in ("read_operations", "write_operations", "other_operations", "read_bytes", "written_bytes", "other_bytes"):
+                self.assertEqual(metrics[key], dict(paired=0, unavailable_pairs=n, observed_total=None, idle_total=None, observed_minus_idle=None))
+            missing = int(kind == "inventory")
+            delta = metrics["working_set_change_bytes"]
+            self.assertEqual((delta["paired"], delta["unavailable_pairs"]), (n - missing, missing))
+            self.assertEqual(delta["observed_minus_idle"], str(-4096 * (n - missing)))
+            self.assertEqual(metrics["roundtrip_ns"]["paired"], n)
+
+    def test_counter_and_clock_contradictions(self):
+        def journal(change):
+            return lambda world: change(next(e for e in world["events"] if "arms" in e))
+        for change, reason in (
+            (lambda e: e.pop("arms"), "fields"),
+            (lambda e: e["arms"].pop(), "incomplete pair"),
+            (lambda e: e["arms"].reverse(), "arm differs"),
+            (lambda e: e["arms"][0]["before"].update(process=[100, "1"]), "different generation"),
+            (lambda e: e["arms"][0]["after"].update(io_error=5, io={}), "failed I/O query"),
+            (lambda e: e["arms"][0]["before"].update(memory_error=5, working_set_bytes="0"), "failed memory query"),
+            (lambda e: e["arms"][0]["before"].update(user_100ns=str(2**64-1)), "regressed"),
+            (lambda e: e["arms"][0]["before"].update(end_qpc="0"), "nonmonotonic performance"),
+            (lambda e: e.update(start=True), "unsigned integer"),
+        ):
+            with self.subTest(reason=reason):
+                self.reject(self.changed_world("fixed", journal=journal(change)), reason)
+
+        def rescale(world):
+            for e in world["events"]:
+                for arm in e.get("arms", []):
+                    for edge in ("before", "after"):
+                        for k in ("begin_qpc", "end_qpc"):
+                            arm[edge][k] = str(int(arm[edge][k]) * 10)
+        self.reject(self.changed_world("fixed", journal=rescale), "outside supervisor")
+
+        def remove_idle_before_inventory(wires):
+            for i, (wire, following) in enumerate(zip(wires, wires[1:])):
+                if wire["payload"]["kind"] == "idle" and following["payload"]["kind"] == "inventory":
+                    del wires[i]
+                    return
+            self.fail("counterbalanced transcript had no idle-then-inventory pair")
+
+        for change, reason in (
+            (lambda wires: wires[1]["qpc"].update(process=[100, "1"]), "different collector"),
+            (lambda wires: wires[1]["qpc"].update(hz="0"), "frequencies differ"),
+            (lambda wires: wires[1]["qpc"].update(end="0"), "outside supervisor"),
+            (lambda wires: wires[1].pop("qpc"), "observer envelope"),
+            (remove_idle_before_inventory, "observer reply"),
+        ):
+            with self.subTest(reason=reason):
+                self.reject(self.changed_world("fixed", replies=change), reason)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -285,20 +423,25 @@ def main():
         parser.error("--owned-module-run requires its original --sha256")
     ReplayTests.live = None
     with tempfile.TemporaryDirectory(prefix="kn-owned-acquisition-") as directory:
+        suite = unittest.TestSuite()
         if args.core_exe:
-            ReplayTests.evidence = Path(directory) / "capture.knbench"
             exe = args.core_exe.resolve(strict=True)
-            run = subprocess.run([sys.executable, str(RUNNER), "--core-exe", str(exe), "--benchmark-out", str(ReplayTests.evidence)],
-                                 capture_output=True, timeout=240, check=True)
-            report = json.loads(run.stdout)
-            ReplayTests.live, ReplayTests.pin = report, report["benchmark_sha256"]
-            with zipfile.ZipFile(ReplayTests.evidence) as archive:
-                for name, path in (("collector.bin", exe), ("target.bin", Path(sys.executable)), ("controller.py", RUNNER)):
-                    if archive.read(name) != path.read_bytes():
-                        raise ValueError("retained bytes differ from the acquired input")
+            for tests, flags in ((ReplayTests, []), (PairedCostTests, ["--paired-costs"])):
+                tests.evidence = Path(directory) / (tests.__name__ + ".knbench")
+                run = subprocess.run([sys.executable, str(RUNNER), "--core-exe", str(exe), "--benchmark-out", str(tests.evidence), *flags],
+                                     capture_output=True, timeout=240, check=True)
+                tests.live = json.loads(run.stdout)
+                tests.pin = tests.live["benchmark_sha256"]
+                with zipfile.ZipFile(tests.evidence) as archive:
+                    for name, path in (("collector.bin", exe), ("target.bin", Path(sys.executable)), ("controller.py", RUNNER)):
+                        if archive.read(name) != path.read_bytes():
+                            raise ValueError("retained bytes differ from the acquired input")
+                suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(tests))
         else:
-            ReplayTests.evidence, ReplayTests.pin = args.owned_module_run, args.sha256
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReplayTests)
+            manifest, _ = package.read_bundle(args.owned_module_run, args.sha256, evaluator.decode_document)
+            tests = PairedCostTests if manifest["schema"] == package.PAIRED_SCHEMA else ReplayTests
+            tests.evidence, tests.pin = args.owned_module_run, args.sha256
+            suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(tests))
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
 

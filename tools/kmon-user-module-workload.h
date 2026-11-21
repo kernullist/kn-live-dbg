@@ -178,9 +178,9 @@ namespace user_module_workload
             return L"{\"kind\":\"finish\",\"ledger\":" + Debt.Json(GetTickCount64()) + L"}";
         }
     };
-    inline void Reply(const std::wstring& payload)
+    inline void Reply(const std::wstring& payload, const std::wstring& timing = {})
     {
-        std::wcout << L"{\"schema\":\"kn.owned_module_workload.v1\",\"payload\":" << payload << L"}" << std::endl;
+        std::wcout << L"{\"schema\":\"kn.owned_module_workload.v1\",\"payload\":" << payload << timing << L"}" << std::endl;
     }
     inline int Run(const std::string& argument)
     {
@@ -192,15 +192,31 @@ namespace user_module_workload
         if (!QueryInformationJobObject(inherited, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr)) { return 2; }
         Handle job(inherited, &CloseHandle);
         Session session(job.get());
+        const Key collector{GetCurrentProcessId(), Creation(GetCurrentProcess(), 0)};
         Reply(L"{\"kind\":\"ready\"}");
         try
         {
             for (std::string command; std::getline(std::cin, command);)
             {
-                if (command == "inventory") { Reply(session.Inventory()); }
-                else if (command == "dispatch") { Reply(session.Dispatch()); }
-                else if (command == "finish") { Reply(session.Finish()); return 0; }
+                const bool measured = command.rfind("timed ", 0) == 0;
+                if (measured) { command.erase(0, 6); }
+                if (command == "finish" && !measured) { Reply(session.Finish()); return 0; }
+
+                LARGE_INTEGER hz{}, begin{}, end{};
+                if (measured && (!collector.second || !QueryPerformanceFrequency(&hz) || !QueryPerformanceCounter(&begin))) { return 2; }
+                std::wstring payload;
+                if (command == "inventory") { payload = session.Inventory(); }
+                else if (command == "dispatch") { payload = session.Dispatch(); }
+                else if (command == "idle" && measured) { payload = L"{\"kind\":\"idle\",\"tick\":" + std::to_wstring(GetTickCount64()) + L"}"; }
                 else { return 2; }
+                std::wstring timing;
+                if (measured)
+                {
+                    if (!QueryPerformanceCounter(&end)) { return 2; }
+                    timing = L",\"qpc\":{\"process\":" + KeyJson(collector) + L",\"hz\":\"" + std::to_wstring(hz.QuadPart) + L"\",\"begin\":\"" +
+                        std::to_wstring(begin.QuadPart) + L"\",\"end\":\"" + std::to_wstring(end.QuadPart) + L"\"}";
+                }
+                Reply(payload, timing);
             }
         }
         catch (const std::exception& ex) { std::cerr << ex.what() << '\n'; }

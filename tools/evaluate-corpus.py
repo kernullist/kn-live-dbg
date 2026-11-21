@@ -293,6 +293,8 @@ def evaluate_campaign(path, snapshot_pin, plan_pin):
         if run is not None:
             require(run["run_id"] == row["ticket"] and all(run["artifacts"][k] == plan["inputs"][k] for k in campaign.IMAGES),
                     "replayed acquisition differs from registered inputs or ticket")
+            require(("paired_costs" in run["scopes"][0]) == plan.get("paired_costs", False),
+                    "paired measurement differs from the registered design")
             gate = True
             for scope in run["scopes"]:
                 changing = scope["workload"] == "changing"
@@ -309,7 +311,7 @@ def evaluate_campaign(path, snapshot_pin, plan_pin):
             passed += campaign.passed(end)
         evidence[result["evidence_status"]] += 1
         rows.append(result)
-    return dict(schema="kn.owned_module_campaign_evaluation.v1", campaign_id=plan["campaign_id"],
+    report = dict(schema="kn.owned_module_campaign_evaluation.v1", campaign_id=plan["campaign_id"],
                 snapshot_sha256=snapshot_pin, plan_sha256=plan_pin, inputs=plan["inputs"], timeout_ms=plan["timeout_ms"],
                 layer="owned_fixture", partition="development", unit="registered_acquisition_run",
                 clock="GetTickCount64_ms", resource_scope="assigned_windows_job_including_descendants",
@@ -324,6 +326,9 @@ def evaluate_campaign(path, snapshot_pin, plan_pin):
                 evidence_survival_per_publication=ratio(verified, states["published"]),
                 verified_packages_per_admission=ratio(verified, admitted), success_per_admission=ratio(passed, admitted),
                 success_per_planned_run=ratio(passed, len(rows)), attempts=rows)
+    if plan.get("paired_costs"):
+        report["paired_costs_per_planned_run"] = ratio(verified, len(rows))
+    return report
 
 
 def main():
