@@ -373,9 +373,54 @@ with the private trace.
 
 ## Normalized execution trace import
 
-This adapter reads local normalized JSON.
+The trace query reads a local normalized trace or a saved CPU profile page.
 Use `KnLiveDbg.exe --offline !kmon trace capture.kntrace /limit 64 /json`.
 A continuation uses the same file and limit with `/cursor <next_cursor>`.
+
+### Query and reproduce a saved ETL profile page
+
+The trace query accepts the JSON produced by `--etl-profile`, from
+`kn.etl_profile.v1` through `v7`, within the same 2 MiB input limit.
+The output schema is `kn.execution_trace_query.v2`. Each normalized sample
+retains its sampled TID, instruction pointer, CPU field, signed raw tick,
+descriptor, stack-extension count, header PID/TID and both original
+ordinals. An event's pointer width describes its own header. Timestamp
+reversals within a page remain in record order. The log header's FILETIMEs
+and event/buffer loss counters stay in their original units.
+[Windows sampled profile](https://learn.microsoft.com/en-us/windows/win32/etw/sampledprofile) · [ETW event header](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header)
+
+`file_sha256` identifies the exact report bytes read by this query.
+`source.reported_etl_sha256` identifies the ETL named by digest inside that
+report. The query checks the profile event type, envelope layout, record and
+sample ordinals, buffer comparison and pagination. Optional evidence tables
+remain in the saved report. Its hash and the sample ordinal locate the
+original witnesses, including thread, process, image, build and capture
+settings. The query checks the presence and container type of those tables.
+It assigns no lifetime or code identity from their contents.
+
+`reported_level=X2` describes the CPU sample type reported by the source.
+`qualified_reported_level` and `verified_level` remain `unqualified`.
+Target, boot, VM, VTL, address space and runtime code identity remain unknown.
+The file's decoded sample ordinal supplies no hardware loss sequence.
+`records_lost`, `sequence_gaps` and `loss_intervals` are null. A partial native
+page retains its rows and returns status `partial` and exit 1.
+
+`next_cursor` continues inside the saved JSON page. `query_complete` marks
+its end. Use `source_page.source_next_after` with the original ETL to obtain
+the next native page. Both restricted launch modes can read a saved page
+from a resident fixed-local file redirected to standard input.
+
+To check the report against the original, repeat the native profile or
+switch command with the same ETL digest, options, page boundary, limit and
+any pinned PE. Add `--check-page <file_sha256>`. The reader regenerates the
+full native page, including optional witnesses, and hashes its UTF-8 bytes
+and final LF. The compact `kn.etl_page_replay.v1` receipt returns both hashes.
+`matched` records byte-for-byte reproduction under those inputs. A different
+digest returns `page_mismatch` and exit 1. A matching partial page retains
+`source_status=partial` and exit 1. An unavailable source leaves
+`page_bytes_match` null. Formatting, re-encoding or changing the line ending
+also changes the digest. Capture-time producer authentication remains open.
+[CLI example](COMMAND_REFERENCE.md#query-a-saved-etl-profile-page)
 
 ## Input contract
 
@@ -517,5 +562,7 @@ Run `tools/validate-execution-trace.ps1 -Sanitize`, then
 The tests independently generate source records and SHA-256 values, inspect
 UTF-8 output, exercise paging across processes, conflicting code, missing
 identity, loss, malformed formats and boundary sizes. The image-recipe harness
-covers the shared artifact reader. These tests validate code and synthetic
-imports; they do not validate a real trace decoder, live backend or sensor.
+covers the shared artifact reader. These tests cover the normalized v1 input. The saved-page comparison in
+`tools/test-etl-trace-import.py` uses Windows `tracerpt`, the native ETL reader
+and the normalized query on the same pinned file.
+[Results for five saved ETLs](VALIDATION.md#normalize-and-replay-saved-etl-pages)

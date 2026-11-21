@@ -18,6 +18,9 @@ struct RetainedReferenceArtifact
     std::vector<uint8_t> Bytes;
 };
 
+// Compare open file identities without reopening either name or querying a remote filesystem.
+bool DistinctLocalFileHandles(HANDLE input, HANDLE output);
+
 // Leases local regular files, denies writes/deletes, and checks content on reuse.
 class ReferenceArtifact
 {

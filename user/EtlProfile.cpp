@@ -1,4 +1,5 @@
 #include "EtlProfile.h"
+#include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "EtlProcessEvidence.h"
 #include "EtlReferenceImage.h"
@@ -14,16 +15,17 @@
 namespace
 {
     using etl_profile::Sample;
-    constexpr uint64_t MaxBytes = 512ull << 20;
-    constexpr uint32_t MaxRecords = 2'000'000;
-    constexpr uint32_t MaxPage = 128;
+    using etl_profile::BufferAccounting;
+    constexpr auto MaxBytes = etl_profile::MaxFileBytes;
+    constexpr auto MaxRecords = etl_profile::MaxEventRecords;
+    constexpr auto MaxPage = etl_profile::MaxPageRows;
     using mcpjson::Quote;
 
     struct Options
     {
         uint32_t after = 0;
         uint32_t limit = 64;
-        std::wstring digest, referencePath, referenceDigest;
+        std::wstring digest, referencePath, referenceDigest, expectedPage;
         bool switches = false, threads = false, images = false, processes = false;
         bool intervals = false, haveTid = false, builds = false, settings = false;
         uint32_t tid = 0;
@@ -67,7 +69,7 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 15 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 17 || args[0].empty() ||
             args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
@@ -90,6 +92,10 @@ namespace
             { haveAfter = true; }
             else if (args[i] == L"--limit" && !haveLimit && Decimal(args[i + 1], MaxPage, options.limit) && options.limit)
             { haveLimit = true; }
+            else if (args[i] == L"--check-page" && options.expectedPage.empty())
+            {
+                if (!Digest(args[i + 1], options.expectedPage)) { return false; }
+            }
             else if (args[i] == L"--thread-id" && options.switches && !options.haveTid && Decimal(args[i + 1], UINT32_MAX, options.tid))
             { options.haveTid = true; }
             else { return false; }
@@ -572,26 +578,35 @@ namespace
             RecordHeaderJson(s) + intervals + L"}";
     }
 
+    std::wstring ReplayReceipt(const Options& o, const wchar_t* status, const std::wstring& source,
+        const std::wstring& replayed = {}, const wchar_t* sourceStatus = nullptr, DWORD error = 0,
+        const std::wstring& reference = {})
+    {
+        return L"{\"schema\":\"kn.etl_page_replay.v1\",\"status\":" + Quote(status) +
+            L",\"source_kind\":" + Quote(o.switches ? L"context_switch" : L"cpu_sample") +
+            L",\"expected_source_sha256\":" + Quote(o.digest) + L",\"expected_reference_sha256\":" +
+            (o.referenceDigest.empty() ? L"null" : Quote(o.referenceDigest)) +
+            L",\"source_sha256\":" + (source.empty() ? L"null" : Quote(source)) +
+            L",\"reference_sha256\":" + (reference.empty() ? L"null" : Quote(reference)) +
+            L",\"expected_page_sha256\":" + Quote(o.expectedPage) +
+            L",\"replayed_page_sha256\":" + (replayed.empty() ? L"null" : Quote(replayed)) +
+            L",\"page_bytes_match\":" + (replayed.empty() ? L"null" : replayed == o.expectedPage ? L"true" : L"false") +
+            L",\"source_status\":" + (sourceStatus ? Quote(sourceStatus) : L"null") +
+            L",\"after\":" + std::to_wstring(o.after) + L",\"limit\":" + std::to_wstring(o.limit) +
+            L",\"collector_authenticated\":false,\"win32_status\":" + (error ? std::to_wstring(error) : L"null") + L"}";
+    }
+
     int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0, const std::wstring& referenceDigest = {})
     {
+        if (!options.expectedPage.empty())
+        {
+            return WriteCapabilityJson(ReplayReceipt(options, status, digest, {}, nullptr, error, referenceDigest)) ? 1 : 2;
+        }
         const auto report = std::wstring(options.Prefix()) + Quote(status) + L",\"source_sha256\":" +
             (digest.empty() ? L"null" : Quote(digest)) + L",\"win32_status\":" +
             (error ? std::to_wstring(error) : L"null") + (options.referencePath.empty() ? L"" :
                 L",\"reference_sha256\":" + (referenceDigest.empty() ? L"null" : Quote(referenceDigest))) + L"}";
         return WriteCapabilityJson(report) ? 1 : 2;
-    }
-
-    enum class BufferAccounting { Unavailable, Matched, Fewer, More };
-
-    BufferAccounting AccountBuffers(const Scan& scan, const TRACE_LOGFILE_HEADER& h)
-    {
-        // A circular logger's written count can include overwritten buffers.
-        if (!h.BuffersWritten || !(h.LogFileMode & EVENT_TRACE_FILE_MODE_SEQUENTIAL) ||
-            (h.LogFileMode & (EVENT_TRACE_FILE_MODE_CIRCULAR | EVENT_TRACE_FILE_MODE_NEWFILE)))
-        { return BufferAccounting::Unavailable; }
-        if (scan.processedBuffers < h.BuffersWritten) { return BufferAccounting::Fewer; }
-        if (scan.processedBuffers > h.BuffersWritten) { return BufferAccounting::More; }
-        return BufferAccounting::Matched;
     }
 
     bool Partial(const Scan& scan, BufferAccounting accounting)
@@ -606,9 +621,7 @@ namespace
         const auto clock = h.ReservedFlags == 1 ? L"qpc" : h.ReservedFlags == 2 ? L"system_time" :
             h.ReservedFlags == 3 ? L"cpu_cycle" : L"unknown";
         const bool partial = Partial(scan, accounting);
-        const auto comparison = accounting == BufferAccounting::Matched ? L"matched" :
-            accounting == BufferAccounting::Fewer ? L"fewer_than_declared" :
-            accounting == BufferAccounting::More ? L"more_than_declared" : L"not_comparable";
+        const auto comparison = etl_profile::BufferComparisonName(accounting);
         auto result = std::wstring(scan.options.Prefix()) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
             L",\"source_bytes\":" + std::to_wstring(source.Bytes()) +
             (scan.options.switches ?
@@ -880,7 +893,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
     if (scan.budgetExceeded) { return Failure(scan.options, L"record_budget_exceeded", source.Sha256); }
     if (status != ERROR_SUCCESS) { return Failure(scan.options, L"process_trace_failed", source.Sha256, status); }
-    const auto accounting = AccountBuffers(scan, log.LogfileHeader);
+    const auto accounting = etl_profile::AccountBuffers(log.LogfileHeader.LogFileMode, log.LogfileHeader.BuffersWritten, scan.processedBuffers);
     const bool partial = Partial(scan, accounting);
     if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
     if (!partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
@@ -904,6 +917,19 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     if (haveReference && (!reference.file.PathNamesFile(referenceVolumePath) || !reference.file.Unchanged()))
     { return Failure(scan.options, L"reference_changed", source.Sha256); }
     if (report.empty()) { return Failure(scan.options, L"reference_read_failed", source.Sha256, 0, reference.file.Sha256); }
+    if (!scan.options.expectedPage.empty())
+    {
+        const auto bytes = CapabilityJsonFileBytes(report);
+        ContentHash hash;
+        if (bytes.empty() || !hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()))
+        { return Failure(scan.options, L"page_hash_unavailable", source.Sha256); }
+        const auto digest = hash.Finish();
+        if (digest.empty()) { return Failure(scan.options, L"page_hash_unavailable", source.Sha256); }
+        const bool match = digest == scan.options.expectedPage;
+        const auto receipt = ReplayReceipt(scan.options, match ? L"matched" : L"page_mismatch", source.Sha256,
+            digest, partial ? L"partial" : L"read", 0, haveReference ? reference.file.Sha256 : std::wstring{});
+        return WriteCapabilityJson(receipt) ? (match && !partial ? 0 : 1) : 2;
+    }
     return WriteCapabilityJson(report) ? (partial ? 1 : 0) : 2;
 }
 
@@ -929,8 +955,8 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         }
     }
     std::wcerr << (switches ?
-        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings]\n" :
-        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>]\n");
+        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256>]\n" :
+        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256>]\n");
     return 2;
 }
 

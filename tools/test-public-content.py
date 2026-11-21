@@ -195,7 +195,12 @@ class PublicContentTests(unittest.TestCase):
         process_point = dict(payload_pid=5, parent_pid=4, session_id=1, exit_status=0)
         process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
         process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
-        for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+        for record in (dict(schema="kn.execution_trace_query.v2", samples=[]), dict(status="matched", schema="kn.etl_page_replay.v1"),
+                       dict(native_schema=v7, reported_etl_sha256="a" * 64), dict(expected_page_sha256="b" * 64, replayed_page_sha256=None),
+                       dict(source_after=8, decoded_samples=9, records_seen=50), dict(sequence="9", record_ordinal=50, tick="4", ip="40"),
+                       dict(file_sha256="a" * 64, reported_etl_sha256="b" * 64),
+                       dict(raw_type=1, kind="qpc", header_perf_frequency="1000"), dict(start_filetime="4", events_lost=0, buffers_written=1),
+                       dict(schema=switch_schema, switches=[]), location, tids, wait,
                        dict(schema=v7, samples=[]), dict(samples=[], schema=v7), dict(switches=[], schema=switch_settings),
                        dict(group_mask_records=1, profile_interval_records=2), dict(group_masks=[0] * 8, kernel_event_version=0),
                        dict(profile_source=0, new_interval_raw=10000, old_interval_raw=10000, profile_source_name="Timer"),

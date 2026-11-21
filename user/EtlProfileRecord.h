@@ -10,6 +10,33 @@ namespace etl_profile
     inline constexpr GUID PerfInfo = {0xce1dbfb4, 0x137e, 0x4da6, {0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}};
     inline constexpr GUID ThreadProvider = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
 
+    inline constexpr uint64_t MaxFileBytes = 512ull << 20;
+    inline constexpr uint32_t MaxEventRecords = 2'000'000;
+    inline constexpr uint32_t MaxPageRows = 128;
+
+    enum class BufferAccounting { Unavailable, Matched, Fewer, More };
+
+    inline BufferAccounting AccountBuffers(uint32_t mode, uint32_t written, uint64_t processed)
+    {
+        // Circular and rotating logs do not describe a single sequential buffer range.
+        if (!written || !(mode & EVENT_TRACE_FILE_MODE_SEQUENTIAL) ||
+            (mode & (EVENT_TRACE_FILE_MODE_CIRCULAR | EVENT_TRACE_FILE_MODE_NEWFILE))) { return BufferAccounting::Unavailable; }
+        if (processed < written) { return BufferAccounting::Fewer; }
+        if (processed > written) { return BufferAccounting::More; }
+        return BufferAccounting::Matched;
+    }
+
+    inline const wchar_t* BufferComparisonName(BufferAccounting value)
+    {
+        switch (value)
+        {
+        case BufferAccounting::Matched: return L"matched";
+        case BufferAccounting::Fewer: return L"fewer_than_declared";
+        case BufferAccounting::More: return L"more_than_declared";
+        default: return L"not_comparable";
+        }
+    }
+
     struct RecordEnvelope
     {
         uint32_t ordinal, record, headerTid, headerPid, cpu;

@@ -1,196 +1,26 @@
 #include "ExecutionTrace.h"
+#include "ArtifactOutput.h"
 #include "ContentHash.h"
+#include "TraceJsonFields.h"
 #include "McpJson.h"
 #include "ReferenceArtifact.h"
 
 #include <algorithm>
 #include <iostream>
-#include <map>
-#include <set>
 
 namespace
 {
-    using Object = std::map<std::wstring, std::wstring>;
+    using namespace trace_json;
 
-    bool Members(const std::wstring& json, std::initializer_list<const wchar_t*> keys, Object* out)
+    template<class Write>
+    int TraceDiagnostic(DWORD stream, const std::vector<std::wstring>& args, bool inherited, Write write)
     {
-        if (!mcpjson::IsObject(json))
-        {
-            return false;
-        }
-        std::set<std::wstring> expected(keys.begin(), keys.end());
-        size_t pos = 0;
-        mcpjson::SkipWhitespace(json, &pos);
-        ++pos;
-        for (;;)
-        {
-            mcpjson::SkipWhitespace(json, &pos);
-            if (pos == json.size() || json[pos] == L'}')
-            {
-                break;
-            }
-            size_t end = pos;
-            if (!mcpjson::ScanString(json, &end))
-            {
-                return false;
-            }
-            const auto key = mcpjson::Unescape(json.substr(pos, end - pos));
-            pos = end;
-            mcpjson::SkipWhitespace(json, &pos);
-            if (pos == json.size() || json[pos++] != L':' || expected.erase(key) != 1)
-            {
-                return false;
-            }
-            mcpjson::SkipWhitespace(json, &pos);
-            if (!mcpjson::ScanValue(json, pos, &end))
-            {
-                return false;
-            }
-            out->emplace(key, json.substr(pos, end - pos));
-            pos = end;
-            mcpjson::SkipWhitespace(json, &pos);
-            if (pos < json.size() && json[pos] == L',')
-            {
-                ++pos;
-            }
-        }
-        return expected.empty();
-    }
-
-    bool Text(const std::wstring& raw, std::wstring* value, size_t maximum = 128)
-    {
-        if (raw.size() < 2 || raw.front() != L'"' || raw.back() != L'"')
-        {
-            return false;
-        }
-        // The shared display decoder repairs unpaired surrogates. Identity
-        // input must reject them before decoding to avoid silent aliasing.
-        bool high = false;
-        for (size_t i = 1; i + 1 < raw.size(); ++i)
-        {
-            wchar_t c = raw[i];
-            if (c == L'\\')
-            {
-                c = raw[++i];
-                if (c == L'u')
-                {
-                    if (i + 4 >= raw.size())
-                    {
-                        return false;
-                    }
-                    c = static_cast<wchar_t>(wcstoul(raw.substr(i + 1, 4).c_str(), nullptr, 16));
-                    i += 4;
-                }
-            }
-            if (c >= 0xd800 && c <= 0xdbff)
-            {
-                if (high)
-                {
-                    return false;
-                }
-                high = true;
-            }
-            else if (c >= 0xdc00 && c <= 0xdfff)
-            {
-                if (!high)
-                {
-                    return false;
-                }
-                high = false;
-            }
-            else if (high)
-            {
-                return false;
-            }
-        }
-        if (high)
-        {
-            return false;
-        }
-        *value = mcpjson::Unescape(raw);
-        return !value->empty() && value->size() <= maximum && mcpjson::SanitizeUtf16(*value) == *value &&
-            std::none_of(value->begin(), value->end(), [](wchar_t c)
-            {
-                return c < 0x20;
-            });
-    }
-
-    bool Decimal(const std::wstring& value, uint64_t* number)
-    {
-        if (value.empty() || value.size() > 20 || (value.size() > 1 && value[0] == L'0'))
-        {
-            return false;
-        }
-        *number = 0;
-        for (const auto c : value)
-        {
-            if (c < L'0' || c > L'9' || *number > (UINT64_MAX - (c - L'0')) / 10)
-            {
-                return false;
-            }
-            *number = *number * 10 + c - L'0';
-        }
-        return true;
-    }
-
-    template<typename T>
-    bool Number(const std::wstring& raw, T* value)
-    {
-        std::wstring text;
-        uint64_t number = 0;
-        if (!Text(raw, &text, 20) || !Decimal(text, &number) || number > static_cast<T>(-1))
-        {
-            return false;
-        }
-        *value = static_cast<T>(number);
-        return true;
-    }
-
-    template<typename T>
-    bool OptionalNumber(const std::wstring& raw, std::optional<T>* value)
-    {
-        T number = 0;
-        if (raw == L"null")
-        {
-            value->reset();
-            return true;
-        }
-        if (!Number(raw, &number))
-        {
-            return false;
-        }
-        *value = number;
-        return true;
-    }
-
-    bool Array(const std::wstring& raw, size_t maximum, std::vector<std::wstring>* rows)
-    {
-        if (raw.empty() || raw.front() != L'[' || !mcpjson::ValidateDocument(raw))
-        {
-            return false;
-        }
-        size_t pos = 1;
-        for (;;)
-        {
-            mcpjson::SkipWhitespace(raw, &pos);
-            if (pos == raw.size() || raw[pos] == L']')
-            {
-                break;
-            }
-            size_t end = 0;
-            if (rows->size() == maximum || !mcpjson::ScanValue(raw, pos, &end))
-            {
-                return false;
-            }
-            rows->push_back(raw.substr(pos, end - pos));
-            pos = end;
-            mcpjson::SkipWhitespace(raw, &pos);
-            if (pos < raw.size() && raw[pos] == L',')
-            {
-                ++pos;
-            }
-        }
-        return true;
+        const HANDLE sink = GetStdHandle(stream);
+        if (GetFileType(sink) != FILE_TYPE_DISK) { return write(); }
+        if (!inherited) { return args.empty() ? write() : WriteWithDistinctInput(stream, args.front(), write); }
+        const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        if (GetFileType(input) == FILE_TYPE_DISK && !DistinctLocalFileHandles(input, sink)) { return 2; }
+        return write();
     }
 
     const TraceAddressSpace* Space(const ExecutionTrace& trace, const std::wstring& id)
@@ -254,7 +84,7 @@ namespace
 
     std::wstring Cursor(const ExecutionTrace& trace, size_t limit, size_t offset)
     {
-        return L"kt1:" + trace.FileSha256 + L":" + std::to_wstring(limit) + L":" + std::to_wstring(offset);
+        return (trace.Etl ? L"kt2:" : L"kt1:") + trace.FileSha256 + L":" + std::to_wstring(limit) + L":" + std::to_wstring(offset);
     }
 
     const wchar_t* Qualification(const ExecutionTrace& trace, const TraceSample& sample)
@@ -337,8 +167,19 @@ bool ParseExecutionTrace(const std::wstring& json, ExecutionTrace* trace, std::w
     std::wstring schema;
     std::wstring architecture;
     ExecutionTrace parsed;
-    if (!Members(json, {L"schema", L"source", L"address_spaces", L"code_versions", L"samples", L"loss_intervals"}, &root) ||
-        !Text(root[L"schema"], &schema) || schema != L"kn.execution_trace.v1" ||
+    if (!ReadObject(json, &root) || !Text(root[L"schema"], &schema)) { return false; }
+    const std::wstring profile = L"kn.etl_profile.v";
+    if (schema.size() == profile.size() + 1 && schema.compare(0, profile.size(), profile) == 0 &&
+        schema.back() >= L'1' && schema.back() <= L'7')
+    {
+        parsed.Etl.emplace();
+        const bool ok = ParseEtlTracePage(root, schema.back() - L'0', *parsed.Etl, cancellation);
+        if (cancelled() || !ok) { return false; }
+        *trace = std::move(parsed);
+        if (error) { error->clear(); }
+        return true;
+    }
+    if (schema != L"kn.execution_trace.v1" || !HasFields(root, {L"schema", L"source", L"address_spaces", L"code_versions", L"samples", L"loss_intervals"}) ||
         !Members(root[L"source"], {L"id", L"producer", L"kind", L"target_id", L"boot_id", L"vm_id", L"vtl",
             L"architecture", L"clock_domain", L"ticks_per_second", L"first_tick", L"last_tick", L"records_lost"}, &source) ||
         !Text(source[L"id"], &parsed.SourceId) || !Text(source[L"producer"], &parsed.Producer) ||
@@ -473,15 +314,25 @@ bool ParseExecutionTrace(const std::wstring& json, ExecutionTrace* trace, std::w
 
 std::wstring ExecutionTracePageJson(const ExecutionTrace& trace, size_t offset, size_t limit)
 {
-    if (offset > trace.Samples.size() || limit == 0 || limit > 128 || trace.FileSha256.size() != 64)
+    const auto total = trace.SampleCount();
+    if (offset > total || limit == 0 || limit > 128 || trace.FileSha256.size() != 64)
     {
         return L"{}";
     }
-    const size_t end = offset + (std::min)(limit, trace.Samples.size() - offset);
+    const size_t end = offset + (std::min)(limit, total - offset);
     std::wstring out = L"{\"schema\":\"kn.execution_trace_query.v1\",\"status\":\"ok\",\"policy\":\"imported-samples-v1\"";
+    if (trace.Etl)
+    {
+        out = std::wstring(L"{\"schema\":\"kn.execution_trace_query.v2\",\"status\":") +
+            mcpjson::Quote(trace.Etl->Partial ? L"partial" : L"ok") + L",\"policy\":\"saved-etl-profile-page-v1\"";
+    }
     out += L",\"collector_authenticated\":false,\"execution_independently_verified\":false,\"execution_observed\":false";
     out += L",\"control_flow_observed\":false,\"write_observed\":false,\"actor_attributed\":false,\"continuous_execution\":false";
     out += L",\"file_sha256\":" + mcpjson::Quote(trace.FileSha256);
+    if (trace.Etl)
+    {
+        return out + EtlTraceQueryFields(*trace.Etl, offset, end, end < total ? Cursor(trace, limit, end) : L"");
+    }
     out += L",\"source\":{\"id\":" + mcpjson::Quote(trace.SourceId) + L",\"producer\":" + mcpjson::Quote(trace.Producer);
     out += L",\"kind\":" + mcpjson::Quote(trace.Kind) + L",\"target_id\":" + mcpjson::Quote(trace.TargetId);
     out += L",\"boot_id\":" + mcpjson::Quote(trace.BootId) + L",\"vm_id\":" + mcpjson::Quote(trace.VmId) + L",\"vtl\":" + O(trace.Vtl);
@@ -542,6 +393,7 @@ std::wstring ExecutionTracePageJson(const ExecutionTrace& trace, size_t offset, 
 int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation, ExecutionTraceInput input)
 {
     std::wstring error;
+    std::wstring unavailable = L"{\"schema\":\"kn.execution_trace_query.v1\",\"status\":\"unavailable\",\"execution_observed\":false";
     std::wstring cursor;
     uint64_t limit = 64;
     bool seenLimit = false;
@@ -573,9 +425,11 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
     }
     if (!arguments)
     {
-        std::wcerr << (inherited ? L"usage: --mode offline|observe trace -" : L"usage: --offline !kmon trace <file>")
-            << L" [/limit 1..128] [/cursor token] [/json]\n";
-        return 2;
+        return TraceDiagnostic(STD_ERROR_HANDLE, args, inherited, [&] {
+            std::wcerr << (inherited ? L"usage: --mode offline|observe trace -" : L"usage: --offline !kmon trace <file>")
+                << L" [/limit 1..128] [/cursor token] [/json]\n";
+            return 2;
+        });
     }
     try
     {
@@ -598,11 +452,17 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
             else if (ParseExecutionTrace(json, &trace, &error, cancellation))
             {
                 trace.FileSha256 = file.Sha256();
+                if (trace.Etl)
+                {
+                    unavailable = L"{\"schema\":\"kn.execution_trace_query.v2\",\"status\":\"unavailable\",\"execution_observed\":false,"
+                        L"\"collector_authenticated\":false,\"file_sha256\":" + mcpjson::Quote(trace.FileSha256) +
+                        L",\"reported_etl_sha256\":" + mcpjson::Quote(trace.Etl->EtlSha256);
+                }
                 uint64_t offset = 0;
                 const auto prefix = Cursor(trace, static_cast<size_t>(limit), 0);
                 const auto stem = prefix.substr(0, prefix.size() - 1);
                 if (!cursor.empty() && (cursor.rfind(stem, 0) != 0 ||
-                    !Decimal(cursor.substr(stem.size()), &offset) || offset > trace.Samples.size()))
+                    !Decimal(cursor.substr(stem.size()), &offset) || offset > trace.SampleCount()))
                 {
                     error = L"cursor does not match the immutable input and query";
                 }
@@ -615,7 +475,7 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
                     std::cout << mcpjson::WideToUtf8(ExecutionTracePageJson(trace,
                         static_cast<size_t>(offset), static_cast<size_t>(limit))) << "\n";
                     std::cout.flush();
-                    return std::cout ? 0 : 1;
+                    return std::cout && !(trace.Etl && trace.Etl->Partial) ? 0 : 1;
                 }
             }
         }
@@ -624,7 +484,8 @@ int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::a
     {
         error = L"execution trace import could not materialize bounded input";
     }
-    std::cout << mcpjson::WideToUtf8(L"{\"schema\":\"kn.execution_trace_query.v1\",\"status\":\"unavailable\",\"execution_observed\":false,\"error\":" +
-        mcpjson::Quote(error) + L"}") << "\n";
-    return 1;
+    return TraceDiagnostic(STD_OUTPUT_HANDLE, args, inherited, [&] {
+        std::cout << mcpjson::WideToUtf8(unavailable + L",\"error\":" + mcpjson::Quote(error) + L"}") << "\n";
+        return 1;
+    });
 }

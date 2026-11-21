@@ -143,7 +143,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None, include_samples=False):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -239,7 +239,7 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None, process
                                 payload = bytes.fromhex(event.findtext(ns + "ProcessingErrorData/" + ns + "EventPayload"))
                                 pid, tid = struct.unpack_from("<II", payload)
                             schedule.boundary(records, tick, cpu, opcode, pid, tid)
-            if not want_switches and guid in (thread_guid, profile_guid):
+            if (not want_switches or include_samples) and guid in (thread_guid, profile_guid):
                 system = event.find(ns + "System")
                 descriptor = {x.tag.removeprefix(ns): x.text for x in system}
                 opcode = int(descriptor["Opcode"])

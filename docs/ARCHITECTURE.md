@@ -1035,6 +1035,13 @@ the wait-mode or flags byte according to the event version. The report exposes
 the incoming wait-time value as recorded.
 [Saved context switches](TRACE_IMPORT.md#saved-windows-context-switches)
 
+The normalized trace query can consume a saved native CPU profile page.
+It retains the report's byte hash, the reported ETL digest and the original
+record and sample ordinals. Native page continuation and normalized query
+continuation each operate within their own source. The native reader can
+also reproduce a full page from a pinned ETL and compare its exact UTF-8
+output with the report hash. [Profile import and replay](TRACE_IMPORT.md#query-and-reproduce-a-saved-etl-profile-page)
+
 The sample and switch readers share a bounded capture-settings index.
 EventTrace group-mask snapshots, PerfInfo sampling-interval records and loss
 indications stay in callback order under the ETL digest. A row's file logger,

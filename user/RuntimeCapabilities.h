@@ -44,15 +44,20 @@ inline bool CapabilityReadAccepted(const ObservationReadResult& read)
         !read.CancellationObserved && !read.OperationDeadlineExceeded;
 }
 
+inline std::string CapabilityJsonFileBytes(const std::wstring& json)
+{
+    return mcpjson::WideToUtf8(json + L"\n");
+}
+
 inline bool WriteCapabilityJson(const std::wstring& json)
 {
     // Wide iostream output can truncate at localized status text in the C
     // locale. Use Unicode for consoles and explicit UTF-8 for redirected JSON.
     const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    const std::wstring line = json + L"\n";
     DWORD mode = 0;
     if (GetConsoleMode(output, &mode))
     {
+        const std::wstring line = json + L"\n";
         size_t offset = 0;
         while (offset < line.size())
         {
@@ -70,7 +75,7 @@ inline bool WriteCapabilityJson(const std::wstring& json)
         }
         return true;
     }
-    const auto bytes = mcpjson::WideToUtf8(line);
+    const auto bytes = CapabilityJsonFileBytes(json);
     if (bytes.empty())
     {
         return false;

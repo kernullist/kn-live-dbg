@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AddressSpaceDescriptor.h"
+#include "EtlTracePage.h"
 #include <atomic>
 #include <optional>
 #include <string>
@@ -70,6 +71,9 @@ struct ExecutionTrace
     std::vector<TraceCodeVersion> Code;
     std::vector<TraceSample> Samples;
     std::vector<TraceLossInterval> Loss;
+    std::optional<EtlTracePage> Etl;
+
+    size_t SampleCount() const { return Etl ? Etl->Rows.size() : Samples.size(); }
 };
 
 // Qualification checks imported metadata. It never authenticates a producer,

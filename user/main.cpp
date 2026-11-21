@@ -23116,7 +23116,7 @@ static void PrintKmonHelp()
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
-    std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples\n";
+    std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples or saved ETL profile pages\n";
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
@@ -54135,8 +54135,8 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
-        std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>]   read saved CPU samples\n";
-        std::wcout << L"  KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N] [--intervals] [--thread-id N] [--capture-settings]   read saved context switches\n";
+        std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256>]   read saved CPU samples\n";
+        std::wcout << L"  KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256>]   read saved context switches\n";
         std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea [--event-xml <file> --event-sha256 <digest>]]   compare saved stop, stack and WHEA evidence\n";
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";
         std::wcout << L"  KnLiveDbg.exe --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>   capture one Windows wait chain\n";

@@ -196,6 +196,7 @@ def main():
     trace = by_key[("execution", "trace_import", "trace")]
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
+    assert all(s in trace["requirements"] for s in ("saved_etl_profile_pages_v1_to_v7", "separate_report_and_source_digests"))
     switches = by_key[("execution", "context_switch", "etl")]
     assert switches["implementation"] == "implemented" and switches["consistency"] == "reported_scheduler_event"
     assert "classic_thread_opcode36_versions2_3_4" in switches["requirements"]
@@ -212,6 +213,7 @@ def main():
     assert all(s in profile["requirements"] for s in ("explicit_pinned_pe_reference", "file_backed_executable_window_sha256", "opt_in_merge_image_id_and_native_rsds"))
     assert all(s in profile["limits"] for s in ("64MiB_reference_file", "32_byte_reference_window", "131072_merge_markers", "runtime_bytes_unobserved"))
     assert all(s in profile["requirements"] for s in ("timer_interval_brackets", "recorded_capture_settings"))
+    assert all("exact_page_replay_sha256" in entry["requirements"] for entry in (profile, switches))
     assert "1024_capture_setting_records" in profile["limits"]
     assert "65536_image_events" in profile["limits"] and "16MiB_image_names" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
@@ -241,7 +243,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings"))
+    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--check-page"))
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout

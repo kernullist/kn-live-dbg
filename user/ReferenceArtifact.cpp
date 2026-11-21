@@ -34,6 +34,17 @@ namespace
             absolute.find(L':', 2) == std::wstring::npos ? absolute : L"";
     }
 
+    bool OnLocalDevice(HANDLE file)
+    {
+        using QueryFile = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+        const auto queryFile = NativeFileFunction<QueryFile>("NtQueryInformationFile");
+        constexpr ULONG fileIsRemoteDeviceInformation = 51; // WDK FILE_INFORMATION_CLASS, answered by the I/O manager.
+        IO_STATUS_BLOCK result{};
+        BOOLEAN remote = TRUE;
+        return queryFile && queryFile(file, &result, &remote, sizeof(remote), fileIsRemoteDeviceInformation) == 0 &&
+            result.Information == sizeof(remote) && !remote;
+    }
+
     bool ResidentLocalDiskFile(HANDLE file)
     {
         if (file == nullptr || file == INVALID_HANDLE_VALUE) { return false; }
@@ -43,13 +54,7 @@ namespace
         PUBLIC_OBJECT_BASIC_INFORMATION access{};
         if (!query || query(file, ObjectBasicInformation, &access, sizeof(access), nullptr) != 0 ||
             (access.GrantedAccess & ResidentFileAccess) != ResidentFileAccess) { return false; }
-        using QueryFile = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-        const auto queryFile = NativeFileFunction<QueryFile>("NtQueryInformationFile");
-        constexpr ULONG fileIsRemoteDeviceInformation = 51; // WDK FILE_INFORMATION_CLASS, answered by the I/O manager.
-        IO_STATUS_BLOCK result{};
-        BOOLEAN remote = TRUE;
-        if (!queryFile || queryFile(file, &result, &remote, sizeof(remote), fileIsRemoteDeviceInformation) != 0 ||
-            result.Information != sizeof(remote) || remote || GetFileType(file) != FILE_TYPE_DISK) { return false; }
+        if (!OnLocalDevice(file) || GetFileType(file) != FILE_TYPE_DISK) { return false; }
         std::wstring path(32768, L'\0');
         const DWORD size = GetFinalPathNameByHandleW(file, path.data(), static_cast<DWORD>(path.size()),
             FILE_NAME_OPENED | VOLUME_NAME_GUID);
@@ -107,6 +112,15 @@ namespace
         LARGE_INTEGER finalSize{};
         return GetFileSizeEx(file, &finalSize) && finalSize.QuadPart == size.QuadPart;
     }
+}
+
+bool DistinctLocalFileHandles(HANDLE input, HANDLE output)
+{
+    FILE_ID_INFO sourceId{}, sinkId{};
+    return OnLocalDevice(input) && OnLocalDevice(output) &&
+        GetFileInformationByHandleEx(input, FileIdInfo, &sourceId, sizeof(sourceId)) &&
+        GetFileInformationByHandleEx(output, FileIdInfo, &sinkId, sizeof(sinkId)) &&
+        std::memcmp(&sourceId, &sinkId, sizeof(sourceId)) != 0;
 }
 
 ReferenceArtifact::~ReferenceArtifact()

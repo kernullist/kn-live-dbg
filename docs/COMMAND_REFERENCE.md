@@ -13,7 +13,8 @@ invocation runs one operation and exits before controller startup. Use
 available in that mode. Both accept `--capabilities` for the compiled
 inventory. That inventory describes the binary across all launch paths.
 
-Both modes can query one saved `kn.execution_trace.v1` file. Redirect a
+Both modes can query one saved `kn.execution_trace.v1` file or a native
+`kn.etl_profile.v1` through `v7` CPU profile page. Redirect a
 readable regular file on a fixed local volume to standard input. For example,
 in **cmd.exe**, using a saved trace named `saved trace.kntrace` in the working
 directory, run
@@ -925,11 +926,27 @@ KnLiveDbg.exe --offline !kmon trace capture.kntrace /limit 64 /cursor <next_curs
 ```
 
 The [trace input contract](TRACE_IMPORT.md) defines required identity, clock,
-code-version and loss fields. The importer accepts normalized JSON, not raw
-PT/ETL/TTD buffers. Its qualified reported level remains a producer claim;
-neither parsing nor a code hash authenticates actual execution. Changed input or
-page limits invalidate the cursor. Error exit 1 returns an unavailable result;
-invalid command arguments exit 2.
+code-version and loss fields. The importer also accepts saved CPU profile
+JSON from the ETL reader. Reported execution levels retain their source
+scope. Changed input or page limits invalidate the cursor. Exit 1 covers an
+unavailable result or a partial native page. Invalid arguments return exit 2.
+
+### Query a saved ETL profile page
+
+In a working directory containing `capture.etl`, choose a fresh output name.
+The native file redirection below preserves the report's UTF-8 bytes on
+Windows PowerShell and PowerShell 7.
+
+```powershell
+$pin = (Get-FileHash -LiteralPath .\capture.etl -Algorithm SHA256).Hash
+cmd.exe /d /c "KnLiveDbg.exe --etl-profile capture.etl --sha256 $pin --capture-settings --limit 8 > profile-page.json"
+$page = & KnLiveDbg.exe --offline '!kmon' trace profile-page.json /limit 4 /json | ConvertFrom-Json
+& KnLiveDbg.exe --etl-profile capture.etl --sha256 $pin --capture-settings --limit 8 --check-page $page.file_sha256
+```
+
+The final command checks the bytes of the whole native page. The normalized
+query's `next_cursor` continues within that page. The ETL reader uses the
+separate `source_page.source_next_after` value. [Source and replay fields](TRACE_IMPORT.md#query-and-reproduce-a-saved-etl-profile-page)
 
 ### Inspect CPU samples from a saved ETL
 

@@ -5064,6 +5064,55 @@ The public files supplied no loss-marker example and do not establish
 recording privilege, original session identity or the memory bytes at
 sampling time. [Capture settings and interpretation](TRACE_IMPORT.md#read-recorded-capture-settings)
 
+### Normalize and replay saved ETL pages
+
+The 2026-11-22 comparison used the five pinned ETLs in the capture-settings
+table above. The trace query consumed saved native profile pages. Windows
+`tracerpt -rts` supplied each sample's event ordinal, raw tick, CPU, payload
+TID, instruction pointer, raw count and reserved values, header PID/TID and
+descriptor fields. Separate comparisons checked the native page's logger,
+header flags, pointer width and stack-extension count.
+
+| Source | Original events | CPU samples checked through the normalized query |
+| --- | ---: | ---: |
+| ETWAnalyzer scheduler | 877,318 | 18,556 |
+| PerfView x64 workload | 179,474 | 79,528 |
+| PerfView x86 workload | 168,298 | 88,809 |
+| SimpleAllocator | 418,378 | 5,496 |
+| Empty sample control | 23 | 0 |
+
+The checker used the named trace command and the restricted offline and
+observe modes. It exercised all seven native profile schemas, including the
+pinned reference PE on the scheduler trace. Its inner cursor advanced
+within one saved report. The separate native continuation kept its original
+ETL offset. Changing a sample while retaining the reported ETL digest
+left the normalized sample unqualified and caused an exact replay mismatch.
+
+```powershell
+python tools/test-etl-trace-import.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --all-pages --adversarial --check-short-tail --reference-image $pe.FullName $pePin
+```
+
+This command uses the scheduler ETL and the pinned Microsoft PE above.
+On the four traces with samples, a one-byte-short copy returned a partial
+page. Replaying its native report reproduced its bytes and retained partial
+status, including when the native `--after` offset exceeded the surviving
+sample count.
+Baseline comparisons covered 32 native profile pages, three scheduler
+pages and six earlier normalized query outputs from the parent executable.
+The 35 native pages were independently hashed and reproduced with their
+original options. The empty sample file also produced an empty normalized
+result. Reproduction establishes agreement with the pinned input bytes.
+Recording privilege, collector identity and code in memory at sampling
+time remain unverified. [Input and replay contract](TRACE_IMPORT.md#query-and-reproduce-a-saved-etl-profile-page)
+
+The Release executable passed 93 existing trace controls and 82 restricted
+launch checks. The Win32 and x64 AddressSanitizer trace harnesses each read
+32 real sample rows and checked a reversed clock, the minimum signed tick
+and an out-of-range tick. The ASan run used the process-local interception
+workaround and emitted startup interceptor warnings. The CLI example also
+ran under Windows PowerShell 5 and PowerShell 7 on the scheduler and empty
+sample files.
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

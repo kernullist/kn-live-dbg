@@ -259,6 +259,9 @@
     <ClCompile Include="PendingIrpScannerTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="EtlTracePage.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ExecutionTrace.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -466,6 +469,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="EtlTracePage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TraceJsonFields.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionTrace.h">
