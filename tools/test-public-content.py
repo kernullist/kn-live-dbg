@@ -164,7 +164,12 @@ class PublicContentTests(unittest.TestCase):
         identity = dict(image_checksum=4, pe_timestamp=5, recorded_file_name="sample.dll")
         witness = dict(relation="one_boundary", before_record=8, after_record=None)
         evidence = dict(relation="one_boundary", candidate_ranges=1, reported_rva=None, witnesses=[witness])
-        for record in (dict(schema=v2, samples=[]), point, pair, dict(schema=v3, image_records=[]),
+        switch_schema = "kn.etl_switches.v1"
+        location = dict(switch_ordinal=1, record_ordinal=2, raw_timestamp="3", cpu=0)
+        tids = dict(new_thread_id=4, old_thread_id=5, new_priority=8, old_priority=9)
+        wait = dict(old_thread_id=4, new_thread_id=5, old_wait_reason=17)
+        for record in (dict(schema=switch_schema, switches=[]), location, tids, wait,
+                       dict(schema=v2, samples=[]), point, pair, dict(schema=v3, image_records=[]),
                        image, identity, evidence, witness):
             for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
                 intact = json.dumps(record, indent=2).encode(encoding)
@@ -177,7 +182,7 @@ class PublicContentTests(unittest.TestCase):
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
             self.assertIn("private-evidence-bundle", {r["rule"] for r in
                           AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
-        for version in (schema, v2, v3):
+        for version in (schema, v2, v3, switch_schema):
             self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + version + ".").encode()), [])
 
     def test_wait_captures_and_reports(self):

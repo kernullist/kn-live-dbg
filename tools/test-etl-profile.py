@@ -15,8 +15,9 @@ import struct
 from xml.etree import ElementTree
 
 
-def run(exe, etl, digest, *args, rc=0):
-    result = subprocess.run([exe, "--etl-profile", etl, "--sha256", digest, *map(str, args)],
+def run(exe, etl, digest, *args, rc=0, switches=False):
+    command = "--etl-switches" if switches else "--etl-profile"
+    result = subprocess.run([exe, command, etl, "--sha256", digest, *map(str, args)],
                             capture_output=True, timeout=90)
     assert result.returncode == rc, (result.returncode, result.stdout[:250], result.stderr[:250])
     if rc == 2:
@@ -24,7 +25,7 @@ def run(exe, etl, digest, *args, rc=0):
         return None
     value = json.loads(result.stdout.decode("utf-8"))
     version = 3 if "--image-evidence" in args else (2 if "--thread-evidence" in args else 1)
-    assert value["schema"] == f"kn.etl_profile.v{version}"
+    assert value["schema"] == ("kn.etl_switches.v1" if switches else f"kn.etl_profile.v{version}")
     return value
 
 
@@ -112,7 +113,28 @@ class ImageOracle:
                     reported_rva=paired_rva if len(candidates) == 1 else None, witnesses=candidates[:2])
 
 
-def oracle(etl, folder, want_images):
+def switch_values(system, ns, fields, ordinal, version):
+    def number(key):
+        assert fields[key].isascii()
+        return int(fields[key], 0)
+
+    def signed_byte(key):
+        value = number(key)
+        assert -128 <= value <= 255
+        return value - 256 if value >= 128 else value
+
+    execution = system.find(ns + "Execution").attrib
+    return (ordinal, int(system.find(ns + "TimeCreated").attrib["RawTime"]), int(execution["ProcessorID"], 0),
+            int(execution["ProcessID"], 0), int(execution["ThreadID"], 0), int(system.findtext(ns + "Keywords"), 0),
+            int(system.findtext(ns + "Channel") or "0", 0), int(system.findtext(ns + "Level"), 0),
+            int(system.findtext(ns + "Task"), 0), version, number("NewThreadId"), number("OldThreadId"),
+            signed_byte("NewThreadPriority"), signed_byte("OldThreadPriority"), number("PreviousCState"),
+            signed_byte("SpareByte"), signed_byte("OldThreadWaitReason"), signed_byte("OldThreadWaitMode") if version == 2 else None,
+            number("ThreadFlags") & 255 if version >= 3 else None, signed_byte("OldThreadState"),
+            signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
+
+
+def oracle(etl, folder, want_images, want_switches=False):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -123,12 +145,20 @@ def oracle(etl, folder, want_images):
     trace_ns = "{http://schemas.microsoft.com/win/2004/08/events/trace}"
     thread_guid = "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c"
     profile_guid = "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc"
-    samples, threads = [], defaultdict(list)
+    samples, threads, switches = [], defaultdict(list), []
     images = ImageOracle() if want_images else None
     pointer_width = None
     records = raw_threads = raw_samples = 0
     with xml_path.open("rb") as stream:
-        events = ElementTree.iterparse(stream, events=("start", "end"))
+        # Switch fields and descriptor IDs are ASCII integers. Some tracerpt
+        # exports write unrelated text in the local code page without an XML
+        # encoding declaration. A single-byte parse preserves the markup and
+        # every selected value. Image evidence needs the original Unicode names.
+        prefix = stream.read(4)
+        stream.seek(0)
+        single_byte = want_switches and b"\0" not in prefix and not prefix.startswith((b"\xff\xfe", b"\xfe\xff"))
+        parser = ElementTree.XMLParser(encoding="iso-8859-1") if single_byte else None
+        events = ElementTree.iterparse(stream, events=("start", "end"), parser=parser)
         _, root = next(events)
         for action, event in events:
             if action != "end" or event.tag != ns + "Event":
@@ -147,7 +177,14 @@ def oracle(etl, folder, want_images):
                     fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
                     tick = int(system.find(ns + "TimeCreated").attrib["RawTime"])
                     images.add(records, tick, version, op, pointer_width, fields)
-            if guid in (thread_guid, profile_guid):
+            if want_switches and guid == thread_guid:
+                system = event.find(ns + "System")
+                if system.findtext(ns + "EventID") == "0" and system.findtext(ns + "Opcode") == "36":
+                    version = int(system.findtext(ns + "Version"))
+                    if version in (2, 3, 4):
+                        fields = {x.attrib["Name"]: x.text for x in event.findall(ns + "EventData/" + ns + "Data")}
+                        switches.append(switch_values(system, ns, fields, records, version))
+            if not want_switches and guid in (thread_guid, profile_guid):
                 system = event.find(ns + "System")
                 descriptor = {x.tag.removeprefix(ns): x.text for x in system}
                 opcode = int(descriptor["Opcode"])
@@ -182,10 +219,11 @@ def oracle(etl, folder, want_images):
                                         int(descriptor["Level"], 0), int(descriptor["Task"], 0)))
             event.clear()
             root.clear()
-    print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
+    if not want_switches:
+        print(f"XML oracle used raw payloads for {raw_samples} CPU samples and {raw_threads} thread records.")
     if images is not None:
         images.prepare()
-    return records, samples, threads, images
+    return records, samples, threads, images, switches
 
 
 def compare_thread(pair, row, events, coverage, clock_ok):
@@ -291,7 +329,7 @@ def compare(report, pin, size, records, oracle_rows, after, limit, threads, imag
     return rows
 
 
-def check_directory_lease(exe, etl, pin, parent):
+def check_directory_lease(exe, etl, pin, parent, switches=False):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
@@ -302,23 +340,41 @@ def check_directory_lease(exe, etl, pin, parent):
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        assert run(exe, etl, pin, rc=1)["status"] == "source_unavailable"
+        assert run(exe, etl, pin, rc=1, switches=switches)["status"] == "source_unavailable"
     finally:
         kernel.CloseHandle(handle)
+
+
+def check_output_alias(exe, command, etl, pin, folder):
+    # The writable stdout hard link must not receive even an error report.
+    size = etl.stat().st_size
+    hardlink = folder / "same-source.bin"
+    os.link(etl, hardlink)
+    with hardlink.open("ab", buffering=0) as redirected:
+        result = subprocess.run([exe, command, etl, "--sha256", pin],
+                                stdout=redirected, stderr=subprocess.PIPE, timeout=30)
+    assert result.returncode != 0 and etl.stat().st_size == size
+    with etl.open("rb") as f:
+        assert hashlib.file_digest(f, "sha256").hexdigest() == pin
+
+
+def page_cases(count, all_pages):
+    pages = [(0, 64), (0, 1), (min(1, count), 128), (count // 2, 128),
+             (max(0, count - 3), 128), (count, 1)]
+    if all_pages:
+        pages.extend((offset, 128) for offset in range(0, count, 128))
+    return pages
 
 
 def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_threads, join_images):
     size = etl.stat().st_size
     with etl.open("rb") as f:
         assert hashlib.file_digest(f, "sha256").hexdigest() == pin
-    records, samples, threads, images = oracle(etl, folder, join_images)
+    records, samples, threads, images, _ = oracle(etl, folder, join_images)
     evidence_args = ["--image-evidence"] if join_images else (["--thread-evidence"] if join_threads else [])
     join_threads = join_threads or join_images
     assert len(samples) == expected_count, (len(samples), expected_count)
-    pages = [(0, 64), (0, 1), (min(1, len(samples)), 128), (len(samples) // 2, 128),
-             (max(0, len(samples) - 3), 128), (len(samples), 1)]
-    if all_pages:
-        pages.extend((offset, 128) for offset in range(0, len(samples), 128))
+    pages = page_cases(len(samples), all_pages)
     compared, compared_images = {}, {}
     for after, limit in pages:
         # The first call exercises the defaults, subsequent calls explicit paging.
@@ -367,15 +423,7 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     missing = folder / "missing.etl"
     assert run(exe, missing, pin, rc=1)["status"] == "source_unavailable"
     check_directory_lease(exe, etl, pin, folder)
-    # The writable stdout hard link must not receive even an error report.
-    hardlink = folder / "same-source.bin"
-    os.link(etl, hardlink)
-    with hardlink.open("ab", buffering=0) as redirected:
-        result = subprocess.run([exe, "--etl-profile", etl, "--sha256", pin],
-                                stdout=redirected, stderr=subprocess.PIPE, timeout=30)
-    assert result.returncode != 0 and etl.stat().st_size == size
-    with etl.open("rb") as f:
-        assert hashlib.file_digest(f, "sha256").hexdigest() == pin
+    check_output_alias(exe, "--etl-profile", etl, pin, folder)
     if join_images:
         print("Image events:", len(images.by_ordinal), "Sample relations:", dict(Counter(compared_images.values())))
     if join_threads:
@@ -383,24 +431,93 @@ def exercise(exe, etl, pin, expected_count, folder, all_pages, short_tail, join_
     print(f"ETL profile passed. {records} events, {len(samples)} CPU samples, {len(compared)} distinct sample rows compared.")
 
 
+def exercise_switches(exe, etl, pin, expected_count, folder, all_pages, short_tail):
+    with etl.open("rb") as source:
+        assert hashlib.file_digest(source, "sha256").hexdigest() == pin
+    records, _, _, _, expected = oracle(etl, folder, False, want_switches=True)
+    assert len(expected) == expected_count, (len(expected), expected_count)
+    compared = set()
+    for after, limit in page_cases(expected_count, all_pages):
+        options = [] if (after, limit) == (0, 64) else ["--limit", limit, "--after", after]
+        report = run(exe, etl, pin, *options, switches=True)
+        assert report["status"] == "read" and report["source_sha256"] == pin and report["source_bytes"] == etl.stat().st_size
+        assert (report["provider_guid"], report["event_id"], report["opcode"], report["versions"]) == (
+            "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c", 0, 36, [2, 3, 4])
+        assert (report["records_seen"], report["decoded_switches"], report["unsupported_switch_records"]) == (records, expected_count, 0)
+        assert "samples" not in report and report["after"] == after
+        assert report["next_after"] == (after + limit if after + limit < expected_count else None)
+        assert report["qualification"] == dict(evidence="reported_context_switch", producer_authenticity="unverified",
+                                              thread_lifetime=None, process_generation=None, wait_duration=None, wait_time_unit=None,
+                                              capture_enable_flags=None, capture_privilege=None, stack_capture_policy=None)
+        header = report["log_header"]
+        assert header["events_lost"] >= 0 and header["buffers_lost"] >= 0 and report["loss_marker_records"] >= 0
+        if report["buffer_comparison"] == "matched":
+            assert report["buffers_processed"] == header["buffers_written"]
+        else:
+            assert report["buffer_comparison"] == "not_comparable"
+        rows = report["switches"]
+        assert len(rows) == len(expected[after:after + limit])
+        for seq, row in enumerate(rows, after + 1):
+            fields = (row["record_ordinal"], int(row["raw_timestamp"]), row["cpu"], row["header_process_id"], row["header_thread_id"],
+                      int(row["event_keyword"], 0), row["event_channel"], row["event_level"], row["event_task"], row["version"],
+                      row["new_thread_id"], row["old_thread_id"], row["new_priority"], row["old_priority"], row["previous_c_state"],
+                      row["spare_byte"], row["old_wait_reason"], row["old_wait_mode"], row["thread_flags"], row["old_state"],
+                      row["old_wait_ideal_processor"], row["new_wait_time"], row["reserved_field"])
+            assert row["switch_ordinal"] == seq and fields == expected[seq - 1], ("switch field mismatch", seq,
+                [i for i, pair in enumerate(zip(fields, expected[seq - 1])) if pair[0] != pair[1]])
+            assert row["cpu_field"] == ("processor_index" if row["header_flags"] & 0x200 else "processor_number")
+            assert row["pointer_bytes"] in (4, 8) and 0 <= row["stack_extension_items"] <= row["extended_data_items"]
+            compared.add(seq)
+    if all_pages:
+        assert len(compared) == expected_count
+    if short_tail:
+        trimmed = folder / "short-tail.etl"
+        shutil.copyfile(etl, trimmed)
+        with trimmed.open("r+b") as out:
+            out.truncate(etl.stat().st_size - 1)
+        with trimmed.open("rb") as f:
+            short_pin = hashlib.file_digest(f, "sha256").hexdigest()
+        partial = run(exe, trimmed, short_pin, "--limit", 1, switches=True, rc=1)
+        assert partial["status"] == "partial" and partial["buffer_comparison"] == "fewer_than_declared"
+        assert partial["buffers_processed"] < partial["log_header"]["buffers_written"] and partial["records_seen"] < records
+    wrong = ("0" if pin[0] != "0" else "1") + pin[1:]
+    assert run(exe, etl, wrong, switches=True, rc=1)["status"] == "digest_mismatch"
+    assert run(exe, etl, pin, "--after", expected_count + 1, switches=True, rc=1)["status"] == "cursor_out_of_range"
+    assert run(exe, folder / "missing.etl", pin, switches=True, rc=1)["status"] == "source_unavailable"
+    for options in (("--thread-evidence",), ("--image-evidence",), ("--limit", 0), ("--limit", 129), ("--after", "-1")):
+        run(exe, etl, pin, *options, switches=True, rc=2)
+    check_directory_lease(exe, etl, pin, folder, switches=True)
+    check_output_alias(exe, "--etl-switches", etl, pin, folder)
+    print(f"ETL switches passed. {records} events, {expected_count} switches, {len(compared)} distinct switch rows compared.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--etl", type=Path, required=True, help="Saved trace for the independent decoder")
     parser.add_argument("--sha256", required=True)
-    parser.add_argument("--expect-samples", type=int, required=True)
+    counts = parser.add_mutually_exclusive_group(required=True)
+    counts.add_argument("--expect-samples", type=int)
+    counts.add_argument("--expect-switches", type=int, help="Check the standalone saved context-switch command")
     parser.add_argument("--thread-evidence", action="store_true", help="Compare the source-local thread records for each sample")
     parser.add_argument("--image-evidence", action="store_true", help="Compare same-process image ranges and their source records")
     parser.add_argument("--all-pages", action="store_true", help="Compare every decoded sample in 128-row pages")
     parser.add_argument("--check-short-tail", action="store_true",
                         help="For fixtures with a populated last buffer, require detection after removing its last byte")
     args = parser.parse_args()
+    if args.expect_switches is not None and (args.thread_evidence or args.image_evidence):
+        parser.error("Thread and image joins apply to sampled profiles.")
     with tempfile.TemporaryDirectory(prefix="kn-etl-profile-") as directory:
         folder = Path(directory)
         (folder / "source").mkdir()
         etl = folder / "source" / "input.etl"
         shutil.copyfile(args.etl, etl)
-        exercise(args.exe.resolve(strict=True), etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail, args.thread_evidence, args.image_evidence)
+        exe = args.exe.resolve(strict=True)
+        if args.expect_switches is not None:
+            exercise_switches(exe, etl, args.sha256.lower(), args.expect_switches, folder, args.all_pages, args.check_short_tail)
+        else:
+            exercise(exe, etl, args.sha256.lower(), args.expect_samples, folder, args.all_pages, args.check_short_tail,
+                     args.thread_evidence, args.image_evidence)
 
 
 if __name__ == "__main__":

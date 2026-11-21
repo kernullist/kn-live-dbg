@@ -110,6 +110,32 @@ unsupported image boundary withholds paired RVAs. The index retains at most
 `retention` identifies the exhausted limit, the command returns `partial`
 and all image lookups report `index_limit`.
 
+## Saved Windows context switches
+
+`KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`
+reads classic Thread provider opcode 36 from a saved ETL. The
+`kn.etl_switches.v1` page uses the same pinned input, raw clock, file and
+event limits, buffer accounting and exit codes as the CPU profile reader.
+`switch_ordinal` counts decoded switches. `record_ordinal` locates the
+original event among all callbacks. Use `next_after` with the same digest to
+page in original order. A trace can contain context switches even when CPU
+sampling was disabled. [Windows CSwitch class](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch)
+
+The decoder accepts the 24-byte version-2, version-3 and version-4 layouts.
+Each row contains the outgoing and incoming thread IDs and priorities,
+previous C-state, spare byte, outgoing wait reason, state and ideal processor,
+incoming wait-time field and reserved value. Byte 13 is the signed
+`old_wait_mode` in version 2 and the raw `thread_flags` byte in versions 3
+and 4. The other field is null. The event header supplies CPU, timestamp,
+logger ID, descriptor, stack-extension count and separate header PID/TID.
+
+`decoded_switches` and `unsupported_switch_records` count the supported
+and unsupported records for this provider and opcode. A valid trace with
+zero decoded switches returns an empty page. The raw `new_wait_time` has
+no assigned time unit in this report. A thread's wait duration, creation
+identity and process generation require more evidence. Keep the ETL and
+its switch reports private.
+
 ## Normalized execution trace import
 
 This adapter reads local normalized JSON.

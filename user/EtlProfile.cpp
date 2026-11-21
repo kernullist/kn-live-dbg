@@ -1,6 +1,7 @@
 #include "EtlProfile.h"
 #include "EtlThreadEvidence.h"
 #include "EtlImageEvidence.h"
+#include "EtlSwitchRecord.h"
 #include "ArtifactOutput.h"
 #include "RuntimeCapabilities.h"
 
@@ -22,10 +23,11 @@ namespace
         uint32_t after = 0;
         uint32_t limit = 64;
         std::wstring digest;
-        bool threads = false, images = false;
+        bool switches = false, threads = false, images = false;
         bool WithThreads() const { return threads || images; }
         const wchar_t* Prefix() const
         {
+            if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
             if (images) { return L"{\"schema\":\"kn.etl_profile.v3\",\"status\":"; }
             return threads ? L"{\"schema\":\"kn.etl_profile.v2\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v1\",\"status\":";
         }
@@ -56,8 +58,8 @@ namespace
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
         {
-            if (args[i] == L"--thread-evidence" && !options.threads) { options.threads = true; continue; }
-            if (args[i] == L"--image-evidence" && !options.images) { options.images = true; continue; }
+            if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
+            if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
             { haveAfter = true; }
@@ -74,10 +76,11 @@ namespace
         Options options;
         etl_profile::ThreadIndex threadIndex;
         etl_profile::ImageIndex imageIndex;
-        uint32_t records = 0, samples = 0, unsupported = 0, lossMarkers = 0;
+        uint32_t records = 0, decoded = 0, unsupported = 0, lossMarkers = 0;
         uint64_t processedBuffers = 0;
         bool budgetExceeded = false;
         std::array<Sample, MaxPage> page{};
+        std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
         size_t used = 0;
     };
 
@@ -91,15 +94,19 @@ namespace
         const auto& h = event->EventHeader;
         if (IsEqualGUID(h.ProviderId, LostEvent) && (h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) &&
             h.EventDescriptor.Opcode >= 32 && h.EventDescriptor.Opcode <= 34) { ++scan.lossMarkers; }
-        Sample* row = scan.samples >= scan.options.after && scan.used < scan.options.limit ? &scan.page[scan.used] : nullptr;
-        const auto match = etl_profile::Decode(*event, row);
-        if (match == etl_profile::Match::Other) { return; }
-        if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; return; }
-        ++scan.samples;
-        if (row)
+        const bool keep = scan.decoded >= scan.options.after && scan.used < scan.options.limit;
+        const auto match = scan.options.switches ?
+            etl_profile::DecodeSwitch(*event, keep ? &scan.switchPage[scan.used] : nullptr) :
+            etl_profile::Decode(*event, keep ? &scan.page[scan.used] : nullptr);
+        if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
+        if (match != etl_profile::Match::Decoded) { return; }
+        ++scan.decoded;
+        if (keep)
         {
-            row->ordinal = scan.samples;
-            row->record = scan.records;
+            etl_profile::RecordEnvelope& row = scan.options.switches ?
+                static_cast<etl_profile::RecordEnvelope&>(scan.switchPage[scan.used]) : scan.page[scan.used];
+            row.ordinal = scan.decoded;
+            row.record = scan.records;
             ++scan.used;
         }
     }
@@ -200,20 +207,45 @@ namespace
         return result + L"]}";
     }
 
-    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread, const std::wstring& image = {})
+    std::wstring RecordLocationJson(const etl_profile::RecordEnvelope& s)
     {
-        return L"{\"sample_ordinal\":" + std::to_wstring(s.ordinal) + L",\"record_ordinal\":" + std::to_wstring(s.record) +
+        return L",\"record_ordinal\":" + std::to_wstring(s.record) +
             L",\"raw_timestamp\":" + Quote(std::to_wstring(s.timestamp)) + L",\"cpu\":" + std::to_wstring(s.cpu) +
-            L",\"cpu_field\":" + Quote((s.flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) ? L"processor_index" : L"processor_number") +
-            L",\"instruction_pointer\":" + Hex(s.ip) + L",\"sampled_thread_id\":" + std::to_wstring(s.tid) +
-            L",\"count_field\":" + std::to_wstring(s.count) + L",\"reserved_field\":" + std::to_wstring(s.reserved) +
-            L",\"pointer_bytes\":" + std::to_wstring(s.width) + L",\"header_thread_id\":" + std::to_wstring(s.headerTid) +
+            L",\"cpu_field\":" + Quote((s.flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) ? L"processor_index" : L"processor_number");
+    }
+
+    std::wstring RecordHeaderJson(const etl_profile::RecordEnvelope& s)
+    {
+        return L",\"pointer_bytes\":" + std::to_wstring(s.width) + L",\"header_thread_id\":" + std::to_wstring(s.headerTid) +
             L",\"header_process_id\":" + std::to_wstring(s.headerPid) + L",\"header_flags\":" + std::to_wstring(s.flags) +
             L",\"logger_id\":" + std::to_wstring(s.loggerId) + L",\"event_keyword\":" + Hex(s.keyword) +
             L",\"event_level\":" + std::to_wstring(s.level) + L",\"event_channel\":" + std::to_wstring(s.channel) +
             L",\"event_task\":" + std::to_wstring(s.task) + L",\"extended_data_items\":" + std::to_wstring(s.extendedItems) +
-            L",\"stack_extension_items\":" + std::to_wstring(s.stackItems) +
+            L",\"stack_extension_items\":" + std::to_wstring(s.stackItems);
+    }
+
+    std::wstring SampleJson(const Sample& s, const etl_profile::ThreadPair* thread, const std::wstring& image = {})
+    {
+        return L"{\"sample_ordinal\":" + std::to_wstring(s.ordinal) + RecordLocationJson(s) +
+            L",\"instruction_pointer\":" + Hex(s.ip) + L",\"sampled_thread_id\":" + std::to_wstring(s.tid) +
+            L",\"count_field\":" + std::to_wstring(s.count) + L",\"reserved_field\":" + std::to_wstring(s.reserved) +
+            RecordHeaderJson(s) +
             (thread ? ThreadPairJson(*thread) : L"") + image + L"}";
+    }
+
+    std::wstring SwitchJson(const etl_profile::SwitchEvent& s)
+    {
+        const auto& f = s.fields;
+        return L"{\"switch_ordinal\":" + std::to_wstring(s.ordinal) + RecordLocationJson(s) +
+            L",\"version\":" + std::to_wstring(s.version) + L",\"new_thread_id\":" + std::to_wstring(f.newTid) +
+            L",\"old_thread_id\":" + std::to_wstring(f.oldTid) + L",\"new_priority\":" + std::to_wstring(f.newPriority) +
+            L",\"old_priority\":" + std::to_wstring(f.oldPriority) + L",\"previous_c_state\":" + std::to_wstring(f.previousCState) +
+            L",\"spare_byte\":" + std::to_wstring(f.spare) + L",\"old_wait_reason\":" + std::to_wstring(f.oldWaitReason) +
+            L",\"old_wait_mode\":" + (s.version == 2 ? std::to_wstring(f.modeOrFlags) : L"null") +
+            L",\"thread_flags\":" + (s.version >= 3 ? std::to_wstring(static_cast<uint8_t>(f.modeOrFlags)) : L"null") +
+            L",\"old_state\":" + std::to_wstring(f.oldState) + L",\"old_wait_ideal_processor\":" + std::to_wstring(f.idealProcessor) +
+            L",\"new_wait_time\":" + std::to_wstring(f.newWaitTime) + L",\"reserved_field\":" + std::to_wstring(f.reserved) +
+            RecordHeaderJson(s) + L"}";
     }
 
     int Failure(const Options& options, const wchar_t* status, const std::wstring& digest = {}, DWORD error = 0)
@@ -253,7 +285,9 @@ namespace
             accounting == BufferAccounting::More ? L"more_than_declared" : L"not_comparable";
         auto result = std::wstring(scan.options.Prefix()) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
             L",\"source_bytes\":" + std::to_wstring(source.Bytes()) +
-            L",\"provider_guid\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\",\"event_id\":0,\"opcode\":46,\"version\":2" +
+            (scan.options.switches ?
+                L",\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcode\":36,\"versions\":[2,3,4]" :
+                L",\"provider_guid\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\",\"event_id\":0,\"opcode\":46,\"version\":2") +
             L",\"clock\":{\"raw_type\":" + std::to_wstring(h.ReservedFlags) + L",\"kind\":" + Quote(clock) +
             L",\"header_perf_frequency\":" + Quote(std::to_wstring(h.PerfFreq.QuadPart)) + L"}" +
             L",\"log_header\":{\"pointer_bytes\":" + std::to_wstring(h.PointerSize) + L",\"processors\":" + std::to_wstring(h.NumberOfProcessors) +
@@ -261,16 +295,30 @@ namespace
             L",\"end_filetime\":" + Quote(std::to_wstring(h.EndTime.QuadPart)) +
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
-            L",\"qualification\":{\"evidence\":\"reported_cpu_sample\",\"producer_authenticity\":\"unverified\","
+            (scan.options.switches ?
+                L",\"qualification\":{\"evidence\":\"reported_context_switch\",\"producer_authenticity\":\"unverified\","
+                L"\"thread_lifetime\":null,\"process_generation\":null,\"wait_duration\":null,\"wait_time_unit\":null,"
+                L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"capture_privilege\":null}" :
+                L",\"qualification\":{\"evidence\":\"reported_cpu_sample\",\"producer_authenticity\":\"unverified\","
             L"\"verified_level\":\"unqualified\",\"sampled_process_id\":null,\"thread_lifetime\":null,"
             L"\"address_space\":null,\"vm\":null,\"vtl\":null,\"code_version\":null,\"capture_privilege\":null,"
-            L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"sample_loss_intervals\":null}" +
-            L",\"records_seen\":" + std::to_wstring(scan.records) + L",\"decoded_samples\":" + std::to_wstring(scan.samples) +
+            L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"sample_loss_intervals\":null}") +
+            L",\"records_seen\":" + std::to_wstring(scan.records) + (scan.options.switches ? L",\"decoded_switches\":" : L",\"decoded_samples\":") + std::to_wstring(scan.decoded) +
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
-            L",\"unsupported_profile_records\":" + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
-            L",\"next_after\":" + (scan.used && scan.page[scan.used - 1].ordinal < scan.samples ?
-                std::to_wstring(scan.page[scan.used - 1].ordinal) : L"null");
+            (scan.options.switches ? L",\"unsupported_switch_records\":" : L",\"unsupported_profile_records\":") + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
+            L",\"next_after\":" + (scan.used && scan.options.after + scan.used < scan.decoded ?
+                std::to_wstring(scan.options.after + scan.used) : L"null");
+        if (scan.options.switches)
+        {
+            result += L",\"switches\":[";
+            for (size_t i = 0; i < scan.used; ++i)
+            {
+                if (i) { result += L','; }
+                result += SwitchJson(scan.switchPage[i]);
+            }
+            return result + L"]}";
+        }
         if (scan.options.WithThreads())
         {
             result += L",\"thread_source\":{\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"version\":3,"
@@ -321,13 +369,16 @@ namespace
     }
 }
 
-int RunEtlProfile(const std::vector<std::wstring>& args)
+static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
 {
     Scan scan;
+    scan.options.switches = switches;
     if (!Parse(args, scan.options))
     {
-        return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence]\n";
+        return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args[0], [switches] {
+            std::wcerr << (switches ?
+                L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128]\n" :
+                L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence]\n");
             return 2;
         });
     }
@@ -368,7 +419,17 @@ int RunEtlProfile(const std::vector<std::wstring>& args)
     const auto accounting = AccountBuffers(scan, log.LogfileHeader);
     const bool partial = Partial(scan, accounting);
     if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
-    if (!partial && scan.options.after > scan.samples) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (!partial && scan.options.after > scan.decoded) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     return WriteCapabilityJson(Report(scan, log.LogfileHeader, source, accounting)) ? (partial ? 1 : 0) : 2;
+}
+
+int RunEtlProfile(const std::vector<std::wstring>& args)
+{
+    return ReadSavedEtl(args, false);
+}
+
+int RunEtlSwitches(const std::vector<std::wstring>& args)
+{
+    return ReadSavedEtl(args, true);
 }

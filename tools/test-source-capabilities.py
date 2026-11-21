@@ -196,6 +196,10 @@ def main():
     trace = by_key[("execution", "trace_import", "trace")]
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
+    switches = by_key[("execution", "context_switch", "etl")]
+    assert switches["implementation"] == "implemented" and switches["consistency"] == "reported_scheduler_event"
+    assert "classic_thread_opcode36_versions2_3_4" in switches["requirements"]
+    assert "no_wait_duration_or_thread_lifetime" in switches["limits"]
     profile = by_key[("execution", "cpu_profile", "etl")]
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]
@@ -229,6 +233,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
+    assert "--etl-switches" in help_result.stdout
     assert "--etl-profile" in help_result.stdout and "--image-evidence" in help_result.stdout
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout

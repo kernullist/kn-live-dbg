@@ -4887,6 +4887,34 @@ checks and 93 normalized controls. The latter used the interceptor override
 described above and emitted the startup warning. Fourteen saved v1/v2 pages
 matched their earlier output byte for byte.
 
+### Context-switch trace comparison
+
+The ETWAnalyzer test archive with SHA-256
+`a9e12312f53036bfab01778fa0de183cbca80362376e2b46fbe525a3b233ed94`
+contains a 94,896,128-byte ETL with SHA-256
+`b4cf77219bacbe8b7ed9467e2b499962cc679373cf141eaae8c25c23bdc7fb23`.
+Windows delivered 877,318 events in 181 sequential buffers, including 168,474
+version-4 context switches. The event and buffer loss counters were zero.
+[ETWAnalyzer test archives at the tested revision](https://github.com/Siemens-Healthineers/ETWAnalyzer/tree/959689ea85c8a0702add801336c00c3ee0e01052/ETWAnalyzer_uTest/TestData)
+
+```powershell
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-switches 168474 --all-pages --check-short-tail
+```
+
+The 2026-11-22 comparison uses the Windows `tracerpt -rts` named fields.
+It checks the callback and switch ordinals, raw tick, CPU, header IDs and
+descriptor, version and all 12 scheduler payload fields for each switch.
+Some unrelated text in this Windows export used the local code page. For
+switch comparisons the checker reads the ASCII identifiers and requires
+numeric payloads to be ASCII, preserving the event order. The x64 PerfView
+fixture and the 23-event control supply zero-switch comparisons. The native
+harness covers all three schema versions, both pointer widths, unaligned
+payloads, signed bytes, flags, stack extensions and malformed headers.
+
+The raw switch evidence leaves thread generations, elapsed running or
+waiting intervals and cause of a wait unresolved. The public trace comparison
+covers version 4. Version 2 and 3 coverage uses constructed records.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

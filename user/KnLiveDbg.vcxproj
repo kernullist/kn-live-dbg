@@ -465,6 +465,7 @@
     <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />
+    <ClInclude Include="EtlSwitchRecord.h" />
     <ClInclude Include="WheaRecord.h" />
     <ClInclude Include="WheaEvent.h" />
     <ClInclude Include="IoLifecycleCapture.h" />

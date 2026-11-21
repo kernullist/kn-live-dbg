@@ -492,6 +492,9 @@
     <ClInclude Include="EtlImageEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlSwitchRecord.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="WheaRecord.h">
       <Filter>Header Files</Filter>
     </ClInclude>

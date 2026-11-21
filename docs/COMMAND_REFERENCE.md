@@ -965,6 +965,22 @@ original file names. [Image evidence fields](TRACE_IMPORT.md#locate-image-record
 & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 8 --image-evidence
 ```
 
+### Inspect context switches from a saved ETL
+
+```powershell
+$etl = Get-Item .\capture.etl
+$pin = (Get-FileHash -LiteralPath $etl.FullName -Algorithm SHA256).Hash
+$page = & KnLiveDbg.exe --etl-switches $etl.FullName --sha256 $pin --limit 64 | ConvertFrom-Json
+if ($null -ne $page.next_after) {
+    & KnLiveDbg.exe --etl-switches $etl.FullName --sha256 $pin --after $page.next_after --limit 64
+}
+```
+
+Each switch identifies the recorded CPU and outgoing and incoming TIDs.
+Inspect `version` before interpreting `old_wait_mode` or `thread_flags`.
+The raw timestamps and `new_wait_time` have distinct meanings.
+[Switch fields and limits](TRACE_IMPORT.md#saved-windows-context-switches)
+
 ## Whole-host hunt
 
 ```text

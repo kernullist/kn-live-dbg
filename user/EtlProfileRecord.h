@@ -8,15 +8,22 @@
 namespace etl_profile
 {
     inline constexpr GUID PerfInfo = {0xce1dbfb4, 0x137e, 0x4da6, {0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}};
+    inline constexpr GUID ThreadProvider = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
 
-    struct Sample
+    struct RecordEnvelope
     {
-        uint32_t ordinal, record, tid, headerTid, headerPid, cpu;
-        uint16_t flags, count, reserved, extendedItems, stackItems, loggerId;
+        uint32_t ordinal, record, headerTid, headerPid, cpu;
+        uint16_t flags, extendedItems, stackItems, loggerId, task;
         uint8_t width, channel, level;
-        uint16_t task;
-        uint64_t ip, keyword;
+        uint64_t keyword;
         int64_t timestamp;
+    };
+
+    struct Sample : RecordEnvelope
+    {
+        uint32_t tid;
+        uint16_t count, reserved;
+        uint64_t ip;
     };
 
     enum class Match { Other, Unsupported, Decoded };
@@ -54,6 +61,31 @@ namespace etl_profile
         }
     }
 
+    inline void ReadEnvelope(const EVENT_RECORD& event, uint8_t width, RecordEnvelope& row)
+    {
+        const auto& h = event.EventHeader;
+        const auto& d = h.EventDescriptor;
+        row.width = width;
+        row.timestamp = h.TimeStamp.QuadPart;
+        row.cpu = GetEventProcessorIndex(&event);
+        row.headerTid = h.ThreadId;
+        row.headerPid = h.ProcessId;
+        row.flags = h.Flags;
+        row.keyword = d.Keyword;
+        row.level = d.Level;
+        row.channel = d.Channel;
+        row.task = d.Task;
+        row.extendedItems = event.ExtendedDataCount;
+        row.stackItems = 0;
+        row.loggerId = event.BufferContext.LoggerId;
+        for (USHORT i = 0; i < event.ExtendedDataCount; ++i)
+        {
+            const auto type = event.ExtendedData[i].ExtType;
+            if (type == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 || type == EVENT_HEADER_EXT_TYPE_STACK_TRACE64)
+            { ++row.stackItems; }
+        }
+    }
+
     // Windows supplies the EVENT_RECORD envelope. Only PerfInfo_V2 /
     // SampledProfile has the layout below. The consumer's bitness is irrelevant.
     inline Match Decode(const EVENT_RECORD& event, Sample* output)
@@ -67,29 +99,12 @@ namespace etl_profile
         if (!output) { return Match::Decoded; }
         auto& row = *output;
         row = {};
-        row.width = width;
         const auto payload = static_cast<const uint8_t*>(event.UserData);
         std::memcpy(&row.ip, payload, width);
         std::memcpy(&row.tid, payload + width, sizeof(row.tid));
         std::memcpy(&row.count, payload + width + 4, sizeof(row.count));
         std::memcpy(&row.reserved, payload + width + 6, sizeof(row.reserved));
-        row.timestamp = h.TimeStamp.QuadPart;
-        row.cpu = GetEventProcessorIndex(&event);
-        row.headerTid = h.ThreadId;
-        row.headerPid = h.ProcessId;
-        row.flags = h.Flags;
-        row.keyword = d.Keyword;
-        row.level = d.Level;
-        row.channel = d.Channel;
-        row.task = d.Task;
-        row.extendedItems = event.ExtendedDataCount;
-        row.loggerId = event.BufferContext.LoggerId;
-        for (USHORT i = 0; i < event.ExtendedDataCount; ++i)
-        {
-            const auto type = event.ExtendedData[i].ExtType;
-            if (type == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 || type == EVENT_HEADER_EXT_TYPE_STACK_TRACE64)
-            { ++row.stackItems; }
-        }
+        ReadEnvelope(event, width, row);
         return Match::Decoded;
     }
 }

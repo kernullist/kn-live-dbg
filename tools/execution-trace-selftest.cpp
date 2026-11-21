@@ -1,6 +1,7 @@
 #include "../user/ExecutionTrace.h"
 #include "../user/EtlThreadEvidence.h"
 #include "../user/EtlImageEvidence.h"
+#include "../user/EtlSwitchRecord.h"
 
 #include <array>
 
@@ -353,11 +354,85 @@ static bool CheckImageEvidence()
     return is(lookup(), L"conflicting_transitions");
 }
 
+static bool CheckSwitchRecord()
+{
+    using namespace etl_profile;
+    std::array<uint8_t, 25> storage{
+        0xee, 0x78, 0x56, 0x34, 0x12, 0x98, 0xba, 0xdc, 0xfe,
+        0xff, 0x7f, 0xa5, 0xf0, 0x80, 0x86, 5, 0xff,
+        1, 2, 3, 4, 0xff, 0xfe, 0xfd, 0xfc
+    };
+    EVENT_RECORD event{};
+    event.UserData = storage.data() + 1;
+    event.UserDataLength = 24;
+    auto& h = event.EventHeader;
+    h.ProviderId = ThreadProvider;
+    h.EventDescriptor.Opcode = 36;
+    h.ThreadId = 87;
+    h.ProcessId = 92;
+    h.TimeStamp.QuadPart = 1234;
+    EVENT_HEADER_EXTENDED_DATA_ITEM ext{};
+    ext.ExtType = EVENT_HEADER_EXT_TYPE_STACK_TRACE32;
+    event.ExtendedData = &ext;
+    event.ExtendedDataCount = 1;
+    SwitchEvent point{};
+    for (const uint8_t width : {uint8_t{4}, uint8_t{8}})
+    {
+        h.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | (width == 4 ? EVENT_HEADER_FLAG_32_BIT_HEADER :
+            EVENT_HEADER_FLAG_64_BIT_HEADER | EVENT_HEADER_FLAG_PROCESSOR_INDEX);
+        event.BufferContext.ProcessorIndex = width == 4 ? 31 : 301;
+        event.BufferContext.LoggerId = 29;
+        for (uint8_t version = 2; version <= 4; ++version)
+        {
+            h.EventDescriptor.Version = version;
+            if (DecodeSwitch(event, nullptr) != Match::Decoded || DecodeSwitch(event, &point) != Match::Decoded) { return false; }
+            const auto& f = point.fields;
+            if (point.version != version || point.timestamp != 1234 || point.headerTid != 87 || point.headerPid != 92 ||
+                point.cpu != (width == 4 ? 31u : 301u) || point.width != width || point.loggerId != 29 ||
+                point.stackItems != 1 || point.extendedItems != 1 || point.flags != h.Flags ||
+                f.newTid != 0x12345678u || f.oldTid != 0xfedcba98u || f.newPriority != -1 ||
+                f.oldPriority != 127 || f.previousCState != 0xa5 || f.spare != -16 ||
+                f.oldWaitReason != -128 || f.modeOrFlags != -122 || f.oldState != 5 ||
+                f.idealProcessor != -1 || f.newWaitTime != 0x04030201u || f.reserved != 0xfcfdfeffu) { return false; }
+        }
+    }
+    auto bad = event;
+    bad.ExtendedData = nullptr;
+    if (DecodeSwitch(bad, nullptr) != Match::Unsupported) { return false; }
+    bad = event;
+    bad.UserData = nullptr;
+    if (DecodeSwitch(bad, &point) != Match::Unsupported) { return false; }
+    bad = event;
+    for (USHORT length : {USHORT{0}, USHORT{23}, USHORT{25}, USHORT{65535}})
+    {
+        bad.UserDataLength = length;
+        if (DecodeSwitch(bad, nullptr) != Match::Unsupported) { return false; }
+    }
+    bad = event;
+    bad.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
+    if (DecodeSwitch(bad, &point) != Match::Unsupported) { return false; }
+    bad = event;
+    bad.EventHeader.EventDescriptor.Id = 1;
+    if (DecodeSwitch(bad, &point) != Match::Unsupported) { return false; }
+    bad = event;
+    for (uint8_t version : {uint8_t{0}, uint8_t{1}, uint8_t{5}})
+    {
+        bad.EventHeader.EventDescriptor.Version = version;
+        if (DecodeSwitch(bad, nullptr) != Match::Unsupported) { return false; }
+    }
+    bad = event;
+    bad.EventHeader.ProviderId = PerfInfo;
+    if (DecodeSwitch(bad, &point) != Match::Other) { return false; }
+    bad = event;
+    bad.EventHeader.EventDescriptor.Opcode = 3;
+    return DecodeSwitch(bad, nullptr) == Match::Other;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
-        return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() ? 0 : 1;
+        return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() && CheckSwitchRecord() ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

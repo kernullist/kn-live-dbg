@@ -1002,6 +1002,15 @@ file name and PE metadata. Binding those records to a process generation,
 an address space and retained executable bytes is a separate step.
 [ETL image evidence](TRACE_IMPORT.md#locate-image-records-for-a-sampled-ip)
 
+`--etl-switches` uses the same pinned input and raw ETW callbacks to page
+through Thread/CSwitch v2, v3 and v4. The event header and scheduler payload
+retain their own IDs. An original record ordinal locates the switch across
+all events in the file and a switch ordinal drives paging. The decoder retains
+the wait-mode or flags byte according to the event version. The report exposes
+the incoming wait-time value as recorded. Per-thread scheduling
+intervals require additional correlation.
+[Saved context switches](TRACE_IMPORT.md#saved-windows-context-switches)
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in
