@@ -637,6 +637,61 @@ the wait. A live traversal leaves simultaneity, duration, timeout,
 cancellation and a whole-host diagnosis unresolved. WCT reserves its lock
 timeout and alertable fields. [WCT node fields](https://learn.microsoft.com/en-us/windows/win32/api/wct/ns-wct-waitchain_node_info)
 
+### Repeat a wait chain from two threads
+
+Choose two thread generations in the same process and append
+`--corroborate <peer-tid> <peer-creation-filetime> <rounds> <pause-ms>`.
+Request 2–8 rounds and a pause of 1–5000 ms between rounds. This PowerShell
+example uses the current shell. Save every output line together as one
+private `kn.wait_series.v1` document and hash the file you will replay.
+
+```powershell
+$target = Get-Process -Id $PID
+$roots = @($target.Threads | Sort-Object Id | Select-Object -First 2)
+if ($roots.Count -ne 2) { throw 'Two target threads are required' }
+$pc = $target.StartTime.ToUniversalTime().ToFileTimeUtc()
+$left, $right = $roots
+$lc = $left.StartTime.ToUniversalTime().ToFileTimeUtc()
+$rc = $right.StartTime.ToUniversalTime().ToFileTimeUtc()
+$receipt = & .\x64\Release\KnLiveDbg.exe --wait-chain $target.Id $pc $left.Id $lc --corroborate $right.Id $rc 4 100
+if ($LASTEXITCODE -ne 0) { throw 'Paired wait-chain capture failed' }
+$file = [IO.Path]::GetTempFileName()
+[IO.File]::WriteAllLines($file, [string[]]$receipt, [Text.Encoding]::ASCII)
+$pin = python -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" $file
+python tools/replay-wait-chain.py $file --sha256 $pin
+```
+
+Each root has a separate WCT session and one discovery pass. The controller
+retains the opened handles, samples them before and after each round, and
+queries each eligible root once. A newly seen thread without a retained
+identity ends that view's qualified chain. A single eligible root still
+produces a view. If both roots become unavailable, capture ends after that
+round. `coverage` in the replay counts issued queries and recorded rounds
+against the original plan, including the unissued slots. The largest plan
+makes two discovery calls and up to 16 measured queries. Windows controls
+the duration of each synchronous call.
+
+For each round, inspect `views` for the two findings and their paths to
+the original nodes and handles. `timing` describes the intervals sampled
+immediately around the Windows calls. The measured overlap must exceed
+two QPC ticks and agree with the millisecond witnesses.
+This margin accounts for cross-thread clock ordering. A serial fallback
+preserves the setup error and both traversal results.
+[Windows high-resolution timestamps](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
+
+A corroborated round requires both views to close the same directed cycle
+through both chosen roots, with matching thread generations and exclusive
+lock types. `repeated_groups` lists runs of consecutive corroborated rounds
+with the same cycle. Each interval between rounds must have a recorded wait
+timeout and a measured gap of at least the requested pause. Separate partial
+chains cannot close a cycle. `repeated_potential_wait_cycle` describes
+repeated observations of that configuration during the series. Earlier
+observations stay in the report after a target exits. Inspect the last
+recorded round for the evidence available at the end. WCT leaves the instant of
+provider execution, the lifetime of each lock and the duration of each
+thread's wait unknown. A deadlock diagnosis still requires evidence of the
+waits, lock lifetimes and possible exits from the cycle.
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

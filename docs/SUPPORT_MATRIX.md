@@ -70,6 +70,7 @@ backends are not implied by an x64 address width.
 | memory / read_virtual | process_handle | implemented | caller_descriptor_la48_la57;user_only;pointer_bytes_8 | handle_bound_single_read |
 | io / request_graph | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | repeated_snapshot |
 | diagnostics / wait_chain | windows_wct | implemented | not_an_address_reader | one_live_traversal |
+| diagnostics / wait_cycle_corroboration | windows_wct | implemented | not_an_address_reader | paired_live_traversals |
 | execution / classify_reference | native | implemented | collector_specific;extended_address_pipeline_unvalidated | source_metadata |
 | execution / observe_writes | vmi | unsupported | collector_specific;extended_address_pipeline_unvalidated | unavailable |
 

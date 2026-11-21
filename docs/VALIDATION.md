@@ -7,6 +7,52 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Paired Windows wait-chain observations, 2026-11-21
+
+The Windows x64 Release controller had SHA-256
+`14ddd54d49d194e791ac3533d7bec542c0c058aa047b46eb3b1a849b93898dee`.
+Two owned fixtures each formed a ring of unnamed Windows mutexes. In each
+fixture every worker held one mutex. The last worker entered its timed
+wait only after the collector flushed the first one-way round. The parent
+checked that the timed wait expired, all other workers acquired their next
+mutex, and both processes exited normally.
+
+| Final capture | Issued / planned queries | Individual cycle views | Overlapping query brackets / planned rounds | Rounds meeting both-root test | Consecutive rounds |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Two threads, one-way wait | 6 / 6 | 0 | 2 / 3 | 0 | None |
+| Three threads, one-way chain | 6 / 6 | 0 | 3 / 3 | 0 | None |
+| Two-thread cycle | 16 / 16 | 16 | 8 / 8 | 8 | 1–8 |
+| Three-thread cycle | 16 / 16 | 16 | 6 / 8 | 6 | 1–4 |
+
+An earlier four-round two-thread run returned a cycle from both roots in
+every round. Only rounds 2 and 4 had overlapping query brackets. Replay
+kept the finding at `potential_wait_cycle`. In both topology-change runs,
+the peer's original discovery lacked a thread that later closed the ring.
+Each run retained all eight queries and three individual cycle views, with
+zero corroborated rounds.
+
+A wrong peer creation time yielded two issued queries out of four planned.
+As the two-thread fixture retired, a longer series recorded five of eight
+rounds and eight of 16 planned queries. Rounds 1–3 formed a repeated
+group. The fifth round preserved both unavailable roots. A new request
+after exit recorded one of four rounds
+and zero of eight planned queries. Offline replay reproduced every original
+report in this run twice and matched five archived single-root reports byte
+for byte. Altered inputs exercised QPC ordering, serial fallback, different
+cycle membership or direction, and a timeout after observed termination.
+The live tests used mutexes. A frozen wait graph, lock lifetimes and a
+persistent deadlock remain unverified.
+[Paired capture and replay](COMMAND_REFERENCE.md#repeat-a-wait-chain-from-two-threads)
+
+All 12 wait-chain tests, 74 restricted launch checks, 55 source contracts,
+3,081 command checks and 19 public-content tests passed. Both documented
+PowerShell examples ran, the runtime capability probe passed, and the support
+matrix matched the binary. The scanner flagged all 12 private variants
+of the actual output, including detached rounds, truncated logs and UTF-16
+text. From 23:03 to 23:26 KST the host recorded zero new reboot or bugcheck
+events and zero new crash dumps. The final check found zero remaining WCT
+fixture processes, temporary fixture directories or running test drivers.
+
 ## Windows user-mode wait chains, 2026-11-21
 
 The Windows x64 Release controller had SHA-256

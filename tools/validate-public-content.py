@@ -136,15 +136,21 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
-                    "kn.wait_chain.v1", "kn.wait_assessment.v1",
+                    "kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1",
                     "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"
                 }):
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):
                 pass
-        # WCT capture and replay each write one schema-first record, possibly redirected into a log.
-        if not binary and "kn.wait_" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
-            record = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.wait_(?:chain|assessment)\.v1"\s*(?:[,}]|$)', text)
+        # WCT output may be redirected or cut between individually flushed rounds.
+        if not binary and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):
+            record = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.wait_(?:chain|assessment|series(?:_assessment)?)\.v1"\s*(?:[,}]|$)', text)
+            if not record:
+                record = re.search(r'(?m)^[ \t]*,?[ \t]*\{[ \t]*"pause"\s*:[^\r\n]*?"receipt"\s*:\s*'
+                                   r'\{\s*"schema"\s*:\s*"kn\.wait_chain\.v1"', text)
+            if not record and '"begin_qpc"' in text:
+                record = re.search(r'(?m)^[ \t]*,?[ \t]*\{[ \t]*"pause"\s*:\s*(?:null|\{[^\r\n]*?\})\s*,\s*'
+                                   r'"begin_qpc"\s*:\s*(?:null|"[0-9]+")\s*,\s*"end_qpc"\s*:', text)
             if record:
                 add("private-evidence-bundle", text.count("\n", 0, record.start()) + 1)
         # The workload emits one tagged object per reply. A transcript can

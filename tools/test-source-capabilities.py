@@ -169,6 +169,9 @@ def main():
     assert wait["availability"] == "not_probed" and wait["consistency"] == "one_live_traversal"
     assert wait["address_contract"] == "not_an_address_reader"
     assert "requested_process_and_thread_creation" in wait["requirements"] and "no_timeout_or_deadlock_proof" in wait["limits"]
+    repeat = by_key[("diagnostics", "wait_cycle_corroboration", "windows_wct")]
+    assert repeat["consistency"] == "paired_live_traversals" and repeat["address_contract"] == "not_an_address_reader"
+    assert "measured_qpc_overlap" in repeat["requirements"] and "gaps_and_missing_roots_in_denominator" in repeat["limits"]
     image_replay = by_key[("image", "replay_verification", "recipe")]
     assert "exact_recorded_claim_reproduction" in image_replay["requirements"] and "legacy_claim_not_recorded" in image_replay["limits"]
     assert "no_hard_deadline_or_measured_slo" in by_key[("scheduler", "capture_timing", "native")]["limits"]

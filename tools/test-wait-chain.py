@@ -45,12 +45,12 @@ def creation(thread):
     return str(stamps[0].dwLowDateTime | (stamps[0].dwHighDateTime << 32))
 
 
-def child():
-    locks = [mutex(None, False, None) for _ in range(2)]
+def child(participants):
+    locks = [mutex(None, False, None) for _ in range(participants)]
     if not all(locks):
         raise c.WinError(c.get_last_error())
-    ids, outcomes = [None, None], [None, None]
-    ready = threading.Barrier(3, timeout=10)
+    ids, outcomes = [None] * participants, [None] * participants
+    ready = threading.Barrier(participants + 1, timeout=10)
     phase = threading.Event()
     command = []
 
@@ -64,16 +64,18 @@ def child():
             return
         try:
             ready.wait()
-            if i == 1 and (not phase.wait(35) or command != ["cycle"]):
+            last = i == participants - 1
+            if last and (not phase.wait(35) or command != ["cycle"]):
                 return
-            outcomes[i] = wait(locks[1-i], 6000 if i else 50000)
-            if outcomes[i] == 0 and not release(locks[1-i]):
+            following = locks[(i + 1) % participants]
+            outcomes[i] = wait(following, 6000 if last else 50000)
+            if outcomes[i] == 0 and not release(following):
                 raise c.WinError(c.get_last_error())
         finally:
             if not release(locks[i]):
                 raise c.WinError(c.get_last_error())
 
-    workers = [threading.Thread(target=work, args=(i,)) for i in (0, 1)]
+    workers = [threading.Thread(target=work, args=(i,)) for i in range(participants)]
     for t in workers:
         t.start()
     try:
@@ -86,7 +88,7 @@ def child():
     finally:
         for h in locks:
             close(h)
-    return 0 if outcomes == [0, WAIT_TIMEOUT] else 1
+    return 0 if outcomes == [0] * (participants - 1) + [WAIT_TIMEOUT] else 1
 
 
 def run(argv, code=0):
@@ -118,28 +120,65 @@ def observe_until(exe, target, want_cycle):
     raise AssertionError(f"Windows did not return the expected owned wait chain (cycle={want_cycle})")
 
 
-def acquire(exe):
-    with subprocess.Popen([sys.executable, "-E", "-s", "-B", str(HERE), "--child"],
+def series_args(exe, target, count, delay, *, peer_generation=None):
+    left, right = target["threads"][:2]
+    return [str(v) for v in (exe, "--wait-chain", target["pid"], target["process_created"], *left,
+                             "--corroborate", right[0], peer_generation or right[1], count, delay)]
+
+
+def observed_transition(exe, target, fixture):
+    # Change the target only after the collector flushes its first complete round.
+    with subprocess.Popen(series_args(exe, target, 4, 150), stdout=subprocess.PIPE, stderr=subprocess.PIPE) as collector:
+        try:
+            lines = queue.Queue()
+            def read_prefix():
+                lines.put((collector.stdout.readline(), collector.stdout.readline()))
+            threading.Thread(target=read_prefix, daemon=True).start()
+            header, first = lines.get(timeout=10)
+            initial = json.loads(header + first + b"]}")
+            assert not any(v["receipt"]["query"]["cycle"] for v in initial["rounds"][0]["views"])
+            fixture.stdin.write(b"cycle\n")
+            fixture.stdin.flush()
+            tail, err = collector.communicate(timeout=12)
+            if collector.returncode:
+                raise AssertionError(f"transition capture failed: {err[-300:]!r}")
+            return header + first + tail
+        finally:
+            if collector.poll() is None:
+                collector.kill()
+                collector.wait(timeout=10)
+
+
+def acquire(exe, participants):
+    raw = {}
+    with subprocess.Popen([sys.executable, "-E", "-s", "-B", str(HERE), "--child", "--participants", str(participants)],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
         try:
             line = queue.Queue()
             threading.Thread(target=lambda: line.put(p.stdout.readline()), daemon=True).start()
             target = json.loads(line.get(timeout=12))
-            one_way = observe_until(exe, target, False)
-            wrong = capture(exe, target, pc=str(int(target["process_created"]) + 1))
-            other_thread = capture(exe, target, tc=str(int(target["threads"][0][1]) + 1))
-            p.stdin.write(b"cycle\n")
-            p.stdin.flush()
-            cycle = observe_until(exe, target, True)
+            raw["one_way"] = observe_until(exe, target, False)
+            raw["open_series"] = run(series_args(exe, target, 3, 35))
+            if participants == 2:
+                raw["wrong_process"] = capture(exe, target, pc=str(int(target["process_created"]) + 1))
+                raw["wrong_thread"] = capture(exe, target, tc=str(int(target["threads"][0][1]) + 1))
+            raw["transition"] = observed_transition(exe, target, p)
+            raw["cycle"] = observe_until(exe, target, True)
+            raw["closed_series"] = run(series_args(exe, target, 8, 50))
+            if participants == 2:
+                wrong_peer = str(int(target["threads"][1][1]) + 1)
+                raw["single_series"] = run(series_args(exe, target, 2, 25, peer_generation=wrong_peer))
+                raw["exit_series"] = run(series_args(exe, target, 8, 1100))
             out, err = p.communicate(timeout=12)
-            if p.returncode or json.loads(out) != [0, WAIT_TIMEOUT]:
+            if p.returncode or json.loads(out) != [0] * (participants - 1) + [WAIT_TIMEOUT]:
                 raise AssertionError(f"fixture outcomes differ: {p.returncode}, {out[:100]!r}, {err[-300:]!r}")
         finally:
             if p.poll() is None:
                 p.kill()
                 p.wait(timeout=10)
-    retired = capture(exe, target)
-    return target, dict(one_way=one_way, cycle=cycle, wrong_process=wrong, wrong_thread=other_thread, retired=retired)
+    raw["retired"] = capture(exe, target)
+    raw["retired_series"] = run(series_args(exe, target, 4, 25))
+    return target, raw
 
 
 class WaitTests(unittest.TestCase):
@@ -154,6 +193,238 @@ class WaitTests(unittest.TestCase):
         c = json.loads(self.original["cycle"])
         change(c)
         return self.replay(json.dumps(c, separators=(",", ":")).encode(), expected)
+
+    def check_series(self, payload, expected=0):
+        return self.replay(json.dumps(payload, separators=(",", ":")).encode(), expected)
+
+    def timed_rounds(self, count, name="closed_series"):
+        # Replace timings explicitly so scheduler jitter cannot select the verdict.
+        data = json.loads(self.original[name])
+        data.update(planned_rounds=count, qpc_hz="1000000", pause_ms=50)
+        data["rounds"] = data["rounds"][:count]
+        for i, row in enumerate(data["rounds"]):
+            base = 1_000_000 + i * 100_000
+            row.update(begin_qpc=str(base), end_qpc=str(base + 1000))
+            tick = row["views"][0]["receipt"]["query"]["start"]
+            for view, (begin, end) in zip(row["views"], ((100, 700), (250, 850))):
+                view["timing"].update(begin=str(base + begin), end=str(base + end))
+                view["receipt"]["query"].update(start=tick, end=tick)
+        return data
+
+    def test_series_native_rotation_and_evidence(self):
+        def resolve(document, pointer):
+            for field in pointer.lstrip("/").split("/"):
+                document = document[int(field) if isinstance(document, list) else field]
+            return document
+
+        for prefix, target in (("", self.target), ("triangle_", self.triangle)):
+            ids = [thread[0] for thread in target["threads"]]
+            for name, closed in (("open_series", False), ("closed_series", True)):
+                raw = self.original[prefix + name]
+                c, a = json.loads(raw), self.replay(raw)
+                self.assertEqual(a, self.replay(raw))
+                hz = int(c["qpc_hz"])
+                count = c["planned_rounds"]
+                self.assertEqual(a["coverage"]["issued_queries"], 2 * count)
+                self.assertEqual(a["coverage"]["successful_queries"], 2 * count)
+                self.assertEqual(a["coverage"]["potential_cycle_views"], 2 * count if closed else 0)
+                groups = []
+                previous_match = False
+                previous_end = None
+                matches = overlaps = 0
+                for i, (r, actual) in enumerate(zip(c["rounds"], a["rounds"]), 1):
+                    self.assertEqual(resolve(c, actual["evidence"]), r)
+                    starts, ends = [], []
+                    for root, (v, view) in enumerate(zip(r["views"], actual["views"])):
+                        self.assertEqual(resolve(c, view["receipt"]), v["receipt"])
+                        q = v["receipt"]["query"]
+                        tids = [n["tid"] for n in q["nodes"] if n["type"] == 8]
+                        self.assertEqual(tids, ids[root:] + ids[:root+1] if closed else ids[root:])
+                        self.assertEqual(q["cycle"], closed)
+                        for edge in view["edges"]:
+                            self.assertEqual(resolve(c, edge["observation"]), q)
+                            node1, node2, proc, pin = (resolve(c, p) for p in edge["evidence"])
+                            self.assertEqual([node1, node2], [q["nodes"][j] for j in edge["node_indices"]])
+                            self.assertEqual((proc["created"], pin["created"]), (target["process_created"], edge["thread_created"]))
+                        if closed:
+                            self.assertEqual(resolve(c, view["potential_cycle"]["evidence"]), q)
+                        starts.append(int(v["timing"]["begin"]))
+                        ends.append(int(v["timing"]["end"]))
+                    overlap = r["dispatch"] == "parallel" and min(ends) - max(starts) > 2
+                    match = closed and overlap
+                    self.assertEqual(actual["overlap_qpc"], [str(max(starts) + 1), str(min(ends) - 1)] if overlap else None)
+                    self.assertEqual(actual["status"] == "corroborated", match)
+                    if (previous_match and match and r["pause"]["signal"]["result"] == WAIT_TIMEOUT and
+                            (min(starts) - previous_end - 1) * 1000 >= c["pause_ms"] * hz):
+                        if groups and groups[-1][1] == i-1:
+                            groups[-1][1] = i
+                        else:
+                            groups.append([i-1, i])
+                    matches += match
+                    overlaps += overlap
+                    previous_match, previous_end = match, max(ends)
+                self.assertEqual((a["coverage"]["overlapping_rounds"], a["coverage"]["corroborated_rounds"]), (overlaps, matches))
+                self.assertEqual([[g["first_round"], g["last_round"]] for g in a["repeated_groups"]], groups)
+                for group in a["repeated_groups"]:
+                    self.assertEqual({(e["waiter_tid"], e["owner_tid"]) for e in group["relations"]},
+                                     {(tid, ids[(idx+1) % len(ids)]) for idx, tid in enumerate(ids)})
+                self.assertEqual(a["conclusion"], "repeated_potential_wait_cycle" if groups else
+                                 "potential_wait_cycle" if closed else "inconclusive")
+                for key in ("atomic_snapshot", "provider_execution_overlap_known", "wait_interval_intersection_known", "same_lock_lifetime_verified",
+                            "continuous_wait_proven", "deadlock_established", "whole_host_assessed", "collector_authenticated"):
+                    self.assertIs(a[key], False)
+
+    def test_series_changing_target_and_coverage(self):
+        for prefix in ("", "triangle_"):
+            raw = self.original[prefix + "transition"]
+            doc, a = json.loads(raw), self.replay(raw)
+            self.assertGreater(a["coverage"]["potential_cycle_views"], 0)
+            self.assertEqual(a["coverage"]["corroborated_rounds"], 0)
+            self.assertNotIn(True, [v["provider_cycle"] for v in a["rounds"][0]["views"]])
+            self.assertTrue(any(v["receipt"]["query"]["cycle"] for r in doc["rounds"][1:] for v in r["views"][1:]))
+            self.assertTrue(any(r["views"][1]["scope_boundary"] for r in a["rounds"][1:]))
+            retired = self.replay(self.original[prefix + "retired_series"])
+            self.assertEqual((retired["coverage"]["recorded_rounds"], retired["coverage"]["unissued_queries"]), (1, 8))
+        partial = self.replay(self.original["single_series"])
+        self.assertEqual((partial["coverage"]["issued_queries"], partial["coverage"]["unissued_queries"]), (2, 2))
+        self.assertEqual(partial["coverage"]["corroborated_rounds"], 0)
+        raw = self.original["exit_series"]
+        doc, a = json.loads(raw), self.replay(raw)
+        self.assertEqual(doc["rounds"][-1]["dispatch"], "unavailable")
+        cov = a["coverage"]
+        self.assertGreater(cov["issued_queries"], 0)
+        self.assertLess(cov["recorded_rounds"], cov["planned_rounds"])
+        self.assertEqual(cov["planned_queries"], cov["issued_queries"] + cov["unissued_queries"])
+
+    def test_series_timing_boundaries(self):
+        c = self.timed_rounds(3)
+        a = self.check_series(c)
+        self.assertEqual((a["conclusion"], a["repeated_groups"][0]["last_round"]), ("repeated_potential_wait_cycle", 3))
+        for separation, status in ((-3, "disjoint"), (-1, "ambiguous"), (0, "ambiguous"), (1, "ambiguous"),
+                                   (2, "ambiguous"), (3, "overlapping")):
+            sample = copy.deepcopy(c)
+            row = sample["rounds"][1]
+            row["views"][1]["timing"]["begin"] = str(int(row["views"][0]["timing"]["end"]) - separation)
+            a = self.check_series(sample)
+            self.assertEqual(a["rounds"][1]["timing"], status)
+            self.assertEqual(bool(a["repeated_groups"]), separation > 2)
+        for field in ("qpc_hz", "created", "end"):
+            sample = copy.deepcopy(c)
+            if field == "qpc_hz":
+                sample[field] = None
+            elif field == "created":
+                sample["collector"][field] = None
+            else:
+                sample["rounds"][1]["views"][1]["timing"][field] = None
+            self.assertEqual(self.check_series(sample)["repeated_groups"], [])
+        for pause, repeat in ((99, True), (100, False)):
+            sample = copy.deepcopy(c)
+            sample["pause_ms"] = pause
+            self.assertEqual(bool(self.check_series(sample)["repeated_groups"]), repeat)
+        # A failure to wait is an original Win32 outcome, even if elapsed QPC would qualify.
+        c["rounds"][1]["pause"]["signal"].update(result=4294967295, error=6)
+        self.assertEqual(self.check_series(c)["repeated_groups"][0]["first_round"], 2)
+        row = c["rounds"][1]
+        row.update(dispatch="serial_fallback", failure={"stage": "create_work", "win32_error": 8})
+        row["views"][1]["timing"].update(reader_tid=c["collector"]["coordinator_tid"], begin=row["views"][0]["timing"]["end"])
+        self.assertEqual(self.check_series(c)["rounds"][1]["timing"], "serial_fallback")
+        self.assertEqual(self.check_series(c)["repeated_groups"], [])
+
+    def test_series_independent_rings(self):
+        c = self.timed_rounds(3, "triangle_closed_series")
+        v = c["rounds"][1]["views"][1]["receipt"]
+        v["query"]["nodes"][1]["type"] = 1
+        self.assertEqual(self.check_series(c)["rounds"][1]["status"], "different_directed_cycles")
+        v["query"]["nodes"][1]["type"] = 3
+        first, second = v["query"]["nodes"][2], v["query"]["nodes"][4]
+        v["query"]["nodes"][2], v["query"]["nodes"][4] = second, first
+        self.assertEqual(self.check_series(c)["rounds"][1]["status"], "different_directed_cycles")
+        # A chain may start at a third thread and end in a two-member cycle.
+        c = self.timed_rounds(2, "triangle_closed_series")
+        for r in c["rounds"]:
+            for vi, v in enumerate(r["views"]):
+                q = v["receipt"]["query"]
+                if vi == 0:
+                    q["nodes"][-1] = copy.deepcopy(q["nodes"][2])
+                else:
+                    q["nodes"] = q["nodes"][:4] + q["nodes"][:1]
+                    q["reported"] = len(q["nodes"])
+        a = self.check_series(c)
+        self.assertTrue(all(r["status"] == "roots_outside_closed_cycle" for r in a["rounds"]))
+        c = self.timed_rounds(2, "triangle_closed_series")
+        for r in c["rounds"]:
+            owner = r["views"][0]["receipt"]["threads"][2]
+            owner["created"] = str(int(owner["created"]) + 1)
+        self.assertTrue(all(r["status"] == "different_directed_cycles" for r in self.check_series(c)["rounds"]))
+        c = self.timed_rounds(3, "triangle_closed_series")
+        for r in c["rounds"]:
+            for v in r["views"]:
+                q = v["receipt"]["query"]
+                q.update(nodes=q["nodes"][:3], reported=3, cycle=False)
+        a = self.check_series(c)
+        self.assertEqual((a["coverage"]["overlapping_rounds"], a["coverage"]["potential_cycle_views"]), (3, 0))
+        self.assertEqual(a["conclusion"], "inconclusive")
+        c = self.timed_rounds(3)
+        c["rounds"][1]["views"][1]["receipt"]["query"].update(ok=False, error=5, cycle=None, nodes=[])
+        a = self.check_series(c)
+        self.assertEqual((a["coverage"]["issued_queries"], a["coverage"]["successful_queries"]), (6, 5))
+        self.assertEqual(a["repeated_groups"], [])
+
+    def test_series_contradictions_and_retirement(self):
+        c = self.timed_rounds(2)
+        for change in (
+            lambda d: d["rounds"].pop(),
+            lambda d: d["rounds"][0]["views"].reverse(),
+            lambda d: d["rounds"][0]["views"][1]["timing"].update(reader_tid=d["collector"]["coordinator_tid"]),
+            lambda d: d["rounds"][1]["views"][0]["timing"].update(begin="1"),
+            lambda d: d["rounds"][1]["views"][1]["receipt"]["discovery"]["nodes"][0].update(context_switches=4294967295),
+            lambda d: d["rounds"][0]["views"][0]["receipt"]["process"]["after"].update(result=0),
+            lambda d: d["rounds"][-1]["views"][0]["receipt"]["threads"][0]["after"].update(result=0),
+        ):
+            d = copy.deepcopy(c)
+            change(d)
+            self.check_series(d, 2)
+        conflicting = copy.deepcopy(c)
+        row = conflicting["rounds"][-1]
+        tick = max(v["receipt"]["query"]["end"] for v in row["views"])
+        for i, v in enumerate(row["views"]):
+            v["receipt"]["query"].update(start=tick + 4*i, end=tick + 4*i + 1)
+            for pin in [v["receipt"]["process"], *v["receipt"]["threads"]]:
+                pin["after"]["tick"] = tick + 10
+        self.check_series(conflicting, 2)
+        row = c["rounds"][1]
+        for v in row["views"]:
+            v["receipt"]["process"]["after"]["result"] = 0
+        self.check_series(c, 2)
+        for v in row["views"]:
+            for pin in v["receipt"]["threads"]:
+                pin["after"]["result"] = 0
+        self.check_series(c)
+        # Both process handles are now signaled. Preserve an otherwise valid terminal round.
+        row = copy.deepcopy(row)
+        row.update(dispatch="unavailable", begin_qpc="1500000", end_qpc="1501000")
+        tick = max(p["after"]["tick"] for v in row["views"] for p in [v["receipt"]["process"], *v["receipt"]["threads"]])
+        row["pause"].update(start=tick, signal={"tick": tick, "result": 0, "error": None})
+        for v in row["views"]:
+            v["timing"], v["receipt"]["query"] = None, None
+            for p in [v["receipt"]["process"], *v["receipt"]["threads"]]:
+                for phase in ("before", "after"):
+                    p[phase].update(tick=tick, result=0)
+        c["rounds"].append(row)
+        c["planned_rounds"] = 4
+        self.assertEqual(self.check_series(c)["coverage"]["unrecorded_rounds"], 1)
+        row["pause"]["signal"]["result"] = WAIT_TIMEOUT
+        self.check_series(c, 2)
+
+    def test_series_invalid_requests(self):
+        argv = series_args(self.exe, self.target, 2, 1)
+        for i, values in ((6, ("--unknown",)), (7, (argv[4], "0")), (8, ("0",)), (9, ("1", "9")), (10, ("0", "5001"))):
+            for value in values:
+                bad = argv.copy()
+                bad[i] = value
+                run(bad, 2)
+        run(argv[:-1], 2)
+        self.replay(b" " * (512 * 1024 + 1), 2)
 
     def test_owned_native_and_offline(self):
         waits = self.target["threads"]
@@ -299,15 +570,18 @@ def main():
     parser.add_argument("--exe", type=Path)
     parser.add_argument("--keep", type=Path, help="save the original owned receipts in a new directory")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--participants", type=int, choices=(2, 3), default=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.child:
-        return child()
+        return child(args.participants)
     if not args.exe:
         parser.error("--exe is required")
     with tempfile.TemporaryDirectory(prefix="kn-wct-") as work:
         WaitTests.folder = Path(work)
         WaitTests.exe = args.exe.resolve(strict=True)
-        WaitTests.target, WaitTests.original = acquire(WaitTests.exe)
+        WaitTests.target, WaitTests.original = acquire(WaitTests.exe, 2)
+        WaitTests.triangle, triangle = acquire(WaitTests.exe, 3)
+        WaitTests.original.update({"triangle_" + name: data for name, data in triangle.items()})
         if args.keep:
             args.keep.mkdir()
             for name, data in WaitTests.original.items():

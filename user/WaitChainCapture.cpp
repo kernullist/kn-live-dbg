@@ -59,6 +59,13 @@ namespace
             signal && signal->result == WAIT_TIMEOUT;
     }
 
+    std::optional<ULONGLONG> Counter()
+    {
+        LARGE_INTEGER value{};
+        if (QueryPerformanceCounter(&value) && value.QuadPart >= 0) { return static_cast<ULONGLONG>(value.QuadPart); }
+        return {};
+    }
+
     struct Query
     {
         std::array<WAITCHAIN_NODE_INFO, WCT_MAX_NODE_COUNT> nodes{};
@@ -66,14 +73,18 @@ namespace
         bool ok = false;
         BOOL cycle = FALSE;
         ULONGLONG start = 0, end = 0;
+        DWORD reader = 0;
+        std::optional<ULONGLONG> beginQpc, endQpc;
     };
 
-    Query ReadChain(HWCT session, DWORD tid)
+    Query ReadChain(HWCT session, DWORD tid, bool timed = false)
     {
         Query q;
         q.start = GetTickCount64();
+        if (timed) { q.reader = GetCurrentThreadId(); q.beginQpc = Counter(); }
         q.ok = GetThreadWaitChain(session, 0, 0, tid, &q.count, q.nodes.data(), &q.cycle) != FALSE;
         if (!q.ok) { q.error = GetLastError(); }
+        if (timed) { q.endQpc = Counter(); }
         q.end = GetTickCount64();
         if (q.ok || q.error == ERROR_MORE_DATA || q.error == ERROR_TOO_MANY_THREADS)
         {
@@ -125,72 +136,232 @@ namespace
         }
         std::cout << "]}";
     }
+
+    struct Source
+    {
+        DWORD pid, tid;
+        uint64_t pc, tc;
+        Pin process;
+        std::vector<Pin> threads;
+        Session session;
+        bool attempted = false;
+        DWORD sessionError = 0;
+        std::optional<Query> discovery;
+
+        Source(DWORD processId, uint64_t processTime, DWORD threadId, uint64_t threadTime)
+            : pid(processId), tid(threadId), pc(processTime), tc(threadTime), process(OpenPin(pid, false))
+        {
+            if (!Bound(process, pid, pc, process.initial)) { return; }
+            threads.emplace_back(OpenPin(tid, true));
+            if (!Bound(threads.front(), pid, tc, threads.front().initial)) { return; }
+
+            attempted = true;
+            session.reset(OpenThreadWaitChainSession(0, nullptr));
+            if (!session) { sessionError = GetLastError(); return; }
+            discovery = ReadChain(session.get(), tid);
+            for (DWORD i = 0; i < discovery->retained; ++i)
+            {
+                const auto& n = discovery->nodes[i];
+                if (n.ObjectType != WctThreadType || n.ThreadObject.ProcessId != pid || !n.ThreadObject.ThreadId) { continue; }
+                const auto owner = n.ThreadObject.ThreadId;
+                if (std::none_of(threads.begin(), threads.end(), [owner](const Pin& p) { return p.requested == owner; }))
+                {
+                    threads.emplace_back(OpenPin(owner, true));
+                }
+            }
+        }
+
+        void Fence(std::optional<Signal> Pin::*member)
+        {
+            process.*member = Sample(process);
+            for (auto& t : threads) { t.*member = Sample(t); }
+        }
+
+        bool Eligible() const
+        {
+            return session && Bound(process, pid, pc, process.before) && Bound(threads.front(), pid, tc, threads.front().before);
+        }
+
+        void Write(const std::optional<Query>& query) const
+        {
+            std::cout << "{\"schema\":\"kn.wait_chain.v1\",\"source\":\"windows_wct\",\"clock\":\"GetTickCount64_ms\",\"flags\":0"
+                      << ",\"node_limit\":" << WCT_MAX_NODE_COUNT << ",\"requested\":{\"pid\":" << pid << ",\"process_created\":\"" << pc
+                      << "\",\"tid\":" << tid << ",\"thread_created\":\"" << tc << "\"},\"process\":";
+            WritePin(process);
+            std::cout << ",\"threads\":[";
+            for (size_t i = 0; i < threads.size(); ++i) { if (i) { std::cout << ','; } WritePin(threads[i]); }
+            std::cout << "],\"session\":";
+            if (!attempted) { std::cout << "null"; }
+            else { std::cout << "{\"ok\":" << (session ? "true" : "false") << ",\"error\":" << (session ? "null" : std::to_string(sessionError)) << '}'; }
+            std::cout << ",\"discovery\":";
+            WriteQuery(discovery);
+            std::cout << ",\"query\":";
+            WriteQuery(query);
+            std::cout << '}';
+        }
+    };
+
+    struct PairWork
+    {
+        SYNCHRONIZATION_BARRIER barrier{};
+        const Source& peer;
+        std::optional<Query>& output;
+    };
+
+    void CALLBACK ReadPeer(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK)
+    {
+        auto& job = *static_cast<PairWork*>(context);
+        EnterSynchronizationBarrier(&job.barrier, 0);
+        job.output = ReadChain(job.peer.session.get(), job.peer.tid, true);
+    }
+
+    struct Dispatch
+    {
+        const char* mode;
+        const char* failure = nullptr;
+        DWORD error = 0;
+    };
+
+    Dispatch ReadPair(const std::array<Source, 2>& sources, std::array<std::optional<Query>, 2>& out)
+    {
+        Dispatch dispatch{"single"};
+        if (sources[0].Eligible() && sources[1].Eligible())
+        {
+            PairWork job{{}, sources[1], out[1]};
+            // Nothing enters the barrier before both resources are available.
+            PTP_WORK work = CreateThreadpoolWork(ReadPeer, &job, nullptr);
+            if (!work) { dispatch = {"serial_fallback", "create_work", GetLastError()}; }
+            else if (!InitializeSynchronizationBarrier(&job.barrier, 2, -1))
+            {
+                dispatch = {"serial_fallback", "initialize_barrier", GetLastError()};
+                CloseThreadpoolWork(work);
+            }
+            else
+            {
+                SubmitThreadpoolWork(work);
+                EnterSynchronizationBarrier(&job.barrier, 0);
+                out[0] = ReadChain(sources[0].session.get(), sources[0].tid, true);
+                WaitForThreadpoolWorkCallbacks(work, FALSE);
+                CloseThreadpoolWork(work);
+                DeleteSynchronizationBarrier(&job.barrier);
+                return {"parallel"};
+            }
+        }
+        for (size_t i = 0; i < sources.size(); ++i)
+        {
+            if (sources[i].Eligible()) { out[i] = ReadChain(sources[i].session.get(), sources[i].tid, true); }
+        }
+        return !out[0] && !out[1] ? Dispatch{"unavailable"} : dispatch;
+    }
+
+    void WriteCounter(const std::optional<ULONGLONG>& n)
+    {
+        if (n) { std::cout << '"' << *n << '"'; }
+        else { std::cout << "null"; }
+    }
+
+    int WriteSeries(std::array<Source, 2>& sources, DWORD count, DWORD pauseMs)
+    {
+        LARGE_INTEGER frequency{};
+        FILETIME birth{}, exitTime{}, kernel{}, user{};
+        const BOOL identified = GetProcessTimes(GetCurrentProcess(), &birth, &exitTime, &kernel, &user);
+        const ULONGLONG generation = (static_cast<ULONGLONG>(birth.dwHighDateTime) << 32) | birth.dwLowDateTime;
+        std::cout << "{\"schema\":\"kn.wait_series.v1\",\"planned_rounds\":" << count << ",\"pause_ms\":" << pauseMs
+                  << ",\"collector\":{\"pid\":" << GetCurrentProcessId() << ",\"created\":";
+        WriteCounter(identified && generation ? std::optional<ULONGLONG>(generation) : std::nullopt);
+        std::cout << ",\"coordinator_tid\":" << GetCurrentThreadId() << "},\"qpc_hz\":";
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) { WriteCounter(frequency.QuadPart); }
+        else { WriteCounter(std::nullopt); }
+        std::cout << ",\"rounds\":[\n";
+
+        HANDLE waitTarget = nullptr;
+        for (DWORD round = 0; round < count; ++round)
+        {
+            if (round) { std::cout << ','; }
+            std::cout << "{\"pause\":";
+            if (waitTarget)
+            {
+                const auto start = GetTickCount64();
+                const DWORD result = WaitForSingleObject(waitTarget, pauseMs);
+                const DWORD error = result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+                std::cout << "{\"start\":" << start << ",\"signal\":";
+                WriteSignal(Signal{result, error, GetTickCount64()});
+                std::cout << '}';
+            }
+            else { std::cout << "null"; }
+
+            for (auto& source : sources) { source.Fence(&Pin::before); }
+            std::array<std::optional<Query>, 2> results;
+            const auto begin = Counter();
+            const Dispatch dispatch = ReadPair(sources, results);
+            const auto end = Counter();
+            for (auto& source : sources) { source.Fence(&Pin::after); }
+
+            std::cout << ",\"begin_qpc\":";
+            WriteCounter(begin);
+            std::cout << ",\"end_qpc\":";
+            WriteCounter(end);
+            std::cout << ",\"dispatch\":\"" << dispatch.mode << "\",\"failure\":";
+            if (dispatch.failure) { std::cout << "{\"stage\":\"" << dispatch.failure << "\",\"win32_error\":" << dispatch.error << '}'; }
+            else { std::cout << "null"; }
+            std::cout << ",\"views\":[";
+            for (size_t i = 0; i < sources.size(); ++i)
+            {
+                if (i) { std::cout << ','; }
+                std::cout << "{\"timing\":";
+                if (results[i])
+                {
+                    const auto& q = *results[i];
+                    std::cout << "{\"reader_tid\":" << q.reader << ",\"begin\":";
+                    WriteCounter(q.beginQpc);
+                    std::cout << ",\"end\":";
+                    WriteCounter(q.endQpc);
+                    std::cout << '}';
+                }
+                else { std::cout << "null"; }
+                std::cout << ",\"receipt\":";
+                sources[i].Write(results[i]);
+                std::cout << '}';
+            }
+            std::cout << "]}\n" << std::flush;
+            if (!std::cout) { return 1; }
+            if (!results[0] && !results[1]) { break; }
+            waitTarget = sources[results[0] ? 0 : 1].process.handle.get();
+        }
+        std::cout << "]}\n" << std::flush;
+        return std::cout ? 0 : 1;
+    }
+
+    bool Decimal(const std::wstring& arg, uint64_t max, uint64_t* out)
+    {
+        return commandinput::ParseDigits(arg, 10, out) && *out && *out <= max;
+    }
 }
 
 int RunWaitChainCapture(const std::vector<std::wstring>& args)
 {
-    uint64_t pid64 = 0, pc = 0, tid64 = 0, tc = 0;
-    if (args.size() != 4 || !commandinput::ParseDigits(args[0], 10, &pid64) || !pid64 || pid64 > MAXDWORD ||
-        !commandinput::ParseDigits(args[1], 10, &pc) || !pc || !commandinput::ParseDigits(args[2], 10, &tid64) ||
-        !tid64 || tid64 > MAXDWORD || !commandinput::ParseDigits(args[3], 10, &tc) || !tc)
+    const bool series = args.size() == 9 && args[4] == L"--corroborate";
+    uint64_t pid = 0, pc = 0, tid = 0, tc = 0, peer = 0, peerTime = 0, count = 0, pause = 0;
+    if ((!series && args.size() != 4) || !Decimal(args[0], MAXDWORD, &pid) || !Decimal(args[1], UINT64_MAX, &pc) ||
+        !Decimal(args[2], MAXDWORD, &tid) || !Decimal(args[3], UINT64_MAX, &tc) ||
+        (series && (!Decimal(args[5], MAXDWORD, &peer) || peer == tid || !Decimal(args[6], UINT64_MAX, &peerTime) ||
+                    !Decimal(args[7], 8, &count) || count < 2 || !Decimal(args[8], 5000, &pause))))
     {
-        std::cerr << "usage: --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime> (decimal)\n";
+        std::cerr << "usage: --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>"
+                     " [--corroborate <peer-tid> <peer-creation-filetime> <rounds 2..8> <pause-ms 1..5000>] (decimal)\n";
         return 2;
     }
-    const auto pid = static_cast<DWORD>(pid64), tid = static_cast<DWORD>(tid64);
-    Pin process = OpenPin(pid, false);
-    std::vector<Pin> threads;
-    Session session;
-    bool attempted = false;
-    DWORD sessionError = 0;
-    std::optional<Query> discovery, query;
-    if (Bound(process, pid, pc, process.initial))
+    Source first(static_cast<DWORD>(pid), pc, static_cast<DWORD>(tid), tc);
+    if (series)
     {
-        threads.emplace_back(OpenPin(tid, true));
-        if (Bound(threads.front(), pid, tc, threads.front().initial))
-        {
-            attempted = true;
-            session.reset(OpenThreadWaitChainSession(0, nullptr));
-            if (!session) { sessionError = GetLastError(); }
-            else
-            {
-                discovery = ReadChain(session.get(), tid);
-                for (DWORD i = 0; i < discovery->retained; ++i)
-                {
-                    const auto& n = discovery->nodes[i];
-                    if (n.ObjectType != WctThreadType || n.ThreadObject.ProcessId != pid || !n.ThreadObject.ThreadId) { continue; }
-                    const auto owner = n.ThreadObject.ThreadId;
-                    if (std::none_of(threads.begin(), threads.end(), [owner](const Pin& p) { return p.requested == owner; }))
-                    {
-                        threads.emplace_back(OpenPin(owner, true));
-                    }
-                }
-            }
-        }
+        std::array<Source, 2> sources{std::move(first), Source(static_cast<DWORD>(pid), pc, static_cast<DWORD>(peer), peerTime)};
+        return WriteSeries(sources, static_cast<DWORD>(count), static_cast<DWORD>(pause));
     }
-    process.before = Sample(process);
-    for (auto& t : threads) { t.before = Sample(t); }
-    if (session && Bound(process, pid, pc, process.before) && Bound(threads.front(), pid, tc, threads.front().before))
-    {
-        query = ReadChain(session.get(), tid);
-    }
-    process.after = Sample(process);
-    for (auto& t : threads) { t.after = Sample(t); }
-
-    std::cout << "{\"schema\":\"kn.wait_chain.v1\",\"source\":\"windows_wct\",\"clock\":\"GetTickCount64_ms\",\"flags\":0"
-              << ",\"node_limit\":" << WCT_MAX_NODE_COUNT << ",\"requested\":{\"pid\":" << pid << ",\"process_created\":\"" << pc
-              << "\",\"tid\":" << tid << ",\"thread_created\":\"" << tc << "\"},\"process\":";
-    WritePin(process);
-    std::cout << ",\"threads\":[";
-    for (size_t i = 0; i < threads.size(); ++i) { if (i) { std::cout << ','; } WritePin(threads[i]); }
-    std::cout << "],\"session\":";
-    if (!attempted) { std::cout << "null"; }
-    else { std::cout << "{\"ok\":" << (session ? "true" : "false") << ",\"error\":" << (session ? "null" : std::to_string(sessionError)) << '}'; }
-    std::cout << ",\"discovery\":";
-    WriteQuery(discovery);
-    std::cout << ",\"query\":";
-    WriteQuery(query);
-    std::cout << "}\n";
-    std::cout.flush();
+    first.Fence(&Pin::before);
+    std::optional<Query> query;
+    if (first.Eligible()) { query = ReadChain(first.session.get(), first.tid); }
+    first.Fence(&Pin::after);
+    first.Write(query);
+    std::cout << '\n' << std::flush;
     return std::cout ? 0 : 1;
 }

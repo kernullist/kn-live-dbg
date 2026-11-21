@@ -68,7 +68,7 @@ class PublicContentTests(unittest.TestCase):
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
     def test_wait_captures_and_reports(self):
-        for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1"):
+        for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1"):
             intact = json.dumps({"requested": {}, "schema": schema})
             cut = "log start\n" + json.dumps({"schema": schema, "requested": {}}, indent=2)[:-3]
             for text in (intact, cut):
@@ -76,6 +76,14 @@ class PublicContentTests(unittest.TestCase):
                     rules = {f["rule"] for f in AUDIT.inspect("unrelated-name.txt", text.encode(encoding))}
                     self.assertIn("private-evidence-bundle", rules)
             self.assertEqual(AUDIT.inspect("guide.md", ("See the " + schema + " schema.").encode()), [])
+
+        part = json.dumps({"pause": None, "views": [{"timing": None, "receipt": {"schema": "kn.wait_chain.v1"}}]})
+        clock = json.dumps({"pause": {"start": 10, "signal": {"result": 258}}, "begin_qpc": "1", "end_qpc": None})
+        for fragment in (part[:-4], clock[:-2]):
+            for prefix in ("", "log start\n,"):
+                for encoding in ("utf-8", "utf-16"):
+                    rules = {f["rule"] for f in AUDIT.inspect("trace.log", (prefix + fragment).encode(encoding))}
+                    self.assertIn("private-evidence-bundle", rules)
 
     def test_private_benchmark_archive(self):
         head = b"PK\x03\x04" + bytes(26)
