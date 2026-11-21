@@ -142,6 +142,27 @@ class PublicContentTests(unittest.TestCase):
                     self.assertIn("private-evidence-bundle", {f["rule"] for f in findings})
             self.assertFalse(AUDIT.inspect("guide.md", ("See the " + schema + " journal.").encode()))
 
+    def test_saved_cpu_profile(self):
+        for name in ("input.ETL", "input.etl.zip"):
+            self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
+        for header_type in (1, 2):
+            header = bytearray(80)
+            header[:4] = (1024).to_bytes(4, "little")
+            header[54] = 4
+            header[74:76] = bytes((header_type, 192))
+            self.assertIn("private-etl-buffer", {r["rule"] for r in AUDIT.inspect("renamed.bin", bytes(header))})
+        schema = "kn.etl_profile.v1"
+        for data in (json.dumps({"samples": [], "schema": schema}),
+                     "log\n" + json.dumps({"schema": schema, "samples": []}, indent=2)[:-2]):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("renamed.txt", data.encode(encoding))})
+        row = json.dumps(dict(sample_ordinal=1, record_ordinal=2, raw_timestamp="3",
+                              instruction_pointer="0x4", sampled_thread_id=5))
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+            self.assertIn("private-evidence-bundle", {r["rule"] for r in
+                          AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
+        self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + schema + ".").encode()), [])
+
     def test_wait_captures_and_reports(self):
         for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1"):
             intact = json.dumps({"requested": {}, "schema": schema})

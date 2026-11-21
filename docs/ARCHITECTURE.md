@@ -973,6 +973,17 @@ eventual exit and the wait call's final result require other evidence.
 A finite wait can expire after Windows reports a cycle.
 [Capture and replay a wait chain](COMMAND_REFERENCE.md#capture-a-windows-wait-chain)
 
+## CPU samples from saved ETLs
+
+The standalone `--etl-profile` route opens a pinned ETL through the Windows
+`OpenTraceW` and `ProcessTrace` event-record interface. It requests raw
+timestamps and decodes the version-2 PerfInfo sample layout using the pointer
+width in the event. An ETL digest and callback ordinal locate each sample
+among all returned records. Payload thread ID, header process/thread IDs,
+clock, loss counters and buffer-count discrepancies remain separately visible.
+The report preserves unknown address space, code version and recording
+conditions for later qualification. [Trace inputs](TRACE_IMPORT.md)
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in

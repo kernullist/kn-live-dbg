@@ -1,7 +1,48 @@
-# Normalized execution trace import
+# Execution trace inputs
 
-This adapter reads local normalized JSON. It does not accept raw PT, ETL, TTD or
-hypervisor packet streams, start a recorder, or authenticate the original sensor.
+## Saved Windows CPU samples
+
+`KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N]`
+reads one saved ETL before driver or symbol initialization. Supply the exact
+input SHA-256. The default page has 64 samples and the largest has 128.
+Use the returned `next_after` and the same digest for the next page.
+`after` counts already decoded samples. The command scans the entire file on
+every call, including when a page is full. The limits are 512 MiB and 2,000,000
+event records. The input must be a resident regular file on a fixed local
+volume. The reader retains the file's read lease and the directory chain while
+Windows opens the volume-qualified path, then rechecks file identity and bytes.
+
+The `kn.etl_profile.v1` report decodes the classic PerfInfo `SampledProfile`
+event, opcode 46, version 2. Pointer width comes from each event header. Each
+row identifies the source by the enclosing digest and its one-based
+`record_ordinal` across all ETW callbacks. `sample_ordinal` counts accepted
+samples. `sampled_thread_id` comes from the payload. The header PID and TID,
+CPU field, descriptor, raw timestamp, instruction pointer, 16-bit count and
+reserved values remain separately available. `unsupported_profile_records`
+counts matching provider/opcode envelopes outside the supported layout.
+[Windows sampled profile event](https://learn.microsoft.com/en-us/windows/win32/etw/sampledprofile)
+
+The header supplies the clock type, performance-counter frequency, capture
+times and loss counters. `raw_timestamp` stays in the original clock domain.
+A stack extension count applies to that event. The recording privilege, stack
+policy, exact intervals of lost samples, process generation, address space,
+VTL and code version remain unknown. The reader assigns `unqualified` to the
+verified execution level. Thread/image lifetimes and exact code bytes require
+separate evidence before an execution claim can be joined to another source.
+
+For a sequential log with a declared buffer count, `buffer_comparison` compares
+that count with buffers processed by ETW. A mismatch returns `partial` and
+exit 1, with available rows and both counts. `matched` describes only the
+buffer count. Circular logs and missing declarations return `not_comparable`.
+A successful page returns `read` and exit 0, which includes a valid trace
+with zero decoded samples. File, digest, cursor and decoder failures return
+exit 1. Malformed arguments and output failures return exit 2. A rotating
+multi-file session requires separate segment provenance. Keep ETLs and JSON
+reports private. [Windows trace file header](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header)
+
+## Normalized execution trace import
+
+This adapter reads local normalized JSON.
 Use `KnLiveDbg.exe --offline !kmon trace capture.kntrace /limit 64 /json`.
 A continuation uses the same file and limit with `/cursor <next_cursor>`.
 

@@ -84,9 +84,10 @@ public:
 
     // The worker cannot inspect private ancestor directories. Its broker owns
     // their no-delete pins; the worker still verifies the loader's pathname.
-    bool PathNamesFile() const
+    bool PathNamesFile() const { return PathNamesFile(Path); }
+    bool PathNamesFile(const std::wstring& name) const
     {
-        HANDLE current = CreateFileW(Path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        HANDLE current = CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         FILE_ID_INFO identity{};
         const bool same = current != INVALID_HANDLE_VALUE &&

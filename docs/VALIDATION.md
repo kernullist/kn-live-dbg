@@ -4779,6 +4779,43 @@ synthetic engine/transport controls, not driver execution or mutation-effect
 validation. No VM or driver load was used. TLS, per-principal authorization,
 durable/idempotent operations and the remote protocol adapter remain open.
 
+## Saved ETL CPU profile validation on 2026-11-22
+
+Windows `tracerpt -rts` decoded three public PerfView test files independently
+of the application's PerfInfo payload reader. Both readers use Windows ETW for
+file traversal. The test compared every supported sample in 128-row pages,
+including its ordinal among all events, raw timestamp, CPU, payload IP and
+TID, count, reserved value, header PID/TID and descriptor fields.
+[Microsoft PerfView inputs at the tested revision](https://github.com/microsoft/perfview/tree/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/TraceEvent.Tests/inputs)
+
+| Original ETL | SHA-256 of extracted ETL | Event records | CPU samples | Buffers |
+| --- | --- | ---: | ---: | ---: |
+| `net.4.5.2.x64.etl` | `50da7f725f80f88a7622b37f9826844a790cb0c4f64e351fa1f38cf24916889a` | 179,474 | 79,528 | 360 |
+| `net.4.5.2.x86.etl` | `18e62d477308bdc9b01ca6674cbbcbb7c350acf2bf68733ba6361976fac9538d` | 168,298 | 88,809 | 276 |
+| `Regression/SelfDescribingSingleEvent.etl` | `4c312c63c7d366e12b908c49769943886c017497183733bc2c93b8d80e932c7c` | 23 | 0 | 3 |
+
+Extract one of the pinned public inputs into a private local directory. Pass
+the ETL path, its digest and the sample count from the table to the checker.
+
+```powershell
+python tools/test-etl-profile.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --expect-samples $count --all-pages --check-short-tail
+```
+
+Removing the last byte of the x64 ETL left Windows able to read 359 of 360
+buffers and 179,022 events. The command returned `partial` and exit 1. The
+suite also checks a zero-sample page, a missing or invalid file, incorrect
+digest, page boundaries, a writable ancestor and a writable hard link to the input. Both positive
+fixtures used 64-bit event pointers. In-memory layout checks cover both widths,
+unaligned payloads, differing header and payload TIDs, stack extension counts,
+wrong provider, opcode, version, flags, lengths and missing data. Run them with
+`tools/validate-execution-trace.ps1`. The standard MSVC AddressSanitizer startup
+stopped before the harness on this host. The process-scoped
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` run passed the layout and
+93 normalized controls with an interceptor warning. The ordinary Release
+harness passed without that override. These saved traces provide sampled IPs.
+Known owned execution, source authentication, thread/image lifetimes and
+exact code-version binding remain open.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

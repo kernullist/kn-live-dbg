@@ -931,6 +931,22 @@ neither parsing nor a code hash authenticates actual execution. Changed input or
 page limits invalidate the cursor. Error exit 1 returns an unavailable result;
 invalid command arguments exit 2.
 
+### Inspect CPU samples from a saved ETL
+
+```powershell
+$etl = Get-Item .\capture.etl
+$pin = (Get-FileHash -LiteralPath $etl.FullName -Algorithm SHA256).Hash
+$page = & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 64 | ConvertFrom-Json
+if ($null -ne $page.next_after) {
+    & KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --after $page.next_after --limit 64
+}
+```
+
+Each sample carries the raw ETW timestamp, CPU, payload thread ID, instruction
+pointer and original record ordinal. Check `status`, `buffer_comparison` and
+the reported loss counters before interpreting the page. A buffer-count
+mismatch returns `partial` and exit 1. [ETL fields and limits](TRACE_IMPORT.md#saved-windows-cpu-samples)
+
 ## Whole-host hunt
 
 ```text

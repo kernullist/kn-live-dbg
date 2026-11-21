@@ -13,7 +13,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -58,7 +58,7 @@ def path_rule(name: str) -> str | None:
     base = path.name.lower()
     if base.endswith(".knmcpjournal") or ".knmcpjournal.tmp." in base:
         return "private-operation-journal"
-    if base.endswith((".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm", ".kncampaign", ".knruns")):
+    if base.endswith((".etl.zip", ".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm", ".kncampaign", ".knruns")):
         return "private-container-or-capture"
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
@@ -91,6 +91,7 @@ DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("relation", "node_indices", "thread_created", "target_tid", "target_created"),
     ("kind", "round", "evidence", "target_tid", "target_created"),
     ("waiter_tid", "waiter_created", "wait_semantics", "target_tid", "target_created"),
+    ("sample_ordinal", "record_ordinal", "raw_timestamp", "instruction_pointer", "sampled_thread_id"),
 ))
 EVIDENCE_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
 JSON_SPACE = re.compile(r'[ \t\r\n]*')
@@ -138,6 +139,13 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if data.startswith(b"PK\x03\x04") and data.startswith(b"owned-module-manifest.json", 30):
         add("private-benchmark-package")
         return findings
+    # ETL's first WMI buffer may contain a 32- or 64-bit system trace header.
+    # Check the header buffer type and the Trace/Header record together.
+    if (len(data) >= 80 and data[54:56] == b"\x04\x00" and
+            data[74:76] in (b"\x01\xc0", b"\x02\xc0") and data[78:80] == b"\x00\x00" and
+            512 <= int.from_bytes(data[:4], "little") <= 16 << 20):
+        add("private-etl-buffer")
+        return findings
     if data.startswith((b"PAGEDU64", b"PAGEDUMP")) and (len(data) == 8 or b"\0" in data[8:256]):
         add("private-crash-dump")
         return findings
@@ -169,8 +177,8 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         for encoding, lane, bom in (("utf-16-le", 1, b"\xff\xfe"), ("utf-16-be", 0, b"\xfe\xff")):
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
-                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1",
-                                                                  "kn.wait_", '"target_created"', '"begin_qpc"',
+                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v1",
+                                                                  "kn.wait_", '"sampled_thread_id"', '"target_created"', '"begin_qpc"',
                                                                  "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
@@ -203,7 +211,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
-                    "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
+                    "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.etl_profile.v1", "kn.mcp_operation.v1",
                     "kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1",
                     "kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1",
                     "kn.benchmark_corpus.v1", "kn.benchmark_results.v1", "kn.benchmark_report.v1"
@@ -212,20 +220,20 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             except (ValueError, RecursionError):
                 pass
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
-        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text) and
+        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|etl_profile\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:
                 for number, line in enumerate(text.splitlines(), 1):
-                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.pending_io_trace" in line or "kn.crash_diagnosis" in line or "kn.whea_event_comparison" in line):
+                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.pending_io_trace" in line or "kn.crash_diagnosis" in line or "kn.whea_event_comparison" in line or "kn.etl_profile" in line):
                         continue
                     try:
                         row = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1"):
+                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.pending_io_trace.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1", "kn.etl_profile.v1"):
                         add("private-evidence-bundle", number)
                         break
         if ((not binary or view is not data) and '"virtual"' in text and
@@ -235,7 +243,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"')):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', '"sampled_thread_id"')):
             decoder = json.JSONDecoder()
             for match in EVIDENCE_OBJECT_START.finditer(text):
                 if detached_evidence_object(text, match.start(1), decoder):

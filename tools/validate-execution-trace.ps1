@@ -28,6 +28,11 @@ if ($LASTEXITCODE -ne 0)
 {
     throw "execution-trace compilation failed: $LASTEXITCODE"
 }
+& $exe --etl-record-check
+if ($LASTEXITCODE -ne 0)
+{
+    throw "ETL profile record layout checks failed with exit $LASTEXITCODE"
+}
 & $exe --cancel-check
 if ($LASTEXITCODE -ne 0)
 {

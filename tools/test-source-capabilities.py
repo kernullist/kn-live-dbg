@@ -196,6 +196,9 @@ def main():
     trace = by_key[("execution", "trace_import", "trace")]
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
+    profile = by_key[("execution", "cpu_profile", "etl")]
+    assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
+    assert "no_thread_lifetime_or_code_binding" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
     observe = by_key[("session", "observe_scope", "mcp")]
     assert observe["consistency"] == "listener_lifetime"

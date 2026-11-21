@@ -2,7 +2,7 @@
 #include "WheaRecord.h"
 #include "WheaEvent.h"
 #include "RuntimeCapabilities.h"
-#include "SymbolArtifactCache.h"
+#include "ArtifactOutput.h"
 
 #include <DbgEng.h>
 #include <DbgHelp.h>
@@ -216,34 +216,6 @@ namespace
         e.Call(L"end_session", client->EndSession(DEBUG_END_PASSIVE));
     }
 
-    template<class Write>
-    int WriteInputError(DWORD stream, const std::wstring& name, Write write)
-    {
-        // A writable redirection can itself prevent the normal read lease. Never
-        // append the error to the dump, including through another hard link.
-        const HANDLE sink = GetStdHandle(stream);
-        if (name.empty() || GetFileType(sink) != FILE_TYPE_DISK) { return write(); }
-        std::filesystem::path path;
-        symbol_artifacts::Directories parents;
-        if (!symbol_artifacts::LocalRoot(name, &path) || !parents.Pin(path.parent_path(), false)) { return 2; }
-        HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        if (raw == INVALID_HANDLE_VALUE)
-        {
-            const auto error = GetLastError();
-            return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? write() : 2;
-        }
-        const std::unique_ptr<void, decltype(&CloseHandle)> input(raw, &CloseHandle);
-        FILE_ATTRIBUTE_TAG_INFO attributes{};
-        FILE_ID_INFO sourceId{}, sinkId{};
-        if (!GetFileInformationByHandleEx(raw, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-            (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
-            !GetFileInformationByHandleEx(raw, FileIdInfo, &sourceId, sizeof(sourceId)) ||
-            !GetFileInformationByHandleEx(sink, FileIdInfo, &sinkId, sizeof(sinkId)) ||
-            std::memcmp(&sourceId, &sinkId, sizeof(sourceId)) == 0) { return 2; }
-        return write();
-    }
-
     int Failure(bool withWhea, const wchar_t* status)
     {
         return WriteCapabilityJson(Prefix(withWhea) + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
@@ -271,7 +243,7 @@ static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool w
     if (!symbol_artifacts::LocalRoot(args[0], &path) || !parents.Pin(path.parent_path(), false) ||
         !source.Open(path.wstring(), MaxDumpBytes))
     {
-        return WriteInputError(STD_OUTPUT_HANDLE, args[0], [withWhea] { return Failure(withWhea, L"source_unavailable"); });
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [withWhea] { return Failure(withWhea, L"source_unavailable"); });
     }
     if (source.Sha256 != expected) { return Failure(withWhea, L"digest_mismatch"); }
     DUMP_HEADER64 h{};
@@ -343,7 +315,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
     if ((!withWhea && args.size() != 3) || args[1] != L"--sha256" || !IsDigest(args[2]))
     {
         auto usage = [&] {
-            return WriteInputError(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
+            return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
                 std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
                     L"[--whea [--event-xml <file> --event-sha256 <digest>]]\n";
                 return 2;
@@ -354,14 +326,14 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
         {
             if (std::find(option + 1, args.end(), L"--event-xml") != args.end() &&
                 GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK) { return 2; }
-            return WriteInputError(STD_ERROR_HANDLE, *(option + 1), usage);
+            return WriteWithDistinctInput(STD_ERROR_HANDLE, *(option + 1), usage);
         }
         return usage();
     }
     if (withEvent)
     {
         // Keep a disk output distinct from both input identities, even if the XML read lease fails.
-        return WriteInputError(STD_OUTPUT_HANDLE, args[5], [&] { return Diagnose(args, true, true); });
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[5], [&] { return Diagnose(args, true, true); });
     }
     return Diagnose(args, withWhea, false);
 }

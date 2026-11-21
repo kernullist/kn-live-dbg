@@ -250,6 +250,7 @@
     <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
+    <ClCompile Include="EtlProfile.cpp" />
     <ClCompile Include="WheaRecord.cpp" />
     <ClCompile Include="WheaEvent.cpp" />
     <ClCompile Include="IoLifecycleCapture.cpp" />
@@ -459,6 +460,9 @@
     <ClInclude Include="BoundedObservationJson.h" />
     <ClInclude Include="ProcessImageCapture.h" />
     <ClInclude Include="CrashDumpDiagnosis.h" />
+    <ClInclude Include="ArtifactOutput.h" />
+    <ClInclude Include="EtlProfile.h" />
+    <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="WheaRecord.h" />
     <ClInclude Include="WheaEvent.h" />
     <ClInclude Include="IoLifecycleCapture.h" />

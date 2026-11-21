@@ -52,6 +52,23 @@ namespace symbol_artifacts
     {
         std::vector<HANDLE> Values;
         ~Directories() { for (const auto h : Values) { CloseHandle(h); } }
+        // The caller supplies an approved directory name, including a volume-GUID
+        // name obtained from a leased handle when the consumer must reopen by path.
+        bool HoldExisting(const std::wstring& directory, DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE)
+        {
+            // Metadata-only access does not participate in Windows share
+            // checks. Include directory read access before creating children.
+            HANDLE h = CreateFileW(directory.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, share,
+                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (h == INVALID_HANDLE_VALUE) { return false; }
+            try { Values.push_back(h); }
+            catch (...) { CloseHandle(h); throw; }
+            FILE_ATTRIBUTE_TAG_INFO info{};
+            if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof(info)) ||
+                (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return false; }
+            return true;
+        }
         bool Pin(const std::filesystem::path& target, bool create)
         {
             std::filesystem::path approved;
@@ -62,17 +79,7 @@ namespace symbol_artifacts
                 const auto slash = path.find(L'\\', start);
                 const auto directory = path.substr(0, slash);
                 if (create && !CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) { return false; }
-                // Metadata-only access does not participate in Windows share
-                // checks. Include directory read access before creating children.
-                HANDLE h = CreateFileW(directory.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-                if (h == INVALID_HANDLE_VALUE) { return false; }
-                try { Values.push_back(h); }
-                catch (...) { CloseHandle(h); throw; }
-                FILE_ATTRIBUTE_TAG_INFO info{};
-                if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof(info)) ||
-                    (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
-                    (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return false; }
+                if (!HoldExisting(directory)) { return false; }
                 if (slash == std::wstring::npos) { break; }
                 start = slash + 1;
             }
