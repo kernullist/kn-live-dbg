@@ -984,6 +984,14 @@ clock, loss counters and buffer-count discrepancies remain separately visible.
 The report preserves unknown address space, code version and recording
 conditions for later qualification. [Trace inputs](TRACE_IMPORT.md)
 
+With `--thread-evidence` the same scan also decodes classic version-3 thread
+start, end and rundown events. TID and original callback order identify the
+nearest records on each side of a sample. The raw source row and clock are
+available on each side. A reported PID agreement requires compatible
+timestamps, consistent thread transitions and an intact bounded index.
+Rundown records describe membership at collection time. The association
+stays local to the pinned ETL.
+
 ## Imported execution samples
 
 `--offline !kmon trace` imports the versioned normalized format described in

@@ -486,6 +486,9 @@
     <ClInclude Include="EtlProfileRecord.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlThreadEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="WheaRecord.h">
       <Filter>Header Files</Filter>
     </ClInclude>

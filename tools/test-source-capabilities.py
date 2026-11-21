@@ -199,6 +199,7 @@ def main():
     profile = by_key[("execution", "cpu_profile", "etl")]
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]
+    assert "thread_v3_start_end_and_rundown_records" in profile["requirements"] and "65536_thread_events" in profile["limits"]
     operation = by_key[("session", "operation_status", "mcp")]
     observe = by_key[("session", "observe_scope", "mcp")]
     assert observe["consistency"] == "listener_lifetime"

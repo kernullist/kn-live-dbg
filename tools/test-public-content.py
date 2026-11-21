@@ -156,6 +156,13 @@ class PublicContentTests(unittest.TestCase):
                      "log\n" + json.dumps({"schema": schema, "samples": []}, indent=2)[:-2]):
             for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("renamed.txt", data.encode(encoding))})
+        v2 = "kn.etl_profile.v2"
+        point = dict(record_ordinal=1, raw_timestamp="2", event="start", opcode=1, payload_pid=3, payload_tid=4)
+        pair = dict(relation="one_boundary", paired_record_pid=None, before=point, after=None)
+        for record in (dict(schema=v2, samples=[]), point, pair):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                fragment = ("log\n" + json.dumps(record)[:-1]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("fragment.txt", fragment)})
         row = json.dumps(dict(sample_ordinal=1, record_ordinal=2, raw_timestamp="3",
                               instruction_pointer="0x4", sampled_thread_id=5))
         for encoding in ("utf-8", "utf-16-le", "utf-16-be"):

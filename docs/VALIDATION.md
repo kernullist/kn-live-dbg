@@ -4816,6 +4816,24 @@ harness passed without that override. These saved traces provide sampled IPs.
 Known owned execution, source authentication, thread/image lifetimes and
 exact code-version binding remain open.
 
+### Thread boundary comparison
+
+Running `tools/test-etl-profile.py` on the same three files with
+`--thread-evidence --all-pages --check-short-tail` checks each returned
+boundary against the Windows `tracerpt` row. Validation includes the original
+thread event ordinal, kind, raw timestamp, payload PID and payload TID.
+
+| Source | Thread records | Samples between actual start/end | Samples bracketed using rundown | One boundary | Unusable TID |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| x64 fixture | 1,358 | 5,126 | 1,075 | 14 | 73,313 |
+| x86 fixture | 1,442 | 4,910 | 1,760 | 11 | 82,128 |
+| Control | 0 | 0 | 0 | 0 | 0 |
+
+The layout harness also checks pointer widths, unsupported versions, unrelated
+opcodes, PID reuse, conflicts, equal or reversed timestamps, a supplied
+capture-gap flag and the first event beyond the index limit. Context switches, independently
+verified code and cross-file lifetime identity require additional evidence.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

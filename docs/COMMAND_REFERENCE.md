@@ -947,6 +947,14 @@ pointer and original record ordinal. Check `status`, `buffer_comparison` and
 the reported loss counters before interpreting the page. A buffer-count
 mismatch returns `partial` and exit 1. [ETL fields and limits](TRACE_IMPORT.md#saved-windows-cpu-samples)
 
+Add `--thread-evidence` to inspect the nearest start, end or rundown records
+for each sampled TID. `paired_record_pid` is populated when both source
+records agree and coverage permits the comparison.
+
+```powershell
+& KnLiveDbg.exe --etl-profile $etl.FullName --sha256 $pin --limit 8 --thread-evidence
+```
+
 ## Whole-host hunt
 
 ```text

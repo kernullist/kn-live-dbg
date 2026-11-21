@@ -1,5 +1,5 @@
 #include "../user/ExecutionTrace.h"
-#include "../user/EtlProfileRecord.h"
+#include "../user/EtlThreadEvidence.h"
 
 #include <array>
 
@@ -75,11 +75,103 @@ static bool CheckProfileRecord()
     return true;
 }
 
+static bool CheckThreadEvidence()
+{
+    using namespace etl_profile;
+    std::array<uint8_t, 73> bytes{};
+    const uint32_t payloadPid = 71, payloadTid = 93;
+    auto* data = bytes.data() + 1;
+    std::memcpy(data, &payloadPid, 4);
+    std::memcpy(data + 4, &payloadTid, 4);
+    EVENT_RECORD record{};
+    auto& h = record.EventHeader;
+    h.ProviderId = ThreadProvider;
+    h.EventDescriptor.Version = 3;
+    h.TimeStamp.QuadPart = 441;
+    record.UserData = data;
+    for (const uint8_t width : {uint8_t{4}, uint8_t{8}})
+    {
+        h.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER | (width == 4 ? EVENT_HEADER_FLAG_32_BIT_HEADER : EVENT_HEADER_FLAG_64_BIT_HEADER);
+        for (uint8_t op = 1; op <= 4; ++op)
+        {
+            h.EventDescriptor.Opcode = op;
+            record.UserDataLength = 16 + 7 * width;
+            ThreadEvent point{};
+            if (DecodeThread(record, 17, point) != Match::Decoded || point.pid != payloadPid || point.tid != payloadTid ||
+                point.tick != 441 || point.record != 17 || point.opcode != op) { return false; }
+            --record.UserDataLength;
+            if (DecodeThread(record, 17, point) != Match::Unsupported) { return false; }
+        }
+    }
+    record.UserDataLength = 72;
+    ThreadIndex index;
+    index.Prepare();
+    h.EventDescriptor.Version = 4;
+    index.Observe(record, 4);
+    h.EventDescriptor.Version = 3;
+    h.EventDescriptor.Opcode = 36;
+    index.Observe(record, 5);
+    if (index.decoded || index.unsupported != 1) { return false; }
+
+    Sample sample{};
+    sample.tid = 93;
+    sample.timestamp = 200;
+    sample.record = 20;
+    auto check = [&](const wchar_t* relation, bool pid, bool clock = true, bool gap = false) {
+        const auto pair = index.Lookup(sample, clock, gap);
+        return std::wstring(pair.relation) == relation && pair.pairedPid == pid;
+    };
+    if (!check(L"no_record", false)) { return false; }
+    index.events = {{30, 71, 93, 300, 2}, {9, 14, 8, 80, 1}, {10, 71, 93, 100, 1}};
+    index.decoded = 3;
+    index.Sort();
+    if (!check(L"coverage_unqualified", false)) { return false; }
+    index.unsupported = 0;
+    if (!check(L"start_end", true) || !check(L"clock_unqualified", false, false) ||
+        !check(L"coverage_unqualified", false, true, true)) { return false; }
+    auto pair = index.Lookup(sample, true, false);
+    if (!pair.before || !pair.after || pair.before->record != 10 || pair.after->record != 30) { return false; }
+    sample.timestamp = 300;
+    if (!check(L"clock_unqualified", false)) { return false; }
+    sample.timestamp = 200;
+    sample.record = 5;
+    if (!check(L"one_boundary", false)) { return false; }
+    sample.record = 20;
+    index.events[1].opcode = 3;
+    if (!check(L"rundown_bracket", true)) { return false; }
+    index.events[1].pid = 89;
+    if (!check(L"pid_conflict", false)) { return false; }
+    index.events[1].pid = 71;
+    index.events[1].opcode = 2;
+    if (!check(L"outside_bracket", false)) { return false; }
+    index.events[1].opcode = 1;
+    index.events.push_back({7, 71, 93, 60, 1});
+    ++index.decoded;
+    index.Sort();
+    if (!check(L"conflicting_transitions", false)) { return false; }
+    index.events = {{1, 45, 93, 10, 1}, {2, 45, 93, 40, 2}, {10, 71, 93, 100, 1}, {30, 71, 93, 300, 2}};
+    index.Sort();
+    pair = index.Lookup(sample, true, false);
+    if (!pair.pairedPid || !pair.before || pair.before->pid != 71) { return false; }
+    index.events[1].tick = 110;
+    index.Sort();
+    if (!check(L"clock_unqualified", false)) { return false; }
+    sample.tid = 0;
+    if (!check(L"unusable_tid", false)) { return false; }
+    // Exercise the real retention bound and ensure no partial index can emit a bracket.
+    index.events.clear();
+    index.decoded = 0;
+    record.EventHeader.EventDescriptor.Opcode = 1;
+    for (uint32_t i = 0; i < MaxThreadEvents + 1; ++i) { index.Observe(record, i + 1); }
+    sample.tid = payloadTid;
+    return index.events.size() == MaxThreadEvents && index.decoded == MaxThreadEvents + 1 && check(L"index_limit", false);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
-        return CheckProfileRecord() ? 0 : 1;
+        return CheckProfileRecord() && CheckThreadEvidence() ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

@@ -21,6 +21,19 @@ namespace etl_profile
 
     enum class Match { Other, Unsupported, Decoded };
 
+    inline uint8_t ClassicPointerWidth(const EVENT_HEADER& header, uint8_t version)
+    {
+        if (header.EventDescriptor.Id != 0 || header.EventDescriptor.Version != version ||
+            !(header.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) ||
+            (header.Flags & (EVENT_HEADER_FLAG_STRING_ONLY | EVENT_HEADER_FLAG_TRACE_MESSAGE))) { return 0; }
+        switch (header.Flags & (EVENT_HEADER_FLAG_32_BIT_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER))
+        {
+        case EVENT_HEADER_FLAG_32_BIT_HEADER: return 4;
+        case EVENT_HEADER_FLAG_64_BIT_HEADER: return 8;
+        default: return 0;
+        }
+    }
+
     // Windows supplies the EVENT_RECORD envelope. Only PerfInfo_V2 /
     // SampledProfile has the layout below. The consumer's bitness is irrelevant.
     inline Match Decode(const EVENT_RECORD& event, Sample* output)
@@ -28,11 +41,8 @@ namespace etl_profile
         const auto& h = event.EventHeader;
         const auto& d = h.EventDescriptor;
         if (!IsEqualGUID(h.ProviderId, PerfInfo) || d.Opcode != 46) { return Match::Other; }
-        const auto bits = h.Flags & (EVENT_HEADER_FLAG_32_BIT_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER);
-        const uint8_t width = bits == EVENT_HEADER_FLAG_32_BIT_HEADER ? 4 : bits == EVENT_HEADER_FLAG_64_BIT_HEADER ? 8 : 0;
-        if (d.Id != 0 || d.Version != 2 || !(h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) ||
-            (h.Flags & (EVENT_HEADER_FLAG_STRING_ONLY | EVENT_HEADER_FLAG_TRACE_MESSAGE)) ||
-            !width || event.UserDataLength != width + 8 || !event.UserData ||
+        const auto width = ClassicPointerWidth(h, 2);
+        if (!width || event.UserDataLength != width + 8 || !event.UserData ||
             (event.ExtendedDataCount && !event.ExtendedData)) { return Match::Unsupported; }
         if (!output) { return Match::Decoded; }
         auto& row = *output;

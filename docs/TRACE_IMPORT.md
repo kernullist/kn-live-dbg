@@ -40,6 +40,32 @@ exit 1. Malformed arguments and output failures return exit 2. A rotating
 multi-file session requires separate segment provenance. Keep ETLs and JSON
 reports private. [Windows trace file header](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header)
 
+### Match a CPU sample to thread records
+
+Add `--thread-evidence` to return `kn.etl_profile.v2`. For each page, the
+reader indexes up to 65,536 classic Thread version-3 start, end and rundown
+events from the same ETL. The payload supplies the PID and TID.
+`thread_source` gives the provider, version and decoded, retained and
+unsupported record counts for those four opcodes. [Windows thread events](https://learn.microsoft.com/en-us/windows/win32/etw/thread-typegroup1)
+
+Each sample's `thread_evidence.before` and `after` locate the closest records
+for its TID by ETW callback ordinal. Each available point includes its event
+kind, ordinal, raw timestamp, opcode, payload PID and payload TID. A TID of
+zero (idle) or all ones has no lookup. `one_boundary` and `no_record` expose
+the extent of the available evidence.
+
+`paired_record_pid` reports the PID shared by two enclosing source records.
+`start_end` requires an actual start and end. `rundown_bracket` uses at least
+one snapshot of threads present during collection. Both require alternating
+start/end directions and strictly increasing thread event ticks for that TID,
+a sample strictly inside the raw time interval, matching usable PIDs, a
+comparable clock, matched sequential buffer counts and no reported loss or
+unsupported thread events. Boundary conflicts, a gap or an unknown clock keep
+the paired PID null. Exceeding the index limit returns `partial`, keeps the
+decoded sample rows and disables lookups across the incomplete index.
+Thread creation FILETIME, authenticated process ownership and code version
+remain unknown.
+
 ## Normalized execution trace import
 
 This adapter reads local normalized JSON.
