@@ -3454,6 +3454,38 @@ usable for locating captured file bytes, not a verified live CPU translation.
 The legacy output and other dump/image collectors retain their existing path;
 initialization receipts, wider migration and durable translation replay remain open.
 
+### Typed crash dump diagnosis
+
+The offline crash command takes an AMD64 Windows kernel dump and a caller
+SHA-256 pin. It holds the local input against writes and deletion, reads
+the SDK `DUMP_HEADER64` directly, and gives DbgEng its own read handle
+to the same file. After DbgEng ends the session, the retained input must
+still have its original identity and digest. Both decoders describe the
+same artifact. Capture provenance and the occurrence of a host crash
+require additional evidence.
+
+The typed client requests a kernel dump target and records the HRESULT
+of each issued query. A matching stop code and four matching parameters
+support `matched_stop_data`. A failed initial event can still yield the
+stored tuple. Stack collection requires a successful initial event and a
+debugger break on the dump. Per-frame module membership requires a
+reported loaded range containing the instruction offset. A candidate
+component also requires the first frame to match the header's saved
+instruction and stack pointers. One contradictory selected register prevents
+that finding even when its peer is unavailable. Missing register reads and debugger-unwound frames remain
+visible. [DbgEng dump handles](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugclient4-opendumpfilewide),
+[typed bugcheck query](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol-readbugcheckdata),
+[debugger stack frames](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/ns-dbgeng-_debug_stack_frame)
+
+The report compares a WHEA stop indication, a component present in the
+saved context and possible earlier corruption. A matching `0x124`
+tuple in a live-generated, offline-generated or unqualified dump retains
+the code and the need for a WHEA error record. A mapped module identifies
+a location. Unwind validation, code verification, the first writer,
+allocation history and causal attribution require other sources.
+The one-shot client uses typed calls with local search paths, module
+symbol loading and image mapping disabled. [WHEA stop parameters](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-0x124---whea-uncorrectable-error)
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

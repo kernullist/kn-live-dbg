@@ -1040,6 +1040,40 @@ different acquisition paths and are not atomic paused-machine snapshots.
 `dump-kernel /strict` rejects unreadable physical ranges instead of accepting
 zero-filled gaps. Inspect the dump metadata and warnings before analysis.
 
+### Diagnose a saved kernel dump
+
+`KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest>`
+compares the AMD64 dump header with the stop code and four parameters
+returned by DbgEng. Run it from a shell with the Release controller on
+`PATH`. This PowerShell example also prints the status when only the header
+could be read.
+
+```powershell
+$dump = Get-Item -LiteralPath '.\saved-kernel.dmp'
+$pin = (Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256).Hash
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $pin
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+$report.status
+$report.assessment.hypotheses | Select-Object candidate, state
+```
+
+Save the digest with the original for later replay. A local regular file
+on a fixed drive is required. The size limit is 16 GiB and each hash pass
+has a 30-second budget checked between reads. A pinned small kernel dump
+may yield a stop tuple even when its saved stack is unavailable. The
+report includes native HRESULTs, the debugger version, up to 32 frames
+and evidence pointers for each hypothesis. `frame_limit_reached` means the
+returned frames filled the buffer.
+
+Exit 0 means the two decoders returned the same tuple. Exit 1 covers a
+missing or unsupported input, pin mismatch, header-only observation or
+conflict. Exit 2 covers command usage and output failures. Error output
+to a disk file is suppressed when it could overwrite the input, including
+through a hard link. Keep the dump
+and the JSON private. Module ranges, stack coordinates and stop
+parameters can identify the target. [Dump diagnosis evidence](ARCHITECTURE.md#typed-crash-dump-diagnosis)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

@@ -109,6 +109,7 @@ inline const wchar_t* CapabilityAddressContract(const std::wstring& domain,
     {
         return L"recorded_descriptor;legacy_la48_when_declared;decoder_specific";
     }
+    if (backend == L"dbgeng_dump") { return L"typed_amd64_saved_context;no_arbitrary_address_input"; }
     if (backend == L"dbgeng")
     {
         return L"backend_defined;command_text_only";

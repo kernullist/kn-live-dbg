@@ -67,6 +67,19 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle",
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
+    def test_crash_dump_and_diagnosis(self):
+        for signature in (b"PAGEDU64", b"PAGEDUMP"):
+            for data in (signature, signature + bytes(128)):
+                self.assertIn("private-crash-dump", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})
+        schema = "kn.crash_diagnosis.v1"
+        frame = {"ip": "0x4000", "sp": "0x8000", "return": "0x10", "virtual": True, "module": {}}
+        for data in (json.dumps({"x": 1, "schema": schema}), "log\n" + json.dumps({"header": {}, "schema": schema}),
+                     "log\n" + json.dumps({"schema": schema, "header": {}}, indent=2)[:-3],
+                     "trace\n" + json.dumps(frame, indent=2)[:-2]):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data.encode(encoding))})
+        self.assertEqual(AUDIT.inspect("guide.md", ("See " + schema + " for the report.").encode()), [])
+
     def test_io_lifecycle_journals_and_reports(self):
         for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
             first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})

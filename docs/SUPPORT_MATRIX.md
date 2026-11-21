@@ -69,6 +69,7 @@ backends are not implied by an x64 address width.
 | session / operation_status | mcp | implemented | not_an_address_reader | engine_reported |
 | memory / read_virtual | process_handle | implemented | caller_descriptor_la48_la57;user_only;pointer_bytes_8 | handle_bound_single_read |
 | io / request_graph | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | repeated_snapshot |
+| diagnostics / crash_diagnosis | dbgeng_dump | implemented | typed_amd64_saved_context;no_arbitrary_address_input | pinned_offline_dump |
 | diagnostics / io_request_lifetime | win32_directory_changes | implemented | not_an_address_reader | retained_overlapped_request |
 | diagnostics / wait_chain | windows_wct | implemented | not_an_address_reader | one_live_traversal |
 | diagnostics / wait_cycle_corroboration | windows_wct | implemented | not_an_address_reader | paired_live_traversals |

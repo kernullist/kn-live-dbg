@@ -38,6 +38,10 @@ def main():
             "semantic_validation": "not_probed", "environment_regression": "not_performed"}
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
+    crash = by_key[("diagnostics", "crash_diagnosis", "dbgeng_dump")]
+    assert crash["consistency"] == "pinned_offline_dump" and "typed_bugcheck_and_stack" in crash["requirements"]
+    assert crash["address_contract"] == "typed_amd64_saved_context;no_arbitrary_address_input"
+    assert "no_host_crash_or_culprit_attribution" in crash["limits"]
     reference_scheduler = by_key[("scheduler", "reference_admission", "native")]
     assert "confirmed_live_source_for_dispatch" in reference_scheduler["requirements"]
     assert "admitted_subject_role_round_robin" in reference_scheduler["limits"]

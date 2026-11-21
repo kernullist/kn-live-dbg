@@ -1,3 +1,4 @@
+#include "../user/CrashDumpDiagnosis.h"
 #include "../user/DumpObservationSource.h"
 #include "../user/ObservationSourceJson.h"
 #include "../user/DumpReadObservationJson.h"
@@ -88,6 +89,17 @@ int wmain(int argc, wchar_t** argv)
     {
         return 2;
     }
+    Check(CompareSavedCrashContext(10, 20, 10, 20) == true, "both saved register coordinates agree");
+    Check(!CompareSavedCrashContext(10, 20, 10, std::nullopt).has_value() &&
+        !CompareSavedCrashContext(10, 20, std::nullopt, 20).has_value() &&
+        !CompareSavedCrashContext(10, 20, std::nullopt, std::nullopt).has_value(),
+        "a partial agreement cannot establish a context match");
+    Check(CompareSavedCrashContext(10, 20, 11, std::nullopt) == false &&
+        CompareSavedCrashContext(10, 20, std::nullopt, 21) == false,
+        "one contradictory register survives a missing peer");
+    Check(CompareSavedCrashContext(10, 20, 0, 20) == false &&
+        CompareSavedCrashContext(10, 20, 10, 0) == false,
+        "a successful zero return disagrees with a nonzero saved coordinate");
     const std::filesystem::path root(argv[1]);
     std::wstring error;
     unsigned callbackCalls = 0;

@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved kernel crash diagnosis, 2026-11-22
+
+The x64 Release controller had SHA-256
+`ade9aa42412322f635ed3cebf1c069ce2fba6cf45734d7f1f705ec8e6bb08987`.
+The typed client loaded DbgEng 10.0.26100.2454. Tests generated small AMD64
+kernel dumps with known stop parameters, stack bytes and two module ranges.
+A separate Windows SDK `kd.exe` 10.0.26100.6584 session read the same
+retained inputs. Across a two-frame and a capped 32-frame stack, all
+34 instruction offsets, stack pointers, return offsets and module names
+agreed. The SDK and the typed client also returned the four original
+64-bit stop parameters. The fixture module containing the first instruction
+was reported as a location. Causal attribution stayed unknown.
+[Run the diagnosis](COMMAND_REFERENCE.md#diagnose-a-saved-kernel-dump)
+
+Nine retained dumps gave byte-identical JSON on two fresh reads each.
+All 26 supporting and contrary references resolved. Live-generated,
+offline-generated and unavailable-initial-stop cases retained their
+stored WHEA code with limited evidence. A rejected dump body still yielded
+the header tuple. A changed file failed the old digest. The boundary
+tests covered missing control registers, the exclusive end of a module
+range, the frame cap, a reparse ancestor, an existing writer, output
+failure and redirects to the source and its hard link. A loopback listener
+in the inherited symbol path accepted zero connections.
+
+All 143 native dump controls passed, including a contradicting register
+with its peer unavailable and a successful zero register return. All 11
+crash tests, 227 dump-source CLI checks, 15 wait-chain tests,
+nine directory I/O tests, 78 restricted-launch checks, 57 source contracts,
+3,081 command checks and 33 runtime policy checks passed. The existing
+dump-source suite skipped its file-symlink control on this host. The
+crash suite exercised a real directory junction. The documented example
+ran in Windows PowerShell and PowerShell 7. The support matrix matched
+the controller. All 21 publication tests passed, and 18 variants of the
+original dump, report and detached frame were flagged.
+
+Between 00:36 and 01:04 KST the host recorded zero new reboot or bugcheck
+events and zero new crash dumps. No fixture process, temporary test directory
+or running test driver remained. The dump corpus was synthetic. Actual host
+crash attribution, independently verified unwind and module bytes,
+allocation history and WHEA error-record decoding remain open.
+[Typed source and evidence limits](ARCHITECTURE.md#typed-crash-dump-diagnosis)
+
 ## Overlapped directory I/O lifetimes, 2026-11-22
 
 The Windows x64 Release controller had SHA-256

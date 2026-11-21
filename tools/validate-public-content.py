@@ -99,6 +99,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if data.startswith(b"PK\x03\x04") and data.startswith(b"owned-module-manifest.json", 30):
         add("private-benchmark-package")
         return findings
+    if data.startswith((b"PAGEDU64", b"PAGEDUMP")) and (len(data) == 8 or b"\0" in data[8:256]):
+        add("private-crash-dump")
+        return findings
     if data.startswith(b"KNSYMIDX"):
         add("private-symbol-index")
     if data.startswith(b"KNMCPJ1\0"):
@@ -113,7 +116,16 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                                                          b'{"schema":"kn.owned_module_attempt_receipt.v1",')))):
         add("private-benchmark-campaign")
         return findings
-    for text in text_views(data):
+    view = data
+    if binary:
+        # Some Windows exporters omit the UTF-16 BOM. Keep the original bytes for binary rules.
+        for encoding, lane, bom in (("utf-16-le", 1, b"\xff\xfe"), ("utf-16-be", 0, b"\xfe\xff")):
+            prefix = data[lane:128:2]
+            if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
+                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v1", '"virtual"'))):
+                view = bom + data
+                break
+    for text in text_views(view):
         # Capture contents remain private even if the extension was changed.
         if text.lstrip().startswith("{"):
             try:
@@ -132,7 +144,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
-                    "kn.translation_receipt.v1", "kn.dump_read.v1",
+                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1",
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
@@ -143,23 +155,29 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     add("private-evidence-bundle")
             except (ValueError, RecursionError):
                 pass
-        # Each flushed I/O lifecycle line and the derived assessment contain private evidence.
-        if not binary and "kn.io_lifetime" in text and not any(f["rule"] == "private-evidence-bundle" for f in findings):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.io_lifetime(?:_assessment)?\.v1"\s*(?:[,}]|$)', text)
+        # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
+        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.crash_diagnosis" in text) and
+                not any(f["rule"] == "private-evidence-bundle" for f in findings)):
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?|crash_diagnosis)\.v1"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:
-                # A JSONL exporter may reorder fields, even in a file with a log preamble.
                 for number, line in enumerate(text.splitlines(), 1):
-                    if "kn.io_lifetime" not in line or not line.lstrip().startswith("{"):
+                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.crash_diagnosis" in line):
                         continue
                     try:
                         row = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
+                    if isinstance(row, dict) and row.get("schema") in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.crash_diagnosis.v1"):
                         add("private-evidence-bundle", number)
                         break
+        if ((not binary or view is not data) and '"virtual"' in text and
+                not any(f["rule"] == "private-evidence-bundle" for f in findings)):
+            frame = re.search(r'(?m)^[ \t,]*\{\s*"ip"\s*:\s*"0x[0-9a-f]+"\s*,\s*"sp"\s*:\s*"0x[0-9a-f]+"'
+                              r'\s*,\s*"return"\s*:\s*"0x[0-9a-f]+"\s*,\s*"virtual"\s*:\s*(?:true|false)\s*,\s*"module"\s*:', text)
+            if frame:
+                add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         # WCT output may be redirected or cut between individually flushed rounds.
         if not binary and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):
             record = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.wait_(?:chain|assessment|diagnosis|series(?:_assessment)?)\.v1"\s*(?:[,}]|$)', text)
