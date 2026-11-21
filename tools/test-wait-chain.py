@@ -182,11 +182,11 @@ def acquire(exe, participants):
 
 
 class WaitTests(unittest.TestCase):
-    def replay(self, raw, expected=0, pin=None):
+    def replay(self, raw, expected=0, pin=None, *, diagnose=False):
         path = self.folder / "review.json"
         path.write_bytes(raw)
         result = run([sys.executable, "-E", "-s", "-B", str(REPLAY), path, "--sha256",
-                      pin or hashlib.sha256(raw).hexdigest()], expected)
+                      pin or hashlib.sha256(raw).hexdigest(), *(["--diagnose"] if diagnose else [])], expected)
         return json.loads(result) if result else None
 
     def altered(self, change, expected=0):
@@ -415,6 +415,117 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(self.check_series(c)["coverage"]["unrecorded_rounds"], 1)
         row["pause"]["signal"]["result"] = WAIT_TIMEOUT
         self.check_series(c, 2)
+
+    def test_diagnosis_native_facts_and_coverage(self):
+        def resolve(raw, pointer):
+            self.assertTrue(pointer == "" or pointer.startswith("/"))
+            for field in pointer.split("/")[1:]:
+                raw = raw[int(field) if isinstance(raw, list) else field]
+            return raw
+
+        for name in ("one_way", "cycle", "open_series", "closed_series", "triangle_closed_series",
+                     "transition", "exit_series", "wrong_thread", "retired_series"):
+            raw = self.original[name]
+            c, d = json.loads(raw), self.replay(raw, diagnose=True)
+            self.assertEqual(d, self.replay(raw, diagnose=True))
+            self.assertEqual((d["schema"], d["source_schema"], d["receipt_sha256"]),
+                             ("kn.wait_diagnosis.v1", c["schema"], hashlib.sha256(raw).hexdigest()))
+            self.assertFalse(any(d[k] for k in ("deadlock_established", "cause_of_hang_established", "intent_assessed",
+                                                "whole_host_assessed", "collector_authenticated")))
+            cov = d["coverage"]
+            self.assertEqual(cov["planned_rounds"], cov["recorded_rounds"] + cov["unrecorded_rounds"])
+            self.assertEqual(cov["planned_queries"], cov["issued_queries"] + cov["unissued_queries"])
+            cycle, contention = d["candidates"]
+            for candidate in d["candidates"]:
+                self.assertTrue(candidate["unobserved"] and candidate["next_observation"])
+                for index in candidate["supporting_facts"] + candidate["counterevidence"]:
+                    self.assertTrue(0 <= index < len(d["facts"]))
+            for fact in d["facts"]:
+                self.assertTrue(fact["evidence"])
+                self.assertTrue(all(resolve(c, p) is not None for p in fact["evidence"]))
+            for gap in d["unclassified_views"]:
+                self.assertEqual(resolve(c, gap["receipt"])["schema"], "kn.wait_chain.v1")
+            if name in ("one_way", "open_series"):
+                self.assertEqual(cycle["status"], "insufficient_evidence")
+                self.assertEqual(contention["status"], "owned_wait_observed")
+            if name in ("cycle", "closed_series", "triangle_closed_series"):
+                self.assertEqual(cycle["status"], self.replay(raw)["conclusion"])
+                self.assertTrue(cycle["supporting_facts"])
+                self.assertFalse(cycle["counterevidence"] or contention["supporting_facts"])
+            if name == "transition":
+                self.assertTrue(contention["supporting_facts"] and contention["counterevidence"])
+            if name == "exit_series":
+                self.assertEqual(cycle["status"], "reference_member_or_process_terminated")
+                end = d["facts"][cycle["counterevidence"][0]]
+                self.assertEqual(resolve(c, end["evidence"][-1])["result"], 0)
+                self.assertGreater(end["round"], 1)
+                self.assertGreater(d["coverage"]["unissued_queries"], 0)
+            if name in ("wrong_thread", "retired_series"):
+                self.assertFalse(d["facts"])
+                self.assertTrue(d["unclassified_views"])
+                self.assertEqual(d["coverage"]["issued_queries"], 0)
+
+    def test_diagnosis_exit_requires_reference_membership(self):
+        c = self.timed_rounds(3, "triangle_closed_series")
+        primary, peer, third = [t[0] for t in self.triangle["threads"]]
+        for r in c["rounds"]:
+            for v in r["views"]:
+                q = v["receipt"]["query"]
+                by_tid = {n["tid"]: n for n in q["nodes"] if n["type"] == 8}
+                root = v["receipt"]["requested"]["tid"]
+                other = peer if root == primary else primary
+                q.update(nodes=[by_tid[root], q["nodes"][1], by_tid[other], q["nodes"][3], by_tid[root]], reported=5)
+        def explain():
+            return self.replay(json.dumps(c).encode(), diagnose=True)["candidates"][0]
+
+        for v in c["rounds"][-1]["views"]:
+            next(p for p in v["receipt"]["threads"] if p["id"] == third)["after"]["result"] = 0
+        self.assertEqual(explain()["counterevidence"], [])
+        # Retain a thread with the same numeric ID and a different creation on the peer side.
+        for r in c["rounds"]:
+            other = next(p for p in r["views"][1]["receipt"]["threads"] if p["id"] == primary)
+            other["created"] = str(int(other["created"]) + 1)
+        other["after"]["result"] = 0
+        self.assertEqual(explain()["counterevidence"], [])
+        # An unsupported observation and a failed wait still leave persistence undetermined.
+        for v in c["rounds"][-1]["views"]:
+            q = v["receipt"]["query"]
+            q.update(nodes=q["nodes"][:1], reported=1, cycle=False)
+        last = c["rounds"][-1]["views"][0]["receipt"]["threads"][0]["after"]
+        last.update(result=4294967295, error=6)
+        self.assertEqual(explain()["counterevidence"], [])
+        last.update(result=0, error=None)
+        self.assertEqual(explain()["status"], "reference_member_or_process_terminated")
+
+    def test_diagnosis_incomplete_and_contradictory_chains(self):
+        def explain(c):
+            return self.replay(json.dumps(c).encode(), diagnose=True)
+
+        c = json.loads(self.original["cycle"])
+        c["query"]["cycle"] = False
+        d = explain(c)
+        self.assertEqual(d["unclassified_views"][0]["reason"], "repeated_thread_without_provider_cycle")
+        self.assertFalse(d["facts"])
+        c = json.loads(self.original["triangle_one_way"])
+        c["query"]["nodes"][-1]["pid"] = 4
+        d = explain(c)
+        self.assertFalse(d["facts"])
+        self.assertEqual(d["unclassified_views"][0]["reason"], "process_scope_boundary")
+        series = self.timed_rounds(3, "triangle_closed_series")
+        for v in series["rounds"][-1]["views"]:
+            nodes = v["receipt"]["query"]["nodes"]
+            nodes[2], nodes[4] = nodes[4], nodes[2]
+        mixed = explain(series)
+        cause = mixed["candidates"][0]
+        self.assertEqual(cause["status"], "multiple_cycle_configurations_observed")
+        self.assertEqual([mixed["facts"][i]["kind"] for i in cause["counterevidence"]], ["different_cycle_observed_in_traversal"] * 2)
+        c = json.loads(self.original["triangle_cycle"])
+        c["query"]["nodes"][-1] = c["query"]["nodes"][2]
+        d = explain(c)
+        self.assertFalse(d["facts"])
+        self.assertEqual(d["unclassified_views"][0]["reason"], "cycle_excludes_primary_generation")
+        self.replay(json.dumps(d).encode(), expected=2, diagnose=True)
+        self.replay(self.original["cycle"], expected=2, pin="0" * 64, diagnose=True)
 
     def test_series_invalid_requests(self):
         argv = series_args(self.exe, self.target, 2, 1)

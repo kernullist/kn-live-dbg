@@ -7,6 +7,38 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Offline comparison of wait explanations, 2026-11-21
+
+After the owned mutex fixtures exited, the Python replayer diagnosed 18
+original single-root and paired WCT captures. Each produced identical
+diagnosis bytes on two runs. All 634 evidence pointers resolved in the
+corresponding SHA-256-pinned input. The default command reproduced 23
+archived assessments byte for byte, including single-root captures from
+before paired acquisition was available.
+
+In the one-way capture the primary thread waited on a mutex held by a
+different thread. The reciprocal capture supplied evidence of a potential
+cycle. In both topology-change captures the diagnostic cited one observed
+owned wait and three cycle views involving the primary thread. The exit
+series retained eight issued queries out of 16 planned. Round 5 contained a
+signaled wait on the same process generation, which ruled out continued
+membership at that point. A new request after exit and a request with the
+wrong primary thread creation time each yielded insufficient evidence for
+both candidates. The observations left the cause of the releases unknown.
+[Compare explanations for a recorded wait](COMMAND_REFERENCE.md#compare-explanations-for-a-recorded-wait)
+
+All 15 wait-chain tests and 19 publication tests passed. Repinned inputs
+covered a different directed cycle, a cycle excluding the primary thread,
+a repeated thread with the native cycle flag clear, an unsupported tail,
+a failed handle wait and termination of an unrelated thread or another
+generation with the same thread ID. The documented PowerShell invocation
+ran against the saved exit series. The scanner flagged six renamed,
+truncated or UTF-16 variants of the actual diagnosis. The run used the
+x64 Release controller identified in the paired-capture section below.
+Between 23:38 and 23:43 KST the host recorded zero new reboot or bugcheck
+events and zero new crash dumps. The final check found zero remaining
+WCT fixture processes, temporary fixture directories or running test drivers.
+
 ## Paired Windows wait-chain observations, 2026-11-21
 
 The Windows x64 Release controller had SHA-256

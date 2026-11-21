@@ -68,7 +68,7 @@ class PublicContentTests(unittest.TestCase):
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
     def test_wait_captures_and_reports(self):
-        for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1"):
+        for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1"):
             intact = json.dumps({"requested": {}, "schema": schema})
             cut = "log start\n" + json.dumps({"schema": schema, "requested": {}}, indent=2)[:-3]
             for text in (intact, cut):

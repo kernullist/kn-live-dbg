@@ -692,6 +692,40 @@ provider execution, the lifetime of each lock and the duration of each
 thread's wait unknown. A deadlock diagnosis still requires evidence of the
 waits, lock lifetimes and possible exits from the cycle.
 
+### Compare explanations for a recorded wait
+
+Use the file and SHA-256 from either capture example above. The Python
+replayer reads the saved bytes and writes a private `kn.wait_diagnosis.v1`
+report. The command also works after the target process has exited.
+
+```powershell
+python tools/replay-wait-chain.py $file --sha256 $pin --diagnose
+```
+
+The two candidates ask different questions about the primary thread.
+
+- Could the first observed cycle involving this thread generation have
+  persisted until collection ended? The report lists every matching view
+  and qualifying repeated group. A different directed cycle is recorded as
+  counterevidence. A signaled handle for the same process or an exact member
+  generation establishes that the original membership ended by that point.
+  The reason the wait ended still requires separate evidence.
+- Can the observations be explained by lock contention throughout the
+  recording without a reported cycle? A qualified wait with a distinct
+  owner and a native cycle flag of false supplies one supporting observation
+  when the chain has no repeated thread or scope boundary. A qualified
+  cycle involving the primary thread supplies counterevidence. An
+  unsupported tail or a missing traversal leaves the question open.
+
+Each entry in `supporting_facts` and `counterevidence` is a zero-based
+index into `facts`. Each fact cites JSON pointers into the original file
+identified by `receipt_sha256`. An empty JSON pointer refers to the entire
+single-root receipt. `unclassified_views` preserves the source
+and reason for each view with insufficient evidence. A candidate's
+`unobserved` and `next_observation` describe the evidence still needed
+to establish a cause. A timeout, cancellation, system-wide deadlock or
+malicious intent cannot be inferred from these observations alone.
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly

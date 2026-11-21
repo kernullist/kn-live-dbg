@@ -253,6 +253,24 @@ def held_inputs(receipt):
             receipt["session"], receipt["discovery"])
 
 
+def cycle_signature(c, cycle):
+    if cycle is None:
+        return None
+    nodes = c["query"]["nodes"]
+    generations = {t["requested"]: t["created"] for t in c["threads"]}
+    arcs = []
+    for i in range(cycle["node_indices"][0], cycle["node_indices"][-1], 2):
+        waiter, owner = nodes[i]["tid"], nodes[i + 2]["tid"]
+        arcs.append((waiter, generations[waiter], LOCKS[nodes[i + 1]["type"]], owner, generations[owner]))
+    # Traversals of the same directed cycle can start at different members.
+    return tuple(sorted(arcs))
+
+
+def cycle_relations(ring):
+    return [dict(waiter_tid=w, waiter_created=wc, lock_semantics=lock, owner_tid=o, owner_created=oc)
+            for w, wc, lock, o, oc in ring]
+
+
 def series_view(view, digest, base):
     fields(view, "timing receipt")
     c, timing = view["receipt"], view["timing"]
@@ -269,18 +287,9 @@ def series_view(view, digest, base):
         edge["observation"] = base + edge["observation"]
         edge["evidence"] = [base + pointer for pointer in edge["evidence"]]
     cycle = a["potential_cycle"]
-    signature = None
+    signature = cycle_signature(c, cycle)
     if cycle is not None:
         cycle["evidence"] = base + cycle["evidence"]
-        c_nodes = c["query"]["nodes"]
-        generations = {t["requested"]: t["created"] for t in c["threads"]}
-        first, last = cycle["node_indices"][0], cycle["node_indices"][-1]
-        arcs = []
-        for i in range(first, last, 2):
-            waiter, owner = c_nodes[i]["tid"], c_nodes[i + 2]["tid"]
-            arcs.append((waiter, generations[waiter], LOCKS[c_nodes[i + 1]["type"]], owner, generations[owner]))
-        # Rotation differs when the same directed ring is queried from another root.
-        signature = tuple(sorted(arcs))
     result = {k: a[k] for k in ("requested", "provider_cycle", "observation_interval", "reason", "conclusion",
                                 "scope_boundary", "node_count", "traversal_error", "edges", "potential_cycle")}
     result["receipt"] = base
@@ -474,9 +483,7 @@ def series(c, digest):
                            pause["signal"]["result"] == WAIT_TIMEOUT)
             if consecutive:
                 if streak_start == ri - 1:
-                    arcs = [dict(waiter_tid=w, waiter_created=wc, lock_semantics=lock, owner_tid=o, owner_created=oc)
-                            for w, wc, lock, o, oc in ring]
-                    streaks.append(dict(first_round=streak_start + 1, last_round=ri + 1, relations=arcs))
+                    streaks.append(dict(first_round=streak_start + 1, last_round=ri + 1, relations=cycle_relations(ring)))
                 else:
                     streaks[-1]["last_round"] = ri + 1
             else:
@@ -499,31 +506,178 @@ def series(c, digest):
                 deadlock_established=False, whole_host_assessed=False, collector_authenticated=False)
 
 
+def first_cycle_exit(capture, rounds, first_round, primary, members):
+    def same_process(pin_):
+        return (pin_["failure"] is None and pin_["id"] == pin_["pid"] == primary["pid"] and
+                pin_["created"] == primary["process_created"])
+
+    for index in range(first_round, len(rounds)):
+        views = rounds[index]
+        if index > first_round:
+            pause = capture["rounds"][index]["pause"]
+            if pause["signal"]["result"] == 0:
+                # The collector waited on the first process handle queried in the preceding round.
+                prior, _, base = next(v for v in rounds[index - 1] if v[0]["query"] is not None)
+                if same_process(prior["process"]):
+                    return index, "process_termination_observed", [base + "/process", f"/rounds/{index}/pause/signal"]
+        phases = ("after",) if index == first_round else ("before", "after")
+        for phase in phases:
+            for receipt, _, base in views:
+                if not same_process(receipt["process"]):
+                    continue
+                pins = [("/process", receipt["process"])]
+                pins.extend((f"/threads/{i}", p) for i, p in enumerate(receipt["threads"])
+                            if p["failure"] is None and p["id"] == p["requested"] and p["pid"] == primary["pid"]
+                            and (p["id"], p["created"]) in members)
+                for path, p in pins:
+                    signal = p[phase]
+                    if signal is not None and signal["result"] == 0:
+                        kind = "process_termination_observed" if path == "/process" else "cycle_member_termination_observed"
+                        return index, kind, [base + "/process", base + path, base + path + "/" + phase]
+    return None
+
+
+def primary_owned_wait(edges, primary):
+    for wait, owner in zip(edges, edges[1:]):
+        if (wait["relation"] == "waits_for" and owner["relation"] == "owned_by" and
+                wait["node_indices"][1] == owner["node_indices"][0] and
+                (wait["thread_id"], wait["thread_created"]) == primary and
+                (owner["thread_id"], owner["thread_created"]) != primary):
+            return wait, owner
+    return None
+
+
+def diagnose(capture, assessment):
+    paired = capture["schema"] == "kn.wait_series.v1"
+    if paired:
+        rounds = [[(raw["receipt"], view, view["receipt"])
+                   for raw, view in zip(r["views"], row["views"])]
+                  for r, row in zip(capture["rounds"], assessment["rounds"])]
+        planned_rounds = capture["planned_rounds"]
+        planned_queries = assessment["coverage"]["planned_queries"]
+    else:
+        rounds = [[(capture, assessment, "")]]
+        planned_rounds = planned_queries = 1
+    primary = rounds[0][0][0]["requested"]
+    primary_key = (primary["tid"], primary["thread_created"])
+    facts, open_waits, closed_views, gaps = [], [], [], []
+    reference_support, different_cycles = [], []
+    reference = None
+    first_round = None
+    issued = 0
+
+    def fact(kind, index, evidence, **details):
+        facts.append(dict(kind=kind, round=index + 1, evidence=list(dict.fromkeys(evidence)), **details))
+        return len(facts) - 1
+
+    for index, views in enumerate(rounds):
+        for c, a, base in views:
+            q = c["query"]
+            issued += q is not None
+            cycle = a["potential_cycle"]
+            ring = cycle_signature(c, cycle)
+            if ring and any((arc[0], arc[1]) == primary_key for arc in ring):
+                if reference is None:
+                    reference, first_round = ring, index
+                raw = [cycle["evidence"]]
+                for edge in a["edges"]:
+                    if edge["node_indices"][0] >= cycle["node_indices"][0]:
+                        raw.extend(edge["evidence"])
+                kind = "cycle_observed_in_traversal" if ring == reference else "different_cycle_observed_in_traversal"
+                pos = fact(kind, index, raw, root_tid=c["requested"]["tid"])
+                closed_views.append(pos)
+                if ring == reference:
+                    reference_support.append(pos)
+                else:
+                    different_cycles.append(pos)
+                continue
+            reason = "cycle_excludes_primary_generation" if ring else a["reason"]
+            if q and q["cycle"] is False and a["scope_boundary"] is None:
+                tids = [n["tid"] for n in q["nodes"] if n["type"] == THREAD]
+                pair = primary_owned_wait(a["edges"], primary_key)
+                if len(set(tids)) != len(tids):
+                    reason = "repeated_thread_without_provider_cycle"
+                elif pair:
+                    wait, owner = pair
+                    open_waits.append(fact("owned_wait_without_reported_cycle", index,
+                                           [base + "/query", base + "/query/cycle", base + "/threads",
+                                            *wait["evidence"], *owner["evidence"]],
+                                           root_tid=c["requested"]["tid"]))
+                    continue
+            gaps.append(dict(round=index + 1, receipt=base, reason=reason))
+
+    ended = []
+    repeated = False
+    relations = cycle_relations(reference) if reference else []
+    if reference:
+        for group in assessment.get("repeated_groups", []):
+            if group["relations"] == relations:
+                first, last = group["first_round"], group["last_round"]
+                refs = ["/collector", "/qpc_hz", "/pause_ms", *[f"/rounds/{i}" for i in range(first - 1, last)]]
+                reference_support.append(fact("cycle_observed_in_consecutive_paired_rounds", first - 1, refs, last_round=last))
+                repeated = True
+        exit_fact = first_cycle_exit(capture, rounds, first_round, primary, {(arc[0], arc[1]) for arc in reference})
+        if exit_fact:
+            index, kind, evidence = exit_fact
+            ended.append(fact(kind, index, evidence))
+
+    cycle_status = "insufficient_evidence"
+    next_cycle = "obtain_a_qualified_wait_observation_for_the_requested_generation"
+    if reference:
+        cycle_status = "repeated_potential_wait_cycle" if repeated else "potential_wait_cycle"
+        next_cycle = "collect_wait_lifetime_and_release_evidence_for_the_same_generations"
+    if different_cycles:
+        cycle_status = "multiple_cycle_configurations_observed"
+    if ended:
+        cycle_status = "reference_member_or_process_terminated"
+        next_cycle = "review_recorded_wait_completions_releases_and_timeouts_before_exit"
+    contention_status = "cycle_reported_in_recording" if closed_views else "owned_wait_observed" if open_waits else "insufficient_evidence"
+    return dict(schema="kn.wait_diagnosis.v1", receipt_sha256=assessment["receipt_sha256"],
+                source_schema=capture["schema"], primary=primary, facts=facts,
+                coverage=dict(planned_queries=planned_queries, issued_queries=issued, unissued_queries=planned_queries-issued,
+                              planned_rounds=planned_rounds, recorded_rounds=len(rounds),
+                              unrecorded_rounds=planned_rounds-len(rounds)), unclassified_views=gaps,
+                candidates=[
+                    dict(candidate="reference_cycle_persisted_to_end_of_capture", status=cycle_status, relations=relations,
+                         supporting_facts=reference_support, counterevidence=different_cycles + ended,
+                         unobserved=["lock_lifetimes", "wait_interval_intersection", "continuous_wait", "timeout_or_cancellation"],
+                         next_observation=next_cycle),
+                    dict(candidate="primary_contention_without_a_reported_cycle_throughout_capture", status=contention_status,
+                         supporting_facts=open_waits, counterevidence=closed_views,
+                         unobserved=["unsupported_wait_dependencies", "lock_release", "cause_of_delay"],
+                         next_observation="record_owner_progress_and_wait_completion_or_timeout")],
+                deadlock_established=False, cause_of_hang_established=False, intent_assessed=False,
+                whole_host_assessed=False, collector_authenticated=False)
+
+
 def unique_object(pairs):
     result = dict(pairs)
     check(len(result) == len(pairs), "duplicate JSON key")
     return result
 
 
-def replay(path, digest):
+def replay(path, digest, *, explain=False):
     check(re.fullmatch(r"[0-9a-f]{64}", digest), "invalid SHA-256")
     with path.open("rb") as stream:
         raw = stream.read(512 * 1024 + 1)
     check(len(raw) <= 512 * 1024 and hashlib.sha256(raw).hexdigest() == digest, "capture size or SHA-256 mismatch")
     capture = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     if type(capture) is dict and capture.get("schema") == "kn.wait_series.v1":
-        return series(capture, digest)
-    check(len(raw) <= 65536, "single capture size limit exceeded")
-    return assess(capture, digest)
+        result = series(capture, digest)
+    else:
+        check(len(raw) <= 65536, "single capture size limit exceeded")
+        result = assess(capture, digest)
+    return diagnose(capture, result) if explain else result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument("--diagnose", action="store_true", help="compare wait hypotheses using the original capture")
     args = parser.parse_args()
     try:
-        print(json.dumps(replay(args.capture, args.sha256), separators=(",", ":"), allow_nan=False))
+        print(json.dumps(replay(args.capture, args.sha256, explain=args.diagnose), separators=(",", ":"), allow_nan=False))
     except (OSError, ValueError, RecursionError) as exc:
         print(f"wait-chain replay failed: {exc}", file=sys.stderr)
         return 2
