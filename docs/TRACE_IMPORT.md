@@ -627,6 +627,47 @@ native timing measurements remain available. Agreement covers the selected
 headers. The native thread lifetime and hard-fault overlap have separate
 witnesses. [Build and replay](COMMAND_REFERENCE.md#check-the-same-markers-with-microsoft-traceprocessor)
 
+### Paired timing of an owned thread handoff
+
+The handoff recorder measures how long a caller takes to finish when it
+must wait for a particular worker thread. A registered plan fixes both
+image hashes, the number of iterations, seeds, timer settings and order.
+Each pair uses the same inputs in two fresh processes. The starting
+condition alternates from pair to pair. Each process starts a private
+in-process ETW session with a raw performance-counter clock. A fresh
+acquisition ID, the registered plan hash and the slot ticket determine the
+activity ID on all ten events. The archive retains the plan, each launch
+outcome and the original ETLs identified by successful recorders. A second
+acquisition of the same plan has its own activity IDs. [Private logger sessions](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-private-logger-session)
+
+The caller signals the worker, completes its calculation, then waits on the
+worker's thread handle. The worker completes its calculation, arms a relative
+waitable timer, waits for the timer and exits. A registered 0 ms uses the
+smallest negative relative due time, one 100 ns unit. Both calculations
+have independently checked results. The controller records process creation
+time and PID. The recorder reads worker creation and exit times from the
+same handle used for the join. [Windows wait semantics](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject) · [Relative timer due times](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setwaitabletimer)
+
+Replay reads the ten original Start and Stop headers for the activity,
+caller calculation, worker span, worker timer and caller join. It checks
+each header against the producer's QPC readings around that event write,
+the expected PID and TID, and the order imposed by the two threads. The
+header and the controller must agree on buffer coverage and report zero
+loss. Separate QPC readings immediately before and after each Windows wait
+call locate the join and timer waits within those markers.
+
+`activity` measures the interval between the outer markers.
+`join_timer_overlap` measures the intersection of the two wait-call
+intervals. Both can include time when a thread was ready to run.
+`work_window_overlap` measures overlap between the two marked calculation
+windows. Replay converts each interval using its recording's QPC frequency
+and computes candidate minus baseline in exact fractional nanoseconds.
+Only pairs with two qualified runs contribute to medians and direction
+counts. All registered slots, missing mates and duplicate recording or
+process identities remain visible. Kernel scheduler residency, whole-product
+latency and producer authenticity require separate evidence.
+[Build, capture and replay](COMMAND_REFERENCE.md#measure-a-caller-waiting-for-a-worker)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

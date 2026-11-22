@@ -363,13 +363,7 @@ def extent(record, limit):
                 original_sha256=record["original_sha256"], retained_sha256=record["retained_sha256"])
 
 
-def attempt(manifest, role, decode, families=FAMILIES):
-    tool, row = manifest["tools"][role], manifest["attempts"][role]
-    fields(tool, "before_sha256 after_sha256 expected_sha256", "comparison binary")
-    before, after = digest(tool["before_sha256"]), digest(tool["after_sha256"])
-    if role == "native" or tool["expected_sha256"] is not None:
-        check(digest(tool["expected_sha256"]) == before, "binary differs from admission pin")
-    fields(row, "state exit_code os_error image_binding started_ns ended_ns stdout stderr", "comparison attempt")
+def process_state(row):
     start, end = decimal(row["started_ns"]), decimal(row["ended_ns"])
     check(start <= end, "reversed comparison clock")
     state = row["state"]
@@ -390,6 +384,17 @@ def attempt(manifest, role, decode, families=FAMILIES):
             check(uint(row["os_error"], 0xffffffff) > 0, "missing original launch error")
         else:
             check(row["os_error"] is None, "unexpected timeout error")
+    return start, end, state, binding
+
+
+def attempt(manifest, role, decode, families=FAMILIES):
+    tool, row = manifest["tools"][role], manifest["attempts"][role]
+    fields(tool, "before_sha256 after_sha256 expected_sha256", "comparison binary")
+    before, after = digest(tool["before_sha256"]), digest(tool["after_sha256"])
+    if role == "native" or tool["expected_sha256"] is not None:
+        check(digest(tool["expected_sha256"]) == before, "binary differs from admission pin")
+    fields(row, "state exit_code os_error image_binding started_ns ended_ns stdout stderr", "comparison attempt")
+    start, end, state, binding = process_state(row)
     limit = MIB if role == "native" else DIAGNOSTIC
     stdout, full = original(row["stdout"], limit)
     _, stderr_full = original(row["stderr"], DIAGNOSTIC)

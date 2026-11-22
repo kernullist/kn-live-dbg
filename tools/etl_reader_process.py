@@ -30,10 +30,24 @@ class WindowsFiles:
         self.final_name = api("GetFinalPathNameByHandleW", w.DWORD, w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD)
         self.open_process = api("OpenProcess", w.HANDLE, w.DWORD, w.BOOL, w.DWORD)
         self.image_name = api("QueryFullProcessImageNameW", w.BOOL, w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD))
+        self.process_times = api("GetProcessTimes", w.BOOL, w.HANDLE, *(ctypes.POINTER(w.FILETIME),) * 4)
         get_system = api("GetSystemDirectoryW", w.UINT, w.LPWSTR, w.UINT)
         buf = ctypes.create_unicode_buffer(32768)
         check(0 < get_system(buf, len(buf)) < len(buf), "cannot locate Windows system directory")
         self.tracerpt = Path(buf.value) / "tracerpt.exe"
+
+    def process_identity(self, pid):
+        handle = self.open_process(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            times = [w.FILETIME() for _ in range(4)]
+            if not self.process_times(handle, *(ctypes.byref(t) for t in times)):
+                return None
+            created = times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+            return dict(pid=pid, process_created=str(created))
+        finally:
+            self.close(handle)
 
     def image_binding(self, pid, pinned):
         import msvcrt
@@ -101,10 +115,10 @@ def reader_receipt(attempt):
     return result
 
 
-def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, pinned):
+def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, pinned, *, capture_identity=False):
     with tempfile.TemporaryFile(dir=directory) as out, tempfile.TemporaryFile(dir=directory) as err:
         start = time.perf_counter_ns()
-        code = error = binding = None
+        code = error = binding = identity = None
         try:
             child = subprocess.Popen([str(program), *arguments], executable=program, cwd=directory,
                                      stdin=subprocess.DEVNULL, stdout=out, stderr=err,
@@ -114,6 +128,8 @@ def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, p
         else:
             try:
                 binding = files.image_binding(child.pid, pinned)
+                if capture_identity:
+                    identity = files.process_identity(child.pid)
                 remaining = max(0, start + timeout_ms * 1_000_000 - time.perf_counter_ns())
                 code = child.wait(timeout=remaining / 1_000_000_000)
                 state = "exited"
@@ -124,5 +140,8 @@ def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, p
                     child.kill()
                     child.wait()
         end = time.perf_counter_ns()
-        return dict(state=state, exit_code=code, os_error=error, image_binding=binding, started_ns=str(start), ended_ns=str(end),
-                    stdout=record_bytes(out, stdout_limit), stderr=record_bytes(err, DIAGNOSTIC))
+        result = dict(state=state, exit_code=code, os_error=error, image_binding=binding, started_ns=str(start), ended_ns=str(end),
+                      stdout=record_bytes(out, stdout_limit), stderr=record_bytes(err, DIAGNOSTIC))
+        if capture_identity:
+            result["process_identity"] = identity
+        return result

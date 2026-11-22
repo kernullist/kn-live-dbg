@@ -7,6 +7,42 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Repeated caller and worker timing on 2026-11-22
+
+On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix
+`aca9ce50443d`) and native reader (`0218aec46253`) measured two
+preregistered studies. Each pair ran both conditions with the same seed
+and 20,000 iterations per thread. Consecutive pairs alternated which
+condition ran first. Each of the 28 runs used a fresh process and a private
+ETW session with system profiling privilege disabled. All 28 ETLs had
+12 records, two processed buffers, a 10 MHz QPC clock and zero reported
+loss. A separate Windows ETW/TDH reader matched all 280 workload markers
+by source record and event header. Independent calculations matched both
+thread checksums, all seven timing metrics and the paired medians.
+
+| Worker timer, baseline / candidate | Pairs measured / planned | Activity longer / shorter | Median activity change | Median change in overlapping waits |
+| --- | ---: | ---: | ---: | ---: |
+| 0 / 25 ms | 8 / 8 | 8 / 0 | +26.03035 ms | +25.74765 ms |
+| 0 / 0 ms | 6 / 6 | 4 / 2 | +1.18105 ms | −1.10740 ms |
+
+Both median columns use candidate minus baseline within each pair. With
+the 25 ms timer, all eight overlap differences were positive. Activity
+increased in both orders, with medians of 25.1210 ms for the four
+baseline-first pairs and 32.6334 ms for the four candidate-first pairs.
+With identical settings, activity differences ranged from −8.3870 to
++13.0328 ms. These observations quantify variation on this host and one
+known dependency on the joined worker. Product regression and kernel
+scheduler residency remain open.
+
+Two replays per study reproduced the report digest. The MSVC runtime-check
+build also completed two pairs and matched 40 original markers. Additional
+tests repeated the same plan with fresh activity IDs, rejected mixed
+acquisitions, retained a surviving mate when its pair was incomplete and
+reported zero measurable pairs after four real process launch failures.
+Other controls covered inconsistent waits, image and source identities,
+source ordering, loss, concurrent publication and private output detection.
+[Integration checks](../tools/test-etl-handoff.py) · [Build, capture and replay](COMMAND_REFERENCE.md#measure-a-caller-waiting-for-a-worker)
+
 ## Microsoft TraceProcessor marker rows on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 adapter built with Visual Studio

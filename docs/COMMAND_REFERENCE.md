@@ -1365,6 +1365,40 @@ Use the `$query` from the preceding example. The receipt gives a native
 requires both pairs of marker headers to match unique SDK rows. Each
 attempt identifies its native page by hash. [SDK table, filters and limits](TRACE_IMPORT.md#traceprocessor-marker-correspondence)
 
+### Measure a caller waiting for a worker
+
+Run this example in an x64 Visual Studio Developer PowerShell at the
+repository root. Use a new private output directory and an existing Release
+reader. The recorder starts one in-process Windows ETW session per run.
+
+```powershell
+New-Item -ItemType Directory -Path .\private\handoff -Force | Out-Null
+cl /nologo /std:c++17 /EHsc /O2 /W4 /WX /DUNICODE /D_UNICODE /Fo:private\handoff\recorder.obj /Fe:private\handoff\recorder.exe tools\etl-statement-capture.cpp
+$recorder = (Get-Item .\private\handoff\recorder.exe).FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$recorderPin = (Get-FileHash -LiteralPath $recorder -Algorithm SHA256).Hash
+$readerPin = (Get-FileHash -LiteralPath $reader -Algorithm SHA256).Hash
+$tool = 'tools/measure-etl-handoff.py'
+$plan = python -B $tool plan --pairs 8 --steps 20000 --baseline-ms 0 --candidate-ms 25 --recorder-sha256 $recorderPin --exe-sha256 $readerPin --output .\private\handoff\plan.json | ConvertFrom-Json
+$capture = python -B $tool capture --plan .\private\handoff\plan.json --plan-sha256 $plan.plan_sha256 --recorder $recorder --output .\private\handoff\originals.zip | ConvertFrom-Json
+$query = @('replay', '--package', '.\private\handoff\originals.zip', '--sha256', $capture.package_sha256, '--plan-sha256', $plan.plan_sha256, '--exe', $reader)
+$receipt = python -B $tool @query --output .\private\handoff\report.json | ConvertFrom-Json
+$report = Get-Content -LiteralPath .\private\handoff\report.json -Raw | ConvertFrom-Json
+$report.changes.activity
+$report.changes.join_timer_overlap
+python -B $tool @query --check-report $receipt.report_sha256
+```
+
+Register 2 to 16 pairs. Each thread performs 1 to 1,000,000 iterations per
+run. Each timer accepts 0 to 1,000 ms. To measure variation with identical
+settings, register a second plan with both timers set to 0. Keep the plan
+digest when registering and the archive digest when capturing. Each named
+output must be new. The capture receipt counts retained ETLs. Replay reports
+planned and measured pairs, signed differences per pair, and medians by
+which condition ran first. Exit 1 preserves a partial study or reports a
+digest mismatch. Exit 2 reports an admission, argument or output failure.
+[Timing fields and interpretation](TRACE_IMPORT.md#paired-timing-of-an-owned-thread-handoff)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

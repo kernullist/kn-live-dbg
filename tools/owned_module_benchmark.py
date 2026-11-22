@@ -105,6 +105,33 @@ def write_bundle(destination, manifest, contents):
     return publish_new(destination, write)
 
 
+def stored_directory(stream, minimum, maximum):
+    # ZipFile eagerly materializes the central directory. Admit only the bounded ZIP32 layout written here.
+    length = stream.seek(0, 2)
+    check(length >= 42, "truncated package directory")
+    stream.seek(-42, 2)
+    check(stream.read(4) != b"PK\x06\x07", "unexpected ZIP64 locator")
+    stream.seek(-22, 2)
+    sig, disk, directory_disk, entries, total, size, offset, comment = struct.unpack("<4s4H2IH", stream.read(22))
+    check(sig == b"PK\x05\x06" and disk == directory_disk == comment == 0 and minimum <= entries == total <= maximum and
+          0 < size <= 4096 and offset + size == length - 22, "invalid package directory")
+    return offset, total
+
+
+def stored_extent(stream, entry, cursor, offset):
+    name = entry.filename.encode("ascii")
+    end = cursor + 30 + len(name) + entry.file_size
+    check(entry.orig_filename == entry.filename and entry.header_offset == cursor and not entry.extra and not entry.comment and
+          end <= offset, "invalid local member extent")
+    stream.seek(cursor)
+    raw = stream.read(30)
+    check(len(raw) == 30, "truncated local member header")
+    sig, _, flags, method, _, _, crc, packed, length, namesize, extra = struct.unpack("<4s5H3I2H", raw)
+    check(sig == b"PK\x03\x04" and flags == method == extra == 0 and packed == length == entry.file_size and
+          crc == entry.CRC and namesize == len(name) and stream.read(namesize) == name, "inconsistent local member header")
+    return end
+
+
 def read_bundle(path, expected, decode):
     check(isinstance(expected, str) and re.fullmatch("[0-9a-f]{64}", expected), "expected a lowercase SHA-256 pin")
     with path.open("rb") as stream:
@@ -113,12 +140,10 @@ def read_bundle(path, expected, decode):
         raise PackagePinMismatch("package size or SHA-256 mismatch")
     check(len(raw) >= 22 and raw.startswith(b"PK\x03\x04") and raw[30:30 + len(MANIFEST)] == MANIFEST.encode(),
           "invalid package header")
-    # ZipFile eagerly materializes the central directory. Bound its byte count before opening it.
-    sig, disk, directory_disk, entries, total, size, offset, comment = struct.unpack_from("<4s4H2IH", raw, len(raw) - 22)
-    check(sig == b"PK\x05\x06" and disk == directory_disk == comment == 0 and entries == total == len(LIMITS) and
-          0 < size <= 4096 and offset + size == len(raw) - 22, "invalid package directory")
+    stream = io.BytesIO(raw)
+    offset, _ = stored_directory(stream, len(LIMITS), len(LIMITS))
     try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        with zipfile.ZipFile(stream) as archive:
             infos = archive.infolist()
             check([i.filename for i in infos] == list(LIMITS), "unexpected package membership or order")
             parts = {}
@@ -126,14 +151,7 @@ def read_bundle(path, expected, decode):
             for i in infos:
                 check(i.compress_type == zipfile.ZIP_STORED and i.flag_bits == 0 and
                       0 < i.file_size == i.compress_size <= LIMITS[i.filename], "unsupported or oversized package member")
-                name = i.filename.encode("ascii")
-                check(i.orig_filename == i.filename and i.header_offset == cursor and not i.extra and not i.comment and
-                      cursor + 30 + len(name) + i.file_size <= offset, "invalid local member extent")
-                sig, _, flags, method, _, _, crc, packed, length, namesize, extra = struct.unpack_from("<4s5H3I2H", raw, cursor)
-                check(sig == b"PK\x03\x04" and flags == method == extra == 0 and
-                      packed == length == i.file_size and crc == i.CRC and namesize == len(name) and
-                      raw.startswith(name, cursor + 30), "inconsistent local member header")
-                cursor += 30 + len(name) + i.file_size
+                cursor = stored_extent(stream, i, cursor, offset)
                 parts[i.filename] = archive.read(i)
             check(cursor == offset, "unaccounted package contents")
     except (zipfile.BadZipFile, NotImplementedError) as exc:

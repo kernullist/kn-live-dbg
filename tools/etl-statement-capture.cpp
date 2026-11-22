@@ -9,6 +9,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "etl-handoff-workload.h"
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -155,9 +156,13 @@ int wmain(int argc, wchar_t** argv)
 {
     if (argc == 3 && std::wstring(argv[2]) == L"--recover-rotation") { return RecoverRotation(argv[1]); }
     const bool rotate = argc == 3 && std::wstring(argv[2]) == L"--rotate";
-    if (argc != 2 && !rotate) { return 2; }
+    const bool measure = argc == 7 && std::wstring(argv[2]) == L"--handoff";
+    handoff::Trial trial;
+    if ((argc != 2 && !rotate && !measure) || (measure && !trial.settings.Parse(argv + 3))) { return 2; }
     GUID session{}, provider{};
-    const auto sessionId = Id(session), providerId = Id(provider);
+    const auto sessionId = Id(session);
+    if (measure) { provider = handoff::Provider; }
+    const auto providerId = measure ? IdText(provider) : Id(provider);
     bool profilePrivilege = false;
     if (sessionId.empty() || providerId.empty() || !ProfilePrivilege(profilePrivilege)) { return 1; }
     const auto owned = std::filesystem::absolute(argv[1]) / sessionId;
@@ -190,7 +195,7 @@ int wmain(int argc, wchar_t** argv)
         if (!status && !EventProviderEnabled(registration, TRACE_LEVEL_INFORMATION, 0)) { status = ERROR_NOT_READY; }
         if (!status)
         {
-            status = rotate ? WriteRotationMarkers(handle, session, registration, increments) :
+            status = measure ? trial.Run(registration) : rotate ? WriteRotationMarkers(handle, session, registration, increments) :
                 EventWriteString(registration, TRACE_LEVEL_INFORMATION, 0, L"KnLiveDbg owned capture statement test");
         }
         stop = ControlTraceW(handle, nullptr, &final.p, EVENT_TRACE_CONTROL_STOP);
@@ -210,6 +215,12 @@ int wmain(int argc, wchar_t** argv)
     std::wcout << L"{\"session_id\":\"" << sessionId << L"\",\"provider_id\":\"" << providerId <<
         L"\",\"system_trace_enable_flags\":" << props.p.EnableFlags << L",\"se_system_profile_privilege_enabled\":" <<
         (profilePrivilege ? L"true" : L"false");
+    if (measure)
+    {
+        trial.Json(IdText(trial.settings.activity));
+        std::wcout << L",\"events_lost\":" << final.p.EventsLost << L",\"log_buffers_lost\":" << final.p.LogBuffersLost
+            << L",\"buffers_written\":" << final.p.BuffersWritten;
+    }
     if (rotate)
     {
         std::wcout << L",\"increments\":" << increments << L",\"stop_win32\":" << stop << L",\"events_lost\":" << final.p.EventsLost <<
