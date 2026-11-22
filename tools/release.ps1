@@ -308,6 +308,22 @@ function Get-ReleaseVersion
     return "dev"
 }
 
+function Get-PackagePathRules
+{
+    param([string]$PythonExecutable, [string]$ValidatorPath)
+
+    $output = & $PythonExecutable -B $ValidatorPath --package-path-rules
+    if ($LASTEXITCODE -ne 0) { throw "Could not load public-content path rules" }
+    $rules = ($output -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+    if ($rules.schema -cne "kn.publication_path_rules.v1" -or
+        $rules.directory -isnot [string] -or [string]::IsNullOrWhiteSpace($rules.directory) -or
+        $rules.file -isnot [string] -or [string]::IsNullOrWhiteSpace($rules.file))
+    {
+        throw "Invalid public-content path rules"
+    }
+    return [pscustomobject]@{ Directory = [regex]$rules.directory; File = [regex]$rules.file }
+}
+
 function Assert-PackagePublicInput
 {
     param(
@@ -318,28 +334,14 @@ function Assert-PackagePublicInput
         [bool]$AllowPrivateSymbols = $false
     )
 
-    $segments = $RelativePath.Replace("\", "/").Split([char]"/")
+    $segments = $RelativePath.Replace("\", "/").ToLowerInvariant().Split([char]"/")
+    for ($i = 0; $i -lt $segments.Length - 1; ++$i)
+    {
+        if ($packagePathRules.Directory.IsMatch($segments[$i])) { throw "Private directory cannot be packaged" }
+    }
     $name = $segments[-1]
+    if ($packagePathRules.File.IsMatch($name)) { throw "Private input cannot be packaged" }
     $extension = [IO.Path]::GetExtension($name)
-    foreach ($segment in $segments)
-    {
-        if ($segment -in @(
-                ".git", ".build", ".vs", ".codex", ".kn-live-dbg",
-                "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"))
-        {
-            throw "Local state or evidence directories cannot be packaged"
-        }
-    }
-    if ($name -match '\.(knirp|knirpledger|knclaims|knblob|knprivacy|knshare|knredact|knsend|knsendresult)(\.pending-.*)?\z')
-    {
-        throw "Private capture, disclosure and transfer files cannot be packaged"
-    }
-    if (($name -like ".env*" -and $name -ine ".env.example") -or
-        $name -in @("auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519") -or
-        $extension -in @(".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log"))
-    {
-        throw "Credential containers or raw captures cannot be packaged"
-    }
     if ($extension -ieq ".pdb" -and -not $AllowPrivateSymbols)
     {
         throw "Private symbols require -IncludePrivateSymbols"
@@ -361,6 +363,8 @@ function Copy-PackageFile
 {
     param(
         [Parameter(Mandatory = $true)]
+        [string]$SourceRoot,
+        [Parameter(Mandatory = $true)]
         [string]$SourcePath,
         [Parameter(Mandatory = $true)]
         [string]$DestinationDir,
@@ -372,9 +376,14 @@ function Copy-PackageFile
         [System.Collections.Generic.List[object]]$Entries
     )
 
+    $base = (Get-FullPath -Path $SourceRoot).TrimEnd("\")
+    Assert-UnderPath -BasePath $base -ChildPath $SourcePath
+    $relative = (Get-FullPath -Path $SourcePath).Substring($base.Length + 1)
+    $relative = Get-SafeRepositoryRelativePath -Path $relative -Context "package source"
+    Assert-NoReparsePointPath -Root $base -RelativePath $relative -Context "package source"
     $sourceItem =
         Get-Item `
-            -LiteralPath $SourcePath `
+            -LiteralPath (Join-Path $base $relative) `
             -Force `
             -ErrorAction Stop
     if (-not $sourceItem.Exists -or
@@ -388,7 +397,7 @@ function Copy-PackageFile
         throw "Package source is a reparse point: $SourcePath"
     }
 
-    Assert-PackagePublicInput -RelativePath $sourceItem.Name `
+    Assert-PackagePublicInput -RelativePath $relative `
         -SourcePath $sourceItem.FullName -AllowPrivateSymbols:$IncludePrivateSymbols
 
     $destination =
@@ -476,6 +485,7 @@ function Copy-PackageRelativeFile
         [string]$RelativePath,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[object]]$Entries
     )
 
@@ -615,6 +625,10 @@ function New-ZipFromDirectory
         $zip.Dispose()
     }
 }
+
+$publicContentValidator = Join-Path $PSScriptRoot "validate-public-content.py"
+Assert-NoReparsePointPath -Root $repo -RelativePath "tools\validate-public-content.py" -Context "public-content validator"
+$packagePathRules = Get-PackagePathRules -PythonExecutable $PythonExecutable -ValidatorPath $publicContentValidator
 
 if (-not (Test-Path $buildScript))
 {
@@ -822,7 +836,7 @@ foreach ($name in $requiredFiles)
         throw "Required release file was not found: $source"
     }
 
-    Copy-PackageFile -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
+    Copy-PackageFile -SourceRoot $repo -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
 }
 
 # Never collect unrelated certificates, symbols, or catalogs from build output.
@@ -853,25 +867,28 @@ foreach ($name in $optionalFiles)
     $source = Join-Path $outputDir $name
     if (Test-Path -LiteralPath $source -PathType Leaf)
     {
-        Copy-PackageFile -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
+        Copy-PackageFile -SourceRoot $repo -SourcePath $source -DestinationDir $stagingDir -Copied $copied -Entries $entries
     }
 }
 
 $readmePath = Join-Path $repo "README.md"
 if (Test-Path $readmePath)
 {
-    Copy-PackageFile -SourcePath $readmePath -DestinationDir $stagingDir -Copied $copied -Entries $entries
+    Copy-PackageFile -SourceRoot $repo -SourcePath $readmePath -DestinationDir $stagingDir -Copied $copied -Entries $entries
 }
 
-$vendorManifest = Join-Path $repo "vendor\debugging-tools\x64\MANIFEST.md"
+$vendorRelative = "vendor\debugging-tools\x64\MANIFEST.md"
+$vendorManifest = Join-Path $repo $vendorRelative
 if (Test-Path $vendorManifest)
 {
     Assert-NoReparsePointPath `
         -Root $repo `
-        -RelativePath (
-            "vendor\debugging-tools\x64\MANIFEST.md") `
+        -RelativePath $vendorRelative `
         -Context "debugging tools manifest"
-    $manifestDestination = Join-Path $stagingDir "debugging-tools-runtime-MANIFEST.md"
+    $manifestName = "debugging-tools-runtime-MANIFEST.md"
+    Assert-PackagePublicInput -RelativePath $vendorRelative -SourcePath $vendorManifest
+    Assert-PackagePublicInput -RelativePath $manifestName -SourcePath $vendorManifest
+    $manifestDestination = Join-Path $stagingDir $manifestName
     Copy-Item -LiteralPath $vendorManifest -Destination $manifestDestination -Force
     $manifestItem = Get-Item -LiteralPath $manifestDestination
     $manifestSourceItem =
@@ -1069,7 +1086,7 @@ $versionManifest = [pscustomobject]@{
 $versionManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $versionManifestPath -Encoding ascii
 
 $publicContentArguments = @(
-    (Join-Path $PSScriptRoot "validate-public-content.py"),
+    $publicContentValidator,
     "--tree", "--root", $stagingDir,
     "--report", (Join-Path $repo ".build\release-public-content-validation.json")
 )

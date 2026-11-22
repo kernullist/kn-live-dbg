@@ -59,22 +59,34 @@ EXAMPLE_USERS = {"a", "test", "user", "public", "default", "o'brien", "o''brien"
 PLACEHOLDERS = {"", "sk-replace-me", "sk-or-replace-me", "<api-key>", "<password>"}
 
 
+def alternatives(values) -> str:
+    return "(?:" + "|".join(re.escape(value) for value in sorted(values)) + ")"
+
+
+# Both engines match one lower-case path component. '$' alone also matches before a final newline.
+END_OF_NAME = r"(?![\s\S])"
+PRIVATE_DIRECTORY_NAME = "^" + alternatives(PRIVATE_DIRECTORIES) + END_OF_NAME
+PRIVATE_PARENT = re.compile(PRIVATE_DIRECTORY_NAME + r"|^\.knbench-etl-")
+PRIVATE_FILE_RULES = (
+    ("local-state-directory", re.compile(PRIVATE_DIRECTORY_NAME)),
+    ("private-operation-journal", re.compile(r"\.knmcpjournal" + END_OF_NAME + r"|\.knmcpjournal\.tmp\.")),
+    ("private-container-or-capture", re.compile(alternatives((
+        ".log.ll", ".etl.zip", ".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm",
+        ".kncampaign", ".knruns")) + END_OF_NAME)),
+    ("credential-file", re.compile(r"^\.env(?!\.example" + END_OF_NAME + ")|^" + alternatives(PRIVATE_NAMES) + END_OF_NAME)),
+    ("private-container-or-capture", re.compile(
+        r"^\.knbench-[\s\S]*\.tmp" + END_OF_NAME + "|" + alternatives(PRIVATE_EXTENSIONS) + END_OF_NAME + "|" +
+        alternatives(ext for ext in PRIVATE_EXTENSIONS if ext.startswith(".kn")) + r"\.pending-")),
+)
+
+
 def path_rule(name: str) -> str | None:
-    path = Path(name)
-    if any(p.lower() in PRIVATE_DIRECTORIES or p.lower().startswith(".knbench-etl-") for p in path.parts[:-1]):
+    parts = name.replace("\\", "/").lower().split("/")
+    if any(PRIVATE_PARENT.search(part) for part in parts[:-1]):
         return "local-state-directory"
-    base = path.name.lower()
-    if base.endswith(".knmcpjournal") or ".knmcpjournal.tmp." in base:
-        return "private-operation-journal"
-    if base.endswith((".log.ll", ".etl.zip", ".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm", ".kncampaign", ".knruns")):
-        return "private-container-or-capture"
-    if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
-        return "credential-file"
-    if (base.startswith(".knbench-") and base.endswith(".tmp")) or path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".knmanifest", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
-    ):
-        return "private-container-or-capture"
-    return None
+    # On POSIX a backslash can also be part of the actual filename in a Git tree.
+    basenames = {parts[-1], Path(name).name.lower()}
+    return next((rule for rule, pattern in PRIVATE_FILE_RULES if any(pattern.search(s) for s in basenames)), None)
 
 
 def text_views(data: bytes) -> list[str]:
@@ -705,20 +717,29 @@ def inputs(root: Path, index: bool, tree: bool):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--index", action="store_true")
     mode.add_argument("--tree", action="store_true")
+    mode.add_argument("--package-path-rules", action="store_true",
+                      help="print the release pre-copy filename rules without inspecting any files")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--allow-private-symbols", action="store_true",
                         help="permit PDB files and their source-path metadata; still check credentials")
     args = parser.parse_args()
+    if args.package_path_rules:
+        if args.root or args.report or args.allow_private_symbols:
+            parser.error("--package-path-rules cannot be combined with inspection options")
+        print(json.dumps({"schema": "kn.publication_path_rules.v1", "directory": PRIVATE_PARENT.pattern,
+                          "file": "|".join(pattern.pattern for _, pattern in PRIVATE_FILE_RULES)}))
+        return 0
+    root = args.root or Path(__file__).resolve().parents[1]
     result = {"mode": "tree" if args.tree else "index" if args.index else "working-tree",
               "files": 0, "bytes": 0, "findings": []}
     try:
-        if not args.root.is_dir():
+        if not root.is_dir():
             raise ValueError("input root is not a directory")
-        for name, data in inputs(args.root.resolve(), args.index, args.tree):
+        for name, data in inputs(root.resolve(), args.index, args.tree):
             result["files"] += 1
             result["bytes"] += len(data)
             result["findings"].extend(inspect(name, data, args.allow_private_symbols))

@@ -110,11 +110,19 @@ The symbol opt-in permits PDB paths, while credential checks still apply. To
 review an intentionally private symbol package manually, add
 `--allow-private-symbols` to the content check below.
 
-Only named project certificates, catalogs and optional PDBs are collected;
-unrelated files in the build directory are ignored. Both ordinary inputs and
-research-ledger anchors reject local-state directories, credential containers,
-environment files other than `.env.example`, and raw logs/dumps. A `.cer` must
-actually be a public X.509 certificate, not a renamed private-key container.
+The release script collects named project certificates, catalogs and optional
+PDBs. Before copying, it loads the filename rules from the public-content
+validator and checks each source path relative to its root. This also covers
+files copied directly to the top of the package. The rules exclude local-state
+directories, credential files, raw captures, evidence stores, private transfer
+records and their recognized temporary names. The public `.env.example` is
+allowed. A `.cer` must contain a public X.509 certificate.
+
+Before creating the ZIP, the release script inspects the bytes of the staged
+files. This second check can identify a credential or a recognized private
+record even under a public filename. The release privacy regression exercises
+both copy paths and verifies the bytes of a synthetic ZIP.
+[Validation results](VALIDATION.md#release-package-path-checks-on-2026-11-23)
 
 ## Public-content check
 

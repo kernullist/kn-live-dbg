@@ -7,6 +7,29 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Release package path checks on 2026-11-23
+
+On `2bbb96c`, eight synthetic evidence filenames entered release staging
+through both copy functions. A ninth file in an ETL working directory entered
+through the relative copy. A separate direct-copy control retained the public
+basenames of files from two private directories. Of the 39 earlier checks,
+15 relative-copy negatives returned an empty-manifest binding error before
+reaching the intended privacy rule.
+
+The updated release functions check the scanner's filename rules before the
+copy and accept an empty manifest for a first relative file. The regression
+verified the specific rejection and checked the destination, copied-name set
+and manifest. It passed 272 checks each on Windows PowerShell 5.1 and
+PowerShell 7.6. The cases included all 53 registered extensions, pending
+forms for 45 evidence extensions, scoped symbol opt-in and public certificate
+handling. Both runs matched the lengths and SHA-256 digests of all 12 files
+inside their synthetic ZIP. A separate file with a public name and synthetic
+credential was rejected during final content inspection.
+
+The public-content scanner passed 41 tests. A comparison with the preceding
+Windows scanner preserved 1,242 prior rejections across 2,517 names and
+accepted all 883 tracked paths. This validation used synthetic packages.
+
 ## Minimized IRP disclosure on 2026-11-23
 
 The preceding x64 Release CLI (`7d3fd43cffdf`) replayed an owned pending IRP
@@ -45,9 +68,10 @@ contracts and 261 command routes. The public-content scanner passed 40
 tests, including renamed UTF-16 files and incomplete claim-report names.
 The generated private file names and their pending forms were also checked
 against the repository's Git ignore rules. The original release copy guard
-accepted four sampled private file names. The updated guard passed 39 release
-privacy checks, including complete and pending forms for nine IRP and
-disclosure file types.
+accepted four sampled private file names. The initial regression reported 39
+passes. Later inspection found that 15 relative-path cases stopped at argument
+binding. The corrected results cover both copy paths.
+[Release package path checks](#release-package-path-checks-on-2026-11-23)
 
 Coverage here is limited to historical captures, a controlled Windows host
 and local HTTP fixtures. Recipient handling, live driver lifecycle and

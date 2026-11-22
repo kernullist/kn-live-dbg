@@ -4,6 +4,7 @@ from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,34 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_release_path_rule_export(self):
+        cli = [sys.executable, "-B", str(Path(AUDIT.__file__).resolve()), "--package-path-rules"]
+        result = subprocess.run(cli, cwd=tempfile.gettempdir(), capture_output=True, check=True)
+        rules = json.loads(result.stdout)
+        self.assertEqual(rules["schema"], "kn.publication_path_rules.v1")
+        directory, file = (re.compile(rules[key]) for key in ("directory", "file"))
+        private = ["ops.knmcpjournal.tmp.42", "rows.ETL.ZIP", "logs", "notes/LOGS/t.txt",
+                   r"attachments\.KNBENCH-ETL-one\event.xml", ".env.example.prod", "archive.kncampaign-wal",
+                   "record.knjlock.pending-1", "record.knbench.pending-1", ".pem", "capture.kncase.pending-7.part",
+                   ".env.example\n", ".knbench-first\nsecond.tmp"]
+        private += ["record" + ext.upper() for ext in AUDIT.PRIVATE_EXTENSIONS]
+        private += ["record" + ext + ".pending-9" for ext in AUDIT.PRIVATE_EXTENSIONS if ext.startswith(".kn")]
+        public = ["x.env", "environments/README.md", "docs/.env.example", "source.kncapture.md",
+                  "docs/.knbench-etl-readme.txt", "symbols-guide/note.txt", "docs/file [v2].txt"]
+        for expected, paths in ((True, private), (False, public)):
+            for path in paths:
+                with self.subTest(path=path):
+                    parts = path.replace("\\", "/").lower().split("/")
+                    matched = any(directory.search(part) for part in parts[:-1]) or bool(file.search(parts[-1]))
+                    self.assertEqual(matched, expected)
+                    self.assertEqual(bool(AUDIT.path_rule(path)), expected)
+        with tempfile.TemporaryDirectory() as temp:
+            report = Path(temp) / "report.json"
+            for other in (["--root", temp], ["--index"], ["--tree"], ["--report", str(report)], ["--allow-private-symbols"]):
+                denied = subprocess.run([*cli, *other], cwd=temp, capture_output=True)
+                self.assertEqual(denied.returncode, 2)
+            self.assertFalse(report.exists())
+
     def test_detached_store_retention(self):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
                 dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),
