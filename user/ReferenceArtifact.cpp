@@ -283,14 +283,17 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
     const std::function<bool(HANDLE)>& admitOutput)
 {
     const auto absolute = LocalPath(path);
-    if (error != nullptr)
-    {
-        *error = L"reference blob publication failed; an existing file is never replaced";
-    }
-    if (absolute.empty() || bytes.empty() || bytes.size() > ReferenceArtifactMaxBytes)
-    {
-        return false;
-    }
+    const bool published = !absolute.empty() && bytes.size() <= ReferenceArtifactMaxBytes &&
+        PublishNewArtifactAt(absolute, bytes.data(), bytes.size(), admitOutput);
+    if (error) { *error = published ? L"" : L"reference blob publication failed; an existing file is never replaced"; }
+    return published;
+}
+
+bool PublishNewArtifactAt(const std::wstring& absolute, const uint8_t* bytes, size_t count,
+    const std::function<bool(HANDLE)>& admitOutput)
+{
+    if (!bytes || !count || count > MAXDWORD || absolute.size() > 32766 || absolute.find(L'\0') != std::wstring::npos ||
+        !std::filesystem::path(absolute).is_absolute()) { return false; }
     static LONG serial = 0;
     const auto temporary = absolute + L".pending-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
         std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(InterlockedIncrement(&serial));
@@ -308,8 +311,8 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
         // Policy admission sees the actual CREATE_NEW handle before any raw
         // bytes are written. Failure/exception disposes only this owned file.
         if (GetFileType(file) == FILE_TYPE_DISK && (!admitOutput || admitOutput(file)) &&
-            WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
-            written == bytes.size() && FlushFileBuffers(file))
+            WriteFile(file, bytes, static_cast<DWORD>(count), &written, nullptr) &&
+            written == count && FlushFileBuffers(file))
         {
             std::vector<uint8_t> storage(offsetof(FILE_RENAME_INFO, FileName) + (absolute.size() + 1) * sizeof(wchar_t), 0);
             auto rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
@@ -323,10 +326,6 @@ bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_
     {
         FILE_DISPOSITION_INFO remove{TRUE};
         SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove));
-    }
-    else if (error != nullptr)
-    {
-        error->clear();
     }
     return ok;
 }

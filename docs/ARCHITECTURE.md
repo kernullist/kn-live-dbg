@@ -892,6 +892,24 @@ of the two files and a compatible function label. The target process creation
 time and the original PC capture timestamp remain unknown.
 [Saved V8 CPU profiles](TRACE_IMPORT.md#saved-v8-cpu-profiles)
 
+### Game object generations and base subobjects
+
+A game can publish its object registry in the main image using the fixed
+x64 slot layout. The build-specific manifest identifies one slot and
+expected container per participating root. Its generator checks the slot
+fields in the exact private PDB and verifies the outer class, base type,
+offset, extent and vftable symbol for each declared subobject.
+
+KMON brackets its existing object and slot reads with two observations of
+the publication. Each observation checks the sequence on both sides of
+the payload read. A stable, active member can support a structural
+comparison for the reported generation. When an address is reused during
+a read, the resulting rows retain both publications and the collector's
+measurement interval. KMON defers the comparison and any dependent code
+checks. Reported membership depends on the cooperative writer. Older
+manifests retain their structural rules and identify lifetime as undeclared.
+[Game registry layout and event fields](KMON_DETECTION_VERIFICATION.md#game-object-lifetime)
+
 ## Pending I/O observation graphs
 
 The native pending-IRP reader retains every admitted request, including requests

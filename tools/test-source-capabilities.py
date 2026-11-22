@@ -38,6 +38,10 @@ def main():
             "semantic_validation": "not_probed", "environment_regression": "not_performed"}
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
+    game = by_key[("objects", "game_object_lifetime", "game_build_manifest")]
+    assert game["consistency"] == "game_reported_two_observations"
+    assert "stable_even_publication_before_and_after" in game["requirements"] and "expected_container_and_member" in game["requirements"]
+    assert "no_independent_lifetime_or_execution" in game["limits"]
     crash = by_key[("diagnostics", "crash_diagnosis", "dbgeng_dump")]
     assert crash["consistency"] == "pinned_offline_dump" and "typed_bugcheck_and_stack" in crash["requirements"]
     assert "optional_stop_parameter_2_cper" in crash["requirements"] and "cper_1MiB_128_sections_512_reads" in crash["limits"]

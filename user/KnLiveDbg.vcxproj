@@ -503,6 +503,7 @@
     <ClInclude Include="WfpCalloutScanner.h" />
     <ClInclude Include="WnfScanner.h" />
     <ClInclude Include="..\shared\KnLiveDbgIoctl.h" />
+    <ClInclude Include="..\shared\KnGameObjectLifetime.h" />
     <ClInclude Include="..\shared\KnLiveDbgReadObservation.h" />
     <ClInclude Include="..\shared\KnLiveDbgPaging.h" />
     <ClInclude Include="..\shared\TimelineCallbackControl.h" />

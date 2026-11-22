@@ -82,6 +82,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle",
                               {f["rule"] for f in AUDIT.inspect("renamed.json", data.encode(encoding))})
 
+    def test_game_manifest_and_registry_evidence(self):
+        self.assertEqual(AUDIT.path_rule("owned.KNMANIFEST"), "private-container-or-capture")
+        self.assertEqual(AUDIT.path_rule("owned.knmanifest.pending-123"), "private-container-or-capture")
+        for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+            for version in (1, 2):
+                wire = "KNDBG_GAME_MANIFEST " + str(version) + "\r\n"
+                self.assertIn("private-game-manifest", {f["rule"] for f in AUDIT.inspect("renamed.txt", wire.encode(encoding))})
+            evidence = json.dumps({"lifetime_source": "game_reported_registry_slot_v1"})
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("copy.txt", evidence.encode(encoding))})
+        self.assertEqual(AUDIT.inspect("guide.md", b"Use KNDBG_GAME_MANIFEST 2 with a selected build."), [])
+
     def test_crash_dump_and_diagnosis(self):
         for signature in (b"PAGEDU64", b"PAGEDUMP"):
             for data in (signature, signature + bytes(128)):

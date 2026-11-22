@@ -1942,6 +1942,73 @@ bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics)
     return failures == 0;
 }
 
+
+bool KmonGameObjectPublicationSelfTest(std::wstring& error)
+{
+    const auto fail = [&](const wchar_t* message) { error = message; return false; };
+    KernelMonitor monitor;
+    auto& manifest = monitor.GameManifest;
+    manifest.ImageSize = 0x6000;
+    manifest.ImageSha256.assign(64, L'a');
+    manifest.FileSha256.assign(64, L'b');
+    manifest.Objects.push_back({L"owned", 0x2000, 0x20, false, GameObjectLifetimeRule{0x3000, 7}});
+    manifest.Vptrs.push_back({0, 8, 0x4000, {{0x1000, 8}}, L"Secondary", 8});
+    KernelMonitor::ImageVerificationWork image;
+    const auto identity = ObserveProcessIdentity(GetCurrentProcessId(), GetCurrentProcess());
+    constexpr uint64_t base = 0x140000000, table = base + 0x4000, target = base + 0x1000;
+    KnGameObjectSlotV1 publication{2, 1, 7, base + 0x2000, static_cast<uint64_t>(KnGameObjectPhase::Destroying)};
+    bool replaceOnSlot = false;
+    const ObservationReader read = [&](uint64_t address, size_t count, std::vector<uint8_t>* bytes)
+    {
+        const void* value = nullptr;
+        if (address == base + 0x3000 && (count == 8 || count == sizeof(publication))) { value = &publication; }
+        else if (address == base + 0x2008 && count == 8) { value = &table; }
+        else if (address == table && count == 8)
+        {
+            value = &target;
+            if (replaceOnSlot) { publication.Sequence += 2; ++publication.Generation; }
+        }
+        if (!value) { return false; }
+        bytes->resize(count);
+        std::memcpy(bytes->data(), value, count);
+        return true;
+    };
+    const auto run = [&] {
+        const auto rows = VerifyGameObjects(manifest, base, read, 1, &image.ObjectCursor);
+        monitor.RecordGameObjectPass(L"owned-fixture", identity, image, rows);
+    };
+    const auto countKind = [&](const wchar_t* kind) {
+        return std::count_if(monitor.Ring.begin(), monitor.Ring.end(), [&](const auto& event) { return event.Kind == kind; });
+    };
+    run();
+    if (monitor.Ring.empty() || monitor.Ring.back().Evidence[L"lifetime_deferred_vptrs"] != L"1" ||
+        !monitor.ExecutionReferences.empty()) { return fail(L"destroying object did not remain deferred"); }
+    publication.Sequence += 2;
+    publication.Phase = static_cast<uint64_t>(KnGameObjectPhase::Live);
+    replaceOnSlot = true;
+    run();
+    if (!monitor.ExecutionReferences.empty() || countKind(L"finding.game_object") ||
+        monitor.Ring.back().Evidence[L"lifetime_deferred_vptrs"] != L"1") { return fail(L"changed publication admitted a stale observation"); }
+    replaceOnSlot = false;
+    run();
+    run();
+    if (countKind(L"observation.game_object") != 1 || monitor.ExecutionReferences.size() != 1)
+    { return fail(L"stable publication or reference deduplication failed"); }
+    publication.Sequence += 2;
+    ++publication.Generation;
+    run();
+    const auto event = std::find_if(monitor.Ring.rbegin(), monitor.Ring.rend(), [](const auto& item) {
+        return item.Kind == L"observation.game_object";
+    });
+    const bool retained = countKind(L"observation.game_object") == 2 && event != monitor.Ring.rend() &&
+        event->Evidence[L"event_category"] == L"observation" && event->Evidence[L"display_suppressed"] == L"true" &&
+        event->Evidence[L"after_generation"] == std::to_wstring(publication.Generation) &&
+        event->Evidence[L"manifest_file_sha256"] == manifest.FileSha256 && event->Evidence[L"image_sha256"] == manifest.ImageSha256 &&
+        event->Evidence.count(L"observer_begin_uptime_ms") && event->Evidence.count(L"observer_end_uptime_ms") &&
+        event->Evidence[L"vptr_role"] == L"secondary" && monitor.Ring.back().Evidence[L"lifetime_qualified_vptrs"] == L"1";
+    return retained || fail(L"new generation or its observation fields were lost");
+}
+
 void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t base,
     const ObservationIdentity& identity, const ObservationReader& reader)
 {
@@ -1967,6 +2034,7 @@ void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t ba
         event.Observation.Source = L"game_build_manifest";
         event.Summary = image->ManifestMatches ? L"exact image and PDB identity match; object rules enabled" : error;
         event.Evidence[L"manifest_applied"] = image->ManifestMatches ? L"true" : L"false";
+        event.Evidence[L"manifest_file_sha256"] = GameManifest.FileSha256;
         event.Evidence[L"image_sha256"] = GameManifest.ImageSha256;
         event.Evidence[L"pdb_age"] = std::to_wstring(GameManifest.PdbAge);
         RecordEvent(std::move(event));
@@ -1991,43 +2059,68 @@ void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t ba
         return;
     }
     const auto observations = VerifyGameObjects(GameManifest, base, reader, 2, &image->ObjectCursor);
+    RecordGameObjectPass(path, identity, *image, observations);
+}
+
+void KernelMonitor::RecordGameObjectPass(const std::wstring& path, const ObservationIdentity& identity,
+    ImageVerificationWork& image, const std::vector<GameObjectObservation>& observations)
+{
     size_t allowed = 0;
     size_t unknown = 0;
+    size_t lifetimeQualified = 0, lifetimeDeferred = 0;
     for (const auto& observation : observations)
     {
         const auto reportKey = std::make_pair(observation.RuleIndex,
             observation.IsVptr ? UINT32_MAX : observation.SlotIndex);
+        const auto& rule = GameManifest.Vptrs[observation.RuleIndex];
+        const auto& object = GameManifest.Objects[rule.ObjectIndex];
+        const bool activeMember = observation.LifetimeStatus == L"reported_active_member";
+        if (object.Lifetime && observation.IsVptr)
+        {
+            if (activeMember) { ++lifetimeQualified; } else { ++lifetimeDeferred; }
+        }
         if (observation.Readable && !observation.IsVptr)
         {
             QueueExecutionReference(observation.Target, observation.SlotAddress, L"manifest_vtable", identity);
         }
         if (observation.Readable && !observation.Modified)
         {
-            image->ObjectReports.erase(reportKey);
             ++allowed;
-            continue;
+            if (!activeMember || !observation.IsVptr)
+            {
+                image.ObjectReports.erase(reportKey);
+                continue;
+            }
         }
         if (!observation.Readable)
         {
             ++unknown;
         }
-        const std::wstring signature = observation.Reason + L":" + std::to_wstring(observation.ObjectAddress) +
+        std::wstring signature = observation.Reason + L":" + std::to_wstring(observation.ObjectAddress) +
             L":" + std::to_wstring(observation.SlotAddress) + L":" + std::to_wstring(observation.Target);
-        if (image->ObjectReports[reportKey] == signature)
+        const auto lifetimeEvidence = GameObjectLifetimeEvidence(object, rule, observation);
+        for (const auto& field : lifetimeEvidence) { signature += L":" + field.first + L"=" + field.second; }
+        if (image.ObjectReports[reportKey] == signature)
         {
             continue;
         }
-        image->ObjectReports[reportKey] = signature;
-        const auto& rule = GameManifest.Vptrs[observation.RuleIndex];
+        image.ObjectReports[reportKey] = signature;
         KmonEvent event;
-        event.Kind = observation.Modified ? L"finding.game_object" : L"coverage.game_object";
+        event.Kind = observation.Modified ? L"finding.game_object" :
+            (activeMember && observation.Readable ? L"observation.game_object" : L"coverage.game_object");
         event.ProcessId = identity.ProcessId;
         event.Image = path;
         event.Summary = observation.Reason;
         event.Observation.Identity = identity;
         event.Observation.Source = L"game_build_manifest";
         event.Observation.ReferenceSource = L"sha256_and_private_pdb_object_rules";
-        event.Evidence[L"object"] = GameManifest.Objects[rule.ObjectIndex].Name;
+        event.Evidence[L"object"] = object.Name;
+        event.Evidence.insert(lifetimeEvidence.begin(), lifetimeEvidence.end());
+        if (object.Lifetime)
+        {
+            event.Evidence[L"observer_begin_uptime_ms"] = std::to_wstring(observation.ObserverBeginUptimeMs);
+            event.Evidence[L"observer_end_uptime_ms"] = std::to_wstring(observation.ObserverEndUptimeMs);
+        }
         event.Evidence[L"object_address"] = std::to_wstring(observation.ObjectAddress);
         event.Evidence[L"vptr_offset"] = std::to_wstring(rule.Offset);
         event.Evidence[L"slot_index"] = observation.IsVptr ? L"vptr" : std::to_wstring(observation.SlotIndex);
@@ -2035,8 +2128,10 @@ void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t ba
         event.Evidence[L"target"] = std::to_wstring(observation.Target);
         event.Evidence[L"relationship"] = L"object_and_address";
         event.Evidence[L"execution_observed"] = L"false";
-        event.Evidence[L"manifest_sha256"] = GameManifest.ImageSha256;
-        if (observation.Readable)
+        event.Evidence[L"manifest_sha256"] = GameManifest.ImageSha256; // Historical image-digest field.
+        event.Evidence[L"image_sha256"] = GameManifest.ImageSha256;
+        event.Evidence[L"manifest_file_sha256"] = GameManifest.FileSha256;
+        if (observation.Readable && observation.Modified)
         {
             std::vector<uint8_t> bytes(sizeof(observation.Target));
             std::memcpy(bytes.data(), &observation.Target, bytes.size());
@@ -2049,10 +2144,12 @@ void KernelMonitor::ScanGameObjectManifest(const std::wstring& path, uint64_t ba
     coverage.ProcessId = identity.ProcessId;
     coverage.Observation.Identity = identity;
     coverage.Observation.Source = L"game_object_sweep";
-    coverage.Evidence[L"rule_cursor"] = std::to_wstring(image->ObjectCursor);
+    coverage.Evidence[L"rule_cursor"] = std::to_wstring(image.ObjectCursor);
     coverage.Evidence[L"rules_total"] = std::to_wstring(GameManifest.Vptrs.size());
     coverage.Evidence[L"allowed_observations"] = std::to_wstring(allowed);
     coverage.Evidence[L"unreadable_observations"] = std::to_wstring(unknown);
+    coverage.Evidence[L"lifetime_qualified_vptrs"] = std::to_wstring(lifetimeQualified);
+    coverage.Evidence[L"lifetime_deferred_vptrs"] = std::to_wstring(lifetimeDeferred);
     coverage.Summary = L"manifest object pass completed; target code is verified separately";
     RecordEvent(std::move(coverage));
 }

@@ -180,6 +180,35 @@ vptr player 20 24040 2
 
 현재 자동 적용 대상은 감시 프로세스의 메인 이미지이다. SHA-256, PDB GUID/age, 실행 구간, 재배치 집합을 확인한 뒤 객체 규칙을 활성화한다. 불일치는 `coverage.manifest`로 남고 범용 검사는 계속한다. 슬롯이 허용 함수 범위 안에 있어도 코드 목적지 검증을 별도로 수행한다. `/manifest`는 첫 start에 지정하며 변경하려면 stop 후 다시 시작한다.
 
+<a id="game-object-lifetime"></a>
+
+### 게임이 발행한 객체 세대와 컨테이너 소속 확인
+
+수명을 제공하는 x64 게임은 검사할 객체마다 메인 이미지의 읽기·쓰기 가능한 데이터 섹션에 `KnGameObjectSlotV1` 레지스트리 항목을 둔다. `ContainerId`는 이 빌드에서 정한 컨테이너 식별자이고 `MemberAddress`는 그 컨테이너에 실제 등록된 완전한 객체의 주소다. `Generation`은 새 할당마다 바뀐다. 한 프로세스 수명 동안 세대와 발행 번호를 재사용하지 않는 것이 이 계약의 전제다. [레지스트리 구조](../shared/KnGameObjectLifetime.h)
+
+게임은 하나의 쓰기 주체가 생성·소멸, 루트 교체, 컨테이너 가입·탈퇴와 객체 상태 변경을 발행하도록 동기화한다. 변경을 시작하기 전에 `Sequence`를 홀수로 만들고, 관련 쓰기가 모두 끝난 뒤 다음 짝수로 발행한다. 두 경계에는 메모리 배리어가 필요하다. 0은 미발행이다. `Phase` 값은 0 비어 있음, 1 생성 중, 2 활성, 3 소멸 중, 4 GC 진행 중이다. [Windows Interlocked 동기화](https://learn.microsoft.com/en-us/windows/win32/sync/interlocked-variable-access)
+
+생성용 레이아웃에 `lifetime <객체명> <레지스트리 RVA> <컨테이너 ID>`를 추가한다. 해당 객체의 각 `vptr` 행에는 PDB의 하위 객체 타입명을 마지막에 붙인다. 생성기는 레지스트리의 다섯 필드와 타입·크기·오프셋을 검사한다. vptr에는 루트 타입 또는 고정 오프셋의 직접 비가상 기저 타입을 사용할 수 있다. PDB의 vftable 심벌도 완전한 객체 타입과 해당 기저 타입에 대응해야 한다. 아래는 자체 테스트 게임을 본뜬 레이아웃이다. RVA와 컨테이너 ID는 빌드에서 제공한 16진수 값으로 채운다. [DIA 기저 클래스 정보](https://learn.microsoft.com/en-us/visualstudio/debugger/debug-interface-access/baseclass?view=vs-2022)
+
+```text
+object player 12000 10 1
+lifetime player 12100 17
+vptr player 0 24000 1 Primary
+vptr player 8 24010 1 game::Secondary
+```
+
+`--game-manifest create`는 수명 규칙이 있을 때 v2를 발행한다. 기존 레이아웃은 v1으로 저장한다. KMON은 대상 루트와 레지스트리의 멤버 주소가 일치하고, vptr·슬롯을 읽기 전후에 컨테이너·세대·활성 상태와 발행 번호가 모두 같을 때 `reported_active_member`를 기록한다. 생성·소멸 중이거나 읽는 도중 발행이 바뀌면 `coverage.game_object`에 이유를 남긴다. 검사 시점에는 원래 슬롯 값을 보존하고, 보류한 결과의 코드 목적지 검사는 예약하지 않는다.
+
+| 이벤트 필드 | 해석 |
+| --- | --- |
+| `before_*`, `after_*` | 각 관측에서 읽은 발행 번호, 세대, 컨테이너, 멤버 주소와 상태. 읽기에 실패한 필드는 생략한다. |
+| `observer_begin_uptime_ms`, `observer_end_uptime_ms` | 검사 시작과 종료를 수집기 PC의 가동 시간(밀리초)으로 나타낸다. |
+| `vptr_role`, `subobject_type`, `subobject_size` | 명세가 지목한 primary·secondary vptr와 하위 객체. 활성 멤버에서 확인한 경우 하위 객체 주소도 기록한다. |
+| `manifest_file_sha256`, `image_sha256` | 실제 읽은 명세 파일과 선택한 PE의 SHA-256. 기존 `manifest_sha256` 필드는 이미지 해시를 유지한다. |
+| `lifetime_qualified_vptrs`, `lifetime_deferred_vptrs` | 한 번의 순회에서 게임의 수명 발행을 확인했거나 보류한 vptr 규칙 수. v1 규칙의 수명 상태는 `not_declared`다. |
+
+같은 주소가 새 세대로 재등장하면 KMON은 이벤트 링에 새 `observation.game_object`를 남긴다. 정상 세대의 반복은 같은 발행 번호일 때 중복으로 처리한다. 이 결과의 신뢰 범위는 선택한 명세와 게임의 발행 계약에 한정된다. 게임 자체가 거짓 상태를 발행한 경우, 제3자 엔진의 할당 이력, 해당 코드의 실행 여부는 다른 소스의 확인이 필요하다. [실제 다중 상속 객체 검증](VALIDATION.md#game-object-lifetime-validation-on-2026-11-22)
+
 ## 재현 가능한 검증
 
 ```powershell

@@ -395,6 +395,7 @@ private:
     friend bool KmonIrpPublicationIntegrationSelfTest(const std::wstring&, std::wstring*);
     friend bool KmonCaptureSchedulingIntegrationSelfTest(std::wstring* diagnostics);
     friend bool KmonReferenceSchedulingIntegrationSelfTest(std::wstring* diagnostics);
+    friend bool KmonGameObjectPublicationSelfTest(std::wstring& error);
     friend bool KmonVerificationHandleSelfTest(std::wstring& diagnostics);
     friend bool KmonWatchMaintenanceSelfTest(HANDLE exitedProcess, std::wstring& diagnostics);
     friend bool KmonHandleScanObserverSelfTest(HANDLE subjectProcess, std::wstring& diagnostics);
@@ -883,6 +884,8 @@ private:
         std::map<uint32_t, uint64_t> ReportedHashes;
         uint64_t PermissionCursor = 0;
     };
+    void RecordGameObjectPass(const std::wstring& path, const ObservationIdentity& identity,
+        ImageVerificationWork& image, const std::vector<GameObjectObservation>& observations);
     ImageVerificationWork* FindImageWork(const std::wstring& path, uint64_t base,
         const ObservationIdentity& identity, bool* referenceUnavailable = nullptr,
         ImageVerificationWork** admitted = nullptr, bool discovery = true);

@@ -762,6 +762,9 @@
     <ClInclude Include="DumpReadObservationJson.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\shared\KnGameObjectLifetime.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\shared\KnLiveDbgReadObservation.h">
       <Filter>Header Files</Filter>
     </ClInclude>

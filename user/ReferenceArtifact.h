@@ -54,6 +54,10 @@ private:
     std::shared_ptr<const RetainedReferenceArtifact> Content;
 };
 
+// Flush and publish a new sibling by handle at the caller's resolved absolute path.
+bool PublishNewArtifactAt(const std::wstring& absolute, const uint8_t* bytes, size_t count,
+    const std::function<bool(HANDLE)>& admitOutput = {});
+
 // A failed or interrupted publication never exposes a valid final blob.
 bool PublishReferenceArtifact(const std::wstring& path, const std::vector<uint8_t>& bytes, std::wstring* error,
     const std::function<bool(HANDLE)>& admitOutput = {});

@@ -5387,6 +5387,54 @@ This adapter covers the pinned Windows V8 format and x64 binary layout.
 Browser builds, other V8 versions, Wasm code identity, live JIT or CLR ReJIT
 transitions and process-lifetime attribution remain open.
 
+## Game object lifetime validation on 2026-11-22
+
+The Windows x64 fixture contains a native MSVC object with two nonvirtual base
+classes, a direct root and a pointer root. The generator used the fixture's PE
+and exact private PDB. A separate invocation observed its own live objects
+with the production verifier. The oracle compared the returned subobject
+addresses with C++ base casts and checked both vptrs, both table entries and
+the complete before/after registry fields.
+
+In the same-address reuse case, a second thread waited until the reader had
+read the table entry, then destroyed and reconstructed the object in place.
+The reader continued only after the writer finished. The root and both
+observed values for the selected vptr were identical. The generation changed
+from 4,294,967,297 to 4,294,967,298 and the sequence advanced from 2 to 4.
+The original rows retained both publications and produced zero structural
+findings. Construction, destruction, GC, a vacant slot and the wrong registry
+member each deferred the comparison before the first vptr read. Separate
+stable controls detected a mismatched table or function range.
+
+The linked KMON self-test exercises the event ring and reference queue. A
+deferred rule queues zero target checks. Repeating a stable publication emits
+one observation, and a new generation at the same address emits another.
+During review, the generator accepted a different base's real vftable and
+the watch filter dropped the healthy generation event. Both paths have
+regression checks. The event records the digest of the exact manifest bytes
+as well as the image digest.
+
+For one PE/PDB and layout, the previous and current generators produced
+all 2,938 bytes of the v1 manifest identically. A mixed v2 manifest kept its undeclared object on the v1
+structural path. The file checks include an input held open for writing,
+overlapping registry locations, a swapped base table, a wrong image or PDB,
+a diagnostic stream hard-linked to an input, and concurrent attempts to
+publish the same destination. The native and x64 AddressSanitizer fixtures
+each exercised 23 lifecycle scenarios and both paths of a mixed manifest.
+The sanitizer run used `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` for
+this host's interceptor warnings. The shared publisher passed 151 IRP
+binding checks, 53 replay checks and 641 claim publication checks.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/validate-kmon-manifest.ps1
+.\x64\Release\KnLiveDbg.exe --game-manifest self-test
+```
+
+The owned workload covers the specified MSVC x64 layout and cooperating
+writer. Production game-engine allocation and GC protocols, virtual bases,
+independent lifetime evidence and live driver-backed collection remain open.
+[Registry contract and field meanings](KMON_DETECTION_VERIFICATION.md#game-object-lifetime)
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

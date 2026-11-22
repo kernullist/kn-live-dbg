@@ -7833,6 +7833,7 @@ bool KmonWatchMatches(const KmonEvent& event, const KmonOptions& options)
             event.Kind == L"thread.dkom" ||
             event.Kind == L"thread.scan" ||
             event.Kind == L"io.request_observation" ||
+            event.Kind == L"observation.game_object" ||
             event.Kind == L"io.claim_assessment")
         {
             matched = true;
@@ -21323,7 +21324,7 @@ void KernelMonitor::RecordEvent(KmonEvent&& event)
     const bool quietFile = event.Kind == L"driver.handle" &&
         event.Evidence[L"channel_class"] == L"filesystem";
     const bool quietCoverage = event.Kind == L"coverage.region" || event.Kind == L"coverage.pipeline" ||
-        event.Kind == L"io.request_observation" || event.Kind == L"io.claim_assessment" ||
+        event.Kind == L"io.request_observation" || event.Kind == L"io.claim_assessment" || event.Kind == L"observation.game_object" ||
         (event.Kind == L"coverage.layout" && (event.Task == L"complete" || event.Task == L"initial_observation")) ||
         event.Kind == L"coverage.page_candidates" ||
         event.Kind == L"coverage.image_permissions" ||

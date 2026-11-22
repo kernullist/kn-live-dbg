@@ -59,6 +59,8 @@ ipch/
 *.ilk
 *.log
 *.log.ll
+*.knmanifest
+*.knmanifest.pending-*
 *.tlog
 *.lastbuildstate
 *.recipe

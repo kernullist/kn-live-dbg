@@ -1,13 +1,10 @@
-param([string]$Executable = (Join-Path $PSScriptRoot '..\x64\Release\KnLiveDbg.exe'))
+param([string]$Executable = (Join-Path $PSScriptRoot '..\x64\Release\KnLiveDbg.exe'), [switch]$Sanitize)
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$vcvars = Get-Item "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\vcvars64.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $vcvars)
-{
-    throw 'Visual C++ build tools were not found'
-}
-$output = Join-Path $repo '.build\kmon-manifest'
+. (Join-Path $PSScriptRoot 'msvc-validation-environment.ps1')
+$compiler = Get-MsvcValidationEnvironment -Sanitize:$Sanitize
+$output = Join-Path $repo ('.build\kmon-manifest\' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $fixture = Join-Path $output 'ordinary-game-fixture.exe'
 $pdb = Join-Path $output 'ordinary-game-fixture.pdb'
@@ -15,7 +12,13 @@ $layout = Join-Path $output 'object-layout.txt'
 $manifest = Join-Path $output ('build-' + [guid]::NewGuid().ToString('N') + '.knmanifest')
 $source = Join-Path $PSScriptRoot 'kmon-manifest-fixture.cpp'
 $batch = Join-Path $output 'compile.cmd'
-$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /Od /Zi /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX "{1}" /Fo:"{2}" /Fd:"{3}" /Fe:"{4}" /link /DEBUG:FULL /INCREMENTAL:NO /PDB:"{5}"' -f $vcvars.FullName, $source, (Join-Path $output 'fixture.obj'), (Join-Path $output 'compiler.pdb'), $fixture, $pdb
+$extraFlags = ''
+if ($Sanitize)
+{
+    $extraFlags = '/fsanitize=address'
+    Copy-Item -LiteralPath $compiler.AsanRuntimePath -Destination $output
+}
+$command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /Od /Zi /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} "{2}" "{3}" "{4}" /Fo:"{5}" /Fd:"{6}" /Fe:"{7}" /link /DEBUG:FULL /INCREMENTAL:NO /PDB:"{8}"' -f $compiler.VcVarsPath, $extraFlags, $source, (Join-Path $repo 'user\GameBuildManifest.cpp'), (Join-Path $repo 'user\ExecutableImage.cpp'), ($output.Replace('\', '/') + '/'), (Join-Path $output 'compiler.pdb'), $fixture, $pdb
 Set-Content -LiteralPath $batch -Value ("@echo off`r`n" + $command + "`r`nexit /b %errorlevel%") -Encoding ascii
 & $batch
 if ($LASTEXITCODE -ne 0)
@@ -59,6 +62,16 @@ $otherPdb = [IO.Path]::ChangeExtension((Resolve-Path -LiteralPath $Executable).P
 if ($LASTEXITCODE -eq 0)
 {
     throw 'Mismatched PDB was accepted'
+}
+& $Executable --game-manifest self-test
+if ($LASTEXITCODE -ne 0)
+{
+    throw 'Manifest reader and KMON event publication self-test failed'
+}
+& python (Join-Path $PSScriptRoot 'test-game-object-lifetime.py') --exe $Executable --fixture $fixture --legacy $manifest
+if ($LASTEXITCODE -ne 0)
+{
+    throw 'Owned game-object lifetime validation failed'
 }
 Write-Output '[kmon.manifest] native binary/PDB generation, secondary vptr and mismatch controls: PASS'
 Write-Output "[kmon.manifest] $manifest"

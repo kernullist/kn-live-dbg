@@ -57,7 +57,8 @@ inline const wchar_t* KmonEventCategory(const std::wstring& kind)
         kind == L"mapper.watch" || kind == L"finding.layout_change" ||
         kind == L"finding.code_modified" || kind == L"finding.tls_metadata" ||
         kind == L"finding.layout_image_identity" || kind == L"finding.executable_memory" ||
-        kind == L"finding.executable_permission" || kind == L"io.request_observation" || kind == L"io.claim_assessment")
+        kind == L"finding.executable_permission" || kind == L"io.request_observation" || kind == L"io.claim_assessment" ||
+        kind == L"observation.game_object")
     {
         return L"observation";
     }

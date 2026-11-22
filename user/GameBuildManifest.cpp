@@ -4,8 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <set>
@@ -47,10 +46,56 @@ namespace
         return false;
     }
 
+    bool TypeName(const std::wstring& name)
+    {
+        if (name.empty() || name.size() > 128) { return false; }
+        const auto letter = [](wchar_t c) { return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || c == L'_'; };
+        bool first = true;
+        for (size_t i = 0; i < name.size(); ++i)
+        {
+            const auto c = name[i];
+            if (!first && c == L':' && i + 1 < name.size() && name[i+1] == L':') { ++i; first = true; continue; }
+            if (!letter(c) && (first || c < L'0' || c > L'9')) { return false; }
+            first = false;
+        }
+        return !first;
+    }
+
+    bool ValidLifetimeSlot(const GameBuildManifest& manifest, size_t index)
+    {
+        const auto& slot = *manifest.Objects[index].Lifetime;
+        if (!slot.ContainerId || slot.SlotRva % alignof(KnGameObjectSlotV1) ||
+            !Within(slot.SlotRva, sizeof(KnGameObjectSlotV1), manifest.ImageSize)) { return false; }
+        const uint64_t end = static_cast<uint64_t>(slot.SlotRva) + sizeof(KnGameObjectSlotV1);
+        const auto overlaps = [&](uint64_t rva, uint64_t size) { return rva < end && slot.SlotRva < rva + size; };
+        for (size_t i = 0; i < manifest.Objects.size(); ++i)
+        {
+            const auto& object = manifest.Objects[i];
+            if (overlaps(object.RootRva, object.Indirect ? 8 : object.Size) ||
+                (i != index && object.Lifetime && overlaps(object.Lifetime->SlotRva, sizeof(KnGameObjectSlotV1)))) { return false; }
+        }
+        for (const auto& range : manifest.ExecutableRanges)
+        {
+            if (overlaps(range.Address, range.Size)) { return false; }
+        }
+        bool hasVptr = false;
+        for (const auto& rule : manifest.Vptrs)
+        {
+            if (overlaps(rule.TableRva, rule.AllowedSlots.size() * uint64_t{8})) { return false; }
+            hasVptr |= rule.ObjectIndex == index;
+        }
+        return hasVptr;
+    }
+
+    bool UserExtent(uint64_t address, uint64_t size)
+    {
+        return address >= 0x10000 && Within(address, size, 0x0000800000000000ull);
+    }
+
     bool Pointer(const ObservationReader& reader, uint64_t address, uint64_t* value)
     {
         std::vector<uint8_t> bytes;
-        if (!reader || address > UINT64_MAX - sizeof(*value) ||
+        if (!reader || !UserExtent(address, sizeof(*value)) ||
             !reader(address, sizeof(*value), &bytes) || bytes.size() != sizeof(*value))
         {
             return false;
@@ -119,6 +164,13 @@ bool ValidateGameManifest(const GameBuildManifest& manifest, std::wstring* error
                 bounds = false;
                 break;
             }
+            const auto& object = manifest.Objects[rule.ObjectIndex];
+            if (object.Lifetime ? (!TypeName(rule.SubobjectType) || rule.Offset % 8 || rule.SubobjectSize < 8 ||
+                !Within(rule.Offset, rule.SubobjectSize, object.Size)) : (!rule.SubobjectType.empty() || rule.SubobjectSize != 0))
+            {
+                bounds = false;
+                break;
+            }
             for (const auto& range : rule.AllowedSlots)
             {
                 if (!Within(range.Address, range.Size, manifest.ImageSize) || !Executable(manifest, range.Address, range.Size))
@@ -127,6 +179,10 @@ bool ValidateGameManifest(const GameBuildManifest& manifest, std::wstring* error
                     break;
                 }
             }
+        }
+        for (size_t i = 0; bounds && i < manifest.Objects.size(); ++i)
+        {
+            if (manifest.Objects[i].Lifetime) { bounds = ValidLifetimeSlot(manifest, i); }
         }
         valid = bounds;
     } while (false);
@@ -140,7 +196,9 @@ bool ValidateGameManifest(const GameBuildManifest& manifest, std::wstring* error
 std::wstring SerializeGameManifest(const GameBuildManifest& manifest)
 {
     std::wostringstream out;
-    out << L"KNDBG_GAME_MANIFEST 1\n" << std::hex;
+    const auto lifetimeCount = std::count_if(manifest.Objects.begin(), manifest.Objects.end(),
+        [](const auto& object) { return object.Lifetime.has_value(); });
+    out << L"KNDBG_GAME_MANIFEST " << (lifetimeCount ? 2 : 1) << L'\n' << std::hex;
     out << L"identity " << manifest.ImageSha256 << L' ' << manifest.PdbSha256 << L' ' << GuidHex(manifest.PdbGuid) << L' '
         << manifest.PdbAge << L' ' << manifest.ImageSize << L' ' << manifest.Machine << L'\n';
     out << L"exec " << manifest.ExecutableRanges.size() << L'\n';
@@ -167,6 +225,23 @@ std::wstring SerializeGameManifest(const GameBuildManifest& manifest)
             out << range.Address << L' ' << range.Size << L'\n';
         }
     }
+    if (lifetimeCount)
+    {
+        out << L"lifetimes " << lifetimeCount << L'\n';
+        for (size_t i = 0; i < manifest.Objects.size(); ++i)
+        {
+            const auto& slot = manifest.Objects[i].Lifetime;
+            if (slot) { out << i << L' ' << slot->SlotRva << L' ' << slot->ContainerId << L'\n'; }
+        }
+        const auto count = std::count_if(manifest.Vptrs.begin(), manifest.Vptrs.end(),
+            [](const auto& rule) { return !rule.SubobjectType.empty(); });
+        out << L"subobjects " << count << L'\n';
+        for (size_t i = 0; i < manifest.Vptrs.size(); ++i)
+        {
+            const auto& rule = manifest.Vptrs[i];
+            if (!rule.SubobjectType.empty()) { out << i << L' ' << rule.SubobjectType << L' ' << rule.SubobjectSize << L'\n'; }
+        }
+    }
     out << L"end\n";
     return out.str();
 }
@@ -177,7 +252,7 @@ bool ParseGameManifest(const std::wstring& text, GameBuildManifest* manifest, st
     do
     {
         if (manifest == nullptr || text.size() > 32 * 1024 * 1024 ||
-            text.find_first_not_of(L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ \t\r\n") != std::wstring::npos)
+            text.find_first_not_of(L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_: \t\r\n") != std::wstring::npos)
         {
             break;
         }
@@ -185,7 +260,7 @@ bool ParseGameManifest(const std::wstring& text, GameBuildManifest* manifest, st
         std::wistringstream in(text);
         std::wstring token;
         uint32_t version = 0;
-        if (!(in >> token >> version) || token != L"KNDBG_GAME_MANIFEST" || version != 1)
+        if (!(in >> token >> version) || token != L"KNDBG_GAME_MANIFEST" || (version != 1 && version != 2))
         {
             break;
         }
@@ -252,6 +327,26 @@ bool ParseGameManifest(const std::wstring& text, GameBuildManifest* manifest, st
                 in >> range.Address >> range.Size;
             }
         }
+        if (version == 2)
+        {
+            if (!(in >> token >> count) || token != L"lifetimes" || !count || count > parsed.Objects.size()) { break; }
+            for (size_t i = 0; i < count; ++i)
+            {
+                size_t index = 0;
+                GameObjectLifetimeRule slot;
+                if (!(in >> index >> slot.SlotRva >> slot.ContainerId) || index >= parsed.Objects.size() || parsed.Objects[index].Lifetime)
+                { in.setstate(std::ios::failbit); break; }
+                parsed.Objects[index].Lifetime = slot;
+            }
+            if (!(in >> token >> count) || token != L"subobjects" || !count || count > parsed.Vptrs.size()) { break; }
+            for (size_t i = 0; i < count; ++i)
+            {
+                size_t index = 0;
+                if (!(in >> index) || index >= parsed.Vptrs.size() || !parsed.Vptrs[index].SubobjectType.empty())
+                { in.setstate(std::ios::failbit); break; }
+                in >> parsed.Vptrs[index].SubobjectType >> parsed.Vptrs[index].SubobjectSize;
+            }
+        }
         if (!(in >> token) || token != L"end" || !ValidateGameManifest(parsed, error))
         {
             break;
@@ -271,21 +366,39 @@ bool ParseGameManifest(const std::wstring& text, GameBuildManifest* manifest, st
     return valid;
 }
 
+bool ReadGameManifestInput(const std::wstring& path, size_t limit, std::string& bytes)
+{
+    const HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    const std::unique_ptr<void, decltype(&CloseHandle)> file(raw == INVALID_HANDLE_VALUE ? nullptr : raw, &CloseHandle);
+    LARGE_INTEGER length{};
+    if (!file || GetFileType(raw) != FILE_TYPE_DISK || !GetFileSizeEx(raw, &length) || length.QuadPart <= 0 ||
+        static_cast<uint64_t>(length.QuadPart) > limit || length.QuadPart > 32 * 1024 * 1024) { return false; }
+    std::string content(static_cast<size_t>(length.QuadPart), '\0');
+    size_t at = 0;
+    while (at < content.size())
+    {
+        DWORD read = 0;
+        if (!ReadFile(raw, content.data() + at, static_cast<DWORD>(content.size() - at), &read, nullptr) || !read) { return false; }
+        at += read;
+    }
+    bytes = std::move(content);
+    return true;
+}
+
 bool ReadGameManifest(const std::wstring& path, GameBuildManifest* manifest, std::wstring* error)
 {
-    std::ifstream input(std::filesystem::path(path), std::ios::binary | std::ios::ate);
-    if (!input || input.tellg() <= 0 || input.tellg() > 32 * 1024 * 1024)
+    std::string bytes;
+    if (!manifest || !ReadGameManifestInput(path, 32 * 1024 * 1024, bytes))
     {
-        if (error != nullptr)
-        {
-            *error = L"manifest could not be opened or exceeds 32 MiB";
-        }
+        if (error) { *error = L"manifest requires a stable, nonempty input file of at most 32 MiB"; }
         return false;
     }
-    std::string bytes(static_cast<size_t>(input.tellg()), '\0');
-    input.seekg(0);
-    input.read(bytes.data(), bytes.size());
-    return input.good() && ParseGameManifest(mcpjson::Utf8ToWide(bytes), manifest, error);
+    GameBuildManifest parsed;
+    ContentHash digest;
+    if (!ParseGameManifest(mcpjson::Utf8ToWide(bytes), &parsed, error) ||
+        !digest.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) || (parsed.FileSha256 = digest.Finish()).empty()) { return false; }
+    *manifest = std::move(parsed);
+    return true;
 }
 
 bool MatchGameManifest(const GameBuildManifest& manifest, const std::wstring& image,
@@ -317,6 +430,15 @@ bool MatchGameManifest(const GameBuildManifest& manifest, const std::wstring& im
                 metadata.BaseRelocations[i].Width == manifest.Relocations[i].Width;
         }
     }
+    for (const auto& object : manifest.Objects)
+    {
+        if (!match || !object.Lifetime) { continue; }
+        const auto rva = object.Lifetime->SlotRva;
+        match = std::count_if(metadata.Sections.begin(), metadata.Sections.end(), [&](const auto& section) {
+            return section.Writable && !section.Executable && (section.Characteristics & IMAGE_SCN_MEM_READ) &&
+                rva >= section.VirtualAddress && Within(rva - section.VirtualAddress, sizeof(KnGameObjectSlotV1), section.VirtualSize);
+        }) == 1;
+    }
     match = match && ContentHash::File(image) == manifest.ImageSha256;
     if (!match && error != nullptr)
     {
@@ -325,87 +447,200 @@ bool MatchGameManifest(const GameBuildManifest& manifest, const std::wstring& im
     return match;
 }
 
-std::vector<GameObjectObservation> VerifyGameObjects(const GameBuildManifest& manifest,
-    uint64_t imageBase, const ObservationReader& reader, size_t budget, size_t* cursor)
+namespace
 {
-    std::vector<GameObjectObservation> result;
-    if (cursor == nullptr || manifest.Vptrs.empty() || imageBase > UINT64_MAX - manifest.ImageSize)
+    const wchar_t* ReadPublication(const ObservationReader& reader, uint64_t address, GameObjectLifetimeSample& sample)
     {
-        return result;
+        uint64_t sequence = 0;
+        if (!UserExtent(address, sizeof(KnGameObjectSlotV1)) || !Pointer(reader, address, &sequence)) { return L"lifetime_unreadable"; }
+        sample.BeginSequence = sequence;
+        if (!sequence) { return L"lifetime_unpublished"; }
+        if (sequence & 1) { return L"lifetime_updating"; }
+        std::vector<uint8_t> bytes;
+        if (!reader(address, sizeof(KnGameObjectSlotV1), &bytes) || bytes.size() != sizeof(KnGameObjectSlotV1)) { return L"lifetime_unreadable"; }
+        auto& record = sample.Record.emplace();
+        std::memcpy(&record, bytes.data(), sizeof(record));
+        if (!Pointer(reader, address, &sequence)) { return L"lifetime_unreadable"; }
+        sample.EndSequence = sequence;
+        return (sequence != *sample.BeginSequence || sequence != record.Sequence) ? L"lifetime_changed_during_read" : nullptr;
     }
-    const size_t start = *cursor % manifest.Vptrs.size();
-    for (size_t n = 0; n < (std::min)(budget, manifest.Vptrs.size()); ++n)
+
+    const wchar_t* ActiveMember(const KnGameObjectSlotV1& slot, const GameObjectLifetimeRule& rule)
     {
-        const size_t index = (start + n) % manifest.Vptrs.size();
-        const auto& rule = manifest.Vptrs[index];
-        if (rule.ObjectIndex >= manifest.Objects.size() || rule.AllowedSlots.size() > 1024)
+        if (slot.ContainerId != rule.ContainerId) { return L"lifetime_wrong_container"; }
+        switch (static_cast<KnGameObjectPhase>(slot.Phase))
         {
-            break;
+        case KnGameObjectPhase::Vacant: return L"lifetime_vacant";
+        case KnGameObjectPhase::Constructing: return L"lifetime_constructing";
+        case KnGameObjectPhase::Destroying: return L"lifetime_destroying";
+        case KnGameObjectPhase::Collecting: return L"lifetime_collecting";
+        case KnGameObjectPhase::Live: break;
+        default: return L"lifetime_phase_unknown";
         }
-        const auto& object = manifest.Objects[rule.ObjectIndex];
-        if (!Within(rule.Offset, 8, object.Size) || !Within(object.RootRva, object.Indirect ? 8 : object.Size, manifest.ImageSize))
-        {
-            break;
-        }
-        GameObjectObservation observation;
-        observation.IsVptr = true;
-        observation.RuleIndex = static_cast<uint32_t>(index);
-        observation.ObjectAddress = imageBase + object.RootRva;
-        uint64_t rootBefore = observation.ObjectAddress;
-        uint64_t vptr = 0;
-        if ((object.Indirect && !Pointer(reader, imageBase + object.RootRva, &rootBefore)) ||
-            rootBefore < 0x10000 || rootBefore >= 0x0000800000000000ull || rootBefore > UINT64_MAX - object.Size)
+        if (!slot.Generation) { return L"lifetime_generation_unknown"; }
+        return UserExtent(slot.MemberAddress, 8) ? nullptr : L"lifetime_member_unavailable";
+    }
+
+    void InspectObject(const GameObjectRule& object, const GameVptrRule& rule, uint64_t imageBase,
+        const ObservationReader& reader, const KnGameObjectSlotV1* member, GameObjectObservation observation,
+        std::vector<GameObjectObservation>& result)
+    {
+        const uint64_t rootSlot = imageBase + object.RootRva;
+        uint64_t root = rootSlot;
+        if ((object.Indirect && !Pointer(reader, rootSlot, &root)) || !UserExtent(root, object.Size))
         {
             observation.Reason = L"object_root_unavailable";
-            result.push_back(observation);
-            continue;
+            if (member) { observation.LifetimeStatus = L"lifetime_root_unconfirmed"; }
+            result.push_back(std::move(observation));
+            return;
         }
-        observation.ObjectAddress = rootBefore;
-        observation.SlotAddress = rootBefore + rule.Offset;
+        observation.ObjectAddress = root;
+        if (member && root != member->MemberAddress)
+        {
+            observation.Reason = observation.LifetimeStatus = L"lifetime_member_mismatch";
+            result.push_back(std::move(observation));
+            return;
+        }
+        observation.SlotAddress = root + rule.Offset;
+        uint64_t vptr = 0;
         if (!Pointer(reader, observation.SlotAddress, &vptr))
         {
             observation.Reason = L"vptr_unreadable";
-            result.push_back(observation);
-            continue;
+            if (member) { observation.LifetimeStatus = L"lifetime_root_unconfirmed"; }
+            result.push_back(std::move(observation));
+            return;
         }
+
+        if (member) { observation.LifetimeStatus = L"reported_active_member"; }
         observation.Readable = true;
         observation.Target = vptr;
         observation.Modified = vptr != imageBase + rule.TableRva;
         observation.Reason = observation.Modified ? L"vptr_differs_from_exact_build" : L"vptr_matches";
-        const size_t groupStart = result.size();
+        const size_t group = result.size();
         result.push_back(observation);
-        if (vptr >= 0x10000 && vptr < 0x0000800000000000ull && vptr <= UINT64_MAX - rule.AllowedSlots.size() * 8)
+        if (UserExtent(vptr, rule.AllowedSlots.size() * uint64_t{8}))
         {
-            for (size_t slot = 0; slot < rule.AllowedSlots.size(); ++slot)
+            for (size_t i = 0; i < rule.AllowedSlots.size(); ++i)
             {
-                auto entry = observation;
-                entry.IsVptr = false;
-                entry.SlotIndex = static_cast<uint32_t>(slot);
-                entry.SlotAddress = vptr + slot * 8;
-                entry.Target = 0;
-                entry.Readable = Pointer(reader, entry.SlotAddress, &entry.Target);
-                entry.Modified = entry.Readable && (entry.Target < imageBase ||
-                    !rule.AllowedSlots[slot].Contains(entry.Target - imageBase));
-                entry.Reason = !entry.Readable ? L"slot_unreadable" : (entry.Modified ? L"slot_outside_allowed_implementation" : L"slot_allowed");
-                result.push_back(entry);
+                auto row = observation;
+                row.IsVptr = false;
+                row.SlotIndex = static_cast<uint32_t>(i);
+                row.SlotAddress = vptr + i * 8;
+                row.Target = 0;
+                row.Readable = Pointer(reader, row.SlotAddress, &row.Target);
+                row.Modified = row.Readable && (row.Target < imageBase || !rule.AllowedSlots[i].Contains(row.Target - imageBase));
+                row.Reason = !row.Readable ? L"slot_unreadable" : (row.Modified ? L"slot_outside_allowed_implementation" : L"slot_allowed");
+                result.push_back(std::move(row));
             }
         }
-        uint64_t rootAfter = rootBefore;
-        uint64_t vptrAfter = 0;
-        const bool stable = (!object.Indirect || (Pointer(reader, imageBase + object.RootRva, &rootAfter) && rootAfter == rootBefore)) &&
-            Pointer(reader, rootBefore + rule.Offset, &vptrAfter) && vptrAfter == vptr;
-        if (!stable)
+        uint64_t rootAfter = root, vptrAfter = 0;
+        if ((object.Indirect && (!Pointer(reader, rootSlot, &rootAfter) || rootAfter != root)) ||
+            !Pointer(reader, root + rule.Offset, &vptrAfter) || vptrAfter != vptr)
         {
-            for (size_t i = groupStart; i < result.size(); ++i)
+            for (size_t i = group; i < result.size(); ++i)
             {
-                result[i].Modified = false;
-                result[i].Readable = false;
+                result[i].Modified = result[i].Readable = false;
                 result[i].Reason = L"object_or_vptr_changed_during_read";
+                if (member) { result[i].LifetimeStatus = L"lifetime_root_or_vptr_changed"; }
             }
         }
     }
-    *cursor = (start + (std::min)(budget, manifest.Vptrs.size())) % manifest.Vptrs.size();
+}
+
+std::vector<GameObjectObservation> VerifyGameObjects(const GameBuildManifest& manifest,
+    uint64_t imageBase, const ObservationReader& reader, size_t budget, size_t* cursor)
+{
+    std::vector<GameObjectObservation> result;
+    if (cursor == nullptr || manifest.Vptrs.empty() || !UserExtent(imageBase, manifest.ImageSize)) { return result; }
+    const size_t start = *cursor % manifest.Vptrs.size();
+    const size_t count = (std::min)(budget, manifest.Vptrs.size());
+    for (size_t n = 0; n < count; ++n)
+    {
+        const size_t index = (start + n) % manifest.Vptrs.size();
+        const auto& rule = manifest.Vptrs[index];
+        if (rule.ObjectIndex >= manifest.Objects.size() || rule.AllowedSlots.size() > 1024) { break; }
+        const auto& object = manifest.Objects[rule.ObjectIndex];
+        if (!Within(rule.Offset, 8, object.Size) || !Within(object.RootRva, object.Indirect ? 8 : object.Size, manifest.ImageSize)) { break; }
+        GameObjectObservation observation;
+        observation.IsVptr = true;
+        observation.RuleIndex = static_cast<uint32_t>(index);
+        if (!object.Lifetime)
+        {
+            observation.ObjectAddress = imageBase + object.RootRva;
+            InspectObject(object, rule, imageBase, reader, nullptr, std::move(observation), result);
+            continue;
+        }
+
+        const auto& lifetime = *object.Lifetime;
+        if (!Within(lifetime.SlotRva, sizeof(KnGameObjectSlotV1), manifest.ImageSize)) { break; }
+        const uint64_t address = imageBase + lifetime.SlotRva;
+        GameObjectLifetimeSample before, after;
+        const auto started = GetTickCount64();
+        const auto* reason = ReadPublication(reader, address, before);
+        if (!reason) { reason = ActiveMember(*before.Record, lifetime); }
+        if (reason)
+        {
+            observation.Reason = observation.LifetimeStatus = reason;
+            observation.ObserverBeginUptimeMs = started;
+            observation.ObserverEndUptimeMs = GetTickCount64();
+            observation.Before = std::move(before);
+            result.push_back(std::move(observation));
+            continue;
+        }
+
+        const size_t group = result.size();
+        InspectObject(object, rule, imageBase, reader, &*before.Record, std::move(observation), result);
+        reason = ReadPublication(reader, address, after);
+        const auto finished = GetTickCount64();
+        if (!reason && std::memcmp(&*before.Record, &*after.Record, sizeof(KnGameObjectSlotV1)) != 0)
+        { reason = L"lifetime_changed_during_read"; }
+        for (size_t i = group; i < result.size(); ++i)
+        {
+            auto& row = result[i];
+            row.Before = before;
+            row.After = after;
+            row.ObserverBeginUptimeMs = started;
+            row.ObserverEndUptimeMs = finished;
+            if (reason)
+            {
+                row.Modified = row.Readable = false;
+                row.Reason = row.LifetimeStatus = reason;
+            }
+        }
+    }
+    *cursor = (start + count) % manifest.Vptrs.size();
     return result;
+}
+
+std::map<std::wstring, std::wstring> GameObjectLifetimeEvidence(const GameObjectRule& object,
+    const GameVptrRule& rule, const GameObjectObservation& observation)
+{
+    std::map<std::wstring, std::wstring> fields{{L"lifetime_status", observation.LifetimeStatus}};
+    if (!object.Lifetime) { return fields; }
+    fields[L"lifetime_source"] = L"game_reported_registry_slot_v1";
+    fields[L"registry_slot_rva"] = std::to_wstring(object.Lifetime->SlotRva);
+    fields[L"expected_container_id"] = std::to_wstring(object.Lifetime->ContainerId);
+    fields[L"subobject_type"] = rule.SubobjectType;
+    fields[L"subobject_size"] = std::to_wstring(rule.SubobjectSize);
+    fields[L"vptr_role"] = rule.Offset ? L"secondary" : L"primary";
+    if (observation.LifetimeStatus == L"reported_active_member")
+    { fields[L"subobject_address"] = std::to_wstring(observation.ObjectAddress + rule.Offset); }
+    const auto retain = [&](const std::wstring& prefix, const GameObjectLifetimeSample& sample)
+    {
+        if (sample.BeginSequence) { fields[prefix + L"sequence_begin"] = std::to_wstring(*sample.BeginSequence); }
+        if (sample.Record)
+        {
+            fields[prefix + L"sequence"] = std::to_wstring(sample.Record->Sequence);
+            fields[prefix + L"generation"] = std::to_wstring(sample.Record->Generation);
+            fields[prefix + L"container_id"] = std::to_wstring(sample.Record->ContainerId);
+            fields[prefix + L"member_address"] = std::to_wstring(sample.Record->MemberAddress);
+            fields[prefix + L"phase"] = std::to_wstring(sample.Record->Phase);
+        }
+        if (sample.EndSequence) { fields[prefix + L"sequence_end"] = std::to_wstring(*sample.EndSequence); }
+    };
+    retain(L"before_", observation.Before);
+    retain(L"after_", observation.After);
+    return fields;
 }
 
 bool GameBuildManifestSelfTest()
