@@ -16,9 +16,11 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
-    def test_detached_approval_retention(self):
+    def test_detached_store_retention(self):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
-                dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}))
+                dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),
+                dict(artifact={}, uncommitted_image_referrers=[]), dict(image_catalog="inputs_incomplete", artifact={}),
+                dict(expected_sha256="synthetic", path="fixture", digest_basis="unwrapped_payload"))
         for row in rows:
             raw = json.dumps(dict(outer=[row])).encode()
             for sample in (raw, raw[:-3], raw.decode().encode("utf-16-le")):

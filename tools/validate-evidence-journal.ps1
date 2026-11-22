@@ -13,7 +13,8 @@ if ($Sanitize) {
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\AnalystSnapshot.cpp') |
+$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\ImageArchiveDependencies.cpp',
+    'user\ImageSweepManifest.cpp', 'user\AnalystSnapshot.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}journal.pdb" /link /INCREMENTAL:NO' -f $validationEnvironment.VcVarsPath, $flags, ($sources -join ' '), $exe, ($output.Replace('\', '/') + '/')
 $batch = Join-Path $output 'compile.cmd'

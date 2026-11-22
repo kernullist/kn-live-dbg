@@ -2817,7 +2817,7 @@ bool KmonPipelineSelfTest()
                 const auto joinedId = std::to_wstring(joined.EvidenceCollectionEpoch.load());
                 std::filesystem::create_directories(std::filesystem::path(joinedRoot) / L"image-reads");
                 const auto readName = L"image-reads/reads-" + joinedId + L"-1.knreads";
-                const std::wstring readJson = L"{\"schema\":\"kn.image_reads.v3\",\"owned_writer_fixture\":true}";
+                const auto readJson = ImageReadArchiveJson(L"{\"owned_writer_fixture\":true}", nullptr, L"not_attempted", L"", false);
                 EvidenceJournalTransaction imageTransaction;
                 imageTransaction.Kind = L"image_reads"; imageTransaction.Id = L"1";
                 imageTransaction.Members.push_back(EvidenceJournalJsonMember(readName, readJson));

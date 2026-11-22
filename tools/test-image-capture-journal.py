@@ -125,6 +125,34 @@ def main():
         publication = json.loads((source / "recipe.knverify").read_bytes())
         recipe = unpack_recipe(publication)
         reference = (source / (recipe["payload"]["reference_sha256"] + ".knblob")).read_bytes()
+        loose = sandbox / "loose-direct"
+        init(loose)
+        ref = "image-references/" + sha(reference) + ".knblob"
+        (loose / ref).parent.mkdir(exist_ok=True)
+        (loose / ref).write_bytes(reference)
+        (loose / "image-captures").mkdir(exist_ok=True)
+        parents = {}
+        for i, document in enumerate((recipe, publication), 1):
+            raw = encoded(document)
+            path = f"image-captures/capture-{i}-{sha(raw)}.kncapture"
+            (loose / path).write_bytes(raw)
+            parents[path] = sha(raw)
+        rows = {r["artifact"]["path"]: r for r in inventory(loose)["artifacts"]}
+        expected = [dict(path=p, sha256=h, expected_sha256=sha(reference), digest_basis="file_bytes", input_matched=True)
+                    for p, h in sorted(parents.items())]
+        check(rows[ref]["retention"] == "uncommitted_image_input_protected" and
+              rows[ref]["uncommitted_image_referrers"] == expected and all(rows[p]["image_catalog"] == "resolved" for p in parents),
+              "bare and claim-wrapped direct captures independently protect the same original")
+        loose_policy = sandbox / "loose-direct.gc-policy"
+        loose_policy.write_bytes(encoded(dict(schema="kn.evidence_gc_policy.v1", policy="kn.gc_explicit_uncommitted.v1",
+            reason="owned direct image input", minimum_age_seconds="0", byte_limit="67108864", members=[rows[ref]["artifact"]])))
+        command = [exe, "--offline", "!kmon", "gc", loose, loose_policy, "/apply", "1"] if args.cli else [journal, "--gc", loose, loose_policy, "1"]
+        denied = invoke(command, 1)
+        check(denied["entries"][0]["issue"] == "uncommitted_image_input_protected" and denied["deleted_this_call"] == "0" and
+              not (loose / "retention/1/operation.kngc").exists() and (loose / ref).read_bytes() == reference,
+              "direct PE deletion denied before intent")
+        for path in parents:
+            replay(loose / path, json.loads((loose / path).read_bytes()), reference)
         store = sandbox / "private 한글"
         init(store)
         for index, name in enumerate(("clean", "modified", "observed", "observed-modified", "unstable", "sparse", "observed-budget"), 7):
@@ -291,7 +319,7 @@ def main():
             collision.unlink()  # Only this test's known sentinel; no deletion in the publisher.
             check(archive(source, root)["closed"], "explicitly resolving owned collision permits exact retry")
 
-        for fault in ("policy-v1", "policy-v2", "policy-v3", "policy-v4", "missing-dependency", "wrong-kind", "wrong-root-id", "corrupt-member"):
+        for fault in ("policy-v1", "policy-v2", "policy-v3", "policy-v4", "missing-dependency", "wrong-kind", "wrong-root-id", "corrupt-member", "wrong-reference"):
             root = sandbox / fault
             shutil.copytree(baseline, root)
             collection = root / "collections/7"
@@ -307,6 +335,16 @@ def main():
                 doc = json.loads(path.read_bytes())
                 doc["payload"]["previous_sha256"] = previous
                 transaction = doc["payload"]["transaction"]
+                if number == 1 and fault == "wrong-reference":
+                    ref = next(m for m in transaction["members"] if m["schema"] == "raw.bytes")
+                    original_ref = ref["path"]
+                    replacement = b"owned replacement".ljust(int(ref["bytes"]), b"!")
+                    alternate = f"image-references/{sha(replacement)}.knblob"
+                    (root / alternate).write_bytes(replacement)
+                    ref.update(path=alternate, sha256=sha(replacement), bytes=str(len(replacement)))
+                    transaction["members"].sort(key=lambda m: m["path"])
+                if number == 2 and fault == "wrong-reference":
+                    transaction["requires"] = sorted(alternate if p == original_ref else p for p in transaction["requires"])
                 if number == 1 and fault == "wrong-kind": transaction["kind"] = "image_reads"
                 if number == 1 and fault == "wrong-root-id": transaction["id"] = "0" * 64
                 if number == 2 and fault == "missing-dependency": transaction["requires"].pop()
@@ -314,6 +352,8 @@ def main():
                 previous = sha(path.read_bytes())
             if fault == "corrupt-member": next((root / "image-captures").glob("*.kncapture")).write_bytes(b"{}")
             recovered = recover(root, code=1)
+            if fault == "wrong-reference":
+                check(recovered["issue"] == "image_reference_not_committed", "unrelated but correctly hashed PE cannot replace recipe input")
             check(not recovered["closed"] and recovered["committed_segments"] == ("1" if fault == "missing-dependency" else "0"), "rehashed invalid policy/transaction cannot establish membership")
 
         orphan = store / ("image-captures/capture-99-" + sha(encoded(recipe)) + ".kncapture")

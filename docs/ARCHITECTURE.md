@@ -351,7 +351,13 @@ multi-artifact transaction or a power-loss durability guarantee.
 The KMON writer publishes original reference/read/recipe files, then a journal
 record under `collections/<collection-id>/journal-segments/`. A sweep root is
 committed only after every artifact it declares as published belongs to an earlier
-record. IRP captures and their retained references use `irp_capture` transactions;
+record. Commit and recovery derive the required paths from each slice's
+`raw_written`, `recipe_written` and `reference_written` flags. The dependency
+list must match those paths exactly. For a read or slice the verifier checks
+the original payload SHA-256 inside its envelope. For a PE reference it checks
+the physical bytes. Each read batch or direct capture must include its own
+declared PE. Reads that recorded a persistence failure contribute no PE path.
+IRP captures and their retained references use `irp_capture` transactions;
 the final IRP ledger uses `irp_ledger`. When IRP work was admitted, dropped or
 unavailable before encoding, the
 writer requires that ledger's commit before publishing the read-session closure
@@ -474,9 +480,20 @@ Journal and failure-ledger protections take precedence. The root reports
 The summary counts these occurrences once per root and physical input.
 
 A physically verified approval with an unreadable catalog protects possible
-inputs in its own families as `unresolved_approval_input_protected`. Other
-verified, unattributed files under closed journals remain
-`uncommitted_requires_policy`. An unreadable file or incomplete enumeration
+inputs in its own families as `unresolved_approval_input_protected`.
+
+The inventory also follows loose direct captures, reads, slices and sweeps.
+It checks each payload seal and the enclosing claim publication when present.
+For each named input, the detailed row records the referring file's path and
+physical SHA-256, the expected input digest, its basis and the match result.
+A sweep can refer to a loose or committed child. Each surviving read or slice
+independently retains its PE even after an operator withdraws the sweep.
+Missing inputs and mismatches are counted once per referring root and named path.
+Present loose inputs receive `uncommitted_image_input_protected` unless a journal,
+ledger or approval already protects them. An unreadable image declaration
+protects possible PE references. An unreadable sweep also protects loose reads
+and slices as `unresolved_image_input_protected`. Unreferenced, verified loose
+files remain `uncommitted_requires_policy`. An unreadable file or incomplete enumeration
 makes the physical inventory partial and blocks GC.
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
@@ -554,13 +571,13 @@ receipt. Corrupt or colliding audit files are preserved and block continuation.
 
 Reports and receipts record selected named bytes and deletion reasons; they do
 not establish reclaimed disk blocks, secure erasure or power-loss durability.
-Each preflight, including retry after an intent, checks the surviving direct
-and scoped approval catalogs. Selecting an approval together with one of its
-inputs denies the entire policy. A separate operation can withdraw an eligible
-uncommitted approval. Its inputs remain protected while another approval or
-journal references them. Other uncommitted artifact families can still lose a
-dependency through explicit removal, so the result retains
-`uncommitted_dependents_resolved:false`. Priority-based GC selection, retirement
+Each preflight, including retry after an intent, checks surviving image archives
+and direct and scoped approval catalogs. Selecting a root together with a
+protected input denies the entire policy. A separate operation can withdraw an
+eligible loose root. The next inventory checks every remaining referrer.
+Dependency resolution for loose IRP captures and other artifact families remains
+open, so the result retains `uncommitted_dependents_resolved:false`.
+Priority-based GC selection, retirement
 of committed roots, full dependency-impact analysis, other-family transfer/redaction controls
 and large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.

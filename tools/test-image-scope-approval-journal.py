@@ -458,6 +458,8 @@ def main():
             if saved_root:
                 check((root / baseline["approval_path"]).read_bytes() == saved_root, "retry preserves original evaluation")
             replay(root / baseline["approval_path"], inputs[3])
+            if stage != "closed":
+                remove_owned(root)
 
         baseline_store = sandbox / "interrupt-closed"
         base_root = baseline_store / baseline["approval_path"]
@@ -513,6 +515,7 @@ def main():
                   (encoded(document) if fault == "checksum" else seal(document, "publication_sha256")) + (b" " if fault == "whitespace" else b"")
             selected.write_bytes(raw)
             replay(selected, inputs[3], code=1)
+            remove_owned(root)
 
         for offset, entry in enumerate(publication["inputs"]):
             root = sandbox / ("missing-" + str(offset))
@@ -524,6 +527,7 @@ def main():
             victim.unlink()
             replay(root / baseline["approval_path"], inputs[3], code=1, issue="scope_inputs_missing_or_corrupt")
             check(recover(root, code=1)["committed_segments"] == "0", "ambient original filename cannot substitute missing CAS")
+            remove_owned(root)
         for field, relative in (("reference", f"image-references/{publication['reference_sha256']}.knblob"),
                                 ("policy", f"image-approvals/policy-{inputs[3]}.knapproval"),
                                 ("manifest", f"image-approvals/changes-{publication['manifest_sha256']}.knchange")):
@@ -533,6 +537,7 @@ def main():
             replay(root / baseline["approval_path"], inputs[3], code=1,
                    issue="scope_inputs_missing_or_corrupt" if field == "reference" else "approval_inputs_missing_or_corrupt")
             check(recover(root, code=1)["committed_segments"] == "0", "missing external approval dependency invalidates membership")
+            remove_owned(root)
 
         old_policies = ["kn.image_collection_journal.v1", "kn.image_irp_collection_journal.v2", "kn.image_claim_irp_collection_journal.v3",
                         "kn.image_irp_claim_collection_journal.v4", "kn.direct_image_collection_journal.v1", "kn.approved_image_collection_journal.v1"]
@@ -582,6 +587,7 @@ def main():
             if fault in ("missing-member", "extra-member"):
                 check(result["issue"] == ("scope_approval_input_not_committed" if fault == "missing-member" else
                       "scope_approval_dependency_set_mismatch"), (fault, result))
+            remove_owned(root)
 
         orphan_raw = encoded({"schema": "kn.image_reads.v3", "owned_orphan": True})
         orphan = store / f"image-scope-inputs/{sha(orphan_raw)}.knscopeblob"

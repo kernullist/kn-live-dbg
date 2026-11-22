@@ -40,12 +40,16 @@ def check_uncommitted_approvals(source, first_root, sandbox, *, init, inventory,
         originals[path] = (source / path).read_bytes()
     source_paths = set(originals)
     unrelated = "image-reads/reads-71-1.knreads"
-    originals[unrelated] = encoded({"schema": "kn.image_reads.v3", "owned_fixture": True})
+    payload = {"owned_fixture": True}
+    originals[unrelated] = encoded(dict(schema="kn.image_reads.v1", payload_sha256=digest(encoded(payload)), payload=payload))
     spare_raw = b"owned unreferenced image input"
     spare_reference = f"image-references/{digest(spare_raw)}.knblob"
     originals[spare_reference] = spare_raw
     if "inputs" in docs[first]:
-        raw = encoded({"schema": "kn.image_recipe.v1", "owned_fixture": True})
+        side_blob = b"owned independent capture reference"
+        originals[f"image-references/{digest(side_blob)}.knblob"] = side_blob
+        payload = dict(reference_sha256=digest(side_blob))
+        raw = encoded(dict(schema="kn.image_recipe.v1", recipe_sha256=digest(encoded(payload)), payload=payload))
         other_family = f"image-captures/capture-71-{digest(raw)}.kncapture"
     else:
         raw = encoded({"schema": "kn.image_reads.v3", "owned_fixture": True})
@@ -184,8 +188,16 @@ def check_uncommitted_approvals(source, first_root, sandbox, *, init, inventory,
     policy(table, [first])
     check(collect("53")["status"] == "completed", "explicit withdrawal of unreadable approval root")
     snapshot, table = rows()
-    check(snapshot["uncommitted_approval_roots"] == "0" and table[reference]["retention"] == "uncommitted_requires_policy",
-          "last root withdrawn, original still present")
+    check(snapshot["uncommitted_approval_roots"] == "0", "last approval withdrawn")
+    if "capture_sha256" in docs[first]:
+        captures = {p for p in source_paths if p.endswith(".kncapture")}
+        check(table[reference]["retention"] == "uncommitted_image_input_protected" and
+              {r["path"] for r in table[reference]["uncommitted_image_referrers"]} == captures,
+              "both direct captures independently retain their reference")
+        policy(table, captures)
+        check(collect("55")["status"] == "completed", "withdraw direct captures under their own exact policy")
+        _, table = rows()
+    check(table[reference]["retention"] == "uncommitted_requires_policy", "original eligible after all referring roots are withdrawn")
 
     # Stop at the durable intent. A publication arriving before retry must protect the same physical file.
     policy(table, [reference])

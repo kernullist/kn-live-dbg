@@ -156,6 +156,7 @@
     <ClCompile Include="EvidenceInvestigation.cpp" />
     <ClCompile Include="EvidenceInventory.cpp" />
     <ClCompile Include="EvidenceJournal.cpp" />
+    <ClCompile Include="ImageArchiveDependencies.cpp" />
     <ClCompile Include="EvidencePrivacy.cpp" />
     <ClCompile Include="EvidenceDisclosure.cpp" />
     <ClCompile Include="EvidenceDisclosureFacts.cpp" />
@@ -281,6 +282,7 @@
     <ClInclude Include="EvidenceInvestigation.h" />
     <ClInclude Include="EvidenceInventory.h" />
     <ClInclude Include="EvidenceJournal.h" />
+    <ClInclude Include="ImageArchiveDependencies.h" />
     <ClInclude Include="EvidencePrivacy.h" />
     <ClInclude Include="EvidenceDisclosure.h" />
     <ClInclude Include="EvidenceOrigin.h" />

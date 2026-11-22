@@ -7,6 +7,7 @@
 #include "ImageScopeClaimPublication.h"
 #include "PendingIrpEvidence.h"
 #include "ImageCaptureCollection.h"
+#include "ImageArchiveDependencies.h"
 #include "ImageApprovalCollection.h"
 #include "ImageScopeApprovalCollection.h"
 #include <algorithm>
@@ -141,24 +142,19 @@ namespace
     bool ReadApprovalInputs(const EvidenceJournalMember& root, const std::wstring& id,
         const std::wstring& json, ApprovalInputs& inputs)
     {
-        const auto field = [](const IndexedObject& object, const wchar_t* key)
-        {
-            std::wstring raw;
-            return object.Raw(key, &raw) && !raw.empty() && raw.front() == L'"' ? mcpjson::Unescape(raw) : std::wstring{};
-        };
         IndexedObject envelope, catalog, recorded;
         std::wstring payload, assessment;
         if (!envelope.Parse(json) || !envelope.Raw(L"payload", &payload)) { return false; }
-        const auto seal = field(envelope, L"publication_sha256");
-        if (!Digest(seal) || Hash(payload) != seal || !catalog.Parse(payload) || field(catalog, L"collection_id") != id ||
+        const auto seal = envelope.String(L"publication_sha256");
+        if (!Digest(seal) || Hash(payload) != seal || !catalog.Parse(payload) || catalog.String(L"collection_id") != id ||
             !catalog.Raw(L"assessment", &assessment) || !recorded.Parse(assessment)) { return false; }
         const bool scoped = root.Schema == ImageScopeApprovalPublicationSchema;
-        if (field(recorded, L"schema") != (scoped ? L"kn.image_scope_change_assessment.v1" : L"kn.image_change_assessment.v1"))
+        if (recorded.String(L"schema") != (scoped ? L"kn.image_scope_change_assessment.v1" : L"kn.image_change_assessment.v1"))
             { return false; }
         const auto commonHash = [&](const wchar_t* key)
         {
-            const auto hash = field(catalog, key);
-            return hash == field(recorded, key) ? hash : std::wstring{};
+            const auto hash = catalog.String(key);
+            return hash == recorded.String(key) ? hash : std::wstring{};
         };
         const auto declare = [&](const std::wstring& hash, const std::wstring& prefix, const wchar_t* suffix, const wchar_t* schema)
         {
@@ -167,15 +163,15 @@ namespace
             return inputs.emplace(path, EvidenceJournalMember{path, hash, schema, 0}).second;
         };
         const auto policy = commonHash(L"policy_sha256");
-        if (policy != field(recorded, L"policy_anchor_sha256") ||
+        if (policy != recorded.String(L"policy_anchor_sha256") ||
             !declare(commonHash(L"reference_sha256"), L"image-references/", L".knblob", L"raw.bytes") ||
             !declare(policy, L"image-approvals/policy-", L".knapproval", L"kn.image_approval_policy.v1") ||
             !declare(commonHash(L"manifest_sha256"), L"image-approvals/changes-", L".knchange", L"kn.authorized_image_changes.v1")) { return false; }
         if (root.Schema == ImageApprovalPublicationSchema)
-            { return declare(field(catalog, L"capture_sha256"), L"image-captures/capture-" + id + L"-", L".kncapture", L""); }
-        const auto kind = field(catalog, L"scope_kind"), rootHash = field(catalog, L"root_sha256");
+            { return declare(catalog.String(L"capture_sha256"), L"image-captures/capture-" + id + L"-", L".kncapture", L""); }
+        const auto kind = catalog.String(L"scope_kind"), rootHash = catalog.String(L"root_sha256");
         std::vector<std::wstring> rows;
-        if (!scoped || (kind != L"slice" && kind != L"sweep") || rootHash != field(recorded, L"root_file_sha256") || !Digest(rootHash) ||
+        if (!scoped || (kind != L"slice" && kind != L"sweep") || rootHash != recorded.String(L"root_file_sha256") || !Digest(rootHash) ||
             !catalog.Rows(L"inputs", ImageScopeApprovalMaximumInputs, &rows) || (kind == L"slice" && rows.size() != 1)) { return false; }
         std::wstring previousName;
         uint64_t total = 0;
@@ -184,8 +180,8 @@ namespace
         {
             IndexedObject entry;
             if (!entry.Parse(row)) { return false; }
-            const auto name = field(entry, L"logical_path"), hash = field(entry, L"sha256");
-            EvidenceJournalMember m{L"image-scope-inputs/" + hash + L".knscopeblob", hash, field(entry, L"schema"), 0};
+            const auto name = entry.String(L"logical_path"), hash = entry.String(L"sha256");
+            EvidenceJournalMember m{L"image-scope-inputs/" + hash + L".knscopeblob", hash, entry.String(L"schema"), 0};
             if (!IsImageScopeApprovalInputName(name, kind == L"sweep") || name <= previousName ||
                 !Number(row, L"bytes", &m.Bytes) || !MemberValid(m, id) ||
                 m.Bytes > ImageScopeApprovalMaximumInputBytes - total) { return false; }
@@ -318,6 +314,11 @@ bool EvidenceStoreLease::Acquire(const std::wstring& root, bool exclusive, std::
 
 struct EvidenceJournal::Impl
 {
+    struct VerifiedMembers
+    {
+        std::map<std::wstring, Handle> Files;
+        std::map<std::wstring, std::wstring> ImagePayloads;
+    };
     fs::path Root, Collection;
     EvidenceJournalRecovery Result;
     std::map<std::wstring, Handle> Directories, Files;
@@ -327,6 +328,7 @@ struct EvidenceJournal::Impl
     uint64_t* SharedReadBytes = nullptr;
     uint64_t* SharedReferences = nullptr;
     std::map<std::wstring, EvidenceJournalMember> Members;
+    std::map<std::wstring, std::wstring> ImagePayloads;
     std::map<std::wstring, uint64_t> ContentSizes;
     std::map<std::wstring, size_t> Transactions;
     std::vector<Record> Records;
@@ -548,24 +550,59 @@ struct EvidenceJournal::Impl
         }
         return true;
     }
-    bool VerifyMembers(const EvidenceJournalTransaction& t, std::map<std::wstring, Handle>* added)
+    bool VerifyImageCatalog(const EvidenceJournalTransaction& t, const EvidenceJournalMember& root,
+        ImageArchiveKind kind, const std::wstring& json, VerifiedMembers& added)
+    {
+        ImageArchiveCatalog catalog;
+        if (!ReadImageArchiveCatalog(kind, root, json, catalog)) { return Fail(L"image_archive_catalog_invalid"); }
+        if (kind == ImageArchiveKind::Sweep)
+        {
+            for (const auto& input : catalog.Inputs)
+            {
+                const auto member = Members.find(input.first);
+                const auto payload = ImagePayloads.find(input.first);
+                if (member == Members.end() || !std::binary_search(t.Requires.begin(), t.Requires.end(), input.first) ||
+                    !MatchesImageArchiveInput(input.second, member->second, payload == ImagePayloads.end() ? L"" : payload->second))
+                    { return Fail(L"image_sweep_input_not_committed"); }
+            }
+            if (catalog.Inputs.size() != t.Requires.size()) { return Fail(L"image_sweep_dependency_set_mismatch"); }
+        }
+        else
+        {
+            for (const auto& input : catalog.Inputs)
+            {
+                const auto member = std::lower_bound(t.Members.begin(), t.Members.end(), input.first,
+                    [](const auto& m, const auto& path) { return m.Path < path; });
+                if (member == t.Members.end() || member->Path != input.first || !MatchesImageArchiveInput(input.second, *member, L""))
+                    { return Fail(L"image_reference_not_committed"); }
+            }
+        }
+        if (kind == ImageArchiveKind::Reads || kind == ImageArchiveKind::Slice)
+            { added.ImagePayloads.emplace(root.Path, std::move(catalog.PayloadSha256)); }
+        return Timely();
+    }
+    bool VerifyMembers(const EvidenceJournalTransaction& t, VerifiedMembers* added)
     {
         for (const auto& m : t.Members)
         {
-            if (Members.count(m.Path)) { continue; } // Still held under write/delete exclusion.
+            const auto imageKind = ImageArchiveKindForPath(m.Path);
+            if (Members.count(m.Path) && imageKind == ImageArchiveKind::None) { continue; } // Still pinned.
             if (SharedMembers != nullptr)
             {
                 const auto found = SharedMembers->find(m.Path);
                 if (found != SharedMembers->end())
                 {
                     if (!Same(found->second.first, m)) { return Fail(L"store_member_conflict"); }
-                    HANDLE duplicate = nullptr;
-                    if (!DuplicateHandle(GetCurrentProcess(), found->second.second.get(), GetCurrentProcess(), &duplicate, 0, FALSE,
-                        DUPLICATE_SAME_ACCESS)) { return Fail(L"store_lease_duplicate_failed"); }
-                    added->emplace(m.Path, Own(duplicate));
-                    continue;
+                    if (imageKind == ImageArchiveKind::None)
+                    {
+                        HANDLE duplicate = nullptr;
+                        if (!DuplicateHandle(GetCurrentProcess(), found->second.second.get(), GetCurrentProcess(), &duplicate, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS)) { return Fail(L"store_lease_duplicate_failed"); }
+                        added->Files.emplace(m.Path, Own(duplicate));
+                        continue;
+                    }
                 }
-                if (SharedMembers->size() == StoreMaxPaths) { return Fail(L"store_path_budget_exhausted"); }
+                else if (SharedMembers->size() == StoreMaxPaths) { return Fail(L"store_path_budget_exhausted"); }
             }
             Handle file{nullptr, &CloseHandle};
             std::wstring digest, json, schema;
@@ -574,6 +611,7 @@ struct EvidenceJournal::Impl
             if (digest != m.Sha256 || size != m.Bytes) { return Fail(L"member_hash_or_size_mismatch"); }
             if (m.Schema != L"raw.bytes" && (!mcpjson::GetString(json, L"schema", &schema) || schema != m.Schema))
                 { return Fail(L"member_schema_mismatch"); }
+            if (imageKind != ImageArchiveKind::None && !VerifyImageCatalog(t, m, imageKind, json, *added)) { return false; }
             if (SharedMembers != nullptr)
             {
                 HANDLE duplicate = nullptr;
@@ -581,7 +619,7 @@ struct EvidenceJournal::Impl
                     DUPLICATE_SAME_ACCESS)) { return Fail(L"store_lease_duplicate_failed"); }
                 SharedMembers->emplace(m.Path, std::make_pair(m, Own(duplicate)));
             }
-            added->emplace(m.Path, std::move(file));
+            added->Files.emplace(m.Path, std::move(file));
         }
         if (t.Kind == L"image_approval" || t.Kind == L"image_scope_approval")
         {
@@ -608,13 +646,14 @@ struct EvidenceJournal::Impl
         }
         return true;
     }
-    void Accept(Record r, std::map<std::wstring, Handle> added)
+    void Accept(Record r, VerifiedMembers added)
     {
         // Publish counters only after all allocating state changes succeed.
         // Any exception poisons the instance; recovery still reports the last
         // fully verified prefix rather than half of the next transaction.
         auto accepted = Result;
-        for (auto& item : added) { Files.emplace(item.first, std::move(item.second)); }
+        Files.merge(added.Files);
+        ImagePayloads.merge(added.ImagePayloads);
         for (const auto& m : r.Transaction.Members)
         {
             ++accepted.MemberReferences; accepted.LogicalBytes += m.Bytes;
@@ -703,7 +742,7 @@ struct EvidenceJournal::Impl
                 { return Fail(L"segment_invalid_or_chain_mismatch"); }
             const auto key = r.Transaction.Kind + L":" + r.Transaction.Id;
             if (Transactions.count(key)) { return Fail(L"duplicate_transaction"); }
-            std::map<std::wstring, Handle> added;
+            VerifiedMembers added;
             if (!ValidateTransaction(r.Transaction) || !VerifyMembers(r.Transaction, &added)) { return false; }
             Files.emplace(L"@segment-" + std::to_wstring(r.Sequence), std::move(lease));
             Accept(std::move(r), std::move(added));
@@ -818,7 +857,7 @@ EvidenceJournalCommit EvidenceJournal::Commit(EvidenceJournalTransaction t)
         }
         if (!d.Writable || d.Records.size() == MaxSegments) { result.Issue = L"journal_closed_unavailable_or_segment_budget"; return result; }
         if (!d.ValidateTransaction(t)) { result.Issue = d.Result.Issue; return result; }
-        std::map<std::wstring, Handle> added;
+        Impl::VerifiedMembers added;
         if (!d.VerifyMembers(t, &added)) { result.Issue = d.Result.Issue; return result; }
         Record record;
         record.Sequence = d.Records.size() + 1; record.Previous = d.Result.HeadSha256; record.Transaction = std::move(t);
@@ -960,9 +999,24 @@ namespace
             }
             approval += L"]";
         }
+        std::wstring image;
+        if (!a.ImageCatalog.empty()) { image = L",\"image_catalog\":" + mcpjson::Quote(a.ImageCatalog); }
+        if (!a.ImageReferrers.empty())
+        {
+            image += L",\"uncommitted_image_referrers\":[";
+            for (const auto& root : a.ImageReferrers)
+            {
+                if (&root != &a.ImageReferrers.front()) { image += L","; }
+                image += L"{\"path\":" + mcpjson::Quote(root.Path) + L",\"sha256\":" + mcpjson::Quote(root.Sha256) +
+                    L",\"expected_sha256\":" + mcpjson::Quote(root.ExpectedSha256) +
+                    L",\"digest_basis\":" + mcpjson::Quote(root.PayloadDigest ? L"unwrapped_payload" : L"file_bytes") +
+                    L",\"input_matched\":" + B(root.InputMatched) + L"}";
+            }
+            image += L"]";
+        }
         return L"{\"artifact\":" + MemberJson(a.Artifact) + L",\"verified\":" + B(a.Verified) +
             L",\"journal_references\":" + N(a.JournalReferences) + L",\"collections\":" + owners +
-            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + L"}";
+            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + image + L"}";
     }
     std::wstring LowerAscii(std::wstring value)
     {
@@ -1075,6 +1129,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     {
                         EvidenceStoreArtifact a;
                         a.Artifact = member; a.Verified = true;
+                        const auto payload = d.ImagePayloads.find(member.Path);
+                        if (payload != d.ImagePayloads.end()) { a.ImagePayloadSha256 = payload->second; }
                         a.Retention = member.Schema == L"raw.bytes" ? L"committed_reference_protected" :
                             FailureLedger(member.Schema) ? L"failure_ledger_protected" : L"committed_original_protected";
                         found = artifacts.emplace(member.Path, std::move(a)).first;
@@ -1106,6 +1162,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         bool physicalComplete = true;
         std::map<std::wstring, ApprovalInputs> approvalCatalogs;
         bool unreadableDirectApproval = false, unreadableScopedApproval = false;
+        std::map<std::wstring, ImageArchiveCatalog> imageCatalogs;
+        bool unknownImageReference = false, unknownSweepInputs = false;
         std::set<std::wstring> observed;
         uint64_t rootEntries = 0;
         for (const auto& folder : {L"image-reads", L"image-references", L"image-sweeps", L"image-captures", L"image-approvals", L"image-scope-inputs", L""})
@@ -1164,6 +1222,30 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     if (a.Verified)
                     {
                         reader.Files.emplace(relative, std::move(lease));
+                        const auto imageKind = ImageArchiveKindForPath(relative);
+                        if (imageKind != ImageArchiveKind::None)
+                        {
+                            ++out.UncommittedImageRoots;
+                            ImageArchiveCatalog imageCatalog;
+                            const bool decoded = ReadImageArchiveCatalog(imageKind, a.Artifact, text, imageCatalog);
+                            if (!decoded || imageCatalog.Inputs.size() > StoreMaxReferences - references)
+                            {
+                                unknownImageReference = true;
+                                if (imageKind == ImageArchiveKind::Sweep) { unknownSweepInputs = true; }
+                                if (!decoded) { ++out.UnreadableImageCatalogs; a.ImageCatalog = L"unreadable"; }
+                                else
+                                {
+                                    physicalComplete = false; a.ImageCatalog = L"budget_exhausted";
+                                    out.Issue = L"store_image_reference_budget_exhausted";
+                                }
+                            }
+                            else
+                            {
+                                references += imageCatalog.Inputs.size();
+                                a.ImagePayloadSha256 = std::move(imageCatalog.PayloadSha256);
+                                imageCatalogs.emplace(relative, std::move(imageCatalog));
+                            }
+                        }
                         const bool scoped = a.Artifact.Schema == ImageScopeApprovalPublicationSchema;
                         if (scoped || a.Artifact.Schema == ImageApprovalPublicationSchema)
                         {
@@ -1219,6 +1301,25 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 if (file.Retention == L"uncommitted_requires_policy") { file.Retention = L"uncommitted_approval_input_protected"; }
             }
         }
+        for (const auto& catalogEntry : imageCatalogs)
+        {
+            auto& publication = artifacts.at(catalogEntry.first);
+            publication.ImageCatalog = L"resolved";
+            for (const auto& input : catalogEntry.second.Inputs)
+            {
+                const auto found = artifacts.find(input.first);
+                if (found == artifacts.end())
+                {
+                    ++out.MissingImageInputs; publication.ImageCatalog = L"inputs_incomplete";
+                    continue;
+                }
+                auto& file = found->second;
+                const bool matched = file.Verified && MatchesImageArchiveInput(input.second, file.Artifact, file.ImagePayloadSha256);
+                if (!matched) { ++out.MismatchedImageInputs; publication.ImageCatalog = L"inputs_incomplete"; }
+                file.ImageReferrers.push_back({publication.Artifact.Path, publication.Artifact.Sha256, input.second.Sha256,
+                    input.second.PayloadDigest, matched});
+            }
+        }
         for (auto& pair : artifacts)
         {
             // An unreadable declaration cannot exclude any original in its input families.
@@ -1226,6 +1327,13 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 (pair.first.rfind(L"image-references/", 0) == 0 || ApprovalInputPath(pair.first) ||
                     (unreadableDirectApproval && DirectPath(pair.first)) || (unreadableScopedApproval && ScopeInputPath(pair.first))))
                 { pair.second.Retention = L"unresolved_approval_input_protected"; }
+            if (pair.second.Retention == L"uncommitted_requires_policy")
+            {
+                if (!pair.second.ImageReferrers.empty()) { pair.second.Retention = L"uncommitted_image_input_protected"; }
+                else if ((unknownImageReference && pair.first.rfind(L"image-references/", 0) == 0) ||
+                    (unknownSweepInputs && pair.first.rfind(L"image-reads/", 0) == 0))
+                    { pair.second.Retention = L"unresolved_image_input_protected"; }
+            }
             if (pair.second.JournalReferences != 0 && !observed.count(pair.first))
                 { physicalComplete = false; out.Issue = L"committed_path_missing_from_inventory"; }
         }
@@ -1300,6 +1408,8 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"uncommitted_approval_roots\":" + N(r.UncommittedApprovalRoots) +
         L",\"unreadable_approval_catalogs\":" + N(r.UnreadableApprovalCatalogs) +
         L",\"missing_approval_inputs\":" + N(r.MissingApprovalInputs) + L",\"mismatched_approval_inputs\":" + N(r.MismatchedApprovalInputs) +
+        L",\"uncommitted_image_roots\":" + N(r.UncommittedImageRoots) + L",\"unreadable_image_catalogs\":" + N(r.UnreadableImageCatalogs) +
+        L",\"missing_image_inputs\":" + N(r.MissingImageInputs) + L",\"mismatched_image_inputs\":" + N(r.MismatchedImageInputs) +
         L",\"read_bytes\":" + N(r.ReadBytes) + L",\"artifacts_included\":" + B(includeArtifacts) +
         L",\"artifact_rows_total\":" + N(r.Artifacts.size()) + L",\"artifact_rows_emitted\":" + N(emitted) +
         L",\"artifact_rows_omitted\":" + N(r.Artifacts.size() - emitted) +
@@ -1545,7 +1655,8 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
                             { entry = intent; entry.State = L"absent_after_intent"; entry.Issue = L"deletion_actor_unknown"; }
                         else { entry.State = L"denied"; entry.Issue = L"selected_file_missing"; }
                     }
-                    else if (found->Retention == L"uncommitted_approval_input_protected" || found->Retention == L"unresolved_approval_input_protected")
+                    else if (found->Retention == L"uncommitted_approval_input_protected" || found->Retention == L"unresolved_approval_input_protected" ||
+                        found->Retention == L"uncommitted_image_input_protected" || found->Retention == L"unresolved_image_input_protected")
                         { entry.State = L"denied"; entry.Issue = found->Retention; }
                     else if (!found->Verified || found->Retention != L"uncommitted_requires_policy" || found->JournalReferences != 0)
                         { entry.State = L"denied"; entry.Issue = L"selected_file_protected"; }

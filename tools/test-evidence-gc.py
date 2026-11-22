@@ -98,9 +98,10 @@ def main():
     def case(name):
         root = sandbox / name
         shutil.copytree(original, root)
-        raw = encoded({"schema": "kn.image_reads.v3", "fixture": "explicitly selected unpublished owned file"})
+        payload = {"fixture": "explicitly selected unpublished owned file"}
+        raw = encoded(dict(schema="kn.image_reads.v1", payload_sha256=sha(encoded(payload)), payload=payload))
         blob = b"owned non-executable reference orphan"
-        artifacts = [("image-reads/reads-99-1.knreads", raw, "kn.image_reads.v3"),
+        artifacts = [("image-reads/reads-99-1.knreads", raw, "kn.image_reads.v1"),
                      ("image-references/" + sha(blob) + ".knblob", blob, "raw.bytes")]
         members = []
         for path, data, schema in artifacts:

@@ -182,6 +182,9 @@ def main():
         ("unknown-field", 2, lambda d: d["payload"].update(unexpected=True), 1),
         ("duplicate-transaction", 2, lambda d: d["payload"]["transaction"].update(id="1"), 1),
         ("uncommitted-dependency", 1, lambda d: d["payload"]["transaction"].update(requires=["image-sweeps/sweep-7-1.knsweep"]), 0),
+        ("sweep-omits-input", 3, lambda d: d["payload"]["transaction"]["requires"].pop(), 2),
+        ("sweep-adds-input", 3, lambda d: d["payload"]["transaction"].update(
+            requires=sorted(d["payload"]["transaction"]["requires"] + ["image-reads/reads-7-2.knreads"])), 2),
         ("duplicate-member", 1, lambda d: d["payload"]["transaction"]["members"].append(d["payload"]["transaction"]["members"][0]), 0),
         ("parent-escape", 1, lambda d: d["payload"]["transaction"]["members"][0].update(path="../outside.knreads"), 0),
         ("absolute-member", 1, lambda d: d["payload"]["transaction"]["members"][0].update(path="C:/outside.knreads"), 0),
@@ -211,6 +214,20 @@ def main():
     rechain(root, change_schema)
     result = recover(root)
     check(result["committed_segments"] == "0" and result["issue"] == "member_schema_mismatch", "exact file digest does not bypass schema")
+
+    for field in ("recipe_sha256", "raw_payload_sha256"):
+        root = copy("sweep-stale-" + field)
+        sweep = root / "image-sweeps/sweep-7-1.knsweep"
+        doc = json.loads(sweep.read_bytes())
+        doc["payload"]["slices"][0][field] = "a" * 64
+        doc["manifest_sha256"] = sha(encoded(doc["payload"]))
+        sweep.write_bytes(encoded(doc))
+        rechain(root, lambda i, d: d["payload"]["transaction"]["members"][0].update(
+            sha256=sha(sweep.read_bytes()), bytes=str(sweep.stat().st_size)) if i == 3 else None)
+        result = recover(root)
+        check(result["committed_segments"] == "2" and result["issue"] == "image_sweep_input_not_committed",
+              "resealed sweep must name the exact earlier " + field)
+        oracle(root, result)
 
     root = copy("missing-terminal-record")
     (root / "collections/7/journal-segments/00000000000000000004.knjseg").unlink()

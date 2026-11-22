@@ -95,6 +95,12 @@ namespace bounded_observation_json
             *out = it->second;
             return true;
         }
+        std::wstring String(const wchar_t* key) const
+        {
+            const auto it = Fields.find(key);
+            return it != Fields.end() && !it->second.empty() && it->second.front() == L'"' ?
+                mcpjson::Unescape(it->second) : std::wstring{};
+        }
         bool Rows(const wchar_t* key, size_t limit, std::vector<std::wstring>* out) const
         {
             const auto it = Fields.find(key);

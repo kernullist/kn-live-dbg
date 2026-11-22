@@ -1,4 +1,5 @@
 #include "../user/EvidenceJournal.h"
+#include "../user/ImageSweepManifest.h"
 #include "../user/EvidenceStore.h"
 #include "../user/EvidenceRetention.h"
 #include "../user/AnalystSnapshot.h"
@@ -43,6 +44,12 @@ namespace
         const auto digest = ContentHash::Bytes(Blob);
         return {L"image-references/" + digest + L".knblob", digest, L"raw.bytes", Blob.size()};
     }
+    std::wstring BatchPayload(const std::wstring& id, bool slice)
+    {
+        const auto ref = mcpjson::Quote(BlobMember().Sha256);
+        return L"{\"fixture_id\":" + mcpjson::Quote(id) + (slice ? L",\"reference_sha256\":" + ref + L"}" :
+            L",\"reference\":{\"sha256\":" + ref + L",\"persistence\":\"committed\",\"bytes\":" + std::to_wstring(Blob.size()) + L"}}");
+    }
     EvidenceJournalTransaction Batch(const fs::path& root, const std::wstring& id, const std::wstring& stage = L"", const std::wstring& collection = L"7")
     {
         EvidenceJournalTransaction t;
@@ -54,8 +61,11 @@ namespace
         const auto prefix = L"image-reads/reads-" + collection + L"-" + id;
         for (const auto& suffix : {L".knreads", L".knslice"})
         {
-            const auto schema = std::wstring(suffix) == L".knreads" ? L"kn.image_reads.v3" : L"kn.image_slice.v2";
-            const auto json = L"{\"schema\":" + mcpjson::Quote(schema) + L",\"fixture_id\":" + mcpjson::Quote(id) + L"}";
+            const bool slice = std::wstring(suffix) == L".knslice";
+            const auto payload = BatchPayload(id, slice);
+            const auto json = L"{\"schema\":" + mcpjson::Quote(slice ? L"kn.image_slice.v2" : L"kn.image_reads.v3") +
+                (slice ? L",\"recipe_sha256\":" : L",\"payload_sha256\":") + mcpjson::Quote(EvidenceJournalJsonMember(L"", payload).Sha256) +
+                L",\"payload\":" + payload + L"}";
             fs::create_directories(root / L"image-reads");
             Check(SaveObservationJson((root / (prefix + suffix)).wstring(), json, nullptr), "publish-owned-json");
             t.Members.push_back(EvidenceJournalJsonMember(prefix + suffix, json));
@@ -67,7 +77,19 @@ namespace
     {
         EvidenceJournalTransaction t;
         t.Kind = L"image_sweep"; t.Id = L"1";
-        const std::wstring json = L"{\"schema\":\"kn.image_sweep.v1\",\"fixture\":\"membership_only_not_replay\"}";
+        ImageSweepManifest manifest;
+        auto& sweep = manifest.Sweep;
+        sweep.CollectionId = collection; sweep.SweepId = collection + L"-1"; sweep.Image = L"owned";
+        sweep.TargetId = L"fixture"; sweep.AddressSpaceId = L"owned-space"; sweep.Identity.BootId = L"owned-boot";
+        sweep.ImageBase = 4096; sweep.ExpectedBytes = 1; sweep.TotalRanges = 1; sweep.StartedFileTime = 1;
+        manifest.ObservedSlices = 1; manifest.EndReason = L"fixture"; manifest.LastEndedTick = 1;
+        ImageSweepSlice row;
+        row.Ordinal = row.ReadSetId = row.ObservedFileTime = row.EndedTick = 1; row.RangeCount = 1; row.Reason = L"fixture";
+        row.ReferenceWritten = row.RawWritten = row.RecipeWritten = true; row.ReferenceSha256 = BlobMember().Sha256;
+        row.RawPayloadSha256 = EvidenceJournalJsonMember(L"", BatchPayload(L"1", false)).Sha256;
+        row.RecipeSha256 = EvidenceJournalJsonMember(L"", BatchPayload(L"1", true)).Sha256;
+        manifest.Slices.push_back(std::move(row));
+        const auto json = ImageSweepManifestJson(manifest);
         fs::create_directories(root / L"image-sweeps");
         const auto path = L"image-sweeps/sweep-" + collection + L"-1.knsweep";
         Check(SaveObservationJson((root / path).wstring(), json, nullptr), "publish-owned-sweep-root");
@@ -334,6 +356,9 @@ namespace
             EvidenceJournal competitor;
             Check(!competitor.Open(root.wstring(), L"7", &error), "second-writer-denied");
             original = Batch(root, L"1");
+            auto omitted = original;
+            omitted.Members.erase(omitted.Members.begin());
+            Check(journal.Commit(omitted).Issue == L"image_reference_not_committed", "declared-read-reference-must-be-in-batch");
             auto invalid = original;
             invalid.Members[0].Path = L"image-references/../outside.knblob";
             Check(!journal.Commit(invalid).Committed, "reject-parent-path");
@@ -368,7 +393,14 @@ namespace
             EvidenceJournal resumed;
             Check(resumed.Open(root.wstring(), L"7", &error), "restart-resumes-verified-prefix");
             Check(resumed.Commit(original).AlreadyCommitted, "restart-exact-retry");
-            Check(resumed.Commit(Sweep(root)).Committed, "restart-appends-dependent-sweep");
+            const auto sweep = Sweep(root);
+            auto omitted = sweep;
+            omitted.Requires.pop_back();
+            Check(resumed.Commit(omitted).Issue == L"image_sweep_input_not_committed", "sweep-requires-every-written-input");
+            auto extra = sweep;
+            extra.Requires.push_back(L"image-reads/reads-7-2.knreads");
+            Check(resumed.Commit(extra).Issue == L"image_sweep_dependency_set_mismatch", "sweep-rejects-unrelated-committed-input");
+            Check(resumed.Commit(sweep).Committed, "restart-appends-dependent-sweep");
             auto closure = Closure(root);
             const auto closed = resumed.Commit(closure);
             Check(closed.Committed && closed.Indexed && resumed.State().Closed && !resumed.State().CanResume, "closure-is-a-committed-record");

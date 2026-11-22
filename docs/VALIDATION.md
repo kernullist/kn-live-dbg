@@ -7,6 +7,41 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Image archive input retention on 2026-11-23
+
+The preceding x64 Release CLI (`39a54b6df4d2`) planned deletion of the PE
+from a loose direct capture and from a loose sweep. In the disposable sweep
+store, offline replay succeeded before GC. After GC deleted the PE, replay
+reported `sweep_reference_or_schedule_mismatch` although both read archives,
+both slice recipes and the sweep manifest were still present.
+
+The updated size-optimized x64 Release CLI (`924a715fd2a7`) denied the same
+deletion before creating an intent. The bare and claim-wrapped sweeps still
+replayed. The dependency tests derived expected paths and hashes from original
+producer files, then compared them to every referring row in the native
+inventory. Cases included a producer-declared missing raw, a missing shared
+PE, a resealed read with an incorrect PE length, an unreadable publication,
+a sweep under the wrong collection name, and loose roots over committed
+children. A sweep published after a durable deletion intent also protected
+the selected read on retry. The suite passed 128 product checks and 108
+harness checks. [Image dependency controls](../tools/test-image-archive-dependencies.py)
+
+Commit and recovery controls omitted or added a sweep dependency, changed
+the original payload digest in a resealed sweep and substituted a separately
+hashed PE in a direct capture transaction. Recovery stopped at the preceding
+verified segment in each case. The previous and updated journal writers each
+published bare, wrapped and raw-loss sweeps that the other product recovered
+as four-segment closed collections. Both products replayed the complete
+bare and wrapped examples. [Journal controls](../tools/test-evidence-journal.py) ·
+[Direct capture controls](../tools/test-image-capture-journal.py)
+
+The native journal checks passed 74 cases. The independent journal, store, GC
+and IRP suites passed 2,152, 476, 892 and 400 checks respectively. The
+product console suite passed 570 checks, including the mixed image/IRP
+writer. Verification used offline user-mode tools and disposable stores.
+Loose IRP dependencies, committed-root retirement, large-store continuation
+and recovery from physical media loss remain open.
+
 ## Approval input retention on 2026-11-23
 
 At `6dba4df`, the x64 offline product accepted a GC preflight for all four
