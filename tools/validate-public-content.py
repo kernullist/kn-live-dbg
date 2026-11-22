@@ -90,6 +90,7 @@ def text_views(data: bytes) -> list[str]:
 
 
 DISK_IO_SCHEMA = "kn.etl_disk_io.v1"
+DISK_REQUEST_SCHEMA = "kn.traceprocessor_disk_requests.v1"
 FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl_hard_faults.v3", "kn.etl_activity_markers.v1",
                        "kn.etl_activity_comparison.v1", "kn.etl_activity_comparison_receipt.v1",
                        "kn.etl_activity_comparison.v2", "kn.etl_activity_comparison_receipt.v2", "kn.traceprocessor_activity_rows.v1")
@@ -100,7 +101,8 @@ HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2", "kn.own
                    *(f"kn.etl_handoff_{kind}{receipt}.v{version}" for kind in ("plan", "study")
                      for receipt in ("", "_receipt") for version in (1, 2, 3)))
 ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_receipt.v1", "kn.etl_activity_waits.v2",
-                          "kn.etl_activity_waits_receipt.v2", "kn.traceprocessor_interrupt_window.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
+                          "kn.etl_activity_waits_receipt.v2", "kn.etl_activity_waits.v3", "kn.etl_activity_waits_receipt.v3",
+                          DISK_REQUEST_SCHEMA, "kn.traceprocessor_interrupt_window.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
 TRACE_QUERY_SCHEMAS = (*ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
@@ -161,8 +163,10 @@ ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
-DISK_IO_MARKERS = (DISK_IO_SCHEMA, '"disk_event_ordinal"', '"high_res_response_ticks"', '"longest_response_ties"',
-                   '"response_ticks_per_second"', '"decoded_disk_records"', '"cross_provider_join"')
+DISK_IO_MARKERS = (DISK_IO_SCHEMA, DISK_REQUEST_SCHEMA, '"disk_event_ordinal"', '"high_res_response_ticks"', '"longest_response_ties"',
+                   '"response_ticks_per_second"', '"decoded_disk_records"', '"cross_provider_join"', '"packet_first_ordinal"',
+                   '"request_union_ticks"', '"switch_start_record"', '"gap_ticks"', '"matched_activities"', '"disk_requests_status"',
+                   '"disk_scope"', '"native_pages"')
 HARD_FAULT_FIELDS = tuple(frozenset(keys) for keys in (
     ("fault_ordinal", "record_ordinal"), ("initial_time_raw", "faulting_thread_id"),
     ("waiting_before_ready_ticks", "unclassified_off_cpu_ticks"), ("off_cpu_intervals", "split_off_cpu_intervals"),
@@ -217,6 +221,10 @@ DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
     ("disk_event_ordinal", "record_ordinal"), ("high_res_response_ticks", "reported_issuing_tid"),
     ("longest_response_ties", "initiations", "completions"), ("response_ticks_per_second", "operations"),
     ("decoded_disk_records", "records_seen"), ("cross_provider_join", "device_service_time", "request_generation"),
+    ("packet_first_ordinal", "disk_ordinal"), ("packet_first_ordinal", "table_row"), ("request_union_ticks", "requests"),
+    ("switch_start_record", "table_rows"), ("gap_ticks", "ready_record", "switch_out_record"),
+    ("unassigned_events", "matched_activities"), ("disk_requests_status", "report_sha256"),
+    ("disk_scope", "device_service_time"), ("sdk_query", "native_pages"),
 ))
 ETL_ROTATION_MARKERS = (*ETL_ROTATION_SCHEMAS, '"expected_inventory_sha256"', '"closed_controller_inventory_verified"',
                         '"final_ordinal"', '"etl_bytes"', '"observed_bytes"')
@@ -232,7 +240,8 @@ READY_ORIGIN_FIELDS = tuple(frozenset(keys) for keys in (
     ("traceprocessor_counts", "summary"), ("source_overlap_end_raw", "source_overlap_start_raw"),
     ("observed_dpc_ns", "observed_isr_ns"), ("cpu_slice_row", "switch_in_record"),
     ("interrupt_activity_row", "fragment"), ("parent_start_ns", "fragment_count"), ("start_qpc", "start_ns", "cpu"),
-    ("start_qpc", "stop_qpc", "processors"), ("reference_qpc", "reference_ns"), ("activity_table_rows", "matched_fragments"),
+    ("start_qpc", "stop_qpc", "processors"), ("start_qpc", "stop_qpc", "pid", "tid"),
+    ("reference_qpc", "reference_ns"), ("activity_table_rows", "matched_fragments"),
     ("initial_qpc", "stop_qpc", "record_ordinal"), ("interrupt_overlap_status", "report_sha256"),
 ))
 READY_ORIGIN_MARKERS = ('"requested_ready_record"', '"source_cpu_context"', '"readying_pid"', '"header_binding"',
@@ -382,7 +391,7 @@ def detached_evidence_line(text: str) -> int | None:
     if any(tag in text for tag in READY_ORIGIN_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, READY_ORIGIN_FIELDS, ("kn.etl_switches.v5", *ACTIVITY_WAITS_SCHEMAS)))
     if any(tag in text for tag in DISK_IO_MARKERS):
-        patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA,)))
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA, DISK_REQUEST_SCHEMA)))
     if any(tag in text for tag in HARD_FAULT_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, HARD_FAULT_FIELDS, FAULT_QUERY_SCHEMAS))
     if any(tag in text for tag in HANDOFF_MARKERS):
@@ -528,7 +537,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12]|traceprocessor_interrupt_window\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[123]|traceprocessor_(?:interrupt_window|disk_requests)\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

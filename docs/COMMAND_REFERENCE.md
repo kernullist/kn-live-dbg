@@ -1657,6 +1657,30 @@ comparison succeeds. Exit 1 retains the report for an unavailable
 measurement or a replay mismatch. Omitting the adapter with this option
 returns exit 2. [Time and coverage fields](TRACE_IMPORT.md#interrupt-handling-during-a-marked-threads-cpu-residency)
 
+### Measure disk requests during a thread activity
+
+Use the same `$query` from **Account for waits across one activity**.
+Build the disk adapter in a Visual Studio Developer PowerShell. The
+following commands write a private v3 report and replay its digest.
+
+```powershell
+MSBuild tools\TraceProcessorDisk\TraceProcessorDisk.csproj /restore /t:PackageAdapter /p:Configuration=Release
+$diskAdapter = (Get-Item .\.build\traceprocessor-disk\TraceProcessorDisk.zip).FullName
+$disk = @('--disk-requests', $diskAdapter, (Get-FileHash -LiteralPath $diskAdapter -Algorithm SHA256).Hash)
+$diskReport = Join-Path $PWD 'private-activity-disk.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query @disk --output $diskReport | ConvertFrom-Json
+$measurement = (Get-Content -Raw -LiteralPath $diskReport | ConvertFrom-Json).result.disk_requests
+$measurement.summary | Select-Object request_union_ticks, waiting_before_ready_ticks, on_cpu_ticks
+python -B tools\measure-etl-activity-waits.py @query @disk --check-report $receipt.report_sha256
+```
+
+The receipt reports `disk_requests_status` as `measured` when all
+participating records agree. Exit 1 retains the reason for an unavailable
+measurement or a digest mismatch. Invalid pins and occupied output paths
+return exit 2. Add the CPU adapter options to the same invocation to
+include ReadyThread correspondence or interrupt overlap.
+[Request pairing and time fields](TRACE_IMPORT.md#disk-requests-during-a-thread-activity)
+
 ## Whole-host hunt
 
 ```text

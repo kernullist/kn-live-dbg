@@ -7,6 +7,50 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Disk requests during marked thread waits on 2026-11-23
+
+The x64 Release reader (`2bda0417bff9`) and the disk adapter
+(`f39772040c3d`, TraceProcessor Disk 1.12.10, Toolkit 1.11.0)
+processed ten qualified marker windows in the public TaskbarLatency ETL
+(`8a59fa63479e`, Windows `10.0.28000`, 10 MHz QPC). An independent
+Windows TDH reader paired the original DiskIo records by the named
+packet and issuing-thread fields. Its context switches and ReadyThread
+records reproduced every reported request intersection and completion-to-ready
+gap. Four windows had pending reads from the marked thread. The six
+other windows returned a measured zero.
+[Source recording](#readythread-cpu-context-on-2026-11-22) · [TDH and replay checks](../tools/test-etl-disk-waits.py)
+
+| Start and Stop records | Reads | Pending (ms) | Pending while waiting before ready (ms) | Pending on CPU (ms) | Completion to ReadyThread (µs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 339732, 374019 | 2 | 0.9082 | 0.8752 | 0.0330 | 2.0, 1.7 |
+| 397312, 398477 | 2 | 3.9082 | 3.8512 | 0.0570 | 3.2, 1.7 |
+| 418372, 418976 | 1 | 3.9668 | 3.9345 | 0.0323 | 4.3 |
+| 451991, 452304 | 1 | 3.9349 | 3.8509 | 0.0840 | 9.0 |
+
+Across the recording, 241 disk events referenced 23 distinct packet
+values. Some values served multiple issuers. All 120 SDK activities
+matched TDH endpoint pairs across 19 issuing TIDs (17 reads, 95 writes
+and eight flushes). Of these, 102
+pairs also fell inside recorded issuer lifetimes. The remaining 18
+completed after the issuer's final rundown record. The last write
+initiation in the trace had no completion. Neither case supplied a
+qualified request duration for the marked thread. A component check
+clipped two concurrent requests inside their common interval and
+counted that time once.
+
+For the first read in the table, the two endpoint timestamps were 5,635
+ticks apart and the storage stack reported 5,632 response ticks. The
+report preserves both observations. The six short completion-to-ready
+gaps establish ordering on this recording. The wait object and the
+contribution to the application's critical path remain unknown.
+
+Replay matched the v3 report digest. The disk result was identical in
+two additional runs, one with two-interval paging and one with both
+CPU and interrupt queries enabled. An intervening activity boundary,
+recorded loss and a non-QPC clock each withheld the measurement. Native-only v1, CPU
+v1 and interrupt v2 reports for the first window were byte-identical
+to those from `b6a4eee`. [Measurement and replay](COMMAND_REFERENCE.md#measure-disk-requests-during-a-thread-activity)
+
 ## Interrupt overlap during thread residency on 2026-11-23
 
 The x64 Release reader (SHA-256 prefix `2bda0417bff9`) and the CPU

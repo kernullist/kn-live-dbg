@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <new>
+#include <unordered_map>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "tdh.lib")
@@ -21,8 +23,15 @@ namespace
     constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID PerfInfo = {0xce1dbfb4, 0x137e, 0x4da6, {0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}};
+    constexpr GUID DiskIo = {0x3d6fa8d4, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID Handoff = {0x4dc673b7, 0xfb3f, 0x4099, {0x95, 0x2a, 0x37, 0xda, 0xc2, 0x7c, 0xf1, 0x94}};
-    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false, payloads = false, interrupts = false; };
+    struct Counts
+    {
+        unsigned records = 0, faults = 0, diskRows = 0;
+        ULONG error = 0;
+        bool scheduler = false, activities = false, payloads = false, interrupts = false, disk = false;
+        std::unordered_map<uint64_t, unsigned> firstPacket;
+    };
 
     template<typename T>
     bool Property(PEVENT_RECORD e, Counts& counts, PCWSTR name, T& value)
@@ -35,6 +44,36 @@ namespace
         if (!counts.error && size != sizeof(T)) { counts.error = ERROR_INVALID_DATA; }
         if (!counts.error) { counts.error = TdhGetProperty(e, 0, nullptr, 1, &field, size, reinterpret_cast<PBYTE>(&value)); }
         return counts.error == ERROR_SUCCESS;
+    }
+
+    void DiskRecord(PEVENT_RECORD e, Counts& counts)
+    {
+        const auto& h = e->EventHeader;
+        const auto& d = h.EventDescriptor;
+        if (counts.error || !IsEqualGUID(h.ProviderId, DiskIo) || d.Id != 0 || d.Opcode < 10 || d.Opcode > 15) { return; }
+        PROPERTY_DATA_DESCRIPTOR irp{};
+        irp.PropertyName = reinterpret_cast<ULONGLONG>(L"Irp");
+        irp.ArrayIndex = ULONG_MAX;
+        ULONG width = 0;
+        counts.error = TdhGetPropertySize(e, 0, nullptr, 1, &irp, &width);
+        if (counts.error) { return; }
+        if ((width != 4 && width != 8) || (d.Version != 2 && d.Version != 3)) { counts.error = ERROR_INVALID_DATA; return; }
+        uint64_t packet = 0, response = 0;
+        counts.error = TdhGetProperty(e, 0, nullptr, 1, &irp, width, reinterpret_cast<PBYTE>(&packet));
+        uint32_t tid = 0, disk = 0, bytes = 0;
+        const bool transfer = d.Opcode == 10 || d.Opcode == 11;
+        if (counts.error || (d.Version == 3 && !Property(e, counts, L"IssuingThreadId", tid)) ||
+            (transfer && !Property(e, counts, L"TransferSize", bytes)) ||
+            ((transfer || d.Opcode == 14) && (!Property(e, counts, L"DiskNumber", disk) || !Property(e, counts, L"HighResResponseTime", response)))) { return; }
+        ++counts.diskRows;
+        unsigned first = 0;
+        try { if (packet) { first = counts.firstPacket.emplace(packet, counts.diskRows).first->second; } }
+        catch (const std::bad_alloc&) { counts.error = ERROR_NOT_ENOUGH_MEMORY; return; }
+        std::printf("{\"record_ordinal\":%u,\"disk_ordinal\":%u,\"packet_first_ordinal\":%u,\"opcode\":%u,\"version\":%u,"
+            "\"pointer_bytes\":%lu,\"logger_id\":%u,\"cpu\":%u,\"issuing_tid\":%u,\"raw_timestamp\":\"%lld\","
+            "\"disk\":%u,\"bytes\":%u,\"response_ticks\":\"%llu\"}\n",
+            counts.records, counts.diskRows, first, static_cast<unsigned>(d.Opcode), static_cast<unsigned>(d.Version), width,
+            static_cast<unsigned>(e->BufferContext.LoggerId), static_cast<unsigned>(GetEventProcessorIndex(e)), tid, h.TimeStamp.QuadPart, disk, bytes, response);
     }
 
     void Scheduler(PEVENT_RECORD e, Counts& counts)
@@ -77,6 +116,7 @@ namespace
         ++counts.records;
         const auto& h = event->EventHeader;
         const auto& d = h.EventDescriptor;
+        if (counts.disk) { DiskRecord(event, counts); return; }
         if (counts.interrupts)
         {
             if (counts.error || !IsEqualGUID(h.ProviderId, PerfInfo) || d.Id != 0 ||
@@ -166,12 +206,14 @@ int wmain(int argc, wchar_t** argv)
 {
     const bool payloads = argc == 3 && std::wcscmp(argv[2], L"--marker-data") == 0;
     const bool interrupts = argc == 3 && std::wcscmp(argv[2], L"--interrupts") == 0;
-    if ((argc != 2 && (argc != 3 || (!payloads && !interrupts && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
+    const bool disk = argc == 3 && std::wcscmp(argv[2], L"--disk-requests") == 0;
+    if ((argc != 2 && (argc != 3 || (!payloads && !interrupts && !disk && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
     counts.scheduler = argc == 3 && std::wcscmp(argv[2], L"--scheduler") == 0;
     counts.payloads = payloads;
     counts.interrupts = interrupts;
+    counts.disk = disk;
     counts.activities = payloads || (argc == 3 && std::wcscmp(argv[2], L"--activities") == 0);
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = argv[1];

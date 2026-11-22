@@ -445,7 +445,7 @@ buffer accounting, a recorded loss or an unsupported DiskIo layout returns
 A complete scan can return `read` with zero disk events. The capability
 probe reports the observed record count, original ordinal and payload hash
 for this family. Keep source traces, evidence pages and replay receipts private.
-[Validation on saved traces](VALIDATION.md#saved-disk-io-response-times-on-2026-11-22)
+[Validation on saved traces](VALIDATION.md#saved-disk-io-response-times-on-2026-11-22) · [Pair requests during a thread activity](#disk-requests-during-a-thread-activity)
 
 ## Read saved hard page faults
 
@@ -1030,6 +1030,51 @@ TaskbarLatency trace this table included ordinary and timer DPCs and
 excluded threaded DPCs. Identifying a handler, measuring the target's
 instructions or attributing application delay requires other evidence.
 [Commands and replay](COMMAND_REFERENCE.md#measure-interrupt-handling-during-a-thread-activity) · [Measured coverage](VALIDATION.md#interrupt-overlap-during-thread-residency-on-2026-11-23)
+
+### Disk requests during a thread activity
+
+With `--disk-requests`, the v3 activity wait report measures how long
+disk reads, writes and flushes issued by the marked thread were pending
+in each scheduler state. A request can start before the first marker or
+complete after the last. Its full endpoints identify it. Only the time
+between the markers contributes to the totals.
+
+The Microsoft disk adapter reads `IDiskActivityDataSource.Activity` and
+the original classic DiskIo events from the pinned ETL. It follows each
+selected packet value through reuse by other issuers. The private report
+identifies the value by the first disk-event ordinal where it appeared.
+A pair needs one initiation and one completion for the same operation,
+issuing TID, logger and pointer width, both inside the recorded lifetime
+of the marked thread. The SDK activity must match the PID, TID, packet,
+operation and both trace-relative times. The native disk pages supply the
+original record numbers, completion counter and transfer fields. A full scan
+checks every native event naming the TID against the SDK history.
+[TraceProcessor disk activity fields](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.disk.idiskactivity) · [DiskIo completion fields](https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1)
+
+| Summary field | Recorded time in QPC ticks |
+| --- | --- |
+| `request_union_ticks` | Time during which at least one selected request was pending. Concurrent requests contribute once. |
+| `on_cpu_ticks` | Pending while the scheduler assigned the issuing thread to a CPU. |
+| `waiting_before_ready_ticks` | Pending between a switch-out in the Waiting state and its qualified ReadyThread event. |
+| `ready_to_dispatch_ticks` | Pending between the qualified ReadyThread and switch-in. |
+| `other_off_cpu_ticks` | Pending during the remaining off-CPU time, including intervals without a qualified ReadyThread. |
+
+Each intersection names the contributing SDK rows and original scheduler
+records. For a completion inside a qualified wait, `following_ready_in_wait`
+gives the gap to the subsequent ReadyThread when both are inside the marker
+window. A null value means that sequence was unobserved. The completion
+event's response counter and the elapsed time between the two original
+events are available separately. The trace establishes temporal overlap.
+Identifying the wait object, physical device service time or the cause of
+application delay requires other evidence.
+
+Missing endpoints, ambiguous reuse, unmatched SDK activities, missing
+issuer IDs, a non-QPC clock or recorded loss prevent a numerical result.
+The query admits at most 8,192 original disk events, 2,048 selected packet
+values, 2,048 selected history records, 2,048 selected activity rows and
+8,192 request-to-state intersections. A measured zero requires observed
+disk events in the source and a qualified scheduler window.
+[Commands and replay](COMMAND_REFERENCE.md#measure-disk-requests-during-a-thread-activity) · [Measured coverage](VALIDATION.md#disk-requests-during-marked-thread-waits-on-2026-11-23)
 
 ## Saved V8 CPU profiles
 

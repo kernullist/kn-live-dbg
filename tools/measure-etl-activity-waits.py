@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 from etl_activity_waits import ActivityWaits, MAX_RECORDS, candidate
+import etl_disk_waits
 import etl_interrupt_overlap
 from etl_ready_correspondence import TableBindings, correlate, key
 from etl_reader_process import WindowsFiles, file_hash, reader_receipt, run_reader
@@ -114,7 +115,7 @@ def interrupt_query(runtime, path, pin, size, window, frequency, running, direct
     return dict(status=status, query=query, summary=summary)
 
 
-def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
+def analyze(args, path, pin, size, reader, sdk, disk, directory, files, emit):
     prefix = ["--etl-switches", str(path), "--sha256", pin]
 
     def native(flags):
@@ -124,6 +125,8 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
     sdk_counts = Counter()
     tables = TableBindings() if sdk else None
     running = []
+    disk_result = dict(status="native_window_unavailable", sdk_query=None, native_pages=[], summary=None)
+    disk_timeline = None
     reason = None
     while True:
         schedule = native(["--schedule-activity", str(args.start), str(args.stop), "--after", str(after), "--limit", str(args.page_size)])
@@ -139,6 +142,16 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
                 common = {k: page[k] for k in TRACE_FIELDS}
                 if aggregate is None:
                     metadata, aggregate = common, ActivityWaits(window)
+                    if disk:
+                        a, b = window["start"], window["stop"]
+                        flags = [str(path), str(a["header_process_id"]), str(a["header_thread_id"]), a["raw_timestamp"], b["raw_timestamp"]]
+                        disk_sdk = read(disk[0], disk[1], flags, directory, args.timeout_ms, files)
+
+                        def disk_page(cursor, count):
+                            flags = ["--etl-disk-io", str(path), "--sha256", pin, "--after", str(cursor), "--limit", str(count)]
+                            return read(*reader, flags, directory, args.timeout_ms, files)
+
+                        disk_result, disk_timeline = etl_disk_waits.prepare(disk_sdk, disk_page, common, window)
                 check(common == metadata, "schedule coverage changed")
                 selectors = [uint(r["record_ordinal"], MAX_RECORDS) for item in window["intervals"] if (r := candidate(item)) is not None]
                 check(selectors == sorted(set(selectors)) and all(selectors), "ready selectors out of sequence")
@@ -152,6 +165,13 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
                         origins = origin_rows(batch, selectors, common, window)
                 if reason is None:
                     part["waits"] = aggregate.account(window, origins)
+                    if disk_timeline is not None:
+                        try:
+                            disk_timeline.account(window, part["waits"])
+                        except etl_disk_waits.Unavailable as exc:
+                            disk_result["status"], disk_timeline = str(exc), None
+                        except (KeyError, TypeError, ValueError, StopIteration):
+                            disk_result["status"], disk_timeline = "inconsistent_disk_evidence", None
                     if args.interrupt_overlap:
                         etl_interrupt_overlap.native_slices(window, running)
                     if sdk and origins:
@@ -179,6 +199,15 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
         sdk_status = "unconfirmed" if reason is not None or sdk_counts["unconfirmed"] else "matched" if sdk_counts else "no_ready_records"
     result = dict(status="accounted" if summary is not None else "unavailable", reason=reason, summary=summary,
                   traceprocessor_status=sdk_status, traceprocessor_counts=dict(sorted(sdk_counts.items())) if sdk else None)
+    if disk:
+        if summary is None:
+            disk_result["status"] = "native_window_unavailable"
+        elif disk_timeline is not None:
+            try:
+                disk_result.update(status="measured", summary=disk_timeline.finish())
+            except (KeyError, TypeError, ValueError):
+                disk_result["status"] = "inconsistent_disk_evidence"
+        result["disk_requests"] = disk_result
     if args.interrupt_overlap:
         overlap = dict(status="native_window_unavailable", query=None, summary=None)
         if summary is not None:
@@ -212,6 +241,7 @@ def execute(args):
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=parent, prefix=".kn-etl-waits-")))
         files.parents(stack, directory, held)
         sdk = etl_traceprocessor.admit(args.traceprocessor, directory, files, stack, held, cpu=True) if args.traceprocessor else None
+        disk = etl_traceprocessor.admit(args.disk_requests, directory, files, stack, held, disk=True) if args.disk_requests else None
         header = dict(schema="kn.etl_activity_waits.v1", source_sha256=pin, source_bytes=size, reader_sha256=expected,
                       requested_start_record=args.start, requested_stop_record=args.stop, interval_page_limit=args.page_size,
                       timeout_ms=args.timeout_ms, traceprocessor=sdk[2] if sdk else None,
@@ -222,11 +252,14 @@ def execute(args):
             header["traceprocessor"]["tables"].extend(etl_interrupt_overlap.TABLES)
             header["qualification"].update(interrupt_scope="exclusive_sdk_fragments_during_thread_residency",
                                            interrupt_time_basis="trace_relative_nanoseconds")
+        if disk:
+            header.update(schema="kn.etl_activity_waits.v3", disk_traceprocessor=disk[2])
+            header["qualification"].update(disk_scope="observed_requests_from_the_marked_thread", device_service_time=None)
         outcome = {}
 
         def render(emit):
             emit(encoded(header)[:-2] + b',"pages":[')
-            outcome.update(analyze(args, path, pin, size, (program, binary), sdk, directory, files, emit))
+            outcome.update(analyze(args, path, pin, size, (program, binary), sdk, disk, directory, files, emit))
             emit(b'],"result":' + encoded(outcome).rstrip(b"\n") + b"}\n")
 
         if output:
@@ -241,8 +274,11 @@ def execute(args):
                    expected_report_sha256=expected_report, activity_waits_status=outcome["status"], traceprocessor_status=outcome["traceprocessor_status"])
     if args.interrupt_overlap:
         receipt.update(schema="kn.etl_activity_waits_receipt.v2", interrupt_overlap_status=outcome["interrupt_overlap"]["status"])
+    if args.disk_requests:
+        receipt.update(schema="kn.etl_activity_waits_receipt.v3", disk_requests_status=outcome["disk_requests"]["status"])
     return receipt, int(result == "mismatch" or outcome["status"] != "accounted" or outcome["traceprocessor_status"] == "unconfirmed" or
-                        (args.interrupt_overlap and receipt["interrupt_overlap_status"] != "measured"))
+                        (args.interrupt_overlap and receipt["interrupt_overlap_status"] != "measured") or
+                        (args.disk_requests is not None and receipt["disk_requests_status"] != "measured"))
 
 
 def main():
@@ -253,6 +289,8 @@ def main():
         p.add_argument("--" + name, required=True)
     p.add_argument("--traceprocessor", nargs=2, metavar=("CPU_ADAPTER_ZIP", "SHA256"))
     p.add_argument("--interrupt-overlap", action="store_true", help="measure exclusive DPC/ISR fragments during the marked thread's CPU residency")
+    p.add_argument("--disk-requests", nargs=2, metavar=("DISK_ADAPTER_ZIP", "SHA256"),
+                   help="bind disk request endpoints and measure their overlap with the thread's scheduler states")
     p.add_argument("--page-size", type=int, default=128)
     p.add_argument("--timeout-ms", type=int, default=240000)
     dest = p.add_mutually_exclusive_group(required=True)
