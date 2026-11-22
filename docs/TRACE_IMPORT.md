@@ -36,9 +36,18 @@ exit 1, with available rows and both counts. `matched` describes only the
 buffer count. Circular logs and missing declarations return `not_comparable`.
 A successful page returns `read` and exit 0, which includes a valid trace
 with zero decoded samples. File, digest, cursor and decoder failures return
-exit 1. Malformed arguments and output failures return exit 2. A rotating
-multi-file session requires separate segment provenance. Keep ETLs and JSON
-reports private. [Windows trace file header](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header)
+exit 1. Malformed arguments and output failures return exit 2.
+[Windows trace file header](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header)
+
+For a rotating recording (`EVENT_TRACE_FILE_MODE_NEWFILE`), supply the
+actual member filename and its SHA-256. Each command reads that file alone.
+The CPU, context-switch and disk pages report `partial` and exit 1 even
+when both buffer counts agree. The numeric mode is in `log_header.log_mode`.
+`--capabilities --probe-etl` adds `rotation_member` with file scope and leaves the
+ordinal, set size and session completeness unknown. An inventory from the
+recorder or archive is needed to establish order and missing files.
+Keep ETLs and JSON reports private.
+[Windows ETW log filenames](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_logfilew)
 
 ### Read recorded capture settings
 

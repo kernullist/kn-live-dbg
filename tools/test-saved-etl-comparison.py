@@ -207,6 +207,34 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(q["families"]["cpu_profile"]["verdict"], "coverage_limited")
         self.assertEqual(q["families"]["context_switch"]["verdict"], "agreed_empty")
 
+    def test_rotating_file_keeps_unknown_session_coverage(self):
+        m, n = manifest(), native()
+        p = n["probe"]
+        member = dict(scope="supplied_file", log_mode=9, ordinal=None, set_size=None, session_complete=None)
+        p.update(status="partial", rotation_member=member)
+        p["coverage"]["buffer_comparison"] = "not_comparable"
+        n["capabilities"][0]["availability"] = "partial"
+
+        def measured(exit_code=1):
+            m["attempts"]["native"].update(exit_code=exit_code, stdout=retained(pair.encoded(n)))
+            return evaluate(m)
+
+        result = measured()
+        self.assertEqual(result["readers"]["native"]["native_probe"]["rotation_member"], member)
+        self.assertTrue(all(v["verdict"] == "coverage_limited" for v in result["families"].values()))
+        self.assertEqual(result["agreement_per_comparable_family"]["denominator"], 0)
+        for invalid in (dict(ordinal=1), dict(set_size=3), dict(session_complete=False), dict(session_complete=True),
+                        dict(log_mode=1), dict(log_mode=True), dict(scope="session"), dict(extra=None)):
+            p["rotation_member"] = dict(member, **invalid)
+            self.assertEqual(measured()["readers"]["native"]["status"], "unqualified_output")
+        p["rotation_member"] = member
+        p.update(status="read")
+        p["coverage"]["buffer_comparison"] = "matched"
+        n["capabilities"][0]["availability"] = "available"
+        self.assertEqual(measured(0)["readers"]["native"]["status"], "unqualified_output")
+        p.update(status="process_trace_failed", win32_status=13, coverage=None)
+        self.assertEqual(measured()["readers"]["native"]["status"], "unqualified_output")
+
     def test_unqualified_summaries_preserve_two_planned_families(self):
         raw = external(ROWS)
         before, after = raw.split(b"Event ID")

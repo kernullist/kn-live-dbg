@@ -27,6 +27,7 @@ struct EtlCapabilityCoverage
 {
     EtlCapabilityRecords Profile, Switches, DiskIo;
     uint32_t RecordsSeen = 0, EventsLost = 0, BuffersLost = 0, LossMarkers = 0, BuffersWritten = 0;
+    uint32_t LogMode = 0;
     uint64_t BuffersProcessed = 0;
     etl_profile::BufferAccounting Accounting = etl_profile::BufferAccounting::Unavailable;
 
@@ -102,10 +103,15 @@ struct SavedEtlCapabilityProbe
 
     std::wstring Json() const
     {
-        std::wstring coverage = L"null";
+        std::wstring coverage = L"null", rotation;
         if (Coverage)
         {
             const auto& c = *Coverage;
+            if (c.LogMode & EVENT_TRACE_FILE_MODE_NEWFILE)
+            {
+                rotation = L",\"rotation_member\":{\"scope\":\"supplied_file\",\"log_mode\":" + std::to_wstring(c.LogMode) +
+                    L",\"ordinal\":null,\"set_size\":null,\"session_complete\":null}";
+            }
             coverage = L"{\"records_seen\":" + std::to_wstring(c.RecordsSeen) +
                 L",\"buffers_written\":" + std::to_wstring(c.BuffersWritten) +
                 L",\"buffers_processed\":" + std::to_wstring(c.BuffersProcessed) +
@@ -120,6 +126,6 @@ struct SavedEtlCapabilityProbe
             L",\"trace_opened\":" + (TraceOpened ? L"true" : L"false") +
             L",\"source_revalidated\":" + (!SourceRevalidated ? L"null" : *SourceRevalidated ? L"true" : L"false") +
             L",\"win32_status\":" + (Win32Status ? std::to_wstring(*Win32Status) : L"null") +
-            L",\"producer_authenticity\":\"unverified\",\"coverage\":" + coverage + L"}";
+            L",\"producer_authenticity\":\"unverified\"" + rotation + L",\"coverage\":" + coverage + L"}";
     }
 };

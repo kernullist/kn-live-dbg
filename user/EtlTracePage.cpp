@@ -119,7 +119,7 @@ namespace
         const auto accounting = etl_profile::AccountBuffers(mode, written, p.BuffersProcessed);
         p.BufferComparison = etl_profile::BufferComparisonName(accounting);
         if (!Label(root.at(L"buffer_comparison"), p.BufferComparison.c_str()) || (!p.Partial &&
-            (accounting == etl_profile::BufferAccounting::More || accounting == etl_profile::BufferAccounting::Fewer)))
+            etl_profile::RequiresPartialPage(mode, accounting)))
         { return false; }
         // These exact objects contain only the checked header fields. The capture FILETIMEs
         // and log-wide loss counters do not supply sample-clock bounds or a sample loss count.

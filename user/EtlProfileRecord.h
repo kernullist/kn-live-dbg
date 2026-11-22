@@ -26,6 +26,12 @@ namespace etl_profile
         return BufferAccounting::Matched;
     }
 
+    inline bool RequiresPartialPage(uint32_t mode, BufferAccounting accounting)
+    {
+        return (mode & EVENT_TRACE_FILE_MODE_NEWFILE) ||
+            accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More;
+    }
+
     inline const wchar_t* BufferComparisonName(BufferAccounting value)
     {
         switch (value)

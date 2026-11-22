@@ -296,6 +296,7 @@ def native_counts(raw, decode, pin, size, exit_code, families=FAMILIES):
         uint(win32, 0xffffffff)
     stages = dict(status=status, win32_status=win32, trace_opened=probe["trace_opened"], source_revalidated=probe["source_revalidated"])
     if probe.get("coverage") is None:
+        check("rotation_member" not in probe, "rotation evidence requires a qualified file traversal")
         check(exit_code == 1 and probe.get("status") not in ("read", "partial"), "native coverage missing from successful report")
         return None, stages
     check(probe.get("source_sha256") == pin and uint(probe.get("source_bytes")) == size and
@@ -313,6 +314,13 @@ def native_counts(raw, decode, pin, size, exit_code, families=FAMILIES):
         expected = ("matched" if c["buffers_processed"] == c["buffers_written"] else
                     "fewer_than_declared" if c["buffers_processed"] < c["buffers_written"] else "more_than_declared")
         check(comparison == expected, "inconsistent native buffer counts")
+    if "rotation_member" in probe:
+        member = probe["rotation_member"]
+        fields(member, "scope log_mode ordinal set_size session_complete", "rotation member")
+        check(member["scope"] == "supplied_file" and (uint(member["log_mode"], 0xffffffff) & 0x8) and
+              all(member[key] is None for key in ("ordinal", "set_size", "session_complete")) and
+              comparison == "not_comparable", "unqualified rotation membership or coverage")
+        stages["rotation_member"] = member
     gap = comparison != "matched" or bool(c["events_lost"] or c["buffers_lost"] or c["loss_marker_records"])
     check(probe.get("status") == ("partial" if gap else "read") and exit_code == int(gap), "native status disagrees with coverage")
     counts = {}

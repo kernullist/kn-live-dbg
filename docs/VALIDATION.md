@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Rotating ETL member read on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 user reader and system `tracerpt`
+each read 114 records and 26 buffers from the 212,992-byte KrabsETW
+`powershell.etl`. Both counted zero CPU samples, context switches and disk
+I/O descriptors in the supported layouts. The header mode was `0x9`.
+All three KnLiveDbg pages reported `partial`. The new development
+comparison retained both readers and three `coverage_limited` verdicts,
+with zero comparable families. Replaying the earlier eight-slot study and
+ten-slot cohort reproduced their archived report bytes, including the
+original heldout result of 0/9 planned and 0/0 comparable families.
+[Microsoft KrabsETW fixture](https://github.com/microsoft/krabsetw/blob/43864e67d592779f05cd982b637ca660923e0e09/examples/NativeExamples/powershell.etl)
+
+Two additional controls used copies of recorded traces with the rotation
+flag set in the header. KnLiveDbg and `tracerpt` counted 79,528 CPU samples
+and 2,462 disk records in the first. In the second they counted 18,556 CPU
+samples, 168,474 context switches and 2,307 disk records. The scheduler
+page retained its switch records and withheld elapsed intervals.
+The member tests covered unrelated numbered neighbors, a literal `%d`
+filename, a missing file, a substituted file, page replay and normalized
+import. Import rejected a rotating CPU page relabeled `read`.
+
+An attempt to capture a new three-file recording on this host stopped at
+`StartTraceW` with Win32 error 5. This run establishes per-file reading.
+A controller-confirmed file sequence and session closure still need
+independent evidence. [Saved ETL reader](TRACE_IMPORT.md#saved-windows-cpu-samples)
+
 ## Partitioned ETL reader study on 2026-11-22
 
 On Windows `10.0.28000`, a corpus registered seven source hashes in two
@@ -33,7 +60,7 @@ buffers and zero matching descriptors for the three families. KnLiveDbg
 opened the same file and returned `segmented_source` with exit 1. A separate
 Windows SDK `OpenTraceW` check read log mode `0x00000009` and 26 declared
 buffers. The rotating-file flag was set on the heldout file and clear on
-the development control. The native reader requires separate segment
+the development control. That reader rejected the file pending segment
 provenance. All three comparisons retained `reader_unavailable`.
 For the second slot the harness deliberately supplied the development
 control. Acquisition kept both hashes and replay identified the supplied

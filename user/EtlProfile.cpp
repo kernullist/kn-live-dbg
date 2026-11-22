@@ -293,7 +293,6 @@ namespace
         {
             handle = OpenTraceW(&log);
             if (handle == INVALID_PROCESSTRACE_HANDLE) { return {L"open_trace_failed", GetLastError()}; }
-            if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return {L"segmented_source"}; }
             return {};
         }
 
@@ -789,7 +788,7 @@ namespace
         {
             return accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers || scan.unsupported;
         }
-        return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
+        return etl_profile::RequiresPartialPage(h.LogFileMode, accounting) ||
             !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete() || !scan.settings.Complete() || !scan.clrIndex.Complete();
     }
 
@@ -1240,6 +1239,7 @@ static void ProbeSavedEtl(const std::wstring& name, SavedEtlCapabilityProbe& pro
         probe.Status = L"sample_hash_unavailable";
         return;
     }
+    coverage.LogMode = h.LogFileMode;
     coverage.RecordsSeen = scan.records;
     coverage.BuffersWritten = h.BuffersWritten;
     coverage.BuffersProcessed = scan.processedBuffers;
