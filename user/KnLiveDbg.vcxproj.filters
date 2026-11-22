@@ -615,6 +615,9 @@
     <ClInclude Include="ThreatIntelSubscriber.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ClrMethodEvent.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="KmonUserEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>

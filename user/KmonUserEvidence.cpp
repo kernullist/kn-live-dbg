@@ -3,7 +3,6 @@
 #include <ProcessSnapshot.h>
 #include <evntrace.h>
 #include <evntcons.h>
-#include <tdh.h>
 #include <dia2.h>
 
 #include <algorithm>
@@ -16,7 +15,6 @@
 #include <set>
 #include <thread>
 
-#pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
 
 namespace
@@ -412,28 +410,6 @@ bool QueryKmonFileIdentity(const std::wstring& path, KmonFileIdentity* result, s
 
 namespace
 {
-    const GUID kClrRuntime = {0xe13c0d23, 0xccbc, 0x4e12, {0x93, 0x1b, 0xd9, 0xcc, 0x2e, 0xee, 0x27, 0xe4}};
-    const GUID kClrRundown = {0xa669021c, 0xc450, 0x4609, {0xa0, 0x35, 0x5a, 0xf5, 0x9a, 0xf4, 0xdf, 0x18}};
-
-    template<typename T>
-    bool EventInteger(PEVENT_RECORD event, const wchar_t* name, T* value)
-    {
-        PROPERTY_DATA_DESCRIPTOR property = {};
-        property.PropertyName = reinterpret_cast<ULONGLONG>(name);
-        property.ArrayIndex = ULONG_MAX;
-        ULONG length = 0;
-        return TdhGetPropertySize(event, 0, nullptr, 1, &property, &length) == ERROR_SUCCESS &&
-            length == sizeof(T) &&
-            TdhGetProperty(event, 0, nullptr, 1, &property, length, reinterpret_cast<PBYTE>(value)) == ERROR_SUCCESS;
-    }
-
-    enum class RuntimeEventAction
-    {
-        Ignore,
-        Load,
-        Unload
-    };
-
     struct RuntimeRundownRequest
     {
         bool Pending = false;
@@ -517,38 +493,19 @@ namespace
         return timestamp >= createTime && timestamp >= minimumTimestamp;
     }
 
-    RuntimeEventAction RuntimeAction(bool rundown, uint16_t id, uint8_t version)
-    {
-        RuntimeEventAction action = RuntimeEventAction::Ignore;
-        if (version <= 2)
-        {
-            if ((!rundown && (id == 141 || id == 143)) ||
-                (rundown && (id == 137 || id == 138 || id == 143 || id == 144)))
-            {
-                action = RuntimeEventAction::Load;
-            }
-            else if (!rundown && (id == 142 || id == 144))
-            {
-                action = RuntimeEventAction::Unload;
-            }
-        }
-        return action;
-    }
-
     bool ApplyRuntimeRange(
         std::map<uint64_t, KmonRuntimeCodeRange>* ranges,
         const KmonRuntimeCodeRange& record,
-        RuntimeEventAction action,
         size_t capacity,
         uint64_t* retentionFloor,
         bool* ambiguous)
     {
         *ambiguous = false;
-        if (action == RuntimeEventAction::Ignore)
+        if (record.Observation == ClrMethodAction::Ignore)
         {
             return true;
         }
-        if (!UserRange(record.Start, record.Size))
+        if (record.Observation == ClrMethodAction::Unsupported || !UserRange(record.Start, record.Size))
         {
             *ambiguous = true;
             return false;
@@ -580,28 +537,26 @@ namespace
             {
                 return true;
             }
-            const bool sameMethod = previous.MethodId == record.MethodId &&
-                previous.RuntimeInstance == record.RuntimeInstance && previous.ModuleId == record.ModuleId;
+            const bool unloading = record.Observation == ClrMethodAction::Unload;
+            const bool wasUnloaded = previous.Observation == ClrMethodAction::Unload;
+            const bool sameRange = previous.RuntimeInstance == record.RuntimeInstance &&
+                previous.ModuleId == record.ModuleId && previous.MethodId == record.MethodId &&
+                previous.MethodToken == record.MethodToken && previous.ReJitId == record.ReJitId &&
+                previous.Size == record.Size && previous.MethodFlags == record.MethodFlags;
             const bool sameTime = previous.Timestamp == record.Timestamp;
-            if ((sameTime && ((action == RuntimeEventAction::Load &&
-                    (previous.Size == 0 || !sameMethod || previous.Size != record.Size)) ||
-                    (action == RuntimeEventAction::Unload && (previous.Size != 0 || !sameMethod)))) ||
-                (action == RuntimeEventAction::Unload && !sameMethod))
+            if ((unloading && !sameRange) ||
+                (sameTime && (!sameRange || unloading != wasUnloaded)))
             {
-                // Equal timestamps do not order events from different CPUs.
-                // Retain a time fence even after recovery clears the cache.
+                // A different or unspecified generation cannot retire this range.
+                // Equal timestamps cannot order conflicting observations. Request
+                // a new inventory and fence delayed records through the conflict.
                 pruneThrough(record.Timestamp);
                 *ambiguous = true;
                 return true;
             }
-            if (sameTime)
+            if (!sameTime)
             {
-                return true;
-            }
-            found->second = record;
-            if (action == RuntimeEventAction::Unload)
-            {
-                found->second.Size = 0;
+                found->second = record;
             }
             return true;
         }
@@ -624,23 +579,18 @@ namespace
                 return false;
             }
         }
-        KmonRuntimeCodeRange retained = record;
-        if (action == RuntimeEventAction::Unload)
-        {
-            // An unload observed before its load still prevents resurrection
-            // by a delayed load or rundown record for this address.
-            retained.Size = 0;
-        }
-        (*ranges)[record.Start] = retained;
+        // Retain an unload with its full identity and extent as a tombstone.
+        // An older load or rundown cannot resurrect that address.
+        (*ranges)[record.Start] = record;
         return complete;
     }
 
     template<typename ProcessRanges>
     void ApplyRuntimeObservation(ProcessRanges* process, const KmonRuntimeCodeRange& record,
-        RuntimeEventAction action, size_t capacity, std::atomic<bool>* lost)
+        size_t capacity, std::atomic<bool>* lost)
     {
         bool ambiguous = false;
-        if (!ApplyRuntimeRange(&process->Ranges, record, action, capacity, &process->RetentionFloor, &ambiguous))
+        if (!ApplyRuntimeRange(&process->Ranges, record, capacity, &process->RetentionFloor, &ambiguous))
         {
             process->Overflow = true;
         }
@@ -759,14 +709,9 @@ struct KmonUserRuntimeTracker::Impl
 
     void Consume(PEVENT_RECORD event)
     {
-        const bool rundown = IsEqualGUID(event->EventHeader.ProviderId, kClrRundown) != FALSE;
-        if (!rundown && !IsEqualGUID(event->EventHeader.ProviderId, kClrRuntime))
-        {
-            return;
-        }
-        const RuntimeEventAction action = RuntimeAction(rundown, event->EventHeader.EventDescriptor.Id,
-            event->EventHeader.EventDescriptor.Version);
-        if (action == RuntimeEventAction::Ignore)
+        // Avoid locking the watch list for unrelated JIT and loader events.
+        const auto id = event->EventHeader.EventDescriptor.Id;
+        if (id < 137 || id > 144)
         {
             return;
         }
@@ -782,24 +727,23 @@ struct KmonUserRuntimeTracker::Impl
             return;
         }
         KmonRuntimeCodeRange record;
-        record.Timestamp = timestamp;
-        uint32_t size = 0;
-        const bool decoded = EventInteger(event, L"MethodStartAddress", &record.Start) &&
-            EventInteger(event, L"MethodSize", &size) &&
-            EventInteger(event, L"MethodID", &record.MethodId) &&
-            EventInteger(event, L"ModuleID", &record.ModuleId) &&
-            EventInteger(event, L"MethodFlags", &record.MethodFlags) &&
-            EventInteger(event, L"ClrInstanceID", &record.RuntimeInstance);
-        record.Size = size;
-        if (!decoded)
+        const auto action = ReadClrMethodRange(*event, record);
+        if (action == ClrMethodAction::Ignore)
         {
-            ++found->second.Failures;
+            return;
+        }
+        if (action == ClrMethodAction::Unsupported)
+        {
+            if (found->second.Failures != UINT32_MAX)
+            {
+                ++found->second.Failures;
+            }
             // An undecodable unload can invalidate any retained method range.
             Lost.store(true);
         }
         else
         {
-            ApplyRuntimeObservation(&found->second, record, action, 4096, &Lost);
+            ApplyRuntimeObservation(&found->second, record, 4096, &Lost);
         }
     }
 
@@ -1023,7 +967,7 @@ void KmonUserRuntimeTracker::Snapshot(
         {
             for (const auto& range : found->second.Ranges)
             {
-                if (range.second.Size != 0)
+                if (range.second.Observation == ClrMethodAction::Load || range.second.Observation == ClrMethodAction::Rundown)
                 {
                     ranges->push_back(range.second);
                 }
@@ -2403,41 +2347,39 @@ bool KmonUserEvidenceSelfTest()
         std::map<uint64_t, KmonRuntimeCodeRange> ranges;
         uint64_t retentionFloor = 0;
         bool rangeAmbiguous = false;
-        const auto applyRange = [&](const KmonRuntimeCodeRange& record, RuntimeEventAction action, size_t capacity)
+        const auto applyRange = [&](KmonRuntimeCodeRange record, ClrMethodAction action, size_t capacity)
         {
-            return ApplyRuntimeRange(&ranges, record, action, capacity, &retentionFloor, &rangeAmbiguous);
+            record.Observation = action;
+            return ApplyRuntimeRange(&ranges, record, capacity, &retentionFloor, &rangeAmbiguous);
         };
         KmonRuntimeCodeRange method;
         method.Start = 0x100000;
         method.Size = 0x100;
         method.MethodId = 11;
-        method.RuntimeInstance = 2;
+        method.RuntimeInstance = uint16_t{2};
         method.Timestamp = 100;
-        if (RuntimeAction(false, 141, 2) != RuntimeEventAction::Load ||
-            RuntimeAction(false, 136, 1) != RuntimeEventAction::Ignore ||
-            RuntimeAction(true, 144, 1) != RuntimeEventAction::Load ||
-            !applyRange(method, RuntimeEventAction::Load, 2))
+        if (!applyRange(method, ClrMethodAction::Load, 2))
         {
             break;
         }
         method.Timestamp = 110;
-        if (!applyRange(method, RuntimeEventAction::Unload, 2) || ranges.begin()->second.Size != 0)
+        if (!applyRange(method, ClrMethodAction::Unload, 2) || ranges.begin()->second.Observation != ClrMethodAction::Unload)
         {
             break;
         }
         method.Timestamp = 105;
-        if (!applyRange(method, RuntimeEventAction::Load, 2) || ranges.begin()->second.Size != 0)
+        if (!applyRange(method, ClrMethodAction::Load, 2) || ranges.begin()->second.Observation != ClrMethodAction::Unload)
         {
             break;
         }
         method.Timestamp = 120;
-        applyRange(method, RuntimeEventAction::Load, 2);
+        applyRange(method, ClrMethodAction::Load, 2);
         method.Start += 0x1000;
         method.Timestamp = 121;
-        applyRange(method, RuntimeEventAction::Load, 2);
+        applyRange(method, ClrMethodAction::Load, 2);
         method.Start += 0x1000;
         method.Timestamp = 122;
-        if (applyRange(method, RuntimeEventAction::Load, 2) || ranges.size() != 2 ||
+        if (applyRange(method, ClrMethodAction::Load, 2) || ranges.size() != 2 ||
             ranges.find(method.Start) == ranges.end() || retentionFloor != 120)
         {
             break;
@@ -2450,26 +2392,27 @@ bool KmonUserEvidenceSelfTest()
             uint64_t RetentionFloor = 0;
             std::map<uint64_t, KmonRuntimeCodeRange> Ranges;
         };
-        const auto orderingEvent = [](uint64_t timestamp, uint64_t start = 0x100000, uint64_t methodId = 11)
+        const auto orderingEvent = [](ClrMethodAction action, uint64_t timestamp, uint64_t start = 0x100000, uint64_t methodId = 11)
         {
             KmonRuntimeCodeRange record;
             record.Start = start;
             record.Size = 0x100;
+            record.Observation = action;
             record.MethodId = methodId;
-            record.RuntimeInstance = 2;
+            record.RuntimeInstance = uint16_t{2};
             record.Timestamp = timestamp;
             return record;
         };
         std::map<uint32_t, RuntimeOrderingFixture> orderedProcesses;
         auto& ordered = orderedProcesses[10];
         std::atomic<bool> orderingLost{false};
-        ApplyRuntimeObservation(&ordered, orderingEvent(110), RuntimeEventAction::Unload, 2, &orderingLost);
-        ApplyRuntimeObservation(&ordered, orderingEvent(105), RuntimeEventAction::Load, 2, &orderingLost);
-        if (orderingLost.load() || ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Size != 0)
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Unload, 110), 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 105), 2, &orderingLost);
+        if (orderingLost.load() || ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Observation != ClrMethodAction::Unload)
         {
             break;
         }
-        ApplyRuntimeObservation(&ordered, orderingEvent(110), RuntimeEventAction::Load, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 110), 2, &orderingLost);
         if (!orderingLost.load() || !ordered.Ranges.empty() || ordered.RetentionFloor != 110)
         {
             break;
@@ -2480,48 +2423,118 @@ bool KmonUserEvidenceSelfTest()
         RuntimeRundownRequest orderingRecovery;
         QueueRuntimeRundown(&orderingRecovery, false, &orderingRundown);
         orderingLost.store(false);
-        ApplyRuntimeObservation(&ordered, orderingEvent(110), RuntimeEventAction::Load, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 110), 2, &orderingLost);
         if (!ordered.Ranges.empty() || orderingFence != 111 || !orderingRecovery.Pending ||
             !BeginRuntimeRundownAttempt(&orderingRecovery, 100))
         {
             break;
         }
-        ApplyRuntimeObservation(&ordered, orderingEvent(120), RuntimeEventAction::Load, 2, &orderingLost);
-        if (ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Size == 0 || orderingLost.load())
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 120), 2, &orderingLost);
+        if (ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Observation == ClrMethodAction::Unload || orderingLost.load())
         {
             break;
         }
-        ApplyRuntimeObservation(&ordered, orderingEvent(120), RuntimeEventAction::Unload, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Unload, 120), 2, &orderingLost);
         if (!orderingLost.load() || !ordered.Ranges.empty() || ordered.RetentionFloor != 120)
         {
             break;
         }
         ordered = {};
         orderingLost.store(false);
-        ApplyRuntimeObservation(&ordered, orderingEvent(100), RuntimeEventAction::Load, 2, &orderingLost);
-        ApplyRuntimeObservation(&ordered, orderingEvent(100), RuntimeEventAction::Load, 2, &orderingLost);
-        if (ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Size == 0 || orderingLost.load())
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 100), 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 100), 2, &orderingLost);
+        if (ordered.Ranges.size() != 1 || ordered.Ranges.begin()->second.Observation == ClrMethodAction::Unload || orderingLost.load())
         {
             break;
         }
-        ApplyRuntimeObservation(&ordered, orderingEvent(100, 0x100000, 12), RuntimeEventAction::Load, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 100, 0x100000, 12), 2, &orderingLost);
         if (!orderingLost.load() || !ordered.Ranges.empty())
         {
             break;
         }
         ordered = {};
         orderingLost.store(false);
-        ApplyRuntimeObservation(&ordered, orderingEvent(100), RuntimeEventAction::Unload, 2, &orderingLost);
-        ApplyRuntimeObservation(&ordered, orderingEvent(200, 0x200000), RuntimeEventAction::Load, 2, &orderingLost);
-        ApplyRuntimeObservation(&ordered, orderingEvent(300, 0x300000), RuntimeEventAction::Load, 2, &orderingLost);
-        ApplyRuntimeObservation(&ordered, orderingEvent(90), RuntimeEventAction::Load, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Unload, 100), 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 200, 0x200000), 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 300, 0x300000), 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Load, 90), 2, &orderingLost);
         if (!ordered.Overflow || ordered.RetentionFloor != 100 || ordered.Ranges.size() != 2 ||
             ordered.Ranges.find(0x100000) != ordered.Ranges.end() || orderingLost.load())
         {
             break;
         }
-        ApplyRuntimeObservation(&ordered, orderingEvent(400, 0x200000, 12), RuntimeEventAction::Unload, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, orderingEvent(ClrMethodAction::Unload, 400, 0x200000, 12), 2, &orderingLost);
         if (!orderingLost.load() || !ordered.Ranges.empty() || ordered.RetentionFloor != 400)
+        {
+            break;
+        }
+        ordered = RuntimeOrderingFixture{};
+        orderingLost.store(false);
+        auto original = orderingEvent(ClrMethodAction::Load, 500);
+        original.ReJitId = uint64_t{0};
+        auto replacement = original;
+        replacement.ReJitId = 0x8000000000000001ULL;
+        replacement.Timestamp = 520;
+        ApplyRuntimeObservation(&ordered, original, 2, &orderingLost);
+        ApplyRuntimeObservation(&ordered, replacement, 2, &orderingLost);
+        original.Observation = ClrMethodAction::Unload;
+        original.Timestamp = 510;
+        ApplyRuntimeObservation(&ordered, original, 2, &orderingLost);
+        if (orderingLost.load() || ordered.Ranges.size() != 1 ||
+            ordered.Ranges.begin()->second.ReJitId != replacement.ReJitId)
+        {
+            break;
+        }
+        original.Timestamp = 530;
+        ApplyRuntimeObservation(&ordered, original, 2, &orderingLost);
+        if (!orderingLost.load() || !ordered.Ranges.empty() || ordered.RetentionFloor != 530)
+        {
+            break;
+        }
+        orderingLost.store(false);
+        replacement.Observation = ClrMethodAction::Rundown;
+        ApplyRuntimeObservation(&ordered, replacement, 2, &orderingLost);
+        if (!ordered.Ranges.empty())
+        {
+            break;
+        }
+        replacement.Timestamp = 540;
+        ApplyRuntimeObservation(&ordered, replacement, 2, &orderingLost);
+        replacement.Observation = ClrMethodAction::Unload;
+        replacement.Timestamp = 550;
+        ApplyRuntimeObservation(&ordered, replacement, 2, &orderingLost);
+        if (orderingLost.load() || ordered.Ranges.size() != 1 ||
+            ordered.Ranges.begin()->second.Observation != ClrMethodAction::Unload ||
+            ordered.Ranges.begin()->second.ReJitId != replacement.ReJitId ||
+            ordered.Ranges.begin()->second.Size != replacement.Size)
+        {
+            break;
+        }
+
+        // A missing v1 ReJITID and a missing v0 instance are distinct from
+        // an explicitly reported zero. Neither is a wildcard for an unload.
+        const auto unloadConflictFenced = [&](const KmonRuntimeCodeRange& live, KmonRuntimeCodeRange unload)
+        {
+            RuntimeOrderingFixture fixture;
+            std::atomic<bool> lost{false};
+            ApplyRuntimeObservation(&fixture, live, 2, &lost);
+            unload.Observation = ClrMethodAction::Unload;
+            unload.Timestamp = live.Timestamp + 1;
+            ApplyRuntimeObservation(&fixture, unload, 2, &lost);
+            return lost.load() && fixture.Ranges.empty() && fixture.RetentionFloor == unload.Timestamp;
+        };
+        auto v1 = orderingEvent(ClrMethodAction::Load, 100);
+        v1.RuntimeInstance = uint16_t{0};
+        auto v0 = v1;
+        v0.RuntimeInstance.reset();
+        auto v2 = v1;
+        v2.ReJitId = uint64_t{0};
+        auto otherExtent = v2;
+        ++otherExtent.Size;
+        auto otherFlags = v2;
+        otherFlags.MethodFlags = 8;
+        if (!unloadConflictFenced(v1, v0) || !unloadConflictFenced(v2, v1) ||
+            !unloadConflictFenced(v2, otherExtent) || !unloadConflictFenced(v2, otherFlags))
         {
             break;
         }

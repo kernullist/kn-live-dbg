@@ -5516,6 +5516,41 @@ namespace
         return diskSize != liveSize || diskEntry != liveEntry;
     }
 
+    void WriteHuntClrMethodRanges(std::wostream& json, const std::vector<KmonRuntimeCodeRange>& ranges)
+    {
+        json << L"[";
+        bool first = true;
+        for (const auto& range : ranges)
+        {
+            if (!first)
+            {
+                json << L",";
+            }
+            first = false;
+            json << L"{\"provider\":\"" << (range.RundownProvider ?
+                L"Microsoft-Windows-DotNETRuntimeRundown" : L"Microsoft-Windows-DotNETRuntime");
+            json << L"\",\"event_id\":" << range.EventId << L",\"event_version\":" << unsigned(range.EventVersion);
+            json << L",\"observation\":\"" << (range.Observation == ClrMethodAction::Rundown ? L"rundown" : L"load");
+            json << L"\",\"observed_filetime\":\"" << range.Timestamp << L"\",\"start\":\"" << HuntHex(range.Start, 16);
+            json << L"\",\"size\":" << range.Size << L",\"method_id\":\"" << HuntHex(range.MethodId, 16);
+            json << L"\",\"module_id\":\"" << HuntHex(range.ModuleId, 16) << L"\",\"method_token\":\"" << HuntHex(range.MethodToken, 8);
+            json << L"\",\"method_flags\":\"" << HuntHex(range.MethodFlags, 8) << L"\",\"jit_flag\":"
+                 << ((range.MethodFlags & 0x8) != 0 ? L"true" : L"false");
+            json << L",\"clr_instance_id\":" << (range.RuntimeInstance ? std::to_wstring(*range.RuntimeInstance) : L"null");
+            json << L",\"rejit_id\":";
+            if (range.ReJitId)
+            {
+                json << L"\"" << HuntHex(*range.ReJitId, 16) << L"\"";
+            }
+            else
+            {
+                json << L"null";
+            }
+            json << L"}";
+        }
+        json << L"]";
+    }
+
     bool HuntAddressHasRuntimeProvenance(const HuntProcessRecord& process, uint64_t address)
     {
         bool observed = false;
@@ -24552,7 +24587,30 @@ bool HuntInProcessHookSelfTest()
         KmonRuntimeCodeRange runtime;
         runtime.Start = 0x200000;
         runtime.Size = 0x1000;
+        runtime.MethodId = 0xfedcba9876543210ULL;
+        runtime.MethodToken = 0x06000001;
+        runtime.Observation = ClrMethodAction::Load;
+        runtime.EventId = 141;
         game.UserEvidence.RuntimeRanges.push_back(runtime);
+        auto inventory = runtime;
+        inventory.RundownProvider = true;
+        inventory.EventId = 142;
+        inventory.EventVersion = 2;
+        inventory.Observation = ClrMethodAction::Rundown;
+        inventory.MethodFlags = 8;
+        inventory.RuntimeInstance = uint16_t{0};
+        inventory.ReJitId = uint64_t{0};
+        std::wostringstream reported;
+        WriteHuntClrMethodRanges(reported, {runtime, inventory});
+        const std::wstring declaration = reported.str();
+        if (declaration.find(L"\"method_id\":\"0xfedcba9876543210\"") == std::wstring::npos ||
+            declaration.find(L"\"event_id\":141,\"event_version\":0,\"observation\":\"load\"") == std::wstring::npos ||
+            declaration.find(L"\"jit_flag\":false,\"clr_instance_id\":null,\"rejit_id\":null") == std::wstring::npos ||
+            declaration.find(L"\"provider\":\"Microsoft-Windows-DotNETRuntimeRundown\",\"event_id\":142,\"event_version\":2,\"observation\":\"rundown\"") == std::wstring::npos ||
+            declaration.find(L"\"jit_flag\":true,\"clr_instance_id\":0,\"rejit_id\":\"0x0000000000000000\"") == std::wstring::npos)
+        {
+            break;
+        }
         if (!HuntAddressHasRuntimeProvenance(game, 0x200100) || HuntAddressHasRuntimeProvenance(game, 0x201000))
         {
             break;
@@ -29192,6 +29250,11 @@ std::wstring BuildHuntJson(const HuntResult& result)
         json << L",\"handlers_available\":" << (process.UserEvidence.HandlerCoverage.Available ? L"true" : L"false");
         json << L",\"handlers_complete\":" << (process.UserEvidence.HandlerCoverage.Complete ? L"true" : L"false");
         json << L",\"runtime_ranges\":" << process.UserEvidence.RuntimeRanges.size();
+        json << L",\"runtime_available\":" << (process.UserEvidence.RuntimeCoverage.Available ? L"true" : L"false");
+        json << L",\"runtime_ranges_truncated\":" << (process.UserEvidence.RuntimeCoverage.Truncated ? L"true" : L"false");
+        json << L",\"runtime_failures\":" << process.UserEvidence.RuntimeCoverage.Failures;
+        json << L",\"runtime_method_ranges\":";
+        WriteHuntClrMethodRanges(json, process.UserEvidence.RuntimeRanges);
         json << L",\"runtime_detail\":\"" << HuntJsonEscape(process.UserEvidence.RuntimeCoverage.Detail) << L"\"";
         json << L",\"native_observations\":" << KmonNativeEvidenceObservationsJson(process.UserEvidence) << L"}";
         const KmonFileIdentity& identity = process.UserEvidence.ImageIdentity;

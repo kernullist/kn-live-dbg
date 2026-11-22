@@ -5228,6 +5228,67 @@ reported interception warnings. Public trace coverage is CSwitch v4,
 ReadyThread v2 and Thread v3 on this QPC capture. The measured intervals
 retain file-local numeric TIDs. Wait-object identity requires another source.
 
+## CLR method range validation on 2026-11-22
+
+The standalone check uses the same range reader as the live CLR tracker.
+For every CLR event in the four saved ETLs it looks up the original Windows
+TDH property `MethodStartAddress`. For a method declaration it checks the
+action against the manifest opcode and compares the start, size, method
+and module IDs, token, flags, CLR instance and ReJIT ID by property name.
+The two .NET inputs below contain verbose v1 declarations. The x86 file
+has ten declarations with the JIT flag clear.
+[PerfView fixture revision and input hashes](#saved-etl-cpu-profile-validation-on-2026-11-22)
+
+| Input | All events | Loads | Unloads | Inventory | Field mismatches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| .NET 4.5.2 x64 | 179,474 | 290 | 288 | 16,702 | 0 |
+| .NET 4.5.2 x86 | 168,298 | 405 | 271 | 13,783 | 0 |
+| Allocator trace | 418,378 | 0 | 0 | 0 | 0 |
+| Self-describing control | 23 | 0 | 0 | 0 | 0 |
+
+Constructed records cover all 28 published provider/ID/version combinations
+with both x86 and x64 event-header flags. Windows TDH independently read
+the method ID, token and optional suffix fields from those records. Controls
+include compact and verbose inventory, empty and non-ASCII method text,
+absent and explicit-zero IDs, a nonzero 64-bit ReJIT ID, every shorter
+payload prefix, trailing bytes, an unknown version and unrelated markers.
+The native x64 and Win32 checks passed. The x64 AddressSanitizer runs
+used `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` for the host's two
+interception warnings.
+
+From a Visual Studio developer shell, supply the extracted x64 and x86
+ETL paths in `$trace64` and `$trace86`. The expected count includes all
+three actions. The console self-test exercises the tracker and hunt output.
+
+```powershell
+cl /nologo /std:c++17 /EHsc /W4 /WX tools/clr-method-event-selftest.cpp /Fo.build/clr-method-event-selftest.obj /Fe.build/clr-method-event-selftest.exe
+.build/clr-method-event-selftest.exe $trace64 17280
+.build/clr-method-event-selftest.exe $trace86 14459
+x64/Release/KnLiveDbg.exe --self-test console
+```
+
+A fresh x64 .NET Framework process enabled the CLR JIT keyword in its own
+private ETW file session. It prepared and invoked a small managed method
+and supplied the method handle and metadata token through reflection. The
+reader found the matching load in the same PID, event 143 v1, with a declared
+size of 48 bytes and the JIT flag set. Both method loads in the six-record
+ETL agreed with TDH. The private session stopped with zero
+reported lost events and buffers. The ordinary system-wide tracker returned
+`ERROR_ACCESS_DENIED` from `StartTraceW` on this host, so its live collection
+path still needs verification with sufficient ETW session permissions.
+
+The ordering controls cover an older unload after a newer ReJIT load, a
+later conflicting unload, matching retirement, mismatched extent or flags,
+absent versus zero generation fields, and a fresh rundown after the
+retention fence. The JSON checks preserve the two observation sources and
+64-bit identifiers. The x64 Release build retained 16 existing C4744 link
+warnings. All 570 console checks passed in an isolated run. A separate AI
+subprocess timeout check failed once while a link was running.
+
+These tests cover runtime declarations. Historical
+sample-to-byte correspondence, live ReJIT activation, V8, Wasm and
+game-object lifetime validation remain open.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

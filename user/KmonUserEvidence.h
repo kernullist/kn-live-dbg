@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ProcessTriageScanner.h"
+#include "ClrMethodEvent.h"
 #include "ExecutionEvidenceJson.h"
 
 #include <array>
@@ -73,17 +74,6 @@ bool QueryKmonFileIdentity(
     std::wstring* error);
 bool KmonSameFileObject(const KmonFileIdentity& left, const KmonFileIdentity& right);
 bool KmonSameFileGeneration(const KmonFileIdentity& left, const KmonFileIdentity& right);
-
-struct KmonRuntimeCodeRange
-{
-    uint64_t Start = 0;
-    uint64_t Size = 0;
-    uint64_t MethodId = 0;
-    uint64_t ModuleId = 0;
-    uint64_t Timestamp = 0;
-    uint16_t RuntimeInstance = 0;
-    uint32_t MethodFlags = 0;
-};
 
 class KmonUserRuntimeTracker
 {

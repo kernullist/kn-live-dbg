@@ -408,6 +408,7 @@
     <ClInclude Include="QosPolicyScanner.h" />
     <ClInclude Include="UserModeHunter.h" />
     <ClInclude Include="ThreatIntelSubscriber.h" />
+    <ClInclude Include="ClrMethodEvent.h" />
     <ClInclude Include="KmonUserEvidence.h" />
     <ClInclude Include="PendingIrpScanner.h" />
     <ClInclude Include="PendingIrpBinding.h" />

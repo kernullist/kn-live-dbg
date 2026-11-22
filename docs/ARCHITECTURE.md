@@ -840,6 +840,39 @@ booleans are false. Detection heuristics still use those reference correlations.
 Trace/VMI producers, X2-X4 validation, additional runtime layouts and game-object
 lifetimes remain separate work.
 
+### CLR method ranges in hunt output
+
+The user-mode tracker collects CLR declarations for a watched PID and process creation
+time. Runtime method load and unload events use IDs 141–144. Runtime v0
+inventory events use IDs 137–140. The separate rundown provider uses IDs
+141–144 for start and end inventory. Both inventory directions describe
+methods present during enumeration. The decoder checks the provider, task,
+opcode, event ID, version and payload length.
+
+| Manifest version | Range identity fields |
+| --- | --- |
+| v0 | Method ID, module ID, start, size, token and flags |
+| v1 | v0 fields and CLR instance ID |
+| v2 | v1 fields and ReJIT ID, including an explicit zero |
+
+Hunt JSON keeps the `execution_evidence.runtime_ranges` count and adds
+`runtime_method_ranges` for the retained declarations. Each row gives its
+provider, event ID, version, load or rundown origin, observation FILETIME
+and range identity. Unsupported fields appear as JSON `null`. Addresses
+and 64-bit IDs use hex strings. The FILETIME uses a decimal string. The
+`jit_flag` field mirrors bit 0x8 of the reported method flags. The output
+also gives collection availability, truncation and failure count.
+
+The tracker uses event timestamps to order declarations at a start address.
+An older unload leaves a newer observation in place. An unload whose extent,
+flags or generation conflicts with the current record fences the cache through
+the conflict and requests fresh inventory. Matching unloads retain a
+tombstone with the declared identity and extent. Collection loss also
+invalidates positive coverage. These rows establish what the CLR declared
+during observation. Matching the code bytes to a historical CPU sample
+requires separate capture-time evidence.
+[.NET runtime event manifest](https://github.com/dotnet/runtime/blob/d7a6547f2a039031d9c29180bb95541a06a86276/src/coreclr/vm/ClrEtwAll.man)
+
 ## Pending I/O observation graphs
 
 The native pending-IRP reader retains every admitted request, including requests
