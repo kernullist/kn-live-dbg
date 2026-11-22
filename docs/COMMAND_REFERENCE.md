@@ -948,6 +948,24 @@ The final command checks the bytes of the whole native page. The normalized
 query's `next_cursor` continues within that page. The ETL reader uses the
 separate `source_page.source_next_after` value. [Source and replay fields](TRACE_IMPORT.md#query-and-reproduce-a-saved-etl-profile-page)
 
+### Verify the author of an ETL capture statement
+
+After the saved-page example above, use the recorder's signed statement
+and the public point independently provisioned for its capture-controller
+role. The point file in this example contains the 130 hexadecimal digits
+of the trusted uncompressed P-256 key.
+
+```powershell
+$trustedPoint = (Get-Content -Raw -LiteralPath .\approved-recorder-p256.hex).Trim()
+& KnLiveDbg.exe --etl-profile capture.etl --sha256 $pin --capture-settings --limit 8 --check-page $page.file_sha256 --capture-statement capture.knetlstatement capture_controller $trustedPoint
+```
+
+The same option works with `--etl-switches`. Use `archive_witness` for a
+key authorized to attest to archived bytes. A matching controller receipt
+identifies the signed claims, the original ETL, the regenerated page, the
+statement file and the trusted key. It records the role check separately
+from the signature check. [Signed statement fields](TRACE_IMPORT.md#verify-a-signed-capture-statement)
+
 ### Inspect CPU samples from a saved ETL
 
 ```powershell

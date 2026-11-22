@@ -422,6 +422,52 @@ digest returns `page_mismatch` and exit 1. A matching partial page retains
 also changes the digest. Capture-time producer authentication remains open.
 [CLI example](COMMAND_REFERENCE.md#query-a-saved-etl-profile-page)
 
+### Verify a signed capture statement
+
+An operator can supply a JWS Compact file, an authorized signer role and a
+trusted P-256 public point when replaying a page. The reader verifies the
+ES256 signature over the original protected-header and payload segments.
+The trusted point comes from the operator's provisioning record. It uses
+the uncompressed SEC 1 form, byte `04` followed by 32-byte big-endian X
+and Y coordinates, encoded as 130 hex digits. The receipt fingerprints
+those 65 bytes with SHA-256. [JWS signing input](https://www.rfc-editor.org/rfc/rfc7515#section-5.2) · [ES256 encoding](https://www.rfc-editor.org/rfc/rfc7518#section-3.4)
+
+The protected header has exactly `alg` (`ES256`) and `typ`
+(`kn.etl_capture_statement.v1+jws`). The header and payload are UTF-8
+JSON objects starting with an opening brace. The three segments use
+unpadded base64url. The file may end with one LF or CRLF. Limits are
+8 KiB for the file, 512 bytes for the decoded header and 4 KiB for the
+decoded payload. The signature contains 32-byte R and S values.
+
+The payload requires every field below. Unknown fields, duplicate keys
+and ambiguous encodings fail verification.
+
+| Field | Signed value |
+| --- | --- |
+| `schema`, `role` | `kn.etl_capture_statement.v1` and either `capture_controller` or `archive_witness`. The operator must authorize that exact role for this key. |
+| `etl_sha256`, `etl_bytes` | Lowercase SHA-256 and the positive file length as a decimal string. Both must match the leased ETL. |
+| `session_id`, `target_id`, `boot_id` | Lowercase, nonzero, hyphenated UUIDs in the signer's namespace, or null. A capture controller must identify the session. |
+| `se_system_profile_privilege_enabled` | Boolean reporting the controller token's privilege state, or null when unknown. |
+| `system_trace_enable_flags` | Unsigned 32-bit ETW enable mask reported by the controller, or null. |
+| `sampled_profile_stack_requested`, `context_switch_stack_requested` | Separate boolean requests for the named event classes, or null. Actual stack delivery remains a per-event observation. |
+
+An archive witness signs the identity of saved bytes and supplies null for
+all capture context. A controller can sign the settings it used. These
+claims stay scoped to the signed artifact, including for a merged ETL.
+The reader projects the claims into `kn.etl_page_replay.v2` only when the
+signature, authorized role, ETL hash and length, and regenerated page all
+match. A partial source keeps its partial status and exit 1. A wrong key,
+wrong role or ETL mismatch returns exit 1 with distinct evidence in
+`capture_statement`. A stale page hash retains its own comparison result.
+The exact statement file digest includes its optional line ending.
+
+The signature covers the ETL identity and the issuer's claims. Local
+replay supplies the link from those signed bytes to an individual page.
+The signing key identifies the author of the assertion. Historical key
+provisioning, independent capture time, OS event origin and runtime code
+identity require other evidence. The normalized samples keep their existing
+qualification. [CLI example](COMMAND_REFERENCE.md#verify-the-author-of-an-etl-capture-statement)
+
 ## Input contract
 
 `kn.execution_trace.v1` has exactly six top-level fields: `schema`, `source`,

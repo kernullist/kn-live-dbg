@@ -5113,6 +5113,52 @@ workaround and emitted startup interceptor warnings. The CLI example also
 ran under Windows PowerShell 5 and PowerShell 7 on the scheduler and empty
 sample files.
 
+### Signed ETL capture statements
+
+On 2026-11-22 the owned recorder started a private in-process ETW session,
+enabled its own provider, wrote one event and stopped the session by its
+returned handle. Windows `tracerpt -rts` found that provider's event among
+three original records. The test controller signed the resulting ETL
+digest, size, session ID, capture flags and the queried state of its own
+profile privilege. The CPU and context-switch readers verified the ES256
+signature using Windows CNG. OpenSSL independently created and verified
+each test signature. [Windows private ETW sessions](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-private-logger-session)
+
+The archive-witness controls used the five pinned public ETLs above. They
+checked CPU and switch pages, and the scheduler trace also exercised the
+pinned reference PE. The four nonempty sample traces retained partial
+status on one-byte-short copies. A different signer, a valid signature
+for an unauthorized role, altered signing input, mismatched ETL length or
+digest and a different page hash each retained their own failure evidence.
+An unavailable or aliased statement, malformed JWS, alternate data stream
+and unsigned role escalation also failed their applicable checks.
+
+With the Release executable built, compile the recorder from an x64 Native
+Tools Command Prompt in the repository root.
+
+```cmd
+cl /nologo /std:c++17 /EHsc /W4 /WX /DUNICODE /D_UNICODE tools\etl-statement-capture.cpp /Fo.build\etl-statement-capture.obj /Fe.build\etl-statement-capture.exe
+```
+
+In PowerShell, set `$openssl` to an OpenSSL 3 executable. The scheduler
+ETL and reference PE variables come from the capture-settings validation
+above.
+
+```powershell
+python tools/test-etl-capture-statement.py --exe x64/Release/KnLiveDbg.exe --capture-exe .build/etl-statement-capture.exe --openssl $openssl --etl $etl --sha256 $pin --reference-image $pe.FullName $pePin --check-short-tail
+```
+
+Compared with the parent executable, 41 native and normalized outputs and
+35 complete unsigned replay receipts matched byte for byte. Win32, x64
+Release and x64 AddressSanitizer harnesses exercised the shared KMON
+signature controls, fresh controller and archive statements, and rejected
+keys, roles, encodings and source identities. The ASan run used the
+process-local interception workaround and emitted startup warnings.
+Windows PowerShell 5 and PowerShell 7 both executed the CLI example.
+These tests exercise the local cryptographic and replay contracts. Historical key
+distribution, original authorship of the public ETLs and code executing
+at sample time remain unverified. [Statement contract](TRACE_IMPORT.md#verify-a-signed-capture-statement)
+
 ### Context-switch trace comparison
 
 The ETWAnalyzer test archive with SHA-256

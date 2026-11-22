@@ -230,6 +230,7 @@
     <ClCompile Include="SymbolIndexGenerator.cpp" />
     <ClCompile Include="BrokeredSymbolIndexes.cpp" />
     <ClCompile Include="ExecutionTrace.cpp" />
+    <ClCompile Include="EtlCaptureStatement.cpp" />
     <ClCompile Include="EtlTracePage.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
@@ -335,7 +336,9 @@
     <ClInclude Include="ExecutionEvidenceJson.h" />
     <ClInclude Include="ExecutionEvidence.h" />
     <ClInclude Include="ExecutionTrace.h" />
+    <ClInclude Include="EtlCaptureStatement.h" />
     <ClInclude Include="EtlTracePage.h" />
+    <ClInclude Include="P256Signature.h" />
     <ClInclude Include="TraceJsonFields.h" />
     <ClInclude Include="HiveScanner.h" />
     <ClInclude Include="HvPostureScanner.h" />

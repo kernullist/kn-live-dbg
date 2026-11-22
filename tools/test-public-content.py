@@ -1,4 +1,5 @@
 """Regression tests for publication checks; all secret-shaped data is synthetic."""
+import base64
 from contextlib import closing
 import importlib.util
 import json
@@ -231,6 +232,22 @@ class PublicContentTests(unittest.TestCase):
                           AUDIT.inspect("fragment.txt", ("log\n" + row[:-1]).encode(encoding))})
         for version in (schema, v2, v3, v4, switch_schema, intervals):
             self.assertEqual(AUDIT.inspect("guide.md", ("Reports use " + version + ".").encode()), [])
+
+    def test_signed_etl_capture_material(self):
+        def encoded(data):
+            return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+        for indent in (None, 2):
+            header = encoded(json.dumps({"typ": "kn.etl_capture_statement.v1+jws", "alg": "ES256"}, indent=indent).encode())
+            claims = encoded(json.dumps({"role": "archive_witness", "schema": "kn.etl_capture_statement.v1"}, indent=indent).encode())
+            for value in (header + "." + claims + "." + encoded(bytes(64)), header + ".", claims,
+                          json.dumps({"schema": "kn.etl_page_replay.v2", "capture_statement": {}}),
+                          json.dumps({"trusted_key_sha256": "a"*64, "statement_file_sha256": "b"*64})[:-1],
+                          json.dumps({"role": "capture_controller", "session_id": None, "se_system_profile_privilege_enabled": False})[:-1]):
+                for codec in ("utf-8", "utf-16-le", "utf-16-be"):
+                    self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("copy.txt", ("log\n"+value).encode(codec))})
+        self.assertEqual(AUDIT.inspect("guide.md", b"Capture statements use ES256 and kn.etl_page_replay.v2."), [])
+        self.assertEqual(AUDIT.inspect("note.txt", encoded(b'{"alg":"ES256","typ":"unrelated"}').encode()), [])
 
     def test_wait_captures_and_reports(self):
         for schema in ("kn.wait_chain.v1", "kn.wait_assessment.v1", "kn.wait_series.v1", "kn.wait_series_assessment.v1", "kn.wait_diagnosis.v1"):

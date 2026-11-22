@@ -1042,6 +1042,13 @@ continuation each operate within their own source. The native reader can
 also reproduce a full page from a pinned ETL and compare its exact UTF-8
 output with the report hash. [Profile import and replay](TRACE_IMPORT.md#query-and-reproduce-a-saved-etl-profile-page)
 
+Both ETL readers can bind a replayed page to an ES256 capture statement.
+The operator supplies an authorized role and public key. The verifier
+checks the signature and both the length and SHA-256 of the original ETL.
+A matching controller statement carries issuer-scoped session identity and
+reported settings. A separate archive-witness role covers custody of the
+file. [Signed capture statements](TRACE_IMPORT.md#verify-a-signed-capture-statement)
+
 The sample and switch readers share a bounded capture-settings index.
 EventTrace group-mask snapshots, PerfInfo sampling-interval records and loss
 indications stay in callback order under the ETL digest. A row's file logger,

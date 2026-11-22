@@ -7,13 +7,15 @@ Pattern checks cannot prove that arbitrary prose, captures or media contain no s
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import re
 import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -63,7 +65,7 @@ def path_rule(name: str) -> str | None:
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if (base.startswith(".knbench-") and base.endswith(".tmp")) or path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
+        extension + ".pending-" in base for extension in (".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
     ):
         return "private-container-or-capture"
     return None
@@ -81,10 +83,25 @@ def text_views(data: bytes) -> list[str]:
             "\n".join(s.decode("utf-16-le") for s in wide_strings)]
 
 
-ETL_QUERY_SCHEMAS = ("kn.execution_trace_query.v2", "kn.etl_page_replay.v1")
+ETL_QUERY_SCHEMAS = ("kn.execution_trace_query.v2", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1")
+# Detect a complete protected header or payload even after a JWS is renamed or cut.
+ETL_JWS_OBJECT = re.compile(r"(?<![A-Za-z0-9_-])(e[wy][A-Za-z0-9_-]{18,5460})(?![A-Za-z0-9_-])")
 
 
-ETL_ROW_MARKERS = (*ETL_QUERY_SCHEMAS, '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
+def capture_jws_offset(text: str) -> int | None:
+    for match in ETL_JWS_OBJECT.finditer(text):
+        part = match.group(1)
+        try:
+            fields = json.loads(base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True).decode("utf-8"))
+        except (binascii.Error, ValueError, UnicodeError, RecursionError):
+            continue
+        if isinstance(fields, dict) and (fields.get("typ") == "kn.etl_capture_statement.v1+jws" or
+                                         fields.get("schema") == "kn.etl_capture_statement.v1"):
+            return match.start()
+    return None
+
+
+ETL_ROW_MARKERS = (*ETL_QUERY_SCHEMAS, '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
                    '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4', 'kn.etl_profile.v5', 'kn.etl_profile.v6', 'kn.etl_profile.v7',
@@ -140,6 +157,8 @@ DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("relation", "reference_comparison"),
     ("rsds_guid_equal", "pdb_age_equal"),
     ("other_opcodes", "header_pid_conflicts"),
+    ("statement_file_sha256", "trusted_key_sha256"),
+    ("role", "se_system_profile_privilege_enabled", "session_id"),
     ("native_schema", "reported_etl_sha256"),
     ("reported_etl_sha256", "file_sha256"),
     ("expected_page_sha256", "replayed_page_sha256"),
@@ -242,12 +261,16 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", *ETL_ROW_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
     for text in text_views(view):
+        if (not binary or view is not data) and ("ey" in text or "ew" in text):
+            offset = capture_jws_offset(text)
+            if offset is not None:
+                add("private-evidence-bundle", text.count("\n", 0, offset) + 1)
         if (not binary or view is not data) and "Provider" in text and ("Microsoft-Windows-WHEA-Logger" in text or
                 "c26c4f3c-3f66-4e99-8f8a-39405cfed220" in text.lower()):
             # Preserve exported Windows Event XML even after renaming or adding a log banner.
@@ -286,7 +309,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in ETL_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|etl_profile\.v[1234567]|etl_switches\.v[123]|execution_trace_query\.v2|etl_page_replay\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|etl_profile\.v[1234567]|etl_switches\.v[123]|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

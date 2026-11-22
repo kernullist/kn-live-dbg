@@ -23,6 +23,7 @@
 *.knschema.pending-*
 *.etl
 *.etl.zip
+*.knetlstatement
 *.kniotrace
 *.kniotrace.pending-*
 *.knirp
