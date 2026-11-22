@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CapabilityProbeContracts.h"
 #include "EtlProfileRecord.h"
 #include "McpJson.h"
 #include <optional>
@@ -38,7 +39,7 @@ struct EtlCapabilityCoverage
 struct SavedEtlCapabilityProbe
 {
     static constexpr auto Scope = L"saved_etl_probe";
-    static constexpr auto AvailabilityScope = L"supplied_etl_record_family";
+    static constexpr auto AvailabilityScope = capability_probes::SavedEtl.AvailabilityScope;
     std::wstring ExpectedSha256, SourceSha256;
     uint64_t SourceBytes = 0;
     const wchar_t* Status = L"source_unavailable";
@@ -49,8 +50,7 @@ struct SavedEtlCapabilityProbe
 
     static bool Covers(std::wstring_view domain, std::wstring_view operation, std::wstring_view backend)
     {
-        return domain == L"execution" && backend == L"etl" &&
-            (operation == L"cpu_profile" || operation == L"context_switch");
+        return capability_probes::For(domain, operation, backend) == &capability_probes::SavedEtl;
     }
 
     const EtlCapabilityRecords* Records(std::wstring_view operation) const

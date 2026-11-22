@@ -57,7 +57,11 @@ means the report was produced, including denied/unavailable probe states; invali
 arguments exit 1 before any probe, and output failures exit 2. Redirected JSON is
 UTF-8, including localized status text. Native calls have no hard timeout.
 Runtime probe JSON contains private process/address metadata and is not a public
-support certificate. See [generated address/backend contracts](SUPPORT_MATRIX.md).
+support certificate. The compiled report's `probe_contracts` lists each
+standalone invocation and what it checks. Match an operation's `probe_contract`
+to a catalog ID to find its scope. A null value means the executable declares
+no standalone probe for that operation. The generated table includes these
+bindings. [Address and backend contracts](SUPPORT_MATRIX.md)
 
 To check what a saved Windows ETL contains, supply the file and its SHA-256 to
 the standalone probe. In this example, `case.etl.sha256` contains the 64 hex

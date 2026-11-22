@@ -472,6 +472,7 @@
     <ClInclude Include="CrashDumpDiagnosis.h" />
     <ClInclude Include="ArtifactOutput.h" />
     <ClInclude Include="EtlProfile.h" />
+    <ClInclude Include="CapabilityProbeContracts.h" />
     <ClInclude Include="SavedEtlCapability.h" />
     <ClInclude Include="SavedDumpCapability.h" />
     <ClInclude Include="EtlProfileRecord.h" />

@@ -39,12 +39,12 @@ namespace
 
     bool SavedSelector(const std::wstring& arg)
     {
-        return _wcsicmp(arg.c_str(), L"--probe-dump") == 0 || _wcsicmp(arg.c_str(), L"--probe-etl") == 0;
+        return _wcsicmp(arg.c_str(), capability_probes::SavedDump.Selector) == 0 || _wcsicmp(arg.c_str(), capability_probes::SavedEtl.Selector) == 0;
     }
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 4 || _wcsicmp(args[0].c_str(), L"--probe-dump") || args[1].empty() ||
+        if (args.size() < 4 || _wcsicmp(args[0].c_str(), capability_probes::SavedDump.Selector) || args[1].empty() ||
             std::count_if(args.begin(), args.end(), SavedSelector) != 1 || args[2] != L"--header-sha256" || !Digest(args[3], options.ExpectedHeader)) { return false; }
         size_t i = 4;
         if (i < args.size() && args[i] == L"--range")
@@ -66,7 +66,7 @@ namespace
     struct SavedDumpProbe
     {
         static constexpr auto Scope = L"saved_dump_probe";
-        static constexpr auto AvailabilityScope = L"supplied_dump_virtual_range";
+        static constexpr auto AvailabilityScope = capability_probes::SavedDump.AvailabilityScope;
         Options Request;
         DumpInitializationObservation Init;
         const wchar_t* Status = L"source_unavailable";
@@ -79,7 +79,7 @@ namespace
 
         static bool Covers(std::wstring_view domain, std::wstring_view operation, std::wstring_view backend)
         {
-            return domain == L"memory" && operation == L"read_virtual" && backend == L"dump";
+            return capability_probes::For(domain, operation, backend) == &capability_probes::SavedDump;
         }
 
         const wchar_t* Availability(std::wstring_view) const
@@ -252,8 +252,7 @@ int RunDumpCapabilityProbe(const std::vector<std::wstring>& args, const std::wst
     if (!Parse(args, probe.Request))
     {
         return WriteWithDistinctSelectedInputs(STD_ERROR_HANDLE, args, SavedSelector, [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --capabilities --probe-dump <local.dmp> --header-sha256 <digest> "
-                L"[--range <hex-va> <1..4096>] [--expect-sha256 <digest>]\n";
+            std::wcerr << L"usage: KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
             return 2;
         });
     }

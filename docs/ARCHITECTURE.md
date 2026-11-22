@@ -94,8 +94,20 @@ described below. Its single receipt is the same observation as `process_read`;
 the probe does not reread the control range to construct evidence.
 
 `tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check`
-detects documentation drift without probing a target. Generation accepts only
-an unprobed compiled inventory and atomically replaces the Markdown output.
+detects documentation drift without probing a target. The compiled inventory
+exposes `probe_contracts` with each standalone invocation, availability scope
+and observation. Each operation's `probe_contract` names its entry or is null.
+Help, saved-file dispatch and capability qualification share these definitions.
+The two live entries use the same invocation. The native entry covers an
+existing device connection and its ABI and session queries. An unsupported
+operation receives no probe contract or observed source stage. Restricted
+observe mode still identifies the launch policy that excluded its native backend.
+
+The generator publishes the catalog and per-operation bindings from unprobed
+compiled JSON. It rejects inconsistent or private stage data, dangling
+references and duplicate JSON keys before replacing the Markdown output.
+Older inventories without a catalog still produce their address and backend
+rows with the missing catalog identified.
 
 ## Ordered read receipts and operation budgets
 

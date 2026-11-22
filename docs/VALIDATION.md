@@ -7,9 +7,50 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Compiled probe catalog on 2026-11-22
+
+The Release executable declared four probe contracts across 23 of its 61
+selected operation rows. Nineteen native rows shared the connection-only
+check. The other four bindings covered the collector's own memory range, a
+saved dump range and the two saved ETL event families. The compiled inventory
+retained all earlier fields and values. Both restricted launches returned the
+same compiled catalog as the standalone command.
+
+Four observed reports exercised the published scopes. The standalone live
+probe checked the owned range and attempted the existing device connection.
+The restricted observe probe reported the native branch blocked by policy.
+The saved full dump supplied a qualified list head. The 23-record ETL control
+reported a successful scan and zero decoded records in either event family.
+The unsupported VTL1 operation carried no observed source-open stage. All
+four observations kept target-environment validation unperformed. A separate
+policy fixture supplied a successful native connection to the serializer.
+Release and AddressSanitizer both marked the 19 native prerequisites partial
+and left the VTL1 row unsupported with no source-open stage. The restricted
+mode regression passed 82 CLI checks, including the launch-policy scope for
+native rows when the device was never opened.
+
+`tools/test-probe-matrix.py` compared these scopes with the catalog, rendered
+a legacy inventory without inferred probe commands and rejected 23 inconsistent
+inventories. Duplicate JSON fields, truncated input and a disguised runtime
+report each preserved a pre-existing output file. On those paths the generator
+issued only the compiled inventory command. The SimpleAllocator ETL report
+matched the previous binary's output byte for byte.
+
+```powershell
+python tools/generate-support-matrix.py --exe x64/Release/KnLiveDbg.exe --check
+python tools/test-probe-matrix.py --exe x64/Release/KnLiveDbg.exe --dump $ownedDump --etl $savedEtl
+```
+
+Use the `probed-4.dmp` fixture from the dump-source harness and a saved ETL
+with complete buffer accounting for this regression. The catalog records
+which checks are implemented. Physical LA57, protected targets and the
+Windows build and security-configuration matrix still require environment
+evidence.
+
 ## Saved dump capability probes on 2026-11-22
 
-The x64 Release CLI completed 66 invocations on synthetic AMD64 full dumps.
+At `b7036d9` the x64 Release CLI completed 66 invocations on synthetic AMD64
+full dumps.
 Independent fixture bytes supplied the expected SHA-256 for every complete
 sample, including a list head split across two pages. LA48 and LA57 fixtures
 exercised 4 KiB, 2 MiB and 1 GiB mappings. An explicit range crossing into

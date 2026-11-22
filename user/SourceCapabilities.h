@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CapabilityProbeContracts.h"
 #include "CommandRegistry.h"
 #include "McpJson.h"
 #include "RuntimeCapabilities.h"
@@ -224,6 +225,20 @@ inline const wchar_t* SourceCommandRoute(CommandSupport support)
     }
 }
 
+inline std::wstring CompiledProbeContractsJson()
+{
+    std::wstring result = L"[";
+    for (const auto* contract : capability_probes::All)
+    {
+        if (result.size() > 1) { result += L','; }
+        result += L"{\"id\":" + mcpjson::Quote(contract->Id) +
+            L",\"invocation\":" + mcpjson::Quote(capability_probes::Invocation(*contract)) +
+            L",\"availability_scope\":" + mcpjson::Quote(contract->AvailabilityScope) +
+            L",\"observation\":" + mcpjson::Quote(contract->Observation) + L"}";
+    }
+    return result + L"]";
+}
+
 // Serialization never probes a target. Runtime observations must be supplied
 // explicitly; compiled implementation alone is not availability or validation.
 template<class SavedProbe>
@@ -241,16 +256,25 @@ inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, 
         << L",\"architecture\":\"x64\",\"target_probed\":" << (probe != nullptr ? L"true" : L"false") << L","
         << L"\"target\":{\"os_build\":null,\"security_state\":\"unknown\","
         << L"\"virtual_address_bits\":null,\"validation\":\"not_performed\"},";
+    const bool compiled = !probe && !saved;
+    if (compiled) { out << L"\"probe_contracts\":" << CompiledProbeContractsJson() << L","; }
     if (saved) { out << L"\"probe\":" << saved->Json() << L","; }
     out << L"\"capabilities\":[";
     bool first = true;
     for (const auto& capability : SourceCapabilities())
     {
-        // An owned byte sample does not exercise reference capture or replay.
-        const bool unsampledProcessOperation = std::wstring(capability.Backend) == L"process_handle" &&
-            (std::wstring(capability.Domain) != L"memory" || std::wstring(capability.Operation) != L"read_virtual");
-        const auto* contractProbe = unsampledProcessOperation ? nullptr : probe;
-        const bool sampled = saved && saved->Covers(capability.Domain, capability.Operation, capability.Backend);
+        const bool unsupported = std::wstring_view(capability.Implementation) == L"unsupported";
+        const auto* route = unsupported ? nullptr : capability_probes::For(capability.Domain, capability.Operation, capability.Backend);
+        const auto* contractProbe = route == &capability_probes::OwnedRead || route == &capability_probes::NativeConnection ? probe : nullptr;
+        const bool sampled = route && saved && saved->Covers(capability.Domain, capability.Operation, capability.Backend);
+        const wchar_t* availabilityScope = L"not_probed";
+        if (compiled) { availabilityScope = L"none"; }
+        else if (sampled) { availabilityScope = SavedProbe::AvailabilityScope; }
+        else if (probe && !probe->NativeProbeAttempted && std::wstring_view(capability.Backend) == L"native")
+        {
+            availabilityScope = L"launch_policy";
+        }
+        else if (contractProbe) { availabilityScope = route->AvailabilityScope; }
         if (!first)
         {
             out << L",";
@@ -260,14 +284,12 @@ inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, 
             << L",\"operation\":" << quote(capability.Operation)
             << L",\"backend\":" << quote(capability.Backend)
             << L",\"implementation\":" << quote(capability.Implementation)
-            << L",\"availability\":" << quote(sampled ? saved->Availability(capability.Operation) :
+            << L",\"availability\":" << quote(sampled ? saved->Availability(capability.Operation) : probe && unsupported ? L"unsupported" :
                 CapabilityAvailability(capability.Implementation, capability.Backend, contractProbe))
-            << L",\"availability_scope\":" << quote(sampled ? SavedProbe::AvailabilityScope : saved ? L"not_probed" : probe == nullptr ? L"none" :
-                contractProbe == nullptr ? L"not_probed" :
-                std::wstring(capability.Backend) == L"process_handle" ? L"owned_control_range_only" :
-                std::wstring(capability.Backend) == L"native" ? (probe->NativeProbeAttempted ? L"connection_contract_only" : L"launch_policy") : L"not_probed")
+            << L",\"availability_scope\":" << quote(availabilityScope)
             << L",\"validation\":\"not_performed_for_target_environment\""
             << L",\"probe_stages\":" << (sampled ? saved->StagesJson(capability.Operation) : CapabilityProbeStagesJson(capability.Backend, contractProbe));
+        if (compiled) { out << L",\"probe_contract\":" << (route ? quote(route->Id) : L"null"); }
         if (sampled) { out << saved->EvidenceJson(capability.Operation); }
         out << L",\"address_contract\":" << quote(CapabilityAddressContract(capability.Domain, capability.Operation, capability.Backend))
             << L",\"consistency\":" << quote(capability.Consistency)

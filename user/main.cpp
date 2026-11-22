@@ -54068,7 +54068,7 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
         {
             for (int i = 1; i + 1 < argc; ++i)
             {
-                if (_wcsicmp(argv[i], L"--probe-etl") == 0 || _wcsicmp(argv[i], L"--probe-dump") == 0 ||
+                if (_wcsicmp(argv[i], capability_probes::SavedEtl.Selector) == 0 || _wcsicmp(argv[i], capability_probes::SavedDump.Selector) == 0 ||
                     (_wcsicmp(argv[i], L"dump-read") == 0 && _wcsicmp(argv[i - 1], L"!kmon") == 0)) { return code; }
             }
         }
@@ -54106,7 +54106,7 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
         return RunExecutionTraceCommand(std::vector<std::wstring>(argv + 4, argv + argc),
             &g_StopRequested, ExecutionTraceInput::LocalStandardInput);
     }
-    if (mode == L"observe" && operation == L"--capabilities" && argc >= 5 && ToLower(argv[4]) == L"--probe")
+    if (mode == L"observe" && operation == L"--capabilities" && argc >= 5 && ToLower(argv[4]) == capability_probes::LiveSelector)
     {
         if (argc != 6 || ToLower(argv[5]) != L"--allow-residency")
         {
@@ -54171,9 +54171,9 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"    trace - /v8 <sha256> [/limit N] [/cursor token] (redirect a V8 profiler log to stdin)\n";
         std::wcout << L"    observe also accepts --capabilities --probe --allow-residency (self only, 32 bytes)\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
-        std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
-        std::wcout << L"  KnLiveDbg.exe --capabilities --probe-dump <local.dmp> --header-sha256 <digest> [--range <hex-va> <1..4096>] [--expect-sha256 <digest>]\n";
-        std::wcout << L"  KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>   check saved CPU and switch records\n";
+        std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
+        std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
+        std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU and switch records\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
@@ -54203,17 +54203,19 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc >= 2 && ToLower(argv[1]) == L"--capabilities")
     {
-        if (std::any_of(argv + 2, argv + argc, [](const wchar_t* arg) { return _wcsicmp(arg, L"--probe-dump") == 0; }))
+        if (std::any_of(argv + 2, argv + argc, [](const wchar_t* arg) { return _wcsicmp(arg, capability_probes::SavedDump.Selector) == 0; }))
         {
             return RunDumpCapabilityProbe(std::vector<std::wstring>(argv + 2, argv + argc), mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT));
         }
-        if (std::any_of(argv + 2, argv + argc, [](const wchar_t* arg) { return _wcsicmp(arg, L"--probe-etl") == 0; }))
+        if (std::any_of(argv + 2, argv + argc, [](const wchar_t* arg) { return _wcsicmp(arg, capability_probes::SavedEtl.Selector) == 0; }))
         {
             return RunEtlCapabilityProbe(std::vector<std::wstring>(argv + 2, argv + argc), mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT));
         }
-        if (argc != 2 && !(argc == 3 && ToLower(argv[2]) == L"--probe"))
+        if (argc != 2 && !(argc == 3 && ToLower(argv[2]) == capability_probes::LiveSelector))
         {
-            std::wcerr << L"usage: KnLiveDbg.exe --capabilities [--probe | --probe-etl <local.etl> --sha256 <digest> | --probe-dump <local.dmp> --header-sha256 <digest> [--range <hex-va> <1..4096>] [--expect-sha256 <digest>]]\n";
+            std::wcerr << L"usage: KnLiveDbg.exe --capabilities [" << capability_probes::LiveSelector << L" | "
+                << capability_probes::SavedEtl.Selector << L" " << capability_probes::SavedEtl.Arguments << L" | "
+                << capability_probes::SavedDump.Selector << L" " << capability_probes::SavedDump.Arguments << L"]\n";
             return 1;
         }
         if (argc == 3)

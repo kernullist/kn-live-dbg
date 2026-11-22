@@ -14,6 +14,15 @@ def main():
     parser.add_argument("--policy-exe", type=Path, required=True)
     args = parser.parse_args()
     exe = str(args.exe.resolve())
+    fixture = json.loads(subprocess.check_output([str(args.policy_exe.resolve()), "--native-connection-json"], timeout=30))
+    native = [row for row in fixture["capabilities"] if row["backend"] == "native"]
+    assert {row["implementation"] == "unsupported" for row in native} == {True, False}
+    for row in native:
+        unsupported = row["implementation"] == "unsupported"
+        assert row["availability"] == ("unsupported" if unsupported else "partial")
+        assert row["availability_scope"] == ("not_probed" if unsupported else "connection_contract_only")
+        assert row["probe_stages"]["source_opened"] == ("not_probed" if unsupported else "passed")
+        assert row["probe_stages"]["sample_read"] == row["probe_stages"]["semantic_validation"] == "not_probed"
     run = subprocess.run([exe, "--capabilities", "--probe"], check=True,
                          capture_output=True, text=True, encoding="utf-8", timeout=30)
     data = json.loads(run.stdout)
@@ -45,7 +54,8 @@ def main():
         assert stages["layout_qualified"] == stages["semantic_validation"] == "not_probed"
         assert stages["environment_regression"] == "not_performed"
         if capability["implementation"] == "unsupported":
-            assert capability["availability"] == "unsupported"
+            assert capability["availability"] == "unsupported" and capability["availability_scope"] == "not_probed"
+            assert stages["source_opened"] == stages["sample_read"] == "not_probed"
         elif capability["backend"] == "process_handle" and capability["domain"] == "memory" and capability["operation"] == "read_virtual":
             assert capability["availability"] == "available"
             assert capability["availability_scope"] == "owned_control_range_only"

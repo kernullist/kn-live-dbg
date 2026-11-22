@@ -1188,11 +1188,11 @@ static void ProbeSavedEtl(const std::wstring& name, SavedEtlCapabilityProbe& pro
 int RunEtlCapabilityProbe(const std::vector<std::wstring>& args, const std::wstring& binaryVersion)
 {
     SavedEtlCapabilityProbe probe;
-    const auto selector = [](const std::wstring& arg) { return _wcsicmp(arg.c_str(), L"--probe-etl") == 0; };
+    const auto selector = [](const std::wstring& arg) { return _wcsicmp(arg.c_str(), capability_probes::SavedEtl.Selector) == 0; };
     if (args.size() != 4 || !selector(args[0]) || args[1].empty() || args[2] != L"--sha256" || !Digest(args[3], probe.ExpectedSha256))
     {
         return WriteWithDistinctSelectedInputs(STD_ERROR_HANDLE, args, selector, [] {
-            std::wcerr << L"usage: KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>\n";
+            std::wcerr << L"usage: KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"\n";
             return 2;
         });
     }

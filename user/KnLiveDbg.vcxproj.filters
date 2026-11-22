@@ -513,6 +513,9 @@
     <ClInclude Include="SavedDumpCapability.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="CapabilityProbeContracts.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="SavedEtlCapability.h">
       <Filter>Header Files</Filter>
     </ClInclude>

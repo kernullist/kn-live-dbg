@@ -1,5 +1,4 @@
-#include "../user/RuntimeCapabilities.h"
-#include "../user/SavedEtlCapability.h"
+#include "../user/SourceCapabilities.h"
 
 #include <iostream>
 #include <sddl.h>
@@ -59,6 +58,15 @@ static bool RunDeniedSelfProbe(const wchar_t* executable)
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 3 && std::wstring(argv[1]) == L"--deny-self-probe") { return RunDeniedSelfProbe(argv[2]) ? 0 : 2; }
+    if (argc == 2 && std::wstring(argv[1]) == L"--native-connection-json")
+    {
+        RuntimeCapabilityProbe connected;
+        connected.NativeProbeAttempted = true;
+        connected.NativeSourceOpened = true;
+        connected.NativeContractPassed = true;
+        connected.NativeSessionPassed = true;
+        return WriteCapabilityJson(SourceCapabilitiesJson(L"fixture", &connected)) ? 0 : 2;
+    }
     if (argc == 2 && std::wstring(argv[1]) == L"--unicode-json")
     {
         RuntimeCapabilityProbe probe;

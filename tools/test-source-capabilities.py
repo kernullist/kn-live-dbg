@@ -256,6 +256,18 @@ def main():
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
+    catalog = {c["id"]: c for c in data["probe_contracts"]}
+    assert set(catalog) == {"owned_read", "native_connection", "saved_etl_family", "saved_dump_range"}
+    assert len(catalog) == len(data["probe_contracts"])
+    for contract in catalog.values():
+        assert "KnLiveDbg.exe " + contract["invocation"] in help_result.stdout and contract["observation"]
+    expected_routes = {("memory", "read_virtual", "process_handle"): "owned_read",
+                       ("memory", "read_virtual", "dump"): "saved_dump_range",
+                       ("execution", "cpu_profile", "etl"): "saved_etl_family",
+                       ("execution", "context_switch", "etl"): "saved_etl_family"}
+    for key, row in by_key.items():
+        expected_route = "native_connection" if key[2] == "native" and row["implementation"] != "unsupported" else expected_routes.get(key)
+        assert row["probe_contract"] == expected_route, key
     assert "--capabilities --probe-etl <local.etl> --sha256 <digest>" in help_result.stdout
     assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout
     print(f"source capabilities passed: {len(keys)} contracts, {len(actual)} command routes")
