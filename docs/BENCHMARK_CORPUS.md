@@ -224,6 +224,19 @@ if ($LASTEXITCODE -ne 0 -or !$receipt.package_sha256) { throw 'ETL comparison pa
 python tools/evaluate-corpus.py --saved-etl-comparison $package --sha256 $receipt.package_sha256
 ```
 
+To include disk I/O, add `--include-disk-io` at acquisition and choose a new
+output path. The v2 manifest registers three families before either reader
+starts. Replay reads the scope from the pinned package. The default command
+continues to register the original two-family v1 comparison.
+
+```powershell
+$diskPackage = '.build/etl-reader-disk-pair.knbench'
+$diskReceipt = python tools/capture-etl-comparison.py --etl $trace --sha256 $tracePin --exe $exe --exe-sha256 $exePin --include-disk-io --output $diskPackage | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$diskReceipt.package_sha256) { throw 'ETL comparison package unavailable' }
+$result = python tools/evaluate-corpus.py --saved-etl-comparison $diskPackage --sha256 $diskReceipt.package_sha256 | ConvertFrom-Json
+$result.families.disk_io
+```
+
 Acquisition copies the admitted bytes into a fresh working directory. Both
 programs read the same file under the name `source.etl`. KnLiveDbg runs its
 saved ETL capability probe, then the system copy of `tracerpt.exe` writes a
@@ -247,9 +260,15 @@ Keep the package and its pin separately. Replay needs the Python tools and
 the package and runs on any supported Python host after the original source
 and readers have been removed.
 
-Each report plans two comparisons in one file. The native count covers
-qualified payloads. The external count covers classic PerfInfo SampleProf
-opcode 46 version 2 and Thread CSwitch opcode 36 versions 2–4. Replay reads
+The original two families cover classic PerfInfo SampleProf opcode 46
+version 2 and Thread CSwitch opcode 36 versions 2–4. The v2 comparison adds
+one DiskIo family covering reads, writes, flushes and their initiations,
+opcodes 10 through 15 in versions 2 and 3. It matches the DiskIo provider
+GUID and recognizes both Windows names and numeric opcodes. The native count
+covers qualified payloads. The external count covers matching descriptors.
+Timing and individual requests require per-record evidence. [Disk I/O reader](TRACE_IMPORT.md#read-saved-disk-io-response-times)
+
+Replay reads
 English summary columns, retains multiword opcodes, and checks the sum of the
 opcode rows against the traversal total. When an event ID table is present,
 its provider/version totals must agree with the opcode table. The report
@@ -261,10 +280,11 @@ records which tables were present.
 | `count_disagreement` | Both counts are comparable. The family stays in the comparable denominator. |
 | `coverage_limited` | A loss counter, incomplete buffer traversal, unsupported layout or unrecognized opcode name limits the family. The original counts remain visible. |
 | `traversal_disagreement` | The programs report different overall record or buffer totals. |
+| `native_family_unavailable` | A usable native report supplied the original two families and omitted disk I/O in a v2 comparison. The Windows count stays visible and disk I/O stays in the planned denominator. |
 | `reader_unavailable` | At least one attempt lacks a usable original result. Process status and any surviving reader's counts remain available. |
 
-`agreement_per_planned_family` always has denominator two.
-`agreement_per_comparable_family` has a null value when neither family is
+`agreement_per_planned_family` has denominator two for v1 and three for v2.
+`agreement_per_comparable_family` has a null value when no family is
 comparable. Exit 0 from acquisition records a published pair. Exit 0 from
 replay records an intact, evaluated pair, including pairs with failed readers.
 An input pin mismatch or malformed package yields exit 2. A supervisor that
@@ -275,7 +295,7 @@ The two readers share the Windows ETW infrastructure. Their agreement measures
 descriptor counts in this saved file. Producer identity, event semantics and
 detection ground truth require separate evidence. The archive, extracted
 streams, receipt and evaluation report contain private evidence.
-[Saved ETL comparison results](VALIDATION.md#saved-etl-reader-comparison-on-2026-11-22)
+[Two-family validation](VALIDATION.md#saved-etl-reader-comparison-on-2026-11-22) · [Three-family disk I/O validation](VALIDATION.md#disk-io-in-paired-etl-evaluations-on-2026-11-22)
 
 ## Run the synthetic example
 

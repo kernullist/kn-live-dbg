@@ -21,7 +21,8 @@ class PublicContentTests(unittest.TestCase):
         for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17)):
             self.assertIn("private-benchmark-package", {f["rule"] for f in AUDIT.inspect("renamed.bin", item)})
         for row in (dict(schema="kn.etl_reader_archive.v1"), dict(schema="kn.etl_reader_comparison.v1"),
-                    dict(schema="kn.etl_reader_evaluation.v1"), dict(retained_sha256="digest", byte_count=17),
+                    dict(schema="kn.etl_reader_evaluation.v1"), dict(schema="kn.etl_reader_comparison.v2"),
+                    dict(schema="kn.etl_reader_evaluation.v2"), dict(retained_sha256="digest", byte_count=17),
                     dict(unresolved_opcode_names=0, supported_descriptors=2), dict(tracerpt=None, verdict="reader_unavailable", native=None),
                     dict(before_sha256="a", after_sha256="b", expected_sha256="c")):
             text = "export\n" + json.dumps(dict(payload=row), indent=2)[:-3]

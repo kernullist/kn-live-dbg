@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Disk I/O in paired ETL evaluations on 2026-11-22
+
+The v2 comparison ran the x64 Release reader from `ab0d56e` and the installed
+Windows `tracerpt` on a pinned copy of each ETL. Acquisition pinned both
+executables. Offline replay verified the archived inputs and tool outputs.
+The three families agree when their qualified counts match, including observed
+zero counts. The table gives agreement divided by the number of registered
+families and the number that could be compared.
+
+| Saved trace | Native disk events | Windows disk descriptors | Agreement / planned | Agreement / comparable |
+| --- | ---: | ---: | ---: | ---: |
+| Control | 0 | 0 | 3/3 | 3/3 |
+| x64 CPU workload | 2,462 | 2,462 | 3/3 | 3/3 |
+| x86 CPU workload | 4,786 | 4,786 | 3/3 | 3/3 |
+| SimpleAllocator | 1,717 | 1,717 | 3/3 | 3/3 |
+| Scheduler | 2,307 | 2,307 | 3/3 | 3/3 |
+| Control with one byte removed | 0 | 0 | 0/3 | 0/0, unavailable |
+
+Both readers reported 22 events in the shortened control. Its buffer gap
+kept all three families outside the comparable denominator. A failed native
+launch retained the Windows counts and the original process error. Synthetic
+controls exercised a missing native disk row with a positive Windows count,
+unknown names, unsupported versions and distinct provider GUIDs. Replay of
+nine existing v1 packages reproduced the original evaluation bytes, including
+the two-family denominator and failed-reader results.
+
+The measurements establish agreement on descriptor counts for these files.
+Both readers use Windows ETW. Hardware service time, producer authenticity
+and independent detection accuracy require separate evidence.
+[Acquisition and replay](BENCHMARK_CORPUS.md#compare-two-readers-on-a-saved-etl) · [Per-record response time validation](#saved-disk-io-response-times-on-2026-11-22)
+
 ## Saved disk I/O response times on 2026-11-22
 
 An x64 Release build on top of `a4bc8da` read the five saved ETLs below.

@@ -24,6 +24,7 @@ SOURCE = b"synthetic framing control"
 PIN = pair.sha(SOURCE)
 PROFILE = "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc"
 THREAD = "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c"
+DISK = "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c"
 OTHER = "00000000-0000-0000-0000-000000000001"
 
 
@@ -66,14 +67,15 @@ def native():
     return dict(schema="kn.capabilities.v1", scope="saved_etl_probe", target_probed=False, probe=probe, capabilities=rows)
 
 
-def manifest():
-    cfg = pair.config(PIN, 3000)
+def manifest(include_disk_io=False):
+    cfg = pair.config(PIN, 3000, include_disk_io)
     binaries = {r: dict(before_sha256=PIN, after_sha256=PIN, expected_sha256=PIN) for r in pair.ROLES}
     attempts = {r: dict(state="exited", os_error=None, exit_code=0, image_binding=dict(status="matched", win32_status=0),
                         started_ns=str(i * 3), ended_ns=str(i * 3 + 2),
                         stdout=retained(pair.encoded(native()) if i == 0 else b""), stderr=retained(b""))
                 for i, r in enumerate(pair.ROLES)}
-    return dict(schema="kn.etl_reader_comparison.v1", source_sha256=PIN, source_bytes=len(SOURCE), config=cfg,
+    schema = "kn.etl_reader_comparison.v2" if include_disk_io else "kn.etl_reader_comparison.v1"
+    return dict(schema=schema, source_sha256=PIN, source_bytes=len(SOURCE), config=cfg,
                 config_sha256=pair.sha(pair.encoded(cfg)), os_build="10.0.1", tools=binaries, attempts=attempts,
                 summary=retained(external(ROWS)))
 
@@ -114,6 +116,74 @@ class ReplayTests(unittest.TestCase):
                 self.assertEqual(q["agreement_per_planned_family"], EVALUATOR["ratio"](agreed, 2))
                 self.assertEqual(q["agreement_per_comparable_family"], EVALUATOR["ratio"](agreed, comparable))
                 self.assertFalse(q["ground_truth_authenticated"] or q["independent_detection_validation"] or q["target_probed"])
+
+    def test_registered_disk_descriptors(self):
+        labels = ("Read", "Write", "ReadInit", "WriteInit", "FlushBuffers", "FlushInit")
+        positive = [(1, "DiskIo", label, version, DISK) for code, name in enumerate(labels, 10)
+                    for label, version in ((name, 2), (str(code), 3))]
+        rows = ROWS + positive + [(1, "DiskIo", "Read", 3, OTHER), (1, "DiskIo", "16", 3, DISK)]
+        m = manifest(include_disk_io=True)
+        n = native()
+        n["probe"]["coverage"]["records_seen"] = sum(r[0] for r in rows)
+        disk = copy.deepcopy(n["capabilities"][0])
+        disk.update(domain="io", operation="disk_io")
+        disk["record_evidence"].update(decoded=len(positive), first_decoded_record=4, first_payload_bytes=48)
+        n["capabilities"].append(disk)
+        m["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        for replacement, verdict, comparable, supported, other, unresolved in (
+                (rows[-1], "agreed_observed", 3, 12, 0, 0),
+                ((1, "DiskIo", "Read", 3, DISK), "count_disagreement", 3, 13, 0, 0),
+                ((1, "DiskIo", "FlushInit", 1, DISK), "coverage_limited", 2, 12, 1, 0),
+                ((1, "DiskIo", "Unknown", 3, DISK), "coverage_limited", 2, 12, 0, 1)):
+            with self.subTest(verdict=verdict, replacement=replacement):
+                m["summary"] = retained(external([*rows[:-1], replacement]))
+                q = evaluate(m)
+                self.assertEqual(q["schema"], "kn.etl_reader_evaluation.v2")
+                expected = dict(supported_descriptors=supported, other_versions=other, unresolved_opcode_names=unresolved)
+                self.assertEqual(q["families"]["disk_io"], dict(verdict=verdict, native=dict(decoded=12, unsupported=0), tracerpt=expected))
+                self.assertEqual(q["agreement_per_planned_family"], EVALUATOR["ratio"](2 + (verdict == "agreed_observed"), 3))
+                self.assertEqual(q["agreement_per_comparable_family"]["denominator"], comparable)
+        m["summary"] = retained(external(rows))
+        disk["availability"] = "partial"
+        disk["record_evidence"]["unsupported"] = 1
+        m["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        self.assertEqual(evaluate(m)["families"]["disk_io"]["verdict"], "coverage_limited")
+        n["capabilities"].append(disk)
+        m["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        self.assertEqual(evaluate(m)["readers"]["native"]["status"], "unqualified_output")
+
+    def test_disk_registration_and_missing_native_family(self):
+        m = manifest(include_disk_io=True)
+        q = evaluate(m)
+        self.assertEqual(q["families"]["disk_io"]["verdict"], "native_family_unavailable")
+        self.assertIsNone(q["families"]["disk_io"]["native"])
+        self.assertEqual(q["families"]["disk_io"]["tracerpt"]["supported_descriptors"], 0)
+        self.assertEqual(q["observed_readers"], 2)
+        self.assertEqual(q["agreement_per_planned_family"], EVALUATOR["ratio"](2, 3))
+        self.assertEqual(q["agreement_per_comparable_family"], EVALUATOR["ratio"](2, 2))
+        m["summary"] = retained(external([ROWS[0], (1, "DiskIo", "Read", 3, DISK)]))
+        missing = evaluate(m)["families"]["disk_io"]
+        self.assertEqual((missing["verdict"], missing["native"], missing["tracerpt"]["supported_descriptors"]),
+                         ("native_family_unavailable", None, 1))
+        m["summary"] = retained(external(ROWS))
+        n = native()
+        empty = dict(n["capabilities"][1], operation="disk_io", domain="other")
+        n["capabilities"].append(empty)
+        m["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        self.assertEqual(evaluate(m)["families"]["disk_io"]["verdict"], "native_family_unavailable")
+        empty["domain"] = "io"
+        m["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        self.assertEqual(evaluate(m)["families"]["disk_io"]["verdict"], "agreed_empty")
+        # The registered configuration fixes the denominator, even with a valid new package pin.
+        m["schema"] = "kn.etl_reader_comparison.v1"
+        with self.assertRaises(ValueError):
+            evaluate(m)
+        old = manifest()
+        n["capabilities"].append(dict(domain="another_backend", backend="etl", operation=[]))
+        old["attempts"]["native"]["stdout"] = retained(pair.encoded(n))
+        q = evaluate(old)
+        self.assertNotIn("disk_io", q["families"])
+        self.assertEqual(q["agreement_per_planned_family"], EVALUATOR["ratio"](2, 2))
 
     def test_loss_and_incomplete_native_layout(self):
         m = manifest()
@@ -279,9 +349,10 @@ def live(args):
         folder = Path(temp)
         source, package = folder / "original saved.etl", folder / "comparison.knbench"
         shutil.copyfile(args.etl, source)
+        flags = ["--include-disk-io"] if args.expected_disk is not None else []
         def capture(src, pin, exe, exe_pin, dest, *extra):
             return invoke("capture-etl-comparison.py", "--etl", src, "--sha256", pin, "--exe", exe,
-                          "--exe-sha256", exe_pin, "--output", dest, *extra)
+                          "--exe-sha256", exe_pin, "--output", dest, *flags, *extra)
         for source_pin, exe_pin in ((PIN, args.exe_sha256), (args.sha256, PIN)):
             r = capture(source, source_pin, args.exe, exe_pin, package)
             assert (r.returncode, r.stdout, package.exists()) == (2, b"", False)
@@ -307,8 +378,11 @@ def live(args):
         r = invoke("evaluate-corpus.py", "--saved-etl-comparison", moved, "--sha256", pin)
         assert r.returncode == 0, r.stderr
         q = json.loads(r.stdout)
-        assert q["agreement_per_planned_family"]["numerator"] == 2
-        for name, expected in zip(pair.FAMILIES, (args.expected_cpu, args.expected_switches)):
+        counts = dict(cpu_profile=args.expected_cpu, context_switch=args.expected_switches)
+        if args.expected_disk is not None:
+            counts["disk_io"] = args.expected_disk
+        assert q["agreement_per_planned_family"]["numerator"] == q["agreement_per_planned_family"]["denominator"] == len(counts)
+        for name, expected in counts.items():
             assert q["families"][name]["native"]["decoded"] == expected == q["families"][name]["tracerpt"]["supported_descriptors"]
         assert all(q["readers"][role]["counts"]["records"] == args.expected_records for role in pair.ROLES)
         invalid = folder / "invalid.exe"
@@ -339,4 +413,5 @@ if __name__ == "__main__":
             parser.add_argument(key, required=True)
         for key in ("--expected-records", "--expected-cpu", "--expected-switches"):
             parser.add_argument(key, type=int, required=True)
+        parser.add_argument("--expected-disk", type=int, help="exercise the registered three-family comparison")
         live(parser.parse_args())

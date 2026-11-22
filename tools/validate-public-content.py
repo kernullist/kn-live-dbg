@@ -19,7 +19,8 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
-ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1")
+ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1",
+                          "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2")
 BENCHMARK_RECORD_SCHEMAS = frozenset(ETL_COMPARISON_SCHEMAS) | frozenset(
     f"kn.owned_module_{kind}.{version}"
     for version, kinds in (

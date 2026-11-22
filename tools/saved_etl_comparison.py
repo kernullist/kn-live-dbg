@@ -9,6 +9,7 @@ import re
 import stat
 import struct
 import sys
+from typing import NamedTuple
 
 from owned_module_benchmark import check, decimal, encoded, fields, publish_new, sha, uint
 
@@ -23,12 +24,28 @@ ROLES = ("native", "tracerpt")
 PROVIDER = re.compile(r"\{([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\}")
 ROW_COUNT = re.compile(r"\| *([0-9]{1,19}) {3}")
 TASK_OR_ID = re.compile(r"(?<!\S)[0-9]{1,5}(?!\S)")
+
+
+class Family(NamedTuple):
+    domain: str
+    provider: str
+    opcodes: dict[int, str]
+    versions: set[int]
+    other_names: set[str]
+
+
 FAMILIES = {
-    "cpu_profile": ("ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", 46, "SampleProf", {2},
-                    {"CollectionStart", "CollectionEnd", "SetInterval"}),
-    "context_switch": ("3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c", 36, "CSwitch", {2, 3, 4},
-                       {"Start", "End", "DCStart", "DCEnd", "ReadyThread", "SetName", "AutoBoost Clear Floor",
-                        "AutoBoost Entry Exhaustion", "AutoBoost Set Floor"}),
+    "cpu_profile": Family("execution", "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", {46: "SampleProf"}, {2},
+                          {"CollectionStart", "CollectionEnd", "SetInterval"}),
+    "context_switch": Family("execution", "3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c", {36: "CSwitch"}, {2, 3, 4},
+                             {"Start", "End", "DCStart", "DCEnd", "ReadyThread", "SetName", "AutoBoost Clear Floor",
+                              "AutoBoost Entry Exhaustion", "AutoBoost Set Floor"}),
+}
+WITH_DISK_IO = {
+    **FAMILIES,
+    "disk_io": Family("io", "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c",
+                      {10: "Read", 11: "Write", 12: "ReadInit", 13: "WriteInit", 14: "FlushBuffers", 15: "FlushInit"},
+                      {2, 3}, set()),
 }
 NATIVE_ARGS = ("--capabilities", "--probe-etl", "source.etl", "--sha256")
 TRACERPT_ARGS = ("source.etl", "-of", "CSV", "-o", "NUL", "-summary", "summary.txt", "-y")
@@ -88,10 +105,11 @@ def digest(value):
     return value
 
 
-def config(pin, timeout_ms):
+def config(pin, timeout_ms, include_disk_io=False):
     check(1 <= uint(timeout_ms, 600000), "timeout must be 1..600000 ms")
     return dict(native=[*NATIVE_ARGS, pin], tracerpt=list(TRACERPT_ARGS), timeout_ms=timeout_ms,
-                adjudication="classic_profile_and_switch_descriptor_counts_v1")
+                adjudication=("classic_profile_switch_and_disk_io_descriptor_counts_v2" if include_disk_io else
+                              "classic_profile_and_switch_descriptor_counts_v1"))
 
 
 def stream_bytes(stream, size, consume):
@@ -197,9 +215,9 @@ def table(lines, heading, with_opcode):
     raise ValueError("unterminated tracerpt table")
 
 
-def tracerpt_counts(raw):
+def tracerpt_counts(raw, families=FAMILIES):
     # English table headings and ASCII descriptors are the supported summary
-    # contract. Opaque provider names outside the two families need no decoding.
+    # contract. Opaque provider names outside the registered families need no decoding.
     text = raw.decode("utf-16") if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else raw.decode("latin1")
     lines = text.splitlines()
     check(len(lines) > 5 and lines[0].strip() == "Files Processed:" and lines[1].strip() == "source.etl",
@@ -228,23 +246,23 @@ def tracerpt_counts(raw):
         check(second == end + 1 and not any(line.strip() for line in lines[last + 1:]), "unexpected tracerpt summary tail")
         check(groups == partitions(ids), "tracerpt event ID table provider/version mismatch")
         tables = "opcode_and_event_id"
-    counts = {name: dict(supported_descriptors=0, other_versions=0, unresolved_opcode_names=0) for name in FAMILIES}
+    counts = {name: dict(supported_descriptors=0, other_versions=0, unresolved_opcode_names=0) for name in families}
     for number, _, _, opcode, version, provider in opcodes:
-        for name, (guid, code, label, versions, other_names) in FAMILIES.items():
-            if provider.lower() != guid:
+        for name, family in families.items():
+            if provider.lower() != family.provider:
                 continue
             numeric = opcode.isascii() and opcode.isdecimal()
             if numeric:
                 uint(int(opcode), 255)
-            if opcode == label or (numeric and int(opcode) == code):
-                counts[name]["supported_descriptors" if int(version) in versions else "other_versions"] += int(number)
-            elif not numeric and opcode not in other_names:
+            if opcode in family.opcodes.values() or (numeric and int(opcode) in family.opcodes):
+                counts[name]["supported_descriptors" if int(version) in family.versions else "other_versions"] += int(number)
+            elif not numeric and opcode not in family.other_names:
                 counts[name]["unresolved_opcode_names"] += int(number)
     return dict(records=total, buffers=counters["Total Buffers Processed"], events_lost=counters["Total Events Lost"],
                 summary_tables=tables, families=counts)
 
 
-def native_counts(raw, decode, pin, size, exit_code):
+def native_counts(raw, decode, pin, size, exit_code, families=FAMILIES):
     doc = decode(raw)
     check(type(doc) is dict and doc.get("schema") == "kn.capabilities.v1" and doc.get("scope") == "saved_etl_probe" and
           doc.get("target_probed") is False, "wrong native report")
@@ -280,10 +298,13 @@ def native_counts(raw, decode, pin, size, exit_code):
     check(probe.get("status") == ("partial" if gap else "read") and exit_code == int(gap), "native status disagrees with coverage")
     counts = {}
     check(type(doc.get("capabilities")) is list, "native family list missing")
+    domains = tuple(family.domain for family in families.values())
     for row in doc["capabilities"]:
         check(type(row) is dict, "invalid native family row")
+        if row.get("domain") not in domains or row.get("backend") != "etl":
+            continue
         name = row.get("operation")
-        if row.get("domain") != "execution" or row.get("backend") != "etl" or name not in FAMILIES:
+        if name not in families or row["domain"] != families[name].domain:
             continue
         check(name not in counts and row.get("availability_scope") == "supplied_etl_record_family", "ambiguous native family")
         evidence = row.get("record_evidence")
@@ -301,7 +322,9 @@ def native_counts(raw, decode, pin, size, exit_code):
         check(evidence["observation"] == label and row.get("availability") == ("available" if observed and not unsupported and not gap else "partial"),
               "native family status disagrees with counts")
         counts[name] = dict(decoded=observed, unsupported=unsupported)
-    check(counts.keys() == FAMILIES.keys() and sum(r["decoded"] + r["unsupported"] for r in counts.values()) <= c["records_seen"],
+    # The original two rows are required by both contracts. Older readers can
+    # successfully report those rows without implementing the optional disk probe.
+    check(FAMILIES.keys() <= counts.keys() and sum(r["decoded"] + r["unsupported"] for r in counts.values()) <= c["records_seen"],
           "native family inventory incomplete")
     return dict(records=c["records_seen"], buffers=c["buffers_processed"], coverage=c, gap=gap, families=counts), stages
 
@@ -313,7 +336,7 @@ def extent(record, limit):
                 original_sha256=record["original_sha256"], retained_sha256=record["retained_sha256"])
 
 
-def attempt(manifest, role, decode):
+def attempt(manifest, role, decode, families=FAMILIES):
     tool, row = manifest["tools"][role], manifest["attempts"][role]
     fields(tool, "before_sha256 after_sha256 expected_sha256", "comparison binary")
     before, after = digest(tool["before_sha256"]), digest(tool["after_sha256"])
@@ -359,9 +382,9 @@ def attempt(manifest, role, decode):
         else:
             try:
                 if role == "native":
-                    counts, stages = native_counts(stdout, decode, manifest["source_sha256"], manifest["source_bytes"], row["exit_code"])
+                    counts, stages = native_counts(stdout, decode, manifest["source_sha256"], manifest["source_bytes"], row["exit_code"], families)
                 else:
-                    counts = tracerpt_counts(summary)
+                    counts = tracerpt_counts(summary, families)
                 status = "observed" if counts is not None else "source_unavailable"
             except (ValueError, KeyError, TypeError, IndexError, OverflowError, RecursionError):
                 status = "unqualified_output"
@@ -372,25 +395,30 @@ def attempt(manifest, role, decode):
 
 def adjudicate(manifest, decode, package_pin, ratio):
     fields(manifest, "schema source_sha256 source_bytes config config_sha256 os_build tools attempts summary", "paired acquisition")
-    check(manifest["schema"] == "kn.etl_reader_comparison.v1", "unknown ETL acquisition")
+    schema = manifest["schema"]
+    check(schema in ("kn.etl_reader_comparison.v1", "kn.etl_reader_comparison.v2"), "unknown ETL acquisition")
+    include_disk_io = schema == "kn.etl_reader_comparison.v2"
+    registered = WITH_DISK_IO if include_disk_io else FAMILIES
     pin = digest(manifest["source_sha256"])
     cfg = manifest["config"]
-    check(type(cfg) is dict and cfg == config(pin, cfg.get("timeout_ms")) and sha(encoded(cfg)) == manifest["config_sha256"],
+    check(type(cfg) is dict and cfg == config(pin, cfg.get("timeout_ms"), include_disk_io) and sha(encoded(cfg)) == manifest["config_sha256"],
           "comparison configuration mismatch")
     check(type(manifest["os_build"]) is str and re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6}){2}", manifest["os_build"]), "invalid reader OS build")
     for key in ("tools", "attempts"):
         fields(manifest[key], "native tracerpt", "paired readers")
-    reads = {role: attempt(manifest, role, decode) for role in ROLES}
+    reads = {role: attempt(manifest, role, decode, registered) for role in ROLES}
     check(decimal(manifest["attempts"]["native"]["ended_ns"]) <= decimal(manifest["attempts"]["tracerpt"]["started_ns"]),
           "reader attempts conflict with registered order")
     native, external = (reads[role]["counts"] for role in ROLES)
     families = {}
     comparable = agreed = 0
-    for name in FAMILIES:
-        nr = native["families"][name] if native else None
+    for name in registered:
+        nr = native["families"].get(name) if native else None
         er = external["families"][name] if external else None
-        if nr is None or er is None:
+        if native is None or external is None:
             status = "reader_unavailable"
+        elif nr is None:
+            status = "native_family_unavailable"
         elif native["gap"] or external["events_lost"] or nr["unsupported"] or er["other_versions"] or er["unresolved_opcode_names"]:
             status = "coverage_limited"
         elif native["records"] != external["records"] or native["buffers"] != external["buffers"]:
@@ -401,13 +429,14 @@ def adjudicate(manifest, decode, package_pin, ratio):
             agreed += matches
             status = ("agreed_observed" if nr["decoded"] else "agreed_empty") if matches else "count_disagreement"
         families[name] = dict(verdict=status, native=nr, tracerpt=er)
-    return dict(schema="kn.etl_reader_evaluation.v1", package_sha256=package_pin, source_sha256=pin,
+    evaluation_schema = "kn.etl_reader_evaluation.v2" if include_disk_io else "kn.etl_reader_evaluation.v1"
+    return dict(schema=evaluation_schema, package_sha256=package_pin, source_sha256=pin,
                 source_bytes=manifest["source_bytes"], config=cfg, config_sha256=manifest["config_sha256"], reader_os_build=manifest["os_build"],
                 layer="independent_comparison", task="saved_etl_descriptor_counts", unit="event_family_in_one_file",
                 artifacts_opened=True, target_probed=False, producer_authenticated=False, ground_truth_authenticated=False,
                 independent_detection_validation=False, overall_ranking=None, readers=reads, families=families,
                 planned_readers=2, observed_readers=sum(r["counts"] is not None for r in reads.values()),
-                agreement_per_planned_family=ratio(agreed, len(FAMILIES)), agreement_per_comparable_family=ratio(agreed, comparable))
+                agreement_per_planned_family=ratio(agreed, len(registered)), agreement_per_comparable_family=ratio(agreed, comparable))
 
 
 def replay(stream, expected, decode, ratio):
