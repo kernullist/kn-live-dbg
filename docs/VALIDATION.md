@@ -7,6 +7,35 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Activity duration across two recordings on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`0218aec46253`) measured one matching marker pair in each of two public
+PerfView ETLs. A separate Windows ETW/TDH program read the original
+markers, thread boundaries, hard-fault properties and QPC frequency.
+Both readers found task 3, channel 0, Start event 8 version 0 and Stop
+event 9 version 1 from the same provider. The activity and thread IDs
+differed between the files. [Fixture revision and SHA-256 values](#saved-etl-cpu-profile-validation-on-2026-11-22)
+
+| Recording | Start and Stop record | Elapsed | Observed hard-fault overlap |
+| --- | --- | ---: | ---: |
+| PerfView x64 | 135036, 135051 | 0.3458 ms | 0 ms |
+| PerfView x86 | 122133, 122302 | 2.7762 ms | 0 ms |
+
+The selected x86 window took 2.4304 ms longer. Reversing the inputs
+reversed the sign. The evidence covers two individual windows. Repeated
+equivalent workloads and the cause of the difference remain unverified.
+
+A separate TaskbarLatency window covered 116.2149 ms with 1.2926 ms of
+observed hard faults. A controlled copy with a 7,000,003 Hz header tested
+conversion between different clock frequencies. TDH and the comparison
+agreed on both exact fractions. The checks also covered large signed
+timestamps, loss, missing records and sources, a wrong source pin,
+incompatible event descriptors, identical input bytes through a hard link,
+concurrent publication and replay of complete and limited reports.
+Run the check with `--exe`, `--oracle`, `--x64`, `--x86` and `--taskbar`.
+[Comparison checks](../tools/test-etl-activity-comparison.py) · [TDH reader build and TaskbarLatency source](#saved-hard-page-fault-timing-on-2026-11-22)
+
 ## Hard fault time inside activity markers on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix

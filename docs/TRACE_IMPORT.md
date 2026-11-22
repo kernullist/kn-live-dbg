@@ -567,6 +567,36 @@ on a reported thread. Logical work identity across threads, collection
 policy and the cause of application latency require additional evidence.
 [CLI and marker discovery](COMMAND_REFERENCE.md#measure-hard-faults-during-a-recorded-activity)
 
+### Comparing activity windows across recordings
+
+`tools/compare-etl-activities.py` runs the same pinned executable against
+two separately pinned files. Each side of its private JSON report retains the
+selected original ordinals, source hash and size, process result, output byte
+counts and hashes, and the decoded native page when available. The page includes
+the thread bracket, clock, loss counters and fault witnesses. Repeating the
+command with `--check-report` checks the digest of the complete comparison.
+For a native `read` or `partial` page, the stdout hash can also be used with
+the native `--check-page` query.
+[Command and replay example](COMMAND_REFERENCE.md#compare-an-activity-across-two-recordings)
+
+For a difference, both windows must qualify in their own trace, the file
+hashes must differ, and the provider, channel, task, Start/Stop event IDs and
+their respective versions must match. Activity IDs, loggers, PIDs, TIDs and
+raw clock origins are local to each capture. Each duration uses that
+capture's own QPC frequency. The report expresses nanoseconds and percentage
+change as exact fractions. A positive time difference means the candidate
+window took longer. A zero baseline leaves the percentage null.
+
+`duration_only` preserves the elapsed-time difference when fault coverage
+is insufficient on either side. `same_recording`, `descriptor_mismatch`
+and `window_unavailable` retain any measured side and leave both differences
+null. A source or reader failure on one side remains visible alongside the
+other attempt. The comparison measures one selected pair. Workload
+equivalence, run-to-run variability and the cause of any change require
+separate evidence. Different file hashes can also describe two edits of one
+recording. The query uses recorded headers and fault payloads without symbol
+lookup.
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

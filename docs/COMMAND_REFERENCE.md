@@ -1313,6 +1313,35 @@ do {
 Use `--check-page` to verify an exact replay. The receipt retains both
 requested record numbers. [Window and coverage rules](TRACE_IMPORT.md#hard-faults-inside-an-activity-window)
 
+### Compare an activity across two recordings
+
+Select a Start and Stop in each ETL using the marker query above. Supply the
+SHA-256 values retained for the two inputs and the reader. This example uses
+the original record numbers from the x64 and x86 PerfView fixtures. Run it
+in the repository with Python 3.11 or later and an existing private output
+directory. [Fixture pins and measurements](VALIDATION.md#activity-duration-across-two-recordings-on-2026-11-22)
+
+```powershell
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$query = @(
+    '--exe', $reader, '--exe-sha256', $readerPin,
+    '--baseline', $baselineEtl, $baselinePin, '135036', '135051',
+    '--candidate', $candidateEtl, $candidatePin, '122133', '122302'
+)
+$receipt = python -B tools/compare-etl-activities.py @query --output .\private\activity-pair.json | ConvertFrom-Json
+$report = Get-Content -LiteralPath .\private\activity-pair.json -Raw | ConvertFrom-Json
+$report.comparison.activity_duration
+$report.comparison.observed_hard_fault_union
+python -B tools/compare-etl-activities.py @query --check-report $receipt.report_sha256
+```
+
+The output path must be new. Exit 0 means both time differences qualified.
+Exit 1 retains a limited comparison or indicates a replay digest mismatch.
+Check the receipt's `status` and `comparison_status` separately. Exit 2
+reports invalid arguments, an unusable reader pin or an output failure.
+`--timeout-ms` sets the per-query deadline, with a default of 240,000 ms.
+[Comparison fields and scope](TRACE_IMPORT.md#comparing-activity-windows-across-recordings)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell
