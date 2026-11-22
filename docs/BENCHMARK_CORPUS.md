@@ -1,7 +1,7 @@
 # Corpus evaluation contract
 
-`tools/evaluate-corpus.py` supports imported case-level declarations and
-offline replay of a pinned Windows module-observation workload. An imported
+`tools/evaluate-corpus.py` supports imported case-level declarations, replay
+of Windows module-observation workloads, and a paired reading of a saved ETL. An imported
 report records the hashes supplied by its author. The workload adapter reads
 the retained files, checks controller and observer records against each other,
 and calculates metrics for the two measured populations. The evidence layers
@@ -205,6 +205,78 @@ and in interrupted output that retains the opening schema field. It also
 recognizes the compact v2 plan in SQLite recovery pages.
 [Publication check results](VALIDATION.md#paired-module-collection-costs-2026-11-21)
 
+## Compare two readers on a saved ETL
+
+On Windows with Python 3.11 or later, point `$trace` at an existing local ETL
+and choose a new package path in a private directory. Record the expected
+hashes of the trace and the KnLiveDbg executable before running the comparison.
+The optional `--tracerpt-sha256` pins the installed Windows reader to an
+independently retained hash as well.
+
+```powershell
+$trace = '.build/control.etl'
+$exe = 'x64/Release/KnLiveDbg.exe'
+$package = '.build/etl-reader-pair.knbench'
+$tracePin = (Get-FileHash -LiteralPath $trace -Algorithm SHA256).Hash.ToLowerInvariant()
+$exePin = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+$receipt = python tools/capture-etl-comparison.py --etl $trace --sha256 $tracePin --exe $exe --exe-sha256 $exePin --output $package | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$receipt.package_sha256) { throw 'ETL comparison package unavailable' }
+python tools/evaluate-corpus.py --saved-etl-comparison $package --sha256 $receipt.package_sha256
+```
+
+Acquisition copies the admitted bytes into a fresh working directory. Both
+programs read the same file under the name `source.etl`. KnLiveDbg runs its
+saved ETL capability probe, then the system copy of `tracerpt.exe` writes a
+summary. Read handles protect the input and executable images during both
+attempts. The runner compares each started process's Windows image path to
+the native path of its pinned executable handle. A missing or different image
+path leaves the reader unqualified. The archive retains the source, both binary hashes before and after
+execution, the arguments and configuration hash, the reader OS build, and
+each program's elapsed time, exit or launch error, stdout and stderr. The
+external summary is a separate original output. `--timeout-ms` sets the wait
+per reader to 1–600,000 ms and defaults to 240,000. A native launch failure or
+timeout still leaves an attempt for the Windows reader.
+
+The private archive accepts a trace up to 512 MiB. It retains up to 1 MiB
+each of native stdout and the Windows summary, and 64 KiB per diagnostic
+stream, along with the full byte count and full and retained SHA-256 values.
+Replay recomputes the package hash, source hash and all retained output hashes.
+When a stream exceeds its limit, the complete-stream hash remains an
+acquisition record and the affected reader receives no comparison credit.
+Keep the package and its pin separately. Replay needs the Python tools and
+the package and runs on any supported Python host after the original source
+and readers have been removed.
+
+Each report plans two comparisons in one file. The native count covers
+qualified payloads. The external count covers classic PerfInfo SampleProf
+opcode 46 version 2 and Thread CSwitch opcode 36 versions 2–4. Replay reads
+English summary columns, retains multiword opcodes, and checks the sum of the
+opcode rows against the traversal total. When an event ID table is present,
+its provider/version totals must agree with the opcode table. The report
+records which tables were present.
+
+| Family verdict | Effect on the comparison |
+|---|---|
+| `agreed_observed`, `agreed_empty` | Equal positive counts or equal zeros on matching, complete traversals. Both contribute to agreement. |
+| `count_disagreement` | Both counts are comparable. The family stays in the comparable denominator. |
+| `coverage_limited` | A loss counter, incomplete buffer traversal, unsupported layout or unrecognized opcode name limits the family. The original counts remain visible. |
+| `traversal_disagreement` | The programs report different overall record or buffer totals. |
+| `reader_unavailable` | At least one attempt lacks a usable original result. Process status and any surviving reader's counts remain available. |
+
+`agreement_per_planned_family` always has denominator two.
+`agreement_per_comparable_family` has a null value when neither family is
+comparable. Exit 0 from acquisition records a published pair. Exit 0 from
+replay records an intact, evaluated pair, including pairs with failed readers.
+An input pin mismatch or malformed package yields exit 2. A supervisor that
+stops before publication has no completed pair. Each invocation covers one
+file and has no campaign-wide denominator for unpublished runs.
+
+The two readers share the Windows ETW infrastructure. Their agreement measures
+descriptor counts in this saved file. Producer identity, event semantics and
+detection ground truth require separate evidence. The archive, extracted
+streams, receipt and evaluation report contain private evidence.
+[Saved ETL comparison results](VALIDATION.md#saved-etl-reader-comparison-on-2026-11-22)
+
 ## Run the synthetic example
 
 Python 3.11 and the standard library are sufficient. From the repository root:
@@ -308,6 +380,6 @@ made by this program; cases without timings do not become zero-latency samples.
 Declared independence-group counts and correlated variants are shown. No
 uncertainty interval is synthesized from unverified or correlated observations.
 Actual independent sampling, uncertainty estimation, authorized corpora, live
-collection overhead/safety and external-tool comparison remain separate work.
+collection overhead/safety and broader external-tool comparisons remain separate work.
 `ground_truth_authenticated`, `target_probed`, `artifacts_opened` and
 `independent_detection_validation` are always false for imported declarations.

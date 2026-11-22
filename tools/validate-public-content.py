@@ -19,7 +19,8 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
-BENCHMARK_RECORD_SCHEMAS = frozenset(
+ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1")
+BENCHMARK_RECORD_SCHEMAS = frozenset(ETL_COMPARISON_SCHEMAS) | frozenset(
     f"kn.owned_module_{kind}.{version}"
     for version, kinds in (
         ("v1", ("benchmark", "truth", "evaluation", "plan", "campaign", "campaign_evaluation",
@@ -55,7 +56,7 @@ PLACEHOLDERS = {"", "sk-replace-me", "sk-or-replace-me", "<api-key>", "<password
 
 def path_rule(name: str) -> str | None:
     path = Path(name)
-    if any(p.lower() in PRIVATE_DIRECTORIES for p in path.parts[:-1]):
+    if any(p.lower() in PRIVATE_DIRECTORIES or p.lower().startswith(".knbench-etl-") for p in path.parts[:-1]):
         return "local-state-directory"
     base = path.name.lower()
     if base.endswith(".knmcpjournal") or ".knmcpjournal.tmp." in base:
@@ -114,6 +115,14 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
     ("evaluated_views", "required_views", "capture_bytes"), ("pid", "process_created", "tid", "thread_created"),
 ))
 DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
+ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',
+                          '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"')
+ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
+    ("retained_sha256", "byte_count"), ("retained_sha256", "base64"),
+    ("before_sha256", "after_sha256", "expected_sha256"), ("verdict", "native", "tracerpt"),
+    ("supported_descriptors", "other_versions"), ("supported_descriptors", "unresolved_opcode_names"),
+    ("process_state", "exit_code", "os_error"), ("state", "started_ns", "ended_ns", "os_error"),
+))
 DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
 ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
@@ -248,6 +257,8 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
 
 def detached_evidence_line(text: str) -> int | None:
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
+    if any(tag in text for tag in ETL_COMPARISON_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, ETL_COMPARISON_FIELDS, ETL_COMPARISON_SCHEMAS))
     if any(tag in text for tag in DUMP_EVIDENCE_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, DUMP_EVIDENCE_FIELDS, DUMP_EVIDENCE_SCHEMAS))
     if any(tag in text for tag in WAIT_PLAN_MARKERS):
@@ -276,7 +287,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if bad_path:
         add(bad_path)
     # A partially written or renamed acquisition still contains private executable and process evidence.
-    if data.startswith(b"PK\x03\x04") and data.startswith(b"owned-module-manifest.json", 30):
+    if data.startswith(b"KNETLBC1") or (data.startswith(b"PK\x03\x04") and data.startswith(b"owned-module-manifest.json", 30)):
         add("private-benchmark-package")
         return findings
     if any(data.startswith(arch + tag) for arch in (b"x64\0", b"ia32\0", b"arm64\0") for tag in (b"C", b"M", b"G")):
@@ -321,12 +332,14 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", "Files Processed:", *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
     for text in text_views(view):
+        if "Files Processed:" in text and re.search(r"(?m)^[ \t]*Files Processed:\r?\n[ \t]+(?:[^\r\n]+\.etl(?:\r?$)|[^\r\n]+\r?\nTotal Buffers Processed[ \t]+[0-9]+)", text, re.I):
+            add("private-tracerpt-summary")
         if "KNDBG_GAME_MANIFEST" in text and re.search(r"(?m)^[ \t]*KNDBG_GAME_MANIFEST[ \t]+[12][ \t]*\r?$", text):
             add("private-game-manifest")
         if "game_reported_registry_slot_v1" in text and re.search(r'(?m)^[ \t]*(?:[\[{][^\r\n]*)?"lifetime_source"\s*:\s*"game_reported_registry_slot_v1"', text):
@@ -402,7 +415,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS)):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *ETL_COMPARISON_MARKERS)):
             line = detached_evidence_line(text)
             if line is not None:
                 add("private-evidence-bundle", line)

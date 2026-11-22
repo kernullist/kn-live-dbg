@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved ETL reader comparison on 2026-11-22
+
+The x64 Release executable from `fd3b28f` and the installed Windows
+`tracerpt.exe` read five saved traces on reader build 10.0.28000. Each pair
+used the same pinned ETL and retained both programs' original outputs.
+The started process image paths matched the paths of the pinned executable
+handles, and both executable hashes matched before and after each run. Offline
+replay verified the archived bytes and recalculated both family counts.
+
+| Saved trace | Records read by each tool | Buffers | CPU samples | Context switches |
+|---|---:|---:|---:|---:|
+| Control | 23 | 3 | 0 | 0 |
+| x64 CPU profile | 179,474 | 360 | 79,528 | 0 |
+| x86 CPU profile | 168,298 | 276 | 88,809 | 0 |
+| SimpleAllocator | 418,378 | 1,300 | 5,496 | 0 |
+| Scheduler | 877,318 | 181 | 18,556 | 168,474 |
+
+All ten file/family comparisons agreed. Five had positive counts and five
+had equal zeros. Four additional acquisitions exercised loss and failure.
+
+| Control | Original evidence | Replay |
+|---|---|---|
+| Final byte removed | Both readers saw 22 records and two of the three declared buffers. Windows emitted an opcode table only. | Both families had limited coverage. |
+| Invalid ETL | Native open returned Win32 1392. The Windows reader exited with `0x80070570`. | Both planned families remained in the report with zero comparable families. |
+| Invalid collector image | Windows rejected the native launch with error 216 on this host. The external reader still read all 23 control records. | The report retained the launch error and the external counts. |
+| One-millisecond deadline | Both attempts timed out on the x64 trace. | Both planned families remained and the comparable agreement value was null. |
+
+The Windows regression removed its original ETL copy and moved the archive
+before replay. It also checked wrong admission hashes, an open writer, a
+destination collision and the actual OS error from launching the invalid
+image. Offline controls covered conflicting counts, ambiguous coverage,
+inconsistent summary tables, over-limit outputs, changed executable evidence,
+tampered bytes, output hard links and two concurrent publishers. The existing
+imported-corpus tests passed, and an earlier paired module campaign replayed
+to its original report. Publication checks recognized renamed archives,
+summary files and detached report rows in UTF-8 and UTF-16.
+
+This comparison uses one Windows reader build and two classic event families.
+Both programs use the Windows ETW infrastructure. Authenticated producer
+provenance, heldout detection performance and host-wide safety or overhead
+remain open. [Acquisition and replay commands](BENCHMARK_CORPUS.md#compare-two-readers-on-a-saved-etl)
+
 ## Compiled probe catalog on 2026-11-22
 
 The Release executable declared four probe contracts across 23 of its 61

@@ -16,6 +16,22 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_saved_etl_comparison_archives_and_excerpts(self):
+        self.assertEqual(AUDIT.path_rule(".knbench-etl-abc/summary.txt"), "local-state-directory")
+        for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17)):
+            self.assertIn("private-benchmark-package", {f["rule"] for f in AUDIT.inspect("renamed.bin", item)})
+        for row in (dict(schema="kn.etl_reader_archive.v1"), dict(schema="kn.etl_reader_comparison.v1"),
+                    dict(schema="kn.etl_reader_evaluation.v1"), dict(retained_sha256="digest", byte_count=17),
+                    dict(unresolved_opcode_names=0, supported_descriptors=2), dict(tracerpt=None, verdict="reader_unavailable", native=None),
+                    dict(before_sha256="a", after_sha256="b", expected_sha256="c")):
+            text = "export\n" + json.dumps(dict(payload=row), indent=2)[:-3]
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", text.encode(encoding))})
+        for text in ("Files Processed:\r\n\tsource.etl", "Files Processed:\n\toriginal\nTotal Buffers Processed 1\n"):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-tracerpt-summary", {f["rule"] for f in AUDIT.inspect("summary.data", text.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"The kn.etl_reader_comparison.v1 archive retains tracerpt output."))
+
     def test_private_operation_journal(self):
         for path in ("operations.KNMCPJOURNAL", "operations.knmcpjournal.tmp.1", "renamed.bin"):
             self.assertIn("private-operation-journal", {r["rule"] for r in AUDIT.inspect(path, b"KNMCPJ1\0ciphertext")})

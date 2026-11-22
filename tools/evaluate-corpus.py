@@ -1,4 +1,4 @@
-"""Evaluate imported declarations or replay a pinned owned-process acquisition offline."""
+"""Evaluate imported declarations or replay a pinned acquisition offline."""
 import argparse
 from collections import Counter, defaultdict
 import hashlib
@@ -332,15 +332,25 @@ def evaluate_campaign(path, snapshot_pin, plan_pin):
 
 
 def main():
+    # Check even malformed or repeated selectors before argparse can write usage to an evidence file.
+    paired = any(arg.startswith("--sa") and "--saved-etl-comparison".startswith(arg.split("=", 1)[0])
+                 for arg in sys.argv[1:])
+    if paired:
+        from saved_etl_comparison import outputs_safe
+        if not outputs_safe(sys.argv[1:]):
+            return 2
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--corpus", type=Path)
     source.add_argument("--owned-module-run", type=Path, help="private acquisition package from the native workload")
     source.add_argument("--owned-module-campaign", type=Path, help="frozen private campaign snapshot beside its packages")
+    source.add_argument("--saved-etl-comparison", type=Path, help="private acquisition from capture-etl-comparison.py")
     parser.add_argument("--results", type=Path)
-    parser.add_argument("--sha256", help="expected SHA-256 retained from workload acquisition")
+    parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     args = parser.parse_args()
+    if args.saved_etl_comparison and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
+        parser.error("--saved-etl-comparison requires only --sha256")
     if args.corpus and (args.results is None or args.sha256 is not None or args.plan_sha256 is not None):
         parser.error("--corpus requires only --results")
     if args.owned_module_run and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
@@ -348,7 +358,22 @@ def main():
     if args.owned_module_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
         parser.error("--owned-module-campaign requires --sha256 and --plan-sha256")
     try:
-        if args.owned_module_campaign:
+        if args.saved_etl_comparison:
+            import os
+            import stat
+            from saved_etl_comparison import local_path, replay, write_result
+            path = local_path(args.saved_etl_comparison)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+            require(stat.S_ISREG(path.stat().st_mode), "a regular comparison package is required")
+            with os.fdopen(os.open(path, flags), "rb") as stream:
+                require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "a regular comparison package is required")
+                if not outputs_safe(sys.argv[1:], stream):
+                    return 2
+                report = replay(stream, args.sha256, decode_document, ratio)
+                if not outputs_safe(sys.argv[1:], stream):
+                    return 2
+                return write_result((json.dumps(report, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+        elif args.owned_module_campaign:
             report = evaluate_campaign(args.owned_module_campaign, args.sha256, args.plan_sha256)
         elif args.owned_module_run:
             report = evaluate_owned(args.owned_module_run, args.sha256)
@@ -359,7 +384,8 @@ def main():
         raw = (json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode("utf-8")
         require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
     except (OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
-        print(f"corpus evaluation failed: {exc}", file=sys.stderr)
+        if not paired or outputs_safe(sys.argv[1:]):
+            print(f"corpus evaluation failed: {exc}", file=sys.stderr)
         return 2
     sys.stdout.buffer.write(raw)
     return 0
