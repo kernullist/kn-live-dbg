@@ -79,6 +79,8 @@ namespace
             schema == ImageApprovalCollectionLedger || schema == ImageScopeApprovalCollectionLedger;
     }
     bool IrpPath(const std::wstring& path) { return path.rfind(L"irp-", 0) == 0; }
+    bool IrpCaptureSchema(const std::wstring& schema)
+    { return schema == L"kn.irp_capture.v1" || schema == L"kn.irp_capture.v2" || schema == PendingIrpClaimPublicationSchema; }
     bool DirectPath(const std::wstring& path) { return path.rfind(L"image-captures/", 0) == 0; }
     bool ApprovalPath(const std::wstring& path) { return path.rfind(L"image-approvals/", 0) == 0; }
     bool ScopeInputPath(const std::wstring& path) { return path.rfind(L"image-scope-inputs/", 0) == 0; }
@@ -101,8 +103,7 @@ namespace
         if (m.Path == L"irp-reference-" + m.Sha256 + L".knblob")
             { return m.Schema == L"raw.bytes" && m.Bytes <= MaxBlobBytes; }
         if (m.Path == L"irp-" + id + L"-" + m.Sha256 + L".knirp")
-            { return Id(id) && m.Bytes <= MaxIrpBytes && (m.Schema == L"kn.irp_capture.v1" || m.Schema == L"kn.irp_capture.v2" ||
-                m.Schema == PendingIrpClaimPublicationSchema); }
+            { return Id(id) && m.Bytes <= MaxIrpBytes && IrpCaptureSchema(m.Schema); }
         if (m.Path == L"image-captures/capture-" + id + L"-" + m.Sha256 + L".kncapture")
         {
             return Id(id) && m.Bytes <= DirectImageCaptureMaxBytes && (m.Schema == L"kn.image_recipe.v1" ||
@@ -137,6 +138,52 @@ namespace
             (m.Schema == L"kn.image_slice.v1" || m.Schema == L"kn.image_slice.v2" || m.Schema == ImageScopeClaimPublicationSchema)) || (ext == L".knreads" &&
             (m.Schema == L"kn.image_reads.v1" || m.Schema == L"kn.image_reads.v2" || m.Schema == L"kn.image_reads.v3")));
     }
+    struct IrpReferenceCatalog
+    {
+        std::wstring Sha256;
+        uint64_t Bytes = 0;
+        bool Readable = false;
+    };
+    IrpReferenceCatalog ReadIrpReferenceCatalog(const std::wstring& schema, const std::wstring& json)
+    {
+        const auto matchesHash = [](const IndexedObject& object, const wchar_t* field, const std::wstring& bytes)
+        {
+            const auto expected = object.String(field);
+            return Digest(expected) && Hash(bytes) == expected;
+        };
+        IndexedObject capture;
+        if (!capture.Parse(json) || capture.String(L"schema") != schema) { return {}; }
+        if (schema == PendingIrpClaimPublicationSchema)
+        {
+            IndexedObject publication, report;
+            std::wstring payload, raw, claim;
+            if (!capture.Raw(L"payload", &payload) || !matchesHash(capture, L"publication_sha256", payload) ||
+                !publication.Parse(payload) || !publication.Raw(L"capture", &raw) || !publication.Raw(L"recorded_claim", &claim) ||
+                !report.Parse(claim) || report.String(L"schema") != L"kn.irp_claim_report.v1" ||
+                !matchesHash(report, L"capture_sha256", raw) || !capture.Parse(raw)) { return {}; }
+        }
+        const auto count = capture.String(L"reference_captured_bytes");
+        if (capture.String(L"schema") != L"kn.irp_capture.v2" || !Id(count) || count.size() > 8) { return {}; }
+        uint64_t bytes = 0;
+        for (const auto digit : count) { bytes = bytes * 10 + (digit - L'0'); }
+        if (bytes > MaxBlobBytes) { return {}; }
+        if (!bytes) { return {L"", 0, true}; }
+        std::vector<std::wstring> packages;
+        if (!capture.Rows(L"schemas", 3, &packages) || packages.size() != 3) { return {}; }
+        std::wstring hash;
+        for (const auto& item : packages)
+        {
+            IndexedObject package, identity;
+            std::wstring payload;
+            if (!package.Parse(item) || package.String(L"schema") != L"kn.type_schema.v1" || !package.Raw(L"payload", &payload) ||
+                !matchesHash(package, L"package_sha256", payload) || !identity.Parse(payload)) { return {}; }
+            const auto image = identity.String(L"image_sha256");
+            if (!Digest(image) || (!hash.empty() && hash != image)) { return {}; }
+            hash = image;
+        }
+        return {std::move(hash), bytes, true};
+    }
+
     // Publication catalogs bind physical originals. Assessment replay has its own entry point.
     using ApprovalInputs = std::map<std::wstring, EvidenceJournalMember>;
     bool ReadApprovalInputs(const EvidenceJournalMember& root, const std::wstring& id,
@@ -325,6 +372,7 @@ struct EvidenceJournal::Impl
     Handle Lock{nullptr, &CloseHandle};
     std::unique_ptr<EvidenceStoreLease> StoreLease;
     std::map<std::wstring, std::pair<EvidenceJournalMember, Handle>>* SharedMembers = nullptr;
+    std::map<std::wstring, IrpReferenceCatalog>* StoreIrpCatalogs = nullptr;
     uint64_t* SharedReadBytes = nullptr;
     uint64_t* SharedReferences = nullptr;
     std::map<std::wstring, EvidenceJournalMember> Members;
@@ -612,6 +660,7 @@ struct EvidenceJournal::Impl
             if (m.Schema != L"raw.bytes" && (!mcpjson::GetString(json, L"schema", &schema) || schema != m.Schema))
                 { return Fail(L"member_schema_mismatch"); }
             if (imageKind != ImageArchiveKind::None && !VerifyImageCatalog(t, m, imageKind, json, *added)) { return false; }
+            if (StoreIrpCatalogs && IrpCaptureSchema(m.Schema)) { StoreIrpCatalogs->emplace(m.Path, ReadIrpReferenceCatalog(m.Schema, json)); }
             if (SharedMembers != nullptr)
             {
                 HANDLE duplicate = nullptr;
@@ -1014,9 +1063,23 @@ namespace
             }
             image += L"]";
         }
+        std::wstring irp;
+        if (!a.IrpCatalog.empty()) { irp = L",\"irp_catalog\":" + mcpjson::Quote(a.IrpCatalog); }
+        if (!a.IrpReferrers.empty())
+        {
+            irp += L",\"irp_referrers\":[";
+            for (const auto& root : a.IrpReferrers)
+            {
+                if (&root != &a.IrpReferrers.front()) { irp += L","; }
+                irp += L"{\"path\":" + mcpjson::Quote(root.Path) + L",\"sha256\":" + mcpjson::Quote(root.Sha256) +
+                    L",\"expected_bytes\":" + N(root.ExpectedBytes) + L",\"root_committed\":" + B(root.Committed) +
+                    L",\"input_matched\":" + B(root.InputMatched) + L"}";
+            }
+            irp += L"]";
+        }
         return L"{\"artifact\":" + MemberJson(a.Artifact) + L",\"verified\":" + B(a.Verified) +
             L",\"journal_references\":" + N(a.JournalReferences) + L",\"collections\":" + owners +
-            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + image + L"}";
+            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + image + irp + L"}";
     }
     std::wstring LowerAscii(std::wstring value)
     {
@@ -1089,6 +1152,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         std::map<std::wstring, std::pair<EvidenceJournalMember, Handle>> cache;
         std::map<std::wstring, EvidenceStoreArtifact> artifacts;
         std::map<std::wstring, uint64_t> contentSizes;
+        std::map<std::wstring, IrpReferenceCatalog> irpCatalogs;
         uint64_t references = 0;
         for (const auto& id : ids)
         {
@@ -1096,6 +1160,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             auto& d = *journal->Data;
             d.Started = out.StartedTick;
             d.SharedMembers = &cache; d.SharedReadBytes = &out.ReadBytes; d.SharedReferences = &references;
+            d.StoreIrpCatalogs = &irpCatalogs;
             bool ok = false;
             try { ok = d.Load(root.wstring(), id, false, true); }
             catch (...) { d.Fail(L"collection_inspection_exception"); }
@@ -1222,6 +1287,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     if (a.Verified)
                     {
                         reader.Files.emplace(relative, std::move(lease));
+                        if (IrpCaptureSchema(a.Artifact.Schema) && !irpCatalogs.count(relative))
+                            { irpCatalogs.emplace(relative, ReadIrpReferenceCatalog(a.Artifact.Schema, text)); }
                         const auto imageKind = ImageArchiveKindForPath(relative);
                         if (imageKind != ImageArchiveKind::None)
                         {
@@ -1320,6 +1387,34 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     input.second.PayloadDigest, matched});
             }
         }
+        bool unknownIrpReference = false;
+        for (const auto& entry : irpCatalogs)
+        {
+            const auto rootFile = artifacts.find(entry.first);
+            if (rootFile == artifacts.end() || !rootFile->second.Verified) { continue; }
+            auto& capture = rootFile->second;
+            const auto& input = entry.second;
+            ++out.IrpCaptureRoots;
+            if (!input.Readable)
+            {
+                ++out.UnreadableIrpCatalogs; capture.IrpCatalog = L"unreadable"; unknownIrpReference = true;
+                continue;
+            }
+            if (!input.Bytes) { capture.IrpCatalog = L"not_captured"; continue; }
+            if (references == StoreMaxReferences)
+            {
+                capture.IrpCatalog = L"budget_exhausted"; physicalComplete = false; unknownIrpReference = true;
+                out.Issue = L"store_irp_reference_budget_exhausted"; continue;
+            }
+            ++references;
+            const auto found = artifacts.find(L"irp-reference-" + input.Sha256 + L".knblob");
+            if (found == artifacts.end()) { ++out.MissingIrpReferences; capture.IrpCatalog = L"inputs_incomplete"; continue; }
+            auto& file = found->second;
+            const bool matched = file.Verified && file.Artifact.Sha256 == input.Sha256 && file.Artifact.Bytes == input.Bytes;
+            if (!matched) { ++out.MismatchedIrpReferences; }
+            capture.IrpCatalog = matched ? L"resolved" : L"inputs_incomplete";
+            file.IrpReferrers.push_back({entry.first, capture.Artifact.Sha256, input.Bytes, capture.JournalReferences != 0, matched});
+        }
         for (auto& pair : artifacts)
         {
             // An unreadable declaration cannot exclude any original in its input families.
@@ -1329,7 +1424,10 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 { pair.second.Retention = L"unresolved_approval_input_protected"; }
             if (pair.second.Retention == L"uncommitted_requires_policy")
             {
-                if (!pair.second.ImageReferrers.empty()) { pair.second.Retention = L"uncommitted_image_input_protected"; }
+                if (!pair.second.IrpReferrers.empty()) { pair.second.Retention = L"irp_replay_reference_protected"; }
+                else if (unknownIrpReference && pair.first.rfind(L"irp-reference-", 0) == 0)
+                    { pair.second.Retention = L"unresolved_irp_reference_protected"; }
+                else if (!pair.second.ImageReferrers.empty()) { pair.second.Retention = L"uncommitted_image_input_protected"; }
                 else if ((unknownImageReference && pair.first.rfind(L"image-references/", 0) == 0) ||
                     (unknownSweepInputs && pair.first.rfind(L"image-reads/", 0) == 0))
                     { pair.second.Retention = L"unresolved_image_input_protected"; }
@@ -1410,6 +1508,8 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"missing_approval_inputs\":" + N(r.MissingApprovalInputs) + L",\"mismatched_approval_inputs\":" + N(r.MismatchedApprovalInputs) +
         L",\"uncommitted_image_roots\":" + N(r.UncommittedImageRoots) + L",\"unreadable_image_catalogs\":" + N(r.UnreadableImageCatalogs) +
         L",\"missing_image_inputs\":" + N(r.MissingImageInputs) + L",\"mismatched_image_inputs\":" + N(r.MismatchedImageInputs) +
+        L",\"irp_capture_roots\":" + N(r.IrpCaptureRoots) + L",\"unreadable_irp_catalogs\":" + N(r.UnreadableIrpCatalogs) +
+        L",\"missing_irp_references\":" + N(r.MissingIrpReferences) + L",\"mismatched_irp_references\":" + N(r.MismatchedIrpReferences) +
         L",\"read_bytes\":" + N(r.ReadBytes) + L",\"artifacts_included\":" + B(includeArtifacts) +
         L",\"artifact_rows_total\":" + N(r.Artifacts.size()) + L",\"artifact_rows_emitted\":" + N(emitted) +
         L",\"artifact_rows_omitted\":" + N(r.Artifacts.size() - emitted) +
@@ -1656,7 +1756,8 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
                         else { entry.State = L"denied"; entry.Issue = L"selected_file_missing"; }
                     }
                     else if (found->Retention == L"uncommitted_approval_input_protected" || found->Retention == L"unresolved_approval_input_protected" ||
-                        found->Retention == L"uncommitted_image_input_protected" || found->Retention == L"unresolved_image_input_protected")
+                        found->Retention == L"uncommitted_image_input_protected" || found->Retention == L"unresolved_image_input_protected" ||
+                        found->Retention == L"irp_replay_reference_protected" || found->Retention == L"unresolved_irp_reference_protected")
                         { entry.State = L"denied"; entry.Issue = found->Retention; }
                     else if (!found->Verified || found->Retention != L"uncommitted_requires_policy" || found->JournalReferences != 0)
                         { entry.State = L"denied"; entry.Issue = L"selected_file_protected"; }

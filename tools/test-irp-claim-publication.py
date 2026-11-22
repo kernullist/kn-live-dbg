@@ -11,6 +11,7 @@ import tempfile
 import threading
 
 from irp_claim_oracle import validate as validate_claims
+from irp_retention_oracle import check_irp_retention
 
 SCHEMA = "kn.irp_claim_publication.v1"
 
@@ -102,6 +103,9 @@ def main():
         source = root / "source.knirp"
         source.write_bytes(raw)
         replay(source, status="not_recorded")
+        if args.journal_exe:
+            check_irp_retention(root, raw, original, journal=args.journal_exe.resolve(),
+                                product=args.exe.resolve() if args.product else None, invoke=invoke, replay=replay, check=check)
         invoke([args.publisher, "--publish-irp", source, published[0]], 1)
         check(published[0].read_bytes() == original, "immutable collision leaves original unchanged")
         budget = root / "budget.knirp"

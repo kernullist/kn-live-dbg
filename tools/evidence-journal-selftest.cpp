@@ -118,7 +118,11 @@ namespace
         if (!fs::exists(root / blob.Path)) { Check(Write(root / blob.Path, Blob), "publish-owned-irp-reference"); }
         t.Members.push_back(blob);
         Stage(stage, L"irp_reference");
-        const auto json = L"{\"schema\":\"kn.irp_capture.v2\",\"fixture\":\"membership_only_not_replay\",\"padding\":\"" +
+        const auto identity = L"{\"image_sha256\":" + mcpjson::Quote(blob.Sha256) + L"}";
+        const auto package = L"{\"schema\":\"kn.type_schema.v1\",\"package_sha256\":" +
+            mcpjson::Quote(EvidenceJournalJsonMember(L"", identity).Sha256) + L",\"payload\":" + identity + L"}";
+        const auto json = L"{\"schema\":\"kn.irp_capture.v2\",\"fixture\":\"membership_only_not_replay\",\"reference_captured_bytes\":" +
+            mcpjson::Quote(std::to_wstring(blob.Bytes)) + L",\"schemas\":[" + package + L"," + package + L"," + package + L"],\"padding\":\"" +
             std::wstring(padding, L'x') + L"\"}";
         auto member = EvidenceJournalJsonMember(L"", json);
         t.Id = member.Sha256;

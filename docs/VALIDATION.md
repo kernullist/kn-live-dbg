@@ -7,6 +7,35 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## IRP replay reference retention on 2026-11-23
+
+In a disposable store the preceding x64 Release CLI (`924a715fd2a7`)
+verified the same PE for a raw IRP capture and a claim publication. GC then
+allowed deletion of that PE. Raw replay reported `missing_or_unreadable`.
+The publication reported `original_claim_inputs_unavailable` when asked to
+reproduce its recorded assessment. Both capture files remained intact.
+
+The updated size-optimized x64 Release CLI (`dc6ee701b80f`) passed 830
+checks over 21 original captures and their claim publications. The harness
+run passed 816. The oracle checked the three original type-schema packages
+against the PE bytes, both physical capture hashes against the inventory
+referrers and the GC result against the surviving files. It covered missing
+and mismatched references, inconsistent schema identities, a broken
+publication seal, explicit zero captured bytes and legacy captures. An IRP
+file published after a durable GC intent protected the PE on retry.
+[IRP retention controls](../tools/irp_retention_oracle.py) ·
+[IRP claim and replay tests](../tools/test-irp-claim-publication.py)
+
+Closed journals were tested with the PE present at commit and with the PE
+added after closure. In both cases the inventory retained the PE and linked
+it to the committed capture. Only the former PE had journal membership.
+The image dependency suites still passed 128 CLI and 108 harness checks.
+The native journal, independent journal, store, GC and IRP journal suites
+passed 74, 2,152, 476, 892 and 400 checks respectively. These offline
+controls cover designated files and participating publishers. Exact
+dependencies for legacy captures, committed-root retirement and recovery
+after media power loss remain open.
+
 ## Image archive input retention on 2026-11-23
 
 The preceding x64 Release CLI (`39a54b6df4d2`) planned deletion of the PE

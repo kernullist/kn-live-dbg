@@ -180,7 +180,7 @@ def main():
                 check(row["retention"] == "unresolved_membership_protected", "interrupted unpublished raw evidence protected")
 
     root = copy("gc")
-    capture_raw = encoded({"schema": "kn.irp_capture.v2", "owned_orphan": True})
+    capture_raw = encoded({"schema": "kn.irp_capture.v2", "owned_orphan": True, "reference_captured_bytes": "0"})
     reference_raw = b"owned orphan IRP reference"
     orphan_members = []
     for path, raw, schema in (("irp-99-" + sha(capture_raw) + ".knirp", capture_raw, "kn.irp_capture.v2"),

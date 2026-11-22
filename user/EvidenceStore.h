@@ -36,6 +36,13 @@ struct EvidenceStoreImageReferrer
     bool PayloadDigest, InputMatched;
 };
 
+struct EvidenceStoreIrpReferrer
+{
+    std::wstring Path, Sha256;
+    uint64_t ExpectedBytes;
+    bool Committed, InputMatched;
+};
+
 struct EvidenceStoreArtifact
 {
     EvidenceJournalMember Artifact;
@@ -44,6 +51,8 @@ struct EvidenceStoreArtifact
     std::wstring ApprovalCatalog;
     std::vector<EvidenceStoreImageReferrer> ImageReferrers;
     std::wstring ImageCatalog, ImagePayloadSha256;
+    std::vector<EvidenceStoreIrpReferrer> IrpReferrers;
+    std::wstring IrpCatalog;
     uint64_t JournalReferences = 0;
     bool Verified = false;
     std::wstring Retention;
@@ -63,6 +72,7 @@ struct EvidenceStoreInventory
     uint64_t MissingApprovalInputs = 0, MismatchedApprovalInputs = 0;
     uint64_t UncommittedImageRoots = 0, UnreadableImageCatalogs = 0;
     uint64_t MissingImageInputs = 0, MismatchedImageInputs = 0;
+    uint64_t IrpCaptureRoots = 0, UnreadableIrpCatalogs = 0, MissingIrpReferences = 0, MismatchedIrpReferences = 0;
     bool CatalogComplete = false, MembershipComplete = false, ArtifactInventoryComplete = false;
     std::vector<EvidenceStoreCollection> Collections;
     std::vector<EvidenceStoreArtifact> Artifacts;

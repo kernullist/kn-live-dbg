@@ -227,7 +227,11 @@ For a loose image capture, read, slice or sweep, inspect `image_catalog` on the
 root and `uncommitted_image_referrers` on each present input. Referrers report the
 physical root hash, expected input hash, digest basis and whether the input
 matched. A sweep identifies reads and slices by their unwrapped payload hashes.
-Images identify PE references by their file hashes. Active participating
+Images identify PE references by their file hashes. IRP captures report
+`irp_catalog`. A present IRP reference lists each referring capture under
+`irp_referrers`, including the expected byte count and whether the capture
+belongs to a journal. The inventory counts missing and mismatched IRP
+references per capture. Active participating
 publishers make the audit unavailable. The exclusive audit lease blocks new
 publication attempts until the audit finishes. Use it
 after collection stops. Exit 0 means complete verified membership and artifact
@@ -244,12 +248,13 @@ Review the generated policy and preflight result before using `/apply` with a
 canonical decimal operation ID of at most 20 digits. The same ID resumes that
 exact operation; it cannot select a new policy or another physical root.
 
-GC denies removal of inputs held by uncommitted image archives and approvals
+GC denies removal of inputs held by uncommitted image archives, approvals and IRP captures
 on initial preflight and retry. An unreadable declaration protects possible
 inputs in its family. To withdraw an eligible loose sweep or approval, select
 the root in a separate operation. A later preflight checks whether any
 surviving capture, read, slice, sweep, approval or journal still needs the
-selected files.
+selected files. An IRP capture in a closed journal can also name a PE that
+was absent at publication. Once that PE appears, GC protects it.
 
 Exit 0 means planned or historically completed; exit 1 includes denied,
 incomplete and unresolved deletion outcomes; exit 2 means invalid grammar.

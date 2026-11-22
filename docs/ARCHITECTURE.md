@@ -495,6 +495,18 @@ protects possible PE references. An unreadable sweep also protects loose reads
 and slices as `unresolved_image_input_protected`. Unreferenced, verified loose
 files remain `uncommitted_requires_policy`. An unreadable file or incomplete enumeration
 makes the physical inventory partial and blocks GC.
+
+For each loose or journaled IRP capture the inventory reads the original
+`reference_captured_bytes` field. A positive length binds the external PE to
+the image SHA-256 shared by the three sealed type-schema packages.
+A claim publication also binds its original capture and the digest recorded
+in the claim. An explicit zero reports `not_captured`. A missing PE or a
+length mismatch reports `inputs_incomplete` on each affected capture.
+The PE lists its referring capture paths, physical hashes, expected lengths,
+match results and journal membership. Even a PE that arrives after collection
+closure receives `irp_replay_reference_protected` if a surviving capture names
+it. A legacy or unreadable declaration protects candidate IRP reference files as
+`unresolved_irp_reference_protected`. The image namespace is independent.
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
@@ -571,12 +583,12 @@ receipt. Corrupt or colliding audit files are preserved and block continuation.
 
 Reports and receipts record selected named bytes and deletion reasons; they do
 not establish reclaimed disk blocks, secure erasure or power-loss durability.
-Each preflight, including retry after an intent, checks surviving image archives
-and direct and scoped approval catalogs. Selecting a root together with a
+Each preflight, including retry after an intent, checks surviving image archives,
+direct and scoped approvals, and IRP replay references. Selecting a root together with a
 protected input denies the entire policy. A separate operation can withdraw an
 eligible loose root. The next inventory checks every remaining referrer.
-Dependency resolution for loose IRP captures and other artifact families remains
-open, so the result retains `uncommitted_dependents_resolved:false`.
+Legacy IRP declarations can leave the exact dependency unknown. The result
+retains `uncommitted_dependents_resolved:false` across the full store.
 Priority-based GC selection, retirement
 of committed roots, full dependency-impact analysis, other-family transfer/redaction controls
 and large-store continuation remain required work. All policy/audit/report artifacts

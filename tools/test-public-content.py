@@ -20,7 +20,9 @@ class PublicContentTests(unittest.TestCase):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
                 dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),
                 dict(artifact={}, uncommitted_image_referrers=[]), dict(image_catalog="inputs_incomplete", artifact={}),
-                dict(expected_sha256="synthetic", path="fixture", digest_basis="unwrapped_payload"))
+                dict(expected_sha256="synthetic", path="fixture", digest_basis="unwrapped_payload"),
+                dict(artifact={}, irp_catalog="unreadable"), dict(artifact={}, irp_referrers=[]),
+                dict(path="fixture", expected_bytes="4", root_committed=True))
         for row in rows:
             raw = json.dumps(dict(outer=[row])).encode()
             for sample in (raw, raw[:-3], raw.decode().encode("utf-16-le")):

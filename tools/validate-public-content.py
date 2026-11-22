@@ -137,10 +137,11 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
 STORE_RETENTION_MARKERS = ('"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
-                           '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"')
+                           '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"')
 STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
     ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog"),
-    ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis")))
+    ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis"),
+    ("artifact", "irp_catalog"), ("artifact", "irp_referrers"), ("path", "expected_bytes", "root_committed")))
 IO_PORT_VALUE = re.compile(r'(?m)^[ \t]*(?:[,{][ \t]*)?"(?:overlapped|port_handle|directory_handle|returned_port)"'
                            r'[ \t]*:[ \t]*"[1-9][0-9]{0,19}(?:"|$)')
 IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
