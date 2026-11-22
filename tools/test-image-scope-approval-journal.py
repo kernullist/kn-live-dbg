@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 
+from approval_retention_oracle import check_uncommitted_approvals
 from image_claim_oracle import normalized_pe
 from image_scope_claim_oracle import check_scope_report, derive_slice
 
@@ -233,6 +234,8 @@ def main():
         check(archive(inputs, store)["historical_root_reused"] and files(store) == snapshot, "closed retry immutable")
         oracle(store, recover(store))
         archive(inputs, store, "8")
+        check_uncommitted_approvals(store, root_path, sandbox, init=init, inventory=inventory, invoke=invoke,
+                                   check=check, journal=journal, product=exe if args.cli else None)
         rows = inventory(store)["artifacts"]
         for entry in publication["inputs"]:
             row = next(r for r in rows if r["artifact"]["path"] == f"image-scope-inputs/{entry['sha256']}.knscopeblob")

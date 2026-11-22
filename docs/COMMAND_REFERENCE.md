@@ -219,8 +219,12 @@ audits stopped image collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.
 `/artifacts` includes bounded per-path ownership detail with explicit omission
-counts. Active participating publishers make the audit unavailable; an exclusive
-audit also denies new publication attempts until it releases its lease. Use it
+counts. A loose direct or scoped approval reports `approval_catalog` on its
+root. Present declared inputs list `uncommitted_approval_referrers` with the
+root path, physical SHA-256 and whether the input matched. The summary counts
+unreadable catalogs, missing inputs and mismatched inputs. Active participating
+publishers make the audit unavailable. The exclusive audit lease blocks new
+publication attempts until the audit finishes. Use it
 after collection stops. Exit 0 means complete verified membership and artifact
 inventory, 1 means partial/unavailable, and 2 means invalid grammar. The returned
 report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
@@ -234,6 +238,12 @@ age and 128 MiB total named bytes. Repeat `--path` for explicit additional membe
 Review the generated policy and preflight result before using `/apply` with a
 canonical decimal operation ID of at most 20 digits. The same ID resumes that
 exact operation; it cannot select a new policy or another physical root.
+
+An input held by an uncommitted image approval is denied on both initial
+preflight and retry. An unreadable approval catalog protects all possible inputs
+of that approval type. Withdrawing an eligible loose approval requires a policy
+that leaves its protected inputs in place. A later preflight checks whether
+another approval or journal still needs them.
 
 Exit 0 means planned or historically completed; exit 1 includes denied,
 incomplete and unresolved deletion outcomes; exit 2 means invalid grammar.

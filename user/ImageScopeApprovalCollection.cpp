@@ -31,23 +31,12 @@ namespace
         return mcpjson::WideToUtf8(*json) == bytes && mcpjson::ValidateDocument(*json);
     }
     uint64_t Now() { FILETIME now{}; GetSystemTimeAsFileTime(&now); return (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime; }
-    std::wstring RootName(bool sweep) { return sweep ? L"root.knsweep" : L"root.knslice"; }
     std::wstring InputPath(const std::wstring& hash) { return L"image-scope-inputs/" + hash + L".knscopeblob"; }
     std::wstring ReferencePath(const std::wstring& hash) { return L"image-references/" + hash + L".knblob"; }
     std::wstring PolicyPath(const std::wstring& hash) { return L"image-approvals/policy-" + hash + L".knapproval"; }
     std::wstring ManifestPath(const std::wstring& hash) { return L"image-approvals/changes-" + hash + L".knchange"; }
     std::wstring ApprovalPath(const std::wstring& id) { return L"image-approvals/scope-assessment-" + id + L".knscopeapproval"; }
     std::wstring LedgerPath(const std::wstring& id) { return L"image-approvals/scope-session-" + id + L".knscopeledger"; }
-    bool InputName(const std::wstring& path, bool sweep)
-    {
-        if (path == RootName(sweep)) { return true; }
-        const std::wstring prefix = L"image-reads/reads-";
-        if (!sweep || path.rfind(prefix, 0) != 0 || path.size() > 80) { return false; }
-        const auto dash = path.find(L'-', prefix.size()), dot = path.rfind(L'.');
-        if (dash == std::wstring::npos || dot == std::wstring::npos || dot <= dash) { return false; }
-        return Id(path.substr(prefix.size(), dash - prefix.size())) && Id(path.substr(dash + 1, dot - dash - 1)) &&
-            (path.substr(dot) == L".knslice" || path.substr(dot) == L".knreads");
-    }
     bool InputSchema(const std::wstring& schema)
     {
         return schema == L"kn.image_slice.v1" || schema == L"kn.image_slice.v2" || schema == L"kn.image_sweep.v1" ||
@@ -79,10 +68,10 @@ namespace
         bool root = false;
         for (const auto& input : p.Inputs)
         {
-            if (!InputName(input.LogicalPath, p.Sweep) || !Digest(input.Sha256) || !InputSchema(input.Schema) ||
+            if (!IsImageScopeApprovalInputName(input.LogicalPath, p.Sweep) || !Digest(input.Sha256) || !InputSchema(input.Schema) ||
                 !input.Bytes || input.Bytes > ImageRecipeMaxBytes || input.Bytes > ImageScopeApprovalMaximumInputBytes - total ||
                 (!previous.empty() && input.LogicalPath <= previous)) { return false; }
-            if (input.LogicalPath == RootName(p.Sweep)) { root = input.Sha256 == p.RootSha256; }
+            if (input.LogicalPath == ImageScopeApprovalRootName(p.Sweep)) { root = input.Sha256 == p.RootSha256; }
             previous = input.LogicalPath; total += input.Bytes;
         }
         return root && (p.Sweep || p.Inputs.size() == 1) && S(p.Assessment, L"schema") == L"kn.image_scope_change_assessment.v1" &&
@@ -141,7 +130,7 @@ namespace
             if (!Reference.Open(((stored ? store : source) / ReferencePath(referenceHash)).wstring(), nullptr) ||
                 Reference.Sha256() != referenceHash || (stored && stored->ReferenceSha256 != referenceHash)) { return false; }
             Paths.Files.emplace(ReferencePath(referenceHash), Reference.Path());
-            const auto rootName = RootName(Paths.Sweep);
+            const auto rootName = ImageScopeApprovalRootName(Paths.Sweep);
             InputBytes = root->Bytes().size();
             Paths.Files.emplace(rootName, RootPath);
             Inputs.push_back({{rootName, RootHash, rootSchema, InputBytes}, std::move(root)});

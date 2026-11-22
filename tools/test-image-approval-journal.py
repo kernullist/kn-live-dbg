@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 
+from approval_retention_oracle import check_uncommitted_approvals
 from image_claim_oracle import check_original_claim, check_report, unpack_recipe
 
 SPEC = importlib.util.spec_from_file_location("approval_inputs", Path(__file__).with_name("test-image-authorized-changes.py"))
@@ -173,6 +174,8 @@ def main():
         check(now["assessment"]["clock_basis"] == "host_wall_clock" and now["recorded_assessment"]["clock_basis"] == "caller_supplied_time", "historical and current clock roles distinct")
         replay(root_path, "0" * 64, code=1, issue="recorded_policy_anchor_mismatch")
         check(archive(inputs, store, "8")["closed"], "shared approval inputs support another collection")
+        check_uncommitted_approvals(store, root_path, sandbox, init=init, inventory=inventory, invoke=invoke,
+                                   check=check, journal=journal, product=exe if args.cli else None)
         catalog = inventory(store)["artifacts"]
         for suffix in (".knapproval", ".knchange", ".knblob"):
             row = next(row for row in catalog if row["artifact"]["path"].endswith(suffix))
@@ -416,7 +419,8 @@ def main():
 
         old_policies = ["kn.image_collection_journal.v1", "kn.image_irp_collection_journal.v2", "kn.image_claim_irp_collection_journal.v3",
                         "kn.image_irp_claim_collection_journal.v4", "kn.direct_image_collection_journal.v1"]
-        for fault in [*range(5), "dependency", "kind", "root-id", "member", "forged-report"]:
+        binding_fields = ("capture_sha256", "reference_sha256", "policy_sha256", "manifest_sha256")
+        for fault in [*range(5), "dependency", "kind", "root-id", "member", "forged-report", *binding_fields, "catalog-seal", "collection-id"]:
             root = sandbox / ("tamper-" + str(fault))
             shutil.copytree(baseline_store, root)
             collection = root / "collections/7"
@@ -425,12 +429,26 @@ def main():
                 document = json.loads(session_path.read_bytes())
                 document["payload"]["policy"] = old_policies[fault]
                 session_path.write_bytes(seal(document))
-            if fault == "forged-report":
+            changed_root = fault in (*binding_fields, "catalog-seal", "collection-id", "forged-report")
+            if changed_root:
                 selected = root / baseline["approval_path"]
                 document = json.loads(selected.read_bytes())
-                document["payload"]["assessment"]["decision"] = "no_observed_change"
+                if fault in binding_fields:
+                    document["payload"][fault] = "0" * 64
+                    if fault != "capture_sha256":
+                        document["payload"]["assessment"][fault] = "0" * 64
+                    if fault == "policy_sha256":
+                        document["payload"]["assessment"]["policy_anchor_sha256"] = "0" * 64
+                elif fault == "collection-id":
+                    document["payload"]["collection_id"] = "99"
+                elif fault == "forged-report":
+                    document["payload"]["assessment"]["decision"] = "no_observed_change"
                 selected.write_bytes(seal(document, "publication_sha256"))
-                replay(selected, inputs[3], code=1, issue="recorded_assessment_mismatch")
+                if fault == "catalog-seal":
+                    document["publication_sha256"] = "0" * 64
+                    selected.write_bytes(encoded(document))
+                if fault == "forged-report":
+                    replay(selected, inputs[3], code=1, issue="recorded_assessment_mismatch")
             previous = sha(session_path.read_bytes())
             for index, path in enumerate(sorted((collection / "journal-segments").glob("*.knjseg")), 1):
                 document = json.loads(path.read_bytes())
@@ -440,7 +458,7 @@ def main():
                     if fault == "kind": tx["kind"] = "image_capture"
                     if fault == "root-id": tx["id"] = "0" * 64
                     if fault == "member": tx["members"].pop()
-                    if fault == "forged-report":
+                    if changed_root:
                         changed = next(m for m in tx["members"] if m["path"].endswith(".knapprovalcase"))
                         raw = (root / changed["path"]).read_bytes()
                         changed["sha256"], changed["bytes"] = sha(raw), str(len(raw))
@@ -452,6 +470,10 @@ def main():
             if fault == "forged-report":
                 check(result["closed"] and not result["replay_established"], "rehashing membership cannot authenticate a false assessment")
             else:
+                if fault in binding_fields:
+                    check(result["issue"] == "approval_input_not_committed", "declared hash selects a different physical member")
+                if fault in ("catalog-seal", "collection-id"):
+                    check(result["issue"] == "approval_catalog_invalid", "approval catalog requires its original seal and collection")
                 check(not result["closed"] and result["committed_segments"] == ("1" if fault == "dependency" else "0"), "old policy or invalid transaction fails closed")
 
         # Shared approval inputs have no collection ID, but exact orphan policy

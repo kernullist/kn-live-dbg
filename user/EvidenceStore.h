@@ -24,10 +24,18 @@ struct EvidenceStoreCollection
     EvidenceJournalRecovery Recovery;
 };
 
+struct EvidenceStoreApprovalReferrer
+{
+    std::wstring Path, Sha256;
+    bool InputMatched;
+};
+
 struct EvidenceStoreArtifact
 {
     EvidenceJournalMember Artifact;
     std::vector<std::wstring> Collections;
+    std::vector<EvidenceStoreApprovalReferrer> ApprovalReferrers;
+    std::wstring ApprovalCatalog;
     uint64_t JournalReferences = 0;
     bool Verified = false;
     std::wstring Retention;
@@ -43,6 +51,8 @@ struct EvidenceStoreInventory
     uint64_t LogicalReferenceBytes = 0, CollectionPathBytes = 0, UniquePathBytes = 0, UniqueContentBytes = 0;
     uint64_t ObservedArtifactFiles = 0, UnverifiedArtifactFiles = 0, UnmanagedEntries = 0;
     uint64_t UnattributedFiles = 0, UnattributedBytes = 0, ReadBytes = 0;
+    uint64_t UncommittedApprovalRoots = 0, UnreadableApprovalCatalogs = 0;
+    uint64_t MissingApprovalInputs = 0, MismatchedApprovalInputs = 0;
     bool CatalogComplete = false, MembershipComplete = false, ArtifactInventoryComplete = false;
     std::vector<EvidenceStoreCollection> Collections;
     std::vector<EvidenceStoreArtifact> Artifacts;

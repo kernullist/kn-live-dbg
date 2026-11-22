@@ -10,6 +10,22 @@ inline constexpr size_t ImageScopeApprovalPublicationMaxBytes = 8 * 1024 * 1024;
 inline constexpr size_t ImageScopeApprovalMaximumInputs = 4097;
 inline constexpr uint64_t ImageScopeApprovalMaximumInputBytes = 256ull * 1024 * 1024;
 
+inline const wchar_t* ImageScopeApprovalRootName(bool sweep) { return sweep ? L"root.knsweep" : L"root.knslice"; }
+inline bool IsImageScopeApprovalInputName(const std::wstring& path, bool sweep)
+{
+    if (path == ImageScopeApprovalRootName(sweep)) { return true; }
+    const std::wstring prefix = L"image-reads/reads-";
+    if (!sweep || path.rfind(prefix, 0) != 0 || path.size() > 80) { return false; }
+    const auto dash = path.find(L'-', prefix.size()), dot = path.rfind(L'.');
+    if (dash == std::wstring::npos || dot == std::wstring::npos || dot <= dash) { return false; }
+    const auto validId = [](const std::wstring& id) {
+        return !id.empty() && id.size() <= 20 && id.find_first_not_of(L"0123456789") == std::wstring::npos &&
+            (id.size() == 1 || id.front() != L'0');
+    };
+    return validId(path.substr(prefix.size(), dash - prefix.size())) && validId(path.substr(dash + 1, dot - dash - 1)) &&
+        (path.substr(dot) == L".knslice" || path.substr(dot) == L".knreads");
+}
+
 struct ImageScopeApprovalInput
 {
     std::wstring LogicalPath, Sha256, Schema;

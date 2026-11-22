@@ -16,6 +16,16 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_detached_approval_retention(self):
+        rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
+                dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}))
+        for row in rows:
+            raw = json.dumps(dict(outer=[row])).encode()
+            for sample in (raw, raw[:-3], raw.decode().encode("utf-16-le")):
+                self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("export.txt", sample)})
+        benign = json.dumps(dict(path="fixture", sha256="synthetic", allowed=True)).encode()
+        self.assertFalse(AUDIT.inspect("example.txt", benign))
+
     def test_rotation_inventories_and_exports(self):
         for filename in ("source.knetlset", "source.knetlset.pending-1", "controller.knetlowner"):
             self.assertIsNotNone(AUDIT.path_rule(filename))

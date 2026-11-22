@@ -462,9 +462,22 @@ outside accepted prefixes never become committed by discovery. Committed
 reference blobs, original observations and failure ledgers have distinct
 protected retention reasons. A verified unattributed file under entirely closed
 roots remains protected if it is a session failure ledger, including when its
-journal was never created. Any other verified unattributed file under closed
-roots is only `uncommitted_requires_policy`; unknown, pending, malformed or
-unreadable artifacts remain protected and make artifact inventory partial.
+journal was never created. A published direct or scoped image approval can also
+retain originals before its first journal commit. The inventory checks its
+payload SHA-256, collection ID and input hashes repeated in the assessment,
+then resolves the declared capture or scoped
+inputs, reference, policy and change manifest against the pinned files.
+Each present input lists its uncommitted approval referrers by path and physical
+SHA-256. An uncommitted input receives `uncommitted_approval_input_protected`.
+Journal and failure-ledger protections take precedence. The root reports
+`inputs_incomplete` when an input is missing or differs in size or schema.
+The summary counts these occurrences once per root and physical input.
+
+A physically verified approval with an unreadable catalog protects possible
+inputs in its own families as `unresolved_approval_input_protected`. Other
+verified, unattributed files under closed journals remain
+`uncommitted_requires_policy`. An unreadable file or incomplete enumeration
+makes the physical inventory partial and blocks GC.
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
@@ -541,10 +554,13 @@ receipt. Corrupt or colliding audit files are preserved and block continuation.
 
 Reports and receipts record selected named bytes and deletion reasons; they do
 not establish reclaimed disk blocks, secure erasure or power-loss durability.
-Uncommitted recipe dependencies are not resolved: explicit removal of an
-uncommitted reference can make another uncommitted artifact unusable. This scope
-is declared as `uncommitted_dependents_resolved:false`; committed dependencies
-stay protected by journal membership. Priority-based GC selection, retirement
+Each preflight, including retry after an intent, checks the surviving direct
+and scoped approval catalogs. Selecting an approval together with one of its
+inputs denies the entire policy. A separate operation can withdraw an eligible
+uncommitted approval. Its inputs remain protected while another approval or
+journal references them. Other uncommitted artifact families can still lose a
+dependency through explicit removal, so the result retains
+`uncommitted_dependents_resolved:false`. Priority-based GC selection, retirement
 of committed roots, full dependency-impact analysis, other-family transfer/redaction controls
 and large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.
@@ -3479,7 +3495,9 @@ collection ID, evaluation FILETIME and complete assessment. Its payload checksum
 and physical file hash are distinct; the latter is the transaction ID. The final
 `image-approvals/session-ID.knapprovalledger` (`kn.image_approval_session.v1`)
 counts one archived assessment and the five members' logical bytes. Closure
-requires all five previously committed paths. Existing journal policies keep
+requires all five previously committed paths. Commit and recovery compare the
+catalog's four SHA-256 values with those exact members. A substituted input
+stops recovery before the approval transaction. Existing journal policies keep
 their original encodings and reject approval transactions. Recovery adds
 `committed_approval_paths`; this is membership evidence, not semantic replay.
 
@@ -3561,7 +3579,9 @@ and closed retries, including later policy expiry. A managed root can supply
 the original inputs for retry or a new collection after source removal; a new
 collection evaluates the separately supplied policy at its own evaluation time.
 Committed inputs and roots, final ledgers and uncertain membership remain
-protected from GC. Eligible uncommitted CAS files require exact-member policy.
+protected from GC. An uncommitted scoped approval also protects every declared
+CAS input, including originals shared with a second approval. Other eligible
+uncommitted CAS files require exact-member policy.
 
 Scoped archive results use `kn.image_scope_approval_collection.v1`; replay uses
 `kn.image_scope_approval_replay.v1`. The caller must supply the policy digest

@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Approval input retention on 2026-11-23
+
+At `6dba4df`, the x64 offline product accepted a GC preflight for all four
+inputs of a loose direct approval and all eight physical inputs of a loose
+sweep approval. In a separate copy of a closed direct journal, the approval
+named a different capture digest. After resealing the publication and journal
+segments, recovery still accepted both segments. These controls used copies
+of locally generated archive fixtures.
+
+The regression oracle takes two archived approvals with a shared reference.
+It checks the input hashes against the original files, the referring root
+hashes against the detailed inventory, and the native GC result against the
+files and receipts left on disk. It also stops a native GC process after its
+durable intent, publishes a referring approval, and retries the same operation.
+The direct journal controls substitute each of the four declared inputs
+individually. Historical assessment reproduction is tested through the
+separate replay command. [Retention oracle](../tools/approval_retention_oracle.py) ·
+[Direct journal tests](../tools/test-image-approval-journal.py) ·
+[Scoped journal tests](../tools/test-image-scope-approval-journal.py)
+
+The size-optimized x64 Release CLI (`39a54b6df4d2`) passed 683 direct and
+1,804 scoped approval checks. The corresponding harness runs passed 669 and
+1,793 checks. The scoped suites exercised 11 interruption points. In the
+loose-store controls the preflight and apply paths both denied removal of the
+four direct inputs and eight sweep inputs. The shared reference survived
+withdrawal of one approval and an interrupted deletion retry. The detached
+referrer export controls ran in the 39-test public-content suite.
+
+Both the previous and updated product recovered two journal segments and
+reproduced the recorded assessment from direct and scoped archives written by
+the other version. The native journal harness passed 71 checks. The independent
+journal, store, GC and IRP journal suites passed 1,952, 476, 892 and 400 checks
+respectively, including nine interrupted GC cases.
+
+The validation covers offline user-mode publication, journal recovery and GC
+in disposable local stores. Cross-family dependency resolution, retirement of
+committed roots and media power-loss recovery remain open.
+
 ## Hard faults and reads during marked waits on 2026-11-23
 
 The public TaskbarLatency recording (`8a59fa63479e`, 10 MHz QPC) had 17

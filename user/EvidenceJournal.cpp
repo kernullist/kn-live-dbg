@@ -136,6 +136,71 @@ namespace
             (m.Schema == L"kn.image_slice.v1" || m.Schema == L"kn.image_slice.v2" || m.Schema == ImageScopeClaimPublicationSchema)) || (ext == L".knreads" &&
             (m.Schema == L"kn.image_reads.v1" || m.Schema == L"kn.image_reads.v2" || m.Schema == L"kn.image_reads.v3")));
     }
+    // Publication catalogs bind physical originals. Assessment replay has its own entry point.
+    using ApprovalInputs = std::map<std::wstring, EvidenceJournalMember>;
+    bool ReadApprovalInputs(const EvidenceJournalMember& root, const std::wstring& id,
+        const std::wstring& json, ApprovalInputs& inputs)
+    {
+        const auto field = [](const IndexedObject& object, const wchar_t* key)
+        {
+            std::wstring raw;
+            return object.Raw(key, &raw) && !raw.empty() && raw.front() == L'"' ? mcpjson::Unescape(raw) : std::wstring{};
+        };
+        IndexedObject envelope, catalog, recorded;
+        std::wstring payload, assessment;
+        if (!envelope.Parse(json) || !envelope.Raw(L"payload", &payload)) { return false; }
+        const auto seal = field(envelope, L"publication_sha256");
+        if (!Digest(seal) || Hash(payload) != seal || !catalog.Parse(payload) || field(catalog, L"collection_id") != id ||
+            !catalog.Raw(L"assessment", &assessment) || !recorded.Parse(assessment)) { return false; }
+        const bool scoped = root.Schema == ImageScopeApprovalPublicationSchema;
+        if (field(recorded, L"schema") != (scoped ? L"kn.image_scope_change_assessment.v1" : L"kn.image_change_assessment.v1"))
+            { return false; }
+        const auto commonHash = [&](const wchar_t* key)
+        {
+            const auto hash = field(catalog, key);
+            return hash == field(recorded, key) ? hash : std::wstring{};
+        };
+        const auto declare = [&](const std::wstring& hash, const std::wstring& prefix, const wchar_t* suffix, const wchar_t* schema)
+        {
+            if (!Digest(hash)) { return false; }
+            const auto path = prefix + hash + suffix;
+            return inputs.emplace(path, EvidenceJournalMember{path, hash, schema, 0}).second;
+        };
+        const auto policy = commonHash(L"policy_sha256");
+        if (policy != field(recorded, L"policy_anchor_sha256") ||
+            !declare(commonHash(L"reference_sha256"), L"image-references/", L".knblob", L"raw.bytes") ||
+            !declare(policy, L"image-approvals/policy-", L".knapproval", L"kn.image_approval_policy.v1") ||
+            !declare(commonHash(L"manifest_sha256"), L"image-approvals/changes-", L".knchange", L"kn.authorized_image_changes.v1")) { return false; }
+        if (root.Schema == ImageApprovalPublicationSchema)
+            { return declare(field(catalog, L"capture_sha256"), L"image-captures/capture-" + id + L"-", L".kncapture", L""); }
+        const auto kind = field(catalog, L"scope_kind"), rootHash = field(catalog, L"root_sha256");
+        std::vector<std::wstring> rows;
+        if (!scoped || (kind != L"slice" && kind != L"sweep") || rootHash != field(recorded, L"root_file_sha256") || !Digest(rootHash) ||
+            !catalog.Rows(L"inputs", ImageScopeApprovalMaximumInputs, &rows) || (kind == L"slice" && rows.size() != 1)) { return false; }
+        std::wstring previousName;
+        uint64_t total = 0;
+        bool hasRoot = false;
+        for (const auto& row : rows)
+        {
+            IndexedObject entry;
+            if (!entry.Parse(row)) { return false; }
+            const auto name = field(entry, L"logical_path"), hash = field(entry, L"sha256");
+            EvidenceJournalMember m{L"image-scope-inputs/" + hash + L".knscopeblob", hash, field(entry, L"schema"), 0};
+            if (!IsImageScopeApprovalInputName(name, kind == L"sweep") || name <= previousName ||
+                !Number(row, L"bytes", &m.Bytes) || !MemberValid(m, id) ||
+                m.Bytes > ImageScopeApprovalMaximumInputBytes - total) { return false; }
+            previousName = name; total += m.Bytes;
+            const auto found = inputs.emplace(m.Path, m);
+            if (!found.second && !Same(found.first->second, m)) { return false; }
+            if (name == ImageScopeApprovalRootName(kind == L"sweep")) { hasRoot = hash == rootHash; }
+        }
+        return hasRoot;
+    }
+    bool MatchesApprovalInput(const EvidenceJournalMember& declaration, const EvidenceJournalMember& file)
+    {
+        return declaration.Path == file.Path && declaration.Sha256 == file.Sha256 &&
+            (declaration.Schema.empty() || declaration.Schema == file.Schema) && (!declaration.Bytes || declaration.Bytes == file.Bytes);
+    }
     struct Record
     {
         uint64_t Sequence = 0;
@@ -518,50 +583,28 @@ struct EvidenceJournal::Impl
             }
             added->emplace(m.Path, std::move(file));
         }
-        if (t.Kind == L"image_scope_approval")
+        if (t.Kind == L"image_approval" || t.Kind == L"image_scope_approval")
         {
-            // Membership verifies the complete declared physical dependency set.
-            // It still does not establish semantic replay of the stored assessment.
-            const auto path = L"image-approvals/scope-assessment-" + Result.CollectionId + L".knscopeapproval";
-            Handle root{nullptr, &CloseHandle};
-            std::wstring json, digest, payload;
+            const bool scoped = t.Kind == L"image_scope_approval";
+            const auto schema = scoped ? ImageScopeApprovalPublicationSchema : ImageApprovalPublicationSchema;
+            const auto root = std::find_if(t.Members.begin(), t.Members.end(), [&](const auto& m) { return m.Schema == schema; });
+            Handle lease{nullptr, &CloseHandle};
+            std::wstring json, digest;
             uint64_t size = 0;
-            if (!Read(Root / path, ImageScopeApprovalPublicationMaxBytes, &root, &digest, &size, &json) || digest != t.Id ||
-                !mcpjson::FindRawValue(json, L"payload", &payload)) { return Fail(L"scope_approval_catalog_unavailable"); }
-            const auto string = [](const std::wstring& object, const wchar_t* field)
-                { std::wstring value; mcpjson::GetString(object, field, &value); return value; };
-            const auto kind = string(payload, L"scope_kind");
-            std::vector<std::wstring> rows;
-            if ((kind != L"slice" && kind != L"sweep") || string(payload, L"collection_id") != Result.CollectionId ||
-                !Array(payload, L"inputs", ImageScopeApprovalMaximumInputs, &rows) || rows.empty())
-                { return Fail(L"scope_approval_catalog_invalid"); }
-            std::map<std::wstring, EvidenceJournalMember> actual;
-            for (const auto& member : t.Members) { actual.emplace(member.Path, member); }
-            std::set<std::wstring> required{path}, logical;
-            bool hasRoot = false;
-            for (const auto& row : rows)
+            if (root == t.Members.end() || !Read(Root / root->Path, root->Bytes, &lease, &digest, &size, &json) || digest != t.Id)
+                { return Fail(scoped ? L"scope_approval_catalog_unavailable" : L"approval_catalog_unavailable"); }
+            ApprovalInputs declared;
+            if (!ReadApprovalInputs(*root, Result.CollectionId, json, declared))
+                { return Fail(scoped ? L"scope_approval_catalog_invalid" : L"approval_catalog_invalid"); }
+            for (const auto& input : declared)
             {
-                const auto hash = string(row, L"sha256"), name = string(row, L"logical_path");
-                const auto input = L"image-scope-inputs/" + hash + L".knscopeblob";
-                const auto found = actual.find(input);
-                uint64_t bytes = 0;
-                if (!Digest(hash) || !Text(name, 80) || !logical.insert(name).second || !Number(row, L"bytes", &bytes) ||
-                    found == actual.end() || found->second.Sha256 != hash || found->second.Bytes != bytes ||
-                    found->second.Schema != string(row, L"schema")) { return Fail(L"scope_approval_input_not_committed"); }
-                required.insert(input);
-                if (name == (kind == L"sweep" ? L"root.knsweep" : L"root.knslice"))
-                    { hasRoot = hash == string(payload, L"root_sha256"); }
+                const auto member = std::lower_bound(t.Members.begin(), t.Members.end(), input.first,
+                    [](const auto& m, const auto& path) { return m.Path < path; });
+                if (member == t.Members.end() || !MatchesApprovalInput(input.second, *member))
+                    { return Fail(scoped ? L"scope_approval_input_not_committed" : L"approval_input_not_committed"); }
             }
-            for (const auto field : {L"reference_sha256", L"policy_sha256", L"manifest_sha256"})
-            {
-                const auto hash = string(payload, field);
-                const auto memberPath = std::wstring(field) == L"reference_sha256" ? L"image-references/" + hash + L".knblob" :
-                    std::wstring(field) == L"policy_sha256" ? L"image-approvals/policy-" + hash + L".knapproval" :
-                    L"image-approvals/changes-" + hash + L".knchange";
-                if (!Digest(hash) || !actual.count(memberPath)) { return Fail(L"scope_approval_input_not_committed"); }
-                required.insert(memberPath);
-            }
-            if (!hasRoot || required.size() != actual.size()) { return Fail(L"scope_approval_dependency_set_mismatch"); }
+            if (declared.size() + 1 != t.Members.size())
+                { return Fail(scoped ? L"scope_approval_dependency_set_mismatch" : L"approval_dependency_set_mismatch"); }
         }
         return true;
     }
@@ -904,9 +947,22 @@ namespace
             if (owners.size() > 1) { owners += L","; }
             owners += mcpjson::Quote(id);
         }
+        std::wstring approval;
+        if (!a.ApprovalCatalog.empty()) { approval = L",\"approval_catalog\":" + mcpjson::Quote(a.ApprovalCatalog); }
+        if (!a.ApprovalReferrers.empty())
+        {
+            approval += L",\"uncommitted_approval_referrers\":[";
+            for (const auto& root : a.ApprovalReferrers)
+            {
+                if (&root != &a.ApprovalReferrers.front()) { approval += L","; }
+                approval += L"{\"path\":" + mcpjson::Quote(root.Path) + L",\"sha256\":" + mcpjson::Quote(root.Sha256) +
+                    L",\"input_matched\":" + B(root.InputMatched) + L"}";
+            }
+            approval += L"]";
+        }
         return L"{\"artifact\":" + MemberJson(a.Artifact) + L",\"verified\":" + B(a.Verified) +
             L",\"journal_references\":" + N(a.JournalReferences) + L",\"collections\":" + owners +
-            L"],\"retention\":" + mcpjson::Quote(a.Retention) + L"}";
+            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + L"}";
     }
     std::wstring LowerAscii(std::wstring value)
     {
@@ -1048,6 +1104,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         auto& reader = *physicalReader.Data;
         reader.Started = out.StartedTick; reader.SharedReadBytes = &out.ReadBytes;
         bool physicalComplete = true;
+        std::map<std::wstring, ApprovalInputs> approvalCatalogs;
+        bool unreadableDirectApproval = false, unreadableScopedApproval = false;
         std::set<std::wstring> observed;
         uint64_t rootEntries = 0;
         for (const auto& folder : {L"image-reads", L"image-references", L"image-sweeps", L"image-captures", L"image-approvals", L"image-scope-inputs", L""})
@@ -1103,7 +1161,32 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     if (blob) { a.Artifact.Schema = L"raw.bytes"; }
                     else { mcpjson::GetString(text, L"schema", &a.Artifact.Schema); }
                     a.Verified = a.Verified && (blob || ApprovalInputPath(relative) || ScopeInputPath(relative) || Id(MemberCollection(relative))) && MemberValid(a.Artifact, MemberCollection(relative));
-                    if (a.Verified) { reader.Files.emplace(relative, std::move(lease)); }
+                    if (a.Verified)
+                    {
+                        reader.Files.emplace(relative, std::move(lease));
+                        const bool scoped = a.Artifact.Schema == ImageScopeApprovalPublicationSchema;
+                        if (scoped || a.Artifact.Schema == ImageApprovalPublicationSchema)
+                        {
+                            ++out.UncommittedApprovalRoots;
+                            ApprovalInputs inputs;
+                            const bool decoded = ReadApprovalInputs(a.Artifact, MemberCollection(relative), text, inputs);
+                            if (!decoded || inputs.size() > StoreMaxReferences - references)
+                            {
+                                if (scoped) { unreadableScopedApproval = true; } else { unreadableDirectApproval = true; }
+                                if (!decoded) { ++out.UnreadableApprovalCatalogs; a.ApprovalCatalog = L"unreadable"; }
+                                else
+                                {
+                                    physicalComplete = false; a.ApprovalCatalog = L"budget_exhausted";
+                                    out.Issue = L"store_approval_reference_budget_exhausted";
+                                }
+                            }
+                            else
+                            {
+                                references += inputs.size();
+                                approvalCatalogs.emplace(relative, std::move(inputs));
+                            }
+                        }
+                    }
                 }
                 else { ++out.UnmanagedEntries; }
                 ++out.UnattributedFiles;
@@ -1116,8 +1199,33 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             }
             if (ec) { physicalComplete = false; out.Issue = L"store_artifact_enumeration_failed"; }
         }
-        for (const auto& pair : artifacts)
+        for (const auto& catalogEntry : approvalCatalogs)
         {
+            auto& publication = artifacts.at(catalogEntry.first);
+            publication.ApprovalCatalog = L"resolved";
+            for (const auto& input : catalogEntry.second)
+            {
+                const auto found = artifacts.find(input.first);
+                if (found == artifacts.end())
+                {
+                    ++out.MissingApprovalInputs;
+                    publication.ApprovalCatalog = L"inputs_incomplete";
+                    continue;
+                }
+                auto& file = found->second;
+                const bool matched = file.Verified && MatchesApprovalInput(input.second, file.Artifact);
+                file.ApprovalReferrers.push_back({publication.Artifact.Path, publication.Artifact.Sha256, matched});
+                if (!matched) { ++out.MismatchedApprovalInputs; publication.ApprovalCatalog = L"inputs_incomplete"; }
+                if (file.Retention == L"uncommitted_requires_policy") { file.Retention = L"uncommitted_approval_input_protected"; }
+            }
+        }
+        for (auto& pair : artifacts)
+        {
+            // An unreadable declaration cannot exclude any original in its input families.
+            if (pair.second.Retention == L"uncommitted_requires_policy" && (unreadableDirectApproval || unreadableScopedApproval) &&
+                (pair.first.rfind(L"image-references/", 0) == 0 || ApprovalInputPath(pair.first) ||
+                    (unreadableDirectApproval && DirectPath(pair.first)) || (unreadableScopedApproval && ScopeInputPath(pair.first))))
+                { pair.second.Retention = L"unresolved_approval_input_protected"; }
             if (pair.second.JournalReferences != 0 && !observed.count(pair.first))
                 { physicalComplete = false; out.Issue = L"committed_path_missing_from_inventory"; }
         }
@@ -1139,6 +1247,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         hashText(L"]");
         out.ArtifactsSha256 = artifactHash.Finish();
         if (!Digest(out.CatalogSha256) || !Digest(out.ArtifactsSha256)) { throw std::runtime_error("store report hashing failed"); }
+        if (!reader.Timely()) { out.ArtifactInventoryComplete = false; out.Issue = reader.Result.Issue; }
         out.Status = out.MembershipComplete && out.ArtifactInventoryComplete ? L"verified" : L"partial";
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
         if (action) { action(out, root, reader); }
@@ -1188,6 +1297,9 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"unique_content_bytes\":" + N(r.UniqueContentBytes) + L",\"observed_artifact_files\":" + N(r.ObservedArtifactFiles) +
         L",\"unverified_artifact_files\":" + N(r.UnverifiedArtifactFiles) + L",\"unmanaged_entries\":" + N(r.UnmanagedEntries) +
         L",\"unattributed_files\":" + N(r.UnattributedFiles) + L",\"verified_unattributed_bytes\":" + N(r.UnattributedBytes) +
+        L",\"uncommitted_approval_roots\":" + N(r.UncommittedApprovalRoots) +
+        L",\"unreadable_approval_catalogs\":" + N(r.UnreadableApprovalCatalogs) +
+        L",\"missing_approval_inputs\":" + N(r.MissingApprovalInputs) + L",\"mismatched_approval_inputs\":" + N(r.MismatchedApprovalInputs) +
         L",\"read_bytes\":" + N(r.ReadBytes) + L",\"artifacts_included\":" + B(includeArtifacts) +
         L",\"artifact_rows_total\":" + N(r.Artifacts.size()) + L",\"artifact_rows_emitted\":" + N(emitted) +
         L",\"artifact_rows_omitted\":" + N(r.Artifacts.size() - emitted) +
@@ -1433,6 +1545,8 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
                             { entry = intent; entry.State = L"absent_after_intent"; entry.Issue = L"deletion_actor_unknown"; }
                         else { entry.State = L"denied"; entry.Issue = L"selected_file_missing"; }
                     }
+                    else if (found->Retention == L"uncommitted_approval_input_protected" || found->Retention == L"unresolved_approval_input_protected")
+                        { entry.State = L"denied"; entry.Issue = found->Retention; }
                     else if (!found->Verified || found->Retention != L"uncommitted_requires_policy" || found->JournalReferences != 0)
                         { entry.State = L"denied"; entry.Issue = L"selected_file_protected"; }
                     else if (!Same(found->Artifact, entry.Artifact)) { entry.State = L"denied"; entry.Issue = L"selected_file_changed"; }

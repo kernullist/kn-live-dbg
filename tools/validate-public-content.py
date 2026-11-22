@@ -136,6 +136,9 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"plan_line_sha256"', '"native_calls"', '"waiting_samples"', '"sample_slot"', '"waiting_inside_call_samples"',
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
+APPROVAL_RETENTION_MARKERS = ('"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"')
+APPROVAL_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
+    ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog")))
 IO_PORT_VALUE = re.compile(r'(?m)^[ \t]*(?:[,{][ \t]*)?"(?:overlapped|port_handle|directory_handle|returned_port)"'
                            r'[ \t]*:[ \t]*"[1-9][0-9]{0,19}(?:"|$)')
 IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
@@ -425,6 +428,8 @@ def detached_evidence_line(text: str) -> int | None:
         if value:
             return text.count("\n", 0, value.start()) + 1
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
+    if any(tag in text for tag in APPROVAL_RETENTION_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, APPROVAL_RETENTION_FIELDS, ()))
     if any(tag in text for tag in READY_ORIGIN_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, READY_ORIGIN_FIELDS, ("kn.etl_switches.v5", *ACTIVITY_WAITS_SCHEMAS)))
     if any(tag in text for tag in DISK_IO_MARKERS):
@@ -512,7 +517,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *APPROVAL_RETENTION_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
@@ -595,7 +600,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *ETL_COMPARISON_MARKERS, *IO_TIMING_MARKERS)):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *ETL_COMPARISON_MARKERS, *IO_TIMING_MARKERS, *APPROVAL_RETENTION_MARKERS)):
             line = detached_evidence_line(text)
             if line is not None:
                 add("private-evidence-bundle", line)
