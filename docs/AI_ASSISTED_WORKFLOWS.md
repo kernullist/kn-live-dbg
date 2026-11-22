@@ -75,6 +75,22 @@ Model explanations remain interpretations. Keep the underlying bytes, identity,
 coverage, warnings and command output. A name, signature or model confidence
 cannot turn an unread region into verified evidence.
 
+## Check claims about a recorded wait
+
+The offline WCT investigation accepts claims from an analyst or a model. Give
+the checker the original capture and its SHA-256. `--investigate` returns the
+six claim names, the requested target identity and the evidence groups
+for each decisive verdict. `--check-claims` reads a typed proposal on standard
+input, replays the capture and returns a result for every submitted claim.
+
+The policy distinguishes a reported cycle, an owned wait and a thread
+termination dependency. Refuting persistence of the first cycle requires evidence
+of the cycle and of a corresponding exit. Unknown command fields, foreign
+evidence IDs and unsupported conclusions fail verification. The checker runs
+locally without calling the configured model or the interactive command
+dispatcher. The operator selects the capture's filesystem location.
+[Run the checker and build a proposal](COMMAND_REFERENCE.md#check-a-proposed-wait-claim)
+
 ## Review minimized image evidence
 
 ```text

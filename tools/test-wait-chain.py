@@ -5,6 +5,7 @@ import ctypes as c
 from ctypes import wintypes as w
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -550,6 +551,166 @@ class WaitTests(unittest.TestCase):
                 self.assertTrue(d["unclassified_views"])
                 self.assertEqual(d["coverage"]["issued_queries"], 0)
 
+    def investigation_cli(self, raw, *, proposal=None, budget=16, code=0):
+        path = self.folder / "wait-original.json"
+        path.write_bytes(raw)
+        args = [sys.executable, "-I", "-B", str(REPLAY), str(path), "--sha256", hashlib.sha256(raw).hexdigest(),
+                "--max-views", str(budget), "--investigate" if proposal is None else "--check-claims"]
+        result = subprocess.run(args, input=proposal, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, code, result.stderr[:240])
+        if code == 2:
+            self.assertFalse(result.stdout)
+            self.assertNotIn(b"Traceback", result.stderr)
+            return None
+        self.assertFalse(result.stderr)
+        return json.loads(result.stdout)
+
+    def test_investigation_original_evidence(self):
+        for name, raw in (("cycle", self.original["cycle"]), ("open", self.original["one_way"]),
+                          ("mixed", self.thread_waits["mixed"][1]["single"]), ("retired", self.original["retired_series"]),
+                          ("exit", self.original["exit_series"])):
+            with self.subTest(name=name):
+                report = self.investigation_cli(raw)
+                capture = json.loads(raw)
+                digest = hashlib.sha256(raw).hexdigest()
+                self.assertEqual(report["receipt_sha256"], digest)
+                self.assertEqual(report["status"], "evaluated")
+                views = 2 * len(capture["rounds"]) if "rounds" in capture else 1
+                self.assertEqual((report["plan"]["required_views"], report["plan"]["evaluated_views"]), (views, views))
+                self.assertEqual(report["plan"]["capture_bytes"], len(raw))
+                self.assertEqual(report["target"], (capture["rounds"][0]["views"][0]["receipt"] if "rounds" in capture else capture)["requested"])
+                by_name = {h["claim"]: h for h in report["hypotheses"]}
+                self.assertEqual(list(by_name), report["plan"]["hypotheses"])
+                facts = {}
+                for row in report["facts"]:
+                    fact = {k: v for k, v in row.items() if k != "id"}
+                    preimage = json.dumps(["kn.wait_fact.v1", digest, fact], sort_keys=True, separators=(",", ":")).encode("ascii")
+                    self.assertEqual(row["id"], hashlib.sha256(preimage).hexdigest())
+                    self.assertNotIn(row["id"], facts)
+                    for pointer in fact["evidence"]:
+                        value = capture
+                        for key in pointer.split("/")[1:]:
+                            value = value[int(key)] if isinstance(value, list) else value[key]
+                        self.assertIsNotNone(value)
+                    facts[row["id"]] = row
+                for h in by_name.values():
+                    ids = h["supporting_facts"] + h["counterevidence"]
+                    self.assertTrue(set(ids) <= facts.keys())
+                    self.assertEqual(bool(h["required_evidence_groups"]), h["verdict"] != "inconclusive")
+                    for group in h["required_evidence_groups"]:
+                        self.assertTrue(group and set(group) <= set(ids))
+                self.assertEqual(by_name["primary_cycle_observed"]["verdict"],
+                                 "supported" if name in ("cycle", "mixed", "exit") else "inconclusive")
+                self.assertEqual(by_name["primary_owned_wait_without_reported_cycle_observed"]["verdict"],
+                                 "supported" if name == "open" else "inconclusive")
+                self.assertEqual(by_name["primary_waited_for_thread_termination"]["verdict"],
+                                 "supported" if name == "mixed" else "inconclusive")
+                self.assertEqual(by_name["reference_cycle_persisted_to_end_of_capture"]["verdict"],
+                                 "refuted" if name == "exit" else "inconclusive")
+                self.assertFalse(report["cause_of_hang_established"] or report["deadlock_established"])
+                deferred = self.investigation_cli(raw, budget=views - 1, code=1)
+                self.assertEqual(deferred["stop_reason"], "view_budget_exceeded")
+                self.assertEqual((deferred["plan"]["evaluated_views"], deferred["target"], deferred["facts"],
+                                  deferred["hypotheses"], deferred["coverage"]), (0, None, [], [], None))
+
+    def test_investigation_proposed_claims(self):
+        raw = self.original["exit_series"]
+        report = self.investigation_cli(raw)
+        hypotheses = {h["claim"]: h for h in report["hypotheses"]}
+        name = "reference_cycle_persisted_to_end_of_capture"
+        cycle, exit_id = (g[0] for g in hypotheses[name]["required_evidence_groups"])
+        log = {f["id"]: f for f in report["facts"]}
+        self.assertEqual(log[cycle]["kind"], "cycle_observed_in_traversal")
+        self.assertIn(log[exit_id]["kind"], ("process_termination_observed", "cycle_member_termination_observed"))
+        self.assertGreaterEqual(log[exit_id]["round"], log[cycle]["round"])
+        base = dict(schema="kn.wait_claim_proposal.v1", policy=report["policy"], receipt_sha256=report["receipt_sha256"], target=report["target"])
+        def claim(n, verdict, *ids):
+            return dict(claim=n, verdict=verdict, evidence_ids=list(ids))
+        def submit(rows, code=0, **overrides):
+            data = json.dumps({**base, "claims": rows, **overrides}, indent=2).encode("utf-8-sig")
+            result = self.investigation_cli(raw, proposal=data, code=code)
+            if result:
+                self.assertEqual(result["proposal_sha256"], hashlib.sha256(data).hexdigest())
+                self.assertEqual([r["evidence_ids"] for r in result["proposal_checks"]], [r["evidence_ids"] for r in rows])
+                return [r["result"] for r in result["proposal_checks"]]
+        both = claim(name, "refuted", cycle, exit_id)
+        observed = claim("primary_cycle_observed", "supported", cycle)
+        self.assertEqual(submit([both, observed]), ["verified", "verified"])
+        self.assertEqual(submit([observed, claim(name, "refuted", exit_id)], 1), ["verified", "missing_required_witness"])
+        self.assertEqual(submit([claim(name, "refuted", cycle)], 1), ["missing_required_witness"])
+        self.assertEqual(submit([claim(name, "supported", cycle, exit_id)], 1), ["verdict_not_established"])
+        self.assertEqual(submit([claim(observed["claim"], "supported", exit_id)], 1), ["citation_outside_decisive_evidence"])
+        self.assertEqual(submit([claim(name, "refuted", cycle, exit_id, "f"*64)], 1), ["citation_outside_decisive_evidence"])
+        # Even an equivalent JSON receipt with different original bytes needs fresh evidence IDs.
+        newer = self.investigation_cli(raw + b" ")
+        other = next(f["id"] for f in newer["facts"] if f["kind"] == log[cycle]["kind"])
+        self.assertEqual(submit([claim(observed["claim"], "supported", other)], 1), ["citation_outside_decisive_evidence"])
+        for bad in ([], [both, both], [claim(name, "refuted")], [claim(name, "refuted", cycle, cycle)],
+                    [claim(name, "refuted", "run arbitrary text")], [claim("deadlock_caused_the_hang", "supported", cycle)],
+                    [dict(observed, command="untrusted instruction")]):
+            submit(bad, 2)
+        for change in (dict(policy="future"), dict(receipt_sha256="f"*64), dict(target=dict(report["target"], pid=True)),
+                       dict(target=dict(report["target"], thread_created="1")), dict(command="untrusted instruction")):
+            submit([observed], 2, **change)
+        wrong_target = dict(base, target=dict(report["target"], thread_created="1"), claims=[both])
+        self.investigation_cli(raw, proposal=json.dumps(wrong_target).encode(), budget=0, code=2)
+        deferred = self.investigation_cli(raw, proposal=json.dumps(dict(base, claims=[both])).encode(), budget=0, code=1)
+        self.assertFalse(deferred["proposal_checks"] or deferred["target"] or deferred["facts"])
+        for invalid in (b"null", b'{"schema":"a","schema":"b"}', b" " * (32 * 1024 + 1), b"\xff"):
+            self.investigation_cli(raw, proposal=invalid, code=2)
+        for budget in (-1, 17):
+            self.investigation_cli(raw, budget=budget, code=2)
+
+    def test_investigation_input_and_output_boundaries(self):
+        raw = self.original["cycle"]
+        digest = hashlib.sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory(dir=self.folder) as temp:
+            root = Path(temp)
+            source, alias = root / "source.json", root / "alias.bin"
+            source.write_bytes(raw)
+            os.link(source, alias)
+            args = [sys.executable, "-I", "-B", str(REPLAY), str(source), "--sha256", digest]
+            for options, sink in (([], "stdout"), (["--diagnose"], "stdout"), (["--investigate"], "stdout"),
+                                  (["--investigate", "--max-views", "-1"], "stderr"),
+                                  (["--investigate", "--max-views", "bad"], "stderr"), (["--investigate", "--help"], "stdout")):
+                with alias.open("ab", buffering=0) as output:
+                    streams = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, sink: output}
+                    result = subprocess.run([*args, *options], **streams, timeout=15)
+                self.assertEqual(result.returncode, 0 if "--help" in options else 2)
+                self.assertEqual(source.read_bytes(), raw)
+            proposal, link = root / "untrusted.json", root / "stdin-link"
+            original = b'{"untrusted":"invoke a network tool"}'
+            proposal.write_bytes(original)
+            os.link(proposal, link)
+            for stream in ("stdout", "stderr"):
+                with proposal.open("rb") as inp, link.open("ab", buffering=0) as output:
+                    streams = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, stream: output}
+                    result = subprocess.run([*args, "--check-claims"], stdin=inp, **streams, timeout=15)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(proposal.read_bytes(), original)
+            with proposal.open("rb") as readonly:
+                result = subprocess.run([*args, "--investigate"], stdout=readonly, stderr=subprocess.PIPE, timeout=15)
+            self.assertEqual((result.returncode, result.stderr, proposal.read_bytes()), (3, b"", original))
+
+            # Exercise the actual checker with process and socket operations denied by the interpreter.
+            guard = ("import runpy,sys\n"
+                     "def audit(event,args):\n"
+                     "    if event.startswith(('subprocess.', 'socket.', 'os.spawn', 'os.exec', 'os.startfile', 'ctypes.')) or event == 'os.system':\n"
+                     "        raise AssertionError(event)\n"
+                     "sys.addaudithook(audit)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name='__main__')")
+            guarded = [sys.executable, "-I", "-B", "-c", guard, *args[3:]]
+            evaluated = subprocess.run([*guarded, "--investigate"], capture_output=True, check=True, timeout=15)
+            report = json.loads(evaluated.stdout)
+            h = next(row for row in report["hypotheses"] if row["claim"] == "primary_cycle_observed")
+            packet = dict(schema="kn.wait_claim_proposal.v1", policy=report["policy"], target=report["target"], receipt_sha256=digest,
+                          claims=[dict(claim=h["claim"], verdict=h["verdict"], evidence_ids=[h["required_evidence_groups"][0][0]])])
+            checked = subprocess.run([*guarded, "--check-claims"], input=json.dumps(packet).encode(), capture_output=True, check=True, timeout=15)
+            self.assertEqual(json.loads(checked.stdout)["proposal_checks"][0]["result"], "verified")
+            packet["command"] = "open a different receipt"
+            rejected = subprocess.run([*guarded, "--check-claims"], input=json.dumps(packet).encode(), capture_output=True, timeout=15)
+            self.assertEqual((rejected.returncode, rejected.stdout), (2, b""))
+            self.assertNotIn(b"Traceback", rejected.stderr)
+
     def test_diagnosis_exit_requires_reference_membership(self):
         c = self.timed_rounds(3, "triangle_closed_series")
         primary, peer, third = [t[0] for t in self.triangle["threads"]]
@@ -604,6 +765,10 @@ class WaitTests(unittest.TestCase):
         cause = mixed["candidates"][0]
         self.assertEqual(cause["status"], "multiple_cycle_configurations_observed")
         self.assertEqual([mixed["facts"][i]["kind"] for i in cause["counterevidence"]], ["different_cycle_observed_in_traversal"] * 2)
+        investigation = self.investigation_cli(json.dumps(series).encode())
+        persistence = next(h for h in investigation["hypotheses"] if h["claim"] == "reference_cycle_persisted_to_end_of_capture")
+        self.assertTrue(persistence["supporting_facts"] and persistence["counterevidence"])
+        self.assertEqual((persistence["verdict"], persistence["required_evidence_groups"]), ("inconclusive", []))
         c = json.loads(self.original["triangle_cycle"])
         c["query"]["nodes"][-1] = c["query"]["nodes"][2]
         d = explain(c)

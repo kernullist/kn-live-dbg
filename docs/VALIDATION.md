@@ -7,6 +7,46 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Evidence-checked wait claims on 2026-11-22
+
+This P15 checkpoint used saved Windows Wait Chain Traversal receipts from
+owned processes. The x64 Release collector had SHA-256
+`273106753f4137e69a5bbe9046ec83e42ecb9ef0b3c67b71513af255d7c7d839`.
+Run `python -I -B tools/test-wait-chain.py --exe x64/Release/KnLiveDbg.exe`
+for the native acquisition and offline verification suite. The 21 tests
+covered two- and three-thread mutexes, thread termination waits, mixed cycles,
+transitions, generation mismatches and post-exit replay.
+
+On 24 original files, the default assessment and diagnosis outputs matched
+the replayer from commit `8919023` byte-for-byte in all 48 comparisons. Its
+original facts supplied an independent expectation for each of the six typed
+claims. Of the 144 verdicts, 29 were supported, 13 refuted and 102 inconclusive.
+All 42 decisive results passed proposal verification with citations derived
+from those original facts. These counts describe this set of receipts.
+
+A signaled member alone and a closed cycle alone both failed to refute
+persistence. Together their witnesses verified the refutation. A different cycle
+without an observed reference exit supplied counterevidence and kept persistence
+inconclusive. Other controls used IDs from a byte-different encoding of the same
+capture, an unrelated authentic fact, a forged ID, a wrong target or policy,
+duplicate claims, extra command fields, invalid encodings and exhausted
+budgets. A deferred plan issued zero graph evaluations. Proposal verification
+ran in an isolated Python process with audit hooks that rejected socket,
+subprocess and native-library loading operations.
+
+Redirecting output to a writable hard link of the input previously appended to
+the original receipt on assessment and diagnosis, including when the caller
+requested only a read. Regression tests check those routes, investigation,
+malformed arguments and proposal-input aliases. A read-only output handle
+returned exit 3 for the typed report. The documented proposal example passed
+in Windows PowerShell and PowerShell 7. All 31 public-content scanner tests
+passed, including truncated and detached UTF-8 and UTF-16 evidence.
+
+The replay evaluates a bounded saved capture. Wait completion, object lifetime,
+the cause of a hang, authentic collection and general AI provider egress
+remain separate validation gates.
+[Operator example](COMMAND_REFERENCE.md#check-a-proposed-wait-claim)
+
 ## Thread termination in Windows wait chains, 2026-11-22
 
 The Windows x64 Release controller had SHA-256

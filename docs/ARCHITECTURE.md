@@ -1061,6 +1061,34 @@ eventual exit and the wait call's final result require other evidence.
 A finite wait can expire after Windows reports a cycle.
 [Capture and replay a wait chain](COMMAND_REFERENCE.md#capture-a-windows-wait-chain)
 
+### Evidence-checked wait investigations
+
+The offline WCT replayer evaluates six code-owned claims about the requested
+primary process and thread generations. It checks the SHA-256 of the original
+file and counts its recorded root views before evaluating the graph. One
+single-root receipt costs one view. Each recorded paired round costs two,
+including a root whose query was never issued. The coverage ledger retains the
+number of issued queries. If the view budget cannot cover the input, the plan
+stops before graph evaluation and returns no target, facts or verdicts.
+
+Each derived fact carries pointers into the pinned original. Its evidence ID is
+the SHA-256 of the ASCII JSON encoding of `["kn.wait_fact.v1", receipt_sha256, fact]`
+with sorted object keys, no extra whitespace and ASCII escapes. Here `fact` is
+the diagnosis fact before adding its ID. Replay resolves its pointers before
+admitting it. The target pointer identifies the requested generation. The
+qualified observations and their handle witnesses determine which claims it supports.
+
+A typed proposal names the policy version, capture digest and target. Every
+cited ID must belong to the decisive evidence for the proposed verdict, and at
+least one ID must satisfy each required group. Refuting persistence needs two
+groups, the observed reference cycle and the matching member or process exit.
+A different cycle contributes counterevidence while leaving the persistence
+question open. An observed cycle can refute a claim of cycle-free contention
+throughout the recording. A single open wait establishes only an observation
+within its traversal. The report preserves both sides when evidence is incomplete.
+The checker takes its operations from the built-in policy and emits the hash of
+the exact submitted proposal bytes. [Command and proposal example](COMMAND_REFERENCE.md#check-a-proposed-wait-claim)
+
 ## CPU samples from saved ETLs
 
 The standalone `--etl-profile` route opens a pinned ETL through the Windows

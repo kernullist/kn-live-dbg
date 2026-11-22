@@ -391,6 +391,20 @@ class PublicContentTests(unittest.TestCase):
             inconsistent = {**runtime, **overrides}
             self.assertTrue(AUDIT.inspect("renamed.json", json.dumps(inconsistent).encode()))
 
+    def test_wait_investigation_exports(self):
+        samples = (dict(schema="kn.wait_claim_proposal.v1"), dict(schema="kn.wait_investigation.v1"),
+                   dict(claim="primary_cycle_observed", verdict="supported", evidence_ids=["a" * 64]),
+                   dict(claim="primary_cycle_observed", verdict="supported", supporting_facts=["a" * 64]),
+                   dict(candidate="reference_cycle_persisted_to_end_of_capture", unobserved=["continuous_wait"], next_observation="review"),
+                   dict(id="b" * 64, kind="cycle_observed_in_traversal", round=1, evidence=["/query"]),
+                   dict(pid=4000, process_created="1000", tid=5000, thread_created="2000"))
+        for obj in samples:
+            for encoding in ("utf-8", "utf-16", "utf-16-be", "utf-16-le"):
+                text = "log entry\n" + json.dumps(dict(entry=[obj]), indent=2)[:-4]
+                self.assertTrue(AUDIT.inspect("transcript.txt", text.encode(encoding)))
+                self.assertTrue(AUDIT.inspect("renamed.log", ("banner\n" + json.dumps([obj])[:-1]).encode(encoding)))
+        self.assertFalse(AUDIT.inspect("manual.md", b"Use kn.wait_investigation.v1 to check evidence_ids."))
+
     def test_dump_initialization_exports(self):
         receipt = dict(purpose="list_head", candidate_levels=4, file_offset="32", requested_bytes=8)
         metadata = dict(decision="depth_ambiguous", schema="kn.dump_initialization.v1")

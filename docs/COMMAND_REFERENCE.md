@@ -859,6 +859,45 @@ and reason for each view with insufficient evidence. A candidate's
 to establish a cause. A timeout, cancellation, system-wide deadlock or
 malicious intent cannot be inferred from these observations alone.
 
+### Check a proposed wait claim
+
+Use the saved WCT file and SHA-256 from the capture examples above. The first
+command returns a private `kn.wait_investigation.v1` report. The plan names
+six hypotheses and evaluates the recorded views within `--max-views` (0–16,
+default 16). Use `coverage` for the separate issued and unissued query counts.
+
+```powershell
+$report = python -I -B tools/replay-wait-chain.py $file --sha256 $pin --investigate --max-views 16 | ConvertFrom-Json
+$claim = $report.hypotheses | Where-Object { $_.verdict -in @('supported', 'refuted') } | Select-Object -First 1
+if ($null -ne $claim) {
+    $ids = @(foreach ($group in $claim.required_evidence_groups) { $group[0] })
+    $proposal = [ordered]@{
+        schema = 'kn.wait_claim_proposal.v1'
+        policy = $report.policy
+        receipt_sha256 = $pin
+        target = $report.target
+        claims = @(@{ claim = $claim.claim; verdict = $claim.verdict; evidence_ids = $ids })
+    }
+    $proposal | ConvertTo-Json -Depth 8 -Compress | python -I -B tools/replay-wait-chain.py $file --sha256 $pin --check-claims
+}
+```
+
+The example submits a claim only when replay found decisive witnesses. Supply
+a UTF-8 proposal of up to 32 KiB on standard input. It can contain up to six
+distinct claims, each with 1–32 distinct evidence IDs. The checker verifies each
+proposed `supported` or `refuted` verdict against the original file. It reports
+the reason for each rejection, including a missing witness or a citation from
+another observation. A different file digest, target generation, policy, extra
+field or unknown claim makes the proposal invalid. No proposal field selects a
+command, file or provider.
+
+Exit 0 means the plan was evaluated and every submitted claim passed. An
+investigation without proposals can finish with all six hypotheses inconclusive.
+Exit 1 means the view budget was insufficient or a claim failed verification.
+Exit 2 indicates invalid input or an input/output file collision. Exit 3 indicates
+a report write failure. Keep captures, proposals and reports private.
+[Evidence semantics](ARCHITECTURE.md#evidence-checked-wait-investigations)
+
 ## Session and memory
 
 Current main starts with the native mutation gate off. Use `write on` explicitly
