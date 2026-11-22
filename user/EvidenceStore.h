@@ -98,6 +98,8 @@ struct EvidenceStorePageOptions
     bool Retention = false;
     bool ScanCatalog = false;
     std::wstring ScanReceipt;
+    bool ScanFiles = false;
+    std::wstring FileReceipt;
 };
 bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page);
 std::wstring QueryEvidenceStore(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,

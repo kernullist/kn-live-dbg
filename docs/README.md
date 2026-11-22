@@ -7,6 +7,10 @@ offline investigation and the subsequent reference/TI queue changes belong to
 main; consult the release notes for shipped behavior. This documentation update
 does not repeat or renew the binary-specific tests in [validation status](VALIDATION.md).
 
+On current main, a stopped evidence store can resume journal checks by
+collection and physical reads by file offset. The [file scan validation](VALIDATION.md#resumable-physical-file-reads-on-2026-11-23)
+records the tested read budget, interruption behavior and remaining limits.
+
 ## Operation
 
 | Guide | Contents |

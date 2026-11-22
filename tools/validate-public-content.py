@@ -148,9 +148,11 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"plan_line_sha256"', '"native_calls"', '"waiting_samples"', '"sample_slot"', '"waiting_inside_call_samples"',
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
-STORE_SCAN_MARKERS = ("kn.store_catalog_scan.v1", "kncs1.", "kncr1.")
-STORE_SCAN_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_catalog_scan\.v1"|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}')
-STORE_RETENTION_MARKERS = ('"namespace_sha256"', '"next_scan_cursor"', '"scan_receipt"', '"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
+STORE_SCAN_MARKERS = ("kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kncs1.", "kncr1.", "knfs1.", "knfr1.")
+STORE_SCAN_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_(?:catalog|file)_scan\.v1"|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}'
+                               r'|\bknf[sr]1\.[0-9]{1,5}\.[0-9]{1,10}\.[0-9a-f]{32,64}')
+STORE_RETENTION_MARKERS = ('"file_namespace_sha256"', '"next_file_cursor"', '"file_receipt"', '"block_sha256"',
+                           '"namespace_sha256"', '"next_scan_cursor"', '"scan_receipt"', '"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
                            '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"',
                            '"next_artifact_cursor"', '"artifact_page_status"', '"routine_paths"', '"routine_named_byte_target"',
@@ -162,6 +164,7 @@ STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
     ("retired_collections", "retired_original_matched"), ("retired_collection_id", "retirement_sha256"),
     ("exclusive_nonledger", "shared_nonledger", "failure_ledgers"), ("collection_id", "head_sha256", "exclusive_byte_limit"),
     ("namespace_sha256", "namespace_entries"), ("next_scan_cursor", "scan_receipt"),
+    ("file_namespace_sha256", "namespace_entries"), ("next_file_cursor", "file_receipt"), ("file_offset", "block_sha256"),
     ("artifact_row_offset", "next_artifact_cursor"), ("artifact_page_status", "artifact_rows_remaining"),
     ("collection_id", "routine_paths", "exclusive_routine_bytes"), ("routine_named_bytes_before", "routine_named_bytes_after"),
     ("routine_named_byte_target", "exclusive_byte_limit", "catalog_sha256")))

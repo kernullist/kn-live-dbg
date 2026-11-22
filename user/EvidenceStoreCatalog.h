@@ -9,12 +9,18 @@
 
 namespace store_catalog
 {
+    using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
+    bool IsDigest(const std::wstring& value);
+    std::wstring Hash(const std::wstring& text);
+    Handle OpenAttributes(const std::filesystem::path& path, DWORD sharing);
+    std::wstring Identity(HANDLE handle, bool directory);
+    std::wstring NativePath(std::filesystem::path path);
     constexpr size_t MaxEntries = 16384, MaxWindow = 1024;
     struct Names
     {
         std::vector<std::wstring> Entries;
         std::wstring Digest;
-        std::unique_ptr<void, decltype(&CloseHandle)> Directory{nullptr, &CloseHandle};
+        Handle Directory{nullptr, &CloseHandle};
     };
     // Caller owns the exclusive store lease and supplies its extended local root.
     bool ReadNames(const std::filesystem::path& root, uint64_t started, uint64_t deadlineMs, Names& result, std::wstring& issue);

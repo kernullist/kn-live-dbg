@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Resumable physical file reads on 2026-11-23
+
+In a stopped test store, 513 ledger paths were hard links to one 2 MiB file.
+The preceding x64 Release CLI (`ac1a6b4fd321`) enumerated all the paths,
+read 1,073,741,824 bytes, left one path unverified
+and returned a partial inventory. The updated CLI (`f2eb6acd7097`)
+resumed inside files across processes. Using its terminal file receipt,
+the full inventory read 1,075,838,976 bytes, verified all 513 paths and
+reported the same total in verified unattributed bytes. These are named
+bytes. The fixture used a single file allocation.
+
+An independent Python oracle read the native file identities, original byte
+ranges and gap entries. It reconstructed each namespace, block digest, cursor
+and terminal receipt. A lock on an earlier block allowed the next block of
+the same file to be read. Full verification failed until the lock was
+released. An in-place, same-size rewrite passed the namespace check after
+its timestamps were restored and failed the final byte comparison. Other controls
+covered an interrupted reader after a confirmed block read, replaced files, reparse points, unknown
+formats, malformed receipts, combined catalog and file receipts, retention
+and artifact detail pagination.
+
+One review case restored a retired original after the full inventory had
+counted its path as absent. The initial implementation returned a partial
+inventory with an absence count of one. The corrected CLI reported zero
+absent and moved the path to the unobserved count when the namespace changed.
+
+The product CLI passed 193 file scan checks. The ASan harness
+(`18474d0ff8c4`) passed 115 checks on the smaller cases. Its default
+Windows interceptor failed at startup on this host. The instrumented run
+used `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and `halt_on_error=1`.
+Coverage excludes the failed intercept. The 8 GiB aggregate budget, path
+and reference limits, per-journal limits and cooperative deadline still
+apply. The large test uses `--large --cli` with separate product and
+producer executables. [File scan oracle](../tools/test-store-file-scan.py)
+
+The same Release CLI passed 168 collection-catalog checks, 2,152 journal,
+553 store, 400 IRP journal, 898 GC, 219 retirement and 104 retention-budget
+checks. The native journal self-test passed 77 checks. The public-content
+scanner passed 43 tests. It accepted the product binary and flagged 12
+exports of actual pages, detached ranges, cursors and receipts across UTF-8
+and both UTF-16 byte orders. The generated support matrix matched 67 compiled
+contracts and 261 command routes. The console suite passed all 570 checks
+with its owned process fixture. The separately linked image recipe harness
+passed 121 recipe checks and 103 mapping checks.
+
 ## Resumable collection catalog verification on 2026-11-23
 
 The preceding x64 Release CLI (`f73c7a2c6b97`) returned

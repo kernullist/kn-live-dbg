@@ -55,6 +55,15 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Resume a kn.store_catalog_scan.v1 window with its cursor."))
 
+    def test_store_file_ranges_and_positions(self):
+        samples = [json.dumps(dict(schema="kn.store_file_scan.v1")), json.dumps(dict(next_file_cursor="", file_receipt="held")),
+                   json.dumps(dict(file_offset="0", block_sha256="held")), json.dumps(dict(file_namespace_sha256="held", namespace_entries="3")),
+                   "knfs1.0.65536." + "b" * 64, "knfr1.13.0." + "c" * 33]
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", sample.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Use the kn.store_file_scan.v1 schema."))
+
     def test_detached_store_retention(self):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
                 dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),

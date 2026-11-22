@@ -157,6 +157,7 @@
     <ClCompile Include="EvidenceInventory.cpp" />
     <ClCompile Include="EvidenceJournal.cpp" />
     <ClCompile Include="EvidenceStoreCatalog.cpp" />
+    <ClCompile Include="EvidenceStoreFiles.cpp" />
     <ClCompile Include="CollectionRetentionBudget.cpp" />
     <ClCompile Include="ImageArchiveDependencies.cpp" />
     <ClCompile Include="EvidencePrivacy.cpp" />
@@ -292,6 +293,7 @@
     <ClInclude Include="TemporalFactStore.h" />
     <ClInclude Include="EvidenceStore.h" />
     <ClInclude Include="EvidenceStoreCatalog.h" />
+    <ClInclude Include="EvidenceStoreFiles.h" />
     <ClInclude Include="CollectionRetentionBudget.h" />
     <ClInclude Include="EvidenceRetention.h" />
     <ClInclude Include="ImageRetentionPolicy.h" />

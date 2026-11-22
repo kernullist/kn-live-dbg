@@ -6,46 +6,48 @@
 namespace store_catalog
 {
     namespace fs = std::filesystem;
-    namespace
+    bool IsDigest(const std::wstring& value)
+    { return value.size() == 64 && value.find_first_not_of(L"0123456789abcdef") == std::wstring::npos; }
+
+    std::wstring Hash(const std::wstring& text)
     {
-        using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
+        const auto bytes = mcpjson::WideToUtf8(text);
+        ContentHash hash;
+        return hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : L"";
+    }
 
-        bool IsDigest(const std::wstring& value)
-        { return value.size() == 64 && value.find_first_not_of(L"0123456789abcdef") == std::wstring::npos; }
+    Handle OpenAttributes(const fs::path& path, DWORD sharing)
+    {
+        const auto file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, sharing, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        return Handle(file == INVALID_HANDLE_VALUE ? nullptr : file, &CloseHandle);
+    }
 
-        std::wstring Hash(const std::wstring& text)
+    std::wstring Identity(HANDLE handle, bool directory)
+    {
+        FILE_ATTRIBUTE_TAG_INFO attributes{};
+        FILE_ID_INFO id{};
+        FILETIME created{};
+        if (!handle || GetFileType(handle) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
+            (directory && ((attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))) ||
+            !GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id)) || !GetFileTime(handle, &created, nullptr, nullptr)) { return {}; }
+        std::wstring key = std::to_wstring(id.VolumeSerialNumber) + L":";
+        for (const auto byte : id.FileId.Identifier)
         {
-            const auto bytes = mcpjson::WideToUtf8(text);
-            ContentHash hash;
-            return hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : L"";
+            key.push_back(L"0123456789abcdef"[byte >> 4]);
+            key.push_back(L"0123456789abcdef"[byte & 15]);
         }
+        return key + L":" + std::to_wstring((uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime) +
+            L":" + std::to_wstring(attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) +
+            L":" + std::to_wstring((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? attributes.ReparseTag : 0);
+    }
 
-        Handle OpenAttributes(const fs::path& path, DWORD sharing)
-        {
-            const auto file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, sharing, nullptr, OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-            return Handle(file == INVALID_HANDLE_VALUE ? nullptr : file, &CloseHandle);
-        }
-
-        std::wstring Identity(HANDLE handle, bool directory)
-        {
-            FILE_ATTRIBUTE_TAG_INFO attributes{};
-            FILE_ID_INFO id{};
-            FILETIME created{};
-            if (!handle || GetFileType(handle) != FILE_TYPE_DISK ||
-                !GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-                (directory && ((attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))) ||
-                !GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id)) || !GetFileTime(handle, &created, nullptr, nullptr)) { return {}; }
-            std::wstring key = std::to_wstring(id.VolumeSerialNumber) + L":";
-            for (const auto byte : id.FileId.Identifier)
-            {
-                key.push_back(L"0123456789abcdef"[byte >> 4]);
-                key.push_back(L"0123456789abcdef"[byte & 15]);
-            }
-            return key + L":" + std::to_wstring((uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime) +
-                L":" + std::to_wstring(attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) +
-                L":" + std::to_wstring((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? attributes.ReparseTag : 0);
-        }
+    std::wstring NativePath(fs::path path)
+    {
+        // Store leases admit only normalized local paths. Extended paths need native separators.
+        path.make_preferred();
+        return L"\\\\?\\" + path.wstring();
     }
 
     bool ReadNames(const fs::path& root, uint64_t started, uint64_t deadlineMs, Names& result, std::wstring& issue)

@@ -1,6 +1,7 @@
 #include "EvidenceJournal.h"
 #include "EvidenceStore.h"
 #include "EvidenceStoreCatalog.h"
+#include "EvidenceStoreFiles.h"
 #include "EvidenceRetention.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
@@ -23,24 +24,18 @@ namespace fs = std::filesystem;
 namespace
 {
     constexpr uint64_t MaxSegments = 8192, MaxPaths = 16384, MaxReferences = 65536;
-    constexpr uint64_t MaxReadBytes = 1024ull * 1024 * 1024, MaxJsonBytes = 2 * 1024 * 1024;
-    constexpr uint64_t MaxBlobBytes = 64 * 1024 * 1024, DeadlineMs = 120000;
-    constexpr uint64_t MaxIrpBytes = 16 * 1024 * 1024;
-    constexpr uint64_t StoreMaxCollections = 1024, StoreMaxPaths = 65536, StoreMaxReferences = 262144;
+    constexpr uint64_t MaxReadBytes = 1024ull * 1024 * 1024;
+    using store_files::MaxJsonBytes;
+    using store_files::MaxBlobBytes;
+    using store_files::DeadlineMs;
+    using store_files::MaxIrpBytes;
+    constexpr uint64_t StoreMaxCollections = 1024, StoreMaxPaths = store_files::MaxEntries, StoreMaxReferences = 262144;
     constexpr uint64_t StoreMaxReadBytes = 8ull * 1024 * 1024 * 1024;
     using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
     uint64_t FileTimeValue(FILETIME time);
     uint64_t CurrentFileTime();
     Handle Own(HANDLE handle) { return Handle(handle == INVALID_HANDLE_VALUE ? nullptr : handle, &CloseHandle); }
-    // Only internally constructed, normalized local DOS paths reach this
-    // helper, after PinDirectory rejects device/UNC/reparse components. Do not
-    // depend on a host manifest or registry switch for temporary-file lengths.
-    std::wstring NativePath(const fs::path& path)
-    {
-        auto preferred = path;
-        preferred.make_preferred(); // Extended paths do not translate forward slashes.
-        return L"\\\\?\\" + preferred.wstring();
-    }
+    using store_catalog::NativePath;
     std::wstring Hash(const std::wstring& text)
     {
         const auto bytes = mcpjson::WideToUtf8(text);
@@ -464,6 +459,8 @@ struct EvidenceJournal::Impl
     uint64_t* SharedReadBytes = nullptr;
     uint64_t* SharedReferences = nullptr;
     const wchar_t* SharedBudgetIssue = nullptr;
+    store_files::Snapshot* PhysicalSnapshot = nullptr;
+    uint64_t ReadBudget = MaxReadBytes;
     std::map<std::wstring, EvidenceJournalMember> Members;
     std::map<std::wstring, std::wstring> ImagePayloads;
     std::map<std::wstring, uint64_t> ContentSizes;
@@ -531,7 +528,7 @@ struct EvidenceJournal::Impl
         return true;
     }
     bool Read(const fs::path& path, uint64_t maximum, Handle* owner, std::wstring* digest, uint64_t* size, std::wstring* json = nullptr,
-        DWORD additionalAccess = 0)
+        DWORD additionalAccess = 0, const std::wstring* physicalName = nullptr)
     {
         if (!PinDirectory(path.parent_path(), false) || !Timely()) { return false; }
         auto file = Own(CreateFileW(NativePath(path).c_str(), GENERIC_READ | additionalAccess, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -545,11 +542,23 @@ struct EvidenceJournal::Impl
             { return Fail(L"file_missing_invalid_or_locked"); }
         if (AdmitOutput && !AdmitOutput(file.get())) { return Fail(L"private_file_admission_failed"); }
         *size = uint64_t(length.QuadPart);
-        if (*size > MaxReadBytes - Result.ReadBytes) { return Fail(L"read_budget_exhausted"); }
+        if (*size > ReadBudget - Result.ReadBytes)
+        {
+            if (ReadBudget == StoreMaxReadBytes) { SharedBudgetIssue = L"store_read_budget_exhausted"; return Fail(SharedBudgetIssue); }
+            return Fail(L"read_budget_exhausted");
+        }
         if (SharedReadBytes != nullptr && *size > StoreMaxReadBytes - *SharedReadBytes)
             { SharedBudgetIssue = L"store_read_budget_exhausted"; return Fail(SharedBudgetIssue); }
+        store_files::Entry* entry = nullptr;
+        std::wstring chunks;
+        if (PhysicalSnapshot && physicalName)
+        {
+            entry = PhysicalSnapshot->Match(*physicalName, file.get());
+            if (!entry) { return Fail(L"store_file_identity_mismatch"); }
+            chunks = store_files::StartChunks(*size);
+        }
         ContentHash hash;
-        uint8_t buffer[65536];
+        uint8_t buffer[store_files::BlockBytes];
         std::string bytes;
         if (json != nullptr) { bytes.reserve(static_cast<size_t>(*size)); }
         uint64_t remaining = *size;
@@ -562,11 +571,17 @@ struct EvidenceJournal::Impl
             Result.ReadBytes += received;
             if (SharedReadBytes != nullptr) { *SharedReadBytes += received; }
             if (!read || received != count || !hash.Add(buffer, received)) { return Fail(L"file_read_failed_or_timed_out"); }
+            if (entry && !store_files::AppendChunk(chunks, *size - remaining, buffer, received)) { return Fail(L"store_file_hash_failed"); }
             if (json != nullptr) { bytes.append(reinterpret_cast<const char*>(buffer), received); }
             remaining -= received;
         }
         *digest = hash.Finish();
         if (!Digest(*digest)) { return Fail(L"file_hash_failed"); }
+        if (entry)
+        {
+            if (!entry->ObservedChunks.empty() && entry->ObservedChunks != chunks) { return Fail(L"store_file_bytes_changed"); }
+            entry->ObservedChunks = std::move(chunks);
+        }
         if (json != nullptr)
         {
             *json = mcpjson::Utf8ToWide(bytes);
@@ -773,7 +788,7 @@ struct EvidenceJournal::Impl
             Handle file{nullptr, &CloseHandle};
             std::wstring digest, json, schema;
             uint64_t size = 0;
-            if (!Read(Root / m.Path, m.Bytes, &file, &digest, &size, m.Schema == L"raw.bytes" ? nullptr : &json)) { return false; }
+            if (!Read(Root / m.Path, m.Bytes, &file, &digest, &size, m.Schema == L"raw.bytes" ? nullptr : &json, 0, &m.Path)) { return false; }
             if (digest != m.Sha256 || size != m.Bytes) { return Fail(L"member_hash_or_size_mismatch"); }
             if (m.Schema != L"raw.bytes" && (!mcpjson::GetString(json, L"schema", &schema) || schema != m.Schema))
                 { return Fail(L"member_schema_mismatch"); }
@@ -1271,7 +1286,8 @@ struct EvidenceStoreAccess
 {
     static EvidenceStoreInventory Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
         const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action,
-        bool retention = false, const std::wstring& scanReceipt = {});
+        bool retention = false, const std::wstring& scanReceipt = {}, const std::wstring& fileReceipt = {},
+        const std::function<void(const wchar_t*)>& observer = {});
     static bool ReadCollection(EvidenceJournal::Impl& reader, const fs::path& root, const std::wstring& id);
     static std::wstring ScanCatalog(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
         const std::function<void(const wchar_t*)>& observer);
@@ -1306,7 +1322,7 @@ std::wstring EvidenceStoreAccess::ScanCatalog(const std::wstring& rootPath, cons
     };
     const auto fail = [&](const std::wstring& issue, uint64_t readBytes = 0)
         { return report(L"unavailable", issue, L"", 0, 0, 0, readBytes, L"[]", L"", L""); };
-    if (page.Artifacts || page.Retention || !page.ScanReceipt.empty() || page.Limit > store_catalog::MaxWindow || page.Cursor.size() > 150)
+    if (page.ScanFiles || page.Artifacts || page.Retention || !page.ScanReceipt.empty() || !page.FileReceipt.empty() || page.Limit > store_catalog::MaxWindow || page.Cursor.size() > 150)
         { return fail(L"invalid_store_scan_options"); }
     uint64_t bytes = 0;
     try
@@ -1358,17 +1374,32 @@ std::wstring EvidenceStoreAccess::ScanCatalog(const std::wstring& rootPath, cons
 
 EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
     const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action,
-    bool retention, const std::wstring& scanReceipt)
+    bool retention, const std::wstring& scanReceipt, const std::wstring& fileReceipt, const std::function<void(const wchar_t*)>& observer)
 {
     EvidenceStoreInventory out;
     out.StartedTick = GetTickCount64();
-    const auto finish = [&]() { out.EndedTick = GetTickCount64(); return out; };
+    const auto finish = [&]()
+    {
+        if (!out.ArtifactInventoryComplete)
+        {
+            out.RetiredUnobservedPaths += out.RetiredAbsentPaths;
+            out.RetiredAbsentPaths = 0;
+        }
+        out.EndedTick = GetTickCount64();
+        return out;
+    };
     try
     {
         EvidenceStoreLease barrier;
         if (!barrier.Acquire(artifactRoot, true, &out.Issue)) { return finish(); }
         const auto root = fs::absolute(artifactRoot).lexically_normal();
         const auto collections = root / L"collections";
+        store_files::Snapshot physical;
+        if (!fileReceipt.empty())
+        {
+            if (!physical.Open(NativePath(root), out.StartedTick, out.Issue)) { return finish(); }
+            if (!physical.Accepts(fileReceipt)) { out.Issue = L"store_file_receipt_mismatch"; return finish(); }
+        }
         EvidenceJournal namespaceOwner; // Keep catalog ancestors pinned through the entire inventory.
         std::error_code ec;
         std::set<std::wstring> ids;
@@ -1418,11 +1449,12 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             auto journal = std::make_unique<EvidenceJournal>();
             auto& d = *journal->Data;
             d.InspectPriority = retention;
+            d.PhysicalSnapshot = fileReceipt.empty() ? nullptr : &physical;
             d.Started = out.StartedTick;
             d.SharedMembers = &cache; d.SharedReadBytes = &out.ReadBytes; d.SharedReferences = &references;
             d.StoreIrpCatalogs = &irpCatalogs;
             const bool ok = ReadCollection(d, root, id);
-            if (!scanReceipt.empty() && (d.SharedBudgetIssue || GetTickCount64() - out.StartedTick > DeadlineMs))
+            if ((!scanReceipt.empty() || !fileReceipt.empty()) && (d.SharedBudgetIssue || GetTickCount64() - out.StartedTick > DeadlineMs))
                 { out.Issue = d.SharedBudgetIssue ? d.SharedBudgetIssue : L"deadline_exhausted"; return finish(); }
             if (!ok)
             {
@@ -1510,6 +1542,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         EvidenceJournal physicalReader;
         auto& reader = *physicalReader.Data;
         reader.Started = out.StartedTick; reader.SharedReadBytes = &out.ReadBytes;
+        if (!fileReceipt.empty()) { reader.PhysicalSnapshot = &physical; reader.ReadBudget = StoreMaxReadBytes; }
         bool physicalComplete = true;
         std::map<std::wstring, ApprovalInputs> approvalCatalogs;
         bool unreadableDirectApproval = false, unreadableScopedApproval = false;
@@ -1517,7 +1550,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         bool unknownImageReference = false, unknownSweepInputs = false;
         std::set<std::wstring> observed;
         uint64_t rootEntries = 0;
-        for (const auto& folder : {L"image-reads", L"image-references", L"image-sweeps", L"image-captures", L"image-approvals", L"image-scope-inputs", L""})
+        for (const auto folder : store_files::Folders)
         {
             const auto directory = root / folder;
             const auto attr = GetFileAttributesW(NativePath(directory).c_str());
@@ -1532,10 +1565,9 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 {
                     if (++rootEntries > StoreMaxPaths || GetTickCount64() - out.StartedTick > DeadlineMs)
                         { physicalComplete = false; out.Issue = L"store_root_enumeration_budget_exhausted"; break; }
-                    const auto ext = fs::path(name).extension().wstring();
                     // Only the reserved IRP root namespace belongs to this inventory.
                     // Unknown names and pending files inside it remain protected.
-                    if (!IrpPath(name) && ext != L".knirp" && ext != L".knirpledger") { continue; }
+                    if (!store_files::ReservedRootName(name)) { continue; }
                 }
                 if (out.ObservedArtifactFiles == StoreMaxPaths || GetTickCount64() - out.StartedTick > DeadlineMs)
                     { physicalComplete = false; out.Issue = L"store_artifact_budget_exhausted"; break; }
@@ -1549,24 +1581,15 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 EvidenceStoreArtifact a;
                 a.Artifact.Path = relative;
                 const auto extension = fs::path(relative).extension().wstring();
-                const bool blob = extension == L".knblob" && (std::wstring(folder) == L"image-references" || irpRoot);
-                const bool json = (std::wstring(folder) == L"image-reads" &&
-                    (extension == L".knreads" || extension == L".knslice" || extension == L".knreadledger")) ||
-                    (std::wstring(folder) == L"image-sweeps" && extension == L".knsweep") ||
-                    (std::wstring(folder) == L"image-captures" && (extension == L".kncapture" || extension == L".kncaptureledger")) ||
-                    (std::wstring(folder) == L"image-scope-inputs" && extension == L".knscopeblob") ||
-                    (std::wstring(folder) == L"image-approvals" && (extension == L".knapprovalcase" || extension == L".knapprovalledger" ||
-                        extension == L".knapproval" || extension == L".knchange" || extension == L".knscopeapproval" || extension == L".knscopeledger")) ||
-                    (irpRoot && (extension == L".knirp" || extension == L".knirpledger"));
+                const auto format = store_files::FileFormat(folder, extension);
+                const bool blob = format.Blob;
                 Handle lease{nullptr, &CloseHandle};
                 std::wstring text;
-                if (blob || json)
+                if (format.Maximum)
                 {
-                    a.Verified = reader.Read(root / relative, blob ? MaxBlobBytes : irpRoot && extension == L".knirp" ? MaxIrpBytes :
-                        extension == L".knscopeapproval" ? ImageScopeApprovalPublicationMaxBytes :
-                        extension == L".kncapture" ? DirectImageCaptureMaxBytes : extension == L".knapprovalcase" ? ImageApprovalPublicationMaxBytes :
-                        (extension == L".knapproval" || extension == L".knchange") ? ImageApprovalInputMaxBytes : MaxJsonBytes, &lease,
-                        &a.Artifact.Sha256, &a.Artifact.Bytes, json ? &text : nullptr, deletionPaths.count(relative) ? DELETE : 0);
+                    const auto source = fileReceipt.empty() ? root / relative : directory / it->path().filename();
+                    a.Verified = reader.Read(source, format.Maximum, &lease, &a.Artifact.Sha256, &a.Artifact.Bytes,
+                        blob ? nullptr : &text, deletionPaths.count(relative) ? DELETE : 0, &relative);
                     if (blob) { a.Artifact.Schema = L"raw.bytes"; }
                     else { mcpjson::GetString(text, L"schema", &a.Artifact.Schema); }
                     a.Verified = a.Verified && (blob || ApprovalInputPath(relative) || ScopeInputPath(relative) || Id(MemberCollection(relative))) && MemberValid(a.Artifact, MemberCollection(relative));
@@ -1749,6 +1772,11 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         }
         if (artifacts.size() + missingRetiredPaths > StoreMaxPaths)
             { physicalComplete = false; out.Issue = L"store_retired_path_budget_exhausted"; }
+        if (!fileReceipt.empty() && !physical.Verified(fileReceipt))
+        {
+            physicalComplete = false;
+            if (out.Issue.empty()) { out.Issue = reader.SharedBudgetIssue ? reader.SharedBudgetIssue : L"store_file_bytes_mismatch"; }
+        }
         out.ArtifactInventoryComplete = physicalComplete;
         ContentHash artifactHash;
         const auto hashText = [&](const std::wstring& text)
@@ -1787,6 +1815,17 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 out.Status = L"partial"; out.CatalogComplete = out.MembershipComplete = out.ArtifactInventoryComplete = false;
                 out.Budget.Observed = 0;
                 out.Issue = issue.empty() ? L"store_scan_namespace_changed" : std::move(issue);
+            }
+        }
+        if (!fileReceipt.empty())
+        {
+            if (observer) { observer(L"file_inventory_hashed"); }
+            store_files::Snapshot after;
+            std::wstring issue;
+            if (!after.Open(NativePath(root), out.StartedTick, issue) || after.Digest != physical.Digest)
+            {
+                out.Status = L"partial"; out.ArtifactInventoryComplete = false; out.Budget.Observed = 0;
+                out.Issue = issue.empty() ? L"store_file_namespace_changed" : std::move(issue);
             }
         }
         if (action) { action(out, root, reader); }
@@ -1843,10 +1882,14 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
         if (key == L"/artifacts" && !parsed.Artifacts) { parsed.Artifacts = true; }
         else if (key == L"/retention" && !parsed.Retention) { parsed.Retention = true; }
         else if (key == L"/scan-catalog" && !parsed.ScanCatalog) { parsed.ScanCatalog = true; }
-        else if (key == L"/scan-receipt" && parsed.ScanReceipt.empty() && ++i < options.size())
+        else if (key == L"/scan-files" && !parsed.ScanFiles) { parsed.ScanFiles = true; }
+        else if (key == L"/scan-receipt" || key == L"/file-receipt")
         {
-            parsed.ScanReceipt = options[i];
-            if (parsed.ScanReceipt.empty() || parsed.ScanReceipt.size() > 150 || parsed.ScanReceipt.front() == L'/') { return false; }
+            const bool files = key == L"/file-receipt";
+            auto& value = files ? parsed.FileReceipt : parsed.ScanReceipt;
+            if (!value.empty() || ++i == options.size()) { return false; }
+            value = options[i];
+            if (value.empty() || value.size() > (files ? 234u : 150u) || value.front() == L'/') { return false; }
         }
         else if (key == L"/json" && !json) { json = true; }
         else if (key == L"/limit" && !parsed.Limit && ++i < options.size())
@@ -1859,13 +1902,16 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
         else if (key == L"/cursor" && parsed.Cursor.empty() && ++i < options.size())
         {
             parsed.Cursor = options[i];
-            if (parsed.Cursor.empty() || parsed.Cursor.size() > 150 || parsed.Cursor.front() == L'/') { return false; }
+            if (parsed.Cursor.empty() || parsed.Cursor.size() > 234 || parsed.Cursor.front() == L'/') { return false; }
         }
         else { return false; }
     }
-    if (parsed.ScanCatalog && (parsed.Artifacts || parsed.Retention || !parsed.ScanReceipt.empty() || parsed.Limit > store_catalog::MaxWindow))
-        { return false; }
-    if (!parsed.ScanCatalog && (parsed.Cursor.size() > 80 || (!parsed.Artifacts && (parsed.Limit || !parsed.Cursor.empty())))) { return false; }
+    if (parsed.ScanCatalog || parsed.ScanFiles)
+    {
+        if ((parsed.ScanCatalog && parsed.ScanFiles) || parsed.Artifacts || parsed.Retention || !parsed.ScanReceipt.empty() || !parsed.FileReceipt.empty() ||
+            parsed.Limit > (parsed.ScanFiles ? store_files::MaxWindow : store_catalog::MaxWindow) || (parsed.ScanCatalog && parsed.Cursor.size() > 150)) { return false; }
+    }
+    else if (parsed.Cursor.size() > 80 || (!parsed.Artifacts && (parsed.Limit || !parsed.Cursor.empty()))) { return false; }
     *page = std::move(parsed);
     return true;
 }
@@ -1873,8 +1919,9 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
 std::wstring QueryEvidenceStore(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
     const std::function<void(const wchar_t*)>& observer)
 {
+    if (page.ScanFiles) { return store_files::Scan(root, page, ready, observer); }
     if (page.ScanCatalog) { return EvidenceStoreAccess::ScanCatalog(root, page, ready, observer); }
-    const auto inventory = EvidenceStoreAccess::Inspect(root, {}, {}, page.Retention, page.ScanReceipt);
+    const auto inventory = EvidenceStoreAccess::Inspect(root, {}, {}, page.Retention, page.ScanReceipt, page.FileReceipt, observer);
     return EvidenceStoreInventoryJson(inventory, page, ready);
 }
 

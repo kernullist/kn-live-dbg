@@ -23132,8 +23132,8 @@ static void PrintKmonHelp()
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
     std::wcout << L"  !kmon replay-irp <capture.knirp> [/current] [/json]  original claim reproduction; /current evaluates current claims only\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
-    std::wcout << L"  !kmon store <artifact-root> /scan-catalog [/limit 1..1024] [/cursor token] [/json]\n";
-    std::wcout << L"  !kmon store <artifact-root> [/scan-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
+    std::wcout << L"  !kmon store <artifact-root> /scan-catalog|/scan-files [/limit 1..1024] [/cursor token] [/json]\n";
+    std::wcout << L"  !kmon store <artifact-root> [/scan-receipt token] [/file-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
     std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
@@ -23970,11 +23970,11 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
     if (action == L"store")
     {
         EvidenceStorePageOptions page;
-        if (args.size() < 3 || args.size() > 12 || args[2].empty() ||
+        if (args.size() < 3 || args.size() > 14 || args[2].empty() ||
             !ParseEvidenceStorePageOptions({args.begin() + 3, args.end()}, &page))
         {
-            std::wcerr << L"usage: !kmon store <artifact-root> [/scan-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
-            std::wcerr << L"       !kmon store <artifact-root> /scan-catalog [/limit 1..1024] [/cursor token] [/json]\n";
+            std::wcerr << L"usage: !kmon store <artifact-root> [/scan-receipt token] [/file-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
+            std::wcerr << L"       !kmon store <artifact-root> /scan-catalog|/scan-files [/limit 1..1024] [/cursor token] [/json]\n";
             return 2;
         }
         bool ready = false;

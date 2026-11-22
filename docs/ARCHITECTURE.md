@@ -540,11 +540,37 @@ A previous window can still be historical when an original changes. Final
 revalidation then fails. These checks apply to participating publishers and
 observed identities. A receipt grants no deletion authority.
 
-The default inventory, retirement and GC allow 1,024 catalog entries. Both
+The physical scanner uses the same managed image folders, reserved IRP names
+and per-format size limits as the inventory. With `/scan-files` it orders the
+paths, reads fixed 64 KiB blocks and reports the offset, actual length and
+SHA-256 of each block. The last block can be shorter. An unsupported name,
+nonregular entry or out-of-format size consumes one position and produces a
+gap row. A read error withholds the checkpoint for the entire window.
+
+Each window pins the store directories and checks the namespace before and
+after reading. Its digest covers directory presence and identity, exact entry
+names, volume and file identity, creation, change and write times, entry
+type and length. The private cursor carries the index, byte offset and running
+digests of the completed paths and current file's blocks. A new process seeks
+directly to that offset. The cursor checksum detects mismatched positions and
+namespaces. Anyone with the fields can recompute it.
+
+The terminal file receipt can accompany a catalog receipt, retention query or
+artifact detail page. Under one exclusive lease the inventory checks the range
+hashes as it reads journal members and loose files for its ordinary whole-file
+SHA-256 and schema checks. It compares the full ordered chain and checks the
+namespace again before reporting completion. Forged history or changed bytes
+cannot produce a verified inventory even when the recorded file metadata
+matches. A late namespace change moves previously absent retired paths into
+the unobserved count. Ownership, deduplication and retention come from the
+original journals and the full inventory. The page reports historical ranges and gaps.
+
+The default inventory, retirement and GC allow 1,024 catalog entries. Full
 inventory modes bound work to 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
-Existing per-collection bounds remain; the separate unattributed-file reader is
-also limited to 1 GiB. Root enumeration has a separate 65,536-entry cap, including
+The unattributed-file reader ordinarily stops at 1 GiB. When revalidating a
+physical file receipt it draws on the same aggregate 8 GiB as the journals.
+Each journal keeps its 1 GiB read limit. Root enumeration has a separate 65,536-entry cap, including
 entries outside the reserved IRP namespace. The shared 120-second deadline is cooperative between
 synchronous operations. Exhaustion yields partial/unavailable status; separate
 flags distinguish verified journal membership from an incomplete artifact scan.

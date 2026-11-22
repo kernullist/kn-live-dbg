@@ -495,18 +495,18 @@ int wmain(int argc, wchar_t** argv)
         {
             std::vector<std::wstring> flags(argv + 3, argv + argc);
             if (std::none_of(flags.begin(), flags.end(), [](const auto& flag) {
-                return _wcsicmp(flag.c_str(), L"/scan-catalog") == 0 || _wcsicmp(flag.c_str(), L"/artifacts") == 0;
+                return _wcsicmp(flag.c_str(), L"/scan-catalog") == 0 || _wcsicmp(flag.c_str(), L"/scan-files") == 0 || _wcsicmp(flag.c_str(), L"/artifacts") == 0;
             })) { flags.emplace_back(L"/artifacts"); }
             EvidenceStorePageOptions page;
             if (!ParseEvidenceStorePageOptions(flags, &page)) { return 2; }
             bool ready = false;
             bool hold = std::wstring(argv[1]) == L"--hold-scan";
-            if (hold && !page.ScanCatalog) { return 2; }
-            const auto output = QueryEvidenceStore(argv[2], page, &ready, [&](const wchar_t*)
+            if (hold && !page.ScanCatalog && !page.ScanFiles && page.FileReceipt.empty()) { return 2; }
+            const auto output = QueryEvidenceStore(argv[2], page, &ready, [&](const wchar_t* stage)
             {
                 if (!hold) { return; }
                 hold = false;
-                std::cout << "[journal.stage] collection_scanned" << std::endl;
+                std::cout << "[journal.stage] " << mcpjson::WideToUtf8(stage) << std::endl;
                 std::string input;
                 if (!std::getline(std::cin, input) || input != "continue") { ExitProcess(91); }
             });

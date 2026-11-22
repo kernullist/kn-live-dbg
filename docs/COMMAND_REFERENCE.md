@@ -233,10 +233,23 @@ the next call. After an interruption, retry the last acknowledged cursor. On
 Each row reports its own closure, unresolved input or retirement. The page
 status describes progress through the catalog.
 
-`KnLiveDbg.exe --offline !kmon store <artifact-root> [/scan-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
+`KnLiveDbg.exe --offline !kmon store <artifact-root> /scan-files [/limit 1..1024] [/cursor token] [/json]`
+reads physical original files in 64 KiB blocks, up to 64 blocks by default.
+Each row identifies the path, byte offset, actual length and SHA-256, or
+records why the entry could not be included. Save `next_file_cursor` when
+the status is `more`. After an interruption, pass the last saved value to
+`/cursor` to resume within the file. A locked range can be retried after it
+becomes readable. A namespace mismatch requires a fresh scan. On `complete`,
+pass `file_receipt` to the full inventory. Keep the ranges and tokens private.
+
+`KnLiveDbg.exe --offline !kmon store <artifact-root> [/scan-receipt token] [/file-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
 audits stopped image and IRP collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.
+With `/file-receipt`, the inventory rechecks the range hashes against its
+own reads of original files. Loose files can use the remaining 8 GiB
+aggregate read budget after journal reads. Pass the same receipts when
+requesting the next artifact detail page.
 `/artifacts` includes per-path ownership detail. For example,
 `store <artifact-root> /artifacts /limit 100` starts a page. When
 `artifact_page_status` is `more`, pass its `next_artifact_cursor` to the next
