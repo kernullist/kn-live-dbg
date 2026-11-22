@@ -1026,6 +1026,43 @@ with a KMON snapshot still require another source.
 
 [Capture and replay a request](COMMAND_REFERENCE.md#trace-an-io-request-through-completion)
 
+#### Completion-port request lifetimes
+
+The directory provider can associate each retained overlapped directory
+handle with one private I/O completion port before issuing the request.
+Each handle receives its own completion key. The provider retains a separate
+`OVERLAPPED` allocation per request through the run, including when several
+handles watch the same directory. The issuing thread is the port's only
+consumer. It records the start, timeout and return tick of each
+`GetQueuedCompletionStatus` call on the `GetTickCount64` clock.
+[Windows completion port associations](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-createiocompletionport)
+
+| Original dequeue observations | Evidence available during replay |
+| --- | --- |
+| Success with the registered key and submitted operation pointer | Packet for that outstanding request, with the returned byte count |
+| Failure with the registered key and submitted operation pointer | Failed I/O packet with its Win32 error and returned byte count |
+| Failure with a null operation pointer | No packet was removed. The wait error is preserved. The indeterminate key and byte count remain empty. |
+| Returned identifiers disagree with the collector's selected generation | Original packet fields, candidate generations and a conflict |
+
+Replay checks the opened port, the port returned by association, the
+associated directory handle and the actual submission arguments. It compares
+each matched packet with the separate `GetOverlappedResult` call on the
+original handle and operation. One-based journal lines identify the original
+calls, the cancellation arguments and the final handle release. A missing
+sequence ends the range in which replay can join new observations.
+Successful results, cancellation and enumeration-required errors can
+corroborate a packet. A result still pending after dequeue is conflicting
+evidence. Other result-query errors leave the packet uncorroborated.
+[Windows dequeue return values](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus)
+
+When the monitor stops with outstanding requests, the collector requests
+cancellation for all of them. A second, shared one-second budget covers
+packet draining. Final result and event checks in this mode use zero wait.
+If the event cannot establish quiescence, the one-shot collector keeps the
+handles and storage until process exit. Kernel IRP identity, packet enqueue
+time and continuous off-CPU time require additional sources.
+[Capture and replay commands](COMMAND_REFERENCE.md#follow-requests-through-an-io-completion-port)
+
 #### Directory notification timing
 
 Replay with `--timing` follows the private manual-reset event that the

@@ -40,7 +40,7 @@ def verify_declined_handle_closed(path):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def completion_during_cancel(exe, directory):
+def completion_during_cancel(exe, directory, *, port=False):
     import ctypes
     from ctypes import wintypes
     import msvcrt
@@ -62,7 +62,9 @@ def completion_during_cancel(exe, directory):
 
     try:
         with adopt(read_end, os.O_RDONLY, "rb") as reader, adopt(write_end, os.O_WRONLY, "wb") as writer:
-            with subprocess.Popen([str(exe), "--io-lifecycle", "45", str(directory)], stdout=writer, stderr=subprocess.PIPE) as child:
+            mode = ["--completion-port"] if port else []
+            record, field = (b'"kind":"dequeue"', b'"error":258,') if port else (b'"kind":"wait"', b'"result":258,')
+            with subprocess.Popen([str(exe), "--io-lifecycle", *mode, "45", str(directory)], stdout=writer, stderr=subprocess.PIPE) as child:
                 writer.close()
                 timer = threading.Timer(12, child.kill)
                 timer.start()
@@ -74,7 +76,7 @@ def completion_during_cancel(exe, directory):
                         line.extend(byte)
                         # The one-byte pipe holds the producer inside its timeout record. More than
                         # one byte of that record still has to be consumed before CancelIoEx can run.
-                        if not changed and b'"kind":"wait"' in line and line.endswith(b'"result":258,'):
+                        if not changed and record in line and line.endswith(field):
                             (directory / "won-the-race.txt").touch()
                             changed = True
                         if byte == b"\n":

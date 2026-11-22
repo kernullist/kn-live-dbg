@@ -882,6 +882,39 @@ hash, signed capture statements and redirected output against owned hard
 links were checked separately. The probe's first payload fingerprint was
 checked against the Windows fields. [Disk I/O command and timing units](TRACE_IMPORT.md#read-saved-disk-io-response-times)
 
+## Directory I/O completion-port packets on 2026-11-23
+
+The x64 user project built on Windows `10.0.28000` with MSVC v143 and
+Windows SDK `10.0.26100.0`. The tested executable (SHA-256 prefix
+`30c79c662ca1`) used the Release configuration with size optimization and
+debug information disabled. Its normal `--io-lifecycle --completion-port`
+entry point ran with the caller's existing privileges.
+
+| Workload | Dequeues | Observed outcome |
+| --- | ---: | --- |
+| Changes in two of three directories | 4 | Requests 2 and 1 each returned 32 bytes. A timeout removed no packet. The drain dequeued a failed packet for request 3 with Win32 error 995 and zero bytes. |
+| Two handles watching one directory | 2 | One change produced two 32-byte packets. The directory IDs agreed and the keys, handles and operation pointers distinguished the requests. |
+| Change after timeout and before cancellation | 2 | The drain returned a successful 44-byte packet after the cancellation attempt. |
+| Missing directory | 0 | Replay retained the planned request and failed admission with partial coverage. |
+
+All six matched packets agreed with a separate result query on the submitted
+handle and operation. Independent `FindFirstChangeNotificationW` watches
+observed each controlled change in the ordered and shared-directory runs.
+The quiet directory stayed unsignaled throughout the ordered run. Closing
+the journal reader while I/O was pending produced exit 1 and an exclusive
+directory open succeeded after the collector exited.
+
+Replay controls changed the port, file handle, key, operation pointer,
+direct result and journal sequence. They retained conflicting inputs, kept
+indeterminate fields empty and withheld joins after a gap. A drain without
+a packet or quiescent event left the request outcome and release unconfirmed.
+An eight-request run drained all eight cancelled operations through one port.
+The nine completion-port tests, 15 existing directory I/O tests and four
+issuing-thread workloads passed. Four earlier thread-state reports also
+replayed to their original SHA-256. These runs cover the owned user-mode
+requests. Kernel IRP allocation and packet enqueue time remain open.
+[Capture example](COMMAND_REFERENCE.md#follow-requests-through-an-io-completion-port) · [Regression controls](../tools/test-io-completion-port.py)
+
 ## Issuing thread state during directory I/O on 2026-11-23
 
 On Windows `10.0.28000` x64, the paired collector sampled the issuing

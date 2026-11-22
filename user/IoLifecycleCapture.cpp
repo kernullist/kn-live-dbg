@@ -14,6 +14,7 @@ namespace
     constexpr size_t Limit = 8;
     constexpr DWORD BufferSize = 4096;
     constexpr DWORD Filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+    constexpr DWORD PortDrainMs = 1000;
 
     std::string Hex(const void* data, size_t bytes)
     {
@@ -31,15 +32,31 @@ namespace
         else { std::cout << "null"; }
     }
 
+    void Pointer(const void* value)
+    {
+        if (value) { std::cout << '"' << reinterpret_cast<ULONG_PTR>(value) << '"'; }
+        else { std::cout << "null"; }
+    }
+
+    void OperationArguments(HANDLE directory, const OVERLAPPED* operation)
+    {
+        std::cout << ",\"directory_handle\":";
+        Pointer(directory);
+        std::cout << ",\"overlapped\":";
+        Pointer(operation);
+    }
+
     class Journal
     {
         std::string run;
+        const char* schema;
         unsigned seq = 0;
     public:
-        explicit Journal(const GUID& id) : run(Hex(&id, sizeof(id))) {}
+        Journal(const GUID& id, bool port) : run(Hex(&id, sizeof(id))),
+            schema(port ? "kn.io_lifetime_port.v1" : "kn.io_lifetime.v1") {}
         void Begin(const char* kind, unsigned generation, ULONGLONG tick = GetTickCount64())
         {
-            std::cout << "{\"schema\":\"kn.io_lifetime.v1\",\"run\":\"" << run << "\",\"seq\":" << seq++
+            std::cout << "{\"schema\":\"" << schema << "\",\"run\":\"" << run << "\",\"seq\":" << seq++
                       << ",\"tick\":" << tick << ",\"kind\":\"" << kind << "\",\"generation\":" << generation;
         }
         void End() { std::cout << "}\n" << std::flush; }
@@ -59,6 +76,7 @@ namespace
         FILE_ID_INFO identity{};
         unsigned generation = 0;
         bool outstanding = false;
+        bool usesPort = false;
 
         Request() = default;
         Request(const Request&) = delete;
@@ -78,7 +96,7 @@ namespace
             if (outstanding)
             {
                 CancelIoEx(directory, &native->operation);
-                if (WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0) { DeferToProcessExit(); }
+                if (WaitForSingleObject(event, usesPort ? 0 : INFINITE) != WAIT_OBJECT_0) { DeferToProcessExit(); }
             }
             if (event) { CloseHandle(event); }
             if (directory != INVALID_HANDLE_VALUE) { CloseHandle(directory); }
@@ -129,7 +147,7 @@ namespace
         std::optional<DWORD> quiesce, quiesceError, dirError, eventError;
         if (r.outstanding)
         {
-            quiesce = WaitForSingleObject(r.event, INFINITE);
+            quiesce = WaitForSingleObject(r.event, r.usesPort ? 0 : INFINITE);
             if (*quiesce == WAIT_FAILED) { quiesceError = GetLastError(); }
         }
         const bool close = !quiesce || *quiesce == WAIT_OBJECT_0;
@@ -156,9 +174,11 @@ namespace
 
     void GetResult(Request& r, Journal& j, bool final)
     {
+        const HANDLE directory = r.directory;
+        auto* operation = &r.native->operation;
         const auto start = GetTickCount64();
         DWORD bytes = 0;
-        const BOOL ok = GetOverlappedResult(r.directory, &r.native->operation, &bytes, final ? TRUE : FALSE);
+        const BOOL ok = GetOverlappedResult(directory, operation, &bytes, final && !r.usesPort);
         const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
         const DWORD signal = WaitForSingleObject(r.event, 0);
         const DWORD signalError = signal == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
@@ -169,6 +189,7 @@ namespace
         Number(ok ? std::optional<DWORD>(bytes) : std::nullopt);
         std::cout << ",\"event_result\":" << signal << ",\"event_error\":";
         Number(signal == WAIT_FAILED ? std::optional<DWORD>(signalError) : std::nullopt);
+        if (r.usesPort) { OperationArguments(directory, operation); }
         j.End();
         if (final)
         {
@@ -176,8 +197,9 @@ namespace
         }
     }
 
-    void Submit(Request& r, const std::wstring& path, Journal& j)
+    void Submit(Request& r, const std::wstring& path, HANDLE port, Journal& j)
     {
+        r.usesPort = port != nullptr;
         const auto admitted = Open(path, r);
         const bool ready = r.event != nullptr;
         std::optional<DWORD> closeError;
@@ -199,19 +221,57 @@ namespace
         j.End();
         if (!ready) { return; }
 
+        if (port)
+        {
+            const HANDLE directory = r.directory;
+            const auto start = GetTickCount64();
+            const HANDLE bound = CreateIoCompletionPort(directory, port, r.generation, 0);
+            const DWORD error = bound ? ERROR_SUCCESS : GetLastError();
+            j.Begin("associate", r.generation);
+            std::cout << ",\"start\":" << start << ",\"ok\":" << (bound ? "true" : "false") << ",\"error\":";
+            Number(bound ? std::optional<DWORD>{} : error);
+            std::cout << ",\"port_handle\":"; Pointer(port);
+            std::cout << ",\"returned_port\":"; Pointer(bound);
+            std::cout << ",\"directory_handle\":"; Pointer(directory);
+            std::cout << ",\"completion_key\":\"" << r.generation << '"';
+            j.End();
+            if (bound != port) { Release(r, j); return; }
+        }
         j.Begin("issue", r.generation);
         j.End();
+        const HANDLE directory = r.directory;
+        auto* operation = &r.native->operation;
         const auto start = GetTickCount64();
-        const BOOL ok = ReadDirectoryChangesW(r.directory, r.native->buffer.data(), BufferSize, FALSE, Filter,
-            nullptr, &r.native->operation, nullptr);
+        const BOOL ok = ReadDirectoryChangesW(directory, r.native->buffer.data(), BufferSize, FALSE, Filter,
+            nullptr, operation, nullptr);
         const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
         r.outstanding = ok != FALSE;
         j.Begin("submit", r.generation);
         std::cout << ",\"start\":" << start << ",\"ok\":" << (ok ? "true" : "false") << ",\"error\":";
         Number(ok ? std::optional<DWORD>{} : error);
+        if (r.usesPort) { OperationArguments(directory, operation); }
         j.End();
         if (ok) { GetResult(r, j, false); }
         else { Release(r, j); }
+    }
+
+    void CancelRemaining(std::array<Request, Limit>& requests, Journal& j)
+    {
+        // Submit all cancellations before collecting any final results.
+        for (auto& r : requests)
+        {
+            if (!r.outstanding) { continue; }
+            const HANDLE directory = r.directory;
+            auto* operation = &r.native->operation;
+            const auto start = GetTickCount64();
+            const BOOL ok = CancelIoEx(directory, operation);
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            j.Begin("cancel", r.generation);
+            std::cout << ",\"start\":" << start << ",\"ok\":" << (ok ? "true" : "false") << ",\"error\":";
+            Number(ok ? std::optional<DWORD>{} : error);
+            if (r.usesPort) { OperationArguments(directory, operation); }
+            j.End();
+        }
     }
 
     void Monitor(std::array<Request, Limit>& requests, DWORD budget, Journal& j)
@@ -243,20 +303,54 @@ namespace
             if (status >= WAIT_OBJECT_0 + count) { break; }
             GetResult(*active[status - WAIT_OBJECT_0], j, true);
         }
-        // Request cancellation for every still-outstanding operation before waiting for any one result.
-        for (auto& r : requests)
-        {
-            if (!r.outstanding) { continue; }
-            const auto start = GetTickCount64();
-            const BOOL ok = CancelIoEx(r.directory, &r.native->operation);
-            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-            j.Begin("cancel", r.generation);
-            std::cout << ",\"start\":" << start << ",\"ok\":" << (ok ? "true" : "false") << ",\"error\":";
-            Number(ok ? std::optional<DWORD>{} : error);
-            j.End();
-        }
+        CancelRemaining(requests, j);
         for (auto& r : requests) { if (r.outstanding) { GetResult(r, j, true); } }
     }
+
+    void ReadPort(HANDLE port, std::array<Request, Limit>& requests, const char* phase, DWORD budget, Journal& j)
+    {
+        const auto epoch = GetTickCount64();
+        j.Begin(phase, 0, epoch);
+        j.End();
+        while (std::cout && std::any_of(requests.begin(), requests.end(), [](const Request& r) { return r.outstanding; }))
+        {
+            DWORD bytes = 0;
+            ULONG_PTR key = 0;
+            OVERLAPPED* operation = nullptr;
+            const auto start = GetTickCount64();
+            const auto elapsed = start - epoch;
+            const DWORD timeout = elapsed >= budget ? 0 : budget - static_cast<DWORD>(elapsed);
+            const BOOL ok = GetQueuedCompletionStatus(port, &bytes, &key, &operation, timeout);
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            const auto end = GetTickCount64();
+            const auto found = std::find_if(requests.begin(), requests.end(), [&](const Request& r) {
+                return operation && r.outstanding && r.generation == key && &r.native->operation == operation;
+            });
+            j.Begin("dequeue", 0, end);
+            std::cout << ",\"port_handle\":"; Pointer(port);
+            std::cout << ",\"start\":" << start << ",\"timeout_ms\":" << timeout
+                      << ",\"ok\":" << (ok ? "true" : "false") << ",\"error\":";
+            Number(ok ? std::optional<DWORD>{} : error);
+            // FALSE with no OVERLAPPED leaves both the byte count and key indeterminate.
+            std::cout << ",\"bytes\":";
+            Number(ok || operation ? std::optional<DWORD>(bytes) : std::nullopt);
+            std::cout << ",\"completion_key\":";
+            if (ok || operation) { std::cout << '"' << key << '"'; } else { std::cout << "null"; }
+            std::cout << ",\"overlapped\":";
+            Pointer(operation);
+            std::cout << ",\"selected_generation\":";
+            Number(found == requests.end() ? std::nullopt : std::optional<DWORD>(found->generation));
+            j.End();
+            if (found == requests.end()) { break; }
+            GetResult(*found, j, true);
+        }
+    }
+
+    struct OwnedPort
+    {
+        HANDLE value = nullptr;
+        ~OwnedPort() { if (value) { CloseHandle(value); } }
+    };
 
     ULONGLONG Birth(const FILETIME& time)
     {
@@ -267,10 +361,12 @@ namespace
 int RunIoLifecycleCapture(const std::vector<std::wstring>& args)
 {
     uint64_t budget = 0;
-    if (args.size() < 2 || args.size() > Limit + 1 || !commandinput::ParseDigits(args[0], 10, &budget) ||
+    const bool usePort = !args.empty() && args.front() == L"--completion-port";
+    const size_t offset = usePort ? 1 : 0;
+    if (args.size() < offset + 2 || args.size() > offset + Limit + 1 || !commandinput::ParseDigits(args[offset], 10, &budget) ||
         !budget || budget > 30000)
     {
-        std::cerr << "usage: --io-lifecycle <wait-ms 1..30000> <local-directory> [up to 8 directories]\n";
+        std::cerr << "usage: --io-lifecycle [--completion-port] <wait-ms 1..30000> <local-directory> [up to 8 directories]\n";
         return 2;
     }
     GUID run{};
@@ -278,21 +374,57 @@ int RunIoLifecycleCapture(const std::vector<std::wstring>& args)
     if (FAILED(CoCreateGuid(&run)) || !GetProcessTimes(GetCurrentProcess(), &process, &end, &kernel, &user) ||
         !GetThreadTimes(GetCurrentThread(), &thread, &end, &kernel, &user) || !Birth(process) || !Birth(thread))
     { std::cerr << "I/O lifecycle collector identity unavailable\n"; return 1; }
-    Journal j(run);
+    Journal j(run, usePort);
     j.Begin("plan", 0);
     std::cout << ",\"source\":\"win32_directory_changes\",\"clock\":\"GetTickCount64_ms\",\"pid\":" << GetCurrentProcessId()
               << ",\"process_created\":\"" << Birth(process) << "\",\"tid\":" << GetCurrentThreadId()
-              << ",\"thread_created\":\"" << Birth(thread) << "\",\"requests\":" << args.size() - 1
+              << ",\"thread_created\":\"" << Birth(thread) << "\",\"requests\":" << args.size() - offset - 1
               << ",\"wait_ms\":" << budget << ",\"buffer_bytes\":" << BufferSize << ",\"notify_filter\":" << Filter
               << ",\"subtree\":false";
     j.End();
-    std::array<Request, Limit> requests;
-    for (size_t i = 1; i < args.size() && std::cout; ++i)
+    OwnedPort port;
+    if (usePort)
     {
-        requests[i - 1].generation = static_cast<unsigned>(i);
-        Submit(requests[i - 1], args[i], j);
+        const auto start = GetTickCount64();
+        port.value = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+        const DWORD error = port.value ? ERROR_SUCCESS : GetLastError();
+        j.Begin("port_open", 0);
+        std::cout << ",\"port_handle\":"; Pointer(port.value);
+        std::cout << ",\"start\":" << start << ",\"ok\":" << (port.value ? "true" : "false") << ",\"error\":";
+        Number(port.value ? std::optional<DWORD>{} : error);
+        j.End();
+        if (!port.value)
+        {
+            j.Begin("end", 0);
+            j.End();
+            return 1;
+        }
     }
-    Monitor(requests, static_cast<DWORD>(budget), j);
+    std::array<Request, Limit> requests;
+    for (size_t i = offset + 1; i < args.size() && std::cout; ++i)
+    {
+        auto& r = requests[i - offset - 1];
+        r.generation = static_cast<unsigned>(i - offset);
+        Submit(r, args[i], port.value, j);
+    }
+    if (port.value)
+    {
+        ReadPort(port.value, requests, "monitor", static_cast<DWORD>(budget), j);
+        CancelRemaining(requests, j);
+        ReadPort(port.value, requests, "drain", PortDrainMs, j);
+        for (auto& r : requests) { if (r.outstanding) { GetResult(r, j, true); } }
+        const auto start = GetTickCount64();
+        const HANDLE original = port.value;
+        const BOOL closed = CloseHandle(original);
+        const DWORD error = closed ? ERROR_SUCCESS : GetLastError();
+        if (closed) { port.value = nullptr; }
+        j.Begin("port_close", 0);
+        std::cout << ",\"port_handle\":"; Pointer(original);
+        std::cout << ",\"start\":" << start << ",\"ok\":" << (closed ? "true" : "false") << ",\"error\":";
+        Number(closed ? std::optional<DWORD>{} : error);
+        j.End();
+    }
+    else { Monitor(requests, static_cast<DWORD>(budget), j); }
     j.Begin("end", 0);
     j.End();
     return std::cout ? 0 : 1;

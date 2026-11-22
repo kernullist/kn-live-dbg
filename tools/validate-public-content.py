@@ -128,12 +128,16 @@ def capture_jws_offset(text: str) -> int | None:
 
 
 IO_LIFETIME_SCHEMAS = ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.io_lifetime_timing.v1",
+                       "kn.io_lifetime_port.v1", "kn.io_lifetime_port_assessment.v1",
                        "kn.io_thread_wait_capture.v1", "kn.io_thread_wait_capture_receipt.v1", "kn.io_thread_waits.v1", "kn.io_thread_waits_receipt.v1",
                        "kn.io_thread_wait_witness.v1")
 IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"signal_window"', '"signal_by_line"',
                      '"wait_call_ms"', '"possible_latest_generations"', '"bounded_signals"', '"state_reason_le"', '"client_thread_id"',
                      '"plan_line_sha256"', '"native_calls"', '"waiting_samples"', '"sample_slot"', '"waiting_inside_call_samples"',
-                     '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"')
+                     '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
+                     '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
+IO_PORT_VALUE = re.compile(r'(?m)^[ \t]*(?:[,{][ \t]*)?"(?:overlapped|port_handle|directory_handle|returned_port)"'
+                           r'[ \t]*:[ \t]*"[1-9][0-9]{0,19}(?:"|$)')
 IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
     ("evidence_line", "tick_field", "tick_ms"), ("evidence_line", "start_tick_ms", "end_tick_ms"),
     ("signal_window", "submission_to_signal_ms"), ("signal_by_line", "clear_or_submission_from_line"),
@@ -144,6 +148,9 @@ IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
     ("sample_slot", "touching_wait_lines"), ("sample_slot", "phase", "wait"), ("waiting_samples", "wait_line"),
     ("pending_probe_line", "submit_line"), ("waiting_inside_call_samples",), ("pointer_bytes", "information_class", "windows_version"),
     ("start_tick_ms", "managed_thread_state", "managed_wait_reason"),
+    ("completion_key", "overlapped"), ("directory_handle", "overlapped"), ("returned_port", "directory_handle"),
+    ("port_handle", "start", "ok"), ("port_open_line", "phase_line"), ("disputed_dequeue_lines", "packet_outcome"),
+    ("joined_packets", "corroborated_results"),
 ))
 WAIT_PLAN_SCHEMAS = ("kn.wait_investigation.v1", "kn.wait_claim_proposal.v1")
 WAIT_PLAN_MARKERS = (*WAIT_PLAN_SCHEMAS, '"evidence_ids"', '"required_evidence_groups"', '"evaluated_views"', '"round"', '"process_created"',
@@ -413,6 +420,10 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
 
 
 def detached_evidence_line(text: str) -> int | None:
+    if any(field in text for field in ('"overlapped"', '"port_handle"', '"directory_handle"', '"returned_port"')):
+        value = IO_PORT_VALUE.search(text)
+        if value:
+            return text.count("\n", 0, value.start()) + 1
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
     if any(tag in text for tag in READY_ORIGIN_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, READY_ORIGIN_FIELDS, ("kn.etl_switches.v5", *ACTIVITY_WAITS_SCHEMAS)))
@@ -563,7 +574,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|io_thread_wait(?:(?:s|_capture)(?:_receipt)?|_witness)\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12345]|etl_(?:operation|fault_file)_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[1234]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[1234]|etl_handoff_study(?:_receipt)?\.v5|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing|_port(?:_assessment)?)?\.v1|io_thread_wait(?:(?:s|_capture)(?:_receipt)?|_witness)\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12345]|etl_(?:operation|fault_file)_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[1234]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[1234]|etl_handoff_study(?:_receipt)?\.v5|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

@@ -199,7 +199,8 @@ class PublicContentTests(unittest.TestCase):
 
 
     def test_io_lifecycle_journals_and_reports(self):
-        for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.io_lifetime_timing.v1"):
+        for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.io_lifetime_timing.v1",
+                       "kn.io_lifetime_port.v1", "kn.io_lifetime_port_assessment.v1"):
             first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})
             reordered = json.dumps({"kind": "result", "schema": schema, "seq": 1})
             for sample in (first, "log\n" + first[:-4], "log\n" + reordered + "\n" + reordered):
@@ -214,11 +215,20 @@ class PublicContentTests(unittest.TestCase):
                     dict(clear_or_submission_from_line=11, signal_by_line=6),
                     dict(proven_precedences=[], possible_latest_generations=[1, 2]),
                     dict(accepted=2, right_censored=1, bounded_signals=1),
-                    dict(signal_window=None, submission_to_signal_ms=None)):
+                    dict(signal_window=None, submission_to_signal_ms=None),
+                    dict(completion_key="9", overlapped="64"), dict(port_open_line=2, phase_line=15),
+                    dict(overlapped="64", directory_handle="7"), dict(start=7, ok=False, port_handle="4"),
+                    dict(returned_port="4", directory_handle="7"),
+                    dict(disputed_dequeue_lines=[7], packet_outcome=None), dict(joined_packets=1, corroborated_results=0)):
             snippet = "log\n" + json.dumps(dict(part=row), indent=2)[:-4]
             for enc in ("utf-8", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", snippet.encode(enc))})
         self.assertFalse(AUDIT.inspect("timing.md", b"The optional report exposes signal_window and tick_field."))
+        for field in ("overlapped", "directory_handle", "returned_port", "port_handle"):
+            tail = 'log\n {"' + field + '": "128'
+            for enc in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("partial.txt", tail.encode(enc))})
+        self.assertFalse(AUDIT.inspect("config.json", json.dumps(dict(overlapped=True)).encode()))
 
     def test_hard_fault_pages_and_detached_rows(self):
         for row in (dict(status="partial", schema="kn.etl_hard_faults.v1"), dict(record_ordinal=15, fault_ordinal=2),

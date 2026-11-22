@@ -721,6 +721,43 @@ ends the qualified prefix. Later records remain visible under
 a directory was unavailable or a request's final outcome is unknown.
 [Request identity and state transitions](ARCHITECTURE.md#directory-io-request-lifetimes)
 
+### Follow requests through an I/O completion port
+
+Use the completion-port mode to determine which outstanding directory request
+supplied each packet Windows returned to the issuing thread. The port is
+private to one collector run. The journal contains process and thread
+creation times, directory IDs and the original user-mode operation addresses.
+Keep it with the ordered directory arguments in the private case.
+
+`KnLiveDbg.exe --io-lifecycle --completion-port <wait-ms> <local-directory> [directories...]`
+
+This example observes a quiet directory and replays both the timeout and the
+subsequent packet returned while draining cancelled I/O.
+
+```powershell
+$directory = (Get-Item -LiteralPath .).FullName
+$records = & .\x64\Release\KnLiveDbg.exe --io-lifecycle --completion-port 250 $directory
+if ($LASTEXITCODE -ne 0) { throw 'Completion port acquisition failed' }
+$journal = [IO.Path]::GetTempFileName()
+[IO.File]::WriteAllLines($journal, [string[]]$records, [Text.Encoding]::ASCII)
+$pin = (Get-FileHash -Algorithm SHA256 -LiteralPath $journal).Hash.ToLowerInvariant()
+$json = python tools/replay-io-lifecycle.py $journal --sha256 $pin --completion-port
+if ($LASTEXITCODE -ne 0) { throw 'Completion port replay failed' }
+$case = $json | ConvertFrom-Json
+$case.waits | Format-Table phase, relation, joined_generation, evidence_line
+$case.requests | Format-Table generation, correspondence, packet_outcome
+```
+
+Each wait lists the outstanding generations and the original dequeue return.
+`timeout_without_packet` leaves those requests outstanding. A later drain
+packet can report success if a change completed during cancellation.
+`packet_and_result_agree` requires the returned completion key and operation
+address to identify one live request and the separate handle result to agree.
+Check the case's **status** for coverage, even on replay exit 0. The collector
+returns exit 1 if Windows cannot create its port and still writes the native
+error when its output stream is available.
+[Packet matching and release](ARCHITECTURE.md#completion-port-request-lifetimes)
+
 ### Measure directory notification timing
 
 Use the journal and SHA-256 from the capture above.
