@@ -54,9 +54,7 @@ def source_fields(actual, expected, names):
     assert all(actual[k] == expected[k] for k in names), (expected["record_ordinal"], names)
 
 
-def intervals(fault, bounds, transitions):
-    tid, record = fault["faulting_thread_id"], fault["record_ordinal"]
-    lo, hi = int(fault["initial_time_raw"]), int(fault["raw_timestamp"])
+def intervals(tid, record, lo, hi, bounds, transitions):
     before = max((r for r in bounds if r["record_ordinal"] < record), key=lambda r: r["record_ordinal"])
     after = min((r for r in bounds if r["record_ordinal"] > record), key=lambda r: r["record_ordinal"])
     assert before["opcode"] in (1, 3) and after["opcode"] in (2, 4) and before["payload_pid"] == after["payload_pid"]
@@ -78,8 +76,27 @@ def intervals(fault, bounds, transitions):
     return before, after, expected
 
 
-def verify_window(schedule, fault, bounds, transitions, ready, tally):
-    before, after, expected = intervals(fault, bounds, transitions)
+def readiness(points, start, end):
+    if not points:
+        return "ready_unobserved", None
+    if any(p["logger_id"] != end["logger_id"] for p in points):
+        return "ready_scope_unqualified", None
+    ticks = [int(row["raw_timestamp"]) for row in [start, *points, end]]
+    if any(a >= b for a, b in pairwise(ticks)):
+        return "ready_clock_unqualified", None
+    flags = [p["ready_flags"] for p in points]
+    if any(f & ~7 for f in flags):
+        return "ready_flags_unqualified", None
+    dispatchable = [p for p in points if p["ready_flags"] in (0, 1)]
+    if not dispatchable:
+        return "ready_deferred", None
+    if len(dispatchable) != 1 or dispatchable[0] != points[-1]:
+        return "ready_sequence_conflict", None
+    return ("waiting_ready_switch_in" if start["old_state"] == 5 else "ready_switch_in"), ticks[-2]
+
+
+def verify_intervals(schedule, tid, bounds_and_intervals, ready, tally):
+    before, after, expected = bounds_and_intervals
     pair = schedule["thread_evidence"]
     assert pair["paired_record_pid"] == before["payload_pid"]
     assert pair["relation"] == ("start_end" if (before["opcode"], after["opcode"]) == (1, 2) else "rundown_bracket")
@@ -87,14 +104,14 @@ def verify_window(schedule, fault, bounds, transitions, ready, tally):
     for name, point in (("before", before), ("after", after)):
         source_fields(pair[name], point, (*base, "payload_tid", "payload_pid", "opcode"))
     assert schedule["status"] == "covered" and schedule["intersecting_intervals"] == len(expected)
-    assert len(schedule["intervals"]) == len(expected) <= schedule["interval_limit"]
+    assert len(schedule["intervals"]) == len(expected)
     for native, (running, start, end, a, b) in zip(schedule["intervals"], expected, strict=True):
         assert (int(native["overlap_start_raw"]), int(native["overlap_end_raw"]), int(native["overlap_ticks"])) == (a, b, b - a)
         assert native["relation"] == ("running_on_cpu" if running else "off_cpu")
         for name, row, outgoing in (("start", start, not running), ("end", end, running)):
             edge = native[name]
             source_fields(edge, row, (*base, "cpu", "opcode", "version", "switch_ordinal"))
-            assert edge["payload_tid"] == fault["faulting_thread_id"] and edge["kind"] == ("switch_out" if outgoing else "switch_in")
+            assert edge["payload_tid"] == tid and edge["kind"] == ("switch_out" if outgoing else "switch_in")
             if outgoing:
                 source_fields(edge, row, ("old_state", "old_wait_reason"))
         tally["intervals"] += 1
@@ -111,14 +128,12 @@ def verify_window(schedule, fault, bounds, transitions, ready, tally):
                 source_fields(r[name], point, (*base, "cpu", "payload_tid", "ready_flags"))
             else:
                 assert r[name] is None
-        if not between:
-            assert r["relation"] == "ready_unobserved" and r["before_ready_ticks"] is r["after_ready_ticks"] is None
+        relation, tick = readiness(between, start, end)
+        assert r["relation"] == relation
+        if tick is None:
+            assert r["before_ready_ticks"] is r["after_ready_ticks"] is None
         else:
-            # The complete reference capture contains a single dispatchable witness per split.
-            assert len(dispatchable) == 1 and between[-1] == dispatchable[0]
-            assert all(p["logger_id"] == start["logger_id"] for p in between)
-            pivot = max(a, min(b, int(dispatchable[0]["raw_timestamp"])))
-            assert r["relation"] == ("waiting_ready_switch_in" if start["old_state"] == 5 else "ready_switch_in")
+            pivot = max(a, min(b, tick))
             assert (int(r["before_ready_ticks"]), int(r["after_ready_ticks"])) == (pivot - a, b - pivot)
         tally[r["relation"]] += 1
     for running, name in ((True, "on_cpu_ticks"), (False, "off_cpu_ticks")):
@@ -190,7 +205,10 @@ def main():
             assert s["requested_fault_ordinal"] == ordinal and s["decoded_switches"] == len(switches)
             assert s["thread_boundaries"] == sum(map(len, boundaries.values())) and s["ready_records"] == sum(map(len, ready.values()))
             tid = fault["faulting_thread_id"]
-            verify_window(s, fault, boundaries[tid], transitions[tid], ready[tid], tally)
+            expected = intervals(tid, fault["record_ordinal"], int(fault["initial_time_raw"]), int(fault["raw_timestamp"]),
+                                 boundaries[tid], transitions[tid])
+            assert len(expected[2]) <= s["interval_limit"]
+            verify_intervals(s, tid, expected, ready[tid], tally)
             if ordinal == 1:
                 digest = hashlib.sha256(raw).hexdigest()
                 receipt = json.loads(CAP["invoke"](exe, [*args, "--check-page", digest]))

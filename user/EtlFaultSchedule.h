@@ -5,29 +5,6 @@
 
 namespace etl_profile
 {
-    struct FaultSlice
-    {
-        SwitchEvent end;
-        IntervalWitnesses witnesses;
-        bool running;
-        int64_t beginTick, endTick; // Intersection with the selected fault window.
-
-        const ScheduleEdge& Start() const
-        {
-            return running ? witnesses.previousCpu : witnesses.previousIncomingThread;
-        }
-
-        int64_t ReadyPivot() const { return std::clamp(witnesses.ready.last.at.tick, beginTick, endTick); }
-
-        ScheduleEdge End() const
-        {
-            const ScheduleRef at{end.timestamp, end.record, end.cpu, end.loggerId,
-                (end.flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) != 0};
-            return {at, running ? EdgeKind::Out : EdgeKind::In, running ? end.fields.oldTid : end.fields.newTid,
-                end.ordinal, 0, end.version, 36, end.fields.oldState, end.fields.oldWaitReason};
-        }
-    };
-
     inline ThreadPair FaultThreadPair(const ThreadIndex& index, const HardFault& fault, bool qpc, bool gap)
     {
         auto pair = index.Lookup(fault.faultingTid, fault.record, fault.timestamp, qpc, gap);
@@ -43,7 +20,7 @@ namespace etl_profile
 
     struct FaultSchedule
     {
-        std::vector<FaultSlice> slices;
+        std::vector<ScheduleSlice> slices;
         uint32_t switches = 0, unsupportedSwitches = 0, candidates = 0;
         bool qpc = false;
 
@@ -55,39 +32,11 @@ namespace etl_profile
 
         void Observe(ScheduleHistory& history, const SwitchEvent& e, const HardFault& fault)
         {
-            const auto tid = fault.faultingTid;
-            const bool outgoing = e.fields.oldTid == tid, incoming = e.fields.newTid == tid;
-            if (!qpc || !tid || tid == UINT32_MAX || (!outgoing && !incoming) || !fault.OrderedTicks())
-            { history.Observe(e, nullptr); return; }
-
-            IntervalWitnesses witnesses;
-            history.Observe(e, &witnesses);
-            const auto retain = [&](bool running, const ScheduleEdge& start)
-            {
-                if (!start.switchOrdinal) { return; }
-                const auto begin = (std::max)(start.at.tick, fault.initialTime);
-                const auto end = (std::min)(e.timestamp, fault.timestamp);
-                if (begin >= end) { return; }
-                ++candidates;
-                if (slices.size() < MaxPageRows) { slices.push_back({e, witnesses, running, begin, end}); }
-            };
-            if (outgoing) { retain(true, witnesses.previousCpu); }
-            if (incoming) { retain(false, witnesses.previousIncomingThread); }
-        }
-
-        ReportedSpan Assess(const FaultSlice& slice, const ScheduleHistory& history,
-            const HardFault& fault, const ThreadPair& pair, bool gap) const
-        {
-            const auto& start = slice.Start().at;
-            if (history.unknownSwitchTid) { return {L"coverage_unqualified"}; }
-            if (history.cpuConflicts) { return {L"cpu_history_conflict"}; }
-            if (history.cpuClockConflicts) { return {L"clock_unqualified"}; }
-            if (start.logger != fault.loggerId || slice.end.loggerId != fault.loggerId) { return {L"logger_conflict"}; }
-            if (!pair.pairedPid) { return {L"thread_bracket_unqualified"}; }
-            if (start.record <= pair.before->record || slice.end.record >= pair.after->record ||
-                start.tick <= pair.before->tick || slice.end.timestamp >= pair.after->tick)
-            { return {L"switch_outside_bracket"}; }
-            return AssessSpan(history, slice.end, slice.witnesses, slice.running, qpc, gap || unsupportedSwitches);
+            VisitScheduleSlices(history, e, fault.faultingTid, qpc ? fault.initialTime : 0, fault.timestamp,
+                [&](const ScheduleSlice& slice) {
+                    ++candidates;
+                    if (slices.size() < MaxPageRows) { slices.push_back(slice); }
+                });
         }
 
         struct Partition
@@ -115,7 +64,7 @@ namespace etl_profile
             auto cursor = fault.initialTime;
             for (const auto& slice : slices)
             {
-                const auto span = Assess(slice, history, fault, pair, gap);
+                const auto span = slice.Assess(history, fault.loggerId, pair, qpc, gap || unsupportedSwitches);
                 if (!span.measured) { return {span.relation}; }
                 if (cursor != slice.beginTick) { return {L"incomplete_switch_coverage"}; }
                 (slice.running ? result.running : result.offCpu) += TickDistance(slice.beginTick, slice.endTick);

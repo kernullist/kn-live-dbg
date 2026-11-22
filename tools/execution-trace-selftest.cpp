@@ -9,6 +9,7 @@
 #include "etl-clr-evidence-selftest.h"
 #include "etl-disk-io-selftest.h"
 #include "../user/EtlFaultSchedule.h"
+#include "../user/EtlActivitySchedule.h"
 #include "etl-activity-window-selftest.h"
 
 #include <array>
@@ -768,6 +769,55 @@ static bool CheckSchedulerScopes()
     return IsSpan(AssessSpan(duplicate, b, earlier, true, true, false), L"thread_transition_conflict");
 }
 
+static bool CheckActivitySchedule()
+{
+    using namespace etl_profile;
+    ThreadEvent first{1, 12, 42, 80, 1}, last{16, 12, 42, 500, 2};
+    first.logger = last.logger = 7;
+    ActivityWindow w;
+    w.start.tid = 42; w.start.logger = 7; w.start.tick = 110; w.stop.tick = 350;
+    w.thread.before = &first; w.thread.after = &last; w.thread.pairedPid = true;
+    ScheduleHistory history;
+    history.Prepare(2, 42);
+    ActivitySchedule schedule;
+    schedule.Prepare(w.start.tick, 1);
+    const auto feed = [&](const SwitchEvent& event) { schedule.Observe(history, event, w, 1, 1); };
+    const auto hasIssue = [&](const ScheduleHistory& source, const wchar_t* expected) {
+        const auto issue = schedule.Issue(w, source, false);
+        return issue && std::wstring(issue) == expected;
+    };
+    feed(SwitchAt(2, 100, 0, 11, 42));
+    feed(SwitchAt(3, 180, 0, 42, 11));
+    std::array<uint8_t, 8> payload{42, 0, 0, 0, 0, 0, 0, 0};
+    auto ready = SchedulerRecord(payload.data(), 8, 50, 2, 220);
+    history.OtherThreadEvent(ready, 5);
+    feed(SwitchAt(6, 300, 1, 25, 42));
+    if (!hasIssue(history, L"incomplete_switch_coverage")) { return false; }
+    feed(SwitchAt(8, 410, 1, 42, 25));
+    const auto split = schedule.Readiness(history);
+    if (schedule.Issue(w, history, false) || schedule.page.size() != 1 || schedule.page[0].running ||
+        schedule.count != 3 || schedule.running != 120 || schedule.offCpu != 120 ||
+        schedule.offIntervals != 1 || split.intervals != 1 || split.before != 40 ||
+        split.waitingBefore != 40 || split.after != 80) { return false; }
+    const auto original = history;
+    history.OtherThreadEvent(SchedulerRecord(payload.data(), 8, 50, 9, 440), 9);
+    if (schedule.Issue(w, history, false) || history.unsupportedReady != 1 || schedule.Readiness(history).intervals) { return false; }
+    history = original;
+    std::fill_n(payload.begin(), 4, uint8_t{0xff});
+    history.OtherThreadEvent(SchedulerRecord(payload.data(), 8, 50, 2, 440), 9);
+    const auto unresolved = schedule.Readiness(history);
+    if (schedule.Issue(w, history, false) || history.unassignedReady != 1 ||
+        unresolved.intervals || unresolved.before || unresolved.after || unresolved.waitingBefore) { return false; }
+    history = original;
+    history.Observe(SwitchAt(10, 450, 1, 899, 12), nullptr);
+    if (!hasIssue(history, L"cpu_history_conflict")) { return false; }
+    history = original;
+    history.ObserveClock(1);
+    if (!hasIssue(history, L"clock_unqualified")) { return false; }
+    w.intervening = 1;
+    return hasIssue(original, L"intervening_activity_boundary");
+}
+
 static bool CheckFaultSchedule()
 {
     using namespace etl_profile;
@@ -868,7 +918,7 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckFaultSchedule() && etl_activity_test::Check() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckActivitySchedule() && CheckFaultSchedule() && etl_activity_test::Check() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

@@ -96,7 +96,7 @@ FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl
 ETL_ROTATION_SCHEMAS = ("kn.etl_rotation_inventory.v1", "kn.etl_rotation_set.v1")
 HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", *(f"kn.etl_handoff_{kind}{receipt}.v1" for kind in ("plan", "capture", "study")
                                                for receipt in ("", "_receipt")))
-TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
+TRACE_QUERY_SCHEMAS = ("kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
@@ -160,6 +160,8 @@ DISK_IO_MARKERS = (DISK_IO_SCHEMA, '"disk_event_ordinal"', '"high_res_response_t
                    '"response_ticks_per_second"', '"decoded_disk_records"', '"cross_provider_join"')
 HARD_FAULT_FIELDS = tuple(frozenset(keys) for keys in (
     ("fault_ordinal", "record_ordinal"), ("initial_time_raw", "faulting_thread_id"),
+    ("waiting_before_ready_ticks", "unclassified_off_cpu_ticks"), ("off_cpu_intervals", "split_off_cpu_intervals"),
+    ("cross_thread_critical_path", "logical_task_identity"),
     ("elapsed_qpc_ticks", "timing_status"), ("timed_faults", "untimed_faults"),
     ("longest_fault_ties", "first_longest_fault"), ("decoded_hard_faults", "records_seen"),
     ("decoded_hard_faults", "unsupported_hard_fault_records"),

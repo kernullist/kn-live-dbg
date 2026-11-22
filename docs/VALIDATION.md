@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Application activity scheduling on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`a09586e448e0`) measured five marked thread activities in the public
+TaskbarLatency ETL. A separate Windows ETW/TDH reader checked both
+activity headers, the thread lifetime, every original switch endpoint,
+the ready records and the clipped durations. The source contained
+1,093,447 records, 62,025 context switches and 33,493 ReadyThread events
+on a 10 MHz QPC clock. [Recording and source checks](#scheduling-during-hard-page-faults-on-2026-11-22)
+
+| Start and Stop records | Switch intervals | On CPU (ms) | Off CPU (ms) | Observed ready to switch-in (ms) | Off CPU with unclassified readiness (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 339732, 374019 | 11 | 55.3563 | 60.8586 | 0.0865 | 0 |
+| 738283, 741351 | 137 | 6.8381 | 3.8478 | 0.0853 | 2.7715 |
+| 87258, 87264 | 1 | 0.0065 | 0 | 0 | 0 |
+| 87669, 105250 | 9 | 5.1738 | 111.9171 | 0.0649 | 0.2090 |
+| 811857, 812141 | 5 | 3.4110 | 0.2205 | 0.0639 | 0 |
+
+On-CPU and off-CPU time added up to the marker duration in every case.
+For the 116.2149 ms activity, all five off-CPU intervals had a dispatchable
+ready witness. The captured thread spent 60.7721 ms before those events
+after switching out in the Waiting state. The 137-interval activity had
+68 off-CPU intervals and seven qualified readiness sequences. Replaying
+different page sizes preserved both totals and the original interval order.
+The two PerfView CPU recordings retained their measured marker durations
+and reported unavailable scheduler totals because neither contained context
+switches.
+
+Signed archive-witness replay matched the complete source and a controlled
+copy declaring loss. Clock, marker, pagination and late scheduler-conflict
+controls passed. Seven existing CPU, disk, fault, marker and switch pages
+matched the previous reader byte for byte. The regular record suite and the
+MSVC `/RTC1` record checks passed. MSVC AddressSanitizer stopped during
+runtime interception before the tests, including in a separate minimal
+program. These measurements describe the emitting thread. Cross-thread
+dependencies and the cause of an application-wide delay remain open.
+[TDH checks](../tools/test-etl-activity-schedule.py) · [Query and pagination](COMMAND_REFERENCE.md#measure-scheduling-inside-an-activity)
+
 ## Repeated caller and worker timing on 2026-11-22
 
 On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix

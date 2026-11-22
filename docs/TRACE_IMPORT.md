@@ -742,6 +742,42 @@ require separate evidence. The incoming `new_wait_time` payload keeps
 its original, unspecified unit. Store both full pages and extracted intervals
 with the private trace.
 
+### Thread scheduling inside an activity
+
+`--etl-switches --schedule-activity` joins two selected ETW activity
+markers to context switches in the same pinned ETL. The first traversal
+finds the original markers and recorded thread lifetime. The second
+checks both endpoints, looks for other boundaries of the same activity,
+and follows switch-in, switch-out and ReadyThread records. The markers
+must share a provider, activity ID, PID, TID, channel, task and logger.
+The entire window and the switches that bound each interval must lie
+within one recorded lifetime. The reader uses the QPC frequency in the
+trace header. [Activity marker selection](#hard-faults-inside-an-activity-window)
+
+The `kn.etl_switches.v4` page includes both marker headers, lifetime
+witnesses, totals, and clipped switch intervals. `on_cpu_ticks` and
+`off_cpu_ticks` are available only when the switch intervals cover
+the whole window once with no gaps or overlaps. Each on-CPU interval
+requires the same CPU at both ends. A thread may resume on a different
+CPU after an off-CPU interval. The totals include every qualifying
+interval even when the witnesses span multiple pages.
+
+| Off-CPU field | Interpretation |
+| --- | --- |
+| `before_ready_ticks` | Time before the dispatchable ReadyThread event in intervals with a qualified readiness sequence. |
+| `waiting_before_ready_ticks` | Portion of the preceding total where the outgoing thread had state 5 (Waiting). |
+| `after_ready_ticks` | Time from dispatchable readiness to the next switch-in, clipped to the activity. |
+| `unclassified_off_cpu_ticks` | Off-CPU time with missing or ambiguous readiness evidence. |
+
+Before-ready, after-ready and unclassified ticks sum to the measured
+off-CPU total. The waiting-state subset is already included in before-ready
+time. With an unsupported ReadyThread record or an unassigned ready TID,
+the reader assigns the off-CPU total to the unclassified field. Loss, incompatible clocks,
+ambiguous lifetimes and conflicting scheduler histories withhold timing
+totals. The markers describe one emitting thread. Identifying a wait
+object or a dependency on another thread requires separate evidence.
+[CSwitch fields](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch) · [ReadyThread fields](https://learn.microsoft.com/en-us/windows/win32/etw/readythread) · [Query example](COMMAND_REFERENCE.md#measure-scheduling-inside-an-activity)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

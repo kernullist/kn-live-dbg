@@ -1433,6 +1433,34 @@ if ($null -ne $chosen) {
 
 [Interval fields, clock and coverage](TRACE_IMPORT.md#reconstruct-scheduler-intervals)
 
+### Measure scheduling inside an activity
+
+Select the original Start and Stop record ordinals from the marker query.
+This example follows a TaskbarLatency activity. Each page reports the
+totals for the whole activity as well as the switch records for that page.
+
+```powershell
+$etl = (Get-Item .\TaskbarLatency.etl).FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$pin = (Get-FileHash -LiteralPath $etl -Algorithm SHA256).Hash
+$query = @('--etl-switches', $etl, '--sha256', $pin, '--schedule-activity', '339732', '374019', '--limit', '7')
+$page = & $reader @query | ConvertFrom-Json
+$page.activity_schedule | Select-Object status, window_ticks, on_cpu_ticks, off_cpu_ticks, after_ready_ticks, unclassified_off_cpu_ticks
+$page.activity_schedule.intervals
+while ($null -ne $page.next_after) {
+    $page = & $reader @query --after $page.next_after | ConvertFrom-Json
+    $page.activity_schedule.intervals
+}
+```
+
+The two selectors use original record ordinals. The continuation cursor
+counts intersecting switch intervals. Page size defaults to 64 and accepts
+1 to 128. Keep the same ETL digest and selectors throughout. The native
+`--check-page` option accepts the SHA-256 of one page's exact output bytes.
+Exit 0 means the file was read. Inspect `activity_schedule.status` for
+timing coverage. Exit 1 includes partial sources and replay mismatches.
+[Timing fields and source requirements](TRACE_IMPORT.md#thread-scheduling-inside-an-activity)
+
 ## Whole-host hunt
 
 ```text

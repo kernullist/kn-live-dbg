@@ -4,7 +4,7 @@
 #include "EtlCaptureSettings.h"
 #include "EtlDiskIo.h"
 #include "EtlFaultSchedule.h"
-#include "EtlActivityWindow.h"
+#include "EtlActivitySchedule.h"
 #include "EtlCaptureStatement.h"
 #include "EtlClrEvidence.h"
 #include "EtlReferenceImage.h"
@@ -61,6 +61,7 @@ namespace
         uint32_t activityStart = 0, activityStop = 0;
         bool activityMarkers = false;
         bool Switches() const { return family == Family::Switches; }
+        bool SchedulingActivity() const { return Switches() && activityStart; }
         bool DiskIo() const { return family == Family::DiskIo; }
         bool HardFaults() const { return family == Family::HardFaults; }
         const FamilyFields& Fields() const { return activityMarkers ? MarkerFields : EventFamilies[static_cast<size_t>(family)]; }
@@ -72,10 +73,15 @@ namespace
             return activityStart ? L",\"requested_start_record\":" + std::to_wstring(activityStart) +
                 L",\"requested_stop_record\":" + std::to_wstring(activityStop) : L"";
         }
+        std::wstring ActivityPagingJson() const
+        {
+            return SchedulingActivity() ? L",\"after\":" + std::to_wstring(after) + L",\"interval_page_limit\":" + std::to_wstring(limit) : L"";
+        }
         const wchar_t* Prefix() const
         {
             if (activityMarkers) { return L"{\"schema\":\"kn.etl_activity_markers.v1\",\"status\":"; }
             if (DiskIo()) { return L"{\"schema\":\"kn.etl_disk_io.v1\",\"status\":"; }
+            if (SchedulingActivity()) { return L"{\"schema\":\"kn.etl_switches.v4\",\"status\":"; }
             if (activityStart) { return L"{\"schema\":\"kn.etl_hard_faults.v3\",\"status\":"; }
             if (HardFaults()) { return scheduleOf ? L"{\"schema\":\"kn.etl_hard_faults.v2\",\"status\":" : L"{\"schema\":\"kn.etl_hard_faults.v1\",\"status\":"; }
             if (clr) { return L"{\"schema\":\"kn.etl_profile.v8\",\"status\":"; }
@@ -150,7 +156,8 @@ namespace
             {
                 if (!Decimal(args[i + 1], MaxRecords, options.scheduleOf) || !options.scheduleOf) { return false; }
             }
-            else if (args[i] == L"--activity-window" && options.HardFaults() && !options.activityStart)
+            else if (!options.activityStart && ((options.HardFaults() && args[i] == L"--activity-window") ||
+                (options.Switches() && args[i] == L"--schedule-activity")))
             {
                 if (i + 2 >= args.size() || !Decimal(args[i + 1], MaxRecords, options.activityStart) || !options.activityStart ||
                     !Decimal(args[i + 2], MaxRecords, options.activityStop) || options.activityStop <= options.activityStart) { return false; }
@@ -161,7 +168,11 @@ namespace
         }
         if (options.HardFaults() && options.haveTid && !options.activityMarkers) { return false; }
         if (options.activityMarkers && (options.activityStart || options.scheduleOf)) { return false; }
-        if (options.activityStart)
+        if (options.SchedulingActivity())
+        {
+            if (options.haveTid || options.intervals || options.settings) { return false; }
+        }
+        else if (options.activityStart)
         {
             if (haveAfter || haveLimit || options.scheduleOf) { return false; }
             options.limit = MaxPage;
@@ -198,6 +209,7 @@ namespace
         std::array<etl_profile::DiskEvent, MaxPage> diskPage{};
         etl_profile::HardFaultTotals faultTotals;
         etl_profile::ActivityWindow activity;
+        etl_profile::ActivitySchedule residency;
         std::vector<std::pair<uint32_t, etl_profile::ActivityMarker>> markers;
         etl_profile::FaultSchedule faultSchedule;
         std::array<etl_profile::HardFault, MaxPage> faultPage{};
@@ -209,7 +221,7 @@ namespace
         bool replaying = false, replayMismatch = false;
     };
 
-    void ReplayActivity(const EVENT_RECORD& event, Scan& scan)
+    void ReplayActivityMarker(const EVENT_RECORD& event, Scan& scan)
     {
         const auto opcode = event.EventHeader.EventDescriptor.Opcode;
         const bool start = scan.records == scan.options.activityStart;
@@ -221,9 +233,14 @@ namespace
             {
                 scan.replayMismatch |= !(start ? scan.activity.start : scan.activity.stop).SameRecord(marker);
                 ++scan.replayedRows;
+                if (scan.options.SchedulingActivity()) { scan.history.ObserveClock(marker.tick); }
             }
             scan.activity.ObserveMarker(marker);
         }
+    }
+
+    void ReplayActivityFault(const EVENT_RECORD& event, Scan& scan)
+    {
         etl_profile::HardFault row{};
         const auto match = etl_profile::DecodeHardFault(event, &row);
         if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
@@ -235,7 +252,11 @@ namespace
 
     void ReplayRecord(const EVENT_RECORD& event, Scan& scan)
     {
-        if (scan.options.activityStart) { ReplayActivity(event, scan); return; }
+        if (scan.options.activityStart)
+        {
+            ReplayActivityMarker(event, scan);
+            if (scan.options.HardFaults()) { ReplayActivityFault(event, scan); return; }
+        }
         const bool faultQuery = scan.options.scheduleOf != 0;
         if (faultQuery && IsEqualGUID(event.EventHeader.ProviderId, etl_profile::PageFaultProvider))
         {
@@ -278,6 +299,11 @@ namespace
             return;
         }
         point.ordinal = ++scan.decoded;
+        if (scan.options.SchedulingActivity())
+        {
+            scan.residency.Observe(scan.history, point, scan.activity, scan.options.after, scan.options.limit);
+            return;
+        }
         etl_profile::IntervalWitnesses* witnesses = nullptr;
         if (scan.replayedRows < scan.used && scan.switchPage[scan.replayedRows].record == point.record)
         {
@@ -325,22 +351,24 @@ namespace
             if (collect(etl_profile::DecodeDisk(*event, row), row, scan.diskPage)) { scan.diskTotals[row.Operation()].Observe(row); }
             return;
         }
-        if (scan.options.HardFaults())
+        if (scan.options.NeedsThreadIndex()) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.activityStart)
         {
-            if (scan.options.NeedsThreadIndex()) { scan.threadIndex.Observe(*event, scan.records); }
             if (scan.records == scan.options.activityStart) { scan.activity.start = etl_profile::ActivityMarker::Read(*event, scan.records); }
             if (scan.records == scan.options.activityStop) { scan.activity.stop = etl_profile::ActivityMarker::Read(*event, scan.records); }
+        }
+        if (scan.options.HardFaults())
+        {
             etl_profile::HardFault row;
             if (collect(etl_profile::DecodeHardFault(*event, &row), row, scan.faultPage)) { scan.faultTotals.Observe(row); }
             return;
         }
         if (scan.options.settings) { scan.settings.Observe(*event, scan.records); }
-        if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
         if (scan.options.builds) { scan.buildIndex.Observe(*event, scan.records); }
         if (scan.options.clr) { scan.clrIndex.Observe(*event, scan.records); }
         if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
         if (scan.options.processes) { scan.processIndex.Observe(*event, scan.records, scan.options.images); }
-        const bool keep = scan.matched >= scan.options.after && scan.used < scan.options.limit;
+        const bool keep = !scan.options.SchedulingActivity() && scan.matched >= scan.options.after && scan.used < scan.options.limit;
         etl_profile::SwitchEvent scratch;
         auto* sw = keep ? &scan.switchPage[scan.used] : (scan.options.haveTid ? &scratch : nullptr);
         const auto match = scan.options.Switches() ? etl_profile::DecodeSwitch(*event, sw) :
@@ -928,15 +956,26 @@ namespace
         const auto report = std::wstring(options.Prefix()) + Quote(status) + L",\"source_sha256\":" +
             (digest.empty() ? L"null" : Quote(digest)) + L",\"win32_status\":" +
             (error ? std::to_wstring(error) : L"null") + (options.referencePath.empty() ? L"" :
-                L",\"reference_sha256\":" + (referenceDigest.empty() ? L"null" : Quote(referenceDigest))) + L"}";
+                L",\"reference_sha256\":" + (referenceDigest.empty() ? L"null" : Quote(referenceDigest))) +
+            (options.SchedulingActivity() ? options.ActivitySelectorJson() + options.ActivityPagingJson() : L"") + L"}";
         return WriteCapabilityJson(report) ? 1 : 2;
+    }
+
+    bool CaptureGap(const Scan& scan, BufferAccounting accounting, const TRACE_LOGFILE_HEADER& h)
+    {
+        return accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
     }
 
     bool Partial(const Scan& scan, BufferAccounting accounting, const TRACE_LOGFILE_HEADER& h)
     {
+        if (scan.options.SchedulingActivity())
+        {
+            return CaptureGap(scan, accounting, h) ||
+                scan.unsupported || !scan.threadIndex.Complete();
+        }
         if (scan.options.DiskIo() || scan.options.HardFaults())
         {
-            return accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers || (!scan.options.activityMarkers && scan.unsupported);
+            return CaptureGap(scan, accounting, h) || (!scan.options.activityMarkers && scan.unsupported);
         }
         return etl_profile::RequiresPartialPage(h.LogFileMode, accounting) ||
             !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete() || !scan.settings.Complete() || !scan.clrIndex.Complete();
@@ -990,6 +1029,27 @@ namespace
             L",\"timing_status\":" + Quote(timing) + L",\"elapsed_qpc_ticks\":" + (elapsed ? Quote(std::to_wstring(*elapsed)) : L"null") + L"}";
     }
 
+    std::wstring ScheduleSliceJson(const etl_profile::ScheduleSlice& slice, uint32_t unresolvedReady,
+        etl_profile::ReportedSpan span)
+    {
+        auto out = L"{\"relation\":" + Quote(span.relation) + L",\"start\":" + EdgeJson(slice.Start()) +
+            L",\"end\":" + EdgeJson(slice.End()) + L",\"overlap_start_raw\":" + Quote(std::to_wstring(slice.beginTick)) +
+            L",\"overlap_end_raw\":" + Quote(std::to_wstring(slice.endTick)) + L",\"overlap_ticks\":" +
+            Elapsed(span.measured, slice.beginTick, slice.endTick);
+        if (!slice.running)
+        {
+            const auto& ready = slice.witnesses.ready;
+            const auto split = etl_profile::AssessReady(ready, slice.Start(), slice.end, span.measured, unresolvedReady);
+            const auto pivot = slice.ReadyPivot();
+            out += L",\"readiness\":{\"relation\":" + Quote(split.relation) + L",\"ready_records\":" + std::to_wstring(ready.count) +
+                L",\"dispatchable_records\":" + std::to_wstring(ready.dispatchable) + L",\"first_ready\":" + ReadyJson(ready.first) +
+                L",\"last_ready\":" + (ready.count > 1 ? ReadyJson(ready.last) : L"null") +
+                L",\"before_ready_ticks\":" + Elapsed(split.measured, slice.beginTick, pivot) +
+                L",\"after_ready_ticks\":" + Elapsed(split.measured, pivot, slice.endTick) + L"}";
+        }
+        return out + L'}';
+    }
+
     std::wstring FaultScheduleJson(const Scan& scan, bool gap)
     {
         const auto& fault = scan.faultPage[0];
@@ -1008,23 +1068,7 @@ namespace
         for (const auto& slice : schedule.slices)
         {
             if (&slice != schedule.slices.data()) { out += L','; }
-            const auto span = schedule.Assess(slice, history, fault, pair, gap);
-            out += L"{\"relation\":" + Quote(span.relation) + L",\"start\":" + EdgeJson(slice.Start()) +
-                L",\"end\":" + EdgeJson(slice.End()) + L",\"overlap_start_raw\":" + Quote(std::to_wstring(slice.beginTick)) +
-                L",\"overlap_end_raw\":" + Quote(std::to_wstring(slice.endTick)) + L",\"overlap_ticks\":" +
-                Elapsed(span.measured, slice.beginTick, slice.endTick);
-            if (!slice.running)
-            {
-                const auto& ready = slice.witnesses.ready;
-                const auto split = etl_profile::AssessReady(ready, slice.Start(), slice.end, span.measured, history.unsupportedReady);
-                const auto pivot = slice.ReadyPivot();
-                out += L",\"readiness\":{\"relation\":" + Quote(split.relation) + L",\"ready_records\":" + std::to_wstring(ready.count) +
-                    L",\"dispatchable_records\":" + std::to_wstring(ready.dispatchable) + L",\"first_ready\":" + ReadyJson(ready.first) +
-                    L",\"last_ready\":" + (ready.count > 1 ? ReadyJson(ready.last) : L"null") +
-                    L",\"before_ready_ticks\":" + Elapsed(split.measured, slice.beginTick, pivot) +
-                    L",\"after_ready_ticks\":" + Elapsed(split.measured, pivot, slice.endTick) + L"}";
-            }
-            out += L'}';
+            out += ScheduleSliceJson(slice, history.unsupportedReady, slice.Assess(history, fault.loggerId, pair, schedule.qpc, gap || schedule.unsupportedSwitches));
         }
         return out + L"]}";
     }
@@ -1060,6 +1104,40 @@ namespace
             out += L"{\"fault_ordinal\":" + std::to_wstring(r.fault.ordinal) + L",\"record_ordinal\":" + std::to_wstring(r.fault.record) +
                 L",\"overlap_start_raw\":" + Quote(std::to_wstring(r.begin)) + L",\"overlap_end_raw\":" + Quote(std::to_wstring(r.end)) +
                 L",\"overlap_ticks\":" + Elapsed(!issue, r.begin, r.end) + L"}";
+        }
+        return out + L"]}";
+    }
+
+    std::wstring ActivityScheduleJson(const Scan& scan, bool gap)
+    {
+        const auto& w = scan.activity;
+        const auto& r = scan.residency;
+        const auto& history = scan.history;
+        const auto windowIssue = w.WindowIssue();
+        const auto issue = r.Issue(w, history, gap);
+        const auto ticks = [&](uint64_t value) { return issue ? std::wstring(L"null") : Quote(std::to_wstring(value)); };
+        const auto ready = r.Readiness(history);
+        auto out = L",\"activity_schedule\":{\"status\":" + Quote(issue ? issue : L"covered") +
+            L",\"start\":" + ActivityMarkerJson(w.start) + L",\"stop\":" + ActivityMarkerJson(w.stop) + ThreadPairJson(w.thread, true) +
+            L",\"window_ticks\":" + Elapsed(!windowIssue, w.start.tick, w.stop.tick) +
+            L",\"on_cpu_ticks\":" + ticks(r.running) + L",\"off_cpu_ticks\":" + ticks(r.offCpu) +
+            L",\"before_ready_ticks\":" + ticks(ready.before) + L",\"after_ready_ticks\":" + ticks(ready.after) +
+            L",\"waiting_before_ready_ticks\":" + ticks(ready.waitingBefore) +
+            L",\"unclassified_off_cpu_ticks\":" + ticks(r.offCpu - ready.before - ready.after) +
+            L",\"off_cpu_intervals\":" + (issue ? L"null" : std::to_wstring(r.offIntervals)) +
+            L",\"split_off_cpu_intervals\":" + (issue ? L"null" : std::to_wstring(ready.intervals)) +
+            L",\"process_key_boundaries\":" + (w.start.Keyed() ? std::to_wstring(w.sameKey) : L"null") +
+            L",\"intervening_boundaries\":" + (w.start.Keyed() ? std::to_wstring(w.intervening) : L"null") +
+            L",\"unassigned_activity_boundaries\":" + (w.start.Keyed() ? std::to_wstring(w.unassignedMarkers) : L"null") +
+            L",\"ready_records\":" + std::to_wstring(history.readyCount) + L",\"unsupported_ready_records\":" + std::to_wstring(history.unsupportedReady) +
+            L",\"unassigned_ready_records\":" + std::to_wstring(history.unassignedReady) +
+            L",\"thread_boundaries\":" + std::to_wstring(history.boundaries) + L",\"unsupported_thread_boundaries\":" + std::to_wstring(history.unsupportedBoundaries) +
+            L",\"intersecting_intervals\":" + std::to_wstring(r.count) + L",\"intervals\":[";
+        for (const auto& slice : r.page)
+        {
+            if (&slice != r.page.data()) { out += L','; }
+            const auto span = windowIssue ? etl_profile::ReportedSpan{windowIssue} : slice.Assess(history, w.start.logger, w.thread, true, gap);
+            out += ScheduleSliceJson(slice, history.unsupportedReady + history.unassignedReady, span);
         }
         return out + L"]}";
     }
@@ -1103,7 +1181,9 @@ namespace
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
             (scan.options.activityMarkers ?
-                L",\"qualification\":{\"evidence\":\"reported_activity_boundary\",\"producer_authenticity\":\"unverified\",\"logical_task_identity\":null}" : scan.options.activityStart ?
+                L",\"qualification\":{\"evidence\":\"reported_activity_boundary\",\"producer_authenticity\":\"unverified\",\"logical_task_identity\":null}" : scan.options.SchedulingActivity() ?
+                L",\"qualification\":{\"evidence\":\"reported_activity_thread_scheduling\",\"producer_authenticity\":\"unverified\","
+                L"\"logical_task_identity\":null,\"wait_object\":null,\"wait_cause\":null,\"cross_thread_critical_path\":null}" : scan.options.activityStart ?
                 L",\"qualification\":{\"evidence\":\"reported_activity_window_and_thread_faults\",\"producer_authenticity\":\"unverified\","
                 L"\"fault_scope\":\"decoded_hard_faults_on_recorded_thread\",\"hard_fault_capture_policy\":null,"
                 L"\"logical_task_identity\":null,\"wait_cause\":null,\"disk_request\":null,\"critical_path\":null}" : scan.options.scheduleOf ?
@@ -1127,9 +1207,14 @@ namespace
             L",\"records_seen\":" + std::to_wstring(scan.records) + scan.options.Fields().decoded + std::to_wstring(scan.decoded) +
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
-            scan.options.Fields().unsupported + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
-            L",\"next_after\":" + (!scan.options.scheduleOf && scan.used && scan.options.after + scan.used < scan.matched ?
-                std::to_wstring(scan.options.after + scan.used) : L"null");
+            scan.options.Fields().unsupported + std::to_wstring(scan.unsupported) +
+            (scan.options.SchedulingActivity() ? scan.options.ActivitySelectorJson() + scan.options.ActivityPagingJson() :
+                L",\"after\":" + std::to_wstring(scan.options.after)) +
+            L",\"next_after\":";
+        const auto pageEnd = scan.options.after + (scan.options.SchedulingActivity() ? scan.residency.page.size() : scan.used);
+        const auto matches = scan.options.SchedulingActivity() ? scan.residency.count : scan.matched;
+        result += !scan.options.scheduleOf && pageEnd > scan.options.after && pageEnd < matches ? std::to_wstring(pageEnd) : L"null";
+        if (scan.options.SchedulingActivity()) { return result + ActivityScheduleJson(scan, partial) + L"}"; }
         if (scan.options.DiskIo()) { return result + DiskResultsJson(scan, h); }
         if (scan.options.activityMarkers)
         {
@@ -1145,7 +1230,7 @@ namespace
         }
         if (scan.options.HardFaults()) { return result + HardFaultResultsJson(scan, h, partial); }
         const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
-        const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
+        const bool captureGap = CaptureGap(scan, accounting, h);
         if (scan.options.settings) { result += SettingsManifestJson(scan.settings, h); }
         if (scan.options.Switches())
         {
@@ -1333,7 +1418,7 @@ namespace
         if (status != ERROR_SUCCESS) { return status; }
         const auto& h = log.LogfileHeader;
         if (scan.replayMismatch || scan.replayedRows != (scan.options.activityStart ? 2 : scan.used) || scan.budgetExceeded ||
-            (scan.options.scheduleOf && (scan.threadIndex.decoded != scan.history.boundaries ||
+            ((scan.options.scheduleOf || scan.options.SchedulingActivity()) && (scan.threadIndex.decoded != scan.history.boundaries ||
                 scan.threadIndex.unsupported != scan.history.unsupportedBoundaries)) ||
             scan.records != first.records || scan.decoded != first.decoded || scan.unsupported != first.unsupported ||
             scan.processedBuffers != first.processedBuffers || scan.lossMarkers != first.lossMarkers ||
@@ -1429,7 +1514,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         const auto sourceStatus = partial ? L"partial" : L"read";
         const auto diagnostic = scan.options.expectedPage.empty() ?
             std::wstring(scan.options.Prefix()) + L"\"activity_record_not_observed\",\"source_status\":" + Quote(sourceStatus) +
-                L",\"source_sha256\":" + Quote(source.Sha256) + scan.options.ActivitySelectorJson() +
+                L",\"source_sha256\":" + Quote(source.Sha256) + scan.options.ActivitySelectorJson() + scan.options.ActivityPagingJson() +
                 L",\"records_seen\":" + std::to_wstring(scan.records) + L"}" :
             ReplayReceipt(scan.options, L"activity_record_not_observed", source.Sha256, {}, sourceStatus);
         return WriteCapabilityJson(diagnostic) ? 1 : 2;
@@ -1444,13 +1529,22 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
             ReplayReceipt(scan.options, L"fault_not_observed", source.Sha256, {}, sourceStatus);
         return WriteCapabilityJson(diagnostic) ? 1 : 2;
     }
-    if (!partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (!scan.options.SchedulingActivity() && !partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
     if (scan.options.WithIntervals() || scan.options.scheduleOf || scan.options.activityStart)
     {
         try
         {
             const bool qpc = log.LogfileHeader.ReservedFlags == 1 && log.LogfileHeader.PerfFreq.QuadPart > 0;
-            if (scan.options.activityStart) { scan.activity.Prepare(scan.threadIndex, qpc, partial); }
+            if (scan.options.activityStart)
+            {
+                const bool markerGap = scan.options.SchedulingActivity() ? CaptureGap(scan, accounting, log.LogfileHeader) : partial;
+                scan.activity.Prepare(scan.threadIndex, qpc, markerGap);
+                if (scan.options.SchedulingActivity())
+                {
+                    scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.activity.start.tid);
+                    scan.residency.Prepare(scan.activity.start.tick, scan.options.limit);
+                }
+            }
             else if (scan.options.scheduleOf)
             {
                 scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.faultPage[0].faultingTid);
@@ -1463,6 +1557,8 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
         if (replay != ERROR_SUCCESS) { return Failure(scan.options, L"interval_replay_failed", source.Sha256, replay); }
     }
+    if (scan.options.SchedulingActivity() && !partial && !scan.activity.WindowIssue() && scan.options.after > scan.residency.count)
+    { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
     if (scan.options.clr && scan.clrIndex.Complete()) { scan.clrIndex.Sort(); }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     if (scan.options.processes && scan.processIndex.Complete()) { scan.processIndex.Sort(); }
@@ -1526,7 +1622,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
     std::wcerr << (scan.options.HardFaults() ?
         L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [[--activity-markers [--thread-id TID]] [--after N] [--limit 1..128] | --schedule-of <fault-ordinal> | --activity-window <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
         L"usage: KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.Switches() ?
-        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
+        L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [[--intervals] [--thread-id N] [--capture-settings] | --schedule-activity <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
         L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");
     return 2;
 }

@@ -519,6 +519,9 @@
     <ClInclude Include="EtlFaultSchedule.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlActivitySchedule.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlActivityWindow.h">
       <Filter>Header Files</Filter>
     </ClInclude>

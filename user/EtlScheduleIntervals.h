@@ -122,7 +122,7 @@ namespace etl_profile
     {
         std::vector<CpuSchedule> cpus;
         std::vector<ThreadSchedule> threads;
-        uint32_t readyCount = 0, unsupportedReady = 0, boundaries = 0, unsupportedBoundaries = 0;
+        uint32_t readyCount = 0, unsupportedReady = 0, unassignedReady = 0, boundaries = 0, unsupportedBoundaries = 0;
         uint32_t cpuConflicts = 0, cpuClockConflicts = 0;
         uint16_t logger = 0;
         bool seenSwitch = false, indexed = false, ambiguousScope = false, unknownSwitchTid = false;
@@ -189,6 +189,7 @@ namespace etl_profile
                 if (m == Match::Unsupported) { ++unsupportedReady; }
                 if (m != Match::Decoded) { return; }
                 ++readyCount;
+                if (!ready.tid || ready.tid == UINT32_MAX) { ++unassignedReady; }
                 ObserveClock(ready.at.tick);
                 auto* thread = Watch(ready.tid);
                 if (thread && thread->last.kind == EdgeKind::Out) { thread->ready.Append(ready); }
@@ -295,5 +296,62 @@ namespace etl_profile
     inline uint64_t TickDistance(int64_t begin, int64_t end)
     {
         return static_cast<uint64_t>(end) - static_cast<uint64_t>(begin);
+    }
+
+    struct ScheduleSlice
+    {
+        SwitchEvent end;
+        IntervalWitnesses witnesses;
+        bool running;
+        int64_t beginTick, endTick; // Intersection with the selected time window.
+
+        const ScheduleEdge& Start() const
+        {
+            return running ? witnesses.previousCpu : witnesses.previousIncomingThread;
+        }
+
+        int64_t ReadyPivot() const { return std::clamp(witnesses.ready.last.at.tick, beginTick, endTick); }
+
+        ScheduleEdge End() const
+        {
+            const ScheduleRef at{end.timestamp, end.record, end.cpu, end.loggerId,
+                (end.flags & EVENT_HEADER_FLAG_PROCESSOR_INDEX) != 0};
+            return {at, running ? EdgeKind::Out : EdgeKind::In, running ? end.fields.oldTid : end.fields.newTid,
+                end.ordinal, 0, end.version, 36, end.fields.oldState, end.fields.oldWaitReason};
+        }
+
+        ReportedSpan Assess(const ScheduleHistory& history, uint16_t logger, const ThreadPair& pair, bool qpc, bool gap) const
+        {
+            const auto& start = Start().at;
+            if (history.unknownSwitchTid) { return {L"coverage_unqualified"}; }
+            if (history.cpuConflicts) { return {L"cpu_history_conflict"}; }
+            if (history.cpuClockConflicts) { return {L"clock_unqualified"}; }
+            if (start.logger != logger || end.loggerId != logger) { return {L"logger_conflict"}; }
+            if (!pair.pairedPid) { return {L"thread_bracket_unqualified"}; }
+            if (start.record <= pair.before->record || end.record >= pair.after->record ||
+                start.tick <= pair.before->tick || end.timestamp >= pair.after->tick)
+            { return {L"switch_outside_bracket"}; }
+            return AssessSpan(history, end, witnesses, running, qpc, gap);
+        }
+    };
+
+    template <class Visitor>
+    void VisitScheduleSlices(ScheduleHistory& history, const SwitchEvent& e, uint32_t tid, int64_t lo, int64_t hi, Visitor visit)
+    {
+        const bool outgoing = e.fields.oldTid == tid, incoming = e.fields.newTid == tid;
+        if (!tid || tid == UINT32_MAX || lo <= 0 || lo >= hi || (!outgoing && !incoming))
+        { history.Observe(e, nullptr); return; }
+
+        IntervalWitnesses witnesses;
+        history.Observe(e, &witnesses);
+        const auto retain = [&](bool running, const ScheduleEdge& start)
+        {
+            if (!start.switchOrdinal) { return; }
+            const auto begin = (std::max)(start.at.tick, lo);
+            const auto end = (std::min)(e.timestamp, hi);
+            if (begin < end) { visit(ScheduleSlice{e, witnesses, running, begin, end}); }
+        };
+        if (outgoing) { retain(true, witnesses.previousCpu); }
+        if (incoming) { retain(false, witnesses.previousIncomingThread); }
     }
 }
