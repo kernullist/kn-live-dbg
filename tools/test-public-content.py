@@ -161,14 +161,26 @@ class PublicContentTests(unittest.TestCase):
 
 
     def test_io_lifecycle_journals_and_reports(self):
-        for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1"):
+        for schema in ("kn.io_lifetime.v1", "kn.io_lifetime_assessment.v1", "kn.io_lifetime_timing.v1"):
             first = json.dumps({"schema": schema, "seq": 1, "kind": "result"})
             reordered = json.dumps({"kind": "result", "schema": schema, "seq": 1})
             for sample in (first, "log\n" + first[:-4], "log\n" + reordered + "\n" + reordered):
-                for encoding in ("utf-8", "utf-16"):
+                for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
                     findings = AUDIT.inspect("unrelated-name.txt", sample.encode(encoding))
                     self.assertIn("private-evidence-bundle", {f["rule"] for f in findings})
             self.assertFalse(AUDIT.inspect("guide.md", ("See the " + schema + " journal.").encode()))
+
+    def test_io_timing_detached_evidence(self):
+        for row in (dict(evidence_line=3, tick_field="start", tick_ms="20"),
+                    dict(end_tick_ms="42", evidence_line=8, start_tick_ms="37"),
+                    dict(clear_or_submission_from_line=11, signal_by_line=6),
+                    dict(proven_precedences=[], possible_latest_generations=[1, 2]),
+                    dict(accepted=2, right_censored=1, bounded_signals=1),
+                    dict(signal_window=None, submission_to_signal_ms=None)):
+            snippet = "log\n" + json.dumps(dict(part=row), indent=2)[:-4]
+            for enc in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", snippet.encode(enc))})
+        self.assertFalse(AUDIT.inspect("timing.md", b"The optional report exposes signal_window and tick_field."))
 
     def test_saved_cpu_profile(self):
         for name in ("input.ETL", "input.etl.zip"):

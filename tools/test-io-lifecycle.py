@@ -3,6 +3,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -93,7 +94,33 @@ def completion_during_cancel(exe, directory):
                 close(handle)
 
 
+def shared_change(exe, directory):
+    directory.mkdir()
+    raw = bytearray()
+    with subprocess.Popen([str(exe), "--io-lifecycle", "3500", str(directory), str(directory)],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        timer = threading.Timer(12, child.kill)
+        timer.start()
+        try:
+            for line in child.stdout:
+                raw.extend(line)
+                if json.loads(line)["kind"] == "monitor":
+                    (directory / "both-watchers.txt").touch(exist_ok=False)
+            if child.wait(timeout=3) != 0:
+                raise AssertionError("shared directory notification capture failed")
+        finally:
+            timer.cancel()
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+    return bytes(raw)
+
+
 def capture(exe, folder):
+    import ctypes
+    clock = ctypes.WinDLL("kernel32").GetTickCount64
+    clock.restype = ctypes.c_uint64
+    stimulus = {1: {}, 2: {}}
     dirs = [folder / n for n in ("first", "second", "quiet")]
     for d in dirs:
         d.mkdir()
@@ -114,10 +141,15 @@ def capture(exe, folder):
             while line := lines.get(timeout=12):
                 original.append(line)
                 r = json.loads(line)
+                if r["kind"] == "wait" and r["result"] < len(r["generations"]):
+                    generation = r["generations"][r["result"]]
+                    stimulus[generation]["signal_report_received"] = clock()
                 if r["kind"] == "monitor":
                     verify_declined_handle_closed(file)
+                    stimulus[2]["before_change"] = clock()
                     (dirs[1] / names[1]).touch()
                 if r["kind"] == "release" and r["generation"] == 2:
+                    stimulus[1]["before_change"] = clock()
                     (dirs[0] / names[0]).touch()
             child.wait(timeout=5)
             if child.returncode:
@@ -129,19 +161,59 @@ def capture(exe, folder):
             pump.join(timeout=5)
     same = command([exe, "--io-lifecycle", 40, dirs[0], dirs[0]])
     raced = completion_during_cancel(exe, dirs[2])
-    return dict(ordered=b"".join(original), same_directory=same, cancel_race=raced), dirs, names
+    both = shared_change(exe, folder / "shared")
+    return dict(ordered=b"".join(original), same_directory=same, cancel_race=raced, shared_change=both), dirs, names, stimulus
 
 
 def encode(rows):
     return b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n" for r in rows)
 
 
+def timed_control(raw, base=100, same_tick=False):
+    rows = list(map(json.loads, raw.splitlines()))
+    rows[0]["wait_ms"] = 1
+    for n, r in enumerate(rows):
+        start = base if same_tick else base + n * 4
+        r["tick"] = start if same_tick else start + 2
+        if "start" in r:
+            r["start"] = start
+        if r["kind"] == "monitor":
+            epoch = r["tick"]
+        if r["kind"] == "wait":
+            r["timeout_ms"] = max(0, rows[0]["wait_ms"] - (start - epoch))
+    return rows
+
+
+def possible_signal_ticks(rows, generation):
+    # Enumerate hidden issue and signal ticks. A non-resetting private event
+    # must be able to satisfy each check at some instant in its call window.
+    submit = next(r for r in rows if r["kind"] == "submit" and r["generation"] == generation)
+    checks = []
+    for r in rows:
+        if r["kind"] == "wait" and generation in r["generations"]:
+            if r["result"] == TIMEOUT:
+                checks.append((False, range(r["start"], r["tick"] + 1)))
+            elif r["result"] < len(r["generations"]) and generation == r["generations"][r["result"]]:
+                checks.append((True, range(r["start"], r["tick"] + 1)))
+        if r["generation"] == generation and r["kind"] in ("probe", "result") and r["event_result"] in (0, TIMEOUT):
+            checks.append((r["event_result"] == 0, range(r["start"], r["tick"] + 1)))
+        if r["generation"] == generation and r["kind"] == "release" and r["quiesce_result"] == 0:
+            checks.append((True, [r["tick"]]))
+    states = []
+    for issue in range(submit["start"], submit["tick"] + 1):
+        for signal in range(issue, rows[-1]["tick"] + 1):
+            if all(any(t >= signal for t in window) if positive else any(t <= signal for t in window)
+                   for positive, window in checks):
+                states.append((issue, signal))
+    return states
+
+
 class IoTests(unittest.TestCase):
-    def replay(self, raw, code=0, pin=None):
+    def replay(self, raw, code=0, pin=None, *, timing=False):
         p = self.folder / "review.jsonl"
         p.write_bytes(raw)
         run = command([sys.executable, "-I", "-B", HERE / "replay-io-lifecycle.py", p,
-                       "--sha256", pin or hashlib.sha256(raw).hexdigest()], code)
+                       "--sha256", pin or hashlib.sha256(raw).hexdigest(), *(["--timing"] if timing else [])], code)
         return json.loads(run) if run else None
 
     def test_native_order_identity_and_outcomes(self):
@@ -267,18 +339,23 @@ class IoTests(unittest.TestCase):
         a = self.replay(encode([dict(r, seq=i) for i, r in enumerate(ordered)]))
         self.assertEqual((a["coverage"]["returned_submissions"], a["coverage"]["queued"], a["coverage"]["known_outcomes"]), (1, 0, 0))
         self.assertEqual(a["requests"][0]["outcome"], "UnknownOutcome")
+        timing = self.replay(encode([dict(r, seq=i) for i, r in enumerate(ordered)]), timing=True)
+        self.assertEqual((timing["requests"][0]["status"], timing["signal_order"]["possible_latest_generations"]), ("submission_failed", []))
         rows = list(map(json.loads, self.raw["ordered"].splitlines()))
-        probe = next(r for r in rows if r["kind"] == "probe")
+        # Complete the first selected event early, preserving the native wait-any ordering.
+        selected = next(r for r in rows if r["kind"] == "wait")
+        first = selected["generations"][selected["result"]]
+        probe = next(r for r in rows if r["kind"] == "probe" and r["generation"] == first)
         final = next(r for r in rows if r["kind"] == "result" and r["generation"] == probe["generation"])
         for k in ("ok", "error", "bytes", "event_result"):
             probe[k] = final[k]
         a = self.replay(encode(rows))
-        op = a["requests"][0]
+        op = a["requests"][first-1]
         self.assertNotIn("PendingObserved", [s["state"] for s in op["states"]])
         self.assertEqual(op["outcome"], "completed")
         for r in (probe, final):
             r.update(ok=False, error=1022, bytes=None)
-        self.assertEqual(self.replay(encode(rows))["requests"][0]["outcome"], "changes_require_enumeration")
+        self.assertEqual(self.replay(encode(rows))["requests"][first-1]["outcome"], "changes_require_enumeration")
 
     def test_conflicting_completion_witnesses(self):
         rows = list(map(json.loads, self.raw["ordered"].splitlines()))
@@ -286,8 +363,9 @@ class IoTests(unittest.TestCase):
         probe.update(ok=True, error=None, bytes=7, event_result=0)
         op = self.replay(encode(rows))["requests"][0]
         self.assertEqual(op["outcome"], "UnknownOutcome")
-        conflict = next(s for s in op["states"] if s["state"] == "IdentityConflict")
-        self.assertEqual([rows[i-1]["kind"] for i in conflict["evidence_lines"]], ["probe", "result"])
+        conflicts = [[rows[i-1]["kind"] for i in s["evidence_lines"]] for s in op["states"] if s["state"] == "IdentityConflict"]
+        self.assertIn(["probe", "result"], conflicts)
+        self.assertIn(["probe", "wait"], conflicts)
         final = next(r for r in rows if r["kind"] == "result" and r["generation"] == 1)
         probe.update(ok=False, error=INCOMPLETE, bytes=None, event_result=TIMEOUT)
         final["event_result"] = TIMEOUT
@@ -335,6 +413,156 @@ class IoTests(unittest.TestCase):
                     child.kill()
                     child.wait()
 
+    def test_owned_signal_windows_and_shared_wait_cost(self):
+        raw = self.raw["ordered"]
+        rows = list(map(json.loads, raw.splitlines()))
+        q = self.replay(raw, timing=True)
+        self.assertEqual(q["schema"], "kn.io_lifetime_timing.v1")
+        self.assertEqual(q["receipt_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(q["coverage"], dict(planned=5, accepted=3, known_outcomes=3, bounded_signals=3, right_censored=0, conflicts=0))
+        self.assertEqual(self.replay(raw, timing=True), q)
+        self.assertLessEqual(self.stimulus[2]["signal_report_received"], self.stimulus[1]["before_change"])
+        for g, witness in self.stimulus.items():
+            w = q["requests"][g-1]["signal_window"]
+            self.assertLessEqual(int(w["not_before"]["tick_ms"]), witness["signal_report_received"])
+            self.assertGreaterEqual(int(w["not_after"]["tick_ms"]), witness["before_change"])
+            for endpoint in w.values():
+                row = rows[endpoint["evidence_line"]-1]
+                self.assertEqual(row[endpoint["tick_field"]], int(endpoint["tick_ms"]))
+        self.assertEqual([r["status"] for r in q["requests"][3:]], ["admission_unavailable"] * 2)
+        self.assertEqual(q["signal_order"]["possible_latest_generations"], [3])
+        edges = [(e["earlier_generation"], e["later_generation"]) for e in q["signal_order"]["proven_precedences"]]
+        self.assertEqual(edges, [(1, 3), (2, 3)])
+        monitor = q["monitor"]
+        waits = [row for row in rows if row["kind"] == "wait"]
+        self.assertEqual([w["selected_generation"] for w in monitor["waits"]], [2, 1, None])
+        self.assertEqual(int(monitor["wait_call_ms"]), sum(r["tick"] - r["start"] for r in waits))
+        self.assertEqual(int(monitor["wait_call_ms"]) + int(monitor["outside_wait_calls_ms"]), int(monitor["elapsed_ms"]))
+        self.assertFalse(q["kernel_service_time_observed"] or q["cross_capture_joins"])
+        same = self.replay(self.raw["same_directory"], timing=True)
+        self.assertEqual(same["signal_order"]["possible_latest_generations"], [1, 2])
+        self.assertEqual(same["signal_order"]["proven_precedences"], [])
+        self.assertEqual(same["monitor"]["wait_call_ms"], same["monitor"]["waits"][0]["elapsed_ms"])
+        race = self.replay(self.raw["cancel_race"], timing=True)["requests"][0]
+        self.assertIsNotNone(race["cancellation"])
+        self.assertEqual(race["outcome"], "completed")
+
+    def test_exhaustive_latency_bounds_and_clock_ties(self):
+        for base in (100, (1 << 64) - 1000):
+            rows = timed_control(self.raw["same_directory"], base)
+            q = self.replay(encode(rows), timing=True)
+            for g in (1, 2):
+                states = possible_signal_ticks(rows, g)
+                durations = [signal - issue for issue, signal in states]
+                request = q["requests"][g-1]
+                self.assertEqual(request["submission_to_signal_ms"], dict(minimum=str(min(durations)), maximum=str(max(durations))))
+                self.assertEqual([int(request["signal_window"][side]["tick_ms"]) for side in ("not_before", "not_after")],
+                                 [min(s for _, s in states), max(s for _, s in states)])
+            self.assertEqual(q["monitor"]["wait_call_ms"], "2")
+        tied = timed_control(self.raw["ordered"], base=42, same_tick=True)
+        q = self.replay(encode(tied), timing=True)
+        self.assertEqual(q["signal_order"]["possible_latest_generations"], [3])
+        self.assertTrue(all(r["submission_to_signal_ms"] == dict(minimum="0", maximum="0") for r in q["requests"][:3]))
+        self.assertEqual({(e["earlier_generation"], e["later_generation"]) for e in q["signal_order"]["proven_precedences"]}, {(1, 3), (2, 3)})
+
+    def test_one_change_signals_two_requests(self):
+        data = self.raw["shared_change"]
+        q = self.replay(data, timing=True)
+        self.assertCountEqual([w["selected_generation"] for w in q["monitor"]["waits"]], [1, 2])
+        self.assertTrue(all(r["outcome"] == "completed" and r["resources_released"] for r in q["requests"]))
+        expected = 12 + len("both-watchers.txt".encode("utf-16-le"))
+        for r in q["requests"]:
+            self.assertTrue(expected <= r["native_final_result"]["bytes"] <= (expected + 3) // 4 * 4)
+        self.assertNotIn(b"both-watchers.txt", data)
+        self.assertEqual(q["signal_order"], dict(status="order_unresolved", possible_latest_generations=[1, 2], proven_precedences=[]))
+
+    def test_gaps_censoring_and_unobserved_monitor(self):
+        rows = timed_control(self.raw["ordered"])
+        q = self.replay(encode(rows[:1]), timing=True)
+        self.assertIsNone(q["monitor"]["wait_call_ms"])
+        self.assertTrue(all(r["status"] == "admission_unobserved" for r in q["requests"]))
+        select = next(i for i, r in enumerate(rows) if r["kind"] == "wait")
+        q = self.replay(encode(rows[:select+1]), timing=True)
+        self.assertEqual(q["requests"][1]["outcome"], "UnknownOutcome")
+        self.assertEqual(q["requests"][1]["signal_window"]["not_after"]["evidence_line"], select+1)
+        self.assertEqual(q["coverage"]["right_censored"], 2)
+        self.assertIsNone(q["requests"][0]["submission_to_signal_ms"]["maximum"])
+        self.assertIsNone(q["signal_order"]["possible_latest_generations"])
+        broken = self.replay(encode(rows[:select] + rows[select+1:]), timing=True)
+        self.assertEqual((broken["coverage"]["bounded_signals"], broken["coverage"]["right_censored"]), (0, 3))
+        self.assertTrue(broken["unjoined_records"])
+        partial = self.replay(encode(rows[:select]) + b'{"incomplete"', timing=True)
+        self.assertGreater(partial["trailing_bytes"], 0)
+        self.assertEqual(partial["monitor"]["waits"], [])
+        excluded = [rows[0], next(r for r in rows if r["kind"] == "admit" and r["stage"] != "ready"),
+                    next(r for r in rows if r["kind"] == "monitor"), rows[-1]]
+        excluded = [dict(r, seq=i, generation=int(i == 1)) for i, r in enumerate(excluded)]
+        excluded[0]["requests"] = 1
+        none = self.replay(encode(excluded), timing=True)
+        self.assertEqual(none["signal_order"], dict(status="no_accepted_requests", possible_latest_generations=[], proven_precedences=[]))
+
+    def test_conflicting_and_failed_shared_waits(self):
+        for name in ("same_directory", "ordered"):
+            rows = timed_control(self.raw[name])
+            first = next(r for r in rows if r["kind"] == "probe" and r["generation"] == 1)
+            first.update(event_result=0, event_error=None)
+            wait = next(r for r in rows if r["kind"] == "wait")
+            q = self.replay(encode(rows), timing=True)
+            self.assertEqual(q["requests"][0]["status"], "identity_conflict")
+            self.assertIsNone(q["requests"][0]["signal_window"])
+            self.assertIsNone(q["signal_order"]["possible_latest_generations"])
+            self.assertEqual(q["monitor"]["waits"][0]["disputed_by_probe_lines"], [first["seq"]+1])
+            # A disputed shared observation cannot tighten a different member's interval.
+            other = q["requests"][1]["signal_window"]
+            self.assertNotIn(wait["seq"]+1, [e["evidence_line"] for e in other.values() if e])
+            op = self.replay(encode(rows))["requests"][0]
+            self.assertEqual(op["outcome"], "UnknownOutcome")
+            self.assertTrue(op["resources_released"])
+            if name == "ordered":
+                selected = self.replay(encode(rows[:wait["seq"] + 1]))["requests"][1]
+                self.assertNotIn("CompletionEventSignaled", [s["state"] for s in selected["states"]])
+                # The disputed selection cannot contradict this member's own later clear check.
+                final = next(r for r in rows if r["kind"] == "result" and r["generation"] == 2)
+                final.update(ok=False, error=6, bytes=None, event_result=TIMEOUT)
+                member = self.replay(encode(rows), timing=True)["requests"][1]
+                self.assertEqual(member["conflict_evidence_lines"], [])
+                self.assertEqual(member["signal_window"]["not_after"]["observation"], "quiescence_observed")
+        rows = timed_control(self.raw["same_directory"])
+        wait = next(r for r in rows if r["kind"] == "wait")
+        wait.update(result=FAILED, error=6)
+        final = next(r for r in rows if r["kind"] == "result")
+        final.update(event_result=FAILED, event_error=6)
+        q = self.replay(encode(rows), timing=True)
+        op = q["requests"][0]
+        self.assertEqual((op["outcome"], op["signal_window"]["not_after"]["observation"]), ("UnknownOutcome", "quiescence_observed"))
+        self.assertEqual(op["signal_window"]["not_before"]["observation"], "private_event_clear")
+        self.assertEqual((q["monitor"]["waits"][0]["win32_error"], q["coverage"]["conflicts"]), (6, 0))
+        rows = timed_control(self.raw["ordered"])
+        previously_ready = next(r for r in rows if r["kind"] == "probe" and r["generation"] == 3)
+        previously_ready["event_result"] = 0
+        first_wait = next(i for i, r in enumerate(rows) if r["kind"] == "wait")
+        q = self.replay(encode(rows[:first_wait+1]), timing=True)
+        self.assertEqual(q["monitor"]["waits"][0]["disputed_by_probe_lines"], [])
+        self.assertEqual(q["requests"][2]["status"], "signal_bounded")
+
+    def test_timing_pin_and_output_aliases(self):
+        raw = self.raw["ordered"]
+        path = self.folder / "timing-original.jsonl"
+        path.write_bytes(raw)
+        alias = self.folder / "timing-hardlink.bin"
+        os.link(path, alias)
+        pin = hashlib.sha256(raw).hexdigest()
+        self.replay(raw, 2, "f" * 64, timing=True)
+        tool = [sys.executable, "-I", "-B", str(HERE / "replay-io-lifecycle.py")]
+        for args, channel in (([path, "--timing", "--sha256", pin], "stdout"), ([path, "--timing", "--sha256"], "stderr"),
+                              (["--help", path], "stdout"), (["--timing", path, "--bad"], "stderr")):
+            with alias.open("ab", buffering=0) as sink:
+                channels = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                channels[channel] = sink
+                result = subprocess.run([*tool, *args], **channels, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(path.read_bytes(), raw)
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -344,7 +572,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kn-io-life-") as tmp:
         IoTests.folder = Path(tmp)
         IoTests.exe = args.exe.resolve(strict=True)
-        IoTests.raw, IoTests.dirs, IoTests.names = capture(IoTests.exe, IoTests.folder)
+        IoTests.raw, IoTests.dirs, IoTests.names, IoTests.stimulus = capture(IoTests.exe, IoTests.folder)
         if args.keep:
             args.keep.mkdir()
             for name, data in IoTests.raw.items():

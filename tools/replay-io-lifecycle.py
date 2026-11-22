@@ -2,8 +2,10 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 
@@ -117,10 +119,9 @@ def validate_record(r, previous_tick):
                 uint(error)
 
 
-def read_journal(path, pin):
+def read_journal_stream(stream, pin):
     check(type(pin) is str and re.fullmatch(r"[a-f0-9]{64}", pin), "invalid SHA-256")
-    with path.open("rb") as stream:
-        raw = stream.read(128 * 1024 + 1)
+    raw = stream.read(128 * 1024 + 1)
     check(len(raw) <= 128 * 1024 and hashlib.sha256(raw).hexdigest() == pin, "capture size or SHA-256 mismatch")
     *lines, tail = raw.split(b"\n")
     check(1 <= len(lines) <= 128 and len(tail) <= 4096, "missing plan or oversized journal")
@@ -172,6 +173,11 @@ def read_journal(path, pin):
     return rows, gaps, len(tail)
 
 
+def read_journal(path, pin):
+    with path.open("rb") as stream:
+        return read_journal_stream(stream, pin)
+
+
 class PrefixEnded(Exception):
     pass
 
@@ -214,6 +220,11 @@ class Operation:
     def state(self, name, *lines):
         self.states.append(dict(state=name, evidence_lines=list(lines)))
 
+    def invalidate(self, *lines):
+        self.conflict = True
+        self.known = None
+        self.state("IdentityConflict", *lines)
+
     def release(self, source):
         r = self.take(source, "release")
         check((r["quiesce_result"] is not None) == self.queued, "final event wait differs from admitted I/O")
@@ -237,13 +248,13 @@ class Operation:
             changed = prior_result and value != (p["ok"], p["error"], p["bytes"])
             signaled_then_timeout = (self.selected or p["event_result"] == 0) and row["event_result"] == TIMEOUT
             if changed or signaled_then_timeout:
-                self.conflict = True
-                self.known = None
                 sources = [self.lines["probe"]] if changed or p["event_result"] == 0 else []
                 if signaled_then_timeout and self.selected:
                     sources.append(self.selected)
-                self.state("IdentityConflict", *sources, line)
+                self.invalidate(*sources, line)
                 return
+        if self.conflict:
+            return
         if row["event_result"] == 0 and (row["ok"] or row["error"] in (ABORTED, ENUM_DIR)):
             if row["ok"]:
                 outcome = "completed_without_change_details" if row["bytes"] == 0 else "completed"
@@ -284,12 +295,126 @@ class Operation:
                     outcome=self.known["outcome"] if self.known else "UnknownOutcome")
 
 
-def replay(path, pin):
-    rows, gaps, tail = read_journal(path, pin)
+def call_window(row, line):
+    return dict(evidence_line=line, start_tick_ms=str(row["start"]), end_tick_ms=str(row["tick"]),
+                elapsed_ms=str(row["tick"] - row["start"]))
+
+
+def monitor_timing(rows, disputed):
+    monitor_line = next((n for n, r in enumerate(rows, 1) if r["kind"] == "monitor"), None)
+    waits = []
+    wait_ticks = 0
+    for n, row in enumerate(rows, 1):
+        if row["kind"] != "wait":
+            continue
+        generations = row["generations"]
+        result = row["result"]
+        waits.append(dict(**call_window(row, n), generations=generations, requested_ms=row["timeout_ms"],
+                          wait_result=result, win32_error=row["error"], disputed_by_probe_lines=disputed.get(n, []),
+                          selected_generation=generations[result] if result < len(generations) else None))
+        wait_ticks += row["tick"] - row["start"]
+    total = rows[-1]["tick"] - rows[monitor_line - 1]["tick"] if monitor_line else None
+    return dict(monitor_line=monitor_line, through_line=len(rows) if monitor_line else None,
+                elapsed_ms=str(total) if monitor_line else None, wait_call_ms=str(wait_ticks) if monitor_line else None,
+                outside_wait_calls_ms=str(total - wait_ticks) if monitor_line else None, waits=waits)
+
+
+def endpoint(row, line, field, observation):
+    return dict(evidence_line=line, tick_field=field, tick_ms=str(row[field]), observation=observation)
+
+
+def request_timing(rows, request, disputed):
+    lines, generation = request["observation_lines"], request["generation"]
+    submit_line = lines.get("submit")
+    submit = rows[submit_line - 1] if submit_line else None
+    submission = dict(**call_window(submit, submit_line), ok=submit["ok"], win32_error=submit["error"]) if submit else None
+    cancel_line = lines.get("cancel")
+    cancel = rows[cancel_line - 1] if cancel_line else None
+    cancellation = dict(**call_window(cancel, cancel_line), ok=cancel["ok"], win32_error=cancel["error"]) if cancel else None
+    conflicts = [s["evidence_lines"] for s in request["states"] if s["state"] == "IdentityConflict"]
+    report = dict(generation=generation, admission=request["admission"], submission=submission, cancellation=cancellation,
+                  outcome=request["outcome"], native_final_result=request["native_final_result"],
+                  resources_released=request["resources_released"], conflict_evidence_lines=conflicts,
+                  signal_window=None, submission_to_signal_ms=None)
+    if not submit:
+        admission = request["admission"]
+        status = ("admission_unobserved" if admission is None else
+                  "submission_unobserved" if admission["stage"] == "ready" else "admission_unavailable")
+        return dict(report, status=status)
+    if not submit["ok"] or conflicts:
+        return dict(report, status="submission_failed" if not submit["ok"] else "identity_conflict")
+
+    # The event starts clear. Each check occurs somewhere inside the recorded
+    # call window. A timeout supplies its start as a lower bound, never its end.
+    lower = endpoint(submit, submit_line, "start", "submission_started")
+    upper = None
+    for n in range(submit_line + 1, len(rows) + 1):
+        row = rows[n - 1]
+        kind = row["kind"]
+        if kind == "wait" and generation in row["generations"] and n not in disputed:
+            if row["result"] == TIMEOUT:
+                lower = endpoint(row, n, "start", "wait_any_timeout")
+            elif row["result"] < len(row["generations"]) and row["generations"][row["result"]] == generation and upper is None:
+                upper = endpoint(row, n, "tick", "wait_any_selected")
+        elif row["generation"] == generation:
+            if kind in ("probe", "result"):
+                if row["event_result"] == TIMEOUT:
+                    lower = endpoint(row, n, "start", "private_event_clear")
+                elif row["event_result"] == 0 and upper is None:
+                    upper = endpoint(row, n, "tick", "private_event_signaled")
+            elif kind == "release" and row["quiesce_result"] == 0 and upper is None:
+                upper = endpoint(row, n, "tick", "quiescence_observed")
+    minimum = max(0, int(lower["tick_ms"]) - submit["tick"])
+    maximum = int(upper["tick_ms"]) - submit["start"] if upper else None
+    report["signal_window"] = dict(not_before=lower, not_after=upper)
+    report["submission_to_signal_ms"] = dict(minimum=str(minimum), maximum=str(maximum) if upper else None)
+    return dict(report, status="signal_bounded" if upper else "right_censored")
+
+
+def signal_order(requests, complete):
+    bounded = [r for r in requests if r["status"] == "signal_bounded"]
+    candidates = {r["generation"] for r in bounded}
+    precedences = []
+    for earlier in bounded:
+        upper = earlier["signal_window"]["not_after"]["evidence_line"]
+        for later in bounded:
+            lower = later["signal_window"]["not_before"]["evidence_line"]
+            # One issuing thread writes these records in order. Distinct
+            # observations can establish order even within a single clock tick.
+            if earlier is not later and upper < lower:
+                candidates.discard(earlier["generation"])
+                precedences.append(dict(earlier_generation=earlier["generation"], later_generation=later["generation"],
+                                        signal_by_line=upper, clear_or_submission_from_line=lower))
+    full = complete and all(r["status"] in ("signal_bounded", "admission_unavailable", "submission_failed") for r in requests)
+    if not full:
+        status = "incomplete"
+    elif len(candidates) == 1:
+        status = "unique_latest_signal"
+    else:
+        status = "order_unresolved" if candidates else "no_accepted_requests"
+    return dict(status=status, possible_latest_generations=sorted(candidates) if full else None, proven_precedences=precedences)
+
+
+def timing_report(rows, assessment, disputed):
+    requests = [request_timing(rows, r, disputed) for r in assessment["requests"]]
+    coverage = assessment["coverage"]
+    return dict(schema="kn.io_lifetime_timing.v1", receipt_sha256=assessment["receipt_sha256"], source=assessment["source"],
+                provider=assessment["provider"], clock=assessment["clock"], measured_event="private_manual_reset_completion_event",
+                journal_complete=assessment["journal_complete"], committed_lines=assessment["committed_lines"],
+                qualified_prefix_lines=len(rows), trailing_bytes=assessment["trailing_bytes"], missing_sequences=assessment["missing_sequences"],
+                unjoined_records=assessment["unjoined_records"], coverage=dict(planned=coverage["planned"], accepted=coverage["queued"],
+                    known_outcomes=coverage["known_outcomes"], bounded_signals=sum(r["status"] == "signal_bounded" for r in requests),
+                    right_censored=sum(r["status"] == "right_censored" for r in requests), conflicts=sum(bool(r["conflict_evidence_lines"]) for r in requests)),
+                monitor=monitor_timing(rows, disputed), requests=requests, signal_order=signal_order(requests, assessment["journal_complete"]),
+                kernel_service_time_observed=False, cross_capture_joins=False, provider_authenticated=False)
+
+
+def assess(rows, gaps, tail, pin, timing):
     p = rows[0]
     limit = gaps[0]["next_line"] - 1 if gaps else len(rows)
     source = Transcript(rows, limit)
     slots = [Operation(i) for i in range(1, p["requests"] + 1)]
+    disputed = {}
     complete = False
     try:
         for op in slots:
@@ -300,6 +425,13 @@ def replay(path, pin):
             wait, wait_line = source.take("wait")
             check(wait["generations"] == [op.gen for op in active], "wait roster differs from outstanding generations")
             check(wait["timeout_ms"] == max(0, p["wait_ms"] - (wait["start"] - monitor["tick"])), "wait budget differs from plan")
+            # A private manual-reset event already seen signaled cannot time out or
+            # lose selection to a higher-index handle. WAIT_FAILED observes no state.
+            if wait["result"] != FAILED:
+                for earlier in active[:wait["result"]]:
+                    if earlier.probe["event_result"] == 0:
+                        earlier.invalidate(earlier.lines["probe"], wait_line)
+                        disputed.setdefault(wait_line, []).append(earlier.lines["probe"])
             if wait["result"] in (TIMEOUT, FAILED):
                 for op in active:
                     op.take(source, "cancel")
@@ -308,8 +440,11 @@ def replay(path, pin):
                     op.finish(source)
                 break
             op = active.pop(wait["result"])
-            op.selected = wait_line
-            op.state("CompletionEventSignaled", wait_line)
+            if wait_line in disputed:
+                op.state("ObservationGap", wait_line)
+            else:
+                op.selected = wait_line
+                op.state("CompletionEventSignaled", wait_line)
             op.finish(source)
         source.take("end")
         check(source.pos == limit, "unexpected record after end")
@@ -321,7 +456,7 @@ def replay(path, pin):
         for op in slots:
             if not op.retired and not (op.lines.get("admit") and not op.admitted):
                 op.state("ObservationGap", 1, *([max(op.lines.values())] if op.lines else []))
-    return dict(schema="kn.io_lifetime_assessment.v1", receipt_sha256=pin, source=p["source"],
+    assessment = dict(schema="kn.io_lifetime_assessment.v1", receipt_sha256=pin, source=p["source"],
                 provider=dict(run=p["run"], pid=p["pid"], process_created=p["process_created"], tid=p["tid"],
                               thread_created=p["thread_created"]), clock=p["clock"],
                 journal_complete=complete, committed_lines=len(rows), qualified_prefix_lines=limit, trailing_bytes=tail,
@@ -337,17 +472,62 @@ def replay(path, pin):
                               unknown_outcomes=sum(op.known is None for op in slots)),
                 requests=[op.report() for op in slots], kernel_dispatch_observed=False, kernel_irp_generation_bound=False,
                 cross_capture_joins=False, provider_authenticated=False)
+    return timing_report(rows[:limit], assessment, disputed) if timing else assessment
+
+
+def replay(path, pin, *, timing=False):
+    return assess(*read_journal(path, pin), pin, timing)
+
+
+def outputs_distinct(arguments, opened=None):
+    if sys.stdout is None:
+        return False
+    try:
+        sinks = [os.fstat(s.fileno()) for s in (sys.stdout, sys.stderr) if s is not None]
+    except (OSError, ValueError):
+        return False
+    sinks = [s for s in sinks if stat.S_ISREG(s.st_mode)]
+    if not sinks:
+        return True
+    if opened is not None and any(os.path.samestat(os.fstat(opened.fileno()), s) for s in sinks):
+        return False
+    # Invalid grammar can reach argparse's help/error output before there is a
+    # parsed journal. Cover literal positional names and --option=value syntax.
+    operands = [*arguments, *(arg.split("=", 1)[1] for arg in arguments if arg.startswith("--") and "=" in arg)]
+    for operand in operands:
+        try:
+            info = os.stat(operand)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError):
+            return False
+        if any(os.path.samestat(info, s) for s in sinks):
+            return False
+    return True
 
 
 def main():
+    if not outputs_distinct(sys.argv[1:]):
+        return 2
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("journal", type=Path)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument("--timing", action="store_true", help="bound private event signals and account for shared wait calls")
     args = parser.parse_args()
     try:
-        print(json.dumps(replay(args.journal, args.sha256), separators=(",", ":"), allow_nan=False))
+        check(stat.S_ISREG(args.journal.stat().st_mode), "a regular I/O journal is required")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(args.journal, flags), "rb") as stream:
+            check(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "a regular I/O journal is required")
+            if not outputs_distinct(sys.argv[1:], stream):
+                return 2
+            report = assess(*read_journal_stream(stream, args.sha256), args.sha256, args.timing)
+            if not outputs_distinct(sys.argv[1:], stream):
+                return 2
+            print(json.dumps(report, separators=(",", ":"), allow_nan=False), flush=True)
     except (OSError, ValueError, RecursionError) as exc:
-        print(f"I/O lifecycle replay failed: {exc}", file=sys.stderr)
+        if outputs_distinct(sys.argv[1:]):
+            print(f"I/O lifecycle replay failed: {exc}", file=sys.stderr)
         return 2
     return 0
 

@@ -1001,8 +1001,8 @@ a unique manual-reset event, a notification buffer and an `OVERLAPPED`
 record for each request. It assigns the request a generation within a
 fresh provider run and records the issuing process and thread creation
 times. Requests for the same directory remain distinct. The shared wait
-records its ordered generation list and the native index of the event that
-signaled, so completion order can differ from submission order.
+records its ordered generation list and the native index Windows selected.
+The collector retrieves one result for the selected request.
 [Windows directory change notifications](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
 
 | Evidence in the journal | State that replay can support |
@@ -1025,6 +1025,45 @@ with a KMON snapshot still require another source.
 [Windows overlapped results](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult)
 
 [Capture and replay a request](COMMAND_REFERENCE.md#trace-an-io-request-through-completion)
+
+#### Directory notification timing
+
+Replay with `--timing` follows the private manual-reset event that the
+collector creates for each accepted request. The collector initializes the
+event clear and retains it until the operation ends. A direct event check,
+selection in a shared wait or a successful final wait can establish an upper
+bound on the signal time. A prior clear check or a shared timeout establishes
+a lower bound. Both bounds cite physical journal lines. A failed wait and a
+cancellation attempt supply no signal observation.
+[Overlapped I/O events](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-overlapped)
+
+For an accepted submission with recorded start and return ticks `S0` and
+`S1`, the initial lower bound `L` is `S0`. A later clear observation advances
+`L` to the start of its call. The first positive observation sets the upper
+bound `U` to the tick recorded after the check. The elapsed time from Windows
+accepting the submission to its event signaling lies between
+`max(0, L - S1)` and `U - S0` on the recorded clock. The report leaves the
+upper bound null when the qualified prefix ends before a signal witness.
+The clock has system-timer resolution, typically 10–16 ms. Distinct events
+can share a tick. [GetTickCount64](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64)
+
+One thread writes the journal. If it sees one event signaled before it
+submits another request or checks that the other event is still clear,
+those two lines establish precedence even at equal clock ticks. Overlapping
+windows can leave several candidates for the latest signal. A shared wait
+reports one selected generation. If it times out after an earlier private
+probe saw a member signaled, or selects a higher index than that member,
+replay records the conflicting lines and excludes the disputed call from
+every member's timing bounds. The native return stays in the report.
+[Windows shared wait semantics](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects)
+
+The monitor accounts for each shared wait call once, with its full roster,
+from the monitor marker through the last qualified record. The remaining
+elapsed ticks include time spent reading results, issuing cancellation,
+closing handles and scheduling the observer. The journal supplies no device
+service time or worker scheduling breakdown. Terminal I/O status comes
+from the retained result for each generation.
+[Replay a timing report](COMMAND_REFERENCE.md#measure-directory-notification-timing)
 
 ### Cooperative kernel I/O request lifetimes
 

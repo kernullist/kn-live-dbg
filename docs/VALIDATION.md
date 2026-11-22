@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Directory notification timing on 2026-11-22
+
+The x64 Release collector from `fd3b28f` recorded four runs against owned
+temporary directories. The timing replay read the same retained bytes as
+the lifecycle assessment. The table gives clock deltas for this run. A
+zero means that the clock did not advance across the measured boundaries.
+
+| Input | Native outcome | Ticks spent in shared wait calls | Latest signal candidates |
+|---|---|---:|---|
+| Two changed directories, one quiet directory, two unavailable paths | Three requests accepted. Generations 2 and 1 completed, and generation 3 returned `ERROR_OPERATION_ABORTED`. | 3,500 ms | 3 |
+| Two requests on one quiet directory | Both returned `ERROR_OPERATION_ABORTED` after one shared timeout. | 63 ms | 1, 2 |
+| Two requests on one directory, one file created | Both returned the notification length for the new name. | 0 ms | 1, 2 |
+| One change after the timeout and before cancellation | The original result reported a successful completion. | 47 ms | 1 |
+
+For the two separately triggered changes, the controller recorded ticks
+before creating each file and after receiving its selection record. Both
+independent intervals intersected the corresponding replay bounds. For
+the ordered run, the later timeout on the quiet directory established
+that its signal followed both completed notifications.
+
+The 15-case lifecycle suite also checked failed and disputed waits, final
+quiescence with an unknown result, hard-linked output and a mismatched
+hash. An independent enumeration of feasible submission and signal ticks
+checked elapsed bounds, including near the unsigned 64-bit limit. Equal
+timestamp controls preserved event order when the journal contained
+separate positive and clear observations. Replaying all 73 complete-line
+prefixes and 65 single-line omissions across the four captures kept every
+timing witness within the qualified prefix.
+
+The default assessment matched the previous replayer byte for byte for
+these four captures and three archived journals. The 34 public-content
+checks passed. Separate checks recognized the actual timing reports,
+detached wait and request rows and their bounds in UTF-8 and BOM-less
+UTF-16. These tests cover this Windows collector and its observer clock.
+Device service time, cross-provider IRP identity and worker scheduling
+remain open. [Command and report fields](COMMAND_REFERENCE.md#measure-directory-notification-timing)
+
 ## Saved ETL reader comparison on 2026-11-22
 
 The x64 Release executable from `fd3b28f` and the installed Windows

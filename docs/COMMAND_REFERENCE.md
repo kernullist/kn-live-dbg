@@ -717,6 +717,31 @@ ends the qualified prefix. Later records remain visible under
 a directory was unavailable or a request's final outcome is unknown.
 [Request identity and state transitions](ARCHITECTURE.md#directory-io-request-lifetimes)
 
+### Measure directory notification timing
+
+Use the journal and SHA-256 from the capture above.
+
+```powershell
+python -I -B tools/replay-io-lifecycle.py $file --sha256 $pin --timing
+```
+
+In the private `kn.io_lifetime_timing.v1` report, `signal_window` cites
+the original lines for an accepted request and `submission_to_signal_ms`
+gives the elapsed range. A null maximum means the recorded prefix ended
+without a qualified signal observation. Conflicting records carry
+`identity_conflict` with the source lines and leave both timing fields
+null. Read `outcome` for the I/O result. A request can have a bounded
+signal and an unknown outcome.
+
+`monitor.wait_call_ms` counts each shared wait once across its listed
+requests. `signal_order.possible_latest_generations` lists the candidates
+that the observed windows allow. The list is null if the journal is
+incomplete or any accepted request lacks a qualified signal. An empty
+list means the complete journal had no accepted requests. Replay exits
+with code 2 for an invalid journal or pin. Use a separate file when
+saving the report.
+[Timing bounds and clock resolution](ARCHITECTURE.md#directory-notification-timing)
+
 ## Capture a cooperative kernel I/O trace
 
 On an elevated Windows test host, build the Release fixture and run the
