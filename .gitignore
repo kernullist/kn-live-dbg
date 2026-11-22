@@ -15,6 +15,14 @@
 *.knmcpjournal
 *.knmcpjournal.tmp.*
 *.knledger.pending-*
+*.knretirement
+*.knretirement.pending-*
+*.kngc
+*.kngc.pending-*
+*.kngcintent
+*.kngcintent.pending-*
+*.kngcreceipt
+*.kngcreceipt.pending-*
 *.knindex
 *.knindex.pending-*
 *.knchunk

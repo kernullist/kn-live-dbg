@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Closed collection retirement on 2026-11-23
+
+Two closed image collections shared a PE in a disposable store. The preceding
+x64 Release CLI (`dc6ee701b80f`) protected the selected sweep and returned
+exit 2 for `retire-collection`. The updated size-optimized x64 Release CLI
+(`c396d34f4f67`) passed 386 retirement checks. The journal harness
+(`bc4818ab1125`) passed 359. The tests independently hashed the original
+sessions, segments and members, counted paths owned by one or both collections,
+and compared those results with the inventory, retirement receipt and files
+remaining after GC. [Retirement tests](../tools/test-evidence-retirement.py)
+
+Retirement alone preserved every original. Releasing the first sweep made its
+reads and slices selectable. The PE stayed protected while another journal or
+archive still referred to it. A new capture appearing after a durable GC intent
+blocked deletion on retry. When both collections' eligible originals had been
+released, both failure ledgers, sessions, segments and indexes still matched
+their original bytes. Changing owners between preflight and apply enforced the
+exclusive-byte limit against the new ownership counts.
+
+The oracle also exercised typed IRP, IRP claim publication, direct image
+capture, direct approval and scoped approval journals. Standalone replay of
+the four original publication fixtures succeeded after retirement while their
+files remained available. After physical release the preceding CLI reported
+incomplete or unavailable recovery. The updated reader could still verify
+the historical manifest and ledgers. A corrupt receipt, segment or ledger
+blocked GC. An interrupted writer, a broken output pipe, a Korean reason,
+a replaced file and incomplete enumeration all had separate controls.
+Retry on a damaged retired collection preserved the missing session and lock
+as evidence of damage.
+
+CLI regressions passed 2,152 journal, 492 store, 898 GC and 400 IRP journal
+checks. The image dependency suite passed 128 and the IRP claim publication
+suite passed 830 over 21 original captures. The console suite passed 570
+checks with the owned target fixture present. The MSVC AddressSanitizer
+harness passed the same 359 retirement checks with
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`. With its default settings
+one Windows interceptor failed at startup, before the first fixture ran.
+
+These checks used local disposable stores, coordinated publishers and
+observed process interruption. Cross-collection retention priorities,
+large-store continuation and recovery after storage power loss remain open.
+
 ## IRP replay reference retention on 2026-11-23
 
 In a disposable store the preceding x64 Release CLI (`924a715fd2a7`)

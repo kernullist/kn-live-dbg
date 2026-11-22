@@ -4,10 +4,11 @@
 #include <functional>
 
 // Explicit operator selection, never inferred from a released inventory.
-// This policy cannot retire a committed root or discard a failure ledger.
+// Retired originals require a separate policy bound to the retirement receipt.
 struct EvidenceGcPolicy
 {
     std::wstring Reason;
+    std::wstring RetiredCollection, RetirementSha256;
     uint64_t MinimumAgeSeconds = 86400;
     uint64_t ByteLimit = 128ull * 1024 * 1024;
     std::vector<EvidenceJournalMember> Members;
@@ -27,6 +28,7 @@ struct EvidenceGcResult
     std::wstring RootIdentity, OperationSha256;
     uint64_t ObservedFileTime = 0, SelectedBytes = 0, DeletedThisCall = 0, DeletedBytesThisCall = 0;
     bool Apply = false;
+    std::wstring RetiredCollection, RetirementSha256;
     std::vector<EvidenceGcEntry> Entries;
 };
 
@@ -38,3 +40,14 @@ bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy);
 EvidenceGcResult CollectEvidenceStore(const std::wstring& root, const std::wstring& policyPath,
     const std::wstring& operationId = L"", const std::function<void(const wchar_t*)>& observer = {});
 std::wstring EvidenceGcResultJson(const EvidenceGcResult& result);
+
+struct EvidenceRetirementResult
+{
+    std::wstring Status = L"unavailable", Issue, PolicySha256, ReceiptSha256, Record;
+    bool Apply = false, Reused = false;
+};
+
+// A single create-new record withdraws a closed root. Physical cleanup uses GC.
+EvidenceRetirementResult RetireEvidenceCollection(const std::wstring& root, const std::wstring& policyPath,
+    bool apply, const std::function<void(const wchar_t*)>& observer = {});
+std::wstring EvidenceRetirementResultJson(const EvidenceRetirementResult& result);

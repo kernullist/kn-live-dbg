@@ -453,6 +453,15 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--retire-collection")
+        {
+            const std::wstring stage = argc == 6 ? argv[5] : L"";
+            const auto result = RetireEvidenceCollection(argv[2], argv[3], std::wstring(argv[4]) == L"apply",
+                [&](const wchar_t* current) { Stage(stage, current); });
+            std::cout << mcpjson::WideToUtf8(EvidenceRetirementResultJson(result)) << std::endl;
+            if (!std::cout) { return 3; }
+            return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
+        }
         if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--gc")
         {
             const std::wstring stage = argc == 6 ? argv[5] : L"";
@@ -483,7 +492,8 @@ int wmain(int argc, wchar_t** argv)
         {
             const auto r = RecoverEvidenceJournal(argv[2], argc == 4 && std::wstring(argv[3]) == L"--index");
             std::wcout << EvidenceJournalRecoveryJson(r) << '\n';
-            return r.Status == L"verified_prefix" && r.IndexStatus != L"failed" ? 0 : 1;
+            return (r.Status == L"verified_prefix" && r.IndexStatus != L"failed") ||
+                (r.Status == L"retired" && r.IndexStatus == L"not_requested") ? 0 : 1;
         }
         if (argc == 4 && std::wstring(argv[1]) == L"--produce") { return Produce(argv[2], argv[3]); }
         if (argc == 3 && std::wstring(argv[1]) == L"--resume")

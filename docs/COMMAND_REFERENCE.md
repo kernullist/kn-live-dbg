@@ -200,7 +200,7 @@ remain provider requests. See [minimized image disclosure](ARCHITECTURE.md#minim
 and the [AI workflow](AI_ASSISTED_WORKFLOWS.md#review-minimized-image-evidence).
 
 `KnLiveDbg.exe --offline !kmon journal <collection-directory> [/index] [/json]`
-verifies a stopped `collections/<collection-id>` image collection and returns
+verifies a stopped `collections/<collection-id>` image or IRP journal and returns
 private `kn.evidence_journal_recovery.v1` JSON. It reports the committed prefix,
 closure/unknown tail, exact collection-scoped byte denominators and committed
 sweep paths. File presence alone does not establish membership. A live writer
@@ -210,12 +210,14 @@ original files are revalidated even if an index exists. Corrupt existing output
 is preserved and reported. No orphan deletion or new target acquisition occurs.
 Exit 0 means a verified prefix and, when requested, a ready index; the prefix can
 still have an unknown tail. Exit 1 means unavailable/incomplete recovery or index
-failure, and 2 means invalid grammar. Pass a returned sweep path relative to the
+failure, and 2 means invalid grammar. A valid retired journal returns 0 without
+`/index` and reports historical manifest membership. It returns 1 with
+`/index` and `index_status:retired`. Pass a returned active sweep path relative to the
 artifact root to `replay-image` or `graph` for separate policy verification.
 See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
 
 `KnLiveDbg.exe --offline !kmon store <artifact-root> [/artifacts] [/json]`
-audits stopped image collections together and returns private
+audits stopped image and IRP collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.
 `/artifacts` includes bounded per-path ownership detail with explicit omission
@@ -238,6 +240,18 @@ after collection stops. Exit 0 means complete verified membership and artifact
 inventory, 1 means partial/unavailable, and 2 means invalid grammar. The returned
 report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
 
+`KnLiveDbg.exe --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json]`
+ends an identified closed collection's retention. Save a verified store
+inventory and prepare the private policy with
+`python tools/new-evidence-gc-policy.py --inventory inventory.json --retire-collection 7 --reason "retention period ended" --output retire.json`.
+The helper defaults to a 24-hour minimum closure-file age and a 128 MiB limit
+on exclusively owned nonledger bytes. Preflight reports the exclusive, shared
+and failure-ledger impacts. Adding `/apply` records the policy and those counts
+in the collection's retirement receipt. Exit 0 means planned, retired or a
+matching receipt was reused. Exit 1 means denied or incomplete, 2 means
+invalid grammar and 3 means output failure. Inspect the receipt after an
+interrupted apply or output failure. [Retirement semantics](ARCHITECTURE.md#closed-collection-retirement)
+
 `KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]`
 preflights an explicit policy by default. Prepare one with
 `python tools/new-evidence-gc-policy.py --inventory inventory.json --path image-reads/reads-123-4.knreads --reason "obsolete unpublished observation" --output policy.json`.
@@ -255,6 +269,14 @@ the root in a separate operation. A later preflight checks whether any
 surviving capture, read, slice, sweep, approval or journal still needs the
 selected files. An IRP capture in a closed journal can also name a PE that
 was absent at publication. Once that PE appears, GC protects it.
+
+To release files after retirement, save a fresh `store /artifacts` inventory.
+Use `--from-retired-collection 7` with one or more `--path` arguments to the
+same helper and a new policy output. It selects only `retired_requires_policy`
+rows owned by that retired collection. GC validates the named retirement
+receipt and current dependencies again. The inventory reports historical
+membership and distinguishes verified replacements, absent paths and paths
+whose current contents or presence could not be established.
 
 Exit 0 means planned or historically completed; exit 1 includes denied,
 incomplete and unresolved deletion outcomes; exit 2 means invalid grammar.

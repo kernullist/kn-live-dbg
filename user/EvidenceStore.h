@@ -47,6 +47,8 @@ struct EvidenceStoreArtifact
 {
     EvidenceJournalMember Artifact;
     std::vector<std::wstring> Collections;
+    std::vector<std::wstring> RetiredCollections;
+    bool RetiredOriginalMatched = false;
     std::vector<EvidenceStoreApprovalReferrer> ApprovalReferrers;
     std::wstring ApprovalCatalog;
     std::vector<EvidenceStoreImageReferrer> ImageReferrers;
@@ -64,6 +66,9 @@ struct EvidenceStoreInventory
     std::wstring ArtifactsSha256;
     uint64_t StartedTick = 0, EndedTick = 0;
     uint64_t CollectionsObserved = 0, ClosedCollections = 0, OpenCollections = 0, UnresolvedCollections = 0;
+    uint64_t RetiredCollections = 0, RetiredSegments = 0, RetiredMemberReferences = 0, RetiredLogicalBytes = 0;
+    uint64_t RetiredDeclaredPaths = 0, RetiredAbsentPaths = 0, RetiredUnobservedPaths = 0, RetiredChangedPaths = 0;
+    uint64_t RetiredOnlyFiles = 0, RetiredOnlyBytes = 0;
     uint64_t CommittedSegments = 0, MemberReferences = 0, CollectionPathReferences = 0;
     uint64_t LogicalReferenceBytes = 0, CollectionPathBytes = 0, UniquePathBytes = 0, UniqueContentBytes = 0;
     uint64_t ObservedArtifactFiles = 0, UnverifiedArtifactFiles = 0, UnmanagedEntries = 0;

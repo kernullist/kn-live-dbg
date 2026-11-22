@@ -24,7 +24,7 @@ struct EvidenceJournalTransaction
 
 struct EvidenceJournalRecovery
 {
-    std::wstring Status = L"unavailable", Issue, CollectionId, SessionSha256, HeadSha256;
+    std::wstring Status = L"unavailable", Issue, CollectionId, SessionSha256, HeadSha256, RetirementSha256;
     uint64_t CommittedSegments = 0, MemberReferences = 0, UniquePaths = 0;
     uint64_t LogicalBytes = 0, UniqueContentBytes = 0, ReadBytes = 0;
     uint64_t PendingFiles = 0, IndexCreated = 0, IndexReused = 0;

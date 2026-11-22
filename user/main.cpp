@@ -23133,6 +23133,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
+    std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23512,7 +23513,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23911,6 +23912,26 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
     }
+    if (action == L"retire-collection" && directJsonOutput)
+    {
+        bool apply = false, json = false, valid = args.size() >= 4 && args.size() <= 6;
+        for (size_t i = 2; valid && i < 4; ++i) { valid = !args[i].empty() && args[i][0] != L'/'; }
+        for (size_t i = 4; valid && i < args.size(); ++i)
+        {
+            const auto option = ToLower(args[i]);
+            if (option == L"/apply" && !apply) { apply = true; }
+            else if (option == L"/json" && !json) { json = true; }
+            else { valid = false; }
+        }
+        if (!valid)
+        {
+            std::wcerr << L"usage: --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json]\n";
+            return 2;
+        }
+        const auto result = RetireEvidenceCollection(args[2], args[3], apply);
+        if (!WriteCapabilityJson(EvidenceRetirementResultJson(result))) { return 3; }
+        return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
+    }
     if (action == L"gc")
     {
         bool valid = args.size() >= 4 && args.size() <= 7 && !args[2].empty() && !args[3].empty();
@@ -23977,7 +23998,8 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         }
         const auto result = RecoverEvidenceJournal(args[2], rebuild);
         std::wcout << EvidenceJournalRecoveryJson(result) << L"\n";
-        return result.Status == L"verified_prefix" && (!rebuild || result.IndexStatus == L"ready") ? 0 : 1;
+        return (result.Status == L"verified_prefix" && (!rebuild || result.IndexStatus == L"ready")) ||
+            (result.Status == L"retired" && !rebuild) ? 0 : 1;
     }
     if (action == L"inventory")
     {
@@ -54178,7 +54200,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch, disk I/O and hard page fault records\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
         std::wcout << L"  KnLiveDbg.exe --etl-rotation-set <inventory.jws> --sha256 <digest> --authority <capture_controller|archive_witness> <trusted-p256-point> [--member <ordinal> <local.etl>]...   verify ordered ETL files\n";

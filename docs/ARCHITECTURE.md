@@ -255,8 +255,8 @@ the policy does not reserve physical disk space or guarantee crash-time closure.
 
 This policy applies to the routed image pipeline. Committed artifact protection
 continues to come from journal membership and the store's GC rules. Priority
-admission for other evidence families, cross-session retention, other-family transfer/redaction
-privacy controls and committed-root retirement remain separate P06 requirements.
+admission for other evidence families, cross-session retention priorities and
+other-family transfer/redaction controls remain separate P06 requirements.
 
 ## Original KMON slice replay
 
@@ -417,8 +417,8 @@ deadline is checked between synchronous operations, not an I/O cancellation
 guarantee. Index reads share this budget. Logical reference bytes and unique
 content bytes cover only the verified collection prefix; they do not measure
 physical disk allocation, orphan volume or global cross-collection retention.
-The stopped-store inventory and explicit uncommitted GC below cover image and
-IRP members. Committed-root retirement, remaining family priorities, large-store
+The stopped-store inventory, closed-collection retirement and explicit GC below
+cover image and IRP members. Remaining family priorities, large-store
 continuation beyond these bounds and media/power-loss testing remain P06 work.
 Files are flushed before create-new
 rename; the observed-process-interruption tests do not establish power-loss
@@ -510,8 +510,8 @@ it. A legacy or unreadable declaration protects candidate IRP reference files as
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
-revalidates its own policy and leases. Committed-root retirement, cross-collection
-retention priorities and other-family transfer/redaction controls remain P06 work.
+revalidates its own policy and leases. Cross-collection retention priorities
+and other-family transfer/redaction controls remain P06 work.
 Local ACL/EFS admission is described under [private evidence roots](#private-evidence-roots).
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
@@ -525,6 +525,45 @@ flags distinguish verified journal membership from an incomplete artifact scan.
 emitted/omitted row counts; the
 aggregate counters and complete captured-row digest remain available. Large-store
 continuation is still required; this bounded audit does not implement it.
+
+## Closed collection retirement
+
+An operator can end the retention of a closed image or IRP journal through
+`--offline !kmon retire-collection <root> <policy.json>`. The policy names the
+collection ID, exact session and closing segment hashes, a reason, minimum age
+of the closure file and a ceiling on exclusively owned nonledger bytes. During
+preflight the collector holds the stopped-store lease, validates each journal
+and scans the managed files. It counts each selected path once, partitioned by
+sole active owner, additional active owners or failure-ledger membership.
+These counts describe ownership at that observation. Surviving archive inputs
+can still protect a file whose journal owner was exclusive.
+
+`/apply` publishes the create-new `collections/<id>/retirement.knretirement`
+receipt. It includes the exact policy, observed closure and evaluation times,
+both complete inventory digests and the path and byte totals. Closure age uses
+the filesystem last-write time. Retrying the same policy returns the existing
+receipt. A different policy for that collection is denied. The session,
+segments, original files, derived indexes and failure ledgers remain in place
+when the receipt is written. Apply recalculates ownership and age even after a
+successful preflight. Later recovery validates the historical chain,
+receipt and original failure ledgers. It reports `retired_manifest_membership`
+and `original_set_verified:false` and declines index rebuilding.
+
+The store counts active and retired membership separately. Present historical
+paths identify their retired owners. An exact original can have active owners
+or surviving dependencies. A different verified file at the same name is
+protected. An unreadable file or an incomplete physical scan leaves affected
+paths unobserved. A complete scan can establish a path's absence. Attribution
+of a deletion requires its own operation history.
+
+Releasing an eligible original requires a separate `kn.evidence_gc_policy.v2`
+selection bound to the retired collection and the receipt's exact SHA-256.
+Each apply and intent retry checks other owners, surviving archive declarations
+and physical identity. A still-present retired capture, sweep or approval can
+keep its inputs reachable. Withdrawing that referrer in an earlier operation
+allows the next inventory to evaluate its inputs again. Failure ledgers stay
+protected. The receipt records the reason supplied by the operator. Its
+integrity depends on the local store's access controls and trusted writers.
 
 ## Explicit uncommitted-artifact GC
 
@@ -549,7 +588,7 @@ Bounds are 128 members, 128 KiB policy input and 128 MiB selected bytes, within
 the existing store budgets and cooperative deadline.
 
 Every captured collection must verify closed and the complete artifact scan
-must succeed. Only `uncommitted_requires_policy` members can be selected;
+must succeed. The v1 policy selects only `uncommitted_requires_policy` members;
 committed originals/references, all failure ledgers, unknown artifacts and open
 or unresolved membership remain protected. All selections are preflighted before
 the first deletion. Exact files are held against writes/path replacement, and
@@ -589,8 +628,7 @@ protected input denies the entire policy. A separate operation can withdraw an
 eligible loose root. The next inventory checks every remaining referrer.
 Legacy IRP declarations can leave the exact dependency unknown. The result
 retains `uncommitted_dependents_resolved:false` across the full store.
-Priority-based GC selection, retirement
-of committed roots, full dependency-impact analysis, other-family transfer/redaction controls
+Priority-based GC selection, full dependency-impact analysis, other-family transfer/redaction controls
 and large-store continuation remain required work. All policy/audit/report artifacts
 are private evidence; there is no automatic external upload.
 
@@ -2118,8 +2156,8 @@ an existing image journal. Store inventory, exact-byte deduplication and explici
 uncommitted GC cover these root files without upgrading their replay or source
 authenticity claims. Unknown tails and failure ledgers remain protected.
 
-Approved build/schema change handling, real native-driver lifecycle evidence,
-committed-root retirement and cross-session retention remain open.
+Approved build/schema change handling, real native-driver lifecycle evidence
+and cross-session retention priorities remain open.
 Journal integration controls are recorded in
 [validation](VALIDATION.md#irp-journal-and-retention-checkpoint-2026-11-07).
 Owned DIA/offset/read-byte and replay controls are recorded in

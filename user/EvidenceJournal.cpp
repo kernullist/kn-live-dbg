@@ -95,6 +95,72 @@ namespace
     {
         return a.Path == b.Path && a.Sha256 == b.Sha256 && a.Bytes == b.Bytes && a.Schema == b.Schema;
     }
+    constexpr const wchar_t* RetirementFile = L"retirement.knretirement";
+    struct RetirementPolicy
+    {
+        std::wstring Id, Session, Head, Reason;
+        uint64_t Age = 0, ExclusiveByteLimit = 0;
+    };
+    struct RetirementCount
+    {
+        uint64_t Paths = 0, Bytes = 0;
+        void Add(uint64_t bytes) { ++Paths; Bytes += bytes; }
+    };
+    struct RetirementRecord
+    {
+        RetirementPolicy Policy;
+        uint64_t Observed = 0, ClosureWritten = 0;
+        std::wstring Catalog, Artifacts;
+        RetirementCount Exclusive, Shared, Ledgers;
+    };
+    std::wstring RetirementPolicyJson(const RetirementPolicy& p)
+    {
+        return L"{\"schema\":\"kn.evidence_retirement_policy.v1\",\"collection_id\":" + mcpjson::Quote(p.Id) +
+            L",\"session_sha256\":" + mcpjson::Quote(p.Session) + L",\"head_sha256\":" + mcpjson::Quote(p.Head) +
+            L",\"reason\":" + mcpjson::Quote(p.Reason) + L",\"minimum_age_seconds\":" + N(p.Age) +
+            L",\"exclusive_byte_limit\":" + N(p.ExclusiveByteLimit) + L"}";
+    }
+    bool ParseRetirementPolicy(const std::wstring& json, RetirementPolicy& p)
+    {
+        IndexedObject o;
+        if (!o.Parse(json)) { return false; }
+        p.Id = o.String(L"collection_id"); p.Head = o.String(L"head_sha256");
+        p.Session = o.String(L"session_sha256"); p.Reason = o.String(L"reason");
+        return Id(p.Id) && Digest(p.Head) && Digest(p.Session) && Text(p.Reason, 512) &&
+            Number(json, L"minimum_age_seconds", &p.Age) && p.Age <= 10ull * 366 * 86400 &&
+            Number(json, L"exclusive_byte_limit", &p.ExclusiveByteLimit) && p.ExclusiveByteLimit <= MaxReadBytes &&
+            RetirementPolicyJson(p) == json;
+    }
+    std::wstring RetirementCountJson(const RetirementCount& c)
+    { return L"{\"paths\":" + N(c.Paths) + L",\"named_bytes\":" + N(c.Bytes) + L"}"; }
+    std::wstring RetirementReceiptJson(const RetirementRecord& r)
+    {
+        return Envelope(L"kn.evidence_retirement.v1", L"{\"policy\":" + RetirementPolicyJson(r.Policy) +
+            L",\"observed_filetime\":" + N(r.Observed) + L",\"closure_last_write_filetime\":" + N(r.ClosureWritten) +
+            L",\"catalog_sha256\":" + mcpjson::Quote(r.Catalog) + L",\"artifacts_sha256\":" + mcpjson::Quote(r.Artifacts) +
+            L",\"exclusive_nonledger\":" + RetirementCountJson(r.Exclusive) + L",\"shared_nonledger\":" + RetirementCountJson(r.Shared) +
+            L",\"failure_ledgers\":" + RetirementCountJson(r.Ledgers) + L"}");
+    }
+    bool ParseRetirementRecord(const std::wstring& json, RetirementRecord& r)
+    {
+        IndexedObject envelope, body;
+        std::wstring payload, policy;
+        if (!envelope.Parse(json) || !envelope.Raw(L"payload", &payload) || !body.Parse(payload) ||
+            !body.Raw(L"policy", &policy) || !ParseRetirementPolicy(policy, r.Policy)) { return false; }
+        r.Catalog = body.String(L"catalog_sha256"); r.Artifacts = body.String(L"artifacts_sha256");
+        const auto count = [&](const wchar_t* key, RetirementCount& c)
+        {
+            std::wstring raw;
+            return body.Raw(key, &raw) && Number(raw, L"paths", &c.Paths) && c.Paths <= MaxPaths &&
+                Number(raw, L"named_bytes", &c.Bytes) && c.Bytes <= MaxReadBytes && c.Paths <= c.Bytes &&
+                (c.Paths != 0 || c.Bytes == 0);
+        };
+        return Digest(r.Catalog) && Digest(r.Artifacts) && Number(payload, L"observed_filetime", &r.Observed) &&
+            Number(payload, L"closure_last_write_filetime", &r.ClosureWritten) && r.ClosureWritten != 0 &&
+            r.Observed >= r.ClosureWritten && (r.Observed - r.ClosureWritten) / 10000000 >= r.Policy.Age &&
+            count(L"exclusive_nonledger", r.Exclusive) && count(L"shared_nonledger", r.Shared) && count(L"failure_ledgers", r.Ledgers) &&
+            r.Exclusive.Bytes <= r.Policy.ExclusiveByteLimit && RetirementReceiptJson(r) == json;
+    }
     bool MemberValid(const EvidenceJournalMember& m, const std::wstring& id)
     {
         if (!Digest(m.Sha256) || m.Bytes == 0 || m.Path.size() > 180) { return false; }
@@ -388,9 +454,23 @@ struct EvidenceJournal::Impl
     bool Direct = false;
     bool Approved = false;
     bool ScopedApproval = false;
+    bool RetirementSeen = false;
     std::function<bool(HANDLE)> AdmitOutput;
 
     bool Fail(const wchar_t* issue) { Result.Issue = issue; return false; }
+    void Incomplete()
+    {
+        // Historical records have no verified original-file prefix until their
+        // complete closed chain has been bound to the retirement receipt.
+        if (RetirementSeen)
+        {
+            EvidenceJournalRecovery failed;
+            failed.Issue = std::move(Result.Issue); failed.CollectionId = std::move(Result.CollectionId); failed.ReadBytes = Result.ReadBytes;
+            Result = std::move(failed);
+        }
+        Result.Status = Result.CommittedSegments ? L"incomplete_prefix" : L"unavailable";
+        Result.Closed = Result.CanResume = false;
+    }
     bool Timely() { return GetTickCount64() - Started <= DeadlineMs || Fail(L"deadline_exhausted"); }
     bool PinDirectory(const fs::path& directory, bool create)
     {
@@ -629,10 +709,11 @@ struct EvidenceJournal::Impl
             { added.ImagePayloads.emplace(root.Path, std::move(catalog.PayloadSha256)); }
         return Timely();
     }
-    bool VerifyMembers(const EvidenceJournalTransaction& t, VerifiedMembers* added)
+    bool VerifyMembers(const EvidenceJournalTransaction& t, VerifiedMembers* added, bool ledgersOnly = false)
     {
         for (const auto& m : t.Members)
         {
+            if (ledgersOnly && !FailureLedger(m.Schema)) { continue; }
             const auto imageKind = ImageArchiveKindForPath(m.Path);
             if (Members.count(m.Path) && imageKind == ImageArchiveKind::None) { continue; } // Still pinned.
             if (SharedMembers != nullptr)
@@ -670,7 +751,7 @@ struct EvidenceJournal::Impl
             }
             added->Files.emplace(m.Path, std::move(file));
         }
-        if (t.Kind == L"image_approval" || t.Kind == L"image_scope_approval")
+        if (!ledgersOnly && (t.Kind == L"image_approval" || t.Kind == L"image_scope_approval"))
         {
             const bool scoped = t.Kind == L"image_scope_approval";
             const auto schema = scoped ? ImageScopeApprovalPublicationSchema : ImageApprovalPublicationSchema;
@@ -738,6 +819,12 @@ struct EvidenceJournal::Impl
             if (!StoreLease->Acquire(artifactRoot, false, &Result.Issue, create)) { return false; }
         }
         if (error || !PinDirectory(Collection, create)) { return false; }
+        // A writer must not recreate even a missing lock or session in a retired collection.
+        const auto receipt = Collection / RetirementFile;
+        const auto receiptPath = NativePath(receipt);
+        RetirementSeen = GetFileAttributesW(receiptPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!RetirementSeen && GetLastError() != ERROR_FILE_NOT_FOUND) { return Fail(L"collection_retirement_state_unavailable"); }
+        if (RetirementSeen && create) { return Fail(L"collection_retired_or_retirement_unresolved"); }
         Lock = Own(CreateFileW(NativePath(Collection / L"writer.knjlock").c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
             create ? OPEN_ALWAYS : OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         FILE_ATTRIBUTE_TAG_INFO attributes{};
@@ -764,6 +851,14 @@ struct EvidenceJournal::Impl
         Typed = Claims || json == SessionJson(id, 2);
         Files.emplace(L"@session", std::move(lease));
         Result.HeadSha256 = Result.SessionSha256;
+        RetirementRecord retirement;
+        std::wstring receiptHash;
+        if (RetirementSeen)
+        {
+            if (!Read(receipt, 16384, &lease, &receiptHash, &bytes, &json) || !ParseRetirementRecord(json, retirement) ||
+                retirement.Policy.Id != id || retirement.Policy.Session != Result.SessionSha256) { return Fail(L"invalid_collection_retirement"); }
+            Files.emplace(L"@retirement", std::move(lease));
+        }
         if (!PinDirectory(Collection / L"journal-segments", create)) { return false; }
         std::set<std::wstring> names;
         for (fs::directory_iterator it(NativePath(Collection / L"journal-segments"), error), end; !error && it != end; it.increment(error))
@@ -792,11 +887,22 @@ struct EvidenceJournal::Impl
             const auto key = r.Transaction.Kind + L":" + r.Transaction.Id;
             if (Transactions.count(key)) { return Fail(L"duplicate_transaction"); }
             VerifiedMembers added;
-            if (!ValidateTransaction(r.Transaction) || !VerifyMembers(r.Transaction, &added)) { return false; }
+            if (!ValidateTransaction(r.Transaction) || !VerifyMembers(r.Transaction, &added, RetirementSeen)) { return false; }
             Files.emplace(L"@segment-" + std::to_wstring(r.Sequence), std::move(lease));
             Accept(std::move(r), std::move(added));
         }
-        Result.Status = L"verified_prefix"; Result.Issue.clear(); Result.CanResume = !Result.Closed;
+        if (RetirementSeen)
+        {
+            RetirementCount originals, ledgers;
+            for (const auto& item : Members)
+                { (FailureLedger(item.second.Schema) ? ledgers : originals).Add(item.second.Bytes); }
+            if (!Result.Closed || retirement.Policy.Head != Result.HeadSha256 ||
+                originals.Paths != retirement.Exclusive.Paths + retirement.Shared.Paths || originals.Bytes != retirement.Exclusive.Bytes + retirement.Shared.Bytes ||
+                ledgers.Paths != retirement.Ledgers.Paths || ledgers.Bytes != retirement.Ledgers.Bytes) { return Fail(L"retirement_closure_or_impact_mismatch"); }
+            Result.RetirementSha256 = std::move(receiptHash);
+            Result.SweepPaths.clear(); Result.DirectCapturePaths.clear(); Result.ApprovalPaths.clear();
+        }
+        Result.Status = RetirementSeen ? L"retired" : L"verified_prefix"; Result.Issue.clear(); Result.CanResume = !Result.Closed;
         Writable = create && Result.CanResume; Healthy = true;
         return true;
     }
@@ -952,12 +1058,12 @@ EvidenceJournalRecovery RecoverEvidenceJournal(const std::wstring& directory, bo
         const auto root = path.parent_path().parent_path();
         if (!d.Load(root.empty() ? L"." : root.wstring(), path.filename().wstring(), false))
         {
-            d.Result.Status = d.Result.CommittedSegments ? L"incomplete_prefix" : L"unavailable";
-            d.Result.CanResume = d.Result.Closed = false;
+            d.Incomplete();
             return d.Result;
         }
         if (rebuildIndex)
         {
+            if (d.RetirementSeen) { d.Result.IndexStatus = L"retired"; return d.Result; }
             d.Result.IndexStatus = L"building";
             for (const auto& r : d.Records)
             {
@@ -966,7 +1072,7 @@ EvidenceJournalRecovery RecoverEvidenceJournal(const std::wstring& directory, bo
             d.Result.IndexStatus = d.IndexHead() ? L"ready" : L"failed";
         }
     }
-    catch (...) { d.Result.Status = L"incomplete_prefix"; d.Result.CanResume = d.Result.Closed = false; d.Fail(L"journal_recovery_exception"); }
+    catch (...) { d.Fail(L"journal_recovery_exception"); d.Incomplete(); }
     return d.Result;
 }
 
@@ -1001,7 +1107,8 @@ std::wstring EvidenceJournalRecoveryJson(const EvidenceJournalRecovery& r)
         L",\"pending_segment_files\":" + N(r.PendingFiles) + L",\"index_status\":" + mcpjson::Quote(r.IndexStatus) +
         L",\"index_created\":" + N(r.IndexCreated) + L",\"index_reused\":" + N(r.IndexReused) +
         L",\"committed_sweep_paths\":" + sweeps + L"],\"committed_direct_capture_paths\":" + captures +
-        L"],\"committed_approval_paths\":" + approvals + L"],\"denominator_scope\":\"verified_collection_prefix\","
+        L"],\"committed_approval_paths\":" + approvals + (r.RetirementSha256.empty() ? L"],\"denominator_scope\":\"verified_collection_prefix\"," :
+            L"],\"retirement_sha256\":" + mcpjson::Quote(r.RetirementSha256) + L",\"denominator_scope\":\"retired_manifest_membership\",\"original_set_verified\":false,") +
         L"\"orphan_files_included\":false,\"target_coverage_established\":false,\"replay_established\":false,"
         L"\"collector_authenticated\":false,\"power_loss_durability_established\":false}";
 }
@@ -1025,7 +1132,8 @@ namespace
             L",\"head_sha256\":" + mcpjson::Quote(r.HeadSha256) + L",\"committed_segments\":" + N(r.CommittedSegments) +
             L",\"closed\":" + B(r.Closed) + L",\"member_references\":" + N(r.MemberReferences) +
             L",\"unique_paths\":" + N(r.UniquePaths) + L",\"logical_bytes\":" + N(r.LogicalBytes) +
-            L",\"unique_content_bytes\":" + N(r.UniqueContentBytes) + L",\"pending_files\":" + N(r.PendingFiles) + L"}";
+            L",\"unique_content_bytes\":" + N(r.UniqueContentBytes) + L",\"pending_files\":" + N(r.PendingFiles) +
+            (r.RetirementSha256.empty() ? L"" : L",\"retirement_sha256\":" + mcpjson::Quote(r.RetirementSha256)) + L"}";
     }
     std::wstring StoreArtifactJson(const EvidenceStoreArtifact& a)
     {
@@ -1077,9 +1185,20 @@ namespace
             }
             irp += L"]";
         }
+        std::wstring retired;
+        if (!a.RetiredCollections.empty())
+        {
+            retired = L",\"retired_collections\":[";
+            for (const auto& id : a.RetiredCollections)
+            {
+                if (&id != &a.RetiredCollections.front()) { retired += L","; }
+                retired += mcpjson::Quote(id);
+            }
+            retired += L"],\"retired_original_matched\":" + B(a.RetiredOriginalMatched);
+        }
         return L"{\"artifact\":" + MemberJson(a.Artifact) + L",\"verified\":" + B(a.Verified) +
             L",\"journal_references\":" + N(a.JournalReferences) + L",\"collections\":" + owners +
-            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + image + irp + L"}";
+            L"],\"retention\":" + mcpjson::Quote(a.Retention) + approval + image + irp + retired + L"}";
     }
     std::wstring LowerAscii(std::wstring value)
     {
@@ -1109,6 +1228,8 @@ struct EvidenceStoreAccess
         const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action);
     static EvidenceGcResult Collect(const std::wstring& root, const std::wstring& policyPath,
         const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer);
+    static EvidenceRetirementResult Retire(const std::wstring& root, const std::wstring& policyPath,
+        bool apply, const std::function<void(const wchar_t*)>& observer);
 };
 
 EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
@@ -1151,6 +1272,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         std::vector<std::unique_ptr<EvidenceJournal>> journals;
         std::map<std::wstring, std::pair<EvidenceJournalMember, Handle>> cache;
         std::map<std::wstring, EvidenceStoreArtifact> artifacts;
+        struct RetiredPath { EvidenceJournalMember Original; std::vector<std::wstring> Collections; };
+        std::map<std::wstring, RetiredPath> retiredPaths;
         std::map<std::wstring, uint64_t> contentSizes;
         std::map<std::wstring, IrpReferenceCatalog> irpCatalogs;
         uint64_t references = 0;
@@ -1166,13 +1289,27 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             catch (...) { d.Fail(L"collection_inspection_exception"); }
             if (!ok)
             {
-                d.Result.Status = d.Result.CommittedSegments ? L"incomplete_prefix" : L"unavailable";
-                d.Result.Closed = d.Result.CanResume = false;
+                d.Incomplete();
                 ++out.UnresolvedCollections;
             }
+            else if (d.RetirementSeen) { ++out.RetiredCollections; }
             else if (d.Result.Closed) { ++out.ClosedCollections; }
             else { ++out.OpenCollections; }
             out.Collections.push_back({id, d.Result});
+            if (ok && d.RetirementSeen)
+            {
+                out.RetiredSegments += d.Result.CommittedSegments;
+                out.RetiredMemberReferences += d.Result.MemberReferences; out.RetiredLogicalBytes += d.Result.LogicalBytes;
+                for (const auto& member : d.Members)
+                {
+                    const auto inserted = retiredPaths.try_emplace(member.first, RetiredPath{member.second, {}});
+                    if (retiredPaths.size() > StoreMaxPaths || !Same(inserted.first->second.Original, member.second))
+                        { out.Issue = L"retired_path_conflict_or_budget"; return finish(); }
+                    inserted.first->second.Collections.push_back(id);
+                }
+                journals.push_back(std::move(journal));
+                continue;
+            }
             out.CommittedSegments += d.Result.CommittedSegments;
             out.MemberReferences += d.Result.MemberReferences;
             out.LogicalReferenceBytes += d.Result.LogicalBytes;
@@ -1435,6 +1572,34 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             if (pair.second.JournalReferences != 0 && !observed.count(pair.first))
                 { physicalComplete = false; out.Issue = L"committed_path_missing_from_inventory"; }
         }
+        out.RetiredDeclaredPaths = retiredPaths.size();
+        uint64_t missingRetiredPaths = 0;
+        for (auto& pair : retiredPaths)
+        {
+            const auto present = artifacts.find(pair.first);
+            if (present == artifacts.end())
+            {
+                ++missingRetiredPaths;
+                continue;
+            }
+            auto& a = present->second;
+            a.RetiredCollections = std::move(pair.second.Collections);
+            if (!a.Verified) { ++out.RetiredUnobservedPaths; continue; }
+            a.RetiredOriginalMatched = Same(a.Artifact, pair.second.Original);
+            if (!a.RetiredOriginalMatched)
+            {
+                ++out.RetiredChangedPaths;
+                if (a.Retention == L"uncommitted_requires_policy") { a.Retention = L"retired_path_changed_protected"; }
+            }
+            else if (!a.JournalReferences)
+            {
+                ++out.RetiredOnlyFiles; out.RetiredOnlyBytes += a.Artifact.Bytes;
+                --out.UnattributedFiles; out.UnattributedBytes -= a.Artifact.Bytes;
+                if (a.Retention == L"uncommitted_requires_policy") { a.Retention = L"retired_requires_policy"; }
+            }
+        }
+        if (artifacts.size() + missingRetiredPaths > StoreMaxPaths)
+            { physicalComplete = false; out.Issue = L"store_retired_path_budget_exhausted"; }
         out.ArtifactInventoryComplete = physicalComplete;
         ContentHash artifactHash;
         const auto hashText = [&](const std::wstring& text)
@@ -1454,6 +1619,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         out.ArtifactsSha256 = artifactHash.Finish();
         if (!Digest(out.CatalogSha256) || !Digest(out.ArtifactsSha256)) { throw std::runtime_error("store report hashing failed"); }
         if (!reader.Timely()) { out.ArtifactInventoryComplete = false; out.Issue = reader.Result.Issue; }
+        if (out.ArtifactInventoryComplete) { out.RetiredAbsentPaths = missingRetiredPaths; }
+        else { out.RetiredUnobservedPaths += missingRetiredPaths; }
         out.Status = out.MembershipComplete && out.ArtifactInventoryComplete ? L"verified" : L"partial";
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
         if (action) { action(out, root, reader); }
@@ -1497,6 +1664,12 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"artifact_inventory_complete\":" + B(r.ArtifactInventoryComplete) +
         L",\"collections_observed\":" + N(r.CollectionsObserved) + L",\"closed_collections\":" + N(r.ClosedCollections) +
         L",\"open_collections\":" + N(r.OpenCollections) + L",\"unresolved_collections\":" + N(r.UnresolvedCollections) +
+        L",\"retired_collections\":" + N(r.RetiredCollections) + L",\"retired_segments\":" + N(r.RetiredSegments) +
+        L",\"retired_member_references\":" + N(r.RetiredMemberReferences) + L",\"retired_logical_bytes\":" + N(r.RetiredLogicalBytes) +
+        L",\"retired_declared_paths\":" + N(r.RetiredDeclaredPaths) + L",\"retired_absent_paths\":" + N(r.RetiredAbsentPaths) +
+        L",\"retired_unobserved_paths\":" + N(r.RetiredUnobservedPaths) + L",\"retired_changed_paths\":" + N(r.RetiredChangedPaths) +
+        L",\"retired_only_files\":" + N(r.RetiredOnlyFiles) +
+        L",\"retired_only_named_bytes\":" + N(r.RetiredOnlyBytes) +
         L",\"committed_segments\":" + N(r.CommittedSegments) + L",\"member_references\":" + N(r.MemberReferences) +
         L",\"collection_path_references\":" + N(r.CollectionPathReferences) + L",\"logical_reference_bytes\":" + N(r.LogicalReferenceBytes) +
         L",\"collection_path_bytes\":" + N(r.CollectionPathBytes) + L",\"unique_path_bytes\":" + N(r.UniquePathBytes) +
@@ -1555,6 +1728,7 @@ namespace
     }
     bool GcPolicyValid(const EvidenceGcPolicy& p)
     {
+        if (p.RetiredCollection.empty() ? !p.RetirementSha256.empty() : !Id(p.RetiredCollection) || !Digest(p.RetirementSha256)) { return false; }
         if (!Text(p.Reason, 512) || p.MinimumAgeSeconds > 10ull * 366 * 86400 ||
             p.ByteLimit == 0 || p.ByteLimit > GcMaxBytes || p.Members.empty() || p.Members.size() > GcMaxFiles) { return false; }
         std::wstring previous;
@@ -1617,9 +1791,102 @@ std::wstring EvidenceGcPolicyJson(const EvidenceGcPolicy& p)
         if (members.size() > 1) { members += L","; }
         members += MemberJson(m);
     }
-    return L"{\"schema\":\"kn.evidence_gc_policy.v1\",\"policy\":\"kn.gc_explicit_uncommitted.v1\",\"reason\":" +
+    const std::wstring prefix = p.RetiredCollection.empty() ? L"{\"schema\":\"kn.evidence_gc_policy.v1\",\"policy\":\"kn.gc_explicit_uncommitted.v1\"" :
+        L"{\"schema\":\"kn.evidence_gc_policy.v2\",\"policy\":\"kn.gc_explicit_retired.v1\",\"retired_collection_id\":" +
+        mcpjson::Quote(p.RetiredCollection) + L",\"retirement_sha256\":" + mcpjson::Quote(p.RetirementSha256);
+    return prefix + L",\"reason\":" +
         mcpjson::Quote(p.Reason) + L",\"minimum_age_seconds\":" + N(p.MinimumAgeSeconds) + L",\"byte_limit\":" +
         N(p.ByteLimit) + L",\"members\":" + members + L"]}";
+}
+
+EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, const std::wstring& policyPath,
+    bool apply, const std::function<void(const wchar_t*)>& observer)
+{
+    EvidenceRetirementResult result;
+    result.Apply = apply;
+    try
+    {
+        if (!Text(policyPath, 30000)) { result.Issue = L"invalid_retirement_policy_path"; return result; }
+        EvidenceJournal policyOwner;
+        Handle policyLease{nullptr, &CloseHandle};
+        std::wstring json;
+        uint64_t size = 0;
+        RetirementRecord record;
+        if (!policyOwner.Data->Read(fs::absolute(policyPath).lexically_normal(), 8192, &policyLease, &result.PolicySha256, &size, &json))
+            { result.Issue = L"retirement_policy_unavailable"; return result; }
+        if (!ParseRetirementPolicy(json, record.Policy)) { result.Issue = L"invalid_retirement_policy"; return result; }
+        bool called = false;
+        const auto snapshot = Inspect(root, {}, [&](const EvidenceStoreInventory& store, const fs::path& absolute, EvidenceJournal::Impl& reader)
+        {
+            called = true;
+            try
+            {
+                const auto& policy = record.Policy;
+                if (store.Status != L"verified") { result.Issue = L"retirement_requires_complete_closed_store"; return; }
+                result.Status = L"denied";
+                const auto found = std::find_if(store.Collections.begin(), store.Collections.end(), [&](const auto& c) { return c.Id == policy.Id; });
+                if (found == store.Collections.end() || !found->Recovery.Closed || found->Recovery.SessionSha256 != policy.Session ||
+                    found->Recovery.HeadSha256 != policy.Head) { result.Issue = L"retirement_root_mismatch"; return; }
+                const auto folder = absolute / L"collections" / policy.Id;
+                const auto receipt = folder / RetirementFile;
+                Handle lease{nullptr, &CloseHandle};
+                std::wstring stored, digest;
+                if (!found->Recovery.RetirementSha256.empty())
+                {
+                    RetirementRecord previous;
+                    if (!reader.Read(receipt, 16384, &lease, &digest, &size, &stored) || digest != found->Recovery.RetirementSha256 ||
+                        !ParseRetirementRecord(stored, previous) || RetirementPolicyJson(previous.Policy) != json)
+                        { result.Issue = L"collection_retirement_policy_conflict"; return; }
+                    result.Record = std::move(stored); result.ReceiptSha256 = std::move(digest);
+                    result.Status = L"retired"; result.Reused = true; return;
+                }
+                const auto closure = folder / L"journal-segments" / SequenceName(found->Recovery.CommittedSegments);
+                WIN32_FILE_ATTRIBUTE_DATA attributes{};
+                if (!GetFileAttributesExW(NativePath(closure).c_str(), GetFileExInfoStandard, &attributes))
+                    { result.Issue = L"closure_timestamp_unavailable"; return; }
+                record.ClosureWritten = FileTimeValue(attributes.ftLastWriteTime); record.Observed = CurrentFileTime();
+                record.Catalog = store.CatalogSha256; record.Artifacts = store.ArtifactsSha256;
+                for (const auto& a : store.Artifacts)
+                {
+                    if (std::binary_search(a.Collections.begin(), a.Collections.end(), policy.Id))
+                    {
+                        auto& count = FailureLedger(a.Artifact.Schema) ? record.Ledgers : a.Collections.size() == 1 ? record.Exclusive : record.Shared;
+                        count.Add(a.Artifact.Bytes);
+                    }
+                }
+                result.Record = RetirementReceiptJson(record);
+                if (!record.ClosureWritten || record.Observed < record.ClosureWritten ||
+                    (record.Observed - record.ClosureWritten) / 10000000 < policy.Age) { result.Issue = L"closure_too_young_or_future"; return; }
+                if (record.Exclusive.Bytes > policy.ExclusiveByteLimit) { result.Issue = L"retirement_exclusive_byte_limit"; return; }
+                if (observer) { observer(L"retire_preflight"); }
+                if (!apply) { result.Status = L"planned"; return; }
+                result.Status = L"incomplete";
+                if (!reader.Timely() || !SaveObservationJson(NativePath(receipt), result.Record, nullptr))
+                    { result.Issue = L"retirement_publication_failed"; return; }
+                if (observer) { observer(L"retire_published"); }
+                if (!reader.Read(receipt, 16384, &lease, &digest, &size, &stored) || stored != result.Record)
+                    { result.Issue = L"retirement_verification_failed"; return; }
+                result.ReceiptSha256 = std::move(digest); result.Status = L"retired";
+            }
+            catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_execution_exception"; }
+        });
+        if (!called) { result.Issue = snapshot.Issue.empty() ? L"retirement_inventory_unavailable" : snapshot.Issue; }
+    }
+    catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_inspection_exception"; }
+    return result;
+}
+
+EvidenceRetirementResult RetireEvidenceCollection(const std::wstring& root, const std::wstring& policyPath,
+    bool apply, const std::function<void(const wchar_t*)>& observer)
+{ return EvidenceStoreAccess::Retire(root, policyPath, apply, observer); }
+
+std::wstring EvidenceRetirementResultJson(const EvidenceRetirementResult& r)
+{
+    return L"{\"schema\":\"kn.evidence_retirement_result.v1\",\"status\":" + mcpjson::Quote(r.Status) +
+        L",\"issue\":" + mcpjson::Quote(r.Issue) + L",\"apply\":" + B(r.Apply) + L",\"reused_receipt\":" + B(r.Reused) +
+        L",\"policy_sha256\":" + mcpjson::Quote(r.PolicySha256) + L",\"receipt_sha256\":" + mcpjson::Quote(r.ReceiptSha256) +
+        L",\"record\":" + (r.Record.empty() ? L"null" : r.Record) +
+        L",\"deleted_this_call\":\"0\",\"collector_authenticated\":false,\"power_loss_durability_established\":false}";
 }
 
 bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy)
@@ -1629,6 +1896,11 @@ bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy)
     if (policy == nullptr || json.size() > GcMaxPolicyBytes || !mcpjson::ValidateDocument(json) ||
         !mcpjson::GetString(json, L"reason", &p.Reason) || !Number(json, L"minimum_age_seconds", &p.MinimumAgeSeconds) ||
         !Number(json, L"byte_limit", &p.ByteLimit) || !Array(json, L"members", GcMaxFiles, &members)) { return false; }
+    std::wstring schema;
+    if (!mcpjson::GetString(json, L"schema", &schema)) { return false; }
+    if (schema == L"kn.evidence_gc_policy.v2" &&
+        (!mcpjson::GetString(json, L"retired_collection_id", &p.RetiredCollection) || !Id(p.RetiredCollection) ||
+        !mcpjson::GetString(json, L"retirement_sha256", &p.RetirementSha256))) { return false; }
     for (const auto& row : members)
     {
         EvidenceJournalMember m;
@@ -1659,6 +1931,7 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
             &result.PolicySha256, &policyBytes, &policyJson)) { result.Issue = L"gc_policy_unavailable"; return result; }
         EvidenceGcPolicy policy;
         if (!ParseEvidenceGcPolicy(policyJson, &policy)) { result.Issue = L"invalid_gc_policy"; return result; }
+        result.RetiredCollection = policy.RetiredCollection; result.RetirementSha256 = policy.RetirementSha256;
         std::set<std::wstring> deletionPaths;
         for (const auto& member : policy.Members)
         {
@@ -1678,6 +1951,9 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
                 result.ObservedFileTime = CurrentFileTime();
                 if (snapshot.Status != L"verified" || !snapshot.MembershipComplete || !snapshot.ArtifactInventoryComplete)
                     { stop(L"gc_requires_complete_closed_store"); }
+                if (!policy.RetiredCollection.empty() && std::none_of(snapshot.Collections.begin(), snapshot.Collections.end(),
+                    [&](const auto& c) { return c.Id == policy.RetiredCollection && c.Recovery.RetirementSha256 == policy.RetirementSha256; }))
+                    { result.Status = L"denied"; result.Issue = L"gc_retirement_receipt_mismatch"; return; }
                 auto directory = Own(CreateFileW(NativePath(absolute).c_str(), FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -1759,7 +2035,10 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
                         found->Retention == L"uncommitted_image_input_protected" || found->Retention == L"unresolved_image_input_protected" ||
                         found->Retention == L"irp_replay_reference_protected" || found->Retention == L"unresolved_irp_reference_protected")
                         { entry.State = L"denied"; entry.Issue = found->Retention; }
-                    else if (!found->Verified || found->Retention != L"uncommitted_requires_policy" || found->JournalReferences != 0)
+                    else if (!found->Verified || found->JournalReferences != 0 ||
+                        (policy.RetiredCollection.empty() ? found->Retention != L"uncommitted_requires_policy" :
+                            found->Retention != L"retired_requires_policy" || !found->RetiredOriginalMatched ||
+                            !std::binary_search(found->RetiredCollections.begin(), found->RetiredCollections.end(), policy.RetiredCollection)))
                         { entry.State = L"denied"; entry.Issue = L"selected_file_protected"; }
                     else if (!Same(found->Artifact, entry.Artifact)) { entry.State = L"denied"; entry.Issue = L"selected_file_changed"; }
                     else if (file == reader.Files.end() || !GcIdentity(file->second.get(), &entry.FileIdentity, &entry.LastWriteTime))
@@ -1866,7 +2145,9 @@ std::wstring EvidenceGcResultJson(const EvidenceGcResult& r)
         L",\"preflight_artifacts_sha256\":" + mcpjson::Quote(r.ArtifactsSha256) + L",\"observed_filetime\":" + N(r.ObservedFileTime) +
         L",\"selected_bytes\":" + N(r.SelectedBytes) + L",\"deleted_this_call\":" + N(r.DeletedThisCall) +
         L",\"deleted_named_bytes_this_call\":" + N(r.DeletedBytesThisCall) + L",\"entries\":" + entries +
-        L"],\"scope\":\"explicit_uncommitted_image_and_irp_artifacts\",\"coordination\":\"participating_publishers\","
+        (r.RetiredCollection.empty() ? L"],\"scope\":\"explicit_uncommitted_image_and_irp_artifacts\"" :
+            L"],\"scope\":\"explicit_retired_collection_artifacts\",\"retired_collection_id\":" + mcpjson::Quote(r.RetiredCollection) +
+            L",\"retirement_sha256\":" + mcpjson::Quote(r.RetirementSha256)) + L",\"coordination\":\"participating_publishers\","
         L"\"receipt_scope\":\"operation_history\",\"current_path_absence_established\":false,\"uncommitted_dependents_resolved\":false,"
         L"\"deletion_authority_after_return\":false,\"disk_reclamation_established\":false,\"collector_authenticated\":false,"
         L"\"power_loss_durability_established\":false}";
