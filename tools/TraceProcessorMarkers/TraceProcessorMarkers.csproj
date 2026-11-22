@@ -15,6 +15,7 @@
     <RestoreLockedMode>true</RestoreLockedMode>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\TraceProcessorModules.cs" Link="TraceProcessorModules.cs" />
     <Compile Include="TraceProcessorMarkers.cs" />
     <Reference Include="System" />
     <Reference Include="System.Core" />

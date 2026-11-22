@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
@@ -13,41 +12,6 @@ internal static class TraceProcessorMarkers
 {
     private const int RowLimit = 128;
     private const int MaxRecords = 2000000;
-
-    private static SortedSet<string> LoadedProcessingModules(string toolkit)
-    {
-        var names = new SortedSet<string>(StringComparer.Ordinal);
-        foreach (var assembly in new[] { typeof(TraceProcessor).Assembly, typeof(IGenericEvent).Assembly, typeof(IProcess).Assembly })
-        {
-            var name = assembly.GetName().Name + ".dll";
-            var expected = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, name);
-            if (!String.Equals(assembly.Location, expected, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException("Unexpected managed assembly location");
-            }
-            names.Add(name);
-        }
-        using (var process = Process.GetCurrentProcess())
-        {
-            foreach (ProcessModule module in process.Modules)
-            {
-                string name = module.ModuleName.ToLowerInvariant();
-                if (name == "perfcore.dll" || name == "perfg.dll" || name.StartsWith("perf_", StringComparison.Ordinal))
-                {
-                    if (!String.Equals(module.FileName, Path.Combine(toolkit, name), StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new InvalidDataException("Unexpected toolkit module location");
-                    }
-                    names.Add("wpt/" + name);
-                }
-            }
-        }
-        if (!names.Contains("wpt/perfcore.dll"))
-        {
-            throw new InvalidDataException("Toolkit core unavailable");
-        }
-        return names;
-    }
 
     private static int Main(string[] args)
     {
@@ -138,7 +102,8 @@ internal static class TraceProcessorMarkers
                         table = "IGenericEventDataSource.Events", provider_guid = provider.ToString("D"), activity_id = activity.ToString("D"),
                         query_filter = new { header_process_id = pid, header_thread_id = tid, channel = channel, task = task,
                                              begin_raw = begin.ToString(culture), end_raw = end.ToString(culture) },
-                        loaded_processing_modules = LoadedProcessingModules(toolkit),
+                        loaded_processing_modules = TraceProcessorModules.Loaded(toolkit, new[] {
+                             typeof(TraceProcessor).Assembly, typeof(IGenericEvent).Assembly, typeof(IProcess).Assembly }),
                         provider_rows = table.Count, activity_marker_rows = activityMarkers, scoped_marker_rows = scoped,
                         matched_rows = matched, row_limit = RowLimit, rows = rows
                     };

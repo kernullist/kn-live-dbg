@@ -808,6 +808,45 @@ attributed source thread. The direct-switch bit records an attempt.
 The page leaves wait-object identity, the reason for the wait and its
 contribution to application latency unresolved. [Microsoft CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis) · [Direct-switch event flag](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.cpu.readythreadevent.isdirectswitchattempt?view=trace-processor-dotnet-1.0) · [Reader command](COMMAND_REFERENCE.md#find-the-cpu-context-of-a-readythread-event)
 
+### Waits across one activity
+
+The activity-wait report follows all switch intervals between two original
+marker records of one thread in a pinned ETL. For each off-CPU interval,
+it locates the last ReadyThread witness and checks the source CPU, target
+dispatch and thread lifetimes against the same recording. The reader
+batches up to 128 ready records per query. The report retains the native
+pages, selectors, reader output digests and the classification of each
+off-CPU interval. Adjacent intervals must share the original switch at
+their boundary, including across pages.
+
+| Off-CPU field | Time counted inside the activity window |
+| --- | --- |
+| `thread_wait_ticks` | Time before a qualified ready event for a waiting thread, when an observed source thread and its lifetime can be identified. |
+| `dpc_wait_ticks` | Time before a qualified ready event that occurred during a DPC. DPC execution duration is a separate measurement. |
+| `unattributed_wait_ticks` | Waiting time before a qualified ready event with an unresolved source thread. |
+| `other_before_ready_ticks` | Time before a qualified ready event when the outgoing thread reported a state other than Waiting. |
+| `ready_to_dispatch_ticks` | Time from the qualified ready event until the target ran again. |
+| `unclassified_off_cpu_ticks` | Off-CPU time with missing or ambiguous dispatch evidence. |
+
+The six fields sum to the full off-CPU total. Adding on-CPU time gives
+the marker duration. `source_running_overlap_ticks` is a subset of
+`thread_wait_ticks`. It intersects the last source CPU interval ending
+after the ready event with the target's pre-ready wait and the marker
+window. It measures scheduled residency, which can include interrupts.
+CPU instructions, the wait object and the part of the delay caused by
+a particular thread require further evidence. The per-source breakdown
+uses the two original lifetime boundaries as well as logger, PID and TID.
+
+With the optional locked CPU adapter, each selected ready event has a
+TraceProcessor comparison keyed by target TID, readying CPU and raw QPC
+timestamp. The report preserves the original one-based ReadyThread,
+ThreadActivity and CpuTimeSlices row numbers. A positive source match
+requires agreement on the target dispatch and the source switch endpoints
+and identity. A DPC or missing source lifetime can still have a matched
+target dispatch. Missing or nonunique SDK rows leave the requested scope
+unconfirmed. Report replay checks exact bytes using the same source,
+reader, options and adapter archive. [Microsoft CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis) · [Command and replay](COMMAND_REFERENCE.md#account-for-waits-across-one-activity)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

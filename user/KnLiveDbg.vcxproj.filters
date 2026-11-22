@@ -522,6 +522,9 @@
     <ClInclude Include="EtlActivitySchedule.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlReadyBatch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlReadyOrigin.h">
       <Filter>Header Files</Filter>
     </ClInclude>

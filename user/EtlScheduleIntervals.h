@@ -164,6 +164,11 @@ namespace etl_profile
                     if (tid && tid != UINT32_MAX) { ids.push_back(tid); }
                 }
             }
+            WatchThreads(ids);
+        }
+
+        void WatchThreads(std::vector<uint32_t>& ids)
+        {
             std::sort(ids.begin(), ids.end());
             ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
             threads.reserve(ids.size());

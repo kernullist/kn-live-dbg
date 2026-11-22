@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Whole-activity wait accounting on 2026-11-22
+
+On Windows `10.0.28000`, the x64 Release reader (SHA-256 prefix
+`e83dfa97dacf`) and the CPU adapter (`94d9da091a40`) processed seven
+marked activities in the public TaskbarLatency ETL. An independent
+Windows TDH reader reconstructed the marker windows, every target
+switch interval, each dispatchable ready event and the source CPU
+overlap. All six categories of off-CPU time reconciled to the original
+switch intervals. The recording used a 10 MHz QPC clock.
+[Recording and source counts](#readythread-cpu-context-on-2026-11-22)
+
+| Start and Stop records | Off-CPU intervals | Off CPU (ms) | Waiting before a thread readied the target (ms) | Last source CPU slice overlapping that wait (ms) | Ready to dispatch (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 339732, 374019 | 5 | 60.8586 | 59.8932 | 0.0877 | 0.0865 |
+| 738283, 741351 | 68 | 3.8478 | 3.1172 | 1.8480 | 0.7306 |
+| 87669, 105250 | 4 | 111.9171 | 2.1420 | 0.3358 | 0.0704 |
+| 87258, 87264 | 0 | 0 | 0 | 0 | 0 |
+| 811857, 812141 | 2 | 0.2205 | 0.1566 | 0.0688 | 0.0639 |
+| 191828, 247898 | 2 | 109.1727 | 109.1602 | 0.0496 | 0.0079 |
+| 117201, 117281 | 4 | 0.1935 | 0.0772 | 0.0204 | 0.1119 |
+
+In the first activity, 0.8789 ms of waiting ended in DPC ready events.
+In the third, the source thread's lifetime could not be established for
+109.7047 ms of pre-ready waiting. The last two activities retained 46
+and 43 ticks of unclassified off-CPU time respectively. The last also
+had one pre-ready tick on a thread switched out in a non-waiting state.
+The source-overlap column is already included in the preceding column.
+
+The locked Microsoft CPU 1.12.10 adapter corroborated 83 ready events
+across the 85 off-CPU intervals. Its tables corroborated the target and
+source CPU slice for 78 events and the target dispatch for five more.
+Original event 369897 matched ReadyThread row 744, ThreadActivity row
+11385 and CpuTimeSlices row 2094. The two remaining intervals had no
+ready witness. Each SDK batch recorded the original input digest,
+filter, loaded processing modules and table row counts. [Microsoft CPU tables](https://www.nuget.org/packages/Microsoft.Windows.EventTracing.Cpu/1.12.10) · [TDH and replay checks](../tools/test-etl-activity-waits.py)
+
+A 137-interval activity required two native pages. Repeating the first
+window with a two-interval page size preserved its totals, and exact
+report replay passed with the pinned adapter. Capture loss and a
+non-QPC clock withheld the activity summary. Signed batch replay,
+shared switch endpoints, the 128-selector limit and prior single-event
+queries were also exercised. These observations cover the selected
+thread in one recording. The delay attributable to an application-wide
+critical path remains open. [Command and replay](COMMAND_REFERENCE.md#account-for-waits-across-one-activity)
+
 ## ReadyThread CPU context on 2026-11-22
 
 The x64 Release reader (SHA-256 prefix `232bcf3ffd0e`) was checked on

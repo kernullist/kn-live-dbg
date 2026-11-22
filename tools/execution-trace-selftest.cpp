@@ -10,7 +10,7 @@
 #include "etl-disk-io-selftest.h"
 #include "../user/EtlFaultSchedule.h"
 #include "../user/EtlActivitySchedule.h"
-#include "../user/EtlReadyOrigin.h"
+#include "../user/EtlReadyBatch.h"
 #include "etl-activity-window-selftest.h"
 
 #include <array>
@@ -780,7 +780,10 @@ static bool CheckReadyOrigin()
     const auto targetOut = SwitchAt(3, 100, 0, 42, 77);
     const auto sourceIn = SwitchAt(4, 150, 1, 99, 73);
     const auto close = SwitchAt(6, 300, 1, 73, 42);
-    ReadyOrigin o;
+    ReadyBatch batch;
+    const std::vector<uint32_t> requested{5};
+    batch.Prepare(requested.size());
+    auto& o = batch.rows.front();
     auto unavailable = ready;
     ++unavailable.EventHeader.EventDescriptor.Version;
     o.Select(unavailable, 5);
@@ -788,18 +791,19 @@ static bool CheckReadyOrigin()
     unavailable.EventHeader.ProviderId = {};
     o.Select(unavailable, 5);
     if (o.match != Match::Other) { return false; }
-    o.Select(ready, 5);
-    o.SelectSwitch(close);
+    batch.Select(ready, 5, requested);
+    batch.SelectSwitch(close);
     ScheduleHistory h;
-    h.allowDirectSwitch = true;
-    h.Prepare(2, 73, 42);
+    batch.PrepareReplay(h, 2);
     h.Observe(targetOut, nullptr);
     h.Observe(sourceIn, nullptr);
-    o.ObserveContext(h);
-    h.OtherThreadEvent(ready, 5);
-    size_t rows = 1;
+    size_t rows = 0;
     bool mismatch = false;
-    o.ReplaySwitch(h, close, rows, mismatch);
+    batch.ReplaySelection(ready, 5, requested, h, rows, mismatch);
+    h.OtherThreadEvent(ready, 5);
+    auto alteredBatch = batch;
+    auto changedHistory = h;
+    batch.ReplaySwitch(h, close, rows, mismatch);
     if (o.ReplayRows() != 3 || rows != 3 || mismatch || !o.SameReady(ready, 5)) { return false; }
     auto changed = ready;
     ++changed.EventHeader.ThreadId;
@@ -807,8 +811,7 @@ static bool CheckReadyOrigin()
     auto wrongEnd = close;
     ++wrongEnd.fields.oldWaitReason;
     auto altered = o;
-    auto changedHistory = h;
-    altered.ReplaySwitch(changedHistory, wrongEnd, rows, mismatch);
+    alteredBatch.ReplaySwitch(changedHistory, wrongEnd, rows, mismatch);
     if (!mismatch) { return false; }
     ThreadIndex i;
     i.events = {{1, 101, 42, 20, 1, false, false, 7}, {2, 177, 73, 25, 3, false, false, 7},
@@ -865,6 +868,42 @@ static bool CheckReadyOrigin()
     current.Append(reserved, true);
     return current.unknownFlags && IsSpan(o.Assess(h, target, false, true, true), L"coverage_unqualified") &&
         IsSpan(o.Assess(h, source, true, false, false), L"clock_unqualified");
+}
+
+static bool CheckSharedReadySwitches()
+{
+    using namespace etl_profile;
+    const std::vector<uint32_t> selected{3, 4, 5};
+    std::array<uint8_t, 8> body{};
+    ReadyBatch batch;
+    batch.Prepare(selected.size());
+    const auto event = [&](uint32_t ordinal) {
+        body[0] = ordinal == 4 ? 17 : 42;
+        return SchedulerRecord(body.data(), 8, 50, 2, 100 * ordinal);
+    };
+    for (const auto n : selected) { batch.Select(event(n), n, selected); }
+    const auto first = SwitchAt(6, 600, 1, 73, 42), second = SwitchAt(7, 700, 0, 22, 17);
+    batch.SelectSwitch(first);
+    batch.SelectSwitch(second);
+    ScheduleHistory history;
+    batch.PrepareReplay(history, 2);
+    history.Observe(SwitchAt(1, 100, 1, 99, 73), nullptr);
+    size_t count = 0;
+    bool mismatch = false;
+    for (const auto n : selected)
+    {
+        const auto ready = event(n);
+        batch.ReplaySelection(ready, n, selected, history, count, mismatch);
+        history.OtherThreadEvent(ready, n);
+    }
+    batch.ReplaySwitch(history, first, count, mismatch);
+    batch.ReplaySwitch(history, second, count, mismatch);
+    for (const auto& origin : batch.rows)
+    {
+        if (origin.source.end.record != 6 || origin.source.witnesses.previousCpu.tid != 73 ||
+            origin.target.end.record != (origin.ready.tid == 17 ? 7u : 6u)) { return false; }
+    }
+    return !mismatch && count == 9 && count == batch.expectedRows && batch.cpu.entries.empty() && batch.target.entries.empty();
 }
 
 static bool CheckActivitySchedule()
@@ -1016,7 +1055,7 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckReadyOrigin() && CheckActivitySchedule() && CheckFaultSchedule() && etl_activity_test::Check() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckReadyOrigin() && CheckSharedReadySwitches() && CheckActivitySchedule() && CheckFaultSchedule() && etl_activity_test::Check() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

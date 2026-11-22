@@ -12,6 +12,13 @@ namespace etl_profile
         {
             SwitchEvent end{};
             IntervalWitnesses witnesses;
+
+            bool SameSwitch(const SwitchEvent& e) const
+            {
+                return end.record == e.record && end.ordinal == e.ordinal && end.timestamp == e.timestamp && end.cpu == e.cpu &&
+                    end.flags == e.flags && end.loggerId == e.loggerId && end.version == e.version &&
+                    std::memcmp(&end.fields, &e.fields, sizeof(e.fields)) == 0;
+            }
         };
 
         ReadyPoint ready;
@@ -47,32 +54,7 @@ namespace etl_profile
                 e.EventHeader.ThreadId == headerTid && e.EventHeader.ProcessId == headerPid && e.EventHeader.Flags == headerFlags;
         }
 
-        void SelectSwitch(const SwitchEvent& e)
-        {
-            if (match != Match::Decoded) { return; }
-            if (!source.end.record && e.cpu == ready.at.cpu) { source.end = e; }
-            if (!target.end.record && e.fields.newTid == ready.tid) { target.end = e; }
-        }
-
         uint32_t ReplayRows() const { return 1u + (source.end.record != 0) + (target.end.record != 0); }
-
-        void ReplaySwitch(ScheduleHistory& history, const SwitchEvent& e, size_t& rows, bool& mismatch)
-        {
-            const bool cpuEnd = e.record == source.end.record, targetIn = e.record == target.end.record;
-            IntervalWitnesses w;
-            history.Observe(e, cpuEnd || targetIn ? &w : nullptr);
-            if (!cpuEnd && !targetIn) { return; }
-            for (auto* span : {&source, &target})
-            {
-                const auto& first = span->end;
-                if (first.record != e.record) { continue; }
-                ++rows;
-                mismatch |= first.ordinal != e.ordinal || first.timestamp != e.timestamp || first.cpu != e.cpu ||
-                    first.flags != e.flags || first.loggerId != e.loggerId || first.version != e.version ||
-                    std::memcmp(&first.fields, &e.fields, sizeof(e.fields)) != 0;
-                span->witnesses = w;
-            }
-        }
 
         ThreadPair Bracket(const ThreadIndex& index, uint32_t tid, bool qpc, bool gap) const
         {

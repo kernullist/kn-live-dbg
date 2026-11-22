@@ -15,6 +15,7 @@
     <RestoreLockedMode>true</RestoreLockedMode>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\TraceProcessorModules.cs" Link="TraceProcessorModules.cs" />
     <Compile Include="TraceProcessorReadyTest.cs" />
     <Reference Include="System" />
     <Reference Include="System.Core" />
@@ -24,4 +25,7 @@
     <PackageReference Include="Microsoft.Windows.EventTracing.Processing.Toolkit" Version="[1.11.0]" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <Target Name="PackageAdapter" DependsOnTargets="Build">
+    <ZipDirectory SourceDirectory="$(TargetDir)" DestinationFile="$(BaseIntermediateOutputPath)..\TraceProcessorCpu.zip" Overwrite="true" />
+  </Target>
 </Project>

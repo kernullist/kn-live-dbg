@@ -1487,6 +1487,51 @@ covers an unavailable selector, a partial source, or a page replay
 mismatch. Use the same selector with `--check-page` to verify exact output
 bytes. [ReadyThread evidence and timing](TRACE_IMPORT.md#cpu-context-at-a-readythread-event)
 
+To inspect several ready events from the same recording, pass up to 128
+increasing original record numbers in one argument, for example
+`--ready-origins 369897,373207,373233`. The reader resolves all
+selectors in two ETW traversals. The v6 page returns one result per
+requested event in order. A selector that names a different event type
+or lies outside the recording returns the first failed record.
+
+### Account for waits across one activity
+
+From the repository root, select the two original ETW marker records
+for one thread activity. The command writes a new private JSON report
+and prints its SHA-256. The example follows the same public TaskbarLatency
+activity as the single-event query.
+
+```powershell
+$etl = (Get-Item .\TaskbarLatency.etl).FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$pin = (Get-FileHash -LiteralPath $etl -Algorithm SHA256).Hash
+$readerPin = (Get-FileHash -LiteralPath $reader -Algorithm SHA256).Hash
+$query = @('--exe', $reader, '--exe-sha256', $readerPin, '--etl', $etl, '--sha256', $pin, '--start', '339732', '--stop', '374019')
+$report = Join-Path $PWD 'private-activity-waits.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query --output $report | ConvertFrom-Json
+(Get-Content -Raw -LiteralPath $report | ConvertFrom-Json).result.summary
+python -B tools\measure-etl-activity-waits.py @query --check-report $receipt.report_sha256
+```
+
+For an independent CPU-table comparison, build the adapter in a Visual
+Studio Developer PowerShell. Supply its archive and digest on both the
+measurement and replay commands. Use a fresh output path for this report.
+
+```powershell
+MSBuild tools\TraceProcessorReadyTest\TraceProcessorReadyTest.csproj /restore /t:PackageAdapter /p:Configuration=Release
+$adapter = (Get-Item .\.build\traceprocessor-ready-test\TraceProcessorCpu.zip).FullName
+$sdk = @('--traceprocessor', $adapter, (Get-FileHash -LiteralPath $adapter -Algorithm SHA256).Hash)
+$verified = Join-Path $PWD 'private-activity-waits-with-sdk.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query @sdk --output $verified | ConvertFrom-Json
+python -B tools\measure-etl-activity-waits.py @query @sdk --check-report $receipt.report_sha256
+```
+
+`--page-size` controls the number of switch intervals read at a time
+(default 128, range 1–128). The report covers the entire marker window.
+Exit 1 covers unavailable timing, an unconfirmed requested SDK comparison
+or a report hash mismatch. Invalid arguments, input pins and occupied
+output paths return exit 2. [Wait categories and source overlap](TRACE_IMPORT.md#waits-across-one-activity)
+
 ## Whole-host hunt
 
 ```text

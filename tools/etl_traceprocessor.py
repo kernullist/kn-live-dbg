@@ -12,18 +12,21 @@ from saved_etl_comparison import MIB, digest, local_path, original
 
 PROGRAM = "TraceProcessorMarkers.exe"
 SDK_HASH = "155f3da1ba1de62d40c75058f8cb5375016fd2d39d4a85a631e9cc168cbb1bd7"
+CPU_PROGRAM = "TraceProcessorReadyTest.exe"
+CPU_SDK_HASH = "bee8791296225909ead0839cd4f18585062f8efeb4a0654dcae5dcca73c00ab8"
 TABLE = "IGenericEventDataSource.Events"
 SCHEMA = "kn.traceprocessor_activity_rows.v1"
 HEADER = ("provider_guid", "activity_id", "channel", "task", "opcode", "event_id", "version", "header_process_id", "header_thread_id")
 
 
-def unpack(source, folder):
+def unpack(source, folder, *, cpu=False):
+    program = CPU_PROGRAM if cpu else PROGRAM
     assets = {}
     names = set()
     total = 0
     with zipfile.ZipFile(source) as archive:
         entries = archive.infolist()
-        check(len(entries) == 50, "unexpected TraceProcessor package layout")
+        check(len(entries) == (51 if cpu else 50), "unexpected TraceProcessor package layout")
         for member in entries:
             name = member.orig_filename
             check(re.fullmatch(r"(?:wpt/(?:Catalog/)?)?[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", name) and
@@ -41,15 +44,16 @@ def unpack(source, folder):
             with dest.open("xb") as output:
                 output.write(raw)
             assets[name] = sha(raw)
-    check(PROGRAM in assets and PROGRAM + ".config" in assets, "missing managed adapter or binding configuration")
-    exe_hash, config_hash = assets.pop(PROGRAM), assets.pop(PROGRAM + ".config")
+    check(program in assets and program + ".config" in assets, "missing managed adapter or binding configuration")
+    exe_hash, config_hash = assets.pop(program), assets.pop(program + ".config")
     # Digest the untouched runtime files from the locked NuGet packages in canonical path order.
     inventory = "".join(assets[name] + " " + name + "\n" for name in sorted(assets)).encode("ascii")
-    check(sha(inventory) == SDK_HASH, "TraceProcessor runtime files differ from the locked x64 distribution")
+    check(sha(inventory) == (CPU_SDK_HASH if cpu else SDK_HASH), "TraceProcessor runtime files differ from the locked x64 distribution")
     return exe_hash, config_hash, assets
 
 
-def admit(values, directory, files, stack, held):
+def admit(values, directory, files, stack, held, *, cpu=False):
+    program = CPU_PROGRAM if cpu else PROGRAM
     path, expected = local_path(values[0]), digest(values[1].lower())
     files.parents(stack, path.parent, held)
     source = stack.enter_context(files.hold(path))
@@ -61,22 +65,35 @@ def admit(values, directory, files, stack, held):
         files.parents(stack, parent, held)
     source.seek(0)
     try:
-        image, config, assets = unpack(source, folder)
+        image, config, assets = unpack(source, folder, cpu=cpu)
     except (zipfile.BadZipFile, NotImplementedError, EOFError, zlib.error) as exc:
         raise ValueError("invalid TraceProcessor package") from exc
     # Run from the verified deployment. Keep each admitted file and directory in place through publication.
     binary = None
-    for name, expected_file in {PROGRAM: image, PROGRAM + ".config": config, **assets}.items():
+    for name, expected_file in {program: image, program + ".config": config, **assets}.items():
         deployed = folder / name
         files.parents(stack, deployed.parent, held)
         stream = stack.enter_context(files.hold(deployed))
         check(file_hash(stream) == expected_file, "TraceProcessor deployment changed")
-        if name == PROGRAM:
+        if name == program:
             binary = stream
     metadata = dict(package_sha256=expected, executable_sha256=image, config_sha256=config, sdk_files_sha256=SDK_HASH,
                     events_package_version="1.12.10", toolkit_package_version="1.11.0", table=TABLE,
                     allow_lost_events=False, allow_time_inversion=False, symbol_lookup="not_requested")
-    return folder / PROGRAM, binary, metadata
+    if cpu:
+        del metadata["events_package_version"], metadata["table"]
+        metadata.update(cpu_package_version="1.12.10", sdk_files_sha256=CPU_SDK_HASH,
+                        tables=["IReadyThreadDataSource.ReadyThreadEvents", "ICpuSchedulingDataSource.ThreadActivity",
+                                "ICpuSchedulingDataSource.CpuTimeSlices"])
+    return folder / program, binary, metadata
+
+
+def verify_modules(modules, required_sdk, optional=()):
+    required = {"Microsoft.Windows.EventTracing." + name + ".dll" for name in required_sdk} | {"wpt/perfcore.dll"}
+    check(type(modules) is list and len(required) <= len(modules) <= 32 and all(type(name) is str for name in modules) and
+          modules == sorted(set(modules)) and required.issubset(modules) and
+          all(name in required or name in optional or re.fullmatch(r"wpt/(?:perfg|perf_[a-z0-9_]+)\.dll", name) for name in modules),
+          "unexpected loaded processing modules")
 
 
 def correlate(document, native):
@@ -94,13 +111,7 @@ def correlate(document, native):
     for key in ("header_process_id", "header_thread_id", "channel", "task"):
         check(uint(scope[key]) == a[key], "TraceProcessor numeric filter mismatch")
     check((scope["begin_raw"], scope["end_raw"]) == (a["raw_timestamp"], b["raw_timestamp"]), "TraceProcessor clock filter mismatch")
-    modules = document["loaded_processing_modules"]
-    required = {"Microsoft.Windows.EventTracing." + name + ".dll" for name in ("Events", "Processes", "Processing")}
-    required.add("wpt/perfcore.dll")
-    check(type(modules) is list and 4 <= len(modules) <= 32 and all(type(name) is str for name in modules) and
-          modules == sorted(set(modules)) and required.issubset(modules) and
-          all(name in required or re.fullmatch(r"wpt/(?:perfg|perf_[a-z0-9_]+)\.dll", name) for name in modules),
-          "unexpected loaded processing modules")
+    verify_modules(document["loaded_processing_modules"], ("Events", "Processes", "Processing"))
     total = uint(document["provider_rows"], 2_000_000)
     activity = uint(document["activity_marker_rows"], total)
     scoped = uint(document["scoped_marker_rows"], activity)
