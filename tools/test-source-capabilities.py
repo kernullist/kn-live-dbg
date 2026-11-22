@@ -244,7 +244,7 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--check-page", "--capture-statement"))
+    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--clr-evidence", "--check-page", "--capture-statement"))
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout

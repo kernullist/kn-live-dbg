@@ -522,6 +522,9 @@
     <ClInclude Include="EtlProcessEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlClrEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlImageEvidence.h">
       <Filter>Header Files</Filter>
     </ClInclude>

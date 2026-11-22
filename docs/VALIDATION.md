@@ -5289,6 +5289,58 @@ These tests cover runtime declarations. Historical
 sample-to-byte correspondence, live ReJIT activation, V8, Wasm and
 game-object lifetime validation remain open.
 
+## CPU samples with recorded CLR methods on 2026-11-22
+
+The v8 profile reader matched sampled instruction pointers against CLR method
+declarations in two public .NET 4.5.2 ETLs. An independent checker read the
+Windows `tracerpt -rts` XML by property name. It first reconstructed the
+thread and process boundaries and the explicit CLR load/unload intervals,
+then checked every CPU sample, candidate count, method offset and cited
+declaration on every page. The two merged files reported logger ID zero for
+the relevant events in `OpenTrace`. XML supplies the other method fields.
+[Fixture revision and SHA-256 values](#saved-etl-cpu-profile-validation-on-2026-11-22)
+
+| ETL | CPU samples | CLR records | Load/unload pair | Preceding declaration only | No covering declaration | Process generation unavailable |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| .NET x64 | 79,528 | 17,280 | 4,456 | 0 | 670 | 74,402 |
+| .NET x86 | 88,809 | 14,459 | 2,440 | 62 | 2,395 | 83,912 |
+
+For example, x64 sample 25,422 lies 0x64 bytes into the declared method.
+Its process started at record 29,326, its method loaded at record 36,189 and
+its method unloaded at record 120,923. The native page and all three query
+modes retain those ordinals. Only the original ETL can establish whether a
+saved page matches what the reader actually produced.
+
+```powershell
+$exe = 'x64/Release/KnLiveDbg.exe'
+$pin64 = '50da7f725f80f88a7622b37f9826844a790cb0c4f64e351fa1f38cf24916889a'
+$pin86 = '18e62d477308bdc9b01ca6674cbbcbb7c350acf2bf68733ba6361976fac9538d'
+python tools/test-etl-clr-evidence.py --exe $exe --etl $trace64 --sha256 $pin64 --expect-methods 17280 --all-pages --expect-paired 4456 --expect-load-only 0 --check-import --check-short-tail
+python tools/test-etl-clr-evidence.py --exe $exe --etl $trace86 --sha256 $pin86 --expect-methods 14459 --all-pages --expect-paired 2440 --expect-load-only 62 --check-import --check-short-tail
+```
+
+Constructed records exercise address and PID reuse, overlapping extents,
+reversed or equal clocks, mismatched loggers, duplicate loads, multiple
+runtime generations, malformed records and the 65,536-record limit. The
+normalized page checks include absent, explicit-zero and full-width ReJIT
+IDs. A fabricated but internally consistent module ID can still be imported
+as a reported field. Exact replay against the original ETL detects the
+changed page. A one-byte-short copy of each workload retained the original
+sample ordinal and tick, reported partial coverage and withheld the method.
+
+The allocator ETL yielded 5,496 CPU samples and zero CLR witnesses. The
+23-record control yielded zero samples and zero CLR witnesses. Checks
+against a saved earlier reader reproduced 28 v1–v7 pages and their 28
+unsigned replay receipts byte for byte. The signed statement tests also
+covered v8 with a private controller session and an archive witness.
+
+The x64 Release build completed with 16 existing C4744 link warnings.
+All 570 console checks passed. The native x64 and Win32 range tests and
+the 93 execution trace controls passed. The x64 AddressSanitizer run used
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` for this host's interceptor
+warnings. The observed workload declarations were v1. Capture-time code
+bytes, a live ReJIT transition and independently verified execution remain open.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

@@ -21,6 +21,14 @@ namespace etl_profile
 
     inline bool ProcessOpcode(uint8_t op) { return (op >= 1 && op <= 4) || op == 39; }
 
+    inline bool ProcessClockRecord(const EVENT_HEADER& h)
+    {
+        const auto op = h.EventDescriptor.Opcode;
+        return (IsEqualGUID(h.ProviderId, ProcessProvider) && ProcessOpcode(op)) ||
+            (IsEqualGUID(h.ProviderId, PerfInfo) && op == 46) ||
+            (IsEqualGUID(h.ProviderId, ThreadProvider) && op >= 1 && op <= 4);
+    }
+
     inline bool ProcessSuffix(const uint8_t* p, size_t size, uint8_t width, uint8_t version)
     {
         // WBEM SID is either one zero ULONG or a TOKEN_USER and an inline SID.
@@ -119,8 +127,7 @@ namespace etl_profile
             const auto& h = event.EventHeader;
             const auto op = h.EventDescriptor.Opcode;
             const bool process = IsEqualGUID(h.ProviderId, ProcessProvider) && ProcessOpcode(op);
-            const bool core = process || (IsEqualGUID(h.ProviderId, PerfInfo) && op == 46) ||
-                (IsEqualGUID(h.ProviderId, ThreadProvider) && op >= 1 && op <= 4);
+            const bool core = ProcessClockRecord(h);
             if (core) { processClock.Observe(h.TimeStamp.QuadPart); }
             if (withImages && (core || (IsEqualGUID(h.ProviderId, ImageProvider) && (op == 10 || (op >= 2 && op <= 4)))))
             { imageClock.Observe(h.TimeStamp.QuadPart); }

@@ -2,7 +2,7 @@
 #include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "EtlCaptureStatement.h"
-#include "EtlProcessEvidence.h"
+#include "EtlClrEvidence.h"
 #include "EtlReferenceImage.h"
 #include "ReferenceArtifact.h"
 #include "EtlScheduleIntervals.h"
@@ -29,12 +29,13 @@ namespace
         std::wstring digest, referencePath, referenceDigest, expectedPage, statementPath;
         etl_profile::StatementAuthority statementAuthority;
         bool switches = false, threads = false, images = false, processes = false;
-        bool intervals = false, haveTid = false, builds = false, settings = false;
+        bool intervals = false, haveTid = false, builds = false, settings = false, clr = false;
         uint32_t tid = 0;
         bool WithIntervals() const { return intervals || haveTid; }
         bool WithThreads() const { return threads || images || processes; }
         const wchar_t* Prefix() const
         {
+            if (clr) { return L"{\"schema\":\"kn.etl_profile.v8\",\"status\":"; }
             if (settings) { return switches ? L"{\"schema\":\"kn.etl_switches.v3\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v7\",\"status\":"; }
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
             if (switches) { return L"{\"schema\":\"kn.etl_switches.v1\",\"status\":"; }
@@ -71,11 +72,12 @@ namespace
 
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
-        if (args.size() < 3 || args.size() > 21 || args[0].empty() ||
+        if (args.size() < 3 || args.size() > 22 || args[0].empty() ||
             args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
         {
+            if (args[i] == L"--clr-evidence" && !options.switches && !options.clr) { options.clr = true; continue; }
             if (args[i] == L"--capture-settings" && !options.settings) { options.settings = true; continue; }
             if (args[i] == L"--thread-evidence" && !options.switches && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && !options.switches && !options.images) { options.images = true; continue; }
@@ -112,6 +114,7 @@ namespace
             ++i;
         }
         if (options.builds || !options.referencePath.empty()) { options.images = true; options.processes = true; }
+        if (options.clr) { options.processes = true; }
         return options.statementPath.empty() || !options.expectedPage.empty();
     }
 
@@ -130,6 +133,7 @@ namespace
         etl_profile::BuildIndex buildIndex;
         etl_profile::CaptureSettings settings;
         etl_profile::ProcessIndex processIndex;
+        etl_profile::ClrIndex clrIndex;
         etl_profile::ScheduleHistory history;
         std::array<Sample, MaxPage> page{};
         std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
@@ -174,6 +178,7 @@ namespace
         if (scan.options.settings) { scan.settings.Observe(*event, scan.records); }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
         if (scan.options.builds) { scan.buildIndex.Observe(*event, scan.records); }
+        if (scan.options.clr) { scan.clrIndex.Observe(*event, scan.records); }
         if (scan.options.images) { scan.imageIndex.Observe(*event, scan.records); }
         if (scan.options.processes) { scan.processIndex.Observe(*event, scan.records, scan.options.images); }
         const bool keep = scan.matched >= scan.options.after && scan.used < scan.options.limit;
@@ -413,6 +418,41 @@ namespace
                 L",\"start_record\":" + std::to_wstring(p.before->record) + L"}" : L"null") + L"}";
     }
 
+    std::wstring ClrPointJson(const etl_profile::ClrPoint& p)
+    {
+        const auto& m = p.method;
+        const auto* action = m.Observation == ClrMethodAction::Load ? L"load" :
+            m.Observation == ClrMethodAction::Unload ? L"unload" : L"rundown";
+        return L"{\"record_ordinal\":" + std::to_wstring(p.record) + L",\"raw_timestamp\":" + Quote(std::to_wstring(p.tick)) +
+            L",\"header_process_id\":" + std::to_wstring(p.pid) + L",\"logger_id\":" + std::to_wstring(p.logger) +
+            L",\"provider_guid\":" + Quote(m.RundownProvider ? L"a669021c-c450-4609-a035-5af59af4df18" : L"e13c0d23-ccbc-4e12-931b-d9cc2eee27e4") +
+            L",\"event_id\":" + std::to_wstring(m.EventId) + L",\"version\":" + std::to_wstring(m.EventVersion) +
+            L",\"opcode\":" + std::to_wstring(p.opcode) + L",\"action\":" + Quote(action) +
+            L",\"method_start\":" + Hex(m.Start) + L",\"method_size\":" + std::to_wstring(m.Size) +
+            L",\"method_id\":" + Hex(m.MethodId) + L",\"module_id\":" + Hex(m.ModuleId) +
+            L",\"method_token\":" + Hex(m.MethodToken) + L",\"method_flags\":" + Hex(m.MethodFlags) +
+            L",\"clr_instance_id\":" + (m.RuntimeInstance ? std::to_wstring(*m.RuntimeInstance) : L"null") +
+            L",\"rejit_id\":" + (m.ReJitId ? Hex(*m.ReJitId) : L"null") + L"}";
+    }
+
+    std::wstring ClrMatchJson(const etl_profile::ClrMatch& m, const Sample& sample, const etl_profile::ProcessPair& process,
+        std::vector<const etl_profile::ClrPoint*>& records)
+    {
+        auto out = L",\"clr_evidence\":{\"relation\":" + Quote(m.relation) + L",\"candidate_ranges\":" +
+            std::to_wstring(m.count) + L",\"process_start_record\":" + (m.lifetime ? std::to_wstring(process.before->record) : L"null") +
+            L",\"method_offset\":" + (m.lifetime ? Hex(sample.ip - m.witnesses.front().before->method.Start) : L"null") + L",\"witnesses\":[";
+        for (size_t i = 0; i < (std::min)(m.count, m.witnesses.size()); ++i)
+        {
+            const auto& w = m.witnesses[i];
+            if (i) { out += L','; }
+            if (w.before) { records.push_back(w.before); }
+            if (w.after) { records.push_back(w.after); }
+            out += L"{\"before_record\":" + (w.before ? std::to_wstring(w.before->record) : L"null") +
+                L",\"after_record\":" + (w.after ? std::to_wstring(w.after->record) : L"null") + L"}";
+        }
+        return out + L"]}";
+    }
+
     std::wstring ImageProcessJson(const etl_profile::ProcessPair& process, const etl_profile::ImageMatch& image,
         const etl_profile::ProcessImagePair& bound)
     {
@@ -646,7 +686,7 @@ namespace
     bool Partial(const Scan& scan, BufferAccounting accounting)
     {
         return accounting == BufferAccounting::Fewer || accounting == BufferAccounting::More ||
-            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete() || !scan.settings.Complete();
+            !scan.threadIndex.Complete() || !scan.imageIndex.Complete() || !scan.processIndex.Complete() || !scan.buildIndex.Complete() || !scan.settings.Complete() || !scan.clrIndex.Complete();
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
@@ -743,6 +783,15 @@ namespace
                 L",\"image_binding_clock_reversed\":" + (scan.options.images ? (index.imageClock.reversed ? L"true" : L"false") : L"null") +
                 L",\"generation_scope\":\"source_sha256_and_start_record\",\"creation_filetime\":null}";
         }
+        if (scan.options.clr)
+        {
+            const auto& c = scan.clrIndex;
+            result += L",\"clr_source\":{\"load_events\":" + std::to_wstring(c.loads) +
+                L",\"unload_events\":" + std::to_wstring(c.unloads) + L",\"rundown_events\":" + std::to_wstring(c.inventory) +
+                L",\"unsupported_events\":" + std::to_wstring(c.unsupported) + L",\"unknown_pid_events\":" + std::to_wstring(c.unknownPid) +
+                L",\"retained_events\":" + std::to_wstring(c.events.size()) + L",\"clock_reversed\":" + (c.clock.reversed ? L"true" : L"false") +
+                L",\"runtime_bytes_observed\":false}";
+        }
         const bool buildCoverage = comparableClock && !captureGap && scan.imageIndex.Complete() && !scan.imageIndex.unsupported;
         if (scan.options.builds)
         {
@@ -773,6 +822,7 @@ namespace
         std::vector<const etl_profile::BuildEvent*> buildRecords;
         std::vector<const etl_profile::ImageEvent*> records;
         std::vector<const etl_profile::ProcessEvent*> processRecords;
+        std::vector<const etl_profile::ClrPoint*> clrRecords;
         result += L",\"samples\":[";
         for (size_t i = 0; i < scan.used; ++i)
         {
@@ -786,6 +836,11 @@ namespace
                 {
                     process = scan.processIndex.Lookup(scan.page[i], pair, comparableClock, captureGap || scan.unsupported);
                     evidence = ProcessPairJson(process, processRecords);
+                    if (scan.options.clr)
+                    {
+                        const auto match = scan.clrIndex.Lookup(scan.page[i], process, comparableClock, captureGap);
+                        evidence += ClrMatchJson(match, scan.page[i], process, clrRecords);
+                    }
                 }
                 if (scan.options.images)
                 {
@@ -828,6 +883,7 @@ namespace
                 return row;
             });
         }
+        if (scan.options.clr) { AppendRecords(result, L"clr_records", clrRecords, ClrPointJson); }
         if (scan.options.builds) { AppendRecords(result, L"build_records", buildRecords, BuildEventJson); }
         if (scan.options.processes) { AppendRecords(result, L"process_records", processRecords, ProcessEventJson); }
         return result + L"]}";
@@ -916,6 +972,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         try
         {
             scan.threadIndex.Prepare();
+            if (scan.options.clr) { scan.clrIndex.Prepare(); }
             if (scan.options.builds) { scan.buildIndex.Prepare(); }
             if (scan.options.images) { scan.imageIndex.Prepare(); }
             if (scan.options.processes) { scan.processIndex.Prepare(); }
@@ -939,6 +996,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
         if (replay != ERROR_SUCCESS) { return Failure(scan.options, L"interval_replay_failed", source.Sha256, replay); }
     }
+    if (scan.options.clr && scan.clrIndex.Complete()) { scan.clrIndex.Sort(); }
     if (scan.options.images && scan.imageIndex.Complete()) { scan.imageIndex.Sort(); }
     if (scan.options.processes && scan.processIndex.Complete()) { scan.processIndex.Sort(); }
     if (scan.options.builds)
@@ -1004,7 +1062,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
     }
     std::wcerr << (switches ?
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
-        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");
+        L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");
     return 2;
 }
 

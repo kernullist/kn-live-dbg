@@ -170,7 +170,7 @@ bool ParseExecutionTrace(const std::wstring& json, ExecutionTrace* trace, std::w
     if (!ReadObject(json, &root) || !Text(root[L"schema"], &schema)) { return false; }
     const std::wstring profile = L"kn.etl_profile.v";
     if (schema.size() == profile.size() + 1 && schema.compare(0, profile.size(), profile) == 0 &&
-        schema.back() >= L'1' && schema.back() <= L'7')
+        schema.back() >= L'1' && schema.back() <= L'8')
     {
         parsed.Etl.emplace();
         const bool ok = ParseEtlTracePage(root, schema.back() - L'0', *parsed.Etl, cancellation);

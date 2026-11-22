@@ -873,6 +873,13 @@ during observation. Matching the code bytes to a historical CPU sample
 requires separate capture-time evidence.
 [.NET runtime event manifest](https://github.com/dotnet/runtime/blob/d7a6547f2a039031d9c29180bb95541a06a86276/src/coreclr/vm/ClrEtwAll.man)
 
+Saved CPU profiles can use the same declaration reader. A sample is attributed
+to a reported method only when an actual matching load and unload surround it
+within a file-local process generation. The native page preserves both
+original method record ordinals and the sample's offset. The normalized
+query carries this reported method separately from verified code identity.
+[Saved CLR method evidence](TRACE_IMPORT.md#match-a-cpu-sample-to-a-clr-method)
+
 ## Pending I/O observation graphs
 
 The native pending-IRP reader retains every admitted request, including requests

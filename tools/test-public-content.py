@@ -177,6 +177,7 @@ class PublicContentTests(unittest.TestCase):
         edge = dict(kind="switch_out", logger_id=0, payload_tid=5, raw_timestamp="2", record_ordinal=3)
         source = dict(thread_filter=5, matched_switches=2)
         split = dict(ready_to_switch_in_ticks="10", switch_out_to_ready_ticks="15")
+        v8 = "kn.etl_profile.v8"
         v7 = "kn.etl_profile.v7"
         switch_settings = "kn.etl_switches.v3"
         mask_bracket = dict(relation="equal_group_snapshots", before_record=5, after_record=6)
@@ -197,6 +198,11 @@ class PublicContentTests(unittest.TestCase):
         process_image = dict(relation="inside_process_generation", process_start_record=6, reported_rva="0x10")
         process_source = dict(generation_scope="source_sha256_and_start_record", defunct_events=1, decoded_events=4)
         for record in (dict(schema="kn.execution_trace_query.v2", samples=[]), dict(status="matched", schema="kn.etl_page_replay.v1"),
+                       dict(schema=v8, samples=[]), dict(load_events=3, rundown_events=2, unsupported_events=0),
+                       dict(candidate_ranges=1, method_offset="0x5", witnesses=[]), dict(before_record=3, after_record=7),
+                       dict(method_start="0x10000", method_id="0x3", module_id="0x4"),
+                       dict(reported_clr_relation="load_unload", reported_clr_method=None),
+                       dict(load_record=9, unload_record=50, method_offset="5"),
                        dict(native_schema=v7, reported_etl_sha256="a" * 64), dict(expected_page_sha256="b" * 64, replayed_page_sha256=None),
                        dict(source_after=8, decoded_samples=9, records_seen=50), dict(sequence="9", record_ordinal=50, tick="4", ip="40"),
                        dict(file_sha256="a" * 64, reported_etl_sha256="b" * 64),

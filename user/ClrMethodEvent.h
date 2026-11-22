@@ -36,6 +36,13 @@ struct KmonRuntimeCodeRange
     ClrMethodAction Observation = ClrMethodAction::Ignore;
 };
 
+inline bool SameClrMethodRange(const KmonRuntimeCodeRange& a, const KmonRuntimeCodeRange& b)
+{
+    return a.Start == b.Start && a.Size == b.Size && a.MethodId == b.MethodId && a.ModuleId == b.ModuleId &&
+        a.MethodToken == b.MethodToken && a.MethodFlags == b.MethodFlags &&
+        a.RuntimeInstance == b.RuntimeInstance && a.ReJitId == b.ReJitId;
+}
+
 inline ClrMethodAction ClassifyClrMethodEvent(const EVENT_HEADER& header)
 {
     const auto& descriptor = header.EventDescriptor;

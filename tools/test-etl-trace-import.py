@@ -130,7 +130,7 @@ def adversarial(exe, path, args, raw):
     for key, field, bad in ((None, "status", "digest_mismatch"), (None, "provider_guid", "unknown"), (None, "opcode", 36),
                             (None, "version", 3), (None, "source_bytes", -1), (None, "records_seen", 2_000_001),
                             (None, "loss_marker_records", source["records_seen"]), (None, "next_after", 0),
-                            (None, "schema", "kn.etl_profile.v8"), (None, "schema", "kn.etl_profile.v7"),
+                            (None, "schema", "kn.etl_profile.v9"), (None, "schema", "kn.etl_profile.v8"), (None, "schema", "kn.etl_profile.v7"),
                             (None, "capture_settings", []), (None, "after", source["decoded_samples"] + 1),
                             ("qualification", "verified_level", "X2"), ("qualification", "vtl", 0),
                             ("clock", "kind", "other"), ("clock", "header_perf_frequency", "9223372036854775808"),
@@ -219,12 +219,11 @@ def main():
             assert len(seen) == len(samples)
         options = [[], ["--thread-evidence"], ["--image-evidence"], ["--process-evidence"],
                    ["--image-evidence", "--process-evidence"], ["--build-evidence"], ["--capture-settings"],
-                   ["--capture-settings", "--build-evidence"]]
+                   ["--capture-settings", "--build-evidence"], ["--clr-evidence"], ["--clr-evidence", "--capture-settings"]]
         if args.reference_image:
             pe = [str(Path(args.reference_image[0]).resolve(strict=True)), args.reference_image[1]]
-            options.extend([["--reference-image", *pe], ["--build-evidence", "--reference-image", *pe],
-                            ["--thread-evidence", "--image-evidence", "--process-evidence", "--capture-settings",
-                             "--reference-image", *pe, "--build-evidence"]])
+            combined = ["--thread-evidence", "--image-evidence", "--process-evidence", "--capture-settings", "--reference-image", *pe, "--build-evidence"]
+            options.extend([["--reference-image", *pe], ["--build-evidence", "--reference-image", *pe], combined, [*combined, "--clr-evidence"]])
             wrong_pin = "0" * 64 if pe[1].lower() != "0" * 64 else "1" * 64
             bad = json.loads(command(exe, [*base, "--reference-image", pe[0], wrong_pin, "--check-page", "0" * 64], 1))
             assert bad["status"] == "reference_digest_mismatch" and bad["source_sha256"] == pin

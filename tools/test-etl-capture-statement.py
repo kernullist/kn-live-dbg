@@ -109,10 +109,12 @@ def check(exe, signer, etl, claims, folder, expected_records=None, reference=Non
     key = signer.point.upper()
     signature_args = ["--capture-statement", jws, claims["role"], key]
     rc = 1 if short else 0
-    variants = [("--etl-profile", ["--capture-settings"]), ("--etl-switches", ["--capture-settings", "--intervals"])]
+    variants = [("--etl-profile", ["--capture-settings"]), ("--etl-profile", ["--clr-evidence"]),
+                ("--etl-switches", ["--capture-settings", "--intervals"])]
     if reference:
-        variants.append(("--etl-profile", ["--after", "0", "--thread-evidence", "--image-evidence", "--process-evidence",
-                                           "--build-evidence", "--capture-settings", "--reference-image", *reference]))
+        flags = ["--after", "0", "--thread-evidence", "--image-evidence", "--process-evidence",
+                 "--build-evidence", "--capture-settings", "--reference-image", *reference]
+        variants.extend([("--etl-profile", flags), ("--etl-profile", [*flags, "--clr-evidence"])])
     for verb, flags in variants:
         native = [exe, verb, etl, "--sha256", source_pin, *flags, "--limit", "4"]
         raw = run(native, rc)

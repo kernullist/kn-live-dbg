@@ -473,6 +473,7 @@
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />
     <ClInclude Include="EtlProcessEvidence.h" />
+    <ClInclude Include="EtlClrEvidence.h" />
     <ClInclude Include="EtlBuildEvidence.h" />
     <ClInclude Include="EtlCaptureSettings.h" />
     <ClInclude Include="EtlReferenceBuild.h" />

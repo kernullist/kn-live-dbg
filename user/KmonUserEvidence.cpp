@@ -539,10 +539,7 @@ namespace
             }
             const bool unloading = record.Observation == ClrMethodAction::Unload;
             const bool wasUnloaded = previous.Observation == ClrMethodAction::Unload;
-            const bool sameRange = previous.RuntimeInstance == record.RuntimeInstance &&
-                previous.ModuleId == record.ModuleId && previous.MethodId == record.MethodId &&
-                previous.MethodToken == record.MethodToken && previous.ReJitId == record.ReJitId &&
-                previous.Size == record.Size && previous.MethodFlags == record.MethodFlags;
+            const bool sameRange = SameClrMethodRange(previous, record);
             const bool sameTime = previous.Timestamp == record.Timestamp;
             if ((unloading && !sameRange) ||
                 (sameTime && (!sameRange || unloading != wasUnloaded)))

@@ -6,6 +6,7 @@
 #include "etl-reference-image-selftest.h"
 #include "etl-build-evidence-selftest.h"
 #include "etl-capture-settings-selftest.h"
+#include "etl-clr-evidence-selftest.h"
 
 #include <array>
 
@@ -703,7 +704,7 @@ int wmain(int argc, wchar_t** argv)
             CheckSwitchRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
-            etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;
+            etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--cancel-check")
     {

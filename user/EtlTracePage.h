@@ -7,6 +7,11 @@
 #include <string>
 #include <vector>
 
+struct EtlTraceSample : etl_profile::Sample
+{
+    std::wstring ReportedClrFields;
+};
+
 struct EtlTracePage
 {
     std::wstring Schema, EtlSha256, ClockKind, ClockJson, LogHeaderJson, BufferComparison;
@@ -15,7 +20,7 @@ struct EtlTracePage
     uint32_t RecordsSeen = 0, Decoded = 0, Unsupported = 0, LossMarkers = 0, After = 0;
     std::optional<uint32_t> NextAfter;
     bool Partial = false, ReversedTicks = false;
-    std::vector<etl_profile::Sample> Rows;
+    std::vector<EtlTraceSample> Rows;
 };
 
 bool ParseEtlTracePage(const std::map<std::wstring, std::wstring>& root, unsigned version,

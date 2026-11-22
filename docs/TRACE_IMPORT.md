@@ -43,7 +43,8 @@ reports private. [Windows trace file header](https://learn.microsoft.com/en-us/w
 ### Read recorded capture settings
 
 Add `--capture-settings` to `--etl-profile` or `--etl-switches` for
-`kn.etl_profile.v7` or `kn.etl_switches.v3`. It works with the other evidence
+`kn.etl_profile.v7` or `kn.etl_switches.v3`. A profile that also requests CLR
+evidence uses v8. Capture settings work with the other evidence
 and paging options. Every page includes the same file-scoped
 `capture_settings.records` in original callback order, including when there
 are no samples or switches. The enclosing ETL SHA-256 and the one-based
@@ -156,6 +157,40 @@ unsupported image boundary withholds paired RVAs. The index retains at most
 65,536 events and 16 MiB of UTF-16 name data. When either limit is exceeded,
 `retention` identifies the exhausted limit, the command returns `partial`
 and all image lookups report `index_limit`.
+
+### Match a CPU sample to a CLR method
+
+`--etl-profile <local.etl> --sha256 <digest> --clr-evidence` requests
+`kn.etl_profile.v8` and includes thread and process evidence. Use `--after`
+and `--limit` to select sample ordinals. The reader compares the sampled IP
+with half-open address ranges declared by the .NET runtime and rundown
+providers. The header PID and original record ordinal locate each declaration
+in the ETL. A process start ordinal distinguishes successive uses of a PID.
+[CLR method events](https://learn.microsoft.com/en-us/dotnet/framework/performance/method-etw-events) · [ETW record and buffer context](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_record)
+
+| `clr_evidence.relation` | What can be recovered from the page |
+| --- | --- |
+| `load_unload` | Exactly one method range contains the IP. A matching load and unload bracket the sample inside its recorded process generation. The row gives the process start ordinal and the byte offset from the declared start. |
+| `preceding_declaration`, `unload_only`, `rundown_bracket` | The original records show one boundary or inventory. The method offset and process-start claim are null. |
+| `overlapping_ranges`, `conflicting_declarations` | The reader retains the candidate count and witnesses for up to two ranges. Overlapping ranges or inconsistent transitions at a start address within this process generation prevent attribution. |
+| `no_covering_declaration`, `process_generation_unavailable` | The examined declarations leave the sample unattributed. The latter also covers samples without usable thread or process boundaries. |
+
+A paired result requires strictly ordered raw timestamps and ordinals, matching
+logger IDs, comparable buffer coverage and usable thread and process records.
+The declarations must agree on method and module IDs, token, flags, extent
+and optional CLR instance and ReJIT IDs. Inventory observed during a matching
+load/unload interval preserves those two original endpoints. A malformed CLR
+record with a known PID fences its process generation. A missing PID, observed
+loss, ambiguous clocks or the 65,536-record limit can withhold associations
+across the file. The page reports the corresponding reason and any witnesses.
+
+`clr_source` reports file-wide counts. `clr_records` contains the original
+method records cited on this page in ordinal order. Opening the page with
+`!kmon trace` preserves the reported relation. A paired row also exposes the
+checked method fields under `reported_clr_method`. The code version stays null
+and the verified level stays `unqualified`. A CLR declaration supplies an
+address range and identity at the time of the event. The ETL inputs used here
+carry no runtime method bytes.
 
 ### Match a sample to a recorded process generation
 
@@ -380,7 +415,7 @@ A continuation uses the same file and limit with `/cursor <next_cursor>`.
 ### Query and reproduce a saved ETL profile page
 
 The trace query accepts the JSON produced by `--etl-profile`, from
-`kn.etl_profile.v1` through `v7`, within the same 2 MiB input limit.
+`kn.etl_profile.v1` through `v8`, within the same 2 MiB input limit.
 The output schema is `kn.execution_trace_query.v2`. Each normalized sample
 retains its sampled TID, instruction pointer, CPU field, signed raw tick,
 descriptor, stack-extension count, header PID/TID and both original
@@ -394,9 +429,11 @@ and event/buffer loss counters stay in their original units.
 report. The query checks the profile event type, envelope layout, record and
 sample ordinals, buffer comparison and pagination. Optional evidence tables
 remain in the saved report. Its hash and the sample ordinal locate the
-original witnesses, including thread, process, image, build and capture
-settings. The query checks the presence and container type of those tables.
-It assigns no lifetime or code identity from their contents.
+original witnesses for thread, process, image, build and capture settings.
+For v8, the query also checks the CLR record references, process and thread
+boundaries, method identity, extent and offset before exposing a reported
+method. Replaying the page against the pinned ETL checks its actual source
+records.
 
 `reported_level=X2` describes the CPU sample type reported by the source.
 `qualified_reported_level` and `verified_level` remain `unqualified`.

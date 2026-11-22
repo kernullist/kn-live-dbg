@@ -31,7 +31,7 @@ def run(exe, etl, digest, *args, rc=0, switches=False):
         family = "kn.etl_switches"
     else:
         versions = {"--thread-evidence": 2, "--image-evidence": 3, "--process-evidence": 4,
-                    "--reference-image": 5, "--build-evidence": 6, "--capture-settings": 7}
+                    "--reference-image": 5, "--build-evidence": 6, "--capture-settings": 7, "--clr-evidence": 8}
         family = "kn.etl_profile"
     version = max((v for flag, v in versions.items() if flag in args), default=1)
     assert value["schema"] == f"{family}.v{version}"
@@ -143,7 +143,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None, include_samples=False):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None, include_samples=False, clr=None):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -178,6 +178,8 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None, process
             if action != "end" or event.tag != ns + "Event":
                 continue
             records += 1
+            if clr is not None:
+                clr.observe_xml(event, ns, records)
             guid = (event.findtext(trace_ns + "ExtendedTracingInfo/" + trace_ns + "EventGuid") or "").strip("{}").lower()
             if (want_images or processes is not None) and guid == "68fdd900-4a3e-11d1-84f4-0000f80464e3":
                 width = event.find(ns + "EventData/" + ns + "Data[@Name='PointerSize']")
