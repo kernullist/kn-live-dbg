@@ -7,6 +7,7 @@ import runpy
 from statistics import median
 from uuid import UUID, uuid5
 
+from etl_handoff_scheduling import MAX_VIEWS, scheduling
 from owned_module_benchmark import check, decimal, encoded, fields, uint
 from saved_etl_comparison import digest
 
@@ -27,7 +28,7 @@ def guid(value):
     return value
 
 
-def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pin, reader_pin, caller_delay_ms=None):
+def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pin, reader_pin, caller_delay_ms=None, observe_scheduling=False):
     namespace = UUID(guid(study))
     check(2 <= uint(pairs, MAX_PAIRS) and 1 <= uint(steps, 1_000_000) and 1 <= uint(timeout_ms, 120_000), "invalid study bounds")
     delays = {"baseline": uint(baseline_ms, 1000), "candidate": uint(candidate_ms, 1000)}
@@ -41,15 +42,20 @@ def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pi
     result = dict(schema="kn.etl_handoff_plan.v1", study_id=study, pairs=pairs, steps=steps, baseline_ms=baseline_ms,
                   candidate_ms=candidate_ms, timeout_ms=timeout_ms, recorder_sha256=digest(recorder_pin),
                   reader_sha256=digest(reader_pin), slots=slots)
-    if caller_delay_ms is not None:
-        result.update(schema="kn.etl_handoff_plan.v2", caller_delay_ms=uint(caller_delay_ms, 1000))
+    check(type(observe_scheduling) is bool, "invalid scheduling selection")
+    if caller_delay_ms is not None or observe_scheduling:
+        result.update(schema="kn.etl_handoff_plan.v2", caller_delay_ms=0 if caller_delay_ms is None else uint(caller_delay_ms, 1000))
+    if observe_scheduling:
+        result.update(schema="kn.etl_handoff_plan.v3", observe_scheduling=True)
     return result
 
 
 def registered(value):
     keys = "study_id pairs steps baseline_ms candidate_ms timeout_ms recorder_sha256 reader_sha256".split()
-    if type(value) is dict and value.get("schema") == "kn.etl_handoff_plan.v2":
+    if type(value) is dict and value.get("schema") in ("kn.etl_handoff_plan.v2", "kn.etl_handoff_plan.v3"):
         keys.append("caller_delay_ms")
+        if value["schema"] == "kn.etl_handoff_plan.v3":
+            keys.append("observe_scheduling")
     fields(value, "schema slots " + " ".join(keys), "handoff plan")
     expected = plan(*(value[k] for k in keys))
     check(encoded(value) == encoded(expected), "plan differs from its registered workloads and arm order")
@@ -138,8 +144,9 @@ def bound_join(ticks, ordinals, worker_write_end, join, timer, probes):
 
 def measure(cfg, slot, activity, truth, process, page, source_hash, size, join_path=False):
     probed = "caller_delay_ms" in cfg
+    scheduled = cfg.get("observe_scheduling", False)
     count = 14 if probed else 10
-    expected_schema = "kn.owned_etl_handoff.v2" if probed else "kn.owned_etl_handoff.v1"
+    expected_schema = "kn.owned_etl_handoff.v3" if scheduled else "kn.owned_etl_handoff.v2" if probed else "kn.owned_etl_handoff.v1"
     require(truth["schema"] == expected_schema and truth["provider_id"] == PROVIDER and
             guid(truth["session_id"]) != activity and truth["activity_id"] == activity, "workload_identity_mismatch")
     if probed:
@@ -153,7 +160,8 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size, join_p
             process["process_created"] == truth["process_created"] and
             0 < decimal(truth["process_created"]) <= decimal(truth["worker_created"]) <= decimal(truth["worker_exited"]),
             "process_or_worker_generation_unqualified")
-    require(page["schema"] == "kn.etl_activity_markers.v1" and page["source_sha256"] == source_hash and
+    marker_schema = "kn.etl_handoff_markers.v1" if scheduled else "kn.etl_activity_markers.v1"
+    require(page["schema"] == marker_schema and (not scheduled or uint(page["handoff_payload_limit"]) == 1024) and page["source_sha256"] == source_hash and
             uint(page["source_bytes"]) == size and page["header_scope"] == "keyed_nonclassic_start_stop" and
             page["thread_filter"] is None and uint(page["after"]) == 0 and page["next_after"] is None, "marker_query_mismatch")
     header = page["log_header"]
@@ -167,29 +175,39 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size, join_p
             qpc(page["clock"]["header_perf_frequency"]) == hz, "clock_unqualified")
     rows, writes = page["markers"], truth["write_brackets"]
     require(type(rows) is list and type(writes) is list and
-            len(writes) == len(rows) == uint(page["matched_markers"]) == uint(page["decoded_activity_markers"]) == count and
+            len(writes) == count and count <= len(rows) <= count + (2 + 2*MAX_VIEWS if scheduled else 0) and
+            len(rows) == uint(page["matched_markers"]) == uint(page["decoded_activity_markers"]) and
             uint(page["excluded_start_stop_records"]) == 0, "incomplete_marker_set")
     spans = list(map(bracket, writes))
     ticks, ordinals, descriptors, loggers = {}, {}, {}, set()
+    main_rows, observer_rows = {}, []
     previous = 0
     for i, row in enumerate(rows, 1):
         event = row["event"]
-        descriptor = uint(event["event_id"], 17 if probed else 10)
-        eid = {16: 12, 17: 14}.get(descriptor, descriptor)
+        descriptor = uint(event["event_id"], 21 if scheduled else 17 if probed else 10)
         index = uint(event["record_ordinal"], uint(page["records_seen"], 2_000_000))
-        require(0 < eid <= count and eid not in ticks and uint(row["marker_ordinal"]) == i and previous < index and
+        require(uint(row["marker_ordinal"]) == i and previous < index and
                 event["provider_guid"] == PROVIDER and event["activity_id"] == activity and
                 uint(event["header_flags"], 65535) & 2 and not uint(event["header_flags"], 65535) & (4 | 8 | 128 | 256) and
                 not uint(event["event_property"], 65535) & 7 and
-                uint(event["header_process_id"]) == pid and uint(event["header_thread_id"]) == (worker if 5 <= eid <= 8 else caller) and
-                (uint(event["version"]), uint(event["channel"]), uint(event["task"]), uint(event["opcode"])) ==
-                (1, 0, 1 + (eid-1)//2, 1 + (eid-1)%2), "marker_identity_mismatch")
+                uint(event["header_process_id"]) == pid and uint(event["channel"]) == 0, "marker_identity_mismatch")
         previous = index
         tick = qpc(event["raw_timestamp"])
+        loggers.add(uint(event["logger_id"], 65535))
+        if scheduled and descriptor >= 18:
+            require((uint(event["version"]), uint(event["task"]), uint(event["opcode"])) ==
+                    (2, 8+(descriptor-18)//2, 1+(descriptor-18)%2), "observer_descriptor_mismatch")
+            observer_rows.append(row)
+            continue
+        eid = {16: 12, 17: 14}.get(descriptor, descriptor)
+        require(0 < eid <= count and eid not in ticks and uint(event["header_thread_id"]) == (worker if 5 <= eid <= 8 else caller) and
+                (uint(event["version"]), uint(event["task"]), uint(event["opcode"])) ==
+                (2 if scheduled and eid in (8, 10) else 1, 1 + (eid-1)//2, 1 + (eid-1)%2), "marker_identity_mismatch")
         lo, hi = spans[eid-1]
         require(lo <= tick <= hi, "marker_outside_producer_write")
-        loggers.add(uint(event["logger_id"], 65535))
         ticks[eid], ordinals[eid], descriptors[eid] = tick, index, descriptor
+        main_rows[eid] = row
+    require(len(ticks) == count, "incomplete_marker_set")
     require(len(loggers) == 1, "logger_mismatch")
     caller_order = (1, 3, 4, 11, 12, 9, 13, 14, 10, 2) if probed else (1, 3, 4, 9, 10, 2)
     for order in (caller_order, (1, 5, 7, 8, 6, 10, 2)):
@@ -227,6 +245,10 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size, join_p
                 probes.append(dict(start_record=ordinals[start], result_record=ordinals[start+1],
                                    wait_result=result, call_start_qpc=str(call[0]), call_end_qpc=str(call[1])))
         measurement["join_path"] = bound_join(ticks, ordinals, spans[5][1], join, timer, probes)
+    if scheduled:
+        path = measurement["join_path"]
+        signal = (int(path["worker_signal_earliest_qpc"]), int(path["worker_signal_latest_qpc"]))
+        measurement["scheduling"] = scheduling(main_rows, observer_rows, spans, join, timer, signal, pid, caller, worker)
     return measurement
 
 
@@ -260,6 +282,13 @@ def path_ranges(row):
     return ranges
 
 
+def bounds(values):
+    longer, shorter, equal = sum(lo > 0 for lo, hi in values), sum(hi < 0 for lo, hi in values), values.count((0, 0))
+    return dict(pairs=len(values), longer=longer, shorter=shorter, equal=equal, unresolved=len(values)-longer-shorter-equal,
+                median_lower_ns=rational(median(lo for lo, hi in values)) if values else None,
+                median_upper_ns=rational(median(hi for lo, hi in values)) if values else None)
+
+
 def summarize_paths(report):
     phases = ("start_to_caller", "exposed_worker", "join_return_delay", "return_to_stop", "worker_timer_after_arrival", "worker_after_join_call_start")
     groups = {group: {phase: [] for phase in phases} for group in ("all", "baseline", "candidate")}
@@ -282,16 +311,40 @@ def summarize_paths(report):
             groups[pair["order"][0]][phase].append((lo, hi))
         pair["join_path_change_ns"] = changes
 
-    def bounds(values):
-        longer, shorter, equal = sum(lo > 0 for lo, hi in values), sum(hi < 0 for lo, hi in values), values.count((0, 0))
-        return dict(pairs=len(values), longer=longer, shorter=shorter, equal=equal, unresolved=len(values)-longer-shorter-equal,
-                    median_lower_ns=rational(median(lo for lo, hi in values)) if values else None,
-                    median_upper_ns=rational(median(hi for lo, hi in values)) if values else None)
-
     summaries = {group: {phase: bounds(values) for phase, values in data.items()} for group, data in groups.items()}
     report.update(schema="kn.etl_handoff_study.v2", join_path_summary=dict(last_prerequisites=counts, changes=summaries["all"],
                   by_first_arm={role: summaries[role] for role in counts}))
     report["qualification"]["join_path"] = "caller_arrival_and_worker_thread_termination"
+
+
+def summarize_scheduling(report):
+    phases = ("caller_residency", "worker_residency")
+    groups = {group: {phase: [] for phase in phases} for group in ("all", "baseline", "candidate")}
+    for i, pair in enumerate(report["pairs"]):
+        pair["off_cpu_change_ns"] = None
+        arms = {row["selection"]["role"]: row["measurement"] for row in report["observations"][2*i:2*i+2]}
+        if any(m is None or m["scheduling"]["status"] != "measured" for m in arms.values()):
+            continue
+        changes = {}
+        for phase in phases:
+            duration = {}
+            for role, m in arms.items():
+                interval = m["scheduling"][phase]
+                scale = Fraction(1_000_000_000, int(m["frequency"]))
+                duration[role] = [int(interval[k])*scale for k in ("off_cpu_lower_ticks", "off_cpu_upper_ticks")]
+            base, candidate = duration["baseline"], duration["candidate"]
+            lo, hi = candidate[0]-base[1], candidate[1]-base[0]
+            changes[phase] = dict(lower=rational(lo), upper=rational(hi))
+            for group in ("all", pair["order"][0]):
+                groups[group][phase].append((lo, hi))
+        pair["off_cpu_change_ns"] = changes
+    measured = len(groups["all"]["caller_residency"])
+    summaries = {group: {phase: bounds(values) for phase, values in data.items()} for group, data in groups.items()}
+    report.update(schema="kn.etl_handoff_study.v3", timing_status=report["status"],
+                  status="complete" if measured == report["planned_pairs"] else "partial",
+                  scheduling_summary=dict(measured_pairs=measured, unavailable_pairs=report["planned_pairs"]-measured,
+                                          changes=summaries["all"], by_first_arm={k: summaries[k] for k in ("baseline", "candidate")}))
+    report["qualification"]["scheduler_residency"] = "wait_call_bounds_from_thread_dispatch_counts_and_wct"
 
 
 def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations, join_path=False):
@@ -341,4 +394,6 @@ def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations
                                    scheduler_residency=None, product_regression=None, producer_authenticity="unverified"))
     if "caller_delay_ms" in cfg or join_path:
         summarize_paths(report)
+    if cfg.get("observe_scheduling"):
+        summarize_scheduling(report)
     return report

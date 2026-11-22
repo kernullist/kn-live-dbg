@@ -724,6 +724,57 @@ Unavailable arms retain their places in the study. For older ten-event
 archives, `replay --join-path` uses the worker's last write and the
 successful join, with no probe observations. [Capture and replay](COMMAND_REFERENCE.md#identify-the-last-prerequisite-at-a-thread-join)
 
+### Scheduler evidence at a thread join
+
+`plan --observe-scheduling` records how often Windows switched the caller
+and worker out around their respective waits. Each thread enables dispatch
+profiling on itself, reads its counters, calls the Windows wait, reads
+again and disables profiling. The caller waits for the worker thread to
+terminate. The worker waits for its timer. Each Stop event retains both
+read intervals, the wait's QPC endpoints and the Win32 status of each
+profiling operation. Cycle counts and the interval wait-reason bitmap
+retain their Windows units and semantics. [Windows thread profiling](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-enablethreadprofiling) · [Dispatch counters](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-performance_data)
+
+A third thread can query the caller's Windows wait chain up to eight
+times. Each query has its own ETW Start and Stop, QPC interval, and two
+zero-timeout probes of the retained worker handle. Replay counts a
+sighting when the query fell wholly inside the final join, the worker
+was alive at both probes, and the successful, noncyclic chain connected
+the blocked caller through a thread wait to this worker. The observer
+also records queries that overlapped the end of the wait, found a
+different state or failed. [Wait-chain traversal](https://learn.microsoft.com/en-us/windows/win32/api/wct/nf-wct-getthreadwaitchain) · [Wait-chain node fields](https://learn.microsoft.com/en-us/windows/win32/api/wct/ns-wct-waitchain_node_info)
+
+With zero switches between the caller's own reads, the thread stayed
+scheduled throughout the inner call, assuming the 32-bit counter did
+not make a full turn. With one switch and two sightings, the thread
+was off CPU for at least the gap between those queries. Replay expands
+each query interval by one QPC tick for cross-thread clock ordering.
+For multiple switches it finds the smallest total gap consistent with
+grouping the sightings into at most that many descheduled intervals.
+Repeated positive switch counts on the blocked wait-chain root also
+bound a single interval. The two counters have different origins.
+Decreasing or incompatible readings withhold the comparison.
+[QPC ordering across threads](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps#guidance-for-acquiring-time-stamps)
+
+`caller_residency` and `worker_residency` give complementary ranges for
+time on and off CPU during each wait. A positive switch count with no
+direct sightings permits the full range from zero to the call's duration.
+The worker has no independent wait-chain observer. Scheduled time can
+include interrupts. A complete switch and ready-thread timeline requires
+a separate scheduler trace. The paired summary gives candidate minus
+baseline off-CPU bounds and their medians, including results by arm order.
+`timing_status` and `scheduling_summary.measured_pairs` show which
+wall-time and scheduling comparisons survived replay.
+
+To inspect the original rows, use `--etl-hard-faults` with
+`--handoff-markers`. The page retains the header and original record
+ordinal of each keyed Start or Stop. Only the owned provider's version-2
+Stop events for the worker timer, caller join, wait-chain query and
+observer session carry a scheduling payload. The page includes its byte
+count and up to 1,024 bytes in hex. An oversized payload retains its
+length with a null hex field. The study retains these rows in its private
+report. [Capture and replay](COMMAND_REFERENCE.md#measure-scheduling-during-a-thread-join)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

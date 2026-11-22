@@ -111,7 +111,8 @@ def check(exe, signer, etl, claims, folder, expected_records=None, reference=Non
     key = signer.point.upper()
     signature_args = ["--capture-statement", jws, claims["role"], key]
     rc = 1 if short else 0
-    variants = [("--etl-hard-faults", []), ("--etl-disk-io", []), ("--etl-profile", ["--capture-settings"]), ("--etl-profile", ["--clr-evidence"]),
+    variants = [("--etl-hard-faults", []), ("--etl-hard-faults", ["--handoff-markers"]),
+                ("--etl-disk-io", []), ("--etl-profile", ["--capture-settings"]), ("--etl-profile", ["--clr-evidence"]),
                 ("--etl-switches", ["--capture-settings", "--intervals"])]
     if reference:
         flags = ["--after", "0", "--thread-evidence", "--image-evidence", "--process-evidence",
@@ -138,7 +139,9 @@ def check(exe, signer, etl, claims, folder, expected_records=None, reference=Non
         assert bound["claimed_etl_sha256"] == source_pin and bound["claimed_etl_bytes"] == claims["etl_bytes"]
         assert bound["statement_file_sha256"] == sha(jws.read_bytes()) and bound["trusted_key_sha256"] == sha(bytes.fromhex(key))
         assert bound["claims"] == {k: claims[k] for k in ("role", *CONTEXT)}
-        if verb == "--etl-hard-faults" and report["hard_faults"]:
+        if "--handoff-markers" in flags:
+            assert proof["source_kind"] == "handoff_marker" and report["schema"] == "kn.etl_handoff_markers.v1"
+        if verb == "--etl-hard-faults" and not flags and report["hard_faults"]:
             selected = [exe, verb, etl, "--sha256", source_pin, "--schedule-of", "1"]
             schedule_pin = sha(run(selected, rc))
             receipt = json.loads(run([*selected, "--check-page", schedule_pin, *signature_args], rc))

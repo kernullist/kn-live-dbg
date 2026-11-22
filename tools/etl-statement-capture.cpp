@@ -156,11 +156,13 @@ int wmain(int argc, wchar_t** argv)
 {
     if (argc == 3 && std::wstring(argv[2]) == L"--recover-rotation") { return RecoverRotation(argv[1]); }
     const bool rotate = argc == 3 && std::wstring(argv[2]) == L"--rotate";
-    const bool probeJoin = argc == 8 && std::wstring(argv[2]) == L"--handoff-join";
+    const bool scheduling = argc == 8 && std::wstring(argv[2]) == L"--handoff-scheduling";
+    const bool probeJoin = scheduling || (argc == 8 && std::wstring(argv[2]) == L"--handoff-join");
     const bool measure = probeJoin || (argc == 7 && std::wstring(argv[2]) == L"--handoff");
     handoff::Trial trial;
     if ((argc != 2 && !rotate && !measure) || (measure && !trial.settings.Parse(argv + 3))) { return 2; }
     trial.settings.probeJoin = probeJoin;
+    trial.settings.observeScheduling = scheduling;
     if (probeJoin && !handoff::Config::Number(argv[7], 1000, trial.settings.callerDelayMs)) { return 2; }
     GUID session{}, provider{};
     const auto sessionId = Id(session);

@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Scheduling during a thread join on 2026-11-22
+
+On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix
+`341ef23fd175`) and reader (`2bda0417bff9`) measured 40 runs of the
+owned caller and worker. The table gives bounds on the median paired
+change in the caller's off-CPU time inside its final Windows wait.
+Counts in the two middle columns are baseline / candidate. A direct
+sighting is a wait-chain query inside that wait which observed the
+caller blocked on the live worker.
+[Acquisition and replay](COMMAND_REFERENCE.md#measure-scheduling-during-a-thread-join) · [Assumptions behind the bounds](TRACE_IMPORT.md#scheduler-evidence-at-a-thread-join)
+
+| Worker timers, caller pause (ms) | Pairs | Caller switches per run | Direct sightings / total queries in each arm | Median off-CPU change (ms) |
+| --- | ---: | --- | --- | ---: |
+| 2 to 180, caller 30 | 8 | 0 / 1 | 0 of 8 / 48 of 59 | +89.75495 to +148.65195 |
+| 2 to 20, caller 110 | 8 | 0 / 0 | 0 of 8 / 0 of 8 | 0 |
+| 85 to 85, caller 0 | 4 | 1 / 1 | 22 of 27 / 23 of 27 | −37.12035 to +23.56690 |
+
+In the first study all eight pairs showed an increase. In the second,
+both workers in every pair had exited before the caller arrived. In the
+equal-timer study the range included zero. The inference assumes that
+the thread's 32-bit switch count did not make a full turn between its
+own reads. Starting a system logger for context-switch and dispatcher
+events under this Windows token returned Win32 error 5. Exact switch
+times, ready delays and the impact on a product workload remain open.
+
+An independent Windows ETW reader checked all 914 original marker headers
+and the scheduling payloads. Microsoft TraceProcessor Events 1.12.10
+with Toolkit 1.11.0 matched all 514 scheduling headers to rows in
+`IGenericEventDataSource.Events` using the same ETLs, task and thread
+filters and raw QPC timestamps. In one candidate ETL, records 14 and 15
+for the first wait-chain query matched SDK rows 12 and 13. The generic
+activity comparator returned `thread_bracket_unqualified` for both selected
+arms because the private session supplied no system thread-lifetime events.
+The handoff study uses the recorder's process and worker lifetime evidence.
+Independent calculations checked the
+paired bounds and exhaustively compared the possible partitions for up
+to eight sightings. An MSVC `/RTC1` recorder added four runs with 100
+original markers and 60 scheduling table rows. [Independent checks](../tools/etl_handoff_scheduling_checks.py)
+
+Replacing a caller's successful profiling cleanup with Win32 error 5 in
+one rehashed ETL preserved the complete wall-time summary and withheld
+that pair's scheduling comparison. Replaying the partial report reproduced
+its digest. Earlier v1 and v2 archives, signed capture statements, and
+the documented four-pair scheduling example also passed. [Archive controls](../tools/test-etl-handoff.py) · [Signed page checks](../tools/test-etl-capture-statement.py)
+
 ## Critical path at a joined worker on 2026-11-22
 
 On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix

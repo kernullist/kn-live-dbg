@@ -1430,6 +1430,56 @@ worker time exposed after caller arrival. Add `--join-path` to a v1
 archive's replay command to derive bounds from its original ten events.
 The default replay of that archive reproduces the v1 report. [Field definitions](TRACE_IMPORT.md#critical-path-at-a-joined-worker)
 
+### Measure scheduling during a thread join
+
+From an x64 Visual Studio Developer PowerShell at the repository root,
+use a new private directory for the plan, original ETLs and report.
+This example gives the caller a 30 ms pause and changes the worker's
+requested timer from 2 to 180 ms.
+
+```powershell
+$out = '.\.build\handoff-scheduling-example'
+New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+cl /nologo /std:c++17 /EHsc /O2 /W4 /WX /DUNICODE /D_UNICODE "/Fo:$out\recorder.obj" "/Fe:$out\recorder.exe" tools\etl-statement-capture.cpp
+if ($LASTEXITCODE -ne 0) { throw 'Recorder build failed' }
+$recorder = (Get-Item "$out\recorder.exe").FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$recorderPin = (Get-FileHash -LiteralPath $recorder -Algorithm SHA256).Hash
+$readerPin = (Get-FileHash -LiteralPath $reader -Algorithm SHA256).Hash
+$tool = 'tools/measure-etl-handoff.py'
+$plan = python -B $tool plan --observe-scheduling --pairs 4 --steps 20000 --baseline-ms 2 --candidate-ms 180 --caller-delay-ms 30 --recorder-sha256 $recorderPin --exe-sha256 $readerPin --output "$out\plan.json" | ConvertFrom-Json
+$capture = python -B $tool capture --plan "$out\plan.json" --plan-sha256 $plan.plan_sha256 --recorder $recorder --output "$out\originals.zip" | ConvertFrom-Json
+$query = @('replay', '--package', "$out\originals.zip", '--sha256', $capture.package_sha256, '--plan-sha256', $plan.plan_sha256, '--exe', $reader)
+$receipt = python -B $tool @query --output "$out\report.json" | ConvertFrom-Json
+$report = Get-Content -LiteralPath "$out\report.json" -Raw | ConvertFrom-Json
+$report.timing_status
+$report.scheduling_summary.measured_pairs
+$report.scheduling_summary.changes.caller_residency
+python -B $tool @query --check-report $receipt.report_sha256
+```
+
+With `--observe-scheduling`, the caller pause defaults to zero. The
+recorder starts a private ETW session and profiles its own two waiting
+threads. Each original ETL travels with its recorder outcome in the
+archive. Replay returns exit 1 for a partial study and retains the
+available wall-time measurements when a dispatch read or wait-chain
+query fails. Use `observations[].measurement.scheduling` for the
+counter values, Win32 statuses, query intervals and source record numbers.
+[How to read the bounds](TRACE_IMPORT.md#scheduler-evidence-at-a-thread-join)
+
+To check the same recordings independently, build the marker adapter
+with the MSBuild command under [Microsoft TraceProcessor](#check-the-same-markers-with-microsoft-traceprocessor).
+Keep the variables from the capture example and run the following in
+the same x64 Developer PowerShell.
+
+```powershell
+cl /nologo /std:c++17 /EHsc /O2 /W4 /WX "/Fo:$out\oracle.obj" "/Fe:$out\oracle.exe" tools\etl-hard-fault-oracle.cpp
+if ($LASTEXITCODE -ne 0) { throw 'ETW reader build failed' }
+$adapter = (Get-Item .\.build\traceprocessor-markers\TraceProcessorMarkers.zip).FullName
+$adapterPin = (Get-FileHash -LiteralPath $adapter -Algorithm SHA256).Hash
+python -B tools/test-etl-handoff.py --package "$out\originals.zip" --sha256 $capture.package_sha256 --plan-sha256 $plan.plan_sha256 --exe $reader --oracle "$out\oracle.exe" --traceprocessor $adapter $adapterPin --check-controls
+```
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

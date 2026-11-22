@@ -16,6 +16,8 @@ import tempfile
 import zipfile
 
 import etl_handoff as study
+import etl_handoff_scheduling as dispatch
+import etl_handoff_scheduling_checks as dispatch_checks
 
 
 HERE = Path(__file__).resolve().parent
@@ -136,7 +138,7 @@ def independent_differences(report, arms):
 
 def independent(package, report, oracle, folder):
     cfg = report["plan"]
-    by_pair, paths = {}, {}
+    by_pair, paths, scheduling = {}, {}, {}
     with zipfile.ZipFile(package) as archive:
         for row in report["observations"]:
             slot, truth = row["selection"], row["workload"]
@@ -146,7 +148,12 @@ def independent(package, report, oracle, folder):
             footer, _, groups, _ = WINDOW["read_oracle"](oracle, path)
             events = sorted((e for group in groups.values() for e in group), key=lambda e: e["record_ordinal"])
             assert [r["event"] for r in row["marker_page"]["markers"]] == events
-            assert len(events) == (14 if "caller_delay_ms" in cfg else 10) and footer["records_seen"] == row["marker_page"]["records_seen"]
+            assert footer["records_seen"] == row["marker_page"]["records_seen"]
+            if cfg.get("observe_scheduling"):
+                scheduling[slot["pair"], slot["role"]] = dispatch_checks.from_etl(oracle, path, row)
+                assert 16 <= len(events) <= 32
+            else:
+                assert len(events) == (14 if "caller_delay_ms" in cfg else 10)
             assert footer["clock_type"] == 1 and footer["frequency"] == int(truth["frequency"])
             t = {e["event_id"]: int(e["raw_timestamp"]) for e in events}
             join, timer = (tuple(map(int, truth[k])) for k in ("join_call", "timer_call"))
@@ -169,8 +176,10 @@ def independent(package, report, oracle, folder):
                     seed = (1664525*seed + 1013904223) % 2**32
                 assert seed == truth[name]
             by_pair.setdefault(slot["pair"], {})[slot["role"]] = {k: Fraction(v*10**9, footer["frequency"]) for k, v in expected.items()}
-            if report["schema"] == "kn.etl_handoff_study.v2":
+            if "join_path_summary" in report:
                 paths[slot["pair"], slot["role"]] = independent_path(events, truth, row["measurement"])
+    if scheduling:
+        dispatch_checks.check_pairs(scheduling, report)
     if paths:
         independent_differences(report, paths)
     def value(r):
@@ -205,12 +214,13 @@ def semantic_controls(report):
             assert str(e) == reason
         else:
             raise AssertionError("accepted inconsistent " + key)
+    start = next(i for i, marker in enumerate(page["markers"]) if marker["event"]["event_id"] == 1)
     for where, key, replacement, reason in (
             (["clock"], "header_perf_frequency", "0", "clock_unqualified"),
             (["log_header"], "events_lost", 1, "private_capture_coverage_unqualified"),
-            (["markers", 0, "event"], "raw_timestamp", "1", "marker_outside_producer_write"),
-            (["markers", 0, "event"], "header_thread_id", 0, "marker_identity_mismatch"),
-            (["markers", 0, "event"], "logger_id", 65535, "logger_mismatch"),
+            (["markers", start, "event"], "raw_timestamp", "1", "marker_outside_producer_write"),
+            (["markers", start, "event"], "header_thread_id", 0, "marker_identity_mismatch"),
+            (["markers", start, "event"], "logger_id", 65535, "logger_mismatch"),
             ([], "matched_markers", 9, "incomplete_marker_set")):
         p = deepcopy(page)
         target = p
@@ -342,6 +352,28 @@ def archive_controls(args, folder, replay, report):
         assert partial["observations"][0]["reason"] == "probe_result_disagrees_with_etl"
         assert partial["measured_pairs"] == report["planned_pairs"]-1 and partial["pairs"][0]["join_path_change_ns"] is None
         assert invoke([*altered, "--check-report", mismatch["report_sha256"]], 1)["status"] == "matched"
+    if report["plan"].get("observe_scheduling"):
+        def failed_dispatch_cleanup(parts, outcomes):
+            row = next(m for m in report["observations"][0]["marker_page"]["markers"] if m["event"]["event_id"] == 10)
+            payload = bytes.fromhex(row["handoff_payload"]["payload_hex"])
+            raw = parts["slot-01.etl"]
+            assert len(payload) == 19*8 and payload[16:24] == bytes(8) and raw.count(payload) == 1
+            changed = raw.replace(payload, payload[:16] + (5).to_bytes(8, "little") + payload[24:])
+            parts["slot-01.etl"] = changed
+            outcomes[0]["source_sha256"] = hashlib.sha256(changed).hexdigest()
+
+        flags = repack(folder/"failed-dispatch.zip", failed_dispatch_cleanup)
+        output = folder/"failed-dispatch.json"
+        evidence = invoke([*flags, "--output", output], 1)
+        result = json.loads(output.read_bytes())
+        assert result["status"] == "partial" and result["timing_status"] == "complete"
+        assert result["measured_pairs"] == report["planned_pairs"] == evidence["scheduling_pairs"]+1
+        assert result["changes"] == report["changes"] and result["join_path_summary"] == report["join_path_summary"]
+        assert result["pairs"][0]["off_cpu_change_ns"] is None and result["scheduling_summary"]["unavailable_pairs"] == 1
+        changed = result["observations"][0]["measurement"]["scheduling"]
+        assert changed["caller_join"]["disable_win32"] == 5 and changed["caller_residency"]["status"] == "unavailable"
+        assert changed["worker_timer"] == report["observations"][0]["measurement"]["scheduling"]["worker_timer"]
+        assert invoke([*flags, "--check-report", evidence["report_sha256"]], 1)["status"] == "matched"
     def reversed_order(_parts, outcomes):
         outcomes[0], outcomes[1] = outcomes[1], outcomes[0]
     def bad_binding(_parts, outcomes):
@@ -367,7 +399,7 @@ def archive_controls(args, folder, replay, report):
     alias.hardlink_to(source)
     with alias.open("ab") as stream:
         result = subprocess.run([sys.executable, "-B", CLI, "--help", "--package", source], stdout=stream, stderr=stream, timeout=30)
-    assert result.returncode == 2 and pin(source) == args.sha256
+    assert result.returncode == 2 and pin(source) == args.sha256.lower()
     race = [sys.executable, "-B", CLI, *replay, "--output", folder/"race.json"]
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = [pool.submit(subprocess.run, race, capture_output=True, timeout=240) for _ in range(2)]
@@ -432,6 +464,8 @@ def main():
     parser.add_argument("--recorder", type=Path, help="include new same-plan acquisitions and actual failed launches")
     parser.add_argument("--check-controls", action="store_true")
     parser.add_argument("--join-path", action="store_true", help="check optional join analysis of a legacy archive")
+    parser.add_argument("--traceprocessor", nargs=2, metavar=("MARKER_ADAPTER_ZIP", "SHA256"),
+                        help="also check scheduling marker table rows with the pinned Microsoft adapter")
     args = parser.parse_args()
     replay = ["replay", "--package", args.package, "--sha256", args.sha256, "--plan-sha256", args.plan_sha256, "--exe", args.exe]
     if args.join_path:
@@ -443,6 +477,9 @@ def main():
         assert receipt["report_sha256"] == pin(output) and invoke([*replay, "--check-report", pin(output)], 0)["status"] == "matched"
         report = json.loads(output.read_bytes())
         markers = independent(args.package, report, args.oracle, folder)
+        if args.traceprocessor:
+            n = dispatch_checks.traceprocessor_markers(args.package, report, args.traceprocessor, folder)
+            print(f"{n} scheduling marker headers matched identified Microsoft TraceProcessor table rows.")
         row = report["observations"][0]
         for part in (receipt, report["plan"], report["plan"]["slots"][0], row, row["workload"], row["measurement"],
                      row["measurement"]["ticks"], row["process"], report["pairs"][0], report["changes"]["activity"],
@@ -453,7 +490,19 @@ def main():
             semantic_controls(report)
             if "join_path_summary" in report:
                 join_controls(report)
+            if "scheduling_summary" in report:
+                def assess(row, page):
+                    return study.measure(report["plan"], row["selection"], row["expected_activity_id"], row["workload"], row["process"],
+                                         page, row["etl_sha256"], page["source_bytes"])["scheduling"]
+                dispatch_checks.controls(report, assess, dispatch.minimum_off_cpu, dispatch.residency)
             archive_controls(args, folder, replay, report)
+        if "scheduling_summary" in report:
+            for record in report["observations"]:
+                data = record["measurement"]["scheduling"]
+                parts = [data, data["caller_join"], data["caller_join"]["before"], data["caller_residency"], data["observer"], *data["observer"]["views"]]
+                for part in parts:
+                    WINDOW["private"](part)
+            WINDOW["private"](report["scheduling_summary"]["changes"])
         if "join_path_summary" in report:
             path = row["measurement"]["join_path"]
             for part in (path, path["at_latest_signal"], *path["probes"], *row["workload"].get("join_probes", []),

@@ -12,6 +12,7 @@
 #include "ReferenceArtifact.h"
 #include "ArtifactOutput.h"
 #include "SourceCapabilities.h"
+#include "../shared/HandoffEvents.h"
 
 #include <evntrace.h>
 #include <array>
@@ -63,7 +64,7 @@ namespace
         bool multipleReady = false;
         bool ReadyQuery() const { return !readyRecords.empty(); }
         uint32_t activityStart = 0, activityStop = 0;
-        bool activityMarkers = false;
+        bool activityMarkers = false, handoffMarkers = false;
         bool Switches() const { return family == Family::Switches; }
         bool SchedulingActivity() const { return Switches() && activityStart; }
         bool DiskIo() const { return family == Family::DiskIo; }
@@ -95,6 +96,7 @@ namespace
         }
         const wchar_t* Prefix() const
         {
+            if (handoffMarkers) { return L"{\"schema\":\"kn.etl_handoff_markers.v1\",\"status\":"; }
             if (activityMarkers) { return L"{\"schema\":\"kn.etl_activity_markers.v1\",\"status\":"; }
             if (DiskIo()) { return L"{\"schema\":\"kn.etl_disk_io.v1\",\"status\":"; }
             if (multipleReady) { return L"{\"schema\":\"kn.etl_switches.v6\",\"status\":"; }
@@ -176,7 +178,12 @@ namespace
                 continue;
             }
             if (args[i] == L"--intervals" && options.Switches() && !options.intervals) { options.intervals = true; continue; }
-            if (args[i] == L"--activity-markers" && options.HardFaults() && !options.activityMarkers) { options.activityMarkers = true; continue; }
+            if ((args[i] == L"--activity-markers" || args[i] == L"--handoff-markers") && options.HardFaults() && !options.activityMarkers)
+            {
+                options.activityMarkers = true;
+                options.handoffMarkers = args[i] == L"--handoff-markers";
+                continue;
+            }
             if (i + 1 == args.size()) { return false; }
             if (args[i] == L"--after" && !haveAfter && Decimal(args[i + 1], MaxRecords, options.after))
             { haveAfter = true; }
@@ -241,6 +248,33 @@ namespace
         bool budgetExceeded = false;
     };
 
+    struct HandoffPayload
+    {
+        std::array<unsigned char, handoff_events::MaxPayload> data{};
+        USHORT length = 0;
+        bool selected = false, complete = false;
+
+        void Read(const EVENT_RECORD& e)
+        {
+            selected = handoff_events::SchedulingPayload(e.EventHeader.ProviderId, e.EventHeader.EventDescriptor);
+            if (!selected) { return; }
+            length = e.UserDataLength;
+            complete = length <= data.size() && (!length || e.UserData);
+            if (complete && length) { std::memcpy(data.data(), e.UserData, length); }
+        }
+
+        std::wstring Json() const
+        {
+            if (!selected) { return L"null"; }
+            std::wstring result = L"{\"payload_bytes\":" + std::to_wstring(length) + L",\"payload_hex\":";
+            if (!complete) { return result + L"null}"; }
+            static constexpr wchar_t hex[] = L"0123456789abcdef";
+            result.push_back(L'"');
+            for (size_t i = 0; i < length; ++i) { result.push_back(hex[data[i] >> 4]); result.push_back(hex[data[i] & 15]); }
+            return result + L"\"}";
+        }
+    };
+
     struct Scan : TraceCounts
     {
         Options options;
@@ -259,6 +293,7 @@ namespace
         etl_profile::ReadyBatch origins;
         uint32_t decodedReady = 0, unsupportedReady = 0, unassignedReady = 0;
         std::vector<std::pair<uint32_t, etl_profile::ActivityMarker>> markers;
+        std::vector<HandoffPayload> handoffPayloads;
         etl_profile::FaultSchedule faultSchedule;
         std::array<etl_profile::HardFault, MaxPage> faultPage{};
         std::array<Sample, MaxPage> page{};
@@ -388,6 +423,7 @@ namespace
             if (++scan.matched > scan.options.after && scan.used < scan.options.limit)
             {
                 scan.markers.emplace_back(scan.decoded, row);
+                if (scan.options.handoffMarkers) { scan.handoffPayloads[scan.used].Read(*event); }
                 ++scan.used;
             }
             return;
@@ -1065,7 +1101,7 @@ namespace
         const bool withStatement = !o.statementPath.empty();
         const auto schema = withStatement ? L"kn.etl_page_replay.v2" : L"kn.etl_page_replay.v1";
         return L"{\"schema\":" + Quote(schema) + L",\"status\":" + Quote(status) +
-            L",\"source_kind\":" + Quote(o.Fields().kind) +
+            L",\"source_kind\":" + Quote(o.handoffMarkers ? L"handoff_marker" : o.Fields().kind) +
             L",\"expected_source_sha256\":" + Quote(o.digest) + L",\"expected_reference_sha256\":" +
             (o.referenceDigest.empty() ? L"null" : Quote(o.referenceDigest)) +
             L",\"source_sha256\":" + (source.empty() ? L"null" : Quote(source)) +
@@ -1360,13 +1396,16 @@ namespace
         if (scan.options.DiskIo()) { return result + DiskResultsJson(scan, h); }
         if (scan.options.activityMarkers)
         {
+            if (scan.options.handoffMarkers) { result += L",\"handoff_payload_limit\":" + std::to_wstring(handoff_events::MaxPayload); }
             result += L",\"thread_filter\":" + (scan.options.haveTid ? std::to_wstring(scan.options.tid) : L"null") +
                 L",\"matched_markers\":" + std::to_wstring(scan.matched) + L",\"markers\":[";
             for (size_t i = 0; i < scan.markers.size(); ++i)
             {
                 const auto& [ordinal, row] = scan.markers[i];
                 if (i) { result += L','; }
-                result += L"{\"marker_ordinal\":" + std::to_wstring(ordinal) + L",\"event\":" + ActivityMarkerJson(row) + L"}";
+                result += L"{\"marker_ordinal\":" + std::to_wstring(ordinal) + L",\"event\":" + ActivityMarkerJson(row);
+                if (scan.options.handoffMarkers) { result += L",\"handoff_payload\":" + scan.handoffPayloads[i].Json(); }
+                result += L"}";
             }
             return result + L"]}";
         }
@@ -1625,7 +1664,11 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     if (opened.failure) { return Failure(scan.options, opened.failure, source.Sha256, opened.win32); }
     if (scan.options.activityMarkers)
     {
-        try { scan.markers.reserve(scan.options.limit); }
+        try
+        {
+            scan.markers.reserve(scan.options.limit);
+            if (scan.options.handoffMarkers) { scan.handoffPayloads.resize(scan.options.limit); }
+        }
         catch (const std::bad_alloc&) { return Failure(scan.options, L"marker_page_unavailable", source.Sha256); }
     }
     if (scan.options.settings)
@@ -1785,7 +1828,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
         if (!guards[i].Hold(sink, args[i])) { return 2; }
     }
     std::wcerr << (scan.options.HardFaults() ?
-        L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [[--activity-markers [--thread-id TID]] [--after N] [--limit 1..128] | --schedule-of <fault-ordinal> | --activity-window <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
+        L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [[--activity-markers|--handoff-markers [--thread-id TID]] [--after N] [--limit 1..128] | --schedule-of <fault-ordinal> | --activity-window <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
         L"usage: KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.Switches() ?
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [[--intervals] [--thread-id N] [--capture-settings] | --schedule-activity <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
         L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");

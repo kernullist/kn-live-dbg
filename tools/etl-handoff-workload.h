@@ -7,17 +7,18 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include "etl-handoff-dispatch.h"
 
 namespace handoff
 {
-    constexpr GUID Provider{0x4dc673b7, 0xfb3f, 0x4099, {0x95, 0x2a, 0x37, 0xda, 0xc2, 0x7c, 0xf1, 0x94}};
+    using handoff_events::Provider;
     constexpr uint32_t WorkerSalt = 0x9e3779b9u;
 
     struct Config
     {
         GUID activity{};
         uint32_t seed = 0, steps = 0, delayMs = 0, callerDelayMs = 0;
-        bool probeJoin = false;
+        bool probeJoin = false, observeScheduling = false;
 
         static bool Number(const wchar_t* input, uint32_t maximum, uint32_t& value)
         {
@@ -62,12 +63,6 @@ namespace handoff
         return (static_cast<uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
     }
 
-    inline LONGLONG Tick()
-    {
-        LARGE_INTEGER value{};
-        return QueryPerformanceCounter(&value) ? value.QuadPart : 0;
-    }
-
     struct Bracket
     {
         LONGLONG begin = 0, end = 0;
@@ -96,13 +91,13 @@ namespace handoff
         std::array<Bracket, 2> probeCalls{};
         std::array<DWORD, 2> probeResults{};
 
-        ULONG Mark(size_t index, USHORT eventId = 0)
+        ULONG Mark(size_t index, USHORT eventId = 0, const DispatchEvent* data = nullptr)
         {
-            const EVENT_DESCRIPTOR descriptor{eventId ? eventId : static_cast<USHORT>(index + 1), 1, 0, TRACE_LEVEL_INFORMATION,
+            const EVENT_DESCRIPTOR descriptor{eventId ? eventId : static_cast<USHORT>(index + 1), static_cast<UCHAR>(data ? 2 : 1), 0, TRACE_LEVEL_INFORMATION,
                 static_cast<UCHAR>(1 + index % 2), static_cast<USHORT>(1 + index / 2), 0};
             auto& span = markers[index];
             span.begin = Tick();
-            const auto status = EventWriteTransfer(registration, &descriptor, &settings.activity, nullptr, 0, nullptr);
+            const auto status = WriteEvent(registration, settings.activity, descriptor, data, data ? sizeof(*data) : 0);
             span.end = Tick();
             return status;
         }
@@ -125,6 +120,7 @@ namespace handoff
         static DWORD WINAPI Worker(void* context)
         {
             auto& trial = *static_cast<Trial*>(context);
+            DispatchWindow profile;
             auto status = Wait(trial.go);
             if (!status) { status = trial.Mark(4); }
             if (!status)
@@ -137,11 +133,13 @@ namespace handoff
                 LARGE_INTEGER due{};
                 due.QuadPart = trial.settings.delayMs ? -10000LL * trial.settings.delayMs : -1;
                 if (!SetWaitableTimer(trial.timer, &due, 0, nullptr, nullptr, FALSE)) { return GetLastError(); }
+                if (trial.settings.observeScheduling) { profile.Begin(); }
                 trial.timerCall.begin = Tick();
                 status = Wait(trial.timer);
                 trial.timerCall.end = Tick();
+                if (trial.settings.observeScheduling) { profile.End(trial.timerCall.begin, trial.timerCall.end); }
             }
-            if (!status) { status = trial.Mark(7); }
+            if (!status) { status = trial.Mark(7, 0, trial.settings.observeScheduling ? &profile.event : nullptr); }
             return status ? status : trial.Mark(5);
         }
 
@@ -164,7 +162,10 @@ namespace handoff
             Handle worker(CreateThread(nullptr, 0, Worker, this, 0, &workerTid));
             if (!worker.value) { return GetLastError(); }
 
-            auto status = Mark(0);
+            JoinObserver observer;
+            DispatchWindow profile;
+            ULONG status = settings.observeScheduling ? observer.Start(provider, settings.activity, callerTid, worker.value) : ERROR_SUCCESS;
+            if (!status) { status = Mark(0); }
             if (!SetEvent(go) && !status) { status = GetLastError(); }
             if (!status) { status = Mark(2); }
             if (!status) { callerResult = Calculate(settings.seed, settings.steps); status = Mark(3); }
@@ -177,27 +178,30 @@ namespace handoff
             if (!status && settings.probeJoin) { status = Probe(worker.value, 0); }
             if (!status) { status = Mark(8); }
             if (!status && settings.probeJoin) { status = Probe(worker.value, 1); }
+            if (settings.observeScheduling) { observer.Arm(); profile.Begin(); }
             joinCall.begin = Tick();
             const auto joined = Wait(worker.value);
             joinCall.end = Tick();
+            if (settings.observeScheduling) { profile.End(joinCall.begin, joinCall.end); observer.Stop(); }
             if (joined)
             {
                 // The worker owns references to this stack frame until its thread has exited.
                 WaitForSingleObject(worker.value, INFINITE);
                 if (!status) { status = joined; }
             }
-            if (!status) { status = Mark(9); }
+            if (!status) { status = Mark(9, 0, settings.observeScheduling ? &profile.event : nullptr); }
             if (!status) { status = Mark(1); }
             DWORD completion = 0;
             if (!status && (!GetExitCodeThread(worker.value, &completion) ||
                 !GetThreadTimes(worker.value, &created, &exited, &kernel, &user))) { status = GetLastError(); }
             if (!status) { workerCreated = Time(created); workerExited = Time(exited); }
+            if (settings.observeScheduling) { const auto finished = observer.Finish(); if (!status) { status = finished; } }
             return status ? status : completion;
         }
 
         void Json(const std::wstring& activity) const
         {
-            std::wcout << L",\"schema\":\"kn.owned_etl_handoff." << (settings.probeJoin ? L"v2" : L"v1") << L"\",\"activity_id\":\"" << activity
+            std::wcout << L",\"schema\":\"kn.owned_etl_handoff." << (settings.observeScheduling ? L"v3" : settings.probeJoin ? L"v2" : L"v1") << L"\",\"activity_id\":\"" << activity
                 << L"\",\"seed\":" << settings.seed << L",\"steps\":" << settings.steps << L",\"delay_ms\":" << settings.delayMs
                 << L",\"caller_result\":" << callerResult << L",\"worker_result\":" << workerResult
                 << L",\"pid\":" << GetCurrentProcessId() << L",\"process_created\":\"" << processCreated

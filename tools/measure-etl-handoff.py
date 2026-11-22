@@ -52,7 +52,7 @@ def recorder_document(attempt):
     raw, complete = original(attempt["stdout"], LIMIT)
     check(complete, "recorder output truncated")
     value = study.DECODE(raw)
-    check(type(value) is dict and value["schema"] in ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2"), "unexpected recorder output")
+    check(type(value) is dict and value["schema"] in ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2", "kn.owned_etl_handoff.v3"), "unexpected recorder output")
     study.guid(value["session_id"])
     return value
 
@@ -63,7 +63,7 @@ def capture_slot(cfg, slot, activity, program, binary, directory, files, stack, 
     files.parents(stack, folder, held)
     args = [".", "--handoff", activity, str(slot["seed"]), str(cfg["steps"]), str(slot["delay_ms"])]
     if "caller_delay_ms" in cfg:
-        args[1] = "--handoff-join"
+        args[1] = "--handoff-scheduling" if cfg.get("observe_scheduling") else "--handoff-join"
         args.append(str(cfg["caller_delay_ms"]))
     attempt = run_reader(program, args, folder, cfg["timeout_ms"], LIMIT, files, binary, capture_identity=True)
     record = dict(slot=slot["slot"], ticket=slot["ticket"], attempt=attempt, retention="not_located",
@@ -205,7 +205,8 @@ def observe(cfg, slot, activity, record, archive, reader, binary, directory, fil
         out.write(raw)
     with files.hold(path) as source:
         check(file_hash(source) == record["source_sha256"], "replay ETL changed")
-        flags = ["--etl-hard-faults", str(path), "--sha256", record["source_sha256"], "--activity-markers", "--limit", "128"]
+        selection = "--handoff-markers" if cfg.get("observe_scheduling") else "--activity-markers"
+        flags = ["--etl-hard-faults", str(path), "--sha256", record["source_sha256"], selection, "--limit", "128"]
         native = run_reader(reader, flags, directory, cfg["timeout_ms"], MIB, files, binary)
     result["reader"] = reader_receipt(native)
     if native["state"] != "exited" or native["image_binding"] != study.MATCHED_IMAGE or native["exit_code"] not in (0, 1):
@@ -248,6 +249,8 @@ def replay(args, output, files, stack, held, directory):
     receipt = dict(schema=report["schema"].replace("study.", "study_receipt."), status=state, study_status=report["status"],
                    report_sha256=report_pin, plan_sha256=plan_pin, package_sha256=expected,
                    planned_pairs=report["planned_pairs"], measured_pairs=report["measured_pairs"])
+    if "scheduling_summary" in report:
+        receipt["scheduling_pairs"] = report["scheduling_summary"]["measured_pairs"]
     return receipt, int(state == "mismatch" or report["status"] != "complete")
 
 
@@ -263,7 +266,7 @@ def execute(args):
             check(not os.path.lexists(output), "choose a new private output file")
         if args.command == "plan":
             cfg = study.plan(str(uuid4()), args.pairs, args.steps, args.baseline_ms, args.candidate_ms, args.timeout_ms,
-                             args.recorder_sha256.lower(), args.exe_sha256.lower(), args.caller_delay_ms)
+                             args.recorder_sha256.lower(), args.exe_sha256.lower(), args.caller_delay_ms, args.observe_scheduling)
             pin = publish_new(output, lambda out: out.write(encoded(cfg)))
             return dict(schema=cfg["schema"].replace("plan.", "plan_receipt."), plan_sha256=pin, planned_pairs=cfg["pairs"]), 0
         if args.command == "replay" and not output:
@@ -286,6 +289,7 @@ def main():
     new.add_argument("--baseline-ms", type=int, required=True, help="baseline relative timer delay (0..1000 ms)")
     new.add_argument("--candidate-ms", type=int, required=True, help="candidate relative timer delay (0..1000 ms)")
     new.add_argument("--caller-delay-ms", type=int, help="record two thread-handle probes around the join after this fixed caller delay (0..1000 ms)")
+    new.add_argument("--observe-scheduling", action="store_true", help="record per-thread dispatch counts and observe the caller's wait chain during the join")
     new.add_argument("--timeout-ms", type=int, default=15000, help="deadline per process (1..120000 ms)")
     for flag in ("--recorder-sha256", "--exe-sha256", "--output"):
         new.add_argument(flag, required=True)

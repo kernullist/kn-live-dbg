@@ -20,7 +20,8 @@ namespace
 {
     constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
-    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false; };
+    constexpr GUID Handoff = {0x4dc673b7, 0xfb3f, 0x4099, {0x95, 0x2a, 0x37, 0xda, 0xc2, 0x7c, 0xf1, 0x94}};
+    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false, payloads = false; };
 
     template<typename T>
     bool Property(PEVENT_RECORD e, Counts& counts, PCWSTR name, T& value)
@@ -83,10 +84,25 @@ namespace
             { counts.error = ERROR_INVALID_DATA; return; }
             std::printf("{\"record_kind\":\"activity_boundary\",\"record_ordinal\":%u,\"raw_timestamp\":\"%lld\","
                 "\"provider_guid\":\"%ls\",\"activity_id\":\"%ls\",\"event_id\":%u,\"task\":%u,\"opcode\":%u,"
-                "\"version\":%u,\"channel\":%u,\"header_flags\":%u,\"event_property\":%u,\"logger_id\":%u,\"header_process_id\":%lu,\"header_thread_id\":%lu}\n",
+                "\"version\":%u,\"channel\":%u,\"header_flags\":%u,\"event_property\":%u,\"logger_id\":%u,\"header_process_id\":%lu,\"header_thread_id\":%lu",
                 counts.records, h.TimeStamp.QuadPart, provider, activity, static_cast<unsigned>(d.Id), static_cast<unsigned>(d.Task),
                 static_cast<unsigned>(d.Opcode), static_cast<unsigned>(d.Version), static_cast<unsigned>(d.Channel),
                 static_cast<unsigned>(h.Flags), static_cast<unsigned>(h.EventProperty), static_cast<unsigned>(event->BufferContext.LoggerId), h.ProcessId, h.ThreadId);
+            if (counts.payloads)
+            {
+                std::printf(",\"length\":%u,\"raw\":", static_cast<unsigned>(event->UserDataLength));
+                const bool scheduling = IsEqualGUID(h.ProviderId, Handoff) && d.Version == 2 && d.Channel == 0 && d.Opcode == 2 &&
+                    ((d.Id == 8 && d.Task == 4) || (d.Id == 10 && d.Task == 5) || (d.Id == 19 && d.Task == 8) || (d.Id == 21 && d.Task == 9));
+                if (event->UserDataLength > 1024 || (event->UserDataLength && (!event->UserData || !scheduling))) { std::printf("null"); }
+                else
+                {
+                    std::putchar('"');
+                    const auto* bytes = static_cast<const unsigned char*>(event->UserData);
+                    for (unsigned i = 0; i < event->UserDataLength; ++i) { std::printf("%02x", static_cast<unsigned>(bytes[i])); }
+                    std::putchar('"');
+                }
+            }
+            std::puts("}");
             return;
         }
         if (!counts.error && counts.activities && IsEqualGUID(h.ProviderId, Thread) && d.Id == 0 && d.Opcode >= 1 && d.Opcode <= 4)
@@ -137,11 +153,13 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-    if ((argc != 2 && (argc != 3 || (std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
+    const bool payloads = argc == 3 && std::wcscmp(argv[2], L"--marker-data") == 0;
+    if ((argc != 2 && (argc != 3 || (!payloads && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
     counts.scheduler = argc == 3 && std::wcscmp(argv[2], L"--scheduler") == 0;
-    counts.activities = argc == 3 && std::wcscmp(argv[2], L"--activities") == 0;
+    counts.payloads = payloads;
+    counts.activities = payloads || (argc == 3 && std::wcscmp(argv[2], L"--activities") == 0);
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = argv[1];
     log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
