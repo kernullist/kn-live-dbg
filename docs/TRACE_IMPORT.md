@@ -41,7 +41,7 @@ exit 1. Malformed arguments and output failures return exit 2.
 
 For a rotating recording (`EVENT_TRACE_FILE_MODE_NEWFILE`), supply the
 actual member filename and its SHA-256. Each command reads that file alone.
-The CPU, context-switch and disk pages report `partial` and exit 1 even
+The CPU, context-switch, disk and hard page fault pages report `partial` and exit 1 even
 when both buffer counts agree. The numeric mode is in `log_header.log_mode`.
 `--capabilities --probe-etl` adds `rotation_member` with file scope and leaves the
 ordinal, set size and session completeness unknown. An inventory from the
@@ -446,6 +446,44 @@ A complete scan can return `read` with zero disk events. The capability
 probe reports the observed record count, original ordinal and payload hash
 for this family. Keep source traces, evidence pages and replay receipts private.
 [Validation on saved traces](VALIDATION.md#saved-disk-io-response-times-on-2026-11-22)
+
+## Read saved hard page faults
+
+`--etl-hard-faults <local.etl> --sha256 <digest>` returns a
+`kn.etl_hard_faults.v1` page for classic PageFault version 2, opcode 32.
+The event's pointer width determines where the payload thread ID and byte
+count occur. Each row retains that ID, the read offset, the initial time
+in the payload and the raw completion timestamp from the event header.
+The header thread ID is a separate field. The source digest and one-based
+record ordinal identify the original event. [Windows hard page fault fields](https://learn.microsoft.com/en-us/windows/win32/etw/pagefault-hardfault)
+
+For a QPC log with positive frequency, `elapsed_qpc_ticks` is the raw
+completion timestamp minus the positive initial timestamp. Equal endpoints
+give zero. An unavailable QPC clock, a nonpositive start, or a reversed
+interval leaves the duration null and supplies a reason in `timing_status`.
+To obtain milliseconds, multiply the tick difference by 1,000 and divide by
+`clock.header_perf_frequency`. The numeric TID and read offset alone cannot
+identify a thread generation, a file, a disk request or an application's
+critical path. [Microsoft TraceEvent duration calculation](https://github.com/microsoft/perfview/blob/ea4e78e0e363a0838c963338619221f3e211ddb5/src/TraceEvent/Parsers/KernelTraceEventParser.cs#L7413-L7433)
+
+`fault_summary` counts timed and untimed decoded events and adds the
+reported bytes from both. Every page retains the first event sharing the
+longest measured interval and the total number of ties. The byte sum can
+include repeated reads of the same range. Loss, an unsupported hard-fault
+layout, or incomplete buffer accounting returns `partial` and exit 1.
+The summary then covers the available records. A completed scan with zero
+faults returns empty rows, zero bytes and a null longest fault.
+
+When a source file or its parent cannot be opened, `source_unavailable`
+includes the measured `win32_status` if Windows returned one. A rejected
+path with no Windows error leaves the field null. This diagnostic also
+applies to the CPU, switch and disk page readers.
+
+Use `--after` and `--limit` for paging, `--check-page` for exact replay, and
+`--capture-statement` with the trusted key and role to verify a signed
+statement about the ETL. The capability probe reports the first decoded
+payload's digest and extent. Keep the trace, pages and test-reader output
+private. [CLI example](COMMAND_REFERENCE.md#inspect-hard-page-faults-from-a-saved-etl)
 
 ## Saved Windows context switches
 

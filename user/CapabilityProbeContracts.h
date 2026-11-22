@@ -35,6 +35,7 @@ namespace capability_probes
             if (backend == L"dump") { return &SavedDump; }
         }
         if (backend == L"etl" && domain == L"io" && operation == L"disk_io") { return &SavedEtl; }
+        if (backend == L"etl" && domain == L"memory" && operation == L"hard_fault") { return &SavedEtl; }
         if (backend == L"etl" && domain == L"execution" && (operation == L"cpu_profile" || operation == L"context_switch")) { return &SavedEtl; }
         return nullptr;
     }

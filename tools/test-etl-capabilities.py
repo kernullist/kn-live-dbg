@@ -13,6 +13,8 @@ import tempfile
 
 
 FAMILIES = (
+    ("hard_fault", "--etl-hard-faults", "hard_faults", "decoded_hard_faults", "unsupported_hard_fault_records",
+     "3d6fa8d3-fe05-11d0-9dda-00c04fd7ba7c", r"(?:HardFault|32)", "2"),
     ("disk_io", "--etl-disk-io", "disk_events", "decoded_disk_records", "unsupported_disk_records",
      "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c", r"(?:Read|Write|ReadInit|WriteInit|FlushBuffers|FlushInit|1[0-5])", "[23]"),
     ("cpu_profile", "--etl-profile", "samples", "decoded_samples", "unsupported_profile_records",
@@ -47,7 +49,7 @@ def report(exe, path, pin, code):
         assert row["validation"] == "not_performed_for_target_environment"
         stages = row["probe_stages"]
         assert stages["environment_regression"] == "not_performed" and stages["semantic_validation"] == "not_probed"
-        expected_domain = "io" if row["operation"] == "disk_io" else "execution"
+        expected_domain = {"disk_io": "io", "hard_fault": "memory"}.get(row["operation"], "execution")
         if (row["domain"], row["backend"]) == (expected_domain, "etl") and row["operation"] in {f[0] for f in FAMILIES}:
             assert row["availability_scope"] == "supplied_etl_record_family" and row["operation"] not in rows
             rows[row["operation"]] = row
@@ -107,7 +109,11 @@ def check_scan(exe, path, pin, code, oracle=None):
         if oracle:
             assert evidence["decoded"] == oracle[1][op]
         assert evidence["first_decoded_record"] == (page[key][0]["record_ordinal"] if page[key] else None)
-        if op == "disk_io" and page[key]:
+        if op == "hard_fault" and page[key]:
+            # The named-property TDH oracle also reconstructs and hashes the private pointer fields.
+            assert evidence["first_payload_bytes"] == 24 + 2 * page[key][0]["pointer_bytes"]
+            assert re.fullmatch(r"[0-9a-f]{64}", evidence["first_payload_sha256"])
+        elif op == "disk_io" and page[key]:
             # Disk pages omit pointer values. The XML disk oracle checks the hash from the full named fields.
             first = page[key][0]
             width = first["pointer_bytes"]

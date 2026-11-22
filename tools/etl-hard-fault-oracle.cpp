@@ -1,0 +1,86 @@
+// Test reader. Windows TDH resolves properties by their registered names.
+#include <windows.h>
+#include <evntrace.h>
+#include <evntcons.h>
+#include <tdh.h>
+#include <bcrypt.h>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "tdh.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+namespace
+{
+    constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
+    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; };
+
+    void WINAPI Observe(PEVENT_RECORD event)
+    {
+        auto& counts = *static_cast<Counts*>(event->UserContext);
+        ++counts.records;
+        const auto& h = event->EventHeader;
+        if (counts.error || !IsEqualGUID(h.ProviderId, PageFault) || h.EventDescriptor.Id != 0 ||
+            h.EventDescriptor.Opcode != 32 || h.EventDescriptor.Version != 2) { return; }
+        constexpr PCWSTR names[] = {L"InitialTime", L"ReadOffset", L"VirtualAddress", L"FileObject", L"TThreadId", L"ByteCount"};
+        std::array<BYTE, 40> payload{};
+        uint64_t values[6]{};
+        ULONG length = 0, pointerWidth = 0;
+        for (size_t i = 0; i < std::size(names); ++i)
+        {
+            PROPERTY_DATA_DESCRIPTOR field{};
+            field.PropertyName = reinterpret_cast<ULONGLONG>(names[i]);
+            field.ArrayIndex = ULONG_MAX;
+            ULONG size = 0;
+            counts.error = TdhGetPropertySize(event, 0, nullptr, 1, &field, &size);
+            if (counts.error) { return; }
+            if (i == 2) { pointerWidth = size; }
+            if ((i < 2 && size != 8) || (i == 2 && size != 4 && size != 8) ||
+                (i == 3 && size != pointerWidth) || (i >= 4 && size != 4) || size > payload.size() - length)
+            { counts.error = ERROR_INVALID_DATA; return; }
+            counts.error = TdhGetProperty(event, 0, nullptr, 1, &field, size, payload.data() + length);
+            if (counts.error) { return; }
+            std::memcpy(&values[i], payload.data() + length, size);
+            length += size;
+        }
+        ++counts.faults;
+        std::printf("{\"record_ordinal\":%u,\"pointer_bytes\":%lu,\"cpu\":%u,\"header_thread_id\":%lu,"
+            "\"raw_timestamp\":\"%lld\",\"initial_time_raw\":\"%llu\",\"read_offset\":\"%llu\","
+            "\"faulting_thread_id\":%llu,\"byte_count\":%llu", counts.records, pointerWidth,
+            static_cast<unsigned>(GetEventProcessorIndex(event)), h.ThreadId, h.TimeStamp.QuadPart, values[0],
+            values[1], values[4], values[5]);
+        if (counts.faults == 1)
+        {
+            std::array<BYTE, 32> hash{};
+            if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, payload.data(), length, hash.data(),
+                           static_cast<ULONG>(hash.size())) < 0) { counts.error = ERROR_INVALID_DATA; return; }
+            std::printf(",\"first_payload_sha256\":\"");
+            for (auto b : hash) { std::printf("%02x", b); }
+            std::putchar('"');
+        }
+        std::puts("}");
+    }
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc != 2 || GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
+    Counts counts;
+    EVENT_TRACE_LOGFILEW log{};
+    log.LogFileName = argv[1];
+    log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+    log.Context = &counts;
+    log.EventRecordCallback = Observe;
+    auto trace = OpenTraceW(&log);
+    if (trace == INVALID_PROCESSTRACE_HANDLE) { return 1; }
+    auto rc = ProcessTrace(&trace, 1, nullptr, nullptr);
+    CloseTrace(trace);
+    if (rc != ERROR_SUCCESS || counts.error)
+    { std::fprintf(stderr, "Windows ETW status %lu, TDH status %lu\n", rc, counts.error); return 1; }
+    std::printf("{\"records_seen\":%u,\"decoded_hard_faults\":%u,\"clock_type\":%lu,\"frequency\":%lld}\n",
+        counts.records, counts.faults, log.LogfileHeader.ReservedFlags, log.LogfileHeader.PerfFreq.QuadPart);
+    return std::ferror(stdout) ? 1 : 0;
+}

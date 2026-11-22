@@ -74,6 +74,7 @@ A dash means the binary declares no standalone probe for that operation.
 | io / interpose_dispatch | native | experimental | collector_specific;extended_address_pipeline_unvalidated | live_non_atomic | `native_connection` |
 | security / inspect_vtl1_memory | native | unsupported | collector_specific;extended_address_pipeline_unvalidated | unavailable | — |
 | evidence / rotation_inventory | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | authenticated_file_inventory | — |
+| memory / hard_fault | etl | implemented | not_an_address_reader | reported_hard_fault | `saved_etl_family` |
 | io / disk_io | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_disk_io | `saved_etl_family` |
 | execution / context_switch | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_scheduler_event | `saved_etl_family` |
 | execution / cpu_profile | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_cpu_samples | `saved_etl_family` |

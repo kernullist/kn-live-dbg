@@ -52,9 +52,9 @@ int WriteWithDistinctSelectedInputs(DWORD stream, const std::vector<std::wstring
 }
 
 template<class Write>
-int WriteWithDistinctInput(DWORD stream, const std::wstring& name, Write write)
+int WriteWithDistinctInput(DWORD stream, const std::wstring& name, Write write, bool allowMissingParent = false)
 {
     const auto sink = GetStdHandle(stream);
     DistinctArtifactInput input;
-    return GetFileType(sink) != FILE_TYPE_DISK || input.Hold(sink, name) ? write() : 2;
+    return GetFileType(sink) != FILE_TYPE_DISK || input.Hold(sink, name, allowMissingParent) ? write() : 2;
 }

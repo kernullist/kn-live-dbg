@@ -25,7 +25,7 @@ struct EtlCapabilityRecords
 
 struct EtlCapabilityCoverage
 {
-    EtlCapabilityRecords Profile, Switches, DiskIo;
+    EtlCapabilityRecords Profile, Switches, DiskIo, HardFault;
     uint32_t RecordsSeen = 0, EventsLost = 0, BuffersLost = 0, LossMarkers = 0, BuffersWritten = 0;
     uint32_t LogMode = 0;
     uint64_t BuffersProcessed = 0;
@@ -60,6 +60,7 @@ struct SavedEtlCapabilityProbe
         if (operation == L"cpu_profile") { return &Coverage->Profile; }
         if (operation == L"context_switch") { return &Coverage->Switches; }
         if (operation == L"disk_io") { return &Coverage->DiskIo; }
+        if (operation == L"hard_fault") { return &Coverage->HardFault; }
         return nullptr;
     }
 

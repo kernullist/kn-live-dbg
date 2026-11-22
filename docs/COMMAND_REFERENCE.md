@@ -77,7 +77,7 @@ $report = & .\x64\Release\KnLiveDbg.exe --capabilities --probe-etl $etl --sha256
 $report.capabilities | Where-Object backend -eq etl | Select-Object operation, availability, record_evidence
 ```
 
-The probe checks CPU samples, context switches and disk I/O. In a
+The probe checks CPU samples, context switches, disk I/O and hard page faults. In a
 `saved_etl_probe` report, `record_evidence` gives the decoded and unsupported
 counts and the first decoded event's one-based position among all records. Its
 payload length and SHA-256 identify the original bytes at that position.
@@ -89,7 +89,7 @@ The file hash identifies the bytes. Producer authenticity and the target
 environment still require independent evidence.
 
 The ETL probe exits 0 for a stable scan with matching buffer totals and no
-reported loss, including a file containing neither family. Exit 1 covers a
+reported loss, including a file with zero records in all four families. Exit 1 covers a
 coverage gap or an unusable source. Exit 2 covers syntax and output errors,
 including a redirected output whose identity cannot be separated from the input.
 Restricted launches reject this named-file operation. A rejection with a named
@@ -1113,7 +1113,7 @@ $trustedPoint = (Get-Content -Raw -LiteralPath .\approved-recorder-p256.hex).Tri
 & KnLiveDbg.exe --etl-profile capture.etl --sha256 $pin --capture-settings --limit 8 --check-page $page.file_sha256 --capture-statement capture.knetlstatement capture_controller $trustedPoint
 ```
 
-The same option works with `--etl-switches` and `--etl-disk-io`. Use `archive_witness` for a
+The same option works with `--etl-switches`, `--etl-disk-io` and `--etl-hard-faults`. Use `archive_witness` for a
 key authorized to attest to archived bytes. A matching controller receipt
 identifies the signed claims, the original ETL, the regenerated page, the
 statement file and the trusted key. It records the role check separately
@@ -1244,6 +1244,22 @@ $page.operations | Select-Object operation, initiations, completions, transfer_b
 The longest-response entry identifies the original completion record. Its
 counter and the header frequency allow a conversion to milliseconds. Check
 `status` and the loss counters before using the totals. [Field definitions, paging and timing example](TRACE_IMPORT.md#read-saved-disk-io-response-times)
+
+### Inspect hard page faults from a saved ETL
+
+Each page includes the total observed read bytes and the first fault with the
+longest measured interval across the file. The original event ordinal identifies
+the record even when it falls on another page.
+
+```powershell
+$etl = Get-Item -LiteralPath '.\case.etl'
+$pin = (Get-Content -LiteralPath '.\case.etl.sha256' -Raw).Trim()
+$page = & KnLiveDbg.exe --etl-hard-faults $etl.FullName --sha256 $pin --limit 16 | ConvertFrom-Json
+$page.fault_summary | Select-Object timed_faults, untimed_faults, read_bytes, longest_fault_ties
+$page.hard_faults | Select-Object record_ordinal, faulting_thread_id, byte_count, timing_status, elapsed_qpc_ticks
+```
+
+Check `status` and the loss counters when comparing captures. [Event fields and timing units](TRACE_IMPORT.md#read-saved-hard-page-faults)
 
 ### Inspect context switches from a saved ETL
 

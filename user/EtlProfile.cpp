@@ -3,6 +3,7 @@
 #include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "EtlDiskIo.h"
+#include "EtlHardFault.h"
 #include "EtlCaptureStatement.h"
 #include "EtlClrEvidence.h"
 #include "EtlReferenceImage.h"
@@ -24,7 +25,24 @@ namespace
     constexpr auto MaxPage = etl_profile::MaxPageRows;
     using mcpjson::Quote;
 
-    enum class Family { Profile, Switches, DiskIo };
+    enum class Family { Profile, Switches, DiskIo, HardFaults };
+    struct FamilyFields
+    {
+        const wchar_t* kind;
+        const wchar_t* descriptor;
+        const wchar_t* decoded;
+        const wchar_t* unsupported;
+    };
+    constexpr FamilyFields EventFamilies[] = {
+        {L"cpu_sample", L",\"provider_guid\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\",\"event_id\":0,\"opcode\":46,\"version\":2",
+            L",\"decoded_samples\":", L",\"unsupported_profile_records\":"},
+        {L"context_switch", L",\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcode\":36,\"versions\":[2,3,4]",
+            L",\"decoded_switches\":", L",\"unsupported_switch_records\":"},
+        {L"disk_io", L",\"provider_guid\":\"3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcodes\":[10,11,12,13,14,15],\"versions\":[2,3]",
+            L",\"decoded_disk_records\":", L",\"unsupported_disk_records\":"},
+        {L"hard_fault", L",\"provider_guid\":\"3d6fa8d3-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcode\":32,\"version\":2",
+            L",\"decoded_hard_faults\":", L",\"unsupported_hard_fault_records\":"}
+    };
     constexpr size_t MaxArguments = 22;
 
     struct Options
@@ -39,11 +57,14 @@ namespace
         uint32_t tid = 0;
         bool Switches() const { return family == Family::Switches; }
         bool DiskIo() const { return family == Family::DiskIo; }
+        bool HardFaults() const { return family == Family::HardFaults; }
+        const FamilyFields& Fields() const { return EventFamilies[static_cast<size_t>(family)]; }
         bool WithIntervals() const { return intervals || haveTid; }
         bool WithThreads() const { return threads || images || processes; }
         const wchar_t* Prefix() const
         {
             if (DiskIo()) { return L"{\"schema\":\"kn.etl_disk_io.v1\",\"status\":"; }
+            if (HardFaults()) { return L"{\"schema\":\"kn.etl_hard_faults.v1\",\"status\":"; }
             if (clr) { return L"{\"schema\":\"kn.etl_profile.v8\",\"status\":"; }
             if (settings) { return Switches() ? L"{\"schema\":\"kn.etl_switches.v3\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v7\",\"status\":"; }
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
@@ -78,7 +99,8 @@ namespace
         for (size_t i = 3; i < args.size(); ++i)
         {
             if (args[i] == L"--clr-evidence" && options.family == Family::Profile && !options.clr) { options.clr = true; continue; }
-            if (args[i] == L"--capture-settings" && !options.DiskIo() && !options.settings) { options.settings = true; continue; }
+            if (args[i] == L"--capture-settings" && (options.family == Family::Profile || options.Switches()) && !options.settings)
+            { options.settings = true; continue; }
             if (args[i] == L"--thread-evidence" && options.family == Family::Profile && !options.threads) { options.threads = true; continue; }
             if (args[i] == L"--image-evidence" && options.family == Family::Profile && !options.images) { options.images = true; continue; }
             if (args[i] == L"--process-evidence" && options.family == Family::Profile && !options.processes) { options.processes = true; continue; }
@@ -137,6 +159,8 @@ namespace
         etl_profile::ScheduleHistory history;
         std::array<etl_profile::DiskTotals, 3> diskTotals{};
         std::array<etl_profile::DiskEvent, MaxPage> diskPage{};
+        etl_profile::HardFaultTotals faultTotals;
+        std::array<etl_profile::HardFault, MaxPage> faultPage{};
         std::array<Sample, MaxPage> page{};
         std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
         std::array<etl_profile::IntervalWitnesses, MaxPage> witnesses{};
@@ -171,17 +195,26 @@ namespace
 
     void ObserveRecord(Scan& scan, PEVENT_RECORD event)
     {
+        auto collect = [&](etl_profile::Match match, auto& row, auto& page)
+        {
+            if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
+            if (match != etl_profile::Match::Decoded) { return false; }
+            row.ordinal = ++scan.decoded;
+            row.record = scan.records;
+            ++scan.matched;
+            if (row.ordinal > scan.options.after && scan.used < scan.options.limit) { page[scan.used++] = row; }
+            return true;
+        };
         if (scan.options.DiskIo())
         {
             etl_profile::DiskEvent row;
-            const auto match = etl_profile::DecodeDisk(*event, row);
-            if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
-            if (match != etl_profile::Match::Decoded) { return; }
-            row.ordinal = ++scan.decoded;
-            row.record = scan.records;
-            scan.diskTotals[row.Operation()].Observe(row);
-            ++scan.matched;
-            if (row.ordinal > scan.options.after && scan.used < scan.options.limit) { scan.diskPage[scan.used++] = row; }
+            if (collect(etl_profile::DecodeDisk(*event, row), row, scan.diskPage)) { scan.diskTotals[row.Operation()].Observe(row); }
+            return;
+        }
+        if (scan.options.HardFaults())
+        {
+            etl_profile::HardFault row;
+            if (collect(etl_profile::DecodeHardFault(*event, &row), row, scan.faultPage)) { scan.faultTotals.Observe(row); }
             return;
         }
         if (scan.replaying) { ReplayRecord(*event, scan); return; }
@@ -240,7 +273,7 @@ namespace
 
     struct CapabilityScan : TraceCounts
     {
-        CapabilityFamily profile, switches, disk;
+        CapabilityFamily profile, switches, disk, hardFault;
     };
 
     void ObserveRecord(CapabilityScan& scan, PEVENT_RECORD event)
@@ -249,6 +282,7 @@ namespace
         scan.switches.Observe(*event, etl_profile::DecodeSwitch(*event, nullptr), scan.records);
         etl_profile::DiskEvent disk;
         scan.disk.Observe(*event, etl_profile::DecodeDisk(*event, disk), scan.records);
+        scan.hardFault.Observe(*event, etl_profile::DecodeHardFault(*event, nullptr), scan.records);
     }
 
     template<class State>
@@ -753,7 +787,7 @@ namespace
         const bool withStatement = !o.statementPath.empty();
         const auto schema = withStatement ? L"kn.etl_page_replay.v2" : L"kn.etl_page_replay.v1";
         return L"{\"schema\":" + Quote(schema) + L",\"status\":" + Quote(status) +
-            L",\"source_kind\":" + Quote(o.DiskIo() ? L"disk_io" : o.Switches() ? L"context_switch" : L"cpu_sample") +
+            L",\"source_kind\":" + Quote(o.Fields().kind) +
             L",\"expected_source_sha256\":" + Quote(o.digest) + L",\"expected_reference_sha256\":" +
             (o.referenceDigest.empty() ? L"null" : Quote(o.referenceDigest)) +
             L",\"source_sha256\":" + (source.empty() ? L"null" : Quote(source)) +
@@ -782,7 +816,7 @@ namespace
 
     bool Partial(const Scan& scan, BufferAccounting accounting, const TRACE_LOGFILE_HEADER& h)
     {
-        if (scan.options.DiskIo())
+        if (scan.options.DiskIo() || scan.options.HardFaults())
         {
             return accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers || scan.unsupported;
         }
@@ -827,6 +861,34 @@ namespace
         return out + L"]}";
     }
 
+    std::wstring HardFaultJson(const etl_profile::HardFault& row, bool qpc)
+    {
+        const auto elapsed = qpc ? row.OrderedTicks() : std::nullopt;
+        const auto timing = !qpc ? L"qpc_unavailable" : row.initialTime <= 0 ? L"nonpositive_start" :
+            elapsed ? L"ordered_qpc" : L"end_precedes_start";
+        return L"{\"fault_ordinal\":" + std::to_wstring(row.ordinal) + RecordLocationJson(row) + RecordHeaderJson(row) +
+            L",\"faulting_thread_id\":" + std::to_wstring(row.faultingTid) + L",\"initial_time_raw\":" + Quote(std::to_wstring(row.initialTime)) +
+            L",\"read_offset\":" + Quote(std::to_wstring(row.readOffset)) + L",\"byte_count\":" + std::to_wstring(row.byteCount) +
+            L",\"timing_status\":" + Quote(timing) + L",\"elapsed_qpc_ticks\":" + (elapsed ? Quote(std::to_wstring(*elapsed)) : L"null") + L"}";
+    }
+
+    std::wstring HardFaultResultsJson(const Scan& scan, const TRACE_LOGFILE_HEADER& h)
+    {
+        const bool qpc = h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0;
+        const auto& total = scan.faultTotals;
+        const auto timed = qpc ? total.ordered : 0;
+        auto out = L",\"fault_summary\":{\"read_bytes\":" + Quote(std::to_wstring(total.bytes)) +
+            L",\"timed_faults\":" + std::to_wstring(timed) + L",\"untimed_faults\":" + std::to_wstring(scan.decoded - timed) +
+            L",\"longest_fault_ties\":" + std::to_wstring(qpc ? total.longestTies : 0) + L",\"first_longest_fault\":" +
+            (timed ? HardFaultJson(total.longest, qpc) : L"null") + L"},\"hard_faults\":[";
+        for (size_t i = 0; i < scan.used; ++i)
+        {
+            if (i) { out += L','; }
+            out += HardFaultJson(scan.faultPage[i], qpc);
+        }
+        return out + L"]}";
+    }
+
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
         const etl_profile::ReferenceImage* reference)
     {
@@ -836,9 +898,7 @@ namespace
         const auto comparison = etl_profile::BufferComparisonName(accounting);
         auto result = std::wstring(scan.options.Prefix()) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
             L",\"source_bytes\":" + std::to_wstring(source.Bytes()) +
-            (scan.options.DiskIo() ? L",\"provider_guid\":\"3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcodes\":[10,11,12,13,14,15],\"versions\":[2,3]" : scan.options.Switches() ?
-                L",\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,\"opcode\":36,\"versions\":[2,3,4]" :
-                L",\"provider_guid\":\"ce1dbfb4-137e-4da6-87b0-3f59aa102cbc\",\"event_id\":0,\"opcode\":46,\"version\":2") +
+            scan.options.Fields().descriptor +
             L",\"clock\":{\"raw_type\":" + std::to_wstring(h.ReservedFlags) + L",\"kind\":" + Quote(clock) +
             L",\"header_perf_frequency\":" + Quote(std::to_wstring(h.PerfFreq.QuadPart)) + L"}" +
             L",\"log_header\":{\"pointer_bytes\":" + std::to_wstring(h.PointerSize) + L",\"processors\":" + std::to_wstring(h.NumberOfProcessors) +
@@ -846,7 +906,9 @@ namespace
             L",\"end_filetime\":" + Quote(std::to_wstring(h.EndTime.QuadPart)) +
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
-            (scan.options.DiskIo() ?
+            (scan.options.HardFaults() ?
+                L",\"qualification\":{\"evidence\":\"reported_hard_fault\",\"producer_authenticity\":\"unverified\","
+                L"\"thread_lifetime\":null,\"file_identity\":null,\"disk_request\":null,\"critical_path\":null}" : scan.options.DiskIo() ?
                 L",\"qualification\":{\"evidence\":\"recorded_disk_io\",\"producer_authenticity\":\"unverified\","
                 L"\"request_generation\":null,\"thread_lifetime\":null,\"device_service_time\":null,\"io_status\":null,\"cross_provider_join\":false}" :
              scan.options.WithIntervals() ?
@@ -860,13 +922,14 @@ namespace
             L"\"verified_level\":\"unqualified\",\"sampled_process_id\":null,\"thread_lifetime\":null,"
             L"\"address_space\":null,\"vm\":null,\"vtl\":null,\"code_version\":null,\"capture_privilege\":null,"
             L"\"capture_enable_flags\":null,\"stack_capture_policy\":null,\"sample_loss_intervals\":null}") +
-            L",\"records_seen\":" + std::to_wstring(scan.records) + (scan.options.DiskIo() ? L",\"decoded_disk_records\":" : scan.options.Switches() ? L",\"decoded_switches\":" : L",\"decoded_samples\":") + std::to_wstring(scan.decoded) +
+            L",\"records_seen\":" + std::to_wstring(scan.records) + scan.options.Fields().decoded + std::to_wstring(scan.decoded) +
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
-            (scan.options.DiskIo() ? L",\"unsupported_disk_records\":" : scan.options.Switches() ? L",\"unsupported_switch_records\":" : L",\"unsupported_profile_records\":") + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
+            scan.options.Fields().unsupported + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
             L",\"next_after\":" + (scan.used && scan.options.after + scan.used < scan.matched ?
                 std::to_wstring(scan.options.after + scan.used) : L"null");
         if (scan.options.DiskIo()) { return result + DiskResultsJson(scan, h); }
+        if (scan.options.HardFaults()) { return result + HardFaultResultsJson(scan, h); }
         const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
         const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
         if (scan.options.settings) { result += SettingsManifestJson(scan.settings, h); }
@@ -1083,9 +1146,12 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     symbol_artifacts::Directories parents;
     SchemaArtifact source;
     std::wstring volumePath;
-    if (!OpenTraceSource(args[0], parents, source, volumePath))
+    DWORD openError = ERROR_SUCCESS;
+    if (!OpenTraceSource(args[0], parents, source, volumePath, MaxBytes, nullptr, &openError))
     {
-        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options, L"source_unavailable"); });
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] {
+            return Failure(scan.options, L"source_unavailable", {}, openError);
+        }, true);
     }
     if (source.Sha256 != scan.options.digest) { return Failure(scan.options, L"digest_mismatch", source.Sha256); }
     symbol_artifacts::Directories referenceParents;
@@ -1206,7 +1272,8 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
     {
         if (!guards[i].Hold(sink, args[i])) { return 2; }
     }
-    std::wcerr << (scan.options.DiskIo() ?
+    std::wcerr << (scan.options.HardFaults() ?
+        L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
         L"usage: KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.Switches() ?
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
         L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");
@@ -1261,7 +1328,8 @@ void etl_profile::SavedEtlInput::Probe(SavedEtlCapabilityProbe& probe)
     }
     const auto& h = log.LogfileHeader;
     EtlCapabilityCoverage coverage;
-    if (!scan.profile.Save(coverage.Profile) || !scan.switches.Save(coverage.Switches) || !scan.disk.Save(coverage.DiskIo))
+    if (!scan.profile.Save(coverage.Profile) || !scan.switches.Save(coverage.Switches) ||
+        !scan.disk.Save(coverage.DiskIo) || !scan.hardFault.Save(coverage.HardFault))
     {
         probe.Status = L"sample_hash_unavailable";
         return;
@@ -1311,4 +1379,9 @@ int RunEtlSwitches(const std::vector<std::wstring>& args)
 int RunEtlDiskIo(const std::vector<std::wstring>& args)
 {
     return ReadSavedEtl(args, Family::DiskIo);
+}
+
+int RunEtlHardFaults(const std::vector<std::wstring>& args)
+{
+    return ReadSavedEtl(args, Family::HardFaults);
 }

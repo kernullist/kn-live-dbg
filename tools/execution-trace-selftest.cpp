@@ -8,10 +8,80 @@
 #include "etl-capture-settings-selftest.h"
 #include "etl-clr-evidence-selftest.h"
 #include "etl-disk-io-selftest.h"
+#include "../user/EtlHardFault.h"
 
 #include <array>
 
 #include <iostream>
+
+static bool CheckHardFaultRecord()
+{
+    using namespace etl_profile;
+    for (unsigned width : {4u, 8u})
+    {
+        EVENT_RECORD event{};
+        auto& h = event.EventHeader;
+        h.ProviderId = PageFaultProvider;
+        h.EventDescriptor.Version = 2;
+        h.EventDescriptor.Opcode = 32;
+        h.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER |
+            (width == 4 ? EVENT_HEADER_FLAG_32_BIT_HEADER : EVENT_HEADER_FLAG_64_BIT_HEADER);
+        h.TimeStamp.QuadPart = INT64_MAX;
+        std::vector<uint8_t> bytes{0x5a}; // Unaligned payload; only the envelope determines pointer width.
+        etl_disk_test::Append(bytes, int64_t{1});
+        etl_disk_test::Append(bytes, UINT64_MAX);
+        bytes.insert(bytes.end(), width * 2, 0xcd);
+        etl_disk_test::Append(bytes, uint32_t{101});
+        etl_disk_test::Append(bytes, UINT32_MAX);
+        event.UserData = bytes.data() + 1;
+        const auto size = static_cast<USHORT>(bytes.size() - 1);
+        HardFault row{};
+        for (USHORT n = 0; n <= size + 1; ++n)
+        {
+            event.UserDataLength = n;
+            auto expected = n == size ? Match::Decoded : Match::Unsupported;
+            if (DecodeHardFault(event, &row) != expected || DecodeHardFault(event, nullptr) != expected) { return false; }
+        }
+        if (row.width != width || row.readOffset != UINT64_MAX || row.faultingTid != 101 || row.byteCount != UINT32_MAX ||
+            row.OrderedTicks() != INT64_MAX - 1ull) { return false; }
+        HardFaultTotals totals;
+        row.record = 4;
+        row.initialTime = INT64_MAX;
+        totals.Observe(row);
+        if (row.OrderedTicks() != 0 || totals.longestTies != 1) { return false; }
+        row.record = 5;
+        --row.initialTime;
+        totals.Observe(row);
+        row.record = 6;
+        totals.Observe(row);
+        row.timestamp = INT64_MIN;
+        totals.Observe(row);
+        if (row.OrderedTicks()) { return false; }
+        row.initialTime = 0;
+        row.timestamp = 99;
+        if (row.OrderedTicks()) { return false; }
+        row.initialTime = INT64_MIN;
+        totals.Observe(row);
+        if (row.OrderedTicks() || totals.longest.record != 5 || totals.ordered != 3 ||
+            totals.longestTies != 2 || totals.bytes != 5ull * UINT32_MAX) { return false; }
+        event.UserDataLength = size;
+        event.ExtendedDataCount = 1;
+        if (DecodeHardFault(event, nullptr) != Match::Unsupported) { return false; }
+        event.ExtendedDataCount = 0;
+        for (auto flags : {0, EVENT_HEADER_FLAG_32_BIT_HEADER | EVENT_HEADER_FLAG_64_BIT_HEADER,
+                          EVENT_HEADER_FLAG_STRING_ONLY, EVENT_HEADER_FLAG_TRACE_MESSAGE})
+        {
+            auto bad = event;
+            bad.EventHeader.Flags = static_cast<USHORT>(flags ? h.Flags | flags : 0);
+            if (DecodeHardFault(bad, &row) != Match::Unsupported) { return false; }
+        }
+        h.EventDescriptor.Version = 3;
+        if (DecodeHardFault(event, &row) != Match::Unsupported) { return false; }
+        h.EventDescriptor.Opcode = 14; // HardPageFault in the soft-fault layout is a different event.
+        if (DecodeHardFault(event, &row) != Match::Other) { return false; }
+    }
+    return true;
+}
 
 static bool CheckProfileRecord()
 {
@@ -702,7 +772,7 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

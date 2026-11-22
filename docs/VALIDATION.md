@@ -7,6 +7,54 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved hard page fault timing on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`ed1d81a44e0c`) and a separate Windows TDH reader agreed on every one of
+551 recorded hard page faults. TDH resolved all six MOF properties by name
+and reconstructed the first payload hash in each positive trace. Windows
+`tracerpt` confirmed the record and descriptor counts. All three readers
+use Windows ETW. [Hard page fault fields](https://learn.microsoft.com/en-us/windows/win32/etw/pagefault-hardfault)
+
+| Saved ETL | Records seen | Hard faults | Reported read bytes | Longest measured interval in QPC ticks |
+| --- | ---: | ---: | ---: | ---: |
+| x64 CPU workload | 179,474 | 153 | 2,722,816 | 1,391,582 |
+| x86 CPU workload | 168,298 | 394 | 6,873,088 | 1,803,293 |
+| Allocator workload | 418,378 | 4 | 28,672 | 2,047 |
+| Scheduler workload | 877,318 | 0 | 0 | — |
+| Small control | 23 | 0 | 0 | — |
+| One rotating file, partial session | 114 | 0 | 0 | — |
+
+All 551 records used 64-bit pointer fields, including those in the x86
+workload. The x86 and x64 builds of the TDH reader returned identical
+property rows. The payload TID differed from the header TID in every row. The
+three positive files used a 10 MHz performance counter. Pages retained the
+first longest fault and its original ordinal across pagination. None of
+these captures establishes that the fault delayed a particular application task.
+
+Copies of the x64 workload with system-time or CPU-cycle clocks or zero QPC
+frequency preserved the fault and byte counts and withheld every duration.
+A copy declaring two lost buffers returned `partial` and retained the
+available timings. Owned record tests covered both pointer widths, short
+and overlong layouts, equal and reversed timestamps, ties, and byte sums
+above 4 GiB. The MSVC AddressSanitizer executable compiled but stopped in
+runtime interception before the first test. The regular record tests passed.
+
+The page and capability probe checks used the original file pins. Signed
+page replay, partial coverage, hard-link output protection, a sharing
+violation and a directory junction were checked separately. A missing file
+or parent directory produced the same Windows error in a pipe and a file.
+Four earlier CPU, scheduling and disk pages reproduced their prior bytes.
+[TDH reader](../tools/etl-hard-fault-oracle.cpp) · [Page and clock checks](../tools/test-etl-hard-faults.py)
+
+To repeat the comparison, compile the TDH reader in a scratch directory
+from an MSVC Native Tools prompt with `cl /EHsc /std:c++17 /W4 /WX`
+and the path to `tools/etl-hard-fault-oracle.cpp`. Run
+`tools/test-etl-hard-faults.py` with `--exe` for KnLiveDbg,
+`--oracle` for the compiled test reader, and the ETL's `--etl` path and
+`--sha256` pin. Add `--partial` for a rotating member or
+`--check-header-controls` for a complete QPC recording containing timed faults.
+
 ## Signed ETL rotation inventory on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix

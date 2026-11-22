@@ -13,7 +13,7 @@ IMPORT = runpy.run_path(str(HERE / "test-etl-trace-import.py"))
 
 
 def check_pages(exe, member, pin, info, folder, switches):
-    for command, flags in (("--etl-profile", []), ("--etl-switches", ["--intervals"]), ("--etl-disk-io", [])):
+    for command, flags in (("--etl-profile", []), ("--etl-switches", ["--intervals"]), ("--etl-disk-io", []), ("--etl-hard-faults", [])):
         after = min(100, max(0, switches - 2)) if command == "--etl-switches" else 0
         args = [command, member, "--sha256", pin, "--limit", "2", "--after", str(after), *flags]
         raw = CAP["invoke"](exe, args, 1)

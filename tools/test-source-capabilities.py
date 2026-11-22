@@ -211,6 +211,9 @@ def main():
     assert all(item in switches["requirements"] for item in ("opt_in_on_cpu_and_off_cpu_intervals", "readythread_v2_boundaries", "numeric_tid_filter"))
     assert "recorded_capture_settings" in switches["requirements"] and "1024_capture_setting_records" in switches["limits"]
     assert "no_authenticated_thread_lifetime_or_wait_cause" in switches["limits"]
+    faults = by_key[("memory", "hard_fault", "etl")]
+    assert faults["consistency"] == "reported_hard_fault" and faults["address_contract"] == "not_an_address_reader"
+    assert "qpc_endpoints" in faults["requirements"] and "file_scoped_observed_faults" in faults["limits"]
     inventory = by_key[("evidence", "rotation_inventory", "etl")]
     assert inventory["consistency"] == "authenticated_file_inventory" and "trusted_es256_key_and_role" in inventory["requirements"]
     assert "controller_reported_stop_and_loss" in inventory["limits"]
@@ -255,8 +258,8 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert all(flag in help_result.stdout for flag in ("--etl-disk-io", "--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--clr-evidence", "--check-page", "--capture-statement"))
-    assert "check saved CPU sample, context switch and disk I/O records" in help_result.stdout
+    assert all(flag in help_result.stdout for flag in ("--etl-hard-faults", "--etl-disk-io", "--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--clr-evidence", "--check-page", "--capture-statement"))
+    assert "check saved CPU sample, context switch, disk I/O and hard page fault records" in help_result.stdout
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
@@ -266,6 +269,7 @@ def main():
     for contract in catalog.values():
         assert "KnLiveDbg.exe " + contract["invocation"] in help_result.stdout and contract["observation"]
     expected_routes = {("io", "disk_io", "etl"): "saved_etl_family",
+                       ("memory", "hard_fault", "etl"): "saved_etl_family",
                        ("memory", "read_virtual", "process_handle"): "owned_read",
                        ("memory", "read_virtual", "dump"): "saved_dump_range",
                        ("execution", "cpu_profile", "etl"): "saved_etl_family",

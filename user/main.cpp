@@ -54069,7 +54069,8 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
             for (int i = 1; i < argc; ++i)
             {
                 if (_wcsicmp(argv[i], L"--etl-profile") == 0 || _wcsicmp(argv[i], L"--etl-switches") == 0 ||
-                    _wcsicmp(argv[i], L"--etl-disk-io") == 0 || _wcsicmp(argv[i], L"--etl-rotation-set") == 0) { return code; }
+                    _wcsicmp(argv[i], L"--etl-disk-io") == 0 || _wcsicmp(argv[i], L"--etl-hard-faults") == 0 ||
+                    _wcsicmp(argv[i], L"--etl-rotation-set") == 0) { return code; }
                 if (i + 1 < argc && (_wcsicmp(argv[i], capability_probes::SavedEtl.Selector) == 0 ||
                     _wcsicmp(argv[i], capability_probes::SavedDump.Selector) == 0 ||
                     (_wcsicmp(argv[i], L"dump-read") == 0 && _wcsicmp(argv[i - 1], L"!kmon") == 0))) { return code; }
@@ -54176,12 +54177,13 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
-        std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch and disk I/O records\n";
+        std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch, disk I/O and hard page fault records\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
         std::wcout << L"  KnLiveDbg.exe --etl-rotation-set <inventory.jws> --sha256 <digest> --authority <capture_controller|archive_witness> <trusted-p256-point> [--member <ordinal> <local.etl>]...   verify ordered ETL files\n";
         std::wcout << L"  KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit N] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved disk I/O timings\n";
+        std::wcout << L"  KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [--after N] [--limit N] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read hard page fault timings and byte counts\n";
         std::wcout << L"  KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved context switches\n";
         std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea [--event-xml <file> --event-sha256 <digest>]]   compare saved stop, stack and WHEA evidence\n";
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";
@@ -54233,6 +54235,10 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--etl-rotation-set")
     {
         return RunEtlRotationSet(std::vector<std::wstring>(argv + 2, argv + argc));
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--etl-hard-faults")
+    {
+        return RunEtlHardFaults(std::vector<std::wstring>(argv + 2, argv + argc));
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--etl-disk-io")
     {
