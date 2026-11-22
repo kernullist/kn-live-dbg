@@ -99,7 +99,8 @@ HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2", "kn.own
                    "kn.etl_handoff_study.v4", "kn.etl_handoff_study_receipt.v4",
                    *(f"kn.etl_handoff_{kind}{receipt}.v{version}" for kind in ("plan", "study")
                      for receipt in ("", "_receipt") for version in (1, 2, 3)))
-ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_receipt.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
+ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_receipt.v1", "kn.etl_activity_waits.v2",
+                          "kn.etl_activity_waits_receipt.v2", "kn.traceprocessor_interrupt_window.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
 TRACE_QUERY_SCHEMAS = (*ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
@@ -229,12 +230,18 @@ READY_ORIGIN_FIELDS = tuple(frozenset(keys) for keys in (
     ("ready_table_rows", "cpu_slice_rows"), ("switch_out", "key", "source_tid"),
     ("schedule", "origins", "waits"), ("report_sha256", "activity_waits_status"),
     ("traceprocessor_counts", "summary"), ("source_overlap_end_raw", "source_overlap_start_raw"),
+    ("observed_dpc_ns", "observed_isr_ns"), ("cpu_slice_row", "switch_in_record"),
+    ("interrupt_activity_row", "fragment"), ("parent_start_ns", "fragment_count"), ("start_qpc", "start_ns", "cpu"),
+    ("start_qpc", "stop_qpc", "processors"), ("reference_qpc", "reference_ns"), ("activity_table_rows", "matched_fragments"),
+    ("initial_qpc", "stop_qpc", "record_ordinal"), ("interrupt_overlap_status", "report_sha256"),
 ))
 READY_ORIGIN_MARKERS = ('"requested_ready_record"', '"source_cpu_context"', '"readying_pid"', '"header_binding"',
                         '"off_cpu_relation"', '"ready_total"', '"source_tid"', '"switch_in_cpu"', '"requested_ready_records"',
                         '"thread_wait_ticks"', '"ready_position"', '"source_running_overlap_ticks"', '"source_lifetimes"',
                         '"ready_table_rows"', '"origins"', '"activity_waits_status"',
-                        '"traceprocessor_counts"', '"source_overlap_start_raw"')
+                        '"traceprocessor_counts"', '"source_overlap_start_raw"', '"observed_dpc_ns"', '"cpu_slice_row"',
+                        '"interrupt_activity_row"', '"parent_start_ns"', '"start_qpc"', '"reference_qpc"', '"matched_fragments"',
+                        '"initial_qpc"', '"interrupt_overlap_status"')
 ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *READY_ORIGIN_MARKERS, *DISK_IO_MARKERS, *HARD_FAULT_MARKERS, *HANDOFF_MARKERS, *ETL_ROTATION_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
@@ -521,7 +528,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12]|traceprocessor_interrupt_window\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

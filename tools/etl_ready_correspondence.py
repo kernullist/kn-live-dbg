@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 
 from owned_module_benchmark import check, uint
 from etl_activity_waits import tick
-from etl_traceprocessor import verify_modules
+from etl_traceprocessor import verify_cpu_modules
 
 
 def key(origin):
@@ -16,9 +16,7 @@ def correlate(doc, origins, source_sha256, source_bytes):
     keys = Counter(map(key, origins))
     check(doc["source_sha256"] == source_sha256 and uint(doc["source_bytes"]) == source_bytes and
           doc["requested_keys"] == list(keys), "CPU projection input or filter mismatch")
-    verify_modules(doc["loaded_processing_modules"], ("Cpu", "Processes", "Processing"),
-                   {"Microsoft.Windows.EventTracing.Metadata.dll", "System.Buffers.dll", "System.Memory.dll",
-                    "System.Numerics.Vectors.dll", "System.Runtime.CompilerServices.Unsafe.dll", "System.Security.Principal.Windows.dll"})
+    verify_cpu_modules(doc["loaded_processing_modules"])
     tables = {}
     for name, total in (("ready_rows", "ready_total"), ("activity_rows", "activity_total"), ("cpu_slices", "slice_total")):
         rows = defaultdict(list)

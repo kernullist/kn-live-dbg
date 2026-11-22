@@ -1637,6 +1637,26 @@ Exit 1 covers unavailable timing, an unconfirmed requested SDK comparison
 or a report hash mismatch. Invalid arguments, input pins and occupied
 output paths return exit 2. [Wait categories and source overlap](TRACE_IMPORT.md#waits-across-one-activity)
 
+### Measure interrupt handling during a thread activity
+
+Use the native reader, marker selection and CPU adapter from the
+preceding example. This option writes a v2 activity wait report. The
+report links DPC and ISR execution on the selected thread's CPU to
+the original switch records and TraceProcessor table rows.
+
+```powershell
+$interruptReport = Join-Path $PWD 'private-activity-interrupts.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query @sdk --interrupt-overlap --output $interruptReport | ConvertFrom-Json
+$overlap = (Get-Content -Raw -LiteralPath $interruptReport | ConvertFrom-Json).result.interrupt_overlap
+$overlap.summary | Select-Object residency_ns, observed_dpc_ns, observed_isr_ns, residency_outside_observed_fragments_ns
+python -B tools\measure-etl-activity-waits.py @query @sdk --interrupt-overlap --check-report $receipt.report_sha256
+```
+
+The receipt's `interrupt_overlap_status` is `measured` when the
+comparison succeeds. Exit 1 retains the report for an unavailable
+measurement or a replay mismatch. Omitting the adapter with this option
+returns exit 2. [Time and coverage fields](TRACE_IMPORT.md#interrupt-handling-during-a-marked-threads-cpu-residency)
+
 ## Whole-host hunt
 
 ```text

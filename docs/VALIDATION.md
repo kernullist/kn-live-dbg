@@ -7,6 +7,54 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Interrupt overlap during thread residency on 2026-11-23
+
+The x64 Release reader (SHA-256 prefix `2bda0417bff9`) and the CPU
+adapter (`17d84e2325d4`, Microsoft TraceProcessor 1.12.10, Toolkit 1.11.0)
+processed seven marked activities in the public TaskbarLatency ETL
+(SHA-256 prefix `8a59fa63479e`) on Windows `10.0.28000`. A separate
+Windows TDH reader decoded interrupt entry times by property name and
+used event headers for completion times
+and processor IDs. It reconstructed the target's scheduled intervals
+from context switches. Both calculations used the recording's 10 MHz
+clock. [Original ETL](#readythread-cpu-context-on-2026-11-22) · [TDH and replay checks](../tools/test-etl-interrupt-overlap.py)
+
+| Start and Stop records | Target residency (ms) | Observed DPC (µs) | Observed ISR (µs) |
+| --- | ---: | ---: | ---: |
+| 339732, 374019 | 55.3563 | 5.4 | 0 |
+| 738283, 741351 | 6.8381 | 16.5 | 2.4 |
+| 87669, 105250 | 5.1738 | 0 | 0 |
+| 87258, 87264 | 0.0065 | 0 | 0 |
+| 811857, 812141 | 3.4110 | 0 | 0 |
+| 191828, 247898 | 0.0341 | 0 | 0 |
+| 117201, 117281 | 0.1130 | 0 | 0 |
+
+All 92 native CPU slices matched the SDK's full switch endpoints.
+The seven queries returned 198 interrupt fragments on selected CPUs
+during the marker windows. Eight intersections fell within target
+residency. In the third window all 49 fragments fell outside it.
+The two positive measurements establish coincidence on the same CPU.
+The contribution to end-to-end application latency remains open.
+
+Across the source, TDH counted 3,814 ordinary DPCs, 470 timer DPCs,
+2,123 message-signaled ISRs and 288 other ISRs. These counts reproduce
+all 6,695 interrupt activities in the SDK. TDH also observed 72
+threaded DPCs outside that table. Subtracting nested intervals from
+their enclosing handlers yielded 6,804 exclusive fragments. Two
+additional windows exercised nested execution in the SDK, but both
+contained intervening application markers and produced no activity
+overlap estimate. The full-span SDK query retained 2,048 of 6,804
+matching fragments. The report calculation withheld totals for that
+projection.
+
+Replaying the first report reproduced its hash. Paging the native
+reader two intervals at a time preserved the interrupt result. Tests
+also covered capture loss, a non-QPC clock, conflicting CPU slices,
+overlapping fragments and a missing interrupt family. With the preceding
+adapter archive, exact replay of the v1 report passed both with and
+without SDK evidence.
+[Measurement and replay](COMMAND_REFERENCE.md#measure-interrupt-handling-during-a-thread-activity) · [Microsoft interrupt table](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.cputracesourceextensions.useinterrupthandlingdata)
+
 ## Independent marker replay of the 2026-11-22 handoff studies
 
 The x64 marker adapter (executable SHA-256 prefix `d88368b82e1e`,

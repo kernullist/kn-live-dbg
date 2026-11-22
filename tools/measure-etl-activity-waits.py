@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 from etl_activity_waits import ActivityWaits, MAX_RECORDS, candidate
+import etl_interrupt_overlap
 from etl_ready_correspondence import TableBindings, correlate, key
 from etl_reader_process import WindowsFiles, file_hash, reader_receipt, run_reader
 import etl_traceprocessor
@@ -98,6 +99,21 @@ def origin_rows(query, selectors, common, window):
     return dict(zip(selectors, rows, strict=True))
 
 
+def interrupt_query(runtime, path, pin, size, window, frequency, running, directory, timeout, files):
+    program, binary, _ = runtime
+    a, b = window["start"], window["stop"]
+    args = [str(path), "--interrupt-window", str(a["header_process_id"]), str(a["header_thread_id"]),
+            a["raw_timestamp"], b["raw_timestamp"]]
+    query = read(program, binary, args, directory, timeout, files)
+    status, summary = "reader_unavailable", None
+    if query["page"] is not None and query["reader"]["exit_code"] == 0:
+        try:
+            status, summary = etl_interrupt_overlap.correlate(query["page"], pin, size, window, frequency, running)
+        except (KeyError, TypeError, ValueError, RecursionError):
+            status = "inconsistent_interrupt_evidence"
+    return dict(status=status, query=query, summary=summary)
+
+
 def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
     prefix = ["--etl-switches", str(path), "--sha256", pin]
 
@@ -107,6 +123,7 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
     after, aggregate, metadata = 0, None, None
     sdk_counts = Counter()
     tables = TableBindings() if sdk else None
+    running = []
     reason = None
     while True:
         schedule = native(["--schedule-activity", str(args.start), str(args.stop), "--after", str(after), "--limit", str(args.page_size)])
@@ -135,6 +152,8 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
                         origins = origin_rows(batch, selectors, common, window)
                 if reason is None:
                     part["waits"] = aggregate.account(window, origins)
+                    if args.interrupt_overlap:
+                        etl_interrupt_overlap.native_slices(window, running)
                     if sdk and origins:
                         result = sdk_query(sdk, path, pin, size, list(origins.values()), directory, args.timeout_ms, files, tables)
                         part["traceprocessor"] = result
@@ -158,12 +177,20 @@ def analyze(args, path, pin, size, reader, sdk, directory, files, emit):
     sdk_status = None
     if sdk:
         sdk_status = "unconfirmed" if reason is not None or sdk_counts["unconfirmed"] else "matched" if sdk_counts else "no_ready_records"
-    return dict(status="accounted" if summary is not None else "unavailable", reason=reason, summary=summary,
-                traceprocessor_status=sdk_status, traceprocessor_counts=dict(sorted(sdk_counts.items())) if sdk else None)
+    result = dict(status="accounted" if summary is not None else "unavailable", reason=reason, summary=summary,
+                  traceprocessor_status=sdk_status, traceprocessor_counts=dict(sorted(sdk_counts.items())) if sdk else None)
+    if args.interrupt_overlap:
+        overlap = dict(status="native_window_unavailable", query=None, summary=None)
+        if summary is not None:
+            frequency = decimal(metadata["clock"]["header_perf_frequency"])
+            overlap = interrupt_query(sdk, path, pin, size, aggregate.header, frequency, running, directory, args.timeout_ms, files)
+        result["interrupt_overlap"] = overlap
+    return result
 
 
 def execute(args):
     check(os.name == "nt" and 1 <= args.timeout_ms <= 600000 and 1 <= args.page_size <= 128, "invalid Windows reader settings")
+    check(not args.interrupt_overlap or args.traceprocessor, "--interrupt-overlap requires --traceprocessor")
     args.start, args.stop = decimal(args.start), decimal(args.stop)
     check(0 < args.start < args.stop <= MAX_RECORDS, "select two increasing original ETW record numbers")
     path, program = local_path(args.etl), local_path(args.exe)
@@ -190,6 +217,11 @@ def execute(args):
                       timeout_ms=args.timeout_ms, traceprocessor=sdk[2] if sdk else None,
                       qualification=dict(scope="one_marked_thread", symbol_lookup="not_requested", wait_object=None,
                                          cause_of_wait=None, application_critical_path=None))
+        if args.interrupt_overlap:
+            header["schema"] = "kn.etl_activity_waits.v2"
+            header["traceprocessor"]["tables"].extend(etl_interrupt_overlap.TABLES)
+            header["qualification"].update(interrupt_scope="exclusive_sdk_fragments_during_thread_residency",
+                                           interrupt_time_basis="trace_relative_nanoseconds")
         outcome = {}
 
         def render(emit):
@@ -207,7 +239,10 @@ def execute(args):
             result = "matched" if report_pin == expected_report else "mismatch"
     receipt = dict(schema="kn.etl_activity_waits_receipt.v1", status=result, report_sha256=report_pin,
                    expected_report_sha256=expected_report, activity_waits_status=outcome["status"], traceprocessor_status=outcome["traceprocessor_status"])
-    return receipt, int(result == "mismatch" or outcome["status"] != "accounted" or outcome["traceprocessor_status"] == "unconfirmed")
+    if args.interrupt_overlap:
+        receipt.update(schema="kn.etl_activity_waits_receipt.v2", interrupt_overlap_status=outcome["interrupt_overlap"]["status"])
+    return receipt, int(result == "mismatch" or outcome["status"] != "accounted" or outcome["traceprocessor_status"] == "unconfirmed" or
+                        (args.interrupt_overlap and receipt["interrupt_overlap_status"] != "measured"))
 
 
 def main():
@@ -217,6 +252,7 @@ def main():
     for name in ("exe", "exe-sha256", "etl", "sha256", "start", "stop"):
         p.add_argument("--" + name, required=True)
     p.add_argument("--traceprocessor", nargs=2, metavar=("CPU_ADAPTER_ZIP", "SHA256"))
+    p.add_argument("--interrupt-overlap", action="store_true", help="measure exclusive DPC/ISR fragments during the marked thread's CPU residency")
     p.add_argument("--page-size", type=int, default=128)
     p.add_argument("--timeout-ms", type=int, default=240000)
     dest = p.add_mutually_exclusive_group(required=True)

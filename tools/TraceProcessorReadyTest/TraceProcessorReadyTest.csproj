@@ -17,6 +17,7 @@
   <ItemGroup>
     <Compile Include="..\TraceProcessorModules.cs" Link="TraceProcessorModules.cs" />
     <Compile Include="TraceProcessorReadyTest.cs" />
+    <Compile Include="InterruptWindow.cs" />
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Web.Extensions" />

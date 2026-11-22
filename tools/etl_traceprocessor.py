@@ -97,6 +97,12 @@ def verify_modules(modules, required_sdk, optional=()):
           "unexpected loaded processing modules")
 
 
+def verify_cpu_modules(modules):
+    verify_modules(modules, ("Cpu", "Processes", "Processing"),
+                   {"Microsoft.Windows.EventTracing.Metadata.dll", "System.Buffers.dll", "System.Memory.dll",
+                    "System.Numerics.Vectors.dll", "System.Runtime.CompilerServices.Unsafe.dll", "System.Security.Principal.Windows.dll"})
+
+
 def validate_projection(document, source_hash, size, provider, activity_id, window=None):
     fields(document, "schema source_sha256 source_bytes table provider_guid activity_id query_filter loaded_processing_modules "
            "provider_rows activity_marker_rows scoped_marker_rows matched_rows row_limit rows" + ("" if window else " trace_metadata"),

@@ -20,8 +20,9 @@ namespace
 {
     constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
+    constexpr GUID PerfInfo = {0xce1dbfb4, 0x137e, 0x4da6, {0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}};
     constexpr GUID Handoff = {0x4dc673b7, 0xfb3f, 0x4099, {0x95, 0x2a, 0x37, 0xda, 0xc2, 0x7c, 0xf1, 0x94}};
-    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false, payloads = false; };
+    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false, payloads = false, interrupts = false; };
 
     template<typename T>
     bool Property(PEVENT_RECORD e, Counts& counts, PCWSTR name, T& value)
@@ -76,6 +77,16 @@ namespace
         ++counts.records;
         const auto& h = event->EventHeader;
         const auto& d = h.EventDescriptor;
+        if (counts.interrupts)
+        {
+            if (counts.error || !IsEqualGUID(h.ProviderId, PerfInfo) || d.Id != 0 ||
+                (d.Opcode != 50 && d.Opcode != 95 && (d.Opcode < 66 || d.Opcode > 69))) { return; }
+            int64_t entry = 0;
+            if (!Property(event, counts, L"InitialTime", entry)) { return; }
+            std::printf("{\"record_ordinal\":%u,\"opcode\":%u,\"cpu\":%u,\"initial_qpc\":\"%lld\",\"stop_qpc\":\"%lld\"}\n",
+                counts.records, static_cast<unsigned>(d.Opcode), static_cast<unsigned>(GetEventProcessorIndex(event)), entry, h.TimeStamp.QuadPart);
+            return;
+        }
         if (!counts.error && counts.activities && (d.Opcode == 1 || d.Opcode == 2) &&
             !(h.Flags & (EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_TRACE_MESSAGE)))
         {
@@ -154,11 +165,13 @@ namespace
 int wmain(int argc, wchar_t** argv)
 {
     const bool payloads = argc == 3 && std::wcscmp(argv[2], L"--marker-data") == 0;
-    if ((argc != 2 && (argc != 3 || (!payloads && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
+    const bool interrupts = argc == 3 && std::wcscmp(argv[2], L"--interrupts") == 0;
+    if ((argc != 2 && (argc != 3 || (!payloads && !interrupts && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
     counts.scheduler = argc == 3 && std::wcscmp(argv[2], L"--scheduler") == 0;
     counts.payloads = payloads;
+    counts.interrupts = interrupts;
     counts.activities = payloads || (argc == 3 && std::wcscmp(argv[2], L"--activities") == 0);
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = argv[1];

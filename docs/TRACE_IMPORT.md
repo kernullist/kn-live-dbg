@@ -993,6 +993,44 @@ target dispatch. Missing or nonunique SDK rows leave the requested scope
 unconfirmed. Report replay checks exact bytes using the same source,
 reader, options and adapter archive. [Microsoft CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis) · [Command and replay](COMMAND_REFERENCE.md#account-for-waits-across-one-activity)
 
+### Interrupt handling during a marked thread's CPU residency
+
+With `--interrupt-overlap`, the activity wait report measures how much of
+the marked thread's scheduled time coincided with recorded DPC or ISR
+execution on the same processor. It uses the original ETL, the native
+switch records and the optional Microsoft CPU adapter. Each native
+switch-in and switch-out must match one `CpuTimeSlices` row on processor,
+PID, TID and both full QPC timestamps, including switches outside the
+marker window. The report retains the native record numbers and SDK row.
+
+The interrupt table supplies exclusive execution fragments. A DPC that
+an ISR preempts can have a fragment on either side of that ISR. For
+every positive intersection the report records the one-based interrupt
+activity row, fragment number, CPU slice row and clipped endpoints.
+The calculation uses half-open intervals in trace-relative nanoseconds.
+The SDK exposes fragment times at this precision and can omit their raw
+QPC values. Its clock context converts the native window bounds. The
+comparison checks the QPC frequency, reference point, normalized switch
+times and trace loss before adding durations. [Microsoft CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis) · [TraceProcessor interrupt table](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.cputracesourceextensions.useinterrupthandlingdata)
+
+| Summary field | Time inside the marker window |
+| --- | --- |
+| `residency_ns` | Time the scheduler assigned the target thread to a CPU. |
+| `observed_dpc_ns`, `observed_isr_ns` | Exclusive fragments of each kind overlapping that same CPU residency. |
+| `residency_outside_observed_fragments_ns` | Scheduled time left after subtracting those two observations. |
+
+The query retains up to 2,048 matching CPU slices and 2,048 interrupt
+fragments on those processors within the marker window. Reaching a
+larger count, missing either interrupt family throughout the source,
+unplaced rows, overlapping exclusive fragments or inconsistent switch
+evidence withholds the overlap summary. A measured zero means the
+recorded fragments had no intersection with the target's residency.
+Coverage depends on the capture and the SDK table. In the public
+TaskbarLatency trace this table included ordinary and timer DPCs and
+excluded threaded DPCs. Identifying a handler, measuring the target's
+instructions or attributing application delay requires other evidence.
+[Commands and replay](COMMAND_REFERENCE.md#measure-interrupt-handling-during-a-thread-activity) · [Measured coverage](VALIDATION.md#interrupt-overlap-during-thread-residency-on-2026-11-23)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

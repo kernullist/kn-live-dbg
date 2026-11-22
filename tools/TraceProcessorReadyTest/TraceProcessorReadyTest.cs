@@ -47,6 +47,7 @@ internal static class ReadyRows
     private static int Run(string[] args)
     {
         if (args.Length < 2) { return 2; }
+        if (args[1] == "--interrupt-window") { return InterruptWindow.Run(args); }
         var requested = new HashSet<string>(StringComparer.Ordinal);
         bool context = args[1] == "--cpu-context";
         int first = context ? 2 : 1;
