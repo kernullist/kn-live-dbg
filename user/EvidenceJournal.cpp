@@ -1636,25 +1636,103 @@ EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
 
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool includeArtifacts)
 {
+    EvidenceStorePageOptions page;
+    page.Artifacts = includeArtifacts;
+    return EvidenceStoreInventoryJson(r, page, nullptr);
+}
+
+namespace
+{
+    constexpr size_t StoreDetailUnits = 16 * 1024 * 1024;
+    constexpr uint64_t StorePageMaxRows = 4096;
+    std::wstring StoreCursor(const EvidenceStoreInventory& r, uint64_t offset)
+    {
+        if (!Digest(r.CatalogSha256) || !Digest(r.ArtifactsSha256)) { return {}; }
+        const auto position = std::to_wstring(offset);
+        const auto seal = Hash(L"kn.store_artifact_cursor.v1|" + r.CatalogSha256 + L"|" + r.ArtifactsSha256 + L"|" + position);
+        return Digest(seal) ? L"kns1." + position + L"." + seal : L"";
+    }
+    bool StoreCursorOffset(const EvidenceStoreInventory& r, const std::wstring& cursor, size_t& offset)
+    {
+        const auto end = cursor.find(L'.', 5);
+        if (cursor.rfind(L"kns1.", 0) != 0 || end == std::wstring::npos || end > 10) { return false; }
+        const auto number = cursor.substr(5, end - 5);
+        if (!Id(number)) { return false; }
+        const auto value = std::stoul(number);
+        if (!value || value >= r.Artifacts.size() || cursor != StoreCursor(r, value)) { return false; }
+        offset = value;
+        return true;
+    }
+}
+
+bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page)
+{
+    if (!page) { return false; }
+    EvidenceStorePageOptions parsed;
+    bool json = false;
+    for (size_t i = 0; i < options.size(); ++i)
+    {
+        const auto key = LowerAscii(options[i]);
+        if (key == L"/artifacts" && !parsed.Artifacts) { parsed.Artifacts = true; }
+        else if (key == L"/json" && !json) { json = true; }
+        else if (key == L"/limit" && !parsed.Limit && ++i < options.size())
+        {
+            const auto& number = options[i];
+            if (number.size() > 4 || !Id(number)) { return false; }
+            parsed.Limit = std::stoul(number);
+            if (!parsed.Limit || parsed.Limit > StorePageMaxRows) { return false; }
+        }
+        else if (key == L"/cursor" && parsed.Cursor.empty() && ++i < options.size())
+        {
+            parsed.Cursor = options[i];
+            if (parsed.Cursor.empty() || parsed.Cursor.size() > 80 || parsed.Cursor.front() == L'/') { return false; }
+        }
+        else { return false; }
+    }
+    if (!parsed.Artifacts && (parsed.Limit || !parsed.Cursor.empty())) { return false; }
+    *page = std::move(parsed);
+    return true;
+}
+
+std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, const EvidenceStorePageOptions& page, bool* pageReady)
+{
     std::wstring collections = L"[", artifacts = L"[";
-    uint64_t emitted = 0;
+    std::wstring pageStatus = L"not_requested", next;
+    size_t offset = 0, emitted = 0;
+    bool ready = r.Status == L"verified";
     for (const auto& c : r.Collections)
     {
         if (collections.size() > 1) { collections += L","; }
         collections += StoreCollectionJson(c);
     }
-    if (includeArtifacts)
+    if (page.Artifacts)
     {
-        for (const auto& a : r.Artifacts)
+        const bool validCursor = page.Cursor.empty() || (ready && StoreCursorOffset(r, page.Cursor, offset));
+        pageStatus = ready ? L"complete" : L"incomplete_inventory";
+        if (!validCursor)
         {
-            const auto row = StoreArtifactJson(a);
-            // At most 16 Mi UTF-16 code units in this optional detail page.
-            // The full canonical artifact digest and aggregate counts remain available.
-            if (row.size() + artifacts.size() > 16 * 1024 * 1024) { break; }
-            if (artifacts.size() > 1) { artifacts += L","; }
-            artifacts += row; ++emitted;
+            if (ready) { pageStatus = L"cursor_mismatch"; }
+            ready = false;
+        }
+        else
+        {
+            for (size_t i = offset; i < r.Artifacts.size() && (!page.Limit || emitted < page.Limit); ++i)
+            {
+                const auto row = StoreArtifactJson(r.Artifacts[i]);
+                if (artifacts.size() + (emitted ? 1 : 0) + row.size() + 1 > StoreDetailUnits) { break; }
+                if (emitted) { artifacts += L","; }
+                artifacts += row;
+                ++emitted;
+            }
+            if (ready && offset + emitted < r.Artifacts.size())
+            {
+                if (emitted) { next = StoreCursor(r, offset + emitted); }
+                pageStatus = !emitted ? L"row_exceeds_budget" : next.empty() ? L"cursor_unavailable" : L"more";
+                ready = !next.empty();
+            }
         }
     }
+    if (pageReady) { *pageReady = ready; }
     return L"{\"schema\":\"kn.evidence_store_inventory.v1\",\"status\":" + mcpjson::Quote(r.Status) +
         L",\"issue\":" + mcpjson::Quote(r.Issue) + L",\"scope\":\"image_and_irp_collection_namespace\","
         L"\"coordination\":\"participating_publishers\",\"retention_policy\":\"kn.retain_committed_and_unresolved.v1\","
@@ -1683,9 +1761,12 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool in
         L",\"missing_image_inputs\":" + N(r.MissingImageInputs) + L",\"mismatched_image_inputs\":" + N(r.MismatchedImageInputs) +
         L",\"irp_capture_roots\":" + N(r.IrpCaptureRoots) + L",\"unreadable_irp_catalogs\":" + N(r.UnreadableIrpCatalogs) +
         L",\"missing_irp_references\":" + N(r.MissingIrpReferences) + L",\"mismatched_irp_references\":" + N(r.MismatchedIrpReferences) +
-        L",\"read_bytes\":" + N(r.ReadBytes) + L",\"artifacts_included\":" + B(includeArtifacts) +
+        L",\"read_bytes\":" + N(r.ReadBytes) + L",\"artifacts_included\":" + B(page.Artifacts) +
         L",\"artifact_rows_total\":" + N(r.Artifacts.size()) + L",\"artifact_rows_emitted\":" + N(emitted) +
         L",\"artifact_rows_omitted\":" + N(r.Artifacts.size() - emitted) +
+        L",\"artifact_page_status\":" + mcpjson::Quote(pageStatus) + L",\"artifact_row_offset\":" + N(offset) +
+        L",\"artifact_rows_remaining\":" + N(r.Artifacts.size() - offset - emitted) +
+        L",\"next_artifact_cursor\":" + mcpjson::Quote(next) +
         L",\"collections\":" + collections + L"],\"artifacts\":" + artifacts +
         L"],\"deletion_authorized\":false,\"disk_allocation_established\":false,\"target_coverage_established\":false,"
         L"\"collector_authenticated\":false,\"power_loss_durability_established\":false}";

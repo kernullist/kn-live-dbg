@@ -23131,7 +23131,7 @@ static void PrintKmonHelp()
     std::wcout << L"    Eligible direct/slice/sweep publications retain original claims; replay checks exact policy/report reproduction. Legacy claims are current evaluations; /current remains direct-only.\n";
     std::wcout << L"  !kmon replay-irp <capture.knirp> [/current] [/json]  original claim reproduction; /current evaluates current claims only\n";
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
-    std::wcout << L"  !kmon store <artifact-root> [/artifacts] [/json]\n";
+    std::wcout << L"  !kmon store <artifact-root> [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
     std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
@@ -23964,22 +23964,19 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
     }
     if (action == L"store")
     {
-        bool artifacts = false, valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty();
-        std::set<std::wstring> seen;
-        for (size_t i = 3; valid && i < args.size(); ++i)
+        EvidenceStorePageOptions page;
+        if (args.size() < 3 || args.size() > 9 || args[2].empty() ||
+            !ParseEvidenceStorePageOptions({args.begin() + 3, args.end()}, &page))
         {
-            const auto option = ToLower(args[i]);
-            valid = seen.insert(option).second && (option == L"/json" || option == L"/artifacts");
-            if (option == L"/artifacts") { artifacts = true; }
-        }
-        if (!valid)
-        {
-            std::wcerr << L"usage: !kmon store <artifact-root> [/artifacts] [/json]\n";
+            std::wcerr << L"usage: !kmon store <artifact-root> [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
             return 2;
         }
         const auto result = InspectEvidenceStore(args[2]);
-        std::wcout << EvidenceStoreInventoryJson(result, artifacts) << L"\n";
-        return result.Status == L"verified" ? 0 : 1;
+        bool ready = false;
+        const auto json = EvidenceStoreInventoryJson(result, page, &ready);
+        if (directJsonOutput) { if (!WriteCapabilityJson(json)) { return 3; } }
+        else { std::wcout << json << L"\n"; }
+        return ready ? 0 : 1;
     }
     if (action == L"journal")
     {

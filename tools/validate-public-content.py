@@ -138,13 +138,15 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
 STORE_RETENTION_MARKERS = ('"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
-                           '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"')
+                           '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"',
+                           '"next_artifact_cursor"', '"artifact_page_status"')
 STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
     ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog"),
     ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis"),
     ("artifact", "irp_catalog"), ("artifact", "irp_referrers"), ("path", "expected_bytes", "root_committed"),
     ("retired_collections", "retired_original_matched"), ("retired_collection_id", "retirement_sha256"),
-    ("exclusive_nonledger", "shared_nonledger", "failure_ledgers"), ("collection_id", "head_sha256", "exclusive_byte_limit")))
+    ("exclusive_nonledger", "shared_nonledger", "failure_ledgers"), ("collection_id", "head_sha256", "exclusive_byte_limit"),
+    ("artifact_row_offset", "next_artifact_cursor"), ("artifact_page_status", "artifact_rows_remaining")))
 IO_PORT_VALUE = re.compile(r'(?m)^[ \t]*(?:[,{][ \t]*)?"(?:overlapped|port_handle|directory_handle|returned_port)"'
                            r'[ \t]*:[ \t]*"[1-9][0-9]{0,19}(?:"|$)')
 IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (

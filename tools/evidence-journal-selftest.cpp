@@ -440,11 +440,31 @@ namespace
             artifact.Retention = L"committed_reference_protected";
             artifact.Collections = {L"12345678901234567890"};
             bounded.Artifacts.assign(65536, artifact);
+            bounded.Status = L"verified";
+            bounded.CatalogSha256 = bounded.ArtifactsSha256 = artifact.Artifact.Sha256;
             const auto json = EvidenceStoreInventoryJson(bounded, true);
-            std::wstring omitted;
+            std::wstring omitted, cursor;
             Check(json.size() < 16 * 1024 * 1024 + 4096 && mcpjson::ValidateDocument(json) &&
                 mcpjson::GetString(json, L"artifact_rows_omitted", &omitted) && std::stoull(omitted) > 0,
                 "bounded-detail-output-reports-omitted-artifacts");
+            bool ready = false;
+            Check(mcpjson::GetString(json, L"next_artifact_cursor", &cursor) && !cursor.empty(), "size-limited-detail-offers-continuation");
+            const auto tail = EvidenceStoreInventoryJson(bounded, {true, 0, cursor}, &ready);
+            std::wstring count, state;
+            Check(ready && mcpjson::GetString(tail, L"artifact_rows_emitted", &count) && count == omitted &&
+                mcpjson::GetString(tail, L"artifact_page_status", &state) && state == L"complete", "default-detail-tail-covers-every-omitted-row");
+        }
+        {
+            EvidenceStoreInventory oversized;
+            oversized.Status = L"verified";
+            EvidenceStoreArtifact artifact;
+            artifact.Retention.assign(16 * 1024 * 1024, L'x');
+            oversized.Artifacts.push_back(std::move(artifact));
+            bool ready = true;
+            const auto json = EvidenceStoreInventoryJson(oversized, {true, 1, {}}, &ready);
+            std::wstring state, cursor;
+            Check(!ready && mcpjson::GetString(json, L"artifact_page_status", &state) && state == L"row_exceeds_budget" &&
+                mcpjson::GetString(json, L"next_artifact_cursor", &cursor) && cursor.empty(), "oversize-row-cannot-issue-a-nonadvancing-cursor");
         }
     }
 }
@@ -470,11 +490,17 @@ int wmain(int argc, wchar_t** argv)
             std::wcout << EvidenceGcResultJson(result) << '\n';
             return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
         }
-        if (argc == 3 && std::wstring(argv[1]) == L"--store")
+        if (argc >= 3 && std::wstring(argv[1]) == L"--store")
         {
+            std::vector<std::wstring> flags{L"/artifacts"};
+            flags.insert(flags.end(), argv + 3, argv + argc);
+            EvidenceStorePageOptions page;
+            if (!ParseEvidenceStorePageOptions(flags, &page)) { return 2; }
             const auto result = InspectEvidenceStore(argv[2]);
-            std::wcout << EvidenceStoreInventoryJson(result, true) << '\n';
-            return result.Status == L"verified" ? 0 : 1;
+            bool ready = false;
+            std::cout << mcpjson::WideToUtf8(EvidenceStoreInventoryJson(result, page, &ready)) << std::endl;
+            if (!std::cout) { return 3; }
+            return ready ? 0 : 1;
         }
         if (argc == 4 && std::wstring(argv[1]) == L"--store-hold")
         {

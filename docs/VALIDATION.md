@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Inventory artifact pagination on 2026-11-23
+
+A disposable store held 24,576 synthetic image capture declarations that
+all named the same test blob in the PE reference directory. The preceding x64 Release CLI
+(`c396d34f4f67`) verified the store and reported one omitted artifact row.
+Its detail output ended before the reference row. On the same files the updated CLI
+(`11da8a1dea86`) returned the 24,576 capture rows and a cursor. The next
+page returned that row and all 24,576 referrers. Joining the two artifact
+arrays reproduced the complete SHA-256 over 17,203,562 ASCII code units.
+The CLI store suite passed 561 checks including the preceding-binary
+comparison. To repeat it, run
+`python tools/test-evidence-store.py --cli --exe <current-cli> --producer <journal-selftest> --fixtures <scratch-directory> --large-detail --previous-cli <preceding-cli>`.
+[Store validation](../tools/test-evidence-store.py)
+
+Smaller native stores exercised row limits, changing the limit between
+requests, terminal and edited offsets, partial scans and Unicode file names.
+Adding a pending segment changed only the catalog digest. Adding a loose
+file changed only the artifact digest. Both changes caused the CLI to reject
+the old cursor. A valid later page supplied an orphan selection to the
+ordinary GC policy helper and native preflight. Rejected pages could supply
+neither a GC policy nor a retirement policy.
+
+The native serializer also exercised 65,536 constructed rows and one
+indivisible row larger than the output budget. The oversized row returned
+`row_exceeds_budget` and an empty cursor. Each CLI page still needs one
+complete stopped-store scan within the existing bounds. These tests measure
+detail delivery and continuity for that scan.
+The Release and MSVC AddressSanitizer harnesses each passed 77 native and
+530 store checks. The instrumented runs used the host interceptor workaround
+described in the retirement checkpoint below.
+
 ## Closed collection retirement on 2026-11-23
 
 Two closed image collections shared a PE in a disposable store. The preceding

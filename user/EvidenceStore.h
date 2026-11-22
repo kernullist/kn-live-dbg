@@ -87,4 +87,12 @@ struct EvidenceStoreInventory
 // publisher barrier. The returned data releases all leases and NEVER grants
 // deletion authority. Unresolved roots protect all unattributed artifacts.
 EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot);
+struct EvidenceStorePageOptions
+{
+    bool Artifacts = false;
+    uint64_t Limit = 0;
+    std::wstring Cursor;
+};
+bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page);
+std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& inventory, const EvidenceStorePageOptions& page, bool* pageReady);
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& inventory, bool includeArtifacts = false);

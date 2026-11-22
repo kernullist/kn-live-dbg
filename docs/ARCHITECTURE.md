@@ -521,10 +521,22 @@ also limited to 1 GiB. Root enumeration has a separate 65,536-entry cap, includi
 entries outside the reserved IRP namespace. The shared 120-second deadline is cooperative between
 synchronous operations. Exhaustion yields partial/unavailable status; separate
 flags distinguish verified journal membership from an incomplete artifact scan.
-`/artifacts` uses a 16 Mi UTF-16 code-unit detail budget and reports
-emitted/omitted row counts; the
-aggregate counters and complete captured-row digest remain available. Large-store
-continuation is still required; this bounded audit does not implement it.
+`/artifacts` emits complete rows in path order within a 16 Mi UTF-16 code-unit
+array budget. `/limit` can reduce the page to 1–4,096 rows. A verified page
+with remaining rows returns `next_artifact_cursor`. Its digest binds the
+complete catalog, the complete ordered artifact array and the next offset.
+Each call reacquires the stopped-store lease and recomputes both digests.
+Changes to either digest invalidate the cursor. A reader can change its page
+size between calls and verify the concatenated rows against `artifacts_sha256`.
+The cursor identifies matching content across inspections. Physical file
+identity and deletion eligibility are checked independently by GC.
+
+The page reports its starting row, emitted count and remaining rows.
+`artifact_rows_omitted` counts every row outside the current page, including
+earlier rows. A partial initial inspection can report observed rows. It
+withholds a cursor. An oversized single row returns `row_exceeds_budget`.
+Resuming the physical scan beyond the collection, path, reference, byte or
+time budgets remains open.
 
 ## Closed collection retirement
 

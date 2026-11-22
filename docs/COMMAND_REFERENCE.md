@@ -216,12 +216,16 @@ failure, and 2 means invalid grammar. A valid retired journal returns 0 without
 artifact root to `replay-image` or `graph` for separate policy verification.
 See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
 
-`KnLiveDbg.exe --offline !kmon store <artifact-root> [/artifacts] [/json]`
+`KnLiveDbg.exe --offline !kmon store <artifact-root> [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
 audits stopped image and IRP collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.
-`/artifacts` includes bounded per-path ownership detail with explicit omission
-counts. A loose direct or scoped approval reports `approval_catalog` on its
+`/artifacts` includes per-path ownership detail. For example,
+`store <artifact-root> /artifacts /limit 100` starts a page. When
+`artifact_page_status` is `more`, pass its `next_artifact_cursor` to the next
+`store <artifact-root> /artifacts /cursor <token>` call. `artifact_row_offset`
+counts earlier rows and `artifact_rows_remaining` counts later rows.
+Restart from the first page after a cursor mismatch. A loose direct or scoped approval reports `approval_catalog` on its
 root. Present declared inputs list `uncommitted_approval_referrers` with the
 root path, physical SHA-256 and whether the input matched. The summary counts
 unreadable catalogs, missing inputs and mismatched inputs.
@@ -237,7 +241,9 @@ references per capture. Active participating
 publishers make the audit unavailable. The exclusive audit lease blocks new
 publication attempts until the audit finishes. Use it
 after collection stops. Exit 0 means complete verified membership and artifact
-inventory, 1 means partial/unavailable, and 2 means invalid grammar. The returned
+inventory and a usable requested page. Exit 1 covers partial or unavailable
+inventory, cursor mismatch and a row exceeding the page budget. Exit 2 means
+invalid grammar and exit 3 means offline output failure. The returned
 report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
 
 `KnLiveDbg.exe --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json]`
@@ -255,7 +261,8 @@ interrupted apply or output failure. [Retirement semantics](ARCHITECTURE.md#clos
 `KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]`
 preflights an explicit policy by default. Prepare one with
 `python tools/new-evidence-gc-policy.py --inventory inventory.json --path image-reads/reads-123-4.knreads --reason "obsolete unpublished observation" --output policy.json`.
-The input must be the JSON from `store /artifacts`; when saving it in PowerShell,
+The input must be a successful `store /artifacts` page containing all selected
+paths. When saving it in PowerShell,
 use `Set-Content -Encoding utf8`. The helper defaults to a 24-hour minimum file
 age and 128 MiB total named bytes. Repeat `--path` for explicit additional members.
 Review the generated policy and preflight result before using `/apply` with a

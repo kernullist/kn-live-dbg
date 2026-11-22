@@ -6,6 +6,7 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import uuid
 
@@ -33,6 +34,8 @@ def main():
     parser.add_argument("--producer", type=Path)
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--large-detail", action="store_true", help="exercise the 16 Mi code-unit limit using 24,576 owned capture files")
+    parser.add_argument("--previous-cli", type=Path, help="compare the earlier detail output on the same large store")
     args = parser.parse_args()
     exe, producer = args.exe.resolve(), (args.producer or args.exe).resolve()
     sandbox = args.fixtures.resolve() / ("store-" + uuid.uuid4().hex)
@@ -115,11 +118,84 @@ def main():
         summary = run(original, False)
         check(summary["artifacts"] == [] and summary["artifact_rows_emitted"] == "0" and summary["artifact_rows_omitted"] == str(len(members)), "explicit detail omission")
         for tail in ([], [str(original), "/unknown"], [str(original), "/json", "/json"],
-                     [str(original), "/artifacts", "/artifacts"], [str(original), "/index"]):
+                     [str(original), "/artifacts", "/artifacts"], [str(original), "/index"], [str(original), "/limit", "1"],
+                     [str(original), "/cursor", "token"], [str(original), "/artifacts", "/limit", "0"],
+                     [str(original), "/artifacts", "/limit", "4097"], [str(original), "/artifacts", "/limit", "01"],
+                     [str(original), "/artifacts", "/limit", "1", "/limit", "1"], [str(original), "/artifacts", "/cursor"]):
             invalid = subprocess.run([str(exe), "--offline", "!kmon", "store", *tail], capture_output=True, timeout=30)
             check(invalid.returncode == 2 and b'kn.evidence_store_inventory.v1' not in invalid.stdout, "invalid store grammar")
 
+    def page(root, limit, cursor="", code=0):
+        command = [exe, "--offline", "!kmon", "store", root, "/artifacts"] if args.cli else [exe, "--store", root]
+        result = subprocess.run(command + ["/limit", str(limit)] + (["/cursor", cursor] if cursor else []), capture_output=True, timeout=45)
+        check(result.returncode == code, ("page exit", code, result.returncode, result.stderr[:200]))
+        return json.loads(result.stdout)
+
+    def token(offset):
+        position = str(offset)
+        basis = "|".join(("kn.store_artifact_cursor.v1", r["catalog_sha256"], r["artifacts_sha256"], position))
+        return "kns1." + position + "." + sha(basis.encode())
+
+    collected, cursor = [], ""
+    while len(collected) < len(members):
+        limit = 1 if not collected else 3
+        selected = page(original, limit, cursor)
+        offset = len(collected)
+        collected.extend(selected["artifacts"])
+        remaining = len(members) - len(collected)
+        check(selected["artifact_row_offset"] == str(offset) and selected["artifact_rows_remaining"] == str(remaining) and
+              selected["artifact_rows_omitted"] == str(len(members) - len(selected["artifacts"])) and 0 < len(selected["artifacts"]) <= limit,
+              "independent page offset, earlier omissions and remaining rows")
+        cursor = selected["next_artifact_cursor"]
+        check(selected["artifact_page_status"] == ("more" if remaining else "complete") and cursor == (token(len(collected)) if remaining else ""),
+              "next offset bound to both complete digests")
+    check(collected == r["artifacts"] and sha(encoded(collected)) == r["artifacts_sha256"], "ordered pages recover the full canonical row digest")
+    for bad in ("invalid", token(0), token(len(members)), token(1).replace(".1.", ".2.")):
+        refused = page(original, 2, bad, 1)
+        check(refused["status"] == "verified" and refused["artifact_page_status"] == "cursor_mismatch" and
+              not refused["artifacts"] and not refused["next_artifact_cursor"], "reject malformed, terminal and edited positions")
+    root = copy("paged-catalog")
+    pending = root / "collections/7/journal-segments/held.knjseg.pending-test"
+    pending.write_bytes(b"owned pending publication")
+    stale = page(root, 2, token(1), 1)
+    check(stale["catalog_sha256"] != r["catalog_sha256"] and stale["artifacts_sha256"] == r["artifacts_sha256"] and
+          stale["artifact_page_status"] == "cursor_mismatch" and not stale["artifacts"], "catalog-only change rejects continuation")
+    pending.unlink()
     orphan = "image-reads/reads-99-1.knreads"
+    (root / orphan).write_bytes(b'{"schema":"kn.image_reads.v3","fixture":"page"}')
+    stale = page(root, 2, token(1), 1)
+    check(stale["catalog_sha256"] == r["catalog_sha256"] and stale["artifacts_sha256"] != r["artifacts_sha256"] and
+          stale["artifact_page_status"] == "cursor_mismatch" and not stale["artifacts"], "artifact-only change rejects continuation")
+    inventory = sandbox / "page.json"
+    policy = sandbox / "paged-policy.json"
+    helper = [sys.executable, "-B", Path(__file__).with_name("new-evidence-gc-policy.py"), "--inventory", inventory,
+              "--path", orphan, "--reason", "owned page test", "--minimum-age-seconds", "0", "--output", policy]
+    inventory.write_bytes(encoded(stale))
+    check(subprocess.run(helper, capture_output=True).returncode == 1 and not policy.exists(), "rejected page cannot prepare a policy")
+    retire_helper = [sys.executable, "-B", Path(__file__).with_name("new-evidence-gc-policy.py"), "--inventory", inventory,
+                     "--retire-collection", "7", "--reason", "owned page test", "--output", policy]
+    check(subprocess.run(retire_helper, capture_output=True).returncode == 1 and not policy.exists(),
+          "stale cursor cannot prepare a retirement even when the requested catalog row is present")
+    current = page(root, 1)
+    inventory.write_bytes(encoded(current))
+    check(subprocess.run(helper, capture_output=True).returncode == 1 and not policy.exists(), "a valid page cannot select an omitted file")
+    while current["artifacts"][0]["artifact"]["path"] != orphan:
+        check(bool(current["next_artifact_cursor"]), "eligible path appears on a subsequent page")
+        current = page(root, 1, current["next_artifact_cursor"])
+    inventory.write_bytes(encoded(current))
+    check(int(current["artifact_row_offset"]) > 0 and subprocess.run(helper, capture_output=True).returncode == 0, "prepare GC from a later page")
+    preflight = [exe, "--offline", "!kmon", "gc", root, policy] if args.cli else [exe, "--gc", root, policy, "-"]
+    checked = subprocess.run(preflight, capture_output=True, timeout=45)
+    check(checked.returncode == 0 and json.loads(checked.stdout)["status"] == "planned" and (root / orphan).exists(), "normal GC revalidates the selection")
+    extra = root / "image-reads/미확인.entry"
+    extra.write_bytes(b"owned partial scan")
+    partial = page(root, 4096, code=1)
+    check(partial["artifact_page_status"] == "incomplete_inventory" and not partial["next_artifact_cursor"] and
+          any(row["artifact"]["path"].endswith(extra.name) for row in partial["artifacts"]), "partial first page preserves Unicode evidence")
+    partial = page(root, 1, token(1), 1)
+    check(partial["artifact_page_status"] == "incomplete_inventory" and not partial["artifacts"] and not partial["next_artifact_cursor"],
+          "partial scan withholds continuation")
+
     for name, mutation in (("closed-orphan", None), ("open-root", "open"), ("invalid-root", "invalid"), ("corrupt-shared-reference", "corrupt")):
         root = copy(name)
         (root / orphan).write_bytes(b'{"schema":"kn.image_reads.v3","fixture":"uncommitted"}')
@@ -213,6 +289,46 @@ def main():
             reader.join(timeout=5)
         check(child.poll() is not None and not reader.is_alive(), "owned child reaped")
         check(run(root)["status"] == "verified", "process termination releases barrier")
+    if args.large_detail or args.previous_cli:
+        wide = sandbox / "detail-cap"
+        captures = wide / "image-captures"
+        captures.mkdir(parents=True)
+        (wide / "image-references").mkdir()
+        reference = b"owned inventory paging reference"
+        digest = sha(reference)
+        reference_path = f"image-references/{digest}.knblob"
+        (wide / reference_path).write_bytes(reference)
+        payload = dict(reference_sha256=digest)
+        original = encoded(dict(schema="kn.image_recipe.v1", recipe_sha256=sha(encoded(payload)), payload=payload))
+        physical = sha(original)
+        paths = [f"image-captures/capture-{i}-{physical}.kncapture" for i in range(10000, 34576)]
+        for relative in paths:
+            (wide / relative).write_bytes(original)
+
+        def wide_page(program, product, cursor=""):
+            command = [program, "--offline", "!kmon", "store", wide, "/artifacts"] if product else [program, "--store", wide]
+            output = subprocess.run(command + (["/cursor", cursor] if cursor else []), capture_output=True, timeout=180)
+            report = json.loads(output.stdout)
+            check(output.returncode == 0 and report["status"] == "verified", ("wide inventory", report["issue"]))
+            return report
+
+        if args.previous_cli:
+            old = wide_page(args.previous_cli.resolve(), True)
+            check(old["artifact_rows_omitted"] == "1" and not old.get("next_artifact_cursor"), "preceding CLI omits the PE row at the detail cap")
+            del old
+        first = wide_page(exe, args.cli)
+        tail = wide_page(exe, args.cli, first["next_artifact_cursor"])
+        check(first["artifact_page_status"] == "more" and first["artifact_rows_remaining"] == "1" and
+              [v["artifact"]["path"] for v in first["artifacts"]] == paths, "all on-disk capture paths in the first page")
+        check(tail["artifact_page_status"] == "complete" and not tail["next_artifact_cursor"] and
+              tail["artifact_row_offset"] == str(len(paths)) and len(tail["artifacts"]) == 1, "terminal page contains the previously omitted row")
+        pe = tail["artifacts"][0]
+        check(pe["artifact"]["path"] == reference_path and
+              [v["path"] for v in pe["uncommitted_image_referrers"]] == paths and
+              all(v["sha256"] == physical and v["input_matched"] for v in pe["uncommitted_image_referrers"]), "every captured PE referrer survives paging")
+        full = encoded(first["artifacts"] + tail["artifacts"])
+        check(len(full) > 16 * 1024 * 1024 and sha(full) == first["artifacts_sha256"] == tail["artifacts_sha256"], "reconstructed wide inventory digest")
+        print(f"[store.detail-cap] rows={len(paths) + 1} first={len(paths)} tail=1 canonical_units={len(full)}")
     print(f"[store.oracle] checks={CHECKS} children_remaining=0 mode={'cli' if args.cli else 'harness'} fixtures={sandbox}")
 
 

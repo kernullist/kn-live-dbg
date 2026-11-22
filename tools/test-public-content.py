@@ -24,7 +24,8 @@ class PublicContentTests(unittest.TestCase):
                 dict(artifact={}, irp_catalog="unreadable"), dict(artifact={}, irp_referrers=[]),
                 dict(path="fixture", expected_bytes="4", root_committed=True), dict(retired_collections=["7"], retired_original_matched=True),
                 dict(retired_collection_id="7", retirement_sha256="fixture"), dict(exclusive_nonledger={}, shared_nonledger={}, failure_ledgers={}),
-                dict(collection_id="7", head_sha256="fixture", exclusive_byte_limit="4"))
+                dict(collection_id="7", head_sha256="fixture", exclusive_byte_limit="4"),
+                dict(artifact_row_offset="1", next_artifact_cursor="owned"), dict(artifact_page_status="more", artifact_rows_remaining="2"))
         for row in rows:
             raw = json.dumps(dict(outer=[row])).encode()
             for sample in (raw, raw[:-3], raw.decode().encode("utf-16-le")):

@@ -67,6 +67,7 @@ def main():
         snapshot = json.loads(args.inventory.read_text(encoding="utf-8-sig"))
         if (snapshot["schema"] != "kn.evidence_store_inventory.v1" or snapshot["status"] != "verified" or
                 snapshot["scope"] not in ("image_collection_namespace", "image_and_irp_collection_namespace") or snapshot["catalog_complete"] is not True or
+                snapshot.get("artifact_page_status", "complete") not in ("not_requested", "complete", "more") or
                 snapshot["membership_complete"] is not True or snapshot["artifact_inventory_complete"] is not True):
             raise ValueError("a complete store inventory is required")
         if (not args.reason or "\0" in args.reason or len(args.reason.encode("utf-16-le")) > 1024 or
