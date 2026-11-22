@@ -391,6 +391,16 @@ class PublicContentTests(unittest.TestCase):
             inconsistent = {**runtime, **overrides}
             self.assertTrue(AUDIT.inspect("renamed.json", json.dumps(inconsistent).encode()))
 
+    def test_saved_etl_capability_exports(self):
+        nested = dict(schema="kn.etl_capability_probe.v1", expected_sha256="a" * 64)
+        report = dict(schema="kn.capabilities.v1", target_probed=False, scope="saved_etl_probe", probe=nested)
+        family = dict(observation="decoded_records", decoded=1, unsupported=0, first_decoded_record=18)
+        for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+            for content in (json.dumps(report), "log\n" + json.dumps(report)[:-8], json.dumps(nested, indent=2)):
+                rules = {f["rule"] for f in AUDIT.inspect("renamed.log", content.encode(encoding))}
+                self.assertIn("private-runtime-probe", rules)
+            self.assertTrue(AUDIT.inspect("row.log", json.dumps(family).encode(encoding)))
+
     def test_utf16_and_binary_strings(self):
         secret = "gh" + "p_" + "A" * 36
         for data in (secret.encode("utf-16"), b"MZ\0\1" + secret.encode(),

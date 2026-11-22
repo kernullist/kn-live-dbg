@@ -4779,6 +4779,48 @@ synthetic engine/transport controls, not driver execution or mutation-effect
 validation. No VM or driver load was used. TLS, per-principal authorization,
 durable/idempotent operations and the remote protocol adapter remain open.
 
+## Saved ETL capability probes on 2026-11-22
+
+The x64 Release binary scanned each pinned file once per capability invocation.
+Windows `tracerpt` supplied independent counts for the two classic event
+families. The existing CPU and switch commands supplied the first decoded
+ordinal and payload fields. The checker reconstructed the little-endian payload
+from those fields and compared its length and SHA-256 with the probe.
+
+| Saved ETL | All records | CPU samples | First sample ordinal | Context switches | First switch ordinal |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PerfView x64 | 179,474 | 79,528 | 1,137 | 0 | — |
+| PerfView x86 | 168,298 | 88,809 | 1,559 | 0 | — |
+| SimpleAllocator | 418,378 | 5,496 | 19 | 0 | — |
+| ETWAnalyzer scheduler | 877,318 | 18,556 | 527 | 168,474 | 610 |
+| PerfView single-event control | 23 | 0 | — | 0 | — |
+
+All five reported matching sequential buffer totals and zero loss indications.
+The control produced a successful source scan and two `partial` rows with zero
+records. Removing the last byte from copies of the four populated files left
+fewer buffers than declared. Each scan returned exit 1, retained the counts
+it could read and limited both families to `partial`.
+
+```powershell
+python tools/test-etl-capabilities.py --exe x64/Release/KnLiveDbg.exe --etl $etl --sha256 $pin --check-short-tail
+```
+
+The short-tail switch applies to the four populated fixtures. Separate controls
+covered a wrong digest, a missing file, an invalid ETL, a read-only output
+stream and hard-linked output on both valid and rejected command forms.
+Repeated file selectors and mixed live/file probe flags protected every named
+ETL from redirected diagnostics.
+Six previously saved pages from the scheduler ETL reproduced byte for byte across
+CPU profile v1–v3 and context-switch v1–v3 at offset 127, four rows each.
+Each original page SHA-256 also matched through `--check-page`.
+The public-content scanner detected the report and detached probe records.
+The matrix generator accepted only the compiled inventory. The 44 native
+capability policy checks passed in Release and ASan, including mixed event
+layouts, all three loss counters and unqualified buffer totals. The Windows
+ASan runtime emitted its existing interception warnings. This evidence covers
+the saved files and decoders tested here. Capture authenticity, event semantics
+and live platform compatibility require separate evidence.
+
 ## Saved ETL CPU profile validation on 2026-11-22
 
 Windows `tracerpt -rts` decoded three public PerfView test files independently

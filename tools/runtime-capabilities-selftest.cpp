@@ -1,4 +1,5 @@
 #include "../user/RuntimeCapabilities.h"
+#include "../user/SavedEtlCapability.h"
 
 #include <iostream>
 #include <sddl.h>
@@ -96,6 +97,40 @@ int wmain(int argc, wchar_t** argv)
     check(!CapabilityReadAccepted(read), "partial sample is not accepted as complete");
     check(available(nullptr, L"native") == L"not_probed", "compiled native stays unprobed");
     check(available(nullptr, L"vmi", L"unsupported") == L"not_probed", "legacy compiled availability unchanged");
+    SavedEtlCapabilityProbe etl;
+    check(std::wstring(etl.Availability(L"cpu_profile")) == L"unavailable" && etl.RecordsJson(L"cpu_profile") == L"null",
+        "failed file probe has no record counts");
+    auto& coverage = etl.Coverage.emplace();
+    coverage.Accounting = etl_profile::BufferAccounting::Matched;
+    coverage.Profile.Count(etl_profile::Match::Other, 1);
+    coverage.Profile.Count(etl_profile::Match::Unsupported, 2);
+    check(etl.StagesJson(L"cpu_profile").find(L"\"layout_qualified\":\"failed\"") != std::wstring::npos &&
+        etl.RecordsJson(L"cpu_profile").find(L"unsupported_layout_only") != std::wstring::npos,
+        "unsupported layout kept apart from absent family");
+    coverage.Profile.Count(etl_profile::Match::Decoded, 3);
+    coverage.Profile.Count(etl_profile::Match::Decoded, 6);
+    check(coverage.Profile.FirstDecodedRecord == 3 && coverage.Profile.Decoded == 2 && coverage.Profile.Unsupported == 1 &&
+        std::wstring(etl.Availability(L"cpu_profile")) == L"partial" &&
+        etl.StagesJson(L"cpu_profile").find(L"\"layout_qualified\":\"partial\"") != std::wstring::npos,
+        "mixed record layouts retain first witness and partial qualification");
+    coverage.Switches.Count(etl_profile::Match::Decoded, 7);
+    check(std::wstring(etl.Availability(L"context_switch")) == L"available" && !etl.Records(L"other"),
+        "CPU layouts do not downgrade a decoded switch");
+    for (auto* field : { &coverage.EventsLost, &coverage.BuffersLost, &coverage.LossMarkers })
+    {
+        *field = 1;
+        check(std::wstring(etl.Availability(L"context_switch")) == L"partial", "recorded loss limits the file claim");
+        *field = 0;
+    }
+    for (const auto accounting : { etl_profile::BufferAccounting::Unavailable, etl_profile::BufferAccounting::Fewer,
+                                   etl_profile::BufferAccounting::More })
+    {
+        coverage.Accounting = accounting;
+        check(std::wstring(etl.Availability(L"context_switch")) == L"partial", "unqualified buffer totals limit both families");
+    }
+    check(!etl.Covers(L"execution", L"cpu_profile", L"other") && !etl.Covers(L"other", L"cpu_profile", L"etl") &&
+        !etl.Covers(L"execution", L"other", L"etl"), "saved probe cannot qualify neighboring contracts");
+
     RuntimeCapabilityProbe probe;
     check(available(&probe, L"native") == L"blocked_by_policy", "unsolicited native probe cannot grant availability");
     probe.NativeProbeAttempted = true;

@@ -54037,27 +54037,40 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
 {
     // Legacy commands accept different option grammars. A misplaced selector
     // must never be consumed as an ignored argument by one of those handlers.
+    const auto reject = [&](const std::wstring& mode, const wchar_t* reason, int code)
+    {
+        // A restricted launch cannot open a named ETL to exclude a writable
+        // hard-link alias. Preserve the file and return the policy exit code.
+        if (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_DISK)
+        {
+            for (int i = 1; i + 1 < argc; ++i)
+            {
+                if (_wcsicmp(argv[i], L"--probe-etl") == 0) { return code; }
+            }
+        }
+        return WriteLaunchDecision(mode, reason, code);
+    };
     bool selected = false;
     for (int i = 1; i < argc; ++i)
     {
         if (_wcsicmp(argv[i], L"--mode") == 0)
         {
-            if (i != 1) { return WriteLaunchDecision({}, L"mode_must_appear_once_and_first", 2); }
+            if (i != 1) { return reject({}, L"mode_must_appear_once_and_first", 2); }
             selected = true;
         }
         else if (_wcsnicmp(argv[i], L"--mode=", 7) == 0)
         {
-            return WriteLaunchDecision({}, L"mode_requires_a_separate_value", 2);
+            return reject({}, L"mode_requires_a_separate_value", 2);
         }
     }
     if (!selected) { return std::nullopt; }
-    if (argc < 3) { return WriteLaunchDecision({}, L"mode_required", 2); }
+    if (argc < 3) { return reject({}, L"mode_required", 2); }
     const auto mode = ToLower(argv[2]);
     if (mode != L"offline" && mode != L"observe")
     {
-        return WriteLaunchDecision({}, L"mode_unavailable", ERROR_ACCESS_DENIED);
+        return reject({}, L"mode_unavailable", ERROR_ACCESS_DENIED);
     }
-    if (argc < 4) { return WriteLaunchDecision(mode, L"operation_required", 2); }
+    if (argc < 4) { return reject(mode, L"operation_required", 2); }
     const auto operation = ToLower(argv[3]);
     if (argc == 4 && operation == L"--help") { return WriteLaunchDecision(mode, L"one_shot", 0); }
     if (argc == 4 && operation == L"--capabilities")
@@ -54073,13 +54086,13 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
     {
         if (argc != 6 || ToLower(argv[5]) != L"--allow-residency")
         {
-            return WriteLaunchDecision(mode, L"owned_probe_requires_explicit_residency_consent", ERROR_ACCESS_DENIED);
+            return reject(mode, L"owned_probe_requires_explicit_residency_consent", ERROR_ACCESS_DENIED);
         }
         const auto probe = ProbeOwnedProcessCapabilities();
         if (!WriteCapabilityJson(SourceCapabilitiesJson(mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT), &probe))) { return 3; }
         return probe.ProcessBytesMatched ? 0 : 1;
     }
-    return WriteLaunchDecision(mode, L"operation_outside_mode", ERROR_ACCESS_DENIED);
+    return reject(mode, L"operation_outside_mode", ERROR_ACCESS_DENIED);
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -54135,6 +54148,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"    observe also accepts --capabilities --probe --allow-residency (self only, 32 bytes)\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";
+        std::wcout << L"  KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>   check saved CPU and switch records\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
@@ -54164,9 +54178,13 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc >= 2 && ToLower(argv[1]) == L"--capabilities")
     {
+        if (std::any_of(argv + 2, argv + argc, [](const wchar_t* arg) { return _wcsicmp(arg, L"--probe-etl") == 0; }))
+        {
+            return RunEtlCapabilityProbe(std::vector<std::wstring>(argv + 2, argv + argc), mcpjson::Utf8ToWide(KN_LIVE_DBG_VERSION_TEXT));
+        }
         if (argc != 2 && !(argc == 3 && ToLower(argv[2]) == L"--probe"))
         {
-            std::wcerr << L"usage: KnLiveDbg.exe --capabilities [--probe]\n";
+            std::wcerr << L"usage: KnLiveDbg.exe --capabilities [--probe | --probe-etl <local.etl> --sha256 <digest>]\n";
             return 1;
         }
         if (argc == 3)

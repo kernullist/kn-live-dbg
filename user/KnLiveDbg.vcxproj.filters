@@ -507,6 +507,9 @@
     <ClInclude Include="EtlProfile.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SavedEtlCapability.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlProfileRecord.h">
       <Filter>Header Files</Filter>
     </ClInclude>

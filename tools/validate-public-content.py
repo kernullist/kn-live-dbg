@@ -104,7 +104,7 @@ def capture_jws_offset(text: str) -> int | None:
     return None
 
 
-ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
+ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
                    '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4', 'kn.etl_profile.v5', 'kn.etl_profile.v6', 'kn.etl_profile.v7', 'kn.etl_profile.v8',
@@ -119,6 +119,8 @@ ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, '"statement_file_sha256"', '"trusted_ke
 
 DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
+    ("observation", "decoded", "unsupported", "first_decoded_record"),
+    ("first_payload_bytes", "first_payload_sha256"),
     ("type_guid", "revision", "offset", "length", "sha256"),
     ("notify_type", "creator", "revision", "record_id"),
     ("bank", "status", "valid", "matches_stop_status"),
@@ -298,6 +300,11 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if re.search(r'(?im)(?:^|>)[ \t\r\n]*<(?:[\w.-]+:)?(?:Event|Provider)\b', text) and re.search(
                     r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})["']''', text):
                 add("private-whea-event")
+        if (not binary or view is not data) and ("saved_etl_probe" in text or "kn.etl_capability_probe.v1" in text):
+            # Outer scope and detached probe metadata can survive a truncated export.
+            marker = re.search(r'(?m)^[ \t]*(?:\{[^\r\n]*?)?"(?:scope"\s*:\s*"saved_etl_probe|schema"\s*:\s*"kn\.etl_capability_probe\.v1)"', text)
+            if marker:
+                add("private-runtime-probe", text.count("\n", 0, marker.start()) + 1)
         # Capture contents remain private even if the extension was changed.
         if text.lstrip().startswith("{"):
             try:

@@ -7,7 +7,7 @@
 #include "ReferenceArtifact.h"
 #include "EtlScheduleIntervals.h"
 #include "ArtifactOutput.h"
-#include "RuntimeCapabilities.h"
+#include "SourceCapabilities.h"
 
 #include <evntrace.h>
 #include <array>
@@ -167,13 +167,8 @@ namespace
         scan.history.Observe(point, witnesses);
     }
 
-    void WINAPI OnRecord(PEVENT_RECORD event)
+    void ObserveRecord(Scan& scan, PEVENT_RECORD event)
     {
-        auto& scan = *static_cast<Scan*>(event->UserContext);
-        if (scan.records == MaxRecords) { scan.budgetExceeded = true; return; }
-        ++scan.records;
-        const auto& h = event->EventHeader;
-        if (etl_profile::LossMarker(h)) { ++scan.lossMarkers; }
         if (scan.replaying) { ReplayRecord(*event, scan); return; }
         if (scan.options.settings) { scan.settings.Observe(*event, scan.records); }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
@@ -201,17 +196,90 @@ namespace
         }
     }
 
+    struct CapabilityFamily
+    {
+        EtlCapabilityRecords records;
+        // A CSwitch payload is 24 bytes. SampledProfile is 12 or 16 bytes.
+        std::array<uint8_t, sizeof(etl_profile::SwitchFields)> firstPayload{};
+
+        void Observe(const EVENT_RECORD& event, etl_profile::Match match, uint32_t ordinal)
+        {
+            if (!records.Decoded && match == etl_profile::Match::Decoded && event.UserDataLength <= firstPayload.size())
+            {
+                records.FirstPayloadBytes = event.UserDataLength;
+                std::memcpy(firstPayload.data(), event.UserData, records.FirstPayloadBytes);
+            }
+            records.Count(match, ordinal);
+        }
+
+        bool Save(EtlCapabilityRecords& result) const
+        {
+            result = records;
+            if (!result.Decoded) { return true; }
+            ContentHash hash;
+            if (!result.FirstPayloadBytes || !hash.Add(firstPayload.data(), result.FirstPayloadBytes)) { return false; }
+            result.FirstPayloadSha256 = hash.Finish();
+            return !result.FirstPayloadSha256.empty();
+        }
+    };
+
+    struct CapabilityScan : TraceCounts
+    {
+        CapabilityFamily profile, switches;
+    };
+
+    void ObserveRecord(CapabilityScan& scan, PEVENT_RECORD event)
+    {
+        scan.profile.Observe(*event, etl_profile::Decode(*event, nullptr), scan.records);
+        scan.switches.Observe(*event, etl_profile::DecodeSwitch(*event, nullptr), scan.records);
+    }
+
+    template<class State>
+    void WINAPI OnRecord(PEVENT_RECORD event)
+    {
+        auto& scan = *static_cast<State*>(event->UserContext);
+        if (scan.records == MaxRecords) { scan.budgetExceeded = true; return; }
+        ++scan.records;
+        if (etl_profile::LossMarker(event->EventHeader)) { ++scan.lossMarkers; }
+        ObserveRecord(scan, event);
+    }
+
+    template<class State>
     ULONG WINAPI OnBuffer(PEVENT_TRACE_LOGFILEW log)
     {
-        auto& scan = *static_cast<Scan*>(log->Context);
+        auto& scan = *static_cast<State*>(log->Context);
         ++scan.processedBuffers;
         return !scan.budgetExceeded;
     }
+
+    struct TraceResult
+    {
+        const wchar_t* failure = nullptr;
+        ULONG win32 = ERROR_SUCCESS;
+        bool sourceChanged = false;
+    };
 
     struct Trace
     {
         PROCESSTRACE_HANDLE handle = INVALID_PROCESSTRACE_HANDLE;
         ~Trace() { if (handle != INVALID_PROCESSTRACE_HANDLE) { CloseTrace(handle); } }
+
+        TraceResult OpenSingle(EVENT_TRACE_LOGFILEW& log)
+        {
+            handle = OpenTraceW(&log);
+            if (handle == INVALID_PROCESSTRACE_HANDLE) { return {L"open_trace_failed", GetLastError()}; }
+            if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return {L"segmented_source"}; }
+            return {};
+        }
+
+        TraceResult ProcessPinned(SchemaArtifact& source, const std::wstring& volumePath, const TraceCounts& scan)
+        {
+            const auto status = ProcessTrace(&handle, 1, nullptr, nullptr);
+            if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return {L"source_changed", 0, true}; }
+            if (scan.budgetExceeded) { return {L"record_budget_exceeded"}; }
+            if (status != ERROR_SUCCESS) { return {L"process_trace_failed", status}; }
+            return {};
+        }
     };
 
     bool OpenSource(const std::filesystem::path& path, symbol_artifacts::Directories& parents,
@@ -243,6 +311,13 @@ namespace
             if (!parents.HoldExisting(volumePath.substr(0, end), FILE_SHARE_READ)) { return false; }
         }
         return source.PathNamesFile(volumePath);
+    }
+
+    bool OpenTraceSource(const std::wstring& name, symbol_artifacts::Directories& parents, SchemaArtifact& source, std::wstring& volumePath)
+    {
+        std::filesystem::path path;
+        return symbol_artifacts::LocalRoot(name, &path) && parents.Pin(path.parent_path(), false) &&
+            OpenSource(path, parents, source, volumePath);
     }
 
     etl_profile::CaptureStatement ReadCaptureStatement(const Options& options, const SchemaArtifact& etl)
@@ -889,13 +964,14 @@ namespace
         return result + L"]}";
     }
 
-    EVENT_TRACE_LOGFILEW ConfigureLog(std::wstring& volumePath, Scan& scan)
+    template<class State>
+    EVENT_TRACE_LOGFILEW ConfigureLog(std::wstring& volumePath, State& scan)
     {
         EVENT_TRACE_LOGFILEW log{};
         log.LogFileName = volumePath.data();
         log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-        log.EventRecordCallback = OnRecord;
-        log.BufferCallback = OnBuffer;
+        log.EventRecordCallback = OnRecord<State>;
+        log.BufferCallback = OnBuffer<State>;
         log.Context = &scan;
         return log;
     }
@@ -928,12 +1004,10 @@ namespace
 
 static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
 {
-    std::filesystem::path path;
     symbol_artifacts::Directories parents;
     SchemaArtifact source;
     std::wstring volumePath;
-    if (!symbol_artifacts::LocalRoot(args[0], &path) || !parents.Pin(path.parent_path(), false) ||
-        !OpenSource(path, parents, source, volumePath))
+    if (!OpenTraceSource(args[0], parents, source, volumePath))
     {
         return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [&] { return Failure(scan.options, L"source_unavailable"); });
     }
@@ -959,9 +1033,8 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     }
     auto log = ConfigureLog(volumePath, scan);
     Trace trace;
-    trace.handle = OpenTraceW(&log);
-    if (trace.handle == INVALID_PROCESSTRACE_HANDLE) { return Failure(scan.options, L"open_trace_failed", source.Sha256, GetLastError()); }
-    if (log.LogfileHeader.LogFileMode & EVENT_TRACE_FILE_MODE_NEWFILE) { return Failure(scan.options, L"segmented_source", source.Sha256); }
+    const auto opened = trace.OpenSingle(log);
+    if (opened.failure) { return Failure(scan.options, opened.failure, source.Sha256, opened.win32); }
     if (scan.options.settings)
     {
         try { scan.settings.Prepare(); }
@@ -980,10 +1053,11 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         catch (const std::bad_alloc&)
         { return Failure(scan.options, (scan.options.images || scan.options.processes) ? L"evidence_index_unavailable" : L"thread_index_unavailable", source.Sha256); }
     }
-    const auto status = ProcessTrace(&trace.handle, 1, nullptr, nullptr);
-    if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
-    if (scan.budgetExceeded) { return Failure(scan.options, L"record_budget_exceeded", source.Sha256); }
-    if (status != ERROR_SUCCESS) { return Failure(scan.options, L"process_trace_failed", source.Sha256, status); }
+    const auto processed = trace.ProcessPinned(source, volumePath, scan);
+    if (processed.failure)
+    {
+        return Failure(scan.options, processed.failure, processed.sourceChanged ? std::wstring{} : source.Sha256, processed.win32);
+    }
     const auto accounting = etl_profile::AccountBuffers(log.LogfileHeader.LogFileMode, log.LogfileHeader.BuffersWritten, scan.processedBuffers);
     const bool partial = Partial(scan, accounting);
     if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
@@ -1064,6 +1138,78 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, bool switches)
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
         L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");
     return 2;
+}
+
+static void ProbeSavedEtl(const std::wstring& name, SavedEtlCapabilityProbe& probe)
+{
+    symbol_artifacts::Directories parents;
+    SchemaArtifact source;
+    std::wstring volumePath;
+    if (!OpenTraceSource(name, parents, source, volumePath)) { return; }
+    probe.SourceSha256 = source.Sha256;
+    probe.SourceBytes = source.Bytes();
+    if (probe.ExpectedSha256 != source.Sha256) { probe.Status = L"digest_mismatch"; return; }
+
+    CapabilityScan scan;
+    auto log = ConfigureLog(volumePath, scan);
+    Trace trace;
+    auto result = trace.OpenSingle(log);
+    probe.TraceOpened = trace.handle != INVALID_PROCESSTRACE_HANDLE;
+    if (!result.failure)
+    {
+        result = trace.ProcessPinned(source, volumePath, scan);
+        probe.SourceRevalidated = !result.sourceChanged;
+    }
+    if (result.failure)
+    {
+        probe.Status = result.failure;
+        if (result.win32) { probe.Win32Status = result.win32; }
+        return;
+    }
+    const auto& h = log.LogfileHeader;
+    EtlCapabilityCoverage coverage;
+    if (!scan.profile.Save(coverage.Profile) || !scan.switches.Save(coverage.Switches))
+    {
+        probe.Status = L"sample_hash_unavailable";
+        return;
+    }
+    coverage.RecordsSeen = scan.records;
+    coverage.BuffersWritten = h.BuffersWritten;
+    coverage.BuffersProcessed = scan.processedBuffers;
+    coverage.Accounting = etl_profile::AccountBuffers(h.LogFileMode, h.BuffersWritten, scan.processedBuffers);
+    coverage.EventsLost = h.EventsLost;
+    coverage.BuffersLost = h.BuffersLost;
+    coverage.LossMarkers = scan.lossMarkers;
+    probe.Win32Status = ERROR_SUCCESS;
+    probe.Status = coverage.HasGap() ? L"partial" : L"read";
+    probe.Coverage = std::move(coverage);
+}
+
+int RunEtlCapabilityProbe(const std::vector<std::wstring>& args, const std::wstring& binaryVersion)
+{
+    SavedEtlCapabilityProbe probe;
+    const auto selector = [](const std::wstring& arg) { return _wcsicmp(arg.c_str(), L"--probe-etl") == 0; };
+    if (args.size() != 4 || !selector(args[0]) || args[1].empty() || args[2] != L"--sha256" || !Digest(args[3], probe.ExpectedSha256))
+    {
+        const auto sink = GetStdHandle(STD_ERROR_HANDLE);
+        const bool disk = GetFileType(sink) == FILE_TYPE_DISK;
+        std::vector<DistinctArtifactInput> guards(disk ? std::count_if(args.begin(), args.end(), selector) : 0);
+        if (disk)
+        {
+            size_t guard = 0;
+            for (size_t i = 0; i + 1 < args.size(); ++i)
+            {
+                if (selector(args[i]) && !guards[guard++].Hold(sink, args[i + 1])) { return 2; }
+            }
+        }
+        std::wcerr << L"usage: KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>\n";
+        return 2;
+    }
+    return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[1], [&] {
+        ProbeSavedEtl(args[1], probe);
+        if (!WriteCapabilityJson(SourceCapabilitiesJson(binaryVersion, probe))) { return 2; }
+        return probe.Coverage && !probe.Coverage->HasGap() ? 0 : 1;
+    });
 }
 
 int RunEtlProfile(const std::vector<std::wstring>& args)

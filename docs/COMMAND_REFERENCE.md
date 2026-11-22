@@ -59,6 +59,35 @@ UTF-8, including localized status text. Native calls have no hard timeout.
 Runtime probe JSON contains private process/address metadata and is not a public
 support certificate. See [generated address/backend contracts](SUPPORT_MATRIX.md).
 
+To check what a saved Windows ETL contains, supply the file and its SHA-256 to
+the standalone probe. In this example, `case.etl.sha256` contains the 64 hex
+digits supplied with the capture. The probe reads the ETL before controller startup.
+
+```powershell
+$etl = (Get-Item -LiteralPath .\case.etl).FullName
+$pin = (Get-Content -LiteralPath .\case.etl.sha256 -Raw).Trim()
+$report = & .\x64\Release\KnLiveDbg.exe --capabilities --probe-etl $etl --sha256 $pin | ConvertFrom-Json
+$report.capabilities | Where-Object backend -eq etl | Select-Object operation, availability, record_evidence
+```
+
+In a `saved_etl_probe` report, `record_evidence` gives the decoded and unsupported
+counts and the first decoded event's one-based position among all records. Its
+payload length and SHA-256 identify the original bytes at that position.
+`available` applies to a record family in the supplied file. A family with
+unsupported layouts, missing records or a capture coverage gap reports `partial`.
+`no_matching_records_observed` means the reader reached the end without seeing
+that family. A failed pin or scan gives `unavailable` and null record evidence.
+The file hash identifies the bytes. Producer authenticity and the target
+environment still require independent evidence.
+
+The saved probe exits 0 for a stable scan with matching buffer totals and no
+reported loss, including a file containing neither family. Exit 1 covers a
+coverage gap or an unusable source. Exit 2 covers syntax and output errors,
+including a redirected output whose identity cannot be separated from the input.
+Restricted launches reject this named-file operation. A rejection with a named
+ETL returns its exit code silently when standard output points to disk, since
+checking a possible file alias would require opening a named input.
+
 `process_handles_acquired` and `process_handles_closed` count successful
 Windows calls during the self-probe. A failed close retains its acquisition
 ID and Win32 error in the timeline. `probe_handles_closed` requires equal

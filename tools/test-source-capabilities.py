@@ -255,6 +255,7 @@ def main():
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
+    assert "--capabilities --probe-etl <local.etl> --sha256 <digest>" in help_result.stdout
     assert "--schema create" in help_result.stdout and "--schema inspect" in help_result.stdout
     print(f"source capabilities passed: {len(keys)} contracts, {len(actual)} command routes")
 
