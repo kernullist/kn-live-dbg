@@ -1504,6 +1504,37 @@ if ($LASTEXITCODE -ne 0) { throw 'ETW reader build failed' }
 python -B tools/test-etl-handoff.py --package "$out\originals.zip" --sha256 $capture.package_sha256 --plan-sha256 $plan.plan_sha256 --exe $reader --oracle "$out\oracle.exe" --traceprocessor $adapter $adapterPin --check-marker-report --check-controls
 ```
 
+### Measure timer pending time at a thread join
+
+Run this example from the repository root in x64 Developer PowerShell.
+It compares two worker timer settings with the same fixed work, caller
+pause and observer schedule. Use a fresh output directory per study.
+
+```powershell
+$out = '.\.build\handoff-timer-example'
+New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+cl /nologo /std:c++17 /EHsc /O2 /W4 /WX /DUNICODE /D_UNICODE "/Fo:$out\recorder.obj" "/Fe:$out\recorder.exe" tools\etl-statement-capture.cpp
+if ($LASTEXITCODE -ne 0) { throw 'Recorder build failed' }
+$tool = 'tools/measure-etl-handoff.py'
+$recorder = (Get-Item "$out\recorder.exe").FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$recorderPin = (Get-FileHash -LiteralPath $recorder -Algorithm SHA256).Hash
+$readerPin = (Get-FileHash -LiteralPath $reader -Algorithm SHA256).Hash
+$plan = python -B $tool plan --observe-timer --pairs 4 --baseline-ms 2 --candidate-ms 180 --caller-delay-ms 30 --recorder-sha256 $recorderPin --exe-sha256 $readerPin --output "$out\plan.json" | ConvertFrom-Json
+$capture = python -B $tool capture --plan "$out\plan.json" --plan-sha256 $plan.plan_sha256 --recorder $recorder --output "$out\originals.zip" | ConvertFrom-Json
+$query = @('replay', '--package', "$out\originals.zip", '--sha256', $capture.package_sha256, '--plan-sha256', $plan.plan_sha256, '--exe', $reader)
+$receipt = python -B $tool @query --output "$out\report.json" | ConvertFrom-Json
+$report = Get-Content -LiteralPath "$out\report.json" -Raw | ConvertFrom-Json
+$report.timer_path_summary.changes.timer_pending
+python -B $tool @query --check-report $receipt.report_sha256
+```
+
+The receipt's `timer_path_pairs` counts pairs with enough evidence in
+both arms. The summary gives the lower and upper bounds on the median
+candidate-minus-baseline change in nanoseconds. The plan also accepts
+`--observe-scheduling` to measure the caller's off-CPU time in the same
+run. [Timer bounds and source events](TRACE_IMPORT.md#timer-signal-on-the-callers-join-path)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

@@ -724,6 +724,45 @@ Unavailable arms retain their places in the study. For older ten-event
 archives, `replay --join-path` uses the worker's last write and the
 successful join, with no probe observations. [Capture and replay](COMMAND_REFERENCE.md#identify-the-last-prerequisite-at-a-thread-join)
 
+### Timer signal on the caller's join path
+
+Register `--observe-timer` to measure how much of the caller's exposed
+dependency on the worker occurred while its one-shot timer was pending.
+In this mode the recorder creates a manual-reset timer. The worker arms
+it once, waits on it successfully and then exits. An independent thread
+can read the same handle without consuming the signal. Both study arms
+use the same probe schedule. [Windows waitable timers](https://learn.microsoft.com/en-us/windows/win32/sync/waitable-timer-objects)
+
+The first zero-time probe observes the unarmed timer before the caller
+releases the worker. The observer issues at most 40 probes and exits
+after its first successful one. Worker events 22 and 23 bracket the successful
+timer set. Each observer probe starts at event 24 and ends at 25 for
+a timeout or 26 for a signaled timer. Replay checks the activity,
+producer process, thread roles, sample count and original record order.
+A timeout sets a lower bound at its **Start** marker because the timer can
+signal before the observer writes its Stop. The successful probe's Stop
+and the worker's successful wait return each supply an upper bound.
+Cross-thread comparisons allow one QPC tick of uncertainty.
+[QPC ordering](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps#guidance-for-acquiring-time-stamps)
+
+In each `measurement.timer_path`, the three phase ranges start at the
+caller's join Start marker and end at worker termination.
+
+| Field | Portion of this interval |
+| --- | --- |
+| `before_timer_set_ticks` | Elapsed before the worker armed the timer. |
+| `timer_pending_ticks` | Elapsed while the armed timer had yet to signal. |
+| `after_timer_signal_ticks` | Elapsed after the signal while the worker still had to exit. |
+
+Each phase is clipped at caller arrival. If the worker had exited by
+then, all three ranges are zero. Each endpoint is bounded separately
+under the order set → signal → worker exit, so adding upper bounds can
+overstate the elapsed time. Probe spacing and delayed observer execution
+can widen a range. CPU residency and the worker's ready-to-run delay
+require separate scheduling evidence. Replay keeps the original markers
+and qualified join timings when timer evidence is incomplete.
+[Capture and replay](COMMAND_REFERENCE.md#measure-timer-pending-time-at-a-thread-join)
+
 ### Scheduler evidence at a thread join
 
 `plan --observe-scheduling` records how often Windows switched the caller

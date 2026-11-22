@@ -20,6 +20,7 @@ import etl_handoff as study
 import etl_handoff_markers as marker_rows
 import etl_handoff_scheduling as dispatch
 import etl_handoff_scheduling_checks as dispatch_checks
+import etl_handoff_timer_checks as timer_checks
 
 
 HERE = Path(__file__).resolve().parent
@@ -140,7 +141,7 @@ def independent_differences(report, arms):
 
 def independent(package, report, oracle, folder):
     cfg = report["plan"]
-    by_pair, paths, scheduling = {}, {}, {}
+    by_pair, paths, scheduling, timers = {}, {}, {}, {}
     with zipfile.ZipFile(package) as archive:
         for row in report["observations"]:
             slot, truth = row["selection"], row["workload"]
@@ -151,11 +152,15 @@ def independent(package, report, oracle, folder):
             events = sorted((e for group in groups.values() for e in group), key=lambda e: e["record_ordinal"])
             assert [r["event"] for r in row["marker_page"]["markers"]] == events
             assert footer["records_seen"] == row["marker_page"]["records_seen"]
+            core_events = events
+            if cfg.get("observe_timer"):
+                timers[slot["pair"], slot["role"]] = timer_checks.from_etl(events, row)
+                core_events = [e for e in events if e["task"] not in (10, 11)]
             if cfg.get("observe_scheduling"):
                 scheduling[slot["pair"], slot["role"]] = dispatch_checks.from_etl(oracle, path, row)
-                assert 16 <= len(events) <= 32
+                assert 16 <= len(core_events) <= 32
             else:
-                assert len(events) == (14 if "caller_delay_ms" in cfg else 10)
+                assert len(core_events) == (14 if "caller_delay_ms" in cfg else 10)
             assert footer["clock_type"] == 1 and footer["frequency"] == int(truth["frequency"])
             t = {e["event_id"]: int(e["raw_timestamp"]) for e in events}
             join, timer = (tuple(map(int, truth[k])) for k in ("join_call", "timer_call"))
@@ -182,6 +187,8 @@ def independent(package, report, oracle, folder):
                 paths[slot["pair"], slot["role"]] = independent_path(events, truth, row["measurement"])
     if scheduling:
         dispatch_checks.check_pairs(scheduling, report)
+    if timers:
+        timer_checks.pairs(report, timers)
     if paths:
         independent_differences(report, paths)
     def value(r):
@@ -337,6 +344,23 @@ def archive_controls(args, folder, replay, report):
         summary = result["join_path_summary"]
         assert summary["last_prerequisites"][result["observations"][0]["selection"]["role"]]["unavailable"] == 1
         assert summary["changes"]["exposed_worker"]["pairs"] == result["measured_pairs"]
+    if "timer_path_summary" in report:
+        assert receipt["timer_path_pairs"] == report["planned_pairs"]-1 and result["pairs"][0]["timer_path_change_ns"] is None
+
+        def absent_timer_signal(parts, outcomes):
+            descriptors = [struct.pack("<HBBBBHQ", eid, 1, 0, 4, 2, 11, 0) for eid in (26, 25)]
+            binary = parts["slot-01.etl"]
+            assert binary.count(descriptors[0]) == 1
+            parts["slot-01.etl"] = binary.replace(*descriptors)
+            outcomes[0]["source_sha256"] = hashlib.sha256(parts["slot-01.etl"]).hexdigest()
+        flags = repack(folder/"absent-timer-signal.zip", absent_timer_signal)
+        destination = folder/"absent-timer-signal.json"
+        partial = invoke([*flags, "--output", destination], 1)
+        changed = json.loads(destination.read_bytes())
+        assert partial["measured_pairs"] == report["planned_pairs"] == partial["timer_path_pairs"]+1
+        assert changed["observations"][0]["measurement"]["timer_path"] == dict(status="unqualified", reason="invalid_timer_probe_sequence")
+        assert changed["pairs"][0]["timer_path_change_ns"] is None and changed["changes"] == report["changes"]
+        assert invoke([*flags, "--check-report", pin(destination)], 1) == dict(partial, status="matched")
     assert invoke([*limited, "--check-report", receipt["report_sha256"]], 1)["status"] == "matched"
     if args.check_marker_report:
         sdk_args = ["--traceprocessor", *args.traceprocessor]
@@ -543,7 +567,8 @@ def main():
                 assert receipt["report_sha256"] == pin(dest) and receipt["traceprocessor_status"] == "matched"
                 assert invoke([*flags, "--check-report", pin(dest)], 0) == dict(receipt, status="matched")
                 checked = json.loads(dest.read_bytes())
-                assert checked["schema"] == "kn.etl_handoff_study.v4" and checked["traceprocessor"]["matched_markers"] == markers
+                assert checked["schema"] == ("kn.etl_handoff_study.v5" if report["plan"].get("observe_timer") else "kn.etl_handoff_study.v4")
+                assert checked["traceprocessor"]["matched_markers"] == markers
                 summary = checked["traceprocessor"]
                 assert receipt["traceprocessor_pairs"] == summary["measured_pairs"] == report["planned_pairs"]
                 assert summary["changes"] == {k: report["changes"][k] for k in marker_rows.PHASES}
@@ -579,6 +604,9 @@ def main():
         assert WINDOW["AUDIT"]["inspect"]("renamed.bin", args.package.read_bytes()[:100])[0]["rule"] == "private-benchmark-package"
         if args.check_controls:
             semantic_controls(report)
+            if "timer_path_summary" in report:
+                timer_checks.small_clocks()
+                timer_checks.evidence_controls(report, study.measure)
             if "join_path_summary" in report:
                 join_controls(report)
             if "scheduling_summary" in report:
@@ -599,6 +627,10 @@ def main():
             for part in (path, path["at_latest_signal"], *path["probes"], *row["workload"].get("join_probes", []),
                          report["join_path_summary"], report["join_path_summary"]["changes"],
                          report["join_path_summary"]["changes"]["exposed_worker"], report["join_path_summary"]["last_prerequisites"]["baseline"]):
+                WINDOW["private"](part)
+        if "timer_path_summary" in report:
+            timer = row["measurement"]["timer_path"]
+            for part in (timer, *timer["probes"], report["timer_path_summary"], report["timer_path_summary"]["changes"]):
                 WINDOW["private"](part)
         if args.recorder:
             acquisition_controls(args, folder)

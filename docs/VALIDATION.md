@@ -220,6 +220,40 @@ the correspondence and timing checks. The Windows ETW oracle covers
 handoff payloads. An exact context-switch timeline requires separate
 scheduler events. [Public fixture checks](../tools/test-traceprocessor-markers.py)
 
+## Timer signal during a thread join on 2026-11-23
+
+On Windows `10.0.28000`, the owned recorder completed 32 private ETW
+captures in 16 preregistered pairs. An independent Windows reader
+checked 1,110 original markers, including 211 zero-time timer probes.
+The table reports the change in elapsed time for which the timer was
+pending **after the caller reached its join**. Each row bounds the
+median paired change. All times in the table are milliseconds.
+
+| Worker timer, baseline → candidate | Caller pause | Pairs | Median change in timer pending time |
+| --- | ---: | ---: | ---: |
+| 2 → 180 | 30 | 4 | +136.48645 to +151.89150 |
+| 2 → 20 | 110 | 4 | 0 to 0 |
+| 85 → 85 | 0 | 4 | −20.13965 to +32.85670 |
+| 0 → 135, checked recorder | 10 | 2 | +89.89130 to +118.07375 |
+| 0 → 1000 | 0 | 2 | +959.81380 to +1009.22070 |
+
+All four exposed pairs showed an increase. In the second row both
+timers had signaled by caller arrival in every pair. With identical
+settings, all four paired ranges included zero. The equal-timer and
+checked runs also recorded per-thread dispatch counts and caller wait
+chains. Microsoft TraceProcessor independently matched all 352 markers
+in the equal-timer runs to table rows.
+
+Release and runtime-checked x64 builds passed with MSVC warnings treated
+as errors. Replay rejected a changed signal descriptor in the original
+ETL while retaining the arm's join timing. An exhaustive four-tick
+model checked ordered set, signal and exit bounds, including simultaneous
+events. Replay reproduced the published report bytes from one archived
+study of each earlier schema version, v1 through v4. These measurements
+describe the instrumented caller and worker.
+Exact dispatcher transitions and application-wide latency remain open.
+[Reproduce the study](COMMAND_REFERENCE.md#measure-timer-pending-time-at-a-thread-join) · [Independent checks](../tools/etl_handoff_timer_checks.py)
+
 ## Scheduling during a thread join on 2026-11-22
 
 On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix

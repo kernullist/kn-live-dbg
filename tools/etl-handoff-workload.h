@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include "etl-handoff-dispatch.h"
+#include "etl-handoff-timer.h"
 
 namespace handoff
 {
@@ -18,7 +19,7 @@ namespace handoff
     {
         GUID activity{};
         uint32_t seed = 0, steps = 0, delayMs = 0, callerDelayMs = 0;
-        bool probeJoin = false, observeScheduling = false;
+        bool probeJoin = false, observeScheduling = false, observeTimer = false;
 
         static bool Number(const wchar_t* input, uint32_t maximum, uint32_t& value)
         {
@@ -90,6 +91,7 @@ namespace handoff
         Bracket joinCall{}, timerCall{}, callerDelayCall{};
         std::array<Bracket, 2> probeCalls{};
         std::array<DWORD, 2> probeResults{};
+        DWORD timerObserverTid{}, timerSamples{};
 
         ULONG Mark(size_t index, USHORT eventId = 0, const DispatchEvent* data = nullptr)
         {
@@ -132,7 +134,17 @@ namespace handoff
             {
                 LARGE_INTEGER due{};
                 due.QuadPart = trial.settings.delayMs ? -10000LL * trial.settings.delayMs : -1;
+                if (trial.settings.observeTimer)
+                {
+                    status = TimerMarker(trial.registration, trial.settings.activity, 22);
+                    if (status) { return status; }
+                }
                 if (!SetWaitableTimer(trial.timer, &due, 0, nullptr, nullptr, FALSE)) { return GetLastError(); }
+                if (trial.settings.observeTimer)
+                {
+                    status = TimerMarker(trial.registration, trial.settings.activity, 23);
+                    if (status) { return status; }
+                }
                 if (trial.settings.observeScheduling) { profile.Begin(); }
                 trial.timerCall.begin = Tick();
                 status = Wait(trial.timer);
@@ -155,7 +167,7 @@ namespace handoff
             callerTid = GetCurrentThreadId();
             Handle release(CreateEventW(nullptr, TRUE, FALSE, nullptr));
             if (!release.value) { return GetLastError(); }
-            Handle alarm(CreateWaitableTimerW(nullptr, FALSE, nullptr));
+            Handle alarm(CreateWaitableTimerW(nullptr, settings.observeTimer, nullptr));
             if (!alarm.value) { return GetLastError(); }
             go = release.value;
             timer = alarm.value;
@@ -163,8 +175,13 @@ namespace handoff
             if (!worker.value) { return GetLastError(); }
 
             JoinObserver observer;
+            TimerObserver timerObserver;
             DispatchWindow profile;
             ULONG status = settings.observeScheduling ? observer.Start(provider, settings.activity, callerTid, worker.value) : ERROR_SUCCESS;
+            if (!status && settings.observeTimer)
+            {
+                status = timerObserver.Start(provider, settings.activity, timer, worker.value);
+            }
             if (!status) { status = Mark(0); }
             if (!SetEvent(go) && !status) { status = GetLastError(); }
             if (!status) { status = Mark(2); }
@@ -196,12 +213,18 @@ namespace handoff
                 !GetThreadTimes(worker.value, &created, &exited, &kernel, &user))) { status = GetLastError(); }
             if (!status) { workerCreated = Time(created); workerExited = Time(exited); }
             if (settings.observeScheduling) { const auto finished = observer.Finish(); if (!status) { status = finished; } }
+            if (settings.observeTimer)
+            {
+                const auto finished = timerObserver.Finish();
+                if (!status) { status = finished; }
+                if (!finished) { timerObserverTid = timerObserver.tid; timerSamples = timerObserver.samples; }
+            }
             return status ? status : completion;
         }
 
         void Json(const std::wstring& activity) const
         {
-            std::wcout << L",\"schema\":\"kn.owned_etl_handoff." << (settings.observeScheduling ? L"v3" : settings.probeJoin ? L"v2" : L"v1") << L"\",\"activity_id\":\"" << activity
+            std::wcout << L",\"schema\":\"kn.owned_etl_handoff." << (settings.observeTimer ? L"v4" : settings.observeScheduling ? L"v3" : settings.probeJoin ? L"v2" : L"v1") << L"\",\"activity_id\":\"" << activity
                 << L"\",\"seed\":" << settings.seed << L",\"steps\":" << settings.steps << L",\"delay_ms\":" << settings.delayMs
                 << L",\"caller_result\":" << callerResult << L",\"worker_result\":" << workerResult
                 << L",\"pid\":" << GetCurrentProcessId() << L",\"process_created\":\"" << processCreated
@@ -224,6 +247,10 @@ namespace handoff
                     std::wcout << L'}';
                 }
                 std::wcout << L']';
+            }
+            if (settings.observeTimer)
+            {
+                std::wcout << L",\"timer_observer_tid\":" << timerObserverTid << L",\"timer_probe_count\":" << timerSamples;
             }
         }
     };
