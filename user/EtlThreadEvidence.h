@@ -107,17 +107,17 @@ namespace etl_profile
             }
         }
 
-        ThreadPair Lookup(const Sample& sample, bool comparableClock, bool captureGap) const
+        ThreadPair Lookup(uint32_t tid, uint32_t record, int64_t tick, bool comparableClock, bool captureGap) const
         {
             ThreadPair pair;
             if (!Complete()) { pair.relation = L"index_limit"; return pair; }
             // TID zero is shared by per-processor idle contexts.
-            if (sample.tid == 0 || sample.tid == UINT32_MAX) { pair.relation = L"unusable_tid"; return pair; }
-            const auto next = std::lower_bound(events.begin(), events.end(), sample, [](const ThreadEvent& e, const Sample& s) {
-                return e.tid == s.tid ? e.record < s.record : e.tid < s.tid;
+            if (tid == 0 || tid == UINT32_MAX) { pair.relation = L"unusable_tid"; return pair; }
+            const auto next = std::lower_bound(events.begin(), events.end(), record, [tid](const ThreadEvent& e, uint32_t r) {
+                return e.tid == tid ? e.record < r : e.tid < tid;
             });
-            if (next != events.end() && next->tid == sample.tid) { pair.after = &*next; }
-            if (next != events.begin() && (next - 1)->tid == sample.tid) { pair.before = &*(next - 1); }
+            if (next != events.end() && next->tid == tid) { pair.after = &*next; }
+            if (next != events.begin() && (next - 1)->tid == tid) { pair.before = &*(next - 1); }
             if (!pair.before && !pair.after) { return pair; }
             if (!pair.before || !pair.after) { pair.relation = L"one_boundary"; return pair; }
             if (!Opening(pair.before->opcode) || Opening(pair.after->opcode))
@@ -126,12 +126,17 @@ namespace etl_profile
             { pair.relation = L"pid_conflict"; return pair; }
             if (pair.before->transitionConflict) { pair.relation = L"conflicting_transitions"; return pair; }
             if (!comparableClock || pair.before->clockConflict ||
-                !(pair.before->tick < sample.timestamp && sample.timestamp < pair.after->tick))
+                !(pair.before->tick < tick && tick < pair.after->tick))
             { pair.relation = L"clock_unqualified"; return pair; }
             if (captureGap || unsupported) { pair.relation = L"coverage_unqualified"; return pair; }
             pair.relation = pair.before->opcode == 1 && pair.after->opcode == 2 ? L"start_end" : L"rundown_bracket";
             pair.pairedPid = true;
             return pair;
+        }
+
+        ThreadPair Lookup(const Sample& sample, bool comparableClock, bool captureGap) const
+        {
+            return Lookup(sample.tid, sample.record, sample.timestamp, comparableClock, captureGap);
         }
     };
 }

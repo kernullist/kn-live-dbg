@@ -485,6 +485,38 @@ statement about the ETL. The capability probe reports the first decoded
 payload's digest and extent. Keep the trace, pages and test-reader output
 private. [CLI example](COMMAND_REFERENCE.md#inspect-hard-page-faults-from-a-saved-etl)
 
+### Scheduling during a hard page fault
+
+`--schedule-of N` selects one decoded fault by its one-based ordinal and
+returns a `kn.etl_hard_faults.v2` page. The reader reopens the pinned
+file to find switches for the thread named in the fault payload. The
+surrounding classic Thread v3 start/end or rundown records must agree on the
+thread ID, process ID and logger. Both the fault window and each contributing
+switch pair must fit strictly inside that bracket. A rundown bracket supplies
+a file-local association. The original source and event ordinals identify
+the witnesses. [Windows hard fault fields](https://learn.microsoft.com/en-us/windows/win32/etw/pagefault-hardfault) · [Context switches](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch)
+
+`fault_schedule.status` is `covered` when consecutive switch intervals
+cover the QPC fault window exactly once. The two totals then sum to
+`elapsed_qpc_ticks`. Each interval identifies its original enclosing
+switches and clips its duration to the fault window. An off-CPU interval
+also gives the outgoing thread's recorded state and wait reason. When a
+qualified dispatchable ReadyThread event occurs between the switches, the
+interval reports how many of the overlapping ticks fell before and after
+that event. Missing or ambiguous readiness leaves this split null while
+preserving a qualified off-CPU interval. [Windows ReadyThread fields](https://learn.microsoft.com/en-us/windows/win32/etw/readythread)
+
+Missing switches or lifetime records, incompatible loggers, clock conflicts,
+loss and incomplete switch coverage leave the full-window totals null. The
+reader retains up to 65,536 thread boundary records and 128 intersecting
+switch intervals for the selected fault. A limit leaves the reason visible
+and withholds the totals. A zero-duration fault has no schedulable interval.
+The page's top-level status describes the ETL read. A selector beyond the
+observed faults returns exit 1 with `fault_not_observed` and `source_status`.
+An observed overlap measures thread scheduling during a fault. Disk-request
+identity, the cause of an off-CPU interval and application critical-path
+impact still require separate evidence.
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

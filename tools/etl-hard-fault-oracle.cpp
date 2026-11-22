@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "tdh.lib")
@@ -16,13 +17,58 @@
 namespace
 {
     constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
-    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; };
+    constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
+    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false; };
+
+    template<typename T>
+    bool Property(PEVENT_RECORD e, Counts& counts, PCWSTR name, T& value)
+    {
+        PROPERTY_DATA_DESCRIPTOR field{};
+        field.PropertyName = reinterpret_cast<ULONGLONG>(name);
+        field.ArrayIndex = ULONG_MAX;
+        ULONG size = 0;
+        counts.error = TdhGetPropertySize(e, 0, nullptr, 1, &field, &size);
+        if (!counts.error && size != sizeof(T)) { counts.error = ERROR_INVALID_DATA; }
+        if (!counts.error) { counts.error = TdhGetProperty(e, 0, nullptr, 1, &field, size, reinterpret_cast<PBYTE>(&value)); }
+        return counts.error == ERROR_SUCCESS;
+    }
+
+    void Scheduler(PEVENT_RECORD e, Counts& counts)
+    {
+        const auto& h = e->EventHeader;
+        const auto op = h.EventDescriptor.Opcode, version = h.EventDescriptor.Version;
+        uint32_t tid = 0, other = 0;
+        if (op == 36 && version >= 2 && version <= 4)
+        {
+            int8_t state = 0, reason = 0;
+            if (!Property(e, counts, L"NewThreadId", tid) || !Property(e, counts, L"OldThreadId", other) ||
+                !Property(e, counts, L"OldThreadState", state) || !Property(e, counts, L"OldThreadWaitReason", reason)) { return; }
+            std::printf("{\"new_thread_id\":%u,\"old_thread_id\":%u,\"old_state\":%d,\"old_wait_reason\":%d", tid, other, state, reason);
+        }
+        else if (op == 50 && version == 2)
+        {
+            uint8_t flags = 0;
+            if (!Property(e, counts, L"TThreadId", tid) || !Property(e, counts, L"Flag", flags)) { return; }
+            std::printf("{\"payload_tid\":%u,\"ready_flags\":%u", tid, static_cast<unsigned>(flags));
+        }
+        else if (op >= 1 && op <= 4 && version == 3)
+        {
+            if (!Property(e, counts, L"TThreadId", tid) || !Property(e, counts, L"ProcessId", other)) { return; }
+            std::printf("{\"payload_tid\":%u,\"payload_pid\":%u", tid, other);
+        }
+        else { return; }
+        std::printf(",\"record_ordinal\":%u,\"raw_timestamp\":\"%lld\",\"cpu\":%u,\"logger_id\":%u,\"opcode\":%u,\"version\":%u}\n",
+            counts.records, h.TimeStamp.QuadPart, static_cast<unsigned>(GetEventProcessorIndex(e)),
+            static_cast<unsigned>(e->BufferContext.LoggerId), static_cast<unsigned>(op), static_cast<unsigned>(version));
+    }
 
     void WINAPI Observe(PEVENT_RECORD event)
     {
         auto& counts = *static_cast<Counts*>(event->UserContext);
         ++counts.records;
         const auto& h = event->EventHeader;
+        if (!counts.error && counts.scheduler && h.EventDescriptor.Id == 0 && IsEqualGUID(h.ProviderId, Thread))
+        { Scheduler(event, counts); return; }
         if (counts.error || !IsEqualGUID(h.ProviderId, PageFault) || h.EventDescriptor.Id != 0 ||
             h.EventDescriptor.Opcode != 32 || h.EventDescriptor.Version != 2) { return; }
         constexpr PCWSTR names[] = {L"InitialTime", L"ReadOffset", L"VirtualAddress", L"FileObject", L"TThreadId", L"ByteCount"};
@@ -67,8 +113,10 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 2 || GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
+    if ((argc != 2 && (argc != 3 || std::wcscmp(argv[2], L"--scheduler") != 0)) ||
+        GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
+    counts.scheduler = argc == 3;
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = argv[1];
     log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;

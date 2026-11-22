@@ -8,7 +8,7 @@
 #include "etl-capture-settings-selftest.h"
 #include "etl-clr-evidence-selftest.h"
 #include "etl-disk-io-selftest.h"
-#include "../user/EtlHardFault.h"
+#include "../user/EtlFaultSchedule.h"
 
 #include <array>
 
@@ -767,12 +767,107 @@ static bool CheckSchedulerScopes()
     return IsSpan(AssessSpan(duplicate, b, earlier, true, true, false), L"thread_transition_conflict");
 }
 
+static bool CheckFaultSchedule()
+{
+    using namespace etl_profile;
+    HardFault fault{};
+    fault.faultingTid = 42; fault.loggerId = 7; fault.record = 7;
+    fault.initialTime = 110; fault.timestamp = 350;
+    ThreadIndex index;
+    index.events = {{1, 12, 42, 80, 1}, {10, 12, 42, 500, 2}, {12, 88, 42, 510, 1}, {15, 88, 42, 600, 2}};
+    for (auto& boundary : index.events) { boundary.logger = 7; }
+    index.decoded = 4;
+    index.Sort();
+    const auto pair = FaultThreadPair(index, fault, true, false);
+    if (!pair.pairedPid || pair.before->pid != 12 || pair.after->record != 10) { return false; }
+    ScheduleHistory history;
+    history.Prepare(2, fault.faultingTid);
+    FaultSchedule schedule;
+    schedule.Prepare(true);
+    schedule.Observe(history, SwitchAt(2, 100, 0, 11, 42), fault);
+    schedule.Observe(history, SwitchAt(3, 180, 0, 42, 11), fault);
+    std::array<uint8_t, 8> payload{42, 0, 0, 0, 0, 0, 0, 0};
+    auto ready = SchedulerRecord(payload.data(), 8, 50, 2, 220);
+    history.OtherThreadEvent(ready, 5);
+    schedule.Observe(history, SwitchAt(6, 300, 1, 25, 42), fault);
+    history.ObserveClock(fault.timestamp);
+    schedule.Observe(history, SwitchAt(8, 410, 1, 42, 25), fault);
+    const auto whole = schedule.Summarize(history, fault, pair, false);
+    if (!whole.measured || whole.running != 120 || whole.offCpu != 120 || schedule.slices.size() != 3 ||
+        schedule.slices[1].witnesses.ready.last.at.record != 5) { return false; }
+    auto shorter = schedule.slices[1];
+    if (shorter.ReadyPivot() != 220) { return false; }
+    shorter.endTick = 210;
+    if (shorter.ReadyPivot() != 210) { return false; }
+    shorter.beginTick = 225; shorter.endTick = 230;
+    if (shorter.ReadyPivot() != 225) { return false; }
+    auto check = [&](const wchar_t* why, const HardFault& query, bool gap = false)
+    {
+        const auto bracket = FaultThreadPair(index, query, schedule.qpc, gap);
+        const auto p = schedule.Summarize(history, query, bracket, gap);
+        return !p.measured && !p.running && !p.offCpu && std::wstring_view(p.status) == why;
+    };
+    auto reused = fault;
+    reused.record = 14; reused.timestamp = 550;
+    if (std::wstring_view(FaultThreadPair(index, reused, true, false).relation) != L"start_outside_bracket" ||
+        !check(L"thread_bracket_unqualified", reused) || !check(L"coverage_unqualified", fault, true)) { return false; }
+    ++index.decoded;
+    if (!check(L"thread_bracket_unqualified", fault)) { return false; }
+    --index.decoded;
+    index.events[0].tick = 105; // Fault starts in the bracket, but its first switch does not.
+    if (!check(L"switch_outside_bracket", fault)) { return false; }
+    index.events[0].tick = 80;
+    index.events[0].mixedLoggers = true;
+    if (!check(L"thread_bracket_unqualified", fault)) { return false; }
+    index.events[0].mixedLoggers = false;
+    ++schedule.unsupportedSwitches;
+    if (!check(L"coverage_unqualified", fault)) { return false; }
+    --schedule.unsupportedSwitches;
+    auto original = history;
+    history.unknownSwitchTid = true;
+    if (!check(L"coverage_unqualified", fault)) { return false; }
+    history = original;
+    ++history.unsupportedBoundaries;
+    if (!check(L"coverage_unqualified", fault)) { return false; }
+    history = original;
+    ++history.logger;
+    if (!check(L"scheduler_scope_unqualified", fault)) { return false; }
+    history = original;
+    history.ObserveClock(1);
+    if (!check(L"clock_unqualified", fault)) { return false; }
+    history = original;
+    history.Observe(SwitchAt(9, 430, 1, 899, 12), nullptr);
+    if (!check(L"cpu_history_conflict", fault)) { return false; }
+    history = original;
+    reused = fault; reused.timestamp = reused.initialTime;
+    if (!check(L"zero_duration", reused)) { return false; }
+    --reused.timestamp;
+    if (!check(L"invalid_fault_interval", reused)) { return false; }
+    reused = fault; reused.faultingTid = UINT32_MAX;
+    if (!check(L"unusable_tid", reused)) { return false; }
+    schedule.qpc = false;
+    if (!check(L"clock_unqualified", fault)) { return false; }
+    schedule.qpc = true;
+    schedule.slices.pop_back(); --schedule.candidates;
+    if (!check(L"incomplete_switch_coverage", fault)) { return false; }
+
+    // Feed the real retention path one more positive intersection than fits.
+    fault.initialTime = 100; fault.timestamp = 100 + MaxPageRows + 1; fault.record = 300;
+    index.events = {{1, 12, 42, 90, 1}, {500, 12, 42, 510, 2}};
+    index.events[0].logger = index.events[1].logger = 7; index.decoded = 2; index.Sort();
+    schedule = {}; schedule.Prepare(true);
+    history = {}; history.Prepare(1, fault.faultingTid);
+    for (uint32_t i = 0; i <= MaxPageRows + 1; ++i)
+    { schedule.Observe(history, SwitchAt(i + 2, 100 + i, 0, i % 2 ? 42 : 11, i % 2 ? 11 : 42), fault); }
+    return schedule.slices.size() == MaxPageRows && schedule.candidates == MaxPageRows + 1 && check(L"interval_limit", fault);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckFaultSchedule() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

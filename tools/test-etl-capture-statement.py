@@ -138,6 +138,13 @@ def check(exe, signer, etl, claims, folder, expected_records=None, reference=Non
         assert bound["claimed_etl_sha256"] == source_pin and bound["claimed_etl_bytes"] == claims["etl_bytes"]
         assert bound["statement_file_sha256"] == sha(jws.read_bytes()) and bound["trusted_key_sha256"] == sha(bytes.fromhex(key))
         assert bound["claims"] == {k: claims[k] for k in ("role", *CONTEXT)}
+        if verb == "--etl-hard-faults" and report["hard_faults"]:
+            selected = [exe, verb, etl, "--sha256", source_pin, "--schedule-of", "1"]
+            schedule_pin = sha(run(selected, rc))
+            receipt = json.loads(run([*selected, "--check-page", schedule_pin, *signature_args], rc))
+            assert receipt["status"] == "matched" and receipt["requested_fault_ordinal"] == 1
+            assert receipt["source_status"] == proof["source_status"] and receipt["page_bytes_match"]
+            assert receipt["capture_statement"] == bound
         for part in (bound, bound["claims"], claims):
             for enc in ("utf-8", "utf-16-le", "utf-16-be"):
                 fragment = ("log\n" + json.dumps(dict(reversed(list(part.items()))))[:-1]).encode(enc)

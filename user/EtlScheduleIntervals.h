@@ -136,11 +136,16 @@ namespace etl_profile
             lastTick = tick;
         }
 
-        void Prepare(uint32_t processors, const SwitchEvent* page, size_t used)
+        void PrepareProcessors(uint32_t processors)
         {
             // BufferContext's processor index is 16 bits.
             if (processors && processors <= 65536) { cpus.resize(processors); }
             else { ambiguousScope = true; }
+        }
+
+        void Prepare(uint32_t processors, const SwitchEvent* page, size_t used)
+        {
+            PrepareProcessors(processors);
             std::vector<uint32_t> ids;
             ids.reserve(2 * used);
             for (size_t i = 0; i < used; ++i)
@@ -154,6 +159,12 @@ namespace etl_profile
             ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
             threads.reserve(ids.size());
             for (const auto tid : ids) { threads.push_back({tid, {}, {}}); }
+        }
+
+        void Prepare(uint32_t processors, uint32_t tid)
+        {
+            PrepareProcessors(processors);
+            if (tid && tid != UINT32_MAX) { threads.push_back({tid, {}, {}}); }
         }
 
         auto Find(uint32_t tid) const

@@ -7,6 +7,42 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Scheduling during hard page faults on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`eaa1f2102659`) and a separate Windows TDH reader agreed on all 17 hard
+faults in the public TaskbarLatency recording (ETL SHA-256 prefix
+`8a59fa63479e`). Windows `tracerpt` counted 1,093,447 records and
+62,025 context switches. TDH read the scheduler properties by name and
+found 33,493 ReadyThread records and 5,086 thread boundary records.
+[Pinned recording](https://github.com/randomascii/blogstuff/blob/138aae8b20e78183894612a1a7e98e2c8f293b29/TaskbarLatency/2019-09-08_22-34-56%20explorer%20jumplist%20delays.etl)
+
+The 17 faults named 10 payload thread IDs. Every header named a different
+thread from its payload. All selected windows lay inside matching rundown
+brackets. The comparison checked the QPC endpoints and original ordinals
+of each switch, the recorded CPU and the outgoing state and wait reason.
+Across those windows it found 56 on-CPU and 39 off-CPU intervals. Of the
+latter, 23 had a dispatchable ReadyThread witness and 16 had no readiness
+record. Each pair of residency totals equaled the corresponding fault
+duration. Application critical-path impact remains unverified.
+
+Copies with system time, CPU-cycle time, zero QPC frequency or declared
+buffer loss withheld the scheduling totals. A trace with faults and no
+switches returned `no_switch_records`. Selecting an absent fault retained
+the source's full or partial read status. Owned record tests exercised
+TID reuse, conflicting processor history, a switch outside the lifetime,
+readiness on either side of the clipped window, and 129 intervals at the
+128-interval limit. The regular tests and the MSVC `/RTC1` record checks
+passed. The MSVC AddressSanitizer build stopped in runtime interception
+before the first record test.
+
+Signed archive-witness replay matched both a complete file and a
+one-byte-short file with a partial read. Six previously saved pages across
+the hard-fault, switch, disk and CPU readers reproduced their original
+bytes. Compile the TDH reader as described below and run the comparison
+with `--exe`, `--oracle`, `--etl`, `--sha256` and `--check-controls`.
+[Comparison and clock controls](../tools/test-etl-fault-schedule.py) · [Windows TDH reader](../tools/etl-hard-fault-oracle.cpp)
+
 ## Saved hard page fault timing on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix

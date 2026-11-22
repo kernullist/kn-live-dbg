@@ -3,12 +3,11 @@
 #include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "EtlDiskIo.h"
-#include "EtlHardFault.h"
+#include "EtlFaultSchedule.h"
 #include "EtlCaptureStatement.h"
 #include "EtlClrEvidence.h"
 #include "EtlReferenceImage.h"
 #include "ReferenceArtifact.h"
-#include "EtlScheduleIntervals.h"
 #include "ArtifactOutput.h"
 #include "SourceCapabilities.h"
 
@@ -55,6 +54,7 @@ namespace
         bool threads = false, images = false, processes = false;
         bool intervals = false, haveTid = false, builds = false, settings = false, clr = false;
         uint32_t tid = 0;
+        uint32_t scheduleOf = 0;
         bool Switches() const { return family == Family::Switches; }
         bool DiskIo() const { return family == Family::DiskIo; }
         bool HardFaults() const { return family == Family::HardFaults; }
@@ -64,7 +64,7 @@ namespace
         const wchar_t* Prefix() const
         {
             if (DiskIo()) { return L"{\"schema\":\"kn.etl_disk_io.v1\",\"status\":"; }
-            if (HardFaults()) { return L"{\"schema\":\"kn.etl_hard_faults.v1\",\"status\":"; }
+            if (HardFaults()) { return scheduleOf ? L"{\"schema\":\"kn.etl_hard_faults.v2\",\"status\":" : L"{\"schema\":\"kn.etl_hard_faults.v1\",\"status\":"; }
             if (clr) { return L"{\"schema\":\"kn.etl_profile.v8\",\"status\":"; }
             if (settings) { return Switches() ? L"{\"schema\":\"kn.etl_switches.v3\",\"status\":" : L"{\"schema\":\"kn.etl_profile.v7\",\"status\":"; }
             if (WithIntervals()) { return L"{\"schema\":\"kn.etl_switches.v2\",\"status\":"; }
@@ -132,8 +132,18 @@ namespace
             }
             else if (args[i] == L"--thread-id" && options.Switches() && !options.haveTid && Decimal(args[i + 1], UINT32_MAX, options.tid))
             { options.haveTid = true; }
+            else if (args[i] == L"--schedule-of" && options.HardFaults() && !options.scheduleOf)
+            {
+                if (!Decimal(args[i + 1], MaxRecords, options.scheduleOf) || !options.scheduleOf) { return false; }
+            }
             else { return false; }
             ++i;
+        }
+        if (options.scheduleOf)
+        {
+            if (haveAfter || haveLimit) { return false; }
+            options.after = options.scheduleOf - 1;
+            options.limit = 1;
         }
         if (options.builds || !options.referencePath.empty()) { options.images = true; options.processes = true; }
         if (options.clr) { options.processes = true; }
@@ -160,6 +170,7 @@ namespace
         std::array<etl_profile::DiskTotals, 3> diskTotals{};
         std::array<etl_profile::DiskEvent, MaxPage> diskPage{};
         etl_profile::HardFaultTotals faultTotals;
+        etl_profile::FaultSchedule faultSchedule;
         std::array<etl_profile::HardFault, MaxPage> faultPage{};
         std::array<Sample, MaxPage> page{};
         std::array<etl_profile::SwitchEvent, MaxPage> switchPage{};
@@ -171,6 +182,28 @@ namespace
 
     void ReplayRecord(const EVENT_RECORD& event, Scan& scan)
     {
+        const bool faultQuery = scan.options.scheduleOf != 0;
+        if (faultQuery && IsEqualGUID(event.EventHeader.ProviderId, etl_profile::PageFaultProvider))
+        {
+            etl_profile::HardFault row{};
+            const auto match = etl_profile::DecodeHardFault(event, &row);
+            if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
+            if (match != etl_profile::Match::Decoded) { return; }
+            scan.history.ObserveClock(row.timestamp);
+            if (++scan.decoded == scan.options.scheduleOf)
+            {
+                const auto& first = scan.faultPage[0];
+                scan.replayMismatch |= first.record != scan.records || first.timestamp != row.timestamp ||
+                    first.cpu != row.cpu || first.flags != row.flags || first.loggerId != row.loggerId ||
+                    first.width != row.width || first.headerTid != row.headerTid || first.headerPid != row.headerPid ||
+                    first.keyword != row.keyword || first.level != row.level || first.channel != row.channel ||
+                    first.task != row.task || first.extendedItems != row.extendedItems || first.stackItems != row.stackItems ||
+                    first.initialTime != row.initialTime || first.readOffset != row.readOffset ||
+                    first.faultingTid != row.faultingTid || first.byteCount != row.byteCount;
+                ++scan.replayedRows;
+            }
+            return;
+        }
         if (!IsEqualGUID(event.EventHeader.ProviderId, etl_profile::ThreadProvider)) { return; }
         if (event.EventHeader.EventDescriptor.Opcode != 36)
         {
@@ -178,8 +211,18 @@ namespace
             return;
         }
         etl_profile::SwitchEvent point{};
-        if (etl_profile::DecodeSwitch(event, &point) != etl_profile::Match::Decoded) { ++scan.unsupported; return; }
+        if (etl_profile::DecodeSwitch(event, &point) != etl_profile::Match::Decoded)
+        {
+            if (faultQuery) { ++scan.faultSchedule.unsupportedSwitches; } else { ++scan.unsupported; }
+            return;
+        }
         point.record = scan.records;
+        if (faultQuery)
+        {
+            point.ordinal = ++scan.faultSchedule.switches;
+            scan.faultSchedule.Observe(scan.history, point, scan.faultPage[0]);
+            return;
+        }
         point.ordinal = ++scan.decoded;
         etl_profile::IntervalWitnesses* witnesses = nullptr;
         if (scan.replayedRows < scan.used && scan.switchPage[scan.replayedRows].record == point.record)
@@ -195,6 +238,7 @@ namespace
 
     void ObserveRecord(Scan& scan, PEVENT_RECORD event)
     {
+        if (scan.replaying) { ReplayRecord(*event, scan); return; }
         auto collect = [&](etl_profile::Match match, auto& row, auto& page)
         {
             if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
@@ -213,11 +257,11 @@ namespace
         }
         if (scan.options.HardFaults())
         {
+            if (scan.options.scheduleOf) { scan.threadIndex.Observe(*event, scan.records); }
             etl_profile::HardFault row;
             if (collect(etl_profile::DecodeHardFault(*event, &row), row, scan.faultPage)) { scan.faultTotals.Observe(row); }
             return;
         }
-        if (scan.replaying) { ReplayRecord(*event, scan); return; }
         if (scan.options.settings) { scan.settings.Observe(*event, scan.records); }
         if (scan.options.WithThreads()) { scan.threadIndex.Observe(*event, scan.records); }
         if (scan.options.builds) { scan.buildIndex.Observe(*event, scan.records); }
@@ -796,6 +840,7 @@ namespace
             L",\"replayed_page_sha256\":" + (replayed.empty() ? L"null" : Quote(replayed)) +
             L",\"page_bytes_match\":" + (replayed.empty() ? L"null" : replayed == o.expectedPage ? L"true" : L"false") +
             L",\"source_status\":" + (sourceStatus ? Quote(sourceStatus) : L"null") +
+            (o.scheduleOf ? L",\"requested_fault_ordinal\":" + std::to_wstring(o.scheduleOf) : L"") +
             L",\"after\":" + std::to_wstring(o.after) + L",\"limit\":" + std::to_wstring(o.limit) +
             (withStatement ? L",\"capture_statement\":" + statement.Json(o.statementAuthority, replayed == o.expectedPage) : L"") +
             L",\"collector_authenticated\":false,\"win32_status\":" + (error ? std::to_wstring(error) : L"null") + L"}";
@@ -872,7 +917,46 @@ namespace
             L",\"timing_status\":" + Quote(timing) + L",\"elapsed_qpc_ticks\":" + (elapsed ? Quote(std::to_wstring(*elapsed)) : L"null") + L"}";
     }
 
-    std::wstring HardFaultResultsJson(const Scan& scan, const TRACE_LOGFILE_HEADER& h)
+    std::wstring FaultScheduleJson(const Scan& scan, bool gap)
+    {
+        const auto& fault = scan.faultPage[0];
+        const auto& schedule = scan.faultSchedule;
+        const auto& history = scan.history;
+        const auto pair = etl_profile::FaultThreadPair(scan.threadIndex, fault, schedule.qpc, gap);
+        const auto partition = schedule.Summarize(history, fault, pair, gap);
+        auto out = L",\"fault_schedule\":{\"requested_fault_ordinal\":" + std::to_wstring(fault.ordinal) +
+            L",\"status\":" + Quote(partition.status) + L",\"on_cpu_ticks\":" +
+            (partition.measured ? Quote(std::to_wstring(partition.running)) : L"null") + L",\"off_cpu_ticks\":" +
+            (partition.measured ? Quote(std::to_wstring(partition.offCpu)) : L"null") + ThreadPairJson(pair, true) +
+            L",\"decoded_switches\":" + std::to_wstring(schedule.switches) + L",\"unsupported_switch_records\":" + std::to_wstring(schedule.unsupportedSwitches) +
+            L",\"ready_records\":" + std::to_wstring(history.readyCount) + L",\"unsupported_ready_records\":" + std::to_wstring(history.unsupportedReady) +
+            L",\"thread_boundaries\":" + std::to_wstring(history.boundaries) + L",\"unsupported_thread_boundaries\":" + std::to_wstring(history.unsupportedBoundaries) +
+            L",\"intersecting_intervals\":" + std::to_wstring(schedule.candidates) + L",\"interval_limit\":" + std::to_wstring(MaxPage) + L",\"intervals\":[";
+        for (const auto& slice : schedule.slices)
+        {
+            if (&slice != schedule.slices.data()) { out += L','; }
+            const auto span = schedule.Assess(slice, history, fault, pair, gap);
+            out += L"{\"relation\":" + Quote(span.relation) + L",\"start\":" + EdgeJson(slice.Start()) +
+                L",\"end\":" + EdgeJson(slice.End()) + L",\"overlap_start_raw\":" + Quote(std::to_wstring(slice.beginTick)) +
+                L",\"overlap_end_raw\":" + Quote(std::to_wstring(slice.endTick)) + L",\"overlap_ticks\":" +
+                Elapsed(span.measured, slice.beginTick, slice.endTick);
+            if (!slice.running)
+            {
+                const auto& ready = slice.witnesses.ready;
+                const auto split = etl_profile::AssessReady(ready, slice.Start(), slice.end, span.measured, history.unsupportedReady);
+                const auto pivot = slice.ReadyPivot();
+                out += L",\"readiness\":{\"relation\":" + Quote(split.relation) + L",\"ready_records\":" + std::to_wstring(ready.count) +
+                    L",\"dispatchable_records\":" + std::to_wstring(ready.dispatchable) + L",\"first_ready\":" + ReadyJson(ready.first) +
+                    L",\"last_ready\":" + (ready.count > 1 ? ReadyJson(ready.last) : L"null") +
+                    L",\"before_ready_ticks\":" + Elapsed(split.measured, slice.beginTick, pivot) +
+                    L",\"after_ready_ticks\":" + Elapsed(split.measured, pivot, slice.endTick) + L"}";
+            }
+            out += L'}';
+        }
+        return out + L"]}";
+    }
+
+    std::wstring HardFaultResultsJson(const Scan& scan, const TRACE_LOGFILE_HEADER& h, bool partial)
     {
         const bool qpc = h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0;
         const auto& total = scan.faultTotals;
@@ -886,7 +970,9 @@ namespace
             if (i) { out += L','; }
             out += HardFaultJson(scan.faultPage[i], qpc);
         }
-        return out + L"]}";
+        out += L']';
+        if (scan.options.scheduleOf) { out += FaultScheduleJson(scan, partial); }
+        return out + L"}";
     }
 
     std::wstring Report(const Scan& scan, const TRACE_LOGFILE_HEADER& h, const SchemaArtifact& source, BufferAccounting accounting,
@@ -906,7 +992,9 @@ namespace
             L",\"end_filetime\":" + Quote(std::to_wstring(h.EndTime.QuadPart)) +
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
-            (scan.options.HardFaults() ?
+            (scan.options.scheduleOf ?
+                L",\"qualification\":{\"evidence\":\"reported_hard_fault_schedule_overlap\",\"producer_authenticity\":\"unverified\","
+                L"\"authenticated_thread_lifetime\":null,\"wait_cause\":null,\"file_identity\":null,\"disk_request\":null,\"critical_path\":null}" : scan.options.HardFaults() ?
                 L",\"qualification\":{\"evidence\":\"reported_hard_fault\",\"producer_authenticity\":\"unverified\","
                 L"\"thread_lifetime\":null,\"file_identity\":null,\"disk_request\":null,\"critical_path\":null}" : scan.options.DiskIo() ?
                 L",\"qualification\":{\"evidence\":\"recorded_disk_io\",\"producer_authenticity\":\"unverified\","
@@ -926,10 +1014,10 @@ namespace
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
             scan.options.Fields().unsupported + std::to_wstring(scan.unsupported) + L",\"after\":" + std::to_wstring(scan.options.after) +
-            L",\"next_after\":" + (scan.used && scan.options.after + scan.used < scan.matched ?
+            L",\"next_after\":" + (!scan.options.scheduleOf && scan.used && scan.options.after + scan.used < scan.matched ?
                 std::to_wstring(scan.options.after + scan.used) : L"null");
         if (scan.options.DiskIo()) { return result + DiskResultsJson(scan, h); }
-        if (scan.options.HardFaults()) { return result + HardFaultResultsJson(scan, h); }
+        if (scan.options.HardFaults()) { return result + HardFaultResultsJson(scan, h, partial); }
         const bool comparableClock = (h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0) || h.ReservedFlags == 2;
         const bool captureGap = accounting != BufferAccounting::Matched || h.EventsLost || h.BuffersLost || scan.lossMarkers;
         if (scan.options.settings) { result += SettingsManifestJson(scan.settings, h); }
@@ -1119,6 +1207,8 @@ namespace
         if (status != ERROR_SUCCESS) { return status; }
         const auto& h = log.LogfileHeader;
         if (scan.replayMismatch || scan.replayedRows != scan.used || scan.budgetExceeded ||
+            (scan.options.scheduleOf && (scan.threadIndex.decoded != scan.history.boundaries ||
+                scan.threadIndex.unsupported != scan.history.unsupportedBoundaries)) ||
             scan.records != first.records || scan.decoded != first.decoded || scan.unsupported != first.unsupported ||
             scan.processedBuffers != first.processedBuffers || scan.lossMarkers != first.lossMarkers ||
             h.StartTime.QuadPart != original.StartTime.QuadPart || h.EndTime.QuadPart != original.EndTime.QuadPart ||
@@ -1182,7 +1272,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         try { scan.settings.Prepare(); }
         catch (const std::bad_alloc&) { return Failure(scan.options, L"settings_index_unavailable", source.Sha256); }
     }
-    if (scan.options.WithThreads())
+    if (scan.options.WithThreads() || scan.options.scheduleOf)
     {
         try
         {
@@ -1202,11 +1292,29 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     }
     const auto accounting = etl_profile::AccountBuffers(log.LogfileHeader.LogFileMode, log.LogfileHeader.BuffersWritten, scan.processedBuffers);
     const bool partial = Partial(scan, accounting, log.LogfileHeader);
-    if (scan.options.WithThreads() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
-    if (!partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
-    if (scan.options.WithIntervals())
+    if ((scan.options.WithThreads() || scan.options.scheduleOf) && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
+    if (scan.options.scheduleOf && !scan.used)
     {
-        try { scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.switchPage.data(), scan.used); }
+        const auto sourceStatus = partial ? L"partial" : L"read";
+        const auto diagnostic = scan.options.expectedPage.empty() ?
+            std::wstring(scan.options.Prefix()) + L"\"fault_not_observed\",\"source_status\":" + Quote(sourceStatus) +
+                L",\"source_sha256\":" + Quote(source.Sha256) + L",\"requested_fault_ordinal\":" + std::to_wstring(scan.options.scheduleOf) +
+                L",\"decoded_hard_faults\":" + std::to_wstring(scan.decoded) + L"}" :
+            ReplayReceipt(scan.options, L"fault_not_observed", source.Sha256, {}, sourceStatus);
+        return WriteCapabilityJson(diagnostic) ? 1 : 2;
+    }
+    if (!partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
+    if (scan.options.WithIntervals() || scan.options.scheduleOf)
+    {
+        try
+        {
+            if (scan.options.scheduleOf)
+            {
+                scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.faultPage[0].faultingTid);
+                scan.faultSchedule.Prepare(log.LogfileHeader.ReservedFlags == 1 && log.LogfileHeader.PerfFreq.QuadPart > 0);
+            }
+            else { scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.switchPage.data(), scan.used); }
+        }
         catch (const std::bad_alloc&) { return Failure(scan.options, L"interval_index_unavailable", source.Sha256); }
         const auto replay = ReplayIntervals(scan, volumePath, log.LogfileHeader);
         if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
@@ -1273,7 +1381,7 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
         if (!guards[i].Hold(sink, args[i])) { return 2; }
     }
     std::wcerr << (scan.options.HardFaults() ?
-        L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
+        L"usage: KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [[--after N] [--limit 1..128] | --schedule-of <fault-ordinal>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.DiskIo() ?
         L"usage: KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" : scan.options.Switches() ?
         L"usage: KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--intervals] [--thread-id N] [--capture-settings] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n" :
         L"usage: KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit 1..128] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]\n");

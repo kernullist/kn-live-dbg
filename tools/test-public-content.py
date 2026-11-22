@@ -224,11 +224,15 @@ class PublicContentTests(unittest.TestCase):
         for row in (dict(status="partial", schema="kn.etl_hard_faults.v1"), dict(record_ordinal=15, fault_ordinal=2),
                     dict(faulting_thread_id=8, initial_time_raw="72"), dict(timing_status="ordered_qpc", elapsed_qpc_ticks="0"),
                     dict(untimed_faults=1, timed_faults=0), dict(first_longest_fault=None, longest_fault_ties=0),
-                    dict(disk_request=None, critical_path=None, thread_lifetime=None)):
+                    dict(disk_request=None, critical_path=None, thread_lifetime=None),
+                    dict(status="read", schema="kn.etl_hard_faults.v2"),
+                    dict(on_cpu_ticks=None, off_cpu_ticks=None), dict(overlap_end_raw="2", overlap_start_raw="1"),
+                    dict(before_ready_ticks="1", after_ready_ticks="0"), dict(requested_fault_ordinal=1, source_status="partial")):
             text = "log\n" + json.dumps(dict(part=row), indent=2)[:-4]
             for enc in ("utf-8", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", text.encode(enc))})
         self.assertFalse(AUDIT.inspect("performance.md", b"The kn.etl_hard_faults.v1 page reports elapsed_qpc_ticks."))
+        self.assertFalse(AUDIT.inspect("performance.md", b"The kn.etl_hard_faults.v2 page reports on_cpu_ticks."))
 
     def test_saved_disk_io(self):
         for row in (dict(status="partial", schema="kn.etl_disk_io.v1"), dict(disk_event_ordinal=3, record_ordinal=42),

@@ -1261,6 +1261,26 @@ $page.hard_faults | Select-Object record_ordinal, faulting_thread_id, byte_count
 
 Check `status` and the loss counters when comparing captures. [Event fields and timing units](TRACE_IMPORT.md#read-saved-hard-page-faults)
 
+### Inspect scheduling during one hard page fault
+
+Pass the one-based `fault_ordinal` from a hard-fault row. To inspect the
+longest timed fault in the file, use the ordinal in the summary.
+
+```powershell
+$longest = $page.fault_summary.first_longest_fault
+if ($null -ne $longest) {
+    $detail = & KnLiveDbg.exe --etl-hard-faults $etl.FullName --sha256 $pin --schedule-of $longest.fault_ordinal | ConvertFrom-Json
+    $detail.fault_schedule | Select-Object status, on_cpu_ticks, off_cpu_ticks
+    $detail.fault_schedule.intervals | Select-Object relation, start, end, overlap_ticks, readiness
+}
+```
+
+`covered` means that the faulting thread's on-CPU and off-CPU intervals
+account for the entire reported fault duration. Select a single fault per
+call. Paging the ordinary list still uses `--after` and `--limit`.
+The detail page also supports `--check-page` and `--capture-statement`.
+[Measurement requirements](TRACE_IMPORT.md#scheduling-during-a-hard-page-fault)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

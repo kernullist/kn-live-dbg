@@ -516,6 +516,9 @@
     <ClInclude Include="EtlHardFault.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlFaultSchedule.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlDiskIo.h">
       <Filter>Header Files</Filter>
     </ClInclude>
