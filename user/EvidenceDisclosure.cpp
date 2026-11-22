@@ -3,6 +3,7 @@
 #include "ImageVerificationRecipe.h"
 #include "ImageClaimPublication.h"
 #include "ImageScopeClaimPublication.h"
+#include "PendingIrpEvidence.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
@@ -44,25 +45,46 @@ namespace
     }
     struct Manifest
     {
+        DisclosureFamily Family = DisclosureFamily::Image;
         std::wstring Id, RootIdentity, Principal, SourcePath, SourceSchema, SourceFileSha, SourceSemanticSha, ProofSha, FactsSha;
+        std::wstring OriginalCaptureSha, RecordedClaimSha;
         uint64_t Created = 0;
     };
     std::wstring Json(const Manifest& m)
     {
         if (!Hex(m.Id, 32) || !Hex(m.SourceFileSha, 64) || !Hex(m.SourceSemanticSha, 64) || !Hex(m.ProofSha, 64) || !Hex(m.FactsSha, 64) ||
-            !Text(m.RootIdentity, 160) || !Text(m.Principal, 256) || !Text(m.SourcePath, 30000) || m.Created == 0 ||
-            (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != ImageScopeClaimPublicationSchema && m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_recipe.v3" && m.SourceSchema != L"kn.image_slice.v1" &&
-                m.SourceSchema != L"kn.image_slice.v2" && m.SourceSchema != L"kn.image_sweep.v1")) { return L""; }
-        return L"{\"schema\":\"kn.redaction_manifest.v1\",\"policy\":\"kn.image_counts_redaction.v1\",\"redaction_id\":" + mcpjson::Quote(m.Id) +
+            !Text(m.RootIdentity, 160) || !Text(m.Principal, 256) || !Text(m.SourcePath, 30000) || m.Created == 0) { return {}; }
+        std::wstring prefix = L"{\"schema\":\"kn.redaction_manifest.v1\",\"policy\":\"kn.image_counts_redaction.v1\"";
+        std::wstring original;
+        if (m.Family == DisclosureFamily::Irp)
+        {
+            const bool wrapped = m.SourceSchema == PendingIrpClaimPublicationSchema;
+            if (!Hex(m.OriginalCaptureSha, 64) || (wrapped ? !Hex(m.RecordedClaimSha, 64) :
+                (m.SourceSchema != L"kn.irp_capture.v2" || !m.RecordedClaimSha.empty() ||
+                 m.SourceSemanticSha != m.SourceFileSha || m.OriginalCaptureSha != m.SourceFileSha))) { return {}; }
+            prefix = L"{\"schema\":\"kn.redaction_manifest.v2\",\"policy\":\"kn.irp_counts_redaction.v1\"";
+            original = L",\"original_capture_sha256\":" + mcpjson::Quote(m.OriginalCaptureSha) +
+                L",\"recorded_claim_sha256\":" + (wrapped ? mcpjson::Quote(m.RecordedClaimSha) : L"null");
+        }
+        else if (m.SourceSchema != ImageClaimPublicationSchema && m.SourceSchema != ImageScopeClaimPublicationSchema &&
+            m.SourceSchema != L"kn.image_recipe.v1" && m.SourceSchema != L"kn.image_recipe.v2" && m.SourceSchema != L"kn.image_recipe.v3" &&
+            m.SourceSchema != L"kn.image_slice.v1" && m.SourceSchema != L"kn.image_slice.v2" && m.SourceSchema != L"kn.image_sweep.v1")
+            { return {}; }
+        return prefix + L",\"redaction_id\":" + mcpjson::Quote(m.Id) +
             L",\"root_identity\":" + mcpjson::Quote(m.RootIdentity) + L",\"principal\":" + mcpjson::Quote(m.Principal) +
             L",\"source_path\":" + mcpjson::Quote(m.SourcePath) + L",\"source_schema\":" + mcpjson::Quote(m.SourceSchema) +
-            L",\"source_file_sha256\":" + mcpjson::Quote(m.SourceFileSha) + L",\"source_semantic_sha256\":" + mcpjson::Quote(m.SourceSemanticSha) +
+            L",\"source_file_sha256\":" + mcpjson::Quote(m.SourceFileSha) + L",\"source_semantic_sha256\":" + mcpjson::Quote(m.SourceSemanticSha) + original +
             L",\"replay_proof_sha256\":" + mcpjson::Quote(m.ProofSha) + L",\"facts_file\":\"facts.knshare\",\"facts_sha256\":" + mcpjson::Quote(m.FactsSha) +
             L",\"created_filetime\":" + N(m.Created) + L",\"collector_authenticated\":false,\"transfer_authorized\":false,\"originals_modified\":false}";
     }
     bool Parse(const std::wstring& json, Manifest* out)
     {
         Manifest m;
+        if (Field(json, L"schema") == L"kn.redaction_manifest.v2")
+        {
+            m.Family = DisclosureFamily::Irp;
+            m.OriginalCaptureSha = Field(json, L"original_capture_sha256"); m.RecordedClaimSha = Field(json, L"recorded_claim_sha256");
+        }
         m.Id = Field(json, L"redaction_id"); m.RootIdentity = Field(json, L"root_identity"); m.Principal = Field(json, L"principal");
         m.SourcePath = Field(json, L"source_path"); m.SourceSchema = Field(json, L"source_schema");
         m.SourceFileSha = Field(json, L"source_file_sha256"); m.SourceSemanticSha = Field(json, L"source_semantic_sha256");
@@ -90,9 +112,10 @@ EvidenceDisclosurePackage LoadEvidenceDisclosure(const std::wstring& root)
         result.Root = privacy.RootPath;
         lease->FactsFile = Read(fs::path(result.Root) / L"facts.knshare", 4096, &result.Facts, &result.FactsSha256);
         lease->ManifestFile = Read(fs::path(result.Root) / L"redaction.knredact", 256 * 1024, &result.Manifest, &result.ManifestSha256);
-        MinimizedImageFacts facts; Manifest manifest;
+        DisclosureFactsIdentity facts; Manifest manifest;
         if (!lease->FactsFile || !lease->ManifestFile || !lease->Privacy.CheckFile(lease->FactsFile.get()) ||
-            !lease->Privacy.CheckFile(lease->ManifestFile.get()) || !ParseMinimizedImageFacts(result.Facts, &facts) || !Parse(result.Manifest, &manifest) ||
+            !lease->Privacy.CheckFile(lease->ManifestFile.get()) || !ParseDisclosureFacts(result.Facts, &facts) || !Parse(result.Manifest, &manifest) ||
+            manifest.Family != facts.Family || facts.RecordedIrpClaims != !manifest.RecordedClaimSha.empty() ||
             manifest.Id != facts.Id || manifest.FactsSha != result.FactsSha256 || manifest.RootIdentity != privacy.RootIdentity || manifest.Principal != privacy.OwnerSid)
         {
             return fail(L"disclosure_missing_corrupt_or_unbound");
@@ -105,8 +128,53 @@ EvidenceDisclosurePackage LoadEvidenceDisclosure(const std::wstring& root)
     return result;
 }
 
-EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, const std::wstring& newRoot,
-    bool efs, const std::function<void(const wchar_t*)>& observer)
+static bool ProjectImageSource(const fs::path& replayInput, const std::wstring& extension, const std::wstring& originalJson,
+    Manifest& manifest, EvidenceDisclosurePackage& result)
+{
+    const auto replay = ReplayImageRecipe(replayInput.wstring(), false, nullptr);
+    const bool publication = manifest.SourceSchema == ImageClaimPublicationSchema || manifest.SourceSchema == ImageScopeClaimPublicationSchema;
+    manifest.SourceSemanticSha = Field(originalJson, publication ? L"publication_sha256" :
+        extension == L".knsweep" ? L"manifest_sha256" : L"recipe_sha256");
+    if (!Hex(manifest.SourceSemanticSha, 64) || manifest.SourceSemanticSha != (publication ? replay.ClaimPublicationSha256 :
+        extension == L".knsweep" ? replay.ManifestSha256 : replay.RecipeSha256))
+        { result.Issue = L"disclosure_original_replay_binding_failed"; return false; }
+    MinimizedImageFacts facts;
+    if (!ProjectImageDisclosure(replay, manifest.Id, &facts)) { result.Issue = L"disclosure_original_policy_replay_failed"; return false; }
+    result.Facts = MinimizedImageFactsJson(facts); manifest.ProofSha = DisclosureTextSha256(replay.Proof);
+    return true;
+}
+
+static bool ProjectIrpSource(const fs::path& path, const std::wstring& originalJson, Manifest& manifest, EvidenceDisclosurePackage& result)
+{
+    const auto replay = ReplayPendingIrpCapture(path.wstring(), false);
+    if (replay.Status != L"replayed" || !replay.SummaryMatched) { result.Issue = L"disclosure_original_policy_replay_failed"; return false; }
+    std::wstring report;
+    if (manifest.SourceSchema == PendingIrpClaimPublicationSchema)
+    {
+        IndexedObject publication, payload;
+        std::wstring body;
+        if (!publication.Parse(originalJson) || !publication.Raw(L"payload", &body) || !payload.Parse(body) ||
+            !payload.Raw(L"recorded_claim", &report) || replay.OriginalClaimStatus != L"reproduced" ||
+            publication.String(L"publication_sha256") != replay.ClaimPublicationSha256)
+            { result.Issue = L"disclosure_original_replay_binding_failed"; return false; }
+        manifest.SourceSemanticSha = replay.ClaimPublicationSha256;
+    }
+    else
+    {
+        if (manifest.SourceSchema != L"kn.irp_capture.v2" || replay.OriginalClaimStatus != L"not_recorded" ||
+            replay.OriginalCaptureSha256 != manifest.SourceFileSha) { result.Issue = L"disclosure_original_replay_binding_failed"; return false; }
+        manifest.SourceSemanticSha = manifest.SourceFileSha;
+    }
+    if (replay.CaptureSha256 != manifest.SourceFileSha) { result.Issue = L"disclosure_original_replay_binding_failed"; return false; }
+    result.Facts = ProjectIrpDisclosure(replay, report, manifest.Id);
+    if (result.Facts.empty()) { result.Issue = L"disclosure_original_policy_replay_failed"; return false; }
+    manifest.OriginalCaptureSha = replay.OriginalCaptureSha256; manifest.RecordedClaimSha = replay.RecordedClaimSha256;
+    manifest.ProofSha = DisclosureTextSha256(PendingIrpReplayJson(replay));
+    return true;
+}
+
+static EvidenceDisclosurePackage PrepareDisclosure(DisclosureFamily family, const std::wstring& source,
+    const std::wstring& newRoot, bool efs, const std::function<void(const wchar_t*)>& observer)
 {
     EvidenceDisclosurePackage result;
     const auto fail = [&](const wchar_t* issue) { result.Status = L"denied"; result.Issue = issue; return result; };
@@ -116,25 +184,22 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
         const auto input = fs::absolute(source).lexically_normal();
         auto original = input, replayInput = input;
         const auto extension = Lower(input.extension().wstring());
-        if (extension != L".knslice" && extension != L".knsweep" && extension != L".kncapture")
+        if (family == DisclosureFamily::Irp && extension != L".knirp") { return fail(L"invalid_disclosure_source"); }
+        if (family == DisclosureFamily::Image && extension != L".knslice" && extension != L".knsweep" && extension != L".kncapture")
         {
             if (Lower(input.filename().wstring()) == L"recipe.knverify") { replayInput = input.parent_path(); }
             else { original /= L"recipe.knverify"; }
         }
         std::wstring originalJson, originalHash;
-        auto originalFile = Read(original, ImageClaimPublicationMaxBytes, &originalJson, &originalHash);
+        auto originalFile = Read(original, family == DisclosureFamily::Irp ? PendingIrpEvidenceMaximumBytes : ImageClaimPublicationMaxBytes,
+            &originalJson, &originalHash);
         if (!originalFile) { return fail(L"disclosure_original_unavailable"); }
-        const auto replay = ReplayImageRecipe(replayInput.wstring(), false, nullptr);
-        const bool claimPublication = Field(originalJson, L"schema") == ImageClaimPublicationSchema ||
-            Field(originalJson, L"schema") == ImageScopeClaimPublicationSchema;
-        const auto semanticHash = Field(originalJson, claimPublication ? L"publication_sha256" :
-            extension == L".knsweep" ? L"manifest_sha256" : L"recipe_sha256");
-        if (!Hex(semanticHash, 64) || semanticHash != (claimPublication ? replay.ClaimPublicationSha256 :
-            extension == L".knsweep" ? replay.ManifestSha256 : replay.RecipeSha256))
-            { return fail(L"disclosure_original_replay_binding_failed"); }
-        MinimizedImageFacts facts;
-        if (!ProjectImageDisclosure(replay, NewDisclosureId(), &facts)) { return fail(L"disclosure_original_policy_replay_failed"); }
-        result.Facts = MinimizedImageFactsJson(facts); result.FactsSha256 = DisclosureTextSha256(result.Facts); result.Id = facts.Id;
+        Manifest manifest;
+        manifest.Family = family; manifest.Id = NewDisclosureId(); manifest.SourcePath = original.wstring();
+        manifest.SourceFileSha = originalHash; manifest.SourceSchema = Field(originalJson, L"schema");
+        if (!(family == DisclosureFamily::Irp ? ProjectIrpSource(original, originalJson, manifest, result) :
+            ProjectImageSource(replayInput, extension, originalJson, manifest, result))) { result.Status = L"denied"; return result; }
+        result.Id = manifest.Id; result.FactsSha256 = manifest.FactsSha = DisclosureTextSha256(result.Facts);
         if (observer) { observer(L"disclosure_replayed"); }
         const auto initialized = InitializeEvidencePrivateStore(newRoot, efs);
         result.Root = initialized.RootPath; result.TemporaryDirectory = initialized.TemporaryDirectory;
@@ -142,11 +207,7 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
         EvidencePrivacyGuard guard; EvidencePrivacyReport privacy;
         if (!guard.Open(result.Root, true, &privacy)) { return fail(L"disclosure_private_root_admission_failed"); }
         FILETIME now{}; GetSystemTimeAsFileTime(&now);
-        Manifest manifest;
-        manifest.Id = facts.Id; manifest.RootIdentity = privacy.RootIdentity; manifest.Principal = privacy.OwnerSid;
-        manifest.SourcePath = original.wstring(); manifest.SourceSchema = Field(originalJson, L"schema");
-        manifest.SourceFileSha = originalHash; manifest.SourceSemanticSha = semanticHash;
-        manifest.ProofSha = DisclosureTextSha256(replay.Proof); manifest.FactsSha = result.FactsSha256;
+        manifest.RootIdentity = privacy.RootIdentity; manifest.Principal = privacy.OwnerSid;
         manifest.Created = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
         result.Manifest = Json(manifest); result.ManifestSha256 = DisclosureTextSha256(result.Manifest);
         if (result.Manifest.empty() || result.ManifestSha256.empty() || result.FactsSha256.empty()) { return fail(L"disclosure_manifest_invalid"); }
@@ -158,6 +219,14 @@ EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, con
     }
     catch (...) { return fail(L"disclosure_preparation_exception"); }
 }
+
+EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, const std::wstring& newRoot,
+    bool efs, const std::function<void(const wchar_t*)>& observer)
+{ return PrepareDisclosure(DisclosureFamily::Image, source, newRoot, efs, observer); }
+
+EvidenceDisclosurePackage PrepareIrpDisclosure(const std::wstring& source, const std::wstring& newRoot,
+    bool efs, const std::function<void(const wchar_t*)>& observer)
+{ return PrepareDisclosure(DisclosureFamily::Irp, source, newRoot, efs, observer); }
 
 bool SaveDisclosureTransferRecord(const EvidenceDisclosurePackage& package, const std::wstring& id,
     bool outcome, const std::wstring& json, std::wstring* error)

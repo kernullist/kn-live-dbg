@@ -778,6 +778,35 @@ flushed files. A partial package cannot be reviewed for sending. Inspection can
 read a completed historical package without reacquiring a target or reopening
 the original; the linkage is not an authenticated collector signature.
 
+### Minimized IRP disclosure
+
+`!kmon redact-irp <capture.knirp> <new-private-root>` replays the original
+ordered reads before creating a package. Its `kn.minimized_irp_facts.v1`
+derivative reports supplied and visited threads, IRPs inspected, requests
+retained and unstable observations. Coverage is limited to the supplied
+inventory. The output records whether the fixed sibling PE was verified and
+whether the replay qualified. A missing reference can leave reproducible raw
+counts with qualification and coverage both false.
+
+A raw `kn.irp_capture.v2` has `recorded_claims` set to null. An embedded
+`kn.irp_claim_publication.v1` must reproduce its entire capture-time report.
+The derivative then includes possible, emitted and omitted claim counts and
+the four outcome counts. An empty recorded report has zero counts. An
+unavailable or changed original report prevents package publication. Request
+addresses, identity, activity times, bytes, symbols and free text stay local.
+
+The private `kn.redaction_manifest.v2` links the physical source, original
+capture, semantic publication, recorded report when present, native replay
+result and minimized file by SHA-256. For raw v2 inputs the physical and
+semantic source are the same file. The loader checks the family and original
+report presence against the derivative. The preceding image-only reader
+denies this package. The existing v1 image package format remains readable.
+The release copier rejects capture, report, private-package and transfer
+files by their managed names, including interrupted writes. The repository
+content scanner also checks renamed derivatives and detached count records.
+
+### Reviewing a private disclosure package
+
 `ai share preview <root>` pins the audited root, facts and sidecar, and displays
 the exact facts, system instructions, HTTP endpoint/model and OAuth refresh
 endpoint when applicable. It sends nothing. `ai share send <review-id> confirm`

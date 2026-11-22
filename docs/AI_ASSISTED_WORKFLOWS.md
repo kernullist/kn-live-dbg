@@ -1,7 +1,7 @@
 # AI-assisted workflows
 
 KnLiveDbg's `ai` command proposes investigation commands from operator text and
-explains explicitly reviewed, minimized image facts. Captured stdout/stderr stays
+explains explicitly reviewed, minimized image or IRP facts. Captured stdout/stderr stays
 local. The implementation is in `user/AiProvider.cpp`, `AiModelCatalog.cpp`,
 `AiCapabilityCatalog.cpp`, and the main dispatcher. It does not change the
 kernel, MCP or remote-console permission contracts.
@@ -126,6 +126,18 @@ sanitize text pasted by an operator or confine other applications. The returned
 explanation is advisory and never parsed as an executable plan. Packages and
 transfer records remain private even after approval. See the
 [architecture and trust limits](ARCHITECTURE.md#minimized-image-disclosure).
+
+### Review minimized IRP evidence
+
+Prepare a package with
+`KnLiveDbg.exe --offline !kmon redact-irp <capture.knirp> <new-private-root> /json`.
+The local preview shows counts of threads and requests and the qualifications
+of the historical replay. A null original-claim field means the source
+contained no embedded claim report. An available report distinguishes
+supported, contradicted, unfulfilled, inapplicable and omitted claims.
+Inspect the exact payload and destination with `ai share preview <new-private-root>`.
+Use the displayed review ID for a single confirmed send or cancel the pending
+review. [IRP package contents](ARCHITECTURE.md#minimized-irp-disclosure)
 
 ## Confirm a planned write
 

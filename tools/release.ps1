@@ -330,6 +330,10 @@ function Assert-PackagePublicInput
             throw "Local state or evidence directories cannot be packaged"
         }
     }
+    if ($name -match '\.(knirp|knirpledger|knclaims|knblob|knprivacy|knshare|knredact|knsend|knsendresult)(\.pending-.*)?\z')
+    {
+        throw "Private capture, disclosure and transfer files cannot be packaged"
+    }
     if (($name -like ".env*" -and $name -ine ".env.example") -or
         $name -in @("auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519") -or
         $extension -in @(".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".log"))

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -22,6 +23,154 @@ def sha(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def check_irp_packages(fixtures, publisher, root, image_package, run, check, cli, env):
+    """Derive the expected public fields from original producer bytes and the saved capture-time report."""
+    fixtures = fixtures.resolve()
+    folder = root / "private IRP 한글 inputs"
+    folder.mkdir()
+    refs = list(fixtures.glob("irp-reference-*.knblob"))
+    cases = sorted(fixtures.glob("case-*.knirp"))
+    check(bool(refs and cases), "native IRP captures and PE references present")
+    for ref in refs:
+        shutil.copyfile(ref, folder / ref.name)
+    seen, ids = set(), set()
+    omitted = 0
+    raw_target = pub_target = None
+    raw_source = pub_source = None
+    for number, case in enumerate(cases):
+        raw = case.read_bytes()
+        source = json.loads(raw)
+        original_report = case.with_suffix(".knirp.knclaims").read_bytes()
+        report = json.loads(original_report)
+        omitted += int(report["claims_omitted"])
+        path = folder / case.name
+        result = subprocess.run([str(publisher.resolve()), "--publish-irp", str(case), str(path)],
+                                capture_output=True, timeout=150)
+        check(result.returncode == 0, "native IRP publisher")
+        doc = json.loads(path.read_bytes())
+        check(canonical(doc["payload"]["capture"]).encode() == raw and canonical(doc["payload"]["recorded_claim"]).encode() == original_report,
+              "native publication contains exact original evidence")
+        for wrapped, original in ((False, case), (True, path)):
+            target = root / f"irp-{number}-{'published' if wrapped else 'raw'}"
+            entry = run("--prepare-irp", original, target, "acl")[0]
+            facts = entry["facts"]
+            check(entry["status"] == "ready" and re.fullmatch("[0-9a-f]{32}", facts["redaction_id"]) and facts["redaction_id"] not in ids,
+                  "fresh IRP derivation")
+            ids.add(facts["redaction_id"])
+            reference = int(source["reference_captured_bytes"]) != 0
+            qualified = source["runtime_qualified"] and reference
+            state_counts = dict((field, report[field]) for field in ("claims_possible", "claims_emitted", "claims_omitted"))
+            state_counts.update(report["counts"])
+            expected = dict(schema="kn.minimized_irp_facts.v1", policy="kn.irp_counts_redaction.v1", redaction_id=facts["redaction_id"],
+                            scope="supplied_thread_inventory", supplied_threads=str(len(source["thread_inputs"])), threads_visited=source["threads_visited"],
+                            irps_inspected=source["irps_inspected"], requests_retained=str(len(source["requests"])), unstable_observations=source["unstable_observations"],
+                            reference_verified=reference, qualified_replay=qualified, complete_for_supplied_inventory=source["enumeration_complete"] and qualified,
+                            recorded_claims=state_counts if wrapped else None, time_scope="historical_non_atomic", global_inventory=False,
+                            referenced_request_lifetime=False, execution_observed=False, collector_authenticated=False, maliciousness="not_established")
+            output = (target / "facts.knshare").read_bytes()
+            check(facts == expected and output == canonical(expected).encode(), "entire IRP facts vocabulary equals independent projection")
+            seen.add((qualified, len(source["requests"]), source["enumeration_complete"]))
+            replay = run("--replay-irp", original)[0]
+            manifest_bytes = (target / "redaction.knredact").read_bytes()
+            m = json.loads(manifest_bytes)
+            check(m["schema"] == "kn.redaction_manifest.v2" and m["policy"] == expected["policy"] and m["source_path"] == str(original) and
+                  m["source_file_sha256"] == sha(original.read_bytes()) and m["source_semantic_sha256"] == (
+                      sha(canonical(doc["payload"]).encode()) if wrapped else sha(raw)) and m["original_capture_sha256"] == sha(raw) and
+                  m["recorded_claim_sha256"] == (sha(original_report) if wrapped else None) and
+                  m["replay_proof_sha256"] == sha(canonical(replay).encode()) and m["facts_sha256"] == sha(output) == entry["facts_sha256"] and
+                  sha(manifest_bytes) == entry["manifest_sha256"], "private manifest links source, report, replay, and minimized facts")
+            check(run("--inspect", target)[0]["facts"] == expected and run("--facts", target / "facts.knshare")[0]["valid"], "canonical reload")
+            if cli:
+                cli_target = target.with_name(target.name + "-cli")
+                output = subprocess.check_output([str(cli.resolve()), "--offline", "!kmon", "redact-irp", str(original), str(cli_target),
+                                                  "/acl-only", "/json"], env=env, timeout=150)
+                product = json.loads(output)
+                other_id = product["facts"]["redaction_id"]
+                check(product["status"] == "ready" and re.fullmatch("[0-9a-f]{32}", other_id) and other_id not in ids and
+                      dict(expected, redaction_id=other_id) == product["facts"] and
+                      (cli_target / "facts.knshare").read_bytes() == canonical(product["facts"]).encode(), "normal CLI original-to-derivative path")
+                ids.add(other_id)
+            if case.name == "case-1.knirp":
+                if wrapped:
+                    pub_source, pub_target = original, target
+                else:
+                    raw_source, raw_target = original, target
+        check(case.read_bytes() == raw and case.with_suffix(".knirp.knclaims").read_bytes() == original_report, "original producer fixtures preserved")
+    check(raw_target and pub_target and omitted > 0 and any(x[1] for x in seen) and any(not x[1] for x in seen) and any(not x[0] for x in seen),
+          "nonempty, empty, unqualified and claim-limited native observations")
+    # A raw capture can reproduce observations after losing its PE. An original report requiring that PE cannot be reproduced.
+    missing = folder / "no-reference"
+    missing.mkdir()
+    for wrapped, src in ((False, raw_source), (True, pub_source)):
+        local = missing / ("published.knirp" if wrapped else "raw.knirp")
+        shutil.copyfile(src, local)
+        target = root / ("missing-pub-package" if wrapped else "missing-raw-package")
+        result = run("--prepare-irp", local, target, "acl", expected=int(wrapped))[0]
+        if wrapped:
+            check(result["status"] == "denied" and not target.exists(), "unreproduced original claims withhold package")
+        else:
+            f = result["facts"]
+            check(f["recorded_claims"] is None and not (f["reference_verified"] or f["qualified_replay"] or f["complete_for_supplied_inventory"]),
+                  "missing PE withholds qualification and coverage")
+    for ref in refs:
+        (missing / ref.name).write_bytes(b"wrong owned reference")
+    check(run("--prepare-irp", missing / "raw.knirp", root / "bad-pe", "acl", expected=1)[0]["status"] == "denied", "substituted PE")
+    for fault in ("policy", "changed_claim", "raw", "legacy", "free_text"):
+        bad = json.loads(pub_source.read_bytes())
+        if fault == "legacy":
+            bad = dict(schema="kn.irp_capture.v1")
+        else:
+            if fault == "policy":
+                bad["payload"]["recorded_claim"]["policy"] += ".unknown"
+            elif fault == "changed_claim":
+                bad["payload"]["recorded_claim"]["counts"]["supported"] = "0"
+            elif fault == "raw":
+                bad["payload"]["capture"]["threads_visited"] = "0"
+            else:
+                bad["payload"]["recorded_claim"]["source_free_text"] = "synthetic-private-canary"
+            bad["publication_sha256"] = sha(canonical(bad["payload"]).encode())
+        altered = folder / f"{fault}.knirp"
+        altered.write_bytes(canonical(bad).encode())
+        target = root / f"denied-{fault}"
+        check(run("--prepare-irp", altered, target, "acl", expected=1)[0]["status"] == "denied" and not target.exists(), fault)
+
+    manifest = pub_target / "redaction.knredact"
+    manifest_bytes = manifest.read_bytes()
+    fact_path = pub_target / "facts.knshare"
+    fact_bytes = fact_path.read_bytes()
+    image = json.loads((image_package / "redaction.knredact").read_bytes())
+    for key in ("redaction_id", "root_identity", "principal", "facts_sha256"):
+        image[key] = json.loads(manifest_bytes)[key]
+    manifest.write_bytes(canonical(image).encode())
+    check(run("--inspect", pub_target, expected=1)[0]["status"] == "denied", "valid image manifest cannot vouch for IRP facts")
+    for fault in ("claim_presence", "missing_count", "overflow", "impossible_sum", "future_field", "unsupported_coverage", "duplicate"):
+        facts = json.loads(fact_bytes)
+        if fault == "claim_presence":
+            facts["recorded_claims"] = None
+        elif fault == "missing_count":
+            del facts["recorded_claims"]["unfulfilled"]
+        elif fault == "overflow":
+            facts["threads_visited"] = str(2**64)
+        elif fault == "impossible_sum":
+            facts["recorded_claims"]["unfulfilled"] = "128"
+        elif fault == "future_field":
+            facts["source_id"] = "synthetic-private-canary"
+        elif fault == "unsupported_coverage":
+            facts.update(qualified_replay=False, complete_for_supplied_inventory=True)
+        data = canonical(facts).encode()
+        if fault == "duplicate":
+            data = data.replace(b'"requests_retained":', b'"requests_retained":"0","requests_retained":', 1)
+        changed = json.loads(manifest_bytes)
+        changed["facts_sha256"] = sha(data)
+        fact_path.write_bytes(data)
+        manifest.write_bytes(canonical(changed).encode())
+        check(run("--inspect", pub_target, expected=1)[0]["status"] == "denied", "rehashed invalid IRP package " + fault)
+    manifest.write_bytes(manifest_bytes)
+    fact_path.write_bytes(fact_bytes)
+    check(run("--inspect", pub_target)[0]["status"] == "ready", "restored owned package")
+    return pub_source, pub_target
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, required=True)
@@ -29,7 +178,12 @@ def main():
     parser.add_argument("--slices", type=Path, required=True)
     parser.add_argument("--recipes", type=Path, required=True)
     parser.add_argument("--cli", type=Path, help="also exercise the built application offline and real AI handlers")
+    parser.add_argument("--irps", type=Path, help="native IRP captures, references and saved reports")
+    parser.add_argument("--irp-publisher", type=Path, help="explicitly selected native test publisher for the IRP fixtures")
+    parser.add_argument("--previous-cli", type=Path, help="check image compatibility and unknown IRP package handling")
     args = parser.parse_args()
+    if bool(args.irps) != bool(args.irp_publisher):
+        parser.error("--irps and --irp-publisher must be supplied together")
     root = args.output.resolve() / ("disclosure-" + uuid.uuid4().hex)
     root.mkdir()
     checks = 0
@@ -213,6 +367,37 @@ def main():
                 (target / name).write_bytes((base / name).read_bytes())
         check(run("--inspect", target, expected=1)[0]["status"] != "ready", "reject corrupt or physically unbound package")
 
+    irp_source, irp_root = check_irp_packages(args.irps, args.irp_publisher, root, base, run, check, args.cli, env) if args.irps else (None, None)
+    if irp_root:
+        with irp_source.open("r+b"):
+            pass
+        for stage in ("disclosure_replayed", "disclosure_facts_committed", "disclosure_manifest_committed"):
+            target = root / ("irp-" + stage)
+            p = start("--prepare-irp", irp_source, target, "acl", stage)
+            check(observed(p)["observed"] == stage, "observed IRP publication boundary")
+            if stage == "disclosure_replayed":
+                blocked = False
+                try:
+                    with irp_source.open("r+b"):
+                        pass
+                except PermissionError:
+                    blocked = True
+                check(blocked and not target.exists(), "original source pinned before private package creation")
+            p.terminate()
+            p.communicate(timeout=15)
+            children.remove(p)
+            ready = stage == "disclosure_manifest_committed"
+            check((run("--inspect", target, expected=0 if ready else 1)[0]["status"] == "ready") == ready, "IRP manifest-last restart")
+        if args.previous_cli:
+            prior_target = root / "previous-image"
+            prior_package = subprocess.run([str(args.previous_cli.resolve()), "--offline", "!kmon", "redact-image", str(sources[0]),
+                                            str(prior_target), "/acl-only", "/json"], env=env, timeout=150, capture_output=True)
+            check(prior_package.returncode == 0 and run("--inspect", prior_target)[0]["facts"] == json.loads(prior_package.stdout)["facts"],
+                  "current loader reads an image package created by the preceding CLI")
+            for target, code in ((base, 0), (irp_root, 1)):
+                previous = subprocess.run([str(args.previous_cli.resolve()), "--offline", "!kmon", "disclosure", str(target)], env=env,
+                                          timeout=150, capture_output=True)
+                check(previous.returncode == code and (json.loads(previous.stdout)["status"] == "ready") == (code == 0), "preceding CLI compatibility")
     requests = []
     server_errors = []
     active = {"root": base, "mode": "ok"}
@@ -227,9 +412,9 @@ def main():
             requests.append((self.path, dict(self.headers), data))
             try:
                 prompt = data.get("messages", [{}, {"content": None}])[1]["content"] if "messages" in data else data["input"][0]["content"][0]["text"]
-                if prompt.startswith('{"schema":"kn.minimized_image_facts.v1"'):
+                if prompt.startswith(('{"schema":"kn.minimized_image_facts.v1"', '{"schema":"kn.minimized_irp_facts.v1"')):
                     facts = json.loads(prompt)
-                    check(prompt == (active["root"] / "facts.knshare").read_text(encoding="utf-8"), "wire prompt is exact reviewed canonical facts")
+                    check(prompt.encode() == (active["root"] / "facts.knshare").read_bytes(), "wire carries only the exact reviewed facts")
                     system = data["messages"][0]["content"] if "messages" in data else data["instructions"]
                     intents = [json.loads(p.read_bytes()) for p in active["root"].glob("*.knsend") if p.read_bytes() != b"{}"]
                     check(any(i["facts_sha256"] == sha(prompt.encode()) and i["system_sha256"] == sha(system.encode()) for i in intents), "durable intent exists before received body")
@@ -266,6 +451,16 @@ def main():
     listener.start()
     env["KNLIVEDBG_AI_BASE_URL"] = f"http://127.0.0.1:{server.server_port}"
     try:
+        if irp_root:
+            active["root"] = irp_root
+            before = len(requests)
+            review = run("--ai", irp_root, "preview")[0]
+            check("historical IRP" in review["system"] and len(requests) == before, "IRP-scoped review has no transport")
+            for mode in ("cancel", "wrong_id", "payload_after", "system_changed", "forged_package"):
+                check(not run("--ai", irp_root, mode)[-1].get("completed", False) and len(requests) == before, "IRP denied " + mode)
+            outcome = run("--ai", irp_root, "send")[-1]
+            check(outcome["completed"] and outcome["audit"] and not outcome["reused"] and len(requests) == before + 1, "one reviewed IRP request")
+            active["root"] = base
         for mode in ("raw", "unknown", "forged", "forged_package", "preview", "wrong_id", "facts_changed", "system_changed",
                      "destination_changed", "cancel", "model_before", "key_before", "intent_collision", "model_after", "key_after", "payload_after"):
             before = len(requests)
@@ -352,6 +547,22 @@ def main():
             report = json.loads(cli("--offline", "!kmon", "redact-image", sources[0], target, "/acl-only", "/json"))
             check(report["status"] == "ready" and report["root"] == str(target), "real EXE UTF-8 offline publication")
             check(json.loads(cli("--offline", "!kmon", "disclosure", target, "/json"))["facts"] == report["facts"], "real EXE inspect")
+            if irp_root:
+                irp_cli = root / "cli IRP 한글"
+                prepared = json.loads(cli("--offline", "!kmon", "redact-irp", irp_source, irp_cli, "/json"))
+                check(prepared["status"] == "ready" and prepared["facts"]["recorded_claims"] ==
+                      json.loads((irp_root / "facts.knshare").read_bytes())["recorded_claims"] and
+                      all(get_attrs(str(irp_cli / name)) & 0x4000 for name in ("facts.knshare", "redaction.knredact", "store.knprivacy")),
+                      "normal IRP command with default EFS")
+                active["root"] = irp_cli
+                active["mode"] = "ok"
+                before = len(requests)
+                check("[ai.disclosure.handlers] completed" in cli("--self-test", "ai-disclosure", irp_cli, str(server.server_port)) and
+                      len(requests) == before + 4, "IRP console preview, confirm, cancel and reuse")
+                active["root"] = base
+                for parts in (("redact-irp",), ("redact-irp", irp_source), ("redact-irp", irp_source, irp_cli, "/current"),
+                              ("redact-irp", irp_source, irp_cli, "/acl-only", "/acl-only")):
+                    cli("--offline", "!kmon", *parts, expected=2)
             for command in (("redact-image",), ("redact-image", sources[0]), ("redact-image", sources[0], target, "/bad"),
                             ("redact-image", sources[0], target, "/json", "/json"), ("disclosure",), ("disclosure", target, "/acl-only")):
                 cli("--offline", "!kmon", *command, expected=2)

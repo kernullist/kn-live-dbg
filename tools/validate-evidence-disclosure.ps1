@@ -2,10 +2,15 @@ param(
     [switch]$Sanitize,
     [Parameter(Mandatory=$true)][string]$ImageSliceFixtures,
     [Parameter(Mandatory=$true)][string]$ImageRecipeFixtures,
-    [string]$Cli
+    [string]$Cli,
+    [string]$IrpFixtures,
+    [string]$IrpPublisher
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($IrpFixtures) -ne [string]::IsNullOrWhiteSpace($IrpPublisher)) {
+    throw 'Supply IrpFixtures and IrpPublisher together.'
+}
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'msvc-validation-environment.ps1')
 $validationEnvironment = Get-MsvcValidationEnvironment -Sanitize:$Sanitize
@@ -19,7 +24,8 @@ if ($Sanitize)
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\evidence-disclosure-selftest.cpp', 'user\EvidenceDisclosure.cpp', 'user\EvidenceDisclosureFacts.cpp',
+$sources = @('tools\evidence-disclosure-selftest.cpp', 'user\EvidenceDisclosure.cpp', 'user\EvidenceDisclosureFacts.cpp', 'user\IrpDisclosureFacts.cpp',
+    'user\PendingIrpEvidence.cpp', 'user\PendingIrpClaims.cpp', 'user\PendingIrpBinding.cpp', 'user\TypeSchema.cpp',
     'user\EvidencePrivacy.cpp', 'user\AiProvider.cpp', 'user\AiModelCatalog.cpp',
     'user\ReferenceArtifact.cpp', 'user\ImageRecipeJson.cpp', 'user\ImageClaimPublication.cpp', 'user\ImageScopeClaimPublication.cpp', 'user\ImageVerificationRecipe.cpp',
     'user\ImageRecipeReadSet.cpp', 'user\ImageProcessMappings.cpp', 'user\ImageSliceRecipe.cpp', 'user\ImageScopeClaims.cpp', 'user\ImageSweepManifest.cpp', 'user\ImageSweepReplay.cpp',
@@ -33,5 +39,8 @@ if ($LASTEXITCODE -ne 0) { throw "Evidence disclosure compilation failed: $LASTE
 $oracleArgs = @((Join-Path $PSScriptRoot 'test-evidence-disclosure.py'), '--exe', $exe, '--output', $output,
     '--slices', $ImageSliceFixtures, '--recipes', $ImageRecipeFixtures)
 if (-not [string]::IsNullOrWhiteSpace($Cli)) { $oracleArgs += @('--cli', (Resolve-Path -LiteralPath $Cli).Path) }
+if (-not [string]::IsNullOrWhiteSpace($IrpFixtures)) {
+    $oracleArgs += @('--irps', (Resolve-Path -LiteralPath $IrpFixtures).Path, '--irp-publisher', (Resolve-Path -LiteralPath $IrpPublisher).Path)
+}
 & python @oracleArgs
 if ($LASTEXITCODE -ne 0) { throw "Evidence disclosure validation failed: $LASTEXITCODE" }

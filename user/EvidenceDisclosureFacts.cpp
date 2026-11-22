@@ -65,6 +65,16 @@ bool ParseMinimizedImageFacts(const std::wstring& json, MinimizedImageFacts* fac
     if (MinimizedImageFactsJson(f) != json) { return false; }
     *facts = std::move(f); return true;
 }
+bool ParseDisclosureFacts(const std::wstring& json, DisclosureFactsIdentity* identity)
+{
+    if (!identity || json.size() > 4096) { return false; }
+    const auto schema = Field(json, L"schema");
+    if (schema == L"kn.minimized_irp_facts.v1") { return ParseMinimizedIrpFacts(json, identity); }
+    MinimizedImageFacts image;
+    if (schema != L"kn.minimized_image_facts.v1" || !ParseMinimizedImageFacts(json, &image)) { return false; }
+    *identity = {std::move(image.Id), DisclosureFamily::Image, false};
+    return true;
+}
 bool ProjectImageDisclosure(const ImageRecipeReplay& replay, const std::wstring& id, MinimizedImageFacts* facts)
 {
     if (!facts || replay.Status != L"replayed" || replay.Mode != L"original_policy" ||

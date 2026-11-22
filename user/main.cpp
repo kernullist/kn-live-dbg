@@ -23105,6 +23105,7 @@ static void PrintKmonHelp()
     std::wcout << L"  /manifest path  optional exact-build SHA256/PDB object and vptr rules\n";
     std::wcout << L"  /private-log root  require initialized private root, audit before acquisition\n";
     std::wcout << L"  --offline !kmon redact-image <recipe-directory|kncapture|knslice|knsweep> <new-private-root> [/acl-only] [/json]\n";
+    std::wcout << L"  --offline !kmon redact-irp <capture.knirp> <new-private-root> [/acl-only] [/json]\n";
     std::wcout << L"  --offline !kmon disclosure <private-root> [/json]  inspect a minimized package; no transfer\n";
     std::wcout << L"  --offline !kmon relate <2..32 file.kncase paths> [/gap-ms N] [/limit N] [/cursor token] [/budget-ms N] [/json]\n";
     std::wcout << L"  --offline !kmon init-store <new-root> [/acl-only] [/json]  require EFS by default\n";
@@ -23513,13 +23514,14 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
-    if (action == L"redact-image" || action == L"disclosure")
+    if (action == L"redact-image" || action == L"redact-irp" || action == L"disclosure")
     {
-        const size_t firstOption = action == L"redact-image" ? 4 : 3;
+        const bool prepare = action != L"disclosure";
+        const size_t firstOption = prepare ? 4 : 3;
         bool aclOnly = false, json = false, valid = args.size() >= firstOption;
         for (size_t i = 2; valid && i < firstOption; ++i)
             { valid = !args[i].empty() && args[i][0] != L'/'; }
@@ -23527,16 +23529,18 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         {
             const auto flag = ToLower(args[i]);
             if (flag == L"/json" && !json) { json = true; }
-            else if (flag == L"/acl-only" && action == L"redact-image" && !aclOnly) { aclOnly = true; }
+            else if (flag == L"/acl-only" && prepare && !aclOnly) { aclOnly = true; }
             else { valid = false; }
         }
         if (!valid)
         {
             std::wcerr << L"usage: --offline !kmon redact-image <recipe-directory|kncapture|knslice|knsweep> <new-private-root> [/acl-only] [/json]\n"
+                L"       --offline !kmon redact-irp <capture.knirp> <new-private-root> [/acl-only] [/json]\n"
                 L"       --offline !kmon disclosure <private-root> [/json]\n";
             return 2;
         }
-        const auto package = action == L"redact-image" ? PrepareImageDisclosure(args[2], args[3], !aclOnly) : LoadEvidenceDisclosure(args[2]);
+        const auto preparePackage = action == L"redact-irp" ? PrepareIrpDisclosure : PrepareImageDisclosure;
+        const auto package = prepare ? preparePackage(args[2], args[3], !aclOnly, {}) : LoadEvidenceDisclosure(args[2]);
         if (!WriteCapabilityJson(EvidenceDisclosurePackageJson(package))) { return 3; }
         return package.Status == L"ready" ? 0 : 1;
     }
@@ -28953,7 +28957,7 @@ static void PrintAiHelp()
     std::wcout << L"  models       list/search cloud models; refresh fetches live OpenRouter IDs\n";
     std::wcout << L"  status       ready/blocked health and the next setup step\n";
     std::wcout << L"  test         smoke-check the selected provider/model\n";
-    std::wcout << L"  share        preview minimized image facts, then explicitly send once or cancel\n";
+    std::wcout << L"  share        preview minimized image or IRP facts, then explicitly send once or cancel\n";
     std::wcout << L"  save         write the current provider/model to the EXE-dir .env\n";
     std::wcout << L"  config       advanced provider, policy, base URL, effort, or auth\n";
     std::wcout << L"  go           run a pending expensive local-tool plan\n";
@@ -28964,7 +28968,7 @@ static void PrintAiHelp()
     std::wcout << L"  run          execute planned read-only commands\n";
     std::wcout << L"  write        preview or confirm a planned write-like command\n";
     std::wcout << L"  explain      run a read-only command locally; raw output transfer is blocked\n";
-    std::wcout << L"  analyze      run a read-only command locally; use share for minimized image facts\n";
+    std::wcout << L"  analyze      run a read-only command locally; use share for minimized image or IRP facts\n";
     std::wcout << L"  report       write a session report\n";
     std::wcout << L"\n";
     std::wcout << L"examples:\n";
@@ -29004,7 +29008,7 @@ static void PrintAiHelp()
     std::wcout << L"  ai chat <goal> skips playbooks, process shortcuts, and command-recommendation plans.\n";
     std::wcout << L"  Exact read-only command lines after ai or ai chat still run as evidence.\n";
     std::wcout << L"  Cheap tools run after a short preview. hunt.run, payload.scan, snapshot.capture, and kpage.list deep wait for ai go.\n";
-    std::wcout << L"  Collected stdout/stderr is kept local. Use offline !kmon redact-image then ai share preview/send for minimized image facts.\n";
+    std::wcout << L"  Collected stdout/stderr is kept local. Use offline !kmon redact-image or redact-irp, then ai share preview/send.\n";
     std::wcout << L"  Operator-authored prompts still go to the selected provider. private/local-only external CLI is not offline inference.\n";
     std::wcout << L"  Conceptual why/what after ai <goal> stay advisory.\n";
     std::wcout << L"  ai chat still tries catalog tools for why/what. dump-kernel and dump-live are not available through AI.\n";
@@ -29171,7 +29175,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai analyze !callbacks [all|object|registry|process|thread|imageload|minifilter] [module]\n";
         std::wcout << L"  ai analyze !callbacks [scope] /module <module>\n";
         std::wcout << L"  Runs a read-only evidence command locally. Raw output transfer is blocked at the provider.\n";
-        std::wcout << L"  Use offline !kmon redact-image and ai share for reviewed image counts; other evidence adapters remain unavailable.\n";
+        std::wcout << L"  Use offline !kmon redact-image or redact-irp and ai share for reviewed counts.\n";
     }
     else if (name == L"explain")
     {
@@ -29184,7 +29188,7 @@ static bool PrintAiSubcommandHelp(const std::wstring& action)
         std::wcout << L"  ai explain !module integrity all /summary\n";
         std::wcout << L"  ai explain !wnf data <state-name-hash|entry-address>\n";
         std::wcout << L"  Runs a read-only evidence command locally. Raw output transfer is blocked at the provider.\n";
-        std::wcout << L"  Use offline !kmon redact-image and ai share for reviewed image counts; other evidence adapters remain unavailable.\n";
+        std::wcout << L"  Use offline !kmon redact-image or redact-irp and ai share for reviewed counts.\n";
     }
     else if (name == L"annotate")
     {
@@ -48349,7 +48353,7 @@ static void ExplainAiCapturedTools(
     RememberAiEvidence(aiState, summary.empty() ? query : summary, stdoutText);
     if (ToLower(ai.ProviderName()) == L"off")
     {
-        std::wcout << L"ai note: raw tool output stays local; ai share accepts reviewed minimized image facts.\n";
+        std::wcout << L"ai note: raw tool output stays local; ai share accepts reviewed image or IRP counts.\n";
         return;
     }
 
@@ -54197,7 +54201,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch, disk I/O and hard page fault records\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
         std::wcout << L"  KnLiveDbg.exe --etl-rotation-set <inventory.jws> --sha256 <digest> --authority <capture_controller|archive_witness> <trusted-p256-point> [--member <ordinal> <local.etl>]...   verify ordered ETL files\n";

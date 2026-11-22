@@ -148,6 +148,9 @@ def main():
     disclosure = by_key[("evidence", "disclosure", "local_files")]
     assert disclosure["availability"] == "not_probed" and disclosure["consistency"] == "reviewed_historical_image_counts"
     assert "durable_intent_before_http" in disclosure["requirements"] and "no_raw_capture_transfer" in disclosure["limits"]
+    irp_disclosure = by_key[("evidence", "disclosure_irp", "local_files")]
+    assert irp_disclosure["availability"] == "not_probed" and irp_disclosure["consistency"] == "reviewed_historical_irp_counts"
+    assert "reproduce_embedded_claims" in irp_disclosure["requirements"] and "supplied_thread_inventory_only" in irp_disclosure["limits"]
     assert privacy["availability"] == "not_probed" and privacy["consistency"] == "observed_os_access_controls"
     assert "efs_default" in privacy["requirements"] and "no_transfer_authority" in privacy["limits"]
     assert retention["availability"] == "not_probed" and retention["consistency"] == "recording_session_partitions"

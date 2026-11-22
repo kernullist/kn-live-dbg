@@ -1,6 +1,7 @@
 #include "../user/AiProvider.h"
 #include "../user/EvidenceDisclosure.h"
 #include "../user/ImageVerificationRecipe.h"
+#include "../user/PendingIrpEvidence.h"
 #include "../user/AnalystSnapshot.h"
 #include "../user/McpJson.h"
 #include <Windows.h>
@@ -21,9 +22,10 @@ int wmain(int argc, wchar_t** argv)
 {
     if (argc < 3) { return 2; }
     const std::wstring action = argv[1];
-    if (action == L"--prepare" && (argc == 5 || argc == 6))
+    if ((action == L"--prepare" || action == L"--prepare-irp") && (argc == 5 || argc == 6))
     {
-        const auto package = PrepareImageDisclosure(argv[2], argv[3], std::wstring(argv[4]) == L"efs", [&](const wchar_t* phase) {
+        const auto prepare = action == L"--prepare-irp" ? PrepareIrpDisclosure : PrepareImageDisclosure;
+        const auto package = prepare(argv[2], argv[3], std::wstring(argv[4]) == L"efs", [&](const wchar_t* phase) {
             if (argc == 6 && std::wstring(argv[5]) == phase)
             {
                 Print(L"{\"observed\":" + mcpjson::Quote(phase) + L"}");
@@ -44,9 +46,14 @@ int wmain(int argc, wchar_t** argv)
     }
     if (action == L"--facts" && argc == 3)
     {
-        MinimizedImageFacts facts;
-        const bool valid = ParseMinimizedImageFacts(ReadText(argv[2]), &facts);
+        DisclosureFactsIdentity facts;
+        const bool valid = ParseDisclosureFacts(ReadText(argv[2]), &facts);
         Print(L"{\"valid\":" + B(valid) + L"}"); return valid ? 0 : 1;
+    }
+    if (action == L"--replay-irp" && argc == 3)
+    {
+        const auto replay = ReplayPendingIrpCapture(argv[2]);
+        Print(PendingIrpReplayJson(replay)); return replay.Status == L"replayed" ? 0 : 1;
     }
     if (action != L"--ai" || argc != 4) { return 2; }
     const std::wstring mode = argv[3];

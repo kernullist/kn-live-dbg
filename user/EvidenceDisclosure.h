@@ -6,6 +6,14 @@
 #include <string>
 
 struct ImageRecipeReplay;
+struct PendingIrpReplay;
+enum class DisclosureFamily { Image, Irp };
+struct DisclosureFactsIdentity
+{
+    std::wstring Id;
+    DisclosureFamily Family = DisclosureFamily::Image;
+    bool RecordedIrpClaims = false;
+};
 
 // A closed vocabulary: no source-controlled text, addresses, identities,
 // artifact hashes, instructions, paths or byte sequences leave this projection.
@@ -18,6 +26,9 @@ struct MinimizedImageFacts
 std::wstring MinimizedImageFactsJson(const MinimizedImageFacts& facts);
 bool ParseMinimizedImageFacts(const std::wstring& json, MinimizedImageFacts* facts);
 bool ProjectImageDisclosure(const ImageRecipeReplay& replay, const std::wstring& id, MinimizedImageFacts* facts);
+std::wstring ProjectIrpDisclosure(const PendingIrpReplay& replay, const std::wstring& originalReport, const std::wstring& id);
+bool ParseMinimizedIrpFacts(const std::wstring& json, DisclosureFactsIdentity* identity);
+bool ParseDisclosureFacts(const std::wstring& json, DisclosureFactsIdentity* identity);
 std::wstring DisclosureTextSha256(const std::wstring& text);
 std::wstring NewDisclosureId();
 
@@ -30,6 +41,8 @@ struct EvidenceDisclosurePackage
     std::shared_ptr<EvidenceDisclosureLease> Lease;
 };
 EvidenceDisclosurePackage PrepareImageDisclosure(const std::wstring& source, const std::wstring& newRoot,
+    bool efs = true, const std::function<void(const wchar_t*)>& observer = {});
+EvidenceDisclosurePackage PrepareIrpDisclosure(const std::wstring& source, const std::wstring& newRoot,
     bool efs = true, const std::function<void(const wchar_t*)>& observer = {});
 EvidenceDisclosurePackage LoadEvidenceDisclosure(const std::wstring& root);
 std::wstring EvidenceDisclosurePackageJson(const EvidenceDisclosurePackage& package);

@@ -39,6 +39,21 @@ class PublicContentTests(unittest.TestCase):
         ordinary = json.dumps(dict(paths="2", named_bytes="4", **{"class": "text_files"})).encode()
         self.assertFalse(AUDIT.inspect("file-counts.txt", ordinary))
 
+    def test_detached_irp_disclosure(self):
+        for name in ("case.knirp.KNCLAIMS", "case.knirp.knclaims.pending-7"):
+            self.assertIsNotNone(AUDIT.path_rule(name))
+        for fields in (dict(recorded_claims=None, requests_retained="1", qualified_replay=True),
+                       dict(original_capture_sha256="fixture", recorded_claim_sha256=None, source_semantic_sha256="fixture"),
+                       dict(claims_possible="7", claims_emitted="7", supported="3", not_applicable="1")):
+            raw = json.dumps(dict(outer=[fields]))
+            for data in (raw.encode(), raw[:-3].encode(), raw.encode("utf-16-le"), raw.encode("utf-16-be")):
+                self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("attachment.txt", data)})
+        for schema in ("kn.minimized_irp_facts.v1", "kn.redaction_manifest.v2", "kn.irp_capture.v1", "kn.irp_capture.v2",
+                       "kn.irp_claim_publication.v1", "kn.irp_claim_report.v1"):
+            raw = json.dumps(dict(schema=schema))
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("renamed.txt", raw.encode(encoding))})
+
     def test_rotation_inventories_and_exports(self):
         for filename in ("source.knetlset", "source.knetlset.pending-1", "controller.knetlowner"):
             self.assertIsNotNone(AUDIT.path_rule(filename))
@@ -144,7 +159,7 @@ class PublicContentTests(unittest.TestCase):
                        "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                        "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
                        "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement_policy.v2", "kn.evidence_retirement.v1", "kn.evidence_retirement.v2", "kn.evidence_collection_retention.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
-                    "kn.minimized_image_facts.v1", "kn.redaction_manifest.v1", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
+                    "kn.minimized_image_facts.v1", "kn.minimized_irp_facts.v1", "kn.redaction_manifest.v1", "kn.redaction_manifest.v2", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
                        "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                        "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                        "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",

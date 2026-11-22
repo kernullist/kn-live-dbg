@@ -161,6 +161,7 @@
     <ClCompile Include="EvidencePrivacy.cpp" />
     <ClCompile Include="EvidenceDisclosure.cpp" />
     <ClCompile Include="EvidenceDisclosureFacts.cpp" />
+    <ClCompile Include="IrpDisclosureFacts.cpp" />
     <ClCompile Include="EvidenceGraph.cpp" />
     <ClCompile Include="EvidenceGraphQuery.cpp" />
     <ClCompile Include="EvidenceGraphJson.cpp" />

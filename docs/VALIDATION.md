@@ -7,6 +7,58 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Minimized IRP disclosure on 2026-11-23
+
+The preceding x64 Release CLI (`7d3fd43cffdf`) replayed an owned pending IRP
+capture but returned exit 2 for `redact-irp`. The updated size-optimized x64
+Release CLI (`f73c7a2c6b97`) and Release harness (`7f09cf5616c0`) processed
+21 native fixture captures in both raw v2 and claim-publication form. The
+oracle derived all expected public fields from the independently saved raw
+captures and capture-time reports. It verified the private hashes of the
+original file, semantic publication, embedded capture and report, replay
+result and exact derivative bytes. All raw derivatives carried a null
+original-claim field. One recorded case preserved 196 possible, 92 emitted
+and 104 omitted claims.
+
+The combined image and IRP suite passed 1,113 checks and observed 19 requests
+at its owned loopback receiver. It exercised the ordinary CLI, EFS file
+attributes, the exact payload on the wire, durable intent, one-use
+confirmation and cancellation. The closing check found zero child processes.
+Known answers included an empty result, unstable observations, missing
+references, substituted source bytes, a mismatched recorded policy and
+rehashed cross-family packages. The original stayed pinned through replay.
+Interruption after publishing the facts left an incomplete package. Once
+the manifest was present, the verifier could reopen it. The previous CLI
+read new v1 image packages and denied v2 IRP packages. The current loader
+also read an image package created by the preceding CLI.
+
+The MSVC ASan harness (`d6ad3681885b`) passed 1,000 checks with 10 loopback
+requests and zero child processes. Its default startup stopped on an unhandled
+instruction in the Windows interceptor. The completed run used
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and `halt_on_error=1`. The
+failed intercept limits sanitizer coverage on this host.
+
+The independent IRP publication and replay regression passed 830 checks
+across 21 cases. The KMON writer passed 35 IRP publication checks and the
+console suite passed 570 checks. The compiled support matrix matched 65
+contracts and 261 command routes. The public-content scanner passed 40
+tests, including renamed UTF-16 files and incomplete claim-report names.
+The generated private file names and their pending forms were also checked
+against the repository's Git ignore rules. The original release copy guard
+accepted four sampled private file names. The updated guard passed 39 release
+privacy checks, including complete and pending forms for nine IRP and
+disclosure file types.
+
+Coverage here is limited to historical captures, a controlled Windows host
+and local HTTP fixtures. Recipient handling, live driver lifecycle and
+redaction of other evidence families remain outside these observations.
+To run the combined oracle, pass the native fixture directories with
+`--slices`, `--recipes` and `--irps`. Supply the disclosure harness with
+`--exe`, the test publisher with `--irp-publisher`, and the current and
+preceding product executables with `--cli` and `--previous-cli`. The
+`--output` directory holds the private test packages.
+[Disclosure oracle](../tools/test-evidence-disclosure.py)
+
 ## Cross-collection routine retention on 2026-11-23
 
 The preceding x64 Release CLI (`11da8a1dea86`) accepted the ordinary stopped

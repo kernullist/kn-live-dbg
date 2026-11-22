@@ -52,6 +52,7 @@ A dash means the binary declares no standalone probe for that operation.
 | image / capture_verification | dump | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_dump | — |
 | evidence / privacy | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | observed_os_access_controls | — |
 | evidence / disclosure | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | reviewed_historical_image_counts | — |
+| evidence / disclosure_irp | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | reviewed_historical_irp_counts | — |
 | evidence / retention | native | implemented | collector_specific;extended_address_pipeline_unvalidated | recording_session_partitions | `native_connection` |
 | evidence / retention_irp | native | implemented | collector_specific;extended_address_pipeline_unvalidated | recorded_state_session_partitions | `native_connection` |
 | evidence / claims_irp | capture | implemented | collector_specific;extended_address_pipeline_unvalidated | current_policy_on_recorded_invariants | — |

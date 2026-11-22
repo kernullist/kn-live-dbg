@@ -1010,7 +1010,7 @@ namespace
 
     const CompletionHint kAiRootTokens[] =
     {
-        { L"share", L"ai share preview <private-package-root> | send <review-id> confirm | cancel", L"review minimized image facts and approve one HTTP request" },
+        { L"share", L"ai share preview <private-package-root> | send <review-id> confirm | cancel", L"review minimized image or IRP facts and approve one HTTP request" },
         { L"status", L"ai status", L"ready/blocked health and next setup step" },
         { L"help", L"ai help [subcommand]", L"AI usage" },
         { L"use", L"ai use <preset|model> [model]", L"pick a preset or cloud model and save .env" },
@@ -1034,7 +1034,7 @@ namespace
         { L"run", L"ai run [index|all]", L"execute planned read-only commands" },
         { L"write", L"ai write [index] [confirm]", L"preview or confirm a write-like plan step" },
         { L"explain", L"ai explain <read-only-command...>", L"collect locally; raw output transfer is blocked" },
-        { L"analyze", L"ai analyze <read-only-command...>", L"collect locally; share supports reviewed image counts" },
+        { L"analyze", L"ai analyze <read-only-command...>", L"collect locally and share reviewed image or IRP counts" },
         { L"annotate", L"ai annotate <u|uf> <addr>", L"annotate native disassembly" },
         { L"diagnose", L"ai diagnose <note>", L"diagnose a symbol/backend/type failure" },
         { L"playbook", L"ai playbook <callbacks|minifilter|object|address|driver|hidden|...>", L"load a repeatable read-only plan" },

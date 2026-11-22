@@ -272,7 +272,7 @@ static PendingIrpReplay ReplayOriginalIrpCapture(const std::wstring& json, const
     {
         replay.Status = L"unavailable"; replay.Issue = issue;
         replay.SummaryMatched = replay.QualifiedObservation = false;
-        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {};
+        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {}; replay.SuppliedThreads = 0;
         if (originalReport) { originalReport->clear(); }
         return replay;
     };
@@ -364,6 +364,7 @@ static PendingIrpReplay ReplayOriginalIrpCapture(const std::wstring& json, const
         if ((capture && !capture->Unchanged()) || (replay.ReferenceStatus == L"verified" && !reference.Unchanged()))
         { return fail(L"artifact_changed_during_replay"); }
         replay.SummaryMatched = true;
+        replay.SuppliedThreads = threads.size();
         replay.QualifiedObservation = result.RuntimeQualified && replay.ReferenceStatus == L"verified";
         replay.Status = L"replayed";
         replay.ClaimAssessmentJson = PendingIrpClaimAssessmentJson(binding, threads, options, result, reads, context,
@@ -438,7 +439,7 @@ PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path, bool currentC
     {
         replay.Status = L"unavailable"; replay.Issue = issue;
         replay.SummaryMatched = replay.QualifiedObservation = false;
-        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {};
+        replay.ClaimAssessmentJson.clear(); replay.Recomputed = {}; replay.SuppliedThreads = 0;
         return replay;
     };
     try
@@ -483,6 +484,7 @@ PendingIrpReplay ReplayPendingIrpCapture(const std::wstring& path, bool currentC
         if (!currentClaims && originalReport != report)
         { replay.OriginalClaimStatus = L"assessment_mismatch"; return fail(L"recorded_claim_assessment_mismatch"); }
         replay.SummaryMatched = true; replay.QualifiedObservation = evaluated.QualifiedObservation;
+        replay.SuppliedThreads = evaluated.SuppliedThreads;
         replay.Status = L"replayed";
         replay.Recomputed = std::move(evaluated.Recomputed);
         replay.ClaimAssessmentJson = std::move(evaluated.ClaimAssessmentJson);

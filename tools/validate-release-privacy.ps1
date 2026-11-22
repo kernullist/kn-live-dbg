@@ -64,6 +64,11 @@ foreach ($name in @("docs\.env.local", "research\signing.key", ".build\evidence.
 {
     Assert-RejectedCopy -Name $name -Relative
 }
+foreach ($extension in @("knirp", "knirpledger", "knclaims", "knblob", "knprivacy", "knshare", "knredact", "knsend", "knsendresult"))
+{
+    Assert-RejectedCopy -Name ("original." + $extension.ToUpperInvariant())
+    Assert-RejectedCopy -Name ("attachments\original." + $extension + ".pending-7") -Relative
+}
 
 $examplePath = Join-Path $sourceRoot ".env.example"
 [IO.File]::WriteAllText($examplePath, "API_KEY=sk-replace-me")

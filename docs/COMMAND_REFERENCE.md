@@ -189,6 +189,14 @@ the completed package. Both always emit private `kn.disclosure_package.v1` JSON:
 0 means ready, 1 denied/unavailable/incomplete, 2 invalid grammar and 3 output
 failure. Publication is create-new; an output failure does not undo it.
 
+`KnLiveDbg.exe --offline !kmon redact-irp <capture.knirp> <new-private-root> [/acl-only] [/json]`
+creates a private package of historical IRP counts. A raw v2 capture yields
+observed counts and a null original-claim field. A capture with an embedded
+claim report also yields its outcome and omission counts after exact
+reproduction. Use `disclosure <root>` to inspect it and `ai share preview <root>`
+to review the minimized facts and destination. EFS is the default. Exit codes
+match `redact-image`. [IRP disclosure semantics](ARCHITECTURE.md#minimized-irp-disclosure)
+
 In the local console, `ai share preview <root>` displays and pins the exact facts
 and HTTP destination without sending. `ai share send <review-id> confirm` approves
 that review once; `ai share cancel` revokes it. A private intent must commit before

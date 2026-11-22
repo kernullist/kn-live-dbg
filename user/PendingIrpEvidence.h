@@ -36,6 +36,7 @@ struct PendingIrpReplay
     std::wstring ReferenceStatus = L"not_checked";
     bool SummaryMatched = false;
     bool QualifiedObservation = false;
+    size_t SuppliedThreads = 0;
     std::wstring ClaimAssessmentJson;
     PendingIrpScanResult Recomputed;
 };
