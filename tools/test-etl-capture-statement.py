@@ -109,7 +109,7 @@ def check(exe, signer, etl, claims, folder, expected_records=None, reference=Non
     key = signer.point.upper()
     signature_args = ["--capture-statement", jws, claims["role"], key]
     rc = 1 if short else 0
-    variants = [("--etl-profile", ["--capture-settings"]), ("--etl-profile", ["--clr-evidence"]),
+    variants = [("--etl-disk-io", []), ("--etl-profile", ["--capture-settings"]), ("--etl-profile", ["--clr-evidence"]),
                 ("--etl-switches", ["--capture-settings", "--intervals"])]
     if reference:
         flags = ["--after", "0", "--thread-evidence", "--image-evidence", "--process-evidence",

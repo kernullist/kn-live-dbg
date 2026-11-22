@@ -332,6 +332,63 @@ checksum conflicts. A matching build pair can distinguish the supplied PE
 when neither loader checksum nor loader stamp is available. Every comparable
 loader field must still agree. [Microsoft PE debug directory](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#debug-directory-image-only)
 
+## Read saved disk I/O response times
+
+Use `--etl-disk-io` to find the read, write and flush completions with the
+longest reported response times in a pinned Windows ETL. The reader also
+counts the initiation events present in the file. It runs before driver or
+symbol initialization.
+
+```powershell
+$etl = (Get-Item -LiteralPath .\case.etl).FullName
+$pin = (Get-Content -LiteralPath .\case.etl.sha256 -Raw).Trim()
+$page = & KnLiveDbg.exe --etl-disk-io $etl --sha256 $pin --limit 8 | ConvertFrom-Json
+$page.operations | Select-Object operation, initiations, completions, transfer_bytes, longest_response_ties
+$read = ($page.operations | Where-Object operation -eq read).first_longest_response
+if ($null -ne $read -and $null -ne $page.response_ticks_per_second) {
+    $ms = 1000 * [decimal]$read.high_res_response_ticks / [decimal]$page.response_ticks_per_second
+    "Read at record $($read.record_ordinal) reported $ms ms"
+}
+```
+
+The `kn.etl_disk_io.v1` page accepts classic DiskIo versions 2 and 3.
+Opcodes 10 and 11 report reads and writes, and 14 reports flushes.
+Opcodes 12, 13 and 15 are the corresponding initiations. Each row gives the
+original one-based `record_ordinal`, raw ETW timestamp, CPU, event version
+and pointer width. Version 3 supplies a numeric issuing thread ID.
+Completion rows carry the disk number and `HighResResponseTime`. Reads and
+writes also carry the transfer size in bytes. Initiations have null disk
+number, transfer size and duration. Flushes have null transfer size.
+[Windows read and write fields](https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1) · [Initiation fields](https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup2) · [Flush fields](https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup3)
+
+`high_res_response_ticks` measures the response interval reported by the
+storage stack. `response_ticks_per_second` comes from the file header's
+positive performance-counter frequency. Both are decimal strings. When the
+frequency is unavailable, the counter remains readable in ticks. A measured
+zero is preserved. The separate event timestamp uses the trace clock.
+Queueing, hardware service time, I/O status, a particular waiting thread and
+the identity of the request across providers need other evidence.
+[Trace header frequency](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-trace_logfile_header) · [WPA disk response and service times](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/optimizing-performance-and-responsiveness-exercise-2)
+
+Each page scans the complete file, up to 512 MiB and two million ETW records.
+The per-operation totals count initiations and completions independently.
+The longest-response entry points to the first completion at the maximum
+counter and gives the number tied there. When there are no completions,
+the entry is null and the tie count is zero. These totals remain visible
+on the empty final page. `--after` counts decoded disk events, and
+`--limit` accepts 1 through 128, with a default of 64. Use `next_after`
+to continue and `--check-page` to reproduce the exact bytes of a retained
+page. The replay also accepts a signed capture statement.
+[Capture statement verification](#verify-a-signed-capture-statement)
+
+Check `status` before interpreting the totals. A buffer mismatch, missing
+buffer accounting, a recorded loss or an unsupported DiskIo layout returns
+`partial` and exit 1. Totals then describe the records that could be decoded.
+A complete scan can return `read` with zero disk events. The capability
+probe reports the observed record count, original ordinal and payload hash
+for this family. Keep source traces, evidence pages and replay receipts private.
+[Validation on saved traces](VALIDATION.md#saved-disk-io-response-times-on-2026-11-22)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

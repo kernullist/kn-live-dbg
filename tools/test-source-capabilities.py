@@ -252,7 +252,8 @@ def main():
     assert invalid.returncode != 0 and not invalid.stdout.strip()
     help_result = subprocess.run([exe, "--help"], capture_output=True, text=True,
                                  check=True, timeout=30)
-    assert all(flag in help_result.stdout for flag in ("--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--clr-evidence", "--check-page", "--capture-statement"))
+    assert all(flag in help_result.stdout for flag in ("--etl-disk-io", "--etl-switches", "--intervals", "--thread-id", "--capture-settings", "--clr-evidence", "--check-page", "--capture-statement"))
+    assert "check saved CPU sample, context switch and disk I/O records" in help_result.stdout
     assert all(s in help_result.stdout for s in ("--etl-profile", "--image-evidence", "--process-evidence", "--build-evidence", "--reference-image"))
     assert "--capabilities" in help_result.stdout
     assert "--capabilities --probe" in help_result.stdout
@@ -261,7 +262,8 @@ def main():
     assert len(catalog) == len(data["probe_contracts"])
     for contract in catalog.values():
         assert "KnLiveDbg.exe " + contract["invocation"] in help_result.stdout and contract["observation"]
-    expected_routes = {("memory", "read_virtual", "process_handle"): "owned_read",
+    expected_routes = {("io", "disk_io", "etl"): "saved_etl_family",
+                       ("memory", "read_virtual", "process_handle"): "owned_read",
                        ("memory", "read_virtual", "dump"): "saved_dump_range",
                        ("execution", "cpu_profile", "etl"): "saved_etl_family",
                        ("execution", "context_switch", "etl"): "saved_etl_family"}

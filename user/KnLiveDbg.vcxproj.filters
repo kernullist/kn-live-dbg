@@ -507,6 +507,9 @@
     <ClInclude Include="ArtifactOutput.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="EtlDiskIo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="EtlProfile.h">
       <Filter>Header Files</Filter>
     </ClInclude>

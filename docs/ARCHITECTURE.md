@@ -50,19 +50,19 @@ Runtime reports contain
 identity/address evidence and are rejected by the public-content scanner.
 
 The standalone `--capabilities --probe-etl <file> --sha256 <digest>` path
-runs the two saved ETL record decoders on one traversal. It holds the file
+checks CPU samples, context switches and disk I/O in one traversal. It holds the file
 and its parent directories through the Windows ETW read, checks the file
 identity and hashes the retained handle again before using the counts. The
 probe reports the SHA-256 measured at open. `source_revalidated` records the
 result of the final check and is null if the scan never reached it.
 
-Only the `execution/cpu_profile/etl` and `execution/context_switch/etl` rows
-carry `record_evidence`. Their ordinals refer to the same traversal. For each
-family with a supported layout, the callback copies its first complete payload
-into a fixed 24-byte buffer. The report includes its length and SHA-256. Each
+The `execution/cpu_profile/etl`, `execution/context_switch/etl` and
+`io/disk_io/etl` rows carry `record_evidence`. Their ordinals refer to
+the same traversal. For each family with a supported layout, the callback
+copies its first complete payload into a fixed 52-byte buffer. The report includes its length and SHA-256. Each
 family qualifies its own sampled payload and recognized layout. Unsupported
 layouts and absent families stay visible. Buffer count discrepancies, unknown
-buffer accounting and reported loss limit both availability claims to
+buffer accounting and reported loss limit the observed families to
 `partial`. The other rows remain unprobed. Process and driver probing require
 the separate live invocation. The private saved report records
 `target_probed=false` and leaves platform regression and event semantics open.

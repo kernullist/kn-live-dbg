@@ -25,7 +25,7 @@ struct EtlCapabilityRecords
 
 struct EtlCapabilityCoverage
 {
-    EtlCapabilityRecords Profile, Switches;
+    EtlCapabilityRecords Profile, Switches, DiskIo;
     uint32_t RecordsSeen = 0, EventsLost = 0, BuffersLost = 0, LossMarkers = 0, BuffersWritten = 0;
     uint64_t BuffersProcessed = 0;
     etl_profile::BufferAccounting Accounting = etl_profile::BufferAccounting::Unavailable;
@@ -58,6 +58,7 @@ struct SavedEtlCapabilityProbe
         if (!Coverage) { return nullptr; }
         if (operation == L"cpu_profile") { return &Coverage->Profile; }
         if (operation == L"context_switch") { return &Coverage->Switches; }
+        if (operation == L"disk_io") { return &Coverage->DiskIo; }
         return nullptr;
     }
 

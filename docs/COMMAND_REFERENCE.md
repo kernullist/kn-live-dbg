@@ -14,7 +14,7 @@ available in that mode. Both accept `--capabilities` for the compiled
 inventory. That inventory describes the binary across all launch paths.
 
 Both modes can query one saved `kn.execution_trace.v1` file or a native
-`kn.etl_profile.v1` through `v7` CPU profile page. Redirect a
+`kn.etl_profile.v1` through `v8` CPU profile page. Redirect a
 readable regular file on a fixed local volume to standard input. For example,
 in **cmd.exe**, using a saved trace named `saved trace.kntrace` in the working
 directory, run
@@ -29,6 +29,9 @@ The 2 MiB input limit also applies here. A pipe, device, metadata-only handle,
 conflicting writer, offline file or unqualified volume produces an unavailable
 result. The parser accepts only trace data. It never resolves paths from the
 record or opens a file named on the command line in these modes.
+A restricted launch that rejects a saved ETL reader emits its decision to
+a pipe or console. If standard output is a disk file, it returns the denial
+or syntax exit code without writing to an input through a hard link.
 
 `KnLiveDbg.exe --mode observe --capabilities --probe --allow-residency` reads
 one known 32-byte range in its own process. The consent flag allows the read
@@ -74,7 +77,8 @@ $report = & .\x64\Release\KnLiveDbg.exe --capabilities --probe-etl $etl --sha256
 $report.capabilities | Where-Object backend -eq etl | Select-Object operation, availability, record_evidence
 ```
 
-In a `saved_etl_probe` report, `record_evidence` gives the decoded and unsupported
+The probe checks CPU samples, context switches and disk I/O. In a
+`saved_etl_probe` report, `record_evidence` gives the decoded and unsupported
 counts and the first decoded event's one-based position among all records. Its
 payload length and SHA-256 identify the original bytes at that position.
 `available` applies to a record family in the supplied file. A family with
@@ -1109,7 +1113,7 @@ $trustedPoint = (Get-Content -Raw -LiteralPath .\approved-recorder-p256.hex).Tri
 & KnLiveDbg.exe --etl-profile capture.etl --sha256 $pin --capture-settings --limit 8 --check-page $page.file_sha256 --capture-statement capture.knetlstatement capture_controller $trustedPoint
 ```
 
-The same option works with `--etl-switches`. Use `archive_witness` for a
+The same option works with `--etl-switches` and `--etl-disk-io`. Use `archive_witness` for a
 key authorized to attest to archived bytes. A matching controller receipt
 identifies the signed claims, the original ETL, the regenerated page, the
 statement file and the trusted key. It records the role check separately
@@ -1220,6 +1224,22 @@ $page.samples | Where-Object { $_.build_evidence.relation -eq 'paired_merge_buil
 
 Omit `--reference-image` and its two arguments to inspect the ETL markers
 alone. [Merge-time build fields](TRACE_IMPORT.md#compare-merge-time-build-identifiers)
+
+### Inspect disk I/O from a saved ETL
+
+Read a local capture using the SHA-256 supplied with it. The three operation
+summaries cover the whole file even when `--limit` selects one event.
+
+```powershell
+$etl = (Get-Item -LiteralPath .\case.etl).FullName
+$pin = (Get-Content -LiteralPath .\case.etl.sha256 -Raw).Trim()
+$page = & KnLiveDbg.exe --etl-disk-io $etl --sha256 $pin --limit 1 | ConvertFrom-Json
+$page.operations | Select-Object operation, initiations, completions, transfer_bytes, first_longest_response
+```
+
+The longest-response entry identifies the original completion record. Its
+counter and the header frequency allow a conversion to milliseconds. Check
+`status` and the loss counters before using the totals. [Field definitions, paging and timing example](TRACE_IMPORT.md#read-saved-disk-io-response-times)
 
 ### Inspect context switches from a saved ETL
 

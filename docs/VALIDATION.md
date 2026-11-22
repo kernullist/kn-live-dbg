@@ -7,6 +7,41 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved disk I/O response times on 2026-11-22
+
+An x64 Release build on top of `a4bc8da` read the five saved ETLs below.
+The Windows `tracerpt` XML export supplied the original record order and
+named fields for the control, CPU workloads and allocator. For the larger
+scheduler trace, a compact raw-clock CSV export fit the available temporary
+space. Its 877,318 rows and 2,307 supported disk records also matched the
+independent Windows summary by provider GUID and version.
+
+| Saved ETL | All records | Disk records | Reads, start / completion | Writes, start / completion | Flushes, start / completion |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control | 23 | 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| x64 CPU workload | 179,474 | 2,462 | 1,208 / 1,208 | 21 / 21 | 2 / 2 |
+| x86 CPU workload | 168,298 | 4,786 | 2,339 / 2,339 | 50 / 50 | 4 / 4 |
+| SimpleAllocator | 418,378 | 1,717 | 42 / 41 | 817 / 817 | 0 / 0 |
+| Scheduler | 877,318 | 2,307 | 0 / 1,573 | 0 / 718 | 0 / 16 |
+
+The readers agreed on the ordinal, timestamp, CPU, operation, phase,
+issuing TID and available disk, byte and response fields for all 11,272
+disk events. Paging preserved the whole-file byte totals, the first maximum
+for each operation and its tie count. The x64 workload reported 19,564,544
+bytes read and a longest read of 4,045,865 ticks at 10 MHz (404.5865 ms).
+The scheduler's longest read was 188,874 ticks (18.8874 ms), with no read
+initiations recorded. These captures establish recorded response intervals.
+Device service time and request identity across providers remain open.
+
+The x86 and x64 labels describe the workloads. The observed DiskIo records
+in these captures used 64-bit envelopes. Synthetic controls exercised both
+pointer widths, versions 2 and 3, all six opcodes, truncated and overlong
+records, zero responses, ties and transfer totals above 4 GiB. The shortened
+control ETL retained its partial buffer count. Exact-page replay, a mismatched
+hash, signed capture statements and redirected output against owned hard
+links were checked separately. The probe's first payload fingerprint was
+checked against the Windows fields. [Disk I/O command and timing units](TRACE_IMPORT.md#read-saved-disk-io-response-times)
+
 ## Directory notification timing on 2026-11-22
 
 The x64 Release collector from `fd3b28f` recorded four runs against owned

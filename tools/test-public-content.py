@@ -182,6 +182,16 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", snippet.encode(enc))})
         self.assertFalse(AUDIT.inspect("timing.md", b"The optional report exposes signal_window and tick_field."))
 
+    def test_saved_disk_io(self):
+        for row in (dict(status="partial", schema="kn.etl_disk_io.v1"), dict(disk_event_ordinal=3, record_ordinal=42),
+                    dict(reported_issuing_tid=32, high_res_response_ticks="0"),
+                    dict(completions=0, longest_response_ties=0, initiations=1),
+                    dict(cross_provider_join=False, device_service_time=None, request_generation=None)):
+            sample = "log\n" + json.dumps(dict(part=row), indent=2)[:-4]
+            for enc in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", sample.encode(enc))})
+        self.assertFalse(AUDIT.inspect("disk.md", b"See the kn.etl_disk_io.v1 report."))
+
     def test_saved_cpu_profile(self):
         for name in ("input.ETL", "input.etl.zip"):
             self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")

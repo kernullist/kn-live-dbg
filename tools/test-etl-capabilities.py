@@ -1,4 +1,4 @@
-"""Compare saved ETL capability rows against Windows tracerpt and both native readers."""
+"""Compare saved ETL capability rows against Windows tracerpt and the native readers."""
 import argparse
 import hashlib
 import json
@@ -13,6 +13,8 @@ import tempfile
 
 
 FAMILIES = (
+    ("disk_io", "--etl-disk-io", "disk_events", "decoded_disk_records", "unsupported_disk_records",
+     "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c", r"(?:Read|Write|ReadInit|WriteInit|FlushBuffers|FlushInit|1[0-5])", "[23]"),
     ("cpu_profile", "--etl-profile", "samples", "decoded_samples", "unsupported_profile_records",
      "ce1dbfb4-137e-4da6-87b0-3f59aa102cbc", r"(?:SampleProf|46)", "2"),
     ("context_switch", "--etl-switches", "switches", "decoded_switches", "unsupported_switch_records",
@@ -45,7 +47,8 @@ def report(exe, path, pin, code):
         assert row["validation"] == "not_performed_for_target_environment"
         stages = row["probe_stages"]
         assert stages["environment_regression"] == "not_performed" and stages["semantic_validation"] == "not_probed"
-        if (row["domain"], row["backend"]) == ("execution", "etl") and row["operation"] in {f[0] for f in FAMILIES}:
+        expected_domain = "io" if row["operation"] == "disk_io" else "execution"
+        if (row["domain"], row["backend"]) == (expected_domain, "etl") and row["operation"] in {f[0] for f in FAMILIES}:
             assert row["availability_scope"] == "supplied_etl_record_family" and row["operation"] not in rows
             rows[row["operation"]] = row
         else:
@@ -104,9 +107,17 @@ def check_scan(exe, path, pin, code, oracle=None):
         if oracle:
             assert evidence["decoded"] == oracle[1][op]
         assert evidence["first_decoded_record"] == (page[key][0]["record_ordinal"] if page[key] else None)
-        payload = first_payload(op, page[key][0]) if page[key] else None
-        assert evidence["first_payload_bytes"] == (len(payload) if payload else None)
-        assert evidence["first_payload_sha256"] == (hashlib.sha256(payload).hexdigest() if payload else None)
+        if op == "disk_io" and page[key]:
+            # Disk pages omit pointer values. The XML disk oracle checks the hash from the full named fields.
+            first = page[key][0]
+            width = first["pointer_bytes"]
+            size = {10: 32+2*width, 11: 32+2*width, 14: 16+width}.get(first["opcode"], width)
+            assert evidence["first_payload_bytes"] == size + (4 if first["version"] == 3 else 0)
+            assert re.fullmatch(r"[0-9a-f]{64}", evidence["first_payload_sha256"])
+        else:
+            payload = first_payload(op, page[key][0]) if page[key] else None
+            assert evidence["first_payload_bytes"] == (len(payload) if payload else None)
+            assert evidence["first_payload_sha256"] == (hashlib.sha256(payload).hexdigest() if payload else None)
         assert evidence["observation"] == ("decoded_records" if page[key] else "no_matching_records_observed")
         assert row["availability"] == ("available" if page[key] and code == 0 else "partial")
         stages = row["probe_stages"]

@@ -475,6 +475,7 @@
     <ClInclude Include="CapabilityProbeContracts.h" />
     <ClInclude Include="SavedEtlCapability.h" />
     <ClInclude Include="SavedDumpCapability.h" />
+    <ClInclude Include="EtlDiskIo.h" />
     <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />

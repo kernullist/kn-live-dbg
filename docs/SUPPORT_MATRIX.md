@@ -73,6 +73,7 @@ A dash means the binary declares no standalone probe for that operation.
 | debugger / execute | dbgeng | implemented | backend_defined;command_text_only | backend_defined | — |
 | io / interpose_dispatch | native | experimental | collector_specific;extended_address_pipeline_unvalidated | live_non_atomic | `native_connection` |
 | security / inspect_vtl1_memory | native | unsupported | collector_specific;extended_address_pipeline_unvalidated | unavailable | — |
+| io / disk_io | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_disk_io | `saved_etl_family` |
 | execution / context_switch | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_scheduler_event | `saved_etl_family` |
 | execution / cpu_profile | etl | implemented | collector_specific;extended_address_pipeline_unvalidated | reported_cpu_samples | `saved_etl_family` |
 | objects / game_object_lifetime | game_build_manifest | implemented | collector_specific;extended_address_pipeline_unvalidated | game_reported_two_observations | — |

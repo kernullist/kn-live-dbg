@@ -84,7 +84,8 @@ def text_views(data: bytes) -> list[str]:
             "\n".join(s.decode("utf-16-le") for s in wide_strings)]
 
 
-TRACE_QUERY_SCHEMAS = ("kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1")
+DISK_IO_SCHEMA = "kn.etl_disk_io.v1"
+TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1")
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
@@ -134,7 +135,14 @@ ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
-ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
+DISK_IO_MARKERS = (DISK_IO_SCHEMA, '"disk_event_ordinal"', '"high_res_response_ticks"', '"longest_response_ties"',
+                   '"response_ticks_per_second"', '"decoded_disk_records"', '"cross_provider_join"')
+DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
+    ("disk_event_ordinal", "record_ordinal"), ("high_res_response_ticks", "reported_issuing_tid"),
+    ("longest_response_ties", "initiations", "completions"), ("response_ticks_per_second", "operations"),
+    ("decoded_disk_records", "records_seen"), ("cross_provider_join", "device_service_time", "request_generation"),
+))
+ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *DISK_IO_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
                    '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4', 'kn.etl_profile.v5', 'kn.etl_profile.v6', 'kn.etl_profile.v7', 'kn.etl_profile.v8',
@@ -266,6 +274,8 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
 
 def detached_evidence_line(text: str) -> int | None:
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
+    if any(tag in text for tag in DISK_IO_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA,)))
     if any(tag in text for tag in IO_TIMING_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, IO_TIMING_FIELDS, IO_LIFETIME_SCHEMAS))
     if any(tag in text for tag in ETL_COMPARISON_MARKERS):
@@ -405,7 +415,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

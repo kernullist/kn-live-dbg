@@ -143,7 +143,7 @@ def switch_values(system, ns, fields, ordinal, version):
             signed_byte("OldThreadWaitIdealProcessor"), number("NewThreadWaitTime"), number("Reserved"))
 
 
-def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None, include_samples=False, clr=None):
+def oracle(etl, folder, want_images, want_switches=False, schedule=None, processes=None, builds=None, include_samples=False, clr=None, disk=None):
     # The XML event envelope gives an ordinal even when TDH cannot format a
     # field. In that case Windows still exports the original event payload.
     xml_path = folder / "raw.xml"
@@ -181,6 +181,11 @@ def oracle(etl, folder, want_images, want_switches=False, schedule=None, process
             if clr is not None:
                 clr.observe_xml(event, ns, records)
             guid = (event.findtext(trace_ns + "ExtendedTracingInfo/" + trace_ns + "EventGuid") or "").strip("{}").lower()
+            if disk is not None:
+                disk.observe_xml(event, ns, guid, records)
+                event.clear()
+                root.clear()
+                continue
             if (want_images or processes is not None) and guid == "68fdd900-4a3e-11d1-84f4-0000f80464e3":
                 width = event.find(ns + "EventData/" + ns + "Data[@Name='PointerSize']")
                 if width is not None:
