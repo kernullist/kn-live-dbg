@@ -33,6 +33,20 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-tracerpt-summary", {f["rule"] for f in AUDIT.inspect("summary.data", text.encode(encoding))})
         self.assertFalse(AUDIT.inspect("guide.md", b"The kn.etl_reader_comparison.v1 archive retains tracerpt output."))
 
+    def test_registered_etl_campaign(self):
+        distinct = (dict(plan_sha256="a", slot=2, ticket="t", admission_id="i"),
+                    dict(admission_sha256="a", tick_ns="2", outcome="os_error"),
+                    dict(planned_slots=2, plan_sha256="a"),
+                    dict(observation="read", file_bytes=11, prefix_sha256="digest"),
+                    dict(domain="admission", role="etl", expected_sha256="a", observed_sha256="b"),
+                    dict(agreement_per_planned=None, agreement_per_comparable=None),
+                    dict(acquisition="published", source_sha256="s", evidence="missing", pair=None))
+        for value in [*distinct, *(dict(schema=s) for s in AUDIT.ETL_COMPARISON_SCHEMAS)]:
+            sample = "retained\n" + json.dumps(dict(data=value), indent=2)[:-3]
+            for enc in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", sample.encode(enc))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"The kn.etl_reader_campaign.v1 snapshot records registered slots."))
+
     def test_private_operation_journal(self):
         for path in ("operations.KNMCPJOURNAL", "operations.knmcpjournal.tmp.1", "renamed.bin"):
             self.assertIn("private-operation-journal", {r["rule"] for r in AUDIT.inspect(path, b"KNMCPJ1\0ciphertext")})

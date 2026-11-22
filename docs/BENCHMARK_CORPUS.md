@@ -288,14 +288,78 @@ records which tables were present.
 comparable. Exit 0 from acquisition records a published pair. Exit 0 from
 replay records an intact, evaluated pair, including pairs with failed readers.
 An input pin mismatch or malformed package yields exit 2. A supervisor that
-stops before publication has no completed pair. Each invocation covers one
-file and has no campaign-wide denominator for unpublished runs.
+stops before publication has no completed pair. To include those attempts in
+the denominator, [register a cohort](#register-a-cohort-of-saved-etls) before acquisition.
 
 The two readers share the Windows ETW infrastructure. Their agreement measures
 descriptor counts in this saved file. Producer identity, event semantics and
 detection ground truth require separate evidence. The archive, extracted
 streams, receipt and evaluation report contain private evidence.
 [Two-family validation](VALIDATION.md#saved-etl-reader-comparison-on-2026-11-22) · [Three-family disk I/O validation](VALIDATION.md#disk-io-in-paired-etl-evaluations-on-2026-11-22)
+
+## Register a cohort of saved ETLs
+
+Register the source hashes in the order the files will be attempted. A plan
+accepts 1–32 slots, pins both readers and fixes the per-reader timeout and
+event families before the first attempt. The default families are CPU profile
+and context switch. Add `--include-disk-io` to register all three. A repeated
+hash counts as another planned attempt and contributes once to
+`distinct_source_hashes`.
+
+The example uses two local ETLs and the x64 Release reader. Substitute the
+files to be compared. Keep the plan hash from registration for later replay.
+
+```powershell
+$traces = @('.build/p11-etl/control.etl', '.build/p11-etl/x64.etl')
+$exe = 'x64/Release/KnLiveDbg.exe'
+$systemReader = Join-Path $env:SystemRoot 'System32/tracerpt.exe'
+$sourcePins = @($traces | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash.ToLowerInvariant() })
+$exePin = (Get-FileHash -LiteralPath $exe).Hash.ToLowerInvariant()
+$systemPin = (Get-FileHash -LiteralPath $systemReader).Hash.ToLowerInvariant()
+$series = Join-Path '.build' ('etl-cohort-' + [guid]::NewGuid().ToString('N'))
+$plan = python tools/saved_etl_campaign.py create --directory $series --source-sha256 $sourcePins[0] --source-sha256 $sourcePins[1] --exe-sha256 $exePin --tracerpt-sha256 $systemPin --include-disk-io | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$plan.plan_sha256) { throw 'Registration failed' }
+for ($i = 0; $i -lt $traces.Count; $i++) {
+    python tools/saved_etl_campaign.py run --directory $series --plan-sha256 $plan.plan_sha256 --slot ($i + 1) --etl $traces[$i] --exe $exe | Out-Null
+    if ($LASTEXITCODE -gt 1) { throw 'Slot command failed' }
+}
+$snap = Join-Path $series 'observed.knruns'
+$frozen = python tools/saved_etl_campaign.py snapshot --directory $series --plan-sha256 $plan.plan_sha256 --out $snap | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$frozen.snapshot_sha256) { throw 'Snapshot failed' }
+$report = python tools/evaluate-corpus.py --etl-reader-campaign $snap --sha256 $frozen.snapshot_sha256 --plan-sha256 $plan.plan_sha256 | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Replay failed' }
+$report | Select-Object planned_slots, acquisition_counts, agreement_per_planned_family, agreement_per_comparable_family
+```
+
+Each slot has one admission. A run reserves it before opening the ETL or
+either reader. Exit 0 records a published comparison, including one with a
+failed reader. Exit 1 records an acquisition failure such as a missing file
+or a mismatched hash. Exit 2 signals a command or publication error. A later
+snapshot counts whichever receipts survived. An issued slot cannot be
+retried in place.
+
+| Receipts in the snapshot | How replay accounts for the slot |
+| --- | --- |
+| No admission or outcome | `unadmitted`. No admission was retained. |
+| Admission only | `unresolved`. A package without an acknowledged hash receives no credit. |
+| Acquisition failure | The outcome retains the input role and both hashes on a mismatch, the original OS code on a file error or a bounded validation diagnostic. |
+| Inconsistent, unreadable or damaged receipt | `unusable_receipts`. The snapshot keeps the read error or up to 2 KiB of each receipt, its size and the prefix hash. A separately valid admission survives. |
+| Acknowledged package | Replay verifies its hash, source, plan and slot identities, both reader pins, scope and attempt intervals. A missing or invalid package stays in the planned denominator. |
+
+Snapshotting checks two consecutive scans of the create-once receipts for
+agreement. A later snapshot uses a new filename. To replay elsewhere, copy
+the frozen snapshot and the ticket-named `.knbench` files together and
+retain both expected hashes. Replay opens these files without launching a
+reader. Keep plans, receipts, snapshots, packages and detailed reports private.
+
+Agreement per planned family includes every registered file and family.
+Agreement per comparable family covers only verified pairs with matching
+scope and sufficient coverage. Both ratios include their counts and use
+`null` for a zero denominator. The report also counts verified packages per
+acknowledged publication and observed readers per planned reader. These
+records describe the local controller's observations. Independent provenance
+and detection accuracy require other evidence.
+[Registered cohort validation](VALIDATION.md#registered-etl-reader-cohort-on-2026-11-22)
 
 ## Run the synthetic example
 

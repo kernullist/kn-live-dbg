@@ -339,16 +339,24 @@ def main():
         from saved_etl_comparison import outputs_safe
         if not outputs_safe(sys.argv[1:]):
             return 2
+    cohort = any(arg.startswith("--e") and "--etl-reader-campaign".startswith(arg.split("=", 1)[0]) for arg in sys.argv[1:])
+    if cohort:
+        import saved_etl_campaign
+        if not saved_etl_campaign.outputs_safe(sys.argv[1:], evaluator=True):
+            return 2
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--corpus", type=Path)
     source.add_argument("--owned-module-run", type=Path, help="private acquisition package from the native workload")
     source.add_argument("--owned-module-campaign", type=Path, help="frozen private campaign snapshot beside its packages")
     source.add_argument("--saved-etl-comparison", type=Path, help="private acquisition from capture-etl-comparison.py")
+    source.add_argument("--etl-reader-campaign", type=Path, help="pinned registered ETL snapshot beside its original packages")
     parser.add_argument("--results", type=Path)
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     args = parser.parse_args()
+    if args.etl_reader_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
+        parser.error("--etl-reader-campaign requires --sha256 and --plan-sha256")
     if args.saved_etl_comparison and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
         parser.error("--saved-etl-comparison requires only --sha256")
     if args.corpus and (args.results is None or args.sha256 is not None or args.plan_sha256 is not None):
@@ -373,6 +381,9 @@ def main():
                 if not outputs_safe(sys.argv[1:], stream):
                     return 2
                 return write_result((json.dumps(report, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+        elif args.etl_reader_campaign:
+            from saved_etl_comparison import local_path
+            report = saved_etl_campaign.evaluate(local_path(args.etl_reader_campaign), args.sha256, args.plan_sha256, decode_document, ratio)
         elif args.owned_module_campaign:
             report = evaluate_campaign(args.owned_module_campaign, args.sha256, args.plan_sha256)
         elif args.owned_module_run:
@@ -384,9 +395,12 @@ def main():
         raw = (json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode("utf-8")
         require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
     except (OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
-        if not paired or outputs_safe(sys.argv[1:]):
+        if (not paired or outputs_safe(sys.argv[1:])) and (not cohort or saved_etl_campaign.outputs_safe(sys.argv[1:], evaluator=True)):
             print(f"corpus evaluation failed: {exc}", file=sys.stderr)
         return 2
+    if cohort:
+        from saved_etl_comparison import write_result
+        return write_result(raw) if saved_etl_campaign.outputs_safe(sys.argv[1:], evaluator=True) else 2
     sys.stdout.buffer.write(raw)
     return 0
 

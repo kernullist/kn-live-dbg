@@ -7,6 +7,49 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Registered ETL reader cohort on 2026-11-22
+
+A development run on Windows `10.0.28000` registered ten slots before opening
+the inputs. The plan pinned the x64 Release reader built from `ab0d56e`, the
+installed `tracerpt`, the ETL hash for each slot and three event families.
+The slots used six distinct source hashes. Several slots reused the control
+hash to exercise different outcomes.
+
+| Registered input or interruption | Slots | Verified pairs | Families agreed / planned |
+| --- | ---: | ---: | ---: |
+| Five intact ETLs from the [disk comparison](#disk-io-in-paired-etl-evaluations-on-2026-11-22) | 5 | 5 | 15/15 |
+| Control with its last byte removed | 1 | 1 | 0/3 |
+| Missing file | 1 | 0 | 0/3 |
+| Different ETL supplied for the control hash | 1 | 0 | 0/3 |
+| Slot left unused | 1 | 0 | 0/3 |
+| Supervisor stopped after writing the package and before publishing its outcome | 1 | 0 | 0/3 |
+| **Total** | **10** | **6** | **15/30** |
+
+Both readers returned counts for the shortened ETL and reported 22 records.
+Its buffer gap excluded all three families from the comparable set. Overall,
+15 of 15 comparable families agreed, 12 of 20 planned reader attempts
+returned usable counts, and all six acknowledged packages verified. The
+missing file retained Windows error 2. The changed input retained the
+expected and observed hashes. For the interrupted slot the harness confirmed
+the package on disk before the supervisor exited. A second admission failed,
+and replay left the slot unresolved. Two freezes of the same receipts gave
+identical snapshots and evaluation bytes.
+
+In a separate two-family control, Windows rejected a deliberately invalid
+native reader. Direct launch and the retained attempt both reported error
+216 on this host. The Windows reader completed. The report credited one of
+two readers, zero of two planned families and zero comparable families.
+Checks also exercised competing admissions, an outcome published during
+snapshotting, malformed receipts, package substitution, missing packages
+and replay after moving the evidence. Earlier single-file reports from nine
+v1 and six v2 packages reproduced byte for byte.
+
+These measurements cover descriptor counts in saved ETLs on one Windows
+build. The registered files share sources and ETW infrastructure. Heldout
+detection performance, external producer provenance, host-wide overhead and
+persistence through power loss remain unmeasured here.
+[Register and replay a cohort](BENCHMARK_CORPUS.md#register-a-cohort-of-saved-etls)
+
 ## Disk I/O in paired ETL evaluations on 2026-11-22
 
 The v2 comparison ran the x64 Release reader from `ab0d56e` and the installed

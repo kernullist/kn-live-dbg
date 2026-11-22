@@ -20,7 +20,10 @@ PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa",
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
 ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1",
-                          "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2")
+                          "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2", "kn.etl_reader_comparison.v3",
+                          "kn.etl_reader_evaluation.v3", "kn.etl_reader_plan.v1", "kn.etl_reader_admission.v1",
+                          "kn.etl_reader_outcome.v1", "kn.etl_reader_campaign.v1", "kn.etl_reader_campaign_evaluation.v1",
+                          "kn.etl_reader_plan_receipt.v1", "kn.etl_reader_slot_receipt.v1", "kn.etl_reader_snapshot_receipt.v1")
 BENCHMARK_RECORD_SCHEMAS = frozenset(ETL_COMPARISON_SCHEMAS) | frozenset(
     f"kn.owned_module_{kind}.{version}"
     for version, kinds in (
@@ -127,12 +130,17 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
 ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',
-                          '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"')
+                          '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"', '"admission_id"',
+                          '"admission_sha256"', '"planned_slots"', '"distinct_source_hashes"', '"agreement_per_planned"', '"acquisition"', '"prefix_sha256"', '"observed_sha256"')
 ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
     ("retained_sha256", "byte_count"), ("retained_sha256", "base64"),
     ("before_sha256", "after_sha256", "expected_sha256"), ("verdict", "native", "tracerpt"),
     ("supported_descriptors", "other_versions"), ("supported_descriptors", "unresolved_opcode_names"),
     ("process_state", "exit_code", "os_error"), ("state", "started_ns", "ended_ns", "os_error"),
+    ("plan_sha256", "slot", "ticket", "admission_id"), ("admission_sha256", "tick_ns", "outcome"),
+    ("observation", "prefix_sha256", "file_bytes"), ("domain", "role", "expected_sha256", "observed_sha256"),
+    ("planned_slots", "plan_sha256"), ("distinct_source_hashes", "reader_statuses"),
+    ("agreement_per_planned", "agreement_per_comparable"), ("source_sha256", "acquisition", "evidence", "pair"),
 ))
 DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')

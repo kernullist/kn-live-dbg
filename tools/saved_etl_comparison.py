@@ -11,13 +11,14 @@ import struct
 import sys
 from typing import NamedTuple
 
-from owned_module_benchmark import check, decimal, encoded, fields, publish_new, sha, uint
+from owned_module_benchmark import PackagePinMismatch, check, decimal, encoded, fields, publish_new, sha, uint
 
 
 MAGIC = b"KNETLBC1"
 HEADER = struct.Struct("<8sIQ")
 MAX_ETL = 512 << 20
 MAX_METADATA = 4 << 20
+MAX_REGISTERED_SLOTS = 32
 MIB = 1 << 20
 DIAGNOSTIC = 64 << 10
 ROLES = ("native", "tracerpt")
@@ -102,6 +103,24 @@ def write_result(data):
 
 def digest(value):
     check(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value), "invalid SHA-256")
+    return value
+
+
+class InputPinMismatch(ValueError):
+    def __init__(self, role, expected, observed):
+        super().__init__("ETL admission pin mismatch" if role == "etl" else "reader binary admission pin mismatch")
+        self.role = role
+        self.expected = expected
+        self.observed = observed
+
+
+def registration(value):
+    fields(value, "plan_sha256 slot ticket admission_id", "registered reader slot")
+    digest(value["plan_sha256"])
+    check(1 <= uint(value["slot"], MAX_REGISTERED_SLOTS), "invalid registered slot")
+    for key in ("ticket", "admission_id"):
+        check(type(value[key]) is str and re.fullmatch(r"[0-9a-f]{32}", value[key]), "invalid registered identity")
+    check(value["ticket"] != value["admission_id"], "repeated registered identity")
     return value
 
 
@@ -394,13 +413,21 @@ def attempt(manifest, role, decode, families=FAMILIES):
 
 
 def adjudicate(manifest, decode, package_pin, ratio):
-    fields(manifest, "schema source_sha256 source_bytes config config_sha256 os_build tools attempts summary", "paired acquisition")
-    schema = manifest["schema"]
-    check(schema in ("kn.etl_reader_comparison.v1", "kn.etl_reader_comparison.v2"), "unknown ETL acquisition")
-    include_disk_io = schema == "kn.etl_reader_comparison.v2"
-    registered = WITH_DISK_IO if include_disk_io else FAMILIES
+    check(type(manifest) is dict, "invalid paired acquisition")
+    schema = manifest.get("schema")
+    campaign = schema == "kn.etl_reader_comparison.v3"
+    fields(manifest, "schema source_sha256 source_bytes config config_sha256 os_build tools attempts summary" +
+           (" registration" if campaign else ""), "paired acquisition")
+    check(campaign or schema in ("kn.etl_reader_comparison.v1", "kn.etl_reader_comparison.v2"), "unknown ETL acquisition")
     pin = digest(manifest["source_sha256"])
     cfg = manifest["config"]
+    if campaign:
+        registration(manifest["registration"])
+        check(type(cfg) is dict, "missing registered reader configuration")
+        include_disk_io = cfg == config(pin, cfg.get("timeout_ms"), True)
+    else:
+        include_disk_io = schema == "kn.etl_reader_comparison.v2"
+    registered = WITH_DISK_IO if include_disk_io else FAMILIES
     check(type(cfg) is dict and cfg == config(pin, cfg.get("timeout_ms"), include_disk_io) and sha(encoded(cfg)) == manifest["config_sha256"],
           "comparison configuration mismatch")
     check(type(manifest["os_build"]) is str and re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6}){2}", manifest["os_build"]), "invalid reader OS build")
@@ -430,13 +457,19 @@ def adjudicate(manifest, decode, package_pin, ratio):
             status = ("agreed_observed" if nr["decoded"] else "agreed_empty") if matches else "count_disagreement"
         families[name] = dict(verdict=status, native=nr, tracerpt=er)
     evaluation_schema = "kn.etl_reader_evaluation.v2" if include_disk_io else "kn.etl_reader_evaluation.v1"
-    return dict(schema=evaluation_schema, package_sha256=package_pin, source_sha256=pin,
+    report = dict(schema=evaluation_schema, package_sha256=package_pin, source_sha256=pin,
                 source_bytes=manifest["source_bytes"], config=cfg, config_sha256=manifest["config_sha256"], reader_os_build=manifest["os_build"],
                 layer="independent_comparison", task="saved_etl_descriptor_counts", unit="event_family_in_one_file",
                 artifacts_opened=True, target_probed=False, producer_authenticated=False, ground_truth_authenticated=False,
                 independent_detection_validation=False, overall_ranking=None, readers=reads, families=families,
                 planned_readers=2, observed_readers=sum(r["counts"] is not None for r in reads.values()),
                 agreement_per_planned_family=ratio(agreed, len(registered)), agreement_per_comparable_family=ratio(agreed, comparable))
+    if campaign:
+        report.update(schema="kn.etl_reader_evaluation.v3", registration=manifest["registration"], campaign_plan_checked=False)
+        for role in ROLES:
+            report["readers"][role].update(started_ns=manifest["attempts"][role]["started_ns"],
+                                          ended_ns=manifest["attempts"][role]["ended_ns"])
+    return report
 
 
 def replay(stream, expected, decode, ratio):
@@ -452,7 +485,8 @@ def replay(stream, expected, decode, ratio):
         package.update(block)
         source.update(block)
     stream_bytes(stream, size, consume)
-    check(package.hexdigest() == expected, "ETL comparison package pin mismatch")
+    if package.hexdigest() != expected:
+        raise PackagePinMismatch("ETL comparison package pin mismatch")
     manifest = decode(metadata)
     check(type(manifest) is dict and uint(manifest.get("source_bytes")) == size and manifest.get("source_sha256") == source.hexdigest(),
           "retained ETL differs from original source")

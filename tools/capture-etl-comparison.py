@@ -11,8 +11,8 @@ import sys
 import tempfile
 import time
 
-from saved_etl_comparison import (DIAGNOSTIC, MAX_ETL, MIB, ROLES, check, config, digest, encoded,
-                                  local_path, outputs_safe, record_bytes, sha, stream_bytes, write_package, write_result)
+from saved_etl_comparison import (DIAGNOSTIC, MAX_ETL, MIB, ROLES, InputPinMismatch, check, config, digest, encoded,
+                                  local_path, outputs_safe, record_bytes, registration, sha, stream_bytes, write_package, write_result)
 
 
 class WindowsFiles:
@@ -123,11 +123,13 @@ def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, p
                     stdout=record_bytes(out, stdout_limit), stderr=record_bytes(err, DIAGNOSTIC))
 
 
-def acquire(args):
+def acquire(args, registered=None):
     check(os.name == "nt", "acquisition requires Windows")
     pin, exe_pin = digest(args.sha256), digest(args.exe_sha256)
     external_pin = digest(args.tracerpt_sha256) if args.tracerpt_sha256 is not None else None
     cfg = config(pin, args.timeout_ms, args.include_disk_io)
+    if registered is not None:
+        registration(registered)
     files = WindowsFiles()
     source, exe, output = map(local_path, (args.etl, args.exe, args.output))
     check(exe.suffix.lower() == ".exe", "expected a Windows executable image")
@@ -145,14 +147,18 @@ def acquire(args):
         identities = [os.fstat(f.fileno()) for f in (original, *binaries.values())]
         check(len({(s.st_dev, s.st_ino) for s in identities}) == len(identities), "use distinct source and reader files")
         before = {role: file_hash(stream) for role, stream in binaries.items()}
-        check(all(expected[r] is None or expected[r] == before[r] for r in ROLES), "reader binary admission pin mismatch")
+        for role in ROLES:
+            if expected[role] is not None and expected[role] != before[role]:
+                raise InputPinMismatch(role, expected[role], before[role])
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=output.parent, prefix=".knbench-etl-")))
         files.parents(stack, directory, parents)
         snapshot = directory / "source.etl"
         with snapshot.open("xb") as out:
             stream_bytes(original, size, out.write)
         retained = stack.enter_context(files.hold(snapshot))
-        check(file_hash(retained) == pin, "ETL admission pin mismatch")
+        source_hash = file_hash(retained)
+        if source_hash != pin:
+            raise InputPinMismatch("etl", pin, source_hash)
         attempts = {role: run_reader(programs[role], cfg[role], directory, cfg["timeout_ms"],
                                      MIB if role == "native" else DIAGNOSTIC, files, binaries[role]) for role in ROLES}
         try:
@@ -166,6 +172,8 @@ def acquire(args):
         manifest = dict(schema=schema, source_sha256=pin, source_bytes=size,
                         config=cfg, config_sha256=sha(encoded(cfg)), os_build=f"{version.major}.{version.minor}.{version.build}",
                         tools=tools, attempts=attempts, summary=summary)
+        if registered is not None:
+            manifest.update(schema="kn.etl_reader_comparison.v3", registration=registered)
         package = write_package(output, manifest, retained)
     return dict(schema="kn.etl_reader_archive.v1", package_sha256=package, source_sha256=pin,
                 attempts={role: attempts[role]["state"] for role in ROLES})
