@@ -1076,6 +1076,46 @@ values, 2,048 selected history records, 2,048 selected activity rows and
 disk events in the source and a qualified scheduler window.
 [Commands and replay](COMMAND_REFERENCE.md#measure-disk-requests-during-a-thread-activity) · [Measured coverage](VALIDATION.md#disk-requests-during-marked-thread-waits-on-2026-11-23)
 
+### File operations enclosing disk requests
+
+Add `--file-operations` to an activity wait query with the disk adapter to
+see which file operations enclose the selected disk requests. For each
+qualified request, the adapter searches the SDK Read, Write or Flush table
+for the same operation and issuing PID/TID. The full disk interval must
+fall inside the file operation, even when one endpoint lies outside the
+activity markers. The report retains every qualifying pair. A file write
+can enclose several disk writes, and several file writes can enclose one
+disk write. [TraceProcessor File I/O tables](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.disktracesourceextensions.usefileiodata)
+
+A second pass follows the selected file packet values across the recording
+and identifies their original FileIo starts and OperationEnd records. Each
+generation needs a unique start and end in the same logger and pointer
+width. A still-open prior generation, a conflicting record inside the
+interval, an unplaced row or an unsupported endpoint withholds the
+comparison. The Windows TDH reader checks the four original record
+numbers and QPC values against both SDK rows and the marked thread's
+recorded lifetime. The supported endpoints are classic FileIo v3
+Read/Write/Flush and OperationEnd and the corresponding DiskIo v3 events.
+[FileIo transfer fields](https://learn.microsoft.com/en-us/windows/win32/etw/fileio-readwrite) · [OperationEnd fields](https://learn.microsoft.com/en-us/windows/win32/etw/fileio-opend)
+
+Each pair reports the QPC ticks before, during and after the disk request.
+For file reads and writes it retains the starting file offset, requested and
+completed bytes, the original `IoFlags` and the SDK's defined flag bits.
+A flush has no transfer-size
+or transfer-flag fields. Each completion retains its unsigned NTSTATUS.
+Packet and file-object comparisons across layers give `equal`, `different`
+or `unreported`. The report uses local record numbers for within-page
+identity. Establishing shared ownership, the backing file or the cause of
+a wait requires other evidence.
+
+The query accepts at most 128 selected disk rows, 128 file rows and 128
+pairs. Each native pass checks up to 128 distinct source records.
+`disk_rows_without_file_context` lists qualified disk requests with no
+enclosing SDK row. `no_disk_requests` means that the earlier disk query
+measured zero in the selected window. The file query leaves the original
+disk and scheduler results available when its own evidence is incomplete.
+[Command and replay](COMMAND_REFERENCE.md#compare-enclosing-file-operations) · [Measured coverage](VALIDATION.md#file-operations-enclosing-disk-requests-on-2026-11-23)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

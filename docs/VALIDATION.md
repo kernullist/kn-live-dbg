@@ -7,6 +7,45 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## File operations enclosing disk requests on 2026-11-23
+
+The x64 Release reader (`2bda0417bff9`), TraceProcessor Disk 1.12.10
+and the packaged Windows TDH reader (`c167e60858fc`) processed the public TaskbarLatency ETL
+(`8a59fa63479e`, 1,093,447 records, 10 MHz QPC). The SDK returned 229,701
+file reads, 132 writes and seven flushes. In four marked windows, six file
+reads enclosed six disk reads on the issuing thread. The independent TDH
+test reader scanned the surrounding records, paired their packet values
+within each layer and reproduced all four endpoint times for each pair.
+[Source recording](#readythread-cpu-context-on-2026-11-22) · [Regression test](../tools/test-etl-file-operations.py)
+
+| File read row | Disk row | File start → disk init → disk completion → file end (source ordinals) | Requested and completed bytes | Before / after disk (QPC ticks) |
+| ---: | ---: | --- | ---: | ---: |
+| 114825 | 42 | 373168 → 373169 → 373206 → 373213 | 12,288 | 89 / 238 |
+| 114826 | 46 | 373244 → 373246 → 373269 → 373280 | 12,288 | 59 / 182 |
+| 114827 | 52 | 397441 → 397446 → 398296 → 398307 | 16,384 | 127 / 235 |
+| 114828 | 53 | 398318 → 398322 → 398368 → 398374 | 16,384 | 88 / 182 |
+| 114829 | 55 | 418377 → 418378 → 418382 → 418388 | 16,384 | 181 / 344 |
+| 114851 | 56 | 452060 → 452067 → 452126 → 452134 | 12,288 | 330 / 866 |
+
+All six file reads completed with NTSTATUS zero. TDH returned `IoFlags`
+of `0x60143` or `0x60043`. The SDK reported `0x143` or `0x43`.
+Both representations set the paging and synchronous-paging bits.
+Every cross-layer packet comparison and file-object comparison returned
+`different`. The recording establishes the time ordering on the issuing
+thread. The backing file, wait object and critical-path effect remain open.
+
+Separate component queries on the same source reproduced a file write
+enclosing two disk writes, two file writes enclosing one disk write, one
+enclosing flush and a disk flush with no qualifying file row. The marked
+query also exercised a measured zero, an intervening-marker rejection,
+two-row pagination, combined CPU and disk options and digest replay.
+For the first window, replay with the scripts at `137539d1` and the current
+scripts produced byte-identical v1, v2 and v3 reports. The v3 check used
+the 52-member disk package rebuilt from that earlier revision.
+Synthetic histories exercised packet reuse across loggers and an
+outstanding operation followed by an opaque record and a single completion.
+[Packet history tests](../tools/test-etl-file-generations.ps1) · [File I/O query and bounds](TRACE_IMPORT.md#file-operations-enclosing-disk-requests)
+
 ## Disk requests during marked thread waits on 2026-11-23
 
 The x64 Release reader (`2bda0417bff9`) and the disk adapter

@@ -1660,7 +1660,7 @@ returns exit 2. [Time and coverage fields](TRACE_IMPORT.md#interrupt-handling-du
 ### Measure disk requests during a thread activity
 
 Use the same `$query` from **Account for waits across one activity**.
-Build the disk adapter in a Visual Studio Developer PowerShell. The
+Build the disk adapter in a Visual Studio 2022 Developer PowerShell with the v143 x64 C++ tools and Windows SDK. The
 following commands write a private v3 report and replay its digest.
 
 ```powershell
@@ -1680,6 +1680,27 @@ measurement or a digest mismatch. Invalid pins and occupied output paths
 return exit 2. Add the CPU adapter options to the same invocation to
 include ReadyThread correspondence or interrupt overlap.
 [Request pairing and time fields](TRACE_IMPORT.md#disk-requests-during-a-thread-activity)
+
+### Compare enclosing file operations
+
+Use the same `$query` and `$disk` from the preceding examples. The disk
+adapter package now contains a Windows TDH reader alongside TraceProcessor.
+Older disk packages still support the v3 disk query. Supply the updated
+package for the v4 file comparison and use the same package for replay.
+
+```powershell
+$fileReport = Join-Path $PWD 'private-activity-file.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query @disk --file-operations --output $fileReport | ConvertFrom-Json
+$files = (Get-Content -Raw -LiteralPath $fileReport | ConvertFrom-Json).result.file_operations
+$files.summary.contexts | Select-Object operation, file_start_record, disk_init_record, disk_completion_record, file_end_record, ntstatus, actual_bytes
+python -B tools\measure-etl-activity-waits.py @query @disk --file-operations --check-report $receipt.report_sha256
+```
+
+`file_operations_status` is `compared` when the selected rows were checked,
+or `no_disk_requests` when the disk query measured zero. Exit 1 preserves
+the reason for incomplete evidence or a replay mismatch. Exit 2 covers an
+invalid package pin, a package missing the native helper or an occupied
+output path. [Fields and limits](TRACE_IMPORT.md#file-operations-enclosing-disk-requests)
 
 ## Whole-host hunt
 

@@ -17,6 +17,7 @@
   <ItemGroup>
     <Compile Include="..\TraceProcessorModules.cs" Link="TraceProcessorModules.cs" />
     <Compile Include="TraceProcessorDisk.cs" />
+    <Compile Include="FileOperationContext.cs" />
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Web.Extensions" />
@@ -26,6 +27,8 @@
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <Target Name="PackageAdapter" DependsOnTargets="Build">
+    <MSBuild Projects="FileOperationRecords.vcxproj" Targets="Build" Properties="Configuration=Release;Platform=x64" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\..\..\.build\traceprocessor-disk\native\bin\FileOperationRecords.exe" DestinationFolder="$(TargetDir)" />
     <ZipDirectory SourceDirectory="$(TargetDir)" DestinationFile="$(BaseIntermediateOutputPath)..\TraceProcessorDisk.zip" Overwrite="true" />
   </Target>
 </Project>

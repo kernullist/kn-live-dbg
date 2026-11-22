@@ -94,6 +94,7 @@ internal static class TraceProcessorDisk
 
     private static int Run(string[] args)
     {
+        if (args.Length == 6 && args[1] == "--file-operations") { return FileOperationContext.Run(args); }
         uint pid, tid;
         long start, stop;
         if (args.Length != 5 || !UInt32.TryParse(args[1], NumberStyles.None, Culture, out pid) ||

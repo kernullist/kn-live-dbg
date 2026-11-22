@@ -24,13 +24,15 @@ namespace
     constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID PerfInfo = {0xce1dbfb4, 0x137e, 0x4da6, {0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc}};
     constexpr GUID DiskIo = {0x3d6fa8d4, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
+    constexpr GUID FileIo = {0x90cbdc39, 0x4a3e, 0x11d1, {0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3}};
     constexpr GUID Handoff = {0x4dc673b7, 0xfb3f, 0x4099, {0x95, 0x2a, 0x37, 0xda, 0xc2, 0x7c, 0xf1, 0x94}};
     struct Counts
     {
         unsigned records = 0, faults = 0, diskRows = 0;
         ULONG error = 0;
         bool scheduler = false, activities = false, payloads = false, interrupts = false, disk = false;
-        std::unordered_map<uint64_t, unsigned> firstPacket;
+        unsigned first = 0, last = 0;
+        std::unordered_map<uint64_t, unsigned> firstPacket, firstObject;
     };
 
     template<typename T>
@@ -44,6 +46,50 @@ namespace
         if (!counts.error && size != sizeof(T)) { counts.error = ERROR_INVALID_DATA; }
         if (!counts.error) { counts.error = TdhGetProperty(e, 0, nullptr, 1, &field, size, reinterpret_cast<PBYTE>(&value)); }
         return counts.error == ERROR_SUCCESS;
+    }
+
+    // Independent short ordinal window. Resolve every admitted source record in the window,
+    // including operations other than the ones ultimately reported by the table query.
+    void OperationWindow(PEVENT_RECORD e, Counts& c)
+    {
+        if (c.error || c.records < c.first || c.records > c.last) { return; }
+        const auto& h = e->EventHeader;
+        const auto op = h.EventDescriptor.Opcode;
+        const bool file = IsEqualGUID(h.ProviderId, FileIo) != 0;
+        const bool disk = IsEqualGUID(h.ProviderId, DiskIo) != 0;
+        if (!(file && (op == 67 || op == 68 || op == 73 || op == 76)) && !(disk && op >= 10 && op <= 15)) { return; }
+        if (h.EventDescriptor.Id != 0 || h.EventDescriptor.Version != 3) { c.error = ERROR_INVALID_DATA; return; }
+        const bool narrow = (h.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
+        auto pointer = [&](PCWSTR name, uint64_t& v) {
+            if (!narrow) { return Property(e, c, name, v); }
+            uint32_t p = 0;
+            if (!Property(e, c, name, p)) { return false; }
+            v = p;
+            return true;
+        };
+        uint64_t packet = 0, object = 0, offset = 0, extra = 0;
+        uint32_t tid = 0, flags = 0, size = 0, status = 0;
+        if (!pointer(file ? L"IrpPtr" : L"Irp", packet)) { return; }
+        if (op == 76)
+        {
+            if (!pointer(L"ExtraInfo", extra) || !Property(e, c, L"NtStatus", status)) { return; }
+        }
+        else
+        {
+            if (!Property(e, c, file ? L"TTID" : L"IssuingThreadId", tid)) { return; }
+            if ((file || op == 10 || op == 11) && !pointer(L"FileObject", object)) { return; }
+            if ((op == 67 || op == 68) && (!Property(e, c, L"IoFlags", flags) || !Property(e, c, L"IoSize", size) ||
+                !Property(e, c, L"Offset", offset))) { return; }
+        }
+        try
+        {
+            unsigned p = packet ? c.firstPacket.emplace(packet, c.records).first->second : 0;
+            unsigned o = object ? c.firstObject.emplace(object, c.records).first->second : 0;
+            std::printf("{\"record\":%u,\"op\":%u,\"tick\":%lld,\"tid\":%u,\"packet\":%u,\"object\":%u,"
+                "\"offset\":%llu,\"size\":%u,\"flags\":%u,\"status\":%u,\"extra\":%llu}\n",
+                c.records, static_cast<unsigned>(op), h.TimeStamp.QuadPart, tid, p, o, offset, size, flags, status, extra);
+        }
+        catch (const std::bad_alloc&) { c.error = ERROR_NOT_ENOUGH_MEMORY; }
     }
 
     void DiskRecord(PEVENT_RECORD e, Counts& counts)
@@ -116,6 +162,7 @@ namespace
         ++counts.records;
         const auto& h = event->EventHeader;
         const auto& d = h.EventDescriptor;
+        if (counts.first) { OperationWindow(event, counts); return; }
         if (counts.disk) { DiskRecord(event, counts); return; }
         if (counts.interrupts)
         {
@@ -207,9 +254,20 @@ int wmain(int argc, wchar_t** argv)
     const bool payloads = argc == 3 && std::wcscmp(argv[2], L"--marker-data") == 0;
     const bool interrupts = argc == 3 && std::wcscmp(argv[2], L"--interrupts") == 0;
     const bool disk = argc == 3 && std::wcscmp(argv[2], L"--disk-requests") == 0;
-    if ((argc != 2 && (argc != 3 || (!payloads && !interrupts && !disk && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
+    const bool files = argc == 5 && std::wcscmp(argv[2], L"--file-window") == 0;
+    if ((!files && argc != 2 && (argc != 3 || (!payloads && !interrupts && !disk && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
+    if (files)
+    {
+        auto number = [](PCWSTR s) -> unsigned {
+            const auto len = std::wcslen(s);
+            return len && len <= 7 && std::wcsspn(s, L"0123456789") == len ? std::wcstoul(s, nullptr, 10) : 0;
+        };
+        counts.first = number(argv[3]);
+        counts.last = number(argv[4]);
+        if (!counts.first || counts.last < counts.first || counts.last - counts.first > 4096) { return 2; }
+    }
     counts.scheduler = argc == 3 && std::wcscmp(argv[2], L"--scheduler") == 0;
     counts.payloads = payloads;
     counts.interrupts = interrupts;

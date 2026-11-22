@@ -11,6 +11,7 @@ import tempfile
 
 from etl_activity_waits import ActivityWaits, MAX_RECORDS, candidate
 import etl_disk_waits
+import etl_file_operations
 import etl_interrupt_overlap
 from etl_ready_correspondence import TableBindings, correlate, key
 from etl_reader_process import WindowsFiles, file_hash, reader_receipt, run_reader
@@ -208,6 +209,17 @@ def analyze(args, path, pin, size, reader, sdk, disk, directory, files, emit):
             except (KeyError, TypeError, ValueError):
                 disk_result["status"] = "inconsistent_disk_evidence"
         result["disk_requests"] = disk_result
+        if args.file_operations:
+            def file_sdk():
+                a, b = aggregate.header["start"], aggregate.header["stop"]
+                flags = [str(path), "--file-operations", str(a["header_process_id"]), str(a["header_thread_id"]), a["raw_timestamp"], b["raw_timestamp"]]
+                return read(disk[0], disk[1], flags, directory, args.timeout_ms, files)
+
+            def file_records(records):
+                flags = [str(path), pin, ",".join(map(str, records))]
+                return read(*disk[3], flags, directory, args.timeout_ms, files)
+
+            result["file_operations"] = etl_file_operations.measure(file_sdk, file_records, metadata, disk_result, aggregate.header if aggregate else None)
     if args.interrupt_overlap:
         overlap = dict(status="native_window_unavailable", query=None, summary=None)
         if summary is not None:
@@ -220,6 +232,7 @@ def analyze(args, path, pin, size, reader, sdk, disk, directory, files, emit):
 def execute(args):
     check(os.name == "nt" and 1 <= args.timeout_ms <= 600000 and 1 <= args.page_size <= 128, "invalid Windows reader settings")
     check(not args.interrupt_overlap or args.traceprocessor, "--interrupt-overlap requires --traceprocessor")
+    check(not args.file_operations or args.disk_requests, "--file-operations requires --disk-requests")
     args.start, args.stop = decimal(args.start), decimal(args.stop)
     check(0 < args.start < args.stop <= MAX_RECORDS, "select two increasing original ETW record numbers")
     path, program = local_path(args.etl), local_path(args.exe)
@@ -241,7 +254,7 @@ def execute(args):
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=parent, prefix=".kn-etl-waits-")))
         files.parents(stack, directory, held)
         sdk = etl_traceprocessor.admit(args.traceprocessor, directory, files, stack, held, cpu=True) if args.traceprocessor else None
-        disk = etl_traceprocessor.admit(args.disk_requests, directory, files, stack, held, disk=True) if args.disk_requests else None
+        disk = etl_traceprocessor.admit(args.disk_requests, directory, files, stack, held, disk=True, file_records=args.file_operations) if args.disk_requests else None
         header = dict(schema="kn.etl_activity_waits.v1", source_sha256=pin, source_bytes=size, reader_sha256=expected,
                       requested_start_record=args.start, requested_stop_record=args.stop, interval_page_limit=args.page_size,
                       timeout_ms=args.timeout_ms, traceprocessor=sdk[2] if sdk else None,
@@ -255,6 +268,10 @@ def execute(args):
         if disk:
             header.update(schema="kn.etl_activity_waits.v3", disk_traceprocessor=disk[2])
             header["qualification"].update(disk_scope="observed_requests_from_the_marked_thread", device_service_time=None)
+        if args.file_operations:
+            header["schema"] = "kn.etl_activity_waits.v4"
+            header["disk_traceprocessor"]["tables"].extend(etl_file_operations.TABLES)
+            header["qualification"]["file_scope"] = "same_issuer_and_operation_enclosing_the_full_disk_interval"
         outcome = {}
 
         def render(emit):
@@ -276,9 +293,12 @@ def execute(args):
         receipt.update(schema="kn.etl_activity_waits_receipt.v2", interrupt_overlap_status=outcome["interrupt_overlap"]["status"])
     if args.disk_requests:
         receipt.update(schema="kn.etl_activity_waits_receipt.v3", disk_requests_status=outcome["disk_requests"]["status"])
+    if args.file_operations:
+        receipt.update(schema="kn.etl_activity_waits_receipt.v4", file_operations_status=outcome["file_operations"]["status"])
     return receipt, int(result == "mismatch" or outcome["status"] != "accounted" or outcome["traceprocessor_status"] == "unconfirmed" or
                         (args.interrupt_overlap and receipt["interrupt_overlap_status"] != "measured") or
-                        (args.disk_requests is not None and receipt["disk_requests_status"] != "measured"))
+                        (args.disk_requests is not None and receipt["disk_requests_status"] != "measured") or
+                        (args.file_operations and receipt["file_operations_status"] not in ("compared", "no_disk_requests")))
 
 
 def main():
@@ -291,6 +311,7 @@ def main():
     p.add_argument("--interrupt-overlap", action="store_true", help="measure exclusive DPC/ISR fragments during the marked thread's CPU residency")
     p.add_argument("--disk-requests", nargs=2, metavar=("DISK_ADAPTER_ZIP", "SHA256"),
                    help="bind disk request endpoints and measure their overlap with the thread's scheduler states")
+    p.add_argument("--file-operations", action="store_true", help="compare enclosing file operations with original FileIo and DiskIo records")
     p.add_argument("--page-size", type=int, default=128)
     p.add_argument("--timeout-ms", type=int, default=240000)
     dest = p.add_mutually_exclusive_group(required=True)
