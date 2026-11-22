@@ -515,7 +515,33 @@ revalidates its own policy and leases. Closed collections can also be evaluated
 under the [routine retention budget](#cross-collection-routine-budget).
 Local ACL/EFS admission is described under [private evidence roots](#private-evidence-roots).
 
-Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
+The optional `/scan-catalog` route enumerates up to 16,384 names, then opens
+and verifies only the selected window of at most 1,024 journals. It checks the
+same session, segment chain and original member bytes as journal recovery.
+The namespace digest covers the store and catalog directory identities and
+every ordered entry's exact name, file identity, creation time and entry
+type. Each call checks this namespace again before returning a cursor. A
+missing catalog and an empty existing directory have distinct identities.
+
+A `kn.store_catalog_scan.v1` page contains historical per-collection receipts.
+A cursor carries the next offset and a running SHA-256 over the canonical
+recovery rows. The check value binds the cursor to its namespace and purpose.
+A resumed process re-enumerates the names and reads the next window's
+journals. It can change the page size. A namespace mismatch requires a new
+scan. A failed or interrupted page can be retried from the preceding cursor.
+Store these cursors and receipts as private evidence.
+
+The terminal `scan_receipt` enables a full `store /scan-receipt` inspection.
+Under one newly acquired exclusive lease it rereads the original membership,
+requires the same recovery rows, inspects the physical artifacts and checks
+the namespace again. This produces the existing `kn.evidence_store_inventory.v1`
+contract, including cross-collection deduplication and optional retention.
+A previous window can still be historical when an original changes. Final
+revalidation then fails. These checks apply to participating publishers and
+observed identities. A receipt grants no deletion authority.
+
+The default inventory, retirement and GC allow 1,024 catalog entries. Both
+inventory modes bound work to 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
 Existing per-collection bounds remain; the separate unattributed-file reader is
 also limited to 1 GiB. Root enumeration has a separate 65,536-entry cap, including

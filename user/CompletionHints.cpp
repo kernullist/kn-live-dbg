@@ -732,6 +732,7 @@ namespace
         { L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]", L"bounded offline reads with explicit missing pages and mapping failures" },
         { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
         { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },
+        { L"store", L"!kmon store <artifact-root> [/scan-catalog | /scan-receipt token] [/json]", L"verify a stopped store or resume collection checks" },
         { L"replay-irp", L"!kmon replay-irp <capture.knirp> [/json]", L"replay IRP reads and evaluate scoped claims" },
         { L"why", L"!kmon why <file.kncase> [/json]", L"evidence provenance, supported facts and missing requirements" },
         { L"surfaces", L"!kmon surfaces <pid> [/json] [/save <path>] [/module-start <N>] [/handle-start <N>]", L"TLS, KCT and WorkerFactory references" },

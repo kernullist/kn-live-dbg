@@ -45,6 +45,16 @@ class PublicContentTests(unittest.TestCase):
                 self.assertEqual(denied.returncode, 2)
             self.assertFalse(report.exists())
 
+    def test_store_catalog_scan_exports(self):
+        samples = [json.dumps(dict(schema="kn.store_catalog_scan.v1")), json.dumps(dict(namespace_sha256="x", namespace_entries="2")),
+                   json.dumps(dict(next_scan_cursor="held", scan_receipt="")),
+                   "kncs1.2." + "a" * 64 + "." + "b" * 64, "kncr1.2." + "c" * 39]
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("retained\n" + sample).encode(encoding)
+                self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Resume a kn.store_catalog_scan.v1 window with its cursor."))
+
     def test_detached_store_retention(self):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
                 dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),

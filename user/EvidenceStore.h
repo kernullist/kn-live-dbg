@@ -96,7 +96,11 @@ struct EvidenceStorePageOptions
     uint64_t Limit = 0;
     std::wstring Cursor;
     bool Retention = false;
+    bool ScanCatalog = false;
+    std::wstring ScanReceipt;
 };
 bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page);
+std::wstring QueryEvidenceStore(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
+    const std::function<void(const wchar_t*)>& observer = {});
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& inventory, const EvidenceStorePageOptions& page, bool* pageReady);
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& inventory, bool includeArtifacts = false);

@@ -43,6 +43,7 @@ A dash means the binary declares no standalone probe for that operation.
 | evidence / temporal_graph | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_local_collector_scope | — |
 | evidence / journal | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | verified_committed_prefix | — |
 | evidence / store | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_stopped_store | — |
+| evidence / store_catalog_scan | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | resumable_collection_verification | — |
 | evidence / journal_image | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | one_archived_capture | — |
 | evidence / journal_image_approval | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | one_archived_assessment | — |
 | image / replay_approval | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_assessment_time | — |

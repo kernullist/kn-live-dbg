@@ -13,7 +13,7 @@ if ($Sanitize) {
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\CollectionRetentionBudget.cpp', 'user\ImageArchiveDependencies.cpp',
+$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\EvidenceStoreCatalog.cpp', 'user\CollectionRetentionBudget.cpp', 'user\ImageArchiveDependencies.cpp',
     'user\ImageSweepManifest.cpp', 'user\AnalystSnapshot.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}journal.pdb" /link /INCREMENTAL:NO' -f $validationEnvironment.VcVarsPath, $flags, ($sources -join ' '), $exe, ($output.Replace('\', '/') + '/')
@@ -28,6 +28,8 @@ if ($LASTEXITCODE -ne 0) { throw "Evidence journal controls failed: $LASTEXITCOD
 if ($LASTEXITCODE -ne 0) { throw "Evidence journal independent validation failed: $LASTEXITCODE; fixtures=$fixtures" }
 & python (Join-Path $PSScriptRoot 'test-evidence-store.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Evidence store independent validation failed: $LASTEXITCODE" }
+& python (Join-Path $PSScriptRoot 'test-store-catalog-scan.py') --exe $exe --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw "Resumable collection scan controls failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-evidence-gc.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Evidence GC independent validation failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-evidence-retirement.py') --exe $exe --fixtures $output

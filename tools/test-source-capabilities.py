@@ -148,6 +148,9 @@ def main():
     disclosure = by_key[("evidence", "disclosure", "local_files")]
     assert disclosure["availability"] == "not_probed" and disclosure["consistency"] == "reviewed_historical_image_counts"
     assert "durable_intent_before_http" in disclosure["requirements"] and "no_raw_capture_transfer" in disclosure["limits"]
+    catalog_scan = by_key[("evidence", "store_catalog_scan", "local_files")]
+    assert "original_journal_and_member_reads" in catalog_scan["requirements"]
+    assert "page_results_historical" in catalog_scan["limits"] and "no_deletion_authority" in catalog_scan["limits"]
     irp_disclosure = by_key[("evidence", "disclosure_irp", "local_files")]
     assert irp_disclosure["availability"] == "not_probed" and irp_disclosure["consistency"] == "reviewed_historical_irp_counts"
     assert "reproduce_embedded_claims" in irp_disclosure["requirements"] and "supplied_thread_inventory_only" in irp_disclosure["limits"]

@@ -1,5 +1,6 @@
 #include "EvidenceJournal.h"
 #include "EvidenceStore.h"
+#include "EvidenceStoreCatalog.h"
 #include "EvidenceRetention.h"
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
@@ -462,6 +463,7 @@ struct EvidenceJournal::Impl
     std::map<std::wstring, IrpReferenceCatalog>* StoreIrpCatalogs = nullptr;
     uint64_t* SharedReadBytes = nullptr;
     uint64_t* SharedReferences = nullptr;
+    const wchar_t* SharedBudgetIssue = nullptr;
     std::map<std::wstring, EvidenceJournalMember> Members;
     std::map<std::wstring, std::wstring> ImagePayloads;
     std::map<std::wstring, uint64_t> ContentSizes;
@@ -544,7 +546,8 @@ struct EvidenceJournal::Impl
         if (AdmitOutput && !AdmitOutput(file.get())) { return Fail(L"private_file_admission_failed"); }
         *size = uint64_t(length.QuadPart);
         if (*size > MaxReadBytes - Result.ReadBytes) { return Fail(L"read_budget_exhausted"); }
-        if (SharedReadBytes != nullptr && *size > StoreMaxReadBytes - *SharedReadBytes) { return Fail(L"store_read_budget_exhausted"); }
+        if (SharedReadBytes != nullptr && *size > StoreMaxReadBytes - *SharedReadBytes)
+            { SharedBudgetIssue = L"store_read_budget_exhausted"; return Fail(SharedBudgetIssue); }
         ContentHash hash;
         uint8_t buffer[65536];
         std::string bytes;
@@ -584,7 +587,7 @@ struct EvidenceJournal::Impl
             t.Members.empty() || t.Members.size() > 8192 || t.Requires.size() > 8192 ||
             t.Members.size() + t.Requires.size() > MaxReferences - References) { return Fail(L"invalid_transaction_or_reference_budget"); }
         if (SharedReferences != nullptr && t.Members.size() + t.Requires.size() > StoreMaxReferences - *SharedReferences)
-            { return Fail(L"store_reference_budget_exhausted"); }
+            { SharedBudgetIssue = L"store_reference_budget_exhausted"; return Fail(SharedBudgetIssue); }
         if ((t.Kind == L"closure" && (t.Id != L"0" || t.Members.size() != 1 ||
                 t.Members[0].Path != (ScopedApproval ? L"image-approvals/scope-session-" + Result.CollectionId + L".knscopeledger" :
                     Approved ? L"image-approvals/session-" + Result.CollectionId + L".knapprovalledger" :
@@ -764,7 +767,8 @@ struct EvidenceJournal::Impl
                         continue;
                     }
                 }
-                else if (SharedMembers->size() == StoreMaxPaths) { return Fail(L"store_path_budget_exhausted"); }
+                else if (SharedMembers->size() == StoreMaxPaths)
+                    { SharedBudgetIssue = L"store_path_budget_exhausted"; return Fail(SharedBudgetIssue); }
             }
             Handle file{nullptr, &CloseHandle};
             std::wstring digest, json, schema;
@@ -1266,15 +1270,95 @@ namespace
 struct EvidenceStoreAccess
 {
     static EvidenceStoreInventory Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
-        const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action, bool retention = false);
+        const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action,
+        bool retention = false, const std::wstring& scanReceipt = {});
+    static bool ReadCollection(EvidenceJournal::Impl& reader, const fs::path& root, const std::wstring& id);
+    static std::wstring ScanCatalog(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
+        const std::function<void(const wchar_t*)>& observer);
     static EvidenceGcResult Collect(const std::wstring& root, const std::wstring& policyPath,
         const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer);
     static EvidenceRetirementResult Retire(const std::wstring& root, const std::wstring& policyPath,
         bool apply, const std::function<void(const wchar_t*)>& observer);
 };
 
+bool EvidenceStoreAccess::ReadCollection(EvidenceJournal::Impl& reader, const fs::path& root, const std::wstring& id)
+{
+    try { if (reader.Load(root.wstring(), id, false, true)) { return true; } }
+    catch (...) { reader.Fail(L"collection_inspection_exception"); }
+    reader.Incomplete();
+    return false;
+}
+
+std::wstring EvidenceStoreAccess::ScanCatalog(const std::wstring& rootPath, const EvidenceStorePageOptions& page, bool* ready,
+    const std::function<void(const wchar_t*)>& observer)
+{
+    if (ready) { *ready = false; }
+    const auto start = GetTickCount64();
+    const auto report = [&](const wchar_t* status, const std::wstring& issue, const std::wstring& scope, size_t total, size_t offset,
+        size_t count, uint64_t readBytes, const std::wstring& rows, const std::wstring& cursor, const std::wstring& receipt)
+    {
+        return L"{\"schema\":\"kn.store_catalog_scan.v1\",\"status\":" + mcpjson::Quote(status) + L",\"issue\":" + mcpjson::Quote(issue) +
+            L",\"namespace_sha256\":" + mcpjson::Quote(scope) + L",\"namespace_entries\":" + (scope.empty() ? L"null" : N(total)) +
+            L",\"collection_offset\":" + N(offset) + L",\"collections_scanned\":" + N(count) + L",\"read_bytes\":" + N(readBytes) +
+            L",\"started_tick\":" + N(start) + L",\"ended_tick\":" + N(GetTickCount64()) + L",\"collections\":" + rows +
+            L",\"next_scan_cursor\":" + mcpjson::Quote(cursor) + L",\"scan_receipt\":" + mcpjson::Quote(receipt) +
+            L",\"global_membership_established\":false,\"deletion_authorized\":false,\"collector_authenticated\":false}";
+    };
+    const auto fail = [&](const std::wstring& issue, uint64_t readBytes = 0)
+        { return report(L"unavailable", issue, L"", 0, 0, 0, readBytes, L"[]", L"", L""); };
+    if (page.Artifacts || page.Retention || !page.ScanReceipt.empty() || page.Limit > store_catalog::MaxWindow || page.Cursor.size() > 150)
+        { return fail(L"invalid_store_scan_options"); }
+    uint64_t bytes = 0;
+    try
+    {
+        EvidenceStoreLease barrier;
+        std::wstring issue;
+        if (!barrier.Acquire(rootPath, true, &issue)) { return fail(issue); }
+        const auto root = fs::absolute(rootPath).lexically_normal();
+        const auto native = NativePath(root);
+        store_catalog::Names names;
+        if (!store_catalog::ReadNames(native, start, DeadlineMs, names, issue)) { return fail(issue); }
+        size_t offset = 0;
+        auto chain = store_catalog::FirstChain(names.Digest);
+        if (!page.Cursor.empty() && !store_catalog::ParseToken(page.Cursor, false, names, offset, chain))
+            { return fail(L"store_scan_cursor_mismatch"); }
+        const size_t limit = page.Limit ? static_cast<size_t>(page.Limit) : 64;
+        const size_t end = (std::min)(names.Entries.size(), offset + limit);
+        std::wstring rows = L"[";
+        uint64_t references = 0;
+        for (size_t i = offset; i < end; ++i)
+        {
+            EvidenceJournal journal;
+            auto& d = *journal.Data;
+            d.Started = start; d.SharedReadBytes = &bytes; d.SharedReferences = &references;
+            const auto& id = names.Entries[i];
+            ReadCollection(d, root, id);
+            if (d.SharedBudgetIssue) { return fail(d.SharedBudgetIssue, bytes); }
+            if (GetTickCount64() - start > DeadlineMs) { return fail(L"deadline_exhausted", bytes); }
+            const auto row = StoreCollectionJson({id, std::move(d.Result), {}});
+            chain = store_catalog::AppendRow(chain, row);
+            if (chain.empty()) { return fail(L"store_scan_hash_failed", bytes); }
+            if (i != offset) { rows += L","; }
+            rows += row;
+            if (observer) { observer(L"collection_scanned"); }
+        }
+        store_catalog::Names after;
+        if (!store_catalog::ReadNames(native, start, DeadlineMs, after, issue)) { return fail(issue, bytes); }
+        if (after.Digest != names.Digest) { return fail(L"store_scan_namespace_changed", bytes); }
+        const bool terminal = end == names.Entries.size();
+        const auto token = store_catalog::Token(terminal, names.Digest, end, chain);
+        if (token.empty()) { return fail(L"store_scan_hash_failed", bytes); }
+        auto json = report(terminal ? L"complete" : L"more", L"", names.Digest, names.Entries.size(), offset, end - offset,
+            bytes, rows + L"]", terminal ? L"" : token, terminal ? token : L"");
+        if (ready) { *ready = true; }
+        return json;
+    }
+    catch (...) { return fail(L"store_scan_exception", bytes); }
+}
+
 EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
-    const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action, bool retention)
+    const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action,
+    bool retention, const std::wstring& scanReceipt)
 {
     EvidenceStoreInventory out;
     out.StartedTick = GetTickCount64();
@@ -1288,8 +1372,19 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         EvidenceJournal namespaceOwner; // Keep catalog ancestors pinned through the entire inventory.
         std::error_code ec;
         std::set<std::wstring> ids;
+        store_catalog::Names scanNames;
+        std::wstring expectedChain, observedChain;
         const auto attributes = GetFileAttributesW(NativePath(collections).c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES)
+        if (!scanReceipt.empty())
+        {
+            size_t count = 0;
+            if (!store_catalog::ReadNames(NativePath(root), out.StartedTick, DeadlineMs, scanNames, out.Issue)) { return finish(); }
+            if (!store_catalog::ParseToken(scanReceipt, true, scanNames, count, expectedChain))
+                { out.Issue = L"store_scan_receipt_mismatch"; return finish(); }
+            observedChain = store_catalog::FirstChain(scanNames.Digest);
+            ids.insert(scanNames.Entries.begin(), scanNames.Entries.end());
+        }
+        else if (attributes == INVALID_FILE_ATTRIBUTES)
         {
             if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
                 { out.Issue = L"collection_catalog_unavailable"; return finish(); }
@@ -1326,18 +1421,18 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             d.Started = out.StartedTick;
             d.SharedMembers = &cache; d.SharedReadBytes = &out.ReadBytes; d.SharedReferences = &references;
             d.StoreIrpCatalogs = &irpCatalogs;
-            bool ok = false;
-            try { ok = d.Load(root.wstring(), id, false, true); }
-            catch (...) { d.Fail(L"collection_inspection_exception"); }
+            const bool ok = ReadCollection(d, root, id);
+            if (!scanReceipt.empty() && (d.SharedBudgetIssue || GetTickCount64() - out.StartedTick > DeadlineMs))
+                { out.Issue = d.SharedBudgetIssue ? d.SharedBudgetIssue : L"deadline_exhausted"; return finish(); }
             if (!ok)
             {
-                d.Incomplete();
                 ++out.UnresolvedCollections;
             }
             else if (d.RetirementSeen) { ++out.RetiredCollections; }
             else if (d.Result.Closed) { ++out.ClosedCollections; }
             else { ++out.OpenCollections; }
             out.Collections.push_back({id, d.Result, {}});
+            if (!scanReceipt.empty()) { observedChain = store_catalog::AppendRow(observedChain, StoreCollectionJson(out.Collections.back())); }
             if (retention && ok && d.Result.Closed && !d.RetirementSeen)
             {
                 auto& info = out.Collections.back().Retention;
@@ -1401,6 +1496,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             }
             journals.push_back(std::move(journal)); // Hold all exact original-file leases together.
         }
+        if (!scanReceipt.empty() && (observedChain.empty() || observedChain != expectedChain))
+            { out.Issue = L"store_scan_recovery_mismatch"; return finish(); }
         out.MembershipComplete = out.UnresolvedCollections == 0 && out.OpenCollections == 0;
         std::wstring catalog = L"[";
         for (const auto& collection : out.Collections)
@@ -1681,9 +1778,21 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             else { out.Budget.Observed = CurrentFileTime(); }
         }
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
+        if (!scanReceipt.empty())
+        {
+            store_catalog::Names after;
+            std::wstring issue;
+            if (!store_catalog::ReadNames(NativePath(root), out.StartedTick, DeadlineMs, after, issue) || after.Digest != scanNames.Digest)
+            {
+                out.Status = L"partial"; out.CatalogComplete = out.MembershipComplete = out.ArtifactInventoryComplete = false;
+                out.Budget.Observed = 0;
+                out.Issue = issue.empty() ? L"store_scan_namespace_changed" : std::move(issue);
+            }
+        }
         if (action) { action(out, root, reader); }
     }
-    catch (...) { out.Status = L"partial"; out.MembershipComplete = out.ArtifactInventoryComplete = false; out.Issue = L"store_inspection_exception"; }
+    catch (...) { out.Status = L"partial"; out.MembershipComplete = out.ArtifactInventoryComplete = false;
+        out.Budget.Observed = 0; out.Issue = L"store_inspection_exception"; }
     return finish();
 }
 
@@ -1733,6 +1842,12 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
         const auto key = LowerAscii(options[i]);
         if (key == L"/artifacts" && !parsed.Artifacts) { parsed.Artifacts = true; }
         else if (key == L"/retention" && !parsed.Retention) { parsed.Retention = true; }
+        else if (key == L"/scan-catalog" && !parsed.ScanCatalog) { parsed.ScanCatalog = true; }
+        else if (key == L"/scan-receipt" && parsed.ScanReceipt.empty() && ++i < options.size())
+        {
+            parsed.ScanReceipt = options[i];
+            if (parsed.ScanReceipt.empty() || parsed.ScanReceipt.size() > 150 || parsed.ScanReceipt.front() == L'/') { return false; }
+        }
         else if (key == L"/json" && !json) { json = true; }
         else if (key == L"/limit" && !parsed.Limit && ++i < options.size())
         {
@@ -1744,13 +1859,23 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
         else if (key == L"/cursor" && parsed.Cursor.empty() && ++i < options.size())
         {
             parsed.Cursor = options[i];
-            if (parsed.Cursor.empty() || parsed.Cursor.size() > 80 || parsed.Cursor.front() == L'/') { return false; }
+            if (parsed.Cursor.empty() || parsed.Cursor.size() > 150 || parsed.Cursor.front() == L'/') { return false; }
         }
         else { return false; }
     }
-    if (!parsed.Artifacts && (parsed.Limit || !parsed.Cursor.empty())) { return false; }
+    if (parsed.ScanCatalog && (parsed.Artifacts || parsed.Retention || !parsed.ScanReceipt.empty() || parsed.Limit > store_catalog::MaxWindow))
+        { return false; }
+    if (!parsed.ScanCatalog && (parsed.Cursor.size() > 80 || (!parsed.Artifacts && (parsed.Limit || !parsed.Cursor.empty())))) { return false; }
     *page = std::move(parsed);
     return true;
+}
+
+std::wstring QueryEvidenceStore(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
+    const std::function<void(const wchar_t*)>& observer)
+{
+    if (page.ScanCatalog) { return EvidenceStoreAccess::ScanCatalog(root, page, ready, observer); }
+    const auto inventory = EvidenceStoreAccess::Inspect(root, {}, {}, page.Retention, page.ScanReceipt);
+    return EvidenceStoreInventoryJson(inventory, page, ready);
 }
 
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, const EvidenceStorePageOptions& page, bool* pageReady)

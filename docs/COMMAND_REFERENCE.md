@@ -224,7 +224,16 @@ failure, and 2 means invalid grammar. A valid retired journal returns 0 without
 artifact root to `replay-image` or `graph` for separate policy verification.
 See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
 
-`KnLiveDbg.exe --offline !kmon store <artifact-root> [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
+`KnLiveDbg.exe --offline !kmon store <artifact-root> /scan-catalog [/limit 1..1024] [/cursor token] [/json]`
+checks the original journals and members of a stopped store in collection-name
+order. Each call checks up to 64 collections by default. Save its
+`next_scan_cursor` locally when the status is `more`, then pass that value to
+the next call. After an interruption, retry the last acknowledged cursor. On
+`complete`, pass the returned `scan_receipt` to the inventory command below.
+Each row reports its own closure, unresolved input or retirement. The page
+status describes progress through the catalog.
+
+`KnLiveDbg.exe --offline !kmon store <artifact-root> [/scan-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
 audits stopped image and IRP collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.

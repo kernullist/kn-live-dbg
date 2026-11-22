@@ -5,6 +5,7 @@
 #include "../user/AnalystSnapshot.h"
 #include "../user/ContentHash.h"
 #include "../user/McpJson.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -490,15 +491,26 @@ int wmain(int argc, wchar_t** argv)
             std::wcout << EvidenceGcResultJson(result) << '\n';
             return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
         }
-        if (argc >= 3 && std::wstring(argv[1]) == L"--store")
+        if (argc >= 3 && (std::wstring(argv[1]) == L"--store" || std::wstring(argv[1]) == L"--hold-scan"))
         {
-            std::vector<std::wstring> flags{L"/artifacts"};
-            flags.insert(flags.end(), argv + 3, argv + argc);
+            std::vector<std::wstring> flags(argv + 3, argv + argc);
+            if (std::none_of(flags.begin(), flags.end(), [](const auto& flag) {
+                return _wcsicmp(flag.c_str(), L"/scan-catalog") == 0 || _wcsicmp(flag.c_str(), L"/artifacts") == 0;
+            })) { flags.emplace_back(L"/artifacts"); }
             EvidenceStorePageOptions page;
             if (!ParseEvidenceStorePageOptions(flags, &page)) { return 2; }
-            const auto result = InspectEvidenceStore(argv[2], page.Retention);
             bool ready = false;
-            std::cout << mcpjson::WideToUtf8(EvidenceStoreInventoryJson(result, page, &ready)) << std::endl;
+            bool hold = std::wstring(argv[1]) == L"--hold-scan";
+            if (hold && !page.ScanCatalog) { return 2; }
+            const auto output = QueryEvidenceStore(argv[2], page, &ready, [&](const wchar_t*)
+            {
+                if (!hold) { return; }
+                hold = false;
+                std::cout << "[journal.stage] collection_scanned" << std::endl;
+                std::string input;
+                if (!std::getline(std::cin, input) || input != "continue") { ExitProcess(91); }
+            });
+            std::cout << mcpjson::WideToUtf8(output) << std::endl;
             if (!std::cout) { return 3; }
             return ready ? 0 : 1;
         }
@@ -509,6 +521,23 @@ int wmain(int argc, wchar_t** argv)
             if (!lease.Acquire(argv[2], std::wstring(argv[3]) == L"exclusive", &error, true)) { return 1; }
             Stage(L"store_held", L"store_held");
             return 0;
+        }
+        if (argc == 3 && std::wstring(argv[1]) == L"--produce-catalog")
+        {
+            const fs::path root(argv[2]);
+            if (!fs::create_directory(root)) { return 2; }
+            for (unsigned n = 1; n <= 1025; ++n)
+            {
+                const auto id = std::to_wstring(n);
+                if (n <= 2) { if (Produce(root, L"", id, true)) { return 1; } }
+                else
+                {
+                    EvidenceJournal journal;
+                    std::wstring issue;
+                    if (!journal.Open(root.wstring(), id, &issue) || !journal.Commit(Closure(root, id)).Committed) { return 1; }
+                }
+            }
+            return Failed ? 1 : 0;
         }
         if (argc == 4 && std::wstring(argv[1]) == L"--produce-collection") { return Produce(argv[2], L"", argv[3], true); }
         if (argc == 5 && std::wstring(argv[1]) == L"--produce-irp") { return ProduceIrp(argv[2], argv[3], argv[4]); }

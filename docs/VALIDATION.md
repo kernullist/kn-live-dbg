@@ -7,6 +7,57 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Resumable collection catalog verification on 2026-11-23
+
+The preceding x64 Release CLI (`f73c7a2c6b97`) returned
+`store_catalog_budget_exhausted` at 1,024 of 1,025 catalog entries, emitted
+zero collection rows and returned usage exit 2 for `/scan-catalog`.
+The updated Release CLI (`ac1a6b4fd321`) resumes journal recovery from a
+cursor in a fresh process.
+A terminal receipt enables a separate full inspection under the store lease.
+
+The native writer produced 1,025 closed collections and 1,031 committed
+segments, with shared reference content in the first two collections.
+The independent oracle read each session and ordered segment, validated the
+payload and previous hashes, then hashed the original member bytes. It
+reconstructed the recovery rows, the progress and terminal receipts and the
+global logical, unique-path and unique-content byte counts.
+
+Holding an earlier ledger exclusively allowed the next window to finish.
+Rechecking the whole store failed until the original became readable again.
+Controls also covered a changed earlier ledger, a new loose artifact, an
+open prefix, a retired collection, a same-name directory replacement,
+a copied store and a nonnumeric collection name containing a Korean character.
+After a process was terminated following an observed journal read, the next
+process resumed from the preceding cursor. Changing the namespace during
+that read withheld the next cursor. The name scan
+accepted 16,384 entries and refused the 16,385th.
+
+The Release CLI passed 168 catalog checks, including the large case. The
+ASan harness (`891e445bdfcd`) passed 135 checks on the small cases with
+`halt_on_error=1`. Its default Windows interceptor stopped at startup on
+this host. The instrumented run used `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`,
+which leaves the failed intercept uncovered. The journal self-test passed
+77 checks. The CLI also passed 2,152 journal, 553 store, 400 IRP journal,
+898 GC, 219 retirement and 104 retention-budget checks. The public-content
+scanner passed 42 tests, including detached cursors and UTF-16 exports.
+The generated matrix matched 66 compiled contracts and 261 command routes.
+The image recipe harness linked the new catalog reader and passed 121
+recipe checks and 103 process mapping checks.
+
+The first incremental build still contained an older receipt-mismatch
+diagnostic. After recompilation, the product checks above used the updated
+binary. With the owned target fixture present, one console run during
+compilation passed 569 checks and failed `kmon-classification`. An isolated
+run of the same binary and fixture passed all 570 checks. The cause of the
+earlier failure remains unconfirmed.
+
+These observations cover local stopped stores and cooperating publishers.
+The full inventory still has independent path, reference, byte and time
+budgets. Run the large case with `--large` and supply `--cli` with the
+product executable and `--producer` with the journal test executable.
+[Catalog oracle](../tools/test-store-catalog-scan.py)
+
 ## Release package path checks on 2026-11-23
 
 On `2bbb96c`, eight synthetic evidence filenames entered release staging
