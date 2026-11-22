@@ -4,6 +4,7 @@
 #include <evntcons.h>
 #include <tdh.h>
 #include <bcrypt.h>
+#include <objbase.h>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -13,12 +14,13 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace
 {
     constexpr GUID PageFault = {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
     constexpr GUID Thread = {0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c}};
-    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false; };
+    struct Counts { unsigned records = 0, faults = 0; ULONG error = 0; bool scheduler = false, activities = false; };
 
     template<typename T>
     bool Property(PEVENT_RECORD e, Counts& counts, PCWSTR name, T& value)
@@ -67,6 +69,23 @@ namespace
         auto& counts = *static_cast<Counts*>(event->UserContext);
         ++counts.records;
         const auto& h = event->EventHeader;
+        const auto& d = h.EventDescriptor;
+        if (!counts.error && counts.activities && (d.Opcode == 1 || d.Opcode == 2) &&
+            !(h.Flags & (EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_TRACE_MESSAGE)))
+        {
+            wchar_t provider[40]{}, activity[40]{};
+            if (!StringFromGUID2(h.ProviderId, provider, 40) || !StringFromGUID2(h.ActivityId, activity, 40))
+            { counts.error = ERROR_INVALID_DATA; return; }
+            std::printf("{\"record_kind\":\"activity_boundary\",\"record_ordinal\":%u,\"raw_timestamp\":\"%lld\","
+                "\"provider_guid\":\"%ls\",\"activity_id\":\"%ls\",\"event_id\":%u,\"task\":%u,\"opcode\":%u,"
+                "\"version\":%u,\"channel\":%u,\"header_flags\":%u,\"event_property\":%u,\"logger_id\":%u,\"header_process_id\":%lu,\"header_thread_id\":%lu}\n",
+                counts.records, h.TimeStamp.QuadPart, provider, activity, static_cast<unsigned>(d.Id), static_cast<unsigned>(d.Task),
+                static_cast<unsigned>(d.Opcode), static_cast<unsigned>(d.Version), static_cast<unsigned>(d.Channel),
+                static_cast<unsigned>(h.Flags), static_cast<unsigned>(h.EventProperty), static_cast<unsigned>(event->BufferContext.LoggerId), h.ProcessId, h.ThreadId);
+            return;
+        }
+        if (!counts.error && counts.activities && IsEqualGUID(h.ProviderId, Thread) && d.Id == 0 && d.Opcode >= 1 && d.Opcode <= 4)
+        { Scheduler(event, counts); return; }
         if (!counts.error && counts.scheduler && h.EventDescriptor.Id == 0 && IsEqualGUID(h.ProviderId, Thread))
         { Scheduler(event, counts); return; }
         if (counts.error || !IsEqualGUID(h.ProviderId, PageFault) || h.EventDescriptor.Id != 0 ||
@@ -113,10 +132,11 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-    if ((argc != 2 && (argc != 3 || std::wcscmp(argv[2], L"--scheduler") != 0)) ||
+    if ((argc != 2 && (argc != 3 || (std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
-    counts.scheduler = argc == 3;
+    counts.scheduler = argc == 3 && std::wcscmp(argv[2], L"--scheduler") == 0;
+    counts.activities = argc == 3 && std::wcscmp(argv[2], L"--activities") == 0;
     EVENT_TRACE_LOGFILEW log{};
     log.LogFileName = argv[1];
     log.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;

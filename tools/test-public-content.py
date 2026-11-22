@@ -226,6 +226,10 @@ class PublicContentTests(unittest.TestCase):
                     dict(untimed_faults=1, timed_faults=0), dict(first_longest_fault=None, longest_fault_ties=0),
                     dict(disk_request=None, critical_path=None, thread_lifetime=None),
                     dict(status="read", schema="kn.etl_hard_faults.v2"),
+                    dict(status="partial", schema="kn.etl_hard_faults.v3"),
+                    dict(status="read", schema="kn.etl_activity_markers.v1"), dict(marker_ordinal=3, event={}),
+                    dict(fault_union_ticks="0", window_ticks="1"), dict(activity_id="private", record_ordinal=4),
+                    dict(requested_start_record=1, requested_stop_record=2),
                     dict(on_cpu_ticks=None, off_cpu_ticks=None), dict(overlap_end_raw="2", overlap_start_raw="1"),
                     dict(before_ready_ticks="1", after_ready_ticks="0"), dict(requested_fault_ordinal=1, source_status="partial")):
             text = "log\n" + json.dumps(dict(part=row), indent=2)[:-4]

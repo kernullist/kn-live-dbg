@@ -9,6 +9,7 @@
 #include "etl-clr-evidence-selftest.h"
 #include "etl-disk-io-selftest.h"
 #include "../user/EtlFaultSchedule.h"
+#include "etl-activity-window-selftest.h"
 
 #include <array>
 
@@ -867,7 +868,7 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckFaultSchedule() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckFaultSchedule() && etl_activity_test::Check() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

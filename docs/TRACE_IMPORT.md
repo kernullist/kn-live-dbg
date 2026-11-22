@@ -517,6 +517,56 @@ An observed overlap measures thread scheduling during a fault. Disk-request
 identity, the cause of an off-CPU interval and application critical-path
 impact still require separate evidence.
 
+### Hard faults inside an activity window
+
+`--activity-markers` produces a `kn.etl_activity_markers.v1` page of
+keyed Start and Stop events. Add `--thread-id` to select an emitting
+header thread. `marker_ordinal` counts eligible markers across the file.
+`--after` counts matches in the selected view. The nested event's
+`record_ordinal` identifies the original record across all providers.
+The page counts excluded nonclassic, non-string Start and Stop headers.
+Missing keys, missing descriptor IDs, XML or legacy Event Log properties
+and headers carrying a decoding GUID disqualify a marker. The numeric TID filter applies across
+thread lifetimes. The capability probe checks the hard-fault family.
+Marker discovery shows which activity boundaries the file contains.
+
+`--activity-window <start-record> <stop-record>` returns a
+`kn.etl_hard_faults.v3` page. Select the original record ordinals in the
+supplied ETL. The endpoints must have standard Start and Stop opcodes,
+nonzero event and task IDs, and matching provider, activity ID, task,
+channel, process, thread and logger. The reader uses nonclassic event
+headers with a nonzero activity ID. The two event IDs may differ. The page
+retains both descriptors and both header timestamps.
+[Windows event descriptors](https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_descriptor) · [Event header activity IDs](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header)
+
+Both endpoints must fall strictly inside one recorded thread lifetime
+bracket with the same process and logger. `thread_evidence` identifies
+the bracket at the opening record. The query checks that it still applies
+at the closing record. An intervening Start or Stop with the same process
+and activity key makes the selection ambiguous, including a boundary on
+another thread. A matching boundary with an unknown process also withholds
+the measurement. The file-wide boundary count shows how often the same
+activity key and numeric PID appear in the recording.
+
+For an ordered QPC window, `overlaps` clips each observed hard fault on the
+selected thread to the two marker ticks. A fault can begin before the
+opening or complete after the closing record. `fault_union_ticks` counts
+each covered tick once, including when one fault interval encloses another.
+Divide it by `window_ticks` for the fraction of recorded elapsed time
+covered by the observed faults. The file-wide `fault_summary` and each
+fault's original duration remain available separately.
+
+A qualified window with evidence of the fault family on its logger can
+report zero overlapping ticks. Missing family evidence, unassignable or
+untimed candidate faults, conflicting logger or lifetime evidence, and more
+than 128 candidates leave the union null. Incomplete buffer coverage,
+reported loss, clock conflicts and ambiguous activity boundaries also
+withhold the window timing. Missing requested records produce
+`activity_record_not_observed` and exit 1. The page describes observations
+on a reported thread. Logical work identity across threads, collection
+policy and the cause of application latency require additional evidence.
+[CLI and marker discovery](COMMAND_REFERENCE.md#measure-hard-faults-during-a-recorded-activity)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

@@ -90,9 +90,9 @@ def text_views(data: bytes) -> list[str]:
 
 
 DISK_IO_SCHEMA = "kn.etl_disk_io.v1"
-HARD_FAULT_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2")
+FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl_hard_faults.v3", "kn.etl_activity_markers.v1")
 ETL_ROTATION_SCHEMAS = ("kn.etl_rotation_inventory.v1", "kn.etl_rotation_set.v1")
-TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, *HARD_FAULT_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS)
+TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
@@ -163,11 +163,16 @@ HARD_FAULT_FIELDS = tuple(frozenset(keys) for keys in (
     ("authenticated_thread_lifetime", "wait_cause", "critical_path"),
     ("requested_fault_ordinal", "thread_evidence"), ("on_cpu_ticks", "off_cpu_ticks"),
     ("requested_fault_ordinal", "source_status"),
+    ("requested_start_record", "requested_stop_record"), ("activity_id", "record_ordinal"),
+    ("fault_union_ticks", "window_ticks"), ("process_key_boundaries", "intervening_boundaries"),
+    ("marker_ordinal", "event"), ("matched_markers", "decoded_activity_markers"),
+    ("evidence", "producer_authenticity", "logical_task_identity"),
+    ("logical_task_identity", "wait_cause", "critical_path"),
     ("overlap_start_raw", "overlap_end_raw"), ("before_ready_ticks", "after_ready_ticks"),
     ("ready_flags", "record_ordinal"), ("old_thread_id", "record_ordinal"),
     ("payload_tid", "payload_pid", "record_ordinal"),
 ))
-HARD_FAULT_MARKERS = (*HARD_FAULT_SCHEMAS, *(f'"{key}"' for keys in HARD_FAULT_FIELDS for key in keys))
+HARD_FAULT_MARKERS = (*FAULT_QUERY_SCHEMAS, *(f'"{key}"' for keys in HARD_FAULT_FIELDS for key in keys))
 DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
     ("disk_event_ordinal", "record_ordinal"), ("high_res_response_ticks", "reported_issuing_tid"),
     ("longest_response_ties", "initiations", "completions"), ("response_ticks_per_second", "operations"),
@@ -315,7 +320,7 @@ def detached_evidence_line(text: str) -> int | None:
     if any(tag in text for tag in DISK_IO_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA,)))
     if any(tag in text for tag in HARD_FAULT_MARKERS):
-        patterns.append((NESTED_EVIDENCE_OBJECT_START, HARD_FAULT_FIELDS, HARD_FAULT_SCHEMAS))
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, HARD_FAULT_FIELDS, FAULT_QUERY_SCHEMAS))
     if any(tag in text for tag in IO_TIMING_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, IO_TIMING_FIELDS, IO_LIFETIME_SCHEMAS))
     if any(tag in text for tag in ETL_ROTATION_MARKERS):
@@ -457,7 +462,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[12]|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

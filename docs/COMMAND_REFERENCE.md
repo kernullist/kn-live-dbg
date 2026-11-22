@@ -1281,6 +1281,38 @@ call. Paging the ordinary list still uses `--after` and `--limit`.
 The detail page also supports `--check-page` and `--capture-statement`.
 [Measurement requirements](TRACE_IMPORT.md#scheduling-during-a-hard-page-fault)
 
+### Measure hard faults during a recorded activity
+
+Pass the one-based original ETL record numbers of a Start event and a Stop
+event. The following pair is from the pinned TaskbarLatency recording.
+[Recording and validation](VALIDATION.md#hard-fault-time-inside-activity-markers-on-2026-11-22)
+
+```powershell
+$result = & KnLiveDbg.exe --etl-hard-faults $etl.FullName --sha256 $pin --activity-window 339732 374019 | ConvertFrom-Json
+$result.activity_window | Select-Object status, window_ticks, fault_union_ticks, candidate_faults
+$result.hard_faults | Select-Object fault_ordinal, record_ordinal, elapsed_qpc_ticks
+```
+
+To find the boundaries emitted by the thread from a hard-fault row, page
+through its activity markers. The query accepts `--after` and `--limit`.
+Use the nested event's `record_ordinal` as an endpoint. Keep the source
+file and its pin together throughout the investigation.
+
+```powershell
+$faultPage = & KnLiveDbg.exe --etl-hard-faults $etl.FullName --sha256 $pin --after 6 --limit 1 | ConvertFrom-Json
+$faultTid = $faultPage.hard_faults[0].faulting_thread_id
+$cursor = 0
+do {
+    $markers = & KnLiveDbg.exe --etl-hard-faults $etl.FullName --sha256 $pin --activity-markers --thread-id $faultTid --after $cursor --limit 128 | ConvertFrom-Json
+    $markers.markers | ForEach-Object { $_.event } |
+        Select-Object record_ordinal, provider_guid, activity_id, task, opcode, header_process_id, header_thread_id
+    $cursor = $markers.next_after
+} while ($null -ne $cursor)
+```
+
+Use `--check-page` to verify an exact replay. The receipt retains both
+requested record numbers. [Window and coverage rules](TRACE_IMPORT.md#hard-faults-inside-an-activity-window)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

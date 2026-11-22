@@ -480,6 +480,7 @@
     <ClInclude Include="EtlDiskIo.h" />
     <ClInclude Include="EtlHardFault.h" />
     <ClInclude Include="EtlFaultSchedule.h" />
+    <ClInclude Include="EtlActivityWindow.h" />
     <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />

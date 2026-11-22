@@ -7,6 +7,41 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Hard fault time inside activity markers on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`0218aec46253`) and a separate Windows event reader agreed on all 7,329
+keyed activity markers in the TaskbarLatency recording. The eligibility
+check excluded another 720 nonclassic Start and Stop headers. The
+comparison checked every paged marker's original ordinal,
+header identities, descriptor, logger and raw timestamp. Filtering by the
+seventh fault's payload thread returned the same 906 markers in both
+readers. Windows `tracerpt` counted 1,093,447 records and 17 hard faults.
+[Pinned recording](https://github.com/randomascii/blogstuff/blob/138aae8b20e78183894612a1a7e98e2c8f293b29/TaskbarLatency/2019-09-08_22-34-56%20explorer%20jumplist%20delays.etl)
+
+Four same-thread Win32k marker windows contained six fault intersections.
+All four unions and two windows with zero observed overlap matched a
+separate calculation using Windows event headers and named TDH properties.
+For example, original records 339732 and 374019 enclosed 1,162,149 QPC
+ticks. Two faults covered 12,926 ticks, or 1.2926 ms at 10 MHz. The trace
+establishes overlap on the reported thread. Its effect on user-visible
+response time remains unverified.
+
+Tests covered intervening boundaries, wrong keys, invalid or absent
+selectors, paging to the end, system-time and CPU-cycle clocks, zero QPC
+frequency, declared buffer loss, a hard-linked output and signed replay of
+complete and partial pages. Owned record tests covered nested faults,
+clipped endpoints, ambiguous IDs, forwarded and legacy event headers, a fault spanning a lifetime boundary,
+missing fault-family evidence, 129 candidates and near-maximum clock
+values. The regular checks and MSVC `/RTC1` passed. MSVC AddressSanitizer
+stopped during runtime interception before its first test. Six older ETL
+pages reproduced their original bytes.
+
+Compile the TDH reader as described under saved hard page fault timing.
+Pass `--exe`, `--oracle`, `--etl`, the fixture's `--sha256` and
+`--check-controls` to the comparison. Supply `--openssl` to include signed
+replay. [Activity window and marker checks](../tools/test-etl-activity-window.py) · [CLI examples](COMMAND_REFERENCE.md#measure-hard-faults-during-a-recorded-activity)
+
 ## Scheduling during hard page faults on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
