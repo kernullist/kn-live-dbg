@@ -255,8 +255,9 @@ the policy does not reserve physical disk space or guarantee crash-time closure.
 
 This policy applies to the routed image pipeline. Committed artifact protection
 continues to come from journal membership and the store's GC rules. Priority
-admission for other evidence families, cross-session retention priorities and
-other-family transfer/redaction controls remain separate P06 requirements.
+admission and transfer/redaction controls for other evidence families remain
+separate P06 requirements. Closed routed-image and IRP collections participate
+in the [cross-collection routine budget](#cross-collection-routine-budget).
 
 ## Original KMON slice replay
 
@@ -510,8 +511,8 @@ it. A legacy or unreadable declaration protects candidate IRP reference files as
 `kn.retain_committed_and_unresolved.v1` is an inventory classification policy,
 not a GC policy. Reports release all leases on return and always declare
 `deletion_authorized:false`. The separate [explicit GC operation](#explicit-uncommitted-artifact-gc)
-revalidates its own policy and leases. Cross-collection retention priorities
-and other-family transfer/redaction controls remain P06 work.
+revalidates its own policy and leases. Closed collections can also be evaluated
+under the [routine retention budget](#cross-collection-routine-budget).
 Local ACL/EFS admission is described under [private evidence roots](#private-evidence-roots).
 
 Bounds are 1,024 catalog entries, 65,536 managed artifact paths/observed directory
@@ -576,6 +577,42 @@ keep its inputs reachable. Withdrawing that referrer in an earlier operation
 allows the next inventory to evaluate its inputs again. Failure ledgers stay
 protected. The receipt records the reason supplied by the operator. Its
 integrity depends on the local store's access controls and trusted writers.
+
+## Cross-collection routine budget
+
+`store <root> /retention` reconstructs the priorities of closed collections
+under the stopped-store lease. Open collections, unresolved membership or an
+incomplete artifact scan make this assessment unavailable. Each native KMON
+image and IRP closure ledger supplies recording-session admission, completion
+and loss counters. They are reconciled with committed transaction counts.
+Image read tickets, slice membership, retained references and sweep ranges
+also participate. A first-state or first-difference attempt protects the
+collection, including an attempt that failed. Loss and interrupted traversal
+protect gap collections. Missing, older or inconsistent priority records can
+leave a collection unclassified. Direct captures and approval journals use
+their own closure formats and stay outside routine selection.
+
+Each active named path is charged once across the store. A path shared by
+collections takes their strongest protection in the order first observation,
+observation gap, unclassified, routine and empty. Failure ledgers have a
+separate path and byte total. The routine total includes shared routine
+paths. The exclusive bytes for one collection count only the routine paths
+that lose their final active journal owner when it retires. File allocation,
+loose archive inputs and historical copies have different denominators.
+
+When the routine total exceeds an operator's target, the policy helper
+selects one eligible collection with positive exclusive bytes under the
+operator's per-collection ceiling. It takes the oldest eligible closure
+last-write time, then the numerically smallest collection ID. The v2 policy
+binds the target, age, ceiling, reason, collection head and session, and both
+complete inventory digests. Native preflight and apply recalculate the choice.
+A v2 retirement receipt records the routine total before and after withdrawal.
+An identical retry returns the same receipt. Each additional withdrawal
+requires an updated inventory and policy. Earlier readers that do not
+recognize the v2 receipt report incomplete membership. Physical removal uses
+the separate receipt-bound file GC operation and checks surviving referrers.
+Cross-session observation identity, automatic background reclamation and
+storage quotas for other evidence families remain open.
 
 ## Explicit uncommitted-artifact GC
 

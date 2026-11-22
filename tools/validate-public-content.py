@@ -139,14 +139,18 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
 STORE_RETENTION_MARKERS = ('"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
                            '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"',
-                           '"next_artifact_cursor"', '"artifact_page_status"')
+                           '"next_artifact_cursor"', '"artifact_page_status"', '"routine_paths"', '"routine_named_byte_target"',
+                           '"routine_named_bytes_before"', '"named_bytes"')
 STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
     ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog"),
     ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis"),
     ("artifact", "irp_catalog"), ("artifact", "irp_referrers"), ("path", "expected_bytes", "root_committed"),
     ("retired_collections", "retired_original_matched"), ("retired_collection_id", "retirement_sha256"),
     ("exclusive_nonledger", "shared_nonledger", "failure_ledgers"), ("collection_id", "head_sha256", "exclusive_byte_limit"),
-    ("artifact_row_offset", "next_artifact_cursor"), ("artifact_page_status", "artifact_rows_remaining")))
+    ("artifact_row_offset", "next_artifact_cursor"), ("artifact_page_status", "artifact_rows_remaining"),
+    ("collection_id", "routine_paths", "exclusive_routine_bytes"), ("routine_named_bytes_before", "routine_named_bytes_after"),
+    ("routine_named_byte_target", "exclusive_byte_limit", "catalog_sha256")))
+COLLECTION_RETENTION_CLASSES = ("first_observation", "observation_gap", "unclassified", "routine_only", "empty")
 IO_PORT_VALUE = re.compile(r'(?m)^[ \t]*(?:[,{][ \t]*)?"(?:overlapped|port_handle|directory_handle|returned_port)"'
                            r'[ \t]*:[ \t]*"[1-9][0-9]{0,19}(?:"|$)')
 IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
@@ -405,6 +409,7 @@ DETACHED_SCHEMAS = (*WAIT_PLAN_SCHEMAS, *DUMP_EVIDENCE_SCHEMAS, *TRACE_QUERY_SCH
 def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool:
     # Count keys in one object. Exporters may reorder them or stop during its final value.
     keys = set()
+    retention_class = False
     pos = JSON_SPACE.match(text, offset + 1).end()
     try:
         while text.startswith('"', pos):
@@ -413,10 +418,14 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
             if not text.startswith(":", pos):
                 break
             keys.add(key)
-            if any(fields <= keys for fields in field_sets):
+            if any(fields <= keys for fields in field_sets) or (retention_class and "paths" in keys and "named_bytes" in keys):
                 return True
             pos = JSON_SPACE.match(text, pos + 1).end()
             value, pos = decoder.raw_decode(text, pos)
+            if key == "class" and value in COLLECTION_RETENTION_CLASSES:
+                retention_class = True
+                if "paths" in keys and "named_bytes" in keys:
+                    return True
             if key == "scope" and value in ("saved_dump_probe", "saved_etl_probe"):
                 return True
             if key == "schema" and value in schemas:
@@ -568,7 +577,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                     "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                     "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
-                    "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
+                    "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement_policy.v2", "kn.evidence_retirement.v1", "kn.evidence_retirement.v2", "kn.evidence_collection_retention.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
                     "kn.minimized_image_facts.v1", "kn.redaction_manifest.v1", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
                     "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",

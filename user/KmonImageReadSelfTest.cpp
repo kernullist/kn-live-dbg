@@ -441,6 +441,11 @@ bool KmonImageReadIntegrationSelfTest()
         check(KmonImageTestAccess::Scan(clean, reference.wstring(), Base, identity, {}, 16, &routing) == CodeOwnership::OwnedVerified &&
             clean.ImageReadsQueued.load() == 1 && clean.ImageSlicesQueued.load() == 1, "clean-sweep-retains-original-matching-range-recipe");
         clean.WriterStopping.store(true); clean.CaptureWriterLoop();
+        const auto cleanBudget = InspectEvidenceStore(clean.Options.LogDirectory, true);
+        check(cleanBudget.Budget.Observed && cleanBudget.Collections.size() == 1 &&
+            cleanBudget.Collections.front().Retention.Priority == CollectionPriority::Routine &&
+            cleanBudget.Collections.front().Retention.ExclusiveRoutineBytes != 0,
+            "closed-clean-writer-charges-its-originals-to-the-routine-store-budget");
         std::filesystem::path cleanRecipe;
         size_t cleanRecipeCount = 0;
         for (const auto& entry : std::filesystem::directory_iterator(root / L"clean" / L"image-reads"))
@@ -500,6 +505,11 @@ bool KmonImageReadIntegrationSelfTest()
             check(partialCollection.Closed && partialCollection.CommittedSegments == 3 && partialCollection.SweepPaths.size() == 1 &&
                 Raw(partialReplay.Proof, L"whole_sweep_complete") == L"false",
                 "journal-closure-does-not-turn-incomplete-target-observation-into-complete-sweep");
+            const auto partialBudget = InspectEvidenceStore(partialSweep.Options.LogDirectory, true);
+            check(partialBudget.Budget.Observed && partialBudget.Collections.size() == 1 &&
+                partialBudget.Collections.front().Retention.Priority == CollectionPriority::Gap &&
+                partialBudget.Collections.front().Retention.ExclusiveRoutineBytes == 0,
+                "stopped-partial-sweep-keeps-its-originals-out-of-routine-retirement");
             const auto multiCollection = RecoverEvidenceJournal((root / L"multiple" / L"collections" /
                 std::to_wstring(multiple.EvidenceCollectionEpoch.load())).wstring());
             check(multiCollection.Closed && multiCollection.CommittedSegments == 4 && multiCollection.UniquePaths == 7 &&

@@ -62,14 +62,21 @@ namespace
         ImageSweepManifest manifest;
         if (!ParseImageSweepManifest(json, &manifest) || path != L"image-sweeps/sweep-" + manifest.Sweep.SweepId + L".knsweep")
             { return false; }
+        catalog.SweepHasGap = !manifest.TerminalObserved || !manifest.TraversalComplete || manifest.Inconsistent ||
+            manifest.Slices.empty() || manifest.ObservedSlices != manifest.Slices.size();
         if (!manifest.Slices.empty()) { firstReference = manifest.Slices.front().ReferenceSha256; }
+        uint32_t nextRange = 0;
         for (const auto& row : manifest.Slices)
         {
+            catalog.SweepHasGap |= !row.ReferenceWritten || !row.RawWritten || !row.RecipeWritten ||
+                !row.RangeCount || row.StartRange != nextRange;
+            nextRange = row.StartRange + row.RangeCount;
             const auto prefix = L"image-reads/reads-" + manifest.Sweep.CollectionId + L"-" + std::to_wstring(row.ReadSetId);
             if ((row.ReferenceWritten && !AddReference(catalog, row.ReferenceSha256)) ||
                 (row.RawWritten && !AddInput(catalog, prefix + L".knreads", row.RawPayloadSha256, true)) ||
                 (row.RecipeWritten && !AddInput(catalog, prefix + L".knslice", row.RecipeSha256, true))) { return false; }
         }
+        catalog.SweepHasGap |= nextRange != manifest.Sweep.TotalRanges;
         return true;
     }
 }
@@ -89,7 +96,7 @@ ImageArchiveKind ImageArchiveKindForPath(const std::wstring& path)
 }
 
 bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember& root,
-    const std::wstring& json, ImageArchiveCatalog& catalog)
+    const std::wstring& json, ImageArchiveCatalog& catalog, bool includeReadTicket)
 {
     IndexedObject record, claim;
     if (!record.Parse(json) || record.String(L"schema") != root.Schema) { return false; }
@@ -122,7 +129,11 @@ bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember&
         std::wstring raw;
         IndexedObject payload;
         if (!SealedPayload(record, reads ? L"payload_sha256" : L"recipe_sha256", raw, catalog.PayloadSha256) || !payload.Parse(raw)) { return false; }
-        if (reads) { return !wrapped && ReadReference(payload, schema, catalog); }
+        if (reads)
+        {
+            if (includeReadTicket && schema == L"kn.image_reads.v3") { payload.Raw(L"retention", &catalog.RetentionTicket); }
+            return !wrapped && ReadReference(payload, schema, catalog);
+        }
         reference = payload.String(L"reference_sha256");
         if (!AddReference(catalog, reference)) { return false; }
     }

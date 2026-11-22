@@ -25,6 +25,10 @@ class PublicContentTests(unittest.TestCase):
                 dict(path="fixture", expected_bytes="4", root_committed=True), dict(retired_collections=["7"], retired_original_matched=True),
                 dict(retired_collection_id="7", retirement_sha256="fixture"), dict(exclusive_nonledger={}, shared_nonledger={}, failure_ledgers={}),
                 dict(collection_id="7", head_sha256="fixture", exclusive_byte_limit="4"),
+                dict(collection_id="7", routine_paths="1", exclusive_routine_bytes="4"),
+                dict(routine_named_bytes_before="20", routine_named_bytes_after="16"),
+                dict(routine_named_byte_target="2", exclusive_byte_limit="4", catalog_sha256="fixture"),
+                dict(paths="2", named_bytes="4", **{"class": "routine_only"}),
                 dict(artifact_row_offset="1", next_artifact_cursor="owned"), dict(artifact_page_status="more", artifact_rows_remaining="2"))
         for row in rows:
             raw = json.dumps(dict(outer=[row])).encode()
@@ -32,6 +36,8 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {r["rule"] for r in AUDIT.inspect("export.txt", sample)})
         benign = json.dumps(dict(path="fixture", sha256="synthetic", allowed=True)).encode()
         self.assertFalse(AUDIT.inspect("example.txt", benign))
+        ordinary = json.dumps(dict(paths="2", named_bytes="4", **{"class": "text_files"})).encode()
+        self.assertFalse(AUDIT.inspect("file-counts.txt", ordinary))
 
     def test_rotation_inventories_and_exports(self):
         for filename in ("source.knetlset", "source.knetlset.pending-1", "controller.knetlowner"):
@@ -137,7 +143,7 @@ class PublicContentTests(unittest.TestCase):
                        "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                        "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                        "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
-                       "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
+                       "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement_policy.v2", "kn.evidence_retirement.v1", "kn.evidence_retirement.v2", "kn.evidence_collection_retention.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",
                     "kn.minimized_image_facts.v1", "kn.redaction_manifest.v1", "kn.disclosure_package.v1", "kn.disclosure_review.v1", "kn.disclosure_transfer_intent.v1", "kn.disclosure_transfer_result.v1",
                        "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                        "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",

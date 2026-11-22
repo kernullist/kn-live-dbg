@@ -14,7 +14,8 @@ struct ImageArchiveInput
 
 struct ImageArchiveCatalog
 {
-    std::wstring PayloadSha256;
+    bool SweepHasGap = false;
+    std::wstring PayloadSha256, RetentionTicket;
     std::map<std::wstring, ImageArchiveInput> Inputs;
 };
 
@@ -22,6 +23,6 @@ struct ImageArchiveCatalog
 // supplies the logical paths for its content-addressed input files.
 ImageArchiveKind ImageArchiveKindForPath(const std::wstring& path);
 bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember& root,
-    const std::wstring& json, ImageArchiveCatalog& catalog);
+    const std::wstring& json, ImageArchiveCatalog& catalog, bool includeReadTicket = false);
 bool MatchesImageArchiveInput(const ImageArchiveInput& input, const EvidenceJournalMember& member,
     const std::wstring& payloadSha256);

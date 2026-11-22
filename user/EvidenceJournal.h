@@ -66,7 +66,7 @@ public:
     const EvidenceJournalRecovery& State() const;
 private:
     friend EvidenceJournalRecovery RecoverEvidenceJournal(const std::wstring&, bool);
-    friend EvidenceStoreInventory InspectEvidenceStore(const std::wstring&);
+    friend EvidenceStoreInventory InspectEvidenceStore(const std::wstring&, bool);
     friend struct EvidenceStoreAccess;
     struct Impl;
     std::unique_ptr<Impl> Data;

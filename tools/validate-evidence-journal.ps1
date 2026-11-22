@@ -13,7 +13,7 @@ if ($Sanitize) {
     $flags += ' /fsanitize=address /Zi'
     Copy-Item -LiteralPath $validationEnvironment.AsanRuntimePath -Destination $output -Force
 }
-$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\ImageArchiveDependencies.cpp',
+$sources = @('tools\evidence-journal-selftest.cpp', 'user\EvidenceJournal.cpp', 'user\CollectionRetentionBudget.cpp', 'user\ImageArchiveDependencies.cpp',
     'user\ImageSweepManifest.cpp', 'user\AnalystSnapshot.cpp') |
     ForEach-Object { '"' + (Join-Path $repo $_) + '"' }
 $command = 'call "{0}" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DNOMINMAX {1} {2} /Fe:"{3}" /Fo:"{4}" /Fd:"{4}journal.pdb" /link /INCREMENTAL:NO' -f $validationEnvironment.VcVarsPath, $flags, ($sources -join ' '), $exe, ($output.Replace('\', '/') + '/')
@@ -32,6 +32,8 @@ if ($LASTEXITCODE -ne 0) { throw "Evidence store independent validation failed: 
 if ($LASTEXITCODE -ne 0) { throw "Evidence GC independent validation failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-evidence-retirement.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Closed collection retirement controls failed: $LASTEXITCODE" }
+& python (Join-Path $PSScriptRoot 'test-collection-retention-budget.py') --exe $exe --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw "Cross-collection routine budget controls failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-irp-journal.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "IRP journal independent validation failed: $LASTEXITCODE" }
 Write-Output "[journal.validation] fixtures=$fixtures"

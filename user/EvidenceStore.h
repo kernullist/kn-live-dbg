@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EvidenceJournal.h"
+#include "CollectionRetentionBudget.h"
 #include <memory>
 
 // Shared by participating publishers; exclusive for a stopped-store inventory.
@@ -22,6 +23,7 @@ struct EvidenceStoreCollection
 {
     std::wstring Id;
     EvidenceJournalRecovery Recovery;
+    CollectionRetentionRoot Retention;
 };
 
 struct EvidenceStoreApprovalReferrer
@@ -62,6 +64,7 @@ struct EvidenceStoreArtifact
 
 struct EvidenceStoreInventory
 {
+    CollectionRetentionBudget Budget;
     std::wstring Status = L"unavailable", Issue, CatalogSha256;
     std::wstring ArtifactsSha256;
     uint64_t StartedTick = 0, EndedTick = 0;
@@ -86,12 +89,13 @@ struct EvidenceStoreInventory
 // Exact counts for the image folders and reserved IRP root namespace under the participating
 // publisher barrier. The returned data releases all leases and NEVER grants
 // deletion authority. Unresolved roots protect all unattributed artifacts.
-EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot);
+EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot, bool includeRetention = false);
 struct EvidenceStorePageOptions
 {
     bool Artifacts = false;
     uint64_t Limit = 0;
     std::wstring Cursor;
+    bool Retention = false;
 };
 bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page);
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& inventory, const EvidenceStorePageOptions& page, bool* pageReady);

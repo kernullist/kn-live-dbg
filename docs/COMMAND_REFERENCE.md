@@ -216,7 +216,7 @@ failure, and 2 means invalid grammar. A valid retired journal returns 0 without
 artifact root to `replay-image` or `graph` for separate policy verification.
 See [journal bounds and recovery semantics](ARCHITECTURE.md#image-collection-publication-journal).
 
-`KnLiveDbg.exe --offline !kmon store <artifact-root> [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
+`KnLiveDbg.exe --offline !kmon store <artifact-root> [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]`
 audits stopped image and IRP collections together and returns private
 `kn.evidence_store_inventory.v1` JSON. It reports closed/open/unresolved roots,
 exact member/path/content byte denominators and protected retention classes.
@@ -257,6 +257,19 @@ in the collection's retirement receipt. Exit 0 means planned, retired or a
 matching receipt was reused. Exit 1 means denied or incomplete, 2 means
 invalid grammar and 3 means output failure. Inspect the receipt after an
 interrupted apply or output failure. [Retirement semantics](ARCHITECTURE.md#closed-collection-retirement)
+
+To budget routine originals across closed KMON image and IRP collections,
+save a successful `store <artifact-root> /retention` report as UTF-8 in a
+private directory. Each root reports its class and exclusive routine bytes.
+The class totals cover the whole store even when artifact detail is paged.
+For a 128 MiB target, run
+`python tools/new-evidence-gc-policy.py --inventory inventory.json --retire-excess-routine 134217728 --reason "routine archive budget" --output routine.json`.
+Use `--minimum-age-seconds` for the minimum closure age and `--byte-limit`
+for the maximum exclusive bytes per withdrawal. Preflight with
+`KnLiveDbg.exe --offline !kmon retire-collection <artifact-root> routine.json`.
+Add `/apply` to publish the retirement receipt. Refresh the inventory before
+selecting another collection. A separate file GC policy is required to reclaim
+physical files. [Cross-collection routine budget](ARCHITECTURE.md#cross-collection-routine-budget)
 
 `KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]`
 preflights an explicit policy by default. Prepare one with

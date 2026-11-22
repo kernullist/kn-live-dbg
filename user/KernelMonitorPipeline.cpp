@@ -2442,7 +2442,10 @@ bool KmonIrpPublicationIntegrationSelfTest(const std::wstring& capturePath, std:
             check(ReadAnalystSnapshot((folder / (L"irp-session-" + id + L".knirpledger")).wstring(), &ledger, nullptr) &&
                 ledger.find(L"\"claims_written\":\"" + std::wstring(mode == 0 ? L"1" : L"0") + L"\"") != std::wstring::npos &&
                 ledger.find(L"\"claims_unavailable\":\"" + std::wstring(mode == 0 ? L"0" : L"1") + L"\"") != std::wstring::npos);
-            check(InspectEvidenceStore(folder.wstring()).Status == L"verified" && InspectEvidencePrivacy(folder.wstring(), true).AuditComplete);
+            const auto inventory = InspectEvidenceStore(folder.wstring(), true);
+            check(inventory.Budget.Observed && inventory.Collections.size() == 1 &&
+                inventory.Collections.front().Retention.Priority == CollectionPriority::First &&
+                inventory.Collections.front().Retention.ExclusiveRoutineBytes == 0 && InspectEvidencePrivacy(folder.wstring(), true).AuditComplete);
         }
     }
     catch (const std::exception&) { check(false); }

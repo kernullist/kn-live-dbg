@@ -7,6 +7,50 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Cross-collection routine retention on 2026-11-23
+
+The preceding x64 Release CLI (`11da8a1dea86`) accepted the ordinary stopped
+store inventory and returned exit 2 for `/retention`. The updated
+size-optimized x64 Release CLI (`7d3fd43cffdf`) and Release journal harness
+(`05c63eaef776`) read 17 closed image/IRP collections in a disposable store.
+The test derived path owners directly from the segment files and measured the
+files independently. The 76 active paths included 26 failure ledgers. Both
+interfaces charged 4,138 bytes to routine originals. Withdrawing the oldest
+eligible root released 752 exclusive named bytes, leaving 3,386 under active
+routine ownership. All original files remained present after that withdrawal.
+In a separate two-root case, the last routine owner inherited the shared PE's
+bytes. Exact-member GC subsequently removed only a nominated retired capture
+in the mixed store. [Independent budget checks](../tools/test-collection-retention-budget.py)
+
+Controls covered first-state attempts, conflicting or missing image tickets,
+an interrupted sweep, skipped ranges, missing references and recipes,
+malformed or overflowing counters and legacy closure formats. Policies that
+named a protected root, exceeded the byte ceiling, reached the requested
+target, or pinned stale inventory data were rejected. Reordering closure
+times changed the eligible candidate even with unchanged catalog and artifact
+digests. Tests terminated a child after observed preflight and receipt
+publication and retried the same policy. A separately rehashed receipt with
+an impossible byte delta made the store partial. The preceding reader also
+reported incomplete membership when it encountered a v2 receipt.
+
+The product's driver-free integration tests used the KMON writer to publish
+a clean image sweep, an interrupted image sweep and first-state IRP captures.
+The budget classified the clean image as routine and protected the interrupted
+sweep and IRP first states, including when an original claim or reference
+could not be published. The CLI and Release harness each passed 106
+budget checks. The normal CLI also passed 553 store, 898 GC, 386
+retirement, 400 IRP journal and 570 console checks. Its routed-image
+integration passed 123 checks and IRP publication passed 35. The private
+content scanner passed all 39 test cases.
+
+On this host the MSVC AddressSanitizer journal build (`5f5bfeba2e1a`)
+stopped during default runtime interception before the program entered its
+test. With `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` it passed the 106
+budget checks with halt-on-error enabled. Instrumentation coverage is
+limited by that interception failure. These tests cover locally controlled files and inputs.
+Other-family quotas, continuation beyond the scan bounds, media power loss
+and the native driver lifecycle remain separate gates.
+
 ## Inventory artifact pagination on 2026-11-23
 
 A disposable store held 24,576 synthetic image capture declarations that

@@ -496,7 +496,7 @@ int wmain(int argc, wchar_t** argv)
             flags.insert(flags.end(), argv + 3, argv + argc);
             EvidenceStorePageOptions page;
             if (!ParseEvidenceStorePageOptions(flags, &page)) { return 2; }
-            const auto result = InspectEvidenceStore(argv[2]);
+            const auto result = InspectEvidenceStore(argv[2], page.Retention);
             bool ready = false;
             std::cout << mcpjson::WideToUtf8(EvidenceStoreInventoryJson(result, page, &ready)) << std::endl;
             if (!std::cout) { return 3; }

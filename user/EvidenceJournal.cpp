@@ -28,6 +28,8 @@ namespace
     constexpr uint64_t StoreMaxCollections = 1024, StoreMaxPaths = 65536, StoreMaxReferences = 262144;
     constexpr uint64_t StoreMaxReadBytes = 8ull * 1024 * 1024 * 1024;
     using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
+    uint64_t FileTimeValue(FILETIME time);
+    uint64_t CurrentFileTime();
     Handle Own(HANDLE handle) { return Handle(handle == INVALID_HANDLE_VALUE ? nullptr : handle, &CloseHandle); }
     // Only internally constructed, normalized local DOS paths reach this
     // helper, after PinDirectory rejects device/UNC/reparse components. Do not
@@ -100,6 +102,9 @@ namespace
     {
         std::wstring Id, Session, Head, Reason;
         uint64_t Age = 0, ExclusiveByteLimit = 0;
+        bool RoutineBudget = false;
+        uint64_t RoutineTarget = 0;
+        std::wstring ReviewedCatalog, ReviewedArtifacts;
     };
     struct RetirementCount
     {
@@ -112,13 +117,17 @@ namespace
         uint64_t Observed = 0, ClosureWritten = 0;
         std::wstring Catalog, Artifacts;
         RetirementCount Exclusive, Shared, Ledgers;
+        uint64_t RoutineBefore = 0, RoutineAfter = 0;
     };
     std::wstring RetirementPolicyJson(const RetirementPolicy& p)
     {
-        return L"{\"schema\":\"kn.evidence_retirement_policy.v1\",\"collection_id\":" + mcpjson::Quote(p.Id) +
+        const std::wstring schema = p.RoutineBudget ? L"kn.evidence_retirement_policy.v2" : L"kn.evidence_retirement_policy.v1";
+        return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"collection_id\":" + mcpjson::Quote(p.Id) +
             L",\"session_sha256\":" + mcpjson::Quote(p.Session) + L",\"head_sha256\":" + mcpjson::Quote(p.Head) +
             L",\"reason\":" + mcpjson::Quote(p.Reason) + L",\"minimum_age_seconds\":" + N(p.Age) +
-            L",\"exclusive_byte_limit\":" + N(p.ExclusiveByteLimit) + L"}";
+            L",\"exclusive_byte_limit\":" + N(p.ExclusiveByteLimit) + (p.RoutineBudget ?
+                L",\"policy\":\"kn.retire_routine_excess.v1\",\"routine_named_byte_target\":" + N(p.RoutineTarget) +
+                L",\"catalog_sha256\":" + mcpjson::Quote(p.ReviewedCatalog) + L",\"artifacts_sha256\":" + mcpjson::Quote(p.ReviewedArtifacts) : L"") + L"}";
     }
     bool ParseRetirementPolicy(const std::wstring& json, RetirementPolicy& p)
     {
@@ -126,6 +135,13 @@ namespace
         if (!o.Parse(json)) { return false; }
         p.Id = o.String(L"collection_id"); p.Head = o.String(L"head_sha256");
         p.Session = o.String(L"session_sha256"); p.Reason = o.String(L"reason");
+        p.RoutineBudget = o.String(L"schema") == L"kn.evidence_retirement_policy.v2";
+        if (p.RoutineBudget)
+        {
+            p.ReviewedCatalog = o.String(L"catalog_sha256"); p.ReviewedArtifacts = o.String(L"artifacts_sha256");
+            if (!Digest(p.ReviewedCatalog) || !Digest(p.ReviewedArtifacts) || !Number(json, L"routine_named_byte_target", &p.RoutineTarget) ||
+                p.RoutineTarget > StoreMaxReadBytes) { return false; }
+        }
         return Id(p.Id) && Digest(p.Head) && Digest(p.Session) && Text(p.Reason, 512) &&
             Number(json, L"minimum_age_seconds", &p.Age) && p.Age <= 10ull * 366 * 86400 &&
             Number(json, L"exclusive_byte_limit", &p.ExclusiveByteLimit) && p.ExclusiveByteLimit <= MaxReadBytes &&
@@ -135,11 +151,12 @@ namespace
     { return L"{\"paths\":" + N(c.Paths) + L",\"named_bytes\":" + N(c.Bytes) + L"}"; }
     std::wstring RetirementReceiptJson(const RetirementRecord& r)
     {
-        return Envelope(L"kn.evidence_retirement.v1", L"{\"policy\":" + RetirementPolicyJson(r.Policy) +
+        return Envelope(r.Policy.RoutineBudget ? L"kn.evidence_retirement.v2" : L"kn.evidence_retirement.v1", L"{\"policy\":" + RetirementPolicyJson(r.Policy) +
             L",\"observed_filetime\":" + N(r.Observed) + L",\"closure_last_write_filetime\":" + N(r.ClosureWritten) +
             L",\"catalog_sha256\":" + mcpjson::Quote(r.Catalog) + L",\"artifacts_sha256\":" + mcpjson::Quote(r.Artifacts) +
             L",\"exclusive_nonledger\":" + RetirementCountJson(r.Exclusive) + L",\"shared_nonledger\":" + RetirementCountJson(r.Shared) +
-            L",\"failure_ledgers\":" + RetirementCountJson(r.Ledgers) + L"}");
+            L",\"failure_ledgers\":" + RetirementCountJson(r.Ledgers) + (r.Policy.RoutineBudget ?
+                L",\"routine_named_bytes_before\":" + N(r.RoutineBefore) + L",\"routine_named_bytes_after\":" + N(r.RoutineAfter) : L"") + L"}");
     }
     bool ParseRetirementRecord(const std::wstring& json, RetirementRecord& r)
     {
@@ -159,7 +176,11 @@ namespace
             Number(payload, L"closure_last_write_filetime", &r.ClosureWritten) && r.ClosureWritten != 0 &&
             r.Observed >= r.ClosureWritten && (r.Observed - r.ClosureWritten) / 10000000 >= r.Policy.Age &&
             count(L"exclusive_nonledger", r.Exclusive) && count(L"shared_nonledger", r.Shared) && count(L"failure_ledgers", r.Ledgers) &&
-            r.Exclusive.Bytes <= r.Policy.ExclusiveByteLimit && RetirementReceiptJson(r) == json;
+            r.Exclusive.Bytes <= r.Policy.ExclusiveByteLimit &&
+            (!r.Policy.RoutineBudget || (r.Policy.ReviewedCatalog == r.Catalog && r.Policy.ReviewedArtifacts == r.Artifacts &&
+                Number(payload, L"routine_named_bytes_before", &r.RoutineBefore) && Number(payload, L"routine_named_bytes_after", &r.RoutineAfter) &&
+                r.RoutineBefore <= StoreMaxReadBytes && r.RoutineBefore > r.Policy.RoutineTarget && r.Exclusive.Bytes &&
+                r.Exclusive.Bytes <= r.RoutineBefore && r.RoutineAfter == r.RoutineBefore - r.Exclusive.Bytes)) && RetirementReceiptJson(r) == json;
     }
     bool MemberValid(const EvidenceJournalMember& m, const std::wstring& id)
     {
@@ -455,6 +476,9 @@ struct EvidenceJournal::Impl
     bool Approved = false;
     bool ScopedApproval = false;
     bool RetirementSeen = false;
+    bool InspectPriority = false, SweepHasGap = false;
+    std::array<uint64_t, 5> ImageTickets{};
+    CollectionPriority ImagePriority = CollectionPriority::Unknown, IrpPriority = CollectionPriority::Empty;
     std::function<bool(HANDLE)> AdmitOutput;
 
     bool Fail(const wchar_t* issue) { Result.Issue = issue; return false; }
@@ -682,9 +706,10 @@ struct EvidenceJournal::Impl
         ImageArchiveKind kind, const std::wstring& json, VerifiedMembers& added)
     {
         ImageArchiveCatalog catalog;
-        if (!ReadImageArchiveCatalog(kind, root, json, catalog)) { return Fail(L"image_archive_catalog_invalid"); }
+        if (!ReadImageArchiveCatalog(kind, root, json, catalog, InspectPriority)) { return Fail(L"image_archive_catalog_invalid"); }
         if (kind == ImageArchiveKind::Sweep)
         {
+            SweepHasGap |= catalog.SweepHasGap;
             for (const auto& input : catalog.Inputs)
             {
                 const auto member = Members.find(input.first);
@@ -704,6 +729,14 @@ struct EvidenceJournal::Impl
                 if (member == t.Members.end() || member->Path != input.first || !MatchesImageArchiveInput(input.second, *member, L""))
                     { return Fail(L"image_reference_not_committed"); }
             }
+        }
+        if (InspectPriority && kind == ImageArchiveKind::Reads && t.Kind == L"image_reads")
+        {
+            auto priority = ReadImageTicketPriority(catalog.RetentionTicket);
+            const auto slice = L"image-reads/reads-" + Result.CollectionId + L"-" + t.Id + L".knslice";
+            if (priority == CollectionPriority::Routine && (catalog.Inputs.empty() || std::none_of(t.Members.begin(), t.Members.end(),
+                [&](const auto& member) { return member.Path == slice; }))) { priority = CollectionPriority::Gap; }
+            ++ImageTickets[static_cast<size_t>(priority)];
         }
         if (kind == ImageArchiveKind::Reads || kind == ImageArchiveKind::Slice)
             { added.ImagePayloads.emplace(root.Path, std::move(catalog.PayloadSha256)); }
@@ -741,6 +774,14 @@ struct EvidenceJournal::Impl
             if (m.Schema != L"raw.bytes" && (!mcpjson::GetString(json, L"schema", &schema) || schema != m.Schema))
                 { return Fail(L"member_schema_mismatch"); }
             if (imageKind != ImageArchiveKind::None && !VerifyImageCatalog(t, m, imageKind, json, *added)) { return false; }
+            if (InspectPriority && !ledgersOnly && (m.Schema == L"kn.image_read_session.v1" || m.Schema == L"kn.irp_capture_session.v1"))
+            {
+                const auto count = [&](const wchar_t* kind)
+                    { return std::count_if(Records.begin(), Records.end(), [&](const auto& r) { return r.Transaction.Kind == kind; }); };
+                const bool irp = m.Schema == L"kn.irp_capture_session.v1";
+                (irp ? IrpPriority : ImagePriority) = ReadLedgerPriority(json, Result.CollectionId, irp,
+                    count(irp ? L"irp_capture" : L"image_reads"), count(L"image_sweep"), ImageTickets);
+            }
             if (StoreIrpCatalogs && IrpCaptureSchema(m.Schema)) { StoreIrpCatalogs->emplace(m.Path, ReadIrpReferenceCatalog(m.Schema, json)); }
             if (SharedMembers != nullptr)
             {
@@ -1225,7 +1266,7 @@ namespace
 struct EvidenceStoreAccess
 {
     static EvidenceStoreInventory Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
-        const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action);
+        const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action, bool retention = false);
     static EvidenceGcResult Collect(const std::wstring& root, const std::wstring& policyPath,
         const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer);
     static EvidenceRetirementResult Retire(const std::wstring& root, const std::wstring& policyPath,
@@ -1233,7 +1274,7 @@ struct EvidenceStoreAccess
 };
 
 EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifactRoot, const std::set<std::wstring>& deletionPaths,
-    const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action)
+    const std::function<void(const EvidenceStoreInventory&, const fs::path&, EvidenceJournal::Impl&)>& action, bool retention)
 {
     EvidenceStoreInventory out;
     out.StartedTick = GetTickCount64();
@@ -1281,6 +1322,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         {
             auto journal = std::make_unique<EvidenceJournal>();
             auto& d = *journal->Data;
+            d.InspectPriority = retention;
             d.Started = out.StartedTick;
             d.SharedMembers = &cache; d.SharedReadBytes = &out.ReadBytes; d.SharedReferences = &references;
             d.StoreIrpCatalogs = &irpCatalogs;
@@ -1295,7 +1337,17 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             else if (d.RetirementSeen) { ++out.RetiredCollections; }
             else if (d.Result.Closed) { ++out.ClosedCollections; }
             else { ++out.OpenCollections; }
-            out.Collections.push_back({id, d.Result});
+            out.Collections.push_back({id, d.Result, {}});
+            if (retention && ok && d.Result.Closed && !d.RetirementSeen)
+            {
+                auto& info = out.Collections.back().Retention;
+                info.Priority = CombineCollectionPriority(d.ImagePriority, d.IrpPriority);
+                if (d.SweepHasGap) { info.Priority = CombineCollectionPriority(info.Priority, CollectionPriority::Gap); }
+                const auto segment = d.Files.find(L"@segment-" + std::to_wstring(d.Result.CommittedSegments));
+                FILETIME time{};
+                if (segment != d.Files.end() && GetFileTime(segment->second.get(), nullptr, nullptr, &time))
+                    { info.ClosureWritten = FileTimeValue(time); }
+            }
             if (ok && d.RetirementSeen)
             {
                 out.RetiredSegments += d.Result.CommittedSegments;
@@ -1622,6 +1674,12 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         if (out.ArtifactInventoryComplete) { out.RetiredAbsentPaths = missingRetiredPaths; }
         else { out.RetiredUnobservedPaths += missingRetiredPaths; }
         out.Status = out.MembershipComplete && out.ArtifactInventoryComplete ? L"verified" : L"partial";
+        if (retention && out.Status == L"verified")
+        {
+            AccountCollectionRetention(out);
+            if (!reader.Timely()) { out.Status = L"partial"; out.Issue = reader.Result.Issue; }
+            else { out.Budget.Observed = CurrentFileTime(); }
+        }
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
         if (action) { action(out, root, reader); }
     }
@@ -1629,9 +1687,9 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
     return finish();
 }
 
-EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot)
+EvidenceStoreInventory InspectEvidenceStore(const std::wstring& artifactRoot, bool includeRetention)
 {
-    return EvidenceStoreAccess::Inspect(artifactRoot, {}, {});
+    return EvidenceStoreAccess::Inspect(artifactRoot, {}, {}, includeRetention);
 }
 
 std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, bool includeArtifacts)
@@ -1674,6 +1732,7 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
     {
         const auto key = LowerAscii(options[i]);
         if (key == L"/artifacts" && !parsed.Artifacts) { parsed.Artifacts = true; }
+        else if (key == L"/retention" && !parsed.Retention) { parsed.Retention = true; }
         else if (key == L"/json" && !json) { json = true; }
         else if (key == L"/limit" && !parsed.Limit && ++i < options.size())
         {
@@ -1767,6 +1826,7 @@ std::wstring EvidenceStoreInventoryJson(const EvidenceStoreInventory& r, const E
         L",\"artifact_page_status\":" + mcpjson::Quote(pageStatus) + L",\"artifact_row_offset\":" + N(offset) +
         L",\"artifact_rows_remaining\":" + N(r.Artifacts.size() - offset - emitted) +
         L",\"next_artifact_cursor\":" + mcpjson::Quote(next) +
+        (page.Retention ? L",\"collection_retention\":" + CollectionRetentionBudgetJson(r) : L"") +
         L",\"collections\":" + collections + L"],\"artifacts\":" + artifacts +
         L"],\"deletion_authorized\":false,\"disk_allocation_established\":false,\"target_coverage_established\":false,"
         L"\"collector_authenticated\":false,\"power_loss_durability_established\":false}";
@@ -1935,6 +1995,19 @@ EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, c
                         count.Add(a.Artifact.Bytes);
                     }
                 }
+                if (policy.RoutineBudget)
+                {
+                    if (policy.ReviewedCatalog != store.CatalogSha256 || policy.ReviewedArtifacts != store.ArtifactsSha256)
+                        { result.Issue = L"routine_budget_inventory_changed"; return; }
+                    if (found->Retention.Priority != CollectionPriority::Routine) { result.Issue = L"routine_budget_root_protected"; return; }
+                    record.RoutineBefore = store.Budget.ByPriority[static_cast<size_t>(CollectionPriority::Routine)].Bytes;
+                    if (record.RoutineBefore <= policy.RoutineTarget) { result.Issue = L"routine_budget_within_target"; return; }
+                    if (SelectRoutineRetirement(store, policy.RoutineTarget, policy.Age, policy.ExclusiveByteLimit) != &*found ||
+                        found->Retention.ClosureWritten != record.ClosureWritten || !record.Exclusive.Bytes ||
+                        record.Exclusive.Bytes != found->Retention.ExclusiveRoutineBytes || record.Exclusive.Bytes > record.RoutineBefore)
+                        { result.Issue = L"routine_budget_candidate_changed_or_ineligible"; return; }
+                    record.RoutineAfter = record.RoutineBefore - record.Exclusive.Bytes;
+                }
                 result.Record = RetirementReceiptJson(record);
                 if (!record.ClosureWritten || record.Observed < record.ClosureWritten ||
                     (record.Observed - record.ClosureWritten) / 10000000 < policy.Age) { result.Issue = L"closure_too_young_or_future"; return; }
@@ -1950,7 +2023,7 @@ EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, c
                 result.ReceiptSha256 = std::move(digest); result.Status = L"retired";
             }
             catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_execution_exception"; }
-        });
+        }, record.Policy.RoutineBudget);
         if (!called) { result.Issue = snapshot.Issue.empty() ? L"retirement_inventory_unavailable" : snapshot.Issue; }
     }
     catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_inspection_exception"; }
