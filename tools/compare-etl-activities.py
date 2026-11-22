@@ -10,7 +10,8 @@ import sys
 import tempfile
 from typing import NamedTuple
 
-from etl_reader_process import WindowsFiles, file_hash, run_reader
+from etl_reader_process import WindowsFiles, file_hash, reader_receipt, run_reader
+import etl_traceprocessor
 from owned_module_benchmark import check, decimal, encoded, publish_new, sha, uint
 from saved_etl_comparison import MAX_ETL, MIB, digest, local_path, original, outputs_safe, write_result
 
@@ -183,10 +184,7 @@ def observe(query, program, binary, files, stack, held, directory, timeout):
         return side, None
     arguments = ["--etl-hard-faults", str(query.path), "--sha256", query.pin, "--activity-window", str(query.start), str(query.stop)]
     attempt = run_reader(program, arguments, directory, timeout, MIB, files, binary)
-    result = {k: attempt[k] for k in ("state", "exit_code", "os_error", "image_binding")}
-    for channel in ("stdout", "stderr"):
-        result[channel + "_sha256"] = attempt[channel]["original_sha256"]
-        result[channel + "_bytes"] = attempt[channel]["byte_count"]
+    result = reader_receipt(attempt)
     side["reader"] = result
     if result["state"] != "exited" or result["image_binding"] != dict(status="matched", win32_status=0):
         side["status"] = "reader_unavailable"
@@ -251,12 +249,19 @@ def execute(args):
         check(file_hash(binary) == expected, "reader executable SHA-256 mismatch")
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=parent, prefix=".kn-etl-activities-")))
         files.parents(stack, directory, held)
+        runtime = etl_traceprocessor.admit(args.traceprocessor, directory, files, stack, held) if args.traceprocessor else None
         before, after = [observe(q, program, binary, files, stack, held, directory, args.timeout_ms) for q in queries]
         result = comparison(before, after)
         report = dict(schema="kn.etl_activity_comparison.v1", reader_sha256=expected, reader_schema=NATIVE_SCHEMA,
                       timeout_ms=args.timeout_ms, baseline=before[0], candidate=after[0], comparison=result,
                       qualification=dict(scope="two_selected_marker_windows", symbol_lookup="not_requested",
                                          equivalent_workload=None, population_regression=None, cause_of_change=None))
+        sdk_status = None
+        if runtime:
+            sides = {role: etl_traceprocessor.verify_side(q, side, measured, runtime, directory, args.timeout_ms, files, DECODE)
+                     for role, q, (side, measured) in zip(("baseline", "candidate"), queries, (before, after), strict=True)}
+            sdk_status = "matched" if all(s["status"] == "matched" for s in sides.values()) else "unconfirmed"
+            report.update(schema="kn.etl_activity_comparison.v2", traceprocessor=dict(status=sdk_status, **runtime[2], **sides))
         data = encoded(report)
         if output:
             report_pin = publish_new(output, lambda stream: stream.write(data))
@@ -266,7 +271,9 @@ def execute(args):
             state = "matched" if report_pin == expected_report else "mismatch"
     receipt = dict(schema="kn.etl_activity_comparison_receipt.v1", status=state, comparison_status=result["status"],
                    report_sha256=report_pin, expected_report_sha256=expected_report)
-    return receipt, int(state == "mismatch" or result["status"] != "compared")
+    if sdk_status is not None:
+        receipt.update(schema="kn.etl_activity_comparison_receipt.v2", traceprocessor_status=sdk_status)
+    return receipt, int(state == "mismatch" or result["status"] != "compared" or sdk_status == "unconfirmed")
 
 
 def main():
@@ -275,6 +282,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--exe", required=True, help="local KnLiveDbg executable")
     parser.add_argument("--exe-sha256", required=True, help="expected executable SHA-256")
+    parser.add_argument("--traceprocessor", nargs=2, metavar=("ADAPTER_ZIP", "SHA256"),
+                        help="independently check both pairs of marker headers with a pinned TraceProcessor adapter")
     for role in ("baseline", "candidate"):
         parser.add_argument("--" + role, required=True, nargs=4, metavar=("ETL", "SHA256", "START", "STOP"),
                             help="pinned recording and its two original record numbers")

@@ -1,0 +1,185 @@
+"""Corroborate selected ETL marker headers with the optional Microsoft TraceProcessor adapter."""
+import os
+from pathlib import Path
+import re
+import zipfile
+import zlib
+
+from etl_reader_process import file_hash, reader_receipt, run_reader
+from owned_module_benchmark import check, fields, sha, uint
+from saved_etl_comparison import MIB, digest, local_path, original
+
+
+PROGRAM = "TraceProcessorMarkers.exe"
+SDK_HASH = "155f3da1ba1de62d40c75058f8cb5375016fd2d39d4a85a631e9cc168cbb1bd7"
+TABLE = "IGenericEventDataSource.Events"
+SCHEMA = "kn.traceprocessor_activity_rows.v1"
+HEADER = ("provider_guid", "activity_id", "channel", "task", "opcode", "event_id", "version", "header_process_id", "header_thread_id")
+
+
+def unpack(source, folder):
+    assets = {}
+    names = set()
+    total = 0
+    with zipfile.ZipFile(source) as archive:
+        entries = archive.infolist()
+        check(len(entries) == 50, "unexpected TraceProcessor package layout")
+        for member in entries:
+            name = member.orig_filename
+            check(re.fullmatch(r"(?:wpt/(?:Catalog/)?)?[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", name) and
+                  not name.endswith(".") and not Path(name).is_reserved() and name.lower() not in names,
+                  "invalid or duplicate TraceProcessor package member")
+            check(member.compress_type in (zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED) and not member.flag_bits & 1 and
+                  0 < member.file_size <= 8 * MIB, "unsupported TraceProcessor package member")
+            names.add(name.lower())
+            total += member.file_size
+            check(total <= 32 * MIB, "TraceProcessor package exceeds expanded limit")
+            with archive.open(member) as item:
+                raw = item.read(member.file_size + 1)
+            check(len(raw) == member.file_size, "incorrect TraceProcessor member extent")
+            dest = folder / name
+            with dest.open("xb") as output:
+                output.write(raw)
+            assets[name] = sha(raw)
+    check(PROGRAM in assets and PROGRAM + ".config" in assets, "missing managed adapter or binding configuration")
+    exe_hash, config_hash = assets.pop(PROGRAM), assets.pop(PROGRAM + ".config")
+    # Digest the untouched runtime files from the locked NuGet packages in canonical path order.
+    inventory = "".join(assets[name] + " " + name + "\n" for name in sorted(assets)).encode("ascii")
+    check(sha(inventory) == SDK_HASH, "TraceProcessor runtime files differ from the locked x64 distribution")
+    return exe_hash, config_hash, assets
+
+
+def admit(values, directory, files, stack, held):
+    path, expected = local_path(values[0]), digest(values[1].lower())
+    files.parents(stack, path.parent, held)
+    source = stack.enter_context(files.hold(path))
+    check(0 < os.fstat(source.fileno()).st_size <= 32 * MIB and file_hash(source) == expected,
+          "TraceProcessor package extent or SHA-256 mismatch")
+    folder = directory / "adapter"
+    for parent in (folder, folder / "wpt", folder / "wpt" / "Catalog"):
+        parent.mkdir()
+        files.parents(stack, parent, held)
+    source.seek(0)
+    try:
+        image, config, assets = unpack(source, folder)
+    except (zipfile.BadZipFile, NotImplementedError, EOFError, zlib.error) as exc:
+        raise ValueError("invalid TraceProcessor package") from exc
+    # Run from the verified deployment. Keep each admitted file and directory in place through publication.
+    binary = None
+    for name, expected_file in {PROGRAM: image, PROGRAM + ".config": config, **assets}.items():
+        deployed = folder / name
+        files.parents(stack, deployed.parent, held)
+        stream = stack.enter_context(files.hold(deployed))
+        check(file_hash(stream) == expected_file, "TraceProcessor deployment changed")
+        if name == PROGRAM:
+            binary = stream
+    metadata = dict(package_sha256=expected, executable_sha256=image, config_sha256=config, sdk_files_sha256=SDK_HASH,
+                    events_package_version="1.12.10", toolkit_package_version="1.11.0", table=TABLE,
+                    allow_lost_events=False, allow_time_inversion=False, symbol_lookup="not_requested")
+    return folder / PROGRAM, binary, metadata
+
+
+def correlate(document, native):
+    page = native["page"]
+    a, b = (page["activity_window"][name] for name in ("start", "stop"))
+    fields(document, "schema source_sha256 source_bytes table provider_guid activity_id query_filter loaded_processing_modules "
+           "provider_rows activity_marker_rows scoped_marker_rows matched_rows row_limit rows",
+           "TraceProcessor query")
+    check(document["schema"] == SCHEMA and document["source_sha256"] == native["source_sha256"] and
+          uint(document["source_bytes"]) == native["source_bytes"] and document["table"] == TABLE and
+          document["provider_guid"] == a["provider_guid"] and document["activity_id"] == a["activity_id"],
+          "TraceProcessor source or filter mismatch")
+    scope = document["query_filter"]
+    fields(scope, "header_process_id header_thread_id channel task begin_raw end_raw", "TraceProcessor filter")
+    for key in ("header_process_id", "header_thread_id", "channel", "task"):
+        check(uint(scope[key]) == a[key], "TraceProcessor numeric filter mismatch")
+    check((scope["begin_raw"], scope["end_raw"]) == (a["raw_timestamp"], b["raw_timestamp"]), "TraceProcessor clock filter mismatch")
+    modules = document["loaded_processing_modules"]
+    required = {"Microsoft.Windows.EventTracing." + name + ".dll" for name in ("Events", "Processes", "Processing")}
+    required.add("wpt/perfcore.dll")
+    check(type(modules) is list and 4 <= len(modules) <= 32 and all(type(name) is str for name in modules) and
+          modules == sorted(set(modules)) and required.issubset(modules) and
+          all(name in required or re.fullmatch(r"wpt/(?:perfg|perf_[a-z0-9_]+)\.dll", name) for name in modules),
+          "unexpected loaded processing modules")
+    total = uint(document["provider_rows"], 2_000_000)
+    activity = uint(document["activity_marker_rows"], total)
+    scoped = uint(document["scoped_marker_rows"], activity)
+    count = uint(document["matched_rows"], scoped)
+    rows = document["rows"]
+    check(uint(document["row_limit"]) == 128 and type(rows) is list and len(rows) == min(count, 128),
+          "invalid TraceProcessor row extent")
+    exact = {"start": [], "stop": []}
+    uncertain = {"start": 0, "stop": 0}
+    previous = 0
+    for row in rows:
+        fields(row, "table_row clock_type timestamp_partial raw_timestamp " + " ".join(HEADER), "TraceProcessor table row")
+        ordinal = uint(row["table_row"], total)
+        check(previous < ordinal and row["provider_guid"] == a["provider_guid"] and row["activity_id"] == a["activity_id"],
+              "row outside filtered TraceProcessor table")
+        previous = ordinal
+        for key, maximum in (("channel", 255), ("task", 65535), ("event_id", 65535), ("version", 255),
+                             ("header_process_id", 0xffffffff), ("header_thread_id", 0xffffffff)):
+            uint(row[key], maximum)
+        check(all(row[k] == scope[k] for k in ("header_process_id", "header_thread_id", "channel", "task")),
+              "row outside TraceProcessor header filter")
+        opcode = uint(row["opcode"])
+        check(opcode in (1, 2) and type(row["timestamp_partial"]) is bool, "invalid marker or clock state")
+        raw, clock = row["raw_timestamp"], row["clock_type"]
+        if raw is None:
+            check(clock is None, "clock kind without a timestamp")
+        else:
+            check(type(clock) is str and 0 < len(clock) <= 64 and type(raw) is str and
+                  re.fullmatch(r"0|-?[1-9][0-9]{0,18}", raw) and -(1 << 63) <= int(raw) < (1 << 63),
+                  "invalid raw TraceProcessor timestamp")
+            if clock == "PerformanceCounter" and not row["timestamp_partial"]:
+                check(int(scope["begin_raw"]) <= int(raw) <= int(scope["end_raw"]), "row outside TraceProcessor clock filter")
+        label, marker = ("start", a) if opcode == 1 else ("stop", b)
+        if any(row[k] != marker[k] for k in HEADER):
+            continue
+        if clock != "PerformanceCounter" or row["timestamp_partial"] or raw is None:
+            uncertain[label] += 1
+        elif raw == marker["raw_timestamp"]:
+            exact[label].append(ordinal)
+
+    if count > len(rows):
+        status = "row_limit"
+    elif any(uncertain.values()):
+        status = "clock_unqualified"
+    elif any(len(values) > 1 for values in exact.values()):
+        status = "ambiguous_rows"
+    elif not exact["start"] or not exact["stop"]:
+        status = "row_missing"
+    elif exact["start"][0] >= exact["stop"][0]:
+        status = "table_order_conflict"
+    else:
+        status = "matched"
+    return dict(status=status, matching_table_rows=exact, unqualified_clock_rows=uncertain)
+
+
+def verify_side(query, native, measured, runtime, directory, timeout, files, decode):
+    result = dict(status="native_window_unavailable", native_page_sha256=native["reader"]["stdout_sha256"] if native["reader"] else None,
+                  reader=None, projection=None, correspondence=None)
+    if measured is None:
+        return result
+    window = native["page"]["activity_window"]
+    marker = window["start"]
+    exe, binary, _ = runtime
+    arguments = [str(query.path), marker["provider_guid"], marker["activity_id"],
+                 *(str(marker[key]) for key in ("header_process_id", "header_thread_id", "channel", "task")),
+                 marker["raw_timestamp"], window["stop"]["raw_timestamp"]]
+    attempt = run_reader(exe, arguments, directory, timeout, MIB, files, binary)
+    receipt = reader_receipt(attempt)
+    result["reader"] = receipt
+    if receipt["state"] != "exited" or receipt["exit_code"] != 0 or receipt["image_binding"] != dict(status="matched", win32_status=0):
+        result["status"] = "reader_unavailable"
+        return result
+    try:
+        raw, complete = original(attempt["stdout"], MIB)
+        check(complete, "TraceProcessor output exceeds byte limit")
+        document = decode(raw)
+        correspondence = correlate(document, native)
+    except (KeyError, TypeError, ValueError, RecursionError):
+        result["status"] = "invalid_projection"
+        return result
+    result.update(status=correspondence["status"], projection=document, correspondence=correspondence)
+    return result

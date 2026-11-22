@@ -1342,6 +1342,29 @@ reports invalid arguments, an unusable reader pin or an output failure.
 `--timeout-ms` sets the per-query deadline, with a default of 240,000 ms.
 [Comparison fields and scope](TRACE_IMPORT.md#comparing-activity-windows-across-recordings)
 
+### Check the same markers with Microsoft TraceProcessor
+
+In a Visual Studio 2022 Developer PowerShell with MSBuild and NuGet, build the
+x64 adapter. Restore uses the committed .NET Framework 4.8 package lock.
+Keep the resulting ZIP and its SHA-256 together for replay.
+
+```powershell
+MSBuild tools\TraceProcessorMarkers\TraceProcessorMarkers.csproj /restore /t:PackageAdapter /p:Configuration=Release
+$adapter = (Get-Item .\.build\traceprocessor-markers\TraceProcessorMarkers.zip).FullName
+$adapterPin = (Get-FileHash -LiteralPath $adapter -Algorithm SHA256).Hash
+$sdkQuery = @('--traceprocessor', $adapter, $adapterPin)
+$checked = python -B tools/compare-etl-activities.py @query @sdkQuery --output .\private\activity-pair-sdk.json | ConvertFrom-Json
+$report = Get-Content -LiteralPath .\private\activity-pair-sdk.json -Raw | ConvertFrom-Json
+$report.traceprocessor.baseline.correspondence
+$report.traceprocessor.candidate.correspondence
+python -B tools/compare-etl-activities.py @query @sdkQuery --check-report $checked.report_sha256
+```
+
+Use the `$query` from the preceding example. The receipt gives a native
+`comparison_status` and a separate `traceprocessor_status`. Exit 0 also
+requires both pairs of marker headers to match unique SDK rows. Each
+attempt identifies its native page by hash. [SDK table, filters and limits](TRACE_IMPORT.md#traceprocessor-marker-correspondence)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

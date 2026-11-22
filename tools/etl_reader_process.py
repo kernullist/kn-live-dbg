@@ -93,6 +93,14 @@ def file_hash(stream):
     return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def reader_receipt(attempt):
+    result = {k: attempt[k] for k in ("state", "exit_code", "os_error", "image_binding")}
+    for channel in ("stdout", "stderr"):
+        result[channel + "_sha256"] = attempt[channel]["original_sha256"]
+        result[channel + "_bytes"] = attempt[channel]["byte_count"]
+    return result
+
+
 def run_reader(program, arguments, directory, timeout_ms, stdout_limit, files, pinned):
     with tempfile.TemporaryFile(dir=directory) as out, tempfile.TemporaryFile(dir=directory) as err:
         start = time.perf_counter_ns()

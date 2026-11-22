@@ -7,6 +7,30 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Microsoft TraceProcessor marker rows on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 adapter built with Visual Studio
+2022 MSBuild and locked NuGet packages. The optional comparison read three
+ETLs through both the native reader (SHA-256 prefix `0218aec46253`) and
+Microsoft TraceProcessor. All six selected endpoint headers agreed on raw
+QPC time, descriptor and recorded identities. Table positions below are
+one-based within the SDK's provider-filtered result. [PerfView measurements](#activity-duration-across-two-recordings-on-2026-11-22) · [TaskbarLatency source and independent TDH checks](#hard-fault-time-inside-activity-markers-on-2026-11-22)
+
+| Recording | Native Start, Stop records | SDK provider rows | SDK Start, Stop rows |
+| --- | --- | ---: | --- |
+| PerfView x64 | 135036, 135051 | 8 | 6, 8 |
+| PerfView x86 | 122133, 122302 | 8 | 6, 8 |
+| TaskbarLatency | 339732, 374019 | 56,702 | 5,413, 7,465 |
+
+The TaskbarLatency provider contained 7,329 activity markers with the
+selected activity ID. The process, thread, task and channel selected 902
+markers, and two remained in the time interval. Both SDK endpoints matched
+even when the native cross-recording comparison reported incompatible
+descriptors. Tests also cover ambiguous matches, unknown clocks, reversed
+row order, the 128-row limit, a missing source qualification and package
+substitution. The SDK check reads generic event headers. The native reader and TDH
+supply the separate hard-fault and scheduler evidence. [Integration checks](../tools/test-traceprocessor-markers.py) · [Build and query](COMMAND_REFERENCE.md#check-the-same-markers-with-microsoft-traceprocessor)
+
 ## Activity duration across two recordings on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix

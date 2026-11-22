@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import shutil
 import struct
 import subprocess
 import sys
@@ -195,9 +196,14 @@ def main():
         for key, after, before in zip(("activity_duration", "observed_hard_fault_union"), expected, (116214900, 1292600), strict=True):
             row = scaled["comparison"][key]
             assert fraction(row["candidate_ns"]) == after and fraction(row["candidate_minus_baseline_ns"]) == after - before
-        with alias.open("ab") as sink:
-            r = subprocess.run([*command(x64, x86), "--help"], stdout=sink, stderr=sink, timeout=30)
-        assert r.returncode == 2 and pin(x64[0]) == x64[1]
+        # A separate comparison can legitimately hold the shared fixture read-only.
+        sink_source = folder / "sink-source.etl"
+        shutil.copyfile(x64[0], sink_source)
+        sink_alias = folder / "sink-alias.etl"
+        sink_alias.hardlink_to(sink_source)
+        with sink_alias.open("ab") as sink:
+            r = subprocess.run([*command((sink_source, *x64[1:]), x86), "--help"], stdout=sink, stderr=sink, timeout=30)
+        assert r.returncode == 2 and pin(sink_source) == x64[1]
         original = (folder / "pair.json").read_bytes()
         invalid = [*command(x64, x86), "--output", folder / "pair.json"]
         assert subprocess.run(invalid, capture_output=True, timeout=30).returncode == 2 and (folder / "pair.json").read_bytes() == original

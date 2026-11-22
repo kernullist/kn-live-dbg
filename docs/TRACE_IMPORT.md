@@ -597,6 +597,36 @@ separate evidence. Different file hashes can also describe two edits of one
 recording. The query uses recorded headers and fault payloads without symbol
 lookup.
 
+### TraceProcessor marker correspondence
+
+The optional `--traceprocessor` query produces a `kn.etl_activity_comparison.v2`
+report. It runs Microsoft.Windows.EventTracing.Events 1.12.10 with the x64
+Processing.Toolkit 1.11.0. The caller pins the ZIP containing the adapter,
+its CLR binding configuration and its dependencies. Acquisition also checks
+the 48 runtime files against the locked distribution and keeps the deployed
+files open during the query. The helper hashes the ETL and checks the
+locations of the loaded managed event assemblies and native processing
+modules. Both loss tolerance and time-inversion tolerance are disabled.
+[Microsoft TraceProcessor data sources](https://learn.microsoft.com/en-us/windows/apps/trace-processing/tutorial)
+
+The SDK reads the generic events for the selected provider. A one-based
+`table_row` identifies the row in its `IGenericEventDataSource.Events`
+result. The projection retains counts for the provider, activity Start/Stop
+events, process/thread/channel/task filter and inclusive time range. Rows
+with an unavailable or partial raw clock remain candidates. At most 128
+rows are retained after these filters. The SDK receives the QPC bounds and
+reads the event IDs, versions, timestamps and original table positions
+from the ETL. [Generic event fields](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.events.igenericevent?view=trace-processor-dotnet-1.0)
+
+Each native endpoint must match exactly one SDK row by provider, activity
+ID, channel, task, opcode, event ID, version, PID, TID and raw QPC tick.
+The Start must precede the Stop in table order. Missing or duplicate rows,
+a possible match with an unqualified clock, a row cap or a reader failure
+leave the SDK result unconfirmed. Both source-specific outcomes and any
+native timing measurements remain available. Agreement covers the selected
+headers. The native thread lifetime and hard-fault overlap have separate
+witnesses. [Build and replay](COMMAND_REFERENCE.md#check-the-same-markers-with-microsoft-traceprocessor)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`
